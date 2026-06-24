@@ -151,12 +151,27 @@ mod tests {
     ///
     /// Fixture name is passed without the `.yaml` extension —
     /// `compile_combine_fixture("two_input_equi")`.
+    /// Top-level node-name → `PlanNodeId`, built from the ids `bind_schema`
+    /// minted in declaration order zipped with each node's name. Top-level
+    /// names are unique, so this is collision-free; tests resolve a
+    /// user-facing node name to its id through it before reading the
+    /// id-keyed `typed` table.
+    type TopLevelIds = std::collections::HashMap<String, clinker_plan::plan::PlanNodeId>;
+
+    /// Resolve a top-level node's id by name, panicking if absent (the
+    /// fixtures here are all top-level and uniquely named).
+    fn top_id(ids: &TopLevelIds, name: &str) -> clinker_plan::plan::PlanNodeId {
+        *ids.get(name)
+            .unwrap_or_else(|| panic!("no top-level id for node {name:?}"))
+    }
+
     #[allow(dead_code)] // Used by C.1.1+ tests; referenced here as a gate.
     fn compile_combine_fixture(
         name: &str,
     ) -> (
         clinker_plan::plan::bind_schema::CompileArtifacts,
         Vec<clinker_core_types::Diagnostic>,
+        TopLevelIds,
     ) {
         let yaml = load_fixture(&format!("{name}.yaml"));
         let config = parse_fixture(&yaml);
@@ -171,7 +186,13 @@ mod tests {
             std::path::Path::new(""),
             Default::default(),
         );
-        (artifacts, diags)
+        let ids: TopLevelIds = config
+            .nodes
+            .iter()
+            .zip(artifacts.top_level_node_ids.iter())
+            .map(|(spanned, id)| (spanned.value.name().to_string(), *id))
+            .collect();
+        (artifacts, diags, ids)
     }
 
     /// Assert that the node's output row (as published on
@@ -181,14 +202,12 @@ mod tests {
     #[allow(dead_code)] // Pre-existing helper retained for combine gate tests.
     fn assert_output_row(
         artifacts: &clinker_plan::plan::bind_schema::CompileArtifacts,
+        ids: &TopLevelIds,
         node_name: &str,
         expected_fields: &[&str],
     ) {
         let row = artifacts
-            .typed_get(
-                clinker_plan::plan::bind_schema::NodeScope::TopLevel,
-                node_name,
-            )
+            .typed_get(top_id(ids, node_name))
             .map(|tp| &tp.output_row)
             .unwrap_or_else(|| panic!("no bound output row for node {node_name:?}"));
         let actual: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
@@ -207,6 +226,7 @@ mod tests {
     #[allow(dead_code)] // Exercised by C.1.2+ tests.
     fn assert_predicate_decomposition(
         artifacts: &clinker_plan::plan::bind_schema::CompileArtifacts,
+        ids: &TopLevelIds,
         node_name: &str,
         expected_equalities: usize,
         expected_ranges: usize,
@@ -214,7 +234,7 @@ mod tests {
     ) {
         let pred = artifacts
             .combine_predicates
-            .get(node_name)
+            .get(&top_id(ids, node_name))
             .unwrap_or_else(|| panic!("no decomposed predicate for combine {node_name:?}"));
         assert_eq!(
             pred.equalities.len(),
@@ -244,7 +264,7 @@ mod tests {
     /// both upstreams are declared sources.
     #[test]
     fn test_combine_schema_scaffold_compiles() {
-        let (_artifacts, diags) = compile_combine_fixture("two_input_equi");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("two_input_equi");
         assert!(
             diags.is_empty(),
             "two_input_equi must bind cleanly; got codes: {:?}",
@@ -304,7 +324,7 @@ mod tests {
     /// construction path runs end-to-end for the canonical shape.
     #[test]
     fn test_combine_merged_row_two_inputs() {
-        let (_artifacts, diags) = compile_combine_fixture("two_input_equi");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("two_input_equi");
         assert!(
             diags.is_empty(),
             "two_input_equi must bind cleanly at C.1.1; got codes: {:?}",
@@ -323,7 +343,7 @@ mod tests {
     /// warnings are out of scope for this gate.
     #[test]
     fn test_combine_merged_row_three_inputs() {
-        let (_artifacts, diags) = compile_combine_fixture("three_input_shared_key");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("three_input_shared_key");
         let errors: Vec<&str> = diags
             .iter()
             .filter(|d| matches!(d.severity, clinker_core_types::Severity::Error))
@@ -338,7 +358,7 @@ mod tests {
     /// C.1.1 gate: fewer than 2 declared inputs → E300.
     #[test]
     fn test_combine_e300_one_input() {
-        let (_artifacts, diags) = compile_combine_fixture("error_one_input");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("error_one_input");
         assert!(
             diags.iter().any(|d| d.code == "E300"),
             "error_one_input must produce E300; got codes: {:?}",
@@ -350,7 +370,7 @@ mod tests {
     /// namespaces (`$pipeline`, `$window`, `$meta`) → E301.
     #[test]
     fn test_combine_e301_reserved_namespace() {
-        let (_artifacts, diags) = compile_combine_fixture("error_reserved_namespace");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("error_reserved_namespace");
         assert!(
             diags.iter().any(|d| d.code == "E301"),
             "error_reserved_namespace must produce E301; got codes: {:?}",
@@ -362,7 +382,7 @@ mod tests {
     /// alias a genuine 3-part CXL reference → E301.
     #[test]
     fn test_combine_e301_dotted_qualifier() {
-        let (_artifacts, diags) = compile_combine_fixture("error_dotted_qualifier");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("error_dotted_qualifier");
         assert!(
             diags.iter().any(|d| d.code == "E301"),
             "error_dotted_qualifier must produce E301; got codes: {:?}",
@@ -382,7 +402,7 @@ mod tests {
     /// and populates `artifacts.combine_predicates`.
     #[test]
     fn test_combine_where_typecheck_bool() {
-        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        let (artifacts, diags, ids) = compile_combine_fixture("two_input_equi");
         assert!(
             diags.is_empty(),
             "two_input_equi must bind cleanly; got codes: {:?}",
@@ -390,7 +410,7 @@ mod tests {
         );
         let pred = artifacts
             .combine_predicates
-            .get("enriched")
+            .get(&top_id(&ids, "enriched"))
             .expect("combine_predicates['enriched'] must exist");
         assert!(
             !pred.equalities.is_empty(),
@@ -401,7 +421,7 @@ mod tests {
     /// C.1.2 gate: a where-clause whose predicate is a non-Bool type → E303.
     #[test]
     fn test_combine_e303_where_not_bool() {
-        let (_artifacts, diags) = compile_combine_fixture("error_where_not_bool");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("error_where_not_bool");
         assert!(
             diags.iter().any(|d| d.code == "E303"),
             "error_where_not_bool must produce E303; got codes: {:?}",
@@ -413,7 +433,7 @@ mod tests {
     /// field → E304.
     #[test]
     fn test_combine_e304_unknown_field() {
-        let (_artifacts, diags) = compile_combine_fixture("error_unknown_field");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("error_unknown_field");
         assert!(
             diags.iter().any(|d| d.code == "E304"),
             "error_unknown_field must produce E304; got codes: {:?}",
@@ -425,7 +445,7 @@ mod tests {
     /// no cross-input extractables → E305.
     #[test]
     fn test_combine_e305_no_cross_input() {
-        let (_artifacts, diags) = compile_combine_fixture("error_no_cross_input");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("error_no_cross_input");
         assert!(
             diags.iter().any(|d| d.code == "E305"),
             "error_no_cross_input must produce E305; got codes: {:?}",
@@ -438,7 +458,7 @@ mod tests {
     /// cross joins; users must add a real predicate or use a Merge node.
     #[test]
     fn test_combine_e305_literal_true() {
-        let (_artifacts, diags) = compile_combine_fixture("error_literal_true");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("error_literal_true");
         assert!(
             diags.iter().any(|d| d.code == "E305"),
             "error_literal_true must produce E305; got codes: {:?}",
@@ -450,9 +470,9 @@ mod tests {
     /// no residual.
     #[test]
     fn test_combine_decompose_pure_equi() {
-        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        let (artifacts, diags, ids) = compile_combine_fixture("two_input_equi");
         assert!(diags.is_empty(), "expected clean compile");
-        let pred = &artifacts.combine_predicates["enriched"];
+        let pred = &artifacts.combine_predicates[&top_id(&ids, "enriched")];
         assert_eq!(pred.equalities.len(), 1, "1 equality expected");
         assert_eq!(pred.ranges.len(), 0, "0 ranges expected");
         assert!(
@@ -470,13 +490,13 @@ mod tests {
     fn test_combine_decompose_mixed() {
         use clinker_plan::plan::combine::RangeOp;
 
-        let (artifacts, diags) = compile_combine_fixture("two_input_mixed");
+        let (artifacts, diags, ids) = compile_combine_fixture("two_input_mixed");
         assert!(
             diags.is_empty(),
             "two_input_mixed must bind cleanly; got codes: {:?}",
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
-        let pred = &artifacts.combine_predicates["qualified"];
+        let pred = &artifacts.combine_predicates[&top_id(&ids, "qualified")];
         assert_eq!(pred.equalities.len(), 1, "1 equality expected");
         assert_eq!(pred.ranges.len(), 2, "2 ranges expected");
         assert!(matches!(pred.ranges[0].op, RangeOp::Ge));
@@ -489,17 +509,14 @@ mod tests {
     /// processing the combine.
     #[test]
     fn test_combine_e311_collect_with_body() {
-        let (artifacts, diags) = compile_combine_fixture("error_collect_with_body");
+        let (artifacts, diags, ids) = compile_combine_fixture("error_collect_with_body");
         assert!(
             diags.iter().any(|d| d.code == "E311"),
             "error_collect_with_body must emit E311; got codes: {:?}",
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
         assert!(
-            !artifacts.typed_contains(
-                clinker_plan::plan::bind_schema::NodeScope::TopLevel,
-                "bad_collect"
-            ),
+            !artifacts.typed_contains(top_id(&ids, "bad_collect")),
             "no output row published when E311 fires"
         );
     }
@@ -518,7 +535,7 @@ mod tests {
         use clinker_plan::plan::types::JoinSide;
         use cxl::typecheck::QualifiedField;
 
-        let (artifacts, diags) = compile_combine_fixture("match_all");
+        let (artifacts, diags, ids) = compile_combine_fixture("match_all");
         assert!(
             diags.is_empty(),
             "match_all must bind cleanly; got codes: {:?}",
@@ -526,7 +543,7 @@ mod tests {
         );
         let resolved = artifacts
             .combine_resolved_columns
-            .get("fanned")
+            .get(&top_id(&ids, "fanned"))
             .expect("bind_combine must publish a resolved_column_map");
 
         // Per `match_all.yaml`, driver = orders (declared first).
@@ -573,17 +590,14 @@ mod tests {
     fn test_combine_collect_output_row_auto_derived() {
         use cxl::typecheck::{QualifiedField, Type};
 
-        let (artifacts, diags) = compile_combine_fixture("match_collect");
+        let (artifacts, diags, ids) = compile_combine_fixture("match_collect");
         assert!(
             diags.is_empty(),
             "match_collect must bind cleanly under R1; got codes: {:?}",
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
         let row = artifacts
-            .typed_get(
-                clinker_plan::plan::bind_schema::NodeScope::TopLevel,
-                "collected",
-            )
+            .typed_get(top_id(&ids, "collected"))
             .map(|tp| &tp.output_row)
             .expect("collected publishes a bound output row");
 
@@ -621,7 +635,7 @@ mod tests {
     /// `select_driving_input` and threads the explicit hint through.
     #[test]
     fn test_combine_driving_input_explicit_drive() {
-        let (artifacts, diags) = compile_combine_fixture("drive_hint");
+        let (artifacts, diags, ids) = compile_combine_fixture("drive_hint");
         assert!(
             diags.is_empty(),
             "drive_hint must bind cleanly; got codes: {:?}",
@@ -629,7 +643,7 @@ mod tests {
         );
         let driver = artifacts
             .combine_driving
-            .get("product_driven")
+            .get(&top_id(&ids, "product_driven"))
             .expect("combine_driving entry for product_driven");
         assert_eq!(driver, "products", "explicit drive wins over default");
     }
@@ -639,14 +653,16 @@ mod tests {
     /// `combine_driving` for that node.
     #[test]
     fn test_combine_e306_invalid_drive() {
-        let (artifacts, diags) = compile_combine_fixture("error_invalid_drive");
+        let (artifacts, diags, ids) = compile_combine_fixture("error_invalid_drive");
         assert!(
             diags.iter().any(|d| d.code == "E306"),
             "error_invalid_drive must emit E306; got codes: {:?}",
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
         assert!(
-            !artifacts.combine_driving.contains_key("bad_drive"),
+            !artifacts
+                .combine_driving
+                .contains_key(&top_id(&ids, "bad_drive")),
             "no combine_driving entry written when drive selection fails"
         );
     }
@@ -656,7 +672,7 @@ mod tests {
     /// `two_input_equi.yaml` the input map declares `orders` first.
     #[test]
     fn test_combine_driving_input_default_first_in_indexmap() {
-        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        let (artifacts, diags, ids) = compile_combine_fixture("two_input_equi");
         assert!(
             diags.is_empty(),
             "two_input_equi must bind cleanly; got codes: {:?}",
@@ -664,7 +680,7 @@ mod tests {
         );
         let driver = artifacts
             .combine_driving
-            .get("enriched")
+            .get(&top_id(&ids, "enriched"))
             .expect("combine_driving entry for enriched");
         assert_eq!(driver, "orders", "first declared input drives by default");
     }
@@ -678,13 +694,13 @@ mod tests {
     /// compiled scalar reuses the where-clause's regex cache.
     #[test]
     fn test_combine_equality_program_compiled() {
-        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        let (artifacts, diags, ids) = compile_combine_fixture("two_input_equi");
         assert!(
             diags.is_empty(),
             "two_input_equi must bind cleanly; got codes: {:?}",
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
-        let pred = &artifacts.combine_predicates["enriched"];
+        let pred = &artifacts.combine_predicates[&top_id(&ids, "enriched")];
         assert!(!pred.equalities.is_empty(), "expected at least 1 equality");
         for eq in &pred.equalities {
             assert!(
@@ -707,8 +723,8 @@ mod tests {
     /// residual holds the whole OR.
     #[test]
     fn test_combine_decompose_or_is_residual() {
-        let (artifacts, _diags) = compile_combine_fixture("error_or_predicate");
-        let pred = &artifacts.combine_predicates["combine_or"];
+        let (artifacts, _diags, ids) = compile_combine_fixture("error_or_predicate");
+        let pred = &artifacts.combine_predicates[&top_id(&ids, "combine_or")];
         assert_eq!(pred.equalities.len(), 0);
         assert_eq!(pred.ranges.len(), 0);
         assert!(pred.residual.is_some(), "residual must hold the OR whole");
@@ -720,13 +736,13 @@ mod tests {
     /// expressions per drill D5.
     #[test]
     fn test_combine_decompose_expression_equality() {
-        let (artifacts, diags) = compile_combine_fixture("expression_equi");
+        let (artifacts, diags, ids) = compile_combine_fixture("expression_equi");
         assert!(
             diags.is_empty(),
             "expression_equi must bind cleanly; got codes: {:?}",
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
-        let pred = &artifacts.combine_predicates["expr_combine"];
+        let pred = &artifacts.combine_predicates[&top_id(&ids, "expr_combine")];
         assert_eq!(pred.equalities.len(), 1, "1 equality expected");
         assert_eq!(pred.equalities[0].left_input.as_ref(), "orders");
         assert_eq!(pred.equalities[0].right_input.as_ref(), "products");
@@ -738,8 +754,8 @@ mod tests {
     /// `canEvaluate` semantics.
     #[test]
     fn test_combine_decompose_mixed_qualifier_residual() {
-        let (artifacts, _diags) = compile_combine_fixture("mixed_qualifier_expr");
-        let pred = &artifacts.combine_predicates["mixed_combine"];
+        let (artifacts, _diags, ids) = compile_combine_fixture("mixed_qualifier_expr");
+        let pred = &artifacts.combine_predicates[&top_id(&ids, "mixed_combine")];
         assert_eq!(pred.equalities.len(), 0);
         assert_eq!(pred.ranges.len(), 0);
         assert!(pred.residual.is_some());
@@ -750,7 +766,7 @@ mod tests {
     /// "only 2-part references are supported" message.
     #[test]
     fn test_combine_3part_ref_residual() {
-        let (_artifacts, diags) = compile_combine_fixture("error_3part_ref");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("error_3part_ref");
         assert!(
             diags.iter().any(|d| d.code == "E304"),
             "error_3part_ref must produce E304; got codes: {:?}",
@@ -787,17 +803,14 @@ mod tests {
     /// occurrence of `$widened` and asserting the count is exactly 1.
     #[test]
     fn test_combine_drops_build_side_widened_sidecar() {
-        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        let (artifacts, diags, ids) = compile_combine_fixture("two_input_equi");
         assert!(
             diags.is_empty(),
             "two_input_equi must bind cleanly; got codes: {:?}",
             diags.iter().map(|d| &d.code).collect::<Vec<_>>()
         );
         let row = artifacts
-            .typed_get(
-                clinker_plan::plan::bind_schema::NodeScope::TopLevel,
-                "enriched",
-            )
+            .typed_get(top_id(&ids, "enriched"))
             .map(|tp| &tp.output_row)
             .expect("enriched publishes a bound output row");
         let names: Vec<String> = row.field_names().map(|qf| qf.to_string()).collect();
@@ -814,7 +827,7 @@ mod tests {
     /// body TypedProgram.
     #[test]
     fn test_combine_output_row_from_emit() {
-        let (artifacts, diags) = compile_combine_fixture("two_input_equi");
+        let (artifacts, diags, ids) = compile_combine_fixture("two_input_equi");
         assert!(
             diags.is_empty(),
             "two_input_equi must bind cleanly; got codes: {:?}",
@@ -827,6 +840,7 @@ mod tests {
         // `combine_output_row` in `bind_schema.rs`.
         assert_output_row(
             &artifacts,
+            &ids,
             "enriched",
             &[
                 "order_id",
@@ -838,10 +852,7 @@ mod tests {
             ],
         );
         assert!(
-            artifacts.typed_contains(
-                clinker_plan::plan::bind_schema::NodeScope::TopLevel,
-                "enriched"
-            ),
+            artifacts.typed_contains(top_id(&ids, "enriched")),
             "artifacts.typed['enriched'] must be populated with body TypedProgram"
         );
     }
@@ -851,7 +862,7 @@ mod tests {
     /// output row, not the internal merged qualified row.
     #[test]
     fn test_combine_downstream_sees_output() {
-        let (_artifacts, diags) = compile_combine_fixture("combine_then_transform");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("combine_then_transform");
         assert!(
             diags.is_empty(),
             "combine_then_transform must bind cleanly; got codes: {:?}",
@@ -863,7 +874,7 @@ mod tests {
     /// → E308.
     #[test]
     fn test_combine_e308_unknown_merged_field() {
-        let (_artifacts, diags) = compile_combine_fixture("error_body_unknown_field");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("error_body_unknown_field");
         assert!(
             diags.iter().any(|d| d.code == "E308"),
             "error_body_unknown_field must produce E308; got codes: {:?}",
@@ -875,7 +886,7 @@ mod tests {
     /// has no pass-through semantics; every output field must be emitted.
     #[test]
     fn test_combine_e309_no_emit() {
-        let (_artifacts, diags) = compile_combine_fixture("error_no_emit");
+        let (_artifacts, diags, _ids) = compile_combine_fixture("error_no_emit");
         assert!(
             diags.iter().any(|d| d.code == "E309"),
             "error_no_emit must produce E309; got codes: {:?}",
@@ -4554,6 +4565,7 @@ nodes:
         };
         use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
         use clinker_plan::plan::row_type::{QualifiedField, Row};
+        use clinker_plan::plan::{EntityRef, PlanNodeId};
         use cxl::ast::{Expr, LiteralValue, NodeId, Program};
         use cxl::lexer::Span as CxlSpan;
         use cxl::typecheck::Type;
@@ -4563,9 +4575,12 @@ nodes:
         let mut artifacts = CompileArtifacts::default();
         let mut graph = petgraph::graph::DiGraph::new();
 
-        for q in ["orders", "products"] {
+        // Distinct ids per node so the from_parts id→index bridge keeps
+        // them separate; the combine below takes the next id.
+        for (i, q) in ["orders", "products"].into_iter().enumerate() {
             graph.add_node(PlanNode::Source {
                 name: q.to_string(),
+                id: PlanNodeId::new(i),
                 span: Span::SYNTHETIC,
                 resolved: None,
                 output_schema: clinker_record::SchemaBuilder::new().build(),
@@ -4590,12 +4605,15 @@ nodes:
                 },
             );
         }
+        // The combine node below is built with this id; key its side-table
+        // entries by the same id so the lowering-mirror reads resolve.
+        let combine_id = clinker_plan::plan::PlanNodeId::new(2);
         artifacts
             .combine_inputs
-            .insert("test_combine".to_string(), inputs_map.clone());
+            .insert(combine_id, inputs_map.clone());
         artifacts
             .combine_driving
-            .insert("test_combine".to_string(), "orders".to_string());
+            .insert(combine_id, "orders".to_string());
 
         let dummy_lit = || Expr::Literal {
             node_id: NodeId(0),
@@ -4627,12 +4645,11 @@ nodes:
             ranges: Vec::new(),
             residual: None,
         };
-        artifacts
-            .combine_predicates
-            .insert("test_combine".to_string(), predicate);
+        artifacts.combine_predicates.insert(combine_id, predicate);
 
         let combine_idx = graph.add_node(PlanNode::Combine {
             name: "test_combine".to_string(),
+            id: combine_id,
             span: Span::SYNTHETIC,
             strategy: CombineStrategy::HashBuildProbe,
             driving_input: String::new(),
@@ -4647,9 +4664,9 @@ nodes:
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
             typed: None,
             // Strategy selection reads these off the node; mirror lowering.
-            combine_inputs: artifacts.combine_inputs.get("test_combine").cloned(),
-            decomposed_predicate: artifacts.combine_predicates.get("test_combine").cloned(),
-            combine_driving: artifacts.combine_driving.get("test_combine").cloned(),
+            combine_inputs: artifacts.combine_inputs.get(&combine_id).cloned(),
+            decomposed_predicate: artifacts.combine_predicates.get(&combine_id).cloned(),
+            combine_driving: artifacts.combine_driving.get(&combine_id).cloned(),
         });
 
         let mut plan = ExecutionPlanDag::from_parts(

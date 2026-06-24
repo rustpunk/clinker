@@ -49,6 +49,32 @@ fn body_node_idx_for(
         .unwrap_or_else(|| panic!("body node {node_name:?} not found"))
 }
 
+/// Resolve a top-level composition call-site node's [`PlanNodeId`] by name,
+/// the way the production lowering does: from the declaration-order id
+/// vector (top-level names are unique). `composition_body_assignments` keys
+/// by this id, so reads must resolve it rather than indexing by name.
+fn top_level_id_for(compiled: &CompiledPlan, node_name: &str) -> crate::plan::PlanNodeId {
+    let artifacts = compiled.artifacts();
+    compiled
+        .config()
+        .nodes
+        .iter()
+        .zip(artifacts.top_level_node_ids.iter())
+        .find_map(|(spanned, id)| (spanned.value.name() == node_name).then_some(*id))
+        .unwrap_or_else(|| panic!("top-level composition node {node_name:?} not found"))
+}
+
+/// Resolve a body-internal composition call-site node's [`PlanNodeId`] by
+/// name from its parent body's mini-DAG. Body nodes carry their own stable
+/// id, which keys `composition_body_assignments` for nested compositions.
+fn body_composition_id_for(
+    body: &crate::plan::composition_body::BoundBody,
+    node_name: &str,
+) -> crate::plan::PlanNodeId {
+    let idx = body_node_idx_for(body, node_name);
+    body.graph[idx].id()
+}
+
 /// Test 1: Simple region — Source(CK=order_id) → Aggregate(group_by=dept,
 /// total=sum(amount)) → Transform → Output. Exactly one region; producer
 /// is the aggregate; members carry the Transform; outputs carry the
@@ -538,7 +564,7 @@ nodes:
     let artifacts = compiled.artifacts();
     let body_id = artifacts
         .composition_body_assignments
-        .get("body")
+        .get(&top_level_id_for(&compiled, "body"))
         .copied()
         .expect("composition 'body' must be assigned a CompositionBodyId");
     let bound = compiled
@@ -702,7 +728,7 @@ nodes:
     let artifacts = compiled.artifacts();
     let outer_body_id = artifacts
         .composition_body_assignments
-        .get("outer")
+        .get(&top_level_id_for(&compiled, "outer"))
         .copied()
         .expect("outer composition assignment");
     let outer_body = compiled
@@ -714,10 +740,11 @@ nodes:
     );
 
     // Inner body assignment lives under the body-internal Composition
-    // node `inner_call` inside `outer_wrap.comp.yaml`.
+    // node `inner_call` inside `outer_wrap.comp.yaml` — resolve its id off
+    // the outer body's mini-DAG.
     let inner_body_id = artifacts
         .composition_body_assignments
-        .get("inner_call")
+        .get(&body_composition_id_for(outer_body, "inner_call"))
         .copied()
         .expect("inner_call composition assignment");
     let inner_body = compiled
@@ -1044,7 +1071,7 @@ nodes:
     let artifacts = compiled.artifacts();
     let outer_body_id = artifacts
         .composition_body_assignments
-        .get("outer")
+        .get(&top_level_id_for(&compiled, "outer"))
         .copied()
         .expect("outer composition assignment");
     let outer_body = compiled
@@ -1250,7 +1277,7 @@ nodes:
     let artifacts = compiled.artifacts();
     let body_id = artifacts
         .composition_body_assignments
-        .get("body")
+        .get(&top_level_id_for(&compiled, "body"))
         .copied()
         .expect("composition 'body' must be assigned a CompositionBodyId");
     let bound = compiled
@@ -1366,7 +1393,7 @@ nodes:
     let artifacts = compiled.artifacts();
     let body_id = artifacts
         .composition_body_assignments
-        .get("body")
+        .get(&top_level_id_for(&compiled, "body"))
         .copied()
         .expect("composition 'body' must be assigned a CompositionBodyId");
     let bound = compiled
@@ -1509,9 +1536,19 @@ nodes:
     let compiled = compile_with_dir_full(yaml, workspace.path());
     let artifacts = compiled.artifacts();
 
+    // `inner_call` is body-internal to the top-level `outer` composition;
+    // resolve outer's body first, then key by inner_call's body-local id.
+    let outer_body_id = artifacts
+        .composition_body_assignments
+        .get(&top_level_id_for(&compiled, "outer"))
+        .copied()
+        .expect("outer composition must be assigned a CompositionBodyId");
+    let outer_body = compiled
+        .body_of(outer_body_id)
+        .expect("outer body resolves");
     let inner_body_id = artifacts
         .composition_body_assignments
-        .get("inner_call")
+        .get(&body_composition_id_for(outer_body, "inner_call"))
         .copied()
         .expect("inner_call composition must be assigned a CompositionBodyId");
     let inner_body = compiled
@@ -1666,7 +1703,7 @@ nodes:
     // referencing `body_b`'s `composition_idx` and continuation.
     let canonical_body_id: CompositionBodyId = artifacts
         .composition_body_assignments
-        .get("body_a")
+        .get(&plan.graph[body_a_idx].id())
         .copied()
         .expect("body_a must be assigned");
 
@@ -1873,7 +1910,7 @@ nodes:
     let artifacts = compiled.artifacts();
     let body_id = artifacts
         .composition_body_assignments
-        .get("body")
+        .get(&top_level_id_for(&compiled, "body"))
         .copied()
         .expect("composition 'body' must be assigned a CompositionBodyId");
     let bound = compiled

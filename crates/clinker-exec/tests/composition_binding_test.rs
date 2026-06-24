@@ -18,6 +18,22 @@ fn parse_pipeline(yaml: &str) -> clinker_plan::config::PipelineConfig {
     clinker_plan::yaml::from_str(yaml).expect("parse PipelineConfig")
 }
 
+/// Resolve a top-level composition call-site node's `PlanNodeId` by name —
+/// `composition_body_assignments` keys by that id, so reads pair the
+/// declaration-order node list with the minted id vector the same way
+/// production lowering does.
+fn top_level_id(
+    cfg: &clinker_plan::config::PipelineConfig,
+    artifacts: &CompileArtifacts,
+    node_name: &str,
+) -> clinker_plan::plan::PlanNodeId {
+    cfg.nodes
+        .iter()
+        .zip(artifacts.top_level_node_ids.iter())
+        .find_map(|(spanned, id)| (spanned.value.name() == node_name).then_some(*id))
+        .unwrap_or_else(|| panic!("top-level node {node_name:?} not found"))
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // Scaffold tests for composition binding.
 // ─────────────────────────────────────────────────────────────────────
@@ -141,10 +157,11 @@ nodes:
     );
 
     // Verify: composition_body_assignments has an entry for "enrich".
+    let enrich_id = top_level_id(&cfg, &artifacts, "enrich");
     assert!(
         artifacts
             .composition_body_assignments
-            .contains_key("enrich"),
+            .contains_key(&enrich_id),
         "expected 'enrich' in body assignments, got: {:?}",
         artifacts
             .composition_body_assignments
@@ -153,7 +170,7 @@ nodes:
     );
 
     // Verify: the assigned body_id points to a real BoundBody.
-    let body_id = artifacts.composition_body_assignments["enrich"];
+    let body_id = artifacts.composition_body_assignments[&enrich_id];
     assert_ne!(body_id, CompositionBodyId::SENTINEL);
     let body = artifacts
         .body_of(body_id)
@@ -222,7 +239,7 @@ nodes:
         Default::default(),
     );
 
-    let body_id = artifacts.composition_body_assignments["enrich"];
+    let body_id = artifacts.composition_body_assignments[&top_level_id(&cfg, &artifacts, "enrich")];
     let body = artifacts.body_of(body_id).unwrap();
 
     // The "customers" input port should have an Open row with declared
@@ -311,7 +328,7 @@ nodes:
     assert!(
         artifacts
             .composition_body_assignments
-            .contains_key("enrich"),
+            .contains_key(&top_level_id(&cfg, &artifacts, "enrich")),
         "enrich should have a body assignment"
     );
 }
@@ -381,7 +398,8 @@ nodes:
     );
 
     // The outer body should reference the inner body.
-    let outer_id = artifacts.composition_body_assignments["nested_process"];
+    let outer_id =
+        artifacts.composition_body_assignments[&top_level_id(&cfg, &artifacts, "nested_process")];
     let outer_body = artifacts.body_of(outer_id).unwrap();
     assert!(
         !outer_body.nested_body_ids.is_empty(),

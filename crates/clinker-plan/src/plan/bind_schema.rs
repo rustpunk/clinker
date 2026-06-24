@@ -4,7 +4,7 @@
 //! source's schema from its author-declared `schema:` block, typechecks
 //! every Transform/Aggregate/Route body against the upstream Row, and
 //! propagates the output Row downstream. Result: a `CompileArtifacts`
-//! map keyed by each node's `ScopedNodeId` holding one `Arc<TypedProgram>`
+//! map keyed by each node's `PlanNodeId` holding one `Arc<TypedProgram>`
 //! per CXL-bearing node.
 //!
 //! For `PipelineNode::Composition` nodes, `bind_composition` recursively
@@ -41,6 +41,7 @@ use crate::plan::combine::{
 };
 use crate::plan::composition_body::{BoundBody, CompositionBodyId};
 use crate::plan::types::JoinSide;
+use crate::plan::{EntityRef, PlanNodeId};
 use crate::yaml::Spanned;
 use clinker_core_types::span::{FileId, Span};
 use clinker_core_types::{Diagnostic, LabeledSpan};
@@ -53,50 +54,33 @@ use clinker_core_types::{Diagnostic, LabeledSpan};
 /// so log-grep on either code finds exactly one emission site.
 pub const MAX_COMPOSITION_DEPTH: u32 = 50;
 
-/// Scope a plan node lives in. Top-level pipeline, or a specific composition body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum NodeScope {
-    TopLevel,
-    Body(crate::plan::composition_body::CompositionBodyId),
-}
-
-/// Scope-qualified node identity. Two composition bodies (or top-level + a body)
-/// can hold same-named nodes; this pair disambiguates them where a bare node
-/// name would collide. Mirrors dbt's `<package>.<name>` and Beam's hierarchical
-/// node name.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ScopedNodeId {
-    pub scope: NodeScope,
-    pub name: String,
-}
-
 /// Compile artifacts produced by `bind_schema` — one entry per node
 /// whose CXL body successfully type-checked, plus per-node row types.
 #[derive(Debug, Default, Clone)]
 pub struct CompileArtifacts {
     /// Per-node typed CXL program (transform/aggregate/combine-body plus
     /// the synthetic pass-through programs for Source/Merge/Output/etc.),
-    /// keyed by the node's [`ScopedNodeId`]. The scope qualifier keeps a
-    /// node named the same in two composition scopes — or a top-level node
-    /// sharing a name with a composition-body node — from colliding in this
-    /// shared table; before scope-keying the last writer silently won.
-    /// Acts as the bind → lowering handoff (lowering reads each node's
-    /// program off the scope-correct key to stamp the node) and as the
+    /// keyed by the node's [`PlanNodeId`]. The id is the node's stable
+    /// identity, distinct for every node in the compiled plan — so a node
+    /// named the same in two composition scopes (or a top-level node
+    /// sharing a name with a composition-body node) gets distinct ids and
+    /// cannot collide in this shared table; bare-name keying let the last
+    /// writer silently win. Acts as the bind → lowering handoff (lowering
+    /// reads each node's program off its id to stamp the node) and as the
     /// compile-time `$doc` path-walk source.
-    pub typed: HashMap<ScopedNodeId, Arc<TypedProgram>>,
+    pub typed: HashMap<PlanNodeId, Arc<TypedProgram>>,
     /// Per-Combine `where:` predicate typed programs, keyed by the
-    /// combine node's [`ScopedNodeId`]. The node-keyed `typed` map stores
+    /// combine node's [`PlanNodeId`]. The node-keyed `typed` map stores
     /// only a Combine's `cxl:` body; the `where:` predicate is decomposed
     /// into `combine_predicates` and otherwise discarded as a standalone
     /// program. This side-table retains it so a `$doc` access used ONLY
     /// in a predicate (e.g. `l.amount > $doc.Head.cutoff`) is still
     /// reachable by the compile-time `$doc` path walk. Compile-time-only:
-    /// the runtime executor never reads it. The scope qualifier keeps a
-    /// combine named the same in two composition scopes from colliding;
-    /// klinx reads the `where` program back by `(scope, name)`.
-    pub combine_where_typed: HashMap<ScopedNodeId, Arc<TypedProgram>>,
+    /// the runtime executor never reads it. The per-node id keeps a
+    /// combine named the same in two composition scopes from colliding.
+    pub combine_where_typed: HashMap<PlanNodeId, Arc<TypedProgram>>,
     /// Per-Route branch-condition typed programs, keyed by the Route
-    /// node's [`ScopedNodeId`] — one program per branch, in declaration
+    /// node's [`PlanNodeId`] — one program per branch, in declaration
     /// order. A Route's node-keyed `typed` entry is an empty body (the
     /// node carries no `cxl:` projection); the branch conditions are
     /// otherwise compiled straight to runtime evaluators and never land
@@ -104,34 +88,38 @@ pub struct CompileArtifacts {
     /// ONLY in a route condition (e.g. `amount > $doc.Head.cutoff`) is
     /// still reachable by the compile-time `$doc` path walk and attributed
     /// to the Route's source(s). Compile-time-only: the runtime executor
-    /// never reads it. The scope qualifier keeps a route named the same in
+    /// never reads it. The per-node id keeps a route named the same in
     /// two composition scopes from colliding.
-    pub route_branch_typed: HashMap<ScopedNodeId, Vec<Arc<TypedProgram>>>,
+    pub route_branch_typed: HashMap<PlanNodeId, Vec<Arc<TypedProgram>>>,
     /// All bound composition bodies, keyed by `CompositionBodyId`. The
     /// top-level pipeline is NOT in this map — it lives on
     /// `CompiledPlan.dag()` directly. Only body scopes are here.
     pub composition_bodies: IndexMap<CompositionBodyId, BoundBody>,
     /// Monotonic counter for allocating fresh `CompositionBodyId`s.
     next_body_id: u32,
-    /// Mapping from composition node name to its assigned body ID.
-    /// Populated by `bind_composition`; consumed by `compile()` Stage 5
-    /// to write the body ID back onto the `PipelineNode::Composition`
-    /// variant (which was borrowed immutably during bind_schema).
-    pub composition_body_assignments: HashMap<String, CompositionBodyId>,
+    /// Mapping from a composition call-site node's [`PlanNodeId`] to its
+    /// assigned body ID. Populated by `bind_composition`; consumed by
+    /// `compile()` Stage 5 to write the body ID back onto the
+    /// `PipelineNode::Composition` variant (which was borrowed immutably
+    /// during bind_schema). The per-node id keeps a composition node named
+    /// the same in two composition scopes from colliding — bare-name keying
+    /// let the last writer silently win.
+    pub composition_body_assignments: HashMap<PlanNodeId, CompositionBodyId>,
     /// Monotonic counter for allocating fresh `FileId`s for body re-parses.
     next_file_id: u32,
     /// Side-table of provenance-tracked config values. Populated by
     /// `bind_composition` for each composition node's config params.
     pub provenance: ProvenanceDb,
-    /// Decomposed `where:` predicates per combine node, keyed by combine
-    /// node name. Populated by the predicate-decomposition pass; consumed
-    /// by combine strategy selection.
-    pub combine_predicates: HashMap<String, DecomposedPredicate>,
-    /// Per-input metadata per combine node, keyed by combine node name.
-    /// The inner `IndexMap` preserves declaration order of the inputs
-    /// (matches `CombineHeader.input` iteration order). Populated during
-    /// schema propagation.
-    pub combine_inputs: HashMap<String, IndexMap<String, CombineInput>>,
+    /// Decomposed `where:` predicates per combine node, keyed by the
+    /// combine node's [`PlanNodeId`]. Populated by the
+    /// predicate-decomposition pass; consumed by combine strategy
+    /// selection.
+    pub combine_predicates: HashMap<PlanNodeId, DecomposedPredicate>,
+    /// Per-input metadata per combine node, keyed by the combine node's
+    /// [`PlanNodeId`]. The inner `IndexMap` preserves declaration order of
+    /// the inputs (matches `CombineHeader.input` iteration order).
+    /// Populated during schema propagation.
+    pub combine_inputs: HashMap<PlanNodeId, IndexMap<String, CombineInput>>,
     /// Planner-wide column-statistics catalog. The single facility every
     /// node consults for row counts, distinct counts, heavy hitters, and
     /// membership. Plane A row counts are seeded from source file metadata
@@ -139,90 +127,96 @@ pub struct CompileArtifacts {
     /// in after a run. Combine strategy selection reads its row counts
     /// instead of a per-input cardinality field.
     pub statistics: crate::plan::statistics::StatisticsCatalog,
-    /// Driving-input qualifier per combine node, chosen at `bind_combine`
-    /// time by [`select_driving_input`] (explicit `drive:` → cardinality
-    /// → first-in-IndexMap default). The `select_combine_strategies`
+    /// Driving-input qualifier per combine node, keyed by the combine
+    /// node's [`PlanNodeId`]; the value is the chosen driving input's
+    /// qualifier string. Chosen at `bind_combine` time by
+    /// [`select_driving_input`] (explicit `drive:` → cardinality →
+    /// first-in-IndexMap default). The `select_combine_strategies`
     /// post-pass reads this to stamp the runtime
     /// `PlanNode::Combine.driving_input` field. Combines that fail driver
     /// selection (E306) are absent from this map and their post-pass
     /// entry is skipped.
-    pub combine_driving: HashMap<String, String>,
+    pub combine_driving: HashMap<PlanNodeId, String>,
     /// User-supplied [`CombineStrategyHint`] per combine node, keyed by
-    /// node name. Populated from `CombineBody.strategy` during
-    /// `bind_combine`. The `select_combine_strategies` post-pass reads
-    /// this to override the planner's predicate-shape default — today
-    /// only `GraceHash` on pure-equi predicates produces a non-default
-    /// outcome. Combines absent from this map default to
-    /// [`CombineStrategyHint::Auto`].
-    pub combine_strategy_hints: HashMap<String, crate::config::CombineStrategyHint>,
+    /// the combine node's [`PlanNodeId`]. Populated from
+    /// `CombineBody.strategy` during `bind_combine`. The
+    /// `select_combine_strategies` post-pass reads this to override the
+    /// planner's predicate-shape default — today only `GraceHash` on
+    /// pure-equi predicates produces a non-default outcome. Combines
+    /// absent from this map default to [`CombineStrategyHint::Auto`].
+    pub combine_strategy_hints: HashMap<PlanNodeId, crate::config::CombineStrategyHint>,
     /// Per-combine pre-resolved column map produced by the CXL
-    /// typechecker's combine-body walk. Key is the combine node's
-    /// name; value is the `ResolvedColumnMap` shape expected by
+    /// typechecker's combine-body walk. Keyed by the combine node's
+    /// [`PlanNodeId`]; value is the `ResolvedColumnMap` shape expected by
     /// `CombineResolverMapping::from_pre_resolved`. Combines that fail
     /// body typecheck (or the collect-mode path, which has no body)
     /// surface an empty map here.
-    pub combine_resolved_columns: HashMap<String, crate::plan::execution::ResolvedColumnMap>,
+    pub combine_resolved_columns: HashMap<PlanNodeId, crate::plan::execution::ResolvedColumnMap>,
     /// Compiled declarative header/footer synthesis per Envelope node, keyed
-    /// by node name. Populated during binding (where the body input `Row` is
-    /// in scope) for every Envelope that declares a `config.header:` or
-    /// `config.footer:` map; consumed at lowering to attach the spec to
-    /// `PlanNode::Envelope.synthesis`. An Envelope declaring neither is absent
-    /// from this map and lowers with `synthesis: None`.
+    /// by the node's [`PlanNodeId`]. Populated during binding (where the body
+    /// input `Row` is in scope) for every Envelope that declares a
+    /// `config.header:` or `config.footer:` map; consumed at lowering to
+    /// attach the spec to `PlanNode::Envelope.synthesis`. An Envelope
+    /// declaring neither is absent from this map and lowers with
+    /// `synthesis: None`. The per-node id keeps a top-level Envelope and a
+    /// composition-body Envelope sharing a name (both declaring header/footer)
+    /// from colliding — bare-name keying let the last writer silently win.
     pub envelope_synthesis:
-        HashMap<String, Arc<crate::plan::envelope_synthesis::EnvelopeSynthesis>>,
+        HashMap<PlanNodeId, Arc<crate::plan::envelope_synthesis::EnvelopeSynthesis>>,
     /// Monotonic counter for fresh tail-variable IDs allocated during
     /// row-polymorphic propagation (composition input-port binding).
     /// Threaded as `&mut u32` into `build_input_port_rows`; IDs are
     /// only comparable within a single `compile()` run.
     pub next_tail_var: u32,
+    /// Monotonic counter minting fresh [`PlanNodeId`]s. ONE counter feeds
+    /// top-level nodes, every composition body, and every planner-
+    /// synthesized node, so two instantiations of one composition body
+    /// get disjoint id sets by construction. Only comparable within a
+    /// single `compile()` run.
+    next_node_id: u32,
+    /// Minted `PlanNodeId`s for the top-level pipeline nodes, in
+    /// declaration order: index `i` is the id for `nodes[i]` as passed to
+    /// [`bind_schema`]. Minted before any body recursion so the top-level
+    /// ids occupy the low, stable range. Stage-5 lowering stamps each
+    /// lowered top-level `PlanNode.id` from this vector by the node's
+    /// original declaration position, which stays correct even when
+    /// lowering omits a node `bind_schema` visited (e.g. a
+    /// failed-binding composition).
+    pub top_level_node_ids: Vec<PlanNodeId>,
 }
 
 impl CompileArtifacts {
-    /// Look up a node's typed CXL program by its scope-qualified identity.
-    /// The lookup allocates the key's `String`; the table is per-node and
-    /// only read at compile time and executor startup, so this is not hot.
-    pub fn typed_get(&self, scope: NodeScope, name: &str) -> Option<&Arc<TypedProgram>> {
-        self.typed.get(&ScopedNodeId {
-            scope,
-            name: name.to_string(),
-        })
+    /// Look up a node's typed CXL program by its stable [`PlanNodeId`].
+    /// The table is per-node and only read at compile time and executor
+    /// startup, so this is not hot.
+    pub fn typed_get(&self, id: PlanNodeId) -> Option<&Arc<TypedProgram>> {
+        self.typed.get(&id)
     }
 
-    /// Whether a typed program is recorded for `(scope, name)`.
-    pub fn typed_contains(&self, scope: NodeScope, name: &str) -> bool {
-        self.typed_get(scope, name).is_some()
+    /// Whether a typed program is recorded for `id`.
+    pub fn typed_contains(&self, id: PlanNodeId) -> bool {
+        self.typed.contains_key(&id)
     }
 
-    /// Record a node's typed CXL program under its scope-qualified identity.
-    pub fn typed_insert(
-        &mut self,
-        scope: NodeScope,
-        name: impl Into<String>,
-        prog: Arc<TypedProgram>,
-    ) {
-        self.typed.insert(
-            ScopedNodeId {
-                scope,
-                name: name.into(),
-            },
-            prog,
-        );
-    }
-
-    /// Drop a node's typed CXL program by its scope-qualified identity.
-    /// Used by N-ary combine decomposition when the original combine's
-    /// name leaves the graph.
-    pub fn typed_remove(&mut self, scope: NodeScope, name: &str) -> Option<Arc<TypedProgram>> {
-        self.typed.remove(&ScopedNodeId {
-            scope,
-            name: name.to_string(),
-        })
+    /// Record a node's typed CXL program under its [`PlanNodeId`].
+    pub fn typed_insert(&mut self, id: PlanNodeId, prog: Arc<TypedProgram>) {
+        self.typed.insert(id, prog);
     }
 
     /// Allocate a fresh, unique `CompositionBodyId`.
     pub fn fresh_body_id(&mut self) -> CompositionBodyId {
         let id = CompositionBodyId(self.next_body_id);
         self.next_body_id += 1;
+        id
+    }
+
+    /// Mint the next fresh [`PlanNodeId`] from the single per-`compile()`
+    /// counter. Every node identity in a compiled plan — top-level, body,
+    /// and planner-synthesized — flows through here, so ids never collide
+    /// across scopes.
+    pub fn fresh_node_id(&mut self) -> PlanNodeId {
+        let id = PlanNodeId::new(self.next_node_id as usize);
+        self.next_node_id += 1;
         id
     }
 
@@ -239,6 +233,35 @@ impl CompileArtifacts {
     /// Look up a bound body by id.
     pub fn body_of(&self, id: CompositionBodyId) -> Option<&BoundBody> {
         self.composition_bodies.get(&id)
+    }
+
+    /// Correlate each top-level node's declared name with the
+    /// [`PlanNodeId`] minted for it, by zipping `nodes` against
+    /// `top_level_node_ids` (index `i` of the latter is the id for
+    /// `nodes[i]`). Top-level node names are unique (config validation
+    /// rejects duplicates), so the map is collision-free. The map covers
+    /// only top-level nodes, never body scopes, so it cannot reintroduce
+    /// the cross-scope name collision the per-node id keying removed.
+    pub fn top_level_name_ids<'a>(
+        &self,
+        nodes: &'a [Spanned<PipelineNode>],
+    ) -> HashMap<&'a str, PlanNodeId> {
+        nodes
+            .iter()
+            .zip(self.top_level_node_ids.iter())
+            .map(|(spanned, id)| (spanned.value.name(), *id))
+            .collect()
+    }
+
+    /// Resolve a single top-level node's [`PlanNodeId`] by its declared
+    /// name, scanning the `nodes` ↔ `top_level_node_ids` correlation. For
+    /// repeated lookups prefer [`Self::top_level_name_ids`] and reuse the
+    /// map; this convenience is for one-off resolutions.
+    pub fn top_level_id(&self, nodes: &[Spanned<PipelineNode>], name: &str) -> Option<PlanNodeId> {
+        nodes
+            .iter()
+            .zip(self.top_level_node_ids.iter())
+            .find_map(|(spanned, id)| (spanned.value.name() == name).then_some(*id))
     }
 
     /// Allocate a fresh `FileId` for body re-parses.
@@ -272,13 +295,6 @@ pub(crate) struct BindContext<'a> {
     /// call site. Empty for compositions that don't propagate scoped vars
     ///.
     pub scoped_vars: cxl::resolve::ScopedVarsRegistry,
-    /// Scope the nodes currently being bound live in. `TopLevel` at the
-    /// pipeline root; `bind_composition` saves and restores it around the
-    /// body recursion, setting it to `Body(body_id)` for the duration.
-    /// The scope-keyed compile-time side-tables (`combine_where_typed`,
-    /// `route_branch_typed`) stamp their producer keys from this so a
-    /// node named the same across two scopes does not collide.
-    pub current_scope: NodeScope,
 }
 
 // ─── Public entry point ─────────────────────────────────────────────
@@ -307,6 +323,17 @@ pub fn bind_schema(
     scoped_vars: cxl::resolve::ScopedVarsRegistry,
 ) -> CompileArtifacts {
     let mut artifacts = CompileArtifacts::default();
+    // Mint one id per top-level node in declaration order BEFORE any body
+    // recursion, so top-level ids occupy the low, stable id range and
+    // `top_level_node_ids[i]` pairs with `nodes[i]`. Lowering stamps the
+    // lowered node from this vector by original declaration position.
+    artifacts.top_level_node_ids = nodes.iter().map(|_| artifacts.fresh_node_id()).collect();
+    // Top-level name → id resolver, built from the just-minted ids zipped
+    // with each node's declared name. Top-level node names are unique
+    // (config validation rejects duplicates), so this is collision-free.
+    // Threaded into the bind walk so every per-node producer keys its
+    // side-table entry by the node's own id.
+    let top_level_ids = top_level_name_ids(nodes, &artifacts);
     let mut schema_by_name: HashMap<String, Row> = HashMap::new();
     let mut bind_ctx = BindContext {
         ctx,
@@ -316,10 +343,10 @@ pub fn bind_schema(
         enclosing_scope_names: HashSet::new(),
         origin_dir: pipeline_dir.to_path_buf(),
         scoped_vars,
-        current_scope: NodeScope::TopLevel,
     };
     bind_schema_inner(
         nodes,
+        &top_level_ids,
         diags,
         &mut bind_ctx,
         &mut artifacts,
@@ -331,11 +358,27 @@ pub fn bind_schema(
     // config-validation time by `validate_unique_scoped_declarations`,
     // so the previous compile-time E170 multi-writer check is dead.
     validate_init_phase_terminals(nodes, diags);
-    validate_read_after_write(nodes, &artifacts, diags);
-    validate_post_merge_source_reads(nodes, &artifacts, diags);
-    validate_init_phase_isolation(nodes, &artifacts, diags);
+    validate_read_after_write(nodes, &top_level_ids, &artifacts, diags);
+    validate_post_merge_source_reads(nodes, &top_level_ids, &artifacts, diags);
+    validate_init_phase_isolation(nodes, &top_level_ids, &artifacts, diags);
 
     artifacts
+}
+
+/// Owned-key view of [`CompileArtifacts::top_level_name_ids`] for the
+/// consumers that key by `String` — the read-after-write / post-merge /
+/// init validators and `bind_schema_inner`, all of which look up by an
+/// owned node name. The correlation itself lives once on the artifacts
+/// method; this only re-keys the borrowed names into owned `String`s.
+fn top_level_name_ids(
+    nodes: &[Spanned<PipelineNode>],
+    artifacts: &CompileArtifacts,
+) -> HashMap<String, PlanNodeId> {
+    artifacts
+        .top_level_name_ids(nodes)
+        .into_iter()
+        .map(|(name, id)| (name.to_string(), id))
+        .collect()
 }
 
 /// Compile-time check: a `phase: init` Transform may not read
@@ -380,6 +423,7 @@ fn iter_writers<'a>(nodes: &'a [Spanned<PipelineNode>]) -> Vec<WriterInfo<'a>> {
 
 fn validate_init_phase_isolation(
     nodes: &[Spanned<PipelineNode>],
+    top_level_ids: &HashMap<String, PlanNodeId>,
     artifacts: &CompileArtifacts,
     diags: &mut Vec<Diagnostic>,
 ) {
@@ -418,7 +462,10 @@ fn validate_init_phase_isolation(
 
     for (reader_name, read_span, typed_keys) in readers {
         for typed_key in &typed_keys {
-            let Some(typed) = artifacts.typed_get(NodeScope::TopLevel, typed_key) else {
+            let Some(typed) = top_level_ids
+                .get(typed_key)
+                .and_then(|id| artifacts.typed_get(*id))
+            else {
                 continue;
             };
             let mut reads: Vec<(VarScope, String)> = Vec::new();
@@ -487,6 +534,7 @@ fn validate_init_phase_isolation(
 /// secondary span on the closest Merge/Combine ancestor.
 fn validate_post_merge_source_reads(
     nodes: &[Spanned<PipelineNode>],
+    top_level_ids: &HashMap<String, PlanNodeId>,
     artifacts: &CompileArtifacts,
     diags: &mut Vec<Diagnostic>,
 ) {
@@ -530,15 +578,17 @@ fn validate_post_merge_source_reads(
         let Some(Some((merge_name, merge_span))) = post_merge.get(&reader_name).cloned() else {
             continue;
         };
-        let mut typed_keys: Vec<String> = Vec::new();
+        let reader_id = top_level_ids.get(&reader_name).copied();
+        let mut typed_keys: Vec<PlanNodeId> = Vec::new();
         if spanned.value.reads_scope_vars_in_cxl()
-            && artifacts.typed_contains(NodeScope::TopLevel, &reader_name)
+            && let Some(id) = reader_id
+            && artifacts.typed_contains(id)
         {
-            typed_keys.push(reader_name.clone());
+            typed_keys.push(id);
         }
         let span = span_for_node(spanned);
         for key in typed_keys {
-            let Some(typed) = artifacts.typed_get(NodeScope::TopLevel, &key) else {
+            let Some(typed) = artifacts.typed_get(key) else {
                 continue;
             };
             let mut reads: Vec<(crate::config::VarScope, String)> = Vec::new();
@@ -604,6 +654,7 @@ fn is_builtin_source_member(field: &str) -> bool {
 /// secondary span on the writer Transform.
 fn validate_read_after_write(
     nodes: &[Spanned<PipelineNode>],
+    top_level_ids: &HashMap<String, PlanNodeId>,
     artifacts: &CompileArtifacts,
     diags: &mut Vec<Diagnostic>,
 ) {
@@ -654,15 +705,17 @@ fn validate_read_after_write(
     // reader's ancestor set.
     for spanned in nodes {
         let reader_name = spanned.value.name().to_string();
-        let mut typed_keys: Vec<String> = Vec::new();
+        let reader_id = top_level_ids.get(&reader_name).copied();
+        let mut typed_keys: Vec<PlanNodeId> = Vec::new();
         if spanned.value.reads_scope_vars_in_cxl()
-            && artifacts.typed_contains(NodeScope::TopLevel, &reader_name)
+            && let Some(id) = reader_id
+            && artifacts.typed_contains(id)
         {
-            typed_keys.push(reader_name.clone());
+            typed_keys.push(id);
         }
         let span = span_for_node(spanned);
         for key in typed_keys {
-            let Some(typed) = artifacts.typed_get(NodeScope::TopLevel, &key) else {
+            let Some(typed) = artifacts.typed_get(key) else {
                 continue;
             };
             let mut reads: Vec<(VarScope, String)> = Vec::new();
@@ -1261,10 +1314,10 @@ struct ReshapeNodeBinding<'a> {
     upstream: &'a Row,
     span: Span,
     scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
-    /// Scope this reshape is bound in, copied from `BindContext.current_scope`
-    /// at the call site. Stamps the `typed` table key so a reshape named the
-    /// same in two composition scopes does not collide.
-    scope: NodeScope,
+    /// This reshape's stable [`PlanNodeId`], resolved from the bind walk's
+    /// scope name→id map. Keys the `typed` table entry so a reshape named
+    /// the same in two composition scopes does not collide.
+    id: PlanNodeId,
 }
 
 /// Bind a `PipelineNode::Reshape`: validate `partition_by` against the
@@ -1294,7 +1347,7 @@ fn bind_reshape(
         upstream,
         span,
         scoped_vars,
-        scope,
+        id,
     } = node;
     let mut ok = true;
 
@@ -1551,11 +1604,7 @@ fn bind_reshape(
     );
     let out = Row::from_parts(declared, upstream.declared_span, upstream.tail.clone());
     schema_by_name.insert(name.to_string(), out.clone());
-    artifacts.typed_insert(
-        scope,
-        name.to_string(),
-        Arc::new(synthetic_typed_program(out)),
-    );
+    artifacts.typed_insert(id, Arc::new(synthetic_typed_program(out)));
 }
 
 /// Borrowed inputs for binding one `PipelineNode::Cull`.
@@ -1569,10 +1618,10 @@ struct CullNodeBinding<'a> {
     upstream: &'a Row,
     span: Span,
     scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
-    /// Scope this cull is bound in, copied from `BindContext.current_scope`
-    /// at the call site. Stamps the `typed` table key so a cull named the
+    /// This cull's stable [`PlanNodeId`], resolved from the bind walk's
+    /// scope name→id map. Keys the `typed` table entry so a cull named the
     /// same in two composition scopes does not collide.
-    scope: NodeScope,
+    id: PlanNodeId,
 }
 
 /// Bind a `PipelineNode::Cull`: validate `partition_by` / `order_by`
@@ -1603,7 +1652,7 @@ fn bind_cull(
         upstream,
         span,
         scoped_vars,
-        scope,
+        id,
     } = node;
     let mut ok = true;
 
@@ -1725,11 +1774,7 @@ fn bind_cull(
     // identical schema on the main and `removed_to` ports.
     let out = upstream.clone();
     schema_by_name.insert(name.to_string(), out.clone());
-    artifacts.typed_insert(
-        scope,
-        name.to_string(),
-        Arc::new(synthetic_typed_program(out)),
-    );
+    artifacts.typed_insert(id, Arc::new(synthetic_typed_program(out)));
 }
 
 // ─── Internal recursive bind_schema ─────────────────────────────────
@@ -1737,8 +1782,18 @@ fn bind_cull(
 /// Internal recursive bind_schema. Walks nodes in topological order,
 /// seeds source schemas, typechecks CXL-bearing nodes, and recurses
 /// into composition bodies via `bind_composition`.
+///
+/// `node_ids` maps each node name in THIS scope to its [`PlanNodeId`] —
+/// for the top-level walk it is built from `top_level_node_ids`; for a
+/// composition body it is the per-body map pre-minted by
+/// `bind_composition` before this recursion. Names are unique within one
+/// scope (config validation rejects duplicates), so the resolution is
+/// unambiguous. Every per-node producer keys its side-table entry by the
+/// id resolved here, so a node named the same across two scopes gets
+/// distinct ids and cannot collide.
 fn bind_schema_inner(
     nodes: &[Spanned<PipelineNode>],
+    node_ids: &HashMap<String, PlanNodeId>,
     diags: &mut Vec<Diagnostic>,
     bind_ctx: &mut BindContext<'_>,
     artifacts: &mut CompileArtifacts,
@@ -1774,6 +1829,30 @@ fn bind_schema_inner(
         let node = &spanned.value;
         let name = node.name().to_string();
         let span = span_for(spanned);
+        // The node's stable id for this scope. Pre-minted before the walk
+        // (top-level vector zip, or body pre-mint), so every visited node
+        // is present. A missing entry can only mean an internal pre-mint /
+        // walk desync — fail loudly with an internal-error diagnostic
+        // rather than mint a colliding fresh id or silently drop the node.
+        let node_id = match node_ids.get(&name) {
+            Some(&id) => id,
+            None => {
+                debug_assert!(
+                    false,
+                    "bind_schema_inner: node {name:?} has no pre-minted PlanNodeId \
+                     (pre-mint/walk desync)"
+                );
+                diags.push(Diagnostic::error(
+                    "E000",
+                    format!(
+                        "internal error: node {name:?} has no pre-minted PlanNodeId \
+                         during schema binding"
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                ));
+                continue;
+            }
+        };
 
         // Compute the upstream-source set for this node BEFORE the
         // typecheck match — Aggregate's E156 guard reads it inside the
@@ -1873,11 +1952,7 @@ fn bind_schema_inner(
                 let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
                 let row = Row::closed(columns, cxl_span);
                 schema_by_name.insert(name.clone(), row.clone());
-                artifacts.typed_insert(
-                    bind_ctx.current_scope,
-                    name,
-                    Arc::new(synthetic_typed_program(row)),
-                );
+                artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
             }
             PipelineNode::Transform { header, config } => {
                 // E108: check for enclosing-scope reference BEFORE upstream lookup.
@@ -1911,7 +1986,7 @@ fn bind_schema_inner(
                         let out = propagate_row(&upstream, &typed);
                         schema_by_name.insert(name.clone(), out.clone());
                         typed.output_row = out;
-                        artifacts.typed_insert(bind_ctx.current_scope, name, Arc::new(typed));
+                        artifacts.typed_insert(node_id, Arc::new(typed));
                     }
                     Err(d) => diags.push(d),
                 }
@@ -2001,7 +2076,7 @@ fn bind_schema_inner(
                         let out = propagate_aggregate(&name, &config.group_by, &upstream, &typed);
                         schema_by_name.insert(name.clone(), out.clone());
                         typed.output_row = out;
-                        artifacts.typed_insert(bind_ctx.current_scope, name, Arc::new(typed));
+                        artifacts.typed_insert(node_id, Arc::new(typed));
                     }
                     Err(d) => diags.push(d),
                 }
@@ -2018,11 +2093,7 @@ fn bind_schema_inner(
                         &bind_ctx.scoped_vars,
                     ) {
                         empty.output_row = cloned.clone();
-                        artifacts.typed_insert(
-                            bind_ctx.current_scope,
-                            name.clone(),
-                            Arc::new(empty),
-                        );
+                        artifacts.typed_insert(node_id, Arc::new(empty));
                     }
                     // Type-check each branch condition into its own program
                     // so the compile-time `$doc` walk can reach an envelope
@@ -2051,13 +2122,9 @@ fn bind_schema_inner(
                         })
                         .collect();
                     if !branch_programs.is_empty() {
-                        artifacts.route_branch_typed.insert(
-                            ScopedNodeId {
-                                scope: bind_ctx.current_scope,
-                                name: name.clone(),
-                            },
-                            branch_programs,
-                        );
+                        artifacts
+                            .route_branch_typed
+                            .insert(node_id, branch_programs);
                     }
                     schema_by_name.insert(name, cloned);
                 }
@@ -2124,22 +2191,14 @@ fn bind_schema_inner(
                 {
                     let row = upstream.clone();
                     schema_by_name.insert(name.clone(), row.clone());
-                    artifacts.typed_insert(
-                        bind_ctx.current_scope,
-                        name,
-                        Arc::new(synthetic_typed_program(row)),
-                    );
+                    artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
                 }
             }
             PipelineNode::Output { header, .. } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let row = upstream.clone();
                     schema_by_name.insert(name.clone(), row.clone());
-                    artifacts.typed_insert(
-                        bind_ctx.current_scope,
-                        name,
-                        Arc::new(synthetic_typed_program(row)),
-                    );
+                    artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
                 }
             }
             PipelineNode::Reshape { header, config } => {
@@ -2152,7 +2211,7 @@ fn bind_schema_inner(
                             upstream: &upstream,
                             span,
                             scoped_vars: &bind_ctx.scoped_vars,
-                            scope: bind_ctx.current_scope,
+                            id: node_id,
                         },
                         diags,
                         artifacts,
@@ -2170,7 +2229,7 @@ fn bind_schema_inner(
                             upstream: &upstream,
                             span,
                             scoped_vars: &bind_ctx.scoped_vars,
-                            scope: bind_ctx.current_scope,
+                            id: node_id,
                         },
                         diags,
                         artifacts,
@@ -2207,13 +2266,9 @@ fn bind_schema_inner(
                     {
                         artifacts
                             .envelope_synthesis
-                            .insert(name.clone(), Arc::new(synthesis));
+                            .insert(node_id, Arc::new(synthesis));
                     }
-                    artifacts.typed_insert(
-                        bind_ctx.current_scope,
-                        name,
-                        Arc::new(synthetic_typed_program(row)),
-                    );
+                    artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
                 }
             }
             // Phase Combine C.1.1 + C.1.2 + C.1.3 (single-pass arm).
@@ -2232,7 +2287,7 @@ fn bind_schema_inner(
                         config,
                         span,
                         scoped_vars: &bind_ctx.scoped_vars,
-                        scope: bind_ctx.current_scope,
+                        id: node_id,
                     },
                     diags,
                     artifacts,
@@ -2250,6 +2305,7 @@ fn bind_schema_inner(
                 bind_composition(
                     &CompositionBindParams {
                         node_name: &name,
+                        node_id,
                         use_path: r#use,
                         call_inputs: inputs,
                         call_outputs: outputs,
@@ -2278,6 +2334,10 @@ fn bind_schema_inner(
 /// validates against the resolved signature.
 struct CompositionBindParams<'a> {
     node_name: &'a str,
+    /// The call-site composition node's stable identity. Keys the body
+    /// assignment so two compositions named the same in disjoint scopes
+    /// (or sharing a name with a top-level node) get distinct entries.
+    node_id: PlanNodeId,
     use_path: &'a Path,
     call_inputs: &'a IndexMap<String, String>,
     call_outputs: &'a IndexMap<String, String>,
@@ -2300,6 +2360,7 @@ fn bind_composition(
 ) {
     let &CompositionBindParams {
         node_name,
+        node_id,
         use_path,
         call_inputs,
         call_outputs,
@@ -2434,9 +2495,6 @@ fn bind_composition(
     // declaration with the same type, the body's registry includes it.
     // Mismatches (parent missing the var, or type doesn't match) emit
     // E174.
-    // Bind this body's nodes under its own scope so the scope-keyed
-    // compile-time side-tables disambiguate same-named nodes across bodies.
-    let saved_scope = std::mem::replace(&mut bind_ctx.current_scope, NodeScope::Body(body_id));
     let saved_scoped_vars = std::mem::take(&mut bind_ctx.scoped_vars);
     bind_ctx.scoped_vars = build_body_scoped_vars(
         &signature.scoped_vars_schema,
@@ -2462,9 +2520,67 @@ fn bind_composition(
         body_schema_by_name.insert(port_name.clone(), row.clone());
     }
 
+    // Reject duplicate body node names (E001) before minting. The
+    // top-level E001 pass in `validate_acyclic` never sees body files, so a
+    // body with two same-named nodes would otherwise collapse to ONE
+    // `PlanNodeId` at the pre-mint below (`entry().or_insert_with`), which
+    // both trips the `rebuild_id_index` coverage assert in debug and
+    // silently aliases the two nodes' compiled programs in release. Emit
+    // one diagnostic per offending node and abandon this body — leaving it
+    // unbound mirrors the other `bind_composition` early-outs.
+    {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut has_duplicate = false;
+        for spanned in &body_file.nodes {
+            let n_name = spanned.value.name();
+            if !seen.insert(n_name) {
+                has_duplicate = true;
+                diags.push(Diagnostic::error(
+                    "E001",
+                    format!(
+                        "composition node {node_name:?}: body file {} declares \
+                         duplicate node name: {n_name:?}",
+                        resolved_path.display()
+                    ),
+                    LabeledSpan::primary(span_for_node(spanned), String::new()),
+                ));
+            }
+        }
+        if has_duplicate {
+            return;
+        }
+    }
+
+    // Pre-mint a stable id per body node and per synthetic input-port
+    // source BEFORE binding, so the bind walk can key this body's typed /
+    // combine side-table entries by id — body node ids are not available
+    // at lowering time, which runs after binding. Step-14 lowering CARRIES
+    // these ids onto the body `PlanNode`s rather than minting fresh, so an
+    // id is minted exactly once per node and two instantiations of one
+    // composition body still get disjoint id sets (the shared counter
+    // advances on each pre-mint). Body names are unique here (the E001 pass
+    // above rejected duplicates), so each `or_insert_with` mints exactly
+    // once. Port-source ids are minted into a separate map because a port
+    // name and a body-internal node name can legally collide; each is
+    // consumed in its own lowering context.
+    let mut body_node_ids: HashMap<String, PlanNodeId> = HashMap::new();
+    for spanned in &body_file.nodes {
+        let n_name = spanned.value.name().to_string();
+        body_node_ids
+            .entry(n_name)
+            .or_insert_with(|| artifacts.fresh_node_id());
+    }
+    let mut body_port_source_ids: HashMap<String, PlanNodeId> = HashMap::new();
+    for (port_name, _row) in &input_port_rows {
+        body_port_source_ids
+            .entry(port_name.clone())
+            .or_insert_with(|| artifacts.fresh_node_id());
+    }
+
     // Recursive bind_schema on body nodes.
     bind_schema_inner(
         &body_file.nodes,
+        &body_node_ids,
         diags,
         bind_ctx,
         artifacts,
@@ -2474,7 +2590,6 @@ fn bind_composition(
     // Restore parent state.
     bind_ctx.depth -= 1;
     bind_ctx.use_path_stack.pop();
-    bind_ctx.current_scope = saved_scope;
     bind_ctx.enclosing_scope_names = saved_enclosing;
     bind_ctx.scoped_vars = saved_scoped_vars;
     bind_ctx.origin_dir = saved_origin_dir;
@@ -2564,8 +2679,11 @@ fn bind_composition(
         };
         let port_schema =
             schema_from_field_names(parent_row.field_names().map(|qf| qf.name.as_ref()));
+        // Carry the port-source id pre-minted before binding (never
+        // re-mint), so it never collides with a top-level or body node id.
         let port_source = crate::plan::execution::PlanNode::Source {
             name: port_name.clone(),
+            id: body_port_source_ids[port_name],
             span,
             resolved: None,
             output_schema: port_schema,
@@ -2590,14 +2708,12 @@ fn bind_composition(
         // top-level pass that walks the lattice. Lowering only stamps
         // the strict default; `apply_retraction_flags` rewrites it.
         let lower_ctx = crate::config::LoweringCtx::default();
+        // Carry the body node's id pre-minted before binding (never
+        // re-mint), so the typed/combine entries the bind walk keyed by
+        // this id resolve to the node lowered here.
+        let node_id = body_node_ids[&n_name];
         if let Some(plan_node) = crate::config::lower_node_to_plan_node(
-            n,
-            &n_name,
-            NodeScope::Body(body_id),
-            body_span,
-            artifacts,
-            &lower_ctx,
-            diags,
+            n, node_id, body_span, artifacts, &lower_ctx, diags,
         ) {
             let idx = body_graph.add_node(plan_node);
             body_name_to_idx.insert(n_name, idx);
@@ -2863,10 +2979,14 @@ fn bind_composition(
     bound_body.input_port_rows = input_port_rows;
     bound_body.nested_body_ids = nested_body_ids;
     bound_body.body_window_configs = body_window_configs;
+    // The body mini-DAG is structurally final here (its graph is built
+    // once and toposorted above; later body passes only stamp fields).
+    // Build the id→index bridge so every body node id resolves.
+    bound_body.rebuild_id_index();
     artifacts.insert_body(body_id, bound_body);
     artifacts
         .composition_body_assignments
-        .insert(node_name.to_string(), body_id);
+        .insert(node_id, body_id);
 
     // 16. Write composition's output row to parent scope.
     // Use the first output port's row as the composition node's output.
@@ -4049,10 +4169,13 @@ struct CombineNodeBinding<'a> {
     config: &'a CombineBody,
     span: Span,
     scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
-    /// Scope this combine is bound in, copied from `BindContext.current_scope`
-    /// at the call site. Stamps the `combine_where_typed` side-table key so a
-    /// combine named the same in two composition scopes does not collide.
-    scope: NodeScope,
+    /// This combine's stable [`PlanNodeId`], resolved from the bind walk's
+    /// scope name→id map. Keys every per-combine side-table entry
+    /// (`combine_where_typed`, `combine_inputs`, `combine_driving`,
+    /// `combine_strategy_hints`, `combine_predicates`,
+    /// `combine_resolved_columns`, `typed`) so a combine named the same in
+    /// two composition scopes does not collide.
+    id: PlanNodeId,
 }
 
 /// Bind a `PipelineNode::Combine` node in one bottom-up traversal.
@@ -4091,7 +4214,7 @@ fn bind_combine(
         config,
         span,
         scoped_vars,
-        scope,
+        id,
     } = node;
     // E300: combine requires at least 2 inputs.
     if header.input.len() < 2 {
@@ -4162,15 +4285,11 @@ fn bind_combine(
         span,
         diags,
     ) {
-        artifacts.combine_driving.insert(name.to_string(), driver);
+        artifacts.combine_driving.insert(id, driver);
     }
 
-    artifacts
-        .combine_inputs
-        .insert(name.to_string(), combine_inputs_entries);
-    artifacts
-        .combine_strategy_hints
-        .insert(name.to_string(), config.strategy);
+    artifacts.combine_inputs.insert(id, combine_inputs_entries);
+    artifacts.combine_strategy_hints.insert(id, config.strategy);
 
     let cxl_span = cxl::lexer::Span::new(span.start as usize, span.start as usize);
     let merged_row = Row::closed(merged_declared, cxl_span);
@@ -4190,13 +4309,9 @@ fn bind_combine(
         }
     };
 
-    artifacts.combine_where_typed.insert(
-        ScopedNodeId {
-            scope,
-            name: name.to_string(),
-        },
-        Arc::clone(&typed_where),
-    );
+    artifacts
+        .combine_where_typed
+        .insert(id, Arc::clone(&typed_where));
 
     // Post-walk for E304 (unknown / 3-part qualified refs in where).
     let e304_before = diags.iter().filter(|d| d.code == "E304").count();
@@ -4243,9 +4358,7 @@ fn bind_combine(
         diags.push(combine_e305(name, span));
     }
 
-    artifacts
-        .combine_predicates
-        .insert(name.to_string(), decomposed);
+    artifacts.combine_predicates.insert(id, decomposed);
 
     // If the where-clause was structurally broken (E304), short-circuit
     // to avoid cascading body errors. The body may be fine, but without
@@ -4273,13 +4386,13 @@ fn bind_combine(
             diags.push(combine_e311_collect_with_body(name, span));
             return;
         }
-        let driving = match artifacts.combine_driving.get(name).cloned() {
+        let driving = match artifacts.combine_driving.get(&id).cloned() {
             Some(d) => d,
             None => return,
         };
         let inputs = artifacts
             .combine_inputs
-            .get(name)
+            .get(&id)
             .expect("combine_inputs populated above");
         if inputs.len() != 2 {
             return;
@@ -4304,7 +4417,7 @@ fn bind_combine(
         }
         artifacts
             .combine_resolved_columns
-            .insert(name.to_string(), Arc::new(resolved_map));
+            .insert(id, Arc::new(resolved_map));
 
         let mut output_decl: IndexMap<QualifiedField, Type> = IndexMap::new();
         for (qf, ty) in driver_input.row.fields() {
@@ -4360,11 +4473,7 @@ fn bind_combine(
         }
         let output_row = Row::closed(output_decl, cxl_span);
         schema_by_name.insert(name.to_string(), output_row.clone());
-        artifacts.typed_insert(
-            scope,
-            name.to_string(),
-            Arc::new(synthetic_typed_program(output_row)),
-        );
+        artifacts.typed_insert(id, Arc::new(synthetic_typed_program(output_row)));
         return;
     }
 
@@ -4410,11 +4519,11 @@ fn bind_combine(
 
     let driver_row = artifacts
         .combine_driving
-        .get(name)
-        .and_then(|q| artifacts.combine_inputs.get(name).and_then(|m| m.get(q)))
+        .get(&id)
+        .and_then(|q| artifacts.combine_inputs.get(&id).and_then(|m| m.get(q)))
         .map(|input| input.row.clone());
-    let driver_qualifier_for_row = artifacts.combine_driving.get(name).cloned();
-    let inputs_for_row = artifacts.combine_inputs.get(name);
+    let driver_qualifier_for_row = artifacts.combine_driving.get(&id).cloned();
+    let inputs_for_row = artifacts.combine_inputs.get(&id);
     let output_row = combine_output_row(
         &body_typed,
         driver_row.as_ref(),
@@ -4437,10 +4546,10 @@ fn bind_combine(
     // that case every qualifier lands on `JoinSide::Build`, which is
     // harmless because the post-pass skips stamping the combine's
     // runtime fields and the executor never reaches it.
-    let driver_qualifier = artifacts.combine_driving.get(name).cloned();
+    let driver_qualifier = artifacts.combine_driving.get(&id).cloned();
     let inputs_for_resolve = artifacts
         .combine_inputs
-        .get(name)
+        .get(&id)
         .expect("combine_inputs populated above");
     let mut resolved_map =
         resolve_combine_body_columns(&body_typed, inputs_for_resolve, driver_qualifier.as_deref());
@@ -4456,9 +4565,9 @@ fn bind_combine(
     }
     artifacts
         .combine_resolved_columns
-        .insert(name.to_string(), Arc::new(resolved_map));
+        .insert(id, Arc::new(resolved_map));
 
-    artifacts.typed_insert(scope, name.to_string(), Arc::new(body_typed));
+    artifacts.typed_insert(id, Arc::new(body_typed));
 }
 
 /// Walk every `Expr::QualifiedFieldRef { parts: [qualifier, name] }` in

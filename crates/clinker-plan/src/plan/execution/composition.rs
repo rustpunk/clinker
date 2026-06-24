@@ -55,34 +55,18 @@ pub(crate) fn resolve_composition_body_windows(
             continue;
         };
 
-        // Build a parent-DAG name → NodeIndex map once per body so
-        // later port resolutions don't re-walk the parent graph for
-        // every window. Top-level lookups walk parent_dag; nested-
-        // body lookups would need the enclosing body's mini-DAG, but
-        // for this pass the parent context is always the top-level
-        // DAG — nested ParentNode rooting through multiple body
-        // layers is an extension that the dispatcher's
-        // `current_body_node_input_refs` plumbing already handles via
-        // active_stack walks; the spec list emitted here points at the
-        // most-immediate parent-DAG operator. Top-level pipelines
-        // dominate the production geometry so this is the load-
-        // bearing case.
-        let mut parent_name_to_idx: std::collections::HashMap<&str, NodeIndex> =
-            std::collections::HashMap::new();
-        for idx in parent_dag.graph.node_indices() {
-            parent_name_to_idx.insert(parent_dag.graph[idx].name(), idx);
-        }
-
         // Find this body's call-site composition node in the parent
         // DAG. Multi-call-site signatures (the same .comp.yaml
         // referenced by N composition nodes) bind to N distinct
         // `CompositionBodyId`s — `composition_body_assignments` keys
-        // by composition node name, not body file path, so each
-        // body has exactly one composition node.
+        // by composition node id, not body file path, so each body has
+        // exactly one composition node. The call-site id resolves to its
+        // current `NodeIndex` through the parent DAG's `id_to_index`
+        // bridge.
         let mut composition_idx: Option<NodeIndex> = None;
-        for (comp_name, &assigned_id) in &artifacts.composition_body_assignments {
+        for (&comp_id, &assigned_id) in &artifacts.composition_body_assignments {
             if assigned_id == body_id
-                && let Some(&idx) = parent_name_to_idx.get(comp_name.as_str())
+                && let Some(idx) = *parent_dag.id_to_index.get(comp_id)
             {
                 composition_idx = Some(idx);
                 break;
@@ -141,12 +125,10 @@ pub(crate) fn resolve_composition_body_windows(
             // `$window.sum(amount)` adds `amount`, and `emit x = y` adds
             // `y`. The analyzer is the same one consumed at top-level
             // lowering (`config/mod.rs`); body Transforms register their
-            // typed programs in `artifacts.typed` under their own `Body`
-            // scope, so resolve by `(Body(body_id), name)` here.
-            if let Some(typed) = artifacts.typed_get(
-                crate::plan::bind_schema::NodeScope::Body(body_id),
-                transform_name,
-            ) {
+            // typed programs in `artifacts.typed` under their own
+            // `PlanNodeId`, so resolve by the body node's id here (read off
+            // the body mini-DAG at `transform_idx`).
+            if let Some(typed) = artifacts.typed_get(body.graph[transform_idx].id()) {
                 let analysis = cxl::analyzer::analyze_transform(transform_name, typed);
                 for f in &analysis.accessed_fields {
                     arena_fields.insert(f.clone());

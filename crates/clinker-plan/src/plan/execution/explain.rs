@@ -2167,6 +2167,7 @@ mod spill_projection_tests {
     use super::*;
     use crate::plan::combine::{CombinePredicateSummary, CombineStrategy};
     use crate::plan::properties::NodeProperties;
+    use crate::plan::{EntityRef, PlanNodeId};
     use petgraph::graph::DiGraph;
     use std::sync::Arc;
 
@@ -2184,9 +2185,10 @@ mod spill_projection_tests {
         )
     }
 
-    fn combine_node(name: &str, strategy: CombineStrategy) -> PlanNode {
+    fn combine_node(name: &str, id: usize, strategy: CombineStrategy) -> PlanNode {
         PlanNode::Combine {
             name: name.to_string(),
+            id: PlanNodeId::new(id),
             span: Span::SYNTHETIC,
             strategy,
             driving_input: "a".to_string(),
@@ -2206,9 +2208,10 @@ mod spill_projection_tests {
         }
     }
 
-    fn sort_node(name: &str) -> PlanNode {
+    fn sort_node(name: &str, id: usize) -> PlanNode {
         PlanNode::Sort {
             name: name.to_string(),
+            id: PlanNodeId::new(id),
             span: Span::SYNTHETIC,
             sort_fields: Vec::new(),
         }
@@ -2217,12 +2220,13 @@ mod spill_projection_tests {
     /// A Source carrying an explicit output schema of `column_names`. The
     /// schema is the exact `Arc` every record this Source emits carries, so a
     /// downstream node's runtime input-record width equals this column count.
-    fn source_node(name: &str, column_names: &[&str]) -> PlanNode {
+    fn source_node(name: &str, id: usize, column_names: &[&str]) -> PlanNode {
         let schema = clinker_record::Schema::new(
             column_names.iter().map(|c| Box::<str>::from(*c)).collect(),
         );
         PlanNode::Source {
             name: name.to_string(),
+            id: PlanNodeId::new(id),
             span: Span::SYNTHETIC,
             resolved: None,
             output_schema: Arc::new(schema),
@@ -2251,18 +2255,19 @@ mod spill_projection_tests {
         let mut dag = empty_dag();
         add_node(
             &mut dag,
-            combine_node("inline_join", CombineStrategy::HashBuildProbe),
+            combine_node("inline_join", 0, CombineStrategy::HashBuildProbe),
             1_000,
         );
         add_node(
             &mut dag,
-            combine_node("range_join", CombineStrategy::IEJoin),
+            combine_node("range_join", 1, CombineStrategy::IEJoin),
             1_000,
         );
         add_node(
             &mut dag,
             combine_node(
                 "hashpart_join",
+                2,
                 CombineStrategy::HashPartitionIEJoin { partition_bits: 4 },
             ),
             1_000,
@@ -2271,16 +2276,17 @@ mod spill_projection_tests {
             &mut dag,
             combine_node(
                 "grace_join",
+                3,
                 CombineStrategy::GraceHash { partition_bits: 4 },
             ),
             1_000,
         );
         add_node(
             &mut dag,
-            combine_node("merge_join", CombineStrategy::SortMerge),
+            combine_node("merge_join", 4, CombineStrategy::SortMerge),
             1_000,
         );
-        add_node(&mut dag, sort_node("external_sort"), 1_000);
+        add_node(&mut dag, sort_node("external_sort", 5), 1_000);
 
         let out = dag.spill_compression_explain(crate::config::CompressMode::Auto, 1_024);
 
@@ -2321,13 +2327,14 @@ mod spill_projection_tests {
         let mut dag = empty_dag();
         add_node(
             &mut dag,
-            combine_node("inline_join", CombineStrategy::HashBuildProbe),
+            combine_node("inline_join", 0, CombineStrategy::HashBuildProbe),
             5_000,
         );
         add_node(
             &mut dag,
             combine_node(
                 "grace_join",
+                1,
                 CombineStrategy::GraceHash { partition_bits: 4 },
             ),
             7_000,
@@ -2362,8 +2369,10 @@ mod spill_projection_tests {
         // Five-wide upstream: three declared columns plus two engine-stamped
         // tail columns, the shape ingest hands every record at runtime.
         let upstream_columns = ["sku", "price", "qty", "$source.file", "$source.name"];
-        let src_idx = dag.graph.add_node(source_node("orders", &upstream_columns));
-        let sort_idx = dag.graph.add_node(sort_node("__sort__orders"));
+        let src_idx = dag
+            .graph
+            .add_node(source_node("orders", 0, &upstream_columns));
+        let sort_idx = dag.graph.add_node(sort_node("__sort__orders", 1));
         dag.graph.add_edge(
             src_idx,
             sort_idx,

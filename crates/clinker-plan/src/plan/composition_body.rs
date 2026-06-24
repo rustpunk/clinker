@@ -175,6 +175,14 @@ pub struct BoundBody {
     /// bodies that contain no nested Composition with a deferred
     /// region somewhere below.
     pub parent_continuations: HashMap<NodeIndex, ParentContinuation>,
+
+    /// Bridge from stable [`crate::plan::PlanNodeId`] identity to the body
+    /// node's storage position in `graph`. Identity survives re-indexing;
+    /// the `NodeIndex` is a position in this body's own NodeIndex space.
+    /// Rebuilt via [`BoundBody::rebuild_id_index`] once the body graph is
+    /// structurally final. The default is `None`, so an id naming no live
+    /// body node reads `None` rather than aliasing `NodeIndex(0)`.
+    pub id_to_index: crate::plan::SecondaryMap<crate::plan::PlanNodeId, Option<NodeIndex>>,
 }
 
 impl BoundBody {
@@ -200,7 +208,17 @@ impl BoundBody {
             body_window_configs: HashMap::new(),
             deferred_regions: HashMap::new(),
             parent_continuations: HashMap::new(),
+            id_to_index: crate::plan::SecondaryMap::with_default(None),
         }
+    }
+
+    /// Rebuild the [`crate::plan::PlanNodeId`] → [`NodeIndex`] bridge from
+    /// this body's `graph`. Call once the body mini-DAG is structurally
+    /// final (after toposort), so every live body node id resolves to its
+    /// current storage position. Replaces the prior map wholesale; see
+    /// [`super::execution::build_id_index`] for the coverage invariant.
+    pub fn rebuild_id_index(&mut self) {
+        self.id_to_index = super::execution::build_id_index(&self.graph);
     }
 }
 
