@@ -15,3 +15,7 @@ examples/pipelines/per-source-ck/output/
 tests/e2e/
 .playwright-mcp/
 notes/
+
+# Filesystem case-sensitivity probe files clinker writes (and cleans up) during
+# test runs; they can linger if a run is interrupted.
+clinker-case-probe-*.tmp
