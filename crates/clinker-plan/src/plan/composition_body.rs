@@ -31,6 +31,13 @@ impl Default for CompositionBodyId {
     }
 }
 
+/// All bound composition bodies, keyed by `CompositionBodyId`. The
+/// runtime-retained slice of the former `CompileArtifacts` — the
+/// executor re-enters these mini-DAGs and nothing else from compile
+/// scratch survives into `CompiledPlan`. Declaration-order preserving
+/// (`IndexMap`) so body iteration is deterministic.
+pub type CompositionBodies = IndexMap<CompositionBodyId, BoundBody>;
+
 /// A bound composition body — one nested scope with its own NodeIndex
 /// space inside `graph`, its own per-node row map, and its own nested
 /// bodies (for composition-of-composition recursion).
@@ -79,9 +86,10 @@ pub struct BoundBody {
     pub port_name_to_node_idx: HashMap<String, NodeIndex>,
 
     /// Per-node output row inside this body scope. Keyed by node name.
-    /// Consumers that want a public accessor go through
-    /// `CompiledPlan::typed_output_row`, which only sees top-level
-    /// names; body-scope rows are drill-in state.
+    /// Body-scope rows are drill-in state reached through this `BoundBody`
+    /// (itself looked up via `CompiledPlan::body_of`); top-level node rows
+    /// live in the compile-time `CompileArtifacts.typed` table, keyed by
+    /// `PlanNodeId`.
     pub body_rows: HashMap<String, Row>,
 
     /// Per-body-node original `input:` references in declaration
@@ -234,7 +242,7 @@ impl BoundBody {
 /// stay synchronized; a divergent answer between plan and runtime
 /// would silently strand commit-time work.
 pub fn body_or_descendants_have_deferred_region(
-    artifacts: &crate::plan::bind_schema::CompileArtifacts,
+    composition_bodies: &CompositionBodies,
     body: &BoundBody,
 ) -> bool {
     if !body.deferred_regions.is_empty() {
@@ -244,8 +252,8 @@ pub fn body_or_descendants_have_deferred_region(
         let PlanNode::Composition { body: nested, .. } = &body.graph[idx] else {
             return false;
         };
-        artifacts
-            .body_of(*nested)
-            .is_some_and(|b| body_or_descendants_have_deferred_region(artifacts, b))
+        composition_bodies
+            .get(nested)
+            .is_some_and(|b| body_or_descendants_have_deferred_region(composition_bodies, b))
     })
 }

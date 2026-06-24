@@ -616,13 +616,14 @@ impl ExecutionPlanDag {
             }
         }
 
-        // Combine blocks render only when artifacts are threaded through
-        // (`explain_with_artifacts` / `explain_full_with_artifacts`).
-        // Without artifacts, `combine_predicates` is unreachable and the
-        // detail block degrades to the summary line embedded in
-        // `display_name()`'s header. The memory-limit argument is ignored
-        // when artifacts is `None`; pass `0` rather than re-reading the
-        // default to avoid a config-coupling cycle here.
+        // Combine blocks render only when the statistics catalog is
+        // threaded through (`explain_with_statistics` /
+        // `explain_full_with_statistics`). The per-node combine metadata
+        // is read off the node, but the row-estimate formatting needs the
+        // catalog; without it the detail block degrades to the summary
+        // line embedded in `display_name()`'s header. The memory-limit
+        // argument is ignored when the catalog is `None`; pass `0` rather
+        // than re-reading the default to avoid a config-coupling cycle here.
         self.render_combine_section(&mut out, None, 0);
 
         self.render_retraction_section(&mut out, None);
@@ -656,7 +657,7 @@ impl ExecutionPlanDag {
     /// and buffer-mode windows.
     ///
     /// `config` is `Some` when the caller went through one of the
-    /// artifacts-aware entry points and can read the pipeline-level
+    /// statistics-aware entry points and can read the pipeline-level
     /// `correlation_fanout_policy` default plus the `correlation_key`
     /// used to classify aggregates. Without it the block still emits
     /// per-window detail; aggregate detection requires the correlation
@@ -820,29 +821,29 @@ impl ExecutionPlanDag {
     }
 
     /// `--explain` text with combine multi-line blocks. Identical to
-    /// [`Self::explain`] except that combine nodes — when paired with
-    /// the `CompileArtifacts` that produced this DAG — render a full
-    /// per-node block (strategy, inputs + roles, predicate decomposition
-    /// detail, match/on-miss policy, planned-share memory budget). N-ary
-    /// chains (`decomposed_from = Some(_)`) group under their original
-    /// user-declared name with numbered step lines.
-    pub fn explain_with_artifacts(
+    /// [`Self::explain`] except that combine nodes — when paired with the
+    /// statistics catalog that backs this DAG's row estimates — render a
+    /// full per-node block (strategy, inputs + roles, predicate
+    /// decomposition detail, match/on-miss policy, planned-share memory
+    /// budget). N-ary chains (`decomposed_from = Some(_)`) group under
+    /// their original user-declared name with numbered step lines.
+    pub fn explain_with_statistics(
         &self,
         config: &PipelineConfig,
-        artifacts: &crate::plan::bind_schema::CompileArtifacts,
+        statistics: &crate::plan::statistics::StatisticsCatalog,
         total_memory_limit_bytes: u64,
     ) -> String {
         // Build the base block (everything except combines) by reusing
         // `explain()` and then overwriting the combine section with the
-        // artifacts-aware render. `explain()` calls
+        // statistics-aware render. `explain()` calls
         // `render_combine_section(.., None, ..)` which is a no-op for
-        // every combine node when artifacts are absent — so the output
+        // every combine node when the catalog is absent — so the output
         // of `explain()` already has no combine block to dedupe.
         let classes = self.classify_node_buffers(config);
         let policy_name = config.pipeline.memory.backpressure.policy_name();
         let mut out = self.explain(&classes, policy_name);
-        self.render_combine_section(&mut out, Some(artifacts), total_memory_limit_bytes);
-        render_statistics_section(&mut out, &artifacts.statistics);
+        self.render_combine_section(&mut out, Some(statistics), total_memory_limit_bytes);
+        render_statistics_section(&mut out, statistics);
         out
     }
 
@@ -853,16 +854,16 @@ impl ExecutionPlanDag {
     /// chain of binary combines that share the original user-declared
     /// name in `decomposed_from` — emits one group header followed by
     /// numbered `Step N:` lines. Singleton combines render their own
-    /// block. Without `artifacts`, the function returns immediately
-    /// (predicate detail is unreachable; the header line on
+    /// block. Without the statistics catalog, the function returns
+    /// immediately (row-estimate detail is unreachable; the header line on
     /// `display_name()` is the only signal).
     fn render_combine_section(
         &self,
         out: &mut String,
-        artifacts: Option<&crate::plan::bind_schema::CompileArtifacts>,
+        statistics: Option<&crate::plan::statistics::StatisticsCatalog>,
         total_memory_limit_bytes: u64,
     ) {
-        let Some(artifacts) = artifacts else {
+        let Some(statistics) = statistics else {
             return;
         };
 
@@ -893,7 +894,7 @@ impl ExecutionPlanDag {
             if indices.len() > 1 {
                 self.render_combine_group(out, group_name, indices, planned_share);
             } else {
-                self.render_combine_single(out, indices[0], artifacts, planned_share);
+                self.render_combine_single(out, indices[0], statistics, planned_share);
             }
         }
     }
@@ -903,15 +904,16 @@ impl ExecutionPlanDag {
     /// input + estimated rows, build inputs + roles, predicate
     /// summary + per-bucket detail (PostgreSQL 3-tier), match mode,
     /// on-miss policy, planned-share memory budget. Defensive paths
-    /// handle a combine whose `combine_predicates` entry is missing
-    /// (E303 fired at compile time) by rendering `<unselected>` /
-    /// summary-only — mirrors `display_name()`'s `<unselected>`
-    /// fallback for an unset driving input.
+    /// handle a combine whose on-node `decomposed_predicate` is `None`
+    /// (a body-less `match: collect` step, or E303 fired at compile
+    /// time) by rendering the count summary only and skipping the detail
+    /// buckets — mirrors `display_name()`'s `<unselected>` fallback for
+    /// an unset driving input.
     fn render_combine_single(
         &self,
         out: &mut String,
         idx: NodeIndex,
-        artifacts: &crate::plan::bind_schema::CompileArtifacts,
+        statistics: &crate::plan::statistics::StatisticsCatalog,
         planned_share: u64,
     ) {
         let PlanNode::Combine {
@@ -945,10 +947,8 @@ impl ExecutionPlanDag {
         } else {
             driving_input.as_str()
         };
-        let drive_rows = format_estimated_rows(
-            inputs_for_node.and_then(|m| m.get(drive_label)),
-            &artifacts.statistics,
-        );
+        let drive_rows =
+            format_estimated_rows(inputs_for_node.and_then(|m| m.get(drive_label)), statistics);
         out.push_str(&format!(
             "  Driving input: {drive_label} (probe, est. {drive_rows} rows)\n",
         ));
@@ -957,7 +957,7 @@ impl ExecutionPlanDag {
             let role = describe_build_role(strategy, build_name);
             let rows = format_estimated_rows(
                 inputs_for_node.and_then(|m| m.get(build_name.as_str())),
-                &artifacts.statistics,
+                statistics,
             );
             out.push_str(&format!(
                 "  Build input: {build_name} ({role}, est. {rows} rows)\n",
@@ -1062,22 +1062,22 @@ impl ExecutionPlanDag {
         out.push('\n');
     }
 
-    /// Like [`Self::explain_full`] but emits the artifacts-aware
+    /// Like [`Self::explain_full`] but emits the statistics-aware
     /// per-combine multi-line block alongside the existing transform /
     /// sort / route blocks. Intended for the CLI `--explain` path
     /// where the caller already holds the [`crate::plan::CompiledPlan`]
-    /// that produced this DAG.
-    pub fn explain_full_with_artifacts(
+    /// that produced this DAG and its statistics catalog.
+    pub fn explain_full_with_statistics(
         &self,
         config: &PipelineConfig,
-        artifacts: &crate::plan::bind_schema::CompileArtifacts,
+        statistics: &crate::plan::statistics::StatisticsCatalog,
     ) -> String {
         let total_limit =
             crate::config::utils::parse_memory_limit_bytes(config.pipeline.memory.limit.as_deref());
-        let mut out = self.explain_with_artifacts(config, artifacts, total_limit);
+        let mut out = self.explain_with_statistics(config, statistics, total_limit);
         // Re-render the retraction section with the pipeline config in
         // scope so the fanout-policy line resolves to the user-visible
-        // setting. `explain()` (called inside `explain_with_artifacts`)
+        // setting. `explain()` (called inside `explain_with_statistics`)
         // already emitted a config-less variant; strip it before
         // re-rendering to avoid duplicate blocks.
         if let Some(start) = out.find("=== Retraction ===\n") {
@@ -1088,15 +1088,15 @@ impl ExecutionPlanDag {
         out
     }
 
-    /// Like [`Self::explain_text`] but routes through the artifacts-
+    /// Like [`Self::explain_text`] but routes through the statistics-
     /// aware text formatter so combine blocks render with full per-
     /// node detail.
-    pub fn explain_text_with_artifacts(
+    pub fn explain_text_with_statistics(
         &self,
         config: &PipelineConfig,
-        artifacts: &crate::plan::bind_schema::CompileArtifacts,
+        statistics: &crate::plan::statistics::StatisticsCatalog,
     ) -> String {
-        let mut out = self.explain_full_with_artifacts(config, artifacts);
+        let mut out = self.explain_full_with_statistics(config, statistics);
         self.append_topology_section(&mut out);
         out
     }
@@ -1286,7 +1286,7 @@ impl ExecutionPlanDag {
 
     /// Append the `CXL Expressions`, `Type Annotations`, `Memory Budget`
     /// trailing sections that `explain_full` adds onto a base
-    /// `explain()` body. Factored so the artifacts-aware variant can
+    /// `explain()` body. Factored so the statistics-aware variant can
     /// reuse them.
     fn append_full_sections(&self, out: &mut String, config: &PipelineConfig) {
         // CXL AST (reformatted expressions from config)
@@ -1331,7 +1331,7 @@ impl ExecutionPlanDag {
     }
 
     /// Append the `DAG Topology` section that `explain_text` adds onto
-    /// a base `explain_full` body. Factored so the artifacts-aware
+    /// a base `explain_full` body. Factored so the statistics-aware
     /// variant can reuse it without duplicating the topology walk.
     fn append_topology_section(&self, out: &mut String) {
         out.push_str("=== DAG Topology ===\n\n");
@@ -1673,11 +1673,11 @@ struct NodeEntry<'a> {
 ///
 /// Keeping the wrapper out of `ExecutionPlanDag` itself preserves the
 /// existing `serde_json::to_value(&dag)` / `to_string_pretty(&dag)`
-/// callers (which neither receive nor want artifacts) without bumping
-/// the JSON `schema_version`.
+/// callers (which neither receive nor want the statistics catalog)
+/// without bumping the JSON `schema_version`.
 pub struct ExplainJson<'a> {
     dag: &'a ExecutionPlanDag,
-    artifacts: &'a crate::plan::bind_schema::CompileArtifacts,
+    statistics: &'a crate::plan::statistics::StatisticsCatalog,
     /// Storage observability at parity with the text `--explain` output:
     /// per-stage spill estimates, the resolved spill root / disk cap, the
     /// per-operator compression decision, cap headroom, and the staging
@@ -1689,14 +1689,14 @@ pub struct ExplainJson<'a> {
 }
 
 impl<'a> ExplainJson<'a> {
-    /// Build an artifacts-aware JSON view of an execution plan.
+    /// Build a statistics-aware JSON view of an execution plan.
     pub fn new(
         dag: &'a ExecutionPlanDag,
-        artifacts: &'a crate::plan::bind_schema::CompileArtifacts,
+        statistics: &'a crate::plan::statistics::StatisticsCatalog,
     ) -> Self {
         Self {
             dag,
-            artifacts,
+            statistics,
             storage_summary: None,
         }
     }
@@ -1863,12 +1863,12 @@ impl<'a> Serialize for ExplainJson<'a> {
         map.serialize_entry("schema_version", "1")?;
 
         // Combine-aware node list. Walks `topo_order` and emits a
-        // `CombineNodeEntry` for combine variants (carrying the
-        // artifacts-derived fields), falling back to the plain
+        // `CombineNodeEntry` for combine variants (whose row estimates
+        // read the statistics catalog), falling back to the plain
         // `NodeEntry` for everything else.
         struct EnrichedNodeList<'a> {
             dag: &'a ExecutionPlanDag,
-            artifacts: &'a crate::plan::bind_schema::CompileArtifacts,
+            statistics: &'a crate::plan::statistics::StatisticsCatalog,
             combine_count_total: usize,
             total_memory_limit: u64,
         }
@@ -1889,7 +1889,7 @@ impl<'a> Serialize for ExplainJson<'a> {
                         let entry = CombineNodeEntry {
                             node,
                             depends_on: &depends_on,
-                            artifacts: self.artifacts,
+                            statistics: self.statistics,
                             memory_budget_bytes: planned_share,
                         };
                         seq.serialize_element(&entry)?;
@@ -1922,7 +1922,7 @@ impl<'a> Serialize for ExplainJson<'a> {
             "nodes",
             &EnrichedNodeList {
                 dag: self.dag,
-                artifacts: self.artifacts,
+                statistics: self.statistics,
                 combine_count_total,
                 total_memory_limit,
             },
@@ -1956,8 +1956,8 @@ impl<'a> Serialize for ExplainJson<'a> {
     }
 }
 
-/// Per-Combine-node JSON entry carrying the artifacts-derived
-/// predicate detail (`equalities[].left/.right`, `ranges[]`,
+/// Per-Combine-node JSON entry carrying the node-derived predicate
+/// detail (`equalities[].left/.right`, `ranges[]`,
 /// `has_residual`), per-input role + cardinality, and the
 /// planned-share `memory_budget_bytes`. Flattens the underlying
 /// `PlanNode::Combine` shape to preserve every field the plain
@@ -1967,7 +1967,7 @@ impl<'a> Serialize for ExplainJson<'a> {
 struct CombineNodeEntry<'a> {
     node: &'a PlanNode,
     depends_on: &'a Vec<String>,
-    artifacts: &'a crate::plan::bind_schema::CompileArtifacts,
+    statistics: &'a crate::plan::statistics::StatisticsCatalog,
     memory_budget_bytes: u64,
 }
 
@@ -1996,8 +1996,8 @@ impl<'a> Serialize for CombineNodeEntry<'a> {
         );
 
         // Combine-specific extras. The per-input metadata and decomposed
-        // predicate come off the node (the runtime source); the statistics
-        // catalog stays in artifacts.
+        // predicate come off the node (the runtime source); only the
+        // row-estimate figures consult the statistics catalog.
         if let PlanNode::Combine {
             strategy,
             driving_input,
@@ -2014,7 +2014,7 @@ impl<'a> Serialize for CombineNodeEntry<'a> {
             // Per-input role + estimated rows.
             let inputs_value = build_inputs_json(
                 combine_inputs.as_ref(),
-                &self.artifacts.statistics,
+                self.statistics,
                 driving_input,
                 build_inputs,
                 strategy,

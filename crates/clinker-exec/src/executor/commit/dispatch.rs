@@ -163,9 +163,9 @@ fn dispatch_deferred_inner(
         // deferred region (the same predicate the plan-time
         // continuation walker uses to decide whether to record a
         // continuation in the first place).
-        let needs_recurse = ctx.artifacts.body_of(body_id).is_some_and(|b| {
+        let needs_recurse = ctx.composition_bodies.get(&body_id).is_some_and(|b| {
             clinker_plan::plan::composition_body::body_or_descendants_have_deferred_region(
-                ctx.artifacts,
+                ctx.composition_bodies,
                 b,
             )
         });
@@ -380,7 +380,7 @@ fn recurse_into_body(
     body_id: CompositionBodyId,
     events: &mut Vec<DlqEvent>,
 ) -> Result<(), PipelineError> {
-    let bound_body = match ctx.artifacts.body_of(body_id) {
+    let bound_body = match ctx.composition_bodies.get(&body_id) {
         Some(b) => b,
         None => return Ok(()),
     };

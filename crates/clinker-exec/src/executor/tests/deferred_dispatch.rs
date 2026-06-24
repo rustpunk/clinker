@@ -550,7 +550,7 @@ o6,ENG,300
     // its body-local deferred region was registered. Without this the
     // orchestrator's `is_relaxed_pipeline` check (which now inspects
     // bodies) returns false and the commit-time recurse never fires.
-    let bodies: Vec<_> = compiled.artifacts().composition_bodies.values().collect();
+    let bodies: Vec<_> = compiled.composition_bodies().values().collect();
     assert_eq!(
         bodies.len(),
         1,
@@ -794,7 +794,7 @@ o6,ENG,300
 
     // Sanity-pin: exactly two bodies are bound; the inner one carries
     // the deferred region rooted at its `dept_totals` Aggregate.
-    let bodies: Vec<_> = compiled.artifacts().composition_bodies.values().collect();
+    let bodies: Vec<_> = compiled.composition_bodies().values().collect();
     assert_eq!(bodies.len(), 2, "inner and outer bodies must both bind");
     assert!(
         bodies.iter().any(|b| !b.deferred_regions.is_empty()),

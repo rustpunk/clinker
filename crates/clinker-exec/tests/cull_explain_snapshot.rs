@@ -12,8 +12,8 @@ fn render_explain(yaml: &str) -> String {
     let config: PipelineConfig = parse_config(yaml).expect("parse_config");
     let plan = config.compile(&CompileContext::default()).expect("compile");
     let dag = plan.dag();
-    let artifacts = plan.artifacts();
-    dag.explain_text_with_artifacts(&config, artifacts)
+    let statistics = plan.statistics();
+    dag.explain_text_with_statistics(&config, statistics)
 }
 
 /// A source → cull → (main output + audit side output) pipeline. The Cull

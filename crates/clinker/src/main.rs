@@ -736,12 +736,12 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             abort_on_overlay_errors(&overlay)?;
         }
         let dag = compiled_plan.dag();
-        let artifacts = compiled_plan.artifacts();
+        let statistics = compiled_plan.statistics();
         match format {
             ExplainFormat::Text => {
                 print!(
                     "{}",
-                    dag.explain_text_with_artifacts(&pipeline_config, artifacts)
+                    dag.explain_text_with_statistics(&pipeline_config, statistics)
                 );
                 // Resolved spill root: the directory under which the per-run
                 // `clinker-spill-*` directory is created. Shows the configured
@@ -819,7 +819,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     spill_root_dir.as_deref(),
                     &args.config,
                 );
-                let view = clinker_plan::plan::execution::ExplainJson::new(dag, artifacts)
+                let view = clinker_plan::plan::execution::ExplainJson::new(dag, statistics)
                     .with_storage_summary(storage_summary);
                 let json = serde_json::to_string_pretty(&view).map_err(|e| {
                     PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(

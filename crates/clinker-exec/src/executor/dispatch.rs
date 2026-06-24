@@ -442,7 +442,7 @@ use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{CompiledRoute, DlqEntry, evaluate_single_transform, stage_metrics};
 use clinker_plan::BudgetCategory;
-use clinker_plan::plan::bind_schema::CompileArtifacts;
+use clinker_plan::plan::composition_body::CompositionBodies;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_record::Schema;
 
@@ -451,7 +451,8 @@ use clinker_record::Schema;
 ///
 /// Borrowed (immutable for the entire walk):
 /// * `config`      — the YAML pipeline config (e.g. error strategy).
-/// * `artifacts`   — compile-time CXL typed programs and combine metadata.
+/// * `composition_bodies` — the bound composition bodies the dispatcher
+///   re-enters; the only compile-artifact slice the runtime walk needs.
 /// * `current_dag` — the DAG being walked. Composition body recursion will
 ///   later swap this in place to re-enter the dispatcher on a body's
 ///   mini-DAG without duplicating arm logic.
@@ -483,7 +484,10 @@ use clinker_record::Schema;
 pub(crate) struct ExecutorContext<'a> {
     // Borrowed plan-time state.
     pub(crate) config: &'a PipelineConfig,
-    pub(crate) artifacts: &'a CompileArtifacts,
+    /// Bound composition bodies the dispatcher re-enters at runtime. The
+    /// runtime-retained slice of the former compile artifacts; resolved
+    /// by `CompositionBodyId` via `composition_bodies.get(&id)`.
+    pub(crate) composition_bodies: &'a CompositionBodies,
     pub(crate) output_configs: &'a [OutputConfig],
     pub(crate) primary_output: &'a OutputConfig,
     pub(crate) stable: &'a StableEvalContext,

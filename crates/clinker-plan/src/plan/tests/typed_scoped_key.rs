@@ -14,7 +14,7 @@
 //! and asserts the two nodes get DISTINCT `PlanNodeId`s with their own
 //! independent typed entry.
 
-use super::deferred_region::compile_with_dir_full;
+use super::deferred_region::bind_schema_with_dir;
 
 /// A top-level transform and a composition-body transform both named
 /// `shape`, each emitting a distinct field, get distinct `PlanNodeId`s and
@@ -102,18 +102,13 @@ nodes:
       path: out_body.csv
       include_unmapped: true
 "#;
-    let compiled = compile_with_dir_full(yaml, workspace.path());
-    let artifacts = compiled.artifacts();
+    let (artifacts, config) = bind_schema_with_dir(yaml, workspace.path());
 
     // The body's scope id comes from the composition-body assignment,
     // keyed by the `body` composition call-site node's own id — resolved
-    // from the declaration-order id vector the way production does.
-    let body_comp_id = compiled
-        .config()
-        .nodes
-        .iter()
-        .zip(artifacts.top_level_node_ids.iter())
-        .find_map(|(spanned, id)| (spanned.value.name() == "body").then_some(*id))
+    // through the production `top_level_id` resolver.
+    let body_comp_id = artifacts
+        .top_level_id(&config.nodes, "body")
         .expect("top-level `body` composition id");
     let body_id = artifacts
         .composition_body_assignments
@@ -121,18 +116,13 @@ nodes:
         .copied()
         .expect("composition body assignment for `body`");
 
-    // Resolve the top-level `shape` node's id from the declaration-order id
-    // vector (top-level names are unique), and the body `shape` node's id
-    // off the bound body's mini-DAG. The two same-named nodes live in
-    // disjoint scopes and so must get DISTINCT ids.
-    let top_id = compiled
-        .config()
-        .nodes
-        .iter()
-        .zip(artifacts.top_level_node_ids.iter())
-        .find_map(|(spanned, id)| (spanned.value.name() == "shape").then_some(*id))
+    // Resolve the top-level `shape` node's id (top-level names are unique),
+    // and the body `shape` node's id off the bound body's mini-DAG. The two
+    // same-named nodes live in disjoint scopes and so must get DISTINCT ids.
+    let top_id = artifacts
+        .top_level_id(&config.nodes, "shape")
         .expect("top-level `shape` id");
-    let body = compiled.body_of(body_id).expect("bound body for `body`");
+    let body = artifacts.body_of(body_id).expect("bound body for `body`");
     let body_idx = body
         .name_to_idx
         .get("shape")
