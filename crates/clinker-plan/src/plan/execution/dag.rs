@@ -52,7 +52,7 @@ impl ExecutionPlanDag {
         output_projections: Vec<OutputSpec>,
         parallelism: ParallelismProfile,
     ) -> Self {
-        Self {
+        let mut dag = Self {
             graph,
             topo_order,
             source_dag,
@@ -62,7 +62,10 @@ impl ExecutionPlanDag {
             node_properties: HashMap::new(),
             deferred_regions: HashMap::new(),
             parent_continuations: HashMap::new(),
-        }
+            id_to_index: SecondaryMap::with_default(None),
+        };
+        dag.rebuild_id_index();
+        dag
     }
 
     /// Build a transient `ExecutionPlanDag` whose graph + topo_order
@@ -101,7 +104,28 @@ impl ExecutionPlanDag {
             // nested Composition, it reads continuations from the same
             // surface as the parent dispatcher uses.
             parent_continuations: body.parent_continuations.clone(),
+            // Runtime body DAGs never resolve id→index; the bridge is a
+            // compile-time concern (composition window resolution runs
+            // against the parent DAG at compile, not here), so leave it
+            // empty rather than clone the body's.
+            id_to_index: SecondaryMap::with_default(None),
         }
+    }
+
+    /// Rebuild the [`PlanNodeId`] → [`NodeIndex`] bridge from the current
+    /// graph. Call after every toposort or structural mutation that
+    /// finalizes the graph: the bridge must name every live node so a
+    /// later id lookup resolves to the node's current storage position.
+    /// Replaces the prior map wholesale so an id whose node was removed no
+    /// longer resolves. See [`build_id_index`] for the coverage invariant.
+    pub fn rebuild_id_index(&mut self) {
+        self.id_to_index = build_id_index(&self.graph);
+    }
+
+    /// Current storage position of the node with stable identity `id`, or
+    /// `None` when no live node carries that id.
+    pub fn index_of(&self, id: PlanNodeId) -> Option<NodeIndex> {
+        self.id_to_index[id]
     }
 
     /// `Some(region)` iff `idx` participates in any deferred region on
@@ -667,6 +691,7 @@ mod port_tag_guard_tests {
     use super::*;
     use crate::plan::bind_schema::CompileArtifacts;
     use crate::plan::composition_body::CompositionBodyId;
+    use crate::plan::{EntityRef, PlanNodeId, SecondaryMap};
     use clinker_record::SchemaBuilder;
     use std::sync::Arc;
 
@@ -684,21 +709,24 @@ mod port_tag_guard_tests {
             node_properties: HashMap::new(),
             deferred_regions: HashMap::new(),
             parent_continuations: HashMap::new(),
+            id_to_index: SecondaryMap::with_default(None),
         }
     }
 
-    fn source_node(name: &str) -> PlanNode {
+    fn source_node(name: &str, id: usize) -> PlanNode {
         PlanNode::Source {
             name: name.to_string(),
+            id: PlanNodeId::new(id),
             span: Span::SYNTHETIC,
             resolved: None,
             output_schema: SchemaBuilder::new().build(),
         }
     }
 
-    fn composition_node(name: &str) -> PlanNode {
+    fn composition_node(name: &str, id: usize) -> PlanNode {
         PlanNode::Composition {
             name: name.to_string(),
+            id: PlanNodeId::new(id),
             span: Span::SYNTHETIC,
             body: CompositionBodyId::SENTINEL,
             output_schema: Arc::new(clinker_record::Schema::new(Vec::new())),
@@ -708,8 +736,8 @@ mod port_tag_guard_tests {
     #[test]
     fn diagnose_silent_when_every_composition_edge_is_port_tagged() {
         let mut dag = empty_dag();
-        let src = dag.graph.add_node(source_node("src"));
-        let comp = dag.graph.add_node(composition_node("comp"));
+        let src = dag.graph.add_node(source_node("src", 0));
+        let comp = dag.graph.add_node(composition_node("comp", 1));
         dag.graph.add_edge(
             src,
             comp,
@@ -731,8 +759,8 @@ mod port_tag_guard_tests {
     #[test]
     fn diagnose_emits_e152_for_untagged_top_level_composition_edge() {
         let mut dag = empty_dag();
-        let src = dag.graph.add_node(source_node("src"));
-        let comp = dag.graph.add_node(composition_node("comp"));
+        let src = dag.graph.add_node(source_node("src", 0));
+        let comp = dag.graph.add_node(composition_node("comp", 1));
         dag.graph.add_edge(
             src,
             comp,
@@ -769,8 +797,8 @@ mod port_tag_guard_tests {
         let mut artifacts = CompileArtifacts::default();
         let body_id = artifacts.fresh_body_id();
         let mut body_graph = DiGraph::<PlanNode, PlanEdge>::new();
-        let body_src = body_graph.add_node(source_node("body_src"));
-        let body_comp = body_graph.add_node(composition_node("nested_comp"));
+        let body_src = body_graph.add_node(source_node("body_src", 0));
+        let body_comp = body_graph.add_node(composition_node("nested_comp", 1));
         body_graph.add_edge(
             body_src,
             body_comp,
@@ -797,6 +825,7 @@ mod port_tag_guard_tests {
             body_window_configs: HashMap::new(),
             deferred_regions: HashMap::new(),
             parent_continuations: HashMap::new(),
+            id_to_index: SecondaryMap::with_default(None),
         };
         artifacts.insert_body(body_id, body);
         let diags = diagnose_untagged_composition_edges(&dag, &artifacts);

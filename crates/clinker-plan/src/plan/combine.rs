@@ -9,14 +9,16 @@
 //! The late-populated compile artifacts that these types describe do NOT
 //! live inline on `PlanNode::Combine`. Instead, they live in
 //! `CompileArtifacts` side-tables:
-//!   - `CompileArtifacts.typed` (keyed by the combine's `ScopedNodeId`)
+//!   - `CompileArtifacts.typed` (keyed by the combine's `PlanNodeId`)
 //!     — typed cxl-body program (same key convention as Transform)
 //!   - `CompileArtifacts.combine_predicates`  — `DecomposedPredicate`
 //!     (the residual re-typechecked program lives inside this, not in
 //!     `typed` — the where-clause TypedProgram is a local intermediate
 //!     that doesn't survive bind_schema)
 //!   - `CompileArtifacts.combine_inputs`      — per-input metadata
-//!     (name-keyed; see `CombineInput` for the no-`NodeIndex` rationale)
+//!     (keyed by the combine's `PlanNodeId`; the inner `IndexMap` is
+//!     keyed by input-port name. See `CombineInput` for why each input
+//!     still refers to its upstream node by name rather than `NodeIndex`.)
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -76,8 +78,8 @@ pub enum CombineStrategy {
 /// equality conjuncts, range conjuncts, and a residual program.
 ///
 /// Populated by C.1 and stored in `CompileArtifacts.combine_predicates`
-/// keyed by combine node name. The planner reads this in C.2 to pick a
-/// `CombineStrategy` and build hash keys / range indices.
+/// keyed by the combine node's `PlanNodeId`. The planner reads this in C.2
+/// to pick a `CombineStrategy` and build hash keys / range indices.
 #[derive(Debug, Clone)]
 pub struct DecomposedPredicate {
     pub equalities: Vec<EqualityConjunct>,
@@ -700,9 +702,10 @@ pub(crate) struct CombineSelectionTables<'a> {
     /// row count from here, keyed by the input's upstream node name, in
     /// place of a per-input cardinality field.
     pub statistics: &'a crate::plan::statistics::StatisticsCatalog,
-    /// Per-combine user-supplied strategy hint, keyed by combine node name.
+    /// Per-combine user-supplied strategy hint, keyed by the combine
+    /// node's [`crate::plan::PlanNodeId`].
     pub combine_strategy_hints:
-        &'a std::collections::HashMap<String, crate::config::CombineStrategyHint>,
+        &'a std::collections::HashMap<crate::plan::PlanNodeId, crate::config::CombineStrategyHint>,
 }
 
 pub fn select_combine_strategies(
@@ -794,15 +797,15 @@ pub(crate) fn select_combine_strategies_in_graph(
     use crate::plan::execution::PlanNode;
     use petgraph::graph::NodeIndex;
 
-    let combine_nodes: Vec<(NodeIndex, String, Span)> = graph
+    let combine_nodes: Vec<(NodeIndex, String, crate::plan::PlanNodeId, Span)> = graph
         .node_indices()
         .filter_map(|idx| match &graph[idx] {
-            PlanNode::Combine { name, span, .. } => Some((idx, name.clone(), *span)),
+            PlanNode::Combine { name, id, span, .. } => Some((idx, name.clone(), *id, *span)),
             _ => None,
         })
         .collect();
 
-    for (idx, name, span) in combine_nodes {
+    for (idx, name, id, span) in combine_nodes {
         // Read the combine's inputs + decomposed predicate off the node
         // (stamped at lowering / N-ary decomposition), cloning them out so the
         // borrow is released before this pass mutates the node's strategy
@@ -886,7 +889,7 @@ pub(crate) fn select_combine_strategies_in_graph(
             }
         } else if grace_hash_should_fire(&inputs, tables.statistics, mem_limit_str)
             || matches!(
-                tables.combine_strategy_hints.get(&name),
+                tables.combine_strategy_hints.get(&id),
                 Some(crate::config::CombineStrategyHint::GraceHash)
             )
         {
@@ -1818,6 +1821,7 @@ pub(crate) fn decompose_nary_combines(
         // index away from `Combine` would invalidate the snapshot's
         // assumption — skip and continue rather than panic.
         let PlanNode::Combine {
+            id: original_id,
             match_mode: original_match_mode,
             on_miss: original_on_miss,
             output_schema: original_output_schema,
@@ -1838,7 +1842,7 @@ pub(crate) fn decompose_nary_combines(
         // per-step maps below, and the final step's map differs from
         // the original because chain qualifiers route through Probe at
         // encoded indices rather than directly to the original sources.
-        artifacts.combine_resolved_columns.remove(&original_name);
+        artifacts.combine_resolved_columns.remove(&original_id);
 
         // Build a name → NodeIndex lookup over the current graph for
         // wiring source-edges. Snapshot here so it captures the
@@ -1966,6 +1970,11 @@ pub(crate) fn decompose_nary_combines(
                     step_output_schema.clone(),
                     plan.graph.add_node(PlanNode::Combine {
                         name: step.name.clone(),
+                        // Each newly-added (N-2) synthetic chain step mints
+                        // fresh. The reused final step (the `i == last_step_idx`
+                        // arm) keeps the original combine's id — only these
+                        // earlier steps are new nodes.
+                        id: artifacts.fresh_node_id(),
                         span,
                         strategy: CombineStrategy::HashBuildProbe,
                         driving_input: String::new(),
@@ -2142,10 +2151,15 @@ pub(crate) fn decompose_nary_combines(
                 },
             );
 
+            // The step's stable id: the final step reuses the original
+            // combine's index (and thus its id); earlier steps were minted
+            // fresh at node creation. Read it off the node so per-step
+            // side-table entries are keyed by the step's own id.
+            let step_id = plan.graph[step_indices[i]].id();
+
             // Stamp the per-step runtime state onto the step's node (created
             // above; the final step reuses the original combine's index) so
-            // strategy selection and the executor read it by node instance,
-            // not via a bare-name lookup that collides across sibling scopes.
+            // strategy selection and the executor read it by node instance.
             if let PlanNode::Combine {
                 combine_inputs: step_node_inputs,
                 decomposed_predicate: step_node_predicate,
@@ -2159,44 +2173,36 @@ pub(crate) fn decompose_nary_combines(
             }
             artifacts
                 .combine_resolved_columns
-                .insert(step.name.clone(), Arc::new(step_resolved_maps[i].clone()));
+                .insert(step_id, Arc::new(step_resolved_maps[i].clone()));
 
             // Propagate the user's strategy hint to every chain step.
             // The hint applies to the join semantics (pure-equi grace
             // hash), and a left-deep chain of pure-equi joins routes
             // every step through the same strategy when the user asked
             // for it.
-            if let Some(hint) = artifacts
-                .combine_strategy_hints
-                .get(&original_name)
-                .copied()
-            {
-                artifacts
-                    .combine_strategy_hints
-                    .insert(step.name.clone(), hint);
+            if let Some(hint) = artifacts.combine_strategy_hints.get(&original_id).copied() {
+                artifacts.combine_strategy_hints.insert(step_id, hint);
             }
         }
 
-        // Drop the original combine's artifacts — its name is gone from
-        // the graph (the index now hosts the final step under a
-        // synthetic name). The body program already migrated onto the
-        // final step node above, so its `typed` entry is dropped here too
-        // rather than re-homed under the synthetic name. This pass runs
-        // over the top-level DAG, so the `typed` key is TopLevel-scoped.
-        artifacts.typed_remove(
-            crate::plan::bind_schema::NodeScope::TopLevel,
-            &original_name,
-        );
-        artifacts.combine_inputs.remove(&original_name);
-        artifacts.combine_predicates.remove(&original_name);
-        artifacts.combine_driving.remove(&original_name);
-        artifacts.combine_strategy_hints.remove(&original_name);
+        // No per-original side-table cleanup: the final step reuses the
+        // original combine's node (and thus its `PlanNodeId`), so the
+        // entries keyed by `original_id` are the final step's own slots.
+        // `combine_strategy_hints` / `combine_resolved_columns` were just
+        // re-set to the final step's values in the per-step loop, and
+        // `combine_strategy_hints` is still read by
+        // `select_combine_strategies`; dropping `original_id` would delete
+        // those live entries. The original N-ary's other entries under
+        // `original_id` (`combine_inputs` / `combine_predicates` /
+        // `combine_driving` / `typed`) are read only at lowering, already
+        // past, so leaving them is inert.
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::{EntityRef, PlanNodeId};
 
     #[test]
     fn test_combine_strategy_serde_round_trip() {
@@ -2374,6 +2380,10 @@ mod tests {
         use indexmap::IndexMap;
 
         let combine_name = "test_combine";
+        // The single combine node below is built with this id; key its
+        // side-table entries by the same id so the lowering-mirror reads
+        // resolve.
+        let combine_id = PlanNodeId::new(0);
         let mut artifacts = CompileArtifacts::default();
 
         let mut inputs_map: IndexMap<String, CombineInput> = IndexMap::new();
@@ -2389,14 +2399,12 @@ mod tests {
                 },
             );
         }
-        artifacts
-            .combine_inputs
-            .insert(combine_name.to_string(), inputs_map);
+        artifacts.combine_inputs.insert(combine_id, inputs_map);
 
         if with_driver {
             artifacts
                 .combine_driving
-                .insert(combine_name.to_string(), inputs[0].0.to_string());
+                .insert(combine_id, inputs[0].0.to_string());
         }
 
         let dummy_lit = || Expr::Literal {
@@ -2437,19 +2445,18 @@ mod tests {
             ranges: (0..ranges).map(|_| mk_range()).collect(),
             residual: None,
         };
-        artifacts
-            .combine_predicates
-            .insert(combine_name.to_string(), decomposed);
+        artifacts.combine_predicates.insert(combine_id, decomposed);
 
         let predicate_summary = CombinePredicateSummary::from_decomposed(
             artifacts
                 .combine_predicates
-                .get(combine_name)
+                .get(&combine_id)
                 .expect("synthetic_combine_plan just inserted a DecomposedPredicate"),
         );
         let mut graph = petgraph::graph::DiGraph::new();
         graph.add_node(PlanNode::Combine {
             name: combine_name.to_string(),
+            id: combine_id,
             span: Span::SYNTHETIC,
             strategy: CombineStrategy::HashBuildProbe,
             driving_input: String::new(),
@@ -2464,11 +2471,11 @@ mod tests {
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
             typed: None,
             // Mirror lowering: the strategy pass reads these off the node.
-            combine_inputs: artifacts.combine_inputs.get(combine_name).cloned(),
-            decomposed_predicate: artifacts.combine_predicates.get(combine_name).cloned(),
-            combine_driving: artifacts.combine_driving.get(combine_name).cloned(),
+            combine_inputs: artifacts.combine_inputs.get(&combine_id).cloned(),
+            decomposed_predicate: artifacts.combine_predicates.get(&combine_id).cloned(),
+            combine_driving: artifacts.combine_driving.get(&combine_id).cloned(),
         });
-        let plan = ExecutionPlanDag {
+        let mut plan = ExecutionPlanDag {
             graph,
             topo_order: Vec::new(),
             source_dag: Vec::new(),
@@ -2481,7 +2488,9 @@ mod tests {
             node_properties: std::collections::HashMap::new(),
             deferred_regions: std::collections::HashMap::new(),
             parent_continuations: std::collections::HashMap::new(),
+            id_to_index: crate::plan::SecondaryMap::with_default(None),
         };
+        plan.rebuild_id_index();
         (plan, artifacts)
     }
 
@@ -2636,6 +2645,7 @@ mod tests {
 
         let node = PlanNode::Combine {
             name: "test_combine".into(),
+            id: PlanNodeId::new(0),
             span: Span::SYNTHETIC,
             strategy: CombineStrategy::HashBuildProbe,
             driving_input: String::new(),
@@ -2685,13 +2695,19 @@ mod tests {
 
         let mut artifacts = CompileArtifacts::default();
         let mut graph = petgraph::graph::DiGraph::new();
+        // The combine node below takes the id after the per-input sources;
+        // key its side-table entries by the same id.
+        let combine_id = PlanNodeId::new(inputs.len());
 
         // Add a Source node per input qualifier so name lookups resolve
         // when the decomposition pass wires edges. The Source's
         // `output_schema` is empty; tests don't run records through it.
-        for (qual, _card) in &inputs {
+        // Distinct ids per node keep the id→index bridge from collapsing
+        // them; the combine below takes the next id after the sources.
+        for (i, (qual, _card)) in inputs.iter().enumerate() {
             graph.add_node(PlanNode::Source {
                 name: (*qual).to_string(),
+                id: PlanNodeId::new(i),
                 span: Span::SYNTHETIC,
                 resolved: None,
                 output_schema: clinker_record::SchemaBuilder::new().build(),
@@ -2717,10 +2733,10 @@ mod tests {
         }
         artifacts
             .combine_inputs
-            .insert(combine_name.to_string(), inputs_map.clone());
+            .insert(combine_id, inputs_map.clone());
         artifacts
             .combine_driving
-            .insert(combine_name.to_string(), driver.to_string());
+            .insert(combine_id, driver.to_string());
 
         // Construct EqualityConjuncts whose left/right inputs match the
         // edges argument. The expressions themselves are dummy literals;
@@ -2759,9 +2775,7 @@ mod tests {
             ranges: Vec::new(),
             residual: None,
         };
-        artifacts
-            .combine_predicates
-            .insert(combine_name.to_string(), predicate);
+        artifacts.combine_predicates.insert(combine_id, predicate);
 
         // Build the merged row mirror of bind_combine's logic so the
         // intermediate-row pruning has something to filter against.
@@ -2776,13 +2790,14 @@ mod tests {
 
         graph.add_node(PlanNode::Combine {
             name: combine_name.to_string(),
+            id: combine_id,
             span: Span::SYNTHETIC,
             strategy: CombineStrategy::HashBuildProbe,
             driving_input: String::new(),
             build_inputs: Vec::new(),
             driving_upstream: None,
             predicate_summary: CombinePredicateSummary::from_decomposed(
-                artifacts.combine_predicates.get(combine_name).unwrap(),
+                artifacts.combine_predicates.get(&combine_id).unwrap(),
             ),
             match_mode: MatchMode::First,
             on_miss: OnMiss::NullFields,
@@ -2792,12 +2807,19 @@ mod tests {
             resolved_column_map: Arc::new(std::collections::HashMap::new()),
             typed: None,
             // Mirror lowering: N-ary decomposition reads these off the node.
-            combine_inputs: artifacts.combine_inputs.get(combine_name).cloned(),
-            decomposed_predicate: artifacts.combine_predicates.get(combine_name).cloned(),
-            combine_driving: artifacts.combine_driving.get(combine_name).cloned(),
+            combine_inputs: artifacts.combine_inputs.get(&combine_id).cloned(),
+            decomposed_predicate: artifacts.combine_predicates.get(&combine_id).cloned(),
+            combine_driving: artifacts.combine_driving.get(&combine_id).cloned(),
         });
 
-        let plan = ExecutionPlanDag {
+        // Seed the artifacts node-id counter past the ids hand-assigned
+        // above so decomposition's `fresh_node_id()` mints non-colliding
+        // ids for the synthetic chain steps.
+        for _ in 0..=inputs.len() {
+            artifacts.fresh_node_id();
+        }
+
+        let mut plan = ExecutionPlanDag {
             graph,
             topo_order: Vec::new(),
             source_dag: Vec::new(),
@@ -2810,7 +2832,9 @@ mod tests {
             node_properties: std::collections::HashMap::new(),
             deferred_regions: std::collections::HashMap::new(),
             parent_continuations: std::collections::HashMap::new(),
+            id_to_index: crate::plan::SecondaryMap::with_default(None),
         };
+        plan.rebuild_id_index();
         (plan, artifacts, merged_row)
     }
 
@@ -2886,6 +2910,132 @@ mod tests {
             combines.len(),
             3,
             "4-input decomposition produces N-1 = 3 binary combines"
+        );
+    }
+
+    #[test]
+    fn decomposition_reused_final_step_keeps_plan_node_id() {
+        // Decomposition rewrites the N-ary combine into a left-deep chain
+        // and reuses the original node's `NodeIndex` (and thus its
+        // `PlanNodeId`) as the final step. If the reused node were ever
+        // re-minted, every side-table entry the bind walk keyed by the
+        // original id (typed body program, strategy hint, resolved-column
+        // map) would desync from the node and the executor would read the
+        // wrong program. This guards that contract directly.
+        use crate::plan::execution::PlanNode;
+
+        let (mut plan, mut artifacts, _row) = nary_plan(
+            "c",
+            vec![("a", None), ("b", None), ("d", None)],
+            vec![("a", "b"), ("b", "d")],
+            "a",
+        );
+
+        // Locate the user-authored combine and snapshot its identity BEFORE
+        // decomposition. The final step reuses this exact `NodeIndex`, so
+        // the post-pass node at this index must still carry `original_id`.
+        let original_idx = plan
+            .graph
+            .node_indices()
+            .find(|&i| matches!(&plan.graph[i], PlanNode::Combine { name, .. } if name == "c"))
+            .expect("nary_plan builds a combine named 'c'");
+        let original_id = plan.graph[original_idx].id();
+
+        // Seed body-program state under the original id so its migration to
+        // the retained-id final step is observable. The body's typed
+        // program lives on the node; decomposition `take()`s it onto the
+        // final step. The strategy hint lives in a `PlanNodeId`-keyed
+        // side-table; decomposition propagates it to every step id.
+        let body_program = Arc::new(cxl::typecheck::pass::TypedProgram {
+            program: cxl::ast::Program {
+                statements: Vec::new(),
+                span: cxl::lexer::Span::new(0, 0),
+            },
+            types: Vec::new(),
+            bindings: Vec::new(),
+            field_types: IndexMap::new(),
+            regexes: Vec::new(),
+            node_count: 0,
+            output_row: Row::closed(IndexMap::new(), cxl::lexer::Span::new(0, 0)),
+            source: None,
+        });
+        if let PlanNode::Combine { typed, .. } = &mut plan.graph[original_idx] {
+            *typed = Some(Arc::clone(&body_program));
+        }
+        artifacts
+            .combine_strategy_hints
+            .insert(original_id, crate::config::CombineStrategyHint::GraceHash);
+
+        let mut diags = Vec::new();
+        decompose_nary_combines(&mut plan, &mut artifacts, &mut diags);
+        let errors: Vec<&Diagnostic> = diags
+            .iter()
+            .filter(|d| matches!(d.severity, clinker_core_types::Severity::Error))
+            .collect();
+        assert!(errors.is_empty(), "no errors expected; got {errors:?}");
+
+        // (a) The reused final step — the node still at `original_idx` —
+        // keeps the original id; it was NOT re-minted.
+        assert_eq!(
+            plan.graph[original_idx].id(),
+            original_id,
+            "the reused final step must retain the original combine's PlanNodeId"
+        );
+
+        // 3 inputs → N-1 = 2 binary combines (one synthetic step + the
+        // reused final step).
+        let combines = collect_combines(&plan);
+        assert_eq!(combines.len(), 2, "3-input decomposition yields 2 combines");
+
+        // (b) Every combine has a DISTINCT id, and each synthetic step's id
+        // differs from the retained original.
+        let ids: Vec<PlanNodeId> = combines.iter().map(|n| n.id()).collect();
+        let unique: std::collections::HashSet<PlanNodeId> = ids.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "no two chain nodes may share a PlanNodeId; got {ids:?}"
+        );
+        // Every chain node records its origin combine. Exactly one keeps
+        // `original_id` (the reused final step); all others are freshly
+        // minted synthetic steps, none of which may reuse the original id.
+        for n in &combines {
+            assert!(
+                matches!(
+                    n,
+                    PlanNode::Combine { decomposed_from: Some(from), .. }
+                        if from.as_str() == "c"
+                ),
+                "every chain combine records its origin combine 'c'"
+            );
+        }
+        let retained = combines.iter().filter(|n| n.id() == original_id).count();
+        assert_eq!(
+            retained, 1,
+            "exactly one chain node — the reused final step — keeps the original id; \
+             a synthetic step must not reuse it"
+        );
+
+        // (c) The body program migrated to the retained-id final step, and
+        // the `PlanNodeId`-keyed side-tables still hold the final step's
+        // state under the retained id (no desync).
+        if let PlanNode::Combine { typed, .. } = &plan.graph[original_idx] {
+            assert!(
+                typed.is_some(),
+                "the body typed program must survive on the reused final step"
+            );
+        } else {
+            panic!("node at the original index must still be a Combine");
+        }
+        assert!(
+            artifacts.combine_strategy_hints.contains_key(&original_id),
+            "the strategy hint must remain keyed by the retained id"
+        );
+        assert!(
+            artifacts
+                .combine_resolved_columns
+                .contains_key(&original_id),
+            "the final step's resolved-column map must be keyed by the retained id"
         );
     }
 

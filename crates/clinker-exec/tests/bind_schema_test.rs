@@ -687,10 +687,19 @@ nodes:
     // Body port-synthetic Source ("data" port): walks the composition
     // body's mini-DAG and finds a PlanNode::Source named after the
     // port. Its output_schema must mirror the parent's widening.
+    // `composition_body_assignments` keys by the call-site node's id;
+    // resolve `passthrough`'s id off the declaration-order id vector.
+    let passthrough_id = plan
+        .config()
+        .nodes
+        .iter()
+        .zip(plan.artifacts().top_level_node_ids.iter())
+        .find_map(|(spanned, id)| (spanned.value.name() == "passthrough").then_some(*id))
+        .expect("top-level `passthrough` id");
     let body_id = plan
         .artifacts()
         .composition_body_assignments
-        .get("passthrough")
+        .get(&passthrough_id)
         .copied()
         .expect("composition body assigned");
     let body = plan.body_of(body_id).expect("body present");

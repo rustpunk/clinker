@@ -1,9 +1,38 @@
 //! Plan-graph lookups over a compiled [`ExecutionPlanDag`] shared by the
 //! planner's strategy-selection passes and the runtime dispatch.
 
-use super::{ExecutionPlanDag, PlanNode, matches_upstream_name};
+use super::{ExecutionPlanDag, PlanEdge, PlanNode, matches_upstream_name};
 use crate::error::PipelineError;
+use crate::plan::{PlanNodeId, SecondaryMap};
 use petgraph::Direction;
+use petgraph::graph::DiGraph;
+
+/// Build the [`PlanNodeId`] → [`NodeIndex`] bridge for a finalized plan
+/// graph: every live node's id maps to `Some(its current index)`.
+///
+/// Call after every toposort or structural mutation that finalizes the
+/// graph — the bridge must name every live node so a later id lookup
+/// resolves to the node's current storage position. In debug builds this
+/// asserts the bridge covers every live node id; a missing entry signals a
+/// node minted with a stale/duplicate id, which would silently collapse two
+/// nodes in any id-keyed side table. Shared verbatim by the top-level
+/// [`ExecutionPlanDag`] and each composition `BoundBody`.
+pub(crate) fn build_id_index(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+) -> SecondaryMap<PlanNodeId, Option<petgraph::graph::NodeIndex>> {
+    let mut id_to_index = SecondaryMap::with_default(None);
+    for idx in graph.node_indices() {
+        let id = graph[idx].id();
+        id_to_index.insert(id, Some(idx));
+    }
+    debug_assert!(
+        graph
+            .node_indices()
+            .all(|idx| id_to_index[graph[idx].id()] == Some(idx)),
+        "id_to_index bridge does not cover every live node id",
+    );
+    id_to_index
+}
 
 /// Compute the init-phase ancestor closure for a compiled plan.
 ///

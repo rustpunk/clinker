@@ -175,10 +175,17 @@ nodes:
 
     // 2. BODY combine: program is reachable off the node in the
     //    composition body's `graph`, with the same fidelity.
-    let body_id = compiled
-        .artifacts()
+    let artifacts = compiled.artifacts();
+    let body_comp_id = compiled
+        .config()
+        .nodes
+        .iter()
+        .zip(artifacts.top_level_node_ids.iter())
+        .find_map(|(spanned, id)| (spanned.value.name() == "body").then_some(*id))
+        .expect("top-level `body` composition id");
+    let body_id = artifacts
         .composition_body_assignments
-        .get("body")
+        .get(&body_comp_id)
         .copied()
         .expect("composition body assignment for `body`");
     let bound = compiled.body_of(body_id).expect("bound body");

@@ -75,7 +75,7 @@ pub struct DocPath {
 /// document never declares.
 /// `K` is the node-identity key the caller attributes paths by — a bare
 /// `&str`/`String` when scope cannot collide (e.g. reshape rule labels), or
-/// a scope-qualified identity (the planner's `ScopedNodeId`) when a node
+/// a scope-distinct identity (the planner's `PlanNodeId`) when a node
 /// named the same in two scopes must stay distinct.
 #[derive(Debug, Clone)]
 pub struct DocPathSet<K> {

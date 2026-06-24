@@ -19,7 +19,7 @@ pub use composition::*;
 pub use dag::*;
 pub use enforcer::*;
 pub use explain::*;
-pub(crate) use graph_util::resolve_envelope_header_upstreams_in_graph;
+pub(crate) use graph_util::{build_id_index, resolve_envelope_header_upstreams_in_graph};
 pub use graph_util::{
     compute_init_phase_node_set, resolve_envelope_header_upstreams, single_predecessor,
 };
@@ -42,6 +42,7 @@ use crate::plan::composition_body::CompositionBodyId;
 use crate::plan::index::{AnalyticWindowSpec, IndexSpec};
 use crate::plan::row_type::QualifiedField;
 use crate::plan::types::{AggregateStrategy, JoinSide};
+use crate::plan::{PlanNodeId, SecondaryMap};
 use clinker_core_types::span::Span;
 use clinker_record::Schema;
 use cxl::plan::CompiledAggregate;
@@ -93,6 +94,12 @@ pub enum NodeExecutionReqs {
 pub enum PlanNode {
     Source {
         name: String,
+        /// Dense, stable identity minted once at graph construction and
+        /// carried unchanged through every plan/exec pass. Distinct from
+        /// the petgraph `NodeIndex` storage position, which shifts as the
+        /// graph is rebuilt. Serialized so it round-trips through
+        /// `--explain`.
+        id: PlanNodeId,
         /// Source-span of this node in the originating YAML document.
         /// `Span::SYNTHETIC` for planner-synthesized nodes and for nodes
         /// produced by the legacy `transformations:` planner path that
@@ -113,6 +120,8 @@ pub enum PlanNode {
     },
     Transform {
         name: String,
+        /// Stable node identity; see the `Source` variant's `id`.
+        id: PlanNodeId,
         #[serde(skip)]
         span: Span,
         /// Full resolved Transform payload.
@@ -149,6 +158,8 @@ pub enum PlanNode {
     },
     Route {
         name: String,
+        /// Stable node identity; see the `Source` variant's `id`.
+        id: PlanNodeId,
         #[serde(skip)]
         span: Span,
         mode: RouteMode,
@@ -157,6 +168,8 @@ pub enum PlanNode {
     },
     Merge {
         name: String,
+        /// Stable node identity; see the `Source` variant's `id`.
+        id: PlanNodeId,
         #[serde(skip)]
         span: Span,
         /// Canonical output schema adopted from `input[0]`. All Merge inputs
@@ -170,6 +183,8 @@ pub enum PlanNode {
     },
     Output {
         name: String,
+        /// Stable node identity; see the `Source` variant's `id`.
+        id: PlanNodeId,
         #[serde(skip)]
         span: Span,
         /// Full resolved Output payload.
@@ -187,6 +202,8 @@ pub enum PlanNode {
     /// schema.
     Reshape {
         name: String,
+        /// Stable node identity; see the `Source` variant's `id`.
+        id: PlanNodeId,
         #[serde(skip)]
         span: Span,
         /// Parsed Reshape configuration (`partition_by` / `order_by` /
@@ -211,6 +228,8 @@ pub enum PlanNode {
     /// `config` and the unchanged output schema.
     Cull {
         name: String,
+        /// Stable node identity; see the `Source` variant's `id`.
+        id: PlanNodeId,
         #[serde(skip)]
         span: Span,
         /// Parsed Cull configuration (`partition_by` / `order_by` /
@@ -244,6 +263,8 @@ pub enum PlanNode {
     /// port stays rejected at plan validation this release.
     Envelope {
         name: String,
+        /// Stable node identity; see the `Source` variant's `id`.
+        id: PlanNodeId,
         #[serde(skip)]
         span: Span,
         strategy: crate::config::pipeline_node::EnvelopeStrategy,
@@ -286,6 +307,8 @@ pub enum PlanNode {
     /// names starting with `__sort_for_` are rejected at compile time.
     Sort {
         name: String,
+        /// Stable node identity; see the `Source` variant's `id`.
+        id: PlanNodeId,
         #[serde(skip)]
         span: Span,
         sort_fields: Vec<SortField>,
@@ -299,6 +322,8 @@ pub enum PlanNode {
     /// shipped through the JSON `--explain` channel.
     Aggregation {
         name: String,
+        /// Stable node identity; see the `Source` variant's `id`.
+        id: PlanNodeId,
         #[serde(skip)]
         span: Span,
         config: AggregateConfig,
@@ -342,6 +367,8 @@ pub enum PlanNode {
     /// keyed by the `body` handle.
     Composition {
         name: String,
+        /// Stable node identity; see the `Source` variant's `id`.
+        id: PlanNodeId,
         #[serde(skip)]
         span: Span,
         /// Handle into `CompileArtifacts.composition_bodies`. Populated by
@@ -368,6 +395,8 @@ pub enum PlanNode {
     /// [`CORRELATION_COMMIT_PREFIX`].
     CorrelationCommit {
         name: String,
+        /// Stable node identity; see the `Source` variant's `id`.
+        id: PlanNodeId,
         #[serde(skip)]
         span: Span,
         /// Correlation key fields. The union of every source's
@@ -392,6 +421,8 @@ pub enum PlanNode {
     /// duplicated here.
     Combine {
         name: String,
+        /// Stable node identity; see the `Source` variant's `id`.
+        id: PlanNodeId,
         #[serde(skip)]
         span: Span,
         /// Planner-selected strategy. Defaults to `HashBuildProbe`;
@@ -553,6 +584,32 @@ pub struct PlanOutputPayload {
 }
 
 impl PlanNode {
+    /// Dense, stable identity of this node, minted once at graph
+    /// construction and carried unchanged through every plan/exec pass.
+    ///
+    /// This is the node's identity, as opposed to its petgraph
+    /// `NodeIndex`, which is a storage position that can shift when the
+    /// graph is rebuilt. Use the id (via a `SecondaryMap` keyed by it or
+    /// the DAG's `id_to_index` bridge) to attach per-node side data that
+    /// must survive lowering, re-indexing, and cross-pass handoff.
+    pub fn id(&self) -> PlanNodeId {
+        match self {
+            PlanNode::Source { id, .. }
+            | PlanNode::Transform { id, .. }
+            | PlanNode::Route { id, .. }
+            | PlanNode::Merge { id, .. }
+            | PlanNode::Output { id, .. }
+            | PlanNode::Reshape { id, .. }
+            | PlanNode::Cull { id, .. }
+            | PlanNode::Envelope { id, .. }
+            | PlanNode::Sort { id, .. }
+            | PlanNode::Aggregation { id, .. }
+            | PlanNode::Composition { id, .. }
+            | PlanNode::Combine { id, .. }
+            | PlanNode::CorrelationCommit { id, .. } => *id,
+        }
+    }
+
     /// Get the name of this node regardless of variant.
     pub fn name(&self) -> &str {
         match self {
@@ -1205,6 +1262,14 @@ pub struct ExecutionPlanDag {
     /// records to drive the parent's downstream chain on
     /// post-recompute data.
     pub parent_continuations: HashMap<NodeIndex, crate::plan::deferred_region::ParentContinuation>,
+    /// Bridge from stable [`PlanNodeId`] identity to the node's current
+    /// petgraph storage position. The id is identity; the `NodeIndex` is
+    /// where the node currently sits, which shifts as the graph is
+    /// rebuilt. Rebuilt via [`ExecutionPlanDag::rebuild_id_index`] after
+    /// every structural mutation that finalizes the graph. The default is
+    /// `None`, so reading an id that names no live node yields `None`
+    /// rather than silently aliasing `NodeIndex(0)`.
+    pub id_to_index: SecondaryMap<PlanNodeId, Option<NodeIndex>>,
 }
 
 /// Errors from execution plan compilation.

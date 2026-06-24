@@ -774,13 +774,20 @@ impl PipelineConfig {
         for (i, e) in entries.iter().enumerate() {
             entries_by_name.insert(e.name.clone(), i);
         }
+        // Top-level node-name → `PlanNodeId`. Consumers below that hold a
+        // user-facing top-level name (the analyzer feed, the `$doc`
+        // source-attribution walk, the E150e array-window guard) resolve
+        // name → id → side-table through it.
+        let top_level_ids: HashMap<&str, crate::plan::PlanNodeId> =
+            artifacts.top_level_name_ids(&self.nodes);
         let compiled_refs: Vec<(&str, &cxl::typecheck::pass::TypedProgram)> = entries
             .iter()
             .filter_map(|e| {
                 // `entries` is the top-level analytic node list; analysis is
-                // top-level-only, so resolve each program by its TopLevel key.
-                artifacts
-                    .typed_get(crate::plan::bind_schema::NodeScope::TopLevel, &e.name)
+                // top-level-only, so resolve each program by its id.
+                top_level_ids
+                    .get(e.name.as_str())
+                    .and_then(|id| artifacts.typed_get(*id))
                     .map(|tp| (e.name.as_str(), tp.as_ref()))
             })
             .collect();
@@ -798,49 +805,60 @@ impl PipelineConfig {
         // conditions are typed into separate side-tables and chained in
         // below. Missing any of them would drop a referenced path from the
         // declared set.
-        // Attribute `$doc` paths by each program's scope-qualified
-        // `ScopedNodeId`, not its bare name, so a node named the same at top
-        // level and inside a composition body keeps its own `$doc` paths
-        // attributed to its own scope's source(s). The key is borrowed from
-        // the artifact tables (all three are `ScopedNodeId`-keyed), so no
-        // allocation; `&ScopedNodeId` is `Ord + Clone` as the collector needs.
-        let doc_refs: Vec<(
-            &crate::plan::bind_schema::ScopedNodeId,
-            &cxl::typecheck::pass::TypedProgram,
-        )> = artifacts
-            .typed
-            .iter()
-            .map(|(scoped, tp)| (scoped, tp.as_ref()))
-            // A Combine's node-keyed `typed` entry holds only its `cxl:` body;
-            // its `where:` predicate program lives in a separate side-table, so
-            // include those too — a `$doc` access used only in a predicate
-            // would otherwise be dropped.
-            .chain(
-                artifacts
-                    .combine_where_typed
-                    .iter()
-                    .map(|(scoped, tp)| (scoped, tp.as_ref())),
-            )
-            // A Route's node-keyed `typed` entry is an empty body; its
-            // branch-condition programs live in a separate side-table, one per
-            // branch. Include each so a `$doc` access used only in a route
-            // condition is still reachable.
-            .chain(
-                artifacts
-                    .route_branch_typed
-                    .iter()
-                    .flat_map(|(scoped, programs)| {
-                        programs.iter().map(move |tp| (scoped, tp.as_ref()))
-                    }),
-            )
-            .collect();
+        // Attribute `$doc` paths by each program's `PlanNodeId`, not its
+        // bare name, so a node named the same at top level and inside a
+        // composition body keeps its own `$doc` paths attributed to its own
+        // scope's source(s). The id is `Copy` (`Ord + Clone` as the
+        // collector needs), so the pairs carry it by value.
+        let doc_refs: Vec<(crate::plan::PlanNodeId, &cxl::typecheck::pass::TypedProgram)> =
+            artifacts
+                .typed
+                .iter()
+                .map(|(id, tp)| (*id, tp.as_ref()))
+                // A Combine's node-keyed `typed` entry holds only its `cxl:` body;
+                // its `where:` predicate program lives in a separate side-table, so
+                // include those too — a `$doc` access used only in a predicate
+                // would otherwise be dropped.
+                .chain(
+                    artifacts
+                        .combine_where_typed
+                        .iter()
+                        .map(|(id, tp)| (*id, tp.as_ref())),
+                )
+                // A Route's node-keyed `typed` entry is an empty body; its
+                // branch-condition programs live in a separate side-table, one per
+                // branch. Include each so a `$doc` access used only in a route
+                // condition is still reachable.
+                .chain(
+                    artifacts
+                        .route_branch_typed
+                        .iter()
+                        .flat_map(|(id, programs)| {
+                            programs.iter().map(move |tp| (*id, tp.as_ref()))
+                        }),
+                )
+                .collect();
         let doc_path_set = cxl::analyzer::doc_paths::collect_doc_paths(&doc_refs);
-        // Anchor each `$doc` diagnostic at the offending node's source line.
-        // Top-level node lines come from the saphyr-captured YAML position;
-        // a composition-body node (not present in `self.nodes`) falls back
-        // to a synthetic span. Shared by the E340 unresolvable-index pass
-        // and the E341 undeclared-path pass below.
-        let doc_node_line: HashMap<&str, u32> = self
+        // Anchor each `$doc` diagnostic at the offending node's source line,
+        // keyed by `PlanNodeId`. Top-level node lines come from the
+        // saphyr-captured YAML position (zip the minted ids with each
+        // node's line); a composition-body node (not present in
+        // `self.nodes`) has no entry and falls back to a synthetic span.
+        // Shared by the E340 unresolvable-index pass and the E341
+        // undeclared-path pass below.
+        let doc_node_line: HashMap<crate::plan::PlanNodeId, u32> = self
+            .nodes
+            .iter()
+            .zip(artifacts.top_level_node_ids.iter())
+            .filter_map(|(sp, id)| {
+                let line = sp.referenced.line();
+                (line > 0).then_some((*id, line as u32))
+            })
+            .collect();
+        // Top-level node-name → source line, for diagnostics keyed by a
+        // user-facing source name rather than a node id (the REST-envelope
+        // E349 pass below).
+        let doc_node_line_by_name: HashMap<&str, u32> = self
             .nodes
             .iter()
             .filter_map(|sp| {
@@ -849,10 +867,10 @@ impl PipelineConfig {
             })
             .collect();
         if !doc_path_set.unresolvable.is_empty() {
-            for (scoped, d) in &doc_path_set.unresolvable {
-                // doc_node_line is top-level-only; a body node falls back to
-                // SYNTHETIC, so look it up by the scoped key's bare name.
-                let primary = match doc_node_line.get(scoped.name.as_str()) {
+            for (node_id, d) in &doc_path_set.unresolvable {
+                // doc_node_line is top-level-only; a body node has no entry
+                // and falls back to SYNTHETIC.
+                let primary = match doc_node_line.get(node_id) {
                     Some(&line) => Span::line_only(line),
                     None => Span::SYNTHETIC,
                 };
@@ -875,12 +893,12 @@ impl PipelineConfig {
         // run must not stamp the pipeline-wide union onto every source —
         // a source would otherwise be told to extract envelope sections
         // its own document never declares.
-        let node_sources = build_node_source_sets(&self.nodes, &artifacts);
+        let node_sources = build_node_source_sets(&self.nodes, &top_level_ids, &artifacts);
         let mut doc_paths_by_source: HashMap<String, std::collections::BTreeSet<_>> =
             HashMap::new();
         for (doc_path, nodes) in &doc_path_set.by_node {
-            for scoped in nodes {
-                let Some(sources) = node_sources.get(*scoped) else {
+            for node_id in nodes {
+                let Some(sources) = node_sources.get(node_id) else {
                     continue;
                 };
                 for source in sources {
@@ -938,10 +956,10 @@ impl PipelineConfig {
             if sections.is_empty() {
                 continue;
             }
-            let Some(feeding) = node_sources.get(&crate::plan::bind_schema::ScopedNodeId {
-                scope: crate::plan::bind_schema::NodeScope::TopLevel,
-                name: output.name.clone(),
-            }) else {
+            let Some(feeding) = top_level_ids
+                .get(output.name.as_str())
+                .and_then(|id| node_sources.get(id))
+            else {
                 continue;
             };
             for source_name in feeding {
@@ -1010,7 +1028,7 @@ impl PipelineConfig {
             if let SourceTransport::Rest(_) = source.transport
                 && source.envelope.is_some()
             {
-                let primary = doc_node_line
+                let primary = doc_node_line_by_name
                     .get(source.name.as_str())
                     .map(|&line| Span::line_only(line))
                     .unwrap_or(Span::SYNTHETIC);
@@ -1037,15 +1055,15 @@ impl PipelineConfig {
             }
         }
         for (doc_path, ref_nodes) in &doc_path_set.by_node {
-            for scoped in ref_nodes {
-                let Some(sources) = node_sources.get(*scoped) else {
+            for node_id in ref_nodes {
+                let Some(sources) = node_sources.get(node_id) else {
                     continue;
                 };
                 for source_name in sources {
                     let Some(source) = source_by_name.get(source_name.as_str()) else {
                         continue;
                     };
-                    let primary = match doc_node_line.get(scoped.name.as_str()) {
+                    let primary = match doc_node_line.get(node_id) {
                         Some(&line) => Span::line_only(line),
                         None => Span::SYNTHETIC,
                     };
@@ -1169,7 +1187,7 @@ impl PipelineConfig {
         // emitted with `window_index = None`; a post-edge-wiring pass
         // populates the deduplicated index list and backfills the
         // field once the upstream `NodeIndex` is known.
-        for spanned in &self.nodes {
+        for (position, spanned) in self.nodes.iter().enumerate() {
             // Thread the real source line number off the saphyr
             // `Spanned<PipelineNode>::referenced` Location.
             // (c) If saphyr did not capture a line (the documented
@@ -1189,15 +1207,13 @@ impl PipelineConfig {
                 window_config: entry_idx.and_then(|i| window_configs[i].as_ref()),
                 primary_source: primary_source.as_str(),
             };
-            let plan_node = lower_node_to_plan_node(
-                node,
-                &name,
-                crate::plan::bind_schema::NodeScope::TopLevel,
-                span,
-                &artifacts,
-                &lowering_ctx,
-                &mut diags,
-            );
+            // Stamp the id minted by `bind_schema` for this declaration
+            // position. Indexing by ORIGINAL position (not lowered-node
+            // count) keeps the pairing correct even when an earlier node
+            // bound but did not lower (e.g. a failed-binding composition).
+            let id = artifacts.top_level_node_ids[position];
+            let plan_node =
+                lower_node_to_plan_node(node, id, span, &artifacts, &lowering_ctx, &mut diags);
             if let Some(pn) = plan_node {
                 let idx = graph.add_node(pn);
                 name_to_idx.insert(name, idx);
@@ -1493,21 +1509,17 @@ impl PipelineConfig {
                         // E150e — windows over Combine emit columns
                         // cannot reference an array-typed field. The
                         // typed `output_row` lives in `artifacts.typed`
-                        // keyed by the combine's scope-qualified id and
-                        // carries the CXL `Type` per emitted column; a
+                        // keyed by the combine's `PlanNodeId` and carries
+                        // the CXL `Type` per emitted column; a
                         // `match: collect` body emits `Type::Array` for
                         // every collected build-row column. Window
                         // builtins (sum/avg/min/max/lag/lead/...) do
                         // not handle `Value::Array`, so they would
-                        // silently see Null at runtime. This pass walks
-                        // the top-level analysis report, so the combine
-                        // is resolved by its TopLevel key.
+                        // silently see Null at runtime. The live combine
+                        // node is in hand, so resolve by its own id.
                         if let crate::plan::execution::PlanNode::Combine { .. } = other {
                             let combine_name = other.name();
-                            if let Some(typed) = artifacts.typed_get(
-                                crate::plan::bind_schema::NodeScope::TopLevel,
-                                combine_name,
-                            ) {
+                            if let Some(typed) = artifacts.typed_get(other.id()) {
                                 for f in &report.transforms[i].accessed_fields {
                                     let is_array = typed
                                         .output_row
@@ -1713,7 +1725,7 @@ impl PipelineConfig {
         // operator-level enforcer pass so the latter sees every
         // CK-driven sort already in place. No-op for sources that
         // declared no `correlation_key:`.
-        if let Err(e) = dag.inject_correlation_sort(&source_bodies) {
+        if let Err(e) = dag.inject_correlation_sort(&source_bodies, &mut artifacts) {
             diags.push(Diagnostic::error(
                 "E003",
                 format!("correlation-sort injection failed: {e}"),
@@ -1721,7 +1733,7 @@ impl PipelineConfig {
             ));
             return Err(diags);
         }
-        if let Err(e) = dag.insert_enforcer_sorts(&format_inputs_map) {
+        if let Err(e) = dag.insert_enforcer_sorts(&format_inputs_map, &mut artifacts) {
             diags.push(Diagnostic::error(
                 "E003",
                 format!("enforcer-sort insertion failed: {e}"),
@@ -1744,6 +1756,9 @@ impl PipelineConfig {
                 return Err(diags);
             }
         };
+        // Correlation-sort + enforcer-sort passes grew the graph; refresh
+        // the id→index bridge against the new node set.
+        dag.rebuild_id_index();
         crate::plan::execution::assign_tiers(&mut dag.graph, &dag.topo_order);
         if let Err(e) = dag.compute_node_properties(&inputs_map) {
             diags.push(Diagnostic::error(
@@ -1963,6 +1978,10 @@ impl PipelineConfig {
                 return Err(diags);
             }
         };
+        // N-ary decomposition added the (N-2) synthetic chain steps;
+        // refresh the bridge so their ids resolve and any reused-node
+        // index shift is reflected.
+        dag.rebuild_id_index();
 
         // Seed the statistics catalog's Plane A row counts from source
         // file metadata before the combine post-pass reads them. Uses the
@@ -2116,7 +2135,9 @@ impl PipelineConfig {
         // commit node and its incoming edges change the order. No-op
         // when no source declares a correlation key.
         let max_group_buffer = self.error_handling.max_group_buffer.unwrap_or(100_000);
-        if let Err(e) = dag.inject_correlation_commit(&source_bodies, max_group_buffer) {
+        if let Err(e) =
+            dag.inject_correlation_commit(&source_bodies, max_group_buffer, &mut artifacts)
+        {
             diags.push(Diagnostic::error(
                 "E003",
                 format!("correlation-commit injection failed: {e}"),
@@ -2143,6 +2164,10 @@ impl PipelineConfig {
                     return Err(diags);
                 }
             };
+            // The terminal commit node and its edges changed the graph;
+            // this is the last structural mutation, so refresh the bridge
+            // to its final state.
+            dag.rebuild_id_index();
         }
 
         // E152 — every PlanNode::Composition's incoming edges must carry
@@ -3123,7 +3148,7 @@ fn rest_doc_access_diagnostic(
 /// input's source set alone — using the union would tell the probe-side
 /// source to extract envelope sections only the driver's document
 /// declares. Both the Combine's `cxl:` body and its `where:` predicate
-/// program are keyed by the combine node's own name, so they share this
+/// program are keyed by the combine node's `PlanNodeId`, so they share this
 /// driving-input source set with no extra handling.
 ///
 /// A `Composition` forwards the union of EVERY bound `inputs:` port's
@@ -3139,43 +3164,37 @@ fn rest_doc_access_diagnostic(
 /// union is the correct attribution.
 fn build_node_source_sets(
     nodes: &[Spanned<PipelineNode>],
+    top_level_ids: &HashMap<&str, crate::plan::PlanNodeId>,
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
-) -> HashMap<crate::plan::bind_schema::ScopedNodeId, std::collections::BTreeSet<String>> {
-    use crate::plan::bind_schema::{NodeScope, ScopedNodeId};
+) -> HashMap<crate::plan::PlanNodeId, std::collections::BTreeSet<String>> {
+    use crate::plan::PlanNodeId;
     use crate::plan::composition_body::CompositionBodyId;
 
-    let mut node_sources: HashMap<ScopedNodeId, std::collections::BTreeSet<String>> =
-        HashMap::new();
+    let mut node_sources: HashMap<PlanNodeId, std::collections::BTreeSet<String>> = HashMap::new();
 
-    // Key for a top-level node. The main loop walks only `self.nodes`
-    // (top-level) and the cross-node lookups resolve top-level upstreams, so
-    // every key built here is TopLevel; body nodes are keyed `Body(id)` by
-    // `attribute_body`.
-    fn top_key(name: &str) -> ScopedNodeId {
-        ScopedNodeId {
-            scope: NodeScope::TopLevel,
-            name: name.to_string(),
-        }
-    }
+    // The id of a top-level node by name. The main loop walks only
+    // `self.nodes` (top-level) and the cross-node lookups resolve top-level
+    // upstreams, so every key built here is a top-level id; body nodes are
+    // keyed by their own id in `attribute_body`. Returns `None` for an
+    // unknown name (an undeclared upstream already diagnosed elsewhere).
+    let top_id = |name: &str| -> Option<PlanNodeId> { top_level_ids.get(name).copied() };
 
     // Attribute every node in a composition body (recursively through
-    // nested bodies) to the call-site's source set, keyed by the body's
-    // scope so a body node named the same as a top-level node stays distinct.
+    // nested bodies) to the call-site's source set, keyed by each body
+    // node's own `PlanNodeId` (read off the body's mini-DAG) so a body node
+    // named the same as a top-level node stays distinct.
     fn attribute_body(
         body_id: CompositionBodyId,
         call_site_sources: &std::collections::BTreeSet<String>,
         artifacts: &crate::plan::bind_schema::CompileArtifacts,
-        node_sources: &mut HashMap<ScopedNodeId, std::collections::BTreeSet<String>>,
+        node_sources: &mut HashMap<PlanNodeId, std::collections::BTreeSet<String>>,
     ) {
         let Some(body) = artifacts.body_of(body_id) else {
             return;
         };
-        for body_node_name in body.name_to_idx.keys() {
+        for &idx in body.name_to_idx.values() {
             node_sources
-                .entry(ScopedNodeId {
-                    scope: NodeScope::Body(body_id),
-                    name: body_node_name.clone(),
-                })
+                .entry(body.graph[idx].id())
                 .or_default()
                 .extend(call_site_sources.iter().cloned());
         }
@@ -3184,11 +3203,12 @@ fn build_node_source_sets(
         }
     }
 
-    // The driving input's upstream node name for a combine, if the
-    // planner picked one (combines that fail driver selection are absent).
-    let combine_driver_upstream = |combine_name: &str| -> Option<String> {
-        let qualifier = artifacts.combine_driving.get(combine_name)?;
-        let inputs = artifacts.combine_inputs.get(combine_name)?;
+    // The driving input's upstream node name for a combine (resolved by the
+    // combine's id), if the planner picked one (combines that fail driver
+    // selection are absent).
+    let combine_driver_upstream = |combine_id: PlanNodeId| -> Option<String> {
+        let qualifier = artifacts.combine_driving.get(&combine_id)?;
+        let inputs = artifacts.combine_inputs.get(&combine_id)?;
         inputs
             .get(qualifier)
             .map(|ci| ci.upstream_name.as_ref().to_string())
@@ -3197,11 +3217,11 @@ fn build_node_source_sets(
     // Union of the source sets feeding the named (top-level) producers,
     // resolved against the sets recorded for already-walked nodes.
     let union_of = |producers: &[&str],
-                    sources: &HashMap<ScopedNodeId, std::collections::BTreeSet<String>>|
+                    sources: &HashMap<PlanNodeId, std::collections::BTreeSet<String>>|
      -> std::collections::BTreeSet<String> {
         producers
             .iter()
-            .filter_map(|inp| sources.get(&top_key(inp)))
+            .filter_map(|inp| top_id(inp).and_then(|id| sources.get(&id)))
             .flat_map(|s| s.iter().cloned())
             .collect()
     };
@@ -3214,7 +3234,7 @@ fn build_node_source_sets(
     // a body `$doc` access, can resolve against any bound port's source.
     let composition_call_site_sources =
         |inputs: &IndexMap<String, String>,
-         sources: &HashMap<ScopedNodeId, std::collections::BTreeSet<String>>|
+         sources: &HashMap<PlanNodeId, std::collections::BTreeSet<String>>|
          -> std::collections::BTreeSet<String> {
             let producers: Vec<&str> = inputs
                 .values()
@@ -3232,8 +3252,13 @@ fn build_node_source_sets(
             // not the union of every input. Falls back to the input union
             // when the planner could not pick a driver (the combine is then
             // omitted from the DAG, so the set is unused either way).
-            PipelineNode::Combine { .. } => combine_driver_upstream(&name)
-                .and_then(|driver| node_sources.get(&top_key(&driver)).cloned())
+            PipelineNode::Combine { .. } => top_id(&name)
+                .and_then(combine_driver_upstream)
+                .and_then(|driver| {
+                    top_id(&driver)
+                        .and_then(|id| node_sources.get(&id))
+                        .cloned()
+                })
                 .unwrap_or_else(|| union_of(&spanned.value.direct_input_names(), &node_sources)),
             // A composition forwards the union of EVERY bound input port's
             // source set, not just its primary port — a downstream node
@@ -3254,12 +3279,15 @@ fn build_node_source_sets(
         // envelope. That union is exactly the source set the Composition
         // arm above computed into `sources`, so reuse it.
         if let PipelineNode::Composition { .. } = &spanned.value
-            && let Some(&body_id) = artifacts.composition_body_assignments.get(&name)
+            && let Some(comp_id) = top_id(&name)
+            && let Some(&body_id) = artifacts.composition_body_assignments.get(&comp_id)
         {
             attribute_body(body_id, &sources, artifacts, &mut node_sources);
         }
 
-        node_sources.insert(top_key(&name), sources);
+        if let Some(id) = top_id(&name) {
+            node_sources.insert(id, sources);
+        }
     }
 
     node_sources
@@ -3298,13 +3326,13 @@ pub(crate) struct LoweringCtx<'a> {
 /// `LoweringCtx::default()` for body nodes.
 pub(crate) fn lower_node_to_plan_node(
     node: &PipelineNode,
-    name: &str,
-    scope: crate::plan::bind_schema::NodeScope,
+    id: crate::plan::PlanNodeId,
     span: clinker_core_types::span::Span,
     artifacts: &crate::plan::bind_schema::CompileArtifacts,
     ctx: &LoweringCtx<'_>,
     diags: &mut Vec<clinker_core_types::Diagnostic>,
 ) -> Option<crate::plan::execution::PlanNode> {
+    let name = node.name();
     use crate::plan::composition_body::CompositionBodyId;
     use crate::plan::execution::{
         NodeExecutionReqs, ParallelismClass, PartitionLookupKind, PlanNode, PlanOutputPayload,
@@ -3336,8 +3364,8 @@ pub(crate) fn lower_node_to_plan_node(
     // Aggregate / Combine output row inherits a `$ck.*` column, its
     // own `Arc<Schema>` recovers the same metadata here. The reserved
     // `$` prefix guarantees no user-declared column collides.
-    let schema_from_bound = |node_name: &str| -> Arc<clinker_record::Schema> {
-        match artifacts.typed_get(scope, node_name) {
+    let schema_from_bound = || -> Arc<clinker_record::Schema> {
+        match artifacts.typed_get(id) {
             Some(tp) => {
                 let mut builder = SchemaBuilder::with_capacity(tp.output_row.field_count());
                 for (qf, _) in tp.output_row.fields() {
@@ -3381,18 +3409,19 @@ pub(crate) fn lower_node_to_plan_node(
             let source = config.source.clone();
             Some(PlanNode::Source {
                 name: name.to_string(),
+                id,
                 span,
                 resolved: Some(Box::new(PlanSourcePayload {
                     source,
                     validated_path: None,
                 })),
-                output_schema: schema_from_bound(name),
+                output_schema: schema_from_bound(),
             })
         }
         PipelineNode::Transform { config, .. } => {
             // Missing typed program means bind_schema hit a CXL error
             // (E108, E200, etc.) on this node — skip lowering.
-            let typed = match artifacts.typed_get(scope, name) {
+            let typed = match artifacts.typed_get(id) {
                 Some(t) => t.clone(),
                 None => return None,
             };
@@ -3453,6 +3482,7 @@ pub(crate) fn lower_node_to_plan_node(
             let has_distinct = extract_has_distinct(&typed);
             Some(PlanNode::Transform {
                 name: name.to_string(),
+                id,
                 span,
                 resolved: Some(Box::new(PlanTransformPayload {
                     analytic_window: config.analytic_window.clone(),
@@ -3471,11 +3501,12 @@ pub(crate) fn lower_node_to_plan_node(
                 partition_lookup,
                 write_set,
                 has_distinct,
-                output_schema: schema_from_bound(name),
+                output_schema: schema_from_bound(),
             })
         }
         PipelineNode::Output { config, .. } => Some(PlanNode::Output {
             name: name.to_string(),
+            id,
             span,
             resolved: Some(Box::new(PlanOutputPayload {
                 output: config.output.clone(),
@@ -3485,6 +3516,7 @@ pub(crate) fn lower_node_to_plan_node(
         }),
         PipelineNode::Route { config, .. } => Some(PlanNode::Route {
             name: name.to_string(),
+            id,
             span,
             mode: config.mode,
             branches: config.conditions.keys().cloned().collect(),
@@ -3492,8 +3524,9 @@ pub(crate) fn lower_node_to_plan_node(
         }),
         PipelineNode::Merge { .. } => Some(PlanNode::Merge {
             name: name.to_string(),
+            id,
             span,
-            output_schema: schema_from_bound(name),
+            output_schema: schema_from_bound(),
         }),
         PipelineNode::Composition { .. } => {
             // Look up the body assigned by bind_composition. If binding
@@ -3501,7 +3534,7 @@ pub(crate) fn lower_node_to_plan_node(
             // node (the binding errors already surfaced in Stage 4.5).
             let body_id = artifacts
                 .composition_body_assignments
-                .get(name)
+                .get(&id)
                 .copied()
                 .unwrap_or(CompositionBodyId::SENTINEL);
             if body_id == CompositionBodyId::SENTINEL {
@@ -3526,6 +3559,7 @@ pub(crate) fn lower_node_to_plan_node(
                 .unwrap_or_else(|| SchemaBuilder::new().build());
             Some(PlanNode::Composition {
                 name: name.to_string(),
+                id,
                 span,
                 body: body_id,
                 output_schema: comp_output_schema,
@@ -3535,7 +3569,7 @@ pub(crate) fn lower_node_to_plan_node(
             config: agg_body, ..
         } => {
             // Skip if bind_schema produced no typed program (CXL error).
-            let typed = match artifacts.typed_get(scope, name) {
+            let typed = match artifacts.typed_get(id) {
                 Some(t) => t.clone(),
                 None => return None,
             };
@@ -3590,14 +3624,15 @@ pub(crate) fn lower_node_to_plan_node(
             // aggregate's `output_schema` and the runtime
             // `finalize_group_inner` had no slot to populate from the
             // group key.
-            let output_schema = schema_from_bound(name);
+            let output_schema = schema_from_bound();
             // Carry the typed program and its distinct-ness on the node so the
             // executor builds its per-group evaluator off the node instead of a
-            // scope-keyed startup table; `has_distinct` records whether the
+            // separate startup table; `has_distinct` records whether the
             // typed program contains a `distinct` statement.
             let has_distinct = extract_has_distinct(&typed);
             Some(PlanNode::Aggregation {
                 name: name.to_string(),
+                id,
                 span,
                 config: agg_cfg,
                 compiled: Arc::new(compiled_agg),
@@ -3631,36 +3666,34 @@ pub(crate) fn lower_node_to_plan_node(
             use crate::plan::combine::{CombinePredicateSummary, CombineStrategy};
             let predicate_summary = artifacts
                 .combine_predicates
-                .get(name)
+                .get(&id)
                 .map(CombinePredicateSummary::from_decomposed)
                 .unwrap_or_default();
             let resolved_column_map = artifacts
                 .combine_resolved_columns
-                .get(name)
+                .get(&id)
                 .cloned()
                 .unwrap_or_else(|| Arc::new(std::collections::HashMap::new()));
             // Carry the typed `cxl:` body program on the node, mirroring the
             // Transform arm's read into `PlanTransformPayload.typed`. Body and
             // top-level combines both flow through this arm; the `typed` table
-            // is keyed by `ScopedNodeId`, so the read resolves this node
+            // is keyed by `PlanNodeId`, so the read resolves this node
             // instance's own program even when a top-level and a body combine
             // share a name. `None` is legitimate here — a body-less combine
             // (e.g. `match: collect`) carries no program.
-            let typed = artifacts.typed_get(scope, name).cloned();
+            let typed = artifacts.typed_get(id).cloned();
             // Carry the per-input metadata, decomposed `where:` predicate, and
             // bind-time driving qualifier on the node so combine strategy
-            // selection and the executor read them by node instance instead of
-            // a bare-name lookup into `CompileArtifacts` (last-writer-wins
-            // across same-named combines in sibling composition bodies). Like
-            // `resolved_column_map`, these maps are still bare-name keyed, so
-            // the read here is transiently scope-correct because each body is
-            // bound then lowered before the next body overwrites the shared map
-            // entry.
-            let combine_inputs = artifacts.combine_inputs.get(name).cloned();
-            let decomposed_predicate = artifacts.combine_predicates.get(name).cloned();
-            let combine_driving = artifacts.combine_driving.get(name).cloned();
+            // selection and the executor read them by node instance. All three
+            // side-tables are keyed by `PlanNodeId`, so the read resolves this
+            // node's own entry even when a top-level and a body combine share a
+            // name.
+            let combine_inputs = artifacts.combine_inputs.get(&id).cloned();
+            let decomposed_predicate = artifacts.combine_predicates.get(&id).cloned();
+            let combine_driving = artifacts.combine_driving.get(&id).cloned();
             Some(crate::plan::execution::PlanNode::Combine {
                 name: name.to_string(),
+                id,
                 span,
                 strategy: CombineStrategy::HashBuildProbe,
                 driving_input: String::new(),
@@ -3671,7 +3704,7 @@ pub(crate) fn lower_node_to_plan_node(
                 on_miss: config.on_miss,
                 propagate_ck: config.propagate_ck.clone(),
                 decomposed_from: None,
-                output_schema: schema_from_bound(name),
+                output_schema: schema_from_bound(),
                 resolved_column_map,
                 typed,
                 combine_inputs,
@@ -3687,12 +3720,13 @@ pub(crate) fn lower_node_to_plan_node(
         PipelineNode::Reshape { config, .. } => {
             // A missing typed entry means bind_schema rejected the node
             // (E200 on a rule predicate / assignment) — skip lowering.
-            artifacts.typed_get(scope, name)?;
+            artifacts.typed_get(id)?;
             Some(crate::plan::execution::PlanNode::Reshape {
                 name: name.to_string(),
+                id,
                 span,
                 config: config.clone(),
-                output_schema: schema_from_bound(name),
+                output_schema: schema_from_bound(),
             })
         }
         // Cull lowers to PlanNode::Cull carrying the parsed config and the
@@ -3703,12 +3737,13 @@ pub(crate) fn lower_node_to_plan_node(
         PipelineNode::Cull { config, .. } => {
             // A missing typed entry means bind_schema rejected the node
             // (E200 on a rule predicate / removed_to) — skip lowering.
-            artifacts.typed_get(scope, name)?;
+            artifacts.typed_get(id)?;
             Some(crate::plan::execution::PlanNode::Cull {
                 name: name.to_string(),
+                id,
                 span,
                 config: config.clone(),
-                output_schema: schema_from_bound(name),
+                output_schema: schema_from_bound(),
             })
         }
         // Envelope lowers carrying the framing strategy, the body's (unchanged)
@@ -3719,7 +3754,7 @@ pub(crate) fn lower_node_to_plan_node(
         // `resolve_envelope_header_upstreams` post-pass fills it. A missing
         // typed entry means bind_schema could not resolve the body input — skip.
         PipelineNode::Envelope { header, config } => {
-            artifacts.typed_get(scope, name)?;
+            artifacts.typed_get(id)?;
             let header_input = header
                 .header
                 .as_ref()
@@ -3734,14 +3769,15 @@ pub(crate) fn lower_node_to_plan_node(
             // `config.header:` / `config.footer:` map) was built during binding
             // against the body input row and stashed in `CompileArtifacts`;
             // attach it here. Absent → the node synthesizes nothing.
-            let synthesis = artifacts.envelope_synthesis.get(name).map(Arc::clone);
+            let synthesis = artifacts.envelope_synthesis.get(&id).map(Arc::clone);
             Some(crate::plan::execution::PlanNode::Envelope {
                 name: name.to_string(),
+                id,
                 span,
                 strategy: config.strategy,
                 header_input,
                 header_upstream: None,
-                output_schema: schema_from_bound(name),
+                output_schema: schema_from_bound(),
                 synthesis,
             })
         }

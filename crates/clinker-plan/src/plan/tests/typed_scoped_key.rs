@@ -1,28 +1,26 @@
-//! Scope-qualified keying of the shared `CompileArtifacts.typed`
+//! Per-node-id keying of the shared `CompileArtifacts.typed`
 //! typed-program table (the transform / aggregate / combine-body surface).
 //!
 //! Every CXL-bearing node's typed program lands in `artifacts.typed` keyed
-//! by [`ScopedNodeId`]. Before scope-qualified keying it was keyed by the
-//! bare node name, so a node named the same at top level and inside a
-//! composition body overwrote one entry with the other — the surviving
-//! program was whichever the bind pass visited last. That fed the executor
-//! transform startup table, the `$doc`-attribution walk, and lowering's
-//! per-node program stamp from the wrong scope.
+//! by its [`PlanNodeId`]. Before id keying it was keyed by the bare node
+//! name, so a node named the same at top level and inside a composition
+//! body overwrote one entry with the other — the surviving program was
+//! whichever the bind pass visited last. That fed the executor transform
+//! startup table, the `$doc`-attribution walk, and lowering's per-node
+//! program stamp from the wrong scope.
 //!
 //! This test compiles a pipeline where a TOP-LEVEL transform and a BODY
 //! transform share the SAME node name (`shape`) but emit DIFFERENT fields,
-//! and asserts both scope-keyed entries survive with their own distinct
-//! program.
-
-use crate::NodeScope;
+//! and asserts the two nodes get DISTINCT `PlanNodeId`s with their own
+//! independent typed entry.
 
 use super::deferred_region::compile_with_dir_full;
 
 /// A top-level transform and a composition-body transform both named
-/// `shape`, each emitting a distinct field, keep separate `typed` entries
-/// under their scope-qualified keys.
+/// `shape`, each emitting a distinct field, get distinct `PlanNodeId`s and
+/// keep separate `typed` entries under those ids.
 #[test]
-fn typed_table_scoped_key_does_not_collide_across_scopes() {
+fn typed_table_node_id_does_not_collide_across_scopes() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
@@ -107,21 +105,55 @@ nodes:
     let compiled = compile_with_dir_full(yaml, workspace.path());
     let artifacts = compiled.artifacts();
 
-    // The body's scope id comes from the composition-body assignment.
+    // The body's scope id comes from the composition-body assignment,
+    // keyed by the `body` composition call-site node's own id — resolved
+    // from the declaration-order id vector the way production does.
+    let body_comp_id = compiled
+        .config()
+        .nodes
+        .iter()
+        .zip(artifacts.top_level_node_ids.iter())
+        .find_map(|(spanned, id)| (spanned.value.name() == "body").then_some(*id))
+        .expect("top-level `body` composition id");
     let body_id = artifacts
         .composition_body_assignments
-        .get("body")
+        .get(&body_comp_id)
         .copied()
         .expect("composition body assignment for `body`");
 
-    // Both scope-qualified keys resolve — with bare-name keying only one of
+    // Resolve the top-level `shape` node's id from the declaration-order id
+    // vector (top-level names are unique), and the body `shape` node's id
+    // off the bound body's mini-DAG. The two same-named nodes live in
+    // disjoint scopes and so must get DISTINCT ids.
+    let top_id = compiled
+        .config()
+        .nodes
+        .iter()
+        .zip(artifacts.top_level_node_ids.iter())
+        .find_map(|(spanned, id)| (spanned.value.name() == "shape").then_some(*id))
+        .expect("top-level `shape` id");
+    let body = compiled.body_of(body_id).expect("bound body for `body`");
+    let body_idx = body
+        .name_to_idx
+        .get("shape")
+        .copied()
+        .expect("body `shape` node index");
+    let body_id_for_shape = body.graph[body_idx].id();
+
+    assert_ne!(
+        top_id, body_id_for_shape,
+        "a top-level node and a body node sharing the name `shape` must mint \
+         distinct PlanNodeIds; got top {top_id} and body {body_id_for_shape}"
+    );
+
+    // Both id-keyed entries resolve — with bare-name keying only one of
     // these would have been populated (last writer wins).
     let top = artifacts
-        .typed_get(NodeScope::TopLevel, "shape")
-        .expect("top-level `shape` program present under TopLevel scope key");
-    let body = artifacts
-        .typed_get(NodeScope::Body(body_id), "shape")
-        .expect("body `shape` program present under Body scope key");
+        .typed_get(top_id)
+        .expect("top-level `shape` program present under its id");
+    let body_prog = artifacts
+        .typed_get(body_id_for_shape)
+        .expect("body `shape` program present under its id");
 
     let emits = |tp: &cxl::typecheck::TypedProgram, field: &str| -> bool {
         tp.output_row
@@ -129,7 +161,7 @@ nodes:
             .any(|(qf, _)| qf.name.as_ref() == field)
     };
 
-    // Each scope's program carries its OWN emit and not the other's. With
+    // Each id's program carries its OWN emit and not the other's. With
     // bare-name keying the two `shape` nodes shared one table slot, so the
     // last writer's marker would appear under both keys (or one key would be
     // absent entirely, already caught by the `expect`s above).
@@ -140,9 +172,9 @@ nodes:
         top.output_row
     );
     assert!(
-        emits(body, "body_marker") && !emits(body, "top_marker"),
+        emits(body_prog, "body_marker") && !emits(body_prog, "top_marker"),
         "body `shape` must carry `body_marker` and not `top_marker`; \
          got output row {:?}",
-        body.output_row
+        body_prog.output_row
     );
 }

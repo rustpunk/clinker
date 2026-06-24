@@ -64,6 +64,7 @@ impl ExecutionPlanDag {
     pub fn insert_enforcer_sorts(
         &mut self,
         inputs: &HashMap<String, SourceConfig>,
+        artifacts: &mut crate::plan::bind_schema::CompileArtifacts,
     ) -> Result<(), PipelineError> {
         // Reserved-prefix guard: validate up-front so insertions cannot
         // collide with a user-declared name. Covers every reserved
@@ -155,6 +156,7 @@ impl ExecutionPlanDag {
             let consumer_name = self.graph[consumer_idx].name().to_string();
             let sort_node = PlanNode::Sort {
                 name: format!("{ENFORCER_SORT_PREFIX}{consumer_name}"),
+                id: artifacts.fresh_node_id(),
                 span: Span::SYNTHETIC,
                 sort_fields: required,
             };
@@ -195,6 +197,7 @@ impl ExecutionPlanDag {
     pub fn inject_correlation_sort(
         &mut self,
         sources: &[&crate::config::pipeline_node::SourceBody],
+        artifacts: &mut crate::plan::bind_schema::CompileArtifacts,
     ) -> Result<(), PipelineError> {
         for body in sources {
             let Some(correlation_key) = body.correlation_key.as_ref() else {
@@ -281,6 +284,7 @@ impl ExecutionPlanDag {
 
             let sort_node = PlanNode::Sort {
                 name: format!("{CORRELATION_SORT_PREFIX}{source_name}"),
+                id: artifacts.fresh_node_id(),
                 span: Span::SYNTHETIC,
                 sort_fields,
             };
@@ -335,6 +339,7 @@ impl ExecutionPlanDag {
         &mut self,
         sources: &[&crate::config::pipeline_node::SourceBody],
         max_group_buffer: u64,
+        artifacts: &mut crate::plan::bind_schema::CompileArtifacts,
     ) -> Result<(), PipelineError> {
         if sources.iter().all(|b| b.correlation_key.is_none()) {
             return Ok(());
@@ -372,6 +377,7 @@ impl ExecutionPlanDag {
 
         let commit_node = PlanNode::CorrelationCommit {
             name: format!("{CORRELATION_COMMIT_PREFIX}terminal"),
+            id: artifacts.fresh_node_id(),
             span: Span::SYNTHETIC,
             commit_group_by,
             max_group_buffer,

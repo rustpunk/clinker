@@ -405,22 +405,25 @@ mod tests {
         DependencyType, ExecutionPlanDag, NodeExecutionReqs, ParallelismClass, PlanEdge, PlanNode,
         SourceTier,
     };
+    use crate::plan::{EntityRef, PlanNodeId};
     use clinker_core_types::span::Span;
     use petgraph::graph::DiGraph;
     use std::collections::BTreeSet;
 
-    fn source(name: &str) -> PlanNode {
+    fn source(name: &str, id: usize) -> PlanNode {
         PlanNode::Source {
             name: name.to_owned(),
+            id: PlanNodeId::new(id),
             span: Span::SYNTHETIC,
             resolved: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
         }
     }
 
-    fn transform(name: &str) -> PlanNode {
+    fn transform(name: &str, id: usize) -> PlanNode {
         PlanNode::Transform {
             name: name.to_owned(),
+            id: PlanNodeId::new(id),
             span: Span::SYNTHETIC,
             resolved: None,
             parallelism_class: ParallelismClass::Stateless,
@@ -434,17 +437,19 @@ mod tests {
         }
     }
 
-    fn output(name: &str) -> PlanNode {
+    fn output(name: &str, id: usize) -> PlanNode {
         PlanNode::Output {
             name: name.to_owned(),
+            id: PlanNodeId::new(id),
             span: Span::SYNTHETIC,
             resolved: None,
         }
     }
 
-    fn route(name: &str) -> PlanNode {
+    fn route(name: &str, id: usize) -> PlanNode {
         PlanNode::Route {
             name: name.to_owned(),
+            id: PlanNodeId::new(id),
             span: Span::SYNTHETIC,
             mode: RouteMode::Exclusive,
             branches: vec![],
@@ -467,7 +472,7 @@ mod tests {
             .filter(|&&idx| matches!(graph[idx], PlanNode::Source { .. }))
             .map(|&idx| graph[idx].name().to_owned())
             .collect();
-        ExecutionPlanDag {
+        let mut dag = ExecutionPlanDag {
             graph,
             topo_order: topo,
             source_dag: vec![SourceTier { sources }],
@@ -480,16 +485,19 @@ mod tests {
             node_properties: Default::default(),
             deferred_regions: Default::default(),
             parent_continuations: Default::default(),
-        }
+            id_to_index: crate::plan::SecondaryMap::with_default(None),
+        };
+        dag.rebuild_id_index();
+        dag
     }
 
     /// Build a simple 4-node linear pipeline: src → t1 → t2 → out
     fn build_4_node_dag() -> ExecutionPlanDag {
         let mut graph = DiGraph::new();
-        let src = graph.add_node(source("src"));
-        let t1 = graph.add_node(transform("t1"));
-        let t2 = graph.add_node(transform("t2"));
-        let out_idx = graph.add_node(output("out"));
+        let src = graph.add_node(source("src", 0));
+        let t1 = graph.add_node(transform("t1", 1));
+        let t2 = graph.add_node(transform("t2", 2));
+        let out_idx = graph.add_node(output("out", 3));
         graph.add_edge(src, t1, data_edge());
         graph.add_edge(t1, t2, data_edge());
         graph.add_edge(t2, out_idx, data_edge());
@@ -499,10 +507,10 @@ mod tests {
     /// Build a DAG with a Route node: src → route → [branch_a, branch_b]
     fn build_route_dag() -> ExecutionPlanDag {
         let mut graph = DiGraph::new();
-        let src = graph.add_node(source("src"));
-        let router = graph.add_node(route("router"));
-        let a = graph.add_node(output("branch_a"));
-        let b = graph.add_node(output("branch_b"));
+        let src = graph.add_node(source("src", 0));
+        let router = graph.add_node(route("router", 1));
+        let a = graph.add_node(output("branch_a", 2));
+        let b = graph.add_node(output("branch_b", 3));
         graph.add_edge(src, router, data_edge());
         graph.add_edge(router, a, data_edge());
         graph.add_edge(router, b, data_edge());

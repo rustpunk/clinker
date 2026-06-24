@@ -496,7 +496,16 @@ evidence.
   renderer or link checker becomes required.
 - Priority: Low
 
-### 28. Should compiled per-node CXL artifacts be keyed by scope, not bare node name?
+### 28. Should compiled per-node CXL artifacts be keyed by scope, not bare node name? (RESOLVED)
+
+- Resolution: Every per-node-identity side-table in `CompileArtifacts`
+  (`typed`, `combine_where_typed`, `route_branch_typed`, the `combine_*` maps,
+  `envelope_synthesis`, `composition_body_assignments`) is now keyed by a dense
+  `PlanNodeId` minted once at graph construction — a stronger guarantee than
+  `(scope, name)`, since two instantiations of one composition body get
+  disjoint id sets by construction. `ScopedNodeId`/`NodeScope` were deleted, and
+  the cross-scope last-writer-wins collision can no longer occur for these
+  tables. One name-keyed facility remains by design — see open question 29.
 
 - Question: `CompileArtifacts.typed` and `CompileArtifacts.combine_where_typed`
   are flat maps keyed by the bare node name, shared across the top-level
@@ -524,4 +533,58 @@ evidence.
   the flat-map source so the program lowered onto each node is unambiguous;
   add a regression test with a nested composition that reuses a combine name.
   If not, add a bind-time diagnostic rejecting the collision.
+- Priority: Low
+
+### 29. Should `ProvenanceDb` be keyed by `PlanNodeId` despite its name-addressed query contract?
+
+- Question: After the `PlanNodeId` identity rip, `CompileArtifacts.provenance`
+  (`ProvenanceDb`) is the one per-node compile facility still keyed by the bare
+  `(node_name, param_name)`. A top-level node and a composition-body node that
+  share a name and both carry provenance-tracked config params collide in the
+  flat map. It was left name-keyed because its query surface is user-facing.
+- Why it matters: `explain --provenance` resolves a dotted `node_name.param_name`
+  path, and `ProvenanceDb`'s public API (`get`, `params_for_node`,
+  `node_names`) is name-addressed by contract — so re-keying the internal store
+  to `PlanNodeId` would require a `PlanNodeId → name` reverse map at every query
+  site and changes the externally-observable lookup model. The residual
+  collision is narrow (same name across scopes, both with tracked params) but
+  real.
+- Files/modules involved:
+  `crates/clinker-plan/src/plan/explain_provenance.rs` (`ProvenanceDb`),
+  `crates/clinker-plan/src/plan/bind_schema.rs` (`bind_composition` provenance
+  population), the `explain --provenance` CLI path.
+- Suggested way to resolve it: Decide whether cross-scope node-name reuse is
+  supported for provenance-tracked compositions. If so, key the internal store
+  by `PlanNodeId` and resolve the user-facing dotted path to an id at query
+  time (preserving the external contract); add a nested-composition regression
+  test. If not, add a bind-time diagnostic rejecting the same-name collision, or
+  document that provenance is attributed by scoped path.
+- Priority: Low
+
+### 30. Analytic windows inside a nested composition body are never resolved
+
+- Question: `resolve_composition_body_windows`
+  (`crates/clinker-plan/src/plan/execution/composition.rs`) resolves each
+  composition call site only against the TOP-LEVEL DAG's `id_to_index` bridge.
+  A composition node whose call site lives inside an enclosing body (a
+  composition-of-composition) has no entry in the top-level bridge, so its
+  `composition_idx` stays `None` and the inner body's analytic-window
+  `IndexSpec`s are never built/backfilled. Should body-window resolution walk
+  nested scopes?
+- Why it matters: A window builtin over a nested composition body sees an
+  unpopulated `window_index` and silently emits `Null`/incorrect window results
+  at runtime instead of a diagnostic. This is a pre-existing limitation — the
+  prior name-map scheme had the same top-level-only reach — surfaced (but not
+  changed) by the move to the `PlanNodeId -> NodeIndex` bridge.
+- Files/modules involved:
+  `crates/clinker-plan/src/plan/execution/composition.rs`
+  (`resolve_composition_body_windows`),
+  `crates/clinker-plan/src/plan/composition_body.rs`
+  (`body_indices_to_build`).
+- Suggested way to resolve it: Decide whether analytic windows are supported in
+  nested composition bodies. If so, resolve each body's call site against the
+  enclosing scope's bridge (recurse through `composition_bodies`), not only the
+  top-level DAG; add a nested-composition window regression test. If not, emit a
+  bind-time diagnostic rejecting `analytic_window:` in a body reachable only
+  through a nested composition.
 - Priority: Low
