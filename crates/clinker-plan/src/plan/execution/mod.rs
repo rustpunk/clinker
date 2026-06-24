@@ -165,6 +165,18 @@ pub enum PlanNode {
         mode: RouteMode,
         branches: Vec<String>,
         default: String,
+        /// Typechecked branch-condition programs, one per entry in `branches`
+        /// and in the same declaration order. Each is the `filter <condition>`
+        /// program the binder produces for the branch; carried on the node —
+        /// mirroring `PlanTransformPayload.typed` / `Aggregation.typed` — so
+        /// route dispatch builds its per-branch `ProgramEvaluator`s off the
+        /// node it is dispatching instead of re-parsing condition source from a
+        /// startup-built table. Populated at lowering from
+        /// `artifacts.route_branch_typed[id]`; a branch whose condition fails to
+        /// typecheck surfaces a compile-time diagnostic and the node is not
+        /// lowered, so a lowered Route always carries one program per branch.
+        #[serde(skip)]
+        branch_programs: Vec<Arc<TypedProgram>>,
     },
     Merge {
         name: String,
@@ -197,9 +209,8 @@ pub enum PlanNode {
     /// observes it, then applies each rule's trigger-row mutation and
     /// row synthesis. Single output. The executor compiles each rule's
     /// `when` / `set` / `overrides` CXL against the live input schema at
-    /// dispatch time (mirroring the Route condition-compile seam), so the
-    /// plan node carries only the parsed `config` and the widened output
-    /// schema.
+    /// dispatch time, so the plan node carries only the parsed `config` and
+    /// the widened output schema.
     Reshape {
         name: String,
         /// Stable node identity; see the `Source` variant's `id`.
@@ -223,9 +234,8 @@ pub enum PlanNode {
     /// `removed_to` producer-side output port while untriggered groups flow
     /// to the main output port. Cull does not widen — both ports carry the
     /// unchanged upstream schema. The executor compiles each rule's
-    /// predicate against the live input schema at dispatch time (the Route
-    /// condition-compile seam), so the plan node carries only the parsed
-    /// `config` and the unchanged output schema.
+    /// predicate against the live input schema at dispatch time, so the plan
+    /// node carries only the parsed `config` and the unchanged output schema.
     Cull {
         name: String,
         /// Stable node identity; see the `Source` variant's `id`.

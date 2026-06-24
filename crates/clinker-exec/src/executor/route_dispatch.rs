@@ -12,13 +12,13 @@ use clinker_record::{Record, Value};
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
-use crate::executor::DlqEntry;
 use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, advance_cursor, drain_node_buffer_slot,
     node_buffer_spill_allowed, push_dlq, record_error_to_buffer_if_grouped, source_file_arc_of,
     source_name_arc_of, stream_linear_producer_emit,
 };
 use crate::executor::schema_check::check_input_schema;
+use crate::executor::{CompiledRoute, DlqEntry};
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
@@ -38,8 +38,9 @@ pub(crate) fn dispatch_route(
     let PlanNode::Route {
         ref name,
         mode,
-        branches: _,
-        default: _,
+        ref branches,
+        ref default,
+        ref branch_programs,
         ..
     } = *node
     else {
@@ -113,69 +114,69 @@ pub(crate) fn dispatch_route(
         branch_buffers.insert(succ, Vec::new());
     }
 
-    // Per-route compiled evaluator wins over the singleton
-    // — `compiled_routes_by_name` is populated for body
-    // Routes (and any Route whose conditions need an explicit
-    // lookup), while the singleton remains the long-standing
-    // path for the top-level Route. A body's Route arm
-    // therefore finds its own conditions here instead of
-    // inheriting the top-level Route's conditions, which
-    // would have been the only ones available before.
-    // `take` + restore keeps the route's `&mut`-mutated state
-    // (regex caches, evaluator counters) consistent across
-    // records hitting the same Route node within one walk.
-    let from_map = ctx.compiled_routes_by_name.remove(name.as_str());
-    let mut from_singleton_flag = false;
-    let mut route_handle = match from_map {
-        Some(r) => Some(r),
-        None => {
-            let taken = ctx.compiled_route.take();
-            from_singleton_flag = taken.is_some();
-            taken
+    // Build the per-record evaluator bundle off the node's own typed branch
+    // programs. Each Route node carries its own conditions, so a body Route and
+    // a same-named top-level Route resolve independently — there is no shared
+    // by-name lookup to collide in. Owning `route` locally for the record loop
+    // keeps its `&mut`-mutated state (regex caches, evaluator counters)
+    // consistent across records without a take/restore against shared context.
+    let mut route = CompiledRoute::from_node(name, branches, branch_programs, default, mode)?;
+    for (i, (record, rn)) in input_records.into_iter().enumerate() {
+        // Poll the shutdown flag every 1024 records so a long
+        // Route chain terminates promptly on SIGINT. Same
+        // chunk-boundary cadence the Transform arm uses.
+        if i > 0 && i.is_multiple_of(1024) {
+            ctx.check_shutdown()?;
         }
-    };
+        let source_file_arc = source_file_arc_of(&record);
+        let source_name_arc = source_name_arc_of(&record);
+        let eval_ctx =
+            ctx.eval_ctx_for_record(&source_file_arc, &source_name_arc, rn, record.doc_ctx());
 
-    if let Some(ref mut route) = route_handle {
-        for (i, (record, rn)) in input_records.into_iter().enumerate() {
-            // Poll the shutdown flag every 1024 records so a long
-            // Route chain terminates promptly on SIGINT. Same
-            // chunk-boundary cadence the Transform arm uses.
-            if i > 0 && i.is_multiple_of(1024) {
-                ctx.check_shutdown()?;
-            }
-            let source_file_arc = source_file_arc_of(&record);
-            let source_name_arc = source_name_arc_of(&record);
-            let eval_ctx =
-                ctx.eval_ctx_for_record(&source_file_arc, &source_name_arc, rn, record.doc_ctx());
-
-            let route_result = {
-                let _guard = ctx.route_timer.guard();
-                route.evaluate(&record, &eval_ctx)
-            };
-            match route_result {
-                Ok(targets) => {
-                    for target in &targets {
-                        if let Some(succs) = branch_to_succ.get(target.as_str()) {
-                            for &succ in succs {
-                                branch_buffers
-                                    .entry(succ)
-                                    .or_default()
-                                    .push((record.clone(), rn));
-                            }
-                        }
-                        // Exclusive mode: stop after first match
-                        if mode == clinker_plan::config::RouteMode::Exclusive {
-                            break;
+        let route_result = {
+            let _guard = ctx.route_timer.guard();
+            route.evaluate(&record, &eval_ctx)
+        };
+        match route_result {
+            Ok(targets) => {
+                for target in &targets {
+                    if let Some(succs) = branch_to_succ.get(target.as_str()) {
+                        for &succ in succs {
+                            branch_buffers
+                                .entry(succ)
+                                .or_default()
+                                .push((record.clone(), rn));
                         }
                     }
-                    advance_cursor(ctx, &source_name_arc, rn);
+                    // Exclusive mode: stop after first match
+                    if mode == clinker_plan::config::RouteMode::Exclusive {
+                        break;
+                    }
                 }
-                Err(route_err) => {
-                    if ctx.strategy == ErrorStrategy::FailFast {
-                        return Err(route_err.into());
-                    }
-                    let stage = Some(DlqEntry::stage_route_eval());
-                    let routed = record_error_to_buffer_if_grouped(
+                advance_cursor(ctx, &source_name_arc, rn);
+            }
+            Err(route_err) => {
+                if ctx.strategy == ErrorStrategy::FailFast {
+                    return Err(route_err.into());
+                }
+                let stage = Some(DlqEntry::stage_route_eval());
+                let routed = record_error_to_buffer_if_grouped(
+                    ctx,
+                    &record,
+                    rn,
+                    clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
+                    route_err.to_string(),
+                    stage.clone(),
+                    None,
+                );
+                let triggering_field = route_err.triggering_field.clone();
+                let triggering_value = route_err.triggering_value();
+                // Under `dlq_granularity: document`, a route-eval failure
+                // condemns the whole document — mark it failed (capturing
+                // this record as the root cause) so the Output emits the
+                // trigger + collateral entries at the document's close.
+                let marked = !routed
+                    && crate::executor::document_dlq::record_error_to_document_buffer_if_doc_dlq(
                         ctx,
                         &record,
                         rn,
@@ -183,54 +184,29 @@ pub(crate) fn dispatch_route(
                         route_err.to_string(),
                         stage.clone(),
                         None,
+                        triggering_field.clone(),
+                        triggering_value.clone(),
                     );
-                    let triggering_field = route_err.triggering_field.clone();
-                    let triggering_value = route_err.triggering_value();
-                    // Under `dlq_granularity: document`, a route-eval failure
-                    // condemns the whole document — mark it failed (capturing
-                    // this record as the root cause) so the Output emits the
-                    // trigger + collateral entries at the document's close.
-                    let marked = !routed
-                        && crate::executor::document_dlq::record_error_to_document_buffer_if_doc_dlq(
-                            ctx,
-                            &record,
-                            rn,
-                            clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
-                            route_err.to_string(),
-                            stage.clone(),
-                            None,
-                            triggering_field.clone(),
-                            triggering_value.clone(),
-                        );
-                    if !routed && !marked {
-                        let source_name = source_name_arc_of(&record);
-                        push_dlq(
-                            ctx,
-                            DlqEntry {
-                                source_row: rn,
-                                category:
-                                    clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
-                                error_message: route_err.to_string(),
-                                original_record: record,
-                                stage,
-                                route: None,
-                                trigger: true,
-                                source_name,
-                                triggering_field,
-                                triggering_value,
-                            },
-                        )?;
-                    }
+                if !routed && !marked {
+                    let source_name = source_name_arc_of(&record);
+                    push_dlq(
+                        ctx,
+                        DlqEntry {
+                            source_row: rn,
+                            category:
+                                clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
+                            error_message: route_err.to_string(),
+                            original_record: record,
+                            stage,
+                            route: None,
+                            trigger: true,
+                            source_name,
+                            triggering_field,
+                            triggering_value,
+                        },
+                    )?;
                 }
             }
-        }
-    }
-    // Restore the route to whichever storage it came from.
-    if let Some(r) = route_handle {
-        if from_singleton_flag {
-            ctx.compiled_route = Some(r);
-        } else {
-            ctx.compiled_routes_by_name.insert(name.to_string(), r);
         }
     }
 

@@ -48,14 +48,13 @@ use params::sum_cpu_io_totals;
 pub use params::{ExecutionReport, PipelineRunParams};
 pub use registry::WriterRegistry;
 pub(crate) use registry::build_format_writer;
-pub(crate) use route::{CompiledRoute, CompiledRouteBranch};
+pub(crate) use route::CompiledRoute;
 pub use storage_validate::{
     CapHeadroomWarning, FreeSpaceWarning, ResolvedStorage, StorageValidationError,
     validate_storage_config,
 };
 pub(crate) use streaming::StreamingOutputTaskOutput;
 use streaming::{compute_streaming_output_specs, streaming_output};
-pub use transform::{TransformSpec, build_transform_specs};
 pub(crate) use transform::{
     WindowedEvalCtx, evaluate_single_transform, evaluate_single_transform_windowed,
 };
@@ -77,8 +76,6 @@ use crate::pipeline::memory::rss_bytes;
 use clinker_plan::config::PipelineConfig;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::ExecutionPlanDag;
-use cxl::eval::ProgramEvaluator;
-use cxl::typecheck::Type;
 
 /// Map from source-node name to the input feeding that source.
 ///
@@ -197,11 +194,6 @@ struct DagExecResources {
     /// Single + fan-out output writers, split into the dispatcher's
     /// `writers` / `fan_out_writers` maps at context construction.
     writers: WriterRegistry,
-    /// Compiled top-level route, if the pipeline declares one Route node.
-    compiled_route: Option<CompiledRoute>,
-    /// Compiled routes keyed by node name, for nested / composition-body
-    /// Route nodes resolved during the walk.
-    compiled_routes_by_name: HashMap<String, CompiledRoute>,
     /// Pipeline-scoped spill directory bundled with its held `.lock`, kept until
     /// the walk drains so operator-side spill files survive the topo loop. The
     /// held lock marks the spill dir as live; the next run's startup crash-purge
@@ -479,131 +471,6 @@ impl PipelineExecutor {
                     transform_name: String::new(),
                     messages: diags.iter().map(|d| d.message.clone()).collect(),
                 })?;
-        let resolved_transforms_owned = crate::executor::build_transform_specs(config);
-        let resolved_transforms: Vec<&TransformSpec> = resolved_transforms_owned.iter().collect();
-        let scoped_vars: cxl::resolve::ScopedVarsRegistry =
-            clinker_plan::config::build_scoped_vars_registry(
-                config.pipeline.vars.as_ref(),
-                &config.nodes,
-            );
-        // Compile route conditions if any transform has a route config.
-        // Collect all emitted field names for route condition resolution.
-        let compiled_route = {
-            let route_config = resolved_transforms
-                .iter()
-                .rev()
-                .find_map(|t| t.route.as_ref());
-            match route_config {
-                Some(rc) => {
-                    // Route conditions reference the fields visible on the
-                    // records flowing into the Route. A top-level Route has one
-                    // incoming data edge, and its predecessor's widened
-                    // `output_schema` already unions every upstream field —
-                    // every Source column plus every Transform / Combine /
-                    // Aggregate emit on the path to the Route. Reading that
-                    // schema off the DAG is the complete field set without
-                    // re-walking the typed-program table. Engine-stamped tail
-                    // columns ($ck.*, $widened, $source.file) carry the
-                    // reserved `$` prefix and are filtered: Route conditions
-                    // reference user-declared field names, not engine sidecars.
-                    let dag = validated_plan.dag();
-                    let mut emitted_fields: Vec<String> = Vec::new();
-                    for route_idx in dag.graph.node_indices() {
-                        if !matches!(
-                            &dag.graph[route_idx],
-                            clinker_plan::plan::execution::PlanNode::Route { .. }
-                        ) {
-                            continue;
-                        }
-                        let Some(pred_idx) = dag
-                            .graph
-                            .neighbors_directed(route_idx, petgraph::Direction::Incoming)
-                            .next()
-                        else {
-                            continue;
-                        };
-                        let pred_schema = dag.graph[pred_idx].output_schema_in(dag);
-                        for col in pred_schema.columns() {
-                            let s = col.as_ref();
-                            if s.starts_with('$') {
-                                continue;
-                            }
-                            if !emitted_fields.iter().any(|f| f == s) {
-                                emitted_fields.push(s.to_string());
-                            }
-                        }
-                    }
-                    Some(Self::compile_route(rc, &emitted_fields, &scoped_vars)?)
-                }
-                None => None,
-            }
-        };
-
-        // Compile body Routes alongside the top-level singleton.
-        // The dispatcher's Route arm consults
-        // `compiled_routes_by_name` first; any name found here wins
-        // over the singleton, which keeps the long-standing
-        // single-top-level-Route path intact while letting body
-        // Routes carry their own conditions.
-        let mut compiled_routes_by_name: std::collections::HashMap<String, CompiledRoute> =
-            std::collections::HashMap::new();
-        for (_body_id, body) in validated_plan.composition_bodies().iter() {
-            for (route_name, route_body) in &body.route_bodies {
-                // Build the body Route's RouteConfig from its parsed
-                // RouteBody. The condition resolver needs the field
-                // set — for body context the body's input port
-                // schema(s) plus everything emitted upstream within
-                // the body.
-                let conditions: Vec<clinker_plan::config::RouteBranch> = route_body
-                    .conditions
-                    .iter()
-                    .map(|(name, cxl)| clinker_plan::config::RouteBranch {
-                        name: name.clone(),
-                        condition: cxl.source.as_str().to_string(),
-                    })
-                    .collect();
-                let route_config = clinker_plan::config::RouteConfig {
-                    mode: route_body.mode,
-                    branches: conditions,
-                    default: route_body.default.clone(),
-                };
-                // Use the union of port column names + any emit on
-                // body upstream nodes. A union of declared body
-                // schemas is overinclusive but safe — branches'
-                // typecheck already passed at bind time, so resolver
-                // false-positives won't surface here.
-                let mut emitted_fields: Vec<String> = Vec::new();
-                for row in body.input_port_rows.values() {
-                    for qf in row.field_names() {
-                        let s = qf.name.to_string();
-                        if !emitted_fields.contains(&s) {
-                            emitted_fields.push(s);
-                        }
-                    }
-                }
-                // Only this body's own nodes contribute emits. Walk the body
-                // mini-DAG and union each producing node's widened
-                // `output_schema` columns — every Transform / Combine /
-                // Aggregate emit shows up there once binding has widened the
-                // node's schema, so the body's own producers contribute their
-                // fields without reaching into the scope-keyed typed table.
-                // A top-level node sharing a name with a body node stays out
-                // because we only walk this body's graph.
-                for node in body.graph.node_weights() {
-                    if let Some(schema) = node.stored_output_schema() {
-                        for col in schema.columns() {
-                            let s = col.as_ref().to_string();
-                            if !emitted_fields.contains(&s) {
-                                emitted_fields.push(s);
-                            }
-                        }
-                    }
-                }
-                let cr = Self::compile_route(&route_config, &emitted_fields, &scoped_vars)?;
-                compiled_routes_by_name.insert(route_name.clone(), cr);
-            }
-        }
-
         let plan = validated_plan.dag();
         collector.record(compile_timer.finish(0, 0));
 
@@ -817,8 +684,6 @@ impl PipelineExecutor {
             DagExecResources {
                 source_records,
                 writers,
-                compiled_route,
-                compiled_routes_by_name,
                 spill_root,
                 watermarks,
                 memory_budget,
@@ -1005,8 +870,6 @@ impl PipelineExecutor {
         let DagExecResources {
             source_records,
             mut writers,
-            compiled_route,
-            compiled_routes_by_name,
             spill_root,
             watermarks,
             memory_budget,
@@ -1325,7 +1188,6 @@ impl PipelineExecutor {
             source_vars_seeded_files: HashMap::new(),
             writers: writers.single,
             fan_out_writers: writers.fan_out,
-            compiled_route,
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
             dlq_per_source: HashMap::new(),
@@ -1341,7 +1203,6 @@ impl PipelineExecutor {
             write_timer: stage_metrics::CumulativeTimer::new(),
             collector,
             recursion_depth: 0,
-            compiled_routes_by_name,
             current_body_node_input_refs: None,
             spill_root,
             spill_root_path,
@@ -1640,88 +1501,6 @@ impl PipelineExecutor {
         })
     }
 
-    /// Compile route conditions from the last transform's RouteConfig.
-    ///
-    /// Each branch condition is compiled as `filter <condition>` — a one-statement
-    /// CXL program. The filter returns Emit if true (route matches), Skip(Filtered)
-    /// if false (no match). This reuses the existing filter evaluation pattern.
-    fn compile_route(
-        route_config: &clinker_plan::config::RouteConfig,
-        emitted_fields: &[String],
-        scoped_vars: &cxl::resolve::ScopedVarsRegistry,
-    ) -> Result<CompiledRoute, PipelineError> {
-        let type_cols: IndexMap<cxl::typecheck::QualifiedField, Type> = emitted_fields
-            .iter()
-            .map(|f| (cxl::typecheck::QualifiedField::bare(f.as_str()), Type::Any))
-            .collect();
-        let type_schema = cxl::typecheck::Row::closed(type_cols, cxl::lexer::Span::new(0, 0));
-        let field_refs: Vec<&str> = emitted_fields.iter().map(|s| s.as_str()).collect();
-
-        let mut branches = Vec::with_capacity(route_config.branches.len());
-        for branch in &route_config.branches {
-            // Compile condition as "filter <condition>"
-            let cxl_source = format!("filter {}", branch.condition);
-
-            let parse_result = cxl::parser::Parser::parse(&cxl_source);
-            if !parse_result.errors.is_empty() {
-                let messages: Vec<String> = parse_result
-                    .errors
-                    .iter()
-                    .map(|e| e.message.clone())
-                    .collect();
-                return Err(PipelineError::Compilation {
-                    transform_name: format!("route:{}", branch.name),
-                    messages,
-                });
-            }
-
-            let resolved = cxl::resolve::resolve_program_with_modules_and_vars(
-                parse_result.ast,
-                &field_refs,
-                parse_result.node_count,
-                &std::collections::HashMap::new(),
-                scoped_vars,
-            )
-            .map_err(|diags| PipelineError::Compilation {
-                transform_name: format!("route:{}", branch.name),
-                messages: diags.into_iter().map(|d| d.message).collect(),
-            })?;
-
-            let typed = cxl::typecheck::pass::type_check_with_mode_and_vars(
-                resolved,
-                &type_schema,
-                cxl::typecheck::pass::AggregateMode::Row,
-                scoped_vars,
-            )
-            .map_err(|diags| {
-                let errors: Vec<String> = diags
-                    .iter()
-                    .filter(|d| !d.is_warning)
-                    .map(|d| d.message.clone())
-                    .collect();
-                PipelineError::Compilation {
-                    transform_name: format!("route:{}", branch.name),
-                    messages: if errors.is_empty() {
-                        diags.into_iter().map(|d| d.message).collect()
-                    } else {
-                        errors
-                    },
-                }
-            })?;
-
-            branches.push(CompiledRouteBranch {
-                name: branch.name.clone(),
-                evaluator: ProgramEvaluator::new(Arc::new(typed), false),
-            });
-        }
-
-        Ok(CompiledRoute {
-            branches,
-            default: route_config.default.clone(),
-            mode: route_config.mode,
-        })
-    }
-
     /// Compile execution plan and return `--explain` output without reading data.
     ///
     /// Input files are NOT opened. Field names are extracted from CXL AST
@@ -1758,7 +1537,7 @@ mod tests {
     //! Executor white-box tests — submodules below each read a crate-private
     //! executor seam the public API does not surface (the pre-seeded
     //! `MemoryArbitrator` run entry, `scheduled_pass_order`,
-    //! `single_predecessor`, `compile_route` / `CompiledRoute`,
+    //! `single_predecessor`, `CompiledRoute::from_node` / `CompiledRoute::evaluate`,
     //! `commit::with_test_loop_cap`, `ExecutionPlanDag::deferred_region_at`),
     //! so they cannot live in the `tests/` integration directory.
     //!

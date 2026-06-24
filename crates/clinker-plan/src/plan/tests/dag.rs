@@ -657,6 +657,65 @@ fn test_dag_route_node_replaces_route_plan() {
     }
 }
 
+/// A non-boolean route branch condition is rejected at compile time.
+///
+/// Route conditions are typechecked in the binder as `filter <condition>`
+/// programs; a numeric condition such as `amount + 1` is not a Bool predicate
+/// and must surface a type error at compile. The binder is the sole place
+/// route conditions are diagnosed — the executor does not recompile them
+/// from source at startup — so this error must originate here.
+#[test]
+fn test_route_non_boolean_condition_rejected_at_compile() {
+    let yaml = r#"
+pipeline:
+  name: route-nonbool-test
+nodes:
+- type: source
+  name: primary
+  config:
+    name: primary
+    path: data.csv
+    type: csv
+    schema:
+      - { name: amount, type: float }
+- type: route
+  name: router
+  input: primary
+  config:
+    conditions:
+      bad: amount + 1
+    default: fallback
+    mode: exclusive
+- type: output
+  name: bad_out
+  input: router.bad
+  config:
+    name: bad_out
+    path: bad.csv
+    include_unmapped: true
+    type: csv
+- type: output
+  name: fallback
+  input: router.fallback
+  config:
+    name: fallback
+    path: out.csv
+    include_unmapped: true
+    type: csv
+"#;
+    let config = parse_fixture(yaml);
+    let result = config.compile(&crate::config::CompileContext::default());
+    assert!(
+        result.is_err(),
+        "non-boolean route condition must fail compile"
+    );
+    let err = format!("{:?}", result.unwrap_err());
+    assert!(
+        err.contains("Bool"),
+        "route condition type error should mention the Bool requirement: {err}"
+    );
+}
+
 /// Self-referencing input is rejected at compile time.
 #[test]
 fn test_dag_self_reference_rejected() {

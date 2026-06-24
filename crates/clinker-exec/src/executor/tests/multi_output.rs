@@ -1,20 +1,78 @@
 //! Multi-output route-evaluation white-box tests (inline half).
 //!
-//! These compile and evaluate routes directly through the crate-private
-//! `PipelineExecutor::compile_route` / `CompiledRoute::evaluate` seam, so
-//! they cannot move to the `tests/` directory. The multi-writer
-//! integration tests (channel fan-out, DLQ staging, backward-compat
-//! shims) run through the public entry point in
-//! `crates/clinker-exec/tests/multi_output.rs`.
+//! These build and evaluate routes directly through the crate-private
+//! `CompiledRoute::from_node` / `CompiledRoute::evaluate` seam, so they
+//! cannot move to the `tests/` directory. The multi-writer integration
+//! tests (channel fan-out, DLQ staging, backward-compat shims) run through
+//! the public entry point in `crates/clinker-exec/tests/multi_output.rs`.
 
 use super::*;
 
-/// Helper: compile a route config against a set of field names.
+/// Helper: build a [`CompiledRoute`] for a route config against a set of
+/// field names.
+///
+/// Mirrors the binder: each branch condition is typechecked as a
+/// `filter <condition>` program against an all-`Any` row of `fields`, and the
+/// resulting typed programs are handed to the production
+/// [`CompiledRoute::from_node`] constructor — so the evaluation tests exercise
+/// the same on-node evaluator-build path the executor uses at dispatch.
 fn compile_test_route(route_yaml: &str, fields: &[&str]) -> CompiledRoute {
+    use std::sync::Arc;
     let route_config: clinker_plan::config::RouteConfig =
         clinker_plan::yaml::from_str(route_yaml).unwrap();
-    let emitted_fields: Vec<String> = fields.iter().map(|s| s.to_string()).collect();
-    PipelineExecutor::compile_route(&route_config, &emitted_fields, &Default::default()).unwrap()
+    let branches: Vec<String> = route_config
+        .branches
+        .iter()
+        .map(|b| b.name.clone())
+        .collect();
+    let programs: Vec<Arc<cxl::typecheck::TypedProgram>> = route_config
+        .branches
+        .iter()
+        .map(|b| Arc::new(typecheck_test_condition(&b.condition, fields)))
+        .collect();
+    CompiledRoute::from_node(
+        "test_route",
+        &branches,
+        &programs,
+        &route_config.default,
+        route_config.mode,
+    )
+    .unwrap()
+}
+
+/// Typecheck a single route branch condition into the `filter <condition>`
+/// program the binder produces, against an all-`Any` row of `fields`.
+/// Panics on parse / resolve / typecheck failure (the caller asserts success).
+fn typecheck_test_condition(condition: &str, fields: &[&str]) -> cxl::typecheck::TypedProgram {
+    let type_cols: indexmap::IndexMap<cxl::typecheck::QualifiedField, cxl::typecheck::Type> =
+        fields
+            .iter()
+            .map(|f| {
+                (
+                    cxl::typecheck::QualifiedField::bare(*f),
+                    cxl::typecheck::Type::Any,
+                )
+            })
+            .collect();
+    let type_schema = cxl::typecheck::Row::closed(type_cols, cxl::lexer::Span::new(0, 0));
+    let source = format!("filter {condition}");
+    let parsed = cxl::parser::Parser::parse(&source);
+    assert!(parsed.errors.is_empty(), "parse failed for {source:?}");
+    let resolved = cxl::resolve::resolve_program_with_modules_and_vars(
+        parsed.ast,
+        fields,
+        parsed.node_count,
+        &std::collections::HashMap::new(),
+        &Default::default(),
+    )
+    .expect("resolve failed");
+    cxl::typecheck::pass::type_check_with_mode_and_vars(
+        resolved,
+        &type_schema,
+        cxl::typecheck::pass::AggregateMode::Row,
+        &Default::default(),
+    )
+    .expect("typecheck failed")
 }
 
 /// Helper: build an EvalContext for route evaluation tests.
@@ -258,53 +316,4 @@ default: regular
     let emitted = indexmap::IndexMap::from([("tier".to_string(), Value::String("gold".into()))]);
     let targets = route.evaluate(&test_record(&emitted), &ctx).unwrap();
     assert_eq!(targets, vec!["vip"]);
-}
-
-#[test]
-fn test_route_config_non_boolean_condition_typecheck_error() {
-    // "amount + 1" returns Int, not Bool — compile_route should reject it
-    let route_yaml = r#"
-mode: exclusive
-branches:
-  - name: bad
-    condition: "amount + 1"
-default: fallback
-"#;
-    let route_config: clinker_plan::config::RouteConfig =
-        clinker_plan::yaml::from_str(route_yaml).unwrap();
-    let emitted_fields = vec!["amount".to_string()];
-    let result =
-        PipelineExecutor::compile_route(&route_config, &emitted_fields, &Default::default());
-    match result {
-        Err(e) => {
-            let err = e.to_string();
-            assert!(
-                err.contains("Bool"),
-                "error should mention Bool type requirement: {err}"
-            );
-        }
-        Ok(_) => panic!("non-boolean route condition should fail typecheck"),
-    }
-}
-
-#[test]
-fn test_route_config_boolean_condition_passes() {
-    // "amount > 10000" returns Bool — compile_route should succeed
-    let route_yaml = r#"
-mode: exclusive
-branches:
-  - name: high
-    condition: "amount > 10000"
-default: low
-"#;
-    let route_config: clinker_plan::config::RouteConfig =
-        clinker_plan::yaml::from_str(route_yaml).unwrap();
-    let emitted_fields = vec!["amount".to_string()];
-    let result =
-        PipelineExecutor::compile_route(&route_config, &emitted_fields, &Default::default());
-    assert!(
-        result.is_ok(),
-        "boolean route condition should pass typecheck: {}",
-        result.err().map(|e| e.to_string()).unwrap_or_default()
-    );
 }

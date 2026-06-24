@@ -102,17 +102,6 @@ pub struct BoundBody {
     /// without inputs (Sources).
     pub node_input_refs: HashMap<String, Vec<String>>,
 
-    /// Compiled `where:` predicates for body Route nodes, keyed by
-    /// route node name. The body Route arm consults this map to
-    /// evaluate per-record routing — without it, body Routes would
-    /// silently inherit the top-level Route's conditions and
-    /// mis-route every record. Empty for bodies with no Routes.
-    /// Stored as `RouteBody` (the parsed source-of-truth) rather
-    /// than a pre-compiled evaluator because compilation has to
-    /// happen at executor entry alongside the top-level route to
-    /// pick up the right `emitted_fields` set.
-    pub route_bodies: HashMap<String, crate::config::pipeline_node::RouteBody>,
-
     /// Output row types at the body's declared output ports, keyed
     /// by port name. These are what the parent scope sees as the
     /// composition node's output row(s).
@@ -207,7 +196,6 @@ impl BoundBody {
             port_name_to_node_idx: HashMap::new(),
             body_rows: HashMap::new(),
             node_input_refs: HashMap::new(),
-            route_bodies: HashMap::new(),
             output_port_rows: IndexMap::new(),
             output_port_to_node_idx: IndexMap::new(),
             input_port_rows: IndexMap::new(),

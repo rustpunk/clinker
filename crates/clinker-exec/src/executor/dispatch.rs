@@ -440,7 +440,7 @@ pub(crate) fn push_write_error(
 
 use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::schema_check::check_input_schema;
-use crate::executor::{CompiledRoute, DlqEntry, evaluate_single_transform, stage_metrics};
+use crate::executor::{DlqEntry, evaluate_single_transform, stage_metrics};
 use clinker_plan::BudgetCategory;
 use clinker_plan::plan::composition_body::CompositionBodies;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -470,7 +470,6 @@ use clinker_record::Schema;
 ///   `SourceIngestChannel`. The `$source.file` per-record stamp travels
 ///   on each record's engine-stamped column.
 /// * `writers` — output writer registry consumed lazily as Output arms fire.
-/// * `compiled_route` — cached evaluator for Route arms.
 /// * `counters` / `dlq_entries` — pipeline-wide accounting.
 /// * `output_errors` — collected sink failures so siblings still attempt
 ///   their writes (DataFusion collection-pattern PR #14439).
@@ -621,14 +620,6 @@ pub(crate) struct ExecutorContext<'a> {
     /// `{source_file}` / `{source_path}` AND whose input is
     /// `FilePartitioned`. Empty map means no fan-out outputs in this run.
     pub(crate) fan_out_writers: HashMap<String, HashMap<Arc<str>, Box<dyn Write + Send>>>,
-    pub(crate) compiled_route: Option<CompiledRoute>,
-    /// Per-route compiled evaluators keyed by route node name.
-    /// Populated for body Routes (and any Route whose conditions
-    /// must survive an explicit name lookup). The Route dispatcher
-    /// arm checks this map first; if absent, it falls back to the
-    /// `compiled_route` singleton — the long-standing single-route
-    /// path the top-level executor uses.
-    pub(crate) compiled_routes_by_name: HashMap<String, CompiledRoute>,
     /// Body-scope `input:` reference table installed by the body
     /// executor before each body walk and cleared afterward. The
     /// Route dispatcher arm consults this map (when present) to

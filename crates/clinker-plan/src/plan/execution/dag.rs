@@ -270,7 +270,7 @@ impl ExecutionPlanDag {
     /// edges to Transform nodes, or Merge nodes).
     ///
     /// Route nodes for multi-output dispatch (no outgoing edges) do NOT
-    /// constitute branching — they're handled by the compiled_route path.
+    /// constitute branching — they're handled by the Route dispatch arm.
     pub fn has_branching(&self) -> bool {
         use petgraph::Direction;
         // Check for Merge nodes (always branching)
@@ -816,7 +816,6 @@ mod port_tag_guard_tests {
             port_name_to_node_idx: HashMap::new(),
             body_rows: HashMap::new(),
             node_input_refs: HashMap::new(),
-            route_bodies: HashMap::new(),
             output_port_rows: indexmap::IndexMap::new(),
             output_port_to_node_idx: indexmap::IndexMap::new(),
             input_port_rows: indexmap::IndexMap::new(),
