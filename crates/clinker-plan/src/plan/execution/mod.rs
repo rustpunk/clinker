@@ -207,10 +207,11 @@ pub enum PlanNode {
     ///
     /// Blocking grouping operator: buffers each `partition_by` group,
     /// observes it, then applies each rule's trigger-row mutation and
-    /// row synthesis. Single output. The executor compiles each rule's
-    /// `when` / `set` / `overrides` CXL against the live input schema at
-    /// dispatch time, so the plan node carries only the parsed `config` and
-    /// the widened output schema.
+    /// row synthesis. Single output. Each rule's `when` / `set` /
+    /// `overrides` CXL is typechecked once at lowering and carried on the
+    /// node as `compiled_rules`; the executor rebuilds the per-run
+    /// `ProgramEvaluator`s off the node at dispatch (mirroring Aggregation
+    /// / Route) instead of recompiling the rule source every dispatch.
     Reshape {
         name: String,
         /// Stable node identity; see the `Source` variant's `id`.
@@ -218,13 +219,23 @@ pub enum PlanNode {
         #[serde(skip)]
         span: Span,
         /// Parsed Reshape configuration (`partition_by` / `order_by` /
-        /// `rules`). Consumed by the executor's reshape dispatch arm.
+        /// `rules`). Still consumed at dispatch for the grouping key and
+        /// group ordering; the rule CXL is carried separately as typed
+        /// programs in `compiled_rules`.
         config: crate::config::pipeline_node::ReshapeBody,
         /// Widened output schema: the upstream columns plus the three
         /// `$meta.*` audit columns Reshape stamps. Populated by
         /// `bind_schema`.
         #[serde(skip)]
         output_schema: Arc<Schema>,
+        /// Per-rule typechecked CXL programs (`when` / `set` / `overrides`),
+        /// one [`CompiledReshapeRule`] per entry in `config.rules` and in
+        /// the same declaration order. Built at lowering from
+        /// `artifacts.reshape_compiled[id]`; the executor reconstructs each
+        /// rule's `ProgramEvaluator`s from these at dispatch. Behind `Arc`
+        /// so the per-dispatch whole-node clone stays O(1).
+        #[serde(skip)]
+        compiled_rules: Arc<Vec<CompiledReshapeRule>>,
     },
     /// Per-correlation-group record removal with a side-output port.
     ///
@@ -233,9 +244,12 @@ pub enum PlanNode {
     /// the whole group, and routes every record of a dropped group to the
     /// `removed_to` producer-side output port while untriggered groups flow
     /// to the main output port. Cull does not widen — both ports carry the
-    /// unchanged upstream schema. The executor compiles each rule's
-    /// predicate against the live input schema at dispatch time, so the plan
-    /// node carries only the parsed `config` and the unchanged output schema.
+    /// unchanged upstream schema. The rules' `drop_group_when` predicates are
+    /// OR-combined into one decision aggregate, typechecked and extracted
+    /// once at lowering, and carried on the node as `compiled` + `typed`
+    /// (mirroring `Aggregation`); the executor builds its per-group
+    /// `ProgramEvaluator` off the node at dispatch instead of recompiling
+    /// the predicate every dispatch.
     Cull {
         name: String,
         /// Stable node identity; see the `Source` variant's `id`.
@@ -243,14 +257,29 @@ pub enum PlanNode {
         #[serde(skip)]
         span: Span,
         /// Parsed Cull configuration (`partition_by` / `order_by` /
-        /// `rules` / `removed_to`). Consumed by the executor's cull
-        /// dispatch arm.
+        /// `rules` / `removed_to`). Still consumed at dispatch for the
+        /// grouping key, group ordering, and `removed_to` port routing; the
+        /// predicate CXL is carried separately as `compiled` + `typed`.
         config: crate::config::pipeline_node::CullBody,
         /// Output schema, equal to the upstream schema (Cull does not
         /// widen). Both the main and `removed_to` ports carry it.
         /// Populated by `bind_schema`.
         #[serde(skip)]
         output_schema: Arc<Schema>,
+        /// Extracted aggregate plan for the OR-combined `drop_group_when`
+        /// decision program (emit target
+        /// [`CULL_DROP_DECISION_COLUMN`](crate::config::pipeline_node::CULL_DROP_DECISION_COLUMN)).
+        /// Built at lowering via `extract_aggregates`, run per group by the
+        /// executor's decision aggregate to produce each group's boolean
+        /// removal decision. Describes the synthetic decision aggregate, not
+        /// the node's port output (which carries the unchanged upstream row).
+        #[serde(skip)]
+        compiled: Arc<CompiledAggregate>,
+        /// Typed OR-combined decision program the executor lowers its
+        /// per-group `ProgramEvaluator` against. The companion of `compiled`;
+        /// populated at lowering from `artifacts.cull_decision_typed[id]`.
+        #[serde(skip)]
+        typed: Arc<TypedProgram>,
     },
     /// Frames a body stream into documents. Single-input, single-output.
     ///
@@ -538,6 +567,37 @@ pub enum PlanNode {
 /// consumed by the executor's combine resolver mapping at executor
 /// start-up. One entry per qualified field the body reads.
 pub type ResolvedColumnMap = Arc<HashMap<QualifiedField, (JoinSide, u32)>>;
+
+/// One Reshape rule's typechecked CXL programs, built once at lowering and
+/// carried on `PlanNode::Reshape` — mirroring `PlanTransformPayload.typed`
+/// / `Aggregation.typed` / `Route.branch_programs`. The executor rebuilds
+/// the per-run `ProgramEvaluator` for each program at dispatch (the
+/// evaluator is non-`Clone`/non-`Send` and so can never live on the node),
+/// instead of re-parsing and re-typechecking the rule source from raw
+/// config on every dispatch.
+#[derive(Debug, Clone)]
+pub struct CompiledReshapeRule {
+    /// The authored rule name; it is stamped into the `$meta.*` audit columns
+    /// of every row this rule mutates or synthesizes, so it is output data, not
+    /// just a label.
+    pub name: String,
+    /// `filter <when>` — the trigger predicate, typechecked in row context.
+    pub when: Arc<TypedProgram>,
+    /// `mutate.set` field → `emit <field> = <expr>` program, in declaration order.
+    pub set: Vec<(String, Arc<TypedProgram>)>,
+    /// Present iff the rule synthesizes rows.
+    pub synth: Option<CompiledReshapeSynth>,
+}
+
+/// A Reshape rule's typechecked synthesis programs (the on-node companion
+/// of [`CompiledReshapeRule`]).
+#[derive(Debug, Clone)]
+pub struct CompiledReshapeSynth {
+    /// Base-value source for the synthesized row (trigger copy vs. all-null).
+    pub copy_from: crate::config::pipeline_node::CopyFrom,
+    /// `overrides` field → `emit <field> = <expr>` program, in declaration order.
+    pub overrides: Vec<(String, Arc<TypedProgram>)>,
+}
 
 /// Fully-resolved Source payload, populated by the
 /// `PipelineConfig::compile()` lowering path. Wraps the parse-time

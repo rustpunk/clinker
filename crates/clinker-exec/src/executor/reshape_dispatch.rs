@@ -48,7 +48,6 @@ use std::sync::Arc;
 
 use clinker_record::{GroupByKey, Record, Schema, Value};
 use cxl::eval::{EvalContext, EvalResult, ProgramEvaluator};
-use cxl::typecheck::{QualifiedField, Row, Type};
 use petgraph::graph::NodeIndex;
 
 use crate::executor::DlqEntry;
@@ -67,13 +66,19 @@ use clinker_plan::config::pipeline_node::{
 };
 use clinker_plan::config::{SortField, SortOrder};
 use clinker_plan::error::PipelineError;
-use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, single_predecessor};
+use clinker_plan::plan::execution::{
+    CompiledReshapeRule, ExecutionPlanDag, PlanNode, single_predecessor,
+};
 
 use crate::executor::NullStorage;
 
 /// A compiled rule: the trigger predicate plus the per-field mutation and
-/// synthesis assignment evaluators, all built against the live input
-/// schema at dispatch time (the same condition-compile seam Route uses).
+/// synthesis assignment evaluators. The evaluators are rebuilt here per
+/// dispatch (by [`build_rules`]) from the rule's on-node typed programs —
+/// the `ProgramEvaluator` holds per-thread state and is non-`Clone`, so it
+/// cannot live on the node; the typechecking itself happened once at
+/// lowering, mirroring how Route and Aggregation rebuild their evaluators
+/// off-node.
 struct CompiledRule {
     name: String,
     /// `filter <when>` — `Emit` iff the row is a trigger row.
@@ -176,6 +181,7 @@ pub(crate) fn dispatch_reshape(
         ref name,
         ref config,
         ref output_schema,
+        ref compiled_rules,
         ..
     } = *node
     else {
@@ -228,6 +234,7 @@ pub(crate) fn dispatch_reshape(
         name,
         config,
         output_schema,
+        compiled_rules,
         input,
         input_puncts,
         &handle,
@@ -251,15 +258,19 @@ fn run_reshape_grouped(
     name: &str,
     config: &ReshapeBody,
     output_schema: &Arc<Schema>,
+    compiled_rules: &[CompiledReshapeRule],
     input: Vec<(Record, u64)>,
     input_puncts: Vec<crate::executor::stream_event::Punctuation>,
     handle: &Arc<ConsumerHandle>,
 ) -> Result<(), PipelineError> {
-    // Compile every rule's predicate / assignment program against the live
-    // input schema. The schema is uniform across a node_buffer slot, so the
-    // first record's schema drives the typecheck row.
+    // Rebuild the per-dispatch evaluators from the node's compiled rule
+    // programs (typechecked once at lowering). The `ProgramEvaluator` is
+    // non-`Clone` and holds per-thread state, so it is reconstructed here
+    // rather than carried on the node — the same seam Route/Aggregation use.
+    let mut rules = build_rules(compiled_rules);
+    // The schema is uniform across a node_buffer slot, so the first record's
+    // schema drives the spill schema for the raw-record group buffer.
     let input_schema = input[0].0.schema().clone();
-    let mut rules = compile_rules(name, config, &input_schema)?;
 
     // The spill file stores INPUT records, so the spill schema is the input
     // schema. The compression FLAG, however, is resolved against the
@@ -968,127 +979,42 @@ fn eval_scalar(
     }
 }
 
-/// Compile each rule's `when` / `set` / `overrides` CXL against `schema`.
-fn compile_rules(
-    node_name: &str,
-    config: &ReshapeBody,
-    schema: &Arc<clinker_record::Schema>,
-) -> Result<Vec<CompiledRule>, PipelineError> {
-    let type_cols: indexmap::IndexMap<QualifiedField, Type> = schema
-        .columns()
+/// Rebuild the per-dispatch executor rules from the node's compiled rule
+/// programs. Each [`CompiledReshapeRule`] carries the typechecked
+/// `Arc<TypedProgram>`s (built once at lowering); the `ProgramEvaluator`
+/// (non-`Clone`, holds per-thread state) is reconstructed here per dispatch,
+/// mirroring how Route and Aggregation rebuild their evaluators off-node.
+fn build_rules(compiled_rules: &[CompiledReshapeRule]) -> Vec<CompiledRule> {
+    compiled_rules
         .iter()
-        .map(|c| (QualifiedField::bare(c.as_ref()), Type::Any))
-        .collect();
-    let row = Row::closed(type_cols, cxl::lexer::Span::new(0, 0));
-    let field_refs: Vec<&str> = schema.columns().iter().map(|c| c.as_ref()).collect();
-
-    let mut compiled = Vec::with_capacity(config.rules.len());
-    for rule in &config.rules {
-        let when = compile_program(
-            node_name,
-            &rule.name,
-            "when",
-            &format!("filter {}", rule.when.source),
-            &row,
-            &field_refs,
-        )?;
-        let mut set = Vec::new();
-        if let Some(mutate) = &rule.mutate {
-            for (field, value) in &mutate.set {
-                let prog = compile_program(
-                    node_name,
-                    &rule.name,
-                    field,
-                    &format!("emit {field} = {}", value.source),
-                    &row,
-                    &field_refs,
-                )?;
-                set.push((field.clone(), prog));
-            }
-        }
-        let synth = match &rule.synthesize {
-            None => None,
-            Some(s) => {
-                let mut overrides = Vec::new();
-                for (field, value) in &s.overrides {
-                    let prog = compile_program(
-                        node_name,
-                        &rule.name,
-                        field,
-                        &format!("emit {field} = {}", value.source),
-                        &row,
-                        &field_refs,
-                    )?;
-                    overrides.push((field.clone(), prog));
-                }
-                Some(CompiledSynth {
-                    copy_from: s.copy_from,
-                    overrides,
-                })
-            }
-        };
-        compiled.push(CompiledRule {
-            name: rule.name.clone(),
-            when,
-            set,
-            synth,
-        });
-    }
-    Ok(compiled)
-}
-
-/// Parse → resolve → typecheck a single CXL fragment into a
-/// [`ProgramEvaluator`]. Type errors here are a planner invariant violation
-/// (bind_schema already typechecked the same fragment), so they surface as
-/// `PipelineError::Compilation`.
-fn compile_program(
-    node_name: &str,
-    rule_name: &str,
-    field: &str,
-    source: &str,
-    row: &Row,
-    field_refs: &[&str],
-) -> Result<ProgramEvaluator, PipelineError> {
-    let scoped_vars = cxl::resolve::ScopedVarsRegistry::default();
-    let make_err = |messages: Vec<String>| PipelineError::Compilation {
-        transform_name: format!("reshape:{node_name}:{rule_name}:{field}"),
-        messages,
-    };
-
-    let parse_result = cxl::parser::Parser::parse(source);
-    if !parse_result.errors.is_empty() {
-        return Err(make_err(
-            parse_result
-                .errors
+        .map(|r| CompiledRule {
+            name: r.name.clone(),
+            when: ProgramEvaluator::new(Arc::clone(&r.when), false),
+            set: r
+                .set
                 .iter()
-                .map(|e| e.message.clone())
+                .map(|(field, prog)| {
+                    (
+                        field.clone(),
+                        ProgramEvaluator::new(Arc::clone(prog), false),
+                    )
+                })
                 .collect(),
-        ));
-    }
-    let resolved = cxl::resolve::resolve_program_with_modules_and_vars(
-        parse_result.ast,
-        field_refs,
-        parse_result.node_count,
-        &std::collections::HashMap::new(),
-        &scoped_vars,
-    )
-    .map_err(|diags| make_err(diags.into_iter().map(|d| d.message).collect()))?;
-    let typed = cxl::typecheck::pass::type_check_with_mode_and_vars(
-        resolved,
-        row,
-        cxl::typecheck::pass::AggregateMode::Row,
-        &scoped_vars,
-    )
-    .map_err(|diags| {
-        make_err(
-            diags
-                .into_iter()
-                .filter(|d| !d.is_warning)
-                .map(|d| d.message)
-                .collect(),
-        )
-    })?;
-    Ok(ProgramEvaluator::new(Arc::new(typed), false))
+            synth: r.synth.as_ref().map(|s| CompiledSynth {
+                copy_from: s.copy_from,
+                overrides: s
+                    .overrides
+                    .iter()
+                    .map(|(field, prog)| {
+                        (
+                            field.clone(),
+                            ProgramEvaluator::new(Arc::clone(prog), false),
+                        )
+                    })
+                    .collect(),
+            }),
+        })
+        .collect()
 }
 
 /// Extract the `partition_by` key tuple from a record. Mirrors the

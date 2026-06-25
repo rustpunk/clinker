@@ -1495,6 +1495,17 @@ pub const RESHAPE_SYNTHESIZED_BY_COLUMN: &str = "$meta.synthesized_by";
 /// on records no rule mutated.
 pub const RESHAPE_MUTATED_BY_COLUMN: &str = "$meta.mutated_by";
 
+/// Synthetic output column the Cull decision aggregate emits the per-group
+/// removal decision into. The compile-time binder builds the OR-combined
+/// `emit <CULL_DROP_DECISION_COLUMN> = (rule_1) or (rule_2) …` decision
+/// program with this emit target, and the executor reads the boolean back
+/// out of each finalized group row by this name — so the two must agree on
+/// one constant. A reserved `__cull_…__` identifier: the CXL parser rejects
+/// an `emit` to a `$`-namespaced column, so the synthetic emit target must
+/// be a plain identifier; the double-underscore bracketing keeps it out of
+/// any realistic user column space.
+pub const CULL_DROP_DECISION_COLUMN: &str = "__cull_drop_decision__";
+
 /// Reshape variant body. A blocking grouping operator: it buffers each
 /// correlation group (keyed by `partition_by`), observes the whole
 /// group, then applies each rule's mutation and synthesis actions.

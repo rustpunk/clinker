@@ -2,6 +2,7 @@ mod ck_aligned_partition;
 mod ck_lattice;
 mod combine_body_typed_on_node;
 mod combine_where_scoped_key;
+mod cull_reshape_compiled_on_node;
 mod cull_validation;
 mod dag;
 mod dedup_node_rooted;

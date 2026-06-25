@@ -55,7 +55,6 @@ use std::sync::Arc;
 
 use clinker_record::{GroupByKey, Record, Schema, SchemaBuilder, Value};
 use cxl::eval::ProgramEvaluator;
-use cxl::typecheck::{QualifiedField, Row, Type};
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -86,12 +85,11 @@ const CULL_SPILL_PRIORITY: i32 = 15;
 /// cap: beyond it, per-file overhead outweighs further skew reduction.
 const MAX_SKEW_PARTITION_BITS: u32 = 12;
 
-/// Synthetic output column the predicate aggregate emits the per-group
-/// removal decision into. A reserved `__cull_…__` name: the CXL parser
-/// rejects an `emit` to a `$`-namespaced column, so the synthetic emit
-/// target must be a plain identifier; the double-underscore bracketing keeps
-/// it out of any realistic user column space.
-const DROP_DECISION_COLUMN: &str = "__cull_drop_decision__";
+// Synthetic output column the decision aggregate emits the per-group removal
+// decision into. Shared with the compile-time binder, which builds the
+// `emit <col> = (rule_1) or …` decision program with this target — both sides
+// reference the one constant in clinker-plan so they cannot drift.
+use clinker_plan::config::pipeline_node::CULL_DROP_DECISION_COLUMN as DROP_DECISION_COLUMN;
 
 /// Arbitrator-facing wrapper over the Cull group buffer.
 ///
@@ -152,6 +150,8 @@ pub(crate) fn dispatch_cull(
         ref name,
         ref config,
         ref output_schema,
+        ref compiled,
+        ref typed,
         ..
     } = *node
     else {
@@ -204,6 +204,8 @@ pub(crate) fn dispatch_cull(
         name,
         config,
         output_schema,
+        compiled,
+        typed,
         input,
         input_puncts,
         &handle,
@@ -228,21 +230,23 @@ fn run_cull_grouped(
     name: &str,
     config: &CullBody,
     output_schema: &Arc<Schema>,
+    compiled: &Arc<cxl::plan::CompiledAggregate>,
+    typed: &Arc<cxl::typecheck::TypedProgram>,
     input: Vec<(Record, u64)>,
     input_puncts: Vec<crate::executor::stream_event::Punctuation>,
     handle: &Arc<ConsumerHandle>,
 ) -> Result<(), PipelineError> {
     // The schema is uniform across a node_buffer slot, so the first record's
-    // schema drives both the predicate aggregate compile and the spill
-    // schema.
+    // schema drives the spill schema for the raw-record group buffer.
     let input_schema = input[0].0.schema().clone();
 
     // Compute the per-group removal decision by folding every record through
     // an in-memory aggregate over the OR of all rules' `drop_group_when`
-    // predicates (group-by = `partition_by`). The aggregate's per-group
-    // state is O(groups) and is not spilled — only the raw buffered records
-    // (which dominate the footprint) spill, below.
-    let drop_decisions = compute_drop_decisions(ctx, name, config, &input_schema, &input)?;
+    // predicates (group-by = `partition_by`), built once at lowering and
+    // carried on the node. The aggregate's per-group state is O(groups) and
+    // is not spilled — only the raw buffered records (which dominate the
+    // footprint) spill, below.
+    let drop_decisions = compute_drop_decisions(ctx, name, config, compiled, typed, &input)?;
 
     let spill_compress = ctx
         .spill_compress
@@ -332,14 +336,13 @@ fn compute_drop_decisions(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
     config: &CullBody,
-    input_schema: &Arc<Schema>,
+    compiled: &Arc<cxl::plan::CompiledAggregate>,
+    typed: &Arc<cxl::typecheck::TypedProgram>,
     input: &[(Record, u64)],
 ) -> Result<HashMap<Vec<GroupByKey>, bool>, PipelineError> {
     use crate::aggregation::{AggregateStream, AggregatorConfig, SortRow};
 
-    let predicate_src = build_drop_predicate(config);
-    let compiled = compile_drop_aggregate(name, config, &predicate_src, input_schema)?;
-    let evaluator = ProgramEvaluator::new(Arc::clone(&compiled.typed), false);
+    let evaluator = ProgramEvaluator::new(Arc::clone(typed), false);
 
     // Output schema = partition-by columns ++ the boolean decision column.
     // Spill schema is unused (the predicate aggregate runs in-memory: budget
@@ -364,7 +367,7 @@ fn compute_drop_decisions(
     let mut stream = AggregateStream::for_node(
         clinker_plan::plan::types::AggregateStrategy::Hash,
         AggregatorConfig {
-            compiled: Arc::clone(&compiled.compiled),
+            compiled: Arc::clone(compiled),
             evaluator,
             output_schema: Arc::clone(&drop_output_schema),
             spill_schema,
@@ -406,100 +409,6 @@ fn compute_drop_decisions(
         decisions.insert(key, drop);
     }
     Ok(decisions)
-}
-
-/// Compiled predicate aggregate: the deduplicated aggregate plan plus the
-/// typed program the evaluator lowers expression bindings against.
-struct CompiledDropAggregate {
-    compiled: Arc<cxl::plan::CompiledAggregate>,
-    typed: Arc<cxl::typecheck::TypedProgram>,
-}
-
-/// Build the OR-combined removal predicate `emit <decision> = (r1) or (r2) …`.
-/// A group is removed when any rule's `drop_group_when` predicate holds, so
-/// the per-group decision is the disjunction of every rule's predicate.
-fn build_drop_predicate(config: &CullBody) -> String {
-    let disjuncts: Vec<String> = config
-        .rules
-        .iter()
-        .map(|r| format!("({})", r.drop_group_when.source))
-        .collect();
-    // `bind_cull` rejects an empty `rules:` list, so a valid plan always has
-    // at least one disjunct; the empty fallback is defensive only (the
-    // executor compiles the predicate independently of bind-time validation).
-    let body = if disjuncts.is_empty() {
-        "false".to_string()
-    } else {
-        disjuncts.join(" or ")
-    };
-    format!("emit {DROP_DECISION_COLUMN} = {body}")
-}
-
-/// Parse → resolve → typecheck the predicate aggregate program in aggregate
-/// context (group-by = `partition_by`) and extract its aggregate plan.
-///
-/// Type errors here are a planner-invariant violation (`bind_cull` already
-/// typechecked each rule fragment), so they surface as
-/// [`PipelineError::Compilation`].
-fn compile_drop_aggregate(
-    name: &str,
-    config: &CullBody,
-    source: &str,
-    schema: &Arc<Schema>,
-) -> Result<CompiledDropAggregate, PipelineError> {
-    let make_err = |messages: Vec<String>| PipelineError::Compilation {
-        transform_name: format!("cull:{name}:drop_group_when"),
-        messages,
-    };
-
-    let type_cols: indexmap::IndexMap<QualifiedField, Type> = schema
-        .columns()
-        .iter()
-        .map(|c| (QualifiedField::bare(c.as_ref()), Type::Any))
-        .collect();
-    let row = Row::closed(type_cols, cxl::lexer::Span::new(0, 0));
-    let field_refs: Vec<&str> = schema.columns().iter().map(|c| c.as_ref()).collect();
-    let schema_names: Vec<String> = schema.columns().iter().map(|c| c.to_string()).collect();
-    let scoped_vars = cxl::resolve::ScopedVarsRegistry::default();
-
-    let parse_result = cxl::parser::Parser::parse(source);
-    if !parse_result.errors.is_empty() {
-        return Err(make_err(
-            parse_result
-                .errors
-                .iter()
-                .map(|e| e.message.clone())
-                .collect(),
-        ));
-    }
-    let resolved = cxl::resolve::resolve_program_with_modules_and_vars(
-        parse_result.ast,
-        &field_refs,
-        parse_result.node_count,
-        &std::collections::HashMap::new(),
-        &scoped_vars,
-    )
-    .map_err(|diags| make_err(diags.into_iter().map(|d| d.message).collect()))?;
-    let agg_mode = cxl::typecheck::pass::AggregateMode::GroupBy {
-        group_by_fields: config.partition_by.iter().cloned().collect(),
-    };
-    let typed =
-        cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, &row, agg_mode, &scoped_vars)
-            .map_err(|diags| {
-                make_err(
-                    diags
-                        .into_iter()
-                        .filter(|d| !d.is_warning)
-                        .map(|d| d.message)
-                        .collect(),
-                )
-            })?;
-    let compiled = cxl::plan::extract_aggregates(&typed, &config.partition_by, &schema_names)
-        .map_err(|diags| make_err(diags.into_iter().map(|d| d.message).collect()))?;
-    Ok(CompiledDropAggregate {
-        compiled: Arc::new(compiled),
-        typed: Arc::new(typed),
-    })
 }
 
 /// Deliver the kept and removed record sets to their producer-side output
