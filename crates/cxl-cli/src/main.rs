@@ -806,7 +806,7 @@ mod tests {
         let Some(Value::Array(scores)) = profile.get("scores") else {
             panic!("expected nested array to stay Value::Array");
         };
-        assert_eq!(scores.get(0), Some(&Value::Integer(1)));
+        assert_eq!(scores.first(), Some(&Value::Integer(1)));
         let Some(Value::Map(score_obj)) = scores.get(1) else {
             panic!("expected object inside array to become Value::Map");
         };
