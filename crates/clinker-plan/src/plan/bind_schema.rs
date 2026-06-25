@@ -1809,26 +1809,34 @@ fn bind_cull(
         ok = false;
     }
 
-    // Each rule's `drop_group_when` typechecks in aggregate context over the
-    // whole group (group-by = `partition_by`), so an aggregate predicate such
-    // as `count(*) > 100` or `sum(if status == 'error' then 1 else 0) > 0` is
-    // well-formed. Each rule is typechecked on its own first so a diagnostic
-    // names the offending rule; the combined decision program built below is
-    // what the runtime actually evaluates.
-    let agg_mode = AggregateMode::GroupBy {
-        group_by_fields: config.partition_by.iter().cloned().collect(),
-    };
+    // Reject a `#` line-comment in any rule predicate. The rules are
+    // OR-combined into ONE single-line decision expression (`(r1) or (r2)`),
+    // and a CXL `#` comment runs to end-of-line — on that single line it would
+    // swallow every following disjunct and the closing paren. The disjunction
+    // has nowhere else to go (CXL `or` cannot span a newline, and an aggregate
+    // predicate cannot move into a `let` — let RHSs must be row-pure), so the
+    // honest fix is to reject the comment with a rule-named diagnostic rather
+    // than surface a baffling parse error against the synthetic combined
+    // program. A `#…#` date literal lexes as a date token, not a comment, so
+    // it is unaffected.
     for rule in &config.rules {
-        let drop_src = format!("emit __drop = {}", rule.drop_group_when.source);
-        if let Err(d) = typecheck_cxl(
-            &format!("{name}:{}:drop_group_when", rule.name),
-            &drop_src,
-            upstream,
-            agg_mode.clone(),
-            span,
-            scoped_vars,
-        ) {
-            diags.push(d);
+        if cxl::lexer::Lexer::tokenize(&rule.drop_group_when.source)
+            .iter()
+            .any(|(t, _)| *t == cxl::lexer::Token::Comment)
+        {
+            diags.push(
+                Diagnostic::error(
+                    "E200",
+                    format!(
+                        "cull {name:?} rule {:?}: drop_group_when may not contain a `#` comment — \
+                         the rule predicates are combined into a single expression where a line \
+                         comment would swallow the other rules",
+                        rule.name
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                )
+                .with_help("remove the `#` comment from the predicate"),
+            );
             ok = false;
         }
     }
@@ -1837,40 +1845,78 @@ fn bind_cull(
         return;
     }
 
-    // Build the OR-combined decision program the runtime evaluates per group:
-    // a group is removed when ANY rule's predicate holds, so the decision is
-    // the disjunction of every rule's `drop_group_when`. This single program —
-    // emit target `CULL_DROP_DECISION_COLUMN` — is the one carried to the
-    // runtime: lowering runs `extract_aggregates` over it and stamps it onto
-    // `PlanNode::Cull.compiled` / `.typed`. `rules` is non-empty (rejected
-    // above), so there is always at least one disjunct.
-    let decision_body = config
+    // Unlike `bind_reshape`, Cull has no `$doc` envelope-reference guard, and
+    // that asymmetry is intentional: Cull folds the decision aggregate over
+    // the live drained input at the START of dispatch — before any group-buffer
+    // spill — with each record's intact document context, and never
+    // re-evaluates the predicate after a spill. So a `$doc` reference in
+    // `drop_group_when` resolves deterministically. (Reshape needs the guard
+    // because it re-runs its rules at finalize, after a spill that drops `$doc`
+    // context.) If Cull's decision aggregate is ever allowed to spill, mirror
+    // Reshape's guard here.
+
+    // Build the decision program the runtime evaluates per group: a group is
+    // removed when ANY rule's `drop_group_when` holds, so the decision is the
+    // OR of every rule's predicate in one `emit`. The aggregates (`count`,
+    // `sum`, …) sit directly in the emit body, where `extract_aggregates`
+    // folds them at lowering; they cannot move into a `let` (let RHSs must be
+    // row-pure) and `or` cannot span a newline, so the disjunction is a single
+    // line — which is why a `#` comment in any rule is rejected above. Emit
+    // target = `CULL_DROP_DECISION_COLUMN`; lowering runs `extract_aggregates`
+    // over this program and stamps it onto `PlanNode::Cull.compiled`/`.typed`.
+    // `rules` is non-empty (rejected above).
+    let agg_mode = AggregateMode::GroupBy {
+        group_by_fields: config.partition_by.iter().cloned().collect(),
+    };
+    let disjunction = config
         .rules
         .iter()
         .map(|r| format!("({})", r.drop_group_when.source))
         .collect::<Vec<_>>()
         .join(" or ");
     let decision_src = format!(
-        "emit {} = {decision_body}",
+        "emit {} = {disjunction}",
         crate::config::pipeline_node::CULL_DROP_DECISION_COLUMN
     );
+
+    // Typecheck the combined program first — the happy path needs only this
+    // one pass. On failure, re-typecheck each rule on its own (same aggregate
+    // mode, with `or false` forcing a boolean operand) purely to attribute the
+    // diagnostic to the offending rule; fall back to the combined diagnostic
+    // if no single rule reproduces it. Either way, skip lowering (the node is
+    // absent from `cull_decision_typed`).
     match typecheck_cxl(
         &format!("{name}:drop_group_when"),
         &decision_src,
         upstream,
-        agg_mode,
+        agg_mode.clone(),
         span,
         scoped_vars,
     ) {
         Ok(typed) => {
             artifacts.cull_decision_typed.insert(id, Arc::new(typed));
         }
-        // The combined program is the per-rule predicates OR'd together, each
-        // of which typechecked above, so a failure here is an internal
-        // invariant violation rather than a user error. Surface it and skip
-        // lowering (the node will be absent from `cull_decision_typed`).
-        Err(d) => {
-            diags.push(d);
+        Err(combined) => {
+            let mut attributed = false;
+            for rule in &config.rules {
+                if let Err(d) = typecheck_cxl(
+                    &format!("{name}:{}:drop_group_when", rule.name),
+                    &format!(
+                        "emit __cull_pred = ({}) or false",
+                        rule.drop_group_when.source
+                    ),
+                    upstream,
+                    agg_mode.clone(),
+                    span,
+                    scoped_vars,
+                ) {
+                    diags.push(d);
+                    attributed = true;
+                }
+            }
+            if !attributed {
+                diags.push(combined);
+            }
             return;
         }
     }
@@ -1878,6 +1924,14 @@ fn bind_cull(
     // Cull does not widen: both output ports carry the unchanged upstream
     // row. Publish it as the node's output so downstream binding sees the
     // identical schema on the main and `removed_to` ports.
+    //
+    // This synthetic upstream-row program is kept in `typed` (distinct from
+    // the decision program in `cull_decision_typed`) deliberately: lowering's
+    // `schema_from_bound()` reads it to build the node's port `output_schema`
+    // (the unchanged upstream row), whereas the decision program's own
+    // output_row is the narrow `[partition_by, __cull_drop_decision__]` shape
+    // — wrong for the ports. The two `id`-keyed entries serve different
+    // consumers and must stay separate.
     let out = upstream.clone();
     schema_by_name.insert(name.to_string(), out.clone());
     artifacts.typed_insert(id, Arc::new(synthetic_typed_program(out)));

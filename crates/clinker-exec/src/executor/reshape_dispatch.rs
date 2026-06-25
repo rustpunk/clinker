@@ -73,8 +73,12 @@ use clinker_plan::plan::execution::{
 use crate::executor::NullStorage;
 
 /// A compiled rule: the trigger predicate plus the per-field mutation and
-/// synthesis assignment evaluators, all built against the live input
-/// schema at dispatch time (the same condition-compile seam Route uses).
+/// synthesis assignment evaluators. The evaluators are rebuilt here per
+/// dispatch (by [`build_rules`]) from the rule's on-node typed programs —
+/// the `ProgramEvaluator` holds per-thread state and is non-`Clone`, so it
+/// cannot live on the node; the typechecking itself happened once at
+/// lowering, mirroring how Route and Aggregation rebuild their evaluators
+/// off-node.
 struct CompiledRule {
     name: String,
     /// `filter <when>` — `Emit` iff the row is a trigger row.

@@ -106,6 +106,73 @@ nodes:
     );
 }
 
+/// A `#` line-comment in a Cull rule predicate is rejected at compile time
+/// with a clear, rule-named diagnostic. The rules are OR-combined into a
+/// single-line decision expression (aggregate predicates cannot move into
+/// `let`s and CXL `or` cannot span a newline), where a `#` comment would
+/// otherwise swallow the following disjuncts and the closing paren — so the
+/// binder rejects the comment up front instead of emitting a baffling parse
+/// error against the synthetic combined program.
+#[test]
+fn cull_rule_with_line_comment_rejected() {
+    let yaml = r#"
+pipeline:
+  name: cull_comment
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: int }
+        - { name: status, type: string }
+  - type: cull
+    name: cd
+    input: src
+    config:
+      partition_by: [id]
+      removed_to: removed
+      rules:
+        - name: drop_errors
+          drop_group_when: "sum(if status == 'error' then 1 else 0) > 0  # any error in group"
+        - name: drop_big
+          drop_group_when: "sum(amount) > 100"
+  - type: output
+    name: out
+    input: cd
+    config:
+      name: out
+      type: csv
+      path: out.csv
+  - type: output
+    name: audit
+    input: cd.removed
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#;
+    let diags = parse_config(yaml)
+        .expect("parse_config")
+        .compile(&CompileContext::default())
+        .expect_err("compile should reject the `#` comment");
+    // A precise, rule-attributed diagnostic — not a parse error citing the
+    // synthetic combined program.
+    assert!(
+        diags.iter().any(|d| d.code == "E200"
+            && d.message.contains("drop_errors")
+            && d.message.contains("`#` comment")),
+        "expected an E200 naming rule `drop_errors` and the `#` comment, got {:?}",
+        diags
+            .iter()
+            .map(|d| (d.code.clone(), d.message.clone()))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// A Reshape carries one `CompiledReshapeRule` per config rule, each with
 /// its `when` / `set` / `overrides` typed programs populated.
 #[test]

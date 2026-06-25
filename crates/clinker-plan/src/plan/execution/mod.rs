@@ -577,7 +577,9 @@ pub type ResolvedColumnMap = Arc<HashMap<QualifiedField, (JoinSide, u32)>>;
 /// config on every dispatch.
 #[derive(Debug, Clone)]
 pub struct CompiledReshapeRule {
-    /// Rule name, used in dispatch diagnostics and the `$meta.*` audit columns.
+    /// The authored rule name; it is stamped into the `$meta.*` audit columns
+    /// of every row this rule mutates or synthesizes, so it is output data, not
+    /// just a label.
     pub name: String,
     /// `filter <when>` — the trigger predicate, typechecked in row context.
     pub when: Arc<TypedProgram>,
