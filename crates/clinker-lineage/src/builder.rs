@@ -34,15 +34,18 @@
 //! - Engine-stamped columns (`$ck.*` / `$meta.*` / `$source.*` / `$widened`) are
 //!   skipped, mirroring the default-writer strip.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use clinker_plan::plan::combine::encode_chain_column;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
-use clinker_plan::plan::{CompiledPlan, JoinSide, PlanNodeId, QualifiedField};
+use clinker_plan::plan::{
+    CompiledPlan, JoinSide, PlanNodeId, PredicateSupport, QualifiedField, predicate_support,
+};
 use clinker_record::Schema;
 use cxl::ast::{EmitTarget, Expr, Program, Statement, for_each_field_emit, program_support_into};
 use cxl::plan::BindingArg;
@@ -62,12 +65,12 @@ pub struct PlanColumnLineage {
     pub outputs: Vec<OutputColumnLineage>,
 }
 
-/// One sink dataset and the DIRECT column lineage of its columns.
+/// One sink dataset and the column lineage of its columns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputColumnLineage {
     pub dataset: DatasetId,
-    /// `fields` populated with per-column DIRECT lineage; `dataset` (INDIRECT)
-    /// left empty for #662.
+    /// `facet.fields` carries per-column DIRECT (value-derivation) lineage;
+    /// `facet.dataset` carries the whole-dataset INDIRECT influence lineage.
     pub facet: ColumnLineageDatasetFacet,
 }
 
@@ -80,9 +83,12 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
     let dag = compiled.dag();
     // Per node, per output column, the resolved Source terminals it derives from.
     let mut lineage: HashMap<PlanNodeId, ColumnTerminals> = HashMap::new();
+    // Per node, the whole-dataset INDIRECT influences accumulated from this node
+    // and every upstream — flushed into each Output's facet `dataset[]`.
+    let mut influence: HashMap<PlanNodeId, InfluenceMap> = HashMap::new();
     let mut inputs: Vec<DatasetId> = Vec::new();
     let mut seen_inputs: HashSet<DatasetId> = HashSet::new();
-    let mut outputs: Vec<OutputColumnLineage> = Vec::new();
+    let mut output_acc: Vec<OutputAcc> = Vec::new();
 
     for &idx in &dag.topo_order {
         let node = &dag.graph[idx];
@@ -202,23 +208,11 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
                 decomposed_from,
                 ..
             } => {
-                let map: &HashMap<QualifiedField, (JoinSide, u32)> = resolved_column_map;
-                let bare = bare_side_index(map);
-                let probe_idx = *driving_upstream;
-                // The build side is the incoming neighbor that is not the probe.
-                // For a self-join (`input: {a: src, b: src}`) both sides are the same
-                // physical predecessor, so fall back to the probe node — the side
-                // distinction is logical (via `resolved_column_map`'s `JoinSide`), not
-                // a distinct node.
-                let build_idx = dag
-                    .graph
-                    .neighbors_directed(idx, Direction::Incoming)
-                    .find(|n| Some(*n) != probe_idx)
-                    .or(probe_idx);
-                let probe =
-                    probe_idx.map(|n| (dag.graph[n].id(), dag.graph[n].output_schema_in(dag)));
-                let build =
-                    build_idx.map(|n| (dag.graph[n].id(), dag.graph[n].output_schema_in(dag)));
+                let sides = combine_sides(dag, idx, resolved_column_map, *driving_upstream);
+                let map = sides.map;
+                let probe = sides.probe;
+                let build = sides.build;
+                let bare = sides.bare;
 
                 let mut cols = ColumnTerminals::new();
                 match typed {
@@ -356,9 +350,6 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
                 for_each_output_col(node, dag, |col| {
                     cols.insert_nonempty(col, passthrough(&lineage, up, col));
                 });
-                if let Some(ds) = dataset_identity(node, base_dir) {
-                    record_output(&mut outputs, ds, &cols);
-                }
                 cols
             }
 
@@ -378,9 +369,19 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
             }
         };
 
+        let node_influence = node_indirect_influence(node, dag, idx, &lineage, &influence);
+
+        if let PlanNode::Output { .. } = node
+            && let Some(ds) = dataset_identity(node, base_dir)
+        {
+            record_output(&mut output_acc, ds, &cols, &node_influence);
+        }
+
         lineage.insert(node_id, cols);
+        influence.insert(node_id, node_influence);
     }
 
+    let outputs = output_acc.into_iter().map(OutputAcc::into_output).collect();
     PlanColumnLineage { inputs, outputs }
 }
 
@@ -405,6 +406,35 @@ impl Subtype {
         }
     }
 }
+
+/// INDIRECT influence subtype: how a column influences the dataset as a whole
+/// (filtering, joining, grouping, sorting, conditionally reshaping) without its
+/// value flowing into a specific output column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum IndirectSub {
+    Filter,
+    Join,
+    GroupBy,
+    Sort,
+    Conditional,
+}
+
+impl IndirectSub {
+    fn to_openlineage(self) -> TransformationSubtype {
+        match self {
+            IndirectSub::Filter => TransformationSubtype::Filter,
+            IndirectSub::Join => TransformationSubtype::Join,
+            IndirectSub::GroupBy => TransformationSubtype::GroupBy,
+            IndirectSub::Sort => TransformationSubtype::Sort,
+            IndirectSub::Conditional => TransformationSubtype::Conditional,
+        }
+    }
+}
+
+/// The INDIRECT influences accumulated for a node: each Source terminal mapped
+/// to the set of influence subtypes through which it reaches the dataset. The
+/// `BTreeMap`/`BTreeSet` keep the emitted `dataset[]` order deterministic.
+type InfluenceMap = BTreeMap<Terminal, BTreeSet<IndirectSub>>;
 
 /// One Source dataset column: the terminal of a DIRECT lineage path.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -907,46 +937,284 @@ fn resolve_side(
     }
 }
 
+/// The probe / build side resolution context of a Combine node: the pre-resolved
+/// `(side, index)` map, the unambiguous-bare-name index, and each side's upstream
+/// `(id, schema)`. Shared by the DIRECT body resolution and the INDIRECT
+/// JOIN-influence resolution.
+struct CombineSides<'a> {
+    map: &'a HashMap<QualifiedField, (JoinSide, u32)>,
+    bare: HashMap<String, (JoinSide, u32)>,
+    probe: Option<(PlanNodeId, &'a Arc<Schema>)>,
+    build: Option<(PlanNodeId, &'a Arc<Schema>)>,
+}
+
+/// Resolve a Combine's probe / build sides. The build side is the incoming
+/// neighbor that is not the probe; for a self-join (`input: {a: src, b: src}`)
+/// both sides are the same physical predecessor, so it falls back to the probe
+/// node — the side distinction is logical (`resolved_column_map`'s `JoinSide`),
+/// not a distinct node.
+fn combine_sides<'a>(
+    dag: &'a ExecutionPlanDag,
+    idx: NodeIndex,
+    resolved_column_map: &'a HashMap<QualifiedField, (JoinSide, u32)>,
+    driving_upstream: Option<NodeIndex>,
+) -> CombineSides<'a> {
+    let probe_idx = driving_upstream;
+    let build_idx = dag
+        .graph
+        .neighbors_directed(idx, Direction::Incoming)
+        .find(|n| Some(*n) != probe_idx)
+        .or(probe_idx);
+    CombineSides {
+        map: resolved_column_map,
+        bare: bare_side_index(resolved_column_map),
+        probe: probe_idx.map(|n| (dag.graph[n].id(), dag.graph[n].output_schema_in(dag))),
+        build: build_idx.map(|n| (dag.graph[n].id(), dag.graph[n].output_schema_in(dag))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INDIRECT influence
+// ---------------------------------------------------------------------------
+
+/// The whole-dataset INDIRECT influences of `node`: every upstream node's
+/// accumulated influence (flowed through unchanged) plus the columns this node
+/// filters / joins / groups / sorts / conditionally reshapes on, each resolved
+/// to its Source terminals via the upstream DIRECT `lineage`.
+fn node_indirect_influence(
+    node: &PlanNode,
+    dag: &ExecutionPlanDag,
+    idx: NodeIndex,
+    lineage: &HashMap<PlanNodeId, ColumnTerminals>,
+    influence: &HashMap<PlanNodeId, InfluenceMap>,
+) -> InfluenceMap {
+    let mut inf = InfluenceMap::new();
+
+    // Inherited: a filter / join / group anywhere upstream taints every
+    // downstream dataset, so each upstream's influence flows through unchanged.
+    for up in upstream_ids(dag, idx) {
+        if let Some(up_inf) = influence.get(&up) {
+            for (terminal, subs) in up_inf {
+                inf.entry(terminal.clone())
+                    .or_default()
+                    .extend(subs.iter().copied());
+            }
+        }
+    }
+
+    // Local: this node's own influence predicate columns.
+    match node {
+        PlanNode::Route { .. } => {
+            if let Some(PredicateSupport::RouteBranches(branches)) = predicate_support(node) {
+                let up = single_upstream(dag, idx);
+                for cols in &branches {
+                    for col in cols {
+                        add_upstream_influence(
+                            &mut inf,
+                            upstream_col(lineage, up, col),
+                            IndirectSub::Filter,
+                        );
+                    }
+                }
+            }
+        }
+        PlanNode::Cull { .. } => {
+            if let Some(PredicateSupport::CullDrop(cols)) = predicate_support(node) {
+                let up = single_upstream(dag, idx);
+                for col in &cols {
+                    add_upstream_influence(
+                        &mut inf,
+                        upstream_col(lineage, up, col),
+                        IndirectSub::Filter,
+                    );
+                }
+            }
+        }
+        PlanNode::Aggregation { compiled, .. } => {
+            let up = single_upstream(dag, idx);
+            for col in &compiled.group_by_fields {
+                add_upstream_influence(
+                    &mut inf,
+                    upstream_col(lineage, up, col),
+                    IndirectSub::GroupBy,
+                );
+            }
+        }
+        PlanNode::Sort { sort_fields, .. } => {
+            let up = single_upstream(dag, idx);
+            for sf in sort_fields {
+                add_upstream_influence(
+                    &mut inf,
+                    upstream_col(lineage, up, &sf.field),
+                    IndirectSub::Sort,
+                );
+            }
+        }
+        PlanNode::Reshape { compiled_rules, .. } => {
+            let up = single_upstream(dag, idx);
+            for rule in compiled_rules.iter() {
+                let mut reads = HashSet::new();
+                program_support_into(&rule.when.program, &mut reads);
+                for col in &reads {
+                    add_upstream_influence(
+                        &mut inf,
+                        upstream_col(lineage, up, col),
+                        IndirectSub::Conditional,
+                    );
+                }
+            }
+        }
+        PlanNode::Combine {
+            resolved_column_map,
+            driving_upstream,
+            decomposed_predicate: Some(dp),
+            ..
+        } => {
+            let sides = combine_sides(dag, idx, resolved_column_map, *driving_upstream);
+            let mut refs = Vec::new();
+            for eq in &dp.equalities {
+                collect_field_refs(&eq.left_expr, &mut refs);
+                collect_field_refs(&eq.right_expr, &mut refs);
+            }
+            for range in &dp.ranges {
+                collect_field_refs(&range.left_expr, &mut refs);
+                collect_field_refs(&range.right_expr, &mut refs);
+            }
+            for qf in &refs {
+                let Some((side, cidx)) = resolve_side(qf, sides.map, &sides.bare) else {
+                    continue;
+                };
+                let resolved = match side {
+                    JoinSide::Probe => sides.probe.as_ref(),
+                    JoinSide::Build => sides.build.as_ref(),
+                };
+                if let Some((up_id, schema)) = resolved
+                    && let Some(col) = schema.column_name(cidx as usize)
+                {
+                    add_upstream_influence(
+                        &mut inf,
+                        lineage.get(up_id).and_then(|m| m.0.get(col)),
+                        IndirectSub::Join,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+
+    inf
+}
+
+/// Add every Source terminal in `up_terms` to `inf` as an INDIRECT influence of
+/// subtype `sub` (the DIRECT subtype of the upstream path is irrelevant — only
+/// the source column identity matters for whole-dataset influence).
+fn add_upstream_influence(inf: &mut InfluenceMap, up_terms: Option<&TermMap>, sub: IndirectSub) {
+    if let Some(terms) = up_terms {
+        for terminal in terms.keys() {
+            inf.entry(terminal.clone()).or_default().insert(sub);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Output facet assembly
 // ---------------------------------------------------------------------------
 
-/// Append (or merge into) the output dataset's column-lineage facet.
+/// Accumulator for one sink dataset: its per-column DIRECT terminals and
+/// whole-dataset INDIRECT influences, merged across every Output node that
+/// resolves to the same dataset.
+struct OutputAcc {
+    dataset: DatasetId,
+    fields: BTreeMap<String, TermMap>,
+    influence: InfluenceMap,
+}
+
+impl OutputAcc {
+    fn into_output(self) -> OutputColumnLineage {
+        let fields = self
+            .fields
+            .iter()
+            .filter(|(_, terms)| !terms.is_empty())
+            .map(|(col, terms)| {
+                (
+                    col.clone(),
+                    FieldLineage {
+                        input_fields: input_fields(terms),
+                    },
+                )
+            })
+            .collect();
+        OutputColumnLineage {
+            dataset: self.dataset,
+            facet: ColumnLineageDatasetFacet {
+                producer: PRODUCER.to_string(),
+                schema_url: COLUMN_LINEAGE_FACET_SCHEMA_URL.to_string(),
+                fields,
+                dataset: indirect_input_fields(&self.influence),
+            },
+        }
+    }
+}
+
+/// Accumulate one Output node's DIRECT columns and INDIRECT influences into the
+/// sink dataset's entry, unioning with any prior Output node naming it.
 fn record_output(
-    outputs: &mut Vec<OutputColumnLineage>,
+    acc: &mut Vec<OutputAcc>,
     dataset: DatasetId,
     cols: &ColumnTerminals,
+    influence: &InfluenceMap,
 ) {
-    let fields: BTreeMap<String, FieldLineage> = cols
-        .0
-        .iter()
-        .filter(|(_, terms)| !terms.is_empty())
-        .map(|(col, terms)| {
-            (
-                col.clone(),
-                FieldLineage {
-                    input_fields: input_fields(terms),
-                },
-            )
-        })
-        .collect();
-
-    if let Some(existing) = outputs.iter_mut().find(|o| o.dataset == dataset) {
-        // Two Output nodes naming one dataset: merge their column maps.
-        for (col, fl) in fields {
-            existing.facet.fields.entry(col).or_insert(fl);
+    if let Some(existing) = acc.iter_mut().find(|o| o.dataset == dataset) {
+        for (col, terms) in &cols.0 {
+            if terms.is_empty() {
+                continue;
+            }
+            let slot = existing.fields.entry(col.clone()).or_default();
+            merge_terminals(slot, Some(terms), Subtype::Identity);
+        }
+        for (terminal, subs) in influence {
+            existing
+                .influence
+                .entry(terminal.clone())
+                .or_default()
+                .extend(subs.iter().copied());
         }
         return;
     }
-    outputs.push(OutputColumnLineage {
+    let fields = cols
+        .0
+        .iter()
+        .filter(|(_, terms)| !terms.is_empty())
+        .map(|(col, terms)| (col.clone(), terms.clone()))
+        .collect();
+    acc.push(OutputAcc {
         dataset,
-        facet: ColumnLineageDatasetFacet {
-            producer: PRODUCER.to_string(),
-            schema_url: COLUMN_LINEAGE_FACET_SCHEMA_URL.to_string(),
-            fields,
-            dataset: Vec::new(),
-        },
+        fields,
+        influence: influence.clone(),
     });
+}
+
+/// An [`InfluenceMap`] → the facet's whole-dataset INDIRECT `dataset[]`: one
+/// `InputField` per Source terminal, carrying one INDIRECT transformation per
+/// influence subtype.
+fn indirect_input_fields(influence: &InfluenceMap) -> Vec<InputField> {
+    influence
+        .iter()
+        .map(|(terminal, subs)| InputField {
+            namespace: terminal.namespace.clone(),
+            name: terminal.name.clone(),
+            field: terminal.field.clone(),
+            transformations: subs
+                .iter()
+                .map(|sub| Transformation {
+                    transformation_type: TransformationType::Indirect,
+                    subtype: Some(sub.to_openlineage()),
+                    description: None,
+                    masking: None,
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// One terminal set → its OpenLineage `inputFields`, in `BTreeMap` (namespace,
@@ -1019,6 +1287,36 @@ mod tests {
             .get(col)
             .unwrap_or_else(|| panic!("column {col:?} missing from lineage"));
         assert_eq!(actual.input_fields, expected, "lineage for column {col:?}");
+    }
+
+    /// One INDIRECT `file:`-namespaced input field carrying the given subtypes.
+    fn indirect(name: &str, field: &str, subtypes: &[TransformationSubtype]) -> InputField {
+        InputField {
+            namespace: "file".to_string(),
+            name: name.to_string(),
+            field: field.to_string(),
+            transformations: subtypes
+                .iter()
+                .map(|s| Transformation {
+                    transformation_type: TransformationType::Indirect,
+                    subtype: Some(*s),
+                    description: None,
+                    masking: None,
+                })
+                .collect(),
+        }
+    }
+
+    /// The output dataset whose name contains `substr` (for multi-output plans).
+    fn output_named<'a>(
+        lineage: &'a PlanColumnLineage,
+        substr: &str,
+    ) -> &'a OutputColumnLineage {
+        lineage
+            .outputs
+            .iter()
+            .find(|o| o.dataset.name.contains(substr))
+            .unwrap_or_else(|| panic!("no output dataset containing {substr:?}"))
     }
 
     // -- subtype composition --------------------------------------------------
@@ -1167,6 +1465,360 @@ nodes:
                 "raw",
                 TransformationSubtype::Identity,
             )],
+        );
+    }
+
+    // -- INDIRECT influence (#662) --------------------------------------------
+
+    #[test]
+    fn route_predicate_columns_are_filter_influence_not_per_column() {
+        // A Route condition column influences every output port as FILTER, landing
+        // in the top-level `dataset[]` — not duplicated into per-column lineage.
+        let yaml = r#"
+pipeline: { name: r }
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: data/s.csv
+      options: { has_header: true }
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: int }
+  - type: route
+    name: split
+    input: s
+    config:
+      mode: exclusive
+      conditions: { high: "amount > 100" }
+      default: low
+  - type: output
+    name: hi
+    input: split.high
+    config: { name: hi, type: csv, path: out/hi.csv }
+  - type: output
+    name: lo
+    input: split.low
+    config: { name: lo, type: csv, path: out/lo.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let src = "/w/data/s.csv";
+        let hi = output_named(&lineage, "hi.csv");
+        use TransformationSubtype::{Filter, Identity};
+        assert_eq!(
+            hi.facet.dataset,
+            vec![indirect(src, "amount", &[Filter])],
+            "route condition column is FILTER influence"
+        );
+        // The influence is NOT duplicated into the per-column DIRECT lineage:
+        // `amount` still passes through as a plain DIRECT identity column.
+        assert_field(&hi.facet.fields, "amount", &[direct(src, "amount", Identity)]);
+        for fl in hi.facet.fields.values() {
+            assert!(
+                fl.input_fields
+                    .iter()
+                    .flat_map(|f| &f.transformations)
+                    .all(|t| t.transformation_type == TransformationType::Direct),
+                "per-column lineage must stay DIRECT-only"
+            );
+        }
+    }
+
+    #[test]
+    fn cull_drop_predicate_columns_are_filter_influence() {
+        let yaml = r#"
+pipeline: { name: c }
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: data/s.csv
+      options: { has_header: true }
+      schema:
+        - { name: employee_id, type: string }
+        - { name: amount, type: int }
+  - type: cull
+    name: trim
+    input: s
+    config:
+      partition_by: [employee_id]
+      removed_to: removed
+      rules:
+        - name: drop_big
+          drop_group_when: "sum(amount) > 100"
+  - type: output
+    name: out
+    input: trim
+    config: { name: out, type: csv, path: out/c.csv }
+  - type: output
+    name: audit
+    input: trim.removed
+    config: { name: audit, type: csv, path: out/audit.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let src = "/w/data/s.csv";
+        let out = output_named(&lineage, "c.csv");
+        assert_eq!(
+            out.facet.dataset,
+            vec![indirect(src, "amount", &[TransformationSubtype::Filter])],
+        );
+    }
+
+    #[test]
+    fn aggregation_group_by_columns_are_group_by_influence() {
+        let yaml = r#"
+pipeline: { name: a }
+nodes:
+  - type: source
+    name: sales
+    config:
+      name: sales
+      type: csv
+      path: data/sales.csv
+      options: { has_header: true }
+      schema:
+        - { name: region, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: agg
+    input: sales
+    config:
+      group_by: [region]
+      cxl: |
+        emit region = region
+        emit total = sum(amount)
+  - type: output
+    name: out
+    input: agg
+    config: { name: out, type: csv, path: out/a.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        assert_eq!(
+            only_output(&lineage).facet.dataset,
+            vec![indirect(
+                "/w/data/sales.csv",
+                "region",
+                &[TransformationSubtype::GroupBy]
+            )],
+        );
+    }
+
+    #[test]
+    fn combine_join_keys_are_join_influence() {
+        let yaml = r#"
+pipeline: { name: c }
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: data/orders.csv
+      options: { has_header: true }
+      schema:
+        - { name: order_id, type: string }
+        - { name: amount, type: float }
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: data/events.csv
+      options: { has_header: true }
+      schema:
+        - { name: order_id, type: string }
+        - { name: actor, type: string }
+  - type: combine
+    name: joined
+    input:
+      orders: orders
+      events: events
+    config:
+      where: "orders.order_id == events.order_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit actor = events.actor
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: joined
+    config: { name: out, type: csv, path: out/c.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        use TransformationSubtype::Join;
+        assert_eq!(
+            only_output(&lineage).facet.dataset,
+            vec![
+                indirect("/w/data/events.csv", "order_id", &[Join]),
+                indirect("/w/data/orders.csv", "order_id", &[Join]),
+            ],
+        );
+    }
+
+    #[test]
+    fn reshape_when_guard_columns_are_conditional_influence() {
+        let yaml = r#"
+pipeline: { name: r }
+nodes:
+  - type: source
+    name: plans
+    config:
+      name: plans
+      type: csv
+      path: data/plans.csv
+      options: { has_header: true }
+      schema:
+        - { name: employee_id, type: string }
+        - { name: plan_start, type: int }
+        - { name: plan_end, type: int }
+  - type: reshape
+    name: backfill
+    input: plans
+    config:
+      partition_by: [employee_id]
+      order_by:
+        - { field: plan_start, order: asc }
+      rules:
+        - name: split
+          when: "plan_start - plan_end > 365"
+          mutate:
+            set:
+              plan_end: "plan_start"
+  - type: output
+    name: out
+    input: backfill
+    config: { name: out, type: csv, path: out/r.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let src = "/w/data/plans.csv";
+        use TransformationSubtype::Conditional;
+        // Sorted by (namespace, name, field): plan_end before plan_start.
+        assert_eq!(
+            only_output(&lineage).facet.dataset,
+            vec![
+                indirect(src, "plan_end", &[Conditional]),
+                indirect(src, "plan_start", &[Conditional]),
+            ],
+        );
+    }
+
+    #[test]
+    fn correlation_sort_key_is_sort_influence() {
+        // `PlanNode::Sort` is engine-synthesized only: a source `correlation_key`
+        // makes the enforcer inject a `__correlation_sort_<src>` Sort whose sort
+        // keys are the (real) correlation columns.
+        let yaml = r#"
+pipeline: { name: cs }
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: data/orders.csv
+      options: { has_header: true }
+      correlation_key: [region]
+      schema:
+        - { name: region, type: string }
+        - { name: order_id, type: string }
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: data/events.csv
+      options: { has_header: true }
+      correlation_key: [region]
+      schema:
+        - { name: region, type: string }
+        - { name: order_id, type: string }
+  - type: combine
+    name: joined
+    input: { orders: orders, events: events }
+    config:
+      where: "orders.order_id == events.order_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit oid = orders.order_id
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: joined
+    config: { name: out, type: csv, path: out/cs.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        use TransformationSubtype::{Join, Sort};
+        assert_eq!(
+            only_output(&lineage).facet.dataset,
+            vec![
+                indirect("/w/data/events.csv", "order_id", &[Join]),
+                indirect("/w/data/events.csv", "region", &[Sort]),
+                indirect("/w/data/orders.csv", "order_id", &[Join]),
+                indirect("/w/data/orders.csv", "region", &[Sort]),
+            ],
+        );
+    }
+
+    #[test]
+    fn indirect_influence_accumulates_downstream() {
+        // A filter (Cull) upstream of a group-by (Aggregation) — both influences
+        // reach the final output's `dataset[]`.
+        let yaml = r#"
+pipeline: { name: acc }
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: data/s.csv
+      options: { has_header: true }
+      schema:
+        - { name: region, type: string }
+        - { name: amount, type: int }
+  - type: cull
+    name: trim
+    input: s
+    config:
+      partition_by: [region]
+      removed_to: removed
+      rules:
+        - name: drop_big
+          drop_group_when: "sum(amount) > 1000"
+  - type: aggregate
+    name: agg
+    input: trim
+    config:
+      group_by: [region]
+      cxl: |
+        emit region = region
+        emit total = sum(amount)
+  - type: output
+    name: out
+    input: agg
+    config: { name: out, type: csv, path: out/acc.csv }
+  - type: output
+    name: audit
+    input: trim.removed
+    config: { name: audit, type: csv, path: out/audit.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let src = "/w/data/s.csv";
+        use TransformationSubtype::{Filter, GroupBy};
+        // amount (cull filter) and region (group-by) both accumulate at the sink.
+        assert_eq!(
+            output_named(&lineage, "acc.csv").facet.dataset,
+            vec![
+                indirect(src, "amount", &[Filter]),
+                indirect(src, "region", &[GroupBy]),
+            ],
         );
     }
 
@@ -1571,6 +2223,19 @@ nodes:
             fields,
             "category_name",
             &[direct("/w/data/categories.csv", "category_name", Identity)],
+        );
+
+        // JOIN influence accumulates across both decomposed steps, each join key
+        // resolved to its true source (not the intermediate encoded column).
+        use TransformationSubtype::Join;
+        assert_eq!(
+            only_output(&lineage).facet.dataset,
+            vec![
+                indirect("/w/data/categories.csv", "category_id", &[Join]),
+                indirect("/w/data/orders.csv", "product_id", &[Join]),
+                indirect("/w/data/products.csv", "category_id", &[Join]),
+                indirect("/w/data/products.csv", "product_id", &[Join]),
+            ],
         );
     }
 
