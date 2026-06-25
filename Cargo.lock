@@ -519,6 +519,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "clinker-lineage"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "clinker-net"
 version = "0.1.0"
 dependencies = [

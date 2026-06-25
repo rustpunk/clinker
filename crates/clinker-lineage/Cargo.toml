@@ -1,0 +1,10 @@
+[package]
+name = "clinker-lineage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenLineage column-level lineage emission from compiled Clinker plans"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

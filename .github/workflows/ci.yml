@@ -85,11 +85,11 @@ jobs:
       - run: >-
           cargo check --all-targets --target x86_64-pc-windows-msvc
           -p clinker-exec -p clinker-plan -p clinker-schema
-          -p clinker-channel -p cxl-cli
+          -p clinker-channel -p cxl-cli -p clinker-lineage
       - run: >-
           cargo check --all-targets --target aarch64-apple-darwin
           -p clinker-exec -p clinker-plan -p clinker-schema
-          -p clinker-channel -p cxl-cli
+          -p clinker-channel -p cxl-cli -p clinker-lineage
 
   deny:
     runs-on: ubuntu-latest
