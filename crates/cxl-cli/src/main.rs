@@ -287,12 +287,12 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
         static_vars: std::sync::Arc::new(indexmap::IndexMap::new()),
     };
     let source_file_arc: std::sync::Arc<str> = std::sync::Arc::from(source_name);
-    // REPL has no Source-node context, but `$source.name` is a stable
+    // CLI eval has no Source-node context, but `$source.name` is a stable
     // per-record namespace; surface the parameter as the originating
     // name so `emit n = $source.name` echoes back the same string the
     // caller passed in.
     let source_name_arc: std::sync::Arc<str> = std::sync::Arc::from(source_name);
-    // REPL has no real batch context — use the same placeholder as the
+    // CLI eval has no real batch context — use the same placeholder as the
     // stable execution_id so `$source.batch` is at least non-empty.
     let source_batch_arc: std::sync::Arc<str> = std::sync::Arc::clone(&stable.pipeline_batch_id);
     let ctx = EvalContext {
@@ -309,7 +309,7 @@ fn cmd_eval(file: Option<&str>, expr: Option<&str>, record_json: Option<&str>, f
 
     let resolver = HashMapResolver::new(record_map);
 
-    // The REPL drives the same statement-level evaluator the engine uses
+    // CLI eval drives the same statement-level evaluator the engine uses
     // per record, so `filter`, `distinct`, and `emit each` behave exactly
     // as they would inside a Transform node rather than being silently
     // ignored. `distinct` needs the dedup set allocated up front.
@@ -515,7 +515,13 @@ fn json_to_value(v: serde_json::Value) -> Value {
         }
         serde_json::Value::String(s) => Value::String(s.into()),
         serde_json::Value::Array(arr) => Value::Array(arr.into_iter().map(json_to_value).collect()),
-        serde_json::Value::Object(_) => Value::Null, // Nested objects not supported in v1
+        serde_json::Value::Object(map) => {
+            let mut out = indexmap::IndexMap::with_capacity(map.len());
+            for (key, value) in map {
+                out.insert(key.into_boxed_str(), json_to_value(value));
+            }
+            Value::Map(Box::new(out))
+        }
     }
 }
 
@@ -777,6 +783,34 @@ mod tests {
             parse_field_value("hello world"),
             Value::String("hello world".into())
         );
+    }
+
+    #[test]
+    fn test_json_to_value_preserves_nested_objects() {
+        let value = json_to_value(serde_json::json!({
+            "profile": {
+                "name": "Alice",
+                "active": true,
+                "scores": [1, {"kind": "bonus"}]
+            }
+        }));
+
+        let Value::Map(root) = value else {
+            panic!("expected root JSON object to become Value::Map");
+        };
+        let Some(Value::Map(profile)) = root.get("profile") else {
+            panic!("expected nested object to become Value::Map");
+        };
+        assert_eq!(profile.get("name"), Some(&Value::String("Alice".into())));
+        assert_eq!(profile.get("active"), Some(&Value::Bool(true)));
+        let Some(Value::Array(scores)) = profile.get("scores") else {
+            panic!("expected nested array to stay Value::Array");
+        };
+        assert_eq!(scores.get(0), Some(&Value::Integer(1)));
+        let Some(Value::Map(score_obj)) = scores.get(1) else {
+            panic!("expected object inside array to become Value::Map");
+        };
+        assert_eq!(score_obj.get("kind"), Some(&Value::String("bonus".into())));
     }
 
     // Note: cmd_check/cmd_eval/cmd_fmt call process::exit() and cannot be tested

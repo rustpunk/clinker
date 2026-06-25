@@ -1,6 +1,6 @@
 # CLI Reference
 
-Clinker ships two command-line tools: `clinker` (the pipeline runner) and `cxl` (the expression REPL, covered in the [CXL CLI chapter](../cxl/cxl-cli.md)). This page is the complete reference for `clinker`.
+Clinker ships two command-line tools: `clinker` (the pipeline runner) and `cxl` (the expression checker/evaluator/formatter, covered in the [CXL CLI chapter](../cxl/cxl-cli.md)). This page is the complete reference for `clinker`.
 
 ## clinker run
 

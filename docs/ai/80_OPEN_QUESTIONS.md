@@ -105,10 +105,11 @@ evidence.
 - Question: Should `extract_schema_refs`, include/exclude glob behavior, format
   matching, and CXL field validation become YAML/parser-backed, or is the
   current heuristic authoring support enough?
-- Why it matters: Current guidance says `exclude_globs` is not applied,
-  `schema:` extraction is line-oriented, CXL field extraction is heuristic, and
-  some warning variants appear unused. Docs and tests should not imply full
-  workspace validation unless that is implemented.
+- Why it matters: Current guidance says include/exclude glob behavior is
+  simple filename wildcard matching, `schema:` extraction is line-oriented,
+  CXL field extraction is heuristic, and some warning variants appear unused.
+  Docs and tests should not imply full workspace validation unless that is
+  implemented.
 - Files/modules involved: `crates/clinker-schema/AGENTS.md`,
   `crates/clinker-schema/src/discovery.rs`,
   `crates/clinker-schema/src/validate.rs`,
@@ -228,36 +229,25 @@ evidence.
   if intentionally reserved.
 - Priority: Medium
 
-### 12. Should `cxl-cli` docs, manifest description, and CLI behavior be aligned?
+### 12. Should `cxl-cli` docs, manifest description, and CLI behavior be aligned? (RESOLVED)
 
-- Question: Are user docs showing multiple `-e` flags correct, or should the
-  docs be corrected to match `Command::Eval.expr: Option<String>`? Should the
-  `cxl-cli` manifest description continue saying "REPL" when source currently
-  exposes only `check`, `eval`, and `fmt` subcommands?
-- Why it matters: Repeated expression examples and REPL wording can mislead
-  users and future tests. If repeated `-e` or REPL behavior is intended, the CLI
-  type and evaluation/output semantics need to change deliberately.
+- Resolution: `Command::Eval.expr` remains a single `Option<String>`.
+  User docs now show multiple CXL statements inside one `-e` value, and the
+  `cxl-cli` package description says validator/evaluator/formatter.
 - Files/modules involved: `crates/cxl-cli/AGENTS.md`,
   `crates/cxl-cli/Cargo.toml`, `crates/cxl-cli/src/main.rs`,
   `docs/user/src/cxl/cxl-cli.md`, `docs/ai/20_CRATE_MAP.md`.
-- Suggested way to resolve it: Decide the intended CLI behavior. Either update
-  docs/manifest wording to one expression and no REPL, or change the Clap field
-  and CLI implementation to support the promised behavior with tests.
-- Priority: Medium
+- Priority: Resolved
 
-### 13. Should `cxl-cli --record` preserve nested JSON objects as `Value::Map`?
+### 13. Should `cxl-cli --record` preserve nested JSON objects as `Value::Map`? (RESOLVED)
 
-- Question: Is mapping nested JSON objects to `Value::Null` in `json_to_value`
-  intentional v1 scope, or should objects become `Value::Map`?
-- Why it matters: `clinker-record::Value` has a `Map` variant, and silently
-  nulling objects affects evaluation results. Docs need to state the behavior
-  if it remains intentional.
+- Resolution: `json_to_value` now recursively maps JSON objects to
+  `Value::Map`; the CXL CLI docs list `{object}` as `Map`, and unit coverage
+  pins nested objects inside maps and arrays.
 - Files/modules involved: `crates/cxl-cli/AGENTS.md`,
   `crates/cxl-cli/src/main.rs`, `crates/clinker-record/src/value.rs`,
   `docs/user/src/cxl/cxl-cli.md`.
-- Suggested way to resolve it: Confirm the intended object mapping. Add unit
-  tests for nested objects and update CXL CLI docs to match the chosen behavior.
-- Priority: Medium
+- Priority: Resolved
 
 ### 14. Should `PipelineCounters::ok_count` use a globally unique source-row identity?
 

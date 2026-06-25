@@ -100,8 +100,8 @@ For language semantics changes, also run the relevant `crates/cxl` checks.
 
 - Keep this local guidance focused on CLI behavior. CXL language semantics
   belong primarily in `crates/cxl/AGENTS.md` and the `cxl` crate.
-- `docs/user/src/cxl/cxl-cli.md` shows multiple `-e` flags, but `Command::Eval.expr` is `Option<String>`. Decide whether docs are stale or CLI should support repeated `-e`.
-- `json_to_value` maps nested JSON objects to `Value::Null`, while the user docs do not clearly document object handling for `--record`.
+- `Command::Eval.expr` is a single `Option<String>`; examples with multiple statements should use one `-e` value containing the CXL source.
+- `json_to_value` preserves nested JSON objects as `Value::Map`; keep `docs/user/src/cxl/cxl-cli.md` aligned if that mapping changes.
 
 ## Evidence
 

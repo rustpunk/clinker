@@ -19,7 +19,7 @@ These pillars are why the memory arbitrator is a single in-process component rat
 ## Crate dependency layers (bottom → top)
 
 ```
-Applications:   clinker (CLI)  |  cxl-cli (REPL)
+Applications:   clinker (CLI)  |  cxl-cli (CXL tool)
                      ↓                ↓
 Orchestration:  clinker-core (DAG planner + executor)
                 clinker-channel (workspace/channel mgmt)

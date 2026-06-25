@@ -65,7 +65,7 @@ Existing direct dependencies are the baseline:
 - `FieldDescriptor::nullable` defaults to `true`.
 - Nested fields are recursive and flatten to dot notation.
 - Discovery is non-recursive by default: schemas under `schema_dir`, pipelines in the workspace root.
-- Include glob support is simple directory/extension scanning; `exclude_globs` is currently not applied.
+- Include/exclude glob support is simple directory/filename wildcard scanning, not full recursive glob handling.
 - `extract_schema_refs` is line-oriented and only strips simple scalar `schema:` values.
 - Validation warnings are advisory. They should not become planner errors from this crate.
 - CXL field extraction in `validate.rs` is heuristic, not parser/typechecker-backed.
@@ -75,7 +75,7 @@ Existing direct dependencies are the baseline:
 
 - Describing this as runtime schema binding; planner schema binding lives in `clinker-plan`.
 - Claiming discovery performs full YAML-aware pipeline parsing.
-- Claiming full glob/exclude support.
+- Claiming full recursive glob support.
 - Claiming compiler-grade CXL validation.
 - Copying old `inputs:` / `transformations:` pipeline shapes from tests or stale docs into current user guidance.
 - Copying stale editor-tooling wording into new docs without checking current source.
