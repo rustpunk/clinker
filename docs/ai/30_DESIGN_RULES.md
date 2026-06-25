@@ -178,7 +178,7 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
   functions, variants, tests, and commands that support a rule.
 - Separate verified facts from hypotheses and stale references. Current example:
   older docs mention `clinker-core` and "11 workspace crates", while the current
-  root workspace has 13 members and separate `clinker-plan` / `clinker-exec` /
+  root workspace has 14 members and separate `clinker-plan` / `clinker-exec` /
   `clinker-core-types` crates.
 - Do not write marketing copy in AI-facing docs. Keep rules actionable for a
   future engineer or coding agent deciding whether a change crosses an

@@ -4,13 +4,13 @@
 //! vendor-neutral open standard for dataset and column-level lineage. The
 //! [`openlineage`] module owns the wire data model and an NDJSON writer; the
 //! [`dataset`] module maps each Source/Output node to its OpenLineage dataset
-//! identity; and the [`builder`] module walks a compiled plan to compute DIRECT
+//! identity; and the [`builder`] module walks a compiled plan to compute
 //! column-level lineage from those identities.
 //!
-//! [`builder::column_lineage`] populates only DIRECT (value-derivation) lineage.
-//! INDIRECT influence (filter / join / group-by / sort), precise composition and
-//! envelope (`$doc`) traversal are deliberately out of scope here; see that
-//! module's documented limitations.
+//! [`builder::column_lineage`] populates both DIRECT (value-derivation) per-column
+//! lineage and whole-dataset INDIRECT influence (filter / join / group-by / sort /
+//! conditional). Precise composition and envelope (`$doc`) traversal remain out of
+//! scope; see that module's documented limitations.
 //!
 //! The model is pinned to OpenLineage core spec `2-0-2` and the
 //! `ColumnLineageDatasetFacet` `1-2-0`. No general-purpose Rust OpenLineage client

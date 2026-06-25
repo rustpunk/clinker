@@ -1,35 +1,44 @@
-//! DIRECT column-level lineage: walk a compiled plan back to its sources.
+//! Column-level lineage: walk a compiled plan back to its sources.
 //!
 //! [`column_lineage`] walks `compiled.dag()` in topological order and, for every
-//! output (sink) dataset column, resolves the **Source** dataset columns its
-//! *value* is derived from — DIRECT lineage in OpenLineage terms — populating the
-//! [`ColumnLineageDatasetFacet::fields`] map. Dataset identity comes from
-//! [`crate::dataset::dataset_identity`] (#660); value derivation is read off each
-//! operator's retained typed/compiled program.
+//! output (sink) dataset, computes two kinds of OpenLineage column lineage:
 //!
-//! Because topo order processes every upstream node first, the working map always
-//! stores terminals already resolved back to a Source dataset column — never an
+//! - **DIRECT** (value-derivation): for each output column, the **Source**
+//!   dataset columns its *value* is derived from, in
+//!   [`ColumnLineageDatasetFacet::fields`].
+//! - **INDIRECT** (influence): the Source columns that influence the dataset as a
+//!   whole — filtering (Route / Cull), joining (Combine), grouping (Aggregation),
+//!   sorting (Sort), conditional reshaping (Reshape `when:`) — collected once in
+//!   [`ColumnLineageDatasetFacet::dataset`].
+//!
+//! Dataset identity comes from [`crate::dataset::dataset_identity`] (#660); value
+//! derivation and influence are read off each operator's retained typed/compiled
+//! program.
+//!
+//! Because topo order processes every upstream node first, the working maps store
+//! terminals already resolved back to a Source dataset column — never an
 //! intermediate reference — so a rename (`emit full = name`) or a multi-hop chain
-//! collapses naturally: the stored `field` is the *source* column, the map key is
-//! the *local* output column.
+//! collapses naturally, and an upstream filter/join influence flows through every
+//! downstream node to the sink.
 //!
 //! ## Subtype model
 //!
-//! Each input→output link carries one DIRECT [`TransformationSubtype`]. Along a
+//! Each DIRECT input→output link carries one [`TransformationSubtype`]; along a
 //! path the dominant subtype wins, ranked `IDENTITY < TRANSFORMATION <
 //! AGGREGATION` (identity is transparent; an aggregate anywhere on the path
-//! dominates). The OpenLineage per-hop transformation *chain* is collapsed to this
-//! single dominant subtype.
+//! dominates). INDIRECT influences carry the per-node subtype (`FILTER` / `JOIN` /
+//! `GROUP_BY` / `SORT` / `CONDITIONAL`) and accumulate downstream unchanged.
 //!
 //! ## Documented limitations
 //!
-//! - **INDIRECT** influence lineage (filter / join / group-by / sort) is not
-//!   populated here — [`ColumnLineageDatasetFacet::dataset`] is left empty (#662).
 //! - **Composition** nodes are treated opaquely: every output column derives from
 //!   every composition input column. Precise traversal is a #653 follow-up.
 //! - **Envelope** / `$doc` provenance is best-effort same-name passthrough only;
 //!   precise envelope lineage is a #653 follow-up.
 //! - A `match: collect` combine (no projection body) is resolved coarsely.
+//! - INDIRECT influence covers the predicate / grouping / sort surfaces above; an
+//!   aggregate's pre-aggregation row `filter`, a Transform-inline `filter`, and
+//!   Reshape `order_by` / `partition_by` are not (yet) attributed as influence.
 //! - Constant and `count(*)` columns (no source input) are omitted from `fields`.
 //! - Engine-stamped columns (`$ck.*` / `$meta.*` / `$source.*` / `$widened`) are
 //!   skipped, mirroring the default-writer strip.
@@ -259,8 +268,7 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
                             if let Some((up_id, schema)) = resolved
                                 && let Some(up_col) = schema.column_name(*cidx as usize)
                             {
-                                let qualifier =
-                                    qf.qualifier.as_deref().unwrap_or(qf.name.as_ref());
+                                let qualifier = qf.qualifier.as_deref().unwrap_or(qf.name.as_ref());
                                 let out_name = encode_chain_column(qualifier, qf.name.as_ref());
                                 let mut terms = TermMap::new();
                                 merge_terminals(
@@ -758,6 +766,15 @@ fn collect_agg_leaves<'a>(expr: &'a Expr, out: &mut Vec<AggLeaf<'a>>) {
         Expr::FieldRef { name, .. } => {
             if !name.starts_with('$') {
                 out.push(AggLeaf::Field(name));
+            }
+        }
+        Expr::QualifiedFieldRef { parts, .. } => {
+            // Aggregates are single-input; a qualified ref in a residual carries
+            // its base column in the first segment.
+            if let Some(first) = parts.first()
+                && !first.starts_with('$')
+            {
+                out.push(AggLeaf::Field(first.as_ref()));
             }
         }
         Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
@@ -1308,10 +1325,7 @@ mod tests {
     }
 
     /// The output dataset whose name contains `substr` (for multi-output plans).
-    fn output_named<'a>(
-        lineage: &'a PlanColumnLineage,
-        substr: &str,
-    ) -> &'a OutputColumnLineage {
+    fn output_named<'a>(lineage: &'a PlanColumnLineage, substr: &str) -> &'a OutputColumnLineage {
         lineage
             .outputs
             .iter()
@@ -1514,7 +1528,11 @@ nodes:
         );
         // The influence is NOT duplicated into the per-column DIRECT lineage:
         // `amount` still passes through as a plain DIRECT identity column.
-        assert_field(&hi.facet.fields, "amount", &[direct(src, "amount", Identity)]);
+        assert_field(
+            &hi.facet.fields,
+            "amount",
+            &[direct(src, "amount", Identity)],
+        );
         for fl in hi.facet.fields.values() {
             assert!(
                 fl.input_fields
@@ -2007,6 +2025,26 @@ nodes:
         );
     }
 
+    #[test]
+    fn agg_residual_qualified_ref_contributes_a_leaf() {
+        // A qualified field ref in an aggregate residual (low-likelihood — an
+        // aggregate is single-input) is no longer silently dropped: its base
+        // column contributes a leaf instead of falling through the catch-all.
+        use cxl::ast::NodeId;
+        use cxl::lexer::Span;
+        let expr = Expr::QualifiedFieldRef {
+            node_id: NodeId(0),
+            parts: vec!["amount".into(), "cents".into()].into(),
+            span: Span::default(),
+        };
+        let mut leaves = Vec::new();
+        collect_agg_leaves(&expr, &mut leaves);
+        assert!(
+            matches!(leaves.as_slice(), [AggLeaf::Field("amount")]),
+            "qualified ref base column must contribute a leaf"
+        );
+    }
+
     // -- Reshape --------------------------------------------------------------
 
     #[test]
@@ -2279,8 +2317,16 @@ nodes:
         let lineage = lineage_of(yaml);
         let fields = &only_output(&lineage).facet.fields;
         use TransformationSubtype::Identity;
-        assert_field(fields, "emp_name", &[direct("/w/data/emp.csv", "name", Identity)]);
+        assert_field(
+            fields,
+            "emp_name",
+            &[direct("/w/data/emp.csv", "name", Identity)],
+        );
         // The build side resolves to the same source dataset/column.
-        assert_field(fields, "mgr_name", &[direct("/w/data/emp.csv", "name", Identity)]);
+        assert_field(
+            fields,
+            "mgr_name",
+            &[direct("/w/data/emp.csv", "name", Identity)],
+        );
     }
 }
