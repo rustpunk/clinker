@@ -44,7 +44,7 @@ use clinker_plan::plan::combine::encode_chain_column;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_plan::plan::{CompiledPlan, JoinSide, PlanNodeId, QualifiedField};
 use clinker_record::Schema;
-use cxl::ast::{Expr, Program, for_each_field_emit, program_support_into};
+use cxl::ast::{EmitTarget, Expr, Program, Statement, for_each_field_emit, program_support_into};
 use cxl::plan::BindingArg;
 
 use crate::dataset::{DatasetId, dataset_identity};
@@ -112,21 +112,27 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
 
             PlanNode::Transform { resolved, .. } => {
                 let up = single_upstream(dag, idx);
-                // Explicit field emits (recursing through `emit each` fan-out).
+                // Explicit field emits, threading `let` and `emit each` scopes.
                 let mut emitted: HashMap<String, TermMap> = HashMap::new();
                 if let Some(payload) = resolved {
-                    for_each_field_emit(&payload.typed.program.statements, &mut |name, expr| {
-                        if name.starts_with('$') {
-                            return;
-                        }
-                        let local = field_ref_subtype(expr);
-                        let mut reads = HashSet::new();
-                        expr.support_into(&mut reads);
-                        let slot = emitted.entry(name.to_string()).or_default();
-                        for r in &reads {
-                            merge_terminals(slot, upstream_col(&lineage, up, r), local);
-                        }
-                    });
+                    // A single-input operator reads bare upstream columns; a
+                    // qualified leaf that is not a loop binding is a struct / system
+                    // access with no single source column to attribute.
+                    let resolve_unbound = |qf: &QualifiedField| -> Option<TermMap> {
+                        qf.qualifier
+                            .is_none()
+                            .then(|| upstream_col(&lineage, up, qf.name.as_ref()).cloned())
+                            .flatten()
+                    };
+                    let mut let_env = HashMap::new();
+                    let mut each_bindings = HashMap::new();
+                    collect_field_emits(
+                        &payload.typed.program.statements,
+                        &mut let_env,
+                        &mut each_bindings,
+                        &mut emitted,
+                        &resolve_unbound,
+                    );
                 }
                 // Output schema = explicit emits + open-row passthrough of the rest.
                 let mut cols = ColumnTerminals::new();
@@ -217,34 +223,31 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
                 let mut cols = ColumnTerminals::new();
                 match typed {
                     Some(tp) => {
-                        for_each_field_emit(&tp.program.statements, &mut |name, expr| {
-                            if name.starts_with('$') {
-                                return;
-                            }
-                            let local = field_ref_subtype(expr);
-                            let mut refs = Vec::new();
-                            collect_combine_refs(expr, &mut refs);
-                            let mut terms = TermMap::new();
-                            for qf in &refs {
-                                let Some((side, cidx)) = resolve_side(qf, map, &bare) else {
-                                    continue;
-                                };
-                                let resolved = match side {
-                                    JoinSide::Probe => probe.as_ref(),
-                                    JoinSide::Build => build.as_ref(),
-                                };
-                                if let Some((up_id, schema)) = resolved
-                                    && let Some(col) = schema.column_name(cidx as usize)
-                                {
-                                    merge_terminals(
-                                        &mut terms,
-                                        lineage.get(up_id).and_then(|m| m.0.get(col)),
-                                        local,
-                                    );
-                                }
-                            }
-                            cols.insert_nonempty(name, terms);
-                        });
+                        // A combine body reads `input.field` references resolved
+                        // through the side map; `let` / `emit each` scopes thread the
+                        // same way as a Transform.
+                        let resolve_unbound = |qf: &QualifiedField| -> Option<TermMap> {
+                            let (side, cidx) = resolve_side(qf, map, &bare)?;
+                            let (up_id, schema) = match side {
+                                JoinSide::Probe => probe.as_ref()?,
+                                JoinSide::Build => build.as_ref()?,
+                            };
+                            let col = schema.column_name(cidx as usize)?;
+                            lineage.get(up_id).and_then(|m| m.0.get(col)).cloned()
+                        };
+                        let mut let_env = HashMap::new();
+                        let mut each_bindings = HashMap::new();
+                        let mut emitted: HashMap<String, TermMap> = HashMap::new();
+                        collect_field_emits(
+                            &tp.program.statements,
+                            &mut let_env,
+                            &mut each_bindings,
+                            &mut emitted,
+                            &resolve_unbound,
+                        );
+                        for (name, terms) in emitted {
+                            cols.insert_nonempty(&name, terms);
+                        }
                     }
                     // Intermediate step of an N-ary decomposition: a body-less inner
                     // join that carries every input column forward by IDENTITY. Its
@@ -542,6 +545,125 @@ fn program_field_ref_subtype(program: &Program) -> Subtype {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Program-aware emit walker
+// ---------------------------------------------------------------------------
+
+/// Walk a CXL program's statements collecting, per field-emit target, the
+/// resolved source terminals its value derives from.
+///
+/// Threads two lexical scopes that a per-emit read-set walk misses:
+///
+/// - **`let` bindings:** `let x = a + b; emit y = x` — `y` derives from `a`/`b`.
+///   On each `Let`, the RHS is resolved (against the upstream and earlier
+///   bindings) and stored, so a later reference to the binding name expands to
+///   its terminals rather than resolving to nothing.
+/// - **`emit each` loop bindings:** `emit each it in items { emit sku = it.sku }`
+///   — `sku` derives from `items`. The loop binding is bound to the source
+///   array's terminals (as a TRANSFORMATION — element extraction), so a body
+///   reference to `it` / `it.field` resolves to the array column.
+///
+/// `resolve_unbound` resolves a leaf that names neither a binding nor a loop
+/// variable — an operator-input column — and differs per node kind (bare
+/// upstream column for Transform; `input.field` via the combine resolver for
+/// Combine). Duplicate field emits are last-wins, matching the runtime.
+fn collect_field_emits(
+    statements: &[Statement],
+    let_env: &mut HashMap<String, TermMap>,
+    each_bindings: &mut HashMap<String, TermMap>,
+    emitted: &mut HashMap<String, TermMap>,
+    resolve_unbound: &impl Fn(&QualifiedField) -> Option<TermMap>,
+) {
+    for stmt in statements {
+        match stmt {
+            Statement::Let { name, expr, .. } => {
+                let terms = resolve_expr_terms(expr, let_env, each_bindings, resolve_unbound);
+                let_env.insert(name.to_string(), terms);
+            }
+            Statement::Emit {
+                name,
+                expr,
+                target: EmitTarget::Field,
+                ..
+            } => {
+                if name.starts_with('$') {
+                    continue;
+                }
+                let terms = resolve_expr_terms(expr, let_env, each_bindings, resolve_unbound);
+                emitted.insert(name.to_string(), terms);
+            }
+            Statement::EmitEach {
+                binding,
+                source,
+                body,
+                ..
+            }
+            | Statement::ExplodeOuter {
+                binding,
+                source,
+                body,
+                ..
+            } => {
+                let src = resolve_expr_terms(source, let_env, each_bindings, resolve_unbound);
+                let mut tagged = TermMap::new();
+                merge_terminals(&mut tagged, Some(&src), Subtype::Transformation);
+                let prev = each_bindings.insert(binding.to_string(), tagged);
+                collect_field_emits(body, let_env, each_bindings, emitted, resolve_unbound);
+                match prev {
+                    Some(p) => {
+                        each_bindings.insert(binding.to_string(), p);
+                    }
+                    None => {
+                        each_bindings.remove(binding.as_ref());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Resolve the source terminals an emit/let RHS expression derives from. The
+/// whole expression's [`field_ref_subtype`] (IDENTITY for a bare copy/rename,
+/// else TRANSFORMATION) is composed onto every leaf it reads.
+fn resolve_expr_terms(
+    expr: &Expr,
+    let_env: &HashMap<String, TermMap>,
+    each_bindings: &HashMap<String, TermMap>,
+    resolve_unbound: &impl Fn(&QualifiedField) -> Option<TermMap>,
+) -> TermMap {
+    let local = field_ref_subtype(expr);
+    let mut refs = Vec::new();
+    collect_field_refs(expr, &mut refs);
+    let mut out = TermMap::new();
+    for qf in &refs {
+        let base = resolve_leaf_terms(qf, let_env, each_bindings, resolve_unbound);
+        merge_terminals(&mut out, base.as_ref(), local);
+    }
+    out
+}
+
+/// Resolve one leaf field reference to its source terminals: an in-scope
+/// `emit each` loop binding (matched by the reference's first segment) wins,
+/// then a bare `let` binding, then `resolve_unbound` (the operator input).
+fn resolve_leaf_terms(
+    qf: &QualifiedField,
+    let_env: &HashMap<String, TermMap>,
+    each_bindings: &HashMap<String, TermMap>,
+    resolve_unbound: &impl Fn(&QualifiedField) -> Option<TermMap>,
+) -> Option<TermMap> {
+    let first = qf.qualifier.as_deref().unwrap_or(qf.name.as_ref());
+    if let Some(terms) = each_bindings.get(first) {
+        return Some(terms.clone());
+    }
+    if qf.qualifier.is_none()
+        && let Some(terms) = let_env.get(qf.name.as_ref())
+    {
+        return Some(terms.clone());
+    }
+    resolve_unbound(qf)
+}
+
 /// The input column(s) and DIRECT subtype each contributing to one aggregate
 /// output column, read off the post-extraction `residual`.
 fn aggregate_emit_sources(
@@ -678,12 +800,15 @@ fn binding_arg_input_names(arg: &BindingArg, schema: Option<&Schema>) -> Vec<Str
 }
 
 // ---------------------------------------------------------------------------
-// Combine reference resolution
+// Field-reference collection and resolution
 // ---------------------------------------------------------------------------
 
-/// Collect every field reference (as a [`QualifiedField`]) read by a combine
-/// body expression, skipping system (`$`) namespaces.
-fn collect_combine_refs(expr: &Expr, out: &mut Vec<QualifiedField>) {
+/// Collect every field reference (as a [`QualifiedField`]) read by an
+/// expression, skipping system (`$`) namespaces. A bare `FieldRef` yields a
+/// bare `QualifiedField`; a `QualifiedFieldRef` yields the (qualifier, field)
+/// pair — used both for combine `input.field` resolution and for detecting an
+/// `emit each` loop-binding reference by its first segment.
+fn collect_field_refs(expr: &Expr, out: &mut Vec<QualifiedField>) {
     match expr {
         Expr::FieldRef { name, .. } => {
             if !name.starts_with('$') {
@@ -706,49 +831,49 @@ fn collect_combine_refs(expr: &Expr, out: &mut Vec<QualifiedField>) {
             }
         }
         Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
-            collect_combine_refs(lhs, out);
-            collect_combine_refs(rhs, out);
+            collect_field_refs(lhs, out);
+            collect_field_refs(rhs, out);
         }
-        Expr::Unary { operand, .. } => collect_combine_refs(operand, out),
+        Expr::Unary { operand, .. } => collect_field_refs(operand, out),
         Expr::IfThenElse {
             condition,
             then_branch,
             else_branch,
             ..
         } => {
-            collect_combine_refs(condition, out);
-            collect_combine_refs(then_branch, out);
+            collect_field_refs(condition, out);
+            collect_field_refs(then_branch, out);
             if let Some(eb) = else_branch {
-                collect_combine_refs(eb, out);
+                collect_field_refs(eb, out);
             }
         }
         Expr::Match { subject, arms, .. } => {
             if let Some(s) = subject {
-                collect_combine_refs(s, out);
+                collect_field_refs(s, out);
             }
             for arm in arms {
-                collect_combine_refs(&arm.pattern, out);
-                collect_combine_refs(&arm.body, out);
+                collect_field_refs(&arm.pattern, out);
+                collect_field_refs(&arm.body, out);
             }
         }
         Expr::MethodCall { receiver, args, .. } => {
-            collect_combine_refs(receiver, out);
+            collect_field_refs(receiver, out);
             for a in args {
-                collect_combine_refs(a, out);
+                collect_field_refs(a, out);
             }
         }
         Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
             for a in args {
-                collect_combine_refs(a, out);
+                collect_field_refs(a, out);
             }
         }
         Expr::IndexAccess {
             receiver, index, ..
         } => {
-            collect_combine_refs(receiver, out);
-            collect_combine_refs(index, out);
+            collect_field_refs(receiver, out);
+            collect_field_refs(index, out);
         }
-        Expr::Closure { body, .. } => collect_combine_refs(body, out),
+        Expr::Closure { body, .. } => collect_field_refs(body, out),
         _ => {}
     }
 }
@@ -1040,6 +1165,141 @@ nodes:
             &[direct(
                 "/w/data/s.csv",
                 "raw",
+                TransformationSubtype::Identity,
+            )],
+        );
+    }
+
+    // -- let / emit each / duplicate emit -------------------------------------
+
+    #[test]
+    fn let_bound_intermediate_resolves_to_its_source_reads() {
+        // `let x = a + b; emit y = x` — `y` derives from `a` and `b` even though
+        // the emit RHS names only the let binding.
+        let yaml = r#"
+pipeline: { name: letbind }
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: data/s.csv
+      options: { has_header: true }
+      schema:
+        - { name: a, type: int }
+        - { name: b, type: int }
+  - type: transform
+    name: t
+    input: s
+    config:
+      cxl: |
+        let x = a + b
+        emit y = x
+  - type: output
+    name: out
+    input: t
+    config: { name: out, type: csv, path: out/letbind.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let fields = &only_output(&lineage).facet.fields;
+        let src = "/w/data/s.csv";
+        use TransformationSubtype::Transformation;
+        assert_field(
+            fields,
+            "y",
+            &[
+                direct(src, "a", Transformation),
+                direct(src, "b", Transformation),
+            ],
+        );
+    }
+
+    #[test]
+    fn emit_each_resolves_body_to_the_source_array_column() {
+        // `emit each it in items { emit sku = it["sku"] }` — `sku` derives from the
+        // `items` source array column, not from nothing.
+        let yaml = r#"
+pipeline: { name: explode }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: json
+      options: { format: ndjson }
+      path: data/rows.ndjson
+      schema:
+        - { name: items, type: any }
+  - type: transform
+    name: explode
+    input: rows
+    config:
+      cxl: |
+        emit each it in items {
+          emit sku = it["sku"]
+        }
+  - type: output
+    name: out
+    input: explode
+    config:
+      name: out
+      type: json
+      options: { format: ndjson }
+      path: out/explode.ndjson
+      include_unmapped: false
+      exclude: [items]
+"#;
+        let lineage = lineage_of(yaml);
+        let fields = &only_output(&lineage).facet.fields;
+        assert_field(
+            fields,
+            "sku",
+            &[direct(
+                "/w/data/rows.ndjson",
+                "items",
+                TransformationSubtype::Transformation,
+            )],
+        );
+    }
+
+    #[test]
+    fn duplicate_emit_is_last_wins() {
+        // Two top-level emits to one column: only the last reaches the sink, so the
+        // lineage lists only the last source (matching the runtime).
+        let yaml = r#"
+pipeline: { name: dup }
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: data/s.csv
+      options: { has_header: true }
+      schema:
+        - { name: list_price, type: float }
+        - { name: sale_price, type: float }
+  - type: transform
+    name: t
+    input: s
+    config:
+      cxl: |
+        emit price = list_price
+        emit price = sale_price
+  - type: output
+    name: out
+    input: t
+    config: { name: out, type: csv, path: out/dup.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let fields = &only_output(&lineage).facet.fields;
+        assert_field(
+            fields,
+            "price",
+            &[direct(
+                "/w/data/s.csv",
+                "sale_price",
                 TransformationSubtype::Identity,
             )],
         );
