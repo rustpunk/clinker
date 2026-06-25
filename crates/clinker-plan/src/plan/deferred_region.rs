@@ -29,6 +29,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
+use cxl::ast::Statement;
 use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 
@@ -997,7 +998,7 @@ fn propagate_through_node_for_body(node: &PlanNode, set: &mut HashSet<String>) {
             }
             // Add fields the transform reads.
             if let Some(payload) = resolved.as_deref() {
-                cxl::ast::program_support_into(&payload.typed.program, set);
+                accumulate_program_support(&payload.typed.program, set);
             }
         }
         PlanNode::Route { .. } => {
@@ -1071,6 +1072,39 @@ fn propagate_through_node_for_body(node: &PlanNode, set: &mut HashSet<String>) {
     }
 }
 
+/// Walk every statement in a TypedProgram and accumulate every column
+/// reference reached by `Expr::support_into`.
+fn accumulate_program_support(program: &cxl::ast::Program, set: &mut HashSet<String>) {
+    for stmt in &program.statements {
+        match stmt {
+            Statement::Emit { expr, .. } | Statement::Let { expr, .. } => {
+                expr.support_into(set);
+            }
+            Statement::Filter { predicate, .. } => predicate.support_into(set),
+            Statement::Trace { guard, message, .. } => {
+                if let Some(g) = guard.as_deref() {
+                    g.support_into(set);
+                }
+                message.support_into(set);
+            }
+            Statement::ExprStmt { expr, .. } => expr.support_into(set),
+            Statement::Distinct { .. } | Statement::UseStmt { .. } => {}
+            Statement::EmitEach { source, body, .. }
+            | Statement::ExplodeOuter { source, body, .. } => {
+                source.support_into(set);
+                // Recurse via a fresh Program-shaped wrapper so the
+                // same statement walker covers body statements
+                // without duplicating the per-statement match.
+                let inner = cxl::ast::Program {
+                    statements: body.clone(),
+                    span: cxl::lexer::Span::new(0, 0),
+                };
+                accumulate_program_support(&inner, set);
+            }
+        }
+    }
+}
+
 /// Pull column references out of an aggregate binding argument (the
 /// runtime accumulator's input expression).
 fn accumulate_binding_arg(arg: &cxl::plan::BindingArg, set: &mut HashSet<String>) {
@@ -1099,7 +1133,7 @@ fn seed_from_node(node: &PlanNode, set: &mut HashSet<String>) {
     match node {
         PlanNode::Transform { resolved, .. } => {
             if let Some(payload) = resolved.as_deref() {
-                cxl::ast::program_support_into(&payload.typed.program, set);
+                accumulate_program_support(&payload.typed.program, set);
             }
         }
         PlanNode::Aggregation {
