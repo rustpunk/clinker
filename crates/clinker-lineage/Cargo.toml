@@ -7,9 +7,11 @@ description = "OpenLineage column-level lineage emission from compiled Clinker p
 
 [dependencies]
 clinker-plan = { workspace = true }
+clinker-record = { workspace = true }
+cxl = { workspace = true }
+petgraph = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
 clinker-core-types = { workspace = true }
-clinker-record = { workspace = true }
