@@ -12,6 +12,7 @@ members = [
     "crates/clinker-channel",
     "crates/clinker",
     "crates/clinker-schema",
+    "crates/clinker-lineage",
     "crates/clinker-bench-support",
     "crates/clinker-benchmarks",
 ]
@@ -31,6 +32,7 @@ clinker-exec = { path = "crates/clinker-exec" }
 clinker-net = { path = "crates/clinker-net" }
 clinker-channel = { path = "crates/clinker-channel" }
 clinker-schema = { path = "crates/clinker-schema" }
+clinker-lineage = { path = "crates/clinker-lineage" }
 
 toml = "0.8"
 serde = { version = "1", features = ["derive", "rc"] }
