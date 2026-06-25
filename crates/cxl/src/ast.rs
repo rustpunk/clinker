@@ -523,6 +523,49 @@ fn is_system_namespace(name: &str) -> bool {
         || name.starts_with("$widened")
 }
 
+/// Accumulate the input column references read by every statement in a
+/// [`Program`], folding [`Expr::support_into`] over each statement's
+/// expressions. Only the columns the program *reads* are added — `emit`
+/// and `let` targets are write positions and are never inserted. `emit
+/// each` / `emit each ... outer` bodies are walked recursively.
+///
+/// The program-level companion of [`Expr::support_into`]: lineage and
+/// column-pruning consumers use it to recover a typechecked program's
+/// read-set (qualified `input.field` references included) without
+/// re-parsing CXL source. `$pipeline.*` / `$source.*` / `$doc.*` /
+/// `$ck.*` / `$widened.*` system namespaces are excluded, per
+/// `Expr::support_into`.
+pub fn program_support_into(program: &Program, fields: &mut std::collections::HashSet<String>) {
+    for stmt in &program.statements {
+        match stmt {
+            Statement::Emit { expr, .. } | Statement::Let { expr, .. } => {
+                expr.support_into(fields);
+            }
+            Statement::Filter { predicate, .. } => predicate.support_into(fields),
+            Statement::Trace { guard, message, .. } => {
+                if let Some(g) = guard.as_deref() {
+                    g.support_into(fields);
+                }
+                message.support_into(fields);
+            }
+            Statement::ExprStmt { expr, .. } => expr.support_into(fields),
+            Statement::Distinct { .. } | Statement::UseStmt { .. } => {}
+            Statement::EmitEach { source, body, .. }
+            | Statement::ExplodeOuter { source, body, .. } => {
+                source.support_into(fields);
+                // Recurse via a fresh Program-shaped wrapper so the
+                // same statement walker covers body statements
+                // without duplicating the per-statement match.
+                let inner = Program {
+                    statements: body.clone(),
+                    span: Span::new(0, 0),
+                };
+                program_support_into(&inner, fields);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MatchArm {
     pub node_id: NodeId,
@@ -647,6 +690,63 @@ mod tests {
             span,
         };
         assert_eq!(program.statements.len(), 3);
+    }
+
+    #[test]
+    fn test_program_support_into_reads_only_no_targets() {
+        let span = Span::new(0, 1);
+        let field = |n: &str| Expr::FieldRef {
+            node_id: NID,
+            name: n.into(),
+            span,
+        };
+        let program = Program {
+            statements: vec![
+                // Filter predicate reads `a`.
+                Statement::Filter {
+                    node_id: NID,
+                    predicate: field("a"),
+                    span,
+                },
+                // Emit reads `b` + `c`; its target `out` is a write, not a read.
+                Statement::Emit {
+                    node_id: NID,
+                    name: "out".into(),
+                    expr: Expr::Binary {
+                        node_id: NID,
+                        op: BinOp::Add,
+                        lhs: Box::new(field("b")),
+                        rhs: Box::new(field("c")),
+                        span,
+                    },
+                    target: EmitTarget::Field,
+                    span,
+                },
+                // `emit each` source reads `items`; the recursive body walk
+                // reaches `base`. The body emit target `y` is a write.
+                Statement::EmitEach {
+                    node_id: NID,
+                    binding: "elem".into(),
+                    source: field("items"),
+                    body: vec![Statement::Emit {
+                        node_id: NID,
+                        name: "y".into(),
+                        expr: field("base"),
+                        target: EmitTarget::Field,
+                        span,
+                    }],
+                    span,
+                },
+            ],
+            span,
+        };
+        let mut got = std::collections::HashSet::new();
+        program_support_into(&program, &mut got);
+        let mut sorted: Vec<&str> = got.iter().map(String::as_str).collect();
+        sorted.sort();
+        assert_eq!(sorted, vec!["a", "b", "base", "c", "items"]);
+        assert!(!got.contains("out"), "emit target is not a read");
+        assert!(!got.contains("y"), "body emit target is not a read");
     }
 
     #[test]

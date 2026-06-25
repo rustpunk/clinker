@@ -59,8 +59,15 @@ pub struct TransformAnalysis {
     pub name: String,
     /// All window function call sites found in this transform's CXL
     pub window_calls: Vec<WindowCallInfo>,
-    /// All field names accessed through window expressions
-    /// (union of field_args + postfix_fields across all window calls)
+    /// Field names accessed through window expressions (union of
+    /// `field_args` + `postfix_fields` across all window calls).
+    ///
+    /// Window-analysis scoped: it records only the bare `FieldRef`s reached
+    /// while walking window-call argument and postfix chains, and does not
+    /// record `QualifiedFieldRef`s. It is therefore NOT the lineage support
+    /// set. For the columns an expression or program *reads* — qualified
+    /// `input.field` references included — use
+    /// [`crate::ast::Expr::support_into`] / [`crate::ast::program_support_into`].
     pub accessed_fields: HashSet<String>,
     /// Parallelism hint derived from window usage pattern
     pub parallelism_hint: ParallelismHint,

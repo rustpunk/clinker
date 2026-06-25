@@ -13,6 +13,7 @@ mod envelope_synthesis;
 mod explain_buffer_class;
 mod explain_polish;
 mod plan_time_window_root;
+mod predicate_support;
 mod reshape_validation;
 mod route_ports;
 mod typed_scoped_key;
