@@ -8,12 +8,25 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Incremental compilation only speeds iterative local rebuilds; in CI every
+  # build is effectively from-scratch, so it just bloats target/ — a disk-
+  # pressure source on the multi-build check job below.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # Reclaim ~25-30 GB of preinstalled SDKs the Rust build never touches.
+      # This job compiles the whole workspace several times over (two clippy
+      # passes, the test build, and three bench-compile steps) into one shared
+      # target/, which can exhaust the hosted runner's root volume mid-link.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - uses: dtolnay/rust-toolchain@master
         with:
