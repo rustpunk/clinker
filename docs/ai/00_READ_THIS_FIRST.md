@@ -184,8 +184,6 @@ current uncertainties are:
   node count, or unclear envelope/document-context examples.
 - Transport docs need alignment around implemented file and finite REST support
   versus SQL cursor wording.
-- `cxl-cli` docs/manifest wording needs alignment around repeated `-e`
-  examples and whether a REPL is actually implemented.
 - The `clinker-format -> cxl` dependency edge is current, but whether it is a
   permanent layering rule remains open.
 - Some public planner/CXL symbols may be exposed without a clear stability

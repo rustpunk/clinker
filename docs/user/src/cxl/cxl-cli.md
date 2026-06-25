@@ -60,11 +60,11 @@ $ cxl eval transform.cxl \
 $ cxl eval transform.cxl --record '{"price": 10.5, "qty": 3}'
 ```
 
-**Multiple inline expressions:**
+**Multiple inline statements:**
 
 ```bash
-$ cxl eval -e 'let tax = 0.21' -e 'emit net = price * (1 - tax)' \
-    --field price=100
+$ cxl eval -e 'let tax = 0.21
+emit net = price * (1 - tax)' --field price=100
 ```
 
 ```json
@@ -146,13 +146,16 @@ JSON types map directly:
 | decimal number | Float |
 | `"string"` | String |
 | `[array]` | Array |
+| `{object}` | Map |
 
 ## Output format
 
 Output is always JSON. Each `emit` statement produces a key-value pair:
 
 ```bash
-$ cxl eval -e 'emit a = 1' -e 'emit b = "two"' -e 'emit c = true'
+$ cxl eval -e 'emit a = 1
+emit b = "two"
+emit c = true'
 ```
 
 ```json
@@ -237,8 +240,9 @@ $ cxl eval -e 'emit tier = match {
 **Test date operations:**
 
 ```bash
-$ cxl eval -e 'emit year = d.year()' -e 'emit month = d.month()' \
-    -e 'emit next_week = d.add_days(7)' \
+$ cxl eval -e 'emit year = d.year()
+emit month = d.month()
+emit next_week = d.add_days(7)' \
     --record '{"d": "2024-03-15"}'
 ```
 

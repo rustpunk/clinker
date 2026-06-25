@@ -3,7 +3,7 @@ name = "cxl-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Standalone CXL language validator and REPL"
+description = "Standalone CXL language validator, evaluator, and formatter"
 
 [dependencies]
 cxl = { workspace = true }

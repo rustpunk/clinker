@@ -5,6 +5,7 @@
 //! `referencing_pipelines`, and builds a `SchemaIndex`.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -124,14 +125,22 @@ pub fn discover_pipelines(
 fn discover_pipelines_with_globs(
     workspace_root: &Path,
     include_globs: &[String],
-    _exclude_globs: &[String],
+    exclude_globs: &[String],
 ) -> Vec<PathBuf> {
-    // Simple glob expansion — match files in workspace
+    // Simple glob expansion — match files in workspace.
+    let excluded: HashSet<PathBuf> = exclude_globs
+        .iter()
+        .flat_map(|pattern| {
+            let full_pattern = workspace_root.join(pattern).display().to_string();
+            glob_paths(&full_pattern).unwrap_or_default()
+        })
+        .collect();
+
     let mut results = Vec::new();
     for pattern in include_globs {
         let full_pattern = workspace_root.join(pattern).display().to_string();
         if let Ok(paths) = glob_paths(&full_pattern) {
-            results.extend(paths);
+            results.extend(paths.into_iter().filter(|p| !excluded.contains(p)));
         }
     }
     results.sort();
@@ -141,31 +150,65 @@ fn discover_pipelines_with_globs(
 
 /// Simple glob expansion using std::fs.
 fn glob_paths(pattern: &str) -> Result<Vec<PathBuf>, ()> {
-    // For now, just check if the pattern is a simple directory/*.yaml
-    // Full glob support can be added with the `glob` crate later.
+    // For now, support simple directory/name patterns with `*` and `?` in the
+    // filename component. Full recursive glob support can be added with the
+    // `glob` crate later if this crate takes that dependency deliberately.
     let path = Path::new(pattern);
     if let Some(parent) = path.parent()
         && parent.is_dir()
     {
-        let ext_match = path.extension().and_then(|e| e.to_str()).unwrap_or("yaml");
+        let Some(file_pattern) = path.file_name().and_then(|n| n.to_str()) else {
+            return Ok(Vec::new());
+        };
         let Ok(entries) = fs::read_dir(parent) else {
             return Ok(Vec::new());
         };
         return Ok(entries
             .filter_map(|e| e.ok())
             .filter(|e| {
-                // Case-insensitive: a case-preserving filesystem (macOS APFS,
-                // Windows NTFS) returns the on-disk casing, so `*.yaml` must
-                // still match a file stored as `flow.YAML`.
                 e.path()
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case(ext_match))
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| wildcard_match_ascii_case_insensitive(file_pattern, name))
             })
             .map(|e| e.path())
             .collect());
     }
     Ok(Vec::new())
+}
+
+fn wildcard_match_ascii_case_insensitive(pattern: &str, candidate: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let candidate = candidate.as_bytes();
+    let mut p = 0;
+    let mut c = 0;
+    let mut star = None;
+    let mut match_after_star = 0;
+
+    while c < candidate.len() {
+        if p < pattern.len()
+            && (pattern[p] == b'?' || pattern[p].eq_ignore_ascii_case(&candidate[c]))
+        {
+            p += 1;
+            c += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            match_after_star = c;
+        } else if let Some(star_idx) = star {
+            p = star_idx + 1;
+            match_after_star += 1;
+            c = match_after_star;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+
+    p == pattern.len()
 }
 
 /// Extract `schema:` references from a pipeline YAML file.
@@ -581,6 +624,48 @@ fields:
             names.contains(&"flow.YAML"),
             "glob discovery missed mixed-case extension: {names:?}"
         );
+    }
+
+    #[test]
+    fn test_glob_discovery_applies_exclude_globs() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("schemas")).unwrap();
+
+        write_file(root, "keep.yaml", "pipeline: {name: keep}");
+        write_file(root, "skip.yaml", "pipeline: {name: skip}");
+        write_file(root, "skip-extra.yaml", "pipeline: {name: skip_extra}");
+
+        let pipelines = discover_pipelines(
+            root,
+            "schemas",
+            &["*.yaml".to_string()],
+            &["skip*.yaml".to_string()],
+        );
+        let names: Vec<_> = pipelines
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+
+        assert_eq!(names, vec!["keep.yaml"]);
+    }
+
+    #[test]
+    fn test_glob_discovery_exact_pattern_does_not_overmatch_by_extension() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("schemas")).unwrap();
+
+        write_file(root, "pipeline.yaml", "pipeline: {name: keep}");
+        write_file(root, "other.yaml", "pipeline: {name: other}");
+
+        let pipelines = discover_pipelines(root, "schemas", &["pipeline.yaml".to_string()], &[]);
+        let names: Vec<_> = pipelines
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+
+        assert_eq!(names, vec!["pipeline.yaml"]);
     }
 
     #[test]
