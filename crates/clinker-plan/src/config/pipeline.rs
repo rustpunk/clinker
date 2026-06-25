@@ -3733,38 +3733,75 @@ pub(crate) fn lower_node_to_plan_node(
                 combine_driving,
             })
         }
-        // Reshape lowers to PlanNode::Reshape carrying the parsed config
-        // and the audit-widened output schema. The executor compiles each
-        // rule's `when` / `set` / `overrides` CXL against the live input
-        // schema at dispatch time, so no per-rule typed program is threaded
-        // through CompileArtifacts.
+        // Reshape lowers to PlanNode::Reshape carrying the parsed config, the
+        // audit-widened output schema, and the per-rule typechecked CXL
+        // programs (`compiled_rules`) bind_reshape produced. The executor
+        // rebuilds its per-rule evaluators off those at dispatch instead of
+        // recompiling the rule source — mirroring Aggregation / Route.
         PipelineNode::Reshape { config, .. } => {
-            // A missing typed entry means bind_schema rejected the node
-            // (E200 on a rule predicate / assignment) — skip lowering.
-            artifacts.typed_get(id)?;
+            // The per-rule typed programs bind_reshape stored. A missing entry
+            // means bind rejected the node (E200 on a rule predicate /
+            // assignment / `$doc` use) — skip lowering.
+            let compiled_rules = artifacts.reshape_compiled.get(&id)?.clone();
+            // bind_reshape inserts the entry only when every rule compiled, so
+            // the count matches; guard defensively against a short set the way
+            // the Route arm guards `branch_programs`.
+            if compiled_rules.len() != config.rules.len() {
+                return None;
+            }
             Some(crate::plan::execution::PlanNode::Reshape {
                 name: name.to_string(),
                 id,
                 span,
                 config: config.clone(),
                 output_schema: schema_from_bound(),
+                compiled_rules,
             })
         }
-        // Cull lowers to PlanNode::Cull carrying the parsed config and the
-        // (unchanged) upstream output schema. The executor recompiles each
-        // rule's `drop_group_when` predicate against the live input schema
-        // at dispatch time, so no per-rule typed program is threaded
-        // through CompileArtifacts.
+        // Cull lowers to PlanNode::Cull carrying the parsed config, the
+        // (unchanged) upstream output schema, and the OR-combined
+        // `drop_group_when` decision aggregate. The executor evaluates that
+        // decision aggregate per group off the node — mirroring Aggregation —
+        // instead of recompiling the predicate at dispatch.
         PipelineNode::Cull { config, .. } => {
-            // A missing typed entry means bind_schema rejected the node
-            // (E200 on a rule predicate / removed_to) — skip lowering.
-            artifacts.typed_get(id)?;
+            // The OR-combined decision program bind_cull stored. A missing
+            // entry means bind rejected the node (E200 on a rule predicate /
+            // removed_to) — skip lowering.
+            let typed = artifacts.cull_decision_typed.get(&id)?.clone();
+            // Extract the decision aggregate from the typed program (mirrors
+            // the Aggregate arm). `typed.field_types` is keyed and ordered by
+            // bind's upstream Row, so its keys are the live column layout the
+            // aggregate projects against — no runtime schema thread needed.
+            let input_schema: Vec<String> = typed
+                .field_types
+                .keys()
+                .map(|qf| qf.name.to_string())
+                .collect();
+            let compiled =
+                match cxl::plan::extract_aggregates(&typed, &config.partition_by, &input_schema) {
+                    Ok(c) => c,
+                    Err(errs) => {
+                        for e in errs {
+                            diags.push(Diagnostic::error(
+                                "E210",
+                                format!(
+                                    "cull decision-aggregate extraction failed for {name:?}: {}",
+                                    e.message
+                                ),
+                                LabeledSpan::primary(span, String::new()),
+                            ));
+                        }
+                        return None;
+                    }
+                };
             Some(crate::plan::execution::PlanNode::Cull {
                 name: name.to_string(),
                 id,
                 span,
                 config: config.clone(),
                 output_schema: schema_from_bound(),
+                compiled: Arc::new(compiled),
+                typed,
             })
         }
         // Envelope lowers carrying the framing strategy, the body's (unchanged)

@@ -92,6 +92,27 @@ pub struct CompileArtifacts {
     /// the Route's source(s). Compile-time-only. The per-node id keeps a
     /// route named the same in two composition scopes from colliding.
     pub route_branch_typed: HashMap<PlanNodeId, Vec<Arc<TypedProgram>>>,
+    /// Per-Cull typed OR-combined `drop_group_when` decision program, keyed
+    /// by the Cull node's [`PlanNodeId`]. `bind_cull` builds and typechecks
+    /// the `emit <decision> = (rule_1) or (rule_2) …` program (after the
+    /// per-rule diagnostic typechecks pass) and stores it here. This is the
+    /// bind→lowering handoff: lowering runs `extract_aggregates` over it and
+    /// stamps the result onto `PlanNode::Cull.compiled` / `.typed`; the
+    /// runtime builds its decision evaluator off that on-node copy and never
+    /// reads this side-table. The per-node id keeps a cull named the same in
+    /// two composition scopes from colliding.
+    pub cull_decision_typed: HashMap<PlanNodeId, Arc<TypedProgram>>,
+    /// Per-Reshape typechecked rule programs, keyed by the Reshape node's
+    /// [`PlanNodeId`] — one [`CompiledReshapeRule`](crate::plan::execution::CompiledReshapeRule)
+    /// per `config.rules` entry, in declaration order. `bind_reshape` builds
+    /// these from the per-fragment typechecks it already runs (previously
+    /// discarded after the `$doc` guard). Bind→lowering handoff: lowering
+    /// stamps them onto `PlanNode::Reshape.compiled_rules`; the runtime
+    /// rebuilds its per-rule evaluators off that on-node copy and never reads
+    /// this side-table. The per-node id keeps a reshape named the same in two
+    /// composition scopes from colliding.
+    pub reshape_compiled:
+        HashMap<PlanNodeId, Arc<Vec<crate::plan::execution::CompiledReshapeRule>>>,
     /// All bound composition bodies, keyed by `CompositionBodyId`. The
     /// top-level pipeline is NOT in this map — it lives on
     /// `CompiledPlan.dag()` directly. Only body scopes are here.
@@ -1388,17 +1409,23 @@ fn bind_reshape(
         }
     }
 
-    // Typed programs for every rule fragment, retained so the `$doc`
-    // envelope-reference guard below can walk them once the per-rule
-    // typechecks have all run. Each is `(label, typed)` where `label` names
-    // the rule fragment for the guard's diagnostic.
-    let mut typed_fragments: Vec<(String, TypedProgram)> = Vec::new();
+    // Per-rule typechecked CXL programs, assembled into the on-node
+    // `CompiledReshapeRule` set that lowering stamps onto the node. Built
+    // only when every fragment typechecks (a single failure sets `ok =
+    // false`); the partially-built vec is consumed only on the `ok` path
+    // below, so the node is never lowered with a short rule set.
+    let mut compiled_rules: Vec<crate::plan::execution::CompiledReshapeRule> =
+        Vec::with_capacity(config.rules.len());
+    // The same typed programs paired with a fragment label, retained so the
+    // `$doc` envelope-reference guard below can walk them once every per-rule
+    // typecheck has run. `label` names the rule fragment for the diagnostic.
+    let mut guard_fragments: Vec<(String, Arc<TypedProgram>)> = Vec::new();
 
     // Per-rule predicate + assignment typechecks and invariants.
     for rule in &config.rules {
         // `when` predicate compiles as a row filter.
         let when_src = format!("filter {}", rule.when.source);
-        match typecheck_cxl(
+        let when_prog = match typecheck_cxl(
             &format!("{name}:{}:when", rule.name),
             &when_src,
             upstream,
@@ -1406,13 +1433,19 @@ fn bind_reshape(
             span,
             scoped_vars,
         ) {
-            Ok(typed) => typed_fragments.push((format!("rule {:?} `when`", rule.name), typed)),
+            Ok(typed) => {
+                let prog = Arc::new(typed);
+                guard_fragments.push((format!("rule {:?} `when`", rule.name), Arc::clone(&prog)));
+                Some(prog)
+            }
             Err(d) => {
                 diags.push(d);
                 ok = false;
+                None
             }
-        }
+        };
 
+        let mut set: Vec<(String, Arc<TypedProgram>)> = Vec::new();
         if let Some(mutate) = &rule.mutate {
             for (field, value) in &mutate.set {
                 // Group identity must survive Reshape: a `set` cannot
@@ -1467,8 +1500,14 @@ fn bind_reshape(
                     span,
                     scoped_vars,
                 ) {
-                    Ok(typed) => typed_fragments
-                        .push((format!("rule {:?} `mutate.set.{field}`", rule.name), typed)),
+                    Ok(typed) => {
+                        let prog = Arc::new(typed);
+                        guard_fragments.push((
+                            format!("rule {:?} `mutate.set.{field}`", rule.name),
+                            Arc::clone(&prog),
+                        ));
+                        set.push((field.clone(), prog));
+                    }
                     Err(d) => {
                         diags.push(d);
                         ok = false;
@@ -1477,7 +1516,7 @@ fn bind_reshape(
             }
         }
 
-        if let Some(synth) = &rule.synthesize {
+        let compiled_synth = if let Some(synth) = &rule.synthesize {
             // `copy_from: none` requires every upstream user column to be
             // supplied by `overrides`, so a synthesized row is never
             // silently all-null.
@@ -1508,6 +1547,7 @@ fn bind_reshape(
                     }
                 }
             }
+            let mut overrides: Vec<(String, Arc<TypedProgram>)> = Vec::new();
             for (field, value) in &synth.overrides {
                 match typecheck_cxl(
                     &format!("{name}:{}:override.{field}", rule.name),
@@ -1517,16 +1557,38 @@ fn bind_reshape(
                     span,
                     scoped_vars,
                 ) {
-                    Ok(typed) => typed_fragments.push((
-                        format!("rule {:?} `synthesize.overrides.{field}`", rule.name),
-                        typed,
-                    )),
+                    Ok(typed) => {
+                        let prog = Arc::new(typed);
+                        guard_fragments.push((
+                            format!("rule {:?} `synthesize.overrides.{field}`", rule.name),
+                            Arc::clone(&prog),
+                        ));
+                        overrides.push((field.clone(), prog));
+                    }
                     Err(d) => {
                         diags.push(d);
                         ok = false;
                     }
                 }
             }
+            Some(crate::plan::execution::CompiledReshapeSynth {
+                copy_from: synth.copy_from,
+                overrides,
+            })
+        } else {
+            None
+        };
+
+        // Assemble the rule only when its `when` typechecked. On any fragment
+        // failure `ok` is already false, so a partial `compiled_rules` is
+        // never consumed — the node is not lowered.
+        if let Some(when) = when_prog {
+            compiled_rules.push(crate::plan::execution::CompiledReshapeRule {
+                name: rule.name.clone(),
+                when,
+                set,
+                synth: compiled_synth,
+            });
         }
     }
 
@@ -1541,9 +1603,9 @@ fn bind_reshape(
         // Reshape rule fragments carry no scope ambiguity (they are
         // labels within one node's rule set), so attribute by the bare
         // label `String`.
-        let programs: Vec<(String, &TypedProgram)> = typed_fragments
+        let programs: Vec<(String, &TypedProgram)> = guard_fragments
             .iter()
-            .map(|(label, typed)| (label.clone(), typed))
+            .map(|(label, typed)| (label.clone(), typed.as_ref()))
             .collect();
         let doc_paths = cxl::analyzer::doc_paths::collect_doc_paths(&programs);
         // Any `$doc` reference disqualifies the rule — both statically-resolved
@@ -1605,6 +1667,12 @@ fn bind_reshape(
     );
     let out = Row::from_parts(declared, upstream.declared_span, upstream.tail.clone());
     schema_by_name.insert(name.to_string(), out.clone());
+    // Bind→lowering handoff: lowering stamps these onto
+    // `PlanNode::Reshape.compiled_rules`. Every rule is present here (each
+    // rule's `when` typechecked, else `ok` was false and we returned above).
+    artifacts
+        .reshape_compiled
+        .insert(id, Arc::new(compiled_rules));
     artifacts.typed_insert(id, Arc::new(synthetic_typed_program(out)));
 }
 
@@ -1744,10 +1812,9 @@ fn bind_cull(
     // Each rule's `drop_group_when` typechecks in aggregate context over the
     // whole group (group-by = `partition_by`), so an aggregate predicate such
     // as `count(*) > 100` or `sum(if status == 'error' then 1 else 0) > 0` is
-    // well-formed. The predicate is wrapped in a single `emit` so it
-    // typechecks through the same aggregate-mode path the Aggregate node uses;
-    // the bound result is discarded here (the executor recompiles this node's
-    // predicate against the live input schema at dispatch time).
+    // well-formed. Each rule is typechecked on its own first so a diagnostic
+    // names the offending rule; the combined decision program built below is
+    // what the runtime actually evaluates.
     let agg_mode = AggregateMode::GroupBy {
         group_by_fields: config.partition_by.iter().cloned().collect(),
     };
@@ -1768,6 +1835,44 @@ fn bind_cull(
 
     if !ok {
         return;
+    }
+
+    // Build the OR-combined decision program the runtime evaluates per group:
+    // a group is removed when ANY rule's predicate holds, so the decision is
+    // the disjunction of every rule's `drop_group_when`. This single program —
+    // emit target `CULL_DROP_DECISION_COLUMN` — is the one carried to the
+    // runtime: lowering runs `extract_aggregates` over it and stamps it onto
+    // `PlanNode::Cull.compiled` / `.typed`. `rules` is non-empty (rejected
+    // above), so there is always at least one disjunct.
+    let decision_body = config
+        .rules
+        .iter()
+        .map(|r| format!("({})", r.drop_group_when.source))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    let decision_src = format!(
+        "emit {} = {decision_body}",
+        crate::config::pipeline_node::CULL_DROP_DECISION_COLUMN
+    );
+    match typecheck_cxl(
+        &format!("{name}:drop_group_when"),
+        &decision_src,
+        upstream,
+        agg_mode,
+        span,
+        scoped_vars,
+    ) {
+        Ok(typed) => {
+            artifacts.cull_decision_typed.insert(id, Arc::new(typed));
+        }
+        // The combined program is the per-rule predicates OR'd together, each
+        // of which typechecked above, so a failure here is an internal
+        // invariant violation rather than a user error. Surface it and skip
+        // lowering (the node will be absent from `cull_decision_typed`).
+        Err(d) => {
+            diags.push(d);
+            return;
+        }
     }
 
     // Cull does not widen: both output ports carry the unchanged upstream
