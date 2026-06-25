@@ -525,6 +525,8 @@ dependencies = [
  "clinker-core-types",
  "clinker-plan",
  "clinker-record",
+ "cxl",
+ "petgraph",
  "serde",
  "serde_json",
 ]
