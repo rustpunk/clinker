@@ -40,6 +40,7 @@ use std::path::Path;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
+use clinker_plan::plan::combine::encode_chain_column;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_plan::plan::{CompiledPlan, JoinSide, PlanNodeId, QualifiedField};
 use clinker_record::Schema;
@@ -192,15 +193,22 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
                 typed,
                 resolved_column_map,
                 driving_upstream,
+                decomposed_from,
                 ..
             } => {
                 let map: &HashMap<QualifiedField, (JoinSide, u32)> = resolved_column_map;
                 let bare = bare_side_index(map);
                 let probe_idx = *driving_upstream;
+                // The build side is the incoming neighbor that is not the probe.
+                // For a self-join (`input: {a: src, b: src}`) both sides are the same
+                // physical predecessor, so fall back to the probe node — the side
+                // distinction is logical (via `resolved_column_map`'s `JoinSide`), not
+                // a distinct node.
                 let build_idx = dag
                     .graph
                     .neighbors_directed(idx, Direction::Incoming)
-                    .find(|n| Some(*n) != probe_idx);
+                    .find(|n| Some(*n) != probe_idx)
+                    .or(probe_idx);
                 let probe =
                     probe_idx.map(|n| (dag.graph[n].id(), dag.graph[n].output_schema_in(dag)));
                 let build =
@@ -237,6 +245,35 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
                             }
                             cols.insert_nonempty(name, terms);
                         });
+                    }
+                    // Intermediate step of an N-ary decomposition: a body-less inner
+                    // join that carries every input column forward by IDENTITY. Its
+                    // output columns are the flat-encoded `__{qualifier}__{field}`
+                    // names, and `resolved_column_map` is a 1:1 cover of them keyed by
+                    // the original `(qualifier, field)`. Keying the lineage entry by
+                    // those encoded names lets the *final* decomposed step resolve its
+                    // probe references straight through this map.
+                    None if decomposed_from.is_some() => {
+                        for (qf, (side, cidx)) in map.iter() {
+                            let resolved = match side {
+                                JoinSide::Probe => probe.as_ref(),
+                                JoinSide::Build => build.as_ref(),
+                            };
+                            if let Some((up_id, schema)) = resolved
+                                && let Some(up_col) = schema.column_name(*cidx as usize)
+                            {
+                                let qualifier =
+                                    qf.qualifier.as_deref().unwrap_or(qf.name.as_ref());
+                                let out_name = encode_chain_column(qualifier, qf.name.as_ref());
+                                let mut terms = TermMap::new();
+                                merge_terminals(
+                                    &mut terms,
+                                    lineage.get(up_id).and_then(|m| m.0.get(up_col)),
+                                    Subtype::Identity,
+                                );
+                                cols.insert_nonempty(&out_name, terms);
+                            }
+                        }
                     }
                     None => {
                         // `match: collect`: probe columns pass through by name; any
@@ -1193,5 +1230,132 @@ nodes:
             input_names,
             vec!["/w/data/events.csv", "/w/data/orders.csv"]
         );
+    }
+
+    // -- N-ary / self-join combine --------------------------------------------
+
+    #[test]
+    fn nary_combine_resolves_each_column_through_decomposed_steps() {
+        // A 3-input combine decomposes into two binary steps; columns sourced from
+        // the all-but-last inputs (`order_id`, `product_name`) flow through the
+        // body-less intermediate step. They must resolve by IDENTITY to their true
+        // source, not get smeared as TRANSFORMATION against the last build input.
+        let yaml = r#"
+pipeline: { name: nary }
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: data/orders.csv
+      options: { has_header: true }
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: data/products.csv
+      options: { has_header: true }
+      schema:
+        - { name: product_id, type: string }
+        - { name: product_name, type: string }
+        - { name: category_id, type: string }
+  - type: source
+    name: categories
+    config:
+      name: categories
+      type: csv
+      path: data/categories.csv
+      options: { has_header: true }
+      schema:
+        - { name: category_id, type: string }
+        - { name: category_name, type: string }
+  - type: combine
+    name: enriched
+    input:
+      orders: orders
+      products: products
+      categories: categories
+    config:
+      where: "orders.product_id == products.product_id and products.category_id == categories.category_id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.product_name
+        emit category_name = categories.category_name
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: enriched
+    config: { name: out, type: csv, path: out/nary.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let fields = &only_output(&lineage).facet.fields;
+        use TransformationSubtype::Identity;
+        assert_field(
+            fields,
+            "order_id",
+            &[direct("/w/data/orders.csv", "order_id", Identity)],
+        );
+        assert_field(
+            fields,
+            "product_name",
+            &[direct("/w/data/products.csv", "product_name", Identity)],
+        );
+        assert_field(
+            fields,
+            "category_name",
+            &[direct("/w/data/categories.csv", "category_name", Identity)],
+        );
+    }
+
+    #[test]
+    fn self_join_resolves_both_sides_to_the_same_source() {
+        // `input: {e: emp, m: emp}` — both sides are the same physical predecessor.
+        // The build side must still resolve (it previously dropped to no lineage
+        // because the build neighbor lookup excluded the only incoming node).
+        let yaml = r#"
+pipeline: { name: selfjoin }
+nodes:
+  - type: source
+    name: emp
+    config:
+      name: emp
+      type: csv
+      path: data/emp.csv
+      options: { has_header: true }
+      schema:
+        - { name: id, type: string }
+        - { name: name, type: string }
+        - { name: manager_id, type: string }
+  - type: combine
+    name: pairs
+    input:
+      e: emp
+      m: emp
+    config:
+      where: "e.manager_id == m.id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit emp_name = e.name
+        emit mgr_name = m.name
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: pairs
+    config: { name: out, type: csv, path: out/selfjoin.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let fields = &only_output(&lineage).facet.fields;
+        use TransformationSubtype::Identity;
+        assert_field(fields, "emp_name", &[direct("/w/data/emp.csv", "name", Identity)]);
+        // The build side resolves to the same source dataset/column.
+        assert_field(fields, "mgr_name", &[direct("/w/data/emp.csv", "name", Identity)]);
     }
 }
