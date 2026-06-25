@@ -50,6 +50,7 @@ use std::sync::Arc;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
+use clinker_plan::config::pipeline_node::MatchMode;
 use clinker_plan::plan::combine::encode_chain_column;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_plan::plan::{
@@ -130,21 +131,18 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
                 // Explicit field emits, threading `let` and `emit each` scopes.
                 let mut emitted: HashMap<String, TermMap> = HashMap::new();
                 if let Some(payload) = resolved {
-                    // A single-input operator reads bare upstream columns; a
-                    // qualified leaf that is not a loop binding is a struct / system
-                    // access with no single source column to attribute.
+                    // A single-input operator reads upstream columns by name; a
+                    // qualified leaf that is not an in-scope binding is a nested /
+                    // struct access whose source is its base column (`address.city`
+                    // → `address`), mirroring the aggregate and combine paths.
                     let resolve_unbound = |qf: &QualifiedField| -> Option<TermMap> {
-                        qf.qualifier
-                            .is_none()
-                            .then(|| upstream_col(&lineage, up, qf.name.as_ref()).cloned())
-                            .flatten()
+                        let col = qf.qualifier.as_deref().unwrap_or(qf.name.as_ref());
+                        upstream_col(&lineage, up, col).cloned()
                     };
-                    let mut let_env = HashMap::new();
-                    let mut each_bindings = HashMap::new();
+                    let mut env = HashMap::new();
                     collect_field_emits(
                         &payload.typed.program.statements,
-                        &mut let_env,
-                        &mut each_bindings,
+                        &mut env,
                         &mut emitted,
                         &resolve_unbound,
                     );
@@ -215,6 +213,7 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
                 resolved_column_map,
                 driving_upstream,
                 decomposed_from,
+                match_mode,
                 ..
             } => {
                 let sides = combine_sides(dag, idx, resolved_column_map, *driving_upstream);
@@ -238,13 +237,11 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
                             let col = schema.column_name(cidx as usize)?;
                             lineage.get(up_id).and_then(|m| m.0.get(col)).cloned()
                         };
-                        let mut let_env = HashMap::new();
-                        let mut each_bindings = HashMap::new();
+                        let mut env = HashMap::new();
                         let mut emitted: HashMap<String, TermMap> = HashMap::new();
                         collect_field_emits(
                             &tp.program.statements,
-                            &mut let_env,
-                            &mut each_bindings,
+                            &mut env,
                             &mut emitted,
                             &resolve_unbound,
                         );
@@ -258,8 +255,12 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
                     // names, and `resolved_column_map` is a 1:1 cover of them keyed by
                     // the original `(qualifier, field)`. Keying the lineage entry by
                     // those encoded names lets the *final* decomposed step resolve its
-                    // probe references straight through this map.
-                    None if decomposed_from.is_some() => {
+                    // probe references straight through this map. A `match: collect`
+                    // step (even when decomposed) has a real collected-array column,
+                    // so it routes to the collect arm, not here.
+                    None if decomposed_from.is_some()
+                        && !matches!(match_mode, MatchMode::Collect) =>
+                    {
                         for (qf, (side, cidx)) in map.iter() {
                             let resolved = match side {
                                 JoinSide::Probe => probe.as_ref(),
@@ -590,7 +591,8 @@ fn program_field_ref_subtype(program: &Program) -> Subtype {
 /// Walk a CXL program's statements collecting, per field-emit target, the
 /// resolved source terminals its value derives from.
 ///
-/// Threads two lexical scopes that a per-emit read-set walk misses:
+/// `env` is one lexical binding scope holding both kinds of in-program name
+/// that a per-emit read-set walk misses:
 ///
 /// - **`let` bindings:** `let x = a + b; emit y = x` — `y` derives from `a`/`b`.
 ///   On each `Let`, the RHS is resolved (against the upstream and earlier
@@ -601,22 +603,26 @@ fn program_field_ref_subtype(program: &Program) -> Subtype {
 ///   array's terminals (as a TRANSFORMATION — element extraction), so a body
 ///   reference to `it` / `it.field` resolves to the array column.
 ///
-/// `resolve_unbound` resolves a leaf that names neither a binding nor a loop
-/// variable — an operator-input column — and differs per node kind (bare
-/// upstream column for Transform; `input.field` via the combine resolver for
-/// Combine). Duplicate field emits are last-wins, matching the runtime.
+/// Both live in one map so the innermost binding of a name wins (a `let` may
+/// shadow a loop variable). `emit each` / `explode` bodies are a lexical block:
+/// the whole `env` is saved on entry and restored on exit, so a body-local
+/// binding never leaks into the enclosing or a sibling scope.
+///
+/// `resolve_unbound` resolves a leaf that names no in-scope binding — an
+/// operator-input column — and differs per node kind (upstream column for
+/// Transform; `input.field` via the combine resolver for Combine). Duplicate
+/// field emits are last-wins, matching the runtime.
 fn collect_field_emits(
     statements: &[Statement],
-    let_env: &mut HashMap<String, TermMap>,
-    each_bindings: &mut HashMap<String, TermMap>,
+    env: &mut HashMap<String, TermMap>,
     emitted: &mut HashMap<String, TermMap>,
     resolve_unbound: &impl Fn(&QualifiedField) -> Option<TermMap>,
 ) {
     for stmt in statements {
         match stmt {
             Statement::Let { name, expr, .. } => {
-                let terms = resolve_expr_terms(expr, let_env, each_bindings, resolve_unbound);
-                let_env.insert(name.to_string(), terms);
+                let terms = resolve_expr_terms(expr, env, resolve_unbound);
+                env.insert(name.to_string(), terms);
             }
             Statement::Emit {
                 name,
@@ -627,7 +633,7 @@ fn collect_field_emits(
                 if name.starts_with('$') {
                     continue;
                 }
-                let terms = resolve_expr_terms(expr, let_env, each_bindings, resolve_unbound);
+                let terms = resolve_expr_terms(expr, env, resolve_unbound);
                 emitted.insert(name.to_string(), terms);
             }
             Statement::EmitEach {
@@ -642,19 +648,16 @@ fn collect_field_emits(
                 body,
                 ..
             } => {
-                let src = resolve_expr_terms(source, let_env, each_bindings, resolve_unbound);
+                let src = resolve_expr_terms(source, env, resolve_unbound);
                 let mut tagged = TermMap::new();
                 merge_terminals(&mut tagged, Some(&src), Subtype::Transformation);
-                let prev = each_bindings.insert(binding.to_string(), tagged);
-                collect_field_emits(body, let_env, each_bindings, emitted, resolve_unbound);
-                match prev {
-                    Some(p) => {
-                        each_bindings.insert(binding.to_string(), p);
-                    }
-                    None => {
-                        each_bindings.remove(binding.as_ref());
-                    }
-                }
+                // The body is a lexical block: save the scope, bind the loop
+                // variable, recurse, then restore — body-local `let`s and the
+                // loop binding both fall out of scope here.
+                let saved = env.clone();
+                env.insert(binding.to_string(), tagged);
+                collect_field_emits(body, env, emitted, resolve_unbound);
+                *env = saved;
             }
             _ => {}
         }
@@ -666,8 +669,7 @@ fn collect_field_emits(
 /// else TRANSFORMATION) is composed onto every leaf it reads.
 fn resolve_expr_terms(
     expr: &Expr,
-    let_env: &HashMap<String, TermMap>,
-    each_bindings: &HashMap<String, TermMap>,
+    env: &HashMap<String, TermMap>,
     resolve_unbound: &impl Fn(&QualifiedField) -> Option<TermMap>,
 ) -> TermMap {
     let local = field_ref_subtype(expr);
@@ -675,28 +677,22 @@ fn resolve_expr_terms(
     collect_field_refs(expr, &mut refs);
     let mut out = TermMap::new();
     for qf in &refs {
-        let base = resolve_leaf_terms(qf, let_env, each_bindings, resolve_unbound);
+        let base = resolve_leaf_terms(qf, env, resolve_unbound);
         merge_terminals(&mut out, base.as_ref(), local);
     }
     out
 }
 
-/// Resolve one leaf field reference to its source terminals: an in-scope
-/// `emit each` loop binding (matched by the reference's first segment) wins,
-/// then a bare `let` binding, then `resolve_unbound` (the operator input).
+/// Resolve one leaf field reference to its source terminals: an in-scope binding
+/// (`let` or `emit each` loop variable, matched by the reference's first segment)
+/// wins, then `resolve_unbound` (the operator input).
 fn resolve_leaf_terms(
     qf: &QualifiedField,
-    let_env: &HashMap<String, TermMap>,
-    each_bindings: &HashMap<String, TermMap>,
+    env: &HashMap<String, TermMap>,
     resolve_unbound: &impl Fn(&QualifiedField) -> Option<TermMap>,
 ) -> Option<TermMap> {
     let first = qf.qualifier.as_deref().unwrap_or(qf.name.as_ref());
-    if let Some(terms) = each_bindings.get(first) {
-        return Some(terms.clone());
-    }
-    if qf.qualifier.is_none()
-        && let Some(terms) = let_env.get(qf.name.as_ref())
-    {
+    if let Some(terms) = env.get(first) {
         return Some(terms.clone());
     }
     resolve_unbound(qf)
@@ -925,6 +921,35 @@ fn collect_field_refs(expr: &Expr, out: &mut Vec<QualifiedField>) {
     }
 }
 
+/// Collect every field reference read by a program's statements (`emit` / `let` /
+/// `filter` predicates, and `emit each` source arrays + bodies). Used for the
+/// combine `where:` residual program, whose conjunct columns still influence the
+/// join even though they are neither an equality nor a range.
+fn collect_stmt_field_refs(statements: &[Statement], out: &mut Vec<QualifiedField>) {
+    for stmt in statements {
+        match stmt {
+            Statement::Emit { expr, .. }
+            | Statement::Let { expr, .. }
+            | Statement::ExprStmt { expr, .. } => collect_field_refs(expr, out),
+            Statement::Filter { predicate, .. } => collect_field_refs(predicate, out),
+            Statement::EmitEach { source, body, .. }
+            | Statement::ExplodeOuter { source, body, .. } => {
+                collect_field_refs(source, out);
+                collect_stmt_field_refs(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The base (first dotted segment) of an input-column reference: a nested /
+/// struct access (`address.city`) influences via its source column `address`.
+/// Predicate read-sets keep qualified refs as the dotted path, but the upstream
+/// lineage map is keyed by bare column name.
+fn base_col(col: &str) -> &str {
+    col.split('.').next().unwrap_or(col)
+}
+
 /// Map a bare field name to its `(side, index)` when it is unambiguous across the
 /// combine's inputs — mirroring the executor's `bare_to_side` derivation.
 fn bare_side_index(
@@ -1028,23 +1053,33 @@ fn node_indirect_influence(
                     for col in cols {
                         add_upstream_influence(
                             &mut inf,
-                            upstream_col(lineage, up, col),
+                            upstream_col(lineage, up, base_col(col)),
                             IndirectSub::Filter,
                         );
                     }
                 }
             }
         }
-        PlanNode::Cull { .. } => {
+        PlanNode::Cull { config, .. } => {
+            let up = single_upstream(dag, idx);
             if let Some(PredicateSupport::CullDrop(cols)) = predicate_support(node) {
-                let up = single_upstream(dag, idx);
                 for col in &cols {
                     add_upstream_influence(
                         &mut inf,
-                        upstream_col(lineage, up, col),
+                        upstream_col(lineage, up, base_col(col)),
                         IndirectSub::Filter,
                     );
                 }
+            }
+            // `partition_by` groups rows for the per-group drop decision, so the
+            // partition columns influence which rows survive — GROUP_BY, mirroring
+            // Aggregation's group keys.
+            for col in &config.partition_by {
+                add_upstream_influence(
+                    &mut inf,
+                    upstream_col(lineage, up, base_col(col)),
+                    IndirectSub::GroupBy,
+                );
             }
         }
         PlanNode::Aggregation { compiled, .. } => {
@@ -1075,7 +1110,7 @@ fn node_indirect_influence(
                 for col in &reads {
                     add_upstream_influence(
                         &mut inf,
-                        upstream_col(lineage, up, col),
+                        upstream_col(lineage, up, base_col(col)),
                         IndirectSub::Conditional,
                     );
                 }
@@ -1096,6 +1131,11 @@ fn node_indirect_influence(
             for range in &dp.ranges {
                 collect_field_refs(&range.left_expr, &mut refs);
                 collect_field_refs(&range.right_expr, &mut refs);
+            }
+            // Non-equi / non-range conjuncts (`!=`, `or`, function predicates)
+            // live in the residual program; their columns still influence the join.
+            if let Some(residual) = &dp.residual {
+                collect_stmt_field_refs(&residual.program.statements, &mut refs);
             }
             for qf in &refs {
                 let Some((side, cidx)) = resolve_side(qf, sides.map, &sides.bare) else {
@@ -1482,7 +1522,159 @@ nodes:
         );
     }
 
-    // -- INDIRECT influence (#662) --------------------------------------------
+    // -- code-review regressions ----------------------------------------------
+
+    #[test]
+    fn transform_nested_ref_resolves_to_base_column() {
+        // `emit city = addr.city` (struct/nested access) attributes to the base
+        // source column `addr` instead of dropping the output column entirely.
+        let yaml = r#"
+pipeline: { name: tq }
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: json
+      options: { format: ndjson }
+      path: data/rows.ndjson
+      schema:
+        - { name: addr, type: any }
+  - type: transform
+    name: t
+    input: rows
+    config: { cxl: "emit city = addr.city" }
+  - type: output
+    name: out
+    input: t
+    config:
+      name: out
+      type: json
+      options: { format: ndjson }
+      path: out/tq.ndjson
+      include_unmapped: false
+"#;
+        let lineage = lineage_of(yaml);
+        let fields = &only_output(&lineage).facet.fields;
+        assert_field(
+            fields,
+            "city",
+            &[direct(
+                "/w/data/rows.ndjson",
+                "addr",
+                TransformationSubtype::Identity,
+            )],
+        );
+    }
+
+    #[test]
+    fn combine_residual_conjunct_columns_are_join_influence() {
+        // A non-equi (`!=`) conjunct lands in the decomposed predicate's residual;
+        // its columns still influence the join and must appear in `dataset[]`.
+        let yaml = r#"
+pipeline: { name: cr }
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: data/a.csv
+      options: { has_header: true }
+      schema:
+        - { name: k, type: string }
+        - { name: region, type: string }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: data/b.csv
+      options: { has_header: true }
+      schema:
+        - { name: k, type: string }
+        - { name: region, type: string }
+  - type: combine
+    name: j
+    input: { a: a, b: b }
+    config:
+      where: "a.k == b.k and a.region != b.region"
+      match: first
+      on_miss: skip
+      cxl: "emit out = a.k"
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: j
+    config: { name: out, type: csv, path: out/cr.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        use TransformationSubtype::Join;
+        assert_eq!(
+            only_output(&lineage).facet.dataset,
+            vec![
+                indirect("/w/data/a.csv", "k", &[Join]),
+                indirect("/w/data/a.csv", "region", &[Join]),
+                indirect("/w/data/b.csv", "k", &[Join]),
+                indirect("/w/data/b.csv", "region", &[Join]),
+            ],
+        );
+    }
+
+    #[test]
+    fn let_in_emit_each_body_does_not_leak() {
+        // A `let` inside an `emit each` body is block-scoped: it must not shadow
+        // a same-named outer binding seen by a later statement. Here the body's
+        // `let total = it` must not survive, so `emit out = total` resolves to the
+        // outer `let total = base`, not the loop array.
+        let yaml = r#"
+pipeline: { name: ll }
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: json
+      options: { format: ndjson }
+      path: data/s.ndjson
+      schema:
+        - { name: base, type: string }
+        - { name: items, type: any }
+  - type: transform
+    name: t
+    input: s
+    config:
+      cxl: |
+        let total = base
+        emit each it in items {
+          let total = it
+        }
+        emit out = total
+  - type: output
+    name: out
+    input: t
+    config:
+      name: out
+      type: json
+      options: { format: ndjson }
+      path: out/ll.ndjson
+      include_unmapped: false
+      exclude: [items]
+"#;
+        let lineage = lineage_of(yaml);
+        let fields = &only_output(&lineage).facet.fields;
+        assert_field(
+            fields,
+            "out",
+            &[direct(
+                "/w/data/s.ndjson",
+                "base",
+                TransformationSubtype::Identity,
+            )],
+        );
+    }
+
+    // -- INDIRECT influence --------------------------------------------
 
     #[test]
     fn route_predicate_columns_are_filter_influence_not_per_column() {
@@ -1580,9 +1772,15 @@ nodes:
         let lineage = lineage_of(yaml);
         let src = "/w/data/s.csv";
         let out = output_named(&lineage, "c.csv");
+        use TransformationSubtype::{Filter, GroupBy};
+        // The drop predicate column is FILTER; the partition key is GROUP_BY
+        // (it determines the per-group drop decision). Sorted by field name.
         assert_eq!(
             out.facet.dataset,
-            vec![indirect(src, "amount", &[TransformationSubtype::Filter])],
+            vec![
+                indirect(src, "amount", &[Filter]),
+                indirect(src, "employee_id", &[GroupBy]),
+            ],
         );
     }
 
@@ -2274,6 +2472,69 @@ nodes:
                 indirect("/w/data/products.csv", "category_id", &[Join]),
                 indirect("/w/data/products.csv", "product_id", &[Join]),
             ],
+        );
+    }
+
+    #[test]
+    fn four_input_combine_resolves_every_column_through_all_steps() {
+        // A 4-input join decomposes into three binary steps; columns from the
+        // earliest-joined inputs flow through two intermediate steps and must
+        // still resolve to their true source by IDENTITY.
+        let yaml = r#"
+pipeline: { name: four }
+nodes:
+  - type: source
+    name: a
+    config: { name: a, type: csv, path: data/a.csv, options: { has_header: true }, schema: [ { name: id, type: string }, { name: a_val, type: string } ] }
+  - type: source
+    name: b
+    config: { name: b, type: csv, path: data/b.csv, options: { has_header: true }, schema: [ { name: id, type: string }, { name: b_val, type: string } ] }
+  - type: source
+    name: c
+    config: { name: c, type: csv, path: data/c.csv, options: { has_header: true }, schema: [ { name: id, type: string }, { name: c_val, type: string } ] }
+  - type: source
+    name: d
+    config: { name: d, type: csv, path: data/d.csv, options: { has_header: true }, schema: [ { name: id, type: string }, { name: d_val, type: string } ] }
+  - type: combine
+    name: j
+    input: { a: a, b: b, c: c, d: d }
+    config:
+      where: "a.id == b.id and b.id == c.id and c.id == d.id"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit a_val = a.a_val
+        emit b_val = b.b_val
+        emit c_val = c.c_val
+        emit d_val = d.d_val
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: j
+    config: { name: out, type: csv, path: out/four.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let fields = &only_output(&lineage).facet.fields;
+        use TransformationSubtype::Identity;
+        assert_field(
+            fields,
+            "a_val",
+            &[direct("/w/data/a.csv", "a_val", Identity)],
+        );
+        assert_field(
+            fields,
+            "b_val",
+            &[direct("/w/data/b.csv", "b_val", Identity)],
+        );
+        assert_field(
+            fields,
+            "c_val",
+            &[direct("/w/data/c.csv", "c_val", Identity)],
+        );
+        assert_field(
+            fields,
+            "d_val",
+            &[direct("/w/data/d.csv", "d_val", Identity)],
         );
     }
 
