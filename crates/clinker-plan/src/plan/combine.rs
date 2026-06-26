@@ -1362,7 +1362,7 @@ pub(crate) const MAX_COMBINE_INPUTS: usize = 8;
 /// from author-declared field names which never legally start with
 /// `__` (CXL identifiers begin with `[A-Za-z_]` but pipeline-author
 /// fields by convention do not lead with double-underscore).
-pub(crate) fn encode_chain_column(qualifier: &str, name: &str) -> String {
+pub fn encode_chain_column(qualifier: &str, name: &str) -> String {
     format!("__{qualifier}__{name}")
 }
 
