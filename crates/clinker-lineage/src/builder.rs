@@ -28,6 +28,18 @@
 //! body surfaces as INDIRECT influence on the sink. Nested compositions recurse
 //! the same way.
 //!
+//! ## Envelope (`$doc`) lineage
+//!
+//! An output column whose value derives from an envelope read
+//! (`$doc.<section>.<field>`, bare / indexed / inside a larger expression)
+//! gets a DIRECT terminal on the **originating Source** dataset with the rendered
+//! `$doc.…` path as its `field`. A `$doc` access carries no source qualifier, so
+//! each node's feeding source datasets are tracked alongside the lineage and
+//! influence maps (`node_doc_sources`), mirroring the planner's own source
+//! attribution: a Source seeds its own dataset, a Combine takes only its driving
+//! input, a Composition unions its bound input-port sources, and every other node
+//! unions its direct upstreams.
+//!
 //! ## Subtype model
 //!
 //! Each DIRECT input→output link carries one [`TransformationSubtype`]; along a
@@ -38,8 +50,9 @@
 //!
 //! ## Documented limitations
 //!
-//! - **Envelope** / `$doc` provenance is best-effort same-name passthrough only;
-//!   precise envelope lineage is a #653 follow-up.
+//! - A whole-section envelope echo (`*_from_doc`) at document grain is not yet
+//!   attributed (it has no output column or CXL expression); a column-grain `$doc`
+//!   read is (see above).
 //! - A `match: collect` combine (no projection body) is resolved coarsely.
 //! - INDIRECT influence covers the predicate / grouping / sort surfaces above; an
 //!   aggregate's pre-aggregation row `filter`, a Transform-inline `filter`, and
@@ -63,6 +76,7 @@ use clinker_plan::plan::{
     CompiledPlan, JoinSide, PlanNodeId, PredicateSupport, QualifiedField, predicate_support,
 };
 use clinker_record::Schema;
+use cxl::analyzer::doc_paths::{DocIndex, DocPath, classify_doc_index_chain};
 use cxl::ast::{EmitTarget, Expr, Program, Statement, for_each_field_emit, program_support_into};
 use cxl::plan::BindingArg;
 
@@ -116,6 +130,7 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
         compiled.dag(),
         HashMap::new(),
         HashMap::new(),
+        HashMap::new(),
         &mut sink,
     );
 
@@ -137,11 +152,11 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
 /// influence maps so a caller (the Composition arm) can harvest a body's output
 /// ports.
 ///
-/// `seed_lineage`/`seed_influence` pre-populate nodes whose lineage the caller
-/// already resolved — a composition body's input-port Source nodes, seeded from
-/// the parent producers feeding the call site. Those nodes are skipped so their
-/// placeholder Source identity is never resolved (which would inject a phantom
-/// input). At the top level both seeds are empty, so this is a
+/// `seed_lineage`/`seed_influence`/`seed_doc_sources` pre-populate nodes whose
+/// state the caller already resolved — a composition body's input-port Source
+/// nodes, seeded from the parent producers feeding the call site. Those nodes are
+/// skipped so their placeholder Source identity is never resolved (which would
+/// inject a phantom input). At the top level all seeds are empty, so this is a
 /// behavior-preserving extraction of the original single-scope walk.
 fn walk_scope(
     compiled: &CompiledPlan,
@@ -149,16 +164,19 @@ fn walk_scope(
     dag: &ExecutionPlanDag,
     seed_lineage: HashMap<PlanNodeId, ColumnTerminals>,
     seed_influence: HashMap<PlanNodeId, InfluenceMap>,
+    seed_doc_sources: HashMap<PlanNodeId, BTreeSet<DatasetId>>,
     sink: &mut ScopeSink,
 ) -> (
     HashMap<PlanNodeId, ColumnTerminals>,
     HashMap<PlanNodeId, InfluenceMap>,
 ) {
-    // Pre-seeded nodes keep their injected terminals/influence and are not
-    // recomputed by the walk. Derived before the seeds move into the working maps.
+    // Pre-seeded nodes keep their injected terminals/influence/doc-sources and are
+    // not recomputed by the walk. Derived before the seeds move into the working
+    // maps.
     let seeded: HashSet<PlanNodeId> = seed_lineage
         .keys()
         .chain(seed_influence.keys())
+        .chain(seed_doc_sources.keys())
         .copied()
         .collect();
     // Per node, per output column, the resolved Source terminals it derives from.
@@ -166,6 +184,9 @@ fn walk_scope(
     // Per node, the whole-dataset INDIRECT influences accumulated from this node
     // and every upstream — flushed into each Output's facet `dataset[]`.
     let mut influence: HashMap<PlanNodeId, InfluenceMap> = seed_influence;
+    // Per node, the Source datasets feeding it — the attribution target for a
+    // `$doc` envelope read, which carries no source qualifier of its own.
+    let mut doc_sources: HashMap<PlanNodeId, BTreeSet<DatasetId>> = seed_doc_sources;
 
     for &idx in &dag.topo_order {
         let node = &dag.graph[idx];
@@ -174,6 +195,10 @@ fn walk_scope(
         if seeded.contains(&node_id) {
             continue;
         }
+
+        // The Source datasets this node draws from, resolved before the per-node
+        // match so the emit-walkers can attribute a `$doc` read to them.
+        let node_doc_srcs = node_doc_sources(node, dag, idx, base_dir, &doc_sources);
 
         // Set by the Composition arm to the body's output-port INDIRECT influence,
         // merged into this node's influence below.
@@ -219,6 +244,7 @@ fn walk_scope(
                         &mut env,
                         &mut emitted,
                         &resolve_unbound,
+                        &node_doc_srcs,
                     );
                 }
                 // Output schema = explicit emits + open-row passthrough of the rest.
@@ -318,6 +344,7 @@ fn walk_scope(
                             &mut env,
                             &mut emitted,
                             &resolve_unbound,
+                            &node_doc_srcs,
                         );
                         for (name, terms) in emitted {
                             cols.insert_nonempty(&name, terms);
@@ -410,6 +437,8 @@ fn walk_scope(
                     // identity into a phantom `clinker:<port>` input.
                     let mut seed_lineage: HashMap<PlanNodeId, ColumnTerminals> = HashMap::new();
                     let mut seed_influence: HashMap<PlanNodeId, InfluenceMap> = HashMap::new();
+                    let mut seed_doc_sources: HashMap<PlanNodeId, BTreeSet<DatasetId>> =
+                        HashMap::new();
                     for edge in dag.graph.edges_directed(idx, Direction::Incoming) {
                         let Some(port) = edge.weight().port.as_deref() else {
                             continue;
@@ -425,6 +454,12 @@ fn walk_scope(
                         if let Some(inf) = influence.get(&parent_id) {
                             seed_influence.insert(body_src_id, inf.clone());
                         }
+                        // Seed the port's body Source with the feeding parent's
+                        // source datasets, so an in-body `$doc` read attributes to
+                        // the real upstream source rather than the synthetic port.
+                        if let Some(ds) = doc_sources.get(&parent_id) {
+                            seed_doc_sources.insert(body_src_id, ds.clone());
+                        }
                     }
                     let (body_lineage, mut body_influence) = walk_scope(
                         compiled,
@@ -432,6 +467,7 @@ fn walk_scope(
                         &body_dag,
                         seed_lineage,
                         seed_influence,
+                        seed_doc_sources,
                         sink,
                     );
                     // Harvest the first declared output port — the records the
@@ -516,6 +552,7 @@ fn walk_scope(
 
         lineage.insert(node_id, cols);
         influence.insert(node_id, node_influence);
+        doc_sources.insert(node_id, node_doc_srcs);
     }
 
     (lineage, influence)
@@ -640,6 +677,54 @@ fn upstream_ids(dag: &ExecutionPlanDag, idx: NodeIndex) -> Vec<PlanNodeId> {
         .collect()
 }
 
+/// The Source datasets feeding `node`, the attribution target for a `$doc`
+/// envelope read (which carries no source qualifier). Mirrors the planner's
+/// `build_node_source_sets`: a Source seeds its own dataset; a Combine carries
+/// only its driving input's document context; every other node (Composition
+/// included — its incoming neighbors are exactly its bound input-port producers)
+/// unions its direct upstreams. Upstreams are already resolved because the walk
+/// is topological.
+fn node_doc_sources(
+    node: &PlanNode,
+    dag: &ExecutionPlanDag,
+    idx: NodeIndex,
+    base_dir: &Path,
+    doc_sources: &HashMap<PlanNodeId, BTreeSet<DatasetId>>,
+) -> BTreeSet<DatasetId> {
+    match node {
+        PlanNode::Source { .. } => dataset_identity(node, base_dir).into_iter().collect(),
+        PlanNode::Combine {
+            driving_upstream, ..
+        } => {
+            // A joined record carries only the driving input's document context.
+            // When the planner picked no driver the combine is omitted from the
+            // DAG, so the union fallback is unused either way.
+            if let Some(drv) = driving_upstream
+                && let Some(srcs) = doc_sources.get(&dag.graph[*drv].id())
+            {
+                return srcs.clone();
+            }
+            union_doc_sources(dag, idx, doc_sources)
+        }
+        _ => union_doc_sources(dag, idx, doc_sources),
+    }
+}
+
+/// Union of the Source datasets feeding every direct upstream of `idx`.
+fn union_doc_sources(
+    dag: &ExecutionPlanDag,
+    idx: NodeIndex,
+    doc_sources: &HashMap<PlanNodeId, BTreeSet<DatasetId>>,
+) -> BTreeSet<DatasetId> {
+    let mut out = BTreeSet::new();
+    for up in upstream_ids(dag, idx) {
+        if let Some(srcs) = doc_sources.get(&up) {
+            out.extend(srcs.iter().cloned());
+        }
+    }
+    out
+}
+
 /// Visit each non-engine-stamped output column name of `node` in schema order.
 fn for_each_output_col(node: &PlanNode, dag: &ExecutionPlanDag, mut visit: impl FnMut(&str)) {
     let schema = node.output_schema_in(dag);
@@ -686,10 +771,15 @@ fn merge_terminals(target: &mut TermMap, upstream: Option<&TermMap>, local: Subt
 // Expression / program inspection
 // ---------------------------------------------------------------------------
 
-/// IDENTITY when `expr` is a single (bare or qualified) field reference — a
-/// copy/rename — otherwise TRANSFORMATION.
+/// IDENTITY when `expr` is a single copy of one leaf — a (bare or qualified)
+/// field reference, a bare `$doc` envelope access, or a `$doc` access with only
+/// literal index segments (`$doc.s.items[0]`) — otherwise TRANSFORMATION.
 fn field_ref_subtype(expr: &Expr) -> Subtype {
-    if matches!(expr, Expr::FieldRef { .. } | Expr::QualifiedFieldRef { .. }) {
+    let is_bare_copy = matches!(
+        expr,
+        Expr::FieldRef { .. } | Expr::QualifiedFieldRef { .. } | Expr::DocAccess { .. }
+    ) || matches!(classify_doc_index_chain(expr), Some(Ok(_)));
+    if is_bare_copy {
         Subtype::Identity
     } else {
         Subtype::Transformation
@@ -739,16 +829,22 @@ fn program_field_ref_subtype(program: &Program) -> Subtype {
 /// operator-input column — and differs per node kind (upstream column for
 /// Transform; `input.field` via the combine resolver for Combine). Duplicate
 /// field emits are last-wins, matching the runtime.
+///
+/// `doc_sources` are the Source datasets feeding this node: an envelope read
+/// (`$doc.<section>.<field>`) carries no source qualifier, so it attributes to
+/// each of them. A `$doc` read inside a `let` is captured the same way — the
+/// resolved terminals land in `env` and expand at the binding's use site.
 fn collect_field_emits(
     statements: &[Statement],
     env: &mut HashMap<String, TermMap>,
     emitted: &mut HashMap<String, TermMap>,
     resolve_unbound: &impl Fn(&QualifiedField) -> Option<TermMap>,
+    doc_sources: &BTreeSet<DatasetId>,
 ) {
     for stmt in statements {
         match stmt {
             Statement::Let { name, expr, .. } => {
-                let terms = resolve_expr_terms(expr, env, resolve_unbound);
+                let terms = resolve_expr_terms(expr, env, resolve_unbound, doc_sources);
                 env.insert(name.to_string(), terms);
             }
             Statement::Emit {
@@ -760,7 +856,7 @@ fn collect_field_emits(
                 if name.starts_with('$') {
                     continue;
                 }
-                let terms = resolve_expr_terms(expr, env, resolve_unbound);
+                let terms = resolve_expr_terms(expr, env, resolve_unbound, doc_sources);
                 emitted.insert(name.to_string(), terms);
             }
             Statement::EmitEach {
@@ -775,7 +871,7 @@ fn collect_field_emits(
                 body,
                 ..
             } => {
-                let src = resolve_expr_terms(source, env, resolve_unbound);
+                let src = resolve_expr_terms(source, env, resolve_unbound, doc_sources);
                 let mut tagged = TermMap::new();
                 merge_terminals(&mut tagged, Some(&src), Subtype::Transformation);
                 // The body is a lexical block: save the scope, bind the loop
@@ -783,7 +879,7 @@ fn collect_field_emits(
                 // loop binding both fall out of scope here.
                 let saved = env.clone();
                 env.insert(binding.to_string(), tagged);
-                collect_field_emits(body, env, emitted, resolve_unbound);
+                collect_field_emits(body, env, emitted, resolve_unbound, doc_sources);
                 *env = saved;
             }
             _ => {}
@@ -793,20 +889,41 @@ fn collect_field_emits(
 
 /// Resolve the source terminals an emit/let RHS expression derives from. The
 /// whole expression's [`field_ref_subtype`] (IDENTITY for a bare copy/rename,
-/// else TRANSFORMATION) is composed onto every leaf it reads.
+/// else TRANSFORMATION) is composed onto every leaf it reads — a record column
+/// (via `resolve_unbound`) or an envelope `$doc` read (attributed to each
+/// `doc_sources` dataset with the rendered doc path as its `field`).
 fn resolve_expr_terms(
     expr: &Expr,
     env: &HashMap<String, TermMap>,
     resolve_unbound: &impl Fn(&QualifiedField) -> Option<TermMap>,
+    doc_sources: &BTreeSet<DatasetId>,
 ) -> TermMap {
     let local = field_ref_subtype(expr);
+    let mut out = TermMap::new();
+
     let mut refs = Vec::new();
     collect_field_refs(expr, &mut refs);
-    let mut out = TermMap::new();
     for qf in &refs {
         let base = resolve_leaf_terms(qf, env, resolve_unbound);
         merge_terminals(&mut out, base.as_ref(), local);
     }
+
+    // Envelope reads resolve to the feeding source datasets, not through the
+    // upstream column map (a `$doc` access names a section/field, not a column).
+    let mut doc_paths = Vec::new();
+    collect_doc_paths_in_expr(expr, &mut doc_paths);
+    for path in &doc_paths {
+        let rendered = render_doc_path(path);
+        let mut base = TermMap::new();
+        for ds in doc_sources {
+            base.insert(
+                Terminal::new(&ds.namespace, &ds.name, &rendered),
+                Subtype::Identity,
+            );
+        }
+        merge_terminals(&mut out, Some(&base), local);
+    }
+
     out
 }
 
@@ -1046,6 +1163,106 @@ fn collect_field_refs(expr: &Expr, out: &mut Vec<QualifiedField>) {
         Expr::Closure { body, .. } => collect_field_refs(body, out),
         _ => {}
     }
+}
+
+/// Collect every envelope (`$doc`) path an expression reads, as a resolved
+/// [`DocPath`]. A bare `$doc.<section>.<field>` yields a two-level path; a `$doc`
+/// access with trailing literal indices (`$doc.s.items[0]`) is classified as one
+/// unit so its index expressions are not descended into as independent
+/// references. The parallel of [`collect_field_refs`] for the off-schema `$doc`
+/// namespace `collect_field_refs` deliberately skips.
+///
+/// Dynamic doc indices are a fail-fast compile error, so a compiled plan never
+/// carries an unresolvable chain; the `Err` arm is descended defensively only so
+/// a nested `$doc` is never silently lost.
+fn collect_doc_paths_in_expr(expr: &Expr, out: &mut Vec<DocPath>) {
+    // A `$doc` index chain is one path — classify before the generic descent so
+    // its index expressions are not walked as separate references. Anything else
+    // (a non-`$doc` index access, or an unreachable dynamic-index `Err`) falls
+    // through to the generic descent, which still collects a `$doc` nested in the
+    // index expression.
+    if let Expr::IndexAccess { .. } = expr
+        && let Some(Ok(path)) = classify_doc_index_chain(expr)
+    {
+        out.push(path);
+        return;
+    }
+    if let Expr::DocAccess { section, field, .. } = expr {
+        out.push(DocPath {
+            section: section.clone(),
+            field: field.clone(),
+            indices: Vec::new(),
+        });
+        return;
+    }
+    match expr {
+        Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
+            collect_doc_paths_in_expr(lhs, out);
+            collect_doc_paths_in_expr(rhs, out);
+        }
+        Expr::Unary { operand, .. } => collect_doc_paths_in_expr(operand, out),
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_doc_paths_in_expr(condition, out);
+            collect_doc_paths_in_expr(then_branch, out);
+            if let Some(eb) = else_branch {
+                collect_doc_paths_in_expr(eb, out);
+            }
+        }
+        Expr::Match { subject, arms, .. } => {
+            if let Some(s) = subject {
+                collect_doc_paths_in_expr(s, out);
+            }
+            for arm in arms {
+                collect_doc_paths_in_expr(&arm.pattern, out);
+                collect_doc_paths_in_expr(&arm.body, out);
+            }
+        }
+        Expr::MethodCall { receiver, args, .. } => {
+            collect_doc_paths_in_expr(receiver, out);
+            for a in args {
+                collect_doc_paths_in_expr(a, out);
+            }
+        }
+        Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+            for a in args {
+                collect_doc_paths_in_expr(a, out);
+            }
+        }
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
+            collect_doc_paths_in_expr(receiver, out);
+            collect_doc_paths_in_expr(index, out);
+        }
+        Expr::Closure { body, .. } => collect_doc_paths_in_expr(body, out),
+        _ => {}
+    }
+}
+
+/// Render a resolved [`DocPath`] back to its CXL surface spelling
+/// `$doc.<section>.<field>` with any literal index segments (`[0]` / `["key"]`).
+/// This stable string is the `field` of the envelope terminal in the lineage
+/// facet — the `$doc.` prefix marks an envelope-derived field and never collides
+/// with a real column (record types may not declare `$`-prefixed columns).
+fn render_doc_path(path: &DocPath) -> String {
+    use std::fmt::Write as _;
+    let mut s = format!("$doc.{}.{}", path.section, path.field);
+    for idx in &path.indices {
+        match idx {
+            DocIndex::Int(n) => {
+                let _ = write!(s, "[{n}]");
+            }
+            DocIndex::Key(k) => {
+                let _ = write!(s, "[\"{k}\"]");
+            }
+        }
+    }
+    s
 }
 
 /// Collect every field reference read by a program's statements (`emit` / `let` /
@@ -2715,6 +2932,229 @@ nodes:
             fields,
             "mgr_name",
             &[direct("/w/data/emp.csv", "name", Identity)],
+        );
+    }
+
+    // -- Envelope ($doc) lineage ----------------------------------------------
+
+    /// One XML source declaring `BatchInfo` (`batch_id`, `nval`) and `Summary`
+    /// (`total`), feeding a `transform` whose `cxl` body is spliced in. The glob
+    /// `data/*.xml` resolves to the directory dataset `/w/data`.
+    fn envelope_pipeline(body_cxl: &str) -> String {
+        let indented: String = body_cxl.lines().map(|l| format!("        {l}\n")).collect();
+        format!(
+            r#"
+pipeline: {{ name: env }}
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: xml
+      glob: data/*.xml
+      options: {{ record_path: doc/records/record }}
+      envelope:
+        sections:
+          BatchInfo:
+            extract: {{ xml_path: "/doc/BatchInfo" }}
+            fields:
+              batch_id: string
+              nval: int
+          Summary:
+            extract: {{ xml_path: "/doc/Summary" }}
+            fields:
+              total: int
+      schema:
+        - {{ name: amount, type: int }}
+  - type: transform
+    name: tag
+    input: payments
+    config:
+      cxl: |
+{indented}  - type: output
+    name: out
+    input: tag
+    config: {{ name: out, type: csv, path: out/env.csv }}
+"#
+        )
+    }
+
+    #[test]
+    fn bare_doc_access_is_direct_identity_on_the_source() {
+        // A `$doc`-only column previously resolved to an empty term set and was
+        // omitted; it now carries a DIRECT IDENTITY terminal naming the source
+        // dataset and the rendered `$doc.<section>.<field>` path.
+        let lineage = lineage_of(&envelope_pipeline(
+            "emit amount = amount\nemit batch = $doc.BatchInfo.batch_id",
+        ));
+        let src = "/w/data";
+        let fields = &only_output(&lineage).facet.fields;
+        use TransformationSubtype::Identity;
+        assert_field(fields, "amount", &[direct(src, "amount", Identity)]);
+        assert_field(
+            fields,
+            "batch",
+            &[direct(src, "$doc.BatchInfo.batch_id", Identity)],
+        );
+        assert_eq!(fields.len(), 2, "no extra/omitted columns");
+    }
+
+    #[test]
+    fn doc_access_inside_an_expression_is_transformation() {
+        // A doc access that is one leaf of a larger expression is TRANSFORMATION,
+        // alongside the record column the expression also reads. InputFields sort
+        // by field name: `$` precedes `a`.
+        let lineage = lineage_of(&envelope_pipeline(
+            "emit amount = amount\nemit x = $doc.BatchInfo.nval + amount",
+        ));
+        let src = "/w/data";
+        let fields = &only_output(&lineage).facet.fields;
+        use TransformationSubtype::Transformation;
+        assert_field(
+            fields,
+            "x",
+            &[
+                direct(src, "$doc.BatchInfo.nval", Transformation),
+                direct(src, "amount", Transformation),
+            ],
+        );
+    }
+
+    #[test]
+    fn indexed_doc_access_renders_its_literal_index() {
+        // A literal index segment is rendered into the `field` path verbatim, and
+        // an indexed-but-whole-value doc read is still IDENTITY.
+        let lineage = lineage_of(&envelope_pipeline(
+            "emit amount = amount\nemit first = $doc.Summary.total[0]",
+        ));
+        let src = "/w/data";
+        let fields = &only_output(&lineage).facet.fields;
+        assert_field(
+            fields,
+            "first",
+            &[direct(
+                src,
+                "$doc.Summary.total[0]",
+                TransformationSubtype::Identity,
+            )],
+        );
+    }
+
+    #[test]
+    fn doc_access_through_a_let_binding_resolves_to_the_source() {
+        // `let b = $doc...; emit batch = b` — the binding's terminals expand at
+        // the use site, so the doc read survives the indirection as IDENTITY.
+        let lineage = lineage_of(&envelope_pipeline(
+            "emit amount = amount\nlet b = $doc.BatchInfo.batch_id\nemit batch = b",
+        ));
+        let src = "/w/data";
+        let fields = &only_output(&lineage).facet.fields;
+        assert_field(
+            fields,
+            "batch",
+            &[direct(
+                src,
+                "$doc.BatchInfo.batch_id",
+                TransformationSubtype::Identity,
+            )],
+        );
+    }
+
+    #[test]
+    fn combine_attributes_a_doc_read_to_the_driving_source_only() {
+        // Both inputs declare `BatchInfo`, but a joined record carries only the
+        // driving input's document context (the first-declared input absent row
+        // stats). The body `$doc` read must attribute to the driver `drv` alone,
+        // never the build side `bld`.
+        let yaml = r#"
+pipeline: { name: cdoc }
+nodes:
+  - type: source
+    name: drv
+    config:
+      name: drv
+      type: xml
+      glob: data/drv/*.xml
+      options: { record_path: doc/records/record }
+      envelope:
+        sections:
+          BatchInfo:
+            extract: { xml_path: "/doc/BatchInfo" }
+            fields:
+              batch_id: string
+      schema:
+        - { name: k, type: string }
+  - type: source
+    name: bld
+    config:
+      name: bld
+      type: xml
+      glob: data/bld/*.xml
+      options: { record_path: doc/records/record }
+      envelope:
+        sections:
+          BatchInfo:
+            extract: { xml_path: "/doc/BatchInfo" }
+            fields:
+              batch_id: string
+      schema:
+        - { name: k, type: string }
+  - type: combine
+    name: j
+    input: { drv: drv, bld: bld }
+    config:
+      where: "drv.k == bld.k"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit k = drv.k
+        emit batch = $doc.BatchInfo.batch_id
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: j
+    config: { name: out, type: csv, path: out/cdoc.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let fields = &only_output(&lineage).facet.fields;
+        assert_field(
+            fields,
+            "batch",
+            &[direct(
+                "/w/data/drv",
+                "$doc.BatchInfo.batch_id",
+                TransformationSubtype::Identity,
+            )],
+        );
+    }
+
+    #[test]
+    fn doc_section_and_index_names_render_verbatim() {
+        // The renderer reproduces the CXL surface spelling for arbitrary (e.g.
+        // EDI/HL7 engine-fixed) section names and both index kinds.
+        assert_eq!(
+            render_doc_path(&DocPath {
+                section: "transaction_set".into(),
+                field: "control_number".into(),
+                indices: vec![],
+            }),
+            "$doc.transaction_set.control_number"
+        );
+        assert_eq!(
+            render_doc_path(&DocPath {
+                section: "summary".into(),
+                field: "rows".into(),
+                indices: vec![DocIndex::Int(2), DocIndex::Key("k".into())],
+            }),
+            "$doc.summary.rows[2][\"k\"]"
+        );
+        assert_eq!(
+            render_doc_path(&DocPath {
+                section: "summary".into(),
+                field: "items".into(),
+                indices: vec![DocIndex::Int(-1)],
+            }),
+            "$doc.summary.items[-1]"
         );
     }
 }

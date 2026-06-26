@@ -43,7 +43,7 @@ The facet has two parts, mirroring the OpenLineage `ColumnLineageDatasetFacet`:
 }
 ```
 
-- **`fields`** -- **DIRECT** (value-derivation) lineage, keyed per output column: the source columns each output column's *value* is computed from. A rename (`emit full = name`), a multi-hop chain, or a path through a **composition** body (including nested compositions) collapses to the originating source column.
+- **`fields`** -- **DIRECT** (value-derivation) lineage, keyed per output column: the source columns each output column's *value* is computed from. A rename (`emit full = name`), a multi-hop chain, or a path through a **composition** body (including nested compositions) collapses to the originating source column. A column whose value derives from an **envelope** read (`$doc.<section>.<field>`, bare / indexed / inside a larger expression) gets a DIRECT input field on the originating source dataset whose `field` is the rendered `$doc.…` path -- so envelope-derived columns trace back to the document section they came from.
 - **`dataset`** -- **INDIRECT** (influence) lineage for the dataset as a whole: source columns that shaped *which rows* exist, via filtering, joining, grouping, or sorting -- collected once rather than duplicated across every column.
 
 Each transformation carries a `type` (`DIRECT` / `INDIRECT`) and a `subtype` (`IDENTITY`, `TRANSFORMATION`, `AGGREGATION`, `JOIN`, `GROUP_BY`, `FILTER`, `SORT`, `CONDITIONAL`).
@@ -60,6 +60,7 @@ Because `--lineage` reads no data, it runs instantly and works on a pipeline who
 
 Lineage is derived from the compiled plan, so a few constructs are approximated:
 
-- **Envelope** / `$doc` provenance is best-effort same-name passthrough.
+- A whole-section **envelope echo** (an output header/footer regenerated from a source document section, with no output column or expression) is not yet attributed; a column-grain `$doc` read **is** (see [`fields`](#reading-the-columnlineage-facet) above).
+- A **multi-record-type** source (one physical file carrying several record shapes over a single superset schema) is modeled as **one** dataset, matching its single physical identity -- lineage is not split per record type.
 - INDIRECT influence covers route/cull predicates, join keys, aggregate grouping, and correlation sort. An aggregate's pre-aggregation row `filter`, a transform-inline `filter`, and Reshape `order_by` / `partition_by` are not (yet) attributed as influence.
 - Constant and `count(*)` columns (which have no source input) are omitted from `fields`; engine-stamped columns (`$ck.*`, `$meta.*`, `$source.*`) are skipped, mirroring the default writer.
