@@ -60,7 +60,7 @@ Because `--lineage` reads no data, it runs instantly and works on a pipeline who
 
 Lineage is derived from the compiled plan, so a few constructs are approximated:
 
-- A whole-section **envelope echo** (an output header/footer regenerated from a source document section, with no output column or expression) is not yet attributed; a column-grain `$doc` read **is** (see [`fields`](#reading-the-columnlineage-facet) above).
+- A column-grain `$doc` read in a transform projection, a combine body, or a composition body is traced (see [`fields`](#reading-the-columnlineage-facet) above). Two envelope cases are not yet attributed: a whole-section **envelope echo** (an output header/footer regenerated from a source document section, with no output column or expression), and a `$doc` read consumed inside an **aggregate** or **reshape** emit.
 - A **multi-record-type** source (one physical file carrying several record shapes over a single superset schema) is modeled as **one** dataset, matching its single physical identity -- lineage is not split per record type.
 - INDIRECT influence covers route/cull predicates, join keys, aggregate grouping, and correlation sort. An aggregate's pre-aggregation row `filter`, a transform-inline `filter`, and Reshape `order_by` / `partition_by` are not (yet) attributed as influence.
 - Constant and `count(*)` columns (which have no source input) are omitted from `fields`; engine-stamped columns (`$ck.*`, `$meta.*`, `$source.*`) are skipped, mirroring the default writer.

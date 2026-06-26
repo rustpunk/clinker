@@ -50,9 +50,12 @@
 //!
 //! ## Documented limitations
 //!
-//! - A whole-section envelope echo (`*_from_doc`) at document grain is not yet
-//!   attributed (it has no output column or CXL expression); a column-grain `$doc`
-//!   read is (see above).
+//! - A column-grain `$doc` read is attributed in a Transform projection, a
+//!   Combine body, and a Composition body (see above). Two envelope cases are
+//!   not: a whole-section echo (`*_from_doc`) at document grain (no output column
+//!   or CXL expression), and a `$doc` read inside an Aggregate or Reshape emit
+//!   (those arms read off the residual / `program_support_into`, which exclude
+//!   the off-schema `$doc` namespace).
 //! - A `match: collect` combine (no projection body) is resolved coarsely.
 //! - INDIRECT influence covers the predicate / grouping / sort surfaces above; an
 //!   aggregate's pre-aggregation row `filter`, a Transform-inline `filter`, and
