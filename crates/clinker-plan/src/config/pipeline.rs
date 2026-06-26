@@ -3126,6 +3126,12 @@ fn rest_doc_access_diagnostic(
 /// attributor unions these source sets across a path's referencing nodes
 /// to stamp each source with only the paths it actually delivers.
 ///
+/// A third mirror of these same three rules (Source-seeds-self,
+/// Combine-narrows-to-driver, every-other-node-unions-upstreams) lives in
+/// `clinker_lineage::builder::node_doc_sources`, which attributes a `$doc`
+/// read to its originating source dataset for column lineage. Keep that copy
+/// in sync when the driver / composition rules here change.
+///
 /// This is a parallel walk to `bind_schema`'s `upstream_sources` map
 /// (which feeds the E156 time-window watermark guard). The two
 /// intentionally diverge: that walk unions every input unconditionally,
