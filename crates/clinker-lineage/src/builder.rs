@@ -21,6 +21,13 @@
 //! collapses naturally, and an upstream filter/join influence flows through every
 //! downstream node to the sink.
 //!
+//! A **Composition** node is traversed precisely: the walk recurses into the bound
+//! body, seeds each input-port Source from the parent producer feeding that port,
+//! and harvests the body's first output port — so each composition output column
+//! resolves to its true source columns, and a filter / join / group-by inside the
+//! body surfaces as INDIRECT influence on the sink. Nested compositions recurse
+//! the same way.
+//!
 //! ## Subtype model
 //!
 //! Each DIRECT input→output link carries one [`TransformationSubtype`]; along a
@@ -31,8 +38,6 @@
 //!
 //! ## Documented limitations
 //!
-//! - **Composition** nodes are treated opaquely: every output column derives from
-//!   every composition input column. Precise traversal is a #653 follow-up.
 //! - **Envelope** / `$doc` provenance is best-effort same-name passthrough only;
 //!   precise envelope lineage is a #653 follow-up.
 //! - A `match: collect` combine (no projection body) is resolved coarsely.
@@ -49,6 +54,7 @@ use std::sync::Arc;
 
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 
 use clinker_plan::config::pipeline_node::MatchMode;
 use clinker_plan::plan::combine::encode_chain_column;
@@ -84,26 +90,94 @@ pub struct OutputColumnLineage {
     pub facet: ColumnLineageDatasetFacet,
 }
 
+/// The result accumulators a scope walk fills: deduplicated input datasets and
+/// per-sink output lineage. Shared by reference across the top-level walk and
+/// every recursive composition-body walk, so a body's internal Sources and sinks
+/// land in the same result as the parent scope.
+#[derive(Default)]
+struct ScopeSink {
+    inputs: Vec<DatasetId>,
+    seen_inputs: HashSet<DatasetId>,
+    output_acc: Vec<OutputAcc>,
+}
+
 /// Build the DIRECT column lineage of `compiled`.
 ///
 /// `base_dir` is the workspace root (the directory containing the pipeline YAML),
 /// threaded in by the caller exactly as [`dataset_identity`] requires — it is not
 /// retained on [`CompiledPlan`].
 pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLineage {
-    let dag = compiled.dag();
+    let mut sink = ScopeSink::default();
+
+    // Top-level scope: nothing pre-seeded.
+    walk_scope(
+        compiled,
+        base_dir,
+        compiled.dag(),
+        HashMap::new(),
+        HashMap::new(),
+        &mut sink,
+    );
+
+    let outputs = sink
+        .output_acc
+        .into_iter()
+        .map(OutputAcc::into_output)
+        .collect();
+    PlanColumnLineage {
+        inputs: sink.inputs,
+        outputs,
+    }
+}
+
+/// Walk one DAG scope — the top-level pipeline or a composition body — in
+/// topological order, accumulating each node's DIRECT terminals and INDIRECT
+/// influence, and recording every Output sink into `output_acc`. Source datasets
+/// are deduplicated into `inputs`/`seen_inputs`. Returns the per-node terminal and
+/// influence maps so a caller (the Composition arm) can harvest a body's output
+/// ports.
+///
+/// `seed_lineage`/`seed_influence` pre-populate nodes whose lineage the caller
+/// already resolved — a composition body's input-port Source nodes, seeded from
+/// the parent producers feeding the call site. Those nodes are skipped so their
+/// placeholder Source identity is never resolved (which would inject a phantom
+/// input). At the top level both seeds are empty, so this is a
+/// behavior-preserving extraction of the original single-scope walk.
+fn walk_scope(
+    compiled: &CompiledPlan,
+    base_dir: &Path,
+    dag: &ExecutionPlanDag,
+    seed_lineage: HashMap<PlanNodeId, ColumnTerminals>,
+    seed_influence: HashMap<PlanNodeId, InfluenceMap>,
+    sink: &mut ScopeSink,
+) -> (
+    HashMap<PlanNodeId, ColumnTerminals>,
+    HashMap<PlanNodeId, InfluenceMap>,
+) {
+    // Pre-seeded nodes keep their injected terminals/influence and are not
+    // recomputed by the walk. Derived before the seeds move into the working maps.
+    let seeded: HashSet<PlanNodeId> = seed_lineage
+        .keys()
+        .chain(seed_influence.keys())
+        .copied()
+        .collect();
     // Per node, per output column, the resolved Source terminals it derives from.
-    let mut lineage: HashMap<PlanNodeId, ColumnTerminals> = HashMap::new();
+    let mut lineage: HashMap<PlanNodeId, ColumnTerminals> = seed_lineage;
     // Per node, the whole-dataset INDIRECT influences accumulated from this node
     // and every upstream — flushed into each Output's facet `dataset[]`.
-    let mut influence: HashMap<PlanNodeId, InfluenceMap> = HashMap::new();
-    let mut inputs: Vec<DatasetId> = Vec::new();
-    let mut seen_inputs: HashSet<DatasetId> = HashSet::new();
-    let mut output_acc: Vec<OutputAcc> = Vec::new();
+    let mut influence: HashMap<PlanNodeId, InfluenceMap> = seed_influence;
 
     for &idx in &dag.topo_order {
         let node = &dag.graph[idx];
         let node_id = node.id();
 
+        if seeded.contains(&node_id) {
+            continue;
+        }
+
+        // Set by the Composition arm to the body's output-port INDIRECT influence,
+        // merged into this node's influence below.
+        let mut comp_body_influence: Option<InfluenceMap> = None;
         let cols: ColumnTerminals = match node {
             PlanNode::Source { .. } => {
                 let mut cols = ColumnTerminals::new();
@@ -119,8 +193,8 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
                         );
                         cols.insert(col.to_string(), terms);
                     }
-                    if seen_inputs.insert(ds.clone()) {
-                        inputs.push(ds);
+                    if sink.seen_inputs.insert(ds.clone()) {
+                        sink.inputs.push(ds);
                     }
                 }
                 cols
@@ -317,20 +391,65 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
                 cols
             }
 
-            PlanNode::Composition { .. } => {
-                // Coarse: every output column derives from every input column.
-                let mut all = TermMap::new();
-                for up in upstream_ids(dag, idx) {
-                    if let Some(m) = lineage.get(&up) {
-                        for up_terms in m.0.values() {
-                            merge_terminals(&mut all, Some(up_terms), Subtype::Transformation);
+            PlanNode::Composition { body, .. } => {
+                // Recurse into the bound body and stitch named ports. Each input
+                // port is a real `Source` node in the body DAG (synthesized at bind
+                // time), so seeding those Sources from the parent producers and
+                // walking the body with the standard per-node rules resolves every
+                // output column to its true upstream source columns — no coarse
+                // all-to-all. `from_body` clones the body graph (O(body size),
+                // negligible vs. record volume); nested compositions recurse
+                // through this same arm.
+                let mut cols = ColumnTerminals::new();
+                if let Some(b) = compiled.body_of(*body) {
+                    let body_dag = ExecutionPlanDag::from_body(b);
+                    // Seed each bound input port's body Source from the parent
+                    // producer feeding it (the composition's incoming port-tagged
+                    // edge). Keyed by the port Source's globally-unique id, so the
+                    // body walk skips it rather than resolving its placeholder
+                    // identity into a phantom `clinker:<port>` input.
+                    let mut seed_lineage: HashMap<PlanNodeId, ColumnTerminals> = HashMap::new();
+                    let mut seed_influence: HashMap<PlanNodeId, InfluenceMap> = HashMap::new();
+                    for edge in dag.graph.edges_directed(idx, Direction::Incoming) {
+                        let Some(port) = edge.weight().port.as_deref() else {
+                            continue;
+                        };
+                        let Some(&body_src_idx) = b.port_name_to_node_idx.get(port) else {
+                            continue;
+                        };
+                        let body_src_id = b.graph[body_src_idx].id();
+                        let parent_id = dag.graph[edge.source()].id();
+                        if let Some(terms) = lineage.get(&parent_id) {
+                            seed_lineage.insert(body_src_id, terms.clone());
+                        }
+                        if let Some(inf) = influence.get(&parent_id) {
+                            seed_influence.insert(body_src_id, inf.clone());
                         }
                     }
+                    let (body_lineage, mut body_influence) = walk_scope(
+                        compiled,
+                        base_dir,
+                        &body_dag,
+                        seed_lineage,
+                        seed_influence,
+                        sink,
+                    );
+                    // Harvest the first declared output port — the records the
+                    // composition surfaces, against the single `output_schema` the
+                    // node carries — matching the runtime harvest.
+                    if let Some((_, &out_idx)) = b.output_port_to_node_idx.iter().next() {
+                        let out_id = b.graph[out_idx].id();
+                        if let Some(body_out) = body_lineage.get(&out_id) {
+                            for_each_output_col(node, dag, |col| {
+                                cols.insert_nonempty(
+                                    col,
+                                    body_out.0.get(col).cloned().unwrap_or_default(),
+                                );
+                            });
+                        }
+                        comp_body_influence = body_influence.remove(&out_id);
+                    }
                 }
-                let mut cols = ColumnTerminals::new();
-                for_each_output_col(node, dag, |col| {
-                    cols.insert_nonempty(col, all.clone());
-                });
                 cols
             }
 
@@ -378,20 +497,28 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
             }
         };
 
-        let node_influence = node_indirect_influence(node, dag, idx, &lineage, &influence);
+        let mut node_influence = node_indirect_influence(node, dag, idx, &lineage, &influence);
+        // A composition's in-body INDIRECT influence (filters / joins / group-bys
+        // inside the body), harvested at its output port, joins the inherited
+        // upstream influence. Set-union, so the parent influence carried through
+        // both paths is not double-counted.
+        if let Some(body_inf) = comp_body_influence {
+            for (terminal, subs) in body_inf {
+                node_influence.entry(terminal).or_default().extend(subs);
+            }
+        }
 
         if let PlanNode::Output { .. } = node
             && let Some(ds) = dataset_identity(node, base_dir)
         {
-            record_output(&mut output_acc, ds, &cols, &node_influence);
+            record_output(&mut sink.output_acc, ds, &cols, &node_influence);
         }
 
         lineage.insert(node_id, cols);
         influence.insert(node_id, node_influence);
     }
 
-    let outputs = output_acc.into_iter().map(OutputAcc::into_output).collect();
-    PlanColumnLineage { inputs, outputs }
+    (lineage, influence)
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +595,7 @@ impl Terminal {
 type TermMap = BTreeMap<Terminal, Subtype>;
 
 /// All of one node's output columns mapped to their resolved terminals.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ColumnTerminals(HashMap<String, TermMap>);
 
 impl ColumnTerminals {

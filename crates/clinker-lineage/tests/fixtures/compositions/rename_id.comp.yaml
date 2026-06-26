@@ -1,0 +1,22 @@
+# Single input port; the body emits an output column derived from a port
+# column (a rename), plus open-row passthrough of the port columns. Used to
+# prove lineage traces through the body to the true source column rather than
+# fanning out to every input column.
+_compose:
+  name: rename_id
+  inputs:
+    inp:
+      schema:
+        - { name: customer_id, type: string }
+        - { name: name, type: string }
+  outputs:
+    out: body_proj
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: body_proj
+    input: inp
+    config:
+      cxl: |
+        emit x = customer_id

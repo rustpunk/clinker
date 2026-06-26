@@ -43,7 +43,7 @@ The facet has two parts, mirroring the OpenLineage `ColumnLineageDatasetFacet`:
 }
 ```
 
-- **`fields`** -- **DIRECT** (value-derivation) lineage, keyed per output column: the source columns each output column's *value* is computed from. A rename (`emit full = name`) or a multi-hop chain collapses to the originating source column.
+- **`fields`** -- **DIRECT** (value-derivation) lineage, keyed per output column: the source columns each output column's *value* is computed from. A rename (`emit full = name`), a multi-hop chain, or a path through a **composition** body (including nested compositions) collapses to the originating source column.
 - **`dataset`** -- **INDIRECT** (influence) lineage for the dataset as a whole: source columns that shaped *which rows* exist, via filtering, joining, grouping, or sorting -- collected once rather than duplicated across every column.
 
 Each transformation carries a `type` (`DIRECT` / `INDIRECT`) and a `subtype` (`IDENTITY`, `TRANSFORMATION`, `AGGREGATION`, `JOIN`, `GROUP_BY`, `FILTER`, `SORT`, `CONDITIONAL`).
@@ -60,7 +60,6 @@ Because `--lineage` reads no data, it runs instantly and works on a pipeline who
 
 Lineage is derived from the compiled plan, so a few constructs are approximated:
 
-- A **Composition** node is treated opaquely: every output column is taken to derive from every composition input column.
 - **Envelope** / `$doc` provenance is best-effort same-name passthrough.
 - INDIRECT influence covers route/cull predicates, join keys, aggregate grouping, and correlation sort. An aggregate's pre-aggregation row `filter`, a transform-inline `filter`, and Reshape `order_by` / `partition_by` are not (yet) attributed as influence.
 - Constant and `count(*)` columns (which have no source input) are omitted from `fields`; engine-stamped columns (`$ck.*`, `$meta.*`, `$source.*`) are skipped, mirroring the default writer.
