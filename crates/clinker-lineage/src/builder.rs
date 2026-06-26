@@ -1041,7 +1041,7 @@ fn resolve_expr_terms(
 /// read is itself a verbatim copy of the envelope value); `local` then dominates
 /// it, so a bare `$doc` emit stays IDENTITY while a `$doc` inside an expression
 /// composes to TRANSFORMATION. Shared by the Transform/Combine body walk
-/// (`resolve_expr_terms`) and the Aggregate/Reshape emit arms.
+/// (`resolve_expr_terms`) and the Aggregate emit arm.
 fn merge_doc_read_terms(
     out: &mut TermMap,
     doc_paths: &[DocPath],
@@ -1050,22 +1050,35 @@ fn merge_doc_read_terms(
     declared_sections: &HashMap<DatasetId, BTreeSet<String>>,
 ) {
     for path in doc_paths {
-        let rendered = render_doc_path(path);
         let mut base = TermMap::new();
-        for ds in doc_sources {
-            if !declared_sections
-                .get(ds)
-                .is_some_and(|sections| sections.contains(path.section.as_ref()))
-            {
-                continue;
-            }
-            base.insert(
-                Terminal::new(&ds.namespace, &ds.name, &rendered),
-                Subtype::Identity,
-            );
+        for terminal in doc_read_terminals(path, doc_sources, declared_sections) {
+            base.insert(terminal, Subtype::Identity);
         }
         merge_terminals(out, Some(&base), local);
     }
+}
+
+/// The Source terminals one `$doc` read resolves to: for each feeding source
+/// whose envelope declares the read's section, a terminal naming that source
+/// with the rendered `$doc.<section>.<field>` path as its `field`. The single
+/// home of the section-declaration gate that keeps a multi-source fan-in from
+/// emitting a false envelope edge — shared by the DIRECT (`merge_doc_read_terms`)
+/// and INDIRECT (`add_doc_influence`) attribution paths so the gate cannot drift
+/// between them.
+fn doc_read_terminals<'a>(
+    path: &'a DocPath,
+    doc_sources: &'a BTreeSet<DatasetId>,
+    declared_sections: &'a HashMap<DatasetId, BTreeSet<String>>,
+) -> impl Iterator<Item = Terminal> + 'a {
+    let rendered = render_doc_path(path);
+    doc_sources
+        .iter()
+        .filter(move |ds| {
+            declared_sections
+                .get(*ds)
+                .is_some_and(|sections| sections.contains(path.section.as_ref()))
+        })
+        .map(move |ds| Terminal::new(&ds.namespace, &ds.name, &rendered))
 }
 
 /// Resolve one leaf field reference to its source terminals: an in-scope binding
@@ -1754,17 +1767,8 @@ fn add_doc_influence(
     sub: IndirectSub,
 ) {
     for path in doc_paths {
-        let rendered = render_doc_path(path);
-        for ds in doc_srcs {
-            if !declared_sections
-                .get(ds)
-                .is_some_and(|sections| sections.contains(path.section.as_ref()))
-            {
-                continue;
-            }
-            inf.entry(Terminal::new(&ds.namespace, &ds.name, &rendered))
-                .or_default()
-                .insert(sub);
+        for terminal in doc_read_terminals(path, doc_srcs, declared_sections) {
+            inf.entry(terminal).or_default().insert(sub);
         }
     }
 }
@@ -3564,9 +3568,9 @@ nodes:
     #[test]
     fn aggregate_emit_doc_read_is_direct_identity_on_the_source() {
         // A `$doc` read in an aggregate emit survives in the post-extraction
-        // residual as a passthrough leaf (it is neither a group key nor an
-        // accumulator), so it was previously dropped. It now carries a DIRECT
-        // IDENTITY terminal naming the source and the rendered `$doc.…` path.
+        // residual as a passthrough leaf (neither a group key nor an
+        // accumulator); it carries a DIRECT IDENTITY terminal naming the source
+        // and the rendered `$doc.…` path.
         let yaml = r#"
 pipeline: { name: aggdoc }
 nodes:
@@ -3671,7 +3675,7 @@ nodes:
     fn route_predicate_doc_read_is_filter_influence() {
         // A Route condition that tests the envelope (`amount > $doc.Head.threshold`)
         // attributes BOTH the record column `amount` and the envelope read as
-        // FILTER influence — the doc term was previously dropped.
+        // FILTER influence.
         let yaml = r#"
 pipeline: { name: rtdoc }
 nodes:
