@@ -1,0 +1,36 @@
+# Two input ports joined inside the body. Exercises the multi-port seeding
+# path: each port's synthetic Source must be seeded from its OWN parent
+# producer (no cross-wiring), and the combine must resolve each output column
+# to the correct side.
+_compose:
+  name: join_ports
+  inputs:
+    orders:
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: quantity, type: int }
+    products:
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: price, type: float }
+  outputs:
+    out: enrich_combine
+  config_schema: {}
+
+nodes:
+  - type: combine
+    name: enrich_combine
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit order_id = orders.order_id
+        emit product_name = products.name
+        emit total = products.price * orders.quantity
+      propagate_ck: driver

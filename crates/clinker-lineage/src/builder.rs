@@ -114,8 +114,8 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
         compiled,
         base_dir,
         compiled.dag(),
-        &HashMap::new(),
-        &HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
         &mut sink,
     );
 
@@ -147,25 +147,25 @@ fn walk_scope(
     compiled: &CompiledPlan,
     base_dir: &Path,
     dag: &ExecutionPlanDag,
-    seed_lineage: &HashMap<PlanNodeId, ColumnTerminals>,
-    seed_influence: &HashMap<PlanNodeId, InfluenceMap>,
+    seed_lineage: HashMap<PlanNodeId, ColumnTerminals>,
+    seed_influence: HashMap<PlanNodeId, InfluenceMap>,
     sink: &mut ScopeSink,
 ) -> (
     HashMap<PlanNodeId, ColumnTerminals>,
     HashMap<PlanNodeId, InfluenceMap>,
 ) {
-    // Per node, per output column, the resolved Source terminals it derives from.
-    let mut lineage: HashMap<PlanNodeId, ColumnTerminals> = seed_lineage.clone();
-    // Per node, the whole-dataset INDIRECT influences accumulated from this node
-    // and every upstream — flushed into each Output's facet `dataset[]`.
-    let mut influence: HashMap<PlanNodeId, InfluenceMap> = seed_influence.clone();
     // Pre-seeded nodes keep their injected terminals/influence and are not
-    // recomputed by the walk.
+    // recomputed by the walk. Derived before the seeds move into the working maps.
     let seeded: HashSet<PlanNodeId> = seed_lineage
         .keys()
         .chain(seed_influence.keys())
         .copied()
         .collect();
+    // Per node, per output column, the resolved Source terminals it derives from.
+    let mut lineage: HashMap<PlanNodeId, ColumnTerminals> = seed_lineage;
+    // Per node, the whole-dataset INDIRECT influences accumulated from this node
+    // and every upstream — flushed into each Output's facet `dataset[]`.
+    let mut influence: HashMap<PlanNodeId, InfluenceMap> = seed_influence;
 
     for &idx in &dag.topo_order {
         let node = &dag.graph[idx];
@@ -426,12 +426,12 @@ fn walk_scope(
                             seed_influence.insert(body_src_id, inf.clone());
                         }
                     }
-                    let (body_lineage, body_influence) = walk_scope(
+                    let (body_lineage, mut body_influence) = walk_scope(
                         compiled,
                         base_dir,
                         &body_dag,
-                        &seed_lineage,
-                        &seed_influence,
+                        seed_lineage,
+                        seed_influence,
                         sink,
                     );
                     // Harvest the first declared output port — the records the
@@ -447,7 +447,7 @@ fn walk_scope(
                                 );
                             });
                         }
-                        comp_body_influence = body_influence.get(&out_id).cloned();
+                        comp_body_influence = body_influence.remove(&out_id);
                     }
                 }
                 cols

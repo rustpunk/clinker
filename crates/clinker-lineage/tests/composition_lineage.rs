@@ -1,4 +1,4 @@
-//! Column lineage traces precisely through composition boundaries (#664).
+//! Column lineage traces precisely through composition boundaries.
 //!
 //! Compositions are referenced by an on-disk `use:` path, so these tests compile
 //! inline parent pipelines against fixture `.comp.yaml` bodies under
@@ -40,15 +40,19 @@ fn lineage_of(yaml: &str) -> PlanColumnLineage {
     column_lineage(&compile_fixture(yaml), &fixtures_root())
 }
 
-/// The deterministic `file:` terminal name a source `path: data/src.csv` resolves
-/// to under `fixtures_root()`, mirroring `dataset::absolutize`.
-fn src_name() -> String {
+/// The deterministic `file:` terminal name a source `path: <rel>` resolves to
+/// under `fixtures_root()`, mirroring `dataset::absolutize`.
+fn file_dataset(rel: &str) -> String {
     fixtures_root()
-        .join("data/src.csv")
+        .join(rel)
         .to_string_lossy()
         .replace('\\', "/")
         .trim_end_matches('/')
         .to_string()
+}
+
+fn src_name() -> String {
+    file_dataset("data/src.csv")
 }
 
 fn direct(name: &str, field: &str, subtype: TransformationSubtype) -> InputField {
@@ -195,12 +199,38 @@ nodes:
 "#;
     let lineage = lineage_of(yaml);
     let src = src_name();
-    let fields = &only_output(&lineage).facet.fields;
+    let out = only_output(&lineage);
+    let fields = &out.facet.fields;
 
     use TransformationSubtype::Identity;
     // `y` (outer) = `z` (inner) = `customer_id` (source), through two boundaries.
     assert_field(fields, "y", &[direct(&src, "customer_id", Identity)]);
     assert_field(fields, "z", &[direct(&src, "customer_id", Identity)]);
+    // Open-row passthrough carries the source column across both boundaries.
+    assert_field(
+        fields,
+        "customer_id",
+        &[direct(&src, "customer_id", Identity)],
+    );
+    assert_eq!(
+        fields.len(),
+        3,
+        "no extra/dropped columns across two boundaries"
+    );
+    // The novel double-recursion seed loop must not leak a phantom
+    // `clinker:o_in`/`clinker:i_in` input at either boundary.
+    assert_eq!(
+        lineage.inputs,
+        vec![DatasetId {
+            namespace: "file".to_string(),
+            name: src.clone(),
+        }],
+        "only the real source should be an input across nested boundaries"
+    );
+    assert!(
+        out.facet.dataset.is_empty(),
+        "no INDIRECT influence expected"
+    );
 }
 
 /// An aggregate inside a composition body: the DIRECT subtypes cross the boundary
@@ -249,6 +279,105 @@ nodes:
             .dataset
             .contains(&indirect(&src, "department", &[GroupBy])),
         "expected in-body group-by to surface as INDIRECT influence, got {:?}",
+        out.facet.dataset
+    );
+}
+
+/// A body with TWO input ports fed by TWO different parents, joined inside the
+/// body. Exercises the multi-port seeding loop: each port's synthetic Source must
+/// be seeded from its OWN parent (no cross-wiring), each output column must
+/// resolve to the correct side, both real sources must appear as inputs (no
+/// phantom port inputs), and the in-body join keys must surface as INDIRECT.
+#[test]
+fn lineage_traces_each_input_port_to_its_own_parent() {
+    let yaml = r#"
+pipeline: { name: join_ports_test }
+nodes:
+  - type: source
+    name: orders_src
+    config:
+      name: orders_src
+      type: csv
+      path: data/orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: product_id, type: string }
+        - { name: quantity, type: int }
+  - type: source
+    name: products_src
+    config:
+      name: products_src
+      type: csv
+      path: data/products.csv
+      schema:
+        - { name: product_id, type: string }
+        - { name: name, type: string }
+        - { name: price, type: float }
+  - type: composition
+    name: comp
+    input: orders_src
+    use: ../compositions/join_ports.comp.yaml
+    inputs:
+      orders: orders_src
+      products: products_src
+  - type: output
+    name: out
+    input: comp
+    config: { name: out, type: csv, path: out/join.csv }
+"#;
+    let lineage = lineage_of(yaml);
+    let orders = file_dataset("data/orders.csv");
+    let products = file_dataset("data/products.csv");
+    let out = only_output(&lineage);
+    let fields = &out.facet.fields;
+
+    use TransformationSubtype::{Identity, Transformation};
+    // Each output column resolves to the column on its OWN side of the join.
+    assert_field(fields, "order_id", &[direct(&orders, "order_id", Identity)]);
+    assert_field(
+        fields,
+        "product_name",
+        &[direct(&products, "name", Identity)],
+    );
+    // A cross-side computed column draws from both parents (terminals ordered by
+    // namespace/name/field: orders.csv < products.csv).
+    assert_field(
+        fields,
+        "total",
+        &[
+            direct(&orders, "quantity", Transformation),
+            direct(&products, "price", Transformation),
+        ],
+    );
+
+    // Both real sources are inputs and nothing else — no phantom
+    // `clinker:orders`/`clinker:products` port inputs. Order-independent: the
+    // topological order of two independent roots is not contractually fixed.
+    assert_eq!(lineage.inputs.len(), 2, "exactly two real source inputs");
+    for name in [&orders, &products] {
+        assert!(
+            lineage.inputs.contains(&DatasetId {
+                namespace: "file".to_string(),
+                name: name.clone(),
+            }),
+            "missing real source input {name:?}; got {:?}",
+            lineage.inputs
+        );
+    }
+    // The in-body join key on each side surfaces as INDIRECT (JOIN) influence.
+    use TransformationSubtype::Join;
+    assert!(
+        out.facet
+            .dataset
+            .contains(&indirect(&orders, "product_id", &[Join])),
+        "expected orders join-key as INDIRECT JOIN, got {:?}",
+        out.facet.dataset
+    );
+    assert!(
+        out.facet
+            .dataset
+            .contains(&indirect(&products, "product_id", &[Join])),
+        "expected products join-key as INDIRECT JOIN, got {:?}",
         out.facet.dataset
     );
 }
