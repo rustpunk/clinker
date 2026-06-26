@@ -90,15 +90,24 @@ pub struct OutputColumnLineage {
     pub facet: ColumnLineageDatasetFacet,
 }
 
+/// The result accumulators a scope walk fills: deduplicated input datasets and
+/// per-sink output lineage. Shared by reference across the top-level walk and
+/// every recursive composition-body walk, so a body's internal Sources and sinks
+/// land in the same result as the parent scope.
+#[derive(Default)]
+struct ScopeSink {
+    inputs: Vec<DatasetId>,
+    seen_inputs: HashSet<DatasetId>,
+    output_acc: Vec<OutputAcc>,
+}
+
 /// Build the DIRECT column lineage of `compiled`.
 ///
 /// `base_dir` is the workspace root (the directory containing the pipeline YAML),
 /// threaded in by the caller exactly as [`dataset_identity`] requires — it is not
 /// retained on [`CompiledPlan`].
 pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLineage {
-    let mut inputs: Vec<DatasetId> = Vec::new();
-    let mut seen_inputs: HashSet<DatasetId> = HashSet::new();
-    let mut output_acc: Vec<OutputAcc> = Vec::new();
+    let mut sink = ScopeSink::default();
 
     // Top-level scope: nothing pre-seeded.
     walk_scope(
@@ -107,13 +116,18 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
         compiled.dag(),
         &HashMap::new(),
         &HashMap::new(),
-        &mut inputs,
-        &mut seen_inputs,
-        &mut output_acc,
+        &mut sink,
     );
 
-    let outputs = output_acc.into_iter().map(OutputAcc::into_output).collect();
-    PlanColumnLineage { inputs, outputs }
+    let outputs = sink
+        .output_acc
+        .into_iter()
+        .map(OutputAcc::into_output)
+        .collect();
+    PlanColumnLineage {
+        inputs: sink.inputs,
+        outputs,
+    }
 }
 
 /// Walk one DAG scope — the top-level pipeline or a composition body — in
@@ -129,16 +143,13 @@ pub fn column_lineage(compiled: &CompiledPlan, base_dir: &Path) -> PlanColumnLin
 /// placeholder Source identity is never resolved (which would inject a phantom
 /// input). At the top level both seeds are empty, so this is a
 /// behavior-preserving extraction of the original single-scope walk.
-#[allow(clippy::too_many_arguments)]
 fn walk_scope(
     compiled: &CompiledPlan,
     base_dir: &Path,
     dag: &ExecutionPlanDag,
     seed_lineage: &HashMap<PlanNodeId, ColumnTerminals>,
     seed_influence: &HashMap<PlanNodeId, InfluenceMap>,
-    inputs: &mut Vec<DatasetId>,
-    seen_inputs: &mut HashSet<DatasetId>,
-    output_acc: &mut Vec<OutputAcc>,
+    sink: &mut ScopeSink,
 ) -> (
     HashMap<PlanNodeId, ColumnTerminals>,
     HashMap<PlanNodeId, InfluenceMap>,
@@ -182,8 +193,8 @@ fn walk_scope(
                         );
                         cols.insert(col.to_string(), terms);
                     }
-                    if seen_inputs.insert(ds.clone()) {
-                        inputs.push(ds);
+                    if sink.seen_inputs.insert(ds.clone()) {
+                        sink.inputs.push(ds);
                     }
                 }
                 cols
@@ -421,9 +432,7 @@ fn walk_scope(
                         &body_dag,
                         &seed_lineage,
                         &seed_influence,
-                        inputs,
-                        seen_inputs,
-                        output_acc,
+                        sink,
                     );
                     // Harvest the first declared output port — the records the
                     // composition surfaces, against the single `output_schema` the
@@ -502,7 +511,7 @@ fn walk_scope(
         if let PlanNode::Output { .. } = node
             && let Some(ds) = dataset_identity(node, base_dir)
         {
-            record_output(output_acc, ds, &cols, &node_influence);
+            record_output(&mut sink.output_acc, ds, &cols, &node_influence);
         }
 
         lineage.insert(node_id, cols);
