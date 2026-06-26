@@ -24,6 +24,9 @@ pub const COLUMN_LINEAGE_FACET_SCHEMA_URL: &str =
 /// Producer URI stamped on emitted events and facets, identifying this emitter.
 pub const PRODUCER: &str = "https://github.com/rustpunk/clinker";
 
+/// OpenLineage namespace for clinker pipeline jobs (the `job.namespace`).
+pub const JOB_NAMESPACE: &str = "clinker";
+
 /// Schema URL for the clinker-specific pipeline job facet (the facet-level
 /// `_schemaURL`). OpenLineage has no standard pipeline-hash facet, so this points
 /// at the clinker producer rather than `openlineage.io`.

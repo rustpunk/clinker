@@ -59,6 +59,24 @@ pub struct Job {
     pub facets: Option<JobFacets>,
 }
 
+impl Job {
+    /// A clinker pipeline job: the [`JOB_NAMESPACE`] namespace, the pipeline
+    /// `name`, and a [`PipelineJobFacet`] carrying the pipeline's content hash.
+    /// The hash rides in the facet, not the name, so the job name stays stable
+    /// across edits while runs of the same definition remain correlatable.
+    ///
+    /// [`JOB_NAMESPACE`]: super::JOB_NAMESPACE
+    pub fn for_pipeline(name: impl Into<String>, source_hash: String) -> Self {
+        Job {
+            namespace: super::JOB_NAMESPACE.to_string(),
+            name: name.into(),
+            facets: Some(JobFacets {
+                clinker_pipeline: Some(PipelineJobFacet::new(source_hash)),
+            }),
+        }
+    }
+}
+
 /// The facet bundle attached to a [`Job`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobFacets {
@@ -208,6 +226,22 @@ mod tests {
         assert!(v["inputs"][0].get("facets").is_none());
         // A job with no facets omits the key too.
         assert!(v["job"].get("facets").is_none());
+    }
+
+    #[test]
+    fn for_pipeline_stamps_namespace_and_hash_facet() {
+        use crate::openlineage::{CLINKER_PIPELINE_FACET_SCHEMA_URL, JOB_NAMESPACE, PRODUCER};
+        let job = Job::for_pipeline("orders", "deadbeef".to_string());
+        assert_eq!(job.namespace, JOB_NAMESPACE);
+        assert_eq!(job.name, "orders");
+        let facet = job
+            .facets
+            .as_ref()
+            .and_then(|f| f.clinker_pipeline.as_ref())
+            .expect("clinker pipeline facet");
+        assert_eq!(facet.source_hash, "deadbeef");
+        assert_eq!(facet.producer, PRODUCER);
+        assert_eq!(facet.schema_url, CLINKER_PIPELINE_FACET_SCHEMA_URL);
     }
 
     #[test]

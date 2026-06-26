@@ -19,7 +19,7 @@ The output is [NDJSON](https://github.com/ndjson/ndjson-spec) (one JSON object p
 {"eventType":"COMPLETE","run":{"runId":"019f030d-0b3e-7ee1-86ec-1bb5b4a2776b"}, "inputs":[...], "outputs":[{"namespace":"file","name":".../audit_report.csv","facets":{"columnLineage":{ ... }}}]}
 ```
 
-- **`runId`** is the run's execution id (a UUID v7), shared by both events.
+- **`runId`** is a UUID v7 minted for this export and shared by both events. Because `--lineage` is a *static, plan-derived* export, the `START`/`COMPLETE` pair describes the pipeline's lineage, not an executed data run — no rows are processed and the two events share one timestamp. A separate `clinker run` mints its own `runId`. (Live run-lifecycle emission with real timing is a planned follow-up.)
 - **`job.namespace`** is `clinker`; **`job.name`** is the pipeline name. The pipeline's content hash rides in the `clinker_pipeline` job facet (`sourceHash`), not the job name -- so the name stays stable across edits while runs of the same definition remain correlatable.
 - **`inputs`** are the source datasets; **`outputs`** are the sink datasets. Filesystem datasets use the `file` namespace with the resolved path as the name; a network source falls back to the `clinker` namespace plus the node name.
 - The `columnLineage` facet is attached to each **output** dataset on the `COMPLETE` event.

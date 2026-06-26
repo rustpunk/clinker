@@ -154,8 +154,14 @@ pub struct RunArgs {
     pub explain: Option<ExplainFormat>,
 
     /// Build column lineage and write OpenLineage NDJSON, then exit (no data
-    /// read). Give a file path, or `-` for stdout.
-    #[arg(long, value_name = "PATH", help_heading = "Validation")]
+    /// read). Give a file path, or `-` for stdout. A plan-only export, so it
+    /// cannot be combined with --explain, --dry-run, or -n.
+    #[arg(
+        long,
+        value_name = "PATH",
+        help_heading = "Validation",
+        conflicts_with_all = ["explain", "dry_run", "dry_run_n"]
+    )]
     pub lineage: Option<PathBuf>,
 
     /// Validate config and CXL without processing data
@@ -653,10 +659,12 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // re-copying it per run.
     let staging_policy = storage_config.staging.clone();
 
-    // Keep the workspace root for plan-derived lineage (--lineage): the same
-    // base_dir the compiler resolves source/output paths against, so dataset
-    // names line up. `workspace_root` is moved into `compile_ctx` below.
-    let lineage_base_dir = workspace_root.clone();
+    // Anchor for plan-derived lineage (--lineage): the pipeline file's directory,
+    // i.e. the `workspace_root.join(pipeline_dir)` the compile context
+    // reconstructs and against which relative source/output `path:` strings
+    // resolve — so dataset names name the same bytes a run reads/writes. Both
+    // halves are moved into `compile_ctx` next, so capture the join now.
+    let lineage_base_dir = workspace_root.join(&pipeline_dir);
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
@@ -707,6 +715,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         n: None,
         unique_suffix_width: 0,
     };
+    // --lineage names output datasets from the pipeline's declared output paths,
+    // so snapshot the config before per-run tokens ({execution_id}/{timestamp}/…)
+    // are baked into them just below; the export compiles from this snapshot to
+    // keep dataset names reproducible across runs of the same pipeline.
+    let lineage_config = args.lineage.as_ref().map(|_| pipeline_config.clone());
     clinker_plan::config::path_template::resolve_output_path_templates_in_place(
         &mut pipeline_config,
         &template_ctx,
@@ -845,48 +858,41 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     }
 
     // Plan-derived OpenLineage column lineage. Like --explain, compile the plan
-    // and emit without reading any data, then exit. runId = the run's
-    // execution_id so a later live-run emission can correlate.
+    // and emit without reading any data, then exit. The export is static: its
+    // runId is this invocation's execution_id and does NOT identify a
+    // data-processing run (live run-lifecycle emission with real timing is a
+    // follow-up). Compiles from the pre-template snapshot so output dataset
+    // names are the declared paths, not this run's resolved ones.
     if let Some(path) = &args.lineage {
+        let cfg = lineage_config
+            .as_ref()
+            .expect("lineage_config is captured whenever --lineage is set");
         let mut compiled_plan =
-            pipeline_config
-                .compile(&compile_ctx)
+            cfg.compile(&compile_ctx)
                 .map_err(|diags| PipelineError::Compilation {
                     transform_name: String::new(),
                     messages: diags.iter().map(|d| d.message.clone()).collect(),
                 })?;
         if let Some(binding) = &channel_binding {
-            let overlay = clinker_channel::apply_channel_overlay(
-                &mut compiled_plan,
-                binding,
-                &pipeline_config,
-            );
+            let overlay = clinker_channel::apply_channel_overlay(&mut compiled_plan, binding, cfg);
             abort_on_overlay_errors(&overlay)?;
         }
 
         let lineage = clinker_lineage::column_lineage(&compiled_plan, &lineage_base_dir);
-        // The pipeline content hash rides in a job facet, not the job name, so
-        // the job name stays stable across edits while runs of the same pipeline
-        // definition remain correlatable.
-        let source_hash: String = pipeline_hash.iter().map(|b| format!("{b:02x}")).collect();
-        let job = clinker_lineage::Job {
-            namespace: clinker_lineage::FALLBACK_NAMESPACE.to_string(),
-            name: pipeline_config.pipeline.name.clone(),
-            facets: Some(clinker_lineage::JobFacets {
-                clinker_pipeline: Some(clinker_lineage::PipelineJobFacet {
-                    producer: clinker_lineage::PRODUCER.to_string(),
-                    schema_url: clinker_lineage::CLINKER_PIPELINE_FACET_SCHEMA_URL.to_string(),
-                    source_hash,
-                }),
-            }),
-        };
+        let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
+        let job = clinker_lineage::Job::for_pipeline(cfg.pipeline.name.clone(), source_hash);
         let event_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
         let events = clinker_lineage::run_events(&lineage, &execution_id, job, &event_time);
 
         let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
             Box::new(std::io::stdout().lock())
         } else {
-            Box::new(std::fs::File::create(path)?)
+            Box::new(std::fs::File::create(path).map_err(|e| {
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                    "cannot open --lineage output {}: {e}",
+                    path.display()
+                )))
+            })?)
         };
         clinker_lineage::write_ndjson(&events, writer).map_err(PipelineError::Io)?;
         return Ok(0);

@@ -106,6 +106,22 @@ pub struct PipelineJobFacet {
     pub source_hash: String,
 }
 
+impl PipelineJobFacet {
+    /// A pipeline-hash facet stamped with the clinker [`PRODUCER`] and
+    /// [`CLINKER_PIPELINE_FACET_SCHEMA_URL`], so the producer/schema-URL
+    /// convention lives in this crate rather than at each call site.
+    ///
+    /// [`PRODUCER`]: super::PRODUCER
+    /// [`CLINKER_PIPELINE_FACET_SCHEMA_URL`]: super::CLINKER_PIPELINE_FACET_SCHEMA_URL
+    pub fn new(source_hash: String) -> Self {
+        Self {
+            producer: super::PRODUCER.to_string(),
+            schema_url: super::CLINKER_PIPELINE_FACET_SCHEMA_URL.to_string(),
+            source_hash,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -30,7 +30,7 @@ pub use dataset::{DatasetId, FALLBACK_NAMESPACE, FILE_NAMESPACE, dataset_identit
 pub use emit::run_events;
 pub use openlineage::{
     CLINKER_PIPELINE_FACET_SCHEMA_URL, COLUMN_LINEAGE_FACET_SCHEMA_URL, ColumnLineageDatasetFacet,
-    Dataset, DatasetFacets, EventType, FieldLineage, InputField, Job, JobFacets,
+    Dataset, DatasetFacets, EventType, FieldLineage, InputField, JOB_NAMESPACE, Job, JobFacets,
     OPENLINEAGE_SCHEMA_URL, PRODUCER, PipelineJobFacet, Run, RunEvent, Transformation,
     TransformationSubtype, TransformationType, write_ndjson,
 };

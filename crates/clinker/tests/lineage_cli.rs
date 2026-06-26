@@ -175,3 +175,87 @@ fn lineage_writes_to_a_file_path() {
     assert_eq!(start["eventType"], "START");
     assert_eq!(complete["eventType"], "COMPLETE");
 }
+
+#[test]
+fn lineage_conflicts_with_explain() {
+    // --lineage is a plan-only export; combining it with --explain would
+    // silently drop one, so clap must reject the combination.
+    let pipeline = repo_root().join("examples/pipelines/audit_join.yaml");
+    let output = Command::new(clinker_bin())
+        .args(["run"])
+        .arg(&pipeline)
+        .args(["--explain", "text", "--lineage", "-"])
+        .output()
+        .expect("spawn clinker");
+    assert!(
+        !output.status.success(),
+        "--explain + --lineage must be rejected, not silently accepted"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "expected a clap conflict error, got:\n{stderr}"
+    );
+}
+
+/// Write a one-source → one-output pipeline (explicit schema, so compile needs
+/// no data file) into `dir` and return its path.
+fn write_pipeline(dir: &Path, output_path: &str) -> PathBuf {
+    let yaml = format!(
+        "pipeline:\n  name: lineage_fixture\nnodes:\n  - type: source\n    name: src\n    \
+         config:\n      name: src\n      type: csv\n      path: ./data/in.csv\n      \
+         options: {{ has_header: true }}\n      schema:\n        - {{ name: id, type: string }}\n  \
+         - type: output\n    name: out\n    input: src\n    config:\n      name: out\n      \
+         type: csv\n      path: \"{output_path}\"\n"
+    );
+    let path = dir.join("pipeline.yaml");
+    std::fs::write(&path, yaml).expect("write pipeline");
+    path
+}
+
+fn output_dataset_name(pipeline: &Path, base_dir: Option<&Path>) -> String {
+    let mut cmd = Command::new(clinker_bin());
+    cmd.arg("run").arg(pipeline).args(["--lineage", "-"]);
+    if let Some(base) = base_dir {
+        cmd.arg("--base-dir").arg(base);
+    }
+    let output = cmd.output().expect("spawn clinker");
+    assert!(
+        output.status.success(),
+        "lineage run failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let complete: serde_json::Value = serde_json::from_str(stdout.lines().nth(1).unwrap()).unwrap();
+    complete["outputs"][0]["name"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn templated_output_dataset_name_is_the_declared_template() {
+    // A per-run {execution_id} token must NOT be baked into the dataset name,
+    // or two runs of the same pipeline name different (un-joinable) datasets.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pipeline = write_pipeline(dir.path(), "./output/report-{execution_id}.csv");
+    let name1 = output_dataset_name(&pipeline, None);
+    let name2 = output_dataset_name(&pipeline, None);
+    assert!(
+        name1.ends_with("report-{execution_id}.csv"),
+        "dataset name must keep the literal template, got: {name1}"
+    );
+    assert_eq!(name1, name2, "templated output name must be reproducible");
+}
+
+#[test]
+fn base_dir_anchors_dataset_names_at_the_pipeline_directory() {
+    // With --base-dir an ancestor of the pipeline file, the pipeline_dir
+    // component must survive in the resolved dataset name.
+    let ws = tempfile::tempdir().expect("tempdir");
+    let subdir = ws.path().join("subdir");
+    std::fs::create_dir_all(&subdir).expect("mkdir subdir");
+    let pipeline = write_pipeline(&subdir, "./out.csv");
+    let name = output_dataset_name(&pipeline, Some(ws.path()));
+    assert!(
+        name.contains("/subdir/"),
+        "dataset name must include the pipeline subdir, got: {name}"
+    );
+}
