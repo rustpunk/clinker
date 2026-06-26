@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::facet::ColumnLineageDatasetFacet;
+use super::facet::{ColumnLineageDatasetFacet, PipelineJobFacet};
 
 /// A single OpenLineage run-state event.
 ///
@@ -55,6 +55,16 @@ pub struct Run {
 pub struct Job {
     pub namespace: String,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facets: Option<JobFacets>,
+}
+
+/// The facet bundle attached to a [`Job`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobFacets {
+    /// Clinker pipeline-source fingerprint facet (producer-defined).
+    #[serde(rename = "clinker_pipeline", skip_serializing_if = "Option::is_none")]
+    pub clinker_pipeline: Option<PipelineJobFacet>,
 }
 
 /// An input or output dataset referenced by a run event.
@@ -127,6 +137,7 @@ mod tests {
             job: Job {
                 namespace: "clinker".to_string(),
                 name: "orders".to_string(),
+                facets: None,
             },
             inputs: vec![Dataset {
                 namespace: "file".to_string(),
@@ -195,5 +206,29 @@ mod tests {
         // A dataset with no facets omits the key rather than emitting null.
         let v = serde_json::to_value(sample_event()).unwrap();
         assert!(v["inputs"][0].get("facets").is_none());
+        // A job with no facets omits the key too.
+        assert!(v["job"].get("facets").is_none());
+    }
+
+    #[test]
+    fn job_facet_serializes_under_clinker_pipeline_key() {
+        use crate::openlineage::{CLINKER_PIPELINE_FACET_SCHEMA_URL, PipelineJobFacet};
+        let mut event = sample_event();
+        event.job.facets = Some(JobFacets {
+            clinker_pipeline: Some(PipelineJobFacet {
+                producer: PRODUCER.to_string(),
+                schema_url: CLINKER_PIPELINE_FACET_SCHEMA_URL.to_string(),
+                source_hash: "deadbeef".to_string(),
+            }),
+        });
+        let v = serde_json::to_value(&event).unwrap();
+        let facet = &v["job"]["facets"]["clinker_pipeline"];
+        assert_eq!(facet["sourceHash"], "deadbeef");
+        assert!(facet.get("_producer").is_some());
+        assert!(facet.get("_schemaURL").is_some());
+        // Round-trips through the wire form unchanged.
+        let json = serde_json::to_string(&event).unwrap();
+        let back: RunEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
     }
 }

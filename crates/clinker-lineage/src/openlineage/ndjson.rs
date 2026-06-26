@@ -46,6 +46,7 @@ mod tests {
             job: Job {
                 namespace: "clinker".to_string(),
                 name: "orders".to_string(),
+                facets: None,
             },
             inputs: vec![],
             outputs: vec![],

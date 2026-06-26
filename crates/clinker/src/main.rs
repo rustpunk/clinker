@@ -153,6 +153,11 @@ pub struct RunArgs {
     )]
     pub explain: Option<ExplainFormat>,
 
+    /// Build column lineage and write OpenLineage NDJSON, then exit (no data
+    /// read). Give a file path, or `-` for stdout.
+    #[arg(long, value_name = "PATH", help_heading = "Validation")]
+    pub lineage: Option<PathBuf>,
+
     /// Validate config and CXL without processing data
     #[arg(long, help_heading = "Validation")]
     pub dry_run: bool,
@@ -648,6 +653,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // re-copying it per run.
     let staging_policy = storage_config.staging.clone();
 
+    // Keep the workspace root for plan-derived lineage (--lineage): the same
+    // base_dir the compiler resolves source/output paths against, so dataset
+    // names line up. `workspace_root` is moved into `compile_ctx` below.
+    let lineage_base_dir = workspace_root.clone();
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
@@ -832,6 +841,54 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 print!("{}", dag.explain_dot());
             }
         }
+        return Ok(0);
+    }
+
+    // Plan-derived OpenLineage column lineage. Like --explain, compile the plan
+    // and emit without reading any data, then exit. runId = the run's
+    // execution_id so a later live-run emission can correlate.
+    if let Some(path) = &args.lineage {
+        let mut compiled_plan =
+            pipeline_config
+                .compile(&compile_ctx)
+                .map_err(|diags| PipelineError::Compilation {
+                    transform_name: String::new(),
+                    messages: diags.iter().map(|d| d.message.clone()).collect(),
+                })?;
+        if let Some(binding) = &channel_binding {
+            let overlay = clinker_channel::apply_channel_overlay(
+                &mut compiled_plan,
+                binding,
+                &pipeline_config,
+            );
+            abort_on_overlay_errors(&overlay)?;
+        }
+
+        let lineage = clinker_lineage::column_lineage(&compiled_plan, &lineage_base_dir);
+        // The pipeline content hash rides in a job facet, not the job name, so
+        // the job name stays stable across edits while runs of the same pipeline
+        // definition remain correlatable.
+        let source_hash: String = pipeline_hash.iter().map(|b| format!("{b:02x}")).collect();
+        let job = clinker_lineage::Job {
+            namespace: clinker_lineage::FALLBACK_NAMESPACE.to_string(),
+            name: pipeline_config.pipeline.name.clone(),
+            facets: Some(clinker_lineage::JobFacets {
+                clinker_pipeline: Some(clinker_lineage::PipelineJobFacet {
+                    producer: clinker_lineage::PRODUCER.to_string(),
+                    schema_url: clinker_lineage::CLINKER_PIPELINE_FACET_SCHEMA_URL.to_string(),
+                    source_hash,
+                }),
+            }),
+        };
+        let event_time = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let events = clinker_lineage::run_events(&lineage, &execution_id, job, &event_time);
+
+        let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
+            Box::new(std::io::stdout().lock())
+        } else {
+            Box::new(std::fs::File::create(path)?)
+        };
+        clinker_lineage::write_ndjson(&events, writer).map_err(PipelineError::Io)?;
         return Ok(0);
     }
 

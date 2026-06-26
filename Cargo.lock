@@ -375,6 +375,7 @@ dependencies = [
  "clinker-core-types",
  "clinker-exec",
  "clinker-format",
+ "clinker-lineage",
  "clinker-net",
  "clinker-plan",
  "clinker-record",

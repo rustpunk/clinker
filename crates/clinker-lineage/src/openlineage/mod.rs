@@ -7,10 +7,10 @@ mod event;
 mod facet;
 mod ndjson;
 
-pub use event::{Dataset, DatasetFacets, EventType, Job, Run, RunEvent};
+pub use event::{Dataset, DatasetFacets, EventType, Job, JobFacets, Run, RunEvent};
 pub use facet::{
-    ColumnLineageDatasetFacet, FieldLineage, InputField, Transformation, TransformationSubtype,
-    TransformationType,
+    ColumnLineageDatasetFacet, FieldLineage, InputField, PipelineJobFacet, Transformation,
+    TransformationSubtype, TransformationType,
 };
 pub use ndjson::write_ndjson;
 
@@ -23,3 +23,9 @@ pub const COLUMN_LINEAGE_FACET_SCHEMA_URL: &str =
 
 /// Producer URI stamped on emitted events and facets, identifying this emitter.
 pub const PRODUCER: &str = "https://github.com/rustpunk/clinker";
+
+/// Schema URL for the clinker-specific pipeline job facet (the facet-level
+/// `_schemaURL`). OpenLineage has no standard pipeline-hash facet, so this points
+/// at the clinker producer rather than `openlineage.io`.
+pub const CLINKER_PIPELINE_FACET_SCHEMA_URL: &str =
+    "https://github.com/rustpunk/clinker/spec/facets/PipelineJobFacet.json";
