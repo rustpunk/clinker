@@ -128,6 +128,23 @@ impl ExecutionPlanDag {
         self.id_to_index[id]
     }
 
+    /// Storage position of `id`'s node, preferring the O(1) [`index_of`] bridge
+    /// and falling back to a linear scan when the bridge is empty — as it is on
+    /// body DAGs built by [`from_body`]. Resolving by id rather than name is
+    /// load-bearing: a composition body can contain an authored node whose name
+    /// collides with a synthesized input-port `Source` at a lower `NodeIndex`,
+    /// which a name match would wrongly select.
+    ///
+    /// [`index_of`]: Self::index_of
+    /// [`from_body`]: Self::from_body
+    pub(crate) fn index_of_or_scan(&self, id: PlanNodeId) -> Option<NodeIndex> {
+        self.index_of(id).or_else(|| {
+            self.graph
+                .node_indices()
+                .find(|&i| self.graph[i].id() == id)
+        })
+    }
+
     /// `Some(region)` iff `idx` participates in any deferred region on
     /// this DAG (producer, member, or output). Dispatcher arms call
     /// this at the top of every operator branch to decide whether to
@@ -839,6 +856,129 @@ mod port_tag_guard_tests {
             diags[0].message.contains(&format!("body {}", body_id.0)),
             "diag should label the body scope: {}",
             diags[0].message
+        );
+    }
+}
+
+// Schema-less, row-preserving nodes (Route/Output/Sort/CorrelationCommit)
+// carry no stored schema, so `output_schema_in`, `expected_input_schema_in`,
+// and `cxl_emit_names_in` locate the node in its DAG and walk to its sole
+// upstream. In a composition body an authored node can legally share a name
+// with a synthesized input-port `Source` (which sits at a lower `NodeIndex`),
+// so resolving by name would select the port and report the wrong schema.
+// These tests pin resolution by stable `PlanNodeId`.
+#[cfg(test)]
+mod schema_resolution_by_id_tests {
+    use super::*;
+    use crate::plan::{EntityRef, PlanNodeId, SecondaryMap};
+    use clinker_record::SchemaBuilder;
+
+    fn source_named(name: &str, id: usize, field: &str) -> PlanNode {
+        PlanNode::Source {
+            name: name.to_string(),
+            id: PlanNodeId::new(id),
+            span: Span::SYNTHETIC,
+            resolved: None,
+            output_schema: SchemaBuilder::new().with_field(field).build(),
+        }
+    }
+
+    fn sort_named(name: &str, id: usize) -> PlanNode {
+        PlanNode::Sort {
+            name: name.to_string(),
+            id: PlanNodeId::new(id),
+            span: Span::SYNTHETIC,
+            sort_fields: Vec::new(),
+        }
+    }
+
+    fn data_edge() -> PlanEdge {
+        PlanEdge {
+            dependency_type: DependencyType::Data,
+            port: None,
+            producer_port: None,
+        }
+    }
+
+    fn dag_from(graph: DiGraph<PlanNode, PlanEdge>) -> ExecutionPlanDag {
+        ExecutionPlanDag::from_parts(
+            graph,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ParallelismProfile {
+                per_transform: Vec::new(),
+                worker_threads: 1,
+            },
+        )
+    }
+
+    fn names_of(schema: &clinker_record::Schema) -> Vec<String> {
+        schema.columns().iter().map(|c| c.to_string()).collect()
+    }
+
+    /// Body-shaped collision: a port-`Source` named `collide` (inserted
+    /// first, so lowest `NodeIndex`) + the real upstream + an authored `Sort`
+    /// also named `collide` wired only to the real upstream. Returns the
+    /// authored Sort's index.
+    fn collision_dag() -> (ExecutionPlanDag, petgraph::graph::NodeIndex) {
+        let mut graph = DiGraph::new();
+        let _port = graph.add_node(source_named("collide", 0, "port_col"));
+        let upstream = graph.add_node(source_named("real_upstream", 1, "x"));
+        let sort = graph.add_node(sort_named("collide", 2));
+        graph.add_edge(upstream, sort, data_edge());
+        let mut dag = dag_from(graph);
+        // Mimic a composition-body DAG: `from_body` leaves the id->index bridge
+        // empty, so resolution falls through to the by-id graph scan — the path
+        // that must defeat the port/authored-node name collision.
+        dag.id_to_index = SecondaryMap::with_default(None);
+        (dag, sort)
+    }
+
+    #[test]
+    fn output_schema_in_resolves_colliding_node_by_id_not_name() {
+        let (dag, sort) = collision_dag();
+        // Must walk the authored Sort's real upstream (`x`), not the
+        // same-named port-Source (which has no upstream, so a name match
+        // would fall back to the empty body-root schema).
+        assert_eq!(
+            names_of(dag.graph[sort].output_schema_in(&dag)),
+            vec!["x".to_string()],
+            "output_schema_in must resolve the authored node, not the port-Source",
+        );
+    }
+
+    #[test]
+    fn expected_input_schema_in_resolves_colliding_node_by_id_not_name() {
+        let (dag, sort) = collision_dag();
+        let schema = dag.graph[sort]
+            .expected_input_schema_in(&dag)
+            .expect("the authored Sort has exactly one upstream");
+        assert_eq!(names_of(schema), vec!["x".to_string()]);
+    }
+
+    #[test]
+    fn cxl_emit_names_in_resolves_colliding_node_by_id_not_name() {
+        let (dag, sort) = collision_dag();
+        assert_eq!(
+            dag.graph[sort].cxl_emit_names_in(&dag),
+            vec!["x".to_string()],
+            "cxl_emit_names_in must inherit the authored upstream's emit names",
+        );
+    }
+
+    /// Control: without a name collision, resolution is unchanged.
+    #[test]
+    fn resolution_unchanged_without_name_collision() {
+        let mut graph = DiGraph::new();
+        let upstream = graph.add_node(source_named("up", 0, "x"));
+        let sort = graph.add_node(sort_named("sorter", 1));
+        graph.add_edge(upstream, sort, data_edge());
+        let dag = dag_from(graph);
+        assert_eq!(
+            names_of(dag.graph[sort].output_schema_in(&dag)),
+            vec!["x".to_string()],
         );
     }
 }

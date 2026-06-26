@@ -767,12 +767,7 @@ impl PlanNode {
             | PlanNode::Sort { .. }
             | PlanNode::Output { .. }
             | PlanNode::CorrelationCommit { .. } => {
-                let name = self.name();
-                let idx = match dag
-                    .graph
-                    .node_indices()
-                    .find(|&i| dag.graph[i].name() == name)
-                {
+                let idx = match dag.index_of_or_scan(self.id()) {
                     Some(i) => i,
                     None => return Vec::new(),
                 };
@@ -817,11 +812,8 @@ impl PlanNode {
         if let Some(s) = self.stored_output_schema() {
             return s;
         }
-        let name = self.name();
         let idx = dag
-            .graph
-            .node_indices()
-            .find(|&i| dag.graph[i].name() == name)
+            .index_of_or_scan(self.id())
             .expect("PlanNode::output_schema_in: node not present in its own dag");
         if let Some(upstream) = dag
             .graph
@@ -854,11 +846,7 @@ impl PlanNode {
         if matches!(self, PlanNode::Source { .. }) {
             return None;
         }
-        let name = self.name();
-        let idx = dag
-            .graph
-            .node_indices()
-            .find(|&i| dag.graph[i].name() == name)?;
+        let idx = dag.index_of_or_scan(self.id())?;
         let mut incoming = dag
             .graph
             .neighbors_directed(idx, petgraph::Direction::Incoming);
