@@ -9,10 +9,10 @@
 //!
 //! [`builder::column_lineage`] populates both DIRECT (value-derivation) per-column
 //! lineage and whole-dataset INDIRECT influence (filter / join / group-by / sort /
-//! conditional). Precise composition and envelope (`$doc`) traversal remain out of
-//! scope; see that module's documented limitations. The [`emit`] module assembles
-//! a built lineage into a `START`/`COMPLETE` run-event pair ready for
-//! [`openlineage::write_ndjson`].
+//! conditional), tracing through composition bodies to true source columns.
+//! Envelope (`$doc`) traversal remains out of scope; see that module's documented
+//! limitations. The [`emit`] module assembles a built lineage into a
+//! `START`/`COMPLETE` run-event pair ready for [`openlineage::write_ndjson`].
 //!
 //! The model is pinned to OpenLineage core spec `2-0-2` and the
 //! `ColumnLineageDatasetFacet` `1-2-0`. No general-purpose Rust OpenLineage client

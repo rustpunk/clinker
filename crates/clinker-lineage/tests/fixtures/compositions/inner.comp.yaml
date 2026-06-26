@@ -1,0 +1,18 @@
+# Inner composition of the nested pair: renames the port column into `z`.
+_compose:
+  name: inner
+  inputs:
+    i_in:
+      schema:
+        - { name: customer_id, type: string }
+  outputs:
+    i_out: inner_proj
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: inner_proj
+    input: i_in
+    config:
+      cxl: |
+        emit z = customer_id

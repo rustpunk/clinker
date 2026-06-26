@@ -1,0 +1,23 @@
+# A body that aggregates with a GROUP BY. Proves both DIRECT subtypes across
+# the boundary (sum -> AGGREGATION, group key -> IDENTITY) and that an in-body
+# group-by surfaces as INDIRECT (GROUP_BY) influence on the composition output.
+_compose:
+  name: agg_in_body
+  inputs:
+    inp:
+      schema:
+        - { name: department, type: string }
+        - { name: amount, type: int }
+  outputs:
+    out: dept_totals
+  config_schema: {}
+
+nodes:
+  - type: aggregate
+    name: dept_totals
+    input: inp
+    config:
+      group_by: [department]
+      cxl: |
+        emit department = department
+        emit total = sum(amount)

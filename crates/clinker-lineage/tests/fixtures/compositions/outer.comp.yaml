@@ -1,0 +1,26 @@
+# Outer composition of the nested pair: calls `inner` and renames its `z`
+# output into `y`. Proves lineage resolves across two stitched composition
+# boundaries back to the real source column.
+_compose:
+  name: outer
+  inputs:
+    o_in:
+      schema:
+        - { name: customer_id, type: string }
+  outputs:
+    o_out: outer_tag
+  config_schema: {}
+
+nodes:
+  - type: composition
+    name: inner_call
+    input: o_in
+    use: ./inner.comp.yaml
+    inputs:
+      i_in: o_in
+  - type: transform
+    name: outer_tag
+    input: inner_call
+    config:
+      cxl: |
+        emit y = z
