@@ -77,6 +77,7 @@
 - [CLI Reference](ops/cli-reference.md)
 - [Validation & Dry Run](ops/validation.md)
 - [Explain Plans](ops/explain.md)
+- [Column Lineage](ops/lineage.md)
 - [Memory Tuning](ops/memory.md)
 - [Storage & Spill Location](ops/storage.md)
 - [Streaming vs. Blocking Stages](ops/streaming-vs-blocking.md)

@@ -86,6 +86,42 @@ pub enum TransformationSubtype {
     Conditional,
 }
 
+/// A clinker-specific job facet carrying the pipeline's content fingerprint.
+///
+/// OpenLineage defines no standard facet for a pipeline-source hash, so this is a
+/// producer-defined facet: its `_schemaURL` points at the clinker producer rather
+/// than an `openlineage.io` schema. Carrying the hash here — instead of encoding
+/// it in the job name — lets consumers correlate runs of the exact same pipeline
+/// definition while keeping the job name stable across edits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PipelineJobFacet {
+    /// URI of the software that produced this facet.
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    /// Schema URL of the facet spec this conforms to (clinker-owned).
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    /// Lowercase hex of the pipeline config's content hash.
+    #[serde(rename = "sourceHash")]
+    pub source_hash: String,
+}
+
+impl PipelineJobFacet {
+    /// A pipeline-hash facet stamped with the clinker [`PRODUCER`] and
+    /// [`CLINKER_PIPELINE_FACET_SCHEMA_URL`], so the producer/schema-URL
+    /// convention lives in this crate rather than at each call site.
+    ///
+    /// [`PRODUCER`]: super::PRODUCER
+    /// [`CLINKER_PIPELINE_FACET_SCHEMA_URL`]: super::CLINKER_PIPELINE_FACET_SCHEMA_URL
+    pub fn new(source_hash: String) -> Self {
+        Self {
+            producer: super::PRODUCER.to_string(),
+            schema_url: super::CLINKER_PIPELINE_FACET_SCHEMA_URL.to_string(),
+            source_hash,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

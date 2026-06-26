@@ -10,7 +10,9 @@
 //! [`builder::column_lineage`] populates both DIRECT (value-derivation) per-column
 //! lineage and whole-dataset INDIRECT influence (filter / join / group-by / sort /
 //! conditional). Precise composition and envelope (`$doc`) traversal remain out of
-//! scope; see that module's documented limitations.
+//! scope; see that module's documented limitations. The [`emit`] module assembles
+//! a built lineage into a `START`/`COMPLETE` run-event pair ready for
+//! [`openlineage::write_ndjson`].
 //!
 //! The model is pinned to OpenLineage core spec `2-0-2` and the
 //! `ColumnLineageDatasetFacet` `1-2-0`. No general-purpose Rust OpenLineage client
@@ -20,12 +22,15 @@
 
 pub mod builder;
 pub mod dataset;
+pub mod emit;
 pub mod openlineage;
 
 pub use builder::{OutputColumnLineage, PlanColumnLineage, column_lineage};
 pub use dataset::{DatasetId, FALLBACK_NAMESPACE, FILE_NAMESPACE, dataset_identity};
+pub use emit::run_events;
 pub use openlineage::{
-    COLUMN_LINEAGE_FACET_SCHEMA_URL, ColumnLineageDatasetFacet, Dataset, DatasetFacets, EventType,
-    FieldLineage, InputField, Job, OPENLINEAGE_SCHEMA_URL, PRODUCER, Run, RunEvent, Transformation,
+    CLINKER_PIPELINE_FACET_SCHEMA_URL, COLUMN_LINEAGE_FACET_SCHEMA_URL, ColumnLineageDatasetFacet,
+    Dataset, DatasetFacets, EventType, FieldLineage, InputField, JOB_NAMESPACE, Job, JobFacets,
+    OPENLINEAGE_SCHEMA_URL, PRODUCER, PipelineJobFacet, Run, RunEvent, Transformation,
     TransformationSubtype, TransformationType, write_ndjson,
 };

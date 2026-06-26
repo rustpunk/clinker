@@ -199,6 +199,7 @@ Common pipeline commands from `CLAUDE.md` and user docs:
 
 ```bash
 cargo run -p clinker -- run examples/pipelines/customer_etl.yaml --explain
+cargo run -p clinker -- run examples/pipelines/customer_etl.yaml --lineage -
 cargo run -p clinker -- run examples/pipelines/customer_etl.yaml --dry-run -n 10
 cargo run -p clinker -- run examples/pipelines/tumbling_clicks.yaml
 cargo run -p clinker -- run examples/pipelines/hopping_sliding_5m_1h.yaml

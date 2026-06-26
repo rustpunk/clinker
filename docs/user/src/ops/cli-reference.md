@@ -25,6 +25,7 @@ clinker run [OPTIONS] <CONFIG>
 | `--error-threshold <N>` | `0` (unlimited) | Maximum number of records routed to the dead-letter queue before the pipeline aborts. `0` means no limit -- the pipeline will run to completion regardless of DLQ volume. |
 | `--batch-id <ID>` | UUID v7 | Custom execution identifier. Appears in metrics output and log lines. Use a meaningful value (e.g. `daily-2026-04-11`) for correlation across retries. |
 | `--explain [FORMAT]` | `text` | Print the execution plan and exit without processing data. Accepted formats: `text`, `json`, `dot`. See [Explain Plans](explain.md). |
+| `--lineage <PATH>` | -- | Build column lineage and write it as OpenLineage NDJSON, then exit without processing data. Give a file path, or `-` for stdout. See [Column Lineage](lineage.md). |
 | `--dry-run` | -- | Validate the configuration (YAML structure, CXL syntax, type checking, DAG wiring) without reading any data. |
 | `-n, --dry-run-n <N>` | -- | Process only the first `N` records through the full pipeline. Implies `--dry-run`. |
 | `--dry-run-output <FILE>` | stdout | Redirect dry-run output to a file instead of stdout. Only meaningful with `-n`. |

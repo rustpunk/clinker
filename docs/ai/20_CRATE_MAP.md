@@ -28,7 +28,7 @@ clinker-bench-support -> clinker-record
 clinker-benchmarks -> clinker-bench-support + clinker-exec + clinker-plan + cxl
 ```
 
-Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clinker-record`; `clinker-format -> clinker-record, cxl`; `clinker-plan -> clinker-core-types, clinker-format, clinker-record, cxl`; `clinker-exec -> clinker-core-types, clinker-format, clinker-plan, clinker-record, cxl`; `clinker-channel -> clinker-core-types, clinker-plan, clinker-record`; `clinker-net -> clinker-exec, clinker-format, clinker-plan, clinker-record`; `clinker -> clinker-channel, clinker-core-types, clinker-exec, clinker-format, clinker-net, clinker-plan, clinker-record`; `cxl-cli -> cxl, clinker-record`; `clinker-schema -> clinker-plan`; `clinker-lineage -> clinker-plan, clinker-record, cxl`.
+Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clinker-record`; `clinker-format -> clinker-record, cxl`; `clinker-plan -> clinker-core-types, clinker-format, clinker-record, cxl`; `clinker-exec -> clinker-core-types, clinker-format, clinker-plan, clinker-record, cxl`; `clinker-channel -> clinker-core-types, clinker-plan, clinker-record`; `clinker-net -> clinker-exec, clinker-format, clinker-plan, clinker-record`; `clinker -> clinker-channel, clinker-core-types, clinker-exec, clinker-format, clinker-lineage, clinker-net, clinker-plan, clinker-record`; `cxl-cli -> cxl, clinker-record`; `clinker-schema -> clinker-plan`; `clinker-lineage -> clinker-plan, clinker-record, cxl`.
 
 ## Current Layering Rules Inferred From Source
 
@@ -39,7 +39,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - `clinker-plan` is compile-time orchestration and DAG construction below the runtime executor; its crate docs explicitly say execution consumes its plan (`crates/clinker-plan/src/lib.rs`).
 - `clinker-exec` is runtime orchestration and operators; binaries and network transports depend on it rather than the reverse (`crates/clinker-exec/src/lib.rs`; `crates/clinker-exec/src/executor/mod.rs`).
 - `clinker-channel`, `clinker-net`, `clinker-schema`, `clinker`, and `cxl-cli` appear to be edge/application or integration crates around the plan/exec/language core.
-- `clinker-lineage` is a plan-time, read-only consumer of `clinker-plan`: it maps Source/Output nodes to OpenLineage dataset identities and walks the compiled DAG to emit DIRECT column-level lineage facets (OpenLineage `2-0-2` / `ColumnLineageDatasetFacet` `1-2-0`). It reads typed/compiled programs off plan nodes via `cxl`; it does not run pipelines (`crates/clinker-lineage/src/lib.rs`).
+- `clinker-lineage` is a plan-time, read-only consumer of `clinker-plan`: it maps Source/Output nodes to OpenLineage dataset identities and walks the compiled DAG to emit DIRECT (per-column) and INDIRECT (whole-dataset influence) column-level lineage facets (OpenLineage `2-0-2` / `ColumnLineageDatasetFacet` `1-2-0`). It reads typed/compiled programs off plan nodes via `cxl`; it does not run pipelines (`crates/clinker-lineage/src/lib.rs`). The `clinker` CLI consumes it via `run --lineage <path>`, which compiles the plan and writes a static START/COMPLETE OpenLineage NDJSON pair without reading data (mirroring `--explain`).
 - Benchmark crates appear intended to stay outside the runtime layer. `clinker-benchmarks/src/lib.rs` says it houses a runner needing both `clinker-exec` and `clinker-bench-support` to avoid a circular dependency.
 
 ## Cycles And Suspicious Coupling
