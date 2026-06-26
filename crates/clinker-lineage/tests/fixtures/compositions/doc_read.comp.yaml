@@ -1,0 +1,22 @@
+# Single input port; the body emits a column derived from a `$doc` envelope
+# read plus open-row passthrough of the port column. Used to prove envelope
+# lineage traces through the body to the real upstream source feeding the port
+# (the rendered `$doc.…` path on that source), not the synthetic port Source.
+_compose:
+  name: doc_read
+  inputs:
+    inp:
+      schema:
+        - { name: amount, type: int }
+  outputs:
+    out: body_proj
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: body_proj
+    input: inp
+    config:
+      cxl: |
+        emit amount = amount
+        emit batch = $doc.BatchInfo.batch_id

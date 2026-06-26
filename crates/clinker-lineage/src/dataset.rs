@@ -43,9 +43,11 @@ pub const FALLBACK_NAMESPACE: &str = "clinker";
 ///
 /// Identity only — deliberately distinct from the wire [`Dataset`], which also
 /// carries facets. Deriving `Hash`/`Eq` lets a later builder group a run's
-/// inputs and outputs by dataset before attaching column-lineage facets.
+/// inputs and outputs by dataset before attaching column-lineage facets; `Ord`
+/// (by `namespace` then `name`) lets a `$doc` envelope read attribute to a
+/// deterministically-ordered set of feeding source datasets.
 /// Convert to a facet-less wire [`Dataset`] via `Dataset::from`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DatasetId {
     pub namespace: String,
     pub name: String,

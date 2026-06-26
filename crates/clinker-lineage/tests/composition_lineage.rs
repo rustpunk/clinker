@@ -381,3 +381,67 @@ nodes:
         out.facet.dataset
     );
 }
+
+/// A `$doc` envelope read inside a composition body must attribute to the REAL
+/// upstream source feeding the port — the source whose envelope declares the
+/// section — not the synthetic port Source. Exercises the doc-source seeding of
+/// the body's input-port Source from the parent producer.
+#[test]
+fn doc_read_inside_a_composition_body_attributes_to_the_feeding_source() {
+    let yaml = r#"
+pipeline: { name: doc_comp_test }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: xml
+      glob: data/*.xml
+      options: { record_path: doc/records/record }
+      envelope:
+        sections:
+          BatchInfo:
+            extract: { xml_path: "/doc/BatchInfo" }
+            fields:
+              batch_id: string
+      schema:
+        - { name: amount, type: int }
+  - type: composition
+    name: comp
+    input: src
+    use: ../compositions/doc_read.comp.yaml
+    inputs:
+      inp: src
+  - type: output
+    name: out
+    input: comp
+    config: { name: out, type: csv, path: out/doc_comp.csv }
+"#;
+    let lineage = lineage_of(yaml);
+    // The glob `data/*.xml` resolves to the directory dataset `<root>/data`.
+    let src = file_dataset("data");
+    let out = only_output(&lineage);
+    let fields = &out.facet.fields;
+
+    use TransformationSubtype::Identity;
+    // The in-body `$doc` read resolves across the port boundary to the real
+    // source, carrying the rendered envelope path as its `field`.
+    assert_field(
+        fields,
+        "batch",
+        &[direct(&src, "$doc.BatchInfo.batch_id", Identity)],
+    );
+    // Open-row passthrough of the port column keeps its own source.
+    assert_field(fields, "amount", &[direct(&src, "amount", Identity)]);
+
+    // Only the real source is an input — the seeded port Source is skipped, so
+    // no phantom `clinker:inp` input leaks.
+    assert_eq!(
+        lineage.inputs,
+        vec![DatasetId {
+            namespace: "file".to_string(),
+            name: src.clone(),
+        }],
+        "only the real envelope source should be an input"
+    );
+}

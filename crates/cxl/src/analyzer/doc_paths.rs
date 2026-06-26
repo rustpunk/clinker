@@ -207,7 +207,13 @@ impl<K: Ord + Clone> Visitor for DocPathCollector<'_, K> {
 /// - `Some(Ok(path))` — every index in the chain is literal.
 /// - `Some(Err(diag))` — some index is a computed expression, so the path
 ///   is unresolvable; the diagnostic points at that index's span.
-fn classify_doc_index_chain(expr: &Expr) -> Option<Result<DocPath, TypeDiagnostic>> {
+///
+/// Public so a downstream consumer (e.g. `clinker-lineage`, rendering a
+/// `$doc` read as a column-lineage terminal) can resolve an indexed envelope
+/// access without re-implementing the chain walk. By the time a compiled plan
+/// reaches that consumer every dynamic index has already failed the compile,
+/// so the `Err` arm is unreachable there.
+pub fn classify_doc_index_chain(expr: &Expr) -> Option<Result<DocPath, TypeDiagnostic>> {
     // First descend the receiver chain to its root WITHOUT judging the
     // indices. Only once the root is confirmed to be a `$doc` access do
     // the index expressions matter — `region[$doc.s.f]` has a `$doc`
