@@ -41,7 +41,11 @@
 //! unions its direct upstreams. The read then attributes only to those feeding
 //! sources whose envelope actually declares the section (`declared_doc_sections`),
 //! so a multi-source fan-in never emits a false edge to a source whose document
-//! cannot carry it.
+//! cannot carry it. The same DIRECT rule covers a `$doc` read inside an Aggregate
+//! emit (the read survives in the post-extraction residual). A `$doc` read inside
+//! an influence predicate — a Route condition, a Cull `drop_group_when`, or a
+//! Combine `where:` — instead surfaces as INDIRECT influence on those same feeding
+//! sources (`FILTER` for Route / Cull, `JOIN` for Combine).
 //!
 //! ## Subtype model
 //!
@@ -54,18 +58,18 @@
 //! ## Documented limitations
 //!
 //! - A column-grain `$doc` read is attributed (as DIRECT) in a Transform
-//!   projection, a Combine body, and a Composition body (see above). It is **not**
-//!   yet attributed in three places: a whole-section echo (`*_from_doc`) at
-//!   document grain (no output column or CXL expression); a `$doc` read inside an
-//!   Aggregate or Reshape emit (those arms read off the residual /
-//!   `program_support_into`, which exclude the off-schema `$doc` namespace); and a
-//!   `$doc` read in any INDIRECT influence predicate (a Route / Cull / Combine
-//!   `where:` / Reshape `when:` condition), for the same read-set reason.
+//!   projection, a Combine body, a Composition body, and an Aggregate emit, and
+//!   (as INDIRECT influence) in a Route / Cull / Combine `where:` predicate. Two
+//!   `$doc` cases remain unattributed: a whole-section echo (`*_from_doc`) at
+//!   document grain (no output column or CXL expression); and any `$doc` reference
+//!   in a Reshape rule — the planner rejects those outright (`bind_reshape`'s E200
+//!   guard, because Reshape re-runs its rules after a spill that drops envelope
+//!   context), so no Reshape envelope read ever reaches this builder.
 //! - A `match: collect` combine (no projection body) is resolved coarsely.
 //! - INDIRECT influence covers the predicate / grouping / sort surfaces above (for
-//!   record columns); an aggregate's pre-aggregation row `filter`, a
-//!   Transform-inline `filter`, and Reshape `order_by` / `partition_by` are not
-//!   (yet) attributed as influence.
+//!   record columns, plus `$doc` terms in the Route / Cull / Combine predicates);
+//!   an aggregate's pre-aggregation row `filter`, a Transform-inline `filter`, and
+//!   Reshape `order_by` / `partition_by` are not (yet) attributed as influence.
 //! - Constant and `count(*)` columns (no source input) are omitted from `fields`.
 //! - Engine-stamped columns (`$ck.*` / `$meta.*` / `$source.*` / `$widened`) are
 //!   skipped, mirroring the default-writer strip.
@@ -299,6 +303,20 @@ fn walk_scope(
                     {
                         merge_terminals(&mut terms, upstream_col(&lineage, up, &col), st);
                     }
+                    // An envelope read survives in the residual as a passthrough
+                    // leaf (`extract_aggregates` rewrites only group keys and
+                    // accumulators), so `aggregate_emit_sources` skips it; attribute
+                    // it directly against the feeding sources, with the emit's own
+                    // subtype (bare `$doc` = IDENTITY, in-expression = TRANSFORMATION).
+                    let mut doc_paths = Vec::new();
+                    collect_doc_paths_in_expr(&emit.residual, &mut doc_paths);
+                    merge_doc_read_terms(
+                        &mut terms,
+                        &doc_paths,
+                        field_ref_subtype(&emit.residual),
+                        &node_doc_srcs,
+                        declared_sections,
+                    );
                     cols.insert_nonempty(&emit.output_name, terms);
                 }
                 cols
@@ -329,6 +347,11 @@ fn walk_scope(
                         for r in &reads {
                             merge_terminals(slot, upstream_col(&lineage, up, r), local);
                         }
+                        // A `$doc` read needs no handling here: the planner rejects
+                        // any `$doc` reference in a Reshape rule (E200), because
+                        // Reshape re-runs its rules after a per-group spill that
+                        // drops envelope context. So a Reshape `set`/`overrides`
+                        // program never carries one.
                     }
                 }
                 cols.prune_empty();
@@ -551,7 +574,15 @@ fn walk_scope(
             }
         };
 
-        let mut node_influence = node_indirect_influence(node, dag, idx, &lineage, &influence);
+        let mut node_influence = node_indirect_influence(
+            node,
+            dag,
+            idx,
+            &lineage,
+            &influence,
+            &node_doc_srcs,
+            declared_sections,
+        );
         // A composition's in-body INDIRECT influence (filters / joins / group-bys
         // inside the body), harvested at its output port, joins the inherited
         // upstream influence. Set-union, so the parent influence carried through
@@ -994,12 +1025,31 @@ fn resolve_expr_terms(
 
     // Envelope reads resolve to the feeding source datasets, not through the
     // upstream column map (a `$doc` access names a section/field, not a column).
-    // A source is a legitimate origin only if its envelope declares the section,
-    // so a multi-source read never emits a false edge to a source whose document
-    // cannot carry it.
     let mut doc_paths = Vec::new();
     collect_doc_paths_in_expr(expr, &mut doc_paths);
-    for path in &doc_paths {
+    merge_doc_read_terms(&mut out, &doc_paths, local, doc_sources, declared_sections);
+
+    out
+}
+
+/// Merge the DIRECT terminals a set of `$doc` envelope reads derives from into
+/// `out`, each composed with `local`. A `$doc` read carries no source qualifier,
+/// so it attributes to every feeding `doc_sources` dataset whose envelope
+/// declares the read section (`declared_sections`) — never emitting a false edge
+/// to a source whose document cannot carry the section — with the rendered
+/// `$doc.<section>.<field>` path as its `field`. The seed subtype is IDENTITY (a
+/// read is itself a verbatim copy of the envelope value); `local` then dominates
+/// it, so a bare `$doc` emit stays IDENTITY while a `$doc` inside an expression
+/// composes to TRANSFORMATION. Shared by the Transform/Combine body walk
+/// (`resolve_expr_terms`) and the Aggregate/Reshape emit arms.
+fn merge_doc_read_terms(
+    out: &mut TermMap,
+    doc_paths: &[DocPath],
+    local: Subtype,
+    doc_sources: &BTreeSet<DatasetId>,
+    declared_sections: &HashMap<DatasetId, BTreeSet<String>>,
+) {
+    for path in doc_paths {
         let rendered = render_doc_path(path);
         let mut base = TermMap::new();
         for ds in doc_sources {
@@ -1014,10 +1064,8 @@ fn resolve_expr_terms(
                 Subtype::Identity,
             );
         }
-        merge_terminals(&mut out, Some(&base), local);
+        merge_terminals(out, Some(&base), local);
     }
-
-    out
 }
 
 /// Resolve one leaf field reference to its source terminals: an in-scope binding
@@ -1385,6 +1433,29 @@ fn collect_stmt_field_refs(statements: &[Statement], out: &mut Vec<QualifiedFiel
     }
 }
 
+/// Collect every envelope (`$doc`) path read by a program's statements — the
+/// statement-level parallel of [`collect_doc_paths_in_expr`], mirroring
+/// [`collect_stmt_field_refs`]. Used for the INDIRECT predicate surfaces whose
+/// condition is a program rather than a bare expression: a Route branch
+/// condition, a Cull group-drop decision, a Reshape `when:` trigger, and a
+/// Combine `where:` residual.
+fn collect_doc_paths_in_stmts(statements: &[Statement], out: &mut Vec<DocPath>) {
+    for stmt in statements {
+        match stmt {
+            Statement::Emit { expr, .. }
+            | Statement::Let { expr, .. }
+            | Statement::ExprStmt { expr, .. } => collect_doc_paths_in_expr(expr, out),
+            Statement::Filter { predicate, .. } => collect_doc_paths_in_expr(predicate, out),
+            Statement::EmitEach { source, body, .. }
+            | Statement::ExplodeOuter { source, body, .. } => {
+                collect_doc_paths_in_expr(source, out);
+                collect_doc_paths_in_stmts(body, out);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The base (first dotted segment) of an input-column reference: a nested /
 /// struct access (`address.city`) influences via its source column `address`.
 /// Predicate read-sets keep qualified refs as the dotted path, but the upstream
@@ -1466,12 +1537,20 @@ fn combine_sides<'a>(
 /// accumulated influence (flowed through unchanged) plus the columns this node
 /// filters / joins / groups / sorts / conditionally reshapes on, each resolved
 /// to its Source terminals via the upstream DIRECT `lineage`.
+///
+/// A predicate may also read the envelope (`$doc.<section>.<field>`); such a read
+/// names a section/field, not a record column, so it resolves not through the
+/// upstream lineage map but directly to each feeding `node_doc_srcs` dataset
+/// whose envelope declares the section (`declared_sections`), mirroring the
+/// DIRECT `$doc` attribution.
 fn node_indirect_influence(
     node: &PlanNode,
     dag: &ExecutionPlanDag,
     idx: NodeIndex,
     lineage: &HashMap<PlanNodeId, ColumnTerminals>,
     influence: &HashMap<PlanNodeId, InfluenceMap>,
+    node_doc_srcs: &BTreeSet<DatasetId>,
+    declared_sections: &HashMap<DatasetId, BTreeSet<String>>,
 ) -> InfluenceMap {
     let mut inf = InfluenceMap::new();
 
@@ -1489,7 +1568,9 @@ fn node_indirect_influence(
 
     // Local: this node's own influence predicate columns.
     match node {
-        PlanNode::Route { .. } => {
+        PlanNode::Route {
+            branch_programs, ..
+        } => {
             if let Some(PredicateSupport::RouteBranches(branches)) = predicate_support(node) {
                 let up = single_upstream(dag, idx);
                 for cols in &branches {
@@ -1502,8 +1583,21 @@ fn node_indirect_influence(
                     }
                 }
             }
+            // A branch condition may filter on the envelope; the branch programs
+            // retain `$doc` (`predicate_support` strips it), so collect it here.
+            let mut doc_paths = Vec::new();
+            for prog in branch_programs.iter() {
+                collect_doc_paths_in_stmts(&prog.program.statements, &mut doc_paths);
+            }
+            add_doc_influence(
+                &mut inf,
+                &doc_paths,
+                node_doc_srcs,
+                declared_sections,
+                IndirectSub::Filter,
+            );
         }
-        PlanNode::Cull { config, .. } => {
+        PlanNode::Cull { config, typed, .. } => {
             let up = single_upstream(dag, idx);
             if let Some(PredicateSupport::CullDrop(cols)) = predicate_support(node) {
                 for col in &cols {
@@ -1524,6 +1618,17 @@ fn node_indirect_influence(
                     IndirectSub::GroupBy,
                 );
             }
+            // A `drop_group_when` predicate may read the envelope; the decision
+            // program retains `$doc` (`predicate_support` strips it).
+            let mut doc_paths = Vec::new();
+            collect_doc_paths_in_stmts(&typed.program.statements, &mut doc_paths);
+            add_doc_influence(
+                &mut inf,
+                &doc_paths,
+                node_doc_srcs,
+                declared_sections,
+                IndirectSub::Filter,
+            );
         }
         PlanNode::Aggregation { compiled, .. } => {
             let up = single_upstream(dag, idx);
@@ -1546,6 +1651,9 @@ fn node_indirect_influence(
             }
         }
         PlanNode::Reshape { compiled_rules, .. } => {
+            // A `when:` trigger cannot read `$doc`: the planner rejects any
+            // envelope reference in a Reshape rule (E200, see `bind_reshape`), so
+            // only record columns reach here.
             let up = single_upstream(dag, idx);
             for rule in compiled_rules.iter() {
                 let mut reads = HashSet::new();
@@ -1567,18 +1675,24 @@ fn node_indirect_influence(
         } => {
             let sides = combine_sides(dag, idx, resolved_column_map, *driving_upstream);
             let mut refs = Vec::new();
+            let mut doc_paths = Vec::new();
             for eq in &dp.equalities {
                 collect_field_refs(&eq.left_expr, &mut refs);
                 collect_field_refs(&eq.right_expr, &mut refs);
+                collect_doc_paths_in_expr(&eq.left_expr, &mut doc_paths);
+                collect_doc_paths_in_expr(&eq.right_expr, &mut doc_paths);
             }
             for range in &dp.ranges {
                 collect_field_refs(&range.left_expr, &mut refs);
                 collect_field_refs(&range.right_expr, &mut refs);
+                collect_doc_paths_in_expr(&range.left_expr, &mut doc_paths);
+                collect_doc_paths_in_expr(&range.right_expr, &mut doc_paths);
             }
             // Non-equi / non-range conjuncts (`!=`, `or`, function predicates)
             // live in the residual program; their columns still influence the join.
             if let Some(residual) = &dp.residual {
                 collect_stmt_field_refs(&residual.program.statements, &mut refs);
+                collect_doc_paths_in_stmts(&residual.program.statements, &mut doc_paths);
             }
             for qf in &refs {
                 let Some((side, cidx)) = resolve_side(qf, sides.map, &sides.bare) else {
@@ -1598,6 +1712,16 @@ fn node_indirect_influence(
                     );
                 }
             }
+            // A `$doc` read in the join predicate carries no source qualifier, so
+            // it attributes to the combine's driving document context
+            // (`node_doc_srcs`), mirroring the DIRECT combine-body `$doc` rule.
+            add_doc_influence(
+                &mut inf,
+                &doc_paths,
+                node_doc_srcs,
+                declared_sections,
+                IndirectSub::Join,
+            );
         }
         _ => {}
     }
@@ -1612,6 +1736,35 @@ fn add_upstream_influence(inf: &mut InfluenceMap, up_terms: Option<&TermMap>, su
     if let Some(terms) = up_terms {
         for terminal in terms.keys() {
             inf.entry(terminal.clone()).or_default().insert(sub);
+        }
+    }
+}
+
+/// Add each `$doc` envelope read in `doc_paths` to `inf` as an INDIRECT influence
+/// of subtype `sub`. A `$doc` read names a section/field, not a record column, so
+/// it resolves directly to each feeding `doc_srcs` dataset whose envelope
+/// declares the read section (`declared_sections`) — never through the upstream
+/// lineage map — with the rendered `$doc.<section>.<field>` path as its `field`.
+/// The INDIRECT counterpart of [`merge_doc_read_terms`].
+fn add_doc_influence(
+    inf: &mut InfluenceMap,
+    doc_paths: &[DocPath],
+    doc_srcs: &BTreeSet<DatasetId>,
+    declared_sections: &HashMap<DatasetId, BTreeSet<String>>,
+    sub: IndirectSub,
+) {
+    for path in doc_paths {
+        let rendered = render_doc_path(path);
+        for ds in doc_srcs {
+            if !declared_sections
+                .get(ds)
+                .is_some_and(|sections| sections.contains(path.section.as_ref()))
+            {
+                continue;
+            }
+            inf.entry(Terminal::new(&ds.namespace, &ds.name, &rendered))
+                .or_default()
+                .insert(sub);
         }
     }
 }
@@ -3403,6 +3556,296 @@ nodes:
                 "$doc.Head.x",
                 TransformationSubtype::Identity,
             )],
+        );
+    }
+
+    // -- Envelope ($doc) on aggregate / reshape / predicate surfaces ----------
+
+    #[test]
+    fn aggregate_emit_doc_read_is_direct_identity_on_the_source() {
+        // A `$doc` read in an aggregate emit survives in the post-extraction
+        // residual as a passthrough leaf (it is neither a group key nor an
+        // accumulator), so it was previously dropped. It now carries a DIRECT
+        // IDENTITY terminal naming the source and the rendered `$doc.…` path.
+        let yaml = r#"
+pipeline: { name: aggdoc }
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: xml
+      glob: data/*.xml
+      options: { record_path: doc/records/record }
+      envelope:
+        sections:
+          Head:
+            extract: { xml_path: "/doc/Head" }
+            fields:
+              batch_id: string
+      schema:
+        - { name: region, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: agg
+    input: payments
+    config:
+      group_by: [region]
+      cxl: |
+        emit region = region
+        emit total = sum(amount)
+        emit batch = $doc.Head.batch_id
+  - type: output
+    name: out
+    input: agg
+    config: { name: out, type: csv, path: out/aggdoc.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let src = "/w/data";
+        let fields = &only_output(&lineage).facet.fields;
+        use TransformationSubtype::{Aggregation, Identity};
+        assert_field(fields, "region", &[direct(src, "region", Identity)]);
+        assert_field(fields, "total", &[direct(src, "amount", Aggregation)]);
+        assert_field(
+            fields,
+            "batch",
+            &[direct(src, "$doc.Head.batch_id", Identity)],
+        );
+    }
+
+    #[test]
+    fn reshape_rule_rejects_doc_reference_at_compile_time() {
+        // Reshape cannot read `$doc` in any rule fragment: it re-runs its rules
+        // after a per-group spill that drops envelope context, so the planner
+        // fails the compile (E200) rather than resolve `$doc` to null. There is
+        // therefore no Reshape `$doc` surface for lineage to attribute — this
+        // pins that contract so a future relaxation revisits the lineage arm.
+        let yaml = r#"
+pipeline: { name: rsdoc }
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: xml
+      glob: data/*.xml
+      options: { record_path: doc/records/record }
+      envelope:
+        sections:
+          Head:
+            extract: { xml_path: "/doc/Head" }
+            fields:
+              batch_id: string
+      schema:
+        - { name: region, type: string }
+        - { name: amount, type: int }
+        - { name: tag, type: string }
+  - type: reshape
+    name: tagit
+    input: payments
+    config:
+      partition_by: [region]
+      rules:
+        - name: stamp
+          when: "amount > 0"
+          mutate:
+            set:
+              tag: "$doc.Head.batch_id"
+  - type: output
+    name: out
+    input: tagit
+    config: { name: out, type: csv, path: out/rsdoc.csv }
+"#;
+        let err = parse_config(yaml)
+            .expect("parse_config")
+            .compile(&CompileContext::default())
+            .expect_err("Reshape `$doc` reference must fail to compile");
+        assert!(
+            err.iter()
+                .any(|d| d.code == "E200" && d.message.contains("references `$doc`")),
+            "expected an E200 `$doc` rejection, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn route_predicate_doc_read_is_filter_influence() {
+        // A Route condition that tests the envelope (`amount > $doc.Head.threshold`)
+        // attributes BOTH the record column `amount` and the envelope read as
+        // FILTER influence — the doc term was previously dropped.
+        let yaml = r#"
+pipeline: { name: rtdoc }
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: xml
+      glob: data/*.xml
+      options: { record_path: doc/records/record }
+      envelope:
+        sections:
+          Head:
+            extract: { xml_path: "/doc/Head" }
+            fields:
+              threshold: int
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: int }
+  - type: route
+    name: split
+    input: payments
+    config:
+      mode: exclusive
+      conditions: { high: "amount > $doc.Head.threshold" }
+      default: low
+  - type: output
+    name: hi
+    input: split.high
+    config: { name: hi, type: csv, path: out/hi.csv }
+  - type: output
+    name: lo
+    input: split.low
+    config: { name: lo, type: csv, path: out/lo.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let src = "/w/data";
+        let hi = output_named(&lineage, "hi.csv");
+        use TransformationSubtype::Filter;
+        // Sorted by field: `$doc.Head.threshold` (leading `$`) before `amount`.
+        assert_eq!(
+            hi.facet.dataset,
+            vec![
+                indirect(src, "$doc.Head.threshold", &[Filter]),
+                indirect(src, "amount", &[Filter]),
+            ],
+        );
+    }
+
+    #[test]
+    fn combine_where_doc_read_is_join_influence() {
+        // A `$doc` read in a combine `where:` residual attributes as JOIN
+        // influence to the combine's driving document context only — never the
+        // build side — mirroring the DIRECT combine-body `$doc` rule.
+        let yaml = r#"
+pipeline: { name: cjdoc }
+nodes:
+  - type: source
+    name: drv
+    config:
+      name: drv
+      type: xml
+      glob: data/drv/*.xml
+      options: { record_path: doc/records/record }
+      envelope:
+        sections:
+          Head:
+            extract: { xml_path: "/doc/Head" }
+            fields:
+              threshold: int
+      schema:
+        - { name: k, type: string }
+        - { name: amount, type: int }
+  - type: source
+    name: bld
+    config:
+      name: bld
+      type: xml
+      glob: data/bld/*.xml
+      options: { record_path: doc/records/record }
+      envelope:
+        sections:
+          Head:
+            extract: { xml_path: "/doc/Head" }
+            fields:
+              threshold: int
+      schema:
+        - { name: k, type: string }
+  - type: combine
+    name: j
+    input: { drv: drv, bld: bld }
+    config:
+      where: "drv.k == bld.k and drv.amount > $doc.Head.threshold"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit k = drv.k
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: j
+    config: { name: out, type: csv, path: out/cjdoc.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        use TransformationSubtype::Join;
+        // Sorted by (name, field): bld < drv; within drv `$doc.…` < `amount` < `k`.
+        assert_eq!(
+            only_output(&lineage).facet.dataset,
+            vec![
+                indirect("/w/data/bld", "k", &[Join]),
+                indirect("/w/data/drv", "$doc.Head.threshold", &[Join]),
+                indirect("/w/data/drv", "amount", &[Join]),
+                indirect("/w/data/drv", "k", &[Join]),
+            ],
+        );
+    }
+
+    #[test]
+    fn cull_drop_predicate_doc_read_is_filter_influence() {
+        // A Cull `drop_group_when` predicate that tests the envelope attributes
+        // the envelope read as FILTER influence alongside the record column.
+        // Cull (unlike Reshape) folds its decision before any spill, so `$doc`
+        // is supported there and reaches the lineage builder.
+        let yaml = r#"
+pipeline: { name: cudoc }
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: xml
+      glob: data/*.xml
+      options: { record_path: doc/records/record }
+      envelope:
+        sections:
+          Head:
+            extract: { xml_path: "/doc/Head" }
+            fields:
+              threshold: int
+      schema:
+        - { name: region, type: string }
+        - { name: amount, type: int }
+  - type: cull
+    name: trim
+    input: payments
+    config:
+      partition_by: [region]
+      removed_to: removed
+      rules:
+        - name: drop_over_budget
+          drop_group_when: "sum(amount) > $doc.Head.threshold"
+  - type: output
+    name: out
+    input: trim
+    config: { name: out, type: csv, path: out/cudoc.csv }
+  - type: output
+    name: audit
+    input: trim.removed
+    config: { name: audit, type: csv, path: out/audit.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let src = "/w/data";
+        let out = output_named(&lineage, "cudoc.csv");
+        use TransformationSubtype::{Filter, GroupBy};
+        // Sorted by (name, field): `$doc.Head.threshold` (leading `$`) < `amount`
+        // < `region`. The partition key `region` is GROUP_BY; the predicate's
+        // record column `amount` and envelope read are FILTER.
+        assert_eq!(
+            out.facet.dataset,
+            vec![
+                indirect(src, "$doc.Head.threshold", &[Filter]),
+                indirect(src, "amount", &[Filter]),
+                indirect(src, "region", &[GroupBy]),
+            ],
         );
     }
 }
