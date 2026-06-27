@@ -303,20 +303,35 @@ fn walk_scope(
                     {
                         merge_terminals(&mut terms, upstream_col(&lineage, up, &col), st);
                     }
-                    // An envelope read survives in the residual as a passthrough
-                    // leaf (`extract_aggregates` rewrites only group keys and
-                    // accumulators), so `aggregate_emit_sources` skips it; attribute
-                    // it directly against the feeding sources, with the emit's own
-                    // subtype (bare `$doc` = IDENTITY, in-expression = TRANSFORMATION).
-                    let mut doc_paths = Vec::new();
-                    collect_doc_paths_in_expr(&emit.residual, &mut doc_paths);
-                    merge_doc_read_terms(
-                        &mut terms,
-                        &doc_paths,
-                        field_ref_subtype(&emit.residual),
-                        &node_doc_srcs,
-                        declared_sections,
-                    );
+                    // Envelope reads in this emit, attributed against the feeding
+                    // sources. A `$doc` left in the residual (outside any aggregate
+                    // call) survives as a passthrough leaf and keeps the emit's own
+                    // subtype (bare = IDENTITY, in-expression = TRANSFORMATION). A
+                    // `$doc` that `extract_aggregates` hoisted into an accumulator
+                    // argument (e.g. `sum(amount * $doc.x)`) is gone from the
+                    // residual and is an AGGREGATION input — recover it from the
+                    // binding. Skipped wholesale when no envelope-bearing source
+                    // feeds this node.
+                    if !node_doc_srcs.is_empty() {
+                        let mut residual_docs = Vec::new();
+                        collect_doc_paths_in_expr(&emit.residual, &mut residual_docs);
+                        merge_doc_read_terms(
+                            &mut terms,
+                            &residual_docs,
+                            field_ref_subtype(&emit.residual),
+                            &node_doc_srcs,
+                            declared_sections,
+                        );
+                        let mut agg_docs = Vec::new();
+                        aggregate_binding_doc_paths(&emit.residual, compiled, &mut agg_docs);
+                        merge_doc_read_terms(
+                            &mut terms,
+                            &agg_docs,
+                            Subtype::Aggregation,
+                            &node_doc_srcs,
+                            declared_sections,
+                        );
+                    }
                     cols.insert_nonempty(&emit.output_name, terms);
                 }
                 cols
@@ -1240,6 +1255,41 @@ fn binding_arg_input_names(arg: &BindingArg, schema: Option<&Schema>) -> Vec<Str
     }
 }
 
+/// `$doc` paths read inside the aggregate-function arguments referenced by
+/// `residual`'s accumulator slots. `extract_aggregates` hoists an aggregated
+/// expression (e.g. `sum(amount * $doc.Head.fx_rate)`) into a binding arg and
+/// leaves only an `AggSlot` in the residual, so an envelope read there never
+/// appears in the residual itself — recover it from the binding.
+fn aggregate_binding_doc_paths(
+    residual: &Expr,
+    compiled: &cxl::plan::CompiledAggregate,
+    out: &mut Vec<DocPath>,
+) {
+    let mut leaves = Vec::new();
+    collect_agg_leaves(residual, &mut leaves);
+    for leaf in leaves {
+        if let AggLeaf::Agg(slot) = leaf
+            && let Some(binding) = compiled.bindings.get(slot as usize)
+        {
+            binding_arg_doc_paths(&binding.arg, out);
+        }
+    }
+}
+
+/// `$doc` paths read by a single aggregate argument — the envelope analogue of
+/// [`binding_arg_input_names`], which sees only record columns (`support_into`
+/// excludes the `$doc` namespace).
+fn binding_arg_doc_paths(arg: &BindingArg, out: &mut Vec<DocPath>) {
+    match arg {
+        BindingArg::Expr(e) => collect_doc_paths_in_expr(e, out),
+        BindingArg::Pair(a, b) => {
+            binding_arg_doc_paths(a, out);
+            binding_arg_doc_paths(b, out);
+        }
+        BindingArg::Field(_) | BindingArg::Wildcard => {}
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Field-reference collection and resolution
 // ---------------------------------------------------------------------------
@@ -1450,8 +1500,9 @@ fn collect_stmt_field_refs(statements: &[Statement], out: &mut Vec<QualifiedFiel
 /// statement-level parallel of [`collect_doc_paths_in_expr`], mirroring
 /// [`collect_stmt_field_refs`]. Used for the INDIRECT predicate surfaces whose
 /// condition is a program rather than a bare expression: a Route branch
-/// condition, a Cull group-drop decision, a Reshape `when:` trigger, and a
-/// Combine `where:` residual.
+/// condition, a Cull group-drop decision, and a Combine `where:` residual.
+/// (Reshape `when:` is deliberately absent — the planner rejects `$doc` in any
+/// Reshape rule via `bind_reshape`'s E200 guard, so none reaches this builder.)
 fn collect_doc_paths_in_stmts(statements: &[Statement], out: &mut Vec<DocPath>) {
     for stmt in statements {
         match stmt {
@@ -3614,6 +3665,61 @@ nodes:
             fields,
             "batch",
             &[direct(src, "$doc.Head.batch_id", Identity)],
+        );
+    }
+
+    #[test]
+    fn aggregate_emit_doc_read_inside_agg_arg_is_attributed() {
+        // A `$doc` read nested inside an aggregate function argument is hoisted
+        // by `extract_aggregates` into the accumulator binding — the residual
+        // keeps only an `AggSlot` — so it must be recovered from the binding and
+        // attributed as an AGGREGATION input on the source, not silently dropped.
+        let yaml = r#"
+pipeline: { name: aggdocarg }
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: xml
+      glob: data/*.xml
+      options: { record_path: doc/records/record }
+      envelope:
+        sections:
+          Head:
+            extract: { xml_path: "/doc/Head" }
+            fields:
+              fx_rate: int
+      schema:
+        - { name: region, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: agg
+    input: payments
+    config:
+      group_by: [region]
+      cxl: |
+        emit region = region
+        emit weighted = sum(amount * $doc.Head.fx_rate)
+  - type: output
+    name: out
+    input: agg
+    config: { name: out, type: csv, path: out/aggdocarg.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let src = "/w/data";
+        let fields = &only_output(&lineage).facet.fields;
+        use TransformationSubtype::{Aggregation, Identity};
+        assert_field(fields, "region", &[direct(src, "region", Identity)]);
+        // The record column and the envelope read both feed the accumulator, so
+        // both are AGGREGATION inputs on the source.
+        assert_field(
+            fields,
+            "weighted",
+            &[
+                direct(src, "$doc.Head.fx_rate", Aggregation),
+                direct(src, "amount", Aggregation),
+            ],
         );
     }
 
