@@ -90,6 +90,28 @@ explicitly instructs otherwise.
 - Agents must not merge PRs by default; leave PRs for maintainer review and
   merge unless a maintainer explicitly instructs otherwise.
 
+## Decision Gate Threshold
+
+Reserve `needs-decision` and the Decision Gate for choices that are truly
+impactful and hard to reverse, where a human must own the call: adding an
+external dependency, committing to an irreversible public wire, schema, or CLI
+contract, security, the memory model or budget, breaking compatibility at
+scale, or touching a named architectural pillar.
+
+The category list above (product, architecture, dependency, public API, schema,
+auth, security, memory, compatibility) names candidates to weigh, not a mandate
+to gate every instance. A reversible API shape, or a schema change behind an
+internal boundary, is usually a bounded call, not a gate.
+
+For bounded decisions, do your own ad-hoc research and decide; record the
+reasoning in the issue or PR. Gating a choice you can resolve with a short
+investigation wastes a maintainer round-trip.
+
+Prefer resolving findings in-session as follow-ups, folded into the parent PR
+or work item, over filing deferral issues. File a standalone issue only when you
+are genuinely blocked on an open prerequisite, or when the finding is
+independently actionable later and out of scope for the current change.
+
 ## Stop Conditions
 
 Stop implementation and route the issue when:
