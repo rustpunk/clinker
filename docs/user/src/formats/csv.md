@@ -36,7 +36,27 @@ standard [RFC 4180](https://www.rfc-editor.org/rfc/rfc4180) defaults.
 | `delimiter` | `,` | Field separator. Set to `\t` for TSV, `;` for semicolon-delimited exports. |
 | `quote_char` | `"` | Quote character that escapes delimiters and newlines inside a field. |
 | `has_header` | `true` | When `true`, the first line names the columns and is consumed, not emitted. When `false`, fields bind to `schema:` positionally. |
-| `encoding` | `utf-8` | Text encoding used to decode the bytes before field splitting. |
+| `encoding` | `utf-8` | Character set each field — including the header row — is decoded through. Supported values are `utf-8` (the default) and `iso-8859-1` (aliases `latin-1`, `latin1`). See [Encoding](#encoding). |
+
+## Encoding
+
+The reader decodes every field through the source's declared `encoding`:
+
+- **`utf-8`** (the default) is strict — a byte sequence that is not valid
+  UTF-8 fails the run loudly rather than substituting replacement
+  characters, so a mis-declared encoding is caught instead of silently
+  corrupting data.
+- **`iso-8859-1`** (Latin-1; also spelled `latin-1` or `latin1`) maps each
+  byte `0xNN` to codepoint `U+00NN`, so high bytes such as `0xE9` (`é`)
+  from legacy exports decode correctly.
+
+An **unsupported** encoding is rejected at startup with a precise error
+naming the value and the supported set — it is never silently ignored.
+
+> Multi-record CSV sources (those declaring a `format_schema:` with a
+> `records:` list, described below) are decoded as UTF-8 only. Declaring a
+> non-UTF-8 `encoding` on such a source is rejected at startup; split the
+> file into a single-schema CSV source if it needs a non-UTF-8 charset.
 
 ## Header handling
 

@@ -1,4 +1,5 @@
 pub mod bom;
+pub mod charset;
 pub mod counting;
 pub mod csv;
 pub mod doc_index;
@@ -18,6 +19,7 @@ pub mod traits;
 pub mod x12;
 pub mod xml;
 
+pub use charset::Charset;
 pub use counting::{CountedFormatWriter, CountingWriter, SharedByteCounter};
 pub use doc_index::DocArenaIndex;
 pub use envelope::{

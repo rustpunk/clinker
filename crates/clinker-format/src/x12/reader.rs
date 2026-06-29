@@ -31,6 +31,7 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
+use crate::charset::Charset;
 use crate::envelope::{
     EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, FrameRole, NestedEnvelopeSection,
     coerce_section_fields,
@@ -38,7 +39,6 @@ use crate::envelope::{
 use crate::error::FormatError;
 use crate::traits::FormatReader;
 use crate::x12::RAW_ELEMENTS_KEY;
-use crate::x12::charset::Charset;
 use crate::x12::tokenizer::{ParsedSegment, SegmentTokenizer, split_isa, split_segment};
 
 /// Default ceiling on the number of positional element columns the record
@@ -1273,7 +1273,7 @@ mod tests {
                 Err(e) => break e,
             }
         };
-        assert!(matches!(err, FormatError::X12(m) if m.contains("not valid UTF-8")));
+        assert!(matches!(err, FormatError::Charset(m) if m.contains("not valid UTF-8")));
     }
 
     /// The headline acceptance: a Latin-1 interchange read with the matching

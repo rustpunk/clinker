@@ -268,6 +268,7 @@ mod tests {
                 delimiter: b',',
                 quote_char: b'"',
                 has_header: true,
+                ..Default::default()
             },
         ))
     }
