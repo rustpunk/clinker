@@ -1072,8 +1072,12 @@ impl ExecutionPlanDag {
         config: &PipelineConfig,
         statistics: &crate::plan::statistics::StatisticsCatalog,
     ) -> String {
+        // Rendering is advisory and infallible by contract; an overflowing
+        // `memory.limit` is rejected at the executor's run boundary, so the
+        // explain view falls back to the default budget instead of erroring.
         let total_limit =
-            crate::config::utils::parse_memory_limit_bytes(config.pipeline.memory.limit.as_deref());
+            crate::config::utils::parse_memory_limit_bytes(config.pipeline.memory.limit.as_deref())
+                .unwrap_or(crate::config::utils::DEFAULT_MEMORY_LIMIT_BYTES);
         let mut out = self.explain_with_statistics(config, statistics, total_limit);
         // Re-render the retraction section with the pipeline config in
         // scope so the fanout-policy line resolves to the user-visible
@@ -1916,7 +1920,8 @@ impl<'a> Serialize for ExplainJson<'a> {
         // share derived from the global default (512MB) divided by
         // the combine count. Callers that have already overridden
         // the limit see the correct share through the text path.
-        let total_memory_limit = crate::config::utils::parse_memory_limit_bytes(None);
+        // `None` always resolves to the default budget; surface it directly.
+        let total_memory_limit = crate::config::utils::DEFAULT_MEMORY_LIMIT_BYTES;
 
         map.serialize_entry(
             "nodes",

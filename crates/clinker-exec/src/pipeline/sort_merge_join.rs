@@ -1829,7 +1829,8 @@ mod tests {
         let mut budget = match rk.budget_bytes {
             Some(b) => MemoryArbitrator::with_policy(b, 0.80, Box::new(NoOpPolicy)),
             None => MemoryArbitrator::with_policy(
-                clinker_plan::config::utils::parse_memory_limit_bytes(None),
+                clinker_plan::config::utils::parse_memory_limit_bytes(None)
+                    .unwrap_or(clinker_plan::config::utils::DEFAULT_MEMORY_LIMIT_BYTES),
                 0.80,
                 Box::new(NoOpPolicy),
             ),

@@ -386,9 +386,16 @@ impl PipelineExecutor {
         // storage-config validation the CLI run path performs, instead of
         // letting the run park. Scoped to the pausing policies; `spill`
         // makes forward progress under a tiny budget and is left alone.
+        // The run boundary is where a bad `memory.limit` becomes a user-facing
+        // error: an unparseable value falls back to the default budget, but a
+        // value whose binary-suffix scaling overflows `u64` fails the run here
+        // with a config diagnostic instead of panicking or wrapping. Every
+        // downstream consumer (arbitrator, dispatch budgets) re-reads the same
+        // validated string, so this gate keeps them overflow-free.
         let configured_limit = clinker_plan::config::utils::parse_memory_limit_bytes(
             config.pipeline.memory.limit.as_deref(),
-        );
+        )
+        .map_err(PipelineError::Config)?;
         crate::pipeline::memory::reject_unsatisfiable_budget(
             configured_limit,
             config.pipeline.memory.backpressure,

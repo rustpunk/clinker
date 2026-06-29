@@ -1797,7 +1797,8 @@ mod tests {
 
     #[test]
     fn test_parse_memory_limit_default_512mb() {
-        let limit = clinker_plan::config::utils::parse_memory_limit_bytes(None);
+        let limit = clinker_plan::config::utils::parse_memory_limit_bytes(None)
+            .unwrap_or(clinker_plan::config::utils::DEFAULT_MEMORY_LIMIT_BYTES);
         let arbitrator = MemoryArbitrator::with_policy(limit, 0.80, Box::new(NoOpPolicy));
         assert_eq!(arbitrator.limit(), 512 * 1024 * 1024);
         assert!((arbitrator.spill_threshold_pct() - 0.80).abs() < f64::EPSILON);

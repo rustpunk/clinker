@@ -967,12 +967,16 @@ fn grace_hash_should_fire(
     statistics: &crate::plan::statistics::StatisticsCatalog,
     mem_limit_str: Option<&str>,
 ) -> bool {
-    use crate::config::utils::parse_memory_limit_bytes;
+    use crate::config::utils::{DEFAULT_MEMORY_LIMIT_BYTES, parse_memory_limit_bytes};
 
     let Some(build_estimate) = build_side_row_count(inputs, statistics) else {
         return false;
     };
-    let limit = parse_memory_limit_bytes(mem_limit_str);
+    // This is an advisory planning threshold, not a run gate: a `memory.limit`
+    // that overflows is rejected at the executor's startup boundary before any
+    // run reaches dispatch, so fall back to the default budget here rather than
+    // threading a config error through strategy selection.
+    let limit = parse_memory_limit_bytes(mem_limit_str).unwrap_or(DEFAULT_MEMORY_LIMIT_BYTES);
     let soft_limit = limit / 100 * 80;
     let estimated_bytes =
         build_estimate.saturating_mul(crate::plan::statistics::RECORD_BYTES_ESTIMATE);
