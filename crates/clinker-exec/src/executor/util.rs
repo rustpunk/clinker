@@ -301,10 +301,15 @@ pub(crate) fn record_with_emitted_fields(
 /// on a 32-bit host a limit above `usize::MAX` saturates rather than
 /// wrapping.
 pub(crate) fn parse_memory_limit(config: &PipelineConfig) -> usize {
-    usize::try_from(clinker_plan::config::utils::parse_memory_limit_bytes(
+    // Reached only from inside a run, after the startup boundary
+    // (`run_with_readers_writers_in_context`) has already rejected an
+    // overflowing `memory.limit`. The default-on-error fallback is therefore
+    // unreachable on the run path; it only keeps this helper panic-free.
+    let bytes = clinker_plan::config::utils::parse_memory_limit_bytes(
         config.pipeline.memory.limit.as_deref(),
-    ))
-    .unwrap_or(usize::MAX)
+    )
+    .unwrap_or(clinker_plan::config::utils::DEFAULT_MEMORY_LIMIT_BYTES);
+    usize::try_from(bytes).unwrap_or(usize::MAX)
 }
 
 /// Build a `MemoryArbitrator` from the pipeline-level `memory:` block.
@@ -317,7 +322,11 @@ pub(crate) fn build_arbitrator_from_config(
     config: &PipelineConfig,
 ) -> crate::pipeline::memory::MemoryArbitrator {
     let mem = &config.pipeline.memory;
-    let limit = clinker_plan::config::utils::parse_memory_limit_bytes(mem.limit.as_deref());
+    // Called only after the run boundary validated `memory.limit`, so the
+    // default-on-error fallback never fires here on the run path; it keeps the
+    // builder total rather than re-surfacing an already-rejected error.
+    let limit = clinker_plan::config::utils::parse_memory_limit_bytes(mem.limit.as_deref())
+        .unwrap_or(clinker_plan::config::utils::DEFAULT_MEMORY_LIMIT_BYTES);
     crate::pipeline::memory::MemoryArbitrator::with_policy(
         limit,
         0.80,
@@ -381,7 +390,8 @@ nodes:
             let config = clinker_plan::config::parse_config(&yaml).expect("parses");
             let arbitrator_ceiling = clinker_plan::config::utils::parse_memory_limit_bytes(
                 config.pipeline.memory.limit.as_deref(),
-            );
+            )
+            .unwrap_or(clinker_plan::config::utils::DEFAULT_MEMORY_LIMIT_BYTES);
             assert_eq!(
                 parse_memory_limit(&config) as u64,
                 arbitrator_ceiling,

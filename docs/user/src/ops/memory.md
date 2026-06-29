@@ -52,6 +52,13 @@ The CLI flag overrides the YAML value. Suffixes are **binary (1024-based)**: `K`
 
 **Default:** 512 MB.
 
+**Invalid values:** an empty or unparseable limit (for example a stray
+non-numeric value) falls back to the 512 MB default. A value whose size is
+well-formed but too large to represent — its scaled byte count exceeds the
+maximum a 64-bit counter can hold — is rejected at startup with a config error
+that names `memory.limit`, rather than wrapping to a small budget. Pick a limit
+that fits your host's real memory.
+
 ## Choosing a backpressure policy
 
 When memory use approaches the limit (the soft threshold is 80 % of `limit`), something has to give up memory. The `backpressure` knob chooses what:

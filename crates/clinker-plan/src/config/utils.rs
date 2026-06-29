@@ -112,26 +112,61 @@ impl<'de> Deserialize<'de> for TimeBound {
     }
 }
 
+/// Memory budget used when `memory.limit` is omitted, empty, or
+/// unparseable. The arbitrator ceiling, the planner's grace-hash
+/// heuristic, and the `--explain` renderers all fall back to this single
+/// value so every consumer agrees on the default budget.
+pub const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Parse the `memory.limit` knob into a byte count.
 ///
 /// Binary units: a trailing `G`/`g`, `M`/`m`, or `K`/`k` multiplies by
 /// 1024^3 / 1024^2 / 1024; a bare integer is bytes. `None`, an empty
-/// value, or any unparseable input falls back to the 512 MB default that
-/// the arbitrator and the `--explain` renderers share.
-pub fn parse_memory_limit_bytes(s: Option<&str>) -> u64 {
-    s.and_then(|s| {
-        let s = s.trim();
-        if let Some(num) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
-            num.parse::<u64>().ok().map(|n| n * 1024 * 1024 * 1024)
-        } else if let Some(num) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
-            num.parse::<u64>().ok().map(|n| n * 1024 * 1024)
-        } else if let Some(num) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
-            num.parse::<u64>().ok().map(|n| n * 1024)
-        } else {
-            s.parse::<u64>().ok()
-        }
+/// value, or any unparseable input falls back to
+/// [`DEFAULT_MEMORY_LIMIT_BYTES`] (512 MB).
+///
+/// A value whose numeric part parses but whose binary-suffix scaling
+/// exceeds `u64::MAX` is rejected with [`ConfigError::Validation`] rather
+/// than silently wrapping — the suffix multiplication is checked.
+///
+/// [`ConfigError::Validation`]: crate::config::ConfigError::Validation
+pub fn parse_memory_limit_bytes(s: Option<&str>) -> Result<u64, crate::config::ConfigError> {
+    let Some(raw) = s else {
+        return Ok(DEFAULT_MEMORY_LIMIT_BYTES);
+    };
+    let trimmed = raw.trim();
+    let (num_part, multiplier) = if let Some(num) = trimmed
+        .strip_suffix('G')
+        .or_else(|| trimmed.strip_suffix('g'))
+    {
+        (num, 1024 * 1024 * 1024)
+    } else if let Some(num) = trimmed
+        .strip_suffix('M')
+        .or_else(|| trimmed.strip_suffix('m'))
+    {
+        (num, 1024 * 1024)
+    } else if let Some(num) = trimmed
+        .strip_suffix('K')
+        .or_else(|| trimmed.strip_suffix('k'))
+    {
+        (num, 1024)
+    } else {
+        (trimmed, 1)
+    };
+    // An unparseable numeric part keeps the lenient fallback contract: the
+    // caller gets the default budget, matching the historical handling of
+    // `None`/empty/garbage input. Only a value that parses cleanly yet
+    // overflows the byte range when scaled by its binary suffix is an
+    // error — that is the case the previous unchecked multiply wrapped (or
+    // panicked on in debug builds).
+    let Ok(value) = num_part.parse::<u64>() else {
+        return Ok(DEFAULT_MEMORY_LIMIT_BYTES);
+    };
+    value.checked_mul(multiplier).ok_or_else(|| {
+        crate::config::ConfigError::Validation(format!(
+            "memory.limit {trimmed:?} overflows the maximum addressable byte count (u64::MAX)"
+        ))
     })
-    .unwrap_or(512 * 1024 * 1024) // 512MB default
 }
 
 /// Byte size for `min_size` / `max_size`. Decimal units (1KB = 1000 bytes,
@@ -212,17 +247,87 @@ pub(crate) fn default_include_unmapped() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_memory_limit_bytes;
+    use super::{DEFAULT_MEMORY_LIMIT_BYTES, parse_memory_limit_bytes};
+    use crate::config::ConfigError;
 
     #[test]
     fn memory_limit_parses_unit_suffixes() {
-        assert_eq!(parse_memory_limit_bytes(Some("512M")), 536_870_912);
-        assert_eq!(parse_memory_limit_bytes(Some("512m")), 536_870_912);
-        assert_eq!(parse_memory_limit_bytes(Some("2G")), 2_147_483_648);
-        assert_eq!(parse_memory_limit_bytes(Some("2g")), 2_147_483_648);
-        assert_eq!(parse_memory_limit_bytes(Some("512K")), 524_288);
-        assert_eq!(parse_memory_limit_bytes(Some("1024")), 1024);
-        assert_eq!(parse_memory_limit_bytes(None), 512 * 1024 * 1024);
-        assert_eq!(parse_memory_limit_bytes(Some("garbage")), 512 * 1024 * 1024);
+        // `.ok()` collapses the success arm to a comparable `Option<u64>`;
+        // `ConfigError` is not `PartialEq`, so the Result cannot be compared
+        // directly.
+        assert_eq!(
+            parse_memory_limit_bytes(Some("512M")).ok(),
+            Some(536_870_912)
+        );
+        assert_eq!(
+            parse_memory_limit_bytes(Some("512m")).ok(),
+            Some(536_870_912)
+        );
+        assert_eq!(
+            parse_memory_limit_bytes(Some("2G")).ok(),
+            Some(2_147_483_648)
+        );
+        assert_eq!(
+            parse_memory_limit_bytes(Some("2g")).ok(),
+            Some(2_147_483_648)
+        );
+        assert_eq!(parse_memory_limit_bytes(Some("512K")).ok(), Some(524_288));
+        assert_eq!(parse_memory_limit_bytes(Some("1024")).ok(), Some(1024));
+        assert_eq!(
+            parse_memory_limit_bytes(None).ok(),
+            Some(DEFAULT_MEMORY_LIMIT_BYTES)
+        );
+    }
+
+    #[test]
+    fn memory_limit_unparseable_falls_back_to_default() {
+        // The lenient contract: a value that does not parse (no recognized
+        // suffix, non-numeric body) yields the default budget, not an error.
+        assert_eq!(
+            parse_memory_limit_bytes(Some("garbage")).ok(),
+            Some(DEFAULT_MEMORY_LIMIT_BYTES)
+        );
+        assert_eq!(
+            parse_memory_limit_bytes(Some("")).ok(),
+            Some(DEFAULT_MEMORY_LIMIT_BYTES)
+        );
+        // Numeric body that itself exceeds `u64` (parse failure, never
+        // reaching the suffix multiply) also falls back rather than erroring.
+        assert_eq!(
+            parse_memory_limit_bytes(Some("99999999999999999999G")).ok(),
+            Some(DEFAULT_MEMORY_LIMIT_BYTES)
+        );
+    }
+
+    #[test]
+    fn memory_limit_max_safe_value_does_not_overflow() {
+        // `floor(u64::MAX / 1024^3) = 2^34 - 1` is the largest `G`-suffixed
+        // value whose scaling still fits in `u64`.
+        let max_safe_g = (1u64 << 34) - 1; // 17_179_869_183
+        assert_eq!(
+            parse_memory_limit_bytes(Some(&format!("{max_safe_g}G"))).ok(),
+            Some(max_safe_g * 1024 * 1024 * 1024),
+        );
+        // A bare byte count at the ceiling has multiplier 1 — also safe.
+        assert_eq!(
+            parse_memory_limit_bytes(Some(&u64::MAX.to_string())).ok(),
+            Some(u64::MAX),
+        );
+    }
+
+    #[test]
+    fn memory_limit_overflow_is_a_typed_error() {
+        // `2^34 * 1024^3 = 2^64`, one past `u64::MAX` — the numeric part
+        // parses, but the suffix multiply overflows and must be rejected.
+        let overflow_g = 1u64 << 34; // 17_179_869_184
+        match parse_memory_limit_bytes(Some(&format!("{overflow_g}G"))) {
+            Err(ConfigError::Validation(msg)) => {
+                assert!(
+                    msg.contains("memory.limit") && msg.contains("overflow"),
+                    "diagnostic must name the setting and the overflow; got: {msg}"
+                );
+            }
+            other => panic!("expected ConfigError::Validation for overflow, got: {other:?}"),
+        }
     }
 }

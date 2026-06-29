@@ -219,7 +219,11 @@ pub struct RunArgs {
 
 impl RunArgs {
     /// Resolve memory limit from CLI flag or default (512MB).
-    pub fn memory_limit_bytes(&self) -> u64 {
+    ///
+    /// Returns a config error when the flag value's binary-suffix scaling
+    /// overflows `u64`, so the caller surfaces a clear diagnostic to the
+    /// operator instead of panicking or silently wrapping to a tiny budget.
+    pub fn memory_limit_bytes(&self) -> Result<u64, clinker_plan::config::ConfigError> {
         parse_memory_limit_bytes(self.mem_limit.as_deref().or(Some("512M")))
     }
 
@@ -2213,7 +2217,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["clinker", "run", "--memory-limit", "512K", "p.yaml"]).unwrap();
         match cli.command {
-            Commands::Run(args) => assert_eq!(args.memory_limit_bytes(), 524288),
+            Commands::Run(args) => assert_eq!(args.memory_limit_bytes().ok(), Some(524288)),
             _ => panic!("expected Run command"),
         }
     }
@@ -2223,7 +2227,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["clinker", "run", "--memory-limit", "256M", "p.yaml"]).unwrap();
         match cli.command {
-            Commands::Run(args) => assert_eq!(args.memory_limit_bytes(), 268435456),
+            Commands::Run(args) => assert_eq!(args.memory_limit_bytes().ok(), Some(268435456)),
             _ => panic!("expected Run command"),
         }
     }
@@ -2233,7 +2237,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["clinker", "run", "--memory-limit", "2G", "p.yaml"]).unwrap();
         match cli.command {
-            Commands::Run(args) => assert_eq!(args.memory_limit_bytes(), 2147483648),
+            Commands::Run(args) => assert_eq!(args.memory_limit_bytes().ok(), Some(2147483648)),
             _ => panic!("expected Run command"),
         }
     }
@@ -2243,7 +2247,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["clinker", "run", "--memory-limit", "1000000", "p.yaml"]).unwrap();
         match cli.command {
-            Commands::Run(args) => assert_eq!(args.memory_limit_bytes(), 1000000),
+            Commands::Run(args) => assert_eq!(args.memory_limit_bytes().ok(), Some(1000000)),
             _ => panic!("expected Run command"),
         }
     }
@@ -2252,7 +2256,9 @@ mod tests {
     fn test_cli_run_default_memory_limit() {
         let cli = Cli::try_parse_from(["clinker", "run", "p.yaml"]).unwrap();
         match cli.command {
-            Commands::Run(args) => assert_eq!(args.memory_limit_bytes(), 512 * 1024 * 1024),
+            Commands::Run(args) => {
+                assert_eq!(args.memory_limit_bytes().ok(), Some(512 * 1024 * 1024))
+            }
             _ => panic!("expected Run command"),
         }
     }
