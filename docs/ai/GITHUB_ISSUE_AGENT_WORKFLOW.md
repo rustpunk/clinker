@@ -96,7 +96,9 @@ Reserve `needs-decision` and the Decision Gate for choices that are truly
 impactful and hard to reverse, where a human must own the call: adding an
 external dependency, committing to an irreversible public wire, schema, or CLI
 contract, security, the memory model or budget, breaking compatibility at
-scale, or touching a named architectural pillar.
+scale, removing or ripping any existing named surface — a rip-vs-wire decision
+judged by reachability from user YAML/CXL/CLI/output, not the absence of a Rust
+caller — or touching a named architectural pillar.
 
 The category list above (product, architecture, dependency, public API, schema,
 auth, security, memory, compatibility) names candidates to weigh, not a mandate
@@ -112,6 +114,21 @@ or work item, over filing deferral issues. File a standalone issue only when you
 are genuinely blocked on an open prerequisite, or when the finding is
 independently actionable later and out of scope for the current change.
 
+### Never agent-decidable
+
+Two calls are never bounded, regardless of apparent size — a human owns them:
+
+- **Rip-vs-wire.** Removing an existing named surface (capability, field,
+  config / CXL / YAML / CLI option, or behavior) is a Decision Gate, not a
+  cleanup. "No internal (Rust) caller" is not proof a surface is dead — it may
+  be reachable from user YAML/CXL/CLI/output, or be scaffolding for an
+  intended-but-unwired feature. Per LD-011, a rip requires a replacement
+  landing in the same change, or explicit human confirmation that the
+  capability is unwanted.
+- **Lifting a gate.** An agent must not remove the `needs-decision` label or
+  otherwise self-clear a Decision Gate. A gate is lifted only by the human who
+  owns the call.
+
 ## Stop Conditions
 
 Stop implementation and route the issue when:
@@ -123,6 +140,8 @@ Stop implementation and route the issue when:
 - the issue requires an unapproved dependency
 - the issue requires a public API, schema, auth, security, product, memory, or
   architecture decision
+- the issue proposes removing or ripping an existing capability without a
+  replacement (a rip-vs-wire decision)
 - the issue contains multiple independent outcomes
 - tests fail for reasons unrelated to the change
 - the implementation would require broad unrelated refactoring
