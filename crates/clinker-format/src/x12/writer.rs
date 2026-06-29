@@ -36,10 +36,10 @@ use std::sync::Arc;
 
 use clinker_record::{Record, Schema, Value};
 
+use crate::charset::Charset;
 use crate::error::FormatError;
 use crate::traits::FormatWriter;
 use crate::x12::RAW_ELEMENTS_KEY;
-use crate::x12::charset::Charset;
 use crate::x12::tokenizer::Delimiters;
 
 /// Default X12 service delimiters used when no `ISA` header dictates

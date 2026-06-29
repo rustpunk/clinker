@@ -28,12 +28,11 @@
 //! (so `$doc` envelope sections over `ISA` cost O(ISA)); the body streams
 //! one segment at a time. The whole interchange is never buffered.
 
-mod charset;
 pub mod reader;
 mod tokenizer;
 pub mod writer;
 
-pub use charset::Charset;
+pub use crate::charset::Charset;
 pub use reader::{X12Reader, X12ReaderConfig};
 pub use writer::{X12Writer, X12WriterConfig};
 

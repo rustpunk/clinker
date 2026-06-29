@@ -12,6 +12,12 @@ pub enum FormatError {
     Json(String),
     Xml(String),
     FixedWidth(String),
+    /// A character-set failure shared across formats that decode declared
+    /// non-UTF-8 text (CSV, X12): an unsupported `encoding` name, bytes that
+    /// are not valid in the configured repertoire, or text a single-byte
+    /// repertoire cannot encode. Carries a precise message naming the
+    /// offending value and the supported set.
+    Charset(String),
     /// An EDIFACT parse, envelope-count, or malformed-segment failure.
     /// Carries a precise message naming the offending control segment or
     /// constraint (bad UNA, UNT/UNZ count mismatch, control-ref echo
@@ -89,6 +95,7 @@ impl fmt::Display for FormatError {
             Self::Json(msg) => write!(f, "JSON error: {msg}"),
             Self::Xml(msg) => write!(f, "XML error: {msg}"),
             Self::FixedWidth(msg) => write!(f, "fixed-width error: {msg}"),
+            Self::Charset(msg) => write!(f, "charset error: {msg}"),
             Self::Edifact(msg) => write!(f, "EDIFACT error: {msg}"),
             Self::X12(msg) => write!(f, "X12 error: {msg}"),
             Self::Hl7(msg) => write!(f, "HL7 error: {msg}"),

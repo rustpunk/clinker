@@ -4,6 +4,7 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
 use crate::bom::SkipBom;
+use crate::charset::Charset;
 use crate::error::FormatError;
 use crate::traits::FormatReader;
 
@@ -12,6 +13,11 @@ pub struct CsvReaderConfig {
     pub delimiter: u8,
     pub quote_char: u8,
     pub has_header: bool,
+    /// Character set the field bytes are decoded through. Defaults to UTF-8;
+    /// set from the source's declared `encoding` so a non-UTF-8 export (e.g.
+    /// `iso-8859-1`) decodes high bytes correctly instead of failing UTF-8
+    /// validation or silently corrupting them.
+    pub charset: Charset,
 }
 
 impl Default for CsvReaderConfig {
@@ -20,6 +26,7 @@ impl Default for CsvReaderConfig {
             delimiter: b',',
             quote_char: b'"',
             has_header: true,
+            charset: Charset::default(),
         }
     }
 }
@@ -30,6 +37,12 @@ impl Default for CsvReaderConfig {
 /// responsibility. Schema is inferred from the header row (or generated
 /// synthetically as `col_0`, `col_1`, ...).
 ///
+/// Rows are read as raw bytes (`csv::ByteRecord`) and each field — including
+/// header cells — is decoded through the configured [`Charset`]. UTF-8 (the
+/// default) validates strictly; a declared `iso-8859-1` source decodes high
+/// bytes faithfully. This per-field decode replaces the csv crate's implicit
+/// UTF-8-only string path so the source's declared `encoding` is honored.
+///
 /// A leading UTF-8 BOM (prepended by Excel "CSV UTF-8" and PowerShell
 /// `Out-File -Encoding utf8`) is stripped before parsing via [`SkipBom`],
 /// so the first header cell — or first data field under
@@ -39,7 +52,7 @@ pub struct CsvReader<R: Read> {
     schema: Option<Arc<Schema>>,
     config: CsvReaderConfig,
     row_count: u64,
-    record_buf: csv::StringRecord,
+    record_buf: csv::ByteRecord,
 }
 
 impl<R: Read> CsvReader<R> {
@@ -54,7 +67,7 @@ impl<R: Read> CsvReader<R> {
             schema: None,
             config,
             row_count: 0,
-            record_buf: csv::StringRecord::new(),
+            record_buf: csv::ByteRecord::new(),
         }
     }
 
@@ -64,16 +77,19 @@ impl<R: Read> CsvReader<R> {
         }
 
         let schema = if self.config.has_header {
-            let headers = self.inner.headers()?;
+            let charset = self.config.charset;
+            let headers = self.inner.byte_headers()?;
             if headers.is_empty() {
                 return Err(FormatError::SchemaInference("header row is empty".into()));
             }
-            headers
+            // Decode each header cell through the configured charset so a
+            // non-UTF-8 column name resolves identically to its body fields.
+            let columns: Vec<Box<str>> = headers
                 .iter()
-                .map(Box::<str>::from)
-                .collect::<SchemaBuilder>()
-                .build()
-        } else if !self.inner.read_record(&mut self.record_buf)? {
+                .map(|f| charset.decode(f.to_vec()).map(Box::<str>::from))
+                .collect::<Result<_, _>>()?;
+            columns.into_iter().collect::<SchemaBuilder>().build()
+        } else if !self.inner.read_byte_record(&mut self.record_buf)? {
             // Peek at the first record to determine column count. No
             // record at all ⇒ empty file ⇒ empty schema.
             SchemaBuilder::new().build()
@@ -97,30 +113,33 @@ impl<R: Read + Send> FormatReader for CsvReader<R> {
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
         let schema = self.ensure_schema()?;
+        let charset = self.config.charset;
 
         // If we peeked a record during no-header schema inference, consume it first
         if !self.config.has_header && self.row_count == 0 && !self.record_buf.is_empty() {
             self.row_count += 1;
-            let values: Vec<Value> = self
-                .record_buf
-                .iter()
-                .map(|f| Value::String(f.into()))
-                .collect();
+            let values = decode_record(&self.record_buf, charset)?;
             return Ok(Some(Record::new(schema, values)));
         }
 
-        if !self.inner.read_record(&mut self.record_buf)? {
+        if !self.inner.read_byte_record(&mut self.record_buf)? {
             return Ok(None);
         }
 
         self.row_count += 1;
-        let values: Vec<Value> = self
-            .record_buf
-            .iter()
-            .map(|f| Value::String(f.into()))
-            .collect();
+        let values = decode_record(&self.record_buf, charset)?;
         Ok(Some(Record::new(schema, values)))
     }
+}
+
+/// Decode every field of a raw [`csv::ByteRecord`] through `charset` into a
+/// `Value::String` column vector. A field that is not valid in the configured
+/// charset (only possible under [`Charset::Utf8`]) fails the record loudly
+/// rather than substituting replacement bytes.
+fn decode_record(rec: &csv::ByteRecord, charset: Charset) -> Result<Vec<Value>, FormatError> {
+    rec.iter()
+        .map(|f| charset.decode(f.to_vec()).map(|s| Value::String(s.into())))
+        .collect()
 }
 
 #[cfg(test)]
@@ -315,5 +334,77 @@ mod tests {
         assert_eq!(record.resolve("name"), Some(&Value::String("Ada".into())));
         assert_eq!(record.resolve("age"), Some(&Value::String("30".into())));
         assert_eq!(record.resolve("missing"), None);
+    }
+
+    /// Build CSV bytes whose body field carries the Latin-1 high byte for `é`.
+    /// `name\nCaf\xE9\n` is not valid UTF-8, so it exercises the non-UTF-8
+    /// decode path rather than incidental ASCII.
+    fn latin1_bytes() -> Vec<u8> {
+        let mut bytes = b"name\nCaf".to_vec();
+        bytes.push(0xE9); // 'é' in ISO-8859-1
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn test_csv_reader_latin1_decodes_high_bytes() {
+        // Under the declared Latin-1 charset the high byte decodes to `é`.
+        let config = CsvReaderConfig {
+            charset: Charset::Latin1,
+            ..Default::default()
+        };
+        let bytes = latin1_bytes();
+        let mut reader = CsvReader::from_reader(&bytes[..], config);
+        let _schema = reader.schema().unwrap();
+        let record = reader.next_record().unwrap().unwrap();
+        assert_eq!(record.get("name"), Some(&Value::String("Café".into())));
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_csv_reader_latin1_decodes_high_byte_in_header() {
+        // A high byte in the header row decodes through the same charset, so
+        // the column name resolves to its decoded form.
+        let mut bytes = b"caf".to_vec();
+        bytes.push(0xE9); // header `café`
+        bytes.extend_from_slice(b"\n1\n");
+        let config = CsvReaderConfig {
+            charset: Charset::Latin1,
+            ..Default::default()
+        };
+        let mut reader = CsvReader::from_reader(&bytes[..], config);
+        let schema = reader.schema().unwrap();
+        assert_eq!(
+            schema.columns().iter().map(|c| &**c).collect::<Vec<_>>(),
+            vec!["café"]
+        );
+        let record = reader.next_record().unwrap().unwrap();
+        assert_eq!(record.get("café"), Some(&Value::String("1".into())));
+    }
+
+    #[test]
+    fn test_csv_reader_utf8_default_rejects_high_byte() {
+        // The same Latin-1 bytes under the default UTF-8 charset fail loudly
+        // rather than substituting replacement characters.
+        let bytes = latin1_bytes();
+        let mut reader = CsvReader::from_reader(&bytes[..], CsvReaderConfig::default());
+        let _schema = reader.schema().unwrap();
+        let err = reader.next_record().unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Charset(m) if m.contains("not valid UTF-8")),
+            "expected a UTF-8 decode error naming the encoding, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_csv_reader_utf8_default_decodes_multibyte() {
+        // Valid multi-byte UTF-8 is unchanged under the default charset.
+        let csv = "name\nCafé\nAño";
+        let mut reader = CsvReader::from_reader(csv.as_bytes(), CsvReaderConfig::default());
+        let _schema = reader.schema().unwrap();
+        let r1 = reader.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("name"), Some(&Value::String("Café".into())));
+        let r2 = reader.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("name"), Some(&Value::String("Año".into())));
     }
 }

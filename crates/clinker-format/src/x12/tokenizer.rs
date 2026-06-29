@@ -27,11 +27,11 @@
 
 use std::io::{BufRead, Read};
 
+use crate::charset::Charset;
 use crate::error::FormatError;
 use crate::segment_tokenizer::{
     SegmentFraming, TrailingSegment, read_raw_segment, skip_inter_segment_whitespace,
 };
-use crate::x12::charset::Charset;
 
 /// Hard ceiling on a single segment's raw byte length. A real X12 segment
 /// is well under a kilobyte; this cap exists only so a stream with no
@@ -199,8 +199,8 @@ impl<R: BufRead> SegmentTokenizer<R> {
     ///
     /// # Errors
     ///
-    /// Returns [`FormatError::X12`] when the segment bytes are not valid in
-    /// the configured charset (only possible under [`Charset::Utf8`]).
+    /// Returns [`FormatError::Charset`] when the segment bytes are not valid
+    /// in the configured charset (only possible under [`Charset::Utf8`]).
     pub(crate) fn next_segment(&mut self) -> Result<Option<String>, FormatError> {
         debug_assert!(
             self.initialized,
@@ -289,7 +289,7 @@ pub(crate) fn split_segment(raw: &str, delims: &Delimiters) -> ParsedSegment {
 ///
 /// # Errors
 ///
-/// Returns [`FormatError::X12`] when the header bytes are not valid in
+/// Returns [`FormatError::Charset`] when the header bytes are not valid in
 /// `charset` (only possible under [`Charset::Utf8`]).
 pub(crate) fn split_isa(
     header: &[u8],
@@ -434,7 +434,7 @@ mod tests {
         let mut t = SegmentTokenizer::new(Cursor::new(data), Charset::Utf8);
         let _ = t.read_isa_header().unwrap();
         let err = t.next_segment().unwrap_err();
-        assert!(matches!(err, FormatError::X12(m) if m.contains("not valid UTF-8")));
+        assert!(matches!(err, FormatError::Charset(m) if m.contains("not valid UTF-8")));
     }
 
     #[test]

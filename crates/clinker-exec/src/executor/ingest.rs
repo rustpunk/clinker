@@ -5,6 +5,7 @@
 use std::io::Read;
 use std::sync::Arc;
 
+use clinker_format::Charset;
 use clinker_format::ReopenableSource;
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::edifact::reader::{EdifactReader, EdifactReaderConfig};
@@ -16,7 +17,6 @@ use clinker_format::json::reader::{
 };
 use clinker_format::swift::reader::{SwiftReader, SwiftReaderConfig};
 use clinker_format::traits::FormatReader;
-use clinker_format::x12::Charset;
 use clinker_format::x12::reader::{X12Reader, X12ReaderConfig};
 use clinker_format::xml::reader::{
     NamespaceMode, XmlArrayMode, XmlArrayPath, XmlReader, XmlReaderConfig,
@@ -50,7 +50,7 @@ fn build_format_reader(
                     open_one_shot(&source)?,
                 ),
                 None => {
-                    let config = build_csv_reader_config(opts.as_ref());
+                    let config = build_csv_reader_config(opts.as_ref())?;
                     Ok(Box::new(CsvReader::from_reader(
                         open_one_shot(&source)?,
                         config,
@@ -1020,7 +1020,21 @@ fn build_multi_record_reader(
             )
         }
         MultiRecordKind::Csv(opts) => {
-            let cfg = build_csv_reader_config(opts);
+            let cfg = build_csv_reader_config(opts)?;
+            // The multi-record CSV backend decodes through the csv crate's
+            // UTF-8 string path, so it cannot honor a declared non-UTF-8
+            // `encoding`. Reject it at startup rather than silently dropping
+            // the option (a single-schema CSV source supports it end-to-end).
+            if cfg.charset != Charset::Utf8 {
+                return Err(PipelineError::Config(
+                    clinker_plan::config::ConfigError::Validation(format!(
+                        "source {:?}: multi-record CSV (a `records:` schema) does not support a \
+                         non-UTF-8 `encoding`; declare `encoding: utf-8` or read it as a \
+                         single-schema CSV source",
+                        input.name
+                    )),
+                ));
+            }
             Box::new(
                 clinker_format::multi_record::MultiRecordReader::new_csv(
                     reader,
@@ -1072,9 +1086,13 @@ enum MultiRecordKind<'a> {
 }
 
 /// Build CSV reader config from optional CSV input options.
+///
+/// A declared `encoding` is resolved to a [`Charset`] here so an unsupported
+/// value fails at startup with the name the user must fix, rather than being
+/// silently dropped (the reader otherwise always decoded as UTF-8).
 fn build_csv_reader_config(
     opts: Option<&clinker_plan::config::CsvInputOptions>,
-) -> CsvReaderConfig {
+) -> Result<CsvReaderConfig, PipelineError> {
     let mut config = CsvReaderConfig::default();
     if let Some(opts) = opts {
         if let Some(ref d) = opts.delimiter
@@ -1090,8 +1108,22 @@ fn build_csv_reader_config(
         if let Some(h) = opts.has_header {
             config.has_header = h;
         }
+        if let Some(encoding) = opts.encoding.as_deref() {
+            config.charset = parse_csv_charset(encoding)?;
+        }
     }
-    config
+    Ok(config)
+}
+
+/// Resolve a source-declared CSV `encoding` name to a [`Charset`], mapping an
+/// unsupported value to a config-validation error so the run fails at startup
+/// with the name the user must fix.
+fn parse_csv_charset(encoding: &str) -> Result<Charset, PipelineError> {
+    Charset::from_name(encoding).map_err(|e| {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+            "CSV source: {e}"
+        )))
+    })
 }
 
 /// Default cap on the JSON envelope pre-scan's path-pruned document index
@@ -1643,6 +1675,42 @@ nodes:
         assert!(
             last_record < first_close,
             "every body record must precede the message close; got {observed:?}"
+        );
+    }
+
+    fn csv_opts(encoding: Option<&str>) -> clinker_plan::config::CsvInputOptions {
+        clinker_plan::config::CsvInputOptions {
+            encoding: encoding.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_csv_reader_config_defaults_to_utf8() {
+        let cfg = build_csv_reader_config(None).expect("no options resolves");
+        assert_eq!(cfg.charset, Charset::Utf8);
+        let cfg = build_csv_reader_config(Some(&csv_opts(Some("utf-8")))).expect("utf-8 resolves");
+        assert_eq!(cfg.charset, Charset::Utf8);
+    }
+
+    #[test]
+    fn build_csv_reader_config_resolves_latin1() {
+        let cfg = build_csv_reader_config(Some(&csv_opts(Some("iso-8859-1"))))
+            .expect("iso-8859-1 resolves");
+        assert_eq!(cfg.charset, Charset::Latin1);
+    }
+
+    #[test]
+    fn build_csv_reader_config_rejects_unsupported_encoding_at_startup() {
+        // `CsvReaderConfig` is not `Debug`, so destructure rather than
+        // `expect_err` to reach the error.
+        let Err(err) = build_csv_reader_config(Some(&csv_opts(Some("shift_jis")))) else {
+            panic!("an unsupported CSV encoding must fail config build");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shift_jis") && msg.contains("iso-8859-1"),
+            "error must name the unsupported value and the supported set: {msg}"
         );
     }
 }
