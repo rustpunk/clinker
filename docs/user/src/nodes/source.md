@@ -71,6 +71,23 @@ Omitting the flag (the common case) leaves the default behavior untouched. Set
 it only when you know a column is genuinely high-cardinality free text; on a
 column whose values repeat, leave it off.
 
+### `source_name` — read a differently-named physical column
+
+A column may carry an optional `source_name` naming the **physical** input
+column it reads from, when that differs from the exposed `name`. The reader
+matches input fields by physical name and re-labels the value under `name`, so
+downstream CXL and the output see `name` carrying the physical column's data.
+
+```yaml
+schema:
+  # read the physical `cust_id` column, expose it downstream as `customer_id`
+  - { name: customer_id, type: string, source_name: cust_id }
+```
+
+Omitting `source_name` (the common case) reads the input field whose key equals
+`name`, unchanged from before. A channel `schema` patch's `rename` op sets this
+alias automatically (see [Channels](../pipelines/channels.md)).
+
 ## Transport vs format
 
 A source declaration has two independent layers:

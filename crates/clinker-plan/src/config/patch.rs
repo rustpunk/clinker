@@ -283,6 +283,17 @@ fn apply_schema_ops(
                     .iter_mut()
                     .find(|c| c.name == *col)
                     .expect("existence checked above");
+                // Rename is a physical→logical alias, not a bare relabel: the
+                // reader binds columns to input fields by name, so preserve the
+                // physical source column (defaulting to the current name on the
+                // first rename) while exposing the new name downstream. A second
+                // rename keeps the original physical binding.
+                column.source_name = Some(
+                    column
+                        .source_name
+                        .take()
+                        .unwrap_or_else(|| column.name.clone()),
+                );
                 column.name = to.clone();
             }
             SchemaColumnOp::Add(add) => {
@@ -296,6 +307,7 @@ fn apply_schema_ops(
                     name: col.clone(),
                     ty: add.ty.clone(),
                     long_unique: add.long_unique,
+                    source_name: None,
                 });
             }
         }
@@ -478,8 +490,21 @@ nodes:
         assert_eq!(columns(&config)[0], ("amount".to_string(), Type::Float));
     }
 
+    /// Fetch a column by exposed name from the single source.
+    fn column_named<'a>(config: &'a PipelineConfig, name: &str) -> &'a ColumnDecl {
+        config
+            .source_bodies()
+            .next()
+            .expect("one source")
+            .schema
+            .columns
+            .iter()
+            .find(|c| c.name == name)
+            .expect("column present")
+    }
+
     #[test]
-    fn schema_rename_renames_column() {
+    fn schema_rename_renames_column_and_sets_physical_alias() {
         let mut config = csv_pipeline();
         apply(
             &mut config,
@@ -487,7 +512,29 @@ nodes:
             patch_from_yaml("schema:\n  cust_id: { rename: customer_id }\n"),
         )
         .unwrap();
+        // Exposed name changes...
         assert_eq!(columns(&config)[1].0, "customer_id");
+        // ...but the physical binding is preserved: rename is an alias, not a
+        // bare relabel, so the reader still reads the `cust_id` source field.
+        let column = column_named(&config, "customer_id");
+        assert_eq!(column.source_name.as_deref(), Some("cust_id"));
+    }
+
+    #[test]
+    fn schema_double_rename_keeps_original_physical() {
+        let mut config = csv_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml(
+                "schema:\n  cust_id: { rename: mid }\n  mid: { rename: customer_id }\n",
+            ),
+        )
+        .unwrap();
+        let column = column_named(&config, "customer_id");
+        // Both renames applied in order; the physical binding is still the
+        // original source column, not the intermediate name.
+        assert_eq!(column.source_name.as_deref(), Some("cust_id"));
     }
 
     #[test]

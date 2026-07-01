@@ -151,15 +151,28 @@ Keyed by column name. Exactly one op per column:
 | Form | Effect | Errors |
 |------|--------|--------|
 | `<col>: { retype: <type> }` | Change the column's CXL type. | Unknown column → **E231** |
-| `<col>: { rename: <new> }` | Rename the column. | Unknown column → **E231**; `<new>` collides with an existing column → **E233** |
+| `<col>: { rename: <new> }` | Expose the column under `<new>` while still reading the original physical column (a source-column alias). | Unknown column → **E231**; `<new>` collides with an existing column → **E233** |
 | `<col>: remove` | Drop the column. | Unknown column → **E231** |
 | `<new>: { add: { type: <type>, long_unique?: <bool> } }` | Add a new column (the map key is its name). | Name already exists → **E232** |
 
 `<type>` is any CXL type (`string`, `int`, `float`, `bool`, `date`, `date_time`,
-`array`, `map`). Because the patch produces the same schema you could have
-written by hand, renaming a column also renames the on-disk field it binds to —
-for a CSV source, the new name must match the file's column header just as a
-hand-written schema would.
+`array`, `map`).
+
+`rename` is a **source-column alias**, not a bare relabel: the reader binds
+declared columns to input fields by name, so a rename keeps reading the original
+physical column and re-labels its value under the new name. Downstream CXL and
+the output see the new name, carrying the original column's data. (A second
+rename keeps the original physical binding.) This is the same alias a base
+`schema:` column can declare directly with the `source_name` field:
+
+```yaml
+schema:
+  # read the physical `cust_id` column, expose it downstream as `customer_id`
+  - { name: customer_id, type: string, source_name: cust_id }
+```
+
+Omitting `source_name` (the common case) reads the input field whose key equals
+`name`, unchanged from before.
 
 ### `array_paths` ops
 

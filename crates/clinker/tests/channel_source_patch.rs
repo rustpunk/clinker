@@ -30,10 +30,11 @@ fn run_in(dir: &Path, extra: &[&str]) -> std::process::Output {
         .expect("spawn clinker")
 }
 
-/// A CSV pipeline whose transform reads a numeric `amount` and a `region`
-/// column that the *base* schema does not provide — so the base pipeline
-/// fails to compile, and only the channel patch (rename `amnt`→`amount`,
-/// retype to int, add `region`) makes it valid.
+/// A CSV pipeline whose transform reads the POST-patch names (`customer_id`
+/// aliased from the physical `cust_id`, added `region`) and a numeric `amount`,
+/// so the base pipeline fails to compile and only the channel patch — rename
+/// `cust_id`→`customer_id`, retype `amount` to int, add `region` — makes it
+/// valid.
 const CSV_PIPELINE: &str = "\
 pipeline:
   name: csv_patch
@@ -46,13 +47,15 @@ nodes:
       path: in.csv
       schema:
         - { name: id, type: string }
-        - { name: amnt, type: string }
+        - { name: cust_id, type: string }
+        - { name: amount, type: string }
   - type: transform
     name: calc
     input: src
     config:
       cxl: |
         emit doubled = amount * 2
+        emit customer = customer_id
         emit zone = region
   - type: output
     name: out
@@ -70,30 +73,32 @@ channel:
 sources:
   src:
     schema:
-      amnt:   { rename: amount }
-      amount: { retype: int }
-      region: { add: { type: string } }
+      cust_id: { rename: customer_id }
+      amount:  { retype: int }
+      region:  { add: { type: string } }
 ";
 
 #[test]
 fn csv_schema_patch_enables_run_and_is_visible_downstream() {
     let dir = tempfile::tempdir().expect("tempdir");
     let p = dir.path();
-    write(p, "in.csv", "id,amount,region\n1,100,west\n2,250,east\n");
+    write(
+        p,
+        "in.csv",
+        "id,cust_id,amount,region\n1,alice,100,west\n2,bob,250,east\n",
+    );
     write(p, "pipe.yaml", CSV_PIPELINE);
     write(p, "fix.channel.yaml", CSV_CHANNEL);
 
-    // Base pipeline: `amount` (numeric) and `region` are not declared, so it
-    // fails to compile.
+    // Base pipeline: `customer_id` / `region` are not declared and `amount` is
+    // a string, so it fails to compile.
     let base = run_in(p, &[]);
     assert!(
         !base.status.success(),
         "base pipeline should fail without the channel patch"
     );
 
-    // Channel patch makes it valid; output reflects retype (doubled), add
-    // (region readable by CXL → zone), and rename (amount bound to the CSV
-    // column).
+    // Channel patch makes it valid; output proves the physical→logical mapping.
     let patched = run_in(p, &["--channel", "fix.channel.yaml"]);
     assert!(
         patched.status.success(),
@@ -102,18 +107,90 @@ fn csv_schema_patch_enables_run_and_is_visible_downstream() {
     );
     let out = std::fs::read_to_string(p.join("out.csv")).expect("read out.csv");
     let header = out.lines().next().unwrap_or_default();
+    assert!(header.contains("customer_id"), "header: {header}");
     assert!(header.contains("doubled"), "header: {header}");
     assert!(header.contains("zone"), "header: {header}");
-    // amount retyped to int and doubled; region added and echoed as zone.
-    assert!(out.contains("1,100,west,200,west"), "output:\n{out}");
-    assert!(out.contains("2,250,east,500,east"), "output:\n{out}");
+    // The renamed column is a real alias: the physical `cust_id` field's data
+    // lands under the exposed `customer_id` name, NOT in `$widened`. If rename
+    // were a bare relabel, `customer_id` would be empty and `cust_id` would be
+    // re-emitted as a widened column.
+    assert!(
+        !header.contains("cust_id"),
+        "physical `cust_id` must be consumed as declared, not re-emitted: {header}"
+    );
+    // amount retyped to int and doubled; region added and echoed as zone;
+    // customer_id carries the real cust_id data.
+    assert!(
+        out.contains("1,alice,100,west,200,alice,west"),
+        "output:\n{out}"
+    );
+    assert!(
+        out.contains("2,bob,250,east,500,bob,east"),
+        "output:\n{out}"
+    );
+}
+
+#[test]
+fn base_schema_source_name_alias_maps_physical_to_logical() {
+    // A hand-written base schema (no channel) can declare `source_name` to read
+    // a differently-named physical column — the same alias the channel rename
+    // op produces.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p = dir.path();
+    write(p, "in.csv", "id,cust_id\n1,alice\n2,bob\n");
+    write(
+        p,
+        "pipe.yaml",
+        "\
+pipeline:
+  name: alias_base
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: id, type: string }
+        - { name: customer_id, type: string, source_name: cust_id }
+  - type: transform
+    name: calc
+    input: src
+    config:
+      cxl: |
+        emit customer = customer_id
+  - type: output
+    name: out
+    input: calc
+    config:
+      name: out
+      type: csv
+      path: out.csv
+",
+    );
+    let run = run_in(p, &[]);
+    assert!(
+        run.status.success(),
+        "base-schema alias run failed:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let out = std::fs::read_to_string(p.join("out.csv")).expect("read out.csv");
+    let header = out.lines().next().unwrap_or_default();
+    assert!(header.contains("customer_id"), "header: {header}");
+    assert!(
+        !header.contains("cust_id"),
+        "physical name must not leak: {header}"
+    );
+    assert!(out.contains("1,alice"), "output:\n{out}");
+    assert!(out.contains("2,bob"), "output:\n{out}");
 }
 
 #[test]
 fn csv_schema_patch_is_reflected_by_explain() {
     let dir = tempfile::tempdir().expect("tempdir");
     let p = dir.path();
-    write(p, "in.csv", "id,amount,region\n1,100,west\n");
+    write(p, "in.csv", "id,cust_id,amount,region\n1,alice,100,west\n");
     write(p, "pipe.yaml", CSV_PIPELINE);
     write(p, "fix.channel.yaml", CSV_CHANNEL);
 
