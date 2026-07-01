@@ -99,9 +99,9 @@ fn format_span(span: Span) -> String {
 ///   Resolved value: 0.92
 ///
 ///   Provenance chain (outermost to innermost):
-///   [WON] ChannelFixed     →  0.92  (line 12)
-///         ChannelDefault   →  0.85  (shadowed)  (line 15)
-///         CompositionDefault →  0.75  (shadowed)  (line 8)
+///   [WON] ChannelPerTarget →  0.92  (line 12)
+///         ChannelWide      →  0.85  (shadowed)  (line 15)
+///         PipelineDefault  →  0.75  (shadowed)  (line 8)
 /// ```
 pub fn explain_field_provenance(
     plan: &CompiledPlan,
@@ -300,11 +300,11 @@ mod tests {
     fn test_layer_value_stored_on_new() {
         let rv = ResolvedValue::new(
             serde_json::json!(0.75),
-            LayerKind::CompositionDefault,
+            LayerKind::PipelineDefault,
             Span::line_only(8),
         );
         assert_eq!(
-            rv.layer_value(LayerKind::CompositionDefault),
+            rv.layer_value(LayerKind::PipelineDefault),
             Some(&serde_json::json!(0.75))
         );
     }
@@ -313,23 +313,23 @@ mod tests {
     fn test_layer_value_stored_on_apply() {
         let mut rv = ResolvedValue::new(
             serde_json::json!(0.75),
-            LayerKind::CompositionDefault,
+            LayerKind::PipelineDefault,
             Span::line_only(8),
         );
         rv.apply_layer(
             serde_json::json!(0.92),
-            LayerKind::ChannelFixed,
+            LayerKind::ChannelPerTarget,
             Span::line_only(12),
         );
         assert_eq!(
-            rv.layer_value(LayerKind::CompositionDefault),
+            rv.layer_value(LayerKind::PipelineDefault),
             Some(&serde_json::json!(0.75))
         );
         assert_eq!(
-            rv.layer_value(LayerKind::ChannelFixed),
+            rv.layer_value(LayerKind::ChannelPerTarget),
             Some(&serde_json::json!(0.92))
         );
-        assert!(rv.provenance.iter().find(|l| l.won).unwrap().kind == LayerKind::ChannelFixed);
+        assert!(rv.provenance.iter().find(|l| l.won).unwrap().kind == LayerKind::ChannelPerTarget);
     }
 
     #[test]
