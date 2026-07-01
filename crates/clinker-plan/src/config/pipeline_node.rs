@@ -968,6 +968,17 @@ pub struct ColumnDecl {
     /// leaves the default policy and serializes to byte-identical YAML.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub long_unique: bool,
+    /// Physical source column this declared column reads FROM, when it differs
+    /// from the exposed [`name`](Self::name). The reader matches input records
+    /// by physical name and re-labels the value under `name`, so downstream CXL
+    /// and the output see `name` while the value is drawn from `source_name`.
+    /// `None` (the common case) means physical == exposed: the column reads the
+    /// input field whose key equals `name`, identical to omitting this field.
+    /// Hand-writable in a base `schema:` block as a source-column alias, and set
+    /// by a channel `schema` patch's `rename` op (which relabels a source column
+    /// without severing its physical binding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
 }
 
 /// Policy for fields a reader discovers in an input record that the
@@ -2555,17 +2566,23 @@ nodes:
             name: "uuid".to_string(),
             ty: cxl::typecheck::Type::String,
             long_unique: false,
+            source_name: None,
         };
         let json = serde_json::to_string(&plain).expect("serialize");
         assert!(
             !json.contains("long_unique"),
             "an unflagged column must not emit the long_unique key, got: {json}"
         );
+        assert!(
+            !json.contains("source_name"),
+            "a column without an alias must not emit the source_name key, got: {json}"
+        );
 
         let flagged = ColumnDecl {
             name: "uuid".to_string(),
             ty: cxl::typecheck::Type::String,
             long_unique: true,
+            source_name: None,
         };
         let json = serde_json::to_string(&flagged).expect("serialize");
         assert!(

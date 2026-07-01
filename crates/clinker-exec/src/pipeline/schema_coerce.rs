@@ -26,7 +26,7 @@
 //! `Type::Any` skip coercion. The `to_*` / `try_*` CXL builtins remain
 //! available for derived fields computed during the pipeline.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use clinker_format::error::FormatError;
@@ -43,11 +43,24 @@ use clinker_plan::config::pipeline_node::{ColumnDecl, OnUnmapped, WIDENED_SIDECA
 /// `OnUnmapped` policy to undeclared input fields.
 pub struct CoercingReader {
     inner: Box<dyn FormatReader>,
-    /// Declared column names — lookup set for the policy's "is this
-    /// key in the declaration?" check.
+    /// Physical input-field names the declaration consumes — lookup set
+    /// for the policy's "is this key in the declaration?" check. Uses each
+    /// column's PHYSICAL name (`source_name` when aliased, else `name`) so an
+    /// aliased source field is recognized as declared rather than widened.
     declared_names: HashSet<Box<str>>,
-    /// Output schema — declared columns followed (under `AutoWiden`)
-    /// by the `$widened` engine-stamped sidecar column.
+    /// Physical input-field name to read each declared column FROM, indexed by
+    /// position across the declared columns. `None` in the common no-alias case
+    /// — the physical name then equals the exposed output-schema column name, so
+    /// reproject reads by that name and no per-column Vec is allocated. `Some`
+    /// only when at least one column declares a differing `source_name`.
+    physical_names: Option<Vec<Box<str>>>,
+    /// Exposed-name → physical-name for columns that alias a differently-named
+    /// physical field. Empty (unallocated) when no column aliases. Used to
+    /// detect an input field whose name clashes with an alias's exposed name,
+    /// which would otherwise silently mislocate that field.
+    aliased_exposed: HashMap<Box<str>, Box<str>>,
+    /// Output schema — declared columns (keyed by exposed name) followed
+    /// (under `AutoWiden`) by the `$widened` engine-stamped sidecar column.
     output_schema: Arc<Schema>,
     /// Per-output-column coercion target (`None` for pass-through).
     /// Indexed by position in `output_schema`. The `$widened` sidecar
@@ -82,8 +95,38 @@ impl CoercingReader {
         // record isn't gated behind an on-demand schema call.
         inner.schema()?;
 
-        let declared_names: HashSet<Box<str>> =
-            schema_decl.iter().map(|c| c.name.as_str().into()).collect();
+        // A column "aliases" only when its `source_name` names a DIFFERENT
+        // physical field; `source_name == name` is a no-op treated as no alias.
+        let has_alias = schema_decl
+            .iter()
+            .any(|c| c.source_name.as_deref().is_some_and(|s| s != c.name));
+
+        // The declared-key set uses each column's PHYSICAL name (the alias when
+        // set, else the exposed name) so an aliased source field counts as
+        // declared rather than widened.
+        let declared_names: HashSet<Box<str>> = schema_decl
+            .iter()
+            .map(|c| c.source_name.as_deref().unwrap_or(c.name.as_str()).into())
+            .collect();
+
+        // Per-column physical name is only materialized when some column
+        // aliases; otherwise reproject reads by the exposed output-schema name.
+        let physical_names: Option<Vec<Box<str>>> = has_alias.then(|| {
+            schema_decl
+                .iter()
+                .map(|c| c.source_name.as_deref().unwrap_or(c.name.as_str()).into())
+                .collect()
+        });
+
+        // Exposed-name → physical-name for real aliases, to detect an input
+        // field colliding with an alias's exposed name. Empty when no aliases.
+        let aliased_exposed: HashMap<Box<str>, Box<str>> = schema_decl
+            .iter()
+            .filter_map(|c| {
+                let physical = c.source_name.as_deref()?;
+                (physical != c.name).then(|| (c.name.as_str().into(), physical.into()))
+            })
+            .collect();
         let mut targets: Vec<Option<Type>> = schema_decl
             .iter()
             .map(|c| {
@@ -119,6 +162,8 @@ impl CoercingReader {
         Ok(CoercingReader {
             inner,
             declared_names,
+            physical_names,
+            aliased_exposed,
             output_schema,
             targets,
             long_unique,
@@ -135,6 +180,17 @@ impl CoercingReader {
         let mut sidecar: Option<IndexMap<Box<str>, Value>> = None;
         for (k, v) in record.iter_all_fields() {
             if !self.declared_names.contains(k) {
+                // Guard the alias collision before any policy branch: an input
+                // field named the same as an alias's exposed name would be
+                // silently widened/dropped while the aliased column exposes a
+                // different physical field's value under that name.
+                if let Some(physical) = self.aliased_exposed.get(k) {
+                    return Err(FormatError::AliasNameCollision {
+                        source: self.source_name.to_string(),
+                        exposed: k.to_string(),
+                        physical: physical.to_string(),
+                    });
+                }
                 match self.policy {
                     OnUnmapped::Reject => {
                         return Err(FormatError::UndeclaredField {
@@ -153,8 +209,9 @@ impl CoercingReader {
         }
 
         let cols = self.output_schema.columns();
-        let mut values: Vec<Value> = Vec::with_capacity(cols.len());
-        for (i, col) in cols.iter().enumerate() {
+        let col_count = cols.len();
+        let mut values: Vec<Value> = Vec::with_capacity(col_count);
+        for i in 0..col_count {
             // The widened slot is filled from the sidecar map (if any
             // non-declared keys were observed); otherwise Null.
             if Some(i) == self.widened_idx {
@@ -164,7 +221,15 @@ impl CoercingReader {
                 });
                 continue;
             }
-            let raw = record.get(col).cloned().unwrap_or(Value::Null);
+            // Read from the PHYSICAL input field, exposing the value under the
+            // declared column at this position. Without aliases the physical
+            // name equals the exposed output-schema name, so this reads exactly
+            // the same field as before with no per-column Vec.
+            let physical: &str = match &self.physical_names {
+                Some(names) => names[i].as_ref(),
+                None => cols[i].as_ref(),
+            };
+            let raw = record.get(physical).cloned().unwrap_or(Value::Null);
             let coerced = match &self.targets[i] {
                 Some(target) => coerce_value(&raw, target).unwrap_or(raw),
                 None => raw,
@@ -278,6 +343,7 @@ mod tests {
             name: name.to_string(),
             ty,
             long_unique: false,
+            source_name: None,
         }
     }
 
@@ -286,6 +352,17 @@ mod tests {
             name: name.to_string(),
             ty,
             long_unique: true,
+            source_name: None,
+        }
+    }
+
+    /// A declared column aliasing a differently-named physical source column.
+    fn col_from(name: &str, source_name: &str, ty: Type) -> ColumnDecl {
+        ColumnDecl {
+            name: name.to_string(),
+            ty,
+            long_unique: false,
+            source_name: Some(source_name.to_string()),
         }
     }
 
@@ -362,6 +439,102 @@ mod tests {
         let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
 
         let rec = coercing.next_record().unwrap().unwrap();
+        assert_eq!(rec.get("name"), Some(&Value::String("Alice".into())));
+    }
+
+    /// A `source_name` alias reads the physical CSV column and exposes the
+    /// value under the declared name — the physical column is recognized as
+    /// declared (never widened), and the exposed name carries the real data.
+    #[test]
+    fn test_source_name_alias_maps_physical_to_exposed() {
+        // Physical header is `cust_id`; the declaration exposes it as
+        // `customer_id`.
+        let schema = vec![
+            col("id", Type::String),
+            col_from("customer_id", "cust_id", Type::String),
+        ];
+        let reader = csv_reader("id,cust_id\n1,alice\n2,bob\n");
+        let mut coercing =
+            CoercingReader::new(reader, &schema, auto_widen_policy(), "src").unwrap();
+
+        // Output schema exposes the logical name.
+        let schema_arc = coercing.schema().unwrap();
+        let cols: Vec<&str> = schema_arc.columns().iter().map(|c| &**c).collect();
+        assert_eq!(cols, vec!["id", "customer_id", WIDENED_SIDECAR_COLUMN]);
+
+        let rec = coercing.next_record().unwrap().unwrap();
+        // The exposed column carries the physical column's value...
+        assert_eq!(rec.get("customer_id"), Some(&Value::String("alice".into())));
+        // ...the physical name is not a top-level output column...
+        assert!(rec.get("cust_id").is_none());
+        // ...and it did NOT fall into `$widened` (recognized as declared).
+        assert_eq!(rec.get(WIDENED_SIDECAR_COLUMN), Some(&Value::Null));
+    }
+
+    /// If an aliased column's exposed name also exists as a real input field,
+    /// reading the alias would mislocate that field — the reader fails loudly
+    /// instead of silently widening/dropping it.
+    #[test]
+    fn test_source_name_alias_exposed_name_collision_errors() {
+        // Column exposes `customer_id` reading physical `cust_id`, but the CSV
+        // ALSO has a real `customer_id` column.
+        let schema = vec![col_from("customer_id", "cust_id", Type::String)];
+        let reader = csv_reader("cust_id,customer_id\nalice,bob\n");
+        let mut coercing =
+            CoercingReader::new(reader, &schema, auto_widen_policy(), "src").unwrap();
+
+        let err = coercing.next_record().unwrap_err();
+        match err {
+            FormatError::AliasNameCollision {
+                source,
+                exposed,
+                physical,
+            } => {
+                assert_eq!(source, "src");
+                assert_eq!(exposed, "customer_id");
+                assert_eq!(physical, "cust_id");
+            }
+            other => panic!("expected AliasNameCollision, got {other:?}"),
+        }
+    }
+
+    /// The collision fires under every policy, not just auto_widen — a `drop`
+    /// source would otherwise silently discard the real field.
+    #[test]
+    fn test_source_name_alias_collision_errors_under_drop() {
+        let schema = vec![col_from("customer_id", "cust_id", Type::String)];
+        let reader = csv_reader("cust_id,customer_id\nalice,bob\n");
+        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+        assert!(matches!(
+            coercing.next_record().unwrap_err(),
+            FormatError::AliasNameCollision { .. }
+        ));
+    }
+
+    /// An aliased column is coerced to its declared type just like a
+    /// same-named column — the alias only changes which field it reads from.
+    #[test]
+    fn test_source_name_alias_still_coerces() {
+        let schema = vec![col_from("total", "raw_amount", Type::Int)];
+        let reader = csv_reader("raw_amount\n100\n250\n");
+        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+
+        let rec = coercing.next_record().unwrap().unwrap();
+        assert_eq!(rec.get("total"), Some(&Value::Integer(100)));
+        let rec2 = coercing.next_record().unwrap().unwrap();
+        assert_eq!(rec2.get("total"), Some(&Value::Integer(250)));
+    }
+
+    /// Backward-compat: a column with `source_name == None` reads the field
+    /// whose key equals its `name`, exactly as before the alias field existed.
+    #[test]
+    fn test_no_alias_reads_by_name_unchanged() {
+        let schema = vec![col("id", Type::String), col("name", Type::String)];
+        let reader = csv_reader("id,name\n1,Alice\n");
+        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+
+        let rec = coercing.next_record().unwrap().unwrap();
+        assert_eq!(rec.get("id"), Some(&Value::String("1".into())));
         assert_eq!(rec.get("name"), Some(&Value::String("Alice".into())));
     }
 

@@ -13,6 +13,7 @@ use serde::Deserialize;
 use clinker_core_types::Span;
 use clinker_core_types::{Diagnostic, LabeledSpan};
 use clinker_plan::config::ScopedVarDecl;
+use clinker_plan::config::SourceConfigPatch;
 use clinker_plan::config::composition::CompositionSymbolTable;
 
 use crate::error::ChannelError;
@@ -133,6 +134,12 @@ pub struct ChannelBinding {
     /// on Transforms via `declares: { scope: record }`. Channel-wide
     /// (every record sees the same channel-supplied default).
     pub vars_record: IndexMap<String, ScopedVarDecl>,
+    /// Per-source config patches keyed by source-node name. Applied to the
+    /// parsed pipeline config before validation/compile, so the run behaves
+    /// as if the source YAML had been hand-edited (schema column ops,
+    /// `array_paths` ops, and scalar per-format `options`). Source names are
+    /// resolved against the loaded pipeline at apply time, not here.
+    pub source_patches: IndexMap<String, SourceConfigPatch>,
     pub source_path: PathBuf,
     /// BLAKE3 hash of the raw file bytes, used as cache-invalidation identity.
     pub channel_hash: [u8; 32],
@@ -180,6 +187,7 @@ impl ChannelBinding {
             vars_pipeline: raw.vars.pipeline,
             vars_source: raw.vars.source,
             vars_record: raw.vars.record,
+            source_patches: raw.sources,
             source_path,
             channel_hash,
         })
@@ -203,6 +211,10 @@ struct RawChannelFile {
     resources: RawChannelConfig,
     #[serde(default)]
     vars: RawChannelVars,
+    /// Per-source config patches, keyed by source-node name. Parsed here;
+    /// validated against the pipeline's sources at apply time.
+    #[serde(default)]
+    sources: IndexMap<String, SourceConfigPatch>,
 }
 
 #[derive(Deserialize)]

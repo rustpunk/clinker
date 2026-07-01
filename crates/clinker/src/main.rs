@@ -582,12 +582,12 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         unsafe { std::env::set_var("CLINKER_ENV", env_name) };
     }
 
-    let mut pipeline_config = clinker_plan::config::load_config_with_vars(&args.config, &[])
-        .map_err(PipelineError::Config)?;
-
-    // Load the channel binding once if `--channel` was supplied. The
-    // overlay itself runs against each `compile()` result below; the
-    // binding is borrowed by the `--explain` arm and the main run.
+    // Load the channel binding once if `--channel` was supplied. It is loaded
+    // BEFORE the pipeline config because its per-source config patches must be
+    // applied to the parsed config before validation/compile (below). The
+    // overlay for composition config/vars still runs against each `compile()`
+    // result later; the binding is borrowed by the `--explain` arm and the
+    // main run.
     let channel_binding = match args.channel.as_deref() {
         Some(path) => Some(clinker_channel::ChannelBinding::load(path).map_err(|e| {
             PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
@@ -615,6 +615,20 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             );
         }
     }
+
+    // Apply the channel's source-config patches (schema / array_paths /
+    // options) to the parsed config before it is validated and compiled, so
+    // every run path — normal run, `--explain`, and `--lineage` — observes the
+    // patched shape. An absent channel (or one with no `sources:` block) is an
+    // empty map, making this equivalent to a plain validated load.
+    let empty_patches = indexmap::IndexMap::new();
+    let source_patches = channel_binding
+        .as_ref()
+        .map(|b| &b.source_patches)
+        .unwrap_or(&empty_patches);
+    let mut pipeline_config =
+        clinker_plan::config::load_config_with_vars_and_patches(&args.config, &[], source_patches)
+            .map_err(PipelineError::Config)?;
 
     // Resolve workspace_root and pipeline_dir ONCE at the entry point so
     // `compile()` never touches the process CWD. The invariant the compile
@@ -2087,9 +2101,21 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
     let yaml = std::fs::read_to_string(config_path)?;
     let interpolated = clinker_plan::config::interpolate_env_vars(&yaml, &[])
         .map_err(|e| format!("environment variable interpolation failed: {e}"))?;
-    let pipeline_config: clinker_plan::config::PipelineConfig =
+    let mut pipeline_config: clinker_plan::config::PipelineConfig =
         clinker_plan::yaml::from_str(&interpolated)
             .map_err(|e| format!("YAML parse error: {e}"))?;
+
+    // Apply the channel's source-config patches before compile, so provenance
+    // is computed against the same patched plan a `run` would execute — no
+    // explain path compiles an unpatched config. Uses the shared
+    // `apply_source_patches` primitive that the run/`--explain`/`--lineage`
+    // paths reach through `load_config_with_vars_and_patches`.
+    if let Some(channel_path) = &args.channel {
+        let binding = clinker_channel::ChannelBinding::load(channel_path)
+            .map_err(|e| format!("channel '{}': {e}", channel_path.display()))?;
+        clinker_plan::config::apply_source_patches(&mut pipeline_config, &binding.source_patches)
+            .map_err(|e| format!("{e}"))?;
+    }
 
     // Resolve workspace root and pipeline_dir so composition `use:` paths
     // resolve correctly. The workspace root is the base_dir (default: CWD),

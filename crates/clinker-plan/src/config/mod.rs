@@ -7,6 +7,7 @@ pub mod format;
 pub mod fs_type;
 pub mod node_header;
 pub mod output;
+pub mod patch;
 pub mod path_template;
 pub mod pipeline;
 pub mod pipeline_node;
@@ -33,6 +34,9 @@ pub use format::*;
 pub use fs_type::{FsKind, case_sensitive_dir, classify, collision_key, same_device};
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use output::*;
+pub use patch::{
+    AddColumnPatch, ArrayPathOp, SchemaColumnOp, SourceConfigPatch, apply_source_patches,
+};
 pub use pipeline::*;
 pub use pipeline_node::{
     AggregateBody, MergeBody, OutputBody, Phase, PipelineNode, RouteBody, SourceBody,

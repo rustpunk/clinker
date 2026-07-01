@@ -64,6 +64,18 @@ pub enum FormatError {
         source: String,
         field: String,
     },
+    /// A declared column aliases a physical source field (its `source_name`
+    /// differs from its exposed name), but the input ALSO carries a real field
+    /// named the same as the exposed name. Reading the alias would expose the
+    /// physical field's value under the exposed name while the real field of
+    /// that name is silently relocated (widened or dropped) — a data
+    /// mislocation. Raised so the collision fails loudly instead. Resolve it by
+    /// choosing an exposed name that does not clash with a real input field.
+    AliasNameCollision {
+        source: String,
+        exposed: String,
+        physical: String,
+    },
     /// A non-JSON writer (CSV / XML / fixed-width) was handed a record
     /// carrying a `Value::Map` payload at a regular column slot.
     /// JSON writers serialize maps natively; the other formats have
@@ -111,6 +123,17 @@ impl fmt::Display for FormatError {
                 f,
                 "source {source:?}: input record carries undeclared field {field:?} \
                  (set `on_unmapped: drop` to silently strip, or declare the field)"
+            ),
+            Self::AliasNameCollision {
+                source,
+                exposed,
+                physical,
+            } => write!(
+                f,
+                "[E236] source {source:?}: column exposed as {exposed:?} aliases physical field \
+                 {physical:?}, but the input also carries a real field named {exposed:?} — \
+                 reading the alias would mislocate that field. Rename the exposed column to a \
+                 name that does not clash with an input field."
             ),
             Self::UnserializableMapValue { format, column } => write!(
                 f,
