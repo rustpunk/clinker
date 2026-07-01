@@ -140,13 +140,18 @@ pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
     Ok(config)
 }
 
-/// Load and parse a pipeline config from a YAML file path with extra variables.
-/// `extra_vars` are checked before system env vars during interpolation.
+/// Read, interpolate, and parse a pipeline config from a YAML file path
+/// **without** running `validate_config`.
 ///
 /// Stamps `config.source_hash` with the BLAKE3 of the post-env-var
 /// interpolated YAML so the executor can resolve `{pipeline_hash}` tokens
 /// and write provenance sidecars without retaining the source bytes.
-pub fn load_config_with_vars(
+///
+/// Callers that need a fully-validated config use [`load_config_with_vars`].
+/// This split exists so channel source-config patches can mutate the parsed
+/// typed config before validation — the patched config is then the one
+/// `validate_config` and `compile()` see (see [`load_config_with_vars_and_patches`]).
+pub fn parse_config_with_vars(
     path: &std::path::Path,
     extra_vars: &[(&str, &str)],
 ) -> Result<PipelineConfig, ConfigError> {
@@ -154,6 +159,36 @@ pub fn load_config_with_vars(
     let interpolated = interpolate_env_vars(&yaml, extra_vars)?;
     let mut config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
     config.source_hash = *blake3::hash(interpolated.as_bytes()).as_bytes();
+    Ok(config)
+}
+
+/// Load, parse, and validate a pipeline config from a YAML file path with
+/// extra variables. `extra_vars` are checked before system env vars during
+/// interpolation.
+pub fn load_config_with_vars(
+    path: &std::path::Path,
+    extra_vars: &[(&str, &str)],
+) -> Result<PipelineConfig, ConfigError> {
+    let config = parse_config_with_vars(path, extra_vars)?;
+    validate_config(&config)?;
+    Ok(config)
+}
+
+/// Load and parse a pipeline config, apply channel source-config patches to
+/// the parsed typed config, then validate.
+///
+/// The patches are applied after parse and before `validate_config`, so the
+/// patched config is exactly what validation and `compile()` consume on every
+/// run path. An empty patch map is a no-op equivalent to
+/// [`load_config_with_vars`]. Unknown source names or ill-formed patch ops
+/// surface as [`ConfigError::Validation`] before the pipeline compiles.
+pub fn load_config_with_vars_and_patches(
+    path: &std::path::Path,
+    extra_vars: &[(&str, &str)],
+    patches: &indexmap::IndexMap<String, crate::config::patch::SourceConfigPatch>,
+) -> Result<PipelineConfig, ConfigError> {
+    let mut config = parse_config_with_vars(path, extra_vars)?;
+    crate::config::patch::apply_source_patches(&mut config, patches)?;
     validate_config(&config)?;
     Ok(config)
 }

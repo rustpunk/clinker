@@ -582,12 +582,12 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         unsafe { std::env::set_var("CLINKER_ENV", env_name) };
     }
 
-    let mut pipeline_config = clinker_plan::config::load_config_with_vars(&args.config, &[])
-        .map_err(PipelineError::Config)?;
-
-    // Load the channel binding once if `--channel` was supplied. The
-    // overlay itself runs against each `compile()` result below; the
-    // binding is borrowed by the `--explain` arm and the main run.
+    // Load the channel binding once if `--channel` was supplied. It is loaded
+    // BEFORE the pipeline config because its per-source config patches must be
+    // applied to the parsed config before validation/compile (below). The
+    // overlay for composition config/vars still runs against each `compile()`
+    // result later; the binding is borrowed by the `--explain` arm and the
+    // main run.
     let channel_binding = match args.channel.as_deref() {
         Some(path) => Some(clinker_channel::ChannelBinding::load(path).map_err(|e| {
             PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
@@ -615,6 +615,20 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             );
         }
     }
+
+    // Apply the channel's source-config patches (schema / array_paths /
+    // options) to the parsed config before it is validated and compiled, so
+    // every run path — normal run, `--explain`, and `--lineage` — observes the
+    // patched shape. An absent channel (or one with no `sources:` block) is an
+    // empty map, making this equivalent to a plain validated load.
+    let empty_patches = indexmap::IndexMap::new();
+    let source_patches = channel_binding
+        .as_ref()
+        .map(|b| &b.source_patches)
+        .unwrap_or(&empty_patches);
+    let mut pipeline_config =
+        clinker_plan::config::load_config_with_vars_and_patches(&args.config, &[], source_patches)
+            .map_err(PipelineError::Config)?;
 
     // Resolve workspace_root and pipeline_dir ONCE at the entry point so
     // `compile()` never touches the process CWD. The invariant the compile

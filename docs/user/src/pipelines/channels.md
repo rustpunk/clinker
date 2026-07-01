@@ -99,12 +99,90 @@ Channels that target a `.comp.yaml` may not carry a `vars:` block (composition v
 | **E109** | Var overrides not supported on composition channels. |
 | **E110** | Channel var shadows reserved system field for that scope. |
 | **E111** | `vars.source.<src>` references a source-node name not declared in the pipeline. |
+| **E230** | `sources.<src>` patch targets a source-node name not declared in the pipeline. |
+| **E231** | `schema` patch `rename` / `retype` / `remove` of a column that does not exist. |
+| **E232** | `schema` patch `add` of a column name that already exists. |
+| **E233** | `schema` patch `rename` target collides with an existing column. |
+| **E234** | `array_paths` patch `remove` of a path with no matching entry. |
+| **E235** | `options` patch sets an unknown or mistyped option key for the source's format. |
 | **W103** | Channel `config.*` key did not match any composition parameter in the compiled plan. |
 | **W104** | `channel.target` does not match the `<config>` argument passed to `clinker run`. |
 
 ### Cross-Transform declaration uniqueness
 
 `$pipeline`, `$source`, and `$record` are flat shared namespaces. The same name declared on more than one Transform's `declares:` is a config-validation error — clinker mirrors the fail-fast posture of Beam, Flink, Kafka Streams, Dagster, and post-fix dbt for shared-namespace key collisions. Authors who want shared state declare it once and reference everywhere.
+
+## Source config patches
+
+A channel can override any part of a **source** node's config through a
+`sources:` block. Each patch is applied to the parsed pipeline config **before**
+validation and compile, so the run behaves exactly as if the source YAML had
+been hand-edited — every per-column, per-array, and per-option rule that applies
+to hand-written config applies to the patched result.
+
+```yaml
+# channels/acme.channel.yaml
+channel:
+  name: acme
+  target: ./pipelines/orders.yaml
+
+sources:
+  transactions:                            # source-node name
+    options:
+      record_path: batch_records           # set a scalar per-format option
+    array_paths:                           # keyed by array path
+      items:      { mode: join, separator: ";" }  # add-or-modify an entry
+      line_items: remove                   # drop an entry
+    schema:                                # keyed by column name
+      amount:      { retype: float }       # change a column's CXL type
+      cust_id:     { rename: customer_id }  # rename a column
+      order_notes: remove                  # drop a column
+      region:      { add: { type: string } }  # add a new column
+```
+
+The top-level key under `sources:` is a **source-node name**; an unknown name is
+a compile error (**E230**). All ops are keyed and leaf-replace — there is no
+deep-merge.
+
+### `schema` ops
+
+Keyed by column name. Exactly one op per column:
+
+| Form | Effect | Errors |
+|------|--------|--------|
+| `<col>: { retype: <type> }` | Change the column's CXL type. | Unknown column → **E231** |
+| `<col>: { rename: <new> }` | Rename the column. | Unknown column → **E231**; `<new>` collides with an existing column → **E233** |
+| `<col>: remove` | Drop the column. | Unknown column → **E231** |
+| `<new>: { add: { type: <type>, long_unique?: <bool> } }` | Add a new column (the map key is its name). | Name already exists → **E232** |
+
+`<type>` is any CXL type (`string`, `int`, `float`, `bool`, `date`, `date_time`,
+`array`, `map`). Because the patch produces the same schema you could have
+written by hand, renaming a column also renames the on-disk field it binds to —
+for a CSV source, the new name must match the file's column header just as a
+hand-written schema would.
+
+### `array_paths` ops
+
+Keyed by array path (the `path:` of an [array-path entry](../formats/json.md)):
+
+| Form | Effect | Errors |
+|------|--------|--------|
+| `<path>: { mode: explode\|join, separator?: <str> }` | Add the entry, or replace an existing one at that path. | — |
+| `<path>: remove` | Drop the entry. | Unknown path → **E234** |
+
+### `options` ops
+
+A map of scalar per-format input options merged onto the source's current
+`options:`. The merged options are re-validated through the format's option
+struct, so an unknown or mistyped option key is rejected (**E235**) exactly as in
+hand-written config. Which keys are valid depends on the source's `type:` (e.g.
+`record_path` for `json`/`xml`, `delimiter` for `csv`).
+
+### Applies on every run path
+
+The patch is applied on the normal run path, on `clinker run --explain`, and on
+`clinker run --lineage` — all three compile the patched config. A channel with no
+`sources:` block leaves the pipeline config untouched.
 
 ## Workspace discovery
 
