@@ -105,6 +105,7 @@ Channels that target a `.comp.yaml` may not carry a `vars:` block (composition v
 | **E233** | `schema` patch `rename` target collides with an existing column. |
 | **E234** | `array_paths` patch `remove` of a path with no matching entry. |
 | **E235** | `options` patch sets an unknown or mistyped option key for the source's format. |
+| **E236** | A renamed/aliased column's exposed name collides with a real input field, which would mislocate that field. Raised at read time. |
 | **W103** | Channel `config.*` key did not match any composition parameter in the compiled plan. |
 | **W104** | `channel.target` does not match the `<config>` argument passed to `clinker run`. |
 
@@ -180,8 +181,12 @@ Keyed by array path (the `path:` of an [array-path entry](../formats/json.md)):
 
 | Form | Effect | Errors |
 |------|--------|--------|
-| `<path>: { mode: explode\|join, separator?: <str> }` | Add the entry, or replace an existing one at that path. | — |
+| `<path>: { mode: explode\|join, separator?: <str> }` | Add or modify the entry at that path. | — |
 | `<path>: remove` | Drop the entry. | Unknown path → **E234** |
+
+On an **existing** entry a `Set` is a partial modify — an omitted field keeps its
+current value, so `{ separator: ";" }` on a `mode: join` entry leaves the mode
+unchanged. On a **new** entry an omitted `mode` defaults to explode.
 
 ### `options` ops
 
@@ -193,9 +198,21 @@ hand-written config. Which keys are valid depends on the source's `type:` (e.g.
 
 ### Applies on every run path
 
-The patch is applied on the normal run path, on `clinker run --explain`, and on
-`clinker run --lineage` — all three compile the patched config. A channel with no
-`sources:` block leaves the pipeline config untouched.
+The patch is applied on the normal run path, on `clinker run --explain`, on
+`clinker run --lineage`, and by the `clinker explain` provenance subcommand — no
+`--channel` path compiles an unpatched config. A channel with no `sources:` block
+leaves the pipeline config untouched. When patches change the effective source
+config, the run's pipeline identity (`{pipeline_hash}` in output paths, lineage)
+differs from the base and from other patched variants, so their outputs and
+lineage do not collide.
+
+### Scope
+
+`sources:` patches target **top-level** source nodes. A source declared inside a
+composition body is not reachable this way (patching it fails with **E230**,
+naming the composition-body limitation); patch the composition's own source, or
+lift the source to the top-level pipeline. Extending patches into composition
+bodies is tracked as a follow-up.
 
 ## Workspace discovery
 

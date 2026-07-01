@@ -2101,9 +2101,21 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
     let yaml = std::fs::read_to_string(config_path)?;
     let interpolated = clinker_plan::config::interpolate_env_vars(&yaml, &[])
         .map_err(|e| format!("environment variable interpolation failed: {e}"))?;
-    let pipeline_config: clinker_plan::config::PipelineConfig =
+    let mut pipeline_config: clinker_plan::config::PipelineConfig =
         clinker_plan::yaml::from_str(&interpolated)
             .map_err(|e| format!("YAML parse error: {e}"))?;
+
+    // Apply the channel's source-config patches before compile, so provenance
+    // is computed against the same patched plan a `run` would execute — no
+    // explain path compiles an unpatched config. Uses the shared
+    // `apply_source_patches` primitive that the run/`--explain`/`--lineage`
+    // paths reach through `load_config_with_vars_and_patches`.
+    if let Some(channel_path) = &args.channel {
+        let binding = clinker_channel::ChannelBinding::load(channel_path)
+            .map_err(|e| format!("channel '{}': {e}", channel_path.display()))?;
+        clinker_plan::config::apply_source_patches(&mut pipeline_config, &binding.source_patches)
+            .map_err(|e| format!("{e}"))?;
+    }
 
     // Resolve workspace root and pipeline_dir so composition `use:` paths
     // resolve correctly. The workspace root is the base_dir (default: CWD),

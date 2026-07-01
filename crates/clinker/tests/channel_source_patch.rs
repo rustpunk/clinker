@@ -335,3 +335,144 @@ sources:
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("E231"), "stderr:\n{stderr}");
 }
+
+/// Pipeline whose output path carries the `{pipeline_hash}` token, so the
+/// effective pipeline identity is observable as the output filename.
+const HASH_PIPELINE: &str = "\
+pipeline:
+  name: hash_demo
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: string }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: \"out_{pipeline_hash}.csv\"
+";
+
+#[test]
+fn channel_patch_changes_pipeline_hash_and_empty_patch_does_not() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p = dir.path();
+    write(p, "in.csv", "id,amount\n1,100\n");
+    write(p, "pipe.yaml", HASH_PIPELINE);
+    write(
+        p,
+        "a.channel.yaml",
+        "channel:\n  name: a\n  target: ./pipe.yaml\nsources:\n  src:\n    schema:\n      amount: { retype: int }\n",
+    );
+    write(
+        p,
+        "b.channel.yaml",
+        "channel:\n  name: b\n  target: ./pipe.yaml\nsources:\n  src:\n    schema:\n      amount: { retype: float }\n",
+    );
+    write(
+        p,
+        "empty.channel.yaml",
+        "channel:\n  name: e\n  target: ./pipe.yaml\n",
+    );
+
+    // Extract the `{pipeline_hash}` token from the single out_*.csv the run
+    // wrote, then clear it before the next run.
+    let hash_after = |args: &[&str]| -> String {
+        let out = run_in(p, args);
+        assert!(
+            out.status.success(),
+            "run failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let mut found = None;
+        for entry in std::fs::read_dir(p).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            if let Some(hash) = name
+                .strip_prefix("out_")
+                .and_then(|rest| rest.strip_suffix(".csv"))
+            {
+                found = Some(hash.to_string());
+                std::fs::remove_file(p.join(&name)).unwrap();
+            }
+        }
+        found.expect("an out_<hash>.csv file")
+    };
+
+    let base = hash_after(&[]);
+    let empty = hash_after(&["--channel", "empty.channel.yaml"]);
+    let patch_a = hash_after(&["--channel", "a.channel.yaml"]);
+    let patch_b = hash_after(&["--channel", "b.channel.yaml"]);
+
+    // An empty patch map leaves the pipeline hash byte-identical to the base.
+    assert_eq!(
+        empty, base,
+        "empty channel must not change the pipeline hash"
+    );
+    // A patched run has a distinct identity from the base...
+    assert_ne!(patch_a, base, "patched run must differ from base");
+    // ...and two different patches produce different identities.
+    assert_ne!(patch_a, patch_b, "two different patches must differ");
+}
+
+/// The `clinker explain` subcommand applies channel source-patches before
+/// compile: an unknown-source patch surfaces E230, proving the channel is
+/// loaded and applied on that path too (not silently ignored).
+#[test]
+fn explain_subcommand_applies_channel_source_patch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p = dir.path();
+    write(p, "in.csv", "id,amount\n1,100\n");
+    write(
+        p,
+        "pipe.yaml",
+        "\
+pipeline:
+  name: explain_patch
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: string }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+",
+    );
+    write(
+        p,
+        "bad.channel.yaml",
+        "channel:\n  name: bad\n  target: ./pipe.yaml\nsources:\n  ghost:\n    schema:\n      id: remove\n",
+    );
+    let out = Command::new(clinker_bin())
+        .arg("explain")
+        .arg("pipe.yaml")
+        .arg("--field")
+        .arg("out.name")
+        .arg("--channel")
+        .arg("bad.channel.yaml")
+        .current_dir(p)
+        .output()
+        .expect("spawn clinker explain");
+    assert!(
+        !out.status.success(),
+        "explain with an unknown-source patch should fail"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("E230"), "stderr:\n{stderr}");
+}

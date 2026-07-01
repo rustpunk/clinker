@@ -189,6 +189,23 @@ pub fn load_config_with_vars_and_patches(
 ) -> Result<PipelineConfig, ConfigError> {
     let mut config = parse_config_with_vars(path, extra_vars)?;
     crate::config::patch::apply_source_patches(&mut config, patches)?;
+    // Fold the applied patches into the pipeline identity. `parse_config_with_vars`
+    // stamped `source_hash` from the pre-patch source bytes, so without this a
+    // channel-patched run would share the base pipeline's identity — colliding
+    // `{pipeline_hash}` output paths and conflating lineage across the base and
+    // its patched variants. An empty patch map contributes nothing, leaving the
+    // hash byte-identical to a plain load; a non-empty map mixes a canonical
+    // serialization of the patches in, so base-vs-patched and two-different-patch
+    // runs get distinct hashes.
+    if !patches.is_empty() {
+        let serialized = serde_json::to_vec(patches).map_err(|e| {
+            ConfigError::Validation(format!("internal: channel patch identity hashing: {e}"))
+        })?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&config.source_hash);
+        hasher.update(&serialized);
+        config.source_hash = *hasher.finalize().as_bytes();
+    }
     validate_config(&config)?;
     Ok(config)
 }

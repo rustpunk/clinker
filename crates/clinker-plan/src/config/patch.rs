@@ -20,15 +20,17 @@ use super::*;
 use crate::config::pipeline_node::{ColumnDecl, PipelineNode, SchemaDecl, SourceBody};
 use cxl::typecheck::Type;
 use indexmap::IndexMap;
-use serde::Deserialize;
 use serde::de;
+use serde::{Deserialize, Serialize};
 
 /// Per-source config patch carried by a channel.
 ///
-/// Keyed forms only — leaf-replace, never deep-merge. `schema` ops are keyed
-/// by column name, `array_paths` ops by array path, and `options` sets a
-/// scalar per-format input option by its key.
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Keyed forms only. `schema` ops are keyed by column name, `array_paths` ops
+/// by array path, and `options` sets a scalar per-format input option by its
+/// key. `Serialize` is derived for config-identity hashing only (folding the
+/// applied patches into the pipeline `source_hash`); the wire deserialize form
+/// is the channel YAML.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SourceConfigPatch {
     /// Column-name-keyed schema ops (`add` / `rename` / `retype` / `remove`).
@@ -58,7 +60,10 @@ impl SourceConfigPatch {
 /// order_notes: remove                   # drop an existing column
 /// region:      { add: { type: string } }# add a new column (key = new name)
 /// ```
-#[derive(Debug, Clone)]
+///
+/// `Serialize` is derived for config-identity hashing only; the deserialize
+/// form is the channel YAML above.
+#[derive(Debug, Clone, Serialize)]
 pub enum SchemaColumnOp {
     /// Drop the keyed column.
     Remove,
@@ -71,7 +76,7 @@ pub enum SchemaColumnOp {
 }
 
 /// Payload for a schema `add` op: the new column's declared shape.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AddColumnPatch {
     /// CXL type of the new column.
@@ -147,16 +152,20 @@ impl<'de> Deserialize<'de> for SchemaColumnOp {
 /// items:      { mode: join, separator: ";" }  # add-or-modify the entry
 /// line_items: remove                          # drop the entry
 /// ```
-#[derive(Debug, Clone)]
+///
+/// `Serialize` is derived for config-identity hashing only.
+#[derive(Debug, Clone, Serialize)]
 pub enum ArrayPathOp {
     /// Drop the keyed array-path entry.
     Remove,
-    /// Add-or-modify the keyed array-path entry (leaf-replace of the whole
-    /// entry — omitted fields take their defaults).
+    /// Add-or-modify the keyed array-path entry. A field is optional so a
+    /// partial modify keeps the omitted field: on an **existing** entry an
+    /// omitted `mode`/`separator` retains the current value; on a **new** entry
+    /// an omitted `mode` defaults to explode and an omitted `separator` is none.
     Set {
-        /// Explode (default) or join.
-        mode: ArrayMode,
-        /// Join separator; ignored for explode mode.
+        /// Explode or join; `None` = keep current (existing) / explode (new).
+        mode: Option<ArrayMode>,
+        /// Join separator; `None` = keep current (existing) / none (new).
         separator: Option<String>,
     },
 }
@@ -170,7 +179,7 @@ impl<'de> Deserialize<'de> for ArrayPathOp {
         #[serde(deny_unknown_fields)]
         struct SetMap {
             #[serde(default)]
-            mode: ArrayMode,
+            mode: Option<ArrayMode>,
             #[serde(default)]
             separator: Option<String>,
         }
@@ -206,14 +215,27 @@ pub fn apply_source_patches(
     config: &mut PipelineConfig,
     patches: &IndexMap<String, SourceConfigPatch>,
 ) -> Result<(), ConfigError> {
+    // Whether the pipeline calls any composition. Sources declared inside a
+    // composition body are not present in `config.nodes` at patch time (the
+    // body is expanded only during compile), so a patch targeting one cannot be
+    // resolved here — the unknown-source error explains that rather than
+    // implying a typo. Computed once so the per-source lookup can stay a plain
+    // borrow.
+    let has_composition = config
+        .nodes
+        .iter()
+        .any(|n| matches!(n.value, PipelineNode::Composition { .. }));
+
     for (src_name, patch) in patches {
         if patch.is_empty() {
             // Still resolve the source so an empty patch on a typo'd name
             // fails rather than passing silently.
-            source_body_mut(config, src_name).ok_or_else(|| unknown_source(src_name))?;
+            source_body_mut(config, src_name)
+                .ok_or_else(|| unknown_source(src_name, has_composition))?;
             continue;
         }
-        let body = source_body_mut(config, src_name).ok_or_else(|| unknown_source(src_name))?;
+        let body = source_body_mut(config, src_name)
+            .ok_or_else(|| unknown_source(src_name, has_composition))?;
         apply_schema_ops(&mut body.schema, &patch.schema, src_name)?;
         apply_array_path_ops(&mut body.source, &patch.array_paths, src_name)?;
         apply_option_ops(&mut body.source, &patch.options, src_name)?;
@@ -221,21 +243,36 @@ pub fn apply_source_patches(
     Ok(())
 }
 
-/// Locate a source node's body by its declared name.
+/// Locate a source node's body by its node identity (`header.name`).
+///
+/// The channel system keys sources by node identity — the `name:` on the node
+/// header — which can differ from the nested `config.name:`. Every other
+/// channel block (`vars.source`, E111) resolves the same way, so the patch
+/// target resolves by `header.name` for consistency.
 fn source_body_mut<'a>(config: &'a mut PipelineConfig, name: &str) -> Option<&'a mut SourceBody> {
     config
         .nodes
         .iter_mut()
         .find_map(|spanned| match &mut spanned.value {
-            PipelineNode::Source { config: body, .. } if body.source.name == name => Some(body),
+            PipelineNode::Source {
+                header,
+                config: body,
+            } if header.name == name => Some(body),
             _ => None,
         })
 }
 
-fn unknown_source(src_name: &str) -> ConfigError {
+fn unknown_source(src_name: &str, has_composition: bool) -> ConfigError {
+    let hint = if has_composition {
+        " (a source declared inside a composition body is not yet patchable by a \
+         channel `sources:` block — patch the composition's own source, or lift it \
+         to the top-level pipeline)"
+    } else {
+        ""
+    };
     ConfigError::Validation(format!(
         "[E230] channel source patch targets unknown source '{src_name}': \
-         no source node by that name in the pipeline"
+         no source node by that name in the pipeline{hint}"
     ))
 }
 
@@ -334,12 +371,20 @@ fn apply_array_path_ops(
             ArrayPathOp::Set { mode, separator } => {
                 let entries = source.array_paths.get_or_insert_with(Vec::new);
                 if let Some(existing) = entries.iter_mut().find(|a| a.path == *path) {
-                    existing.mode = mode.clone();
-                    existing.separator = separator.clone();
+                    // Partial modify: an omitted field keeps the current value,
+                    // so setting only `separator` on a `join` entry does not
+                    // silently revert its mode to explode.
+                    if let Some(m) = mode {
+                        existing.mode = m.clone();
+                    }
+                    if let Some(s) = separator {
+                        existing.separator = Some(s.clone());
+                    }
                 } else {
+                    // New entry: an omitted `mode` defaults to explode.
                     entries.push(ArrayPathConfig {
                         path: path.clone(),
-                        mode: mode.clone(),
+                        mode: mode.clone().unwrap_or_default(),
                         separator: separator.clone(),
                     });
                 }
@@ -687,6 +732,102 @@ nodes:
         assert!(err.to_string().contains("E230"), "{err}");
     }
 
+    /// A pipeline whose source NODE identity (`header.name`) differs from the
+    /// nested `config.name` — the two come from different YAML keys.
+    fn distinct_name_pipeline() -> PipelineConfig {
+        let yaml = "\
+pipeline:
+  name: patch_test
+nodes:
+  - type: source
+    name: node_ident
+    config:
+      name: cfg_name
+      type: csv
+      path: /tmp/in.csv
+      schema:
+        - { name: amount, type: int }
+  - type: output
+    name: out
+    input: node_ident
+    config:
+      name: out
+      type: csv
+      path: /tmp/out.csv
+";
+        crate::yaml::from_str(yaml).expect("parse distinct-name pipeline")
+    }
+
+    #[test]
+    fn patch_resolves_by_node_header_name() {
+        let mut config = distinct_name_pipeline();
+        // Keyed by node identity (header.name), the same key every channel
+        // block uses.
+        apply(
+            &mut config,
+            "node_ident",
+            patch_from_yaml("schema:\n  amount: { retype: float }\n"),
+        )
+        .unwrap();
+        assert_eq!(columns(&config)[0], ("amount".to_string(), Type::Float));
+    }
+
+    #[test]
+    fn patch_by_config_name_does_not_resolve() {
+        let mut config = distinct_name_pipeline();
+        // The nested `config.name` is NOT the channel identity → unknown source.
+        let err = apply(
+            &mut config,
+            "cfg_name",
+            patch_from_yaml("schema:\n  amount: { retype: float }\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E230"), "{err}");
+    }
+
+    #[test]
+    fn unknown_source_with_composition_gives_hint() {
+        // A pipeline that calls a composition: an unresolved source name gets a
+        // hint about composition-body sources rather than a bare typo error.
+        let yaml = "\
+pipeline:
+  name: patch_test
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: /tmp/in.csv
+      schema:
+        - { name: id, type: string }
+  - type: composition
+    name: comp
+    input: src
+    use: ./thing.comp.yaml
+  - type: output
+    name: out
+    input: comp
+    config:
+      name: out
+      type: csv
+      path: /tmp/out.csv
+";
+        let mut config = crate::yaml::from_str(yaml).expect("parse composition pipeline");
+        let err = apply(
+            &mut config,
+            "inner_src",
+            patch_from_yaml("schema:\n  id: remove\n"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("E230"), "{msg}");
+        assert!(
+            msg.contains("composition"),
+            "expected a composition-body hint: {msg}"
+        );
+    }
+
     /// A JSON source declaring a `record_path` option and one array-path entry.
     fn json_pipeline() -> PipelineConfig {
         let yaml = "\
@@ -756,6 +897,50 @@ nodes:
         let entries = array_paths(&config);
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|(p, _, _)| p == "tags"));
+    }
+
+    #[test]
+    fn array_paths_partial_modify_keeps_omitted_mode() {
+        let mut config = json_pipeline();
+        // Make `items` a join entry...
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("array_paths:\n  items: { mode: join, separator: \";\" }\n"),
+        )
+        .unwrap();
+        // ...then patch only the separator: the mode must stay join, not
+        // silently revert to explode.
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("array_paths:\n  items: { separator: \"|\" }\n"),
+        )
+        .unwrap();
+        let entries = array_paths(&config);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            matches!(entries[0].1, ArrayMode::Join),
+            "mode must remain join, got {:?}",
+            entries[0].1
+        );
+        assert_eq!(entries[0].2.as_deref(), Some("|"));
+    }
+
+    #[test]
+    fn array_paths_new_entry_defaults_mode_explode() {
+        let mut config = json_pipeline();
+        // A new entry with no `mode` defaults to explode.
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("array_paths:\n  tags: { separator: \",\" }\n"),
+        )
+        .unwrap();
+        let entries = array_paths(&config);
+        let tags = entries.iter().find(|(p, _, _)| p == "tags").unwrap();
+        assert!(matches!(tags.1, ArrayMode::Explode));
+        assert_eq!(tags.2.as_deref(), Some(","));
     }
 
     #[test]
