@@ -131,8 +131,8 @@ impl CompiledPlan {
     }
 
     /// Mutable access to the provenance side-table for channel overlay
-    /// application. The overlay applies `ChannelDefault`/`ChannelFixed`
-    /// layers to existing `ResolvedValue` entries.
+    /// application. The overlay applies `ChannelWide`/`ChannelPerTarget`
+    /// layers (optionally `fixed`) to existing `ResolvedValue` entries.
     pub fn provenance_mut(&mut self) -> &mut ProvenanceDb {
         &mut self.provenance
     }
