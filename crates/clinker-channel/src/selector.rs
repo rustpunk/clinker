@@ -319,11 +319,9 @@ fn scalar_label(json: &JsonValue) -> Option<(Type, Value)> {
 }
 
 /// The Unix epoch, used as an inert placeholder timestamp (see
-/// [`inert_stable_context`]). Always a valid instant.
+/// [`inert_stable_context`]). A compile-time constant with no fallible path.
 fn inert_datetime() -> chrono::NaiveDateTime {
-    chrono::DateTime::from_timestamp(0, 0)
-        .expect("Unix epoch is a valid timestamp")
-        .naive_utc()
+    chrono::DateTime::<chrono::Utc>::UNIX_EPOCH.naive_utc()
 }
 
 /// A windowless [`RecordStorage`]. Selectors never reference `$window`
