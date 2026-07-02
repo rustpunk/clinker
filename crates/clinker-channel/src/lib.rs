@@ -51,6 +51,7 @@
 //! recompilation is skipped when the channel content has not changed.
 
 pub mod binding;
+pub mod derivation;
 pub mod discovery;
 pub mod error;
 pub mod group;
@@ -61,6 +62,10 @@ pub mod staging_copy;
 
 // Explicit re-exports at crate root.
 pub use binding::{ChannelBinding, ChannelTarget, DottedPath, validate_channel_bindings};
+pub use derivation::{
+    GroupDerivation, GroupSelection, SelectionOutcome, apply_group_config, derive_groups,
+    group_layer,
+};
 pub use discovery::{
     DiscoveredChannel, OverlayKind, ResolvedOverlay, channel_folder_path, resolve_channel_overlay,
     scan_channels, scan_groups,

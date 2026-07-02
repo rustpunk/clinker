@@ -37,7 +37,7 @@ use indexmap::IndexMap;
 
 use clinker_core_types::Span;
 use clinker_core_types::{Diagnostic, LabeledSpan};
-use clinker_plan::config::composition::LayerKind;
+use clinker_plan::config::composition::{LayerKind, ProvenanceDb};
 use clinker_plan::config::pipeline_node::{PipelineNode, VarScope};
 use clinker_plan::config::{
     PipelineConfig, ScopedVarDecl, ScopedVarType, check_scoped_var_default,
@@ -95,7 +95,7 @@ pub fn apply_channel_overlay(
     // for a key present in both, the fixed value wins by replacing in place and
     // setting the lock, matching the historical `fixed > default` precedence.
     apply_config_clobber(
-        plan,
+        plan.provenance_mut(),
         &binding.config_default,
         LayerKind::ChannelPerTarget,
         false,
@@ -103,7 +103,7 @@ pub fn apply_channel_overlay(
         &mut result.diagnostics,
     );
     apply_config_clobber(
-        plan,
+        plan.provenance_mut(),
         &binding.config_fixed,
         LayerKind::ChannelPerTarget,
         true,
@@ -167,7 +167,7 @@ pub fn apply_channel_overlay(
     result
 }
 
-/// Clobber a channel config map onto the plan's provenance as one layer.
+/// Clobber a config map onto a plan's provenance as one layer.
 ///
 /// Each `alias.param` key selects a single `(node, param)` provenance entry and
 /// *replaces* its value at `kind` (clobber, never deep-merge). When `fixed` is
@@ -176,16 +176,19 @@ pub fn apply_channel_overlay(
 /// A key that matches no entry in the compiled plan is a hard error (E113, the
 /// promotion of the former W103 warning): at multi-tenant scale a misspelled
 /// key must fail loudly rather than silently no-op.
-fn apply_config_clobber(
-    plan: &mut CompiledPlan,
+///
+/// Shared by every clobber layer: the channel-wide / channel-per-target layers
+/// applied here, and the group layers applied by the group-derivation path
+/// (see [`crate::derivation`]) — each supplies its own [`LayerKind`], so no
+/// layer needs bespoke resolution logic.
+pub(crate) fn apply_config_clobber(
+    provenance: &mut ProvenanceDb,
     config: &IndexMap<DottedPath, serde_json::Value>,
     kind: LayerKind,
     fixed: bool,
     channel_name: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let provenance = plan.provenance_mut();
-
     for (dotted_path, value) in config {
         let (node_name, param_name) = match dotted_path.segments() {
             (Some(alias), param) => (alias, param),
