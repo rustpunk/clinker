@@ -981,8 +981,6 @@ mod tests {
             precision: None,
             scale: None,
             path: None,
-            drop: None,
-            record: None,
         }
     }
 

@@ -1,5 +1,3 @@
-pub mod resolve;
-
 use std::path::Path;
 
 use clinker_record::schema_def::{
@@ -165,20 +163,6 @@ fn resolve_inherits(
     let mut resolved = Vec::with_capacity(fields.len());
 
     for mut field in fields {
-        // Validate override-only fields are None in base schema context
-        if field.drop == Some(true) {
-            return Err(SchemaError::Validation(format!(
-                "field '{}': 'drop: true' is only allowed in schema_overrides, not in base schema",
-                field.name
-            )));
-        }
-        if field.record.is_some() {
-            return Err(SchemaError::Validation(format!(
-                "field '{}': 'record' is only allowed in schema_overrides, not in base schema",
-                field.name
-            )));
-        }
-
         if let Some(template_name) = field.inherits.take() {
             let defs_map = defs.ok_or_else(|| {
                 SchemaError::Validation(format!(
@@ -510,20 +494,6 @@ fields:
     }
 
     #[test]
-    fn test_schema_drop_in_base_rejected() {
-        let yaml = r#"
-fields:
-  - name: to_drop
-    type: string
-    drop: true
-"#;
-        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
-        let err = resolve_schema(def).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("drop"), "error should mention drop: {msg}");
-    }
-
-    #[test]
     fn test_schema_fields_and_records_both_present_rejected() {
         let yaml = r#"
 fields:
@@ -651,5 +621,44 @@ structure:
         assert_eq!(resolved.record_types.len(), 2);
         assert_eq!(resolved.structure.len(), 1);
         assert_eq!(resolved.structure[0].record, "trailer");
+    }
+
+    #[test]
+    fn test_schema_decimal_type_token_retired() {
+        // `decimal` is no longer a type token: a decimal is a `float` carrying
+        // `precision`/`scale` attributes, never a distinct type. Declaring
+        // `type: decimal` is rejected at parse.
+        let yaml = r#"
+fields:
+  - name: price
+    type: decimal
+"#;
+        let err = crate::yaml::from_str::<SchemaDefinition>(yaml);
+        assert!(
+            err.is_err(),
+            "`type: decimal` must be rejected; a decimal is `float` + precision/scale"
+        );
+    }
+
+    #[test]
+    fn test_schema_decimal_expressed_as_float_with_scale() {
+        // The canonical decimal: a `float` field carrying `precision`/`scale`.
+        // The single format-layer resolver preserves those attributes.
+        let yaml = r#"
+fields:
+  - name: price
+    type: float
+    precision: 10
+    scale: 2
+"#;
+        let def: SchemaDefinition = crate::yaml::from_str(yaml).unwrap();
+        let resolved = resolve_schema(def).unwrap();
+        let price = &resolved.fields[0];
+        assert_eq!(
+            price.field_type,
+            Some(clinker_record::schema_def::FieldType::Float)
+        );
+        assert_eq!(price.precision, Some(10));
+        assert_eq!(price.scale, Some(2));
     }
 }

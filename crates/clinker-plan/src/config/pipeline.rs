@@ -4049,18 +4049,6 @@ pub fn reserved_names_for(scope: pipeline_node::VarScope) -> &'static [&'static 
 /// Post-deserialization validation.
 pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
     for input in config.source_configs() {
-        // Fail-fast: inline schema + schema_overrides is a conflict.
-        // Overrides only apply to externally referenced schemas.
-        if let Some(SchemaSource::Inline(_)) = &input.schema
-            && input.schema_overrides.is_some()
-        {
-            return Err(ConfigError::Validation(format!(
-                "input '{}': cannot use both inline 'schema' and 'schema_overrides' — \
-                     overrides only apply to externally referenced schemas",
-                input.name
-            )));
-        }
-
         // Matcher-exclusivity, gated on transport. A file transport
         // resolves its file set through the discovery layer's
         // `path`/`glob`/`regex`/`paths` matchers, so exactly one must be

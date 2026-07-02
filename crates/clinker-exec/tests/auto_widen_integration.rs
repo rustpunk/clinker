@@ -122,8 +122,6 @@ nodes:
     name: src
     type: csv
     path: in.csv
-    schema_overrides:
-    - { name: salary, type: integer }
     schema:
       - { name: dept, type: string }
       - { name: salary, type: int }

@@ -76,7 +76,7 @@ impl<W: Write> FixedWidthWriter<W> {
 
                 let is_numeric = matches!(
                     f.field_type,
-                    Some(FieldType::Integer) | Some(FieldType::Float) | Some(FieldType::Decimal)
+                    Some(FieldType::Integer) | Some(FieldType::Float)
                 );
 
                 let justify = f.justify.clone().unwrap_or(if is_numeric {
@@ -342,8 +342,6 @@ mod tests {
             precision: None,
             scale: None,
             path: None,
-            drop: None,
-            record: None,
         }
     }
 

@@ -59,8 +59,6 @@ impl From<&BenchFieldSpec> for FieldDef {
             precision: None,
             scale: None,
             path: None,
-            drop: None,
-            record: None,
         }
     }
 }

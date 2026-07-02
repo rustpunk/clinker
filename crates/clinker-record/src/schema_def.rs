@@ -9,7 +9,6 @@ pub enum FieldType {
     String,
     Integer,
     Float,
-    Decimal,
     Boolean,
     Date,
     #[serde(rename = "datetime")]
@@ -45,9 +44,9 @@ pub enum TruncationPolicy {
     Silent,
 }
 
-/// A field definition from a schema file, inline schema, or override.
-/// All fields except `name` are Optional to support both full definitions
-/// and partial overrides (schema_overrides use the same struct).
+/// A field definition from a schema file or inline schema. All fields except
+/// `name` are `Option` so a `defs:` template can be a partial that a
+/// referencing field fills in via `inherits:`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FieldDef {
@@ -70,14 +69,12 @@ pub struct FieldDef {
     pub pad: Option<String>,
     pub trim: Option<bool>,
     pub truncation: Option<TruncationPolicy>,
-    // Decimal
+    // Decimal formatting on a `float` field: there is no distinct `decimal`
+    // type token, so a decimal is a `float` carrying these attributes.
     pub precision: Option<u8>,
     pub scale: Option<u8>,
     // XML
     pub path: Option<String>,
-    // Override-only (validated as None in schema file contexts)
-    pub drop: Option<bool>,
-    pub record: Option<String>,
 }
 
 /// Discriminator for multi-record dispatch.
