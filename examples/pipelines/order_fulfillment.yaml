@@ -1,8 +1,8 @@
 pipeline:
   name: order_fulfillment
   vars:
-    # Per-tenant knobs. Channels override these via `vars.static.*`
-    # (see channels/express-logistics/ and channels/warehouse-west/).
+    # Per-tenant knobs. Channels override these via `vars.static.*`.
+    # See examples/multitenant/ for a full channel/group overlay workspace.
     express_surcharge: { type: float, default: 5.99 }
     high_value_threshold: { type: float, default: 500.0 }
     region: { type: string, default: "central" }

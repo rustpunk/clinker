@@ -1,0 +1,9 @@
+# Per-target overlay: initech's customization of the order_fulfillment
+# pipeline. A minimal channel that overrides a single config field and adds no
+# structural ops.
+
+channel:
+  target: ../../pipeline/order_fulfillment.yaml
+
+config:
+  risk.threshold: 0.7

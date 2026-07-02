@@ -2,7 +2,8 @@ pipeline:
   name: customer_etl
   vars:
     # Lifetime-value cut for the "gold" tier. A channel overrides this per
-    # tenant via `vars.static.gold_threshold` (see channels/acme-corp/).
+    # tenant via `vars.static.gold_threshold`. See examples/multitenant/ for a
+    # full channel/group overlay workspace.
     gold_threshold: { type: int, default: 10000 }
 
 nodes:

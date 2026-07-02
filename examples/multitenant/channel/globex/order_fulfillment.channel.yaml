@@ -1,0 +1,21 @@
+# Per-target overlay: globex's customization of the order_fulfillment pipeline.
+# This is the highest-precedence layer, so its values win the 4-layer clobber
+# (pipeline-default < group < channel-wide < channel-per-target).
+#
+#   - `channel.target:` is authoritative; the `.channel.yaml` filename suffix is
+#     optional documentation.
+#   - `config:` raises `risk.threshold` to 0.95 (over the channel-wide 0.9).
+#   - `overrides:` structurally patches the `orders` source schema, declaring a
+#     `channel_note` column globex ships in its extract.
+
+channel:
+  target: ../../pipeline/order_fulfillment.yaml
+
+config:
+  risk.threshold: 0.95
+
+overrides:
+  - op: patch_schema
+    target: orders
+    schema:
+      channel_note: { add: { type: string } }

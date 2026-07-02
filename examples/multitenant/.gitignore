@@ -1,0 +1,3 @@
+# Generated run output (the output/ directory is kept via .gitkeep).
+output/*
+!output/.gitkeep
