@@ -9,6 +9,10 @@ description = "Channel binding, validation, and overlay merge for Clinker"
 clinker-plan = { workspace = true }
 clinker-core-types = { workspace = true }
 clinker-record = { workspace = true }
+# Channel-label selectors compile a group's `match:` string as a bare CXL
+# boolean and evaluate it against a channel's labels, reusing the CXL
+# parser/resolver/typechecker/evaluator rather than a bespoke mini-DSL.
+cxl = { workspace = true }
 serde-saphyr = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
