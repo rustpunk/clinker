@@ -88,7 +88,7 @@ impl Group {
         })?;
         let raw: RawGroupFile =
             clinker_plan::yaml::from_str(text).map_err(|e| ChannelError::Yaml {
-                path: source_path.clone(),
+                path: source_path,
                 source: Box::new(e.0),
             })?;
 
