@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod error;
+pub mod overlay_ops;
 pub mod plan;
 pub mod runtime_error;
 pub mod schema;
@@ -22,6 +23,10 @@ pub use config::{
     scan_workspace_signatures, validate_signatures,
 };
 pub use error::PipelineError;
+pub use overlay_ops::{
+    AddOp, LayeredOp, OverlayLayer, OverlayOp, OverlayOpError, RemoveOp, ReplaceOp,
+    apply_overlay_ops,
+};
 pub use plan::{
     BoundBody, ColumnLookup, CompositionBodyId, QualifiedField, Row, RowTail, TailVarId,
 };

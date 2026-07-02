@@ -892,6 +892,57 @@ impl PipelineNode {
             PipelineNode::Composition { .. } => "composition",
         }
     }
+
+    /// The single upstream input reference for the single-input consumer
+    /// variants (`Transform`, `Aggregate`, `Route`, `Output`, `Reshape`,
+    /// `Cull`, `Composition`). Returns `None` for `Source` (no input) and for
+    /// the multi-input / multi-port variants (`Merge`, `Combine`, `Envelope`),
+    /// whose wiring the caller must walk explicitly through their own input
+    /// collections.
+    ///
+    /// This is the read counterpart to [`PipelineNode::set_primary_input`];
+    /// the overlay op engine uses the pair to splice a stage into a linear
+    /// edge without disturbing the input's original span.
+    pub fn primary_input(&self) -> Option<&crate::config::node_header::NodeInput> {
+        match self {
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::Reshape { header, .. }
+            | PipelineNode::Cull { header, .. }
+            | PipelineNode::Composition { header, .. } => Some(&header.input.value),
+            PipelineNode::Source { .. }
+            | PipelineNode::Merge { .. }
+            | PipelineNode::Combine { .. }
+            | PipelineNode::Envelope { .. } => None,
+        }
+    }
+
+    /// Repoint the single upstream input of a single-input consumer variant,
+    /// preserving the field's existing span. Returns `true` when the input was
+    /// set; returns `false` (leaving the node unchanged) for variants without
+    /// exactly one primary input — `Source`, `Merge`, `Combine`, and
+    /// `Envelope` — whose wiring must be edited through their own multi-input
+    /// collections instead.
+    pub fn set_primary_input(&mut self, input: crate::config::node_header::NodeInput) -> bool {
+        match self {
+            PipelineNode::Transform { header, .. }
+            | PipelineNode::Aggregate { header, .. }
+            | PipelineNode::Route { header, .. }
+            | PipelineNode::Output { header, .. }
+            | PipelineNode::Reshape { header, .. }
+            | PipelineNode::Cull { header, .. }
+            | PipelineNode::Composition { header, .. } => {
+                header.input.value = input;
+                true
+            }
+            PipelineNode::Source { .. }
+            | PipelineNode::Merge { .. }
+            | PipelineNode::Combine { .. }
+            | PipelineNode::Envelope { .. } => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
