@@ -282,7 +282,13 @@ fn unknown_column(src: &str, col: &str, op: &str) -> ConfigError {
     ))
 }
 
-fn apply_schema_ops(
+/// Apply column-keyed schema ops to a source's declared schema in place.
+///
+/// Shared by the channel source-config patch pass ([`apply_source_patches`])
+/// and the overlay op engine's `patch_schema` op, so both surfaces resolve the
+/// keyed-map grammar (`add` / `rename` / `retype` / `remove`) and its E231–E233
+/// diagnostics identically. `src` names the source for the diagnostic text.
+pub(crate) fn apply_schema_ops(
     schema: &mut SchemaDecl,
     ops: &IndexMap<String, SchemaColumnOp>,
     src: &str,

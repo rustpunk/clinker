@@ -943,6 +943,43 @@ impl PipelineNode {
             | PipelineNode::Envelope { .. } => false,
         }
     }
+
+    /// Replace the node's primary CXL body source, returning `true` when the
+    /// variant carries one and `false` (leaving the node unchanged) otherwise.
+    ///
+    /// True for the three variants whose body exposes a primary `cxl:` field —
+    /// `Transform`, `Aggregate`, and `Combine` (mirroring
+    /// [`PipelineNode::reads_scope_vars_in_cxl`]). This is the mutation the
+    /// overlay op engine's `set config.cxl` uses to replace a stage's logic
+    /// wholesale; the supplied [`CxlSource`] carries the op's span so a later
+    /// typecheck error anchors to the override, not the base pipeline. Every
+    /// other variant (`Source`, `Route`, `Merge`, `Output`, `Reshape`, `Cull`,
+    /// `Envelope`, `Composition`) has no single primary `cxl:` field and is
+    /// left unchanged.
+    pub fn set_primary_cxl(&mut self, cxl: CxlSource) -> bool {
+        match self {
+            PipelineNode::Transform { config, .. } => {
+                config.cxl = cxl;
+                true
+            }
+            PipelineNode::Aggregate { config, .. } => {
+                config.cxl = cxl;
+                true
+            }
+            PipelineNode::Combine { config, .. } => {
+                config.cxl = cxl;
+                true
+            }
+            PipelineNode::Source { .. }
+            | PipelineNode::Route { .. }
+            | PipelineNode::Merge { .. }
+            | PipelineNode::Output { .. }
+            | PipelineNode::Reshape { .. }
+            | PipelineNode::Cull { .. }
+            | PipelineNode::Envelope { .. }
+            | PipelineNode::Composition { .. } => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
