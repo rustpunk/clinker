@@ -27,10 +27,14 @@
 //!
 //! # Scope
 //!
-//! This module implements the three **structural** ops: [`AddOp`], [`RemoveOp`],
-//! and [`ReplaceOp`]. The value-level ops (`set`, `bypass`, `patch_schema`) are
-//! a deliberate extension seam — see [`OverlayOp`] and the `op`-tag dispatch in
-//! `RawOverlayOp::into_op` for where new variants slot in.
+//! This module implements the structural ops — [`AddOp`], [`RemoveOp`],
+//! [`ReplaceOp`] — plus the field-level ops [`SetOp`] (set a field within a
+//! node by path, including `config.cxl` to replace a stage's logic wholesale),
+//! [`BypassOp`] (sugar for removing and auto-rewiring a 1-in/1-out node), and
+//! [`PatchSchemaOp`] (add / rename / retype / remove columns on a `Source`
+//! node's declared schema via the column-keyed grammar shared with the channel
+//! source-config patch pass). Each `op:` discriminant slots into
+//! `RawOverlayOp::into_op` and [`apply_overlay_ops`].
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -41,9 +45,10 @@ use serde_saphyr::Location;
 
 use clinker_core_types::span::Span;
 
-use crate::config::PipelineNode;
 use crate::config::node_header::{NodeHeader, NodeInput};
-use crate::yaml::Spanned;
+use crate::config::patch::apply_schema_ops;
+use crate::config::{PipelineNode, SchemaColumnOp};
+use crate::yaml::{CxlSource, Spanned};
 
 // ---------------------------------------------------------------------
 // Layer precedence
@@ -85,10 +90,6 @@ pub enum OverlayLayer {
 /// though `OverlayOp` routes through a custom deserializer — that location is
 /// what the engine stamps onto injected/replaced nodes so a later ill-typed-op
 /// diagnostic points at the op, not the base pipeline.
-///
-/// Extension seam: the `set` / `bypass` / `patch_schema` value-ops are not yet
-/// modeled. They slot in as new variants here plus new arms in
-/// `RawOverlayOp::into_op` and [`apply_overlay_ops`].
 #[derive(Debug, Clone)]
 pub enum OverlayOp {
     /// Insert a new node (inline or a composition reference), spliced into the
@@ -100,6 +101,15 @@ pub enum OverlayOp {
     /// Replace a whole node by name, keeping its identity (and thus every
     /// consumer edge) intact.
     Replace(ReplaceOp),
+    /// Set a single field within a named node by path — currently `config.cxl`,
+    /// which replaces a stage's CXL logic wholesale.
+    Set(SetOp),
+    /// Remove a 1-in/1-out node and auto-rewire its sole consumer onto its sole
+    /// upstream — sugar for a `remove` with a single-edge `rewire`.
+    Bypass(BypassOp),
+    /// Add / rename / retype / remove columns on a `Source` node's declared
+    /// schema, keyed by column name.
+    PatchSchema(PatchSchemaOp),
 }
 
 /// The `add` op: splice a new node into the base graph.
@@ -150,6 +160,52 @@ pub struct ReplaceOp {
     pub node: PipelineNode,
 }
 
+/// The `set` op: set a single field within a named node by path.
+///
+/// The uniform-op-model reason "override the whole CXL" is *not* a special
+/// case — CXL is just a node field, so replacing a stage's logic is a
+/// `set <node> config.cxl: <program>`. The currently addressable path is
+/// `config.cxl` (the primary CXL body of a `Transform` / `Aggregate` /
+/// `Combine`); any other path is a hard [`OverlayOpError::UnknownField`] rather
+/// than a silent no-op.
+#[derive(Debug, Clone)]
+pub struct SetOp {
+    /// Name of the node whose field is being set. Must exist.
+    pub target: String,
+    /// Dotted field path within the node — currently only `config.cxl`.
+    pub field: String,
+    /// The new value. For `config.cxl` this must be a CXL source string.
+    pub value: serde_json::Value,
+}
+
+/// The `bypass` op: sugar for removing a 1-in/1-out node and auto-rewiring.
+///
+/// Equivalent to a `remove` whose `rewire` repoints the node's sole consumer
+/// onto the node's sole upstream input. The target must be a single-input
+/// consumer node fed into by exactly one downstream consumer; anything else is
+/// a hard [`OverlayOpError::BypassInvalid`] (a fan-in/fan-out node must use the
+/// explicit `remove` op with a spelled-out `rewire` map).
+#[derive(Debug, Clone)]
+pub struct BypassOp {
+    /// Name of the linear node to bypass. Must exist.
+    pub target: String,
+}
+
+/// The `patch_schema` op: shape a `Source` node's declared columns.
+///
+/// The payload is the column-name-keyed grammar shared with the channel
+/// source-config patch pass (`add` / `rename` / `retype` / `remove`), applied
+/// by the same [`apply_schema_ops`] engine so both surfaces resolve columns and
+/// their E231–E233 diagnostics identically. The target must be a `Source` node.
+#[derive(Debug, Clone)]
+pub struct PatchSchemaOp {
+    /// Name of the `Source` node whose schema is patched. Must exist and be a
+    /// `Source`.
+    pub target: String,
+    /// Column-name-keyed schema ops.
+    pub schema: IndexMap<String, SchemaColumnOp>,
+}
+
 /// An op paired with the layer it came from — the unit [`apply_overlay_ops`]
 /// consumes. The [`Spanned`] wrapper carries the op's source location.
 #[derive(Debug, Clone)]
@@ -171,14 +227,17 @@ impl LayeredOp {
 // Deserialization (strict, op-tag dispatch)
 // ---------------------------------------------------------------------
 
-/// The `op:` discriminant. Only the structural ops are modeled; `op: set`
-/// (etc.) surfaces as a clear "unknown variant" error until the value-ops land.
+/// The `op:` discriminant. An unmodeled tag surfaces as a clear "unknown
+/// variant" error.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum OverlayOpKind {
     Add,
     Remove,
     Replace,
+    Set,
+    Bypass,
+    PatchSchema,
 }
 
 /// Flat, strict wire form. `deny_unknown_fields` rejects typo'd keys; the
@@ -206,6 +265,12 @@ struct RawOverlayOp {
     target: Option<String>,
     #[serde(default)]
     rewire: IndexMap<String, NodeInput>,
+    #[serde(default)]
+    field: Option<String>,
+    #[serde(default)]
+    value: Option<serde_json::Value>,
+    #[serde(default)]
+    schema: IndexMap<String, SchemaColumnOp>,
 }
 
 impl RawOverlayOp {
@@ -221,12 +286,18 @@ impl RawOverlayOp {
             input,
             target,
             rewire,
+            field,
+            value,
+            schema,
         } = self;
 
         match op {
             OverlayOpKind::Add => {
                 reject(target.is_some(), "add", "target")?;
                 reject(!rewire.is_empty(), "add", "rewire")?;
+                reject(field.is_some(), "add", "field")?;
+                reject(value.is_some(), "add", "value")?;
+                reject(!schema.is_empty(), "add", "schema")?;
                 Ok(OverlayOp::Add(AddOp {
                     node,
                     composition,
@@ -245,6 +316,9 @@ impl RawOverlayOp {
                 reject(after.is_some(), "remove", "after")?;
                 reject(before.is_some(), "remove", "before")?;
                 reject(input.is_some(), "remove", "input")?;
+                reject(field.is_some(), "remove", "field")?;
+                reject(value.is_some(), "remove", "value")?;
+                reject(!schema.is_empty(), "remove", "schema")?;
                 let target = target.ok_or("`remove` op requires a `target`")?;
                 Ok(OverlayOp::Remove(RemoveOp { target, rewire }))
             }
@@ -256,9 +330,63 @@ impl RawOverlayOp {
                 reject(before.is_some(), "replace", "before")?;
                 reject(input.is_some(), "replace", "input")?;
                 reject(!rewire.is_empty(), "replace", "rewire")?;
+                reject(field.is_some(), "replace", "field")?;
+                reject(value.is_some(), "replace", "value")?;
+                reject(!schema.is_empty(), "replace", "schema")?;
                 let target = target.ok_or("`replace` op requires a `target`")?;
                 let node = node.ok_or("`replace` op requires a `node`")?;
                 Ok(OverlayOp::Replace(ReplaceOp { target, node }))
+            }
+            OverlayOpKind::Set => {
+                reject(node.is_some(), "set", "node")?;
+                reject(composition.is_some(), "set", "composition")?;
+                reject(alias.is_some(), "set", "alias")?;
+                reject(!config.is_empty(), "set", "config")?;
+                reject(after.is_some(), "set", "after")?;
+                reject(before.is_some(), "set", "before")?;
+                reject(input.is_some(), "set", "input")?;
+                reject(!rewire.is_empty(), "set", "rewire")?;
+                reject(!schema.is_empty(), "set", "schema")?;
+                let target = target.ok_or("`set` op requires a `target`")?;
+                let field = field.ok_or("`set` op requires a `field`")?;
+                let value = value.ok_or("`set` op requires a `value`")?;
+                Ok(OverlayOp::Set(SetOp {
+                    target,
+                    field,
+                    value,
+                }))
+            }
+            OverlayOpKind::Bypass => {
+                reject(node.is_some(), "bypass", "node")?;
+                reject(composition.is_some(), "bypass", "composition")?;
+                reject(alias.is_some(), "bypass", "alias")?;
+                reject(!config.is_empty(), "bypass", "config")?;
+                reject(after.is_some(), "bypass", "after")?;
+                reject(before.is_some(), "bypass", "before")?;
+                reject(input.is_some(), "bypass", "input")?;
+                reject(!rewire.is_empty(), "bypass", "rewire")?;
+                reject(field.is_some(), "bypass", "field")?;
+                reject(value.is_some(), "bypass", "value")?;
+                reject(!schema.is_empty(), "bypass", "schema")?;
+                let target = target.ok_or("`bypass` op requires a `target`")?;
+                Ok(OverlayOp::Bypass(BypassOp { target }))
+            }
+            OverlayOpKind::PatchSchema => {
+                reject(node.is_some(), "patch_schema", "node")?;
+                reject(composition.is_some(), "patch_schema", "composition")?;
+                reject(alias.is_some(), "patch_schema", "alias")?;
+                reject(!config.is_empty(), "patch_schema", "config")?;
+                reject(after.is_some(), "patch_schema", "after")?;
+                reject(before.is_some(), "patch_schema", "before")?;
+                reject(input.is_some(), "patch_schema", "input")?;
+                reject(!rewire.is_empty(), "patch_schema", "rewire")?;
+                reject(field.is_some(), "patch_schema", "field")?;
+                reject(value.is_some(), "patch_schema", "value")?;
+                let target = target.ok_or("`patch_schema` op requires a `target`")?;
+                if schema.is_empty() {
+                    return Err("`patch_schema` op requires a non-empty `schema`".to_string());
+                }
+                Ok(OverlayOp::PatchSchema(PatchSchemaOp { target, schema }))
             }
         }
     }
@@ -332,6 +460,28 @@ pub enum OverlayOpError {
         context: String,
         span: Span,
     },
+    /// A `set` op named a field path the target node does not expose.
+    UnknownField {
+        target: String,
+        field: String,
+        span: Span,
+    },
+    /// A `patch_schema` op targeted a node that is not a `Source`.
+    NotSource {
+        target: String,
+        actual: &'static str,
+        span: Span,
+    },
+    /// A `patch_schema` column op failed. `message` carries the reused
+    /// column-op diagnostic (E231–E233) from the shared schema-op engine.
+    PatchSchema { message: String, span: Span },
+    /// A `bypass` target is not a 1-in/1-out linear node. `reason` states which
+    /// precondition failed (no single upstream, or not exactly one consumer).
+    BypassInvalid {
+        target: String,
+        reason: String,
+        span: Span,
+    },
 }
 
 impl OverlayOpError {
@@ -344,7 +494,11 @@ impl OverlayOpError {
             | OverlayOpError::UndeclaredReference { span, .. }
             | OverlayOpError::DanglingReference { span, .. }
             | OverlayOpError::ReplaceNameMismatch { span, .. }
-            | OverlayOpError::NotSingleInput { span, .. } => *span,
+            | OverlayOpError::NotSingleInput { span, .. }
+            | OverlayOpError::UnknownField { span, .. }
+            | OverlayOpError::NotSource { span, .. }
+            | OverlayOpError::PatchSchema { span, .. }
+            | OverlayOpError::BypassInvalid { span, .. } => *span,
         }
     }
 }
@@ -412,6 +566,38 @@ impl std::fmt::Display for OverlayOpError {
                  not{}",
                 at(*span)
             ),
+            OverlayOpError::UnknownField {
+                target,
+                field,
+                span,
+            } => write!(
+                f,
+                "`set` op targets field {field:?} on node {target:?}, which does not \
+                 expose it (currently only `config.cxl` is settable){}",
+                at(*span)
+            ),
+            OverlayOpError::NotSource {
+                target,
+                actual,
+                span,
+            } => write!(
+                f,
+                "`patch_schema` op targets node {target:?}, which is a {actual} node, \
+                 not a source{}",
+                at(*span)
+            ),
+            OverlayOpError::PatchSchema { message, span } => {
+                write!(f, "`patch_schema` op failed: {message}{}", at(*span))
+            }
+            OverlayOpError::BypassInvalid {
+                target,
+                reason,
+                span,
+            } => write!(
+                f,
+                "`bypass` op cannot bypass node {target:?}: {reason}{}",
+                at(*span)
+            ),
         }
     }
 }
@@ -446,6 +632,9 @@ pub fn apply_overlay_ops(
             OverlayOp::Add(add) => apply_add(&mut nodes, add, loc, span)?,
             OverlayOp::Remove(remove) => apply_remove(&mut nodes, remove, span)?,
             OverlayOp::Replace(replace) => apply_replace(&mut nodes, replace, loc, span)?,
+            OverlayOp::Set(set) => apply_set(&mut nodes, set, loc, span)?,
+            OverlayOp::Bypass(bypass) => apply_bypass(&mut nodes, bypass, span)?,
+            OverlayOp::PatchSchema(patch) => apply_patch_schema(&mut nodes, patch, span)?,
         }
     }
 
@@ -761,6 +950,161 @@ fn apply_replace(
     validate_node_inputs(nodes, &replace.target, span)
 }
 
+/// The only currently-settable `set` field path.
+const SET_CXL_FIELD: &str = "config.cxl";
+
+fn apply_set(
+    nodes: &mut [Spanned<PipelineNode>],
+    set: SetOp,
+    loc: Location,
+    span: Span,
+) -> Result<(), OverlayOpError> {
+    let idx = index_of(nodes, &set.target).ok_or_else(|| OverlayOpError::MissingTarget {
+        op: "set",
+        target: set.target.clone(),
+        span,
+    })?;
+
+    if set.field != SET_CXL_FIELD {
+        return Err(OverlayOpError::UnknownField {
+            target: set.target,
+            field: set.field,
+            span,
+        });
+    }
+
+    // `config.cxl` replaces the stage's CXL logic wholesale. The value must be
+    // a CXL source string; the new `CxlSource` carries the op location so a
+    // later typecheck error anchors to the override, not the base pipeline.
+    let source = set
+        .value
+        .as_str()
+        .ok_or_else(|| OverlayOpError::Malformed {
+            message: format!(
+                "`set` of `config.cxl` on node {:?} requires a string value",
+                set.target
+            ),
+            span,
+        })?;
+
+    if !nodes[idx]
+        .value
+        .set_primary_cxl(CxlSource::new(source.to_string(), loc.span()))
+    {
+        // The field path is valid but this node kind has no primary `cxl:`
+        // body (e.g. a `Source` or `Route`) — a missing field path, not a
+        // silent no-op.
+        return Err(OverlayOpError::UnknownField {
+            target: set.target,
+            field: set.field,
+            span,
+        });
+    }
+
+    Ok(())
+}
+
+fn apply_bypass(
+    nodes: &mut Vec<Spanned<PipelineNode>>,
+    bypass: BypassOp,
+    span: Span,
+) -> Result<(), OverlayOpError> {
+    let idx = index_of(nodes, &bypass.target).ok_or_else(|| OverlayOpError::MissingTarget {
+        op: "bypass",
+        target: bypass.target.clone(),
+        span,
+    })?;
+
+    // 1-in: the node must have exactly one upstream input to hand its consumer.
+    let upstream =
+        nodes[idx]
+            .value
+            .primary_input()
+            .cloned()
+            .ok_or_else(|| OverlayOpError::BypassInvalid {
+                target: bypass.target.clone(),
+                reason: "it has no single upstream input (bypass rewires a 1-in/1-out linear node)"
+                    .to_string(),
+                span,
+            })?;
+
+    // 1-out: exactly one downstream node may consume the target, or the
+    // auto-rewire is ambiguous — spell it out with `remove` + `rewire` instead.
+    let consumers: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(i, node)| {
+            *i != idx
+                && node
+                    .value
+                    .direct_input_names()
+                    .iter()
+                    .any(|r| *r == bypass.target)
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if consumers.len() != 1 {
+        return Err(OverlayOpError::BypassInvalid {
+            target: bypass.target.clone(),
+            reason: format!(
+                "it feeds {} consumers (bypass rewires exactly one; use `remove` with an \
+                 explicit `rewire` for a fan-out)",
+                consumers.len()
+            ),
+            span,
+        });
+    }
+    let consumer_idx = consumers[0];
+
+    // Repoint the sole consumer onto the target's former upstream, then drop
+    // the target. A consumer without a single primary input (a `Merge` /
+    // `Combine` fan-in) cannot be auto-rewired and must use `remove`.
+    if !nodes[consumer_idx].value.set_primary_input(upstream) {
+        let consumer = nodes[consumer_idx].value.name().to_string();
+        return Err(OverlayOpError::BypassInvalid {
+            target: bypass.target,
+            reason: format!(
+                "its consumer {consumer:?} has no single input to rewire; use `remove` with an \
+                 explicit `rewire`"
+            ),
+            span,
+        });
+    }
+
+    nodes.remove(idx);
+    Ok(())
+}
+
+fn apply_patch_schema(
+    nodes: &mut [Spanned<PipelineNode>],
+    patch: PatchSchemaOp,
+    span: Span,
+) -> Result<(), OverlayOpError> {
+    let idx = index_of(nodes, &patch.target).ok_or_else(|| OverlayOpError::MissingTarget {
+        op: "patch_schema",
+        target: patch.target.clone(),
+        span,
+    })?;
+
+    match &mut nodes[idx].value {
+        PipelineNode::Source { config, .. } => {
+            // Reuse the shared column-op engine so the op surface and the
+            // channel source-config patch surface resolve columns identically.
+            apply_schema_ops(&mut config.schema, &patch.schema, &patch.target).map_err(|e| {
+                OverlayOpError::PatchSchema {
+                    message: e.to_string(),
+                    span,
+                }
+            })
+        }
+        other => Err(OverlayOpError::NotSource {
+            target: patch.target.clone(),
+            actual: other.type_tag(),
+            span,
+        }),
+    }
+}
+
 /// Repoint every plain `Single(from)` input reference on `node` to
 /// `Single(to)`, across all of the variant's input positions.
 ///
@@ -844,6 +1188,7 @@ fn parse_rewire_key(key: &str) -> Option<(&str, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cxl::typecheck::Type;
 
     // ---- fixtures ----------------------------------------------------
 
@@ -1561,17 +1906,17 @@ after: y
 
     #[test]
     fn deserialize_rejects_unmodeled_op_kind() {
-        // `set` / `bypass` / `patch_schema` are the extension seam — until they
-        // land, they surface as a clear unknown-variant error.
+        // An `op:` tag outside the modeled vocabulary surfaces as a clear
+        // unknown-variant error.
         let err = crate::yaml::from_str::<Spanned<OverlayOp>>(
             r#"
-op: set
+op: frobnicate
 target: x
 "#,
         )
         .expect_err("unmodeled op");
         assert!(
-            err.to_string().contains("set") || err.to_string().contains("variant"),
+            err.to_string().contains("frobnicate") || err.to_string().contains("variant"),
             "error should flag the unknown op kind: {err}"
         );
     }
@@ -1582,5 +1927,549 @@ target: x
         let op = parse_op("op: add\nafter: normalize\n");
         let err = apply_overlay_ops(linear_base(), one(op)).expect_err("empty add");
         assert!(matches!(err, OverlayOpError::Malformed { .. }));
+    }
+
+    // ---- set: config.cxl ---------------------------------------------
+
+    /// The CXL body source of a named transform in the current graph.
+    fn transform_cxl(nodes: &[Spanned<PipelineNode>], name: &str) -> String {
+        match &nodes.iter().find(|n| n.value.name() == name).unwrap().value {
+            PipelineNode::Transform { config, .. } => config.cxl.source.clone(),
+            other => panic!("expected transform, got {}", other.type_tag()),
+        }
+    }
+
+    /// A three-node linear pipeline whose middle stage is an aggregate:
+    /// `orders -> totals -> sink`.
+    fn aggregate_base() -> Vec<Spanned<PipelineNode>> {
+        parse_nodes(
+            r#"
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: amount, type: int }
+  - type: aggregate
+    name: totals
+    input: orders
+    config:
+      group_by: [order_id]
+      cxl: "emit order_id = order_id"
+  - type: transform
+    name: sink
+    input: totals
+    config:
+      cxl: "emit order_id = order_id"
+"#,
+        )
+    }
+
+    #[test]
+    fn set_config_cxl_replaces_transform_logic() {
+        let base = linear_base();
+        let op = parse_op(
+            r#"
+op: set
+target: normalize
+field: config.cxl
+value: "emit order_id = upper(order_id)"
+"#,
+        );
+        let out = apply_overlay_ops(base, one(op)).expect("apply");
+        // Node identity, position, and wiring are untouched...
+        assert_eq!(names(&out), vec!["orders", "normalize", "sink"]);
+        assert_eq!(out[2].value.direct_input_names(), vec!["normalize"]);
+        // ...only the CXL logic changed.
+        assert_eq!(
+            transform_cxl(&out, "normalize"),
+            "emit order_id = upper(order_id)"
+        );
+    }
+
+    #[test]
+    fn set_config_cxl_replaces_aggregate_logic() {
+        // `config.cxl` is a uniform field op: it addresses the primary CXL body
+        // of any variant that has one, not only a transform.
+        let base = aggregate_base();
+        let op = parse_op(
+            r#"
+op: set
+target: totals
+field: config.cxl
+value: "emit order_id = order_id, total = sum(amount)"
+"#,
+        );
+        let out = apply_overlay_ops(base, one(op)).expect("apply");
+        match &out
+            .iter()
+            .find(|n| n.value.name() == "totals")
+            .unwrap()
+            .value
+        {
+            PipelineNode::Aggregate { config, .. } => {
+                assert_eq!(
+                    config.cxl.source,
+                    "emit order_id = order_id, total = sum(amount)"
+                );
+            }
+            other => panic!("expected aggregate, got {}", other.type_tag()),
+        }
+    }
+
+    #[test]
+    fn set_new_cxl_carries_op_span() {
+        // The replaced `CxlSource` takes the op's location, so a later CXL
+        // typecheck error anchors to the override rather than the base pipeline.
+        let base = linear_base();
+        let op = parse_op(
+            r#"
+op: set
+target: normalize
+field: config.cxl
+value: "emit order_id = order_id"
+"#,
+        );
+        let op_span = op.referenced.span();
+        assert_ne!(
+            op_span,
+            crate::yaml::Span::UNKNOWN,
+            "op should carry a span"
+        );
+        let out = apply_overlay_ops(base, one(op)).expect("apply");
+        match &out
+            .iter()
+            .find(|n| n.value.name() == "normalize")
+            .unwrap()
+            .value
+        {
+            PipelineNode::Transform { config, .. } => {
+                assert_eq!(
+                    config.cxl.span, op_span,
+                    "replaced CXL span should anchor to the op"
+                );
+            }
+            other => panic!("expected transform, got {}", other.type_tag()),
+        }
+    }
+
+    #[test]
+    fn set_missing_target_errors() {
+        let base = linear_base();
+        let op = parse_op(
+            r#"
+op: set
+target: ghost
+field: config.cxl
+value: "emit x = y"
+"#,
+        );
+        let err = apply_overlay_ops(base, one(op)).expect_err("missing target");
+        assert!(
+            matches!(err, OverlayOpError::MissingTarget { op: "set", ref target, .. } if target == "ghost")
+        );
+    }
+
+    #[test]
+    fn set_unknown_field_path_errors() {
+        // A field path other than the settable ones is a hard error, never a
+        // silent no-op.
+        let base = linear_base();
+        let op = parse_op(
+            r#"
+op: set
+target: normalize
+field: config.batch_size
+value: 512
+"#,
+        );
+        let err = apply_overlay_ops(base, one(op)).expect_err("unknown field");
+        assert!(
+            matches!(err, OverlayOpError::UnknownField { ref field, .. } if field == "config.batch_size")
+        );
+    }
+
+    #[test]
+    fn set_config_cxl_on_node_without_cxl_body_errors() {
+        // `config.cxl` on a `Source` (no primary CXL body) is a missing field
+        // path, not a silent no-op.
+        let base = linear_base();
+        let op = parse_op(
+            r#"
+op: set
+target: orders
+field: config.cxl
+value: "emit x = y"
+"#,
+        );
+        let err = apply_overlay_ops(base, one(op)).expect_err("no cxl body");
+        assert!(
+            matches!(err, OverlayOpError::UnknownField { ref target, ref field, .. }
+                if target == "orders" && field == "config.cxl")
+        );
+    }
+
+    #[test]
+    fn set_config_cxl_non_string_value_errors() {
+        let base = linear_base();
+        let op = parse_op(
+            r#"
+op: set
+target: normalize
+field: config.cxl
+value: 42
+"#,
+        );
+        let err = apply_overlay_ops(base, one(op)).expect_err("non-string value");
+        assert!(matches!(err, OverlayOpError::Malformed { .. }));
+    }
+
+    // ---- bypass ------------------------------------------------------
+
+    #[test]
+    fn bypass_rewires_linear_node() {
+        // orders -> normalize -> sink; bypass normalize => orders -> sink.
+        let base = linear_base();
+        let op = parse_op("op: bypass\ntarget: normalize\n");
+        let out = apply_overlay_ops(base, one(op)).expect("apply");
+        assert_eq!(names(&out), vec!["orders", "sink"]);
+        assert_eq!(out[1].value.direct_input_names(), vec!["orders"]);
+    }
+
+    #[test]
+    fn bypass_matches_equivalent_remove_rewire() {
+        // bypass is exactly sugar for a remove + single-edge rewire.
+        let bypassed = apply_overlay_ops(
+            linear_base(),
+            one(parse_op("op: bypass\ntarget: normalize\n")),
+        )
+        .expect("bypass");
+        let removed = apply_overlay_ops(
+            linear_base(),
+            one(parse_op(
+                "op: remove\ntarget: normalize\nrewire:\n  sink.input: orders\n",
+            )),
+        )
+        .expect("remove");
+        assert_eq!(fingerprint(&bypassed), fingerprint(&removed));
+    }
+
+    #[test]
+    fn bypass_missing_target_errors() {
+        let err = apply_overlay_ops(linear_base(), one(parse_op("op: bypass\ntarget: ghost\n")))
+            .expect_err("missing target");
+        assert!(
+            matches!(err, OverlayOpError::MissingTarget { op: "bypass", ref target, .. } if target == "ghost")
+        );
+    }
+
+    #[test]
+    fn bypass_source_without_input_errors() {
+        // A source has no upstream input to hand its consumer.
+        let err = apply_overlay_ops(linear_base(), one(parse_op("op: bypass\ntarget: orders\n")))
+            .expect_err("no input");
+        assert!(
+            matches!(err, OverlayOpError::BypassInvalid { ref target, .. } if target == "orders")
+        );
+    }
+
+    #[test]
+    fn bypass_terminal_node_without_consumer_errors() {
+        // `sink` is fed by `normalize` but has no consumer to rewire.
+        let err = apply_overlay_ops(linear_base(), one(parse_op("op: bypass\ntarget: sink\n")))
+            .expect_err("no consumer");
+        assert!(
+            matches!(err, OverlayOpError::BypassInvalid { ref target, ref reason, .. }
+                if target == "sink" && reason.contains("0 consumers"))
+        );
+    }
+
+    #[test]
+    fn bypass_fan_out_node_errors() {
+        // `orders` feeds two consumers; auto-rewiring is ambiguous.
+        let base = parse_nodes(
+            r#"
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+  - type: transform
+    name: mid
+    input: orders
+    config:
+      cxl: "emit order_id = order_id"
+  - type: transform
+    name: a
+    input: mid
+    config:
+      cxl: "emit order_id = order_id"
+  - type: transform
+    name: b
+    input: mid
+    config:
+      cxl: "emit order_id = order_id"
+"#,
+        );
+        let err = apply_overlay_ops(base, one(parse_op("op: bypass\ntarget: mid\n")))
+            .expect_err("fan-out");
+        assert!(
+            matches!(err, OverlayOpError::BypassInvalid { ref target, ref reason, .. }
+                if target == "mid" && reason.contains("2 consumers"))
+        );
+    }
+
+    // ---- patch_schema ------------------------------------------------
+
+    /// A source `orders` with three columns feeding a sink.
+    fn schema_base() -> Vec<Spanned<PipelineNode>> {
+        parse_nodes(
+            r#"
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: amount, type: int }
+        - { name: cust_id, type: string }
+        - { name: order_notes, type: string }
+  - type: output
+    name: sink
+    input: orders
+    config:
+      name: sink
+      type: csv
+      path: out.csv
+"#,
+        )
+    }
+
+    /// (name, type) pairs of a named source node's declared columns.
+    fn source_columns(nodes: &[Spanned<PipelineNode>], name: &str) -> Vec<(String, Type)> {
+        match &nodes.iter().find(|n| n.value.name() == name).unwrap().value {
+            PipelineNode::Source { config, .. } => config
+                .schema
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.ty.clone()))
+                .collect(),
+            other => panic!("expected source, got {}", other.type_tag()),
+        }
+    }
+
+    #[test]
+    fn patch_schema_add_drop_retype_reflected() {
+        let base = schema_base();
+        let op = parse_op(
+            r#"
+op: patch_schema
+target: orders
+schema:
+  amount: { retype: float }
+  order_notes: remove
+  region: { add: { type: string } }
+"#,
+        );
+        let out = apply_overlay_ops(base, one(op)).expect("apply");
+        assert_eq!(
+            source_columns(&out, "orders"),
+            vec![
+                ("amount".to_string(), Type::Float),
+                ("cust_id".to_string(), Type::String),
+                ("region".to_string(), Type::String),
+            ]
+        );
+    }
+
+    #[test]
+    fn patch_schema_rename_sets_physical_alias() {
+        let base = schema_base();
+        let op = parse_op(
+            r#"
+op: patch_schema
+target: orders
+schema:
+  cust_id: { rename: customer_id }
+"#,
+        );
+        let out = apply_overlay_ops(base, one(op)).expect("apply");
+        match &out
+            .iter()
+            .find(|n| n.value.name() == "orders")
+            .unwrap()
+            .value
+        {
+            PipelineNode::Source { config, .. } => {
+                let col = config
+                    .schema
+                    .columns
+                    .iter()
+                    .find(|c| c.name == "customer_id")
+                    .expect("renamed column");
+                // Rename is a physical->logical alias: the reader still binds the
+                // original source field.
+                assert_eq!(col.source_name.as_deref(), Some("cust_id"));
+            }
+            other => panic!("expected source, got {}", other.type_tag()),
+        }
+    }
+
+    #[test]
+    fn patch_schema_unknown_column_errors() {
+        // The reused column-op engine reports its E231 diagnostic.
+        let base = schema_base();
+        let op = parse_op(
+            r#"
+op: patch_schema
+target: orders
+schema:
+  nope: { retype: float }
+"#,
+        );
+        let err = apply_overlay_ops(base, one(op)).expect_err("unknown column");
+        assert!(
+            matches!(err, OverlayOpError::PatchSchema { ref message, .. } if message.contains("E231")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn patch_schema_missing_target_errors() {
+        let base = schema_base();
+        let op = parse_op(
+            r#"
+op: patch_schema
+target: ghost
+schema:
+  amount: remove
+"#,
+        );
+        let err = apply_overlay_ops(base, one(op)).expect_err("missing target");
+        assert!(
+            matches!(err, OverlayOpError::MissingTarget { op: "patch_schema", ref target, .. } if target == "ghost")
+        );
+    }
+
+    #[test]
+    fn patch_schema_non_source_target_errors() {
+        // `sink` is an output node, not a source.
+        let base = schema_base();
+        let op = parse_op(
+            r#"
+op: patch_schema
+target: sink
+schema:
+  amount: remove
+"#,
+        );
+        let err = apply_overlay_ops(base, one(op)).expect_err("not a source");
+        assert!(
+            matches!(err, OverlayOpError::NotSource { ref target, actual, .. }
+                if target == "sink" && actual == "output")
+        );
+    }
+
+    // ---- deserialization: new ops ------------------------------------
+
+    #[test]
+    fn deserialize_set_shape() {
+        let op = parse_op(
+            r#"
+op: set
+target: route_priority
+field: config.cxl
+value: "emit _route = fulfilled"
+"#,
+        );
+        match op.value {
+            OverlayOp::Set(set) => {
+                assert_eq!(set.target, "route_priority");
+                assert_eq!(set.field, "config.cxl");
+                assert_eq!(set.value.as_str(), Some("emit _route = fulfilled"));
+            }
+            _ => panic!("expected set"),
+        }
+    }
+
+    #[test]
+    fn deserialize_bypass_shape() {
+        let op = parse_op("op: bypass\ntarget: legacy_audit\n");
+        match op.value {
+            OverlayOp::Bypass(bypass) => assert_eq!(bypass.target, "legacy_audit"),
+            _ => panic!("expected bypass"),
+        }
+    }
+
+    #[test]
+    fn deserialize_patch_schema_shape() {
+        let op = parse_op(
+            r#"
+op: patch_schema
+target: orders
+schema:
+  tax_exempt: { add: { type: bool } }
+  order_notes: remove
+"#,
+        );
+        match op.value {
+            OverlayOp::PatchSchema(patch) => {
+                assert_eq!(patch.target, "orders");
+                assert_eq!(patch.schema.len(), 2);
+                assert!(matches!(
+                    patch.schema.get("order_notes"),
+                    Some(SchemaColumnOp::Remove)
+                ));
+            }
+            _ => panic!("expected patch_schema"),
+        }
+    }
+
+    #[test]
+    fn set_requires_field_and_value() {
+        let err = crate::yaml::from_str::<Spanned<OverlayOp>>("op: set\ntarget: x\n")
+            .expect_err("missing field/value");
+        assert!(
+            err.to_string().contains("field") || err.to_string().contains("value"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn patch_schema_requires_schema() {
+        let err = crate::yaml::from_str::<Spanned<OverlayOp>>("op: patch_schema\ntarget: x\n")
+            .expect_err("missing schema");
+        assert!(err.to_string().contains("schema"), "{err}");
+    }
+
+    #[test]
+    fn deserialize_rejects_cross_variant_field_on_set() {
+        // `node` is not a valid field on a `set` op.
+        let err = crate::yaml::from_str::<Spanned<OverlayOp>>(
+            r#"
+op: set
+target: x
+field: config.cxl
+value: "emit a = b"
+node:
+  type: transform
+  name: x
+  input: y
+  config:
+    cxl: "emit a = b"
+"#,
+        )
+        .expect_err("cross-variant field");
+        assert!(err.to_string().contains("node"), "{err}");
     }
 }

@@ -24,8 +24,8 @@ pub use config::{
 };
 pub use error::PipelineError;
 pub use overlay_ops::{
-    AddOp, LayeredOp, OverlayLayer, OverlayOp, OverlayOpError, RemoveOp, ReplaceOp,
-    apply_overlay_ops,
+    AddOp, BypassOp, LayeredOp, OverlayLayer, OverlayOp, OverlayOpError, PatchSchemaOp, RemoveOp,
+    ReplaceOp, SetOp, apply_overlay_ops,
 };
 pub use plan::{
     BoundBody, ColumnLookup, CompositionBodyId, QualifiedField, Row, RowTail, TailVarId,
