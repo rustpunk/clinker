@@ -18,19 +18,19 @@
 //! - **`channel.name:`** — human-readable channel identifier.
 //! - **`channel.target:`** — path to the target pipeline or composition
 //!   (each channel file declares exactly one target).
-//! - **`config.default:`** — values applied as `ChannelDefault` provenance
-//!   layer. These can be overridden by `ChannelFixed` or `InspectorEdit`.
-//! - **`config.fixed:`** — values applied as `ChannelFixed` provenance layer.
-//!   These win over all other layers and cannot be overridden.
+//! - **`config.default:`** — values applied non-fixed on the channel's overlay
+//!   layer. A later, higher-precedence layer may override them.
+//! - **`config.fixed:`** — values applied with the `fixed` lock set on the same
+//!   layer. A fixed value cannot be overridden by any higher-precedence layer.
 //!
 //! ## `fixed` vs `default` distinction
 //!
-//! `ChannelFixed` is the highest-priority override — it represents a
-//! hard-pinned value that the channel author does not want changed.
-//! `ChannelDefault` provides a fallback that can still be overridden by
-//! higher-priority layers. The provenance chain is bounded at 4 layers,
-//! applied in strict precedence order (later layers win):
-//! `CompositionDefault → ChannelDefault → ChannelFixed → InspectorEdit`.
+//! `fixed` is not a separate layer — it is a lock flag on the value. A fixed
+//! value is hard-pinned: no higher-precedence layer may change it. A default
+//! value is a fallback that a higher layer may still override. Config resolves
+//! through a fixed *semantic* layer order (never lexical or positional); higher
+//! layers win unless a lower one is `fixed`:
+//! `PipelineDefault < Group(s) by priority < ChannelWide < ChannelPerTarget`.
 //!
 //! ## Sealed composition internals
 //!

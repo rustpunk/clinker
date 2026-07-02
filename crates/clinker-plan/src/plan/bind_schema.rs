@@ -3268,8 +3268,8 @@ fn validate_resources(
 /// - The call-site override if present, or
 /// - The signature's default if present.
 ///
-/// All values at this stage are tagged as [`LayerKind::CompositionDefault`]
-/// since channel-level resolution is not yet wired.
+/// All values at this stage are tagged as [`LayerKind::PipelineDefault`]
+/// since channel/group-level resolution is layered on afterwards.
 fn populate_config_provenance(
     call_site: &IndexMap<String, serde_json::Value>,
     signature: &CompositionSignature,
@@ -3300,7 +3300,7 @@ fn populate_config_provenance(
         provenance.insert(
             node_name.to_owned(),
             param_name.clone(),
-            ResolvedValue::new(resolved_value, LayerKind::CompositionDefault, value_span),
+            ResolvedValue::new(resolved_value, LayerKind::PipelineDefault, value_span),
         );
     }
 }

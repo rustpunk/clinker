@@ -23,7 +23,7 @@ fn fixture_root() -> PathBuf {
 fn test_explain_field_provenance_shows_winning_layer() {
     // The nested_composition_pipeline.yaml has composition node
     // "nested_process" with config param "strict_mode" (default: false,
-    // call-site: false). Provenance should show CompositionDefault as winner.
+    // call-site: false). Provenance should show PipelineDefault as winner.
     let fixture_dir = fixture_root();
     let pipeline_path = fixture_dir.join("pipelines/nested_composition_pipeline.yaml");
     let output = Command::new(clinker_bin())
@@ -52,8 +52,8 @@ fn test_explain_field_provenance_shows_winning_layer() {
 
     // Must show the winning layer kind
     assert!(
-        stdout.contains("CompositionDefault"),
-        "output must show CompositionDefault layer.\nstdout: {stdout}"
+        stdout.contains("PipelineDefault"),
+        "output must show PipelineDefault layer.\nstdout: {stdout}"
     );
 
     // Must show the field path header
