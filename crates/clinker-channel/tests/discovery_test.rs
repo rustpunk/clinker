@@ -1,4 +1,4 @@
-//! Channel/group discovery + computed-path overlay resolution (CH-4).
+//! Channel/group discovery + computed-path overlay resolution.
 
 use std::fs;
 use std::path::{Path, PathBuf};

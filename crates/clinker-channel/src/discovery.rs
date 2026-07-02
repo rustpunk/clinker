@@ -16,9 +16,10 @@
 //!   walk pattern of `scan_workspace_signatures` in clinker-plan, with a
 //!   budget sized for the lint use case rather than the run path.
 //!
-//! Roots and the directory-sharding scheme come from CH-1's
-//! [`ChannelLayout`]/[`GroupLayout`] (`clinker.toml`). A relative root is
-//! resolved against the workspace root here (the layout stores it verbatim).
+//! Roots and the directory-sharding scheme come from the
+//! [`ChannelLayout`]/[`GroupLayout`] sections of `clinker.toml`. A relative
+//! root is resolved against the workspace root here (the layout stores it
+//! verbatim).
 //!
 //! ## Overlay candidate filenames and ambiguity
 //!
