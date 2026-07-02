@@ -36,7 +36,7 @@
 //! source-config patch pass). Each `op:` discriminant slots into
 //! `RawOverlayOp::into_op` and [`apply_overlay_ops`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use indexmap::IndexMap;
@@ -608,6 +608,16 @@ impl std::error::Error for OverlayOpError {}
 // Engine
 // ---------------------------------------------------------------------
 
+/// Declared input port names for each composition an `add composition` op may
+/// splice in, keyed by the op's raw `composition:` path (exactly as the op
+/// carries it). The overlay driver builds this by scanning workspace
+/// composition signatures before applying ops, so an injected composition's
+/// `inputs:` port map can be populated the same way a hand-authored call
+/// site's is. A path absent from the map — or one whose composition declares
+/// zero or more than one input port — leaves the injected node's `inputs:`
+/// empty, deferring the real port diagnostic to `bind_schema`.
+pub type CompositionInputPorts = HashMap<PathBuf, Vec<String>>;
+
 /// Apply a stream of layered overlay ops to a base node list, returning the
 /// transformed list.
 ///
@@ -616,9 +626,28 @@ impl std::error::Error for OverlayOpError {}
 /// order the caller concatenated the ops in. Every op must resolve against a
 /// live node — a missing splice anchor, remove/replace target, or dangling
 /// reference is a hard [`OverlayOpError`], never a silent no-op.
+///
+/// Injected compositions get empty `inputs:` port maps; use
+/// [`apply_overlay_ops_with_ports`] to bind each splice anchor to the
+/// composition's declared input port.
 pub fn apply_overlay_ops(
+    nodes: Vec<Spanned<PipelineNode>>,
+    ops: Vec<LayeredOp>,
+) -> Result<Vec<Spanned<PipelineNode>>, OverlayOpError> {
+    apply_overlay_ops_with_ports(nodes, ops, &CompositionInputPorts::new())
+}
+
+/// [`apply_overlay_ops`] with composition input-port bindings.
+///
+/// For each `add composition` op whose `composition:` path resolves in `ports`
+/// to a single declared input port, the injected node's `inputs:` map binds
+/// that port to the splice anchor — the same call-site binding a hand-authored
+/// composition node carries — so the injected node is fed by the top-level edge
+/// wiring instead of being left a dead, unfed node.
+pub fn apply_overlay_ops_with_ports(
     mut nodes: Vec<Spanned<PipelineNode>>,
     mut ops: Vec<LayeredOp>,
+    ports: &CompositionInputPorts,
 ) -> Result<Vec<Spanned<PipelineNode>>, OverlayOpError> {
     // Stable sort by layer: cross-layer order follows fixed semantic
     // precedence, while ops sharing a layer keep the caller's declaration
@@ -629,7 +658,7 @@ pub fn apply_overlay_ops(
         let loc = layered.op.referenced;
         let span = span_from_loc(loc);
         match layered.op.value {
-            OverlayOp::Add(add) => apply_add(&mut nodes, add, loc, span)?,
+            OverlayOp::Add(add) => apply_add(&mut nodes, add, ports, loc, span)?,
             OverlayOp::Remove(remove) => apply_remove(&mut nodes, remove, span)?,
             OverlayOp::Replace(replace) => apply_replace(&mut nodes, replace, loc, span)?,
             OverlayOp::Set(set) => apply_set(&mut nodes, set, loc, span)?,
@@ -729,6 +758,7 @@ impl AddOp {
     fn build_node(
         &self,
         input: Option<NodeInput>,
+        ports: &CompositionInputPorts,
         loc: Location,
         span: Span,
     ) -> Result<PipelineNode, OverlayOpError> {
@@ -757,11 +787,21 @@ impl AddOp {
                     message: "a `composition` add requires an `alias`".to_string(),
                     span,
                 })?;
+                // Bind the splice anchor to the composition's sole declared
+                // input port. A composition with zero or several input ports
+                // can't be fed by a single splice anchor, so `inputs:` stays
+                // empty and `bind_schema` reports any unbound required port
+                // (E104) against the op's span.
+                let input_port = match ports.get(path.as_path()).map(Vec::as_slice) {
+                    Some([only]) => Some(only.clone()),
+                    _ => None,
+                };
                 Ok(build_composition_node(
                     alias,
                     path.clone(),
                     self.config.clone(),
                     input,
+                    input_port,
                     loc,
                 ))
             }
@@ -780,8 +820,20 @@ fn build_composition_node(
     use_path: PathBuf,
     config: IndexMap<String, serde_json::Value>,
     input: NodeInput,
+    input_port: Option<String>,
     loc: Location,
 ) -> PipelineNode {
+    // A composition consumes through its named-port `inputs:` map — the
+    // authoritative call-site binding the top-level edge wiring reads to feed
+    // it. `header.input` is the YAML-shape obligation the shared `NodeHeader`
+    // carries and drives consumer rewiring, but it produces no incoming edge on
+    // its own. Binding the sole input port to the splice anchor here is what
+    // makes the injected node wire up like a hand-authored call site instead of
+    // sitting dead with no producer.
+    let mut inputs = IndexMap::new();
+    if let Some(port) = input_port {
+        inputs.insert(port, node_input_ref(&input));
+    }
     PipelineNode::Composition {
         header: NodeHeader {
             name: alias.clone(),
@@ -791,7 +843,7 @@ fn build_composition_node(
         },
         r#use: use_path,
         alias: Some(alias),
-        inputs: IndexMap::new(),
+        inputs,
         outputs: IndexMap::new(),
         config,
         resources: IndexMap::new(),
@@ -799,9 +851,20 @@ fn build_composition_node(
     }
 }
 
+/// Render a [`NodeInput`] as the plain upstream-reference string a composition
+/// `inputs:` map stores: `Single("x")` → `"x"`, `Port { node, port }` →
+/// `"node.port"` (the same shape the top-level edge wiring strips a port from).
+fn node_input_ref(input: &NodeInput) -> String {
+    match input {
+        NodeInput::Single(name) => name.clone(),
+        NodeInput::Port { node, port } => format!("{node}.{port}"),
+    }
+}
+
 fn apply_add(
     nodes: &mut Vec<Spanned<PipelineNode>>,
     add: AddOp,
+    ports: &CompositionInputPorts,
     loc: Location,
     span: Span,
 ) -> Result<(), OverlayOpError> {
@@ -825,7 +888,7 @@ fn apply_add(
             for node in nodes.iter_mut() {
                 reroute_single_ref(&mut node.value, &anchor, &name);
             }
-            let node = add.build_node(Some(NodeInput::Single(anchor)), loc, span)?;
+            let node = add.build_node(Some(NodeInput::Single(anchor)), ports, loc, span)?;
             nodes.insert(anchor_idx + 1, Spanned::new(node, loc, loc));
         }
         Splice::Before(anchor) => {
@@ -845,18 +908,25 @@ fn apply_add(
                     context: "a `before` splice".to_string(),
                     span,
                 })?;
+            let former_upstream = node_input_ref(&anchor_input);
             nodes[anchor_idx]
                 .value
                 .set_primary_input(NodeInput::Single(name.clone()));
-            let node = add.build_node(Some(anchor_input), loc, span)?;
+            // For a composition anchor, `set_primary_input` moves only
+            // `header.input`; the real edge lives in its `inputs:` map, so
+            // repoint the port bound to the former upstream onto the new node
+            // too — otherwise the anchor keeps reading its old upstream and the
+            // injected node is bypassed.
+            reroute_composition_inputs(&mut nodes[anchor_idx].value, &former_upstream, &name);
+            let node = add.build_node(Some(anchor_input), ports, loc, span)?;
             nodes.insert(anchor_idx, Spanned::new(node, loc, loc));
         }
         Splice::ExplicitInput(input) => {
-            let node = add.build_node(Some(input), loc, span)?;
+            let node = add.build_node(Some(input), ports, loc, span)?;
             nodes.push(Spanned::new(node, loc, loc));
         }
         Splice::NodeDeclared => {
-            let node = add.build_node(None, loc, span)?;
+            let node = add.build_node(None, ports, loc, span)?;
             nodes.push(Spanned::new(node, loc, loc));
         }
     }
@@ -1120,6 +1190,12 @@ fn reroute_single_ref(node: &mut PipelineNode, from: &str, to: &str) {
         }
     }
 
+    // A composition consumes through its named-port `inputs:` map, not
+    // `header.input` (which produces no incoming edge), so its real upstream
+    // edge follows this repoint, not the `header.input` repoint below. Run it
+    // first so the borrow ends before the `match` re-borrows `node`.
+    reroute_composition_inputs(node, from, to);
+
     match node {
         PipelineNode::Source { .. } => {}
         PipelineNode::Transform { header, .. }
@@ -1146,6 +1222,26 @@ fn reroute_single_ref(node: &mut PipelineNode, from: &str, to: &str) {
             }
             if let Some(t) = header.trailer.as_mut() {
                 repoint(&mut t.value, from, to);
+            }
+        }
+    }
+}
+
+/// Repoint a composition's named-port `inputs:` map: any port bound to `from`
+/// is rebound to `to`. No-op for non-composition nodes and for port-qualified
+/// values (`from.port`), matching [`reroute_single_ref`]'s exact-match policy.
+///
+/// The `inputs:` map is a composition's authoritative call-site binding — the
+/// map the top-level edge wiring reads to feed each port — whereas
+/// `header.input` produces no edge. Both an `after` splice (via
+/// [`reroute_single_ref`]) and a `before` splice must repoint it, or a
+/// composition consumer keeps reading the spliced-out anchor directly and the
+/// injected node is bypassed.
+fn reroute_composition_inputs(node: &mut PipelineNode, from: &str, to: &str) {
+    if let PipelineNode::Composition { inputs, .. } = node {
+        for upstream in inputs.values_mut() {
+            if upstream == from {
+                *upstream = to.to_string();
             }
         }
     }
@@ -1416,6 +1512,146 @@ config:
         }
         // sink was rewired onto the injected composition.
         assert_eq!(out[3].value.direct_input_names(), vec!["fraud_check"]);
+    }
+
+    /// A base whose downstream consumer of `normalize` is a composition, so the
+    /// splice must both feed the injected composition and repoint the consumer's
+    /// named-port `inputs:` map — the two halves of the issue #768 fix.
+    fn composition_consumer_base() -> Vec<Spanned<PipelineNode>> {
+        parse_nodes(
+            r#"
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+  - type: transform
+    name: normalize
+    input: orders
+    config:
+      cxl: "emit order_id = order_id"
+  - type: composition
+    name: scorer
+    input: normalize
+    use: ../composition/score.comp.yaml
+    inputs:
+      inp: normalize
+"#,
+        )
+    }
+
+    /// The composition node named `name`'s `(header input, inputs map)`.
+    fn composition_wiring(
+        nodes: &[Spanned<PipelineNode>],
+        name: &str,
+    ) -> (NodeInput, IndexMap<String, String>) {
+        match &nodes.iter().find(|n| n.value.name() == name).unwrap().value {
+            PipelineNode::Composition { header, inputs, .. } => {
+                (header.input.value.clone(), inputs.clone())
+            }
+            other => panic!("expected composition {name:?}, got {}", other.type_tag()),
+        }
+    }
+
+    #[test]
+    fn add_composition_binds_input_port_and_reroutes_downstream_composition() {
+        let base = composition_consumer_base();
+        let op = parse_op(
+            r#"
+op: add
+composition: ../composition/screen.comp.yaml
+alias: screen
+after: normalize
+"#,
+        );
+        let mut ports = CompositionInputPorts::new();
+        ports.insert(
+            PathBuf::from("../composition/screen.comp.yaml"),
+            vec!["inp".to_string()],
+        );
+
+        let out = apply_overlay_ops_with_ports(base, one(op), &ports).expect("apply");
+
+        assert_eq!(names(&out), vec!["orders", "normalize", "screen", "scorer"]);
+
+        // The injected composition's sole input port is bound to the splice
+        // anchor, so the top-level edge wiring feeds it (defect 1).
+        let (screen_header, screen_inputs) = composition_wiring(&out, "screen");
+        assert_eq!(screen_header, NodeInput::Single("normalize".into()));
+        assert_eq!(
+            screen_inputs.get("inp").map(String::as_str),
+            Some("normalize")
+        );
+        assert_eq!(screen_inputs.len(), 1);
+
+        // The downstream composition consumer's named-port `inputs:` map follows
+        // the rewire onto the injected node — not just its header input (defect 2).
+        let (scorer_header, scorer_inputs) = composition_wiring(&out, "scorer");
+        assert_eq!(scorer_header, NodeInput::Single("screen".into()));
+        assert_eq!(scorer_inputs.get("inp").map(String::as_str), Some("screen"));
+    }
+
+    #[test]
+    fn add_composition_without_resolved_ports_leaves_inputs_empty() {
+        // With no port info (the 2-arg entry point), the injected composition
+        // keeps an empty `inputs:` map; `bind_schema` then surfaces the real
+        // port diagnostic against the op span rather than the engine guessing.
+        let base = composition_consumer_base();
+        let op = parse_op(
+            r#"
+op: add
+composition: ../composition/screen.comp.yaml
+alias: screen
+after: normalize
+"#,
+        );
+        let out = apply_overlay_ops(base, one(op)).expect("apply");
+        let (_, screen_inputs) = composition_wiring(&out, "screen");
+        assert!(screen_inputs.is_empty());
+    }
+
+    #[test]
+    fn add_composition_before_composition_anchor_reroutes_inputs_map() {
+        // A `before` splice in front of a composition anchor must repoint the
+        // anchor's named-port `inputs:` map (which carries the real edge), not
+        // just its `header.input` — otherwise the anchor keeps reading its old
+        // upstream directly and the injected composition is bypassed.
+        let base = composition_consumer_base();
+        let op = parse_op(
+            r#"
+op: add
+composition: ../composition/screen.comp.yaml
+alias: screen
+before: scorer
+"#,
+        );
+        let mut ports = CompositionInputPorts::new();
+        ports.insert(
+            PathBuf::from("../composition/screen.comp.yaml"),
+            vec!["inp".to_string()],
+        );
+
+        let out = apply_overlay_ops_with_ports(base, one(op), &ports).expect("apply");
+
+        assert_eq!(names(&out), vec!["orders", "normalize", "screen", "scorer"]);
+
+        // The injected node takes over the anchor's former upstream (`normalize`).
+        let (screen_header, screen_inputs) = composition_wiring(&out, "screen");
+        assert_eq!(screen_header, NodeInput::Single("normalize".into()));
+        assert_eq!(
+            screen_inputs.get("inp").map(String::as_str),
+            Some("normalize")
+        );
+
+        // The anchor now reads the injected node through both its header input
+        // and its `inputs:` map — the map is what actually feeds it.
+        let (scorer_header, scorer_inputs) = composition_wiring(&out, "scorer");
+        assert_eq!(scorer_header, NodeInput::Single("screen".into()));
+        assert_eq!(scorer_inputs.get("inp").map(String::as_str), Some("screen"));
     }
 
     #[test]

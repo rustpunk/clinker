@@ -3597,7 +3597,7 @@ fn check_w101_shadows(
 /// 2. Try the normalized path directly against the symbol table.
 ///
 /// Falls back to the normalized path for the E103 diagnostic.
-fn resolve_use_path(
+pub(crate) fn resolve_use_path(
     use_path: &Path,
     origin_dir: &Path,
     workspace_root: &Path,
