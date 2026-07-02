@@ -25,7 +25,8 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use quick_xml::Reader as XmlParser;
-use quick_xml::events::Event;
+use quick_xml::escape;
+use quick_xml::events::{BytesRef, Event};
 
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
 
@@ -229,8 +230,12 @@ impl XmlReader {
     /// Returns [`FormatError::Io`] if the source cannot be opened.
     fn open_body(source: &ReopenableSource) -> Result<(BodyParser, SourceIdentity), FormatError> {
         let (buf, identity) = Self::open_buf(source)?;
-        let mut parser = XmlParser::from_reader(buf);
-        parser.config_mut().trim_text(true);
+        let parser = XmlParser::from_reader(buf);
+        // Text-node whitespace is trimmed when a run is finalized
+        // ([`finalize_text_run`]), not per parser event: quick-xml splits a
+        // text node into `Text` + `GeneralRef` fragments, and per-fragment
+        // trimming would eat whitespace adjacent to a reference. Trimming the
+        // reassembled raw node instead keeps reference-produced whitespace.
         Ok((parser, identity))
     }
 
@@ -298,6 +303,7 @@ impl XmlReader {
                     return Ok(None);
                 }
                 Event::Text(_)
+                | Event::GeneralRef(_)
                 | Event::CData(_)
                 | Event::Comment(_)
                 | Event::Decl(_)
@@ -318,6 +324,12 @@ impl XmlReader {
         let mut fields = start_attrs;
         let record_depth = self.xml_depth;
         let mut element_stack: Vec<String> = Vec::new();
+        // Raw source form of the current text node, accumulated across the
+        // `Text` + `GeneralRef` fragment run quick-xml splits a text node into.
+        // Flushed — trimmed and reference-resolved — at the next structural
+        // event, yielding one field per text node exactly as a single `Text`
+        // event did before the 0.41 reference split.
+        let mut text_run = String::new();
         let mut buf2 = Vec::new();
 
         loop {
@@ -326,6 +338,12 @@ impl XmlReader {
                 .parser
                 .read_event_into(&mut buf2)
                 .map_err(|e| FormatError::Xml(e.to_string()))?;
+
+            // Any event other than a text fragment terminates the current text
+            // node; resolve and push it before handling the structural event.
+            if !matches!(&event, Event::Text(_) | Event::GeneralRef(_)) {
+                flush_text_field(&mut fields, &element_stack, &mut text_run)?;
+            }
 
             match event {
                 Event::Start(ref e) => {
@@ -359,16 +377,10 @@ impl XmlReader {
                     }
                 }
                 Event::Text(ref t) => {
-                    let text = t
-                        .unescape()
-                        .map_err(|e| FormatError::Xml(e.to_string()))?
-                        .into_owned();
-                    if !text.is_empty() {
-                        let field_name = element_stack.join(".");
-                        if !field_name.is_empty() {
-                            fields.push((field_name, text));
-                        }
-                    }
+                    text_run.push_str(&t.decode().map_err(|e| FormatError::Xml(e.to_string()))?);
+                }
+                Event::GeneralRef(ref r) => {
+                    append_general_ref(&mut text_run, r)?;
                 }
                 Event::CData(ref cd) => {
                     let text = String::from_utf8_lossy(cd.as_ref()).into_owned();
@@ -629,13 +641,75 @@ pub(crate) fn extract_attributes_static(
     for attr in elem.attributes() {
         let attr = attr.map_err(|e| FormatError::Xml(e.to_string()))?;
         let key = String::from_utf8_lossy(attr.key.as_ref()).into_owned();
-        let val = attr
-            .unescape_value()
+        // Resolve entity and character references over the UTF-8-decoded raw
+        // value — the exact behavior of the removed `unescape_value()`. The
+        // `normalized_value` replacement additionally collapses literal tab / CR
+        // / LF to a space (XML attribute-value normalization), which would alter
+        // attribute values carrying literal whitespace, so it is not used here.
+        let decoded = std::str::from_utf8(attr.value.as_ref())
+            .map_err(|e| FormatError::Xml(e.to_string()))?;
+        let val = escape::unescape(decoded)
             .map_err(|e| FormatError::Xml(e.to_string()))?
             .into_owned();
         attrs.push((format!("{prefix}{key}"), val));
     }
     Ok(attrs)
+}
+
+/// True for the whitespace characters XML (and quick-xml's `trim_text`)
+/// trims from a text node: space, tab, carriage return, line feed.
+fn is_xml_whitespace(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\r' | '\n')
+}
+
+/// Append a general or character reference to a raw text run in its source
+/// form (`&name;`), so it resolves alongside the rest of the run in
+/// [`finalize_text_run`].
+///
+/// quick-xml emits each `&name;` in a text node as its own `GeneralRef`
+/// event carrying just the inner `name` (`amp`, `#65`, `#x41`, …); rewrapping
+/// it lets one [`escape::unescape`] pass decode the whole node.
+pub(crate) fn append_general_ref(raw: &mut String, r: &BytesRef) -> Result<(), FormatError> {
+    let name = r.decode().map_err(|e| FormatError::Xml(e.to_string()))?;
+    raw.push('&');
+    raw.push_str(&name);
+    raw.push(';');
+    Ok(())
+}
+
+/// Resolve one accumulated text node's raw source form into its final value.
+///
+/// Reproduces the pre-0.41 `trim_text(true)` + `BytesText::unescape()`
+/// behavior: the raw node — `Text` fragments verbatim, each reference rewrapped
+/// as `&name;` by [`append_general_ref`] — is edge-trimmed on the XML
+/// whitespace set, then predefined entities and character references are
+/// resolved by [`escape::unescape`]. Trimming the reassembled raw node (rather
+/// than each fragment) preserves whitespace produced by a reference such as
+/// `&#32;`, and an unknown entity still errors, exactly as before.
+pub(crate) fn finalize_text_run(raw: &str) -> Result<String, FormatError> {
+    let trimmed = raw.trim_matches(is_xml_whitespace);
+    let value = escape::unescape(trimmed).map_err(|e| FormatError::Xml(e.to_string()))?;
+    Ok(value.into_owned())
+}
+
+/// Resolve the current text run and push it, if non-empty, as a field keyed by
+/// the innermost open element's dotted path. Text directly under the record
+/// element (empty path) or an empty resolved value pushes nothing. Clears
+/// `text_run` for the next node.
+fn flush_text_field(
+    fields: &mut Vec<(String, String)>,
+    element_stack: &[String],
+    text_run: &mut String,
+) -> Result<(), FormatError> {
+    let value = finalize_text_run(text_run)?;
+    text_run.clear();
+    if !value.is_empty() {
+        let field_name = element_stack.join(".");
+        if !field_name.is_empty() {
+            fields.push((field_name, value));
+        }
+    }
+    Ok(())
 }
 
 /// Consume a single leading UTF-8 BOM from a freshly opened reader, if present.
@@ -1191,5 +1265,83 @@ mod tests {
         let r2 = r.next_record().unwrap().unwrap();
         assert_eq!(r2.get("name"), Some(&Value::String("Bob".into())));
         assert_eq!(r2.get("bonus"), Some(&Value::String("flagged".into())));
+    }
+
+    #[test]
+    fn test_xml_reads_entities_and_char_refs_in_element_text() {
+        // Predefined entities and character references in element text decode
+        // to their characters. quick-xml emits each reference as its own event
+        // separate from the surrounding text; the reader reassembles the whole
+        // text node before decoding, so a value split across references is
+        // recovered intact rather than truncated at the first fragment.
+        let xml = r#"<Root><Item><amp>a &amp; b</amp><lt>&lt;tag&gt;</lt><num>&#65;&#66;</num></Item></Root>"#;
+        let mut r = reader_from_str(xml, default_config_with_path("Root/Item"));
+        let _s = r.schema().unwrap();
+        let rec = r.next_record().unwrap().unwrap();
+        assert_eq!(rec.get("amp"), Some(&Value::String("a & b".into())));
+        assert_eq!(rec.get("lt"), Some(&Value::String("<tag>".into())));
+        assert_eq!(rec.get("num"), Some(&Value::String("AB".into())));
+    }
+
+    #[test]
+    fn test_xml_text_trims_source_whitespace_but_preserves_reference_whitespace() {
+        // Text-node whitespace trimming applies to the source bytes, not the
+        // decoded value: literal leading/trailing whitespace is trimmed, but
+        // whitespace that surrounds — or is produced by — a reference is kept.
+        let xml = concat!(
+            "<Root><Item>",
+            "<pad>  hello  </pad>",       // literal edge whitespace trimmed
+            "<around>x &amp; y</around>", // spaces around an entity preserved
+            "<charws>&#32;hi</charws>",   // leading space from a char ref preserved
+            "</Item></Root>",
+        );
+        let mut r = reader_from_str(xml, default_config_with_path("Root/Item"));
+        let _s = r.schema().unwrap();
+        let rec = r.next_record().unwrap().unwrap();
+        assert_eq!(rec.get("pad"), Some(&Value::String("hello".into())));
+        assert_eq!(rec.get("around"), Some(&Value::String("x & y".into())));
+        assert_eq!(rec.get("charws"), Some(&Value::String(" hi".into())));
+    }
+
+    #[test]
+    fn test_xml_attribute_preserves_literal_whitespace() {
+        // Attribute decoding resolves references only; it does not apply XML
+        // attribute-value whitespace normalization, so a literal newline or tab
+        // inside a value is preserved rather than collapsed to a space.
+        let xml = "<Root><Item title=\"Hello\nWorld\" tab=\"a\tb\"/></Root>";
+        let mut r = reader_from_str(xml, default_config_with_path("Root/Item"));
+        let _s = r.schema().unwrap();
+        let rec = r.next_record().unwrap().unwrap();
+        assert_eq!(
+            rec.get("@title"),
+            Some(&Value::String("Hello\nWorld".into()))
+        );
+        assert_eq!(rec.get("@tab"), Some(&Value::String("a\tb".into())));
+    }
+
+    #[test]
+    fn test_xml_attribute_resolves_entities_and_char_refs() {
+        // Predefined entities and character references in an attribute value
+        // decode to their characters, matching the prior `unescape_value`.
+        let xml = r#"<Root><Item note="a &amp; b &#65;"/></Root>"#;
+        let mut r = reader_from_str(xml, default_config_with_path("Root/Item"));
+        let _s = r.schema().unwrap();
+        let rec = r.next_record().unwrap().unwrap();
+        assert_eq!(rec.get("@note"), Some(&Value::String("a & b A".into())));
+    }
+
+    #[test]
+    fn test_xml_unknown_entity_in_text_errors() {
+        // An unrecognized general entity in element text is rejected, matching
+        // the strict decoding the reader applied before the parser upgrade.
+        // Schema inference reads the first record eagerly, so the error may
+        // surface from either `schema` or `next_record`.
+        let xml = r#"<Root><Item><v>&nope;</v></Item></Root>"#;
+        let mut r = reader_from_str(xml, default_config_with_path("Root/Item"));
+        let outcome = match r.schema() {
+            Err(e) => Err(e),
+            Ok(_) => r.next_record(),
+        };
+        assert!(matches!(outcome, Err(FormatError::Xml(_))));
     }
 }

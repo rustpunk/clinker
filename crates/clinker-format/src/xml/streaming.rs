@@ -27,7 +27,10 @@ use quick_xml::Reader as XmlParser;
 use quick_xml::events::Event;
 
 use crate::error::FormatError;
-use crate::xml::reader::{BodyParser, NamespaceMode, elem_name_static, extract_attributes_static};
+use crate::xml::reader::{
+    BodyParser, NamespaceMode, append_general_ref, elem_name_static, extract_attributes_static,
+    finalize_text_run,
+};
 
 /// One matched section's name paired with its flat `(field, raw_string)`
 /// payload, as produced by [`extract_sections`].
@@ -83,8 +86,10 @@ pub(crate) fn extract_sections(
     attr_prefix: &str,
     max_index_bytes: Option<usize>,
 ) -> Result<Vec<MatchedSection>, FormatError> {
+    // Text nodes are trimmed when a run is finalized in `read_section_payload`,
+    // not per parser event, so reference-adjacent whitespace survives the
+    // `Text`/`GeneralRef` fragment split (see `finalize_text_run`).
     let mut parser = XmlParser::from_reader(reader);
-    parser.config_mut().trim_text(true);
 
     let parse_ctx = SectionParseCtx { ns, attr_prefix };
     let mut path_stack: Vec<String> = Vec::new();
@@ -236,11 +241,30 @@ fn read_section_payload(
     let mut fields: Vec<(String, String)> = seed;
     let mut element_stack: Vec<String> = Vec::new();
     let mut depth_here = section_depth;
+    // Raw source form of the current text node, accumulated across the
+    // `Text` + `GeneralRef` fragments quick-xml splits a text node into and
+    // flushed at the next structural event — see `read::finalize_text_run`.
+    let mut text_run = String::new();
     loop {
         buf.clear();
         let event = parser
             .read_event_into(buf)
             .map_err(|e| FormatError::Xml(e.to_string()))?;
+
+        // Any event other than a text fragment ends the current text node;
+        // resolve, charge, and retain it before handling the structural event.
+        if !matches!(&event, Event::Text(_) | Event::GeneralRef(_)) {
+            let value = finalize_text_run(&text_run)?;
+            text_run.clear();
+            if !value.is_empty() {
+                let field_name = element_stack.join(".");
+                if !field_name.is_empty() {
+                    charge.charge(field_name.len() + value.len(), section)?;
+                    fields.push((field_name, value));
+                }
+            }
+        }
+
         match event {
             Event::Start(ref e) => {
                 depth_here += 1;
@@ -278,17 +302,10 @@ fn read_section_payload(
                 }
             }
             Event::Text(ref t) => {
-                let text = t
-                    .unescape()
-                    .map_err(|e| FormatError::Xml(e.to_string()))?
-                    .into_owned();
-                if !text.is_empty() {
-                    let field_name = element_stack.join(".");
-                    if !field_name.is_empty() {
-                        charge.charge(field_name.len() + text.len(), section)?;
-                        fields.push((field_name, text));
-                    }
-                }
+                text_run.push_str(&t.decode().map_err(|e| FormatError::Xml(e.to_string()))?);
+            }
+            Event::GeneralRef(ref r) => {
+                append_general_ref(&mut text_run, r)?;
             }
             Event::CData(ref cd) => {
                 let text = String::from_utf8_lossy(cd.as_ref()).into_owned();

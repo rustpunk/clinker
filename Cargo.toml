@@ -87,7 +87,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 serial_test = "3"
 petgraph = "0.8"
 fastrand = "2"
-quick-xml = "0.37"
+quick-xml = "0.41"
 # Synchronous HTTP client for the `rest` source transport. rustls + ring
 # only (pure-Rust TLS) — `default-features = false` drops the native-tls
 # path so no openssl/native-tls/cmake enters the graph.
