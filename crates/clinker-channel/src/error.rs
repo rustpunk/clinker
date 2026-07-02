@@ -19,4 +19,21 @@ pub enum ChannelError {
     InvalidDottedPath { path: String, reason: String },
     #[error("invalid var name `{name}`: {reason}")]
     InvalidVarName { name: String, reason: String },
+    #[error(
+        "channel `{channel_id}`: multiple overlay candidates for target `{target}`: {}",
+        .candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+    )]
+    AmbiguousOverlay {
+        channel_id: String,
+        target: String,
+        candidates: Vec<PathBuf>,
+    },
+    #[error(
+        "overlay {path} declares target `{declared}` that disagrees with its filename: {reason}"
+    )]
+    OverlayTargetMismatch {
+        path: PathBuf,
+        declared: String,
+        reason: String,
+    },
 }

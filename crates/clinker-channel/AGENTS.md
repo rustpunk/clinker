@@ -19,7 +19,9 @@ Root `AGENTS.md` still applies. This file adds local guidance for `clinker-chann
 
 - `ChannelBinding`, `ChannelTarget`, `DottedPath`
 - `ChannelBinding::{from_yaml_bytes, load}`
-- `scan_workspace_channels`, `validate_channel_bindings`
+- `validate_channel_bindings`
+- `resolve_channel_overlay`, `scan_channels`, `scan_groups`, `channel_folder_path`
+- `DiscoveredChannel`, `ResolvedOverlay`, `OverlayKind`
 - `apply_channel_overlay`, `ChannelOverlayResult`
 - `SourceStager`, `StagingPlanEntry`, `ReuseDecision`, `open_source_file`
 - `ChannelError`, `StagingError`
@@ -27,7 +29,8 @@ Root `AGENTS.md` still applies. This file adds local guidance for `clinker-chann
 ## Internal module map
 
 - `src/lib.rs`: channel authoring guide and crate-root re-exports.
-- `src/binding.rs`: channel YAML parsing, target classification, dotted-path validation, workspace scan, and composition-target validation.
+- `src/binding.rs`: channel YAML parsing, target classification, dotted-path validation, and composition-target validation.
+- `src/discovery.rs`: channel-centric layout discovery — folder-per-tenant channel scan, group scan, and computed-path per-target overlay resolution with ambiguity/disagreement diagnostics.
 - `src/overlay.rs`: provenance overlay merge, channel identity stamping, scoped-var overlay validation/coercion.
 - `src/staging_copy.rs`: source staging protocol, cache layout, manifests, advisory locks, reuse prediction, cleanup, crash purge, and platform open/fsync helpers.
 - `src/error.rs`: channel parse and validation errors.

@@ -306,77 +306,6 @@ fn validate_var_names<'a>(names: impl IntoIterator<Item = &'a String>) -> Result
 
 // ── Channel validation ─────────────────────────────────────────────────
 
-/// Maximum number of `.channel.yaml` files per workspace scan.
-const WORKSPACE_CHANNEL_BUDGET: usize = 50;
-
-/// Maximum filesystem depth for channel workspace walks.
-const WORKSPACE_CHANNEL_MAX_DEPTH: usize = 16;
-
-/// Scan a workspace root for `.channel.yaml` files and parse each into a
-/// [`ChannelBinding`].
-///
-/// Companion to `scan_workspace_signatures` in clinker-plan — uses the
-/// same walkdir + budget pattern. Symlinks rejected, depth bounded.
-pub fn scan_workspace_channels(
-    workspace_root: &Path,
-) -> Result<Vec<ChannelBinding>, Vec<Diagnostic>> {
-    use walkdir::WalkDir;
-
-    if !workspace_root.exists() {
-        return Ok(Vec::new());
-    }
-
-    let mut bindings = Vec::new();
-    let mut diagnostics: Vec<Diagnostic> = Vec::new();
-
-    let walker = WalkDir::new(workspace_root)
-        .follow_links(false)
-        .max_depth(WORKSPACE_CHANNEL_MAX_DEPTH)
-        .into_iter();
-
-    for entry in walker {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        if !entry.file_type().is_file() {
-            continue;
-        }
-
-        let path = entry.path();
-        if !is_channel_yaml(path) {
-            continue;
-        }
-
-        if bindings.len() >= WORKSPACE_CHANNEL_BUDGET {
-            diagnostics.push(Diagnostic::error(
-                "E101",
-                format!(
-                    "channel file budget exceeded: more than {WORKSPACE_CHANNEL_BUDGET} \
-                     .channel.yaml files in workspace"
-                ),
-                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
-            ));
-            return Err(diagnostics);
-        }
-
-        match ChannelBinding::load(path) {
-            Ok(binding) => bindings.push(binding),
-            Err(e) => {
-                diagnostics.push(Diagnostic::error(
-                    "E101",
-                    format!("failed to parse {}: {e}", path.display()),
-                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
-                ));
-                return Err(diagnostics);
-            }
-        }
-    }
-
-    Ok(bindings)
-}
-
 /// Validate channel bindings against the composition symbol table.
 ///
 /// For composition targets: verifies the target exists in the symbol table
@@ -482,13 +411,6 @@ fn validate_config_keys(
             ));
         }
     }
-}
-
-fn is_channel_yaml(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| n.ends_with(".channel.yaml"))
-        .unwrap_or(false)
 }
 
 /// Normalize a target path for lookup in the composition symbol table.
