@@ -23,16 +23,25 @@ use std::path::{Path, PathBuf};
 
 /// Top-level `clinker.toml` document.
 ///
-/// Only the `[storage]` table is modeled. Channel/workspace discovery keys
-/// that may also live in `clinker.toml` are not deserialized here — this
-/// type is consulted solely for the storage scaffold, so unknown top-level
-/// tables are tolerated rather than rejected.
+/// The `[storage]`, `[channel]`, and `[group]` tables are modeled. Any other
+/// top-level table is tolerated rather than rejected — this type is consulted
+/// for the storage scaffold and the channel/group layout roots, so unknown
+/// top-level tables (future workspace-discovery keys) pass through untouched.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClinkerToml {
     /// The `[storage]` table. Absent → every field defaults (spill to the
     /// OS temp dir, staging off), matching pre-config behavior exactly.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// The `[channel]` table: the workspace root under which per-channel
+    /// folders live and the directory-sharding scheme used to enumerate them.
+    /// Absent → `root = "channel"`, `shard = none` (see [`ChannelLayout`]).
+    #[serde(default)]
+    pub channel: ChannelLayout,
+    /// The `[group]` table: the workspace root under which group definition
+    /// files live. Absent → `root = "group"` (see [`GroupLayout`]).
+    #[serde(default)]
+    pub group: GroupLayout,
 }
 
 impl ClinkerToml {
@@ -86,6 +95,101 @@ pub struct StorageConfig {
     /// staging-copy engine per matched source.
     #[serde(default)]
     pub staging: StagingPolicy,
+}
+
+/// Default `[channel]` root when the table or its `root` key is omitted.
+fn default_channel_root() -> PathBuf {
+    PathBuf::from("channel")
+}
+
+/// Default `[group]` root when the table or its `root` key is omitted.
+fn default_group_root() -> PathBuf {
+    PathBuf::from("group")
+}
+
+/// The `[channel]` block: where per-channel folders live and how they shard.
+///
+/// This is pure layout declaration — parsing only, no behavior is wired here.
+/// `root` anchors the per-channel folder tree (`<root>/<channel-id>/…`) so a
+/// `--channel <id>` invocation resolves by a computed path rather than an
+/// O(N) workspace glob-scan. `shard` records the directory-sharding scheme
+/// used when materializing and enumerating that tree; it is enumeration
+/// ergonomics only (keeping `ls`/editor/git listings small), not a lookup
+/// requirement, so it defaults to [`ShardScheme::None`].
+///
+/// Absent table → both fields default (`root = "channel"`, `shard = none`),
+/// matching a workspace that has not opted into an explicit layout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChannelLayout {
+    /// Workspace-relative (or absolute) root under which per-channel folders
+    /// live. Omitted → `"channel"`. A relative path is resolved against the
+    /// workspace root by the discovery layer, not normalized here.
+    #[serde(default = "default_channel_root")]
+    pub root: PathBuf,
+    /// Directory-sharding scheme for the channel tree. Omitted →
+    /// [`ShardScheme::None`] (flat: one folder per channel directly under
+    /// `root`).
+    #[serde(default)]
+    pub shard: ShardScheme,
+}
+
+impl Default for ChannelLayout {
+    fn default() -> Self {
+        Self {
+            root: default_channel_root(),
+            shard: ShardScheme::default(),
+        }
+    }
+}
+
+/// The `[group]` block: where group definition files live.
+///
+/// Layout declaration only — no behavior is wired here. `root` anchors the
+/// directory holding `*.group.yaml` definitions. Absent table → `root =
+/// "group"`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupLayout {
+    /// Workspace-relative (or absolute) root under which group definition
+    /// files live. Omitted → `"group"`. A relative path is resolved against
+    /// the workspace root by the discovery layer, not normalized here.
+    #[serde(default = "default_group_root")]
+    pub root: PathBuf,
+}
+
+impl Default for GroupLayout {
+    fn default() -> Self {
+        Self {
+            root: default_group_root(),
+        }
+    }
+}
+
+/// How the per-channel folder tree is sharded on disk for enumeration.
+///
+/// Sharding is an enumeration-ergonomics choice, not a lookup requirement: a
+/// `--channel <id>` invocation always resolves by a computed path, so on ext4
+/// htree single-name lookup stays ~O(log n) regardless. `readdir` over one
+/// giant flat directory, however, stays O(N); sharding splits the tree into
+/// smaller directories so `ls`, editors, and git enumerate a bounded fan-out.
+/// It is therefore opt-in, defaulting to [`ShardScheme::None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShardScheme {
+    /// Flat: every channel folder sits directly under the channel root. The
+    /// default — the smallest layout, correct for workspaces below the
+    /// directory-fan-out sizes where enumeration cost bites.
+    #[default]
+    None,
+    /// One intermediate directory per leading channel-id character
+    /// (`<root>/<first-char>/<channel-id>/`), bounding fan-out by the id
+    /// alphabet.
+    FirstChar,
+    /// Hash the channel id into a fixed set of shard buckets
+    /// (`<root>/<hash-bucket>/<channel-id>/`), spreading channels evenly
+    /// regardless of id-prefix skew.
+    Hash,
 }
 
 /// How spill files are compressed: `auto` (the default), `off`, or `on`.
@@ -1069,6 +1173,124 @@ mod tests {
             p.validate(&[src]).unwrap_err(),
             StorageConfigError::StagingSameVolume { .. }
         ));
+    }
+
+    #[test]
+    fn channel_and_group_absent_use_defaults() {
+        // A document with no [channel]/[group] tables falls back to the
+        // conventional roots and the flat shard scheme.
+        let doc = ClinkerToml::parse("").unwrap();
+        assert_eq!(doc.channel.root, Path::new("channel"));
+        assert_eq!(doc.channel.shard, ShardScheme::None);
+        assert_eq!(doc.group.root, Path::new("group"));
+    }
+
+    #[test]
+    fn channel_section_present_but_empty_uses_key_defaults() {
+        // The table exists but sets no keys: each key defaults independently.
+        let doc = ClinkerToml::parse("[channel]\n").unwrap();
+        assert_eq!(doc.channel.root, Path::new("channel"));
+        assert_eq!(doc.channel.shard, ShardScheme::None);
+    }
+
+    #[test]
+    fn channel_section_parses_root_and_each_shard_scheme() {
+        for (text, expected) in [
+            ("none", ShardScheme::None),
+            ("first-char", ShardScheme::FirstChar),
+            ("hash", ShardScheme::Hash),
+        ] {
+            let doc = ClinkerToml::parse(&format!(
+                "[channel]\nroot = \"tenants\"\nshard = \"{text}\"\n"
+            ))
+            .unwrap();
+            assert_eq!(doc.channel.root, Path::new("tenants"));
+            assert_eq!(doc.channel.shard, expected, "shard {text}");
+        }
+    }
+
+    #[test]
+    fn channel_root_defaults_when_only_shard_set() {
+        // Setting one key leaves the other at its default.
+        let doc = ClinkerToml::parse("[channel]\nshard = \"hash\"\n").unwrap();
+        assert_eq!(doc.channel.root, Path::new("channel"));
+        assert_eq!(doc.channel.shard, ShardScheme::Hash);
+    }
+
+    #[test]
+    fn group_section_parses_root() {
+        let doc = ClinkerToml::parse("[group]\nroot = \"cohorts\"\n").unwrap();
+        assert_eq!(doc.group.root, Path::new("cohorts"));
+    }
+
+    #[test]
+    fn group_section_present_but_empty_uses_default_root() {
+        let doc = ClinkerToml::parse("[group]\n").unwrap();
+        assert_eq!(doc.group.root, Path::new("group"));
+    }
+
+    #[test]
+    fn channel_rejects_unknown_shard_scheme() {
+        let err = ClinkerToml::parse("[channel]\nshard = \"round-robin\"\n").unwrap_err();
+        assert!(matches!(err, StorageConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn channel_rejects_unknown_key() {
+        let err = ClinkerToml::parse("[channel]\nroots = \"channel\"\n").unwrap_err();
+        assert!(matches!(err, StorageConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn group_rejects_unknown_key() {
+        let err = ClinkerToml::parse("[group]\nshard = \"none\"\n").unwrap_err();
+        assert!(matches!(err, StorageConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn channel_root_rejects_wrong_type() {
+        // `root` is a path (string); an integer is a type mismatch.
+        let err = ClinkerToml::parse("[channel]\nroot = 3\n").unwrap_err();
+        assert!(matches!(err, StorageConfigError::Parse(_)));
+    }
+
+    #[test]
+    fn channel_and_group_coexist_with_storage() {
+        // All three top-level tables parse together, and an unrelated unknown
+        // top-level table is still tolerated (ClinkerToml is not
+        // deny_unknown_fields).
+        let doc = ClinkerToml::parse(
+            r#"
+            [storage.spill]
+            dir = "/var/clinker/spill"
+
+            [channel]
+            root = "channel"
+            shard = "first-char"
+
+            [group]
+            root = "group"
+
+            [future_discovery]
+            anything = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            doc.storage.spill.dir.as_deref(),
+            Some(Path::new("/var/clinker/spill"))
+        );
+        assert_eq!(doc.channel.shard, ShardScheme::FirstChar);
+        assert_eq!(doc.group.root, Path::new("group"));
+    }
+
+    #[test]
+    fn layout_defaults_match_absent_document() {
+        // The Default impls agree with parsing an empty document, so callers
+        // that construct a ClinkerToml programmatically see the same roots.
+        assert_eq!(ChannelLayout::default().root, Path::new("channel"));
+        assert_eq!(ChannelLayout::default().shard, ShardScheme::None);
+        assert_eq!(GroupLayout::default().root, Path::new("group"));
     }
 
     #[test]

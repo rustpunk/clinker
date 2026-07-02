@@ -47,8 +47,9 @@ pub use scoped_var::*;
 pub use sort::*;
 pub use source::*;
 pub use storage::{
-    Cleanup, ClinkerToml, CompressMode, OnExisting, SpillConfig, StagedPath, StagingMatcher,
-    StagingPolicy, StagingVerify, StorageConfig, StorageConfigError,
+    ChannelLayout, Cleanup, ClinkerToml, CompressMode, GroupLayout, OnExisting, ShardScheme,
+    SpillConfig, StagedPath, StagingMatcher, StagingPolicy, StagingVerify, StorageConfig,
+    StorageConfigError,
 };
 pub use transform::*;
 pub use utils::*;
