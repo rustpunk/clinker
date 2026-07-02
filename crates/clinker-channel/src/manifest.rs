@@ -25,6 +25,8 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use clinker_plan::config::ScopedVarDecl;
+use clinker_plan::overlay_ops::OverlayOp;
+use clinker_plan::yaml::Spanned;
 
 use crate::error::ChannelError;
 
@@ -38,7 +40,7 @@ use crate::error::ChannelError;
 /// vars:
 ///   static: { currency: { type: string, default: "USD" } }
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelManifest {
     /// The manifest header — carries the channel `name`.
@@ -57,11 +59,12 @@ pub struct ChannelManifest {
     /// `vars:` block uses.
     #[serde(default)]
     pub vars: ChannelVars,
-    /// Channel-wide ordered override op list. The element type is finalized
-    /// by CH-10 (#525); until then each op is carried as an opaque map so
-    /// this parse layer does not invent the op vocabulary.
+    /// Channel-wide ordered override op list, applied at the `ChannelWide`
+    /// layer. Each op keeps its source [`Spanned`] location so a later
+    /// ill-typed-op diagnostic anchors to the offending op rather than the
+    /// base pipeline.
     #[serde(default)]
-    pub overrides: Vec<serde_json::Value>,
+    pub overrides: Vec<Spanned<OverlayOp>>,
 }
 
 /// The `channel:` header of a manifest.
@@ -82,7 +85,7 @@ pub struct ManifestHeader {
 /// vars:   { static: { currency: { type: string, default: "USD" } } }
 /// overrides: [ ... ]
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverlayFile {
     /// The overlay header — carries the authoritative `target`.
@@ -94,10 +97,11 @@ pub struct OverlayFile {
     /// `vars:` block uses.
     #[serde(default)]
     pub vars: ChannelVars,
-    /// Per-target ordered override op list. Opaque until CH-10 (#525) — see
-    /// [`ChannelManifest::overrides`].
+    /// Per-target ordered override op list, applied at the highest
+    /// `ChannelPerTarget` layer. Each op keeps its source [`Spanned`]
+    /// location — see [`ChannelManifest::overrides`].
     #[serde(default)]
-    pub overrides: Vec<serde_json::Value>,
+    pub overrides: Vec<Spanned<OverlayOp>>,
 }
 
 /// The `channel:` header of an overlay file.

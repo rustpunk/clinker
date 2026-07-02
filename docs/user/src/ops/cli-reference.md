@@ -37,6 +37,8 @@ clinker run [OPTIONS] <CONFIG>
 | `--force` | -- | Allow output files to be overwritten if they already exist. Without this flag, the pipeline aborts rather than clobbering existing output. |
 | `--log-level <LEVEL>` | `info` | Logging verbosity. One of: `error`, `warn`, `info`, `debug`, `trace`. |
 | `--metrics-spool-dir <DIR>` | -- | Directory for per-execution metrics files. See [Metrics & Monitoring](metrics.md). |
+| `--group <NAME>` | -- | Force-include a group overlay by name (repeatable). Applies the group's `overrides` op stream and `config`/`vars` clobber before the pipeline compiles, regardless of the group's selector. Use `clinker channels resolve` to preview the effective plan. |
+| `--no-auto-groups` | -- | Suppress selector-derived group membership; only groups named with `--group` apply. |
 
 ### Examples
 
@@ -93,6 +95,61 @@ clinker metrics collect \
   --spool-dir ./metrics/ \
   --output-file ./archive.ndjson \
   --dry-run
+```
+
+---
+
+## clinker channels
+
+Inspect and validate the channel/group multi-tenant overlay system.
+
+```bash
+clinker channels resolve <TARGET> [OPTIONS]
+clinker channels lint [OPTIONS]
+```
+
+### clinker channels resolve
+
+Renders the effective post-overlay plan for one target — the DAG plus per-value
+provenance (which layer supplied each value, and which group injected which
+node). This answers "what does tenant X actually run?".
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<TARGET>` | -- | Path to the base pipeline (or composition) YAML to resolve (required). |
+| `--channel <ID>` | -- | Channel id to resolve for (a folder under the channel root). Matching groups are derived from the channel's labels. |
+| `--group <NAME>` | -- | Force-include a group overlay by name (repeatable), with or without a channel. |
+| `--no-auto-groups` | -- | Suppress selector-derived group membership. |
+| `--base-dir <DIR>` | `.` | Workspace root holding `clinker.toml` and the channel/group roots. |
+
+Exits non-zero when the overlay raises an error (e.g. a config key matching no
+parameter), so `resolve` doubles as a targeted check for one tenant.
+
+### clinker channels lint
+
+Compiles every (target × overlay) combination across the workspace and reports
+failures — the CI safety net for base-change blast radius. This is where the
+full-tree scan lives; the run path resolves a single channel by computed lookup.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--base-dir <DIR>` | `.` | Workspace root to lint. |
+
+Exits non-zero if any combination fails to compile or apply. Dangling splice
+anchors (an op referencing a missing node) and config keys matching no parameter
+are reported per combination.
+
+### Examples
+
+```bash
+# What does tenant `globex` actually run for this pipeline?
+clinker channels resolve pipeline/order_fulfillment.yaml --channel globex
+
+# Preview a group overlay standalone (no channel)
+clinker channels resolve pipeline/order_fulfillment.yaml --group enterprise
+
+# Compile every channel/group overlay in the workspace and report failures
+clinker channels lint
 ```
 
 ---
