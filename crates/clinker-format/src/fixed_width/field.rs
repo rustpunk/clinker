@@ -4,7 +4,7 @@
 //! multi-record [`crate::multi_record::MultiRecordReader`] both slice a line
 //! into byte-positioned fields, strip padding by justification, and coerce the
 //! trimmed text to a declared type. Hosting that logic here keeps the two
-//! readers byte-for-byte identical — a declared `type: integer` (or `decimal`,
+//! readers byte-for-byte identical — a declared `type: integer` (or `float`,
 //! or `boolean`) parses the same way regardless of whether the file is single-
 //! or multi-record — instead of two forks that drift apart.
 
@@ -254,9 +254,9 @@ pub fn parse_field_value(field: &ResolvedField, raw: &str, row: u64) -> Result<V
 ///
 /// Format-neutral: the caller owns the row/field framing. This is the single
 /// canonical typed coercion shared by every fixed-width parse path. Boolean
-/// matching is ASCII-case-insensitive (`TRUE`/`true`/`YES`/`Y`/`1` → true);
-/// `Decimal` parses as an f64 like `Float`. `String`/`Object`/`Array` are
-/// caller concerns and are not reachable here (the field parse handles them).
+/// matching is ASCII-case-insensitive (`TRUE`/`true`/`YES`/`Y`/`1` → true).
+/// `String`/`Object`/`Array` are caller concerns and are not reachable here
+/// (the field parse handles them).
 ///
 /// # Errors
 ///
@@ -268,7 +268,7 @@ pub fn coerce_scalar(ty: &FieldType, format: Option<&str>, raw: &str) -> Result<
             .parse::<i64>()
             .map(Value::Integer)
             .map_err(|e| format!("cannot parse '{raw}' as integer: {e}")),
-        FieldType::Float | FieldType::Decimal => raw
+        FieldType::Float => raw
             .parse::<f64>()
             .map(Value::Float)
             .map_err(|e| format!("cannot parse '{raw}' as {}: {e}", ty_name(ty))),
@@ -293,7 +293,6 @@ fn ty_name(ty: &FieldType) -> &'static str {
     match ty {
         FieldType::Integer => "integer",
         FieldType::Float => "float",
-        FieldType::Decimal => "decimal",
         FieldType::Boolean => "boolean",
         FieldType::Date => "date",
         FieldType::DateTime => "datetime",

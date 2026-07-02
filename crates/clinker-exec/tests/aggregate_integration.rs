@@ -83,9 +83,10 @@ fn run_single(yaml: &str, csv_input: &str) -> (clinker_exec::executor::Execution
 // ---------- End-to-end aggregation ----------
 //
 // These exercise the full pipeline path: YAML parse → DAG compile → executor
-// dispatch of `PlanNode::Aggregation` → CSV output. They use `schema_overrides`
-// to type numeric columns so `sum`/`avg`/`min`/`max`/`weighted_avg` see Int/Float
-// values rather than the Type::Any string default.
+// dispatch of `PlanNode::Aggregation` → CSV output. The declared source
+// `schema:` types columns as `any`; the CXL bodies cast with `.to_int()` /
+// `.to_float()` so `sum`/`avg`/`min`/`max`/`weighted_avg` see Int/Float values
+// rather than the Type::Any string default.
 //
 // Output row order is hash-table-arbitrary, so set-equality assertions read the
 // CSV body lines into a sorted Vec and compare against the expected lines.
@@ -111,9 +112,6 @@ nodes:
     name: src
     type: csv
     path: in.csv
-    schema_overrides:
-    - name: salary
-      type: integer
     schema:
       - { name: id, type: any }
       - { name: name, type: any }
@@ -171,9 +169,6 @@ nodes:
     name: src
     type: csv
     path: in.csv
-    schema_overrides:
-    - name: salary
-      type: integer
     schema:
       - { name: id, type: any }
       - { name: name, type: any }
@@ -308,11 +303,6 @@ nodes:
     name: src
     type: csv
     path: in.csv
-    schema_overrides:
-    - name: salary
-      type: float
-    - name: hours
-      type: float
     schema:
       - { name: id, type: any }
       - { name: name, type: any }
@@ -386,9 +376,6 @@ nodes:
     name: src
     type: csv
     path: in.csv
-    schema_overrides:
-    - name: amount
-      type: integer
     schema:
       - { name: id, type: any }
       - { name: name, type: any }
@@ -443,9 +430,6 @@ nodes:
     name: src
     type: csv
     path: in.csv
-    schema_overrides:
-    - name: salary
-      type: integer
     schema:
       - { name: id, type: any }
       - { name: name, type: any }
@@ -511,9 +495,6 @@ nodes:
     name: src
     type: csv
     path: in.csv
-    schema_overrides:
-    - name: salary
-      type: integer
     schema:
       - { name: id, type: any }
       - { name: name, type: any }
@@ -585,9 +566,6 @@ nodes:
     name: src
     type: csv
     path: in.csv
-    schema_overrides:
-    - name: salary
-      type: integer
     schema:
       - { name: id, type: any }
       - { name: name, type: any }
@@ -636,9 +614,6 @@ nodes:
     name: src
     type: csv
     path: in.csv
-    schema_overrides:
-    - name: salary
-      type: integer
     sort_order:
     - field: dept
       order: asc

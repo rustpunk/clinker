@@ -15,7 +15,8 @@ use crate::value::Value;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GroupByKey {
     Str(Box<str>),
-    /// Used only when schema_overrides pins a field to "integer".
+    /// Used when a source column is pinned to an integer type via
+    /// `schema_pin`, so `42` and `42.0` do not collapse into one group.
     Int(i64),
     /// f64::to_bits() — default numeric path. -0.0 canonicalized to 0.0.
     Float(u64),
@@ -114,7 +115,7 @@ impl std::error::Error for GroupKeyError {}
 /// Convert a Value to a GroupByKey, applying numeric normalization rules.
 ///
 /// - Default: widen Int to Float via `to_bits()` so 42 and 42.0 group together.
-/// - Integer-pinned (via schema_overrides): use `GroupByKey::Int(i64)`, reject Float.
+/// - Integer-pinned (via `schema_pin`): use `GroupByKey::Int(i64)`, reject Float.
 /// - NaN → hard error.
 /// - Null → None (caller decides whether to skip or use GroupByKey::Null).
 /// - `-0.0` canonicalized to `0.0` before `to_bits()`.
@@ -333,8 +334,6 @@ mod tests {
             precision: None,
             scale: None,
             path: None,
-            drop: None,
-            record: None,
         };
         let key = value_to_group_key(&Value::Integer(42), "x", Some(&pin), 0)
             .unwrap()

@@ -578,3 +578,44 @@ evidence.
   bind-time diagnostic rejecting `analytic_window:` in a body reachable only
   through a nested composition.
 - Priority: Low
+
+### 31. Schema-resolver unification: what still needs one resolved schema per source
+
+- Landed: the dead `schema_overrides` strategic-merge surface
+  (`schema/resolve.rs`, `SourceConfig.schema_overrides`, the override-only
+  `FieldDef.drop`/`record` fields, and the inline-schema/overrides conflict
+  check) is removed. The keyed-map `patch_schema` op (`config/patch.rs::apply_schema_ops`,
+  E230–E235) is now the single sanctioned schema-override path — no parallel
+  override merger remains. The `decimal` type token is retired: a decimal is a
+  `float` field carrying `precision`/`scale` attributes, so the format-layer
+  `FieldType` and the CXL `Type` vocabularies agree on the fractional type.
+- Still open (intended for the schema-resolver-provenance follow-on): the two
+  per-source schema representations have NOT been merged. The format-layer
+  `FieldDef` list still resolves lazily at ingest
+  (`clinker-exec/src/executor/ingest.rs` → `schema::resolve_schema`/`resolve_records`,
+  the `inherits:` template merge in `schema/mod.rs`), while the type-layer
+  `ColumnDecl` list binds at compile in `bind_schema`; `CompiledPlan` carries no
+  single fully-resolved schema per source. The executable
+  `FieldType -> cxl::typecheck::Type` bridge is deliberately NOT added yet — no
+  safe consumer exists in the current shape (fixtures such as
+  `benches/pipelines/format/fixed_width_passthrough.yaml` and the
+  `format_dispatch` fixed-width test deliberately declare a source's
+  `format_schema` field type and its `schema:` `ColumnDecl` type differently, so
+  a reconciling check would break green). The `numeric` "never survives a
+  resolved schema" invariant is likewise deferred: `type: numeric` is today a
+  live, documented (auto-widen) declared source-column type with real runtime
+  coercion semantics (`clinker-exec/src/pipeline/schema_coerce.rs` coerces a
+  `Numeric` column int-then-float per value). Concretizing a declared `numeric`
+  to `int`/`float` is a user-facing behavior change that belongs WITH the single
+  resolved schema, not bolted onto the current two-representation model.
+- Why it matters: until the two representations collapse into one resolved
+  schema on `CompiledPlan`, per-attribute schema provenance (`--explain --field`)
+  and a single authoritative source-column type cannot be built.
+- Files/modules involved: `crates/clinker-plan/src/schema/mod.rs`,
+  `crates/clinker-plan/src/config/patch.rs`,
+  `crates/clinker-plan/src/plan/bind_schema.rs`,
+  `crates/clinker-plan/src/plan/compiled.rs`,
+  `crates/clinker-exec/src/executor/ingest.rs`,
+  `crates/clinker-exec/src/pipeline/schema_coerce.rs`,
+  `crates/cxl/src/typecheck/types.rs`.
+- Priority: Medium

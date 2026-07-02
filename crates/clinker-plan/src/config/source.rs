@@ -1,7 +1,7 @@
 //! Source node configuration: file discovery, transports, and per-format input options.
 
 use super::*;
-use clinker_record::schema_def::{FieldDef, LineSeparator};
+use clinker_record::schema_def::LineSeparator;
 use serde::de::{self};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -102,8 +102,6 @@ pub struct SourceConfig {
     /// compile-time typecheck.
     #[serde(rename = "format_schema", skip_serializing_if = "Option::is_none")]
     pub schema: Option<SchemaSource>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schema_overrides: Option<Vec<FieldDef>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub array_paths: Option<Vec<ArrayPathConfig>>,
     /// Record-level sortedness inside the file (used by combine/aggregate
