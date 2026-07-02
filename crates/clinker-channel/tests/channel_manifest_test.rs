@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use clinker_channel::{ChannelManifest, OverlayFile};
 use clinker_plan::config::ScopedVarType;
+use clinker_plan::overlay_ops::OverlayOp;
 
 fn manifest(yaml: &[u8]) -> ChannelManifest {
     ChannelManifest::from_yaml_bytes(yaml, PathBuf::from("channel.cfg.yaml"))
@@ -78,10 +79,18 @@ overrides:
     );
     assert_eq!(m.vars.record["tag"].var_type, ScopedVarType::String);
 
-    // `overrides` stays opaque — a list of maps, uninterpreted here.
+    // `overrides` parses into the typed op vocabulary, keeping each op's span.
     assert_eq!(m.overrides.len(), 1);
-    assert_eq!(m.overrides[0]["op"], serde_json::json!("add"));
-    assert_eq!(m.overrides[0]["alias"], serde_json::json!("fraud"));
+    match &m.overrides[0].value {
+        OverlayOp::Add(add) => {
+            assert_eq!(add.alias.as_deref(), Some("fraud"));
+            assert_eq!(
+                add.composition.as_deref(),
+                Some(std::path::Path::new("./composition/fraud.comp.yaml"))
+            );
+        }
+        other => panic!("expected add op, got {other:?}"),
+    }
 }
 
 #[test]
@@ -126,13 +135,15 @@ labels: { region: west, tier: enterprise, shard: "07" }
 "#,
     );
 
-    // Serialize the parsed manifest and read it back; labels must survive
-    // with identical order and values.
-    let json = serde_json::to_string(&m).expect("manifest serializes");
-    let round: ChannelManifest = serde_json::from_str(&json).expect("manifest re-parses");
+    // Labels are an order-preserving scalar map: round-tripping them through
+    // JSON keeps declared order and values (the manifest itself is parse-only
+    // now that `overrides` carries span-bearing typed ops).
+    let json = serde_json::to_string(&m.labels).expect("labels serialize");
+    let round: indexmap::IndexMap<String, serde_json::Value> =
+        serde_json::from_str(&json).expect("labels re-parse");
 
     let before: Vec<(&String, &serde_json::Value)> = m.labels.iter().collect();
-    let after: Vec<(&String, &serde_json::Value)> = round.labels.iter().collect();
+    let after: Vec<(&String, &serde_json::Value)> = round.iter().collect();
     assert_eq!(before, after);
     assert_eq!(
         after[2],
@@ -168,7 +179,13 @@ overrides:
         ScopedVarType::String
     );
     assert_eq!(o.overrides.len(), 1);
-    assert_eq!(o.overrides[0]["op"], serde_json::json!("set"));
+    match &o.overrides[0].value {
+        OverlayOp::Set(set) => {
+            assert_eq!(set.target, "route_priority");
+            assert_eq!(set.field, "config.cxl");
+        }
+        other => panic!("expected set op, got {other:?}"),
+    }
 }
 
 #[test]
@@ -224,23 +241,35 @@ labels: { region: west }
 }
 
 #[test]
-fn overlay_overrides_stay_opaque() {
-    // A structurally rich op list parses as opaque values without this layer
-    // asserting any op vocabulary (that is CH-10's job).
+fn overlay_overrides_parse_typed() {
+    // A structurally rich op list parses into the typed op vocabulary, each op
+    // keeping its source span. The keyed `schema:` grammar (not a list) is the
+    // canonical `patch_schema` shape.
     let o = overlay(
         br#"
 channel:
   target: ./pipeline.yaml
 overrides:
-  - { op: add, node: { type: transform, name: stamp, input: src }, after: src }
-  - { op: patch_schema, target: orders, add: [ { name: tax_exempt, type: bool } ] }
+  - { op: add, node: { type: transform, name: stamp, input: src, config: { cxl: "emit a = b" } }, after: src }
+  - { op: patch_schema, target: orders, schema: { tax_exempt: { add: { type: bool } } } }
   - { op: bypass, target: legacy_audit }
 "#,
         "pipeline.channel.yaml",
     );
 
     assert_eq!(o.overrides.len(), 3);
-    assert!(o.overrides[0].is_object());
-    assert_eq!(o.overrides[1]["op"], serde_json::json!("patch_schema"));
-    assert_eq!(o.overrides[2]["target"], serde_json::json!("legacy_audit"));
+    assert!(matches!(o.overrides[0].value, OverlayOp::Add(_)));
+    match &o.overrides[1].value {
+        OverlayOp::PatchSchema(patch) => {
+            assert_eq!(patch.target, "orders");
+            assert!(patch.schema.contains_key("tax_exempt"));
+        }
+        other => panic!("expected patch_schema op, got {other:?}"),
+    }
+    match &o.overrides[2].value {
+        OverlayOp::Bypass(bypass) => assert_eq!(bypass.target, "legacy_audit"),
+        other => panic!("expected bypass op, got {other:?}"),
+    }
+    // Ops carry a non-zero source line (span anchoring for op diagnostics).
+    assert!(o.overrides[0].referenced.line() > 0);
 }

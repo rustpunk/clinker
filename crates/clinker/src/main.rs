@@ -107,6 +107,75 @@ EXAMPLES:
   clinker explain --code E105"
     )]
     Explain(ExplainArgs),
+    /// Channel/group overlay tooling: resolve one effective plan, or lint the
+    /// whole workspace.
+    #[command(
+        long_about = "\
+Inspect and validate the channel/group multi-tenant overlay system.\n\n\
+`resolve` renders the effective post-overlay DAG for one target under a chosen \
+channel and/or groups, with per-value provenance — which layer supplied each \
+value and which group injected which node. `lint` compiles every \
+(target × overlay) combination across the workspace and reports failures, the \
+CI safety net for base-change blast radius.",
+        after_long_help = "\
+EXAMPLES:
+  # What does tenant `globex` actually run for this pipeline?
+  clinker channels resolve pipeline/order_fulfillment.yaml --channel globex
+
+  # Preview a group overlay standalone (no channel)
+  clinker channels resolve pipeline/order_fulfillment.yaml --group enterprise
+
+  # Compile every channel/group overlay in the workspace and report failures
+  clinker channels lint"
+    )]
+    Channels {
+        #[command(subcommand)]
+        subcommand: ChannelsCommands,
+    },
+}
+
+/// Subcommands for `clinker channels`.
+#[derive(Subcommand, Debug)]
+pub enum ChannelsCommands {
+    /// Render the effective post-overlay plan for one target with provenance.
+    Resolve(ResolveArgs),
+    /// Compile every (target × overlay) combination and report failures.
+    Lint(LintArgs),
+}
+
+/// Arguments for `clinker channels resolve`.
+#[derive(Parser, Debug)]
+pub struct ResolveArgs {
+    /// Path to the base pipeline (or composition) YAML to resolve.
+    pub target: PathBuf,
+
+    /// Channel id to resolve the overlay stack for (folder under the channel
+    /// root). Derives matching groups from the channel's labels.
+    #[arg(long)]
+    pub channel: Option<String>,
+
+    /// Force-include a group overlay by name (repeatable), with or without a
+    /// channel.
+    #[arg(long = "group", value_name = "NAME")]
+    pub groups: Vec<String>,
+
+    /// Suppress selector-derived group membership; only explicit `--group`
+    /// overlays apply.
+    #[arg(long = "no-auto-groups")]
+    pub no_auto_groups: bool,
+
+    /// Workspace root (holds `clinker.toml` and the channel/group roots).
+    #[arg(long, default_value = ".")]
+    pub base_dir: PathBuf,
+}
+
+/// Arguments for `clinker channels lint`.
+#[derive(Parser, Debug)]
+pub struct LintArgs {
+    /// Workspace root to lint (holds `clinker.toml` and the channel/group
+    /// roots).
+    #[arg(long, default_value = ".")]
+    pub base_dir: PathBuf,
 }
 
 /// Output format for --explain.
@@ -215,6 +284,17 @@ pub struct RunArgs {
     /// are rejected.
     #[arg(long, help_heading = "Configuration")]
     pub channel: Option<PathBuf>,
+
+    /// Force-include a group overlay by name (repeatable). Applies the group's
+    /// `overrides` op stream and `config`/`vars` clobber regardless of its
+    /// selector, with or without a channel. See `clinker channels resolve`.
+    #[arg(long = "group", value_name = "NAME", help_heading = "Configuration")]
+    pub groups: Vec<String>,
+
+    /// Suppress selector-derived group membership; only explicit `--group`
+    /// overlays apply.
+    #[arg(long = "no-auto-groups", help_heading = "Configuration")]
+    pub no_auto_groups: bool,
 }
 
 impl RunArgs {
@@ -289,6 +369,16 @@ pub struct ExplainArgs {
     /// Channel YAML file to apply before provenance lookup
     #[arg(long)]
     pub channel: Option<PathBuf>,
+
+    /// Force-include a group overlay by name (repeatable) before provenance
+    /// lookup, mirroring `clinker run --group`.
+    #[arg(long = "group", value_name = "NAME")]
+    pub groups: Vec<String>,
+
+    /// Suppress selector-derived group membership; only explicit `--group`
+    /// overlays apply.
+    #[arg(long = "no-auto-groups")]
+    pub no_auto_groups: bool,
 
     /// Error/warning code to look up (e.g. "E105")
     #[arg(long)]
@@ -392,6 +482,22 @@ fn main() -> ExitCode {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(e) => {
                     eprintln!("clinker explain error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::Channels { subcommand } => {
+            tracing_subscriber::fmt()
+                .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+                .init();
+            let result = match subcommand {
+                ChannelsCommands::Resolve(args) => run_channels_resolve(args),
+                ChannelsCommands::Lint(args) => run_channels_lint(args),
+            };
+            match result {
+                Ok(code) => ExitCode::from(code),
+                Err(e) => {
+                    eprintln!("clinker channels error: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -651,9 +757,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // plan-only `--explain` display path (which never ingests, so the
     // filesystem-class rejections do not apply) and seeds the run path with the
     // same resolved root the validator re-derives.
-    let storage_config = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
-        .map_err(storage_config_error)?
-        .storage;
+    let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
+        .map_err(storage_config_error)?;
+    let channel_layout = clinker_toml.channel.clone();
+    let group_layout = clinker_toml.group.clone();
+    let storage_config = clinker_toml.storage;
     let spill_root_dir = storage_config
         .spill
         .resolve()
@@ -683,9 +791,52 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // resolve — so dataset names name the same bytes a run reads/writes. Both
     // halves are moved into `compile_ctx` next, so capture the join now.
     let lineage_base_dir = workspace_root.join(&pipeline_dir);
+
+    // Resolve the channel/group overlay stack (op stream + config/vars clobber)
+    // before building the compile context. Groups here are force-included by
+    // name (`--group`); auto-derivation keys off a channel manifest's labels,
+    // which the legacy file-based `--channel` flag does not carry, so on the run
+    // path only explicit `--group` overlays apply (full label-derivation is
+    // available via `clinker channels resolve`). An empty request resolves to
+    // an empty stack, keeping a plain run byte-identical.
+    let target_name = args
+        .config
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let overlay_resolution = if args.groups.is_empty() {
+        None
+    } else {
+        Some(
+            clinker_channel::resolve(
+                &workspace_root,
+                &channel_layout,
+                &group_layout,
+                target_name,
+                None,
+                &args.groups,
+                !args.no_auto_groups,
+            )
+            .map_err(|e| {
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                    "overlay resolution failed: {e}"
+                )))
+            })?,
+        )
+    };
+    if let Some(res) = &overlay_resolution
+        && !args.quiet
+        && !res.is_empty()
+    {
+        eprintln!("clinker: applied overlay — {}", overlay_summary(res));
+    }
+
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
+    if let Some(res) = &overlay_resolution {
+        compile_ctx.overlay_ops = res.op_stream().to_vec();
+    }
 
     // Run identity values flow through Output path templates and the
     // provenance sidecar. Generated before --explain so resolved-path
@@ -767,6 +918,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     transform_name: String::new(),
                     messages: diags.iter().map(|d| d.message.clone()).collect(),
                 })?;
+        if let Some(res) = &overlay_resolution {
+            let overlay = res.apply_config_and_vars(&mut compiled_plan, &pipeline_config);
+            abort_on_overlay_errors(&overlay)?;
+        }
         if let Some(binding) = &channel_binding {
             let overlay = clinker_channel::apply_channel_overlay(
                 &mut compiled_plan,
@@ -891,6 +1046,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     transform_name: String::new(),
                     messages: diags.iter().map(|d| d.message.clone()).collect(),
                 })?;
+        if let Some(res) = &overlay_resolution {
+            let overlay = res.apply_config_and_vars(&mut compiled_plan, cfg);
+            abort_on_overlay_errors(&overlay)?;
+        }
         if let Some(binding) = &channel_binding {
             let overlay = clinker_channel::apply_channel_overlay(&mut compiled_plan, binding, cfg);
             abort_on_overlay_errors(&overlay)?;
@@ -995,15 +1154,39 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // preflight, and so output-side fan-out detection (§5) can read
     // `fan_out_per_source_file` flags before the writer setup decides whether
     // to open one writer or N.
-    let mut compiled_plan = pipeline_config.compile(&compile_ctx).expect("compile");
+    // The structural overlay op stream (if any) is applied inside `compile`
+    // via `compile_ctx.overlay_ops`, so a bad splice anchor or ill-typed op is
+    // a compile diagnostic, not a panic — propagate it rather than unwrapping.
+    let mut compiled_plan =
+        pipeline_config
+            .compile(&compile_ctx)
+            .map_err(|diags| PipelineError::Compilation {
+                transform_name: String::new(),
+                messages: diags.iter().map(|d| d.message.clone()).collect(),
+            })?;
+    // Group/channel-folder overlay: config/vars clobber at the lower layers.
+    // Applied before the legacy channel-file overlay so the latter (the
+    // highest layer) still wins any shared key.
+    if let Some(res) = &overlay_resolution {
+        let overlay = res.apply_config_and_vars(&mut compiled_plan, &pipeline_config);
+        abort_on_overlay_errors(&overlay)?;
+        channel_static_vars.extend(overlay.static_vars);
+        channel_pipeline_vars.extend(overlay.pipeline_vars);
+        for (src, inner) in overlay.source_vars {
+            channel_source_vars.entry(src).or_default().extend(inner);
+        }
+        channel_record_vars.extend(overlay.record_vars);
+    }
     if let Some(binding) = &channel_binding {
         let overlay =
             clinker_channel::apply_channel_overlay(&mut compiled_plan, binding, &pipeline_config);
         abort_on_overlay_errors(&overlay)?;
-        channel_static_vars = overlay.static_vars;
-        channel_pipeline_vars = overlay.pipeline_vars;
-        channel_source_vars = overlay.source_vars;
-        channel_record_vars = overlay.record_vars;
+        channel_static_vars.extend(overlay.static_vars);
+        channel_pipeline_vars.extend(overlay.pipeline_vars);
+        for (src, inner) in overlay.source_vars {
+            channel_source_vars.entry(src).or_default().extend(inner);
+        }
+        channel_record_vars.extend(overlay.record_vars);
     }
 
     // Discovery pre-pass: resolve every File source's matcher to its file set
@@ -1306,12 +1489,16 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         spill_disk_cap_bytes,
         spill_compress: storage_config.spill.compress,
     };
+    // The executor recompiles `compiled_plan.config()` — already the effective,
+    // post-overlay config — so the context it recompiles under must NOT carry
+    // the overlay ops again (they would double-apply and collide). For a plain
+    // run this is identical to `compile_ctx.clone()` (the op stream is empty).
     let report = match PipelineExecutor::run_plan_with_readers_writers_in_context(
         &compiled_plan,
         readers,
         registry,
         &run_params,
-        compile_ctx.clone(),
+        compile_ctx.without_overlay_ops(),
     ) {
         Ok(report) => report,
         Err(e) => {
@@ -2129,13 +2316,56 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
         .strip_prefix(&workspace_root)
         .unwrap_or_else(|_| std::path::Path::new(""))
         .to_path_buf();
-    let compile_ctx =
-        clinker_plan::config::CompileContext::with_pipeline_dir(&workspace_root, pipeline_dir);
 
-    let compiled_plan = pipeline_config.compile(&compile_ctx).map_err(|diags| {
+    // Force-included group overlays (`--group`) apply their op stream and
+    // config/vars clobber before provenance is computed, mirroring `run`.
+    let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
+        .map_err(|e| format!("clinker.toml: {e}"))?;
+    let target_name = config_path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    let overlay_resolution = if args.groups.is_empty() {
+        None
+    } else {
+        Some(
+            clinker_channel::resolve(
+                &workspace_root,
+                &clinker_toml.channel,
+                &clinker_toml.group,
+                target_name,
+                None,
+                &args.groups,
+                !args.no_auto_groups,
+            )
+            .map_err(|e| format!("overlay resolution failed: {e}"))?,
+        )
+    };
+
+    let mut compile_ctx =
+        clinker_plan::config::CompileContext::with_pipeline_dir(&workspace_root, pipeline_dir);
+    if let Some(res) = &overlay_resolution {
+        compile_ctx.overlay_ops = res.op_stream().to_vec();
+    }
+
+    let mut compiled_plan = pipeline_config.compile(&compile_ctx).map_err(|diags| {
         let messages: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
         format!("compilation failed:\n{}", messages.join("\n"))
     })?;
+
+    if let Some(res) = &overlay_resolution {
+        use clinker_core_types::Severity;
+        let overlay = res.apply_config_and_vars(&mut compiled_plan, &pipeline_config);
+        let errors: Vec<String> = overlay
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d.severity, Severity::Error))
+            .map(|d| format!("[{}] {}", d.code, d.message))
+            .collect();
+        if !errors.is_empty() {
+            return Err(format!("overlay application failed:\n{}", errors.join("\n")).into());
+        }
+    }
 
     let output =
         clinker_plan::plan::explain_provenance::explain_field_provenance(&compiled_plan, field)
@@ -2143,6 +2373,379 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     print!("{output}");
     Ok(())
+}
+
+/// One-line summary of an applied overlay resolution for run/explain output.
+fn overlay_summary(res: &clinker_channel::OverlayResolution) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(id) = res.channel_id() {
+        parts.push(format!("channel {id}"));
+    }
+    if res.applied_groups().is_empty() {
+        parts.push("no groups".to_string());
+    } else {
+        let groups: Vec<String> = res
+            .applied_groups()
+            .iter()
+            .map(|g| format!("{} ({}, priority {})", g.name, g.source.label(), g.priority))
+            .collect();
+        parts.push(format!("groups: {}", groups.join(", ")));
+    }
+    parts.join("; ")
+}
+
+/// Human-readable label for an op-stream overlay layer.
+fn op_layer_label(layer: clinker_plan::overlay_ops::OverlayLayer) -> String {
+    use clinker_plan::overlay_ops::OverlayLayer;
+    match layer {
+        OverlayLayer::PipelineDefault => "pipeline-default".to_string(),
+        OverlayLayer::Group { priority } => format!("group (priority {priority})"),
+        OverlayLayer::ChannelWide => "channel-wide".to_string(),
+        OverlayLayer::ChannelPerTarget => "channel-per-target".to_string(),
+    }
+}
+
+/// Format a JSON value for the provenance table (strip quotes from strings).
+fn format_overlay_value(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => format!("\"{s}\""),
+        other => other.to_string(),
+    }
+}
+
+/// Compile the effective (post-overlay) plan for a target under a resolution.
+///
+/// Applies the structural op stream pre-compile (via `overlay_ops`) and the
+/// `config`/`vars` clobber post-compile, returning the config, the compiled
+/// plan, and the overlay result (whose diagnostics carry any `E113`/`E109`).
+/// A compile failure (e.g. a dangling splice anchor) is a hard `Err`.
+fn compile_effective_plan(
+    base_path: &std::path::Path,
+    workspace_root: &std::path::Path,
+    res: &clinker_channel::OverlayResolution,
+) -> Result<
+    (
+        clinker_plan::config::PipelineConfig,
+        clinker_plan::plan::CompiledPlan,
+        clinker_channel::ChannelOverlayResult,
+    ),
+    String,
+> {
+    let yaml = std::fs::read_to_string(base_path)
+        .map_err(|e| format!("cannot read {}: {e}", base_path.display()))?;
+    let interpolated = clinker_plan::config::interpolate_env_vars(&yaml, &[])
+        .map_err(|e| format!("environment variable interpolation failed: {e}"))?;
+    let config: clinker_plan::config::PipelineConfig = clinker_plan::yaml::from_str(&interpolated)
+        .map_err(|e| format!("YAML parse error: {e}"))?;
+
+    let base_parent = base_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .canonicalize()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let pipeline_dir = base_parent
+        .strip_prefix(workspace_root)
+        .unwrap_or_else(|_| std::path::Path::new(""))
+        .to_path_buf();
+    let mut ctx =
+        clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
+    ctx.overlay_ops = res.op_stream().to_vec();
+
+    let mut plan = config.compile(&ctx).map_err(|diags| {
+        let messages: Vec<String> = diags
+            .iter()
+            .map(|d| format!("[{}] {}", d.code, d.message))
+            .collect();
+        format!("compilation failed:\n{}", messages.join("\n"))
+    })?;
+    let overlay = res.apply_config_and_vars(&mut plan, &config);
+    Ok((config, plan, overlay))
+}
+
+/// Render the effective post-overlay plan with per-node/op provenance — the
+/// `channels resolve` report. Deterministic (no file sizes / timing), so it
+/// snapshots cleanly.
+fn render_resolved(
+    plan: &clinker_plan::plan::CompiledPlan,
+    overlay: &clinker_channel::ChannelOverlayResult,
+    res: &clinker_channel::OverlayResolution,
+    target_name: &str,
+) -> String {
+    use clinker_core_types::Severity;
+    use clinker_plan::config::composition::LayerKind;
+
+    let mut out = String::new();
+    out.push_str(&format!("Effective plan for `{target_name}`\n"));
+    match res.channel_id() {
+        Some(id) => out.push_str(&format!("  channel: {id}\n")),
+        None => out.push_str("  channel: <none>\n"),
+    }
+    if res.applied_groups().is_empty() {
+        out.push_str("  groups:  <none>\n");
+    } else {
+        out.push_str("  groups:\n");
+        for g in res.applied_groups() {
+            out.push_str(&format!(
+                "    - {} (priority {}, {})\n",
+                g.name,
+                g.priority,
+                g.source.label()
+            ));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("Injected nodes:\n");
+    if res.injected_nodes().is_empty() {
+        out.push_str("  <none>\n");
+    } else {
+        for inj in res.injected_nodes() {
+            out.push_str(&format!(
+                "  {} <- {} [{}]\n",
+                inj.node,
+                inj.source,
+                op_layer_label(inj.layer)
+            ));
+        }
+    }
+    out.push('\n');
+
+    out.push_str("Config provenance (overlay-affected):\n");
+    let mut rows: Vec<String> = Vec::new();
+    for ((node, param), resolved) in plan.provenance().iter() {
+        let Some(win) = resolved.winning_layer() else {
+            continue;
+        };
+        if win.kind == LayerKind::PipelineDefault {
+            continue;
+        }
+        let base = resolved
+            .layer_value(LayerKind::PipelineDefault)
+            .map(format_overlay_value)
+            .unwrap_or_else(|| "<none>".to_string());
+        rows.push(format!(
+            "  {node}.{param} = {}  [{}]  (base: {})",
+            format_overlay_value(&resolved.value),
+            win.kind,
+            base
+        ));
+    }
+    rows.sort();
+    if rows.is_empty() {
+        out.push_str("  <none>\n");
+    } else {
+        for r in rows {
+            out.push_str(&r);
+            out.push('\n');
+        }
+    }
+
+    let diags: Vec<&clinker_core_types::Diagnostic> = overlay
+        .diagnostics
+        .iter()
+        .filter(|d| matches!(d.severity, Severity::Error | Severity::Warning))
+        .collect();
+    if !diags.is_empty() {
+        out.push('\n');
+        out.push_str("Diagnostics:\n");
+        for d in diags {
+            let label = match d.severity {
+                Severity::Error => "error",
+                Severity::Warning => "warning",
+                Severity::Note => "note",
+            };
+            out.push_str(&format!("  {label}: [{}] {}\n", d.code, d.message));
+        }
+    }
+
+    out
+}
+
+/// `clinker channels resolve <target>` — render the effective post-overlay plan
+/// for one target with per-value provenance.
+fn run_channels_resolve(args: &ResolveArgs) -> Result<u8, Box<dyn std::error::Error>> {
+    let workspace_root = args.base_dir.canonicalize()?;
+    let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
+        .map_err(|e| format!("clinker.toml: {e}"))?;
+    // Strip the full `.comp.yaml` / `.yaml` suffix (not just the last
+    // extension) so a composition target `score.comp.yaml` resolves to the bare
+    // stem `score` the discovery layer expects — matching `channels lint`.
+    let file_name = args
+        .target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or("target path has no file name")?;
+    let target_name = target_stem_of(file_name);
+
+    let res = clinker_channel::resolve(
+        &workspace_root,
+        &clinker_toml.channel,
+        &clinker_toml.group,
+        &target_name,
+        args.channel.as_deref(),
+        &args.groups,
+        !args.no_auto_groups,
+    )
+    .map_err(|e| format!("overlay resolution failed: {e}"))?;
+
+    let (config, plan, overlay) = compile_effective_plan(&args.target, &workspace_root, &res)?;
+
+    // Overlay report (deterministic) followed by the effective DAG for context.
+    print!("{}", render_resolved(&plan, &overlay, &res, &target_name));
+    println!("\nEffective DAG:");
+    print!("{}", plan.dag().explain_text(&config));
+
+    // An overlay that raised an error diagnostic (e.g. an unknown config key)
+    // resolves to a non-zero exit so `resolve` doubles as a targeted check.
+    use clinker_core_types::Severity;
+    let has_error = overlay
+        .diagnostics
+        .iter()
+        .any(|d| matches!(d.severity, Severity::Error));
+    Ok(if has_error { 1 } else { 0 })
+}
+
+/// `clinker channels lint` — compile every (target × overlay) combination in the
+/// workspace and report failures. This is the full-tree scan (kept off the run
+/// path, which resolves by computed lookup).
+fn run_channels_lint(args: &LintArgs) -> Result<u8, Box<dyn std::error::Error>> {
+    let workspace_root = args.base_dir.canonicalize()?;
+    let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
+        .map_err(|e| format!("clinker.toml: {e}"))?;
+
+    let channels = clinker_channel::scan_channels(&clinker_toml.channel, &workspace_root).map_err(
+        |diags| {
+            let msgs: Vec<String> = diags
+                .iter()
+                .map(|d| format!("[{}] {}", d.code, d.message))
+                .collect();
+            format!("channel scan failed:\n{}", msgs.join("\n"))
+        },
+    )?;
+
+    let mut checked = 0usize;
+    let mut failures: Vec<(String, String, Vec<String>)> = Vec::new();
+
+    for channel in &channels {
+        // Every overlay file in the tenant folder is a (channel × target) combo.
+        for overlay_path in overlay_files_in(&channel.dir) {
+            let overlay_file = match clinker_channel::OverlayFile::load(&overlay_path) {
+                Ok(o) => o,
+                Err(e) => {
+                    failures.push((
+                        channel.id.clone(),
+                        overlay_path.display().to_string(),
+                        vec![format!("overlay parse error: {e}")],
+                    ));
+                    continue;
+                }
+            };
+            let target_name = target_stem_of(&overlay_file.channel.target);
+            let base_path = channel.dir.join(&overlay_file.channel.target);
+
+            checked += 1;
+            let res = match clinker_channel::resolve(
+                &workspace_root,
+                &clinker_toml.channel,
+                &clinker_toml.group,
+                &target_name,
+                Some(&channel.id),
+                &[],
+                true,
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    failures.push((
+                        channel.id.clone(),
+                        target_name.clone(),
+                        vec![format!("resolution failed: {e}")],
+                    ));
+                    continue;
+                }
+            };
+
+            match compile_effective_plan(&base_path, &workspace_root, &res) {
+                Ok((_, _, overlay)) => {
+                    use clinker_core_types::Severity;
+                    let errs: Vec<String> = overlay
+                        .diagnostics
+                        .iter()
+                        .filter(|d| matches!(d.severity, Severity::Error))
+                        .map(|d| format!("[{}] {}", d.code, d.message))
+                        .collect();
+                    if !errs.is_empty() {
+                        failures.push((channel.id.clone(), target_name.clone(), errs));
+                    }
+                }
+                Err(msg) => {
+                    failures.push((
+                        channel.id.clone(),
+                        target_name.clone(),
+                        msg.lines().map(str::to_string).collect(),
+                    ));
+                }
+            }
+        }
+    }
+
+    if failures.is_empty() {
+        println!(
+            "channels lint: OK — {checked} (target × overlay) combination(s) across {} channel(s) compiled clean",
+            channels.len()
+        );
+        Ok(0)
+    } else {
+        for (channel_id, target, msgs) in &failures {
+            eprintln!("FAIL  channel `{channel_id}`  target `{target}`");
+            for m in msgs {
+                eprintln!("        {m}");
+            }
+        }
+        eprintln!(
+            "channels lint: {} failure(s) of {checked} combination(s)",
+            failures.len()
+        );
+        Ok(1)
+    }
+}
+
+/// The candidate overlay files in a tenant folder: every `*.yaml` except the
+/// `channel.cfg.yaml` manifest. Non-recursive, symlinks skipped.
+fn overlay_files_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name == clinker_channel::CHANNEL_MANIFEST_FILE {
+            continue;
+        }
+        if name.ends_with(".yaml") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
+/// The bare target stem of a `channel.target:` path (strip `.comp.yaml` /
+/// `.yaml` and the directory).
+fn target_stem_of(target: &str) -> String {
+    let file = std::path::Path::new(target)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(target);
+    file.strip_suffix(".comp.yaml")
+        .or_else(|| file.strip_suffix(".yaml"))
+        .unwrap_or(file)
+        .to_string()
 }
 
 #[cfg(test)]

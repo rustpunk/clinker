@@ -1,0 +1,14 @@
+---
+source: crates/clinker/tests/channels_overlay.rs
+expression: report
+---
+Effective plan for `order_fulfillment`
+  channel: globex
+  groups:
+    - enterprise (priority 20, derived)
+
+Injected nodes:
+  fraud_stamp <- enterprise [group (priority 20)]
+
+Config provenance (overlay-affected):
+  scorer.threshold = 0.95  [ChannelPerTarget]  (base: 0.5)

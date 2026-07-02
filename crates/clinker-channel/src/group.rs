@@ -32,6 +32,9 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
+use clinker_plan::overlay_ops::OverlayOp;
+use clinker_plan::yaml::Spanned;
+
 use crate::error::ChannelError;
 use crate::manifest::ChannelVars;
 
@@ -69,10 +72,10 @@ pub struct Group {
     /// block uses (`static` / `pipeline` / `source` / `record`). Reuses the
     /// channel overlay's [`ChannelVars`](crate::manifest::ChannelVars) type.
     pub vars: ChannelVars,
-    /// Ordered override ops, preserved verbatim. The typed op vocabulary is
-    /// owned by the overlay op engine and interpreted there; this stage only
-    /// captures the raw entries without losing information.
-    pub overrides: Vec<serde_json::Value>,
+    /// Ordered override ops applied at this group's `Group` layer. Each op
+    /// keeps its source [`Spanned`] location so a later ill-typed-op
+    /// diagnostic anchors to the offending op rather than the base pipeline.
+    pub overrides: Vec<Spanned<OverlayOp>>,
 }
 
 impl Group {
@@ -120,7 +123,7 @@ struct RawGroupFile {
     #[serde(default)]
     vars: ChannelVars,
     #[serde(default)]
-    overrides: Vec<serde_json::Value>,
+    overrides: Vec<Spanned<OverlayOp>>,
 }
 
 #[derive(Deserialize)]

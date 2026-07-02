@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 use clinker_channel::Group;
 use clinker_plan::config::ScopedVarType;
+use clinker_plan::overlay_ops::OverlayOp;
 
 fn group(yaml: &[u8]) -> Group {
     Group::from_yaml_bytes(yaml, PathBuf::from("test.group.yaml")).expect("group YAML parses")
@@ -148,20 +149,19 @@ overrides:
     );
     assert_eq!(g.vars.record["seen"].var_type, ScopedVarType::Bool);
 
-    // Overrides are preserved verbatim, in declaration order.
+    // Overrides parse into the typed op vocabulary, in declaration order.
     assert_eq!(g.overrides.len(), 2);
-    assert_eq!(
-        g.overrides[0].get("op").and_then(|v| v.as_str()),
-        Some("add")
-    );
-    assert_eq!(
-        g.overrides[0].get("alias").and_then(|v| v.as_str()),
-        Some("fraud_check")
-    );
-    assert_eq!(
-        g.overrides[1].get("op").and_then(|v| v.as_str()),
-        Some("set")
-    );
+    match &g.overrides[0].value {
+        OverlayOp::Add(add) => {
+            assert_eq!(add.alias.as_deref(), Some("fraud_check"));
+            assert_eq!(add.after.as_deref(), Some("normalize_fields"));
+        }
+        other => panic!("expected add op, got {other:?}"),
+    }
+    match &g.overrides[1].value {
+        OverlayOp::Set(set) => assert_eq!(set.target, "route_priority"),
+        other => panic!("expected set op, got {other:?}"),
+    }
 }
 
 #[test]

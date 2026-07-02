@@ -380,6 +380,7 @@ dependencies = [
  "clinker-plan",
  "clinker-record",
  "indexmap",
+ "insta",
  "miette",
  "num_cpus",
  "serde-saphyr",

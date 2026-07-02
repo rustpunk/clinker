@@ -57,6 +57,7 @@ pub mod error;
 pub mod group;
 pub mod manifest;
 pub mod overlay;
+pub mod resolve;
 pub mod selector;
 pub mod staging_copy;
 
@@ -67,13 +68,16 @@ pub use derivation::{
     group_layer,
 };
 pub use discovery::{
-    DiscoveredChannel, OverlayKind, ResolvedOverlay, channel_folder_path, resolve_channel_overlay,
-    scan_channels, scan_groups,
+    CHANNEL_MANIFEST_FILE, DiscoveredChannel, OverlayKind, ResolvedOverlay, channel_dir,
+    channel_folder_path, resolve_channel_overlay, scan_channels, scan_groups,
 };
 pub use error::ChannelError;
 pub use group::Group;
 pub use manifest::{ChannelManifest, ChannelVars, ManifestHeader, OverlayFile, OverlayHeader};
 pub use overlay::{ChannelOverlayResult, apply_channel_overlay};
+pub use resolve::{
+    AppliedGroup, GroupSource, InjectedNode, OverlayResolution, ResolveError, resolve,
+};
 pub use selector::{LabelSelector, SelectorError};
 pub use staging_copy::{
     ReuseDecision, SourceStager, StagingError, StagingPlanEntry, open_source_file,

@@ -47,6 +47,8 @@ use clinker_plan::plan::{ChannelIdentity, CompiledPlan};
 use clinker_record::Value;
 
 use crate::binding::{ChannelBinding, ChannelTarget, DottedPath};
+use crate::error::ChannelError;
+use crate::manifest::ChannelVars;
 
 /// Resolved channel overlay output: typed var maps and any diagnostics
 /// raised during validation.
@@ -216,6 +218,64 @@ pub(crate) fn apply_config_clobber(
                 ));
             }
         }
+    }
+}
+
+/// Validate a raw `alias.param` config map into [`DottedPath`] keys, cloning
+/// the values. The first malformed key fails the whole map.
+///
+/// Shared by the channel-folder resolution ([`crate::resolve`]) so the
+/// channel-wide (`channel.cfg.yaml`) and per-target (`<target>.channel.yaml`)
+/// `config:` maps — which keep raw string keys at parse time — validate through
+/// the same [`DottedPath`] grammar the group and per-target layers already use.
+pub(crate) fn validate_config_keys(
+    config: &IndexMap<String, serde_json::Value>,
+) -> Result<IndexMap<DottedPath, serde_json::Value>, ChannelError> {
+    config
+        .iter()
+        .map(|(key, value)| Ok((DottedPath::try_from(key.as_str())?, value.clone())))
+        .collect()
+}
+
+/// Resolve one overlay layer's [`ChannelVars`] against the pipeline's declared
+/// registries and **merge** the results into `out` with later-layer-wins
+/// semantics (a key an earlier layer set is overwritten by this layer).
+///
+/// Reuses the same per-registry validators the per-target [`apply_channel_overlay`]
+/// path uses, so every layer (group, channel-wide, per-target) resolves vars
+/// identically. Callers apply layers in ascending precedence order so the
+/// highest layer wins each key. `source_label` names the layer for diagnostics
+/// (e.g. a group or channel name).
+pub(crate) fn resolve_vars_layer(
+    source_label: &str,
+    vars: &ChannelVars,
+    config: &PipelineConfig,
+    out: &mut ChannelOverlayResult,
+) {
+    out.static_vars.extend(resolve_static_overrides(
+        source_label,
+        &vars.static_scope,
+        config,
+        &mut out.diagnostics,
+    ));
+    out.pipeline_vars.extend(resolve_scoped_overrides(
+        source_label,
+        &vars.pipeline,
+        config,
+        VarScope::Pipeline,
+        &mut out.diagnostics,
+    ));
+    out.record_vars.extend(resolve_scoped_overrides(
+        source_label,
+        &vars.record,
+        config,
+        VarScope::Record,
+        &mut out.diagnostics,
+    ));
+    for (src, inner) in
+        resolve_source_overrides(source_label, &vars.source, config, &mut out.diagnostics)
+    {
+        out.source_vars.entry(src).or_default().extend(inner);
     }
 }
 

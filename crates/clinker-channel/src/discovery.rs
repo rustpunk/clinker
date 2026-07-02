@@ -45,7 +45,7 @@ use crate::group::Group;
 use crate::manifest::{ChannelManifest, OverlayFile};
 
 /// Filename of the optional per-channel manifest inside each tenant folder.
-const CHANNEL_MANIFEST_FILE: &str = "channel.cfg.yaml";
+pub const CHANNEL_MANIFEST_FILE: &str = "channel.cfg.yaml";
 
 /// Filename suffix marking a group definition file.
 const GROUP_FILE_SUFFIX: &str = ".group.yaml";
@@ -145,6 +145,19 @@ pub fn channel_folder_path(channel_root: &Path, shard: ShardScheme, channel_id: 
             channel_root.join(bucket).join(channel_id)
         }
     }
+}
+
+/// The on-disk tenant folder for `channel_id` under a channel layout, resolved
+/// against the workspace root.
+///
+/// This is the folder [`resolve_channel_overlay`] probes for per-target
+/// overlays and where the optional [`CHANNEL_MANIFEST_FILE`] manifest lives.
+/// It composes [`resolve_root`] (workspace-relative-or-absolute root) with
+/// [`channel_folder_path`] (the shard-aware id→folder mapping), so callers get
+/// the same path both the run-path computed lookup and the lint scan land on.
+pub fn channel_dir(layout: &ChannelLayout, workspace_root: &Path, channel_id: &str) -> PathBuf {
+    let root = resolve_root(&layout.root, workspace_root);
+    channel_folder_path(&root, layout.shard, channel_id)
 }
 
 /// Depth (relative to the channel root) at which tenant folders sit for a
