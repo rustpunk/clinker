@@ -1,0 +1,32 @@
+# Reusable scoring sub-pipeline used by the base pipeline as node `risk`.
+#
+# `threshold` is a declared config knob: the base pipeline sets it to 0.5, and
+# group/channel overlays clobber it per tenant. The resolved value is what
+# `clinker channels resolve` and `clinker explain --field risk.threshold`
+# report per layer (see group/enterprise and channel/globex).
+
+_compose:
+  name: risk_score
+  inputs:
+    inp:
+      schema:
+        - { name: order_id, type: string }
+        - { name: amount, type: float }
+  outputs:
+    out: scored
+  config_schema:
+    threshold:
+      type: float
+      default: 0.5
+      range: [0.0, 1.0]
+      description: high-value cut, as a fraction of the tenant's review ceiling
+
+nodes:
+  - type: transform
+    name: scored
+    input: inp
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit amount = amount
+        emit high_value = amount >= 1000.0

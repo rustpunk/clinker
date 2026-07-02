@@ -1,0 +1,23 @@
+# Workspace layout for the channel/group multi-tenant overlay system.
+#
+# A single base pipeline under pipeline/ is customized per tenant without
+# copying the YAML. The [channel] and [group] tables below tell the CLI where
+# to find per-tenant channel folders and reusable group overlays.
+#
+#   clinker channels resolve pipeline/order_fulfillment.yaml --channel globex --base-dir .
+#   clinker run pipeline/order_fulfillment.yaml --group enterprise --base-dir .
+#   clinker channels lint --base-dir .
+#
+# Run every command from this directory (the workspace root) and pass
+# --base-dir . so the channel/group roots and relative paths resolve here.
+# See README.md for the full command list.
+
+[channel]
+# Per-tenant folders live under channel/<tenant>/. Each folder name IS the
+# channel id; a flat scheme (one folder per tenant) suits this small workspace.
+root = "channel"
+shard = "none"
+
+[group]
+# Reusable *.group.yaml overlays live under group/.
+root = "group"

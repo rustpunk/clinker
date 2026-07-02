@@ -1,0 +1,28 @@
+# The `enterprise` group: a reusable overlay layer that sits between the
+# pipeline default and the channel layers.
+#
+#   - `match:` selects it automatically for any channel whose labels satisfy the
+#     CXL boolean (here: tier == "enterprise"). It can also be applied
+#     standalone by name: `clinker run ... --group enterprise`.
+#   - `priority:` breaks ties when several groups match one channel (higher
+#     wins).
+#   - `config:` clobbers the base `risk.threshold` for every enterprise tenant
+#     (verify with `explain --field risk.threshold --group enterprise`).
+#   - `overrides:` splices the `fraud_check` screening composition into the plan
+#     after `normalize` (shown under "Injected nodes" by `channels resolve`).
+
+group:
+  name: enterprise
+  match: 'tier == "enterprise"'
+  priority: 20
+
+config:
+  risk.threshold: 0.8
+
+overrides:
+  - op: add
+    composition: ../composition/fraud_check.comp.yaml
+    alias: fraud_check
+    after: normalize
+    config:
+      sensitivity: 0.8

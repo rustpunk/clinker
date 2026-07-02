@@ -1,0 +1,13 @@
+# Manifest for the `initech` tenant — a standard-tier channel.
+#
+# Its `tier: standard` label does NOT satisfy the `enterprise` group selector,
+# so initech runs the base pipeline without the fraud_check injection. It only
+# nudges the risk threshold down channel-wide.
+
+channel:
+  name: initech
+
+labels: { tier: standard, region: east }
+
+config:
+  risk.threshold: 0.6

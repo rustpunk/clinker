@@ -1,0 +1,56 @@
+# Base order-fulfillment pipeline (the pipeline-default layer).
+#
+# It reads orders, normalizes the fields, scores each order through the `risk`
+# composition, and writes the result. Tenants customize it via group and
+# channel overlays without editing this file:
+#
+#   - the `enterprise` group splices a `fraud_check` screening composition in
+#     after `normalize` and raises `risk.threshold`;
+#   - the `globex` channel raises `risk.threshold` further and declares an
+#     extra source column via a schema patch.
+#
+# `risk.threshold` is the per-tenant knob the overlays clobber; `normalize` is
+# the stable splice anchor the group's `add` op targets.
+
+pipeline:
+  name: order_fulfillment
+
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      options:
+        has_header: true
+      schema:
+        - { name: order_id, type: string }
+        - { name: amount, type: float }
+
+  - type: transform
+    name: normalize
+    description: Trim identifiers and pass the order fields through
+    input: orders
+    config:
+      cxl: |
+        emit order_id = order_id.trim()
+        emit amount = amount
+
+  - type: composition
+    name: risk
+    description: Score each order for value/risk
+    input: normalize
+    use: ../composition/risk_score.comp.yaml
+    inputs:
+      inp: normalize
+    config:
+      threshold: 0.5
+
+  - type: output
+    name: out
+    input: risk
+    config:
+      name: out
+      type: csv
+      path: output/fulfilled.csv

@@ -1,0 +1,34 @@
+# Fraud-screening sub-pipeline. It is NOT part of the base pipeline; the
+# `enterprise` group splices it into the effective plan via an
+# `overrides: [{op: add, composition: ...}]` op, so only enterprise tenants
+# carry it. `channels resolve --group enterprise` lists it under "Injected
+# nodes", and `channels lint` compiles it as part of every enterprise overlay.
+#
+# `sensitivity` is a declared config knob the injecting group supplies; its
+# resolved value shows up in `channels resolve`. The screen reads normalized
+# orders and holds a suspiciously large one by zeroing its amount.
+
+_compose:
+  name: fraud_check
+  inputs:
+    inp:
+      schema:
+        - { name: order_id, type: string }
+        - { name: amount, type: float }
+  outputs:
+    out: screened
+  config_schema:
+    sensitivity:
+      type: float
+      default: 0.5
+      range: [0.0, 1.0]
+      description: fraud-screen sensitivity; higher holds more orders for review
+
+nodes:
+  - type: transform
+    name: screened
+    input: inp
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit amount = if amount >= 2000.0 then 0.0 else amount

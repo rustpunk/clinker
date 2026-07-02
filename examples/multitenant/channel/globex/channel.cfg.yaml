@@ -1,0 +1,16 @@
+# Manifest for the `globex` tenant. The folder name (globex) is the channel id;
+# this manifest adds identity labels and channel-wide overrides.
+#
+#   - `labels:` are identity, never a pipeline override. The `tier: enterprise`
+#     label makes the `enterprise` group's selector match, so globex gets the
+#     fraud_check injection automatically.
+#   - channel-wide `config:` applies to every pipeline this tenant runs; it sits
+#     above the group layer, so 0.9 clobbers the group's 0.8.
+
+channel:
+  name: globex
+
+labels: { tier: enterprise, region: west }
+
+config:
+  risk.threshold: 0.9
