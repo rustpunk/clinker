@@ -579,7 +579,7 @@ mod tests {
             "fuzzy_threshold".to_owned(),
             ResolvedValue::new(
                 serde_json::json!(0.85),
-                LayerKind::CompositionDefault,
+                LayerKind::PipelineDefault,
                 Span::line_only(10),
             ),
         );
