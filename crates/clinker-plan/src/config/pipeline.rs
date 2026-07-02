@@ -625,6 +625,29 @@ impl PipelineConfig {
         use petgraph::graph::{DiGraph, NodeIndex};
         use std::collections::HashMap;
 
+        // Stage 0: pre-compile structural overlay pass (channel/group system).
+        //
+        // When the compile context carries resolved overlay ops, splice them
+        // into a working copy of the base AST and compile the EFFECTIVE plan
+        // through the ordinary path below — so schema binding, typecheck, and
+        // lowering all see the post-overlay DAG. The op stream is re-ordered by
+        // the engine into fixed (layer-precedence, declaration) order, so the
+        // result depends only on each op's layer identity, never on the order
+        // the layers were concatenated in. A plain pipeline (no overlay ops)
+        // skips this branch entirely and compiles byte-identically to before.
+        //
+        // Two failure surfaces stay anchored to the offending op, not the base
+        // pipeline: a structural op that cannot apply (missing target, orphaning
+        // remove, breaking schema patch) fails here with an op-spanned E114;
+        // ill-typed CXL introduced by an op (a bad `set config.cxl`, a spliced
+        // node whose body does not typecheck) is caught unchanged by the normal
+        // `bind_schema` pass below, anchored to the op because the engine stamps
+        // each injected / replaced node with the op's source location.
+        if !ctx.overlay_ops.is_empty() {
+            let effective = self.with_structural_overlay(&ctx.overlay_ops)?;
+            return effective.compile_with_diagnostics(&ctx.without_overlay_ops());
+        }
+
         // Stage 1-4: name/topology/path validation pre-pass.
         let mut diags = self.compile_topology_only(ctx);
         // Hard-error stop: stages 1-4 already collected; stage 5
@@ -2216,6 +2239,35 @@ impl PipelineConfig {
 
         let plan = CompiledPlan::from_compile(dag, runtime_config, artifacts);
         Ok((plan, diags))
+    }
+
+    /// Apply resolved structural overlay ops to a working copy of this
+    /// pipeline, returning the effective config to compile.
+    ///
+    /// The op engine folds the (layer-tagged) op stream over the node list in
+    /// fixed layer-precedence order; a failure to apply an op is mapped to an
+    /// `E114` diagnostic anchored to that op's source span, so the error points
+    /// at the offending overlay op rather than the base pipeline. This is a
+    /// pure transform on the AST — `config` / `vars` value clobber and the
+    /// runtime `vars` that flow to the executor via `PipelineRunParams` are
+    /// resolved on separate surfaces and never enter the AST here.
+    fn with_structural_overlay(
+        &self,
+        ops: &[crate::overlay_ops::LayeredOp],
+    ) -> Result<PipelineConfig, Vec<clinker_core_types::Diagnostic>> {
+        use clinker_core_types::{Diagnostic, LabeledSpan};
+
+        let mut effective = self.clone();
+        let base_nodes = std::mem::take(&mut effective.nodes);
+        effective.nodes =
+            crate::overlay_ops::apply_overlay_ops(base_nodes, ops.to_vec()).map_err(|err| {
+                vec![Diagnostic::error(
+                    "E114",
+                    err.to_string(),
+                    LabeledSpan::primary(err.span(), String::new()),
+                )]
+            })?;
+        Ok(effective)
     }
 }
 
