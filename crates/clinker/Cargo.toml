@@ -14,8 +14,10 @@ clinker-channel = { workspace = true }
 clinker-format = { workspace = true }
 clinker-record = { workspace = true }
 clinker-lineage = { workspace = true }
+cxl = { workspace = true }
 clap = { workspace = true }
 indexmap = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde-saphyr = { workspace = true }
 chrono = { workspace = true }

@@ -8,6 +8,8 @@ use clinker_exec::metrics::{self, ExecutionMetrics};
 use clinker_plan::config::utils::parse_memory_limit_bytes;
 use clinker_plan::error::PipelineError;
 
+mod refactor;
+
 /// CXL streaming ETL engine.
 #[derive(Parser, Debug)]
 #[command(
@@ -132,6 +134,27 @@ EXAMPLES:
         #[command(subcommand)]
         subcommand: ChannelsCommands,
     },
+    /// Workspace-wide refactors over pipelines and their channel/group overlays.
+    #[command(
+        long_about = "\
+Structural refactors that span a base pipeline and every channel/group overlay \
+that references it.\n\n\
+`rename-node` renames a base node and propagates the rename to every overlay \
+reference — op `target`, splice anchors, `rewire` paths, injected `alias`, \
+`config` dotted-paths, and CXL input-alias references in Combine `where:`/`cxl:` \
+bodies — with a `--dry-run` preview and a `channels lint` re-check afterward.",
+        after_long_help = "\
+EXAMPLES:
+  # Preview a rename across the base pipeline and every overlay
+  clinker refactor rename-node pipeline/order_fulfillment.yaml orders purchases --dry-run
+
+  # Apply it, then re-lint the workspace
+  clinker refactor rename-node pipeline/order_fulfillment.yaml orders purchases"
+    )]
+    Refactor {
+        #[command(subcommand)]
+        subcommand: RefactorCommands,
+    },
 }
 
 /// Subcommands for `clinker channels`.
@@ -141,6 +164,87 @@ pub enum ChannelsCommands {
     Resolve(ResolveArgs),
     /// Compile every (target × overlay) combination and report failures.
     Lint(LintArgs),
+    /// Group membership queries (which channels a group's selector matches).
+    Group {
+        #[command(subcommand)]
+        subcommand: GroupCommands,
+    },
+    /// Bulk channel-label editing.
+    Label {
+        #[command(subcommand)]
+        subcommand: LabelCommands,
+    },
+}
+
+/// Subcommands for `clinker channels group`.
+#[derive(Subcommand, Debug)]
+pub enum GroupCommands {
+    /// List the channels a group's selector currently matches.
+    Members(GroupMembersArgs),
+}
+
+/// Subcommands for `clinker channels label`.
+#[derive(Subcommand, Debug)]
+pub enum LabelCommands {
+    /// Stamp/overwrite a label across the named channels (idempotent).
+    Set(LabelSetArgs),
+}
+
+/// Subcommands for `clinker refactor`.
+#[derive(Subcommand, Debug)]
+pub enum RefactorCommands {
+    /// Rename a base node and propagate the rename to every overlay reference.
+    RenameNode(RenameNodeArgs),
+}
+
+/// Arguments for `clinker channels group members`.
+#[derive(Parser, Debug)]
+pub struct GroupMembersArgs {
+    /// Group name (the `group.name` of a `*.group.yaml`).
+    pub group: String,
+
+    /// Workspace root (holds `clinker.toml` and the channel/group roots).
+    #[arg(long, default_value = ".")]
+    pub base_dir: PathBuf,
+}
+
+/// Arguments for `clinker channels label set`.
+#[derive(Parser, Debug)]
+pub struct LabelSetArgs {
+    /// Label assignment as `key=value`. The value is typed by YAML scalar
+    /// inference (`true`/`false` → bool, integers → int, decimals → float,
+    /// everything else → string) so numeric/boolean labels match selectors.
+    #[arg(value_name = "KEY=VALUE")]
+    pub assignment: String,
+
+    /// One or more channel ids (tenant folder names) to stamp the label on.
+    #[arg(required = true, value_name = "CHANNEL_ID")]
+    pub ids: Vec<String>,
+
+    /// Workspace root (holds `clinker.toml` and the channel root).
+    #[arg(long, default_value = ".")]
+    pub base_dir: PathBuf,
+}
+
+/// Arguments for `clinker refactor rename-node`.
+#[derive(Parser, Debug)]
+pub struct RenameNodeArgs {
+    /// Path to the base pipeline (or composition) YAML that declares the node.
+    pub target: PathBuf,
+
+    /// Current node name.
+    pub old: String,
+
+    /// New node name (letters, digits, and `_` only).
+    pub new: String,
+
+    /// Print the diff of every file that would change without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Workspace root (holds `clinker.toml` and the channel/group roots).
+    #[arg(long, default_value = ".")]
+    pub base_dir: PathBuf,
 }
 
 /// Arguments for `clinker channels resolve`.
@@ -493,11 +597,32 @@ fn main() -> ExitCode {
             let result = match subcommand {
                 ChannelsCommands::Resolve(args) => run_channels_resolve(args),
                 ChannelsCommands::Lint(args) => run_channels_lint(args),
+                ChannelsCommands::Group {
+                    subcommand: GroupCommands::Members(args),
+                } => run_channels_group_members(args),
+                ChannelsCommands::Label {
+                    subcommand: LabelCommands::Set(args),
+                } => run_channels_label_set(args),
             };
             match result {
                 Ok(code) => ExitCode::from(code),
                 Err(e) => {
                     eprintln!("clinker channels error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::Refactor { subcommand } => {
+            tracing_subscriber::fmt()
+                .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+                .init();
+            let result = match subcommand {
+                RefactorCommands::RenameNode(args) => refactor::run_rename_node(args),
+            };
+            match result {
+                Ok(code) => ExitCode::from(code),
+                Err(e) => {
+                    eprintln!("clinker refactor error: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -2748,10 +2873,647 @@ fn target_stem_of(target: &str) -> String {
         .to_string()
 }
 
+/// `clinker channels group members <group>` — list the channels whose labels
+/// satisfy a group's selector, evaluated through the same group-derivation
+/// machinery the overlay resolver uses.
+fn run_channels_group_members(args: &GroupMembersArgs) -> Result<u8, Box<dyn std::error::Error>> {
+    let workspace_root = args.base_dir.canonicalize()?;
+    let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
+        .map_err(|e| format!("clinker.toml: {e}"))?;
+
+    let groups = clinker_channel::scan_groups(&clinker_toml.group, &workspace_root)
+        .map_err(diag_message("group scan failed"))?;
+    let group = groups
+        .iter()
+        .find(|g| g.name == args.group)
+        .ok_or_else(|| {
+            let known: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
+            format!(
+                "no group named `{}` under the group root (known: {})",
+                args.group,
+                if known.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    known.join(", ")
+                }
+            )
+        })?;
+
+    // An explicit-only group (no `match:`) is never derived — it applies only by
+    // name. Report that rather than pretend an empty membership is meaningful.
+    let Some(selector) = group.selector.as_deref() else {
+        println!(
+            "group `{}` has no selector (explicit-only); it has no derived members",
+            args.group
+        );
+        return Ok(0);
+    };
+
+    let channels = clinker_channel::scan_channels(&clinker_toml.channel, &workspace_root)
+        .map_err(diag_message("channel scan failed"))?;
+
+    let mut matched: Vec<String> = Vec::new();
+    let mut errors: Vec<(String, String)> = Vec::new();
+    for channel in &channels {
+        let labels = channel
+            .manifest
+            .as_ref()
+            .map(|m| m.labels.clone())
+            .unwrap_or_default();
+        // Route through CH-8 derivation so a selector error (e.g. a channel
+        // missing a referenced label) surfaces transparently, never as a silent
+        // non-match.
+        let derivation = clinker_channel::derive_groups(std::slice::from_ref(group), &labels);
+        // `derive_groups` yields one record per input group, so a single-group
+        // slice always has exactly one; `first()` keeps this panic-free.
+        match derivation.all().first().map(|s| &s.outcome) {
+            Some(clinker_channel::SelectionOutcome::Selected { .. }) => {
+                matched.push(channel.id.clone())
+            }
+            Some(clinker_channel::SelectionOutcome::Error(e)) => {
+                errors.push((channel.id.clone(), e.to_string()))
+            }
+            _ => {}
+        }
+    }
+    matched.sort();
+
+    println!("group `{}` (match: {selector})", args.group);
+    if matched.is_empty() {
+        println!("  members: <none>");
+    } else {
+        println!("  members ({}):", matched.len());
+        for id in &matched {
+            println!("    - {id}");
+        }
+    }
+    if !errors.is_empty() {
+        eprintln!("  selector errors ({}):", errors.len());
+        for (id, reason) in &errors {
+            eprintln!("    - {id}: {reason}");
+        }
+        return Ok(1);
+    }
+    Ok(0)
+}
+
+/// `clinker channels label set <key>=<value> <id...>` — stamp/overwrite one
+/// label across the named channels' manifests, idempotently.
+fn run_channels_label_set(args: &LabelSetArgs) -> Result<u8, Box<dyn std::error::Error>> {
+    let (key, raw_value) = args
+        .assignment
+        .split_once('=')
+        .ok_or("label assignment must be `key=value`")?;
+    validate_label_key(key)?;
+    let value = parse_label_value(raw_value);
+    let rendered = render_label_scalar(&value);
+
+    let workspace_root = args.base_dir.canonicalize()?;
+    let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
+        .map_err(|e| format!("clinker.toml: {e}"))?;
+
+    let mut errors: Vec<(String, String)> = Vec::new();
+    let mut changed = 0usize;
+    let mut unchanged = 0usize;
+    for id in &args.ids {
+        let dir = clinker_channel::channel_dir(&clinker_toml.channel, &workspace_root, id);
+        if !dir.is_dir() {
+            errors.push((
+                id.clone(),
+                format!("channel folder not found ({})", dir.display()),
+            ));
+            continue;
+        }
+        let manifest_path = dir.join(clinker_channel::CHANNEL_MANIFEST_FILE);
+        match set_manifest_label(&manifest_path, id, key, &value) {
+            Ok(LabelOutcome::Unchanged) => {
+                unchanged += 1;
+                println!("{id}: {key}={rendered} (unchanged)");
+            }
+            Ok(outcome) => {
+                changed += 1;
+                let verb = match outcome {
+                    LabelOutcome::Created => "created manifest",
+                    LabelOutcome::Updated => "set",
+                    LabelOutcome::Unchanged => unreachable!(),
+                };
+                println!("{id}: {verb} {key}={rendered}");
+            }
+            Err(e) => errors.push((id.clone(), e)),
+        }
+    }
+
+    println!(
+        "label set: {changed} channel(s) changed, {unchanged} already current, {} error(s)",
+        errors.len()
+    );
+    if !errors.is_empty() {
+        for (id, reason) in &errors {
+            eprintln!("FAIL {id}: {reason}");
+        }
+        return Ok(1);
+    }
+    Ok(0)
+}
+
+/// The effect of a `label set` on one manifest.
+enum LabelOutcome {
+    /// The manifest did not exist and was created with the label.
+    Created,
+    /// The label was added or its value changed.
+    Updated,
+    /// The label already had this exact value; nothing was written.
+    Unchanged,
+}
+
+/// A label key must be a CXL identifier so a group selector can reference it.
+fn validate_label_key(key: &str) -> Result<(), String> {
+    if key.is_empty() {
+        return Err("label key is empty".to_string());
+    }
+    if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(format!(
+            "invalid label key `{key}`: keys may only contain letters, digits, and `_` \
+             (so a selector can reference them)"
+        ));
+    }
+    Ok(())
+}
+
+/// Infer a label value's type from its text the way YAML scalar inference would,
+/// so numeric/boolean labels compare correctly in selectors.
+fn parse_label_value(raw: &str) -> serde_json::Value {
+    match raw {
+        "true" => return serde_json::Value::Bool(true),
+        "false" => return serde_json::Value::Bool(false),
+        _ => {}
+    }
+    if let Ok(i) = raw.parse::<i64>() {
+        return serde_json::Value::from(i);
+    }
+    // Only treat as float when it round-trips and actually looks numeric (a bare
+    // `inf`/`nan` parses as f64 but should stay a string label).
+    if raw
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit() || c == '-' || c == '+' || c == '.')
+        .unwrap_or(false)
+        && let Ok(f) = raw.parse::<f64>()
+        && f.is_finite()
+        && let Some(n) = serde_json::Number::from_f64(f)
+    {
+        return serde_json::Value::Number(n);
+    }
+    serde_json::Value::String(raw.to_string())
+}
+
+/// Render a scalar label value as a YAML scalar: bare when unambiguous,
+/// double-quoted when it would otherwise be misread (empty, special chars, or
+/// bool/number/null-looking strings).
+fn render_label_scalar(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => {
+            if is_plain_yaml_scalar(s) {
+                s.clone()
+            } else {
+                // Double-quoted YAML scalar with the minimal escapes.
+                let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+                format!("\"{escaped}\"")
+            }
+        }
+        // Non-scalar labels are out of the selector's scope; render defensively.
+        other => other.to_string(),
+    }
+}
+
+/// Whether a string can be emitted as a bare (unquoted) YAML scalar without the
+/// reader reinterpreting it as another type or breaking mapping syntax.
+///
+/// The reader is serde-saphyr with YAML 1.1 scalar resolution, which is a
+/// strictly larger recognizer than Rust's `str::parse`: it resolves booleans
+/// case-insensitively (including single-letter `y`/`n`), nulls, and integers in
+/// hex/octal/binary/underscore forms. This function is deliberately
+/// conservative — it emits bare only for values that are unambiguously strings
+/// under those rules — so a label never silently changes type on round-trip.
+fn is_plain_yaml_scalar(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    // Leading/trailing whitespace is trimmed by a plain scalar; must quote.
+    if s.starts_with(char::is_whitespace) || s.ends_with(char::is_whitespace) {
+        return false;
+    }
+    // YAML 1.1 boolean / null tokens, matched case-insensitively (the reader is
+    // case-insensitive and accepts the single-letter y/n forms).
+    let lower = s.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "y" | "yes"
+            | "true"
+            | "on"
+            | "n"
+            | "no"
+            | "false"
+            | "off"
+            | "null"
+            | "~"
+            | "nan"
+            | "inf"
+            | "-inf"
+            | "+inf"
+    ) {
+        return false;
+    }
+    // A bare scalar that starts with anything but an ASCII letter risks being
+    // read as a number (any digit / sign / dot / `0x`/`0o`/`0b` prefix start
+    // here) or an indicator; require an alphabetic lead. Rust's number parser is
+    // a further guard against letter-leading numerics like `inf`.
+    if !s.starts_with(|c: char| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() {
+        return false;
+    }
+    // Keep the character set narrow and reject interior structure that would
+    // change the mapping's meaning.
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || " _./-".contains(c))
+        && !s.contains(": ")
+        && !s.ends_with(':')
+        && !s.contains(" #")
+}
+
+/// Set (or overwrite) `key` to `value` in a channel manifest, rewriting only the
+/// top-level `labels:` block. Idempotent: an identical value writes nothing.
+fn set_manifest_label(
+    manifest_path: &std::path::Path,
+    channel_id: &str,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<LabelOutcome, String> {
+    if !manifest_path.exists() {
+        let block = render_labels_block(&[(key.to_string(), value.clone())]);
+        let text = format!("channel:\n  name: {channel_id}\n{}\n", block.join("\n"));
+        std::fs::write(manifest_path, text)
+            .map_err(|e| format!("writing {}: {e}", manifest_path.display()))?;
+        return Ok(LabelOutcome::Created);
+    }
+
+    let original = std::fs::read_to_string(manifest_path)
+        .map_err(|e| format!("reading {}: {e}", manifest_path.display()))?;
+    // Parse-validate and read the current labels through the CH-2 model.
+    let manifest = clinker_channel::ChannelManifest::load(manifest_path)
+        .map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+
+    if manifest.labels.get(key) == Some(value) {
+        return Ok(LabelOutcome::Unchanged);
+    }
+
+    let mut labels = manifest.labels.clone();
+    labels.insert(key.to_string(), value.clone());
+    let block = render_labels_block(&labels.into_iter().collect::<Vec<_>>());
+
+    let new_text = splice_top_level_block(&original, "labels", &block);
+    if new_text == original {
+        return Ok(LabelOutcome::Unchanged);
+    }
+    std::fs::write(manifest_path, new_text)
+        .map_err(|e| format!("writing {}: {e}", manifest_path.display()))?;
+    Ok(LabelOutcome::Updated)
+}
+
+/// Render a `labels:` block as YAML lines (block style, deterministic order).
+fn render_labels_block(labels: &[(String, serde_json::Value)]) -> Vec<String> {
+    let mut lines = vec!["labels:".to_string()];
+    for (k, v) in labels {
+        lines.push(format!("  {k}: {}", render_label_scalar(v)));
+    }
+    lines
+}
+
+/// Replace the top-level `<key>:` block (that line plus its indented body) with
+/// `block`, or insert `block` (after a `channel:` block if present, else at end)
+/// when the key is absent. Preserves every other line, including comments.
+fn splice_top_level_block(text: &str, key: &str, block: &[String]) -> String {
+    let had_trailing_newline = text.ends_with('\n');
+    // Preserve the file's line ending: `lines()` strips `\r`, so re-join with the
+    // same terminator the manifest already used rather than forcing LF.
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+    let lines: Vec<&str> = text.lines().collect();
+
+    let key_line = lines.iter().position(|l| top_level_key(l) == Some(key));
+
+    let mut out: Vec<String> = Vec::new();
+    match key_line {
+        Some(start) => {
+            let end = block_extent(&lines, start);
+            out.extend(lines[..start].iter().map(|s| s.to_string()));
+            out.extend(block.iter().cloned());
+            out.extend(lines[end..].iter().map(|s| s.to_string()));
+        }
+        None => {
+            // Insert after the `channel:` block if there is one, else at the end.
+            let insert_at = match lines
+                .iter()
+                .position(|l| top_level_key(l) == Some("channel"))
+            {
+                Some(c) => block_extent(&lines, c),
+                None => lines.len(),
+            };
+            out.extend(lines[..insert_at].iter().map(|s| s.to_string()));
+            out.extend(block.iter().cloned());
+            out.extend(lines[insert_at..].iter().map(|s| s.to_string()));
+        }
+    }
+
+    let mut joined = out.join(newline);
+    if had_trailing_newline {
+        joined.push_str(newline);
+    }
+    joined
+}
+
+/// The extent of a top-level block: the key line at `start` up to (excluding)
+/// the next top-level mapping key, or end of input.
+///
+/// The block ends at the next *key* — not merely the next column-0 line — so a
+/// column-0 comment or blank interleaved between indented body lines stays
+/// inside the block rather than splitting it (which would orphan the body lines
+/// after it into invalid YAML). The cost is that a comment sitting inside the
+/// replaced block is dropped; for the `labels:` rewrite this is a bounded,
+/// block-local formatting loss, never a correctness hazard.
+fn block_extent(lines: &[&str], start: usize) -> usize {
+    let mut end = start + 1;
+    while end < lines.len() && top_level_key(lines[end]).is_none() {
+        end += 1;
+    }
+    end
+}
+
+/// The key name of a top-level (column-0) mapping entry line, or `None` for
+/// indented lines, comments, blanks, and list items.
+fn top_level_key(line: &str) -> Option<&str> {
+    let first = line.chars().next()?;
+    if first.is_whitespace() || first == '#' || first == '-' {
+        return None;
+    }
+    let key = line.split_once(':')?.0;
+    if key.is_empty() || key.contains(' ') {
+        return None;
+    }
+    Some(key)
+}
+
+/// Build a closure that renders channel/group scan diagnostics into a message.
+fn diag_message(
+    prefix: &'static str,
+) -> impl FnOnce(Vec<clinker_core_types::Diagnostic>) -> String {
+    move |diags| {
+        let msgs: Vec<String> = diags
+            .iter()
+            .map(|d| format!("[{}] {}", d.code, d.message))
+            .collect();
+        format!("{prefix}: {}", msgs.join("; "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
+
+    // ── CH-15: label-value inference / rendering ────────────────────────
+
+    #[test]
+    fn label_value_inference_typing() {
+        assert_eq!(parse_label_value("true"), serde_json::Value::Bool(true));
+        assert_eq!(parse_label_value("false"), serde_json::Value::Bool(false));
+        assert_eq!(parse_label_value("3"), serde_json::Value::from(3i64));
+        assert_eq!(
+            parse_label_value("enterprise"),
+            serde_json::Value::from("enterprise")
+        );
+        assert!(parse_label_value("0.9").is_number());
+        // Non-numeric leading char stays a string even if f64 could parse it.
+        assert_eq!(parse_label_value("inf"), serde_json::Value::from("inf"));
+    }
+
+    #[test]
+    fn label_scalar_rendering_quotes_only_when_needed() {
+        assert_eq!(
+            render_label_scalar(&serde_json::Value::from("west")),
+            "west"
+        );
+        assert_eq!(render_label_scalar(&serde_json::Value::from(3i64)), "3");
+        assert_eq!(render_label_scalar(&serde_json::Value::Bool(true)), "true");
+        // A string that would otherwise be read as a bool/number must be quoted.
+        assert_eq!(
+            render_label_scalar(&serde_json::Value::from("true")),
+            "\"true\""
+        );
+        assert_eq!(render_label_scalar(&serde_json::Value::from("3")), "\"3\"");
+        assert_eq!(
+            render_label_scalar(&serde_json::Value::from("a: b")),
+            "\"a: b\""
+        );
+        // YAML 1.1 booleans/nulls the reader resolves case-insensitively, and the
+        // single-letter forms, must be quoted so they stay strings on reload.
+        for s in [
+            "True", "TRUE", "Yes", "No", "OFF", "Null", "y", "Y", "n", "N", "~",
+        ] {
+            let q = render_label_scalar(&serde_json::Value::from(s));
+            assert!(q.starts_with('"'), "{s} must be quoted, got {q}");
+        }
+        // YAML numeric forms Rust's parser misses (hex/oct/bin/underscore) must
+        // also quote so they are not re-read as ints/floats.
+        for s in ["0x1f", "0o17", "0b101", "1_000", ".inf"] {
+            let q = render_label_scalar(&serde_json::Value::from(s));
+            assert!(q.starts_with('"'), "{s} must be quoted, got {q}");
+        }
+        // Leading/trailing whitespace would be trimmed by a bare scalar.
+        assert_eq!(
+            render_label_scalar(&serde_json::Value::from(" west")),
+            "\" west\""
+        );
+        // Ordinary string labels stay bare, including interior punctuation.
+        assert_eq!(
+            render_label_scalar(&serde_json::Value::from("west-coast")),
+            "west-coast"
+        );
+    }
+
+    #[test]
+    fn label_key_validation() {
+        assert!(validate_label_key("tier").is_ok());
+        assert!(validate_label_key("region_west").is_ok());
+        assert!(validate_label_key("").is_err());
+        assert!(validate_label_key("has space").is_err());
+        assert!(validate_label_key("dotted.key").is_err());
+    }
+
+    // ── CH-15: label set is idempotent and format-preserving ─────────────
+
+    fn write_channel_manifest(root: &std::path::Path, id: &str, body: &str) -> std::path::PathBuf {
+        let dir = root.join("channel").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(clinker_channel::CHANNEL_MANIFEST_FILE);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn label_set_inserts_updates_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Manifest with a comment and existing config that must survive.
+        let path = write_channel_manifest(
+            root,
+            "acme",
+            "channel:\n  name: acme\n# keep me\nlabels:\n  region: west\nconfig:\n  fraud.threshold: 0.9\n",
+        );
+
+        // Insert a new label.
+        let out = set_manifest_label(
+            &path,
+            "acme",
+            "tier",
+            &serde_json::Value::from("enterprise"),
+        )
+        .unwrap();
+        assert!(matches!(out, LabelOutcome::Updated));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep me"), "comment preserved:\n{text}");
+        assert!(
+            text.contains("fraud.threshold: 0.9"),
+            "config preserved:\n{text}"
+        );
+        assert!(
+            text.contains("region: west") && text.contains("tier: enterprise"),
+            "{text}"
+        );
+
+        // Re-running with the same value is a no-op.
+        let out = set_manifest_label(
+            &path,
+            "acme",
+            "tier",
+            &serde_json::Value::from("enterprise"),
+        )
+        .unwrap();
+        assert!(matches!(out, LabelOutcome::Unchanged));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text,
+            "idempotent write"
+        );
+
+        // Overwriting an existing label value updates it.
+        let out =
+            set_manifest_label(&path, "acme", "region", &serde_json::Value::from("east")).unwrap();
+        assert!(matches!(out, LabelOutcome::Updated));
+        let m = clinker_channel::ChannelManifest::load(&path).unwrap();
+        assert_eq!(
+            m.labels.get("region"),
+            Some(&serde_json::Value::from("east"))
+        );
+    }
+
+    #[test]
+    fn label_set_with_interleaved_comment_stays_valid_yaml() {
+        // A column-0 comment sitting *between* indented label lines must not
+        // orphan the labels after it — the rebuilt block absorbs the region and
+        // the result re-parses with every label present and `config:` intact.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let path = write_channel_manifest(
+            root,
+            "acme",
+            "channel:\n  name: acme\nlabels:\n  region: west\n# note\n  region2: east\nconfig:\n  k.v: 1\n",
+        );
+        set_manifest_label(
+            &path,
+            "acme",
+            "tier",
+            &serde_json::Value::from("enterprise"),
+        )
+        .unwrap();
+        let m = clinker_channel::ChannelManifest::load(&path).unwrap();
+        assert_eq!(
+            m.labels.get("region"),
+            Some(&serde_json::Value::from("west"))
+        );
+        assert_eq!(
+            m.labels.get("region2"),
+            Some(&serde_json::Value::from("east"))
+        );
+        assert_eq!(
+            m.labels.get("tier"),
+            Some(&serde_json::Value::from("enterprise"))
+        );
+        assert!(m.config.contains_key("k.v"), "config survives");
+    }
+
+    #[test]
+    fn label_set_creates_absent_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join("channel").join("globex");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(clinker_channel::CHANNEL_MANIFEST_FILE);
+
+        let out = set_manifest_label(
+            &path,
+            "globex",
+            "tier",
+            &serde_json::Value::from("enterprise"),
+        )
+        .unwrap();
+        assert!(matches!(out, LabelOutcome::Created));
+        let m = clinker_channel::ChannelManifest::load(&path).unwrap();
+        assert_eq!(m.channel.name, "globex");
+        assert_eq!(
+            m.labels.get("tier"),
+            Some(&serde_json::Value::from("enterprise"))
+        );
+    }
+
+    // ── CH-15: group members via the full command ───────────────────────
+
+    #[test]
+    fn group_members_lists_selector_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("clinker.toml"),
+            "[channel]\nroot=\"channel\"\n[group]\nroot=\"group\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join("group")).unwrap();
+        std::fs::write(
+            root.join("group/enterprise.group.yaml"),
+            "group:\n  name: enterprise\n  match: 'tier == \"enterprise\"'\n",
+        )
+        .unwrap();
+        write_channel_manifest(
+            root,
+            "acme",
+            "channel:\n  name: acme\nlabels:\n  tier: enterprise\n",
+        );
+        write_channel_manifest(
+            root,
+            "beta",
+            "channel:\n  name: beta\nlabels:\n  tier: basic\n",
+        );
+
+        let code = run_channels_group_members(&GroupMembersArgs {
+            group: "enterprise".to_string(),
+            base_dir: root.to_path_buf(),
+        })
+        .unwrap();
+        assert_eq!(code, 0, "acme matches, beta does not, no selector errors");
+    }
 
     /// The compile anchor must reconstruct the pipeline file's directory —
     /// the same directory the runtime source-discovery layer anchors on — and

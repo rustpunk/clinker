@@ -106,6 +106,8 @@ Inspect and validate the channel/group multi-tenant overlay system.
 ```bash
 clinker channels resolve <TARGET> [OPTIONS]
 clinker channels lint [OPTIONS]
+clinker channels group members <GROUP> [OPTIONS]
+clinker channels label set <KEY>=<VALUE> <CHANNEL_ID>... [OPTIONS]
 ```
 
 ### clinker channels resolve
@@ -139,6 +141,41 @@ Exits non-zero if any combination fails to compile or apply. Dangling splice
 anchors (an op referencing a missing node) and config keys matching no parameter
 are reported per combination.
 
+### clinker channels group members
+
+Lists the channels whose labels currently satisfy a group's selector — "who is
+in this group right now?". Because membership is *derived* from labels, this
+evaluates the group's `match:` selector against each channel's manifest labels
+through the same derivation the overlay resolver uses.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<GROUP>` | -- | Group name (the `group.name` of a `*.group.yaml`). |
+| `--base-dir <DIR>` | `.` | Workspace root holding `clinker.toml` and the channel/group roots. |
+
+A group with no `match:` selector is explicit-only and reports no derived
+members. A channel whose labels make the selector ill-typed or reference an
+undeclared label is reported as a selector error (never a silent non-match), and
+the command exits non-zero when any such error occurs.
+
+### clinker channels label set
+
+Stamps (or overwrites) one label across the named channels by editing each
+channel's `channel.cfg.yaml` manifest in place. Idempotent: re-running with the
+same value writes nothing. Only the manifest's `labels:` block is rewritten;
+other keys and comments are preserved. A channel with no manifest yet gets one
+created (with its folder name as the channel name).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<KEY>=<VALUE>` | -- | Label assignment. `KEY` must be an identifier (letters, digits, `_`) so a selector can reference it. `VALUE` is typed by YAML scalar inference (`true`/`false` → bool, integers → int, decimals → float, otherwise string). |
+| `<CHANNEL_ID>...` | -- | One or more channel ids (tenant folder names) to stamp. |
+| `--base-dir <DIR>` | `.` | Workspace root holding `clinker.toml` and the channel root. |
+
+Because group membership is attribute-derived, `label set` is the maintenance
+operation for group membership: set a label once and every group whose selector
+matches gains the channel — no membership list to hand-edit.
+
 ### Examples
 
 ```bash
@@ -150,6 +187,78 @@ clinker channels resolve pipeline/order_fulfillment.yaml --group enterprise
 
 # Compile every channel/group overlay in the workspace and report failures
 clinker channels lint
+
+# Which channels are currently in the `enterprise` group?
+clinker channels group members enterprise
+
+# Onboard two tenants into the enterprise tier in one shot
+clinker channels label set tier=enterprise globex acme-corp
+```
+
+---
+
+## clinker refactor
+
+Structural refactors that span a base pipeline and every channel/group overlay
+that references it.
+
+```bash
+clinker refactor rename-node <TARGET> <OLD> <NEW> [OPTIONS]
+```
+
+### clinker refactor rename-node
+
+Renames a base node and propagates the rename to every overlay reference. The
+overlay op model addresses base nodes *by name*, so renaming a node otherwise
+breaks every overlay that referenced it. This command rewrites, in one
+operation:
+
+- the base node's `name` and every consumer's `input:` / `inputs:` /
+  `body:`/`header:`/`trailer:` reference;
+- a Combine's named-input map (qualifier key and/or upstream value) and — when
+  the Combine draws from the renamed node under a same-named qualifier — its
+  `where:` / `cxl:` bodies, rewritten via the CXL parser so only true source
+  qualifiers are touched (a method receiver like `region.contains(...)` is left
+  alone);
+- across every group / channel-manifest / per-target overlay file: op `target`,
+  `after`, `before`, injected `alias`, explicit `input`, `rewire` keys and
+  values, an inline `node`, a `set config.cxl` value's CXL, and top-level
+  `config` dotted-path prefixes (`old.param` → `new.param`).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<TARGET>` | -- | Path to the base pipeline (or composition) YAML that declares the node. |
+| `<OLD>` | -- | Current node name (must exist in the target). |
+| `<NEW>` | -- | New node name — identifier only (letters, digits, `_`); must not already exist in the target. |
+| `--dry-run` | -- | Print the diff of every file that would change without writing anything. |
+| `--base-dir <DIR>` | `.` | Workspace root holding `clinker.toml` and the channel/group roots. |
+
+Ambiguity is guarded: renaming to a name that already exists in the target, or
+renaming a node that does not exist, is a hard error. A Combine `where:`/`cxl:`
+body that must be rewritten but does not parse aborts the whole operation before
+anything is written. After a real (non-dry-run) run the command re-runs
+`channels lint` so an incomplete rename fails loudly.
+
+Scope: a *per-target* overlay (`<target>.channel.yaml` / `.comp.yaml`) is
+rewritten only when it overlays the renamed pipeline, so a different pipeline
+that happens to share the node name is left alone. *Target-agnostic* layers —
+channel-wide manifest overrides and group files — are rewritten wherever they
+reference the old name; if two pipelines share a node name and the same group or
+channel-wide override targets it, review the `--dry-run` diff and rely on
+`channels lint` to catch any pipeline the rename should not have touched.
+
+Files are rewritten by re-serializing their YAML: key order is preserved, but
+comments and incidental scalar styling are normalized. Use `--dry-run` to review
+the exact on-disk diff first.
+
+### Examples
+
+```bash
+# Preview a rename across the base pipeline and every overlay that references it
+clinker refactor rename-node pipeline/order_fulfillment.yaml orders purchases --dry-run
+
+# Apply it, then re-lint the workspace
+clinker refactor rename-node pipeline/order_fulfillment.yaml orders purchases
 ```
 
 ---
