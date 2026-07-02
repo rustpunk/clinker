@@ -53,7 +53,7 @@ fn bench_channel_merge(c: &mut Criterion) {
                         format!("param{i}"),
                         ResolvedValue::new(
                             serde_json::json!(0),
-                            LayerKind::CompositionDefault,
+                            LayerKind::PipelineDefault,
                             Span::SYNTHETIC,
                         ),
                     );

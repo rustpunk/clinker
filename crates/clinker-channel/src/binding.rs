@@ -106,10 +106,11 @@ pub enum ChannelTarget {
 
 /// A parsed `.channel.yaml` file.
 ///
-/// The `config_default` / `config_fixed` split maps to `LayerKind::ChannelDefault`
-/// and `LayerKind::ChannelFixed` respectively; channel-fixed layers merge with
-/// deterministic precedence over variable (default) layers. Resources follow
-/// the same split pattern.
+/// A per-target overlay resolves onto the `LayerKind::ChannelPerTarget` layer.
+/// The `config_default` / `config_fixed` split maps to that layer's `fixed`
+/// lock flag: `config_fixed` values are applied as fixed (locking against every
+/// higher-precedence layer), `config_default` values non-fixed. Resources
+/// follow the same split pattern.
 #[derive(Debug, Clone)]
 pub struct ChannelBinding {
     pub name: String,

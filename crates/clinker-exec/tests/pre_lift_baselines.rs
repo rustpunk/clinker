@@ -725,7 +725,7 @@ fn test_all_14_fixtures_have_baseline() {
 }
 
 /// Gate test: channel overlay on a pipeline produces a provenance chain with
-/// ChannelFixed layer recorded in the compiled plan.
+/// a fixed ChannelPerTarget layer recorded in the compiled plan.
 #[test]
 fn test_channel_overlay_provenance_chain_recorded_in_baseline() {
     use clinker_channel::binding::ChannelBinding;
@@ -742,7 +742,7 @@ fn test_channel_overlay_provenance_chain_recorded_in_baseline() {
     );
     let mut plan = clinker_plan::config::PipelineConfig::compile(&config, &ctx).expect("compile");
 
-    // Apply the acme_prod channel (which has ChannelFixed bindings) but
+    // Apply the acme_prod channel (which has `config.fixed` bindings) but
     // adapted to target this pipeline's provenance entries.
     let channel_yaml = br#"
 channel:
@@ -760,27 +760,28 @@ config:
 
     let _result = apply_channel_overlay(&mut plan, &binding, &config);
 
-    // Verify the provenance chain contains a ChannelFixed layer
+    // Verify the provenance chain contains a fixed ChannelPerTarget layer
     let resolved = plan
         .provenance()
         .get("nested_process", "strict_mode")
         .expect("nested_process.strict_mode must exist in provenance");
 
-    let has_channel_fixed = resolved
+    let has_fixed_per_target = resolved
         .provenance
         .iter()
-        .any(|l| l.kind == LayerKind::ChannelFixed);
+        .any(|l| l.kind == LayerKind::ChannelPerTarget && l.fixed);
     assert!(
-        has_channel_fixed,
-        "provenance chain must contain a ChannelFixed layer"
+        has_fixed_per_target,
+        "provenance chain must contain a fixed ChannelPerTarget layer"
     );
 
     let winner = resolved.winning_layer().expect("must have a winner");
     assert_eq!(
         winner.kind,
-        LayerKind::ChannelFixed,
-        "ChannelFixed must be the winning layer"
+        LayerKind::ChannelPerTarget,
+        "the fixed ChannelPerTarget layer must be the winner"
     );
+    assert!(winner.fixed, "the winning layer must carry the fixed lock");
 
     // Verify channel identity is stamped
     let identity = plan

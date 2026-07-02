@@ -26,6 +26,7 @@
 //! | `E109`      | error    | Ambiguous column reference (declared vs pass-through in open row) |
 //! | `E111`      | error    | Composition body has zero nodes (rejected at bind time) |
 //! | `E112`      | error    | Runtime composition recursion depth exceeded |
+//! | `E113`      | error    | Channel `config`/override key matches no parameter in the compiled plan (unknown key) |
 //! | `E200`      | error    | CXL type error (compile-time typecheck failure)      |
 //! | `E201`      | error    | Source declaration missing required `schema:` field  |
 //! | `E210`      | error    | Source declares more than one of `{path,glob,regex,paths}` |
@@ -304,6 +305,7 @@ mod diagnostic_tests {
         let source = include_str!("diagnostic.rs");
         for code in [
             "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "E109", "E111", "E112",
+            "E113",
         ] {
             let pattern = format!("`{code}`");
             assert!(

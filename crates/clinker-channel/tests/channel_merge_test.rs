@@ -43,7 +43,7 @@ fn compile_fixture(
 #[test]
 fn test_channel_overlay_applies_fixed_binding_wins() {
     // nested_composition_pipeline has composition `nested_process` with
-    // `strict_mode: false` at the call site (CompositionDefault).
+    // `strict_mode: false` at the call site (PipelineDefault).
     let (config, mut plan) = compile_fixture("pipelines/nested_composition_pipeline.yaml");
 
     // Verify provenance exists before overlay
@@ -75,8 +75,12 @@ config:
     let winner = resolved.winning_layer().expect("should have a winner");
     assert_eq!(
         winner.kind,
-        LayerKind::ChannelFixed,
-        "ChannelFixed should win over CompositionDefault"
+        LayerKind::ChannelPerTarget,
+        "fixed ChannelPerTarget should win over PipelineDefault"
+    );
+    assert!(
+        winner.fixed,
+        "the winning layer should carry the fixed lock from config.fixed"
     );
     assert_eq!(
         resolved.value,
@@ -87,34 +91,25 @@ config:
 
 #[test]
 fn test_channel_overlay_default_does_not_override_fixed() {
+    // `config.default` and `config.fixed` land on the same ChannelPerTarget
+    // layer; the split maps to the layer's `fixed` lock. When a key appears in
+    // both, the fixed value wins — it locks against the default within the
+    // layer, regardless of which was authored first.
     let (config, mut plan) = compile_fixture("pipelines/nested_composition_pipeline.yaml");
 
-    // First apply a ChannelFixed layer
-    let fixed_yaml = br#"
+    let yaml = br#"
 channel:
-  name: test_fixed_first
-  target: ./pipelines/nested_composition_pipeline.yaml
-config:
-  fixed:
-    nested_process.strict_mode: true
-"#;
-    let fixed_binding =
-        ChannelBinding::from_yaml_bytes(fixed_yaml, PathBuf::from("fixed.channel.yaml")).unwrap();
-    apply_channel_overlay(&mut plan, &fixed_binding, &config);
-
-    // Now apply a ChannelDefault layer — it should NOT override the fixed winner
-    let default_yaml = br#"
-channel:
-  name: test_default_after
+  name: test_default_and_fixed
   target: ./pipelines/nested_composition_pipeline.yaml
 config:
   default:
     nested_process.strict_mode: false
+  fixed:
+    nested_process.strict_mode: true
 "#;
-    let default_binding =
-        ChannelBinding::from_yaml_bytes(default_yaml, PathBuf::from("default.channel.yaml"))
-            .unwrap();
-    apply_channel_overlay(&mut plan, &default_binding, &config);
+    let binding =
+        ChannelBinding::from_yaml_bytes(yaml, PathBuf::from("both.channel.yaml")).unwrap();
+    apply_channel_overlay(&mut plan, &binding, &config);
 
     let resolved = plan
         .provenance()
@@ -124,13 +119,17 @@ config:
     let winner = resolved.winning_layer().expect("should have a winner");
     assert_eq!(
         winner.kind,
-        LayerKind::ChannelFixed,
-        "ChannelFixed should still win after ChannelDefault applied"
+        LayerKind::ChannelPerTarget,
+        "the fixed ChannelPerTarget value should win over the default"
+    );
+    assert!(
+        winner.fixed,
+        "the winning layer should carry the fixed lock"
     );
     assert_eq!(
         resolved.value,
         serde_json::json!(true),
-        "value should remain at the ChannelFixed value"
+        "value should remain at the fixed value, not the default"
     );
 }
 
@@ -166,20 +165,13 @@ config:
 }
 
 #[test]
-fn test_channel_overlay_applies_all_six_fixtures_without_errors() {
-    // The 6 channel fixtures target various pipelines. For overlay testing,
-    // we apply each to a compiled plan. Some fixture keys may not match
-    // provenance entries (warnings are OK), but no errors should occur.
-    //
-    // Pipeline targets:
-    // - acme_prod/staging/empty_defaults → channel_target_pipeline.yaml
-    //   (no compositions, so no provenance entries — all keys emit warnings)
-    // - beta_prod/staging → composition_pipeline.yaml
-    //   (enrich1 has validation errors so no provenance for it; addr_norm has provenance)
-    // - comp_direct → targets composition directly, not a pipeline
-    //
-    // We apply each to nested_composition_pipeline which has provenance for
-    // nested_process.strict_mode. Keys won't match but that's OK — no errors.
+fn test_channel_overlay_unmatched_keys_are_hard_errors() {
+    // The 6 channel fixtures each carry `config` keys targeting other pipelines.
+    // Applied to nested_composition_pipeline — whose only tracked parameter is
+    // `nested_process.strict_mode` — none of their keys match. Promoting the
+    // former W103 warning to the E113 hard error means every unmatched key now
+    // aborts the run instead of silently no-op'ing. Identity is still stamped so
+    // downstream diagnostics can name the channel.
 
     let all_fixtures = [
         "acme_prod.channel.yaml",
@@ -198,21 +190,26 @@ fn test_channel_overlay_applies_all_six_fixtures_without_errors() {
         let (config, mut plan) = compile_fixture("pipelines/nested_composition_pipeline.yaml");
         let result = apply_channel_overlay(&mut plan, &binding, &config);
 
-        // Channel identity should be stamped
+        // Channel identity is stamped regardless of overlay diagnostics.
         assert!(
             plan.channel_identity().is_some(),
             "{channel_name}: should have channel identity after overlay"
         );
 
-        // No error-severity diagnostics
+        // Every unmatched config key is an E113 hard error; no other error
+        // codes are expected from these config-only, pipeline-target channels.
         let errors: Vec<_> = result
             .diagnostics
             .iter()
             .filter(|d| matches!(d.severity, clinker_core_types::Severity::Error))
             .collect();
         assert!(
-            errors.is_empty(),
-            "{channel_name}: should have no errors, got: {errors:?}"
+            !errors.is_empty(),
+            "{channel_name}: unmatched config keys must produce E113 errors"
+        );
+        assert!(
+            errors.iter().all(|d| d.code == "E113"),
+            "{channel_name}: config-key mismatches must all be E113, got: {errors:?}"
         );
     }
 }

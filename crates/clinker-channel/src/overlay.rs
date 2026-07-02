@@ -1,12 +1,37 @@
 //! Channel overlay merge.
 //!
-//! Applies a [`ChannelBinding`] to a [`CompiledPlan`], overlaying config
-//! values as `ChannelDefault` or `ChannelFixed` provenance layers on the
-//! plan's [`ProvenanceDb`](clinker_plan::config::composition::ProvenanceDb),
-//! and resolving channel-supplied var
-//! overrides/adds for the four scoped registries (`$vars.*`,
-//! `$pipeline.*`, `$source.*`, `$record.*`) against the pipeline's
-//! declarations. Stamps a [`ChannelIdentity`] for cache-keying.
+//! Applies a [`ChannelBinding`] to a [`CompiledPlan`] as a layered **clobber**
+//! over the plan's
+//! [`ProvenanceDb`](clinker_plan::config::composition::ProvenanceDb): a higher
+//! layer's value fully *replaces* the lower one (never a deep-merge), and each
+//! resolved value maps to exactly one winning layer.
+//!
+//! # Layer stack
+//!
+//! Config resolves through a fixed *semantic* order of layers — never lexical
+//! or positional — encoded by
+//! [`LayerKind`](clinker_plan::config::composition::LayerKind):
+//!
+//! ```text
+//! PipelineDefault  <  Group(s) by priority  <  ChannelWide  <  ChannelPerTarget
+//! ```
+//!
+//! - **PipelineDefault** is the base layer, already recorded in the plan's
+//!   `ProvenanceDb` by composition compile.
+//! - **Group** (selector-derived) and **ChannelWide** (`channel.cfg.yaml`
+//!   manifest) layers plug into the same [`apply_config_clobber`] engine — it
+//!   resolves at any `LayerKind`, so those layers need no new resolution logic
+//!   once their sources are wired in by later stages.
+//! - **ChannelPerTarget** is the per-target `.channel.yaml` binding this
+//!   function overlays. Its `config.default` / `config.fixed` split maps to the
+//!   within-layer `fixed` lock flag: a `fixed` value cannot be overridden by
+//!   any higher-precedence layer.
+//!
+//! Also resolves channel-supplied var overrides/adds for the four scoped
+//! registries (`$vars.*`, `$pipeline.*`, `$source.*`, `$record.*`) against the
+//! pipeline's declarations (these flow to the executor as runtime values via
+//! `PipelineRunParams`, not into the AST), and stamps a [`ChannelIdentity`] for
+//! cache-keying.
 
 use indexmap::IndexMap;
 
@@ -44,17 +69,19 @@ pub struct ChannelOverlayResult {
 ///
 /// Performs three things:
 ///
-/// 1. Overlays `config.default` / `config.fixed` onto the plan's
-///    [`ProvenanceDb`](clinker_plan::config::composition::ProvenanceDb) as
-///    `ChannelDefault` / `ChannelFixed` layers
-///    (W103 for keys not matched in the plan).
+/// 1. Clobbers `config.default` / `config.fixed` onto the plan's
+///    [`ProvenanceDb`](clinker_plan::config::composition::ProvenanceDb) at the
+///    `ChannelPerTarget` layer. `default` is applied first (non-fixed), then
+///    `fixed` (locking), so a key present in both resolves to the fixed value
+///    (fixed wins over default within the layer). A key matching no plan
+///    parameter is a hard error (E113).
 /// 2. Resolves the channel's `vars:` block against the pipeline's
 ///    declared registries — typecheck on override (E107), reserved
 ///    name guard (E110), unknown source-node guard (E111),
 ///    composition-target guard (E109).
 /// 3. Stamps `ChannelIdentity` on the plan.
 ///
-/// Returns the typed var maps even when diagnostics include warnings;
+/// Returns the typed var maps even when diagnostics include errors;
 /// callers should refuse to execute if any `Severity::Error` is present.
 pub fn apply_channel_overlay(
     plan: &mut CompiledPlan,
@@ -63,17 +90,23 @@ pub fn apply_channel_overlay(
 ) -> ChannelOverlayResult {
     let mut result = ChannelOverlayResult::default();
 
-    apply_config_layer(
+    // A per-target `.channel.yaml` overlays the ChannelPerTarget layer, the
+    // highest in the stack. `default` first (non-fixed) then `fixed` (locking):
+    // for a key present in both, the fixed value wins by replacing in place and
+    // setting the lock, matching the historical `fixed > default` precedence.
+    apply_config_clobber(
         plan,
         &binding.config_default,
-        LayerKind::ChannelDefault,
+        LayerKind::ChannelPerTarget,
+        false,
         &binding.name,
         &mut result.diagnostics,
     );
-    apply_config_layer(
+    apply_config_clobber(
         plan,
         &binding.config_fixed,
-        LayerKind::ChannelFixed,
+        LayerKind::ChannelPerTarget,
+        true,
         &binding.name,
         &mut result.diagnostics,
     );
@@ -134,10 +167,20 @@ pub fn apply_channel_overlay(
     result
 }
 
-fn apply_config_layer(
+/// Clobber a channel config map onto the plan's provenance as one layer.
+///
+/// Each `alias.param` key selects a single `(node, param)` provenance entry and
+/// *replaces* its value at `kind` (clobber, never deep-merge). When `fixed` is
+/// set the layer locks its value against every higher-precedence layer.
+///
+/// A key that matches no entry in the compiled plan is a hard error (E113, the
+/// promotion of the former W103 warning): at multi-tenant scale a misspelled
+/// key must fail loudly rather than silently no-op.
+fn apply_config_clobber(
     plan: &mut CompiledPlan,
     config: &IndexMap<DottedPath, serde_json::Value>,
     kind: LayerKind,
+    fixed: bool,
     channel_name: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
@@ -151,11 +194,15 @@ fn apply_config_layer(
 
         match provenance.get_mut(node_name, param_name) {
             Some(resolved) => {
-                resolved.apply_layer(value.clone(), kind, Span::SYNTHETIC);
+                if fixed {
+                    resolved.apply_layer_fixed(value.clone(), kind, Span::SYNTHETIC);
+                } else {
+                    resolved.apply_layer(value.clone(), kind, Span::SYNTHETIC);
+                }
             }
             None => {
-                diagnostics.push(Diagnostic::warning(
-                    "W103",
+                diagnostics.push(Diagnostic::error(
+                    "E113",
                     format!(
                         "channel {:?}: config key {:?} does not match any \
                          composition parameter in the compiled plan",

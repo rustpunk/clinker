@@ -10,7 +10,7 @@ Root `AGENTS.md` still applies. This file adds local guidance for `clinker-chann
 
 - Parse `.channel.yaml` files into `ChannelBinding` values and compute raw-file BLAKE3 channel hashes.
 - Validate `DottedPath` keys, channel var names, channel targets, and composition config keys.
-- Apply `ChannelDefault` / `ChannelFixed` config layers to `CompiledPlan` provenance.
+- Clobber a channel's `config` onto `CompiledPlan` provenance at the `ChannelPerTarget` layer (`config.fixed` sets the layer's `fixed` lock).
 - Resolve channel `vars:` overrides/adds for `$vars`, `$pipeline`, `$source`, and `$record`.
 - Stamp `ChannelIdentity` on compiled plans.
 - Stage selected source files to local disk with stable cache paths, manifests, locks, reuse, cleanup, and crash purge.
@@ -54,7 +54,8 @@ Current normal dependencies are intentional: `clinker-plan`, `clinker-core-types
 - Channels override declared config/resource surfaces only; no mid-graph patching or sealed composition-internal access.
 - `DottedPath` is strict: one or two segments, no empty/edge/consecutive dots, and only ASCII alphanumeric, underscore, or dot.
 - Workspace channel scans are bounded and do not follow symlinks.
-- `ChannelDefault` and `ChannelFixed` must preserve provenance precedence; fixed wins over default.
+- Config resolves through the fixed semantic layer order `PipelineDefault < Group(s) < ChannelWide < ChannelPerTarget` (clobber, never deep-merge); a `fixed` value locks against every higher-precedence layer.
+- A channel `config` key that matches no compiled-plan parameter is a hard error (E113), never a silent no-op.
 - Channel `vars:` on composition targets currently errors.
 - Var overrides must match declared types and use planner scoped-var checking/coercion helpers.
 - Source-scoped var overrides must name an existing source node.

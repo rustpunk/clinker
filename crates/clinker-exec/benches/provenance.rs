@@ -12,16 +12,23 @@ fn bench_apply_layer_full_stack(c: &mut Criterion) {
         b.iter(|| {
             let mut rv = ResolvedValue::new(
                 serde_json::json!(42),
-                LayerKind::CompositionDefault,
+                LayerKind::PipelineDefault,
                 test_span(),
             );
             rv.apply_layer(
                 serde_json::json!(43),
-                LayerKind::ChannelDefault,
+                LayerKind::Group {
+                    priority: 10,
+                    seq: 0,
+                },
                 test_span(),
             );
-            rv.apply_layer(serde_json::json!(44), LayerKind::ChannelFixed, test_span());
-            rv.apply_layer(serde_json::json!(45), LayerKind::InspectorEdit, test_span());
+            rv.apply_layer(serde_json::json!(44), LayerKind::ChannelWide, test_span());
+            rv.apply_layer(
+                serde_json::json!(45),
+                LayerKind::ChannelPerTarget,
+                test_span(),
+            );
             black_box(&rv);
         })
     });
@@ -38,7 +45,7 @@ fn bench_provenance_db_insert_50(c: &mut Criterion) {
                     format!("param_{i}"),
                     ResolvedValue::new(
                         serde_json::json!(i),
-                        LayerKind::CompositionDefault,
+                        LayerKind::PipelineDefault,
                         test_span(),
                     ),
                 );

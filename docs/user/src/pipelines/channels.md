@@ -106,7 +106,7 @@ Channels that target a `.comp.yaml` may not carry a `vars:` block (composition v
 | **E234** | `array_paths` patch `remove` of a path with no matching entry. |
 | **E235** | `options` patch sets an unknown or mistyped option key for the source's format. |
 | **E236** | A renamed/aliased column's exposed name collides with a real input field, which would mislocate that field. Raised at read time. |
-| **W103** | Channel `config.*` key did not match any composition parameter in the compiled plan. |
+| **E113** | Channel `config.*` key matches no composition parameter in the compiled plan. A misspelled or stale key aborts the run instead of silently doing nothing. |
 | **W104** | `channel.target` does not match the `<config>` argument passed to `clinker run`. |
 
 ### Cross-Transform declaration uniqueness
