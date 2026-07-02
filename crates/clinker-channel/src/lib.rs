@@ -55,6 +55,7 @@ pub mod error;
 pub mod group;
 pub mod manifest;
 pub mod overlay;
+pub mod selector;
 pub mod staging_copy;
 
 // Explicit re-exports at crate root.
@@ -65,6 +66,7 @@ pub use error::ChannelError;
 pub use group::Group;
 pub use manifest::{ChannelManifest, ChannelVars, ManifestHeader, OverlayFile, OverlayHeader};
 pub use overlay::{ChannelOverlayResult, apply_channel_overlay};
+pub use selector::{LabelSelector, SelectorError};
 pub use staging_copy::{
     ReuseDecision, SourceStager, StagingError, StagingPlanEntry, open_source_file,
 };
