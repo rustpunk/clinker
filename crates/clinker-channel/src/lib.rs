@@ -52,6 +52,7 @@
 
 pub mod binding;
 pub mod error;
+pub mod group;
 pub mod manifest;
 pub mod overlay;
 pub mod staging_copy;
@@ -61,6 +62,7 @@ pub use binding::{
     ChannelBinding, ChannelTarget, DottedPath, scan_workspace_channels, validate_channel_bindings,
 };
 pub use error::ChannelError;
+pub use group::Group;
 pub use manifest::{ChannelManifest, ChannelVars, ManifestHeader, OverlayFile, OverlayHeader};
 pub use overlay::{ChannelOverlayResult, apply_channel_overlay};
 pub use staging_copy::{
