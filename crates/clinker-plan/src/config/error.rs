@@ -303,7 +303,7 @@ mod external_schema_tests {
             "pipeline:\n  name: ext_schema_test\n\
              nodes:\n  - type: source\n    name: src\n    config:\n      \
              name: src\n      type: csv\n      path: /tmp/in.csv\n      \
-             schema: \"{}\"\n  - type: output\n    name: out\n    input: src\n    \
+             schema: '{}'\n  - type: output\n    name: out\n    input: src\n    \
              config:\n      name: out\n      type: csv\n      path: /tmp/out.csv\n",
             schema_path.display()
         );
