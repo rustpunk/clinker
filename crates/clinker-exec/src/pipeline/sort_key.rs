@@ -64,17 +64,9 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
                 !f.is_nan(),
                 "NaN should be DLQ'd before reaching sort encoder"
             );
-            // Canonicalize -0.0 → 0.0 so byte order agrees with semantic
-            // equality (`-0.0 == 0.0` per IEEE). Matches `value_to_group_key`.
-            let f = if *f == 0.0 { 0.0 } else { *f };
-            let bits = f.to_bits();
-            let encoded = if bits >> 63 == 1 {
-                bits ^ u64::MAX // negative: flip all bits
-            } else {
-                bits ^ (1 << 63) // positive/zero: flip sign bit only
-            };
-            buf.extend_from_slice(&encoded.to_be_bytes());
+            encode_f64_order(*f, buf);
         }
+        Value::Decimal(d) => encode_decimal_order(*d, buf),
         Value::String(s) => {
             buf.extend_from_slice(s.as_bytes());
             buf.push(0x00); // null terminator
@@ -95,6 +87,84 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
         Value::Null => {}                     // handled by caller
         Value::Array(_) | Value::Map(_) => {} // not a valid sort key; defensive no-op
     }
+}
+
+/// Append the EXACT, value-canonical, order-preserving memcomparable encoding
+/// of a `Decimal` (a fixed 33 bytes).
+///
+/// The decimal sort key is load-bearing for GROUP IDENTITY, not just ordering:
+/// the spilled-aggregation path ([`crate::aggregation::spill`]) compares group
+/// keys by these bytes, so the encoding must be **value-canonical** — equal
+/// values (`2.50` and `2.5`) must produce byte-identical keys, and distinct
+/// values must not collide — as well as order-preserving. A lossy `f64`
+/// projection is monotone but NOT injective, so it would silently merge two
+/// distinct high-precision decimal groups once aggregation spills; this exact
+/// encoding avoids that divergence from the in-memory `GroupByKey::Decimal`
+/// path.
+///
+/// Encoding: the value scaled to a fixed 10^28 grid is the integer
+/// `mantissa × 10^(28 − scale)` (identical for `2.50` and `2.5`), which fits
+/// in 256 bits over `rust_decimal`'s range. It is emitted as a sign marker
+/// (`0x00` negative sorts before `0x01` non-negative) followed by the 32-byte
+/// big-endian magnitude — bit-inverted for negatives so a larger magnitude
+/// sorts earlier. `-0` normalizes to `0`, so there is no signed-zero ambiguity.
+fn encode_decimal_order(d: rust_decimal::Decimal, buf: &mut Vec<u8>) {
+    const FIXED_SCALE: u32 = 28; // rust_decimal's maximum scale
+    let negative = d.is_sign_negative() && !d.is_zero();
+    let magnitude = d.mantissa().unsigned_abs();
+    // scale ≤ 28, so 28 − scale ≥ 0 and 10^(28−scale) ≤ 10^28 < u128::MAX.
+    let pow = 10u128.pow(FIXED_SCALE - d.scale());
+    let scaled = mul_u128_to_u256_be(magnitude, pow);
+    if negative {
+        buf.push(0x00);
+        buf.extend(scaled.iter().map(|b| !b));
+    } else {
+        buf.push(0x01);
+        buf.extend_from_slice(&scaled);
+    }
+}
+
+/// Full 256-bit product of two `u128`s as a 32-byte big-endian array, via
+/// schoolbook multiplication over four 64-bit limbs. Used to place a decimal on
+/// a fixed 10^28 grid without a bignum dependency; the operands here are bounded
+/// (`magnitude < 2^96`, `pow ≤ 10^28 < 2^94`) so the product never exceeds 2^190.
+fn mul_u128_to_u256_be(a: u128, b: u128) -> [u8; 32] {
+    const MASK: u128 = u64::MAX as u128;
+    let (a_lo, a_hi) = (a & MASK, a >> 64);
+    let (b_lo, b_hi) = (b & MASK, b >> 64);
+
+    let ll = a_lo * b_lo;
+    let lh = a_lo * b_hi;
+    let hl = a_hi * b_lo;
+    let hh = a_hi * b_hi;
+
+    let r0 = ll & MASK;
+    let mid = (ll >> 64) + (lh & MASK) + (hl & MASK);
+    let r1 = mid & MASK;
+    let hi = (mid >> 64) + (lh >> 64) + (hl >> 64) + (hh & MASK);
+    let r2 = hi & MASK;
+    let r3 = (hi >> 64) + (hh >> 64);
+
+    let mut out = [0u8; 32];
+    out[0..8].copy_from_slice(&(r3 as u64).to_be_bytes());
+    out[8..16].copy_from_slice(&(r2 as u64).to_be_bytes());
+    out[16..24].copy_from_slice(&(r1 as u64).to_be_bytes());
+    out[24..32].copy_from_slice(&(r0 as u64).to_be_bytes());
+    out
+}
+
+/// Append the order-preserving 8-byte memcomparable encoding of an `f64`.
+fn encode_f64_order(f: f64, buf: &mut Vec<u8>) {
+    // Canonicalize -0.0 → 0.0 so byte order agrees with semantic equality
+    // (`-0.0 == 0.0` per IEEE). Matches `value_to_group_key`.
+    let f = if f == 0.0 { 0.0 } else { f };
+    let bits = f.to_bits();
+    let encoded = if bits >> 63 == 1 {
+        bits ^ u64::MAX // negative: flip all bits
+    } else {
+        bits ^ (1 << 63) // positive/zero: flip sign bit only
+    };
+    buf.extend_from_slice(&encoded.to_be_bytes());
 }
 
 /// Owning wrapper around a `Vec<SortField>` that encodes and compares
@@ -222,7 +292,56 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use clinker_record::Schema;
+    use rust_decimal::Decimal;
     use std::sync::Arc;
+
+    fn dec_key(d: Decimal) -> Vec<u8> {
+        let mut buf = Vec::new();
+        encode_value(&Value::Decimal(d), &mut buf);
+        buf
+    }
+
+    #[test]
+    fn decimal_sort_key_is_value_canonical() {
+        // Equal values of differing scale MUST produce identical keys — the
+        // spilled-aggregation group-identity invariant.
+        assert_eq!(dec_key(Decimal::new(250, 2)), dec_key(Decimal::new(25, 1))); // 2.50 == 2.5
+        assert_eq!(dec_key(Decimal::new(0, 0)), dec_key(Decimal::new(0, 5))); // 0 == 0.00000
+        assert_eq!(dec_key(Decimal::new(4200, 2)), dec_key(Decimal::new(42, 0))); // 42.00 == 42
+        // Distinct values MUST NOT collide (a lossy f64 projection would).
+        assert_ne!(dec_key(Decimal::new(250, 2)), dec_key(Decimal::new(251, 2)));
+        // Two decimals that round to the same f64 must still differ.
+        assert_ne!(
+            dec_key(Decimal::new(9007199254740992, 0)),
+            dec_key(Decimal::new(9007199254740993, 0))
+        );
+    }
+
+    #[test]
+    fn decimal_sort_key_is_order_preserving() {
+        let mut vals = vec![
+            Decimal::new(-99999, 2),
+            Decimal::new(-1, 0),
+            Decimal::new(-1, 2),
+            Decimal::new(0, 0),
+            Decimal::new(1, 2),
+            Decimal::new(1, 0),
+            Decimal::new(250, 2),
+            Decimal::new(251, 2),
+            Decimal::new(99999, 2),
+            Decimal::MAX,
+            Decimal::MIN,
+        ];
+        vals.sort();
+        for w in vals.windows(2) {
+            assert!(
+                dec_key(w[0]) <= dec_key(w[1]),
+                "byte order must match numeric order: {} vs {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
 
     fn make_record(fields: &[(&str, Value)]) -> Record {
         let schema = Arc::new(Schema::new(

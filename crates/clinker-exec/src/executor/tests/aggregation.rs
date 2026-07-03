@@ -1134,6 +1134,7 @@ mod two_phase_bytes_encoder {
                 G::Str(_) => 4,
                 G::Date(_) => 5,
                 G::DateTime(_) => 6,
+                G::Decimal(_) => 7,
             }
         }
         for (x, y) in a.iter().zip(b.iter()) {

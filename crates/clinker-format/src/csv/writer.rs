@@ -273,6 +273,8 @@ fn value_to_csv_cell(col: &str, value: &Value) -> Result<String, FormatError> {
         Value::Bool(b) => if *b { "true" } else { "false" }.into(),
         Value::Integer(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
+        // A decimal carries its own (column) scale; Display preserves it.
+        Value::Decimal(d) => d.to_string(),
         Value::String(s) => s.to_string(),
         Value::Date(d) => d.format("%Y-%m-%d").to_string(),
         Value::DateTime(dt) => dt.format("%Y-%m-%dT%H:%M:%S").to_string(),

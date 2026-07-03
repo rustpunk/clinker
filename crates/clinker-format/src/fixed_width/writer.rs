@@ -78,7 +78,7 @@ impl<W: Write> FixedWidthWriter<W> {
 
                 let is_numeric = matches!(
                     f.ty.unwrap_nullable(),
-                    Type::Int | Type::Float | Type::Numeric
+                    Type::Int | Type::Float | Type::Decimal | Type::Numeric
                 );
 
                 let justify = f.justify.clone().unwrap_or(if is_numeric {
@@ -174,6 +174,9 @@ impl<W: Write> FixedWidthWriter<W> {
             Value::String(s) => s.to_string(),
             Value::Integer(i) => i.to_string(),
             Value::Float(f) => f.to_string(),
+            // The decimal already carries its column scale (coercion rounds to
+            // it), and Display renders that scale, e.g. `2.50`.
+            Value::Decimal(d) => d.to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => d.format("%Y%m%d").to_string(),
             Value::DateTime(dt) => dt.format("%Y%m%d%H%M%S").to_string(),
@@ -309,6 +312,7 @@ fn value_to_envelope_cell(value: &Value) -> String {
         Value::String(s) => s.to_string(),
         Value::Integer(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
+        Value::Decimal(d) => d.to_string(),
         Value::Bool(b) => b.to_string(),
         Value::Date(d) => d.format("%Y%m%d").to_string(),
         Value::DateTime(dt) => dt.format("%Y%m%d%H%M%S").to_string(),

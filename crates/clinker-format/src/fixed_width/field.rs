@@ -31,6 +31,9 @@ pub struct ResolvedField {
     pub width: usize,
     pub ty: Type,
     pub format: Option<String>,
+    /// Decimal scale (fractional digits) a `decimal` column is rounded to at
+    /// parse; `None` for non-decimal columns and unscaled decimals.
+    pub scale: Option<u8>,
     pub justify: Option<Justify>,
     pub pad: String,
     pub trim: bool,
@@ -75,6 +78,7 @@ impl ResolvedField {
             width,
             ty: f.ty.clone(),
             format: f.format.clone(),
+            scale: f.scale,
             justify: f.justify.clone(),
             pad: f.pad.clone().unwrap_or_else(|| " ".into()),
             trim: f.trim.unwrap_or(true),
@@ -241,7 +245,7 @@ pub fn parse_field_value(field: &ResolvedField, raw: &str, row: u64) -> Result<V
     if raw.is_empty() {
         return Ok(Value::Null);
     }
-    coerce_scalar(&field.ty, field.format.as_deref(), raw).map_err(|message| {
+    coerce_scalar(&field.ty, field.format.as_deref(), field.scale, raw).map_err(|message| {
         FormatError::InvalidRecord {
             row,
             message: with_field(&field.name, &message),
@@ -272,7 +276,12 @@ pub fn parse_field_value(field: &ResolvedField, raw: &str, row: u64) -> Result<V
 /// Returns the human-readable failure message (caller wraps it in a
 /// format-specific error) when the text does not parse as `ty`, or when `ty`
 /// is a `Map` / `Array` a positional field cannot represent.
-pub fn coerce_scalar(ty: &Type, format: Option<&str>, raw: &str) -> Result<Value, String> {
+pub fn coerce_scalar(
+    ty: &Type,
+    format: Option<&str>,
+    scale: Option<u8>,
+    raw: &str,
+) -> Result<Value, String> {
     match ty.unwrap_nullable() {
         Type::Int => raw
             .parse::<i64>()
@@ -282,6 +291,12 @@ pub fn coerce_scalar(ty: &Type, format: Option<&str>, raw: &str) -> Result<Value
             .parse::<f64>()
             .map(Value::Float)
             .map_err(|e| format!("cannot parse '{raw}' as float: {e}")),
+        // Exact base-10 parse into `Value::Decimal`, rounded to the column
+        // `scale` (banker's rounding). Never routed through a binary float.
+        Type::Decimal => {
+            clinker_record::coercion::coerce_to_decimal(&Value::String(raw.into()), scale)
+                .map_err(|e| e.to_string())
+        }
         Type::Numeric => raw
             .parse::<i64>()
             .map(Value::Integer)
@@ -345,7 +360,13 @@ mod tests {
     fn coerce_scalar_datetime_honors_format() {
         // The positional parse now produces a real `Value::DateTime`, honoring
         // the column's `format:` string — no punt-to-String / re-coerce.
-        let v = coerce_scalar(&Type::DateTime, Some("%Y%m%d%H%M%S"), "20240115103000").unwrap();
+        let v = coerce_scalar(
+            &Type::DateTime,
+            Some("%Y%m%d%H%M%S"),
+            None,
+            "20240115103000",
+        )
+        .unwrap();
         let expected = Value::DateTime(
             NaiveDate::from_ymd_opt(2024, 1, 15)
                 .unwrap()
@@ -373,7 +394,7 @@ mod tests {
             "01/15/2024 10:30:00",
         ] {
             assert_eq!(
-                coerce_scalar(&Type::DateTime, None, raw).unwrap(),
+                coerce_scalar(&Type::DateTime, None, None, raw).unwrap(),
                 expected,
                 "default datetime chain should accept {raw:?}"
             );
@@ -384,41 +405,55 @@ mod tests {
     fn coerce_scalar_datetime_bad_input_errors() {
         // A value matching neither an explicit format nor the default chain is a
         // loud parse error (positional formats are strict), not a silent String.
-        assert!(coerce_scalar(&Type::DateTime, Some("%Y%m%d%H%M%S"), "not-a-time").is_err());
-        assert!(coerce_scalar(&Type::DateTime, None, "definitely not a datetime").is_err());
+        assert!(coerce_scalar(&Type::DateTime, Some("%Y%m%d%H%M%S"), None, "not-a-time").is_err());
+        assert!(coerce_scalar(&Type::DateTime, None, None, "definitely not a datetime").is_err());
     }
 
     #[test]
     fn coerce_scalar_numeric_int_then_float() {
         assert_eq!(
-            coerce_scalar(&Type::Numeric, None, "42").unwrap(),
+            coerce_scalar(&Type::Numeric, None, None, "42").unwrap(),
             Value::Integer(42)
         );
         assert_eq!(
-            coerce_scalar(&Type::Numeric, None, "3.5").unwrap(),
+            coerce_scalar(&Type::Numeric, None, None, "3.5").unwrap(),
             Value::Float(3.5)
         );
-        assert!(coerce_scalar(&Type::Numeric, None, "abc").is_err());
+        assert!(coerce_scalar(&Type::Numeric, None, None, "abc").is_err());
     }
 
     #[test]
     fn coerce_scalar_map_and_array_are_rejected() {
         // A positional field cannot represent a native composite — declaring one
         // is an author error, not a silent String pass-through.
-        assert!(coerce_scalar(&Type::Map, None, "{}").is_err());
-        assert!(coerce_scalar(&Type::Array, None, "[]").is_err());
+        assert!(coerce_scalar(&Type::Map, None, None, "{}").is_err());
+        assert!(coerce_scalar(&Type::Array, None, None, "[]").is_err());
         // Nullable is peeled first, so the rejection still fires.
-        assert!(coerce_scalar(&Type::nullable(Type::Array), None, "[]").is_err());
+        assert!(coerce_scalar(&Type::nullable(Type::Array), None, None, "[]").is_err());
+    }
+
+    #[test]
+    fn coerce_scalar_decimal_parses_exactly_and_rounds_to_scale() {
+        // Exact base-10 parse (never via f64): "12.50" is exactly 12.50, and
+        // Display preserves the column scale.
+        let v = coerce_scalar(&Type::Decimal, None, Some(2), "12.50").unwrap();
+        assert!(matches!(v, Value::Decimal(_)));
+        assert_eq!(v.to_string(), "12.50");
+        // Rounds to the column scale (banker's): "2.125" at scale 2 -> 2.12.
+        let r = coerce_scalar(&Type::Decimal, None, Some(2), "2.125").unwrap();
+        assert_eq!(r.to_string(), "2.12");
+        // A non-numeric decimal field is a loud parse error.
+        assert!(coerce_scalar(&Type::Decimal, None, Some(2), "abc").is_err());
     }
 
     #[test]
     fn coerce_scalar_string_any_pass_through() {
         assert_eq!(
-            coerce_scalar(&Type::String, None, "hello").unwrap(),
+            coerce_scalar(&Type::String, None, None, "hello").unwrap(),
             Value::String("hello".into())
         );
         assert_eq!(
-            coerce_scalar(&Type::Any, None, "raw").unwrap(),
+            coerce_scalar(&Type::Any, None, None, "raw").unwrap(),
             Value::String("raw".into())
         );
     }

@@ -1,6 +1,25 @@
 use crate::value::Value;
 use chrono::{NaiveDate, NaiveDateTime};
+use rust_decimal::{Decimal, RoundingStrategy};
 use std::fmt;
+use std::str::FromStr;
+
+/// The house rounding strategy for the `decimal` type: round-half-to-even
+/// (banker's rounding). Unbiased over a stream of values — the accounting
+/// standard and `rust_decimal`'s own default — so summing rounded amounts does
+/// not systematically drift up or down the way round-half-away-from-zero does.
+/// Applied when coercing a value into a scaled `decimal` column and when
+/// dividing/averaging to a target scale.
+pub const DECIMAL_ROUNDING: RoundingStrategy = RoundingStrategy::MidpointNearestEven;
+
+/// Round a `Decimal` to `scale` fractional digits using [`DECIMAL_ROUNDING`],
+/// or return it unchanged when no scale is declared.
+pub fn round_decimal_to_scale(d: Decimal, scale: Option<u8>) -> Decimal {
+    match scale {
+        Some(s) => d.round_dp_with_strategy(u32::from(s), DECIMAL_ROUNDING),
+        None => d,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum CoercionError {
@@ -98,6 +117,60 @@ pub fn coerce_to_float(value: &Value) -> Result<Value, CoercionError> {
 
 pub fn coerce_to_float_lenient(value: &Value) -> Option<Value> {
     coerce_to_float(value).ok()
+}
+
+/// Strict coercion to an exact `decimal`, rounded to `scale` fractional digits
+/// (banker's rounding — see [`DECIMAL_ROUNDING`]) when a scale is declared.
+///
+/// - `String` parses base-10 EXACTLY (`Decimal::from_str`), so a CSV/fixed-width
+///   `12.50` becomes exactly `12.50` — never routed through a lossy binary
+///   float first.
+/// - `Integer` converts exactly.
+/// - `Decimal` is re-rounded to the target scale.
+/// - `Float` is converted via `Decimal::from_f64_retain`; this is inherently a
+///   binary-float source, so it is the one lossy input (a JSON number already
+///   parsed to `f64` upstream). Rounding to scale then applies.
+///
+/// Null propagates as `Ok(Null)`.
+///
+/// # Errors
+///
+/// Returns [`CoercionError`] when the string does not parse as a decimal, a
+/// float is non-finite, or the value is a non-coercible type (bool / array /
+/// map / temporal).
+pub fn coerce_to_decimal(value: &Value, scale: Option<u8>) -> Result<Value, CoercionError> {
+    match value {
+        Value::Null => Ok(Value::Null),
+        Value::Decimal(d) => Ok(Value::Decimal(round_decimal_to_scale(*d, scale))),
+        Value::Integer(n) => Ok(Value::Decimal(round_decimal_to_scale(
+            Decimal::from(*n),
+            scale,
+        ))),
+        Value::String(s) => Decimal::from_str(s.as_str())
+            .or_else(|_| Decimal::from_scientific(s.as_str()))
+            .map(|d| Value::Decimal(round_decimal_to_scale(d, scale)))
+            .map_err(|_| CoercionError::ParseFailure {
+                input: s.to_string(),
+                target: "Decimal",
+            }),
+        Value::Float(f) => Decimal::from_f64_retain(*f)
+            .map(|d| Value::Decimal(round_decimal_to_scale(d, scale)))
+            .ok_or_else(|| CoercionError::ParseFailure {
+                input: f.to_string(),
+                target: "Decimal",
+            }),
+        other => Err(CoercionError::TypeMismatch {
+            from: other.type_name(),
+            to: "Decimal",
+            value: other.to_string(),
+        }),
+    }
+}
+
+/// Lenient decimal coercion: returns `None` on failure. Null propagates as
+/// `Some(Null)`.
+pub fn coerce_to_decimal_lenient(value: &Value, scale: Option<u8>) -> Option<Value> {
+    coerce_to_decimal(value, scale).ok()
 }
 
 pub fn coerce_to_string(value: &Value) -> Result<Value, CoercionError> {
@@ -336,5 +409,51 @@ mod tests {
     #[test]
     fn test_coerce_string_to_int_float_string() {
         assert!(coerce_to_int(&Value::String("1.5".into())).is_err());
+    }
+
+    #[test]
+    fn test_coerce_string_to_decimal_is_exact() {
+        // A base-10 string parses to the EXACT decimal, never via a binary
+        // float: 0.10 + 0.20 == 0.30 after coercion.
+        let a = coerce_to_decimal(&Value::String("0.10".into()), Some(2)).unwrap();
+        let b = coerce_to_decimal(&Value::String("0.20".into()), Some(2)).unwrap();
+        let (Value::Decimal(da), Value::Decimal(db)) = (&a, &b) else {
+            panic!("expected decimals");
+        };
+        assert_eq!(
+            Value::Decimal(*da + *db),
+            coerce_to_decimal(&Value::String("0.30".into()), Some(2)).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_coerce_decimal_rounds_to_scale_bankers() {
+        // Round-half-to-even: 2.125 -> 2.12 (2 is even), 2.135 -> 2.14.
+        assert_eq!(
+            coerce_to_decimal(&Value::String("2.125".into()), Some(2)).unwrap(),
+            Value::Decimal(Decimal::new(212, 2))
+        );
+        assert_eq!(
+            coerce_to_decimal(&Value::String("2.135".into()), Some(2)).unwrap(),
+            Value::Decimal(Decimal::new(214, 2))
+        );
+    }
+
+    #[test]
+    fn test_coerce_int_to_decimal_and_null_propagates() {
+        assert_eq!(
+            coerce_to_decimal(&Value::Integer(42), Some(2)).unwrap(),
+            Value::Decimal(Decimal::new(4200, 2))
+        );
+        assert_eq!(
+            coerce_to_decimal(&Value::Null, Some(2)).unwrap(),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn test_coerce_decimal_parse_failure() {
+        assert!(coerce_to_decimal(&Value::String("not-a-number".into()), Some(2)).is_err());
+        assert!(coerce_to_decimal_lenient(&Value::String("nope".into()), Some(2)).is_none());
     }
 }

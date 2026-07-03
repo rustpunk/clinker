@@ -120,6 +120,10 @@ pub fn compare_values(a: &Value, b: &Value) -> Ordering {
         (Value::Float(x), Value::Integer(y)) => {
             x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
         }
+        // Exact decimal ordering, incl. widening int into decimal context.
+        (Value::Decimal(x), Value::Decimal(y)) => x.cmp(y),
+        (Value::Decimal(x), Value::Integer(y)) => x.cmp(&rust_decimal::Decimal::from(*y)),
+        (Value::Integer(x), Value::Decimal(y)) => rust_decimal::Decimal::from(*x).cmp(y),
         (Value::String(x), Value::String(y)) => x.cmp(y),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::DateTime(x), Value::DateTime(y)) => x.cmp(y),

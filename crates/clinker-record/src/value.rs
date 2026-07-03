@@ -1,6 +1,7 @@
 use crate::field_str::FieldStr;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use indexmap::IndexMap;
+use rust_decimal::Decimal;
 use std::cmp::Ordering;
 use std::fmt;
 
@@ -10,6 +11,15 @@ pub enum Value {
     Bool(bool),
     Integer(i64),
     Float(f64),
+    /// Exact base-10 fixed-point value for the `decimal` column type
+    /// (monetary/financial data). Backed by [`rust_decimal::Decimal`] — a
+    /// 16-byte `Copy` value with exact base-10 arithmetic, so `0.10 + 0.20`
+    /// is exactly `0.30` rather than the IEEE-754 binary-float approximation.
+    /// Fits within the 24-byte `String(FieldStr)` payload, so it does not
+    /// widen the enum (`test_value_enum_size` still pins 32 bytes). The
+    /// column's `scale` attribute drives coercion rounding and formatting;
+    /// the value itself carries its own scale.
+    Decimal(Decimal),
     /// Field-value string. Short values (<=23 bytes — the dominant ETL field
     /// shape) live inline in the enum with zero heap allocation; longer values
     /// are `Arc`-backed by default, so cloning a long string is an O(1) refcount
@@ -40,7 +50,11 @@ pub enum Value {
 //
 // Discriminant assignment:
 //   0=Null  1=Bool  2=Integer  3=Float  4=String
-//   5=Date  6=DateTime  7=Array  8=Map
+//   5=Date  6=DateTime  7=Array  8=Map  9=Decimal
+//
+// Decimal payload: the exact 16-byte little-endian form from
+//   `rust_decimal::Decimal::serialize()` (round-trips bit-exact through
+//   `Decimal::deserialize`), independent of the crate's optional serde format.
 //
 // Date payload: i32 days from proleptic Gregorian ordinal
 //   (chrono::Datelike::num_days_from_ce, where 1 = 0001-01-01).
@@ -88,6 +102,12 @@ impl Serialize for Value {
                 let pairs: Vec<(&str, &Value)> = m.iter().map(|(k, v)| (k.as_ref(), v)).collect();
                 serializer.serialize_newtype_variant("Value", 8, "Map", &pairs)
             }
+            Value::Decimal(d) => {
+                // Exact 16-byte form (inherent `Decimal::serialize`), not the
+                // crate's serde format. Round-trips bit-exact through
+                // `Decimal::deserialize` on the read path.
+                serializer.serialize_newtype_variant("Value", 9, "Decimal", &d.serialize())
+            }
         }
     }
 }
@@ -98,6 +118,7 @@ impl<'de> Deserialize<'de> for Value {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         const VARIANTS: &[&str] = &[
             "Null", "Bool", "Integer", "Float", "String", "Date", "DateTime", "Array", "Map",
+            "Decimal",
         ];
         deserializer.deserialize_enum("Value", VARIANTS, ValueVisitor)
     }
@@ -158,9 +179,14 @@ impl<'de> Visitor<'de> for ValueVisitor {
                 }
                 Ok(Value::Map(Box::new(m)))
             }
+            9 => {
+                // Exact 16-byte reconstruction (inherent `Decimal::deserialize`).
+                let bytes: [u8; 16] = va.newtype_variant()?;
+                Ok(Value::Decimal(Decimal::deserialize(bytes)))
+            }
             other => Err(de::Error::unknown_variant(
                 &other.to_string(),
-                &["0", "1", "2", "3", "4", "5", "6", "7", "8"],
+                &["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
             )),
         }
     }
@@ -199,11 +225,12 @@ impl<'de> Deserialize<'de> for VariantIdx {
                     "DateTime" => Ok(VariantIdx(6)),
                     "Array" => Ok(VariantIdx(7)),
                     "Map" => Ok(VariantIdx(8)),
+                    "Decimal" => Ok(VariantIdx(9)),
                     other => Err(de::Error::unknown_variant(
                         other,
                         &[
                             "Null", "Bool", "Integer", "Float", "String", "Date", "DateTime",
-                            "Array", "Map",
+                            "Array", "Map", "Decimal",
                         ],
                     )),
                 }
@@ -220,6 +247,10 @@ impl PartialEq for Value {
             (Value::Bool(a), Value::Bool(b)) => a == b,
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+            // `Decimal` equality is by mathematical value: `2.50 == 2.5`
+            // (rust_decimal compares normalized), so two equal amounts of
+            // differing scale are equal (and hash equally in `GroupByKey`).
+            (Value::Decimal(a), Value::Decimal(b)) => a == b,
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Date(a), Value::Date(b)) => a == b,
             (Value::DateTime(a), Value::DateTime(b)) => a == b,
@@ -237,6 +268,7 @@ impl PartialOrd for Value {
             (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
             (Value::Integer(a), Value::Integer(b)) => a.partial_cmp(b),
             (Value::Float(a), Value::Float(b)) => Some(a.total_cmp(b)),
+            (Value::Decimal(a), Value::Decimal(b)) => Some(a.cmp(b)),
             (Value::String(a), Value::String(b)) => a.partial_cmp(b),
             (Value::Date(a), Value::Date(b)) => a.partial_cmp(b),
             (Value::DateTime(a), Value::DateTime(b)) => a.partial_cmp(b),
@@ -252,6 +284,9 @@ impl fmt::Display for Value {
             Value::Bool(b) => write!(f, "{b}"),
             Value::Integer(n) => write!(f, "{n}"),
             Value::Float(n) => write!(f, "{n}"),
+            // `Decimal`'s Display preserves the value's own scale
+            // (`2.50` prints `2.50`), which coercion sets to the column scale.
+            Value::Decimal(d) => write!(f, "{d}"),
             Value::String(s) => write!(f, "{s}"),
             Value::Date(d) => write!(f, "{}", d.format("%Y-%m-%d")),
             Value::DateTime(dt) => write!(f, "{}", dt.format("%Y-%m-%dT%H:%M:%S")),
@@ -324,6 +359,7 @@ impl Value {
             Value::Bool(_) => "bool",
             Value::Integer(_) => "int",
             Value::Float(_) => "float",
+            Value::Decimal(_) => "decimal",
             Value::String(_) => "string",
             Value::Date(_) => "date",
             Value::DateTime(_) => "datetime",
@@ -466,11 +502,53 @@ mod tests {
             Value::Array(vec![]),
             Value::Array(vec![Value::Integer(1), Value::Bool(true)]),
             Value::Array(vec![Value::Null, Value::String("x".into())]),
+            Value::Decimal(rust_decimal::Decimal::new(0, 0)),
+            Value::Decimal(rust_decimal::Decimal::new(1050, 2)),
+            Value::Decimal(rust_decimal::Decimal::new(-1050, 2)),
+            Value::Decimal(rust_decimal::Decimal::MAX),
+            Value::Decimal(rust_decimal::Decimal::MIN),
         ];
         for original in &cases {
             let recovered = roundtrip(original);
             assert_eq!(*original, recovered, "roundtrip failed for: {original:?}");
         }
+    }
+
+    #[test]
+    fn test_value_decimal_serde_preserves_scale_and_equality() {
+        use rust_decimal::Decimal;
+
+        // The spill wire form is the exact 16-byte `Decimal::serialize` payload:
+        // a value round-trips bit-exact, PRESERVING its scale (2.50 stays 2.50,
+        // not collapsed to 2.5).
+        let scaled = Value::Decimal(Decimal::new(250, 2)); // 2.50
+        let recovered = roundtrip(&scaled);
+        assert_eq!(scaled, recovered);
+        assert_eq!(
+            recovered.to_string(),
+            "2.50",
+            "scale survives the round-trip"
+        );
+
+        // Equality is by mathematical value: 2.50 == 2.5 despite differing scale.
+        assert_eq!(
+            Value::Decimal(Decimal::new(250, 2)),
+            Value::Decimal(Decimal::new(25, 1))
+        );
+
+        assert_eq!(scaled.type_name(), "decimal");
+        assert_eq!(scaled.heap_size(), 0, "Decimal is inline — no heap");
+    }
+
+    #[test]
+    fn test_value_decimal_exact_addition() {
+        use rust_decimal::Decimal;
+        // The whole point of the type: 0.10 + 0.20 is exactly 0.30, not the
+        // 0.30000000000000004 an IEEE-754 binary float produces.
+        let a = Decimal::new(10, 2); // 0.10
+        let b = Decimal::new(20, 2); // 0.20
+        assert_eq!(a + b, Decimal::new(30, 2));
+        assert_eq!(Value::Decimal(a + b), Value::Decimal(Decimal::new(30, 2)));
     }
 
     #[test]

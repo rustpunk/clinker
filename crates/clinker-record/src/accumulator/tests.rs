@@ -36,6 +36,124 @@ fn add_all(acc: &mut AccumulatorEnum, values: &[Value]) {
     }
 }
 
+fn dec(mantissa: i64, scale: u32) -> Value {
+    Value::Decimal(rust_decimal::Decimal::new(mantissa, scale))
+}
+
+// ---------- Decimal aggregates (exactness) ----------
+
+#[test]
+fn test_sum_decimal_is_exact() {
+    // 0.10 + 0.20 + 0.30 == 0.60 exactly (a binary-float sum drifts).
+    let mut acc = sum();
+    add_all(&mut acc, &[dec(10, 2), dec(20, 2), dec(30, 2)]);
+    assert_eq!(acc.finalize().unwrap(), dec(60, 2));
+}
+
+#[test]
+fn test_sum_decimal_and_integer_widen_to_decimal() {
+    // A decimal observed after an integer folds the integer into the exact
+    // decimal accumulator (defence-in-depth; typecheck keeps columns
+    // homogeneous). Result stays exact decimal.
+    let mut acc = sum();
+    add_all(&mut acc, &[Value::Integer(1), dec(50, 2)]);
+    assert_eq!(acc.finalize().unwrap(), dec(150, 2));
+}
+
+#[test]
+fn test_avg_decimal_is_exact() {
+    // avg(0.10, 0.20, 0.30) = 0.20 exactly.
+    let mut acc = avg();
+    add_all(&mut acc, &[dec(10, 2), dec(20, 2), dec(30, 2)]);
+    assert_eq!(acc.finalize().unwrap(), dec(20, 2));
+}
+
+#[test]
+fn test_min_max_decimal() {
+    let mut lo = min();
+    let mut hi = max();
+    let vals = [dec(250, 2), dec(125, 2), dec(999, 2)];
+    add_all(&mut lo, &vals);
+    add_all(&mut hi, &vals);
+    assert_eq!(lo.finalize().unwrap(), dec(125, 2));
+    assert_eq!(hi.finalize().unwrap(), dec(999, 2));
+}
+
+#[test]
+fn test_sum_decimal_merge_is_exact() {
+    let mut a = sum();
+    add_all(&mut a, &[dec(10, 2), dec(20, 2)]);
+    let mut b = sum();
+    add_all(&mut b, &[dec(30, 2), dec(5, 2)]);
+    a.merge(&b);
+    assert_eq!(a.finalize().unwrap(), dec(65, 2));
+}
+
+#[test]
+fn test_sum_decimal_then_integer_not_lost() {
+    // An integer observed AFTER decimal mode (e.g. `sum(if flag then amount
+    // else 1)`) must fold into the exact decimal sum, not vanish.
+    let mut acc = sum();
+    add_all(
+        &mut acc,
+        &[dec(250, 2), Value::Integer(1), Value::Integer(1)],
+    );
+    assert_eq!(acc.finalize().unwrap(), dec(450, 2)); // 2.50 + 1 + 1 = 4.50
+}
+
+#[test]
+fn test_sum_decimal_merge_with_integer_only_state_either_order() {
+    // Merging an integer-only partial into a decimal partial (and vice versa)
+    // must give the same exact total regardless of merge direction.
+    let build_dec = || {
+        let mut a = sum();
+        add_all(&mut a, &[dec(250, 2)]); // 2.50
+        a
+    };
+    let build_int = || {
+        let mut b = sum();
+        add_all(&mut b, &[Value::Integer(2)]);
+        b
+    };
+    let mut ab = build_dec();
+    ab.merge(&build_int());
+    assert_eq!(ab.finalize().unwrap(), dec(450, 2)); // 2.50 + 2 = 4.50
+    let mut ba = build_int();
+    ba.merge(&build_dec());
+    assert_eq!(ba.finalize().unwrap(), dec(450, 2)); // order-independent
+}
+
+#[test]
+fn test_avg_decimal_then_integer_not_lost() {
+    // avg(2.00, 4) with 4 an integer observed after decimal mode = 3.00.
+    let mut acc = avg();
+    add_all(&mut acc, &[dec(200, 2), Value::Integer(4)]);
+    assert_eq!(acc.finalize().unwrap(), dec(300, 2));
+}
+
+#[test]
+fn test_avg_decimal_merge_with_integer_only_state() {
+    // avg over [2.00] merged with avg over [4] = (2.00 + 4) / 2 = 3.00.
+    let mut a = avg();
+    add_all(&mut a, &[dec(200, 2)]);
+    let mut b = avg();
+    add_all(&mut b, &[Value::Integer(4)]);
+    a.merge(&b);
+    assert_eq!(a.finalize().unwrap(), dec(300, 2));
+}
+
+#[test]
+fn test_sum_decimal_spill_roundtrip() {
+    // The accumulator state serializes exactly (decimal via the 16-byte form),
+    // so a spilled-and-reloaded Sum finalizes identically.
+    let mut a = sum();
+    add_all(&mut a, &[dec(1050, 2), dec(295, 2)]);
+    let bytes = postcard::to_stdvec(&a).unwrap();
+    let restored: AccumulatorEnum = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(restored.finalize().unwrap(), dec(1345, 2));
+    assert_eq!(restored, a);
+}
+
 // ---------- Sum ----------
 
 #[test]
