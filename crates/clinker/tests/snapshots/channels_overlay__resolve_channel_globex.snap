@@ -8,7 +8,7 @@ Effective plan for `order_fulfillment`
     - enterprise (priority 20, derived)
 
 Injected nodes:
-  fraud_stamp <- enterprise [group (priority 20)]
+  screen <- enterprise [group (priority 20)]
 
 Config provenance (overlay-affected):
   scorer.threshold = 0.95  [ChannelPerTarget]  (base: 0.5)

@@ -644,7 +644,7 @@ impl PipelineConfig {
         // `bind_schema` pass below, anchored to the op because the engine stamps
         // each injected / replaced node with the op's source location.
         if !ctx.overlay_ops.is_empty() {
-            let effective = self.with_structural_overlay(&ctx.overlay_ops)?;
+            let effective = self.with_structural_overlay(&ctx.overlay_ops, ctx)?;
             return effective.compile_with_diagnostics(&ctx.without_overlay_ops());
         }
 
@@ -2254,20 +2254,78 @@ impl PipelineConfig {
     fn with_structural_overlay(
         &self,
         ops: &[crate::overlay_ops::LayeredOp],
+        ctx: &CompileContext,
     ) -> Result<PipelineConfig, Vec<clinker_core_types::Diagnostic>> {
         use clinker_core_types::{Diagnostic, LabeledSpan};
+
+        // Resolve each `add composition` op's declared input ports so the engine
+        // binds the splice anchor to the composition's input port — the same
+        // call-site `inputs:` binding a hand-authored composition node carries.
+        // Without it an injected composition keeps an empty `inputs:` map, gets
+        // no incoming edge, and sits dead in the data path (issue #768).
+        let comp_ports = self.resolve_injected_composition_ports(ops, ctx);
 
         let mut effective = self.clone();
         let base_nodes = std::mem::take(&mut effective.nodes);
         effective.nodes =
-            crate::overlay_ops::apply_overlay_ops(base_nodes, ops.to_vec()).map_err(|err| {
-                vec![Diagnostic::error(
-                    "E114",
-                    err.to_string(),
-                    LabeledSpan::primary(err.span(), String::new()),
-                )]
-            })?;
+            crate::overlay_ops::apply_overlay_ops_with_ports(base_nodes, ops.to_vec(), &comp_ports)
+                .map_err(|err| {
+                    vec![Diagnostic::error(
+                        "E114",
+                        err.to_string(),
+                        LabeledSpan::primary(err.span(), String::new()),
+                    )]
+                })?;
         Ok(effective)
+    }
+
+    /// Resolve the declared input-port names for every `add composition` op in
+    /// the stream, keyed by the op's raw `composition:` path.
+    ///
+    /// Scans workspace composition signatures the same way the ordinary compile
+    /// path does, resolving each op's `composition:` reference through the
+    /// shared [`resolve_use_path`](crate::plan::bind_schema::resolve_use_path)
+    /// (top-level `origin_dir` is the pipeline directory). Best-effort: a scan
+    /// failure or unresolved reference yields no entry, leaving the injected
+    /// node's `inputs:` empty so the real diagnostic surfaces later in
+    /// `bind_schema`. Streams with no composition adds skip the scan entirely.
+    fn resolve_injected_composition_ports(
+        &self,
+        ops: &[crate::overlay_ops::LayeredOp],
+        ctx: &CompileContext,
+    ) -> crate::overlay_ops::CompositionInputPorts {
+        use crate::config::composition::scan_workspace_signatures;
+        use crate::overlay_ops::OverlayOp;
+
+        let comp_paths: Vec<std::path::PathBuf> = ops
+            .iter()
+            .filter_map(|layered| match &layered.op.value {
+                OverlayOp::Add(add) => add.composition.clone(),
+                _ => None,
+            })
+            .collect();
+        if comp_paths.is_empty() {
+            return crate::overlay_ops::CompositionInputPorts::new();
+        }
+
+        let table = match scan_workspace_signatures(ctx.workspace_root()) {
+            Ok(table) => table,
+            Err(_) => return crate::overlay_ops::CompositionInputPorts::new(),
+        };
+
+        let mut ports = crate::overlay_ops::CompositionInputPorts::new();
+        for path in comp_paths {
+            let key = crate::plan::bind_schema::resolve_use_path(
+                &path,
+                &ctx.pipeline_dir,
+                ctx.workspace_root(),
+                &table,
+            );
+            if let Some(sig) = table.get(&key) {
+                ports.insert(path, sig.inputs.keys().cloned().collect());
+            }
+        }
+        ports
     }
 }
 

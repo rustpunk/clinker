@@ -9,7 +9,8 @@
 //! The workspace pairs a base pipeline that uses a composition `scorer` (with a
 //! `threshold` config knob) against:
 //!   - a group `enterprise` (selector `tier == "enterprise"`, priority 20) that
-//!     injects a `fraud_stamp` transform and clobbers `scorer.threshold`;
+//!     splices a `screen` composition into the consumed path and clobbers
+//!     `scorer.threshold`;
 //!   - a channel `globex` (labels `tier=enterprise`) whose manifest and
 //!     per-target overlay clobber `scorer.threshold` at the higher layers.
 
@@ -88,6 +89,29 @@ nodes:
       path: out.csv
 "#;
 
+/// The screening composition the `enterprise` group splices into the consumed
+/// data path (issue #768): it zeroes any amount at or above 100 and passes the
+/// rest through. Its input port `inp` is bound to the splice anchor, and its
+/// output feeds the base pipeline's `scorer` composition.
+const SCREEN_COMPOSITION: &str = r#"_compose:
+  name: screen
+  inputs:
+    inp:
+      schema:
+        - { name: order_id, type: string }
+        - { name: amount, type: float }
+  outputs:
+    out: screened
+nodes:
+  - type: transform
+    name: screened
+    input: inp
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit amount = if amount >= 100.0 then 0.0 else amount
+"#;
+
 const GROUP: &str = r#"group:
   name: enterprise
   match: 'tier == "enterprise"'
@@ -96,14 +120,8 @@ config:
   scorer.threshold: 0.8
 overrides:
   - op: add
-    node:
-      type: transform
-      name: fraud_stamp
-      input: normalize
-      config:
-        cxl: |
-          emit order_id = order_id
-          emit amount = amount
+    composition: ../composition/screen.comp.yaml
+    alias: screen
     after: normalize
 "#;
 
@@ -158,6 +176,7 @@ fn build_workspace(root: &Path, broken: bool) {
     write(root, "pipeline/orders.csv", ORDERS_CSV);
     write(root, "pipeline/order_fulfillment.yaml", PIPELINE);
     write(root, "composition/score.comp.yaml", COMPOSITION);
+    write(root, "composition/screen.comp.yaml", SCREEN_COMPOSITION);
     write(root, "group/enterprise.group.yaml", GROUP);
     write(root, "channel/globex/channel.cfg.yaml", GLOBEX_MANIFEST);
     write(
@@ -220,16 +239,25 @@ fn plain_run_is_unaffected_by_overlay_wiring() {
 }
 
 #[test]
-fn run_with_group_applies_the_overlay() {
+fn run_with_group_splices_composition_into_consumed_path() {
+    // The `enterprise` group splices the `screen` composition in after
+    // `normalize`, so the effective path is `orders → normalize → screen →
+    // scorer → out`. This is a real run (not `--dry-run`): the output proves the
+    // injected composition's transform actually executes and its rows flow
+    // downstream through `scorer`, the fix for issue #768. Before the fix the
+    // injected composition was left unfed and bypassed — `scorer` read
+    // `normalize` directly, so `a1` would keep its unscreened amount `150`.
     let tmp = tempfile::tempdir().unwrap();
     build_workspace(tmp.path(), false);
 
+    // Run from the workspace dir so the output node's relative `out.csv` path
+    // (resolved against the process cwd) lands inside the tempdir.
     let out = Command::new(clinker_bin())
+        .current_dir(tmp.path())
         .arg("run")
         .arg(pipeline_path(tmp.path()))
         .args(["--base-dir", tmp.path().to_str().unwrap()])
         .args(["--group", "enterprise"])
-        .args(["--dry-run", "-n", "2"])
         .output()
         .expect("spawn clinker");
 
@@ -237,17 +265,32 @@ fn run_with_group_applies_the_overlay() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         out.status.success(),
-        "run --group must succeed (injected node preserves the schema).\nstdout: {stdout}\nstderr: {stderr}"
+        "run --group must succeed.\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
         stderr.contains("applied overlay") && stderr.contains("enterprise"),
         "run --group must report the applied group.\nstderr: {stderr}"
     );
-    // Both input records flow through the injected + composition nodes (the
-    // run completion is logged to stdout).
     assert!(
         stdout.contains("2 written"),
         "the overlaid run must process both records.\nstdout: {stdout}"
+    );
+
+    // The output path resolves against the base dir; `screen` zeroed the
+    // at-or-above-100 amount (`a1`: 150 → 0) and passed the rest through
+    // (`a2`: 20). Both prove the injected composition ran in the consumed path.
+    let output = std::fs::read_to_string(tmp.path().join("out.csv")).expect("read out.csv");
+    assert!(
+        output.contains("a1,0"),
+        "screen must zero a1's amount (150 → 0) in the consumed path.\nout.csv:\n{output}"
+    );
+    assert!(
+        output.contains("a2,20"),
+        "screen must pass a2's amount through unchanged.\nout.csv:\n{output}"
+    );
+    assert!(
+        !output.contains("a1,150"),
+        "a1's unscreened amount must not survive — screen would be bypassed.\nout.csv:\n{output}"
     );
 }
 
@@ -287,8 +330,8 @@ fn channels_resolve_channel_renders_provenance() {
         report.contains("enterprise (priority 20, derived)"),
         "{report}"
     );
-    // The group injected a node.
-    assert!(report.contains("fraud_stamp <- enterprise"), "{report}");
+    // The group injected the screening composition.
+    assert!(report.contains("screen <- enterprise"), "{report}");
     // The per-target overlay (0.95) won the 4-layer clobber over base 0.5.
     assert!(
         report.contains("scorer.threshold = 0.95") && report.contains("ChannelPerTarget"),
@@ -325,7 +368,7 @@ fn channels_resolve_group_standalone() {
     );
     // With no higher layer, the group's value wins.
     assert!(report.contains("scorer.threshold = 0.8"), "{report}");
-    assert!(report.contains("fraud_stamp <- enterprise"), "{report}");
+    assert!(report.contains("screen <- enterprise"), "{report}");
 }
 
 #[test]
