@@ -89,17 +89,17 @@ type's columns) automatically.
     type: csv
     path: "./data/payments.csv"
     schema:                                     # one multi-record schema (map form)
-      discriminator: { field: record_type }     # the column carrying the type tag
+      discriminator: { field: rec_type }        # the physical column carrying the type tag
       records:
-        - { id: header,  tag: H, columns: [ { name: record_type, type: string }, { name: batch_id, type: string } ] }
-        - { id: detail,  tag: D, columns: [ { name: record_type, type: string }, { name: id, type: int }, { name: amount, type: int } ] }
-        - { id: trailer, tag: T, columns: [ { name: record_type, type: string }, { name: count, type: int } ] }
+        - { id: header,  tag: H, columns: [ { name: rec_type, type: string }, { name: batch_id, type: string } ] }
+        - { id: detail,  tag: D, columns: [ { name: rec_type, type: string }, { name: id, type: int }, { name: amount, type: int } ] }
+        - { id: trailer, tag: T, columns: [ { name: rec_type, type: string }, { name: count, type: int } ] }
       structure:
         - { record: trailer, count: count }     # validate T's count against the body count
     envelope:
       sections:
         head:
-          extract: { record_type: H }          # the H row surfaces as $doc.head.*
+          extract: { record_type: H }          # the H record type surfaces as $doc.head.*
           fields:
             batch_id: string
 ```

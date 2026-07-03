@@ -249,13 +249,24 @@ pub const RECORD_TYPE_COLUMN: &str = "record_type";
 
 /// Build the discriminator-led superset column list over a multi-record
 /// schema's record types: a leading engine-stamped `record_type` string column
-/// followed by the union of every record type's columns (first declaration of
-/// each name wins its position and type).
+/// followed by the union of every record type's columns. The first declaration
+/// of each name wins its position and physical-extraction attributes; a name
+/// shared across record types resolves to the *unified* (widened) type, so the
+/// superset column the planner typechecks against accepts every record type's
+/// runtime value (e.g. a field declared `int` in one type and `float` in
+/// another widens to `float`). This mirrors the reader's `SupersetBuilder`
+/// unify compatibility rule, so the typechecked row and the emitted records
+/// cannot disagree on a shared column's type. A pair that does not unify keeps
+/// the first declaration's type here; the reader rejects that config at build.
 pub fn multi_record_superset(record_types: &[RecordType]) -> Vec<Column> {
     let mut columns: Vec<Column> = vec![Column::bare(RECORD_TYPE_COLUMN, Type::String)];
     for rt in record_types {
         for col in &rt.columns {
-            if !columns.iter().any(|c| c.name == col.name) {
+            if let Some(existing) = columns.iter_mut().find(|c| c.name == col.name) {
+                if let Some(unified) = existing.ty.unify(&col.ty) {
+                    existing.ty = unified;
+                }
+            } else {
                 columns.push(col.clone());
             }
         }

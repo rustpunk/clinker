@@ -118,8 +118,6 @@ Track unresolved questions only in `docs/ai/80_OPEN_QUESTIONS.md`. Relevant entr
 - `crates/clinker-schema/src/parse.rs`
 - `crates/clinker-schema/src/discovery.rs`
 - `crates/clinker-schema/src/validate.rs`
-- `examples/pipelines/retract-demo/orders.schema.yaml`
-- `examples/pipelines/retract-demo/audit_events.schema.yaml`
 - `docs/ai/20_CRATE_MAP.md`
 - `docs/ai/80_OPEN_QUESTIONS.md`
 - `docs/ai/90_CRATE_AGENT_PLAN.md`

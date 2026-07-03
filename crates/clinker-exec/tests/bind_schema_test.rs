@@ -893,9 +893,9 @@ nodes:
 /// A `SourceSchema::Generated` EDIFACT source synthesizes its positional
 /// columns at compile time from the format's `max_elements` (default 32), so
 /// the bound source row carries `seg_id`/`msg_ref`/`msg_type`/`e01…e32` as
-/// concrete `string` columns — not the empty row the Phase-1 stub produced.
-/// This is what lets a downstream CXL expression reference `e01` as a concrete
-/// `string` instead of degrading it to `Any`.
+/// concrete `string` columns rather than binding an empty row. This is what
+/// lets a downstream CXL expression reference `e01` as a concrete `string`
+/// instead of degrading it to `Any`.
 #[test]
 fn test_bind_schema_generated_edifact_synthesizes_positional_columns() {
     let yaml = r#"
