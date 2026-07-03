@@ -79,9 +79,14 @@ use std::sync::Arc;
 mod provenance;
 mod raw;
 mod resource;
+mod schema_provenance;
 
 pub use provenance::{LayerKind, ProvenanceDb, ProvenanceLayer, ResolvedValue};
 pub use resource::Resource;
+pub use schema_provenance::{
+    PRESENCE_ATTR, SchemaAttr, SchemaLayer, SchemaProvRecorder, SchemaProvenanceDb,
+    SchemaResolvedValue, column_attrs,
+};
 
 #[cfg(test)]
 mod tests;

@@ -602,16 +602,19 @@ evidence.
   `benches/pipelines/format/fixed_width_passthrough.yaml` and the
   `format_dispatch` fixed-width test deliberately declare a source's
   `format_schema` field type and its `schema:` `ColumnDecl` type differently, so
-  a reconciling check would break green). The `numeric` "never survives a
-  resolved schema" invariant is likewise deferred: `type: numeric` is today a
-  live, documented (auto-widen) declared source-column type with real runtime
-  coercion semantics (`clinker-exec/src/pipeline/schema_coerce.rs` coerces a
-  `Numeric` column int-then-float per value). Concretizing a declared `numeric`
-  to `int`/`float` is a user-facing behavior change that belongs WITH the single
-  resolved schema, not bolted onto the current two-representation model.
-- Why it matters: until the two representations collapse into one resolved
-  schema on `CompiledPlan`, per-attribute schema provenance (`--explain --field`)
-  and a single authoritative source-column type cannot be built.
+  a reconciling check would break green).
+- Resolved (unified-source-schema, phases 1-3): the two representations have
+  collapsed into one `Column` / `SourceSchema`, `CompiledPlan` carries the
+  resolved per-source schema (`bound_schemas`), per-attribute schema provenance
+  is built (`SchemaProvenanceDb`, `--explain --field <source>.<column>.<attr>`),
+  and the `numeric` "never survives a resolved schema" invariant is enforced:
+  a declared `type: numeric` that has not been concretized is rejected at compile
+  (E158). The remaining migration of `numeric` user-doc examples (auto-widen) to
+  concrete types and the authoring-time `numeric -> int|float` inference path
+  (`clinker guess`) are the open follow-ons.
+- Why it matters: a single authoritative source-column type now backs both byte
+  parsing and CXL typecheck; `numeric` is an inference-only union that must be
+  resolved before it reaches the compiled plan.
 - Files/modules involved: `crates/clinker-plan/src/schema/mod.rs`,
   `crates/clinker-plan/src/config/patch.rs`,
   `crates/clinker-plan/src/plan/bind_schema.rs`,

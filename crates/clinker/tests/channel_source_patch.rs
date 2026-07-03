@@ -85,7 +85,7 @@ sources:
   src:
     schema:
       cust_id: { rename: customer_id }
-      amount:  { retype: int }
+      amount:  { type: int }
       region:  { add: { type: string } }
 ";
 
@@ -329,7 +329,7 @@ fn unknown_column_op_fails_at_compile() {
 sources:
   src:
     schema:
-      not_a_column: { retype: int }
+      not_a_column: { type: int }
 ",
     );
     let out = run_in(p, &["--channel", "bad"]);
@@ -371,12 +371,12 @@ fn channel_patch_changes_pipeline_hash_and_empty_patch_does_not() {
     write_channel(
         p,
         "a",
-        "sources:\n  src:\n    schema:\n      amount: { retype: int }\n",
+        "sources:\n  src:\n    schema:\n      amount: { type: int }\n",
     );
     write_channel(
         p,
         "b",
-        "sources:\n  src:\n    schema:\n      amount: { retype: float }\n",
+        "sources:\n  src:\n    schema:\n      amount: { type: float }\n",
     );
     // An overlay that declares no `sources:` block contributes no patch.
     write_channel(p, "e", "");

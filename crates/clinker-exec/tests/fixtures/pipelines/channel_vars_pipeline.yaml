@@ -19,7 +19,7 @@ nodes:
       path: data/orders.csv
       schema:
         - { name: order_id, type: string }
-        - { name: amount, type: numeric }
+        - { name: amount, type: float }
 
   - type: transform
     name: enrich

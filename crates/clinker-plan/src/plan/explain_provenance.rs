@@ -6,13 +6,15 @@
 
 use std::fmt;
 
+use crate::config::composition::SchemaResolvedValue;
 use crate::plan::CompiledPlan;
 use clinker_core_types::span::Span;
 
 /// Error returned when field provenance cannot be resolved.
 #[derive(Debug)]
 pub enum ProvenanceExplainError {
-    /// Dotted path has no `.` separator — must be `node_name.param_name`.
+    /// Dotted path is neither `node.param` (config) nor `source.column.attr`
+    /// (schema).
     InvalidPath(String),
     /// The node exists in the provenance DB but the param does not.
     ParamNotFound {
@@ -24,6 +26,24 @@ pub enum ProvenanceExplainError {
     NodeNotFound {
         node_name: String,
         valid_nodes: Vec<String>,
+    },
+    /// No schema provenance tracked for this source name.
+    SchemaSourceNotFound {
+        source: String,
+        valid_sources: Vec<String>,
+    },
+    /// The source is tracked but the column is not.
+    SchemaColumnNotFound {
+        source: String,
+        column: String,
+        valid_columns: Vec<String>,
+    },
+    /// The column is tracked but the attribute is not.
+    SchemaAttrNotFound {
+        source: String,
+        column: String,
+        attribute: String,
+        valid_attributes: Vec<String>,
     },
 }
 
@@ -67,6 +87,49 @@ impl fmt::Display for ProvenanceExplainError {
                     Ok(())
                 }
             }
+            ProvenanceExplainError::SchemaSourceNotFound {
+                source,
+                valid_sources,
+            } => {
+                write!(f, "no schema provenance for source '{source}'")?;
+                if valid_sources.is_empty() {
+                    write!(f, "\n  no sources with tracked schema found")
+                } else {
+                    write!(f, "\n  sources with schema provenance:")?;
+                    for s in valid_sources {
+                        write!(f, "\n    - {s}")?;
+                    }
+                    Ok(())
+                }
+            }
+            ProvenanceExplainError::SchemaColumnNotFound {
+                source,
+                column,
+                valid_columns,
+            } => {
+                write!(f, "no schema provenance for '{source}.{column}'")?;
+                write!(f, "\n  columns of '{source}':")?;
+                for c in valid_columns {
+                    write!(f, "\n    - {source}.{c}")?;
+                }
+                Ok(())
+            }
+            ProvenanceExplainError::SchemaAttrNotFound {
+                source,
+                column,
+                attribute,
+                valid_attributes,
+            } => {
+                write!(
+                    f,
+                    "no schema provenance for '{source}.{column}.{attribute}'"
+                )?;
+                write!(f, "\n  attributes of '{source}.{column}':")?;
+                for a in valid_attributes {
+                    write!(f, "\n    - {source}.{column}.{a}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -107,6 +170,14 @@ pub fn explain_field_provenance(
     plan: &CompiledPlan,
     dotted_path: &str,
 ) -> Result<String, ProvenanceExplainError> {
+    // Dispatch by path arity: a three-part `source.column.attribute` path is a
+    // source-schema attribute; a two-part `node.param` is a composition config
+    // param. Both are honest, documented forms.
+    let segments: Vec<&str> = dotted_path.split('.').collect();
+    if segments.len() == 3 && segments.iter().all(|s| !s.is_empty()) {
+        return explain_schema_field(plan, segments[0], segments[1], segments[2]);
+    }
+
     let (node_name, param_name) = parse_dotted_path(dotted_path)?;
 
     let provenance_db = plan.provenance();
@@ -165,6 +236,85 @@ pub fn explain_field_provenance(
     }
 
     Ok(output)
+}
+
+/// Render schema-attribute provenance for a `source.column.attribute` path.
+///
+/// Mirrors [`explain_field_provenance`]'s config-param output, showing the
+/// winning [`SchemaLayer`](crate::config::composition::SchemaLayer) and each
+/// shadowed layer's value plus its source span (honestly synthetic for the Base
+/// seed, which retains no per-column byte span).
+fn explain_schema_field(
+    plan: &CompiledPlan,
+    source: &str,
+    column: &str,
+    attribute: &str,
+) -> Result<String, ProvenanceExplainError> {
+    let db = plan.schema_provenance();
+    let resolved = db.get(source, column, attribute).ok_or_else(|| {
+        // Distinguish a missing source / column / attribute for a useful hint.
+        let sources = db.sources();
+        if !sources.contains(&source) {
+            return ProvenanceExplainError::SchemaSourceNotFound {
+                source: source.to_owned(),
+                valid_sources: sources.into_iter().map(String::from).collect(),
+            };
+        }
+        let columns = db.columns_for(source);
+        if !columns.contains(&column) {
+            return ProvenanceExplainError::SchemaColumnNotFound {
+                source: source.to_owned(),
+                column: column.to_owned(),
+                valid_columns: columns.into_iter().map(String::from).collect(),
+            };
+        }
+        ProvenanceExplainError::SchemaAttrNotFound {
+            source: source.to_owned(),
+            column: column.to_owned(),
+            attribute: attribute.to_owned(),
+            valid_attributes: db
+                .attrs_for(source, column)
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        }
+    })?;
+
+    Ok(render_schema_resolved(
+        &format!("{source}.{column}.{attribute}"),
+        resolved,
+    ))
+}
+
+/// Render a resolved schema-attribute leaf as the `[WON]` / `(shadowed)` chain.
+fn render_schema_resolved(field: &str, resolved: &SchemaResolvedValue) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("Field: {field}\n\n"));
+    output.push_str(&format!("  Resolved value: {}\n\n", resolved.value));
+    output.push_str("  Provenance chain (outermost to innermost):\n");
+
+    // Highest-precedence layer first.
+    let mut layers: Vec<_> = resolved.provenance.iter().collect();
+    layers.sort_by(|a, b| b.kind.cmp(&a.kind));
+    for layer in &layers {
+        let prefix = if layer.won { "[WON]" } else { "     " };
+        let suffix = if layer.won { "" } else { "  (shadowed)" };
+        let kind_label = format!("{}", layer.kind);
+        let value_str = resolved
+            .layer_value(layer.kind)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        let span_str = format_span(layer.span);
+        let span_part = if span_str.is_empty() {
+            String::new()
+        } else {
+            format!("  ({span_str})")
+        };
+        output.push_str(&format!(
+            "  {prefix} {kind_label:<22} →  {value_str}{suffix}{span_part}\n"
+        ));
+    }
+    output
 }
 
 /// Format a JSON value for display — strip quotes from strings, compact arrays.

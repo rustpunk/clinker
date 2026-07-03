@@ -644,8 +644,13 @@ impl PipelineConfig {
         // `bind_schema` pass below, anchored to the op because the engine stamps
         // each injected / replaced node with the op's source location.
         if !ctx.overlay_ops.is_empty() {
-            let effective = self.with_structural_overlay(&ctx.overlay_ops, ctx)?;
-            return effective.compile_with_diagnostics(&ctx.without_overlay_ops());
+            let (effective, schema_prov) = self.with_structural_overlay(&ctx.overlay_ops, ctx)?;
+            let (mut plan, warnings) =
+                effective.compile_with_diagnostics(&ctx.without_overlay_ops())?;
+            // Lay the layered schema attribution recorded while the overlay ops
+            // were applied over the Base-only seed the tail compile produced.
+            plan.merge_schema_provenance(schema_prov);
+            return Ok((plan, warnings));
         }
 
         // Stage 1-4: name/topology/path validation pre-pass.
@@ -2263,6 +2268,22 @@ impl PipelineConfig {
                         }
                     }
                 }
+                // A resolved source column type must be concrete: `numeric` is
+                // the inference-only Int|Float union and must resolve (via
+                // authoring-time inference) or be rejected before it reaches the
+                // compiled plan — it never carries into a bound schema.
+                if let Some(col) = first_non_concrete_column(&body.schema) {
+                    diags.push(Diagnostic::error(
+                        "E158",
+                        format!(
+                            "source {:?} column {:?} has non-concrete type `numeric`; declare a \
+                             concrete `int` or `float` (numeric is inference-only)",
+                            header.name, col
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                }
                 bound_schemas.insert(header.name.clone(), body.schema.clone());
             }
         }
@@ -2285,7 +2306,13 @@ impl PipelineConfig {
         &self,
         ops: &[crate::overlay_ops::LayeredOp],
         ctx: &CompileContext,
-    ) -> Result<PipelineConfig, Vec<clinker_core_types::Diagnostic>> {
+    ) -> Result<
+        (
+            PipelineConfig,
+            crate::config::composition::SchemaProvenanceDb,
+        ),
+        Vec<clinker_core_types::Diagnostic>,
+    > {
         use clinker_core_types::{Diagnostic, LabeledSpan};
 
         // Resolve each `add composition` op's declared input ports so the engine
@@ -2297,16 +2324,21 @@ impl PipelineConfig {
 
         let mut effective = self.clone();
         let base_nodes = std::mem::take(&mut effective.nodes);
-        effective.nodes =
-            crate::overlay_ops::apply_overlay_ops_with_ports(base_nodes, ops.to_vec(), &comp_ports)
-                .map_err(|err| {
-                    vec![Diagnostic::error(
-                        "E114",
-                        err.to_string(),
-                        LabeledSpan::primary(err.span(), String::new()),
-                    )]
-                })?;
-        Ok(effective)
+        let mut schema_prov = crate::config::composition::SchemaProvenanceDb::default();
+        effective.nodes = crate::overlay_ops::apply_overlay_ops_recording(
+            base_nodes,
+            ops.to_vec(),
+            &comp_ports,
+            Some(&mut schema_prov),
+        )
+        .map_err(|err| {
+            vec![Diagnostic::error(
+                "E114",
+                err.to_string(),
+                LabeledSpan::primary(err.span(), String::new()),
+            )]
+        })?;
+        Ok((effective, schema_prov))
     }
 
     /// Resolve the declared input-port names for every `add composition` op in
@@ -2356,6 +2388,35 @@ impl PipelineConfig {
             }
         }
         ports
+    }
+}
+
+/// The name of the first column in `schema` whose declared type is (or wraps)
+/// the inference-only `Numeric` union, if any.
+///
+/// `numeric` is the `Int | Float` union resolved during unification; a bound
+/// source schema must carry a concrete type, so the compile rejects a surviving
+/// `numeric` (E158) rather than letting it reach the executor.
+fn first_non_concrete_column(schema: &clinker_format::SourceSchema) -> Option<String> {
+    use clinker_format::SourceSchema;
+    fn contains_numeric(t: &cxl::typecheck::Type) -> bool {
+        match t {
+            cxl::typecheck::Type::Numeric => true,
+            cxl::typecheck::Type::Nullable(inner) => contains_numeric(inner),
+            _ => false,
+        }
+    }
+    match schema {
+        SourceSchema::Columns(cols) => cols
+            .iter()
+            .find(|c| contains_numeric(&c.ty))
+            .map(|c| c.name.clone()),
+        SourceSchema::MultiRecord { record_types, .. } => record_types
+            .iter()
+            .flat_map(|rt| rt.columns.iter())
+            .find(|c| contains_numeric(&c.ty))
+            .map(|c| c.name.clone()),
+        SourceSchema::Generated(_) | SourceSchema::File(_) => None,
     }
 }
 

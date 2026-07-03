@@ -36,7 +36,7 @@ pub use fs_type::{FsKind, case_sensitive_dir, classify, collision_key, same_devi
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use output::*;
 pub use patch::{
-    AddColumnPatch, ArrayPathOp, SchemaColumnOp, SourceConfigPatch, apply_source_patches,
+    ArrayPathOp, ColumnPatch, SchemaColumnOp, SourceConfigPatch, apply_source_patches,
 };
 pub use pipeline::*;
 pub use pipeline_node::{

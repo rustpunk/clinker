@@ -32,7 +32,7 @@ use super::composition_body::{BoundBody, CompositionBodies, CompositionBodyId};
 use super::execution::ExecutionPlanDag;
 use super::statistics::StatisticsCatalog;
 use crate::config::PipelineConfig;
-use crate::config::composition::ProvenanceDb;
+use crate::config::composition::{ProvenanceDb, SchemaProvenanceDb};
 use clinker_format::SourceSchema;
 use indexmap::IndexMap;
 
@@ -69,9 +69,15 @@ pub struct CompiledPlan {
     /// name. Every source's `schema:` — including an external
     /// `.schema.yaml` ([`SourceSchema::File`]) — is resolved to its inline
     /// form exactly once at compile time and retained here, so the ingest
-    /// path (and, ahead, `patch_schema` / per-attribute provenance) reads
-    /// the schema from the plan rather than re-reading the file at runtime.
+    /// path (and `patch_schema` / per-attribute provenance) reads the schema
+    /// from the plan rather than re-reading the file at runtime.
     bound_schemas: IndexMap<String, SourceSchema>,
+    /// Per-attribute source-schema provenance keyed by `(source, column,
+    /// attribute)`. Base-seeded from `bound_schemas`; the overlay path merges
+    /// its layered attribution over that seed. Queried by `explain --field
+    /// <source>.<column>.<attribute>`. Excluded from `pipeline_hash`; rebuilt
+    /// each compile.
+    schema_provenance: SchemaProvenanceDb,
 }
 
 impl CompiledPlan {
@@ -92,6 +98,13 @@ impl CompiledPlan {
             provenance,
             ..
         } = artifacts;
+        // Base-seed the schema provenance from the resolved schemas. The overlay
+        // path overwrites this with fully layered attribution via
+        // `merge_schema_provenance`; a plain compile keeps this Base-only seed.
+        let mut schema_provenance = SchemaProvenanceDb::default();
+        for (name, schema) in &bound_schemas {
+            schema_provenance.seed_base(name, schema);
+        }
         Self {
             dag,
             config,
@@ -101,6 +114,7 @@ impl CompiledPlan {
             channel_identity: None,
             pipeline_hash,
             bound_schemas,
+            schema_provenance,
         }
     }
 
@@ -176,5 +190,19 @@ impl CompiledPlan {
     /// re-reading the file at runtime.
     pub fn bound_schemas(&self) -> &IndexMap<String, SourceSchema> {
         &self.bound_schemas
+    }
+
+    /// Per-attribute source-schema provenance, queried by `explain --field
+    /// <source>.<column>.<attribute>`.
+    pub fn schema_provenance(&self) -> &SchemaProvenanceDb {
+        &self.schema_provenance
+    }
+
+    /// Lay layered schema provenance (recorded while structural overlay ops were
+    /// applied) over the Base-only seed. The argument wins per leaf, so an
+    /// overlay-shaped source keeps its full layer attribution while untouched
+    /// sources keep their Base seed. Called once, from the overlay compile path.
+    pub(crate) fn merge_schema_provenance(&mut self, overlay: SchemaProvenanceDb) {
+        self.schema_provenance.merge_over(overlay);
     }
 }
