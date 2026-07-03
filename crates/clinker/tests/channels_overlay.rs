@@ -423,6 +423,49 @@ fn channels_resolve_channel_renders_provenance() {
 }
 
 #[test]
+fn channels_resolve_reflects_fixed_lock() {
+    let tmp = tempfile::tempdir().unwrap();
+    build_workspace(tmp.path(), false);
+    // Re-author globex: the channel-wide manifest locks the threshold, and the
+    // per-target overlay tries to raise it. The lock must hold and be surfaced.
+    write(
+        tmp.path(),
+        "channel/globex/channel.cfg.yaml",
+        "channel:\n  name: globex\nlabels: { tier: enterprise, region: west }\nfixed:\n  scorer.threshold: 0.9\n",
+    );
+    write(
+        tmp.path(),
+        "channel/globex/order_fulfillment.channel.yaml",
+        "channel:\n  target: ../../pipeline/order_fulfillment.yaml\nconfig:\n  scorer.threshold: 0.95\n",
+    );
+
+    let out = Command::new(clinker_bin())
+        .args(["channels", "resolve"])
+        .arg(pipeline_path(tmp.path()))
+        .args(["--channel", "globex"])
+        .args(["--base-dir", tmp.path().to_str().unwrap()])
+        .output()
+        .expect("spawn clinker");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "channels resolve must succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+
+    let report = overlay_report(&stdout);
+    // The fixed channel-wide value holds against the higher per-target layer,
+    // and the report marks it as locked.
+    assert!(
+        report.contains("scorer.threshold = 0.9")
+            && report.contains("ChannelWide")
+            && report.contains("(fixed)"),
+        "{report}"
+    );
+}
+
+#[test]
 fn channels_resolve_group_standalone() {
     let tmp = tempfile::tempdir().unwrap();
     build_workspace(tmp.path(), false);

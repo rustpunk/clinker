@@ -104,11 +104,11 @@ fn test_explain_field_unknown_path_returns_helpful_error() {
 }
 
 #[test]
-fn test_explain_error_code_e105_outputs_doc_content() {
+fn test_explain_error_code_e103_outputs_doc_content() {
     let output = Command::new(clinker_bin())
         .arg("explain")
         .arg("--code")
-        .arg("E105")
+        .arg("E103")
         .output()
         .expect("spawn clinker");
 
@@ -116,14 +116,14 @@ fn test_explain_error_code_e105_outputs_doc_content() {
 
     assert!(
         output.status.success(),
-        "clinker explain --code E105 must succeed.\nstderr: {}",
+        "clinker explain --code E103 must succeed.\nstderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Must contain the E105 doc content
+    // Must contain the E103 doc content
     assert!(
-        stdout.contains("E105"),
-        "output must contain E105.\nstdout: {stdout}"
+        stdout.contains("E103"),
+        "output must contain E103.\nstdout: {stdout}"
     );
 
     // Must contain actual doc content (not empty)

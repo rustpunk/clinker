@@ -112,7 +112,7 @@ EXAMPLES:
   clinker explain pipeline.yaml --field orders.amount.scale --channel acme_prod
 
   # Look up error code documentation
-  clinker explain --code E105"
+  clinker explain --code E113"
     )]
     Explain(ExplainArgs),
     /// Channel/group overlay tooling: resolve one effective plan, or lint the
@@ -492,7 +492,7 @@ pub struct ExplainArgs {
     #[arg(long = "no-auto-groups")]
     pub no_auto_groups: bool,
 
-    /// Error/warning code to look up (e.g. "E105")
+    /// Error/warning code to look up (e.g. "E113")
     #[arg(long)]
     pub code: Option<String>,
 
@@ -2614,8 +2614,12 @@ fn render_resolved(
             .layer_value(LayerKind::PipelineDefault)
             .map(format_overlay_value)
             .unwrap_or_else(|| "<none>".to_string());
+        // Surface the per-value lock: a `fixed:` overlay value holds against
+        // every higher-precedence layer, so the winning layer here may be a
+        // lower one than plain precedence would pick.
+        let lock = if win.fixed { " (fixed)" } else { "" };
         rows.push(format!(
-            "  {node}.{param} = {}  [{}]  (base: {})",
+            "  {node}.{param} = {}  [{}]{lock}  (base: {})",
             format_overlay_value(&resolved.value),
             win.kind,
             base

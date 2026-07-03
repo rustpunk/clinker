@@ -204,7 +204,7 @@ cargo run -p clinker -- run examples/pipelines/customer_etl.yaml --dry-run -n 10
 cargo run -p clinker -- run examples/pipelines/tumbling_clicks.yaml
 cargo run -p clinker -- run examples/pipelines/hopping_sliding_5m_1h.yaml
 cargo run -p clinker -- run examples/pipelines/scd_type2.yaml
-cargo run -p clinker -- explain --code E105
+cargo run -p clinker -- explain --code E103
 cargo run -p cxl-cli -- check transform.cxl
 cargo run -p cxl-cli -- eval -e 'emit result = 1 + 2'
 cargo run -p cxl-cli -- fmt transform.cxl

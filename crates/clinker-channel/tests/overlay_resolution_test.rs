@@ -336,6 +336,219 @@ fn channel_identity_stable_across_reruns() {
     assert_ne!(id1.content_hash, [0u8; 32]);
 }
 
+// ── Fixed lock (per-value config lock) ──────────────────────────────────
+
+/// A channel manifest body (`channel.cfg.yaml`) for channel `id`, with an
+/// arbitrary trailing block (`config:` / `fixed:` / `labels:`).
+fn manifest(id: &str, body: &str) -> String {
+    format!("channel:\n  name: {id}\n{body}")
+}
+
+#[test]
+fn channel_wide_fixed_locks_out_per_target() {
+    let ws = workspace();
+    // Channel-wide (a *lower* layer) marks the value fixed; the per-target
+    // overlay (the highest layer) tries to override it non-fixed.
+    write(
+        &ws.path().join("channel/globex/channel.cfg.yaml"),
+        &manifest("globex", "fixed: { risk.threshold: 0.6 }\n"),
+    );
+    write(
+        &ws.path().join("channel/globex/base.channel.yaml"),
+        &per_target_overlay("config: { risk.threshold: 0.95 }\n"),
+    );
+
+    let (_res, plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
+    assert!(
+        has_no_errors(&result.diagnostics),
+        "{:?}",
+        result.diagnostics
+    );
+
+    let resolved = plan
+        .provenance()
+        .get("risk", "threshold")
+        .expect("risk.threshold tracked in provenance");
+    let winner = resolved.winning_layer().expect("a layer won");
+    // The fixed lower layer holds against the higher per-target layer.
+    assert_eq!(winner.kind, LayerKind::ChannelWide);
+    assert!(winner.fixed, "winning layer is marked fixed");
+    assert_eq!(resolved.value, json!(0.6));
+}
+
+#[test]
+fn non_fixed_channel_wide_is_overridden_by_per_target() {
+    // Control for `channel_wide_fixed_locks_out_per_target`: without the lock,
+    // plain precedence makes the higher per-target layer win.
+    let ws = workspace();
+    write(
+        &ws.path().join("channel/globex/channel.cfg.yaml"),
+        &manifest("globex", "config: { risk.threshold: 0.6 }\n"),
+    );
+    write(
+        &ws.path().join("channel/globex/base.channel.yaml"),
+        &per_target_overlay("config: { risk.threshold: 0.95 }\n"),
+    );
+
+    let (_res, plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
+    assert!(
+        has_no_errors(&result.diagnostics),
+        "{:?}",
+        result.diagnostics
+    );
+
+    let resolved = plan.provenance().get("risk", "threshold").expect("tracked");
+    let winner = resolved.winning_layer().expect("a layer won");
+    assert_eq!(winner.kind, LayerKind::ChannelPerTarget);
+    assert!(!winner.fixed);
+    assert_eq!(resolved.value, json!(0.95));
+}
+
+#[test]
+fn group_fixed_locks_out_channel_layers() {
+    let ws = workspace();
+    // The lowest overlay layer (a derived group) locks the value; both channel
+    // layers above try to override it non-fixed.
+    write(
+        &ws.path().join("group/enterprise.group.yaml"),
+        "group:\n  name: enterprise\n  match: 'tier == \"enterprise\"'\n  priority: 20\nfixed: { risk.threshold: 0.7 }\n",
+    );
+    write(
+        &ws.path().join("channel/globex/channel.cfg.yaml"),
+        &manifest(
+            "globex",
+            "labels: { tier: enterprise }\nconfig: { risk.threshold: 0.9 }\n",
+        ),
+    );
+    write(
+        &ws.path().join("channel/globex/base.channel.yaml"),
+        &per_target_overlay("config: { risk.threshold: 0.95 }\n"),
+    );
+
+    let (res, plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
+    assert!(
+        has_no_errors(&result.diagnostics),
+        "{:?}",
+        result.diagnostics
+    );
+    assert!(
+        res.applied_groups()
+            .iter()
+            .any(|g| g.name == "enterprise" && g.source == GroupSource::Derived),
+        "enterprise group derived: {:?}",
+        res.applied_groups()
+    );
+
+    let resolved = plan.provenance().get("risk", "threshold").expect("tracked");
+    let winner = resolved.winning_layer().expect("a layer won");
+    assert!(
+        matches!(winner.kind, LayerKind::Group { .. }),
+        "fixed group layer wins: {:?}",
+        winner.kind
+    );
+    assert!(winner.fixed);
+    assert_eq!(resolved.value, json!(0.7));
+}
+
+#[test]
+fn fixed_and_config_same_key_in_layer_fixed_wins() {
+    // A key present in both `config:` and `fixed:` of one file resolves to the
+    // fixed value (fixed is clobbered last within the layer).
+    let ws = workspace();
+    write(
+        &ws.path().join("channel/globex/base.channel.yaml"),
+        &per_target_overlay("config: { risk.threshold: 0.5 }\nfixed: { risk.threshold: 0.9 }\n"),
+    );
+
+    let (_res, plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
+    assert!(
+        has_no_errors(&result.diagnostics),
+        "{:?}",
+        result.diagnostics
+    );
+
+    let resolved = plan.provenance().get("risk", "threshold").expect("tracked");
+    let winner = resolved.winning_layer().expect("a layer won");
+    assert_eq!(winner.kind, LayerKind::ChannelPerTarget);
+    assert!(winner.fixed, "the fixed entry wins within the layer");
+    assert_eq!(resolved.value, json!(0.9));
+}
+
+#[test]
+fn per_target_fixed_marks_provenance() {
+    // Even at the highest layer, a `fixed:` value records the lock in provenance.
+    let ws = workspace();
+    write(
+        &ws.path().join("channel/globex/base.channel.yaml"),
+        &per_target_overlay("fixed: { risk.threshold: 0.42 }\n"),
+    );
+
+    let (_res, plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
+    assert!(
+        has_no_errors(&result.diagnostics),
+        "{:?}",
+        result.diagnostics
+    );
+
+    let resolved = plan.provenance().get("risk", "threshold").expect("tracked");
+    let winner = resolved.winning_layer().expect("a layer won");
+    assert_eq!(winner.kind, LayerKind::ChannelPerTarget);
+    assert!(winner.fixed);
+    assert_eq!(resolved.value, json!(0.42));
+}
+
+#[test]
+fn unmatched_fixed_key_is_e113() {
+    // A `fixed:` key is validated exactly like a `config:` key: an unknown
+    // parameter is the same hard E113 error.
+    let ws = workspace();
+    write(
+        &ws.path().join("channel/globex/base.channel.yaml"),
+        &per_target_overlay("fixed: { nonexistent.param: 1 }\n"),
+    );
+
+    let (_res, _plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
+    assert_eq!(
+        errors_with_code(&result.diagnostics, "E113").len(),
+        1,
+        "{:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn effective_config_overrides_fold_honors_fixed() {
+    // The `$config.<param>` pre-compile fold agrees with the provenance winner:
+    // a fixed lower layer wins the folded value too, so the executed body and
+    // the rendered `[WON]` layer never disagree.
+    let ws = workspace();
+    write(
+        &ws.path().join("channel/globex/channel.cfg.yaml"),
+        &manifest("globex", "fixed: { risk.threshold: 0.6 }\n"),
+    );
+    write(
+        &ws.path().join("channel/globex/base.channel.yaml"),
+        &per_target_overlay("config: { risk.threshold: 0.95 }\n"),
+    );
+
+    let res = resolve(
+        ws.path(),
+        &channel_layout(),
+        &group_layout(),
+        "base",
+        Some("globex"),
+        &[],
+        true,
+    )
+    .expect("resolve");
+    let overrides = res.effective_config_overrides();
+    assert_eq!(
+        overrides.get("risk").and_then(|m| m.get("threshold")),
+        Some(&json!(0.6)),
+        "fold honors the fixed lower layer: {overrides:?}"
+    );
+}
+
 // ── Var overlay: $vars (static) ─────────────────────────────────────────
 
 #[test]

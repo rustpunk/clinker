@@ -112,6 +112,37 @@ A `config:` key that matches no parameter in the compiled plan is a hard error
 ([E113](#diagnostics)) — a misspelled or stale key aborts the run rather than
 silently doing nothing.
 
+### Locking a value: `fixed`
+
+Every layer file (a group, the channel manifest, and a per-target overlay) may
+carry a `fixed:` block beside its `config:` block. Both use the same
+`alias.param` dotted-path grammar and the same unknown-key hard error
+([E113](#diagnostics)); the difference is precedence. A key under `config:` is a
+plain clobber — a higher layer may still override it. A key under `fixed:` is
+**locked**: it holds against every *higher*-precedence layer, so a lower layer
+can pin a value the layers above it cannot change.
+
+```yaml
+# channel.cfg.yaml — the channel-wide manifest
+channel: { name: globex }
+fixed:
+  scorer.threshold: 0.9      # locked channel-wide
+```
+
+```yaml
+# order_fulfillment.channel.yaml — the per-target overlay (a higher layer)
+channel: { target: ../../pipeline/order_fulfillment.yaml }
+config:
+  scorer.threshold: 0.95     # ignored: the channel-wide layer locked this key
+```
+
+Here the resolved `scorer.threshold` is `0.9`, not `0.95`: the fixed channel-wide
+value wins even though the per-target layer is higher. When several layers lock
+the same key, the **lowest**-precedence lock wins (it pinned the value first). A
+key present in both `config:` and `fixed:` of the *same* file resolves to the
+`fixed:` value. `channels resolve` marks a locked value with `(fixed)` next to
+its winning layer, and `explain --field` reports the same.
+
 `vars:` overrides or adds scoped-variable defaults, using the same four scopes a
 pipeline's own `vars:` block uses (`$vars.*` / `$pipeline.*` / `$source.*` /
 `$record.*`). Each leaf is the same `{ type, default }` shape a pipeline
@@ -513,10 +544,3 @@ not collide.
 | **E234** | An `array_paths` `remove` of a path with no matching entry. |
 | **E235** | An `options` patch sets an unknown or mistyped option key for the source's format. |
 | **E236** | A renamed/aliased column's exposed name collides with a real input field, which would mislocate that field. Raised at read time. |
-
-## Known behavior notes
-
-- **Per-value locking is not yet a folder-overlay surface.** The layer stack
-  resolves by fixed semantic precedence (a higher layer wins), but an overlay
-  cannot yet mark a value as `fixed` to lock it against a higher layer. Config
-  maps are a flat `alias.param: value` clobber at every layer.

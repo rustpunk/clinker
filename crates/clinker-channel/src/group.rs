@@ -67,7 +67,14 @@ pub struct Group {
     pub priority: i64,
     /// Value-clobber config surface. Keys are `alias.param` dotted paths (kept
     /// as raw strings here; dotted-path validation happens at apply time).
+    /// Applied non-fixed, so a higher-precedence layer may override them.
     pub config: IndexMap<String, serde_json::Value>,
+    /// **Fixed** (locked) config surface, same `alias.param` dotted-path
+    /// grammar as [`Self::config`]. Applied with the layer `fixed` lock set at
+    /// this group's `Group` layer: a fixed value locks against every
+    /// higher-precedence layer (other groups, channel-wide, and per-target).
+    /// For a key present in both maps, the `fixed` entry wins within the layer.
+    pub fixed: IndexMap<String, serde_json::Value>,
     /// Value-clobber vars surface, in the same four scopes a pipeline's `vars:`
     /// block uses (`static` / `pipeline` / `source` / `record`). Reuses the
     /// channel overlay's [`ChannelVars`](crate::manifest::ChannelVars) type.
@@ -100,6 +107,7 @@ impl Group {
             selector: raw.group.selector,
             priority: raw.group.priority,
             config: raw.config,
+            fixed: raw.fixed,
             vars: raw.vars,
             overrides: raw.overrides,
         })
@@ -120,6 +128,8 @@ struct RawGroupFile {
     group: RawGroupMeta,
     #[serde(default)]
     config: IndexMap<String, serde_json::Value>,
+    #[serde(default)]
+    fixed: IndexMap<String, serde_json::Value>,
     #[serde(default)]
     vars: ChannelVars,
     #[serde(default)]

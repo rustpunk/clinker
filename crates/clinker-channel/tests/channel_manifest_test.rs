@@ -94,6 +94,43 @@ overrides:
 }
 
 #[test]
+fn parses_fixed_lock_block() {
+    // The `fixed:` block is a sibling of `config:` on both the manifest and the
+    // per-target overlay, carrying the same raw `alias.param` dotted keys.
+    let m = manifest(
+        br#"
+channel:
+  name: globex
+config: { fraud_check.threshold: 0.9 }
+fixed:  { fraud_check.mode: 1 }
+"#,
+    );
+    assert_eq!(
+        m.config.get("fraud_check.threshold"),
+        Some(&serde_json::json!(0.9))
+    );
+    assert_eq!(m.fixed.get("fraud_check.mode"), Some(&serde_json::json!(1)));
+
+    let o = overlay(
+        br#"
+channel:
+  target: ../../pipeline/base.yaml
+config: { scorer.threshold: 0.5 }
+fixed:  { scorer.threshold: 0.9 }
+"#,
+        "base.channel.yaml",
+    );
+    assert_eq!(
+        o.config.get("scorer.threshold"),
+        Some(&serde_json::json!(0.5))
+    );
+    assert_eq!(
+        o.fixed.get("scorer.threshold"),
+        Some(&serde_json::json!(0.9))
+    );
+}
+
+#[test]
 fn parses_minimal_manifest() {
     // Only the header is required; every other block defaults to empty.
     let m = manifest(

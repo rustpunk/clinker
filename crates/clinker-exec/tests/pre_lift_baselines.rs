@@ -489,8 +489,7 @@ fn test_composition_explain_docs_exist() {
     let explain_dir = workspace_root.join("docs").join("explain");
 
     let expected = [
-        "E101.md", "E102.md", "E103.md", "E104.md", "E105.md", "E106.md", "E107.md", "E108.md",
-        "W101.md",
+        "E101.md", "E102.md", "E103.md", "E104.md", "E106.md", "E107.md", "E108.md", "W101.md",
     ];
 
     for file in &expected {
