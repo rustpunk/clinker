@@ -112,7 +112,7 @@ EXAMPLES:
   clinker explain pipeline.yaml --field orders.amount.scale --channel acme_prod
 
   # Look up error code documentation
-  clinker explain --code E113"
+  clinker explain --code E103"
     )]
     Explain(ExplainArgs),
     /// Channel/group overlay tooling: resolve one effective plan, or lint the
@@ -492,7 +492,7 @@ pub struct ExplainArgs {
     #[arg(long = "no-auto-groups")]
     pub no_auto_groups: bool,
 
-    /// Error/warning code to look up (e.g. "E113")
+    /// Error/warning code to look up (e.g. "E103")
     #[arg(long)]
     pub code: Option<String>,
 
@@ -2350,8 +2350,8 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             None => {
                 return Err(format!(
-                    "unknown diagnostic code '{code}'. Valid codes: E101-E108, E150b-E150e, \
-                     E15Y, E300/E301/E303-E313/E319, E320/E321/E323, E330-E354, \
+                    "unknown diagnostic code '{code}'. Valid codes: E101-E104, E106-E108, \
+                     E150b-E150e, E15Y, E300/E301/E303-E313/E319, E320/E321/E323, E330-E354, \
                      W101/W302/W305/W306"
                 )
                 .into());
