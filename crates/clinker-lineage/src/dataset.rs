@@ -71,6 +71,19 @@ impl DatasetId {
             name: name.into(),
         }
     }
+
+    /// A per-record-type sub-dataset of a multi-record flat-file source: the
+    /// base source dataset's identity with the record type id appended as a
+    /// `#<id>` fragment, keeping the base namespace. A multi-record file carries
+    /// several record shapes in one physical file; each record type is modeled
+    /// as its own logical dataset partition, so column lineage is attributed per
+    /// record type rather than collapsed onto the flat superset dataset.
+    pub(crate) fn record_type(base: &DatasetId, record_type_id: &str) -> Self {
+        Self {
+            namespace: base.namespace.clone(),
+            name: format!("{}#{record_type_id}", base.name),
+        }
+    }
 }
 
 impl From<DatasetId> for Dataset {
@@ -538,5 +551,21 @@ mod tests {
         assert_eq!(dataset.namespace, "file");
         assert_eq!(dataset.name, "/work/in.csv");
         assert!(dataset.facets.is_none());
+    }
+
+    // --- per-record-type sub-dataset ---
+
+    #[test]
+    fn record_type_sub_dataset_appends_id_fragment_and_keeps_namespace() {
+        let base = DatasetId::file("/work/payments.txt".to_string());
+        let header = DatasetId::record_type(&base, "header");
+        assert_eq!(header.namespace, "file");
+        assert_eq!(header.name, "/work/payments.txt#header");
+
+        // A fallback-namespaced base (network source) keeps its namespace too.
+        let net = DatasetId::fallback("orders_api");
+        let sub = DatasetId::record_type(&net, "detail");
+        assert_eq!(sub.namespace, FALLBACK_NAMESPACE);
+        assert_eq!(sub.name, "orders_api#detail");
     }
 }

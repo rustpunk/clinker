@@ -55,6 +55,17 @@ The facet has two parts, mirroring the OpenLineage `ColumnLineageDatasetFacet`:
 
 Each transformation carries a `type` (`DIRECT` / `INDIRECT`) and a `subtype` (`IDENTITY`, `TRANSFORMATION`, `AGGREGATION`, `JOIN`, `GROUP_BY`, `FILTER`, `SORT`, `CONDITIONAL`).
 
+## Multi-record sources
+
+A **multi-record flat file** carries several record shapes in one physical file, discriminated by a lead `record_type` column. Lineage attributes each record type to **its own logical dataset**, rather than collapsing every shape onto one flat superset dataset:
+
+- Each record type is a dataset named `<file>#<id>` -- the physical file path with the record type's `id` as a `#` fragment (e.g. `.../payments.txt#detail`). Its columns are exactly that record type's declared columns, so an output column that derives from a detail-record field traces to `<file>#detail`, and one from a header field traces to `<file>#header`.
+- A column declared by **several** record types (unified into one superset column) lists **each** owning `<file>#<id>` dataset as an input field, so a derived output column traces to every record type it could have come from.
+- The engine-stamped `record_type` **discriminator** lead column belongs to no record type, so it stays on the **base** file dataset (`<file>`, no fragment) -- a `Route` that branches on `record_type` still references `{file, <path>, record_type}`.
+- The run's `inputs` list the base file dataset followed by each `<file>#<id>` record-type dataset, in record-type declaration order.
+
+A record type's `parent` / `join_key` -- the intra-file hierarchy linking a child record type to its parent -- is carried implicitly in the per-record-type dataset identities; it is not emitted as a synthetic lineage edge, since no plan operation performs that join.
+
 ## Live run events
 
 `--lineage-events <PATH>` **runs the pipeline** and emits OpenLineage run events tied to that actual execution, as NDJSON to a file path (or `-` for stdout):
@@ -102,6 +113,5 @@ Lineage is derived from the compiled plan, so a few constructs are approximated:
 
 - A column-grain `$doc` read is traced as DIRECT lineage (see [`fields`](#reading-the-columnlineage-facet) above) in a transform projection, a combine body, a composition body, and an **aggregate** emit, attributed only to a source whose envelope declares the section. A `$doc` read in an **influence predicate** -- a route condition, a cull `drop_group_when`, or a combine `where` -- is surfaced as INDIRECT influence (`FILTER` for route and cull, `JOIN` for combine). Two `$doc` cases remain uncovered: a whole-section **envelope echo** (an output header/footer regenerated from a source document section, with no output column or expression); and any `$doc` reference in a **Reshape** rule, which the compiler rejects outright (Reshape re-runs its rules after a per-group spill that drops envelope context), so there is no Reshape envelope lineage to produce.
 - A **match: collect** combine declared without a projection body produces coarse column lineage: each collected column derives (as `TRANSFORMATION`) from *every* build-side column, because there is no body expression to pin the exact source column.
-- A **multi-record-type** source (one physical file carrying several record shapes over a single superset schema) is modeled as **one** dataset, matching its single physical identity -- lineage is not split per record type.
 - INDIRECT influence covers route/cull predicates, join keys, aggregate grouping, and correlation sort over **record columns** (and `$doc` envelope terms in route/cull/combine predicates, as above). An aggregate's pre-aggregation row `filter`, a transform-inline `filter`, and Reshape `order_by` / `partition_by` are not (yet) attributed as influence.
 - Constant and `count(*)` columns (which have no source input) are omitted from `fields`; engine-stamped columns (`$ck.*`, `$meta.*`, `$source.*`) are skipped, mirroring the default writer.
