@@ -53,7 +53,7 @@ The reader decodes every field through the source's declared `encoding`:
 An **unsupported** encoding is rejected at startup with a precise error
 naming the value and the supported set — it is never silently ignored.
 
-> Multi-record CSV sources (those declaring a `format_schema:` with a
+> Multi-record CSV sources (those whose `schema:` is a map with a
 > `records:` list, described below) are decoded as UTF-8 only. Declaring a
 > non-UTF-8 `encoding` on such a source is rejected at startup; split the
 > file into a single-schema CSV source if it needs a non-UTF-8 charset.
@@ -73,11 +73,13 @@ format.
 
 Some CSV exports interleave **multiple record types** in one file — a
 header row, many body rows, and a trailer row — each distinguished by a
-discriminator column. Declare these under `format_schema:` with a
-`discriminator:` and a `records:` list instead of the single top-level
-`schema:`. Each record type names its `tag` (the discriminator value
-that identifies it) and its own positional `fields:`; the discriminator
-field must sit at the same column in every type (usually the first).
+discriminator column. Declare these with a **map-form `schema:`** carrying a
+`discriminator:` and a `records:` list, instead of the single column-list
+`schema:`. Each record type names its `tag` (the discriminator value that
+identifies it) and its own `columns:`; the discriminator field must sit at the
+same column in every type (usually the first). The reader derives the runtime
+superset schema (a lead `record_type` column plus the union of every record
+type's columns) automatically.
 
 ```yaml
 - type: source
@@ -86,24 +88,18 @@ field must sit at the same column in every type (usually the first).
     name: payments
     type: csv
     path: "./data/payments.csv"
-    schema:                              # superset CXL types: record_type + every field
-      - { name: record_type, type: string }
-      - { name: batch_id, type: string }
-      - { name: id, type: int }
-      - { name: amount, type: int }
-      - { name: count, type: int }
-    format_schema:
-      discriminator: { field: record_type }   # the column carrying the type tag
+    schema:                                     # one multi-record schema (map form)
+      discriminator: { field: rec_type }        # the physical column carrying the type tag
       records:
-        - { id: header,  tag: H, fields: [ { name: record_type }, { name: batch_id } ] }
-        - { id: detail,  tag: D, fields: [ { name: record_type }, { name: id, type: integer }, { name: amount, type: integer } ] }
-        - { id: trailer, tag: T, fields: [ { name: record_type }, { name: count, type: integer } ] }
+        - { id: header,  tag: H, columns: [ { name: rec_type, type: string }, { name: batch_id, type: string } ] }
+        - { id: detail,  tag: D, columns: [ { name: rec_type, type: string }, { name: id, type: int }, { name: amount, type: int } ] }
+        - { id: trailer, tag: T, columns: [ { name: rec_type, type: string }, { name: count, type: int } ] }
       structure:
-        - { record: trailer, count: count }    # validate T's count against the body count
+        - { record: trailer, count: count }     # validate T's count against the body count
     envelope:
       sections:
         head:
-          extract: { record_type: H }          # the H row surfaces as $doc.head.*
+          extract: { record_type: H }          # the H record type surfaces as $doc.head.*
           fields:
             batch_id: string
 ```

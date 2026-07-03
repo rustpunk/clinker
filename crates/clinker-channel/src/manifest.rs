@@ -86,7 +86,7 @@ pub struct ManifestHeader {
 /// vars:   { static: { currency: { type: string, default: "USD" } } }
 /// overrides: [ ... ]
 /// sources:
-///   orders: { schema: { amount: { retype: float } }, options: { delimiter: "|" } }
+///   orders: { schema: { amount: { type: float } }, options: { delimiter: "|" } }
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]

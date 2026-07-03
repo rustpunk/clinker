@@ -48,7 +48,9 @@ use crate::hl7::field_split::Hl7FieldSplit;
 use crate::hl7::tokenizer::{
     Delimiters, ParsedSegment, SegmentTokenizer, raw_field, split_segment,
 };
+use crate::schema::Column;
 use crate::traits::FormatReader;
+use cxl::typecheck::Type;
 
 /// Default ceiling on the number of positional field columns the record
 /// schema exposes. A segment carrying more data fields than this errors
@@ -654,11 +656,35 @@ fn parse_optional_count(
     }
 }
 
+/// The engine-synthesized positional columns for an HL7 `Generated` source:
+/// `[seg_id, set_ref, set_type, <field columns>]`, every column `string`-typed.
+/// A verbatim field contributes one `fNN` column; a split field contributes its
+/// structured leaf columns in place of `fNN`. Single source of truth for the
+/// HL7 positional schema alongside the reader's [`build_schema`] — both derive
+/// their column set from the same [`build_field_layout`] +
+/// [`FieldGroup::column_names`], so the planner's compile-time bind of a
+/// [`SourceSchema::Generated`](crate::SourceSchema) HL7 source and the runtime
+/// reader schema never disagree (locked by a unit test).
+pub fn generated_columns(max_fields: usize, splits: &[Hl7FieldSplit]) -> Vec<Column> {
+    let layout = build_field_layout(max_fields, splits);
+    let mut columns = Vec::with_capacity(3 + layout.len());
+    columns.push(Column::bare("seg_id", Type::String));
+    columns.push(Column::bare("set_ref", Type::String));
+    columns.push(Column::bare("set_type", Type::String));
+    for group in &layout {
+        for name in group.column_names() {
+            columns.push(Column::bare(name, Type::String));
+        }
+    }
+    columns
+}
+
 /// Build the static positional schema `[seg_id, set_ref, set_type, <field
 /// columns>]` from the field layout. A verbatim field contributes one `fNN`
 /// column; a split field contributes its structured leaf columns in place of
 /// `fNN`. All columns are string-typed; field text is stored verbatim
-/// (escapes decoded) so the round-trip is lossless.
+/// (escapes decoded) so the round-trip is lossless. Shares its column identity
+/// with [`generated_columns`].
 fn build_schema(layout: &[FieldGroup]) -> Arc<Schema> {
     let mut columns: Vec<Box<str>> = Vec::with_capacity(3 + layout.len());
     columns.push(Box::from("seg_id"));
@@ -748,6 +774,34 @@ mod tests {
             components: comps,
             subcomponents: subs,
         }
+    }
+
+    /// The public `generated_columns` (which the planner seeds a Generated HL7
+    /// source's compile-time bind from) must yield the exact column names the
+    /// runtime reader's schema exposes, including split-leaf columns — otherwise
+    /// the typechecked row and the emitted records would disagree. Lock both
+    /// producers together over a split configuration.
+    #[test]
+    fn generated_columns_match_reader_schema_names_with_splits() {
+        let splits = [split(8, 1, 2, 1), split(3, 1, 4, 1)];
+        let config = Hl7ReaderConfig {
+            max_fields: 12,
+            split_fields: splits.to_vec(),
+        };
+        // Reader schema names, built at reader construction from the layout.
+        let reader = Hl7Reader::new(Cursor::new(Vec::new()), config);
+        let reader_names: Vec<&str> = reader.schema.columns().iter().map(|c| c.as_ref()).collect();
+        // Planner-facing synthesized columns for the same config.
+        let synthesized = generated_columns(12, &splits);
+        let synth_names: Vec<&str> = synthesized.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            reader_names, synth_names,
+            "reader schema and generated_columns must expose identical columns"
+        );
+        // Split leaves replace their verbatim fNN slot.
+        assert!(synth_names.contains(&"f08_c1"));
+        assert!(synth_names.contains(&"f08_c2"));
+        assert!(!synth_names.contains(&"f08"));
     }
 
     #[test]

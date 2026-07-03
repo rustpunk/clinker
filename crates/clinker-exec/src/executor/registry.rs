@@ -178,31 +178,37 @@ fn build_swift_writer_config(
     }
 }
 
-/// Extract `Vec<FieldDef>` from an output config's schema for fixed-width format.
+/// Extract the fixed-width output column list from an output config's `schema:`.
 ///
-/// Fixed-width output requires explicit schema with field definitions specifying
-/// field names, widths, and optionally start positions, justification, and padding.
+/// Fixed-width output requires an explicit single-record column list specifying
+/// names, widths, and optionally start positions, justification, and padding.
 fn extract_output_field_defs(
     output: &OutputConfig,
-) -> Result<Vec<clinker_record::schema_def::FieldDef>, PipelineError> {
-    let schema_source = output.schema.as_ref().ok_or_else(|| {
+) -> Result<Vec<clinker_format::Column>, PipelineError> {
+    let schema = output.schema.as_ref().ok_or_else(|| {
         PipelineError::Config(clinker_plan::config::ConfigError::Validation(
-            "fixed-width output format requires explicit schema with field definitions".into(),
+            "fixed-width output format requires an explicit `schema:` column list".into(),
         ))
     })?;
-    let def = match schema_source {
-        clinker_plan::config::SchemaSource::Inline(def) => def.clone(),
-        clinker_plan::config::SchemaSource::FilePath(path) => {
-            clinker_plan::schema::load_schema(std::path::Path::new(path)).map_err(|e| {
-                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                    "failed to load output schema from '{path}': {e}",
-                )))
-            })?
+    // Resolve an external `.schema.yaml` (File) to its inline form.
+    let resolved_file;
+    let schema = match schema {
+        clinker_format::SourceSchema::File(path) => {
+            resolved_file = clinker_plan::schema::load_source_schema(std::path::Path::new(path))
+                .map_err(|e| {
+                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                        "failed to load output schema from '{path}': {e}",
+                    )))
+                })?;
+            &resolved_file
         }
+        other => other,
     };
-    def.fields.ok_or_else(|| {
+    schema.as_columns().map(<[_]>::to_vec).ok_or_else(|| {
         PipelineError::Config(clinker_plan::config::ConfigError::Validation(
-            "fixed-width output schema must have 'fields' defined".into(),
+            "fixed-width output schema must be a single-record column list (not a multi-record \
+             or generated schema)"
+                .into(),
         ))
     })
 }
@@ -212,7 +218,7 @@ fn extract_output_field_defs(
 /// The returned `WriterFactory` creates format writers wrapping a `CountingWriter`.
 /// For CSV with `repeat_header`, the first call creates a `HeaderCapturingCsvWriter`
 /// and subsequent calls replay the captured header via `write_preset_header`.
-/// For fixed-width, the factory captures pre-resolved `FieldDef`s from the output schema.
+/// For fixed-width, the factory captures pre-resolved `Column`s from the output schema.
 /// Map the plan's `OutputEnvelopeConfig` onto the format-local
 /// `OutputEnvelopeSpec` the writers consume, but only when the Output declares
 /// `reconstruct_envelope: true`. Returns `None` (no framing) when the flag is
@@ -233,7 +239,7 @@ fn build_writer_factory(
     format: &OutputFormat,
     include_header: Option<bool>,
     repeat_header: bool,
-    field_defs: Option<Vec<clinker_record::schema_def::FieldDef>>,
+    field_defs: Option<Vec<clinker_format::Column>>,
     include_engine_stamped: bool,
     reconstruct_envelope: bool,
 ) -> WriterFactory {

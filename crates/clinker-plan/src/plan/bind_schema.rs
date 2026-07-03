@@ -34,7 +34,7 @@ use crate::config::composition::{
 use crate::config::node_header::CombineHeader;
 use crate::config::pipeline_node::{
     CombineBody, CopyFrom, CullBody, MatchMode, OnUnmapped, PipelineNode, PropagateCkSpec,
-    ReshapeBody, SchemaDecl,
+    ReshapeBody,
 };
 use crate::plan::combine::{
     CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
@@ -45,6 +45,7 @@ use crate::plan::{EntityRef, PlanNodeId};
 use crate::yaml::Spanned;
 use clinker_core_types::span::{FileId, Span};
 use clinker_core_types::{Diagnostic, LabeledSpan};
+use clinker_format::{Column, SourceSchema};
 
 /// Maximum composition nesting depth.
 ///
@@ -2127,9 +2128,18 @@ fn bind_schema_inner(
 
         match node {
             PipelineNode::Source { config, .. } => {
-                let schema_decl: &SchemaDecl = &config.schema;
+                // Resolve the unified `schema:` (single-record column list,
+                // multi-record superset, external file, or engine-generated)
+                // to the effective column list this source seeds its row from.
+                let resolved_columns = resolve_source_columns(
+                    &config.schema,
+                    &config.source.format,
+                    name.as_str(),
+                    span,
+                    diags,
+                );
                 let (columns, missing) = columns_from_decl(
-                    schema_decl,
+                    &resolved_columns,
                     config.correlation_key.as_ref(),
                     &config.on_unmapped,
                 );
@@ -2153,7 +2163,7 @@ fn bind_schema_inner(
                 // source's declared schema AND have an event-time-
                 // coercible CXL type (DateTime or Date).
                 if let Some(wm) = config.source.watermark.as_ref() {
-                    let declared = schema_decl.columns.iter().find(|c| c.name == wm.column);
+                    let declared = resolved_columns.iter().find(|c| c.name == wm.column);
                     match declared {
                         None => diags.push(
                             Diagnostic::error(
@@ -3560,8 +3570,7 @@ fn build_input_port_rows(
 /// qualifiers — qualification is a Combine-only concept.
 fn port_columns(decl: &PortDecl) -> IndexMap<QualifiedField, Type> {
     match &decl.schema {
-        Some(schema) => schema
-            .columns
+        Some(columns) => columns
             .iter()
             .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
             .collect(),
@@ -3808,6 +3817,96 @@ where
     builder.build()
 }
 
+/// Resolve a source's unified [`SourceSchema`] to the effective ordered column
+/// list its runtime row is seeded from:
+///
+/// - `Columns` — the declared single-record columns directly.
+/// - `MultiRecord` — the discriminator-led superset over every record type
+///   (matching the multi-record reader's static superset schema).
+/// - `File` — the external `.schema.yaml`, loaded and resolved at compile time
+///   (an I/O or parse failure emits E157 and seeds no columns).
+/// - `Generated` — engine-synthesized positional columns (EDI/HL7/SWIFT),
+///   synthesized here at compile time from the source's declared format and its
+///   count options via [`generated_source_columns`], so a Generated source's
+///   typechecked row carries exactly the columns the runtime reader emits.
+fn resolve_source_columns(
+    schema: &SourceSchema,
+    format: &crate::config::InputFormat,
+    name: &str,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) -> Vec<Column> {
+    match schema {
+        SourceSchema::Columns(cols) => cols.clone(),
+        SourceSchema::MultiRecord { record_types, .. } => {
+            clinker_format::multi_record_superset(record_types)
+        }
+        SourceSchema::Generated(_) => generated_source_columns(format),
+        SourceSchema::File(path) => {
+            match crate::schema::load_source_schema(std::path::Path::new(path)) {
+                Ok(inner) => resolve_source_columns(&inner, format, name, span, diags),
+                Err(e) => {
+                    diags.push(Diagnostic::error(
+                        "E157",
+                        format!(
+                            "source {name:?} declares an external schema file {path:?} that \
+                             failed to load: {e}"
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                    Vec::new()
+                }
+            }
+        }
+    }
+}
+
+/// Synthesize the engine-generated positional columns for a
+/// [`SourceSchema::Generated`] source from its declared EDI-family format and
+/// count options. This is the compile-time twin of the runtime reader's own
+/// schema synthesis — both draw the layout from the same
+/// `clinker_format::*_generated_columns` functions — so a Generated source's
+/// typechecked row carries exactly the columns the reader emits at runtime
+/// (`seg_id`/`e01…` for EDIFACT/X12, `f01…`/split leaves for HL7,
+/// `block,tag,value` for SWIFT). A non-EDI format cannot carry a `generated`
+/// schema (config validation rejects that with E159 before this runs), so its
+/// arm synthesizes nothing.
+fn generated_source_columns(format: &crate::config::InputFormat) -> Vec<Column> {
+    use crate::config::InputFormat;
+    match format {
+        InputFormat::Edifact(opts) => {
+            let max = opts
+                .as_ref()
+                .and_then(|o| o.max_elements)
+                .unwrap_or(clinker_format::EDIFACT_DEFAULT_MAX_ELEMENTS);
+            clinker_format::edifact_generated_columns(max)
+        }
+        InputFormat::X12(opts) => {
+            let max = opts
+                .as_ref()
+                .and_then(|o| o.max_elements)
+                .unwrap_or(clinker_format::X12_DEFAULT_MAX_ELEMENTS);
+            clinker_format::x12_generated_columns(max)
+        }
+        InputFormat::Hl7(opts) => {
+            let max = opts
+                .as_ref()
+                .and_then(|o| o.max_fields)
+                .unwrap_or(clinker_format::HL7_DEFAULT_MAX_FIELDS);
+            let splits = opts
+                .as_ref()
+                .map(|o| o.resolved_splits())
+                .unwrap_or_default();
+            clinker_format::hl7_generated_columns(max, &splits)
+        }
+        InputFormat::Swift(_) => clinker_format::swift_generated_columns(),
+        InputFormat::Csv(_)
+        | InputFormat::Json(_)
+        | InputFormat::Xml(_)
+        | InputFormat::FixedWidth(_) => Vec::new(),
+    }
+}
+
 /// Build the `Row.declared` map for a Source from its author-declared
 /// `schema:` block, tail-appending engine-stamped columns:
 ///
@@ -3826,12 +3925,11 @@ where
 /// E153 for each such name — every CK field a source declares MUST be
 /// in that source's own schema.
 fn columns_from_decl(
-    decl: &SchemaDecl,
+    columns: &[Column],
     correlation_key: Option<&crate::config::CorrelationKey>,
     on_unmapped: &OnUnmapped,
 ) -> (IndexMap<QualifiedField, Type>, Vec<String>) {
-    let mut cols: IndexMap<QualifiedField, Type> = decl
-        .columns
+    let mut cols: IndexMap<QualifiedField, Type> = columns
         .iter()
         .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
         .collect();
@@ -3851,8 +3949,7 @@ fn columns_from_decl(
     let mut missing: Vec<String> = Vec::new();
     if let Some(ck) = correlation_key {
         for field in ck.fields() {
-            match decl
-                .columns
+            match columns
                 .iter()
                 .find(|c| c.name.as_str() == field)
                 .map(|c| c.ty.clone())

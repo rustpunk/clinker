@@ -13,9 +13,10 @@ use super::{
     CompositionFile, CompositionSignature, OutputAlias, ParamDecl, ParamType, PortDecl, Resource,
     ResourceDecl, ResourceKind, SourceMap, SpannedNodeRef,
 };
-use crate::config::pipeline_node::{PipelineNode, SchemaDecl};
+use crate::config::pipeline_node::PipelineNode;
 use crate::yaml::Spanned;
 use clinker_core_types::span::{FileId, Span};
+use clinker_format::Column;
 use indexmap::IndexMap;
 use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -73,10 +74,10 @@ pub(super) struct RawScopedVarTypeDecl {
 #[serde(deny_unknown_fields)]
 pub(super) struct RawPortDecl {
     /// Minimum-required column set. YAML form: a list of
-    /// `{ name, type }` entries matching the `SchemaDecl` convention.
-    /// Absence means accept-any.
+    /// `{ name, type }` entries — the same single-record column-list shape a
+    /// `SourceBody` schema uses. Absence means accept-any.
     #[serde(default)]
-    pub schema: Option<SchemaDecl>,
+    pub schema: Option<Vec<Column>>,
     #[serde(default)]
     pub description: Option<String>,
     #[serde(default)]

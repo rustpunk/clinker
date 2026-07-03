@@ -21,10 +21,21 @@
 //!   with [`FormatError::UndeclaredField`].
 //!
 //! Declared columns missing from a particular input record materialize
-//! as `Value::Null`. Values declared with a concrete type (`Type::Int`,
-//! `Type::Float`, `Type::Bool`, etc.) are coerced; `Type::String` /
-//! `Type::Any` skip coercion. The `to_*` / `try_*` CXL builtins remain
-//! available for derived fields computed during the pipeline.
+//! as `Value::Null`. This is the single coercion pass for the untyped
+//! formats (CSV) and the native-typed formats (JSON / XML / REST): values
+//! declared with a concrete type (`Type::Int`, `Type::Float`, `Type::Bool`,
+//! `Type::Date`, `Type::DateTime`, `Type::Numeric`) are coerced here,
+//! honoring each column's `format:` strftime string for `date` / `date_time`;
+//! `Type::String` / `Type::Any` skip coercion, and native `Map` / `Array`
+//! pass through untouched. The `to_*` / `try_*` CXL builtins remain available
+//! for derived fields computed during the pipeline.
+//!
+//! Positional formats (fixed-width / multi-record) parse their bytes into
+//! final typed values in the reader itself (`fixed_width::field::coerce_scalar`,
+//! also format-aware), so those readers are wrapped with coercion disabled
+//! (`pretyped`) — the value is already typed, and a second parse here would be
+//! redundant. Those readers keep every other reprojection service (the
+//! `OnUnmapped` policy, the `$widened` sidecar, the `long_unique` storage hint).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -35,7 +46,8 @@ use clinker_record::{FieldMetadata, Record, Schema, SchemaBuilder, Value, coerci
 use cxl::typecheck::Type;
 use indexmap::IndexMap;
 
-use clinker_plan::config::pipeline_node::{ColumnDecl, OnUnmapped, WIDENED_SIDECAR_COLUMN};
+use clinker_format::Column;
+use clinker_plan::config::pipeline_node::{OnUnmapped, WIDENED_SIDECAR_COLUMN};
 
 /// Wraps a `FormatReader` and reprojects every record onto the
 /// user-declared `Arc<Schema>` (plus the `$widened` engine-stamped
@@ -65,8 +77,13 @@ pub struct CoercingReader {
     /// Per-output-column coercion target (`None` for pass-through).
     /// Indexed by position in `output_schema`. The `$widened` sidecar
     /// slot, when present, gets `None` (no coercion — payload is a
-    /// `Value::Map`).
+    /// `Value::Map`). Every slot is `None` when the inner reader is
+    /// `pretyped` (positional formats parse their own final typed values).
     targets: Vec<Option<Type>>,
+    /// Per-output-column `format:` strftime string for `date` / `date_time`
+    /// coercion, indexed alongside `targets`. `None` uses the default format
+    /// chain. The `$widened` sidecar slot is always `None`.
+    formats: Vec<Option<String>>,
     /// Per-output-column `long_unique` storage hint, indexed alongside
     /// `targets`. When set for a column, its string values are stored in
     /// the header-free `Box`-backed [`FieldStr`](clinker_record::FieldStr)
@@ -85,11 +102,19 @@ pub struct CoercingReader {
 impl CoercingReader {
     /// Build a coercing reader from a format reader, the user-declared
     /// `schema:` block, and the per-Source `on_unmapped` policy.
+    ///
+    /// `pretyped` is set for positional readers (fixed-width / multi-record)
+    /// whose bytes are already parsed into final typed values by the reader
+    /// itself; coercion is then disabled (every target `None`) so no value is
+    /// parsed twice. It is clear for untyped/native readers (CSV / JSON / XML /
+    /// REST), where this is the sole coercion pass and each column's `format:`
+    /// is honored for `date` / `date_time`.
     pub fn new(
         mut inner: Box<dyn FormatReader>,
-        schema_decl: &[ColumnDecl],
+        schema_decl: &[Column],
         policy: OnUnmapped,
         source_name: &str,
+        pretyped: bool,
     ) -> Result<Self, FormatError> {
         // Trigger schema discovery on the inner reader so the first
         // record isn't gated behind an on-demand schema call.
@@ -106,7 +131,7 @@ impl CoercingReader {
         // declared rather than widened.
         let declared_names: HashSet<Box<str>> = schema_decl
             .iter()
-            .map(|c| c.source_name.as_deref().unwrap_or(c.name.as_str()).into())
+            .map(|c| c.physical_name().into())
             .collect();
 
         // Per-column physical name is only materialized when some column
@@ -130,14 +155,21 @@ impl CoercingReader {
         let mut targets: Vec<Option<Type>> = schema_decl
             .iter()
             .map(|c| {
-                let target = unwrap_nullable(&c.ty);
-                match target {
+                // A pretyped (positional) reader already produced the final
+                // typed value; a second coercion here would be a redundant
+                // re-parse, so leave every target as pass-through.
+                if pretyped {
+                    return None;
+                }
+                match unwrap_nullable(&c.ty) {
                     Type::String | Type::Any | Type::Null => None,
                     other => Some(other.clone()),
                 }
             })
             .collect();
-        let mut long_unique: Vec<bool> = schema_decl.iter().map(|c| c.long_unique).collect();
+        let mut formats: Vec<Option<String>> =
+            schema_decl.iter().map(|c| c.format.clone()).collect();
+        let mut long_unique: Vec<bool> = schema_decl.iter().map(|c| c.is_long_unique()).collect();
 
         let mut builder = SchemaBuilder::new();
         for c in schema_decl {
@@ -152,6 +184,7 @@ impl CoercingReader {
             builder =
                 builder.with_field_meta(WIDENED_SIDECAR_COLUMN, FieldMetadata::widened_sidecar());
             targets.push(None);
+            formats.push(None);
             long_unique.push(false);
             Some(idx)
         } else {
@@ -166,6 +199,7 @@ impl CoercingReader {
             aliased_exposed,
             output_schema,
             targets,
+            formats,
             long_unique,
             widened_idx,
             policy,
@@ -231,7 +265,9 @@ impl CoercingReader {
             };
             let raw = record.get(physical).cloned().unwrap_or(Value::Null);
             let coerced = match &self.targets[i] {
-                Some(target) => coerce_value(&raw, target).unwrap_or(raw),
+                Some(target) => {
+                    coerce_value(&raw, target, self.formats[i].as_deref()).unwrap_or(raw)
+                }
                 None => raw,
             };
             // Honor the column's `long_unique` storage hint: rebuild a string
@@ -305,13 +341,21 @@ fn unwrap_nullable(ty: &Type) -> &Type {
 
 /// Coerce a value to the target type. Returns None if coercion fails
 /// (value passes through unchanged — lenient behavior at read time).
-fn coerce_value(value: &Value, target: &Type) -> Option<Value> {
+///
+/// `format` is the column's `format:` strftime string, honored for `date` /
+/// `date_time`; `None` falls back to the coercion module's default format
+/// chain. Native `Map` / `Array` (and any other type) return `None`, so a
+/// JSON/XML composite passes through untouched.
+fn coerce_value(value: &Value, target: &Type, format: Option<&str>) -> Option<Value> {
+    // `Option<&str>::into_iter` yields the one format when present, else
+    // nothing — an empty chain selects the default formats.
+    let chain: Vec<&str> = format.into_iter().collect();
     match target {
         Type::Int => coercion::coerce_to_int_lenient(value),
         Type::Float => coercion::coerce_to_float_lenient(value),
         Type::Bool => coercion::coerce_to_bool_lenient(value),
-        Type::Date => coercion::coerce_to_date_lenient(value, &[]),
-        Type::DateTime => coercion::coerce_to_datetime_lenient(value, &[]),
+        Type::Date => coercion::coerce_to_date_lenient(value, &chain),
+        Type::DateTime => coercion::coerce_to_datetime_lenient(value, &chain),
         Type::Numeric => {
             // Try int first, then float
             coercion::coerce_to_int_lenient(value)
@@ -338,31 +382,22 @@ mod tests {
         ))
     }
 
-    fn col(name: &str, ty: Type) -> ColumnDecl {
-        ColumnDecl {
-            name: name.to_string(),
-            ty,
-            long_unique: false,
-            source_name: None,
-        }
+    fn col(name: &str, ty: Type) -> Column {
+        Column::bare(name, ty)
     }
 
-    fn col_unique(name: &str, ty: Type) -> ColumnDecl {
-        ColumnDecl {
-            name: name.to_string(),
-            ty,
-            long_unique: true,
-            source_name: None,
+    fn col_unique(name: &str, ty: Type) -> Column {
+        Column {
+            long_unique: Some(true),
+            ..Column::bare(name, ty)
         }
     }
 
     /// A declared column aliasing a differently-named physical source column.
-    fn col_from(name: &str, source_name: &str, ty: Type) -> ColumnDecl {
-        ColumnDecl {
-            name: name.to_string(),
-            ty,
-            long_unique: false,
+    fn col_from(name: &str, source_name: &str, ty: Type) -> Column {
+        Column {
             source_name: Some(source_name.to_string()),
+            ..Column::bare(name, ty)
         }
     }
 
@@ -386,7 +421,8 @@ mod tests {
             col("score", Type::Float),
         ];
         let reader = csv_reader("name,age,score\nAlice,30,95.5\nBob,25,88.0\n");
-        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
 
         let rec = coercing.next_record().unwrap().unwrap();
         assert_eq!(rec.get("name"), Some(&Value::String("Alice".into())));
@@ -402,7 +438,8 @@ mod tests {
     fn test_coerce_bool() {
         let schema = vec![col("active", Type::Bool)];
         let reader = csv_reader("active\ntrue\nfalse\n");
-        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
 
         let rec = coercing.next_record().unwrap().unwrap();
         assert_eq!(rec.get("active"), Some(&Value::Bool(true)));
@@ -415,7 +452,8 @@ mod tests {
     fn test_coerce_nullable_int() {
         let schema = vec![col("val", Type::nullable(Type::Int))];
         let reader = csv_reader("val\n42\n\n99\n");
-        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
 
         let rec = coercing.next_record().unwrap().unwrap();
         assert_eq!(rec.get("val"), Some(&Value::Integer(42)));
@@ -425,18 +463,93 @@ mod tests {
     fn test_coerce_failure_passes_through() {
         let schema = vec![col("num", Type::Int)];
         let reader = csv_reader("num\nnot_a_number\n");
-        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
 
         let rec = coercing.next_record().unwrap().unwrap();
         // Coercion fails → value passes through as original string
         assert_eq!(rec.get("num"), Some(&Value::String("not_a_number".into())));
     }
 
+    /// A CSV `date` column honors the column's `format:` strftime string — the
+    /// single coercion pass threads it through instead of only trying the
+    /// engine default chain.
+    #[test]
+    fn test_coerce_date_honors_column_format() {
+        let schema = vec![Column {
+            format: Some("%d/%m/%Y".to_string()),
+            ..Column::bare("d", Type::Date)
+        }];
+        let reader = csv_reader("d\n15/01/2024\n");
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
+        let rec = coercing.next_record().unwrap().unwrap();
+        assert_eq!(
+            rec.get("d"),
+            Some(&Value::Date(
+                chrono::NaiveDate::from_ymd_opt(2024, 1, 15).unwrap()
+            ))
+        );
+    }
+
+    /// Without the column `format:`, `15/01/2024` matches no default date
+    /// format (`%m/%d/%Y` rejects month 15), so lenient coercion leaves it a
+    /// String — proving the custom format above is what parsed it.
+    #[test]
+    fn test_coerce_date_without_format_falls_through() {
+        let schema = vec![Column::bare("d", Type::Date)];
+        let reader = csv_reader("d\n15/01/2024\n");
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
+        let rec = coercing.next_record().unwrap().unwrap();
+        assert_eq!(rec.get("d"), Some(&Value::String("15/01/2024".into())));
+    }
+
+    /// With `pretyped` set, the second coercion is disabled: a value the reader
+    /// emitted passes through untouched even when it would otherwise coerce.
+    /// The positional readers rely on this — they already produced final typed
+    /// values, so a redundant re-parse is skipped.
+    #[test]
+    fn test_pretyped_passes_values_through_uncoerced() {
+        use clinker_format::traits::FormatReader as FRTrait;
+        use clinker_record::Schema as RecordSchema;
+        use std::sync::Arc as StdArc;
+
+        struct StubReader {
+            schema: StdArc<RecordSchema>,
+            rows: std::vec::IntoIter<Vec<Value>>,
+        }
+        impl FRTrait for StubReader {
+            fn schema(&mut self) -> Result<StdArc<RecordSchema>, FormatError> {
+                Ok(StdArc::clone(&self.schema))
+            }
+            fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
+                Ok(self
+                    .rows
+                    .next()
+                    .map(|v| Record::new(StdArc::clone(&self.schema), v)))
+            }
+        }
+
+        let schema_arc = StdArc::new(RecordSchema::new(vec!["n".into()]));
+        let reader = Box::new(StubReader {
+            schema: StdArc::clone(&schema_arc),
+            rows: vec![vec![Value::String("42".into())]].into_iter(),
+        });
+        let decl = vec![col("n", Type::Int)];
+        let mut coercing = CoercingReader::new(reader, &decl, drop_policy(), "p", true).unwrap();
+        let rec = coercing.next_record().unwrap().unwrap();
+        // pretyped=true disables coercion: the Int column keeps the reader's
+        // String value rather than coercing to Integer(42).
+        assert_eq!(rec.get("n"), Some(&Value::String("42".into())));
+    }
+
     #[test]
     fn test_string_type_no_coercion() {
         let schema = vec![col("name", Type::String)];
         let reader = csv_reader("name\nAlice\n");
-        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
 
         let rec = coercing.next_record().unwrap().unwrap();
         assert_eq!(rec.get("name"), Some(&Value::String("Alice".into())));
@@ -455,7 +568,7 @@ mod tests {
         ];
         let reader = csv_reader("id,cust_id\n1,alice\n2,bob\n");
         let mut coercing =
-            CoercingReader::new(reader, &schema, auto_widen_policy(), "src").unwrap();
+            CoercingReader::new(reader, &schema, auto_widen_policy(), "src", false).unwrap();
 
         // Output schema exposes the logical name.
         let schema_arc = coercing.schema().unwrap();
@@ -481,7 +594,7 @@ mod tests {
         let schema = vec![col_from("customer_id", "cust_id", Type::String)];
         let reader = csv_reader("cust_id,customer_id\nalice,bob\n");
         let mut coercing =
-            CoercingReader::new(reader, &schema, auto_widen_policy(), "src").unwrap();
+            CoercingReader::new(reader, &schema, auto_widen_policy(), "src", false).unwrap();
 
         let err = coercing.next_record().unwrap_err();
         match err {
@@ -504,7 +617,8 @@ mod tests {
     fn test_source_name_alias_collision_errors_under_drop() {
         let schema = vec![col_from("customer_id", "cust_id", Type::String)];
         let reader = csv_reader("cust_id,customer_id\nalice,bob\n");
-        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
         assert!(matches!(
             coercing.next_record().unwrap_err(),
             FormatError::AliasNameCollision { .. }
@@ -517,7 +631,8 @@ mod tests {
     fn test_source_name_alias_still_coerces() {
         let schema = vec![col_from("total", "raw_amount", Type::Int)];
         let reader = csv_reader("raw_amount\n100\n250\n");
-        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
 
         let rec = coercing.next_record().unwrap().unwrap();
         assert_eq!(rec.get("total"), Some(&Value::Integer(100)));
@@ -531,7 +646,8 @@ mod tests {
     fn test_no_alias_reads_by_name_unchanged() {
         let schema = vec![col("id", Type::String), col("name", Type::String)];
         let reader = csv_reader("id,name\n1,Alice\n");
-        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
 
         let rec = coercing.next_record().unwrap().unwrap();
         assert_eq!(rec.get("id"), Some(&Value::String("1".into())));
@@ -545,7 +661,8 @@ mod tests {
     fn test_on_unmapped_drop_strips_extras() {
         let schema = vec![col("id", Type::String)];
         let reader = csv_reader("id,extra\n1,foo\n2,bar\n");
-        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
 
         let schema_arc = coercing.schema().unwrap();
         let cols: Vec<&str> = schema_arc.columns().iter().map(|c| &**c).collect();
@@ -562,7 +679,8 @@ mod tests {
     fn test_on_unmapped_reject_errors_on_extra() {
         let schema = vec![col("id", Type::String)];
         let reader = csv_reader("id,extra\n1,foo\n");
-        let mut coercing = CoercingReader::new(reader, &schema, reject_policy(), "src").unwrap();
+        let mut coercing =
+            CoercingReader::new(reader, &schema, reject_policy(), "src", false).unwrap();
 
         let err = coercing.next_record().unwrap_err();
         match err {
@@ -581,7 +699,7 @@ mod tests {
         let schema = vec![col("id", Type::String)];
         let reader = csv_reader("id,extra1,extra2\n1,foo,42\n2,bar,99\n");
         let mut coercing =
-            CoercingReader::new(reader, &schema, auto_widen_policy(), "src").unwrap();
+            CoercingReader::new(reader, &schema, auto_widen_policy(), "src", false).unwrap();
 
         let schema_arc = coercing.schema().unwrap();
         let cols: Vec<&str> = schema_arc.columns().iter().map(|c| &**c).collect();
@@ -605,7 +723,7 @@ mod tests {
         let schema = vec![col("id", Type::String), col("name", Type::String)];
         let reader = csv_reader("id,name\n1,Alice\n");
         let mut coercing =
-            CoercingReader::new(reader, &schema, auto_widen_policy(), "src").unwrap();
+            CoercingReader::new(reader, &schema, auto_widen_policy(), "src", false).unwrap();
 
         let rec = coercing.next_record().unwrap().unwrap();
         assert_eq!(rec.get(WIDENED_SIDECAR_COLUMN), Some(&Value::Null));
@@ -628,7 +746,8 @@ mod tests {
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         let name = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
         let reader = csv_reader(&format!("uuid,name_uuid\n{uuid},{name}\n"));
-        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
 
         let rec = coercing.next_record().unwrap().unwrap();
         match rec.get("uuid") {
@@ -672,7 +791,8 @@ mod tests {
         let schema = vec![col("uuid", Type::String)];
         let uuid = "550e8400-e29b-41d4-a716-446655440000";
         let reader = csv_reader(&format!("uuid\n{uuid}\n"));
-        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
 
         let rec = coercing.next_record().unwrap().unwrap();
         match rec.get("uuid") {
@@ -695,7 +815,8 @@ mod tests {
     fn test_long_unique_inert_on_numeric_column() {
         let schema = vec![col_unique("n", Type::Int)];
         let reader = csv_reader("n\n42\n");
-        let mut coercing = CoercingReader::new(reader, &schema, drop_policy(), "src").unwrap();
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
 
         let rec = coercing.next_record().unwrap().unwrap();
         assert_eq!(rec.get("n"), Some(&Value::Integer(42)));
@@ -742,7 +863,7 @@ mod tests {
         });
         let decl = vec![col("id", Type::String), col("name", Type::String)];
         let mut coercing =
-            CoercingReader::new(reader, &decl, auto_widen_policy(), "fw_src").unwrap();
+            CoercingReader::new(reader, &decl, auto_widen_policy(), "fw_src", true).unwrap();
         for _ in 0..2 {
             let rec = coercing.next_record().unwrap().unwrap();
             assert_eq!(

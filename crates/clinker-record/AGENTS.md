@@ -23,7 +23,7 @@ storage/resolver traits.
 - `Value`, `NULL`, and `FieldStr`.
 - `Record`, `RecordPayload`, and `MinimalRecord`.
 - `Schema`, `SchemaBuilder`, and `FieldMetadata`.
-- `SchemaDefinition`, `FieldDef`, `FieldType`, and fixed-width/schema metadata types.
+- Fixed-width formatting enums `Justify`, `LineSeparator`, and `TruncationPolicy` (`schema_def`). The typed source-schema vocabulary (`Column`, `SourceSchema`) lives in `clinker-format`, above this crate's `cxl` dependency boundary.
 - `RecordStorage`, `RecordView`, `FieldResolver`, `HashMapResolver`, and `WindowContext`.
 - `DocumentContext`, `DocumentId`, `DocumentGrain`, `EnvelopeRecord`, and `synthetic_document_context`.
 - `RecordProvenance`, `GroupByKey`, `value_to_group_key`, `PipelineCounters`, and `RetractionCounters`.

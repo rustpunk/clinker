@@ -479,3 +479,50 @@ nodes:
         "error should name the EDIFACT count failure: {err}"
     );
 }
+
+#[test]
+fn edifact_generated_schema_runs_end_to_end() {
+    // `schema: { generated: {} }` lets the engine synthesize the EDIFACT
+    // positional schema (`seg_id`/`msg_ref`/`msg_type`/`e01…`) from the
+    // format's `max_elements` — the author declares no columns. The synthesized
+    // columns are typed `string` at compile time (see `bind_schema_test`), so
+    // the Transform below references `seg_id`/`e01` as concrete columns and the
+    // pipeline runs to a CSV sink.
+    let yaml = r#"
+pipeline:
+  name: edifact_generated
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: edifact
+      glob: ./*.edi
+      schema: { generated: {} }
+  - type: transform
+    name: project
+    input: interchange
+    config:
+      cxl: |
+        emit seg = seg_id
+        emit first = e01
+  - type: output
+    name: out
+    input: project
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let (report, output) = run(yaml, "interchange", ORDERS, "orders.edi", "out")
+        .expect("run generated-schema edifact pipeline");
+    // Three body segments: UNH, BGM, NAD (service segments not emitted).
+    assert_eq!(report.counters.total_count, 3, "output was: {output}");
+    assert_eq!(report.counters.dlq_count, 0);
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), 4, "header + 3 rows; got: {output}");
+    // seg_id + e01 resolved per body segment: UNH/M1, BGM/220, NAD/BY.
+    assert!(output.contains("UNH,M1"), "UNH row seg_id/e01: {output}");
+    assert!(output.contains("BGM,220"), "BGM row seg_id/e01: {output}");
+    assert!(output.contains("NAD,BY"), "NAD row seg_id/e01: {output}");
+}

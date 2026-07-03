@@ -564,3 +564,52 @@ nodes:
         "expected a max_fields overflow naming f08, got: {msg}"
     );
 }
+
+#[test]
+fn hl7_generated_schema_with_split_runs_end_to_end() {
+    // `schema: { generated: {} }` synthesizes the HL7 positional schema from
+    // `max_fields`, applying the declared `split_fields` so the composite MSH-9
+    // (`f08` = `ADT^A01`) is exposed as its component leaves `f08_c1`/`f08_c2`.
+    // The author declares no columns; the Transform references the synthesized
+    // split leaves directly.
+    let yaml = r#"
+pipeline:
+  name: hl7_generated
+nodes:
+  - type: source
+    name: messages
+    config:
+      name: messages
+      type: hl7
+      glob: ./*.hl7
+      options:
+        split_fields:
+          - { field: f08, components: 2 }
+      schema: { generated: {} }
+  - type: transform
+    name: project
+    input: messages
+    config:
+      cxl: |
+        emit seg = seg_id
+        emit mtype = f08_c1
+        emit mtrigger = f08_c2
+  - type: output
+    name: out
+    input: project
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let (report, output) =
+        run(yaml, "messages", &adt_a01(), "adt.hl7", "out").expect("run generated hl7 pipeline");
+    // Four body segments: MSH, EVN, PID, PV1.
+    assert_eq!(report.counters.total_count, 4, "output was: {output}");
+    assert_eq!(report.counters.dlq_count, 0);
+    // MSH-9 (`ADT^A01`) split into component leaves on the MSH row.
+    assert!(
+        output.contains("MSH,ADT,A01"),
+        "MSH row must expose split MSH-9 leaves ADT/A01: {output}"
+    );
+}

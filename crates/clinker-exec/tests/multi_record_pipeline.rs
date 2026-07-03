@@ -41,35 +41,29 @@ nodes:
       type: fixed_width
       glob: ./*.txt
       schema:
-        - { name: record_type, type: string }
-        - { name: batch_id, type: string }
-        - { name: id, type: int }
-        - { name: amount, type: int }
-        - { name: count, type: int }
-      envelope:
-        sections:
-          head:
-            extract: { record_type: H }
-            fields:
-              batch_id: string
-      format_schema:
         discriminator: { start: 0, width: 1 }
         structure:
           - { record: trailer, count: count }
         records:
           - id: header
             tag: H
-            fields:
+            columns:
               - { name: batch_id, type: string, start: 1, width: 9 }
           - id: detail
             tag: D
-            fields:
-              - { name: id, type: integer, start: 1, width: 5 }
-              - { name: amount, type: integer, start: 6, width: 4 }
+            columns:
+              - { name: id, type: int, start: 1, width: 5 }
+              - { name: amount, type: int, start: 6, width: 4 }
           - id: trailer
             tag: T
+            columns:
+              - { name: count, type: int, start: 1, width: 5 }
+      envelope:
+        sections:
+          head:
+            extract: { record_type: H }
             fields:
-              - { name: count, type: integer, start: 1, width: 5 }
+              batch_id: string
   - type: transform
     name: tag
     input: payments
@@ -267,16 +261,10 @@ nodes:
       files:
         on_no_match: skip
       schema:
-        - { name: record_type, type: string }
-        - { name: batch_id, type: string }
-        - { name: id, type: int }
-        - { name: amount, type: int }
-        - { name: count, type: int }
-      format_schema:
         discriminator: { start: 0, width: 1 }
         records:
-          - { id: header,  tag: H, fields: [ { name: batch_id, type: string, start: 1, width: 9 } ] }
-          - { id: detail,  tag: D, fields: [ { name: id, type: integer, start: 1, width: 5 }, { name: amount, type: integer, start: 6, width: 4 } ] }
+          - { id: header,  tag: H, columns: [ { name: batch_id, type: string, start: 1, width: 9 } ] }
+          - { id: detail,  tag: D, columns: [ { name: id, type: int, start: 1, width: 5 }, { name: amount, type: int, start: 6, width: 4 } ] }
   - type: transform
     name: tag
     input: payments

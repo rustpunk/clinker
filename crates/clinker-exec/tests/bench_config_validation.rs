@@ -1,7 +1,7 @@
 use clinker_bench_support::workspace_root;
 use clinker_plan::config::{
     AggregateStrategyHint, CompileContext, InputFormat, NodeInput, OutputFormat, PipelineNode,
-    SchemaSource, parse_config,
+    parse_config,
 };
 use std::fs;
 
@@ -78,28 +78,24 @@ fn test_all_four_formats_represented() {
     );
 }
 
-/// fixed_width_passthrough.yaml has inline format_schema with 2 FieldDef entries.
+/// fixed_width_passthrough.yaml declares its byte layout in the unified
+/// single-record `schema:` — two columns carrying `start`/`width`.
 #[test]
 fn test_fixed_width_inline_schema_materializes() {
     let root = workspace_root().join("benches/pipelines/format/fixed_width_passthrough.yaml");
     let yaml = fs::read_to_string(&root).unwrap();
     let config = parse_config(&yaml).unwrap();
-    let source = config.source_configs().next().expect("no source node");
+    let body = config.source_bodies().next().expect("no source node");
 
-    match &source.schema {
-        Some(SchemaSource::Inline(def)) => {
-            let fields = def.fields.as_ref().expect("no fields in inline schema");
-            assert_eq!(fields.len(), 2, "expected 2 FieldDef entries");
-            assert_eq!(fields[0].start, Some(0));
-            assert_eq!(fields[0].width, Some(10));
-            assert_eq!(fields[1].start, Some(10));
-            assert_eq!(fields[1].width, Some(10));
-        }
-        Some(SchemaSource::FilePath(p)) => {
-            panic!("expected Inline schema, got FilePath({p})")
-        }
-        None => panic!("expected format_schema to be present"),
-    }
+    let columns = body
+        .schema
+        .as_columns()
+        .expect("single-record fixed-width schema");
+    assert_eq!(columns.len(), 2, "expected 2 columns");
+    assert_eq!(columns[0].start, Some(0));
+    assert_eq!(columns[0].width, Some(10));
+    assert_eq!(columns[1].start, Some(10));
+    assert_eq!(columns[1].width, Some(10));
 }
 
 /// cross_format_csv_to_xml.yaml: source is CSV, output is XML.
@@ -396,7 +392,12 @@ fn test_scale_narrow_and_wide_cxl_field_references() {
         .nodes
         .iter()
         .find_map(|n| match &n.value {
-            PipelineNode::Source { config: body, .. } => Some(body.schema.columns.len()),
+            PipelineNode::Source { config: body, .. } => Some(
+                body.schema
+                    .as_columns()
+                    .expect("single-record schema")
+                    .len(),
+            ),
             _ => None,
         })
         .expect("no source in wide_50fields");

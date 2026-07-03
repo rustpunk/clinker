@@ -31,7 +31,7 @@
 //! [`ReplaceOp`] — plus the field-level ops [`SetOp`] (set a field within a
 //! node by path, including `config.cxl` to replace a stage's logic wholesale),
 //! [`BypassOp`] (sugar for removing and auto-rewiring a 1-in/1-out node), and
-//! [`PatchSchemaOp`] (add / rename / retype / remove columns on a `Source`
+//! [`PatchSchemaOp`] (add / rename / modify / remove columns on a `Source`
 //! node's declared schema via the column-keyed grammar shared with the channel
 //! source-config patch pass). Each `op:` discriminant slots into
 //! `RawOverlayOp::into_op` and [`apply_overlay_ops`].
@@ -45,6 +45,7 @@ use serde_saphyr::Location;
 
 use clinker_core_types::span::Span;
 
+use crate::config::composition::{SchemaLayer, SchemaProvRecorder, SchemaProvenanceDb};
 use crate::config::node_header::{NodeHeader, NodeInput};
 use crate::config::patch::apply_schema_ops;
 use crate::config::{PipelineNode, SchemaColumnOp};
@@ -107,7 +108,7 @@ pub enum OverlayOp {
     /// Remove a 1-in/1-out node and auto-rewire its sole consumer onto its sole
     /// upstream — sugar for a `remove` with a single-edge `rewire`.
     Bypass(BypassOp),
-    /// Add / rename / retype / remove columns on a `Source` node's declared
+    /// Add / rename / modify / remove columns on a `Source` node's declared
     /// schema, keyed by column name.
     PatchSchema(PatchSchemaOp),
 }
@@ -194,7 +195,7 @@ pub struct BypassOp {
 /// The `patch_schema` op: shape a `Source` node's declared columns.
 ///
 /// The payload is the column-name-keyed grammar shared with the channel
-/// source-config patch pass (`add` / `rename` / `retype` / `remove`), applied
+/// source-config patch pass (`add` / `rename` / `modify` / `remove`), applied
 /// by the same [`apply_schema_ops`] engine so both surfaces resolve columns and
 /// their E231–E233 diagnostics identically. The target must be a `Source` node.
 #[derive(Debug, Clone)]
@@ -645,16 +646,45 @@ pub fn apply_overlay_ops(
 /// composition node carries — so the injected node is fed by the top-level edge
 /// wiring instead of being left a dead, unfed node.
 pub fn apply_overlay_ops_with_ports(
+    nodes: Vec<Spanned<PipelineNode>>,
+    ops: Vec<LayeredOp>,
+    ports: &CompositionInputPorts,
+) -> Result<Vec<Spanned<PipelineNode>>, OverlayOpError> {
+    apply_overlay_ops_recording(nodes, ops, ports, None)
+}
+
+/// [`apply_overlay_ops_with_ports`] that also records per-attribute schema
+/// provenance when `schema_prov` is `Some`.
+///
+/// Before applying any op, [`SchemaLayer::Base`] is seeded from every source's
+/// pre-overlay schema; each `patch_schema` op then records its attribute edits
+/// at the layer mapped from its [`OverlayLayer`] (pipeline-default → Pipeline,
+/// group → Group, channel-wide / per-target → Channel). Recording happens in the
+/// same pass that mutates the schema, so attribution is a byproduct of
+/// resolution rather than a later reconstruction.
+pub fn apply_overlay_ops_recording(
     mut nodes: Vec<Spanned<PipelineNode>>,
     mut ops: Vec<LayeredOp>,
     ports: &CompositionInputPorts,
+    mut schema_prov: Option<&mut SchemaProvenanceDb>,
 ) -> Result<Vec<Spanned<PipelineNode>>, OverlayOpError> {
+    // Seed Base from the pre-overlay source schemas so a later override layers
+    // onto (and shadows) the declared value rather than replacing it silently.
+    if let Some(db) = schema_prov.as_deref_mut() {
+        for spanned in nodes.iter() {
+            if let PipelineNode::Source { header, config } = &spanned.value {
+                db.seed_base(&header.name, &config.schema);
+            }
+        }
+    }
+
     // Stable sort by layer: cross-layer order follows fixed semantic
     // precedence, while ops sharing a layer keep the caller's declaration
     // order. This is the "(layer, declaration order)" total order.
     ops.sort_by(|a, b| a.layer.cmp(&b.layer));
 
     for layered in ops {
+        let layer = layered.layer;
         let loc = layered.op.referenced;
         let span = span_from_loc(loc);
         match layered.op.value {
@@ -663,11 +693,27 @@ pub fn apply_overlay_ops_with_ports(
             OverlayOp::Replace(replace) => apply_replace(&mut nodes, replace, loc, span)?,
             OverlayOp::Set(set) => apply_set(&mut nodes, set, loc, span)?,
             OverlayOp::Bypass(bypass) => apply_bypass(&mut nodes, bypass, span)?,
-            OverlayOp::PatchSchema(patch) => apply_patch_schema(&mut nodes, patch, span)?,
+            OverlayOp::PatchSchema(patch) => {
+                let mut recorder = schema_prov.as_deref_mut().map(|db| {
+                    SchemaProvRecorder::new(db, &patch.target, schema_layer_of(layer), span)
+                });
+                apply_patch_schema(&mut nodes, patch, span, recorder.as_mut())?
+            }
         }
     }
 
     Ok(nodes)
+}
+
+/// Map a structural [`OverlayLayer`] onto the schema-provenance [`SchemaLayer`].
+/// The two channel layers collapse onto `Channel`; the sort applies channel-wide
+/// before per-target, so per-target wins as the later same-layer application.
+fn schema_layer_of(layer: OverlayLayer) -> SchemaLayer {
+    match layer {
+        OverlayLayer::PipelineDefault => SchemaLayer::Pipeline,
+        OverlayLayer::Group { .. } => SchemaLayer::Group,
+        OverlayLayer::ChannelWide | OverlayLayer::ChannelPerTarget => SchemaLayer::Channel,
+    }
 }
 
 /// Line-only span from an op's YAML location (matches the compile path's
@@ -1149,6 +1195,7 @@ fn apply_patch_schema(
     nodes: &mut [Spanned<PipelineNode>],
     patch: PatchSchemaOp,
     span: Span,
+    recorder: Option<&mut SchemaProvRecorder<'_>>,
 ) -> Result<(), OverlayOpError> {
     let idx = index_of(nodes, &patch.target).ok_or_else(|| OverlayOpError::MissingTarget {
         op: "patch_schema",
@@ -1160,12 +1207,12 @@ fn apply_patch_schema(
         PipelineNode::Source { config, .. } => {
             // Reuse the shared column-op engine so the op surface and the
             // channel source-config patch surface resolve columns identically.
-            apply_schema_ops(&mut config.schema, &patch.schema, &patch.target).map_err(|e| {
-                OverlayOpError::PatchSchema {
+            apply_schema_ops(&mut config.schema, &patch.schema, &patch.target, recorder).map_err(
+                |e| OverlayOpError::PatchSchema {
                     message: e.to_string(),
                     span,
-                }
-            })
+                },
+            )
         }
         other => Err(OverlayOpError::NotSource {
             target: patch.target.clone(),
@@ -2496,7 +2543,8 @@ nodes:
         match &nodes.iter().find(|n| n.value.name() == name).unwrap().value {
             PipelineNode::Source { config, .. } => config
                 .schema
-                .columns
+                .as_columns()
+                .expect("single-record schema")
                 .iter()
                 .map(|c| (c.name.clone(), c.ty.clone()))
                 .collect(),
@@ -2505,14 +2553,14 @@ nodes:
     }
 
     #[test]
-    fn patch_schema_add_drop_retype_reflected() {
+    fn patch_schema_add_drop_modify_reflected() {
         let base = schema_base();
         let op = parse_op(
             r#"
 op: patch_schema
 target: orders
 schema:
-  amount: { retype: float }
+  amount: { type: float }
   order_notes: remove
   region: { add: { type: string } }
 "#,
@@ -2549,7 +2597,8 @@ schema:
             PipelineNode::Source { config, .. } => {
                 let col = config
                     .schema
-                    .columns
+                    .as_columns()
+                    .expect("single-record schema")
                     .iter()
                     .find(|c| c.name == "customer_id")
                     .expect("renamed column");
@@ -2570,7 +2619,7 @@ schema:
 op: patch_schema
 target: orders
 schema:
-  nope: { retype: float }
+  nope: { type: float }
 "#,
         );
         let err = apply_overlay_ops(base, one(op)).expect_err("unknown column");

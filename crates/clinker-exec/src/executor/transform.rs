@@ -166,9 +166,7 @@ pub(crate) fn evaluate_single_transform_windowed(
         .iter()
         .map(|field| {
             let val = record.get(field).cloned().unwrap_or(Value::Null);
-            value_to_group_key(&val, field, None, record_pos)
-                .ok()
-                .flatten()
+            value_to_group_key(&val, field, record_pos).ok().flatten()
         })
         .collect();
 

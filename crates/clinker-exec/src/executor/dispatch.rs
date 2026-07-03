@@ -230,7 +230,7 @@ fn value_to_correlation_key(v: &Value, idx: usize) -> GroupByKey {
     if v.is_null() {
         return GroupByKey::Null;
     }
-    value_to_group_key(v, "__correlation_key", None, idx as u64)
+    value_to_group_key(v, "__correlation_key", idx as u64)
         .ok()
         .flatten()
         .unwrap_or(GroupByKey::Null)
@@ -1844,13 +1844,10 @@ pub(crate) fn finalize_node_rooted_windows(
         ctx.window_arena_consumer_ids
             .insert(idx, (arena_consumer_id, arena_handle));
 
-        // Node-rooted arenas project from already-coerced upstream
-        // output Records — the upstream operator's plan-time
-        // `output_schema` is the canonical type table, so no
-        // schema_pins overrides apply here. Source-rooted arenas
-        // need pins because raw reader Values land as strings; node-
-        // rooted Values arrive pre-typed.
-        let schema_pins: HashMap<String, clinker_record::schema_def::FieldDef> = HashMap::new();
+        // Node-rooted arenas project from already-coerced upstream output
+        // Records — the upstream operator's plan-time `output_schema` is the
+        // canonical type table, so every group-by value already arrives
+        // pre-typed and the group key needs no per-field type pin.
         let index_name = format!(
             "node({}):{}",
             current_dag.graph[upstream_idx].name(),
@@ -1859,11 +1856,12 @@ pub(crate) fn finalize_node_rooted_windows(
         let index_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::IndexBuild {
             name: index_name,
         });
-        let mut secondary_index = SecondaryIndex::build(&arena, &spec.group_by, &schema_pins)
-            .map_err(|e| PipelineError::Compilation {
+        let mut secondary_index = SecondaryIndex::build(&arena, &spec.group_by).map_err(|e| {
+            PipelineError::Compilation {
                 transform_name: String::new(),
                 messages: vec![e.to_string()],
-            })?;
+            }
+        })?;
         ctx.collector
             .record(index_timer.finish(arena_len, arena_len));
 

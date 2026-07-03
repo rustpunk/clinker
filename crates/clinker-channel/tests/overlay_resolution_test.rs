@@ -643,14 +643,11 @@ fn per_target_source_schema_patch_applies() {
     let mut config = parse_base(ws.path());
     apply_source_patches(&mut config, patches).expect("apply source patches");
     let body = config.source_bodies().next().expect("one source");
+    let columns = body.schema.as_columns().expect("single-record schema");
     assert!(
-        body.schema.columns.iter().any(|c| c.name == "region"),
+        columns.iter().any(|c| c.name == "region"),
         "region column added: {:?}",
-        body.schema
-            .columns
-            .iter()
-            .map(|c| &c.name)
-            .collect::<Vec<_>>()
+        columns.iter().map(|c| &c.name).collect::<Vec<_>>()
     );
 
     // An overlay with no `sources:` block resolves to an empty patch map, not

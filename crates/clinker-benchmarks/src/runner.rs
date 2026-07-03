@@ -183,7 +183,8 @@ fn field_types_for_source(body: &SourceBody) -> Vec<FieldKind> {
     use cxl::typecheck::Type;
 
     body.schema
-        .columns
+        .bound_columns()
+        .unwrap_or_default()
         .iter()
         .enumerate()
         .map(|(i, col)| match &col.ty {

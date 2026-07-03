@@ -67,10 +67,11 @@
 //! Provenance tracking: [`ResolvedValue`], [`ProvenanceLayer`],
 //! [`LayerKind`], [`ProvenanceDb`].
 
-use crate::config::pipeline_node::{PipelineNode, SchemaDecl};
+use crate::config::pipeline_node::PipelineNode;
 use crate::yaml::{Spanned, YamlError};
 use clinker_core_types::span::{FileId, Span};
 use clinker_core_types::{Diagnostic, LabeledSpan, Severity};
+use clinker_format::Column;
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -78,9 +79,14 @@ use std::sync::Arc;
 mod provenance;
 mod raw;
 mod resource;
+mod schema_provenance;
 
 pub use provenance::{LayerKind, ProvenanceDb, ProvenanceLayer, ResolvedValue};
 pub use resource::Resource;
+pub use schema_provenance::{
+    PRESENCE_ATTR, SchemaAttr, SchemaLayer, SchemaProvRecorder, SchemaProvenanceDb,
+    SchemaResolvedValue, column_attrs,
+};
 
 #[cfg(test)]
 mod tests;
@@ -168,13 +174,13 @@ pub struct ScopedVarsSchema {
 /// the port must carry at least these columns, but may carry extras
 /// (pass-through). `None` means accept-any — the port has no declared shape.
 ///
-/// The schema carries typed column declarations via [`SchemaDecl`] — the
-/// same `[{name, type}]` shape used by `SourceBody`. Types drive
-/// composition-load-time type-checking.
+/// The schema carries typed column declarations as a [`Column`] list — the
+/// same `[{name, type}]` shape a single-record `SourceBody` schema uses. Types
+/// drive composition-load-time type-checking.
 #[derive(Debug, Clone)]
 pub struct PortDecl {
-    /// Minimum-required typed schema. `None` = accept any row shape.
-    pub schema: Option<SchemaDecl>,
+    /// Minimum-required typed columns. `None` = accept any row shape.
+    pub schema: Option<Vec<Column>>,
     pub description: Option<String>,
     pub required: bool,
 }
@@ -209,7 +215,7 @@ pub struct ParamDecl {
     pub param_type: ParamType,
     pub required: bool,
     /// Default value as a serde-json [`Value`](serde_json::Value), matching
-    /// the existing `FieldDef.default` convention.
+    /// the `Column.default` convention.
     pub default: Option<serde_json::Value>,
     /// Optional enum constraint (`enum: [a, b, c]`).
     pub enum_values: Option<Vec<serde_json::Value>>,

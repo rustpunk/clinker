@@ -116,6 +116,44 @@ When the plan carries column statistics, the output ends with a `=== Statistics 
 
 A statistic that was never gathered renders as `null` rather than a fabricated zero — for example, a multi-file `glob` source or a network source whose size cannot be read adds no Statistics section at all.
 
+## Field provenance
+
+`clinker explain <pipeline> --field <path>` traces where a single resolved value
+comes from across every configuration layer, printing the winning layer plus
+each shadowed layer and its source span. The path arity selects what is traced:
+
+- **`<node>.<param>`** (two parts) — a composition config parameter, resolved
+  across composition defaults and channel/group overlays.
+- **`<source>.<column>.<attribute>`** (three parts) — a **source-schema
+  attribute** (`type`, `scale`, `precision`, `format`, `width`, `required`, …),
+  resolved across the schema-provenance layers `Base < Pipeline < Group <
+  Channel`. `Base` is the source's own declared `schema:`; the higher layers are
+  the [`patch_schema`](../pipelines/channels.md#patch_schema--shape-a-sources-columns)
+  overlay ops each channel/group applies.
+
+```bash
+# Where does the `scale` on the orders source's `amount` column come from?
+clinker explain pipeline.yaml --field orders.amount.scale
+
+# Resolve the same attribute with a channel overlay applied first.
+clinker explain pipeline.yaml --field orders.amount.scale --channel acme_prod
+```
+
+```
+Field: orders.amount.scale
+
+  Resolved value: 2
+
+  Provenance chain (outermost to innermost):
+  [WON] Channel               →  2  (line 12)
+        Pipeline              →  0  (shadowed)  (line 5)
+        Base                  →  0  (shadowed)
+```
+
+The `[WON]` marker names the layer whose value survives; shadowed layers show
+what they proposed. An unknown source, column, or attribute is rejected with a
+hint listing the valid names at that level.
+
 ## Looking up diagnostic codes
 
 `clinker explain --code <CODE>` prints the documentation for any registered error or warning code, including retraction-specific codes:

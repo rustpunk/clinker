@@ -17,7 +17,10 @@
 //! discrimination) reuse this same framework as additional handlers.
 
 use super::*;
-use crate::config::pipeline_node::{ColumnDecl, PipelineNode, SchemaDecl, SourceBody};
+use crate::config::composition::SchemaProvRecorder;
+use crate::config::pipeline_node::{PipelineNode, SourceBody};
+use clinker_format::{Column, SourceSchema};
+use clinker_record::schema_def::{Justify, TruncationPolicy};
 use cxl::typecheck::Type;
 use indexmap::IndexMap;
 use serde::de;
@@ -33,7 +36,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SourceConfigPatch {
-    /// Column-name-keyed schema ops (`add` / `rename` / `retype` / `remove`).
+    /// Column-name-keyed schema ops (`modify` / `rename` / `add` / `remove`).
     pub schema: IndexMap<String, SchemaColumnOp>,
     /// Array-path-keyed ops: set-by-path (add-or-modify) or `remove`.
     pub array_paths: IndexMap<String, ArrayPathOp>,
@@ -50,93 +53,207 @@ impl SourceConfigPatch {
     }
 }
 
-/// One column-keyed schema op.
+/// A partial [`Column`]: any subset of a column's attributes, all optional.
+///
+/// The payload of a `modify` (bare-attribute map) or an `add` op. Every setter
+/// is `Option<_>` so a modify sets exactly the attributes it names and keeps the
+/// rest of the base column; `deny_unknown_fields` turns a typo into an error
+/// rather than a silent no-op. `Serialize` is for config-identity hashing only.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ColumnPatch {
+    /// CXL type. Required for `add`; on `modify`, retypes the column.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub ty: Option<Type>,
+    /// Physical source column read FROM (see [`Column::source_name`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
+    /// Fixed-width start offset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<usize>,
+    /// Fixed-width field width.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<usize>,
+    /// Fixed-width end offset (exclusive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<usize>,
+    /// XML path (inert consumer today).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Fixed-width write justification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub justify: Option<Justify>,
+    /// Fixed-width pad character.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pad: Option<String>,
+    /// Fixed-width read trim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trim: Option<bool>,
+    /// Fixed-width write truncation policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncation: Option<TruncationPolicy>,
+    /// strftime pattern for date/datetime parse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// Decimal precision.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub precision: Option<u8>,
+    /// Decimal scale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale: Option<u8>,
+    /// Whether the column must be present/non-null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    /// Default value when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
+    /// Whether to coerce the raw value to the declared type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coerce: Option<bool>,
+    /// Allowed value set (enum constraint).
+    #[serde(rename = "enum", skip_serializing_if = "Option::is_none")]
+    pub allowed_values: Option<Vec<String>>,
+    /// Advisory storage hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub long_unique: Option<bool>,
+}
+
+impl ColumnPatch {
+    /// Whether the patch names no attribute at all (an empty `{}` modify).
+    fn is_empty(&self) -> bool {
+        *self == ColumnPatch::default()
+    }
+}
+
+/// One column-keyed schema op — the keyed-map grammar shared by every override
+/// layer (pipeline / group / channel) and the channel `sources:` patch.
 ///
 /// YAML forms (the map key is the target column name):
 ///
 /// ```yaml
-/// amount:      { retype: float }        # change an existing column's type
-/// cust_id:     { rename: customer_id }  # rename an existing column
-/// order_notes: remove                   # drop an existing column
-/// region:      { add: { type: string } }# add a new column (key = new name)
+/// amount:      { type: float, scale: 2 }    # modify: set any subset of attrs
+/// cust_id:     { rename: customer_id }      # rename (physical alias preserved)
+/// order_notes: remove                       # drop the column
+/// region:      { add: { type: string } }    # add a new column (key = new name)
 /// ```
 ///
-/// `Serialize` is derived for config-identity hashing only; the deserialize
-/// form is the channel YAML above.
+/// The modify leaf sets *any* subset of a [`Column`]'s attributes, leaf-replace
+/// per attribute onto the base column. `Serialize` is derived for config-identity
+/// hashing only; the deserialize form is the channel YAML above.
 #[derive(Debug, Clone, Serialize)]
 pub enum SchemaColumnOp {
     /// Drop the keyed column.
     Remove,
     /// Rename the keyed column to the given name.
     Rename(String),
-    /// Change the keyed column's CXL type.
-    Retype(Type),
+    /// Set a subset of the keyed column's attributes.
+    Modify(ColumnPatch),
     /// Add a new column named by the map key.
-    Add(AddColumnPatch),
-}
-
-/// Payload for a schema `add` op: the new column's declared shape.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct AddColumnPatch {
-    /// CXL type of the new column.
-    #[serde(rename = "type")]
-    pub ty: Type,
-    /// Mirrors [`ColumnDecl::long_unique`] — advisory storage hint.
-    #[serde(default)]
-    pub long_unique: bool,
+    Add(ColumnPatch),
 }
 
 impl<'de> Deserialize<'de> for SchemaColumnOp {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        // Two accepted YAML shapes:
-        //   remove                         (bare scalar)
-        //   { rename | retype | add: ... } (single-key map)
-        // The bare scalar is handled explicitly; the map form accepts exactly
-        // one of the three op keys.
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
+        // Accepted YAML shapes:
+        //   remove                          (bare scalar)
+        //   { rename: <name> }              (rename op)
+        //   { add: { <attrs> } }            (add op)
+        //   { <attrs> }                     (modify op — bare column attributes)
+        // `rename` and `add` are op selectors; every other key is a `Column`
+        // attribute that belongs to the modify leaf. Mixing a selector with
+        // modify attributes (or with each other) is rejected.
+        #[derive(Deserialize, Default)]
+        #[serde(deny_unknown_fields, default)]
         struct OpMap {
-            #[serde(default)]
             rename: Option<String>,
-            #[serde(default)]
-            retype: Option<Type>,
-            #[serde(default)]
-            add: Option<AddColumnPatch>,
+            add: Option<ColumnPatch>,
+            // Modify leaf: the same attribute set as `ColumnPatch`, inlined so
+            // `deny_unknown_fields` still rejects a typo (a `#[serde(flatten)]`
+            // would disable that check and drop saphyr spans).
+            #[serde(rename = "type")]
+            ty: Option<Type>,
+            source_name: Option<String>,
+            start: Option<usize>,
+            width: Option<usize>,
+            end: Option<usize>,
+            path: Option<String>,
+            justify: Option<Justify>,
+            pad: Option<String>,
+            trim: Option<bool>,
+            truncation: Option<TruncationPolicy>,
+            format: Option<String>,
+            precision: Option<u8>,
+            scale: Option<u8>,
+            required: Option<bool>,
+            default: Option<serde_json::Value>,
+            coerce: Option<bool>,
+            #[serde(rename = "enum")]
+            allowed_values: Option<Vec<String>>,
+            long_unique: Option<bool>,
         }
 
+        impl OpMap {
+            fn modify_leaf(self) -> ColumnPatch {
+                ColumnPatch {
+                    ty: self.ty,
+                    source_name: self.source_name,
+                    start: self.start,
+                    width: self.width,
+                    end: self.end,
+                    path: self.path,
+                    justify: self.justify,
+                    pad: self.pad,
+                    trim: self.trim,
+                    truncation: self.truncation,
+                    format: self.format,
+                    precision: self.precision,
+                    scale: self.scale,
+                    required: self.required,
+                    default: self.default,
+                    coerce: self.coerce,
+                    allowed_values: self.allowed_values,
+                    long_unique: self.long_unique,
+                }
+            }
+        }
+
+        // `OpMap` is boxed in the map arm: it carries the full column-attribute
+        // set, so an unboxed variant would leave `Either` lopsided.
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Either {
             Scalar(String),
-            Map(OpMap),
+            Map(Box<OpMap>),
         }
 
         match Either::deserialize(d)? {
             Either::Scalar(s) if s == "remove" => Ok(SchemaColumnOp::Remove),
             Either::Scalar(other) => Err(de::Error::custom(format!(
                 "unknown schema op {other:?}; the bare scalar form only accepts `remove` — \
-                 use `{{ rename: <name> }}`, `{{ retype: <type> }}`, or `{{ add: {{ type: <type> }} }}`"
+                 use `{{ rename: <name> }}`, `{{ add: {{ type: <type> }} }}`, or a bare \
+                 attribute map like `{{ type: <type>, scale: <n> }}` to modify"
             ))),
             Either::Map(m) => {
-                let count =
-                    m.rename.is_some() as u8 + m.retype.is_some() as u8 + m.add.is_some() as u8;
-                match count {
-                    0 => Err(de::Error::custom(
-                        "empty schema op; provide exactly one of `rename`, `retype`, `add`, \
-                         or the bare scalar `remove`",
-                    )),
-                    1 => {
-                        if let Some(to) = m.rename {
-                            Ok(SchemaColumnOp::Rename(to))
-                        } else if let Some(t) = m.retype {
-                            Ok(SchemaColumnOp::Retype(t))
-                        } else {
-                            Ok(SchemaColumnOp::Add(m.add.expect("count==1 with add set")))
-                        }
+                let m = *m;
+                let has_rename = m.rename.is_some();
+                let has_add = m.add.is_some();
+                let rename = m.rename.clone();
+                let add = m.add.clone();
+                let modify = m.modify_leaf();
+                let has_modify = !modify.is_empty();
+                match (has_rename, has_add, has_modify) {
+                    (true, false, false) => {
+                        Ok(SchemaColumnOp::Rename(rename.expect("rename present")))
                     }
+                    (false, true, false) => Ok(SchemaColumnOp::Add(add.expect("add present"))),
+                    (false, false, true) => Ok(SchemaColumnOp::Modify(modify)),
+                    (false, false, false) => Err(de::Error::custom(
+                        "empty schema op; use `remove`, `{ rename: <name> }`, \
+                         `{ add: { type: <type> } }`, or a bare attribute map to modify",
+                    )),
                     _ => Err(de::Error::custom(
-                        "ambiguous schema op; provide exactly one of `rename`, `retype`, `add`",
+                        "ambiguous schema op; `rename`, `add`, and a bare-attribute modify are \
+                         mutually exclusive — use exactly one",
                     )),
                 }
             }
@@ -236,7 +353,7 @@ pub fn apply_source_patches(
         }
         let body = source_body_mut(config, src_name)
             .ok_or_else(|| unknown_source(src_name, has_composition))?;
-        apply_schema_ops(&mut body.schema, &patch.schema, src_name)?;
+        apply_schema_ops(&mut body.schema, &patch.schema, src_name, None)?;
         apply_array_path_ops(&mut body.source, &patch.array_paths, src_name)?;
         apply_option_ops(&mut body.source, &patch.options, src_name)?;
     }
@@ -282,47 +399,66 @@ fn unknown_column(src: &str, col: &str, op: &str) -> ConfigError {
     ))
 }
 
-/// Apply column-keyed schema ops to a source's declared schema in place.
+/// Apply column-keyed schema ops to a source's declared schema in place,
+/// optionally recording per-attribute provenance at the merge.
 ///
 /// Shared by the channel source-config patch pass ([`apply_source_patches`])
 /// and the overlay op engine's `patch_schema` op, so both surfaces resolve the
-/// keyed-map grammar (`add` / `rename` / `retype` / `remove`) and its E231–E233
+/// keyed-map grammar (`modify` / `rename` / `add` / `remove`) and its E231–E237
 /// diagnostics identically. `src` names the source for the diagnostic text.
+///
+/// When `recorder` is `Some`, every attribute an op sets is recorded into the
+/// shared schema-provenance table at the recorder's layer, in the same pass that
+/// mutates the schema — so a resolved value and its layer attribution can never
+/// drift. The channel `sources:` surface passes `None` (it folds into the Base
+/// seed); the overlay op stream passes a per-op recorder tagged with its layer.
 pub(crate) fn apply_schema_ops(
-    schema: &mut SchemaDecl,
+    schema: &mut SourceSchema,
     ops: &IndexMap<String, SchemaColumnOp>,
     src: &str,
+    mut recorder: Option<&mut SchemaProvRecorder<'_>>,
 ) -> Result<(), ConfigError> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    // The keyed column ops target a single-record column list. A multi-record,
+    // generated, or external-file schema has no flat column list to patch here.
+    let columns = schema.as_columns_mut().ok_or_else(|| {
+        ConfigError::Validation(format!(
+            "[E237] channel schema patch on source '{src}': column ops apply only to a \
+             single-record (column-list) schema, not a multi-record / generated / file schema"
+        ))
+    })?;
     for (col, op) in ops {
         match op {
             SchemaColumnOp::Remove => {
-                let idx = schema
-                    .columns
+                let idx = columns
                     .iter()
                     .position(|c| c.name == *col)
                     .ok_or_else(|| unknown_column(src, col, "remove"))?;
-                schema.columns.remove(idx);
+                columns.remove(idx);
+                if let Some(r) = recorder.as_deref_mut() {
+                    r.remove_column(col);
+                }
             }
-            SchemaColumnOp::Retype(ty) => {
-                let column = schema
-                    .columns
+            SchemaColumnOp::Modify(patch) => {
+                let column = columns
                     .iter_mut()
                     .find(|c| c.name == *col)
-                    .ok_or_else(|| unknown_column(src, col, "retype"))?;
-                column.ty = ty.clone();
+                    .ok_or_else(|| unknown_column(src, col, "modify"))?;
+                apply_column_patch(column, patch, col, recorder.as_deref_mut());
             }
             SchemaColumnOp::Rename(to) => {
-                if !schema.columns.iter().any(|c| c.name == *col) {
+                if !columns.iter().any(|c| c.name == *col) {
                     return Err(unknown_column(src, col, "rename"));
                 }
-                if to != col && schema.columns.iter().any(|c| c.name == *to) {
+                if to != col && columns.iter().any(|c| c.name == *to) {
                     return Err(ConfigError::Validation(format!(
                         "[E233] channel schema patch on source '{src}': rename of '{col}' to \
                          '{to}' collides with an existing column"
                     )));
                 }
-                let column = schema
-                    .columns
+                let column = columns
                     .iter_mut()
                     .find(|c| c.name == *col)
                     .expect("existence checked above");
@@ -337,25 +473,80 @@ pub(crate) fn apply_schema_ops(
                         .take()
                         .unwrap_or_else(|| column.name.clone()),
                 );
+                let physical = column.source_name.clone().expect("set above");
                 column.name = to.clone();
+                if let Some(r) = recorder.as_deref_mut() {
+                    r.rename_column(col, to, &physical);
+                }
             }
             SchemaColumnOp::Add(add) => {
-                if schema.columns.iter().any(|c| c.name == *col) {
+                if columns.iter().any(|c| c.name == *col) {
                     return Err(ConfigError::Validation(format!(
                         "[E232] channel schema patch on source '{src}': add of column '{col}' \
                          that already exists"
                     )));
                 }
-                schema.columns.push(ColumnDecl {
-                    name: col.clone(),
-                    ty: add.ty.clone(),
-                    long_unique: add.long_unique,
-                    source_name: None,
-                });
+                let ty = add.ty.clone().ok_or_else(|| {
+                    ConfigError::Validation(format!(
+                        "[E236] channel schema patch on source '{src}': add of column '{col}' \
+                         requires a `type`"
+                    ))
+                })?;
+                let mut column = Column::bare(col.clone(), ty);
+                apply_column_patch(&mut column, add, col, None);
+                if let Some(r) = recorder.as_deref_mut() {
+                    r.add_column(&column);
+                }
+                columns.push(column);
             }
         }
     }
     Ok(())
+}
+
+/// Set each attribute a [`ColumnPatch`] names onto `column` (leaf-replace),
+/// recording each set attribute into `rec` under `col_name` when present. The
+/// attribute names match [`column_attrs`](crate::config::composition::column_attrs)
+/// exactly, so a modify and the Base seed key the same leaves.
+fn apply_column_patch(
+    column: &mut Column,
+    patch: &ColumnPatch,
+    col_name: &str,
+    mut rec: Option<&mut SchemaProvRecorder<'_>>,
+) {
+    if let Some(t) = &patch.ty {
+        column.ty = t.clone();
+        if let Some(r) = rec.as_deref_mut() {
+            r.set_attr(col_name, "type", t);
+        }
+    }
+    macro_rules! set {
+        ($field:ident, $name:literal) => {
+            if let Some(v) = &patch.$field {
+                column.$field = Some(v.clone());
+                if let Some(r) = rec.as_deref_mut() {
+                    r.set_attr(col_name, $name, v);
+                }
+            }
+        };
+    }
+    set!(source_name, "source_name");
+    set!(start, "start");
+    set!(width, "width");
+    set!(end, "end");
+    set!(path, "path");
+    set!(justify, "justify");
+    set!(pad, "pad");
+    set!(trim, "trim");
+    set!(truncation, "truncation");
+    set!(format, "format");
+    set!(precision, "precision");
+    set!(scale, "scale");
+    set!(required, "required");
+    set!(default, "default");
+    set!(coerce, "coerce");
+    set!(allowed_values, "enum");
+    set!(long_unique, "long_unique");
 }
 
 fn apply_array_path_ops(
@@ -513,7 +704,8 @@ nodes:
             .next()
             .expect("one source")
             .schema
-            .columns
+            .as_columns()
+            .expect("single-record schema")
             .iter()
             .map(|c| (c.name.clone(), c.ty.clone()))
             .collect()
@@ -530,25 +722,95 @@ nodes:
     }
 
     #[test]
-    fn schema_retype_changes_type() {
+    fn schema_modify_changes_type() {
         let mut config = csv_pipeline();
         apply(
             &mut config,
             "src",
-            patch_from_yaml("schema:\n  amount: { retype: float }\n"),
+            patch_from_yaml("schema:\n  amount: { type: float }\n"),
         )
         .unwrap();
         assert_eq!(columns(&config)[0], ("amount".to_string(), Type::Float));
     }
 
+    #[test]
+    fn schema_modify_sets_multiple_attributes() {
+        // The enriched modify leaf sets any subset of a column's attributes,
+        // leaf-replace, keeping every attribute it does not name.
+        let mut config = csv_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("schema:\n  amount: { type: float, scale: 2, format: \"%.2f\" }\n"),
+        )
+        .unwrap();
+        let col = column_named(&config, "amount");
+        assert_eq!(col.ty, Type::Float);
+        assert_eq!(col.scale, Some(2));
+        assert_eq!(col.format.as_deref(), Some("%.2f"));
+    }
+
+    #[test]
+    fn schema_modify_only_scale_keeps_type() {
+        // A modify that names only `scale` must keep the base column's type.
+        let mut config = csv_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("schema:\n  amount: { scale: 4 }\n"),
+        )
+        .unwrap();
+        let col = column_named(&config, "amount");
+        assert_eq!(col.ty, Type::Int, "type unchanged");
+        assert_eq!(col.scale, Some(4));
+    }
+
+    #[test]
+    fn schema_modify_unknown_attribute_rejected_at_parse() {
+        // A typo on a modify attribute is an error, not a silent append.
+        let err = crate::yaml::from_str::<SourceConfigPatch>("schema:\n  amount: { scal: 2 }\n")
+            .unwrap_err();
+        let msg = format!("{}", err.0);
+        assert!(msg.contains("scal") || msg.contains("unknown"), "{msg}");
+    }
+
+    #[test]
+    fn schema_add_with_extra_attributes() {
+        // `add` accepts the full attribute set, not just `type`.
+        let mut config = csv_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("schema:\n  offset: { add: { type: int, start: 4, width: 8 } }\n"),
+        )
+        .unwrap();
+        let col = column_named(&config, "offset");
+        assert_eq!(col.ty, Type::Int);
+        assert_eq!(col.start, Some(4));
+        assert_eq!(col.width, Some(8));
+    }
+
+    #[test]
+    fn schema_add_without_type_errors_e236() {
+        let mut config = csv_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("schema:\n  region: { add: { scale: 2 } }\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E236"), "{err}");
+    }
+
     /// Fetch a column by exposed name from the single source.
-    fn column_named<'a>(config: &'a PipelineConfig, name: &str) -> &'a ColumnDecl {
+    fn column_named<'a>(config: &'a PipelineConfig, name: &str) -> &'a Column {
         config
             .source_bodies()
             .next()
             .expect("one source")
             .schema
-            .columns
+            .as_columns()
+            .expect("single-record schema")
             .iter()
             .find(|c| c.name == name)
             .expect("column present")
@@ -626,11 +888,12 @@ nodes:
         let body = config.source_bodies().next().unwrap();
         let col = body
             .schema
-            .columns
+            .as_columns()
+            .expect("single-record schema")
             .iter()
             .find(|c| c.name == "uuid")
             .unwrap();
-        assert!(col.long_unique);
+        assert!(col.is_long_unique());
     }
 
     #[test]
@@ -640,7 +903,7 @@ nodes:
             &mut config,
             "src",
             patch_from_yaml(
-                "schema:\n  amount: { retype: float }\n  cust_id: { rename: customer_id }\n  order_notes: remove\n  region: { add: { type: string } }\n",
+                "schema:\n  amount: { type: float }\n  cust_id: { rename: customer_id }\n  order_notes: remove\n  region: { add: { type: string } }\n",
             ),
         )
         .unwrap();
@@ -655,12 +918,12 @@ nodes:
     }
 
     #[test]
-    fn schema_retype_unknown_column_errors() {
+    fn schema_modify_unknown_column_errors() {
         let mut config = csv_pipeline();
         let err = apply(
             &mut config,
             "src",
-            patch_from_yaml("schema:\n  nope: { retype: float }\n"),
+            patch_from_yaml("schema:\n  nope: { type: float }\n"),
         )
         .unwrap_err();
         assert!(err.to_string().contains("E231"), "{err}");
@@ -726,6 +989,44 @@ nodes:
         assert_eq!(columns(&config)[0].0, "amount");
     }
 
+    /// A column-keyed schema patch targets a single-record (column-list) schema.
+    /// Targeting a multi-record source is rejected with E237 (enriched
+    /// multi-record patching is a later phase), not silently ignored.
+    #[test]
+    fn schema_patch_on_multi_record_source_errors_e237() {
+        let yaml = "\
+pipeline:
+  name: patch_test
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: fixed_width
+      path: /tmp/in.dat
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - { id: detail, tag: D, columns: [ { name: amount, type: int, start: 1, width: 9 } ] }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: /tmp/out.csv
+";
+        let mut config: PipelineConfig =
+            crate::yaml::from_str(yaml).expect("parse multi-record pipeline");
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("schema:\n  amount: { type: float }\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E237"), "{err}");
+    }
+
     #[test]
     fn unknown_source_name_errors() {
         let mut config = csv_pipeline();
@@ -772,7 +1073,7 @@ nodes:
         apply(
             &mut config,
             "node_ident",
-            patch_from_yaml("schema:\n  amount: { retype: float }\n"),
+            patch_from_yaml("schema:\n  amount: { type: float }\n"),
         )
         .unwrap();
         assert_eq!(columns(&config)[0], ("amount".to_string(), Type::Float));
@@ -785,7 +1086,7 @@ nodes:
         let err = apply(
             &mut config,
             "cfg_name",
-            patch_from_yaml("schema:\n  amount: { retype: float }\n"),
+            patch_from_yaml("schema:\n  amount: { type: float }\n"),
         )
         .unwrap_err();
         assert!(err.to_string().contains("E230"), "{err}");
@@ -1052,7 +1353,7 @@ nodes:
     #[test]
     fn schema_op_ambiguous_map_rejected_at_parse() {
         let err = crate::yaml::from_str::<SourceConfigPatch>(
-            "schema:\n  amount: { rename: x, retype: float }\n",
+            "schema:\n  amount: { rename: x, type: float }\n",
         )
         .unwrap_err();
         assert!(

@@ -159,7 +159,7 @@ impl SplittingWriter {
         };
 
         let val = record.get(field_name).unwrap_or(&Value::Null);
-        match value_to_group_key(val, field_name, None, 0) {
+        match value_to_group_key(val, field_name, 0) {
             Ok(Some(key)) => Ok(Some(vec![key])),
             // Null key treated as its own distinct group (test_split_null_key_treated_as_group)
             Ok(None) => Ok(Some(vec![GroupByKey::Null])),

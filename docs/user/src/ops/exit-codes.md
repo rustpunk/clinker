@@ -116,6 +116,9 @@ related code sets live in
 | **E154** | A source declares `watermark.column: <col>` but `<col>` is not present in that source's `schema:` block. | Add the column to `schema:`, or remove the `watermark:` block. |
 | **E155** | A source declares `watermark.column: <col>` and the column exists, but its declared CXL type is not `date_time` or `date`. | Change the column's `type:` to `date_time` or `date`, or point `watermark.column` at a column that already has one of those types. |
 | **E156** | An aggregate declares `time_window:` but at least one upstream-reachable source does not declare `watermark.column`. | Add `watermark: { column: <event-time-column> }` to each listed source, or remove `time_window:` from the aggregate. Without a watermark on every upstream source, `min_across_sources` never advances past `None` and the window can never close. |
+| **E157** | A source declares an external `schema:` file (`schema: path.schema.yaml`) that could not be read or parsed as a `SourceSchema`. | Fix the file path or its contents. A schema file is a bare column list or a multi-record `discriminator:`/`records:` map — it may not itself point at another schema file. |
+| **E158** | A source column's declared type is (or wraps) the inference-only `numeric` union. | Declare a concrete `int` or `float`. `numeric` is `int \| float` resolved during type unification and never carries into a compiled source schema. |
+| **E159** | A source pairs a `generated` schema with a non-EDI format. | `generated` (engine-synthesized positional columns) is valid only for the EDI-family formats (`edifact`, `x12`, `hl7`, `swift`). Declare an explicit column list for any other format. |
 
 See [Source Nodes → Watermarks](../nodes/source.md#watermarks)
 and [Aggregate Nodes → Time-windowed aggregates](../nodes/aggregate.md#time-windowed-aggregates)

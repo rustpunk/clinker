@@ -13,7 +13,7 @@ nodes:
       schema:
         - { name: customer_id, type: string }
         - { name: name, type: string }
-        - { name: amount, type: numeric }
+        - { name: amount, type: float }
 
   - type: composition
     name: enrich1

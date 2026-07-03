@@ -2,12 +2,11 @@
 
 Fixed-width files carry no delimiters — each field occupies a fixed column
 range on every line, the layout common to mainframe extracts and legacy
-COBOL exports. Because the byte layout is not self-describing, a
-fixed-width source needs **two** schemas: the `schema:` on the source body
-declares CXL types for compile-time checking, and a separate format schema
-(`.schema.yaml`) defines the physical layout — each field's start, width,
-and padding. See [Source Nodes](../nodes/source.md) for the shared
-transport rules.
+COBOL exports. Because the byte layout is not self-describing, each column in
+a fixed-width source's `schema:` carries its **byte layout** (`start` +
+`width`) alongside its CXL `type` — one unified declaration drives both the
+physical slice and compile-time type checking. See
+[Source Nodes](../nodes/source.md) for the shared transport rules.
 
 ```yaml
 - type: source
@@ -17,20 +16,22 @@ transport rules.
     type: fixed_width
     path: "./data/mainframe.dat"
     schema:
-      - { name: account_id, type: string }
-      - { name: balance, type: float }
-      - { name: status_code, type: string }
+      - { name: account_id,  type: string, start: 0,  width: 12 }
+      - { name: balance,     type: float,  start: 12, width: 10 }
+      - { name: status_code, type: string, start: 22, width: 2 }
     options:
       line_separator: crlf    # line-ending style
 ```
 
-## The format schema
+## The column layout
 
-The `.schema.yaml` file is the physical layout: it pins each field to a
-column range and declares its padding so the reader can slice every line
-identically. The source-body `schema:` and the format schema must name the
-same fields — the former gives them CXL types, the latter gives them
-positions.
+Each column pins itself to a byte range with `start` (a 0-based offset) and
+`width` (a byte count); `end` (exclusive) may be given instead of `width`.
+Optional per-column formatting keys — `justify`, `pad`, `trim`, `truncation`
+— control padding and trimming on read and write. Because the same column
+declaration carries both the byte range and the CXL type, the physical layout
+and the types can never drift apart. A layout shared across pipelines can live
+in an external `.schema.yaml` file referenced by `schema: layout.schema.yaml`.
 
 ## Options
 
@@ -50,10 +51,11 @@ absorb. The `on_unmapped` policy has no effect on a fixed-width source.
 Mainframe and banking extracts often interleave **multiple record types**
 in one file — a header line, many body lines, and a trailer line — each
 identified by a discriminator at a fixed byte position (commonly the
-first character). Declare these under `format_schema:` with a
-`discriminator:` byte range and a `records:` list instead of a flat
-`fields:` layout. Each record type names its `tag` (the discriminator
-value) and its own byte-positioned `fields:`.
+first character). Declare these with a **map-form `schema:`** carrying a
+`discriminator:` byte range and a `records:` list, instead of a flat column
+list. Each record type names its `tag` (the discriminator value) and its own
+byte-positioned `columns:`; the reader synthesizes the lead `record_type`
+column automatically.
 
 ```yaml
 - type: source
@@ -62,20 +64,14 @@ value) and its own byte-positioned `fields:`.
     name: payments
     type: fixed_width
     path: "./data/payments.dat"
-    schema:                                   # superset CXL types: record_type + every field
-      - { name: record_type, type: string }
-      - { name: batch_id, type: string }
-      - { name: id, type: int }
-      - { name: amount, type: int }
-      - { name: count, type: int }
-    format_schema:
-      discriminator: { start: 0, width: 1 }   # the type tag occupies byte 0
+    schema:                                    # one multi-record schema (map form)
+      discriminator: { start: 0, width: 1 }    # the type tag occupies byte 0
       records:
-        - { id: header,  tag: H, fields: [ { name: batch_id, type: string,  start: 1, width: 9 } ] }
-        - { id: detail,  tag: D, fields: [ { name: id, type: integer, start: 1, width: 5 }, { name: amount, type: integer, start: 6, width: 4 } ] }
-        - { id: trailer, tag: T, fields: [ { name: count, type: integer, start: 1, width: 5 } ] }
+        - { id: header,  tag: H, columns: [ { name: batch_id, type: string, start: 1, width: 9 } ] }
+        - { id: detail,  tag: D, columns: [ { name: id, type: int, start: 1, width: 5 }, { name: amount, type: int, start: 6, width: 4 } ] }
+        - { id: trailer, tag: T, columns: [ { name: count, type: int, start: 1, width: 5 } ] }
       structure:
-        - { record: trailer, count: count }    # validate T's count against the body count
+        - { record: trailer, count: count }     # validate T's count against the body count
     envelope:
       sections:
         head:

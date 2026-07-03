@@ -242,7 +242,7 @@ Any other field path is a hard error, never a silent no-op.
 
 ### `patch_schema` — shape a source's columns
 
-Add / rename / retype / remove columns on a **source** node's declared schema,
+Add / rename / modify / remove columns on a **source** node's declared schema,
 via a **column-name-keyed map** (the map key is the column name). Each column
 carries exactly one op:
 
@@ -251,11 +251,17 @@ overrides:
   - op: patch_schema
     target: orders
     schema:
-      amount:      { retype: float }              # change an existing column's type
+      amount:      { type: float, scale: 2 }       # modify: set any subset of attrs
       cust_id:     { rename: customer_id }         # rename (a physical->logical alias)
       order_notes: remove                          # drop an existing column (bare scalar)
       region:      { add: { type: string } }       # add a new column (map key = new name)
 ```
+
+The **modify** leaf is a bare attribute map: it sets any subset of the column's
+attributes (`type`, `scale`, `precision`, `format`, `width`, …), leaf-replace,
+keeping every attribute it does not name. A typo'd attribute is rejected rather
+than silently appended. The same grammar applies identically at every override
+layer (pipeline / group / channel).
 
 The keyed-map shape (rather than a list) is deliberate: a column op is addressed
 and leaf-replaced by name, with first-class `rename` / `remove` / `add`, exactly
@@ -267,6 +273,12 @@ the original physical column and re-labels its value under the new name, so
 downstream CXL and the output see the new name carrying the original column's
 data. A missing column, an add that collides with an existing name, or a rename
 onto an existing name are all errors ([E231–E233](#diagnostics)).
+
+To see which layer set a given attribute on a patched column, trace it with
+`clinker explain <pipeline> --field <source>.<column>.<attribute>` (optionally
+`--channel <name>`); the output names the winning `Base < Pipeline < Group <
+Channel` layer and each shadowed one. See
+[Field provenance](../ops/explain.md#field-provenance).
 
 ## Groups and selectors
 
@@ -462,7 +474,7 @@ sources:
       items:      { mode: join, separator: ";" }   # add-or-modify an entry
       line_items: remove                    # drop an entry (unknown path -> E234)
     schema:                                 # keyed by column name
-      amount:      { retype: float }
+      amount:      { type: float, scale: 2 }
       cust_id:     { rename: customer_id }
       order_notes: remove
       region:      { add: { type: string } }
@@ -495,7 +507,7 @@ not collide.
 | **E113** | A `config:` / override key matches no composition parameter in the compiled plan. A misspelled or stale key aborts the run instead of silently doing nothing. |
 | **E114** | An overlay op failed to apply (missing splice anchor, duplicate node name, missing/removed `target`, invalid `set` field, invalid `bypass` node). The diagnostic is anchored to the offending op's source span, not the base pipeline. |
 | **E230** | A source patch (`sources.<src>` or `patch_schema`) targets a source-node name not present in the pipeline. |
-| **E231** | A schema `rename` / `retype` / `remove` of a column that does not exist. |
+| **E231** | A schema `rename` / `modify` / `remove` of a column that does not exist. |
 | **E232** | A schema `add` of a column name that already exists. |
 | **E233** | A schema `rename` whose target name collides with an existing column. |
 | **E234** | An `array_paths` `remove` of a path with no matching entry. |

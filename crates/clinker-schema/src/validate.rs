@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use crate::model::{SchemaIndex, SourceSchema};
-use clinker_plan::config::{InputFormat, PipelineConfig, PipelineNode, SchemaSource, SourceConfig};
+use clinker_plan::config::{InputFormat, PipelineConfig, PipelineNode, SourceConfig};
 
 /// A schema validation warning.
 #[derive(Clone, Debug, PartialEq)]
@@ -50,14 +50,22 @@ pub fn validate_pipeline(
 ) -> Vec<SchemaWarning> {
     let mut warnings = Vec::new();
 
-    for input in config.source_configs() {
-        validate_input(input, index, workspace_root, &mut warnings);
+    for body in config.source_bodies() {
+        validate_input(
+            &body.source,
+            linked_schema_file(&body.schema),
+            index,
+            workspace_root,
+            &mut warnings,
+        );
     }
 
     // Collect known fields from all inputs for CXL validation
     let mut available_fields: HashSet<String> = HashSet::new();
-    for input in config.source_configs() {
-        if let Some(schema) = resolve_input_schema(input, index, workspace_root) {
+    for body in config.source_bodies() {
+        if let Some(schema) =
+            resolve_input_schema(linked_schema_file(&body.schema), index, workspace_root)
+        {
             for field_name in schema.all_field_names() {
                 available_fields.insert(field_name);
             }
@@ -83,20 +91,26 @@ pub fn validate_pipeline(
     warnings
 }
 
+/// The external `.schema.yaml` path a source's unified `schema:` links to, or
+/// `None` for an inline (column-list / multi-record / generated) schema —
+/// clinker-schema discovery only cross-checks the external shareable form.
+fn linked_schema_file(schema: &clinker_plan::config::SourceSchema) -> Option<&str> {
+    match schema {
+        clinker_plan::config::SourceSchema::File(path) => Some(path.as_str()),
+        _ => None,
+    }
+}
+
 /// Validate an input stage against its linked schema.
 fn validate_input(
     input: &SourceConfig,
+    linked_schema: Option<&str>,
     index: &SchemaIndex,
     workspace_root: &Path,
     warnings: &mut Vec<SchemaWarning>,
 ) {
-    let Some(schema_source) = &input.schema else {
-        return; // No schema linked — no validation
-    };
-
-    let schema_file = match schema_source {
-        SchemaSource::FilePath(path) => path.as_str(),
-        SchemaSource::Inline(_) => return, // Inline schemas validated separately
+    let Some(schema_file) = linked_schema else {
+        return; // No external schema linked — no validation
     };
 
     let schema_path = workspace_root.join(schema_file);
@@ -182,15 +196,11 @@ fn validate_transform(
 
 /// Resolve the schema for an input stage.
 fn resolve_input_schema<'a>(
-    input: &SourceConfig,
+    linked_schema: Option<&str>,
     index: &'a SchemaIndex,
     workspace_root: &Path,
 ) -> Option<&'a SourceSchema> {
-    let schema_source = input.schema.as_ref()?;
-    let schema_file = match schema_source {
-        SchemaSource::FilePath(path) => path.as_str(),
-        SchemaSource::Inline(_) => return None,
-    };
+    let schema_file = linked_schema?;
     let schema_path = workspace_root.join(schema_file);
     let canonical = schema_path.canonicalize().unwrap_or(schema_path);
 

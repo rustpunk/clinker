@@ -10,7 +10,6 @@
 use std::collections::HashMap;
 
 use clinker_record::RecordStorage;
-use clinker_record::schema_def::FieldDef;
 
 // Re-export from clinker-record for backwards compatibility
 pub use clinker_record::{GroupByKey, GroupKeyError, value_to_group_key};
@@ -32,7 +31,6 @@ impl SecondaryIndex {
     pub fn build<S: RecordStorage>(
         storage: &S,
         group_by: &[String],
-        schema_pins: &HashMap<String, FieldDef>,
     ) -> Result<Self, GroupKeyError> {
         let mut groups: HashMap<Vec<GroupByKey>, Vec<u64>> = HashMap::new();
         let record_count = storage.record_count();
@@ -46,8 +44,7 @@ impl SecondaryIndex {
                     .resolve_field(pos, field_name)
                     .unwrap_or(&clinker_record::NULL);
 
-                let pin = schema_pins.get(field_name.as_str());
-                match value_to_group_key(value, field_name, pin, pos)? {
+                match value_to_group_key(value, field_name, pos)? {
                     Some(gk) => key.push(gk),
                     None => {
                         // Null value — exclude this record from all groups
@@ -133,7 +130,7 @@ mod tests {
             ],
         );
 
-        let index = SecondaryIndex::build(&storage, &["dept".into()], &HashMap::new()).unwrap();
+        let index = SecondaryIndex::build(&storage, &["dept".into()]).unwrap();
 
         assert_eq!(index.group_count(), 3);
 
@@ -162,9 +159,7 @@ mod tests {
             ],
         );
 
-        let index =
-            SecondaryIndex::build(&storage, &["dept".into(), "region".into()], &HashMap::new())
-                .unwrap();
+        let index = SecondaryIndex::build(&storage, &["dept".into(), "region".into()]).unwrap();
 
         assert_eq!(index.group_count(), 3); // (A,East), (A,West), (B,East)
 
@@ -179,7 +174,7 @@ mod tests {
             vec![vec![Value::Float(1.0)], vec![Value::Float(f64::NAN)]],
         );
 
-        let result = SecondaryIndex::build(&storage, &["amount".into()], &HashMap::new());
+        let result = SecondaryIndex::build(&storage, &["amount".into()]);
         assert!(result.is_err());
         match result.unwrap_err() {
             GroupKeyError::NanInGroupBy { field, row } => {
@@ -203,7 +198,7 @@ mod tests {
             ],
         );
 
-        let index = SecondaryIndex::build(&storage, &["dept".into()], &HashMap::new()).unwrap();
+        let index = SecondaryIndex::build(&storage, &["dept".into()]).unwrap();
 
         // Total positions should be 3 (rows 0, 2, 3) — two null rows excluded
         let total: usize = index.groups.values().map(|v| v.len()).sum();
@@ -213,7 +208,7 @@ mod tests {
     #[test]
     fn test_secondary_index_empty_arena() {
         let storage = TestStorage::new(&["dept"], vec![]);
-        let index = SecondaryIndex::build(&storage, &["dept".into()], &HashMap::new()).unwrap();
+        let index = SecondaryIndex::build(&storage, &["dept".into()]).unwrap();
         assert!(index.groups.is_empty());
     }
 
@@ -224,7 +219,7 @@ mod tests {
             vec![vec![Value::Null], vec![Value::Null], vec![Value::Null]],
         );
 
-        let index = SecondaryIndex::build(&storage, &["dept".into()], &HashMap::new()).unwrap();
+        let index = SecondaryIndex::build(&storage, &["dept".into()]).unwrap();
         assert!(index.groups.is_empty());
     }
 }

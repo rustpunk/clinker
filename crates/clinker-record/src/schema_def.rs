@@ -1,21 +1,12 @@
-use std::collections::HashMap;
+//! Format-styling vocabulary shared by the fixed-width readers/writers.
+//!
+//! The typed source-schema vocabulary (columns, record types, discriminators)
+//! lives above this crate in `clinker_format::schema`, where it can carry a
+//! `cxl::typecheck::Type`. This module keeps only the parse-time formatting
+//! enums that have no type dependency, so the foundation crate stays below
+//! `cxl` in the layering.
 
 use serde::{Deserialize, Serialize};
-
-/// Field type enum -- parse-time validated, exhaustive match downstream.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FieldType {
-    String,
-    Integer,
-    Float,
-    Boolean,
-    Date,
-    #[serde(rename = "datetime")]
-    DateTime,
-    Object,
-    Array,
-}
 
 /// Field justification for fixed-width formatting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -42,80 +33,4 @@ pub enum TruncationPolicy {
     Error,
     Warn,
     Silent,
-}
-
-/// A field definition from a schema file or inline schema. All fields except
-/// `name` are `Option` so a `defs:` template can be a partial that a
-/// referencing field fills in via `inherits:`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct FieldDef {
-    pub name: String,
-    #[serde(default, rename = "type")]
-    pub field_type: Option<FieldType>,
-    pub required: Option<bool>,
-    pub format: Option<String>,
-    pub coerce: Option<bool>,
-    pub default: Option<serde_json::Value>,
-    #[serde(rename = "enum")]
-    pub allowed_values: Option<Vec<String>>,
-    pub alias: Option<String>,
-    pub inherits: Option<String>,
-    // Fixed-width positioning
-    pub start: Option<usize>,
-    pub width: Option<usize>,
-    pub end: Option<usize>,
-    pub justify: Option<Justify>,
-    pub pad: Option<String>,
-    pub trim: Option<bool>,
-    pub truncation: Option<TruncationPolicy>,
-    // Decimal formatting on a `float` field: there is no distinct `decimal`
-    // type token, so a decimal is a `float` carrying these attributes.
-    pub precision: Option<u8>,
-    pub scale: Option<u8>,
-    // XML
-    pub path: Option<String>,
-}
-
-/// Discriminator for multi-record dispatch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Discriminator {
-    pub start: Option<usize>,
-    pub width: Option<usize>,
-    pub field: Option<String>,
-}
-
-/// A record type definition within a multi-record schema.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct RecordTypeDef {
-    pub id: String,
-    pub tag: String,
-    pub description: Option<String>,
-    pub parent: Option<String>,
-    pub join_key: Option<String>,
-    pub fields: Vec<FieldDef>,
-}
-
-/// Structural ordering constraint (parsed here, validated downstream).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StructureConstraint {
-    pub record: String,
-    pub count: String,
-}
-
-/// Parsed schema -- from file or inline. Single struct, one resolution path.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SchemaDefinition {
-    pub version: Option<String>,
-    pub format: Option<String>,
-    pub encoding: Option<String>,
-    pub defs: Option<HashMap<String, FieldDef>>,
-    pub fields: Option<Vec<FieldDef>>,
-    pub records: Option<Vec<RecordTypeDef>>,
-    pub discriminator: Option<Discriminator>,
-    pub structure: Option<Vec<StructureConstraint>>,
 }

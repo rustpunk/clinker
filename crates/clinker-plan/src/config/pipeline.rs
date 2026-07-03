@@ -644,8 +644,13 @@ impl PipelineConfig {
         // `bind_schema` pass below, anchored to the op because the engine stamps
         // each injected / replaced node with the op's source location.
         if !ctx.overlay_ops.is_empty() {
-            let effective = self.with_structural_overlay(&ctx.overlay_ops, ctx)?;
-            return effective.compile_with_diagnostics(&ctx.without_overlay_ops());
+            let (effective, schema_prov) = self.with_structural_overlay(&ctx.overlay_ops, ctx)?;
+            let (mut plan, warnings) =
+                effective.compile_with_diagnostics(&ctx.without_overlay_ops())?;
+            // Lay the layered schema attribution recorded while the overlay ops
+            // were applied over the Base-only seed the tail compile produced.
+            plan.merge_schema_provenance(schema_prov);
+            return Ok((plan, warnings));
         }
 
         // Stage 1-4: name/topology/path validation pre-pass.
@@ -2226,18 +2231,92 @@ impl PipelineConfig {
         // through keeps an empty set, which the reader treats as "skip the
         // pre-scan entirely".
         let mut runtime_config = self.clone();
+        // Resolved unified `SourceSchema` per source, retained on the plan.
+        let mut bound_schemas: indexmap::IndexMap<String, clinker_format::SourceSchema> =
+            indexmap::IndexMap::new();
         for spanned in runtime_config.nodes.iter_mut() {
             if let PipelineNode::Source {
                 header,
                 config: body,
             } = &mut spanned.value
-                && let Some(paths) = declared_doc_paths.get(&header.name)
             {
-                body.source.declared_doc_paths = paths.clone();
+                if let Some(paths) = declared_doc_paths.get(&header.name) {
+                    body.source.declared_doc_paths = paths.clone();
+                }
+                // Resolve any external `.schema.yaml` (`SourceSchema::File`)
+                // still present to its inline form. File-loaded pipelines
+                // already resolved these at config-load time (folding the
+                // content into `source_hash`); this covers an in-memory config
+                // compiled without the file loader. Resolving here — and
+                // retaining the result in `bound_schemas` — means the executor's
+                // ingest path reads the schema from the plan and never re-reads
+                // the file at runtime.
+                if let clinker_format::SourceSchema::File(path) = &body.schema {
+                    match crate::schema::load_source_schema(std::path::Path::new(path)) {
+                        Ok(inline) => body.schema = inline,
+                        Err(e) => {
+                            diags.push(Diagnostic::error(
+                                "E157",
+                                format!(
+                                    "source {:?} declares an external schema file {:?} that \
+                                     failed to load: {e}",
+                                    header.name, path
+                                ),
+                                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                            ));
+                            return Err(diags);
+                        }
+                    }
+                }
+                // A `generated` schema is engine-synthesized positional columns
+                // for the EDI-family formats only; every other format has no
+                // positional column model to generate, so pairing one with
+                // `generated` is a config error rather than a silently empty
+                // schema.
+                if matches!(body.schema, clinker_format::SourceSchema::Generated(_))
+                    && !matches!(
+                        body.source.format,
+                        crate::config::InputFormat::Edifact(_)
+                            | crate::config::InputFormat::X12(_)
+                            | crate::config::InputFormat::Hl7(_)
+                            | crate::config::InputFormat::Swift(_)
+                    )
+                {
+                    diags.push(Diagnostic::error(
+                        "E159",
+                        format!(
+                            "source {:?} declares a `generated` schema, but its format {:?} has \
+                             no engine-generated positional column model; `generated` is valid \
+                             only for the EDI-family formats (edifact, x12, hl7, swift). Declare \
+                             an explicit column list instead.",
+                            header.name,
+                            body.source.format.format_name(),
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                }
+                // A resolved source column type must be concrete: `numeric` is
+                // the inference-only Int|Float union and must resolve (via
+                // authoring-time inference) or be rejected before it reaches the
+                // compiled plan — it never carries into a bound schema.
+                if let Some(col) = first_non_concrete_column(&body.schema) {
+                    diags.push(Diagnostic::error(
+                        "E158",
+                        format!(
+                            "source {:?} column {:?} has non-concrete type `numeric`; declare a \
+                             concrete `int` or `float` (numeric is inference-only)",
+                            header.name, col
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                }
+                bound_schemas.insert(header.name.clone(), body.schema.clone());
             }
         }
 
-        let plan = CompiledPlan::from_compile(dag, runtime_config, artifacts);
+        let plan = CompiledPlan::from_compile(dag, runtime_config, bound_schemas, artifacts);
         Ok((plan, diags))
     }
 
@@ -2255,7 +2334,13 @@ impl PipelineConfig {
         &self,
         ops: &[crate::overlay_ops::LayeredOp],
         ctx: &CompileContext,
-    ) -> Result<PipelineConfig, Vec<clinker_core_types::Diagnostic>> {
+    ) -> Result<
+        (
+            PipelineConfig,
+            crate::config::composition::SchemaProvenanceDb,
+        ),
+        Vec<clinker_core_types::Diagnostic>,
+    > {
         use clinker_core_types::{Diagnostic, LabeledSpan};
 
         // Resolve each `add composition` op's declared input ports so the engine
@@ -2267,16 +2352,21 @@ impl PipelineConfig {
 
         let mut effective = self.clone();
         let base_nodes = std::mem::take(&mut effective.nodes);
-        effective.nodes =
-            crate::overlay_ops::apply_overlay_ops_with_ports(base_nodes, ops.to_vec(), &comp_ports)
-                .map_err(|err| {
-                    vec![Diagnostic::error(
-                        "E114",
-                        err.to_string(),
-                        LabeledSpan::primary(err.span(), String::new()),
-                    )]
-                })?;
-        Ok(effective)
+        let mut schema_prov = crate::config::composition::SchemaProvenanceDb::default();
+        effective.nodes = crate::overlay_ops::apply_overlay_ops_recording(
+            base_nodes,
+            ops.to_vec(),
+            &comp_ports,
+            Some(&mut schema_prov),
+        )
+        .map_err(|err| {
+            vec![Diagnostic::error(
+                "E114",
+                err.to_string(),
+                LabeledSpan::primary(err.span(), String::new()),
+            )]
+        })?;
+        Ok((effective, schema_prov))
     }
 
     /// Resolve the declared input-port names for every `add composition` op in
@@ -2326,6 +2416,35 @@ impl PipelineConfig {
             }
         }
         ports
+    }
+}
+
+/// The name of the first column in `schema` whose declared type is (or wraps)
+/// the inference-only `Numeric` union, if any.
+///
+/// `numeric` is the `Int | Float` union resolved during unification; a bound
+/// source schema must carry a concrete type, so the compile rejects a surviving
+/// `numeric` (E158) rather than letting it reach the executor.
+fn first_non_concrete_column(schema: &clinker_format::SourceSchema) -> Option<String> {
+    use clinker_format::SourceSchema;
+    fn contains_numeric(t: &cxl::typecheck::Type) -> bool {
+        match t {
+            cxl::typecheck::Type::Numeric => true,
+            cxl::typecheck::Type::Nullable(inner) => contains_numeric(inner),
+            _ => false,
+        }
+    }
+    match schema {
+        SourceSchema::Columns(cols) => cols
+            .iter()
+            .find(|c| contains_numeric(&c.ty))
+            .map(|c| c.name.clone()),
+        SourceSchema::MultiRecord { record_types, .. } => record_types
+            .iter()
+            .flat_map(|rt| rt.columns.iter())
+            .find(|c| contains_numeric(&c.ty))
+            .map(|c| c.name.clone()),
+        SourceSchema::Generated(_) | SourceSchema::File(_) => None,
     }
 }
 

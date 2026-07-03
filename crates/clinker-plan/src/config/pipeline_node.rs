@@ -12,7 +12,7 @@
 //! and dispatches to a per-variant serde-saphyr-native deserializer —
 //! NOT through a `serde_json::Value` intermediate. This is the fourth
 //! application of the key-presence-dispatch pattern in this codebase
-//! (peers: [`crate::config::SortFieldSpec`], [`crate::config::SchemaSource`],
+//! (peers: [`crate::config::SortFieldSpec`], [`clinker_format::SourceSchema`],
 //! [`crate::config::composition::raw::RawOutputAlias`]).
 //!
 //! What this preserves:
@@ -998,10 +998,14 @@ impl PipelineNode {
 /// [`crate::config::PipelineConfig::compile`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceBody {
-    /// Declared top-level columns and their CXL types. Required —
-    /// missing this field is a serde parse error routed to E201 via
-    /// the diagnostic layer.
-    pub schema: SchemaDecl,
+    /// The source's unified schema. Required — missing this field is a
+    /// serde parse error routed to E201 via the diagnostic layer. A
+    /// [`SourceSchema`](clinker_format::SourceSchema) carrying the declared
+    /// single-record columns, a discriminator-driven multi-record layout, an
+    /// engine-generated positional schema, or an external `.schema.yaml` file
+    /// path. It drives BOTH compile-time CXL typechecking and byte-level
+    /// parsing — one declaration, no separate `format_schema:`.
+    pub schema: crate::config::SourceSchema,
     /// Per-source correlation key. When set, widens this source's
     /// schema with one `$ck.<field>` shadow column per listed field
     /// and triggers grouped DLQ for records sharing the key value.
@@ -1019,54 +1023,6 @@ pub struct SourceBody {
     pub on_unmapped: OnUnmapped,
     #[serde(flatten)]
     pub source: crate::config::SourceConfig,
-}
-
-/// Inline schema declaration on `SourceBody`.
-///
-/// Deserializes from a YAML sequence of `{ name, type }` entries:
-///
-/// ```yaml
-/// schema:
-///   - { name: employee_id, type: string }
-///   - { name: salary, type: int }
-///   - { name: hired_at, type: date_time }
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct SchemaDecl {
-    pub columns: Vec<ColumnDecl>,
-}
-
-/// One declared column in a [`SchemaDecl`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ColumnDecl {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub ty: cxl::typecheck::Type,
-    /// Advisory storage hint: when set, the reader stores this column's string
-    /// values in the header-free `Box`-backed representation rather than the
-    /// default inline-or-`Arc`-shared one. Intended for high-cardinality
-    /// free-text columns whose values are long and effectively unique (UUIDs,
-    /// street addresses, comment fields), where the per-value `Arc` refcount
-    /// header is pure overhead because there is no sharing to amortize it
-    /// against. Opt-in and purely advisory — it changes the in-memory footprint
-    /// only; the value's content, comparison/grouping semantics, and on-disk
-    /// spill encoding are all unchanged. Omitting the key (the common case)
-    /// leaves the default policy and serializes to byte-identical YAML.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub long_unique: bool,
-    /// Physical source column this declared column reads FROM, when it differs
-    /// from the exposed [`name`](Self::name). The reader matches input records
-    /// by physical name and re-labels the value under `name`, so downstream CXL
-    /// and the output see `name` while the value is drawn from `source_name`.
-    /// `None` (the common case) means physical == exposed: the column reads the
-    /// input field whose key equals `name`, identical to omitting this field.
-    /// Hand-writable in a base `schema:` block as a source-column alias, and set
-    /// by a channel `schema` patch's `rename` op (which relabels a source column
-    /// without severing its physical binding).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_name: Option<String>,
 }
 
 /// Policy for fields a reader discovers in an input record that the
@@ -2029,7 +1985,13 @@ nodes:
 
         // SourceBody inner flatten.
         if let PipelineNode::Source { config, .. } = &doc2.nodes[0].value {
-            assert!(!config.schema.columns.is_empty());
+            assert!(
+                !config
+                    .schema
+                    .as_columns()
+                    .expect("single-record")
+                    .is_empty()
+            );
         } else {
             panic!("expected source");
         }
@@ -2589,11 +2551,16 @@ nodes:
 
     /// Extract the declared columns of the first source node in a parsed
     /// pipeline document.
-    fn source_columns(doc: &crate::config::PipelineConfig) -> &[ColumnDecl] {
+    fn source_columns(doc: &crate::config::PipelineConfig) -> &[clinker_format::Column] {
         doc.nodes
             .iter()
             .find_map(|spanned| match &spanned.value {
-                PipelineNode::Source { config, .. } => Some(config.schema.columns.as_slice()),
+                PipelineNode::Source { config, .. } => Some(
+                    config
+                        .schema
+                        .as_columns()
+                        .expect("single-record source schema"),
+                ),
                 _ => None,
             })
             .expect("source node present")
@@ -2619,8 +2586,8 @@ nodes:
         let doc: crate::config::PipelineConfig =
             crate::yaml::from_str(yaml).expect("pipeline parses");
         let cols = source_columns(&doc);
-        assert!(cols[0].long_unique, "flagged column carries the hint");
-        assert!(!cols[1].long_unique, "unflagged column defaults false");
+        assert!(cols[0].is_long_unique(), "flagged column carries the hint");
+        assert!(!cols[1].is_long_unique(), "unflagged column defaults false");
     }
 
     /// Omitting the flag defaults it to false — the pre-existing YAML shape is
@@ -2642,7 +2609,7 @@ nodes:
 "#;
         let doc: crate::config::PipelineConfig =
             crate::yaml::from_str(yaml).expect("pipeline parses");
-        assert!(!source_columns(&doc)[0].long_unique);
+        assert!(!source_columns(&doc)[0].is_long_unique());
     }
 
     /// A `false` flag serializes to byte-identical output as a column that
@@ -2650,12 +2617,7 @@ nodes:
     /// columns wire-identical to pre-flag schemas.
     #[test]
     fn column_decl_unflagged_serializes_without_key() {
-        let plain = ColumnDecl {
-            name: "uuid".to_string(),
-            ty: cxl::typecheck::Type::String,
-            long_unique: false,
-            source_name: None,
-        };
+        let plain = clinker_format::Column::bare("uuid", cxl::typecheck::Type::String);
         let json = serde_json::to_string(&plain).expect("serialize");
         assert!(
             !json.contains("long_unique"),
@@ -2666,11 +2628,9 @@ nodes:
             "a column without an alias must not emit the source_name key, got: {json}"
         );
 
-        let flagged = ColumnDecl {
-            name: "uuid".to_string(),
-            ty: cxl::typecheck::Type::String,
-            long_unique: true,
-            source_name: None,
+        let flagged = clinker_format::Column {
+            long_unique: Some(true),
+            ..clinker_format::Column::bare("uuid", cxl::typecheck::Type::String)
         };
         let json = serde_json::to_string(&flagged).expect("serialize");
         assert!(

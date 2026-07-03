@@ -7,7 +7,6 @@
 use chrono::{NaiveDate, NaiveDateTime};
 use serde::{Deserialize, Serialize};
 
-use crate::schema_def::{FieldDef, FieldType};
 use crate::value::Value;
 
 /// Group-by key for SecondaryIndex and distinct dedup.
@@ -15,8 +14,10 @@ use crate::value::Value;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum GroupByKey {
     Str(Box<str>),
-    /// Used when a source column is pinned to an integer type via
-    /// `schema_pin`, so `42` and `42.0` do not collapse into one group.
+    /// Integer group key. Constructed directly by callers that already hold a
+    /// typed integer partition/row index (reshape group index, row number,
+    /// correlation index); the value-conversion path below always widens a
+    /// `Value::Integer` to `Float` so `42` and `42.0` group together.
     Int(i64),
     /// f64::to_bits() — default numeric path. -0.0 canonicalized to 0.0.
     Float(u64),
@@ -58,13 +59,6 @@ impl GroupByKey {
 pub enum GroupKeyError {
     /// NaN value in a group_by / distinct field.
     NanInGroupBy { field: String, row: u64 },
-    /// Float value in an integer-pinned field.
-    TypeMismatch {
-        field: String,
-        expected: &'static str,
-        got: &'static str,
-        row: u64,
-    },
     /// Unsupported type (e.g. Array) used as group key.
     UnsupportedType {
         field: String,
@@ -81,18 +75,6 @@ impl std::fmt::Display for GroupKeyError {
                     f,
                     "NaN in group_by field '{}' at row {} — pipeline must halt (exit code 3)",
                     field, row
-                )
-            }
-            GroupKeyError::TypeMismatch {
-                field,
-                expected,
-                got,
-                row,
-            } => {
-                write!(
-                    f,
-                    "type mismatch in group_by field '{}' at row {}: expected {}, got {}",
-                    field, row, expected, got
                 )
             }
             GroupKeyError::UnsupportedType {
@@ -114,8 +96,7 @@ impl std::error::Error for GroupKeyError {}
 
 /// Convert a Value to a GroupByKey, applying numeric normalization rules.
 ///
-/// - Default: widen Int to Float via `to_bits()` so 42 and 42.0 group together.
-/// - Integer-pinned (via `schema_pin`): use `GroupByKey::Int(i64)`, reject Float.
+/// - Int is widened to Float via `to_bits()` so 42 and 42.0 group together.
 /// - NaN → hard error.
 /// - Null → None (caller decides whether to skip or use GroupByKey::Null).
 /// - `-0.0` canonicalized to `0.0` before `to_bits()`.
@@ -123,7 +104,6 @@ impl std::error::Error for GroupKeyError {}
 pub fn value_to_group_key(
     val: &Value,
     field: &str,
-    schema_pin: Option<&FieldDef>,
     row: u64,
 ) -> Result<Option<GroupByKey>, GroupKeyError> {
     match val {
@@ -141,12 +121,7 @@ pub fn value_to_group_key(
         }
 
         Value::Integer(i) => {
-            if let Some(pin) = schema_pin
-                && pin.field_type == Some(FieldType::Integer)
-            {
-                return Ok(Some(GroupByKey::Int(*i)));
-            }
-            // Default: widen to Float
+            // Widen to Float so an integer and its float twin group together.
             Ok(Some(GroupByKey::Float((*i as f64).to_bits())))
         }
 
@@ -194,10 +169,10 @@ mod tests {
 
     #[test]
     fn test_group_by_key_int_float_unify() {
-        let int_key = value_to_group_key(&Value::Integer(42), "x", None, 0)
+        let int_key = value_to_group_key(&Value::Integer(42), "x", 0)
             .unwrap()
             .unwrap();
-        let float_key = value_to_group_key(&Value::Float(42.0), "x", None, 0)
+        let float_key = value_to_group_key(&Value::Float(42.0), "x", 0)
             .unwrap()
             .unwrap();
         assert_eq!(int_key, float_key);
@@ -205,10 +180,10 @@ mod tests {
 
     #[test]
     fn test_group_by_key_neg_zero_canonical() {
-        let pos = value_to_group_key(&Value::Float(0.0), "x", None, 0)
+        let pos = value_to_group_key(&Value::Float(0.0), "x", 0)
             .unwrap()
             .unwrap();
-        let neg = value_to_group_key(&Value::Float(-0.0), "x", None, 0)
+        let neg = value_to_group_key(&Value::Float(-0.0), "x", 0)
             .unwrap()
             .unwrap();
         assert_eq!(pos, neg);
@@ -216,7 +191,7 @@ mod tests {
 
     #[test]
     fn test_group_by_key_null_returns_none() {
-        let result = value_to_group_key(&Value::Null, "x", None, 0).unwrap();
+        let result = value_to_group_key(&Value::Null, "x", 0).unwrap();
         assert!(result.is_none());
     }
 
@@ -233,7 +208,7 @@ mod tests {
 
     #[test]
     fn test_group_by_key_nan_error() {
-        let result = value_to_group_key(&Value::Float(f64::NAN), "amount", None, 5);
+        let result = value_to_group_key(&Value::Float(f64::NAN), "amount", 5);
         assert!(result.is_err());
         match result.unwrap_err() {
             GroupKeyError::NanInGroupBy { field, row } => {
@@ -247,7 +222,7 @@ mod tests {
     #[test]
     fn test_group_by_key_array_unsupported() {
         let arr = Value::Array(vec![Value::Integer(1)]);
-        let result = value_to_group_key(&arr, "tags", None, 3);
+        let result = value_to_group_key(&arr, "tags", 3);
         assert!(result.is_err());
         match result.unwrap_err() {
             GroupKeyError::UnsupportedType {
@@ -268,21 +243,21 @@ mod tests {
         use chrono::NaiveDate;
 
         assert!(matches!(
-            value_to_group_key(&Value::String("x".into()), "f", None, 0).unwrap(),
+            value_to_group_key(&Value::String("x".into()), "f", 0).unwrap(),
             Some(GroupByKey::Str(_))
         ));
         assert!(matches!(
-            value_to_group_key(&Value::Bool(true), "f", None, 0).unwrap(),
+            value_to_group_key(&Value::Bool(true), "f", 0).unwrap(),
             Some(GroupByKey::Bool(true))
         ));
         let d = NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
         assert!(matches!(
-            value_to_group_key(&Value::Date(d), "f", None, 0).unwrap(),
+            value_to_group_key(&Value::Date(d), "f", 0).unwrap(),
             Some(GroupByKey::Date(_))
         ));
         let dt = d.and_hms_opt(10, 0, 0).unwrap();
         assert!(matches!(
-            value_to_group_key(&Value::DateTime(dt), "f", None, 0).unwrap(),
+            value_to_group_key(&Value::DateTime(dt), "f", 0).unwrap(),
             Some(GroupByKey::DateTime(_))
         ));
     }
@@ -313,36 +288,10 @@ mod tests {
     }
 
     #[test]
-    fn test_group_by_key_integer_pin() {
-        let mut pin = FieldDef {
-            name: "x".into(),
-            field_type: Some(FieldType::Integer),
-            required: None,
-            format: None,
-            coerce: None,
-            default: None,
-            allowed_values: None,
-            alias: None,
-            inherits: None,
-            start: None,
-            width: None,
-            end: None,
-            justify: None,
-            pad: None,
-            trim: None,
-            truncation: None,
-            precision: None,
-            scale: None,
-            path: None,
-        };
-        let key = value_to_group_key(&Value::Integer(42), "x", Some(&pin), 0)
-            .unwrap()
-            .unwrap();
-        assert_eq!(key, GroupByKey::Int(42));
-
-        // Without integer pin, integer widens to float
-        pin.field_type = None;
-        let key = value_to_group_key(&Value::Integer(42), "x", Some(&pin), 0)
+    fn test_group_by_key_integer_widens_to_float() {
+        // An integer value always widens to the Float key so `42` and `42.0`
+        // land in the same group.
+        let key = value_to_group_key(&Value::Integer(42), "x", 0)
             .unwrap()
             .unwrap();
         assert!(matches!(key, GroupByKey::Float(_)));

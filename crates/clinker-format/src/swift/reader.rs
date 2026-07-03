@@ -30,6 +30,7 @@ use indexmap::IndexMap;
 
 use crate::envelope::{EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, FrameRole};
 use crate::error::FormatError;
+use crate::schema::Column;
 use crate::swift::tokenizer::{
     BlockTokenizer, ParsedBlock, ParsedBlock4Line, TEXT_BLOCK_ID, split_block4,
 };
@@ -38,6 +39,7 @@ use crate::swift::{
     DEFAULT_USER_HEADER_SECTION,
 };
 use crate::traits::FormatReader;
+use cxl::typecheck::Type;
 
 /// Default ceiling on the number of block-4 field lines a single message may
 /// carry. A message with more `:tag:value` lines than this is rejected with
@@ -328,11 +330,30 @@ fn block_section_value(body: &str) -> Value {
     Value::Map(Box::new(fields))
 }
 
-/// Build the static `[block, tag, value]` schema. All columns are
-/// string-typed; tag and value text is stored verbatim so the round-trip is
-/// lossless.
+/// The engine-synthesized columns for a SWIFT `Generated` source: the fixed
+/// `[block, tag, value]` triple, every column `string`-typed. Unlike the
+/// element-positional EDI formats, SWIFT's column set is constant (one record
+/// per block-4 `:tag:value` line), independent of any count option. Single
+/// source of truth for the SWIFT schema — the runtime reader's [`build_schema`]
+/// derives its column names from this list, and the planner seeds the
+/// compile-time bind of a [`SourceSchema::Generated`](crate::SourceSchema)
+/// SWIFT source from the same list.
+pub fn generated_columns() -> Vec<Column> {
+    vec![
+        Column::bare("block", Type::String),
+        Column::bare("tag", Type::String),
+        Column::bare("value", Type::String),
+    ]
+}
+
+/// Build the static `[block, tag, value]` schema. Column names come from
+/// [`generated_columns`]; tag and value text is stored verbatim so the
+/// round-trip is lossless.
 fn build_schema() -> Arc<Schema> {
-    let columns: Vec<Box<str>> = vec![Box::from("block"), Box::from("tag"), Box::from("value")];
+    let columns = generated_columns()
+        .into_iter()
+        .map(|c| c.name.into_boxed_str())
+        .collect();
     Arc::new(Schema::new(columns))
 }
 

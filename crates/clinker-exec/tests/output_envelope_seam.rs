@@ -471,8 +471,7 @@ nodes:
       path: out.txt
       reconstruct_envelope: true
       schema:
-        fields:
-          - { name: amount, width: 10 }
+        - { name: amount, type: int, width: 10 }
       options:
         envelope:
           footer_from_doc: Foot

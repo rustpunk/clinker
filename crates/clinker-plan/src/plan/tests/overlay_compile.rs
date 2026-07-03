@@ -251,3 +251,224 @@ fn plain_pipeline_without_overlay_is_unaffected() {
     );
     assert_eq!(inputs_of(&plan, "sink"), vec!["normalize"]);
 }
+
+// ── per-attribute schema provenance ───────────────────────────────────────
+
+/// Guard against value/provenance drift: for every attribute of every resolved
+/// single-record source column, the bound-schema value must equal the schema
+/// provenance winning value. This is the invariant the whole side-table exists
+/// to uphold, checked over an arbitrary compiled plan.
+fn assert_schema_provenance_invariant(plan: &CompiledPlan) {
+    use crate::config::composition::{SchemaAttr, column_attrs};
+    use clinker_format::SourceSchema;
+
+    let db = plan.schema_provenance();
+    for (source, schema) in plan.bound_schemas() {
+        let SourceSchema::Columns(cols) = schema else {
+            continue;
+        };
+        for col in cols {
+            for (attr, json) in column_attrs(col) {
+                let resolved = db.get(source, &col.name, attr).unwrap_or_else(|| {
+                    panic!(
+                        "missing schema provenance leaf {source}.{}.{attr}",
+                        col.name
+                    )
+                });
+                assert_eq!(
+                    resolved.value,
+                    SchemaAttr::Value(json),
+                    "value/provenance drift at {source}.{}.{attr}",
+                    col.name,
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn plain_compile_seeds_base_and_upholds_invariant() {
+    let plan = compile_with_ops(Vec::new()).expect("plain pipeline compiles");
+    assert_schema_provenance_invariant(&plan);
+    // With no overlay, every attribute is attributed to Base.
+    let db = plan.schema_provenance();
+    let amount_type = db
+        .get("orders", "amount", "type")
+        .expect("amount.type leaf");
+    assert_eq!(
+        amount_type.winning_layer().unwrap().kind,
+        crate::config::composition::SchemaLayer::Base,
+    );
+}
+
+/// A channel-wide `patch_schema` op that retypes `amount` to float and adds a
+/// `scale` — the two edits must both land, attribute to Channel, and keep the
+/// value/provenance invariant.
+#[test]
+fn channel_patch_schema_attributes_to_channel_and_records_span() {
+    use crate::config::composition::SchemaLayer;
+
+    let op = parse_op(
+        r#"
+op: patch_schema
+target: orders
+schema:
+  amount: { type: float, scale: 2 }
+"#,
+    );
+    let op_line = op.referenced.line() as u32;
+    assert!(op_line > 0, "op should carry a real source line");
+
+    let plan = compile_with_ops(vec![LayeredOp::new(OverlayLayer::ChannelWide, op)])
+        .expect("overlay plan compiles");
+
+    // Resolved schema reflects both edits.
+    let db = plan.schema_provenance();
+    let ty = db.get("orders", "amount", "type").expect("amount.type");
+    assert_eq!(ty.winning_layer().unwrap().kind, SchemaLayer::Channel);
+    assert_eq!(
+        ty.winning_layer().unwrap().span.synthetic_line_number(),
+        Some(op_line)
+    );
+    // The shadowed Base value is still the original declared type.
+    assert_eq!(
+        ty.layer_value(SchemaLayer::Base),
+        Some(&crate::config::composition::SchemaAttr::Value(
+            serde_json::to_value(cxl::typecheck::Type::Int).unwrap()
+        ))
+    );
+
+    let scale = db.get("orders", "amount", "scale").expect("amount.scale");
+    assert_eq!(scale.winning_layer().unwrap().kind, SchemaLayer::Channel);
+
+    // The whole plan still upholds the value/provenance invariant.
+    assert_schema_provenance_invariant(&plan);
+}
+
+/// `explain --field <source>.<column>.<attribute>` renders the winning layer,
+/// its value, and its source span.
+#[test]
+fn explain_field_renders_schema_attribute_provenance() {
+    let op = parse_op(
+        r#"
+op: patch_schema
+target: orders
+schema:
+  amount: { type: float }
+"#,
+    );
+    let op_line = op.referenced.line() as u32;
+    let plan = compile_with_ops(vec![LayeredOp::new(OverlayLayer::ChannelWide, op)])
+        .expect("overlay plan compiles");
+
+    let out =
+        crate::plan::explain_provenance::explain_field_provenance(&plan, "orders.amount.type")
+            .expect("schema field resolves");
+    assert!(out.contains("orders.amount.type"), "{out}");
+    assert!(out.contains("[WON] Channel"), "winner layer shown: {out}");
+    assert!(out.contains("Base"), "shadowed base shown: {out}");
+    assert!(
+        out.contains(&format!("line {op_line}")),
+        "span shown: {out}"
+    );
+}
+
+/// A `remove` op must not leave a stale resolved value for the removed column:
+/// its attribute leaves are dropped, and `explain --field` reports the attribute
+/// as absent rather than a live type from the shadowed Base seed.
+#[test]
+fn removed_column_has_no_stale_provenance() {
+    // A source with an unreferenced `order_notes` column the transform never
+    // emits, so removing it does not break downstream CXL.
+    const WITH_SPARE: &str = r#"
+pipeline:
+  name: overlay_remove
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: order_id, type: string }
+        - { name: amount, type: int }
+        - { name: order_notes, type: string }
+  - type: transform
+    name: normalize
+    input: orders
+    config:
+      cxl: "emit order_id = order_id\nemit amount = amount"
+  - type: output
+    name: sink
+    input: normalize
+    config:
+      name: sink
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(WITH_SPARE).expect("parse config");
+    let op = parse_op(
+        r#"
+op: patch_schema
+target: orders
+schema:
+  order_notes: remove
+"#,
+    );
+    let ctx = CompileContext {
+        overlay_ops: vec![LayeredOp::new(OverlayLayer::ChannelWide, op)],
+        ..CompileContext::default()
+    };
+    let plan = config.compile(&ctx).expect("overlay plan compiles");
+
+    // The removed column carries no resolved attribute leaf...
+    assert!(
+        plan.schema_provenance()
+            .get("orders", "order_notes", "type")
+            .is_none(),
+        "removed column must not carry a resolved type leaf",
+    );
+    // ...and `explain --field` on it errors rather than reporting a live value.
+    assert!(
+        crate::plan::explain_provenance::explain_field_provenance(&plan, "orders.order_notes.type")
+            .is_err(),
+        "explain must not report a value for a removed column",
+    );
+    // The invariant still holds over the surviving columns.
+    assert_schema_provenance_invariant(&plan);
+}
+
+// ── numeric enforcement ───────────────────────────────────────────────────
+
+#[test]
+fn numeric_source_column_type_is_rejected() {
+    const NUMERIC_SRC: &str = r#"
+pipeline:
+  name: numeric_reject
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: amount, type: numeric }
+  - type: output
+    name: sink
+    input: orders
+    config:
+      name: sink
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(NUMERIC_SRC).expect("parse numeric config");
+    let diags = config
+        .compile(&CompileContext::default())
+        .expect_err("a `numeric` source column must be rejected");
+    assert!(
+        diags.iter().any(|d| d.code == "E158"),
+        "expected E158 for non-concrete numeric, got: {diags:?}",
+    );
+}

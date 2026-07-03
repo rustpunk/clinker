@@ -590,28 +590,27 @@ evidence.
   override merger remains. The `decimal` type token is retired: a decimal is a
   `float` field carrying `precision`/`scale` attributes, so the format-layer
   `FieldType` and the CXL `Type` vocabularies agree on the fractional type.
-- Still open (intended for the schema-resolver-provenance follow-on): the two
-  per-source schema representations have NOT been merged. The format-layer
-  `FieldDef` list still resolves lazily at ingest
-  (`clinker-exec/src/executor/ingest.rs` → `schema::resolve_schema`/`resolve_records`,
-  the `inherits:` template merge in `schema/mod.rs`), while the type-layer
-  `ColumnDecl` list binds at compile in `bind_schema`; `CompiledPlan` carries no
-  single fully-resolved schema per source. The executable
-  `FieldType -> cxl::typecheck::Type` bridge is deliberately NOT added yet — no
-  safe consumer exists in the current shape (fixtures such as
-  `benches/pipelines/format/fixed_width_passthrough.yaml` and the
-  `format_dispatch` fixed-width test deliberately declare a source's
-  `format_schema` field type and its `schema:` `ColumnDecl` type differently, so
-  a reconciling check would break green). The `numeric` "never survives a
-  resolved schema" invariant is likewise deferred: `type: numeric` is today a
-  live, documented (auto-widen) declared source-column type with real runtime
-  coercion semantics (`clinker-exec/src/pipeline/schema_coerce.rs` coerces a
-  `Numeric` column int-then-float per value). Concretizing a declared `numeric`
-  to `int`/`float` is a user-facing behavior change that belongs WITH the single
-  resolved schema, not bolted onto the current two-representation model.
-- Why it matters: until the two representations collapse into one resolved
-  schema on `CompiledPlan`, per-attribute schema provenance (`--explain --field`)
-  and a single authoritative source-column type cannot be built.
+- Resolved (unified-source-schema, phases 1-4): the two per-source schema
+  representations have collapsed into one `Column` / `SourceSchema`. The
+  format-layer `FieldType` / `FieldDef` byte-layout vocabulary is retired; each
+  `Column` carries one `cxl::typecheck::Type` that drives both byte parsing and
+  typecheck, and the schema resolves at compile (external `.schema.yaml` folded
+  into `source_hash`), not lazily at ingest. `CompiledPlan` carries the resolved
+  per-source schema (`bound_schemas`); per-attribute schema provenance is built
+  (`SchemaProvenanceDb`, `--explain --field <source>.<column>.<attr>`); and the
+  `numeric` "never survives a resolved schema" invariant is enforced — a declared
+  `type: numeric` that has not been concretized is rejected at compile (E158),
+  and the `numeric` user-doc examples now declare concrete `int`/`float`. The
+  EDI-family `generated` schema synthesizes its positional columns
+  (`seg_id`/`e01…`/`f01…`/`block,tag,value`) at compile from the format's count
+  options via `clinker_format::*_generated_columns` — the same functions the
+  runtime readers build their schema from — so a Generated source's typechecked
+  row matches the emitted records (E159 rejects `generated` on a non-EDI format).
+  The one remaining follow-on is the authoring-time `numeric -> int|float`
+  inference path (`clinker guess`, unbuilt).
+- Why it matters: a single authoritative source-column type now backs both byte
+  parsing and CXL typecheck; `numeric` is an inference-only union that must be
+  resolved before it reaches the compiled plan.
 - Files/modules involved: `crates/clinker-plan/src/schema/mod.rs`,
   `crates/clinker-plan/src/config/patch.rs`,
   `crates/clinker-plan/src/plan/bind_schema.rs`,

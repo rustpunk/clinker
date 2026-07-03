@@ -457,7 +457,7 @@ impl HashAggregator {
                 .get(*idx as usize)
                 .cloned()
                 .unwrap_or(Value::Null);
-            match value_to_group_key(&val, field_name, None, ctx.source_row) {
+            match value_to_group_key(&val, field_name, ctx.source_row) {
                 Ok(Some(gk)) => key.push(gk),
                 Ok(None) => key.push(GroupByKey::Null),
                 Err(e) => {
@@ -693,7 +693,7 @@ impl HashAggregator {
                 .get(*idx as usize)
                 .cloned()
                 .unwrap_or(Value::Null);
-            match value_to_group_key(&val, field_name, None, ctx.source_row) {
+            match value_to_group_key(&val, field_name, ctx.source_row) {
                 Ok(Some(gk)) => key.push(gk),
                 Ok(None) => key.push(GroupByKey::Null),
                 Err(e) => {

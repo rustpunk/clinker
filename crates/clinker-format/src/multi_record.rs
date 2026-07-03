@@ -28,15 +28,15 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use clinker_record::schema_def::{
-    Discriminator, FieldDef, FieldType, Justify, LineSeparator, RecordTypeDef, StructureConstraint,
-};
+use clinker_record::schema_def::{Justify, LineSeparator};
 use clinker_record::{Record, Schema, SchemaBuilder, Value};
+use cxl::typecheck::Type;
 
 use crate::bom::SkipBom;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
 use crate::error::FormatError;
 use crate::fixed_width::field::{self, ResolvedField};
+use crate::schema::{Column, Discriminator, RecordType, StructureConstraint};
 use crate::traits::FormatReader;
 
 /// The lead column of the superset schema, carrying the matched record type's
@@ -45,7 +45,9 @@ use crate::traits::FormatReader;
 ///
 /// Reserved: a record type may not declare a field of this name, or its raw
 /// value would overwrite the stamped type id and silently misroute every row.
-pub const RECORD_TYPE_COLUMN: &str = "record_type";
+/// Aliased to the shared [`crate::schema::RECORD_TYPE_COLUMN`] so the reader's
+/// lead column and the planner's multi-record superset cannot drift apart.
+pub const RECORD_TYPE_COLUMN: &str = crate::schema::RECORD_TYPE_COLUMN;
 
 /// CSV dialect for the multi-record reader.
 pub struct CsvDialect {
@@ -86,7 +88,7 @@ struct TypeField {
     column: usize,
     /// The field's name (keys header pre-scan and trailer pairs).
     name: String,
-    field_type: Option<FieldType>,
+    ty: Type,
     format: Option<String>,
     /// Fixed-width byte-positioned field, or `None` for a CSV field.
     fixed: Option<ResolvedField>,
@@ -184,7 +186,7 @@ pub struct MultiRecordSpec {
     /// How each line's record type is identified.
     pub discriminator: Discriminator,
     /// The resolved record types — each with its tag and per-field layout.
-    pub record_types: Vec<RecordTypeDef>,
+    pub record_types: Vec<RecordType>,
     /// Trailer structural-count constraints validated at document close.
     pub structure: Vec<StructureConstraint>,
     /// Header record-type tags captured by the pre-scan (the `record_type`
@@ -656,7 +658,7 @@ impl<R: Read + Send> FormatReader for MultiRecordReader<R> {
 
 /// Resolve the fixed-width superset schema, tag map, and record length.
 fn resolve_fixed_width(
-    record_types: &[RecordTypeDef],
+    record_types: &[RecordType],
     disc_start: usize,
     disc_width: usize,
 ) -> Result<ResolvedBackend, FormatError> {
@@ -665,16 +667,16 @@ fn resolve_fixed_width(
     for rt in record_types {
         let tag = require_tag(&rt.tag, &rt.id).map_err(FormatError::FixedWidth)?;
         let id: Arc<str> = Arc::from(rt.id.as_str());
-        let mut fields = Vec::with_capacity(rt.fields.len());
-        for f in &rt.fields {
+        let mut fields = Vec::with_capacity(rt.columns.len());
+        for f in &rt.columns {
             reject_record_type_field(&f.name).map_err(FormatError::FixedWidth)?;
-            let resolved = ResolvedField::from_field_def(f)?;
+            let resolved = ResolvedField::from_column(f)?;
             record_length = record_length.max(resolved.end());
             let column = builder.intern(f).map_err(FormatError::FixedWidth)?;
             fields.push(TypeField {
                 column,
                 name: f.name.clone(),
-                field_type: f.field_type.clone(),
+                ty: f.ty.clone(),
                 format: f.format.clone(),
                 fixed: Some(resolved),
                 csv_column: None,
@@ -697,7 +699,7 @@ fn resolve_fixed_width(
 
 /// Resolve the CSV superset schema, tag map, and the discriminator column index.
 fn resolve_csv(
-    record_types: &[RecordTypeDef],
+    record_types: &[RecordType],
     disc_field: &str,
 ) -> Result<ResolvedBackend, FormatError> {
     let mut builder = SupersetBuilder::new();
@@ -706,7 +708,7 @@ fn resolve_csv(
         let tag = require_tag(&rt.tag, &rt.id).map_err(|m| FormatError::Csv(csv_error(&m)))?;
         let id: Arc<str> = Arc::from(rt.id.as_str());
         let local = rt
-            .fields
+            .columns
             .iter()
             .position(|f| f.name == disc_field)
             .ok_or_else(|| {
@@ -728,8 +730,8 @@ fn resolve_csv(
             }
             Some(_) => {}
         }
-        let mut fields = Vec::with_capacity(rt.fields.len());
-        for (csv_idx, f) in rt.fields.iter().enumerate() {
+        let mut fields = Vec::with_capacity(rt.columns.len());
+        for (csv_idx, f) in rt.columns.iter().enumerate() {
             reject_record_type_field(&f.name).map_err(|m| FormatError::Csv(csv_error(&m)))?;
             let column = builder
                 .intern(f)
@@ -737,7 +739,7 @@ fn resolve_csv(
             fields.push(TypeField {
                 column,
                 name: f.name.clone(),
-                field_type: f.field_type.clone(),
+                ty: f.ty.clone(),
                 format: f.format.clone(),
                 fixed: None,
                 csv_column: Some(csv_idx),
@@ -769,7 +771,7 @@ struct SupersetBuilder {
     columns: Vec<String>,
     column_index: HashMap<String, usize>,
     /// Declared type of each named column, to reject an incompatible re-use.
-    column_type: HashMap<String, Option<FieldType>>,
+    column_type: HashMap<String, Type>,
     by_tag: HashMap<String, ResolvedType>,
 }
 
@@ -787,22 +789,25 @@ impl SupersetBuilder {
 
     /// Intern a field name into the shared superset column list, returning its
     /// index. A name shared across record types maps to one column — but only
-    /// when the declared types match; two types declaring the same field name
-    /// with incompatible types would corrupt one shared slot, so that is an
-    /// error.
+    /// when the two declared types unify; two types declaring the same field
+    /// name with types that cannot unify (e.g. `string` vs `int`) would corrupt
+    /// one shared slot, so that is an error. Unification (not exact equality) is
+    /// the compatibility rule, so a numeric widening (`int` vs `float`) is
+    /// accepted.
     ///
     /// # Errors
     ///
-    /// Returns a message when a same-named field is re-declared with a
-    /// different type.
-    fn intern(&mut self, f: &FieldDef) -> Result<usize, String> {
+    /// Returns a message when a same-named field is re-declared with a type
+    /// that does not unify with its prior declaration.
+    fn intern(&mut self, f: &Column) -> Result<usize, String> {
         if let Some(&idx) = self.column_index.get(&f.name) {
-            let prior = self.column_type.get(&f.name).cloned().flatten();
-            if prior != f.field_type {
+            if let Some(prior) = self.column_type.get(&f.name)
+                && prior.unify(&f.ty).is_none()
+            {
                 return Err(format!(
                     "field '{}' is declared by more than one record type with incompatible \
-                     types ({prior:?} vs {:?}); a shared superset column must have one type",
-                    f.name, f.field_type
+                     types ({prior} vs {}); a shared superset column must have unifiable types",
+                    f.name, f.ty
                 ));
             }
             return Ok(idx);
@@ -810,8 +815,7 @@ impl SupersetBuilder {
         let idx = self.columns.len();
         self.columns.push(f.name.clone());
         self.column_index.insert(f.name.clone(), idx);
-        self.column_type
-            .insert(f.name.clone(), f.field_type.clone());
+        self.column_type.insert(f.name.clone(), f.ty.clone());
         Ok(idx)
     }
 
@@ -878,15 +882,12 @@ fn extract_field_value(tf: &TypeField, line: &ScannedLine, row: u64) -> Result<V
     if raw.is_empty() {
         return Ok(Value::Null);
     }
-    match &tf.field_type {
-        None | Some(FieldType::String) => Ok(Value::String(raw.as_str().into())),
-        Some(ty) => field::coerce_scalar(ty, tf.format.as_deref(), &raw).map_err(|m| {
-            FormatError::InvalidRecord {
-                row,
-                message: format!("field '{}': {m}", tf.name),
-            }
-        }),
-    }
+    field::coerce_scalar(&tf.ty, tf.format.as_deref(), &raw).map_err(|m| {
+        FormatError::InvalidRecord {
+            row,
+            message: format!("field '{}': {m}", tf.name),
+        }
+    })
 }
 
 /// A field's raw (un-coerced) text from a scanned line, stripped of padding
@@ -960,45 +961,26 @@ mod tests {
     use crate::envelope::EnvelopeSection;
     use std::io::Cursor;
 
-    fn fw_field(name: &str, start: usize, width: usize, ty: Option<FieldType>) -> FieldDef {
-        FieldDef {
-            name: name.into(),
-            field_type: ty,
-            required: None,
-            format: None,
-            coerce: None,
-            default: None,
-            allowed_values: None,
-            alias: None,
-            inherits: None,
+    fn fw_field(name: &str, start: usize, width: usize, ty: Type) -> Column {
+        Column {
             start: Some(start),
             width: Some(width),
-            end: None,
-            justify: None,
-            pad: None,
-            trim: None,
-            truncation: None,
-            precision: None,
-            scale: None,
-            path: None,
+            ..Column::bare(name, ty)
         }
     }
 
-    fn csv_field(name: &str, ty: Option<FieldType>) -> FieldDef {
-        let mut f = fw_field(name, 0, 1, ty);
-        f.start = None;
-        f.width = None;
-        f
+    fn csv_field(name: &str, ty: Type) -> Column {
+        Column::bare(name, ty)
     }
 
-    fn rtype(id: &str, tag: &str, fields: Vec<FieldDef>) -> RecordTypeDef {
-        RecordTypeDef {
+    fn rtype(id: &str, tag: &str, columns: Vec<Column>) -> RecordType {
+        RecordType {
             id: id.into(),
             tag: tag.into(),
             description: None,
             parent: None,
             join_key: None,
-            fields,
+            columns,
         }
     }
 
@@ -1018,28 +1000,24 @@ mod tests {
         }
     }
 
-    fn fw_types() -> Vec<RecordTypeDef> {
+    fn fw_types() -> Vec<RecordType> {
         vec![
-            rtype("header", "H", vec![fw_field("batch", 1, 9, None)]),
+            rtype("header", "H", vec![fw_field("batch", 1, 9, Type::String)]),
             rtype(
                 "detail",
                 "D",
                 vec![
-                    fw_field("id", 1, 5, Some(FieldType::Integer)),
-                    fw_field("amount", 6, 4, Some(FieldType::Integer)),
+                    fw_field("id", 1, 5, Type::Int),
+                    fw_field("amount", 6, 4, Type::Int),
                 ],
             ),
-            rtype(
-                "trailer",
-                "T",
-                vec![fw_field("count", 1, 5, Some(FieldType::Integer))],
-            ),
+            rtype("trailer", "T", vec![fw_field("count", 1, 5, Type::Int)]),
         ]
     }
 
     fn fw_reader<R: Read>(
         reader: R,
-        types: Vec<RecordTypeDef>,
+        types: Vec<RecordType>,
         structure: Vec<StructureConstraint>,
         header_tags: Vec<String>,
     ) -> Result<MultiRecordReader<R>, FormatError> {
@@ -1233,7 +1211,7 @@ mod tests {
         let types = vec![rtype(
             "detail",
             "D",
-            vec![fw_field("record_type", 1, 1, None)],
+            vec![fw_field("record_type", 1, 1, Type::String)],
         )];
         let err = match fw_reader(&b""[..], types, Vec::new(), Vec::new()) {
             Ok(_) => panic!("expected a reserved-name error"),
@@ -1245,8 +1223,8 @@ mod tests {
     #[test]
     fn duplicate_tag_is_rejected() {
         let types = vec![
-            rtype("a", "D", vec![fw_field("x", 1, 3, None)]),
-            rtype("b", "D", vec![fw_field("y", 1, 3, None)]),
+            rtype("a", "D", vec![fw_field("x", 1, 3, Type::String)]),
+            rtype("b", "D", vec![fw_field("y", 1, 3, Type::String)]),
         ];
         let err = match fw_reader(&b""[..], types, Vec::new(), Vec::new()) {
             Ok(_) => panic!("expected a duplicate-tag error"),
@@ -1260,16 +1238,8 @@ mod tests {
         // `ref` is string in one type, integer in another — one shared column
         // cannot carry both.
         let types = vec![
-            rtype(
-                "a",
-                "A",
-                vec![fw_field("ref", 1, 4, Some(FieldType::String))],
-            ),
-            rtype(
-                "b",
-                "B",
-                vec![fw_field("ref", 1, 4, Some(FieldType::Integer))],
-            ),
+            rtype("a", "A", vec![fw_field("ref", 1, 4, Type::String)]),
+            rtype("b", "B", vec![fw_field("ref", 1, 4, Type::Int)]),
         ];
         let err = match fw_reader(&b""[..], types, Vec::new(), Vec::new()) {
             Ok(_) => panic!("expected an incompatible-type error"),
@@ -1296,10 +1266,10 @@ mod tests {
         // A left-justified field padded with the multi-char string "ab":
         // "42abab" strips trailing "ab" runs as a unit → "42". The old reader
         // honored only the first pad char, so a multi-char pad leaked.
-        let mut field = fw_field("v", 0, 6, Some(FieldType::Integer));
+        let mut field = fw_field("v", 0, 6, Type::Int);
         field.justify = Some(Justify::Left);
         field.pad = Some("ab".into());
-        let resolved = ResolvedField::from_field_def(&field).unwrap();
+        let resolved = ResolvedField::from_column(&field).unwrap();
         let v = field::extract_value(&resolved, b"42abab", 1).unwrap();
         assert_eq!(v, Value::Integer(42));
     }
@@ -1311,23 +1281,26 @@ mod tests {
             rtype(
                 "header",
                 "H",
-                vec![csv_field("rec_type", None), csv_field("run_date", None)],
+                vec![
+                    csv_field("rec_type", Type::String),
+                    csv_field("run_date", Type::String),
+                ],
             ),
             rtype(
                 "detail",
                 "D",
                 vec![
-                    csv_field("rec_type", None),
-                    csv_field("id", Some(FieldType::Integer)),
-                    csv_field("amount", Some(FieldType::Integer)),
+                    csv_field("rec_type", Type::String),
+                    csv_field("id", Type::Int),
+                    csv_field("amount", Type::Int),
                 ],
             ),
             rtype(
                 "trailer",
                 "T",
                 vec![
-                    csv_field("rec_type", None),
-                    csv_field("count", Some(FieldType::Integer)),
+                    csv_field("rec_type", Type::String),
+                    csv_field("count", Type::Int),
                 ],
             ),
         ];
@@ -1362,17 +1335,17 @@ mod tests {
                 "detail",
                 "D",
                 vec![
-                    csv_field("rec_type", None),
-                    csv_field("id", Some(FieldType::Integer)),
-                    csv_field("amount", Some(FieldType::Integer)),
+                    csv_field("rec_type", Type::String),
+                    csv_field("id", Type::Int),
+                    csv_field("amount", Type::Int),
                 ],
             ),
             rtype(
                 "trailer",
                 "T",
                 vec![
-                    csv_field("rec_type", None),
-                    csv_field("count", Some(FieldType::Integer)),
+                    csv_field("rec_type", Type::String),
+                    csv_field("count", Type::Int),
                 ],
             ),
         ];
@@ -1404,8 +1377,8 @@ mod tests {
     #[test]
     fn csv_discriminator_absent_from_a_type_errors() {
         let types = vec![
-            rtype("header", "H", vec![csv_field("rec_type", None)]),
-            rtype("detail", "D", vec![csv_field("id", None)]),
+            rtype("header", "H", vec![csv_field("rec_type", Type::String)]),
+            rtype("detail", "D", vec![csv_field("id", Type::String)]),
         ];
         let result = MultiRecordReader::new_csv(
             Cursor::new(Vec::new()),

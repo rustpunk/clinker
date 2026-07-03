@@ -15,7 +15,7 @@ When an input file carries columns the source's declared `schema:` block does no
       mode: auto_widen     # default; other values: drop, reject
     schema:
       - { name: order_id, type: string }
-      - { name: amount, type: numeric }
+      - { name: amount, type: float }
 ```
 
 - **`auto_widen`** *(default)* — undeclared input fields are carried along with each record and re-expanded to top-level columns at the output (when the Output node's `include_unmapped` is left at its default of `true`). Nothing is lost, and you don't have to declare every column up front.

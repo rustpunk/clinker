@@ -1029,7 +1029,7 @@ fn partition_key(record: &Record, partition_by: &[String]) -> Vec<GroupByKey> {
             if v.is_null() || matches!(v, Value::String(s) if s.is_empty()) {
                 return GroupByKey::Null;
             }
-            clinker_record::value_to_group_key(v, f, None, idx as u64)
+            clinker_record::value_to_group_key(v, f, idx as u64)
                 .ok()
                 .flatten()
                 .unwrap_or(GroupByKey::Null)

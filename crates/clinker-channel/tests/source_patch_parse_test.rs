@@ -2,7 +2,7 @@
 //!
 //! These tests pin the on-the-wire YAML surface for the per-source patch a
 //! channel's per-target overlay carries: the schema column ops (`add` /
-//! `rename` / `retype` / `remove`), the `array_paths` ops (set-by-path /
+//! `rename` / `modify` / `remove`), the `array_paths` ops (set-by-path /
 //! `remove`), and the scalar `options` map. Applying the parsed patch to a
 //! pipeline is covered in `clinker-plan`; here we only assert that every
 //! documented form deserializes into the typed [`SourceConfigPatch`] carried on
@@ -27,7 +27,7 @@ channel:
 sources:
   transactions:
     schema:
-      amount:      { retype: float }
+      amount:      { type: float }
       cust_id:     { rename: customer_id }
       order_notes: remove
       region:      { add: { type: string } }
@@ -47,7 +47,7 @@ sources:
     // Schema ops: one of each form, in declared order.
     let schema: Vec<(&String, &SchemaColumnOp)> = patch.schema.iter().collect();
     assert_eq!(schema.len(), 4);
-    assert!(matches!(schema[0].1, SchemaColumnOp::Retype(_)));
+    assert!(matches!(schema[0].1, SchemaColumnOp::Modify(_)));
     assert!(matches!(schema[1].1, SchemaColumnOp::Rename(to) if to == "customer_id"));
     assert!(matches!(schema[2].1, SchemaColumnOp::Remove));
     assert!(matches!(schema[3].1, SchemaColumnOp::Add(_)));
@@ -89,7 +89,7 @@ channel:
 sources:
   orders:
     schema:
-      id: { retype: int }
+      id: { type: int }
   customers:
     options:
       delimiter: "|"
@@ -113,7 +113,7 @@ sources:
 "#,
     );
     match o.sources["src"].schema.get("uuid") {
-        Some(SchemaColumnOp::Add(add)) => assert!(add.long_unique),
+        Some(SchemaColumnOp::Add(add)) => assert_eq!(add.long_unique, Some(true)),
         other => panic!("expected add op, got {other:?}"),
     }
 }

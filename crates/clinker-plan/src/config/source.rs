@@ -95,13 +95,6 @@ pub struct SourceConfig {
     #[serde(skip)]
     pub declared_doc_paths: Vec<cxl::analyzer::doc_paths::DocPath>,
 
-    /// Format-layer schema pointer (e.g. fixed-width field layouts).
-    /// Distinct from the CXL-type-level `SourceBody.schema` declared
-    /// at the parent `SourceBody` scope — this one points at on-disk
-    /// format metadata, the other declares column CXL types for
-    /// compile-time typecheck.
-    #[serde(rename = "format_schema", skip_serializing_if = "Option::is_none")]
-    pub schema: Option<SchemaSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub array_paths: Option<Vec<ArrayPathConfig>>,
     /// Record-level sortedness inside the file (used by combine/aggregate
@@ -670,6 +663,32 @@ pub struct Hl7InputOptions {
     /// unless a split is declared.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split_fields: Option<Vec<Hl7FieldSplitOption>>,
+}
+
+impl Hl7InputOptions {
+    /// Resolve the declared composite-field splits to the format-native
+    /// [`clinker_format::Hl7FieldSplit`] list: each option's `fNN` field name is
+    /// parsed to its 1-based wire position, and an option whose name does not
+    /// parse is dropped defensively (config validation rejects a bad name with a
+    /// source span before this runs). Shared by the runtime reader construction
+    /// and the compile-time bind of a `SourceSchema::Generated` HL7 source, so
+    /// both observe the same split-leaf columns.
+    pub fn resolved_splits(&self) -> Vec<clinker_format::Hl7FieldSplit> {
+        self.split_fields
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|s| {
+                s.field_position()
+                    .map(|field_index| clinker_format::Hl7FieldSplit {
+                        field_index,
+                        repetitions: s.repetitions,
+                        components: s.components,
+                        subcomponents: s.subcomponents,
+                    })
+            })
+            .collect()
+    }
 }
 
 /// SWIFT MT input options.

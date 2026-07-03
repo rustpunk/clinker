@@ -233,7 +233,6 @@ impl ProgramEvaluator {
 pub(super) fn group_key_error_to_eval_error(e: GroupKeyError) -> EvalError {
     let got = match &e {
         GroupKeyError::NanInGroupBy { .. } => "NaN",
-        GroupKeyError::TypeMismatch { got, .. } => got,
         GroupKeyError::UnsupportedType { type_name, .. } => type_name,
     };
     EvalError::new(
