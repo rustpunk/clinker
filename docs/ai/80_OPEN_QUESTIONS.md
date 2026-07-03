@@ -40,27 +40,28 @@ evidence.
   document the deliberate recompile step with its invariants.
 - Priority: High
 
-### 2. Should channel `resources.default` and `resources.fixed` be implemented, rejected, or documented as reserved?
+### 2. Should the folder overlay gain a `resources:` surface and per-value `fixed`/`default` locking?
 
-- Question: What is the intended behavior for parsed channel resource overlay
-  fields when `apply_channel_overlay` currently applies config and var layers
-  but not resource overlays?
-- Why it matters: Channels are documented as overriding declared config/resource
-  surfaces only. Parsed-but-underwired resource fields can mislead future agents
-  into documenting behavior that is not implemented or adding ad hoc overlay
-  logic without preserving provenance.
-- Files/modules involved: `docs/ai/80_OPEN_QUESTIONS.md`,
-  `crates/clinker-channel/AGENTS.md`,
-  `crates/clinker-channel/src/binding.rs`,
+- Question: The folder overlay (`ChannelManifest` / `OverlayFile`) carries flat
+  `config` / `vars` / `overrides` / `sources`, but no `resources:` surface and no
+  per-value `fixed`/`default` lock. Both existed only on the retired file-based
+  channel path. Should the folder model reintroduce either, and if so with what
+  precedence/provenance semantics?
+- Why it matters: Config resolves by fixed layer precedence (higher layer wins),
+  but a lower layer cannot lock a value against a higher one. The `fixed`
+  provenance plumbing (`ResolvedValue::apply_layer_fixed`) is preserved and
+  reachable, but no overlay YAML feeds it. Resource overrides have no folder
+  surface at all.
+- Files/modules involved: `crates/clinker-channel/src/manifest.rs`,
+  `crates/clinker-channel/src/resolve.rs`,
   `crates/clinker-channel/src/overlay.rs`,
   `crates/clinker-plan/src/config/composition/resource.rs`,
-  `docs/user/src/pipelines/channels.md`,
-  `examples/pipelines/channels/`.
-- Suggested way to resolve it: Decide whether resource overlays are active
-  scope. If active, implement them with diagnostics and tests for precedence,
-  provenance, and composition boundaries. If future-only, reject or warn on the
-  fields and document them as reserved.
-- Priority: High
+  `docs/user/src/pipelines/channels.md`.
+- Suggested way to resolve it: Decide whether a `fixed:` lock and a `resources:`
+  overlay are active scope for the folder model. If active, wire them at the
+  layer boundary with diagnostics and precedence/provenance tests; if future-only,
+  document them as reserved.
+- Priority: Medium
 
 ### 3. Should pipeline-target channel config keys be validated before overlay application?
 

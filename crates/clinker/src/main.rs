@@ -878,11 +878,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // drive selector-derived group membership); `--group <name>` force-includes
     // a group regardless of selector. An empty request (no channel, no groups)
     // resolves to nothing, keeping a plain run byte-identical.
-    let target_name = args
-        .config
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
+    // Strip the full `.comp.yaml` / `.yaml` suffix (not just the last extension)
+    // so a composition target `score.comp.yaml` resolves to the bare stem the
+    // discovery layer expects — matching `channels resolve` / `channels lint`.
+    let target_name = target_stem_of(&args.config.to_string_lossy());
     let overlay_resolution = if args.channel.is_none() && args.groups.is_empty() {
         None
     } else {
@@ -891,7 +890,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 &workspace_root,
                 &channel_layout,
                 &group_layout,
-                target_name,
+                &target_name,
                 args.channel.as_deref(),
                 &args.groups,
                 !args.no_auto_groups,
@@ -2389,10 +2388,9 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
     // clobber apply before provenance is computed, mirroring `run`.
     let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
         .map_err(|e| format!("clinker.toml: {e}"))?;
-    let target_name = config_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or_default();
+    // Strip the full `.comp.yaml` / `.yaml` suffix so a composition target
+    // resolves to the bare stem the discovery layer expects, mirroring `run`.
+    let target_name = target_stem_of(&config_path.to_string_lossy());
     let overlay_resolution = if args.channel.is_none() && args.groups.is_empty() {
         None
     } else {
@@ -2401,7 +2399,7 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
                 &workspace_root,
                 &clinker_toml.channel,
                 &clinker_toml.group,
-                target_name,
+                &target_name,
                 args.channel.as_deref(),
                 &args.groups,
                 !args.no_auto_groups,
