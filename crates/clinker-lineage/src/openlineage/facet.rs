@@ -122,6 +122,103 @@ impl PipelineJobFacet {
     }
 }
 
+/// The standard OpenLineage error-message run facet.
+///
+/// Attached to a `FAIL` [`RunEvent`](super::event::RunEvent)'s
+/// [`Run`](super::event::Run) to carry the failure's message. Unlike the
+/// clinker-defined facets, this is an OpenLineage standard facet; its
+/// `_schemaURL` points at `openlineage.io`, pinned to `ErrorMessageRunFacet`
+/// `1-0-0`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorMessageRunFacet {
+    /// URI of the software that produced this facet.
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    /// Schema URL of the facet spec this conforms to.
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    /// Human-readable failure message.
+    pub message: String,
+    /// The producer's implementation language. The spec keeps this free-form;
+    /// clinker stamps `rust`.
+    #[serde(rename = "programmingLanguage")]
+    pub programming_language: String,
+    /// Optional stack trace or extended diagnostic detail. Clinker's runtime
+    /// errors carry no captured backtrace, so this is normally omitted.
+    #[serde(rename = "stackTrace", skip_serializing_if = "Option::is_none")]
+    pub stack_trace: Option<String>,
+}
+
+impl ErrorMessageRunFacet {
+    /// An error facet stamped with the clinker [`PRODUCER`], the standard
+    /// [`ERROR_MESSAGE_FACET_SCHEMA_URL`], and `programmingLanguage = "rust"`.
+    ///
+    /// [`PRODUCER`]: super::PRODUCER
+    /// [`ERROR_MESSAGE_FACET_SCHEMA_URL`]: super::ERROR_MESSAGE_FACET_SCHEMA_URL
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            producer: super::PRODUCER.to_string(),
+            schema_url: super::ERROR_MESSAGE_FACET_SCHEMA_URL.to_string(),
+            message: message.into(),
+            programming_language: "rust".to_string(),
+            stack_trace: None,
+        }
+    }
+}
+
+/// A clinker-specific run facet carrying whole-run record counts and timing.
+///
+/// OpenLineage defines no standard run-level record-count facet, so — like
+/// [`PipelineJobFacet`] — this is a producer-defined facet whose `_schemaURL`
+/// points at the clinker producer. The counts are pipeline-wide run totals, not
+/// per-output: the executor does not surface per-output record attribution, so a
+/// single run-level count is the honest granularity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunStatsFacet {
+    /// URI of the software that produced this facet.
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    /// Schema URL of the facet spec this conforms to (clinker-owned).
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    /// Total records read across all sources.
+    #[serde(rename = "recordsRead")]
+    pub records_read: u64,
+    /// Total records written across all sinks. Exceeds `recordsRead` under
+    /// inclusive route fan-out or multi-output sinks.
+    #[serde(rename = "recordsWritten")]
+    pub records_written: u64,
+    /// Records routed to the dead-letter queue.
+    #[serde(rename = "recordsDlq")]
+    pub records_dlq: u64,
+    /// Wall-clock run duration in milliseconds (`finished_at - started_at`).
+    #[serde(rename = "durationMs")]
+    pub duration_ms: i64,
+}
+
+impl RunStatsFacet {
+    /// A run-stats facet stamped with the clinker [`PRODUCER`] and
+    /// [`CLINKER_RUN_STATS_FACET_SCHEMA_URL`].
+    ///
+    /// [`PRODUCER`]: super::PRODUCER
+    /// [`CLINKER_RUN_STATS_FACET_SCHEMA_URL`]: super::CLINKER_RUN_STATS_FACET_SCHEMA_URL
+    pub fn new(
+        records_read: u64,
+        records_written: u64,
+        records_dlq: u64,
+        duration_ms: i64,
+    ) -> Self {
+        Self {
+            producer: super::PRODUCER.to_string(),
+            schema_url: super::CLINKER_RUN_STATS_FACET_SCHEMA_URL.to_string(),
+            records_read,
+            records_written,
+            records_dlq,
+            duration_ms,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
