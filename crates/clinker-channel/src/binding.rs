@@ -199,6 +199,24 @@ impl ChannelBinding {
         let bytes = std::fs::read(path)?;
         Self::from_yaml_bytes(&bytes, path.to_path_buf())
     }
+
+    /// Resolve the winning composition `config:` value per node for the
+    /// pre-compile `$config.<param>` fold, keyed
+    /// `composition-node-name -> param -> value`.
+    ///
+    /// Applies `config.default` then `config.fixed` at the `ChannelPerTarget`
+    /// layer (fixed wins within the layer), matching the order
+    /// [`apply_channel_overlay`](crate::apply_channel_overlay) clobbers onto the
+    /// `ProvenanceDb`, so the folded value agrees with the rendered `[WON]`
+    /// layer. Feeds
+    /// [`CompileContext::config_overrides`](clinker_plan::config::CompileContext).
+    pub fn effective_config(&self) -> clinker_plan::config::ConfigOverrides {
+        use clinker_plan::config::composition::LayerKind;
+        let mut eff = crate::overlay::EffectiveConfig::default();
+        eff.apply_dotted(&self.config_default, LayerKind::ChannelPerTarget, false);
+        eff.apply_dotted(&self.config_fixed, LayerKind::ChannelPerTarget, true);
+        eff.into_overrides()
+    }
 }
 
 // ── Serde intermediate types ────────────────────────────────────────────

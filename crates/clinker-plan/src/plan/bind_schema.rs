@@ -20,16 +20,16 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use cxl::ast::{Expr, Statement};
+use cxl::ast::{Expr, LiteralValue, Statement};
 use cxl::typecheck::{
     AggregateMode, ColumnLookup, QualifiedField, Row, RowTail, Type, TypedProgram,
 };
 use indexmap::IndexMap;
 
-use crate::config::compile_context::CompileContext;
+use crate::config::compile_context::{CompileContext, ConfigOverrides};
 use crate::config::composition::{
     CompositionFile, CompositionSignature, CompositionSymbolTable, LayerKind, OutputAlias,
-    PortDecl, ProvenanceDb, ResolvedValue,
+    ParamType, PortDecl, ProvenanceDb, ResolvedValue,
 };
 use crate::config::node_header::CombineHeader;
 use crate::config::pipeline_node::{
@@ -928,6 +928,94 @@ fn build_body_scoped_vars(
     registry
 }
 
+/// Populate the body registry's `$config.<param>` tiers for one composition
+/// instantiation.
+///
+/// `config` carries the declared type of every param (so the resolver
+/// accepts `$config.<param>` and rejects unknown ones, and the typechecker
+/// types each read); `config_fold` carries the resolved literal the planner
+/// folds each read to. Resolution precedence, highest first:
+/// channel/group `config:` clobber → call-site `config:` → signature default
+/// → `null`. An absent value folds to `null`, matching the `$vars.*`
+/// missing-read convention.
+fn populate_body_config(
+    registry: &mut cxl::resolve::ScopedVarsRegistry,
+    signature: &CompositionSignature,
+    node_name: &str,
+    call_config: &IndexMap<String, serde_json::Value>,
+    config_overrides: &ConfigOverrides,
+) {
+    let node_overrides = config_overrides.get(node_name);
+    for (param_name, decl) in &signature.config_schema {
+        registry
+            .config
+            .insert(param_name.clone(), param_type_to_scoped(decl.param_type));
+
+        let resolved = node_overrides
+            .and_then(|m| m.get(param_name))
+            .or_else(|| call_config.get(param_name))
+            .or(decl.default.as_ref());
+        let literal = match resolved {
+            Some(value) => config_value_to_literal(value, decl.param_type),
+            None => LiteralValue::Null,
+        };
+        registry.config_fold.insert(param_name.clone(), literal);
+    }
+}
+
+/// Map a composition config [`ParamType`] to the CXL scoped-var type used by
+/// the resolver / typechecker. `path` is a string at the CXL layer.
+fn param_type_to_scoped(param_type: ParamType) -> cxl::resolve::ScopedVarType {
+    use cxl::resolve::ScopedVarType;
+    match param_type {
+        ParamType::String | ParamType::Path => ScopedVarType::String,
+        ParamType::Int => ScopedVarType::Int,
+        ParamType::Float => ScopedVarType::Float,
+        ParamType::Bool => ScopedVarType::Bool,
+    }
+}
+
+/// Coerce a resolved config value to the CXL literal the fold substitutes,
+/// driven by the param's declared type. Values are already type-validated
+/// (signature-load and `validate_config`), so a shape mismatch here can only
+/// be a `null`/absent value, which folds to [`LiteralValue::Null`].
+fn config_value_to_literal(value: &serde_json::Value, param_type: ParamType) -> LiteralValue {
+    if value.is_null() {
+        return LiteralValue::Null;
+    }
+    match param_type {
+        ParamType::Int => value
+            .as_i64()
+            .map(LiteralValue::Int)
+            .or_else(|| value.as_f64().map(|f| LiteralValue::Int(f as i64)))
+            .unwrap_or(LiteralValue::Null),
+        ParamType::Float => value
+            .as_f64()
+            .map(LiteralValue::Float)
+            .unwrap_or(LiteralValue::Null),
+        ParamType::Bool => value
+            .as_bool()
+            .map(LiteralValue::Bool)
+            .unwrap_or(LiteralValue::Null),
+        ParamType::String | ParamType::Path => value
+            .as_str()
+            .map(|s| LiteralValue::String(s.into()))
+            .unwrap_or(LiteralValue::Null),
+    }
+}
+
+/// Constant-fold every `$config.<param>` in a freshly typechecked body
+/// program to its resolved literal. A no-op outside a composition body
+/// (empty `config_fold`), so a plain pipeline compiles byte-identically.
+fn fold_body_config(typed: &mut TypedProgram, scoped_vars: &cxl::resolve::ScopedVarsRegistry) {
+    if scoped_vars.config_fold.is_empty() {
+        return;
+    }
+    cxl::ast::fold_config_program(&mut typed.program, &|param| {
+        scoped_vars.config_fold.get(param).cloned()
+    });
+}
+
 fn span_for_node(spanned: &Spanned<PipelineNode>) -> Span {
     let line = spanned.referenced.line() as u32;
     if line > 0 {
@@ -1023,9 +1111,11 @@ fn collect_scope_reads_in_expr(expr: &Expr, out: &mut Vec<(crate::config::VarSco
         | Expr::GroupKey { .. }
         | Expr::QualifiedSourceAccess { .. }
         | Expr::DocAccess { .. }
+        | Expr::ConfigAccess { .. }
         | Expr::VarsAccess { .. } => {
             // $vars.* reads are global static config — no producer, no
-            // DAG-descendant rule applies. Skipped from the scope-read
+            // DAG-descendant rule applies. $config.* is folded to a literal
+            // before this walk runs. Both are skipped from the scope-read
             // accounting that drives E170/E171/E175 validation.
         }
     }
@@ -2667,13 +2757,25 @@ fn bind_composition(
     // Mismatches (parent missing the var, or type doesn't match) emit
     // E174.
     let saved_scoped_vars = std::mem::take(&mut bind_ctx.scoped_vars);
-    bind_ctx.scoped_vars = build_body_scoped_vars(
+    let mut body_scoped_vars = build_body_scoped_vars(
         &signature.scoped_vars_schema,
         &saved_scoped_vars,
         &signature.name,
         span,
         diags,
     );
+    // Wire `$config.<param>` for this instantiation's body: the declared
+    // types drive resolve/typecheck, and the resolved values drive the
+    // compile-time fold (see `fold_body_config`). Two call sites of the same
+    // composition with different config therefore compile to different bodies.
+    populate_body_config(
+        &mut body_scoped_vars,
+        signature,
+        node_name,
+        call_config,
+        &bind_ctx.ctx.config_overrides,
+    );
+    bind_ctx.scoped_vars = body_scoped_vars;
     // The new enclosing_scope is the parent's node names (for E108).
     bind_ctx.enclosing_scope_names = parent_schema_by_name.keys().cloned().collect();
     // Also include the enclosing scope's names so nested compositions
@@ -3854,7 +3956,10 @@ fn typecheck_cxl(
         )
     })?;
     cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode, scoped_vars)
-        .map(|typed| typed.with_source(std::sync::Arc::from(source)))
+        .map(|mut typed| {
+            fold_body_config(&mut typed, scoped_vars);
+            typed.with_source(std::sync::Arc::from(source))
+        })
         .map_err(|diags| {
             let errors: Vec<String> = diags
                 .iter()
@@ -4074,6 +4179,7 @@ fn first_body_field_ref(expr: &Expr) -> Option<String> {
         Expr::Literal { .. }
         | Expr::PipelineAccess { .. }
         | Expr::VarsAccess { .. }
+        | Expr::ConfigAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
         | Expr::RecordAccess { .. }
@@ -4930,7 +5036,10 @@ fn typecheck_combine_where(
         cxl::typecheck::pass::AggregateMode::Row,
         scoped_vars,
     ) {
-        Ok(typed) => Ok(typed.with_source(std::sync::Arc::from(wrapped.as_str()))),
+        Ok(mut typed) => {
+            fold_body_config(&mut typed, scoped_vars);
+            Ok(typed.with_source(std::sync::Arc::from(wrapped.as_str())))
+        }
         Err(type_diags) => {
             let mut out = Vec::new();
             for td in type_diags.into_iter().filter(|d| !d.is_warning) {
@@ -5092,6 +5201,7 @@ fn walk_for_unknown_refs(expr: &Expr, cx: CombineWalkContext<'_>, diags: &mut Ve
         | Expr::Literal { .. }
         | Expr::PipelineAccess { .. }
         | Expr::VarsAccess { .. }
+        | Expr::ConfigAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
         | Expr::RecordAccess { .. }

@@ -961,6 +961,17 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
     if let Some(res) = &overlay_resolution {
         compile_ctx.overlay_ops = res.op_stream().to_vec();
+        // Resolve the winning `config:` value per composition node so the
+        // compile-time fold substitutes it into `$config.<param>` reads. The
+        // ProvenanceDb still records the full layer chain (post-compile
+        // overlay), so this drives execution without double-applying to it.
+        compile_ctx.config_overrides = res.effective_config_overrides();
+    }
+    if let Some(binding) = &channel_binding {
+        clinker_channel::merge_config_overrides(
+            &mut compile_ctx.config_overrides,
+            binding.effective_config(),
+        );
     }
 
     // Run identity values flow through Output path templates and the

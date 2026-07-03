@@ -415,6 +415,7 @@ fn collect_qualifiers_inner(expr: &Expr, out: &mut HashSet<Arc<str>>) {
         | Expr::Literal { .. }
         | Expr::PipelineAccess { .. }
         | Expr::VarsAccess { .. }
+        | Expr::ConfigAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
         | Expr::RecordAccess { .. }

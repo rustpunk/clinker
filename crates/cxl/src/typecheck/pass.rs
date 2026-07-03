@@ -506,6 +506,22 @@ impl<'a> TypeChecker<'a> {
                 ty
             }
 
+            Expr::ConfigAccess { node_id, param, .. } => {
+                // Type from the composition's declared config schema. An
+                // unknown param was already rejected by the resolver, so the
+                // `Any` fallback only shields the typecheck pass from cascading
+                // on an already-diagnosed read.
+                let ty = self
+                    .scoped_vars
+                    .config
+                    .get(&**param)
+                    .copied()
+                    .map(scoped_var_type_to_type)
+                    .unwrap_or(Type::Any);
+                self.set_type(*node_id, ty.clone());
+                ty
+            }
+
             Expr::SourceAccess { node_id, field, .. } => {
                 let ty = match &**field {
                     "file" | "path" | "batch" | "name" => Type::String,
@@ -1195,6 +1211,7 @@ impl<'a> TypeChecker<'a> {
             | Expr::QualifiedFieldRef { .. }
             | Expr::PipelineAccess { .. }
             | Expr::VarsAccess { .. }
+            | Expr::ConfigAccess { .. }
             | Expr::SourceAccess { .. }
             | Expr::QualifiedSourceAccess { .. }
             | Expr::RecordAccess { .. }

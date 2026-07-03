@@ -52,6 +52,10 @@ composition:
 | `produces` | Yes | Output fields the composition adds to the record (name + type) |
 | `params` | No | Configurable parameters with optional defaults |
 
+### Reading config parameters in the body
+
+A composition body reads its own config parameters as [`$config.<param>`](../cxl/system-variables.md#config-composition-config-parameters). The planner constant-folds each reference to the value resolved for that instantiation — the call site's `config:` value, or a [channel/group](channels.md) `config:` override, or the declared default — so the same composition used with different `config:` compiles to different bodies. Because the resolution happens per instantiation, a channel or group `config:` override changes what the body computes, not just the reported provenance.
+
 ## Advanced wiring
 
 For compositions with multiple input or output ports, the node supports explicit port bindings:

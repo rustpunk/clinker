@@ -21,7 +21,7 @@ pub mod utils;
 
 pub use crate::plan::index::AnalyticWindowSpec;
 pub use aggregate::*;
-pub use compile_context::CompileContext;
+pub use compile_context::{CompileContext, ConfigOverrides};
 pub use composition::{
     CompositionFile, CompositionSignature, CompositionSymbolTable, LayerKind, NodeRef, OutputAlias,
     ParamDecl, ParamName, ParamType, PortDecl, PortName, ProvenanceDb, ProvenanceLayer,

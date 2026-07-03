@@ -26,6 +26,8 @@
 
 use indexmap::IndexMap;
 
+use crate::ast::LiteralValue;
+
 /// Scoped-variable primitive type set.
 ///
 /// Mirrors `clinker_plan::config::ScopedVarType`. Conversion to the CXL
@@ -67,6 +69,19 @@ pub struct ScopedVarsRegistry {
     /// above (which are producer-written); a `$vars.*` read is global
     /// and DAG-position-independent.
     pub static_vars: IndexMap<String, ScopedVarType>,
+    /// Composition config parameters read via `$config.<param>`. Declared
+    /// types drive resolve (unknown param → error) and typecheck. Empty
+    /// outside a composition body, so a top-level `$config.*` read is
+    /// rejected. Paired with [`Self::config_fold`], which carries each
+    /// param's resolved literal for the compile-time constant fold.
+    pub config: IndexMap<String, ScopedVarType>,
+    /// Resolved literal value per `$config.<param>` for THIS composition
+    /// instantiation (signature default, call-site `config:`, or
+    /// channel/group `config:` clobber). The planner folds each
+    /// `$config.<param>` to this literal after typecheck; the values are
+    /// per-instantiation, so `config_fold` is never shared across
+    /// composition call sites.
+    pub config_fold: IndexMap<String, LiteralValue>,
 }
 
 /// Per-scope tag for `ScopedVarsRegistry::hidden_lookup`.

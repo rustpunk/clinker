@@ -78,6 +78,11 @@ pub fn build_scoped_vars_registry(
                     .collect()
             })
             .unwrap_or_default(),
+        // `$config.*` is composition-body-only; a top-level pipeline
+        // declares no config schema, so both tiers stay empty and the
+        // resolver rejects any `$config.*` read here.
+        config: indexmap::IndexMap::new(),
+        config_fold: indexmap::IndexMap::new(),
     };
     for spanned in nodes {
         if let PipelineNode::Transform { config, .. } = &spanned.value {

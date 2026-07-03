@@ -377,6 +377,35 @@ impl<'a> Resolver<'a> {
                     });
                 }
             }
+            Expr::ConfigAccess {
+                node_id,
+                param,
+                span,
+            } => {
+                if self.scoped_vars.config.contains_key(&**param) {
+                    self.bind(*node_id, ResolvedBinding::PipelineMember);
+                } else {
+                    let declared: Vec<&str> =
+                        self.scoped_vars.config.keys().map(|s| s.as_str()).collect();
+                    // `$config.*` is only meaningful inside a composition body,
+                    // where the registry carries that composition's declared
+                    // config params. A top-level pipeline has an empty config
+                    // registry, so every `$config.*` read falls here.
+                    self.diagnostics.push(ResolveDiagnostic {
+                        span: *span,
+                        message: format!("unknown config parameter '$config.{param}'"),
+                        help: best_match(param, &declared, 3)
+                            .map(|s| format!("did you mean '$config.{s}'?"))
+                            .or_else(|| {
+                                Some(
+                                    "declare it in the composition's `_compose.config_schema`; \
+                                     `$config.*` is only available inside a composition body"
+                                        .into(),
+                                )
+                            }),
+                    });
+                }
+            }
             Expr::SourceAccess {
                 node_id,
                 field,
@@ -844,6 +873,68 @@ mod tests {
         assert!(
             has_pipeline,
             "Expected PipelineMember binding for declared fuzzy_score"
+        );
+    }
+
+    #[test]
+    fn test_resolve_config_top_level_rejected() {
+        // `$config.*` outside a composition body: the default (top-level)
+        // registry declares no config params, so every read is rejected.
+        let diags = resolve_err("filter amount >= $config.threshold", &["amount"]);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("$config.threshold")),
+            "expected diagnostic for $config outside a composition: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_config_unknown_param_rejected() {
+        use crate::resolve::scoped_vars::ScopedVarType;
+        let mut registry = ScopedVarsRegistry::default();
+        registry
+            .config
+            .insert("threshold".to_string(), ScopedVarType::Float);
+        let parsed = Parser::parse("filter amount >= $config.cutoff");
+        assert!(parsed.errors.is_empty());
+        let diags = resolve_program_with_modules_and_vars(
+            parsed.ast,
+            &["amount"],
+            parsed.node_count,
+            &HashMap::new(),
+            &registry,
+        )
+        .expect_err("an undeclared $config param must be a resolve error");
+        assert!(
+            diags.iter().any(|d| d.message.contains("$config.cutoff")),
+            "expected diagnostic for unknown $config param: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_resolve_declared_config_param() {
+        use crate::resolve::scoped_vars::ScopedVarType;
+        let mut registry = ScopedVarsRegistry::default();
+        registry
+            .config
+            .insert("threshold".to_string(), ScopedVarType::Float);
+        let parsed = Parser::parse("filter amount >= $config.threshold");
+        assert!(parsed.errors.is_empty());
+        let resolved = resolve_program_with_modules_and_vars(
+            parsed.ast,
+            &["amount"],
+            parsed.node_count,
+            &HashMap::new(),
+            &registry,
+        )
+        .expect("declared $config param should resolve");
+        assert!(
+            resolved
+                .bindings
+                .iter()
+                .any(|b| matches!(b, Some(ResolvedBinding::PipelineMember))),
+            "expected PipelineMember binding for declared $config.threshold"
         );
     }
 

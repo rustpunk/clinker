@@ -33,11 +33,14 @@
 //! `PipelineRunParams`, not into the AST), and stamps a [`ChannelIdentity`] for
 //! cache-keying.
 
+use std::collections::HashMap;
+
 use indexmap::IndexMap;
 
 use clinker_core_types::Span;
 use clinker_core_types::{Diagnostic, LabeledSpan};
-use clinker_plan::config::composition::{LayerKind, ProvenanceDb};
+use clinker_plan::config::ConfigOverrides;
+use clinker_plan::config::composition::{LayerKind, ProvenanceDb, ResolvedValue};
 use clinker_plan::config::pipeline_node::{PipelineNode, VarScope};
 use clinker_plan::config::{
     PipelineConfig, ScopedVarDecl, ScopedVarType, check_scoped_var_default,
@@ -217,6 +220,109 @@ pub(crate) fn apply_config_clobber(
                     LabeledSpan::primary(Span::SYNTHETIC, String::new()),
                 ));
             }
+        }
+    }
+}
+
+/// Resolve the winning `config:` value per `(node, param)` across overlay
+/// layers, for the pre-compile constant fold of `$config.<param>` in a
+/// composition body.
+///
+/// Reuses the same [`ResolvedValue`] winner logic the post-compile
+/// [`ProvenanceDb`] path uses, applied in the identical ascending-precedence
+/// order (`apply_config_and_vars`: groups → channel-wide → per-target; the
+/// legacy binding: `config.default` → `config.fixed`). Resolving the fold value
+/// and the rendered provenance from the same layer machinery keeps the executed
+/// value and the `channels resolve` / `explain --field` `[WON]` layer in
+/// agreement.
+#[derive(Default)]
+pub(crate) struct EffectiveConfig {
+    winners: HashMap<(String, String), ResolvedValue<serde_json::Value>>,
+}
+
+impl EffectiveConfig {
+    /// Apply one layer's raw string-keyed `config:` map. A malformed key is
+    /// skipped (it surfaces as a diagnostic on the clobber path); a
+    /// single-segment key targets no composition node and never folds.
+    pub(crate) fn apply(
+        &mut self,
+        config: &IndexMap<String, serde_json::Value>,
+        kind: LayerKind,
+        fixed: bool,
+    ) {
+        for (key, value) in config {
+            let Ok(dotted) = DottedPath::try_from(key.as_str()) else {
+                continue;
+            };
+            if let (Some(node), param) = dotted.segments() {
+                self.insert(node, param, value, kind, fixed);
+            }
+        }
+    }
+
+    /// Apply one layer's already-validated dotted-keyed `config:` map.
+    pub(crate) fn apply_dotted(
+        &mut self,
+        config: &IndexMap<DottedPath, serde_json::Value>,
+        kind: LayerKind,
+        fixed: bool,
+    ) {
+        for (dotted, value) in config {
+            if let (Some(node), param) = dotted.segments() {
+                self.insert(node, param, value, kind, fixed);
+            }
+        }
+    }
+
+    fn insert(
+        &mut self,
+        node: &str,
+        param: &str,
+        value: &serde_json::Value,
+        kind: LayerKind,
+        fixed: bool,
+    ) {
+        self.winners
+            .entry((node.to_string(), param.to_string()))
+            .and_modify(|rv| {
+                if fixed {
+                    rv.apply_layer_fixed(value.clone(), kind, Span::SYNTHETIC);
+                } else {
+                    rv.apply_layer(value.clone(), kind, Span::SYNTHETIC);
+                }
+            })
+            .or_insert_with(|| {
+                // Preserve the `fixed` lock on the first-touched layer too, so a
+                // fixed lower tier keeps winning over a later higher tier —
+                // matching `ResolvedValue::winner_kind`, which the ProvenanceDb
+                // path uses.
+                if fixed {
+                    ResolvedValue::new_fixed(value.clone(), kind, Span::SYNTHETIC)
+                } else {
+                    ResolvedValue::new(value.clone(), kind, Span::SYNTHETIC)
+                }
+            });
+    }
+
+    /// Collapse to the per-node winning values for
+    /// [`CompileContext::config_overrides`](clinker_plan::config::CompileContext).
+    pub(crate) fn into_overrides(self) -> ConfigOverrides {
+        let mut out = ConfigOverrides::new();
+        for ((node, param), rv) in self.winners {
+            out.entry(node).or_default().insert(param, rv.value);
+        }
+        out
+    }
+}
+
+/// Merge `higher` config overrides over `base`, resolving each `(node, param)`
+/// to the higher map's value. Used to layer the legacy channel-file binding
+/// (highest precedence) over the channel/group folder resolution.
+pub fn merge_config_overrides(base: &mut ConfigOverrides, higher: ConfigOverrides) {
+    for (node, params) in higher {
+        let entry = base.entry(node).or_default();
+        for (param, value) in params {
+            entry.insert(param, value);
         }
     }
 }
