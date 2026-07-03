@@ -1,29 +1,29 @@
-//! Parse coverage for the channel `sources:` config-patch block (issue #550).
+//! Parse coverage for the per-target overlay `sources:` config-patch block.
 //!
-//! These tests pin the on-the-wire YAML surface for the per-source patch: the
-//! schema column ops (`add` / `rename` / `retype` / `remove`), the
-//! `array_paths` ops (set-by-path / `remove`), and the scalar `options` map.
-//! Applying the parsed patch to a pipeline is covered in `clinker-plan`; here
-//! we only assert that every documented form deserializes into the typed
-//! [`SourceConfigPatch`] carried on the binding.
+//! These tests pin the on-the-wire YAML surface for the per-source patch a
+//! channel's per-target overlay carries: the schema column ops (`add` /
+//! `rename` / `retype` / `remove`), the `array_paths` ops (set-by-path /
+//! `remove`), and the scalar `options` map. Applying the parsed patch to a
+//! pipeline is covered in `clinker-plan`; here we only assert that every
+//! documented form deserializes into the typed [`SourceConfigPatch`] carried on
+//! the overlay.
 
 use std::path::PathBuf;
 
-use clinker_channel::binding::ChannelBinding;
+use clinker_channel::OverlayFile;
 use clinker_plan::config::{ArrayPathOp, SchemaColumnOp};
 
-fn binding(yaml: &[u8]) -> ChannelBinding {
-    ChannelBinding::from_yaml_bytes(yaml, PathBuf::from("test.channel.yaml"))
-        .expect("channel YAML parses")
+fn overlay(yaml: &[u8]) -> OverlayFile {
+    OverlayFile::from_yaml_bytes(yaml, PathBuf::from("base.channel.yaml"))
+        .expect("overlay YAML parses")
 }
 
 #[test]
 fn parses_full_sources_patch_block() {
-    let b = binding(
+    let o = overlay(
         br#"
 channel:
-  name: acme
-  target: ./pipeline.yaml
+  target: ../../pipeline/base.yaml
 sources:
   transactions:
     schema:
@@ -39,8 +39,8 @@ sources:
 "#,
     );
 
-    let patch = b
-        .source_patches
+    let patch = o
+        .sources
         .get("transactions")
         .expect("transactions patch present");
 
@@ -71,23 +71,21 @@ sources:
 
 #[test]
 fn absent_sources_block_is_empty() {
-    let b = binding(
+    let o = overlay(
         br#"
 channel:
-  name: plain
-  target: ./pipeline.yaml
+  target: ../../pipeline/base.yaml
 "#,
     );
-    assert!(b.source_patches.is_empty());
+    assert!(o.sources.is_empty());
 }
 
 #[test]
 fn multiple_sources_each_carry_their_patch() {
-    let b = binding(
+    let o = overlay(
         br#"
 channel:
-  name: multi
-  target: ./pipeline.yaml
+  target: ../../pipeline/base.yaml
 sources:
   orders:
     schema:
@@ -97,25 +95,24 @@ sources:
       delimiter: "|"
 "#,
     );
-    assert_eq!(b.source_patches.len(), 2);
-    assert!(b.source_patches.contains_key("orders"));
-    assert!(b.source_patches.contains_key("customers"));
+    assert_eq!(o.sources.len(), 2);
+    assert!(o.sources.contains_key("orders"));
+    assert!(o.sources.contains_key("customers"));
 }
 
 #[test]
 fn schema_add_carries_long_unique_flag() {
-    let b = binding(
+    let o = overlay(
         br#"
 channel:
-  name: lu
-  target: ./pipeline.yaml
+  target: ../../pipeline/base.yaml
 sources:
   src:
     schema:
       uuid: { add: { type: string, long_unique: true } }
 "#,
     );
-    match b.source_patches["src"].schema.get("uuid") {
+    match o.sources["src"].schema.get("uuid") {
         Some(SchemaColumnOp::Add(add)) => assert!(add.long_unique),
         other => panic!("expected add op, got {other:?}"),
     }
@@ -123,13 +120,12 @@ sources:
 
 #[test]
 fn unknown_op_key_is_a_parse_error() {
-    // A schema op map with an unrecognized key is rejected by the binding
+    // A schema op map with an unrecognized key is rejected by the overlay
     // parser (deny_unknown_fields on the op payload).
-    let err = ChannelBinding::from_yaml_bytes(
+    let err = OverlayFile::from_yaml_bytes(
         br#"
 channel:
-  name: bad
-  target: ./pipeline.yaml
+  target: ../../pipeline/base.yaml
 sources:
   src:
     schema:

@@ -5,17 +5,15 @@
 #   - `channel.target:` is authoritative; the `.channel.yaml` filename suffix is
 #     optional documentation.
 #   - `config:` raises `risk.threshold` to 0.95 (over the channel-wide 0.9).
-#   - `overrides:` structurally patches the `orders` source schema, declaring a
-#     `channel_note` column globex ships in its extract.
+#
+# globex is labelled `tier: enterprise` (see channel.cfg.yaml), so the
+# `enterprise` group's selector matches and its `fraud_check` screen is spliced
+# in automatically. That injection is the overlay effect visible in a
+# `run --channel globex`: order ord-1004 (amount 2100) is held for review and
+# written as 0, where the base pipeline writes it unchanged.
 
 channel:
   target: ../../pipeline/order_fulfillment.yaml
 
 config:
   risk.threshold: 0.95
-
-overrides:
-  - op: patch_schema
-    target: orders
-    schema:
-      channel_note: { add: { type: string } }

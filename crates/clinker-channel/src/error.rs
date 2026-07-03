@@ -17,8 +17,6 @@ pub enum ChannelError {
     },
     #[error("invalid dotted path `{path}`: {reason}")]
     InvalidDottedPath { path: String, reason: String },
-    #[error("invalid var name `{name}`: {reason}")]
-    InvalidVarName { name: String, reason: String },
     #[error(
         "channel `{channel_id}`: multiple overlay candidates for target `{target}`: {}",
         .candidates.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")

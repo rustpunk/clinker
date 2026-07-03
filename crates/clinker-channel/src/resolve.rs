@@ -36,7 +36,7 @@ use clinker_core_types::{Diagnostic, LabeledSpan, Span};
 
 use clinker_plan::config::composition::LayerKind;
 use clinker_plan::config::pipeline_node::PipelineNode;
-use clinker_plan::config::{ChannelLayout, GroupLayout, PipelineConfig};
+use clinker_plan::config::{ChannelLayout, GroupLayout, PipelineConfig, SourceConfigPatch};
 use clinker_plan::overlay_ops::{LayeredOp, OverlayLayer, OverlayOp};
 use clinker_plan::plan::{ChannelIdentity, CompiledPlan};
 use clinker_plan::yaml::Spanned;
@@ -112,9 +112,8 @@ struct ChannelContext {
     per_target: Option<ResolvedOverlay>,
     /// BLAKE3 over the channel id plus the raw bytes of its manifest and
     /// per-target overlay files. Content-sensitive so a changed overlay yields
-    /// a distinct [`ChannelIdentity`], matching the channel-file overlay path
-    /// (which hashes the `.channel.yaml` bytes) rather than a bare id hash that
-    /// would collide across edits.
+    /// a distinct [`ChannelIdentity`], rather than a bare id hash that would
+    /// collide across edits.
     content_hash: [u8; 32],
 }
 
@@ -164,6 +163,22 @@ impl OverlayResolution {
             .as_ref()
             .and_then(|c| c.per_target.as_ref())
             .map(|o| o.path.as_path())
+    }
+
+    /// Per-source config patches carried by the resolved per-target overlay,
+    /// keyed by source-node name (empty when the channel has no per-target
+    /// overlay, or the overlay declares no `sources:` block).
+    ///
+    /// Applied to the parsed pipeline config *before* validation/compile via
+    /// [`apply_source_patches`](clinker_plan::config::apply_source_patches), so
+    /// the effective plan observes the patched source shape (schema column ops,
+    /// `array_paths`, and per-format `options`). Per-target scoping keeps the
+    /// source-node keys resolvable against exactly the overlaid pipeline.
+    pub fn source_patches(&self) -> Option<&indexmap::IndexMap<String, SourceConfigPatch>> {
+        self.channel
+            .as_ref()
+            .and_then(|c| c.per_target.as_ref())
+            .map(|o| &o.overlay.sources)
     }
 
     /// Resolve the winning composition `config:` value per node for the
@@ -280,9 +295,8 @@ fn clobber_config(
 }
 
 /// Resolve a per-target overlay's `vars`. Var overrides are not supported on a
-/// composition overlay (E109), matching the per-target `apply_channel_overlay`
-/// path; a composition overlay carrying vars raises the diagnostic instead of
-/// silently resolving them.
+/// composition overlay (E109): a composition overlay carrying vars raises the
+/// diagnostic instead of silently resolving them.
 fn apply_overlay_vars(
     overlay: &ResolvedOverlay,
     source_label: &str,

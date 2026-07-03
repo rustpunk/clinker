@@ -724,13 +724,12 @@ fn test_all_14_fixtures_have_baseline() {
     }
 }
 
-/// Gate test: channel overlay on a pipeline produces a provenance chain with
-/// a fixed ChannelPerTarget layer recorded in the compiled plan.
+/// Gate test: a channel/group folder overlay on a compiled pipeline records a
+/// ChannelPerTarget provenance layer and stamps a channel identity.
 #[test]
 fn test_channel_overlay_provenance_chain_recorded_in_baseline() {
-    use clinker_channel::binding::ChannelBinding;
-    use clinker_channel::overlay::apply_channel_overlay;
     use clinker_plan::config::composition::LayerKind;
+    use clinker_plan::config::{ChannelLayout, GroupLayout, ShardScheme};
 
     let root = composition_fixture_root();
     let yaml_path = root.join("pipelines/nested_composition_pipeline.yaml");
@@ -742,51 +741,71 @@ fn test_channel_overlay_provenance_chain_recorded_in_baseline() {
     );
     let mut plan = clinker_plan::config::PipelineConfig::compile(&config, &ctx).expect("compile");
 
-    // Apply the acme_prod channel (which has `config.fixed` bindings) but
-    // adapted to target this pipeline's provenance entries.
-    let channel_yaml = br#"
-channel:
-  name: acme_prod_test
-  target: ./pipelines/nested_composition_pipeline.yaml
-config:
-  fixed:
-    nested_process.strict_mode: true
-"#;
-    let binding = ChannelBinding::from_yaml_bytes(
-        channel_yaml,
-        root.join("channels/synthetic_test.channel.yaml"),
+    // A tenant folder whose per-target overlay clobbers the pipeline's tracked
+    // `nested_process.strict_mode` parameter. The overlay is resolved by
+    // computed path and applied over the compiled plan's provenance.
+    let ws = tempfile::tempdir().expect("tempdir");
+    let overlay_dir = ws.path().join("channel").join("acme");
+    std::fs::create_dir_all(&overlay_dir).expect("create channel dir");
+    std::fs::write(
+        overlay_dir.join("nested_composition_pipeline.channel.yaml"),
+        "channel:\n  target: ../../pipelines/nested_composition_pipeline.yaml\n\
+         config:\n  nested_process.strict_mode: true\n",
     )
-    .expect("parse channel");
+    .expect("write overlay");
 
-    let _result = apply_channel_overlay(&mut plan, &binding, &config);
+    let channel_layout = ChannelLayout {
+        root: std::path::PathBuf::from("channel"),
+        shard: ShardScheme::None,
+    };
+    let group_layout = GroupLayout {
+        root: std::path::PathBuf::from("group"),
+    };
+    let resolution = clinker_channel::resolve(
+        ws.path(),
+        &channel_layout,
+        &group_layout,
+        "nested_composition_pipeline",
+        Some("acme"),
+        &[],
+        true,
+    )
+    .expect("resolve overlay");
+    let result = resolution.apply_config_and_vars(&mut plan, &config);
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .all(|d| !matches!(d.severity, clinker_core_types::Severity::Error)),
+        "overlay diagnostics: {:?}",
+        result.diagnostics
+    );
 
-    // Verify the provenance chain contains a fixed ChannelPerTarget layer
+    // The provenance chain records a ChannelPerTarget layer, and it wins over
+    // the pipeline default.
     let resolved = plan
         .provenance()
         .get("nested_process", "strict_mode")
         .expect("nested_process.strict_mode must exist in provenance");
-
-    let has_fixed_per_target = resolved
-        .provenance
-        .iter()
-        .any(|l| l.kind == LayerKind::ChannelPerTarget && l.fixed);
     assert!(
-        has_fixed_per_target,
-        "provenance chain must contain a fixed ChannelPerTarget layer"
+        resolved
+            .provenance
+            .iter()
+            .any(|l| l.kind == LayerKind::ChannelPerTarget),
+        "provenance chain must contain a ChannelPerTarget layer"
     );
-
     let winner = resolved.winning_layer().expect("must have a winner");
     assert_eq!(
         winner.kind,
         LayerKind::ChannelPerTarget,
-        "the fixed ChannelPerTarget layer must be the winner"
+        "the ChannelPerTarget layer must be the winner"
     );
-    assert!(winner.fixed, "the winning layer must carry the fixed lock");
+    assert_eq!(resolved.value, serde_json::json!(true));
 
-    // Verify channel identity is stamped
+    // Channel identity is stamped from the resolved tenant id.
     let identity = plan
         .channel_identity()
         .expect("channel identity must be set");
-    assert_eq!(identity.name, "acme_prod_test");
+    assert_eq!(identity.name, "acme");
     assert_ne!(identity.content_hash, [0u8; 32]);
 }

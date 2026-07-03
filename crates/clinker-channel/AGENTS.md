@@ -4,34 +4,39 @@ Root `AGENTS.md` still applies. This file adds local guidance for `clinker-chann
 
 ## Purpose
 
-`clinker-channel` owns channel binding, validation, overlay application, and source-file staging copy for Clinker launch flows.
+`clinker-channel` owns the channel/group folder-overlay system — discovery, group derivation, layered overlay resolution and application — plus source-file staging copy for Clinker launch flows.
 
 ## Responsibilities
 
-- Parse `.channel.yaml` files into `ChannelBinding` values and compute raw-file BLAKE3 channel hashes.
-- Validate `DottedPath` keys, channel var names, channel targets, and composition config keys.
-- Clobber a channel's `config` onto `CompiledPlan` provenance at the `ChannelPerTarget` layer (`config.fixed` sets the layer's `fixed` lock).
-- Resolve channel `vars:` overrides/adds for `$vars`, `$pipeline`, `$source`, and `$record`.
+- Discover per-tenant `channel/<id>/` folders (manifest + per-target overlays) and `group/*.group.yaml` overlays by computed path, and parse them.
+- Derive matching groups for a channel from its manifest `labels` via CXL boolean selectors, ordered by priority.
+- Resolve the four-layer overlay stack (`PipelineDefault < Group(s) < ChannelWide < ChannelPerTarget`) into one `OverlayResolution`: a structural `overrides:` op stream (applied pre-compile via `CompileContext::overlay_ops`) plus a `config`/`vars` value clobber (applied post-compile over the plan's provenance).
+- Validate `DottedPath` config keys and resolve channel `vars:` overrides/adds for `$vars`, `$pipeline`, `$source`, and `$record`.
+- Carry per-target `sources:` config patches (schema / array_paths / options) for `apply_source_patches`.
 - Stamp `ChannelIdentity` on compiled plans.
 - Stage selected source files to local disk with stable cache paths, manifests, locks, reuse, cleanup, and crash purge.
 
 ## Important public APIs
 
-- `ChannelBinding`, `ChannelTarget`, `DottedPath`
-- `ChannelBinding::{from_yaml_bytes, load}`
-- `validate_channel_bindings`
-- `resolve_channel_overlay`, `scan_channels`, `scan_groups`, `channel_folder_path`
-- `DiscoveredChannel`, `ResolvedOverlay`, `OverlayKind`
-- `apply_channel_overlay`, `ChannelOverlayResult`
+- `resolve`, `OverlayResolution`, `ResolveError`, `AppliedGroup`, `GroupSource`, `InjectedNode`
+- `resolve_channel_overlay`, `scan_channels`, `scan_groups`, `channel_folder_path`, `channel_dir`
+- `DiscoveredChannel`, `ResolvedOverlay`, `OverlayKind`, `CHANNEL_MANIFEST_FILE`
+- `ChannelManifest`, `OverlayFile`, `ChannelVars`, `Group`, `derive_groups`
+- `DottedPath`, `LabelSelector`, `ChannelOverlayResult`
 - `SourceStager`, `StagingPlanEntry`, `ReuseDecision`, `open_source_file`
 - `ChannelError`, `StagingError`
 
 ## Internal module map
 
-- `src/lib.rs`: channel authoring guide and crate-root re-exports.
-- `src/binding.rs`: channel YAML parsing, target classification, dotted-path validation, and composition-target validation.
+- `src/lib.rs`: channel/group overlay authoring guide and crate-root re-exports.
 - `src/discovery.rs`: channel-centric layout discovery — folder-per-tenant channel scan, group scan, and computed-path per-target overlay resolution with ambiguity/disagreement diagnostics.
-- `src/overlay.rs`: provenance overlay merge, channel identity stamping, scoped-var overlay validation/coercion.
+- `src/manifest.rs`: parse-only serde shapes for `channel.cfg.yaml` (manifest) and per-target overlay files (config/vars/overrides/sources).
+- `src/selector.rs`: CXL boolean label selectors evaluated in a label-only context.
+- `src/derivation.rs`: derive matching groups from channel labels and order them by priority.
+- `src/group.rs`: parsed `*.group.yaml` model.
+- `src/resolve.rs`: end-to-end overlay-stack resolution (`OverlayResolution`) and its two application surfaces.
+- `src/overlay.rs`: provenance config clobber, channel identity stamping, scoped-var overlay validation/coercion.
+- `src/dotted.rs`: `DottedPath` `alias.param` key validation.
 - `src/staging_copy.rs`: source staging protocol, cache layout, manifests, advisory locks, reuse prediction, cleanup, crash purge, and platform open/fsync helpers.
 - `src/error.rs`: channel parse and validation errors.
 
@@ -54,7 +59,7 @@ Current normal dependencies are intentional: `clinker-plan`, `clinker-core-types
 - Channels override declared config/resource surfaces only; no mid-graph patching or sealed composition-internal access.
 - `DottedPath` is strict: one or two segments, no empty/edge/consecutive dots, and only ASCII alphanumeric, underscore, or dot.
 - Workspace channel scans are bounded and do not follow symlinks.
-- Config resolves through the fixed semantic layer order `PipelineDefault < Group(s) < ChannelWide < ChannelPerTarget` (clobber, never deep-merge); a `fixed` value locks against every higher-precedence layer.
+- Config resolves through the fixed semantic layer order `PipelineDefault < Group(s) < ChannelWide < ChannelPerTarget` (clobber, never deep-merge). Config maps are a flat `alias.param: value` clobber; per-value `fixed` locking is not yet a folder-overlay surface (the `fixed` provenance plumbing exists but no overlay YAML feeds it).
 - A channel `config` key that matches no compiled-plan parameter is a hard error (E113), never a silent no-op.
 - Channel `vars:` on composition targets currently errors.
 - Var overrides must match declared types and use planner scoped-var checking/coercion helpers.
@@ -65,7 +70,7 @@ Current normal dependencies are intentional: `clinker-plan`, `clinker-core-types
 - Per-source advisory locks protect copy/publish, readers, cleanup, overwrite, and crash purge.
 - Crash purge must be liveness-aware and grace-gated; do not reap live sibling artifacts.
 - `SourceStager` keeps shared read guards alive until cleanup so staged files cannot vanish before or during reads.
-- Resource overlay fields are parsed but not fully applied by `apply_channel_overlay`; ask before documenting resources as implemented overlay behavior.
+- Per-target `sources:` patches resolve source-node names against the overlaid pipeline at apply time; they are scoped to one target, so keys resolve unambiguously.
 
 ## Common mistakes for AI agents to avoid
 
@@ -101,14 +106,20 @@ Update these when changing related behavior:
 ## Evidence
 
 - `crates/clinker-channel/src/lib.rs`
-- `crates/clinker-channel/src/binding.rs`
+- `crates/clinker-channel/src/discovery.rs`
+- `crates/clinker-channel/src/manifest.rs`
+- `crates/clinker-channel/src/resolve.rs`
+- `crates/clinker-channel/src/derivation.rs`
+- `crates/clinker-channel/src/selector.rs`
 - `crates/clinker-channel/src/overlay.rs`
+- `crates/clinker-channel/src/dotted.rs`
 - `crates/clinker-channel/src/staging_copy.rs`
 - `crates/clinker-channel/src/error.rs`
 - `crates/clinker-channel/Cargo.toml`
-- `crates/clinker-channel/tests/channel_binding_test.rs`
-- `crates/clinker-channel/tests/channel_merge_test.rs`
-- `crates/clinker-channel/tests/channel_var_overlay_test.rs`
+- `crates/clinker-channel/tests/overlay_resolution_test.rs`
+- `crates/clinker-channel/tests/discovery_test.rs`
+- `crates/clinker-channel/tests/channel_manifest_test.rs`
+- `crates/clinker-channel/tests/source_patch_parse_test.rs`
 - `crates/clinker-channel/tests/staging_reuse_concurrent.rs`
 - `crates/clinker-channel/benches/channel_merge.rs`
 - `crates/clinker/src/main.rs`

@@ -1,58 +1,63 @@
-//! # Channel Authoring Guide
+//! # Channel/Group Overlay System
 //!
-//! Channels are per-tenant launch plans that bind a pipeline's or composition's
-//! declared configuration and resources for a specific deployment context.
-//! They enable multi-tenant ETL without duplicating pipeline definitions.
+//! Channels and groups are the multi-tenant overlay layer over a base pipeline.
+//! A single pipeline serves many tenants without duplication: each tenant is a
+//! `channel/<id>/` folder whose manifest and per-target overlay files clobber
+//! the base pipeline's declared config, `vars`, and structure.
 //!
-//! ## What channels are for
+//! ## Layout
 //!
-//! A single pipeline can serve multiple tenants (e.g., `acme_prod`,
-//! `beta_staging`) by pairing it with different `.channel.yaml` files. Each
-//! channel overrides only the declared config parameters — no mid-graph
-//! patching, no internal node access.
+//! - `channel/<id>/channel.cfg.yaml` — the per-channel [`manifest`]: identity
+//!   `labels` (which drive group selectors), plus optional channel-wide
+//!   `config`, `vars`, and `overrides` that apply to every pipeline the channel
+//!   runs.
+//! - `channel/<id>/<target>.channel.yaml` — a per-target [`OverlayFile`]:
+//!   `config` / `vars` clobber, an `overrides:` op stream, and `sources:`
+//!   per-source config patches, all scoped to one pipeline or composition.
+//! - `group/<name>.group.yaml` — a selector-scoped [`Group`]: a CXL boolean over
+//!   channel `labels` picks the channels a group applies to, with a `priority`
+//!   ordering matching groups.
 //!
-//! ## The `_channel:` header
+//! ## Layer stack
 //!
-//! Every `.channel.yaml` file declares:
+//! Both application surfaces resolve through the fixed *semantic* order (never
+//! lexical or positional), with clobber (full replace) between layers:
 //!
-//! - **`channel.name:`** — human-readable channel identifier.
-//! - **`channel.target:`** — path to the target pipeline or composition
-//!   (each channel file declares exactly one target).
-//! - **`config.default:`** — values applied non-fixed on the channel's overlay
-//!   layer. A later, higher-precedence layer may override them.
-//! - **`config.fixed:`** — values applied with the `fixed` lock set on the same
-//!   layer. A fixed value cannot be overridden by any higher-precedence layer.
+//! ```text
+//! PipelineDefault  <  Group(s) by priority  <  ChannelWide  <  ChannelPerTarget
+//! ```
 //!
-//! ## `fixed` vs `default` distinction
+//! `fixed:` locks a value within its layer against every higher-precedence
+//! layer.
 //!
-//! `fixed` is not a separate layer — it is a lock flag on the value. A fixed
-//! value is hard-pinned: no higher-precedence layer may change it. A default
-//! value is a fallback that a higher layer may still override. Config resolves
-//! through a fixed *semantic* layer order (never lexical or positional); higher
-//! layers win unless a lower one is `fixed`:
-//! `PipelineDefault < Group(s) by priority < ChannelWide < ChannelPerTarget`.
+//! ## Two application surfaces
 //!
-//! ## Sealed composition internals
+//! - **Structural** — the `overrides:` op stream ([`OverlayOp`](clinker_plan::overlay_ops::OverlayOp))
+//!   splices into the base AST *pre-compile* (via `CompileContext::overlay_ops`),
+//!   so the effective DAG is what binds and lowers.
+//! - **Value** — `config:` / `vars:` clobber onto the compiled plan's
+//!   `ProvenanceDb` *post-compile*, with `vars` resolving to runtime values.
 //!
-//! Channels can only override parameters declared in the target's
-//! `config_schema`. They cannot reach into sealed composition internals.
-//! Attempting to bind an undeclared key produces error E105.
+//! [`resolve`] ties discovery, group derivation, and both surfaces into one
+//! [`OverlayResolution`] for a `(target, channel?, groups)` invocation; the CLI
+//! (`run`, `explain`, `channels resolve`, `channels lint`) drives it.
 //!
 //! ## DottedPath syntax
 //!
-//! Channel binding keys use dotted-path notation: `alias.param_name` for
-//! composition config, or `param_name` alone for pipeline-level config.
+//! `config:` keys use dotted-path notation: `alias.param_name` for a
+//! composition-node parameter, or `param_name` alone for pipeline-level config.
 //! See [`DottedPath`] for validation rules.
 //!
 //! ## Content-hash keying
 //!
-//! Channel files are content-hashed (BLAKE3) on load. Unchanged channels
-//! produce identical hashes, enabling efficient cache invalidation —
-//! recompilation is skipped when the channel content has not changed.
+//! A channel's overlay files are content-hashed (BLAKE3) into its
+//! [`ChannelIdentity`](clinker_plan::plan::ChannelIdentity), so an unchanged
+//! channel keeps a stable identity and a changed overlay invalidates any
+//! identity-keyed cache.
 
-pub mod binding;
 pub mod derivation;
 pub mod discovery;
+pub mod dotted;
 pub mod error;
 pub mod group;
 pub mod manifest;
@@ -62,7 +67,6 @@ pub mod selector;
 pub mod staging_copy;
 
 // Explicit re-exports at crate root.
-pub use binding::{ChannelBinding, ChannelTarget, DottedPath, validate_channel_bindings};
 pub use derivation::{
     GroupDerivation, GroupSelection, SelectionOutcome, apply_group_config, derive_groups,
     group_layer,
@@ -71,10 +75,11 @@ pub use discovery::{
     CHANNEL_MANIFEST_FILE, DiscoveredChannel, OverlayKind, ResolvedOverlay, channel_dir,
     channel_folder_path, resolve_channel_overlay, scan_channels, scan_groups,
 };
+pub use dotted::DottedPath;
 pub use error::ChannelError;
 pub use group::Group;
 pub use manifest::{ChannelManifest, ChannelVars, ManifestHeader, OverlayFile, OverlayHeader};
-pub use overlay::{ChannelOverlayResult, apply_channel_overlay, merge_config_overrides};
+pub use overlay::ChannelOverlayResult;
 pub use resolve::{
     AppliedGroup, GroupSource, InjectedNode, OverlayResolution, ResolveError, resolve,
 };

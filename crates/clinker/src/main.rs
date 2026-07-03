@@ -103,7 +103,7 @@ EXAMPLES:
   clinker explain pipeline.yaml --field enrich1.fuzzy_threshold
 
   # Show provenance with a channel overlay applied
-  clinker explain pipeline.yaml --field enrich1.fuzzy_threshold --channel acme_prod.channel.yaml
+  clinker explain pipeline.yaml --field enrich1.fuzzy_threshold --channel acme_prod
 
   # Look up error code documentation
   clinker explain --code E105"
@@ -382,12 +382,13 @@ pub struct RunArgs {
     #[arg(long, help_heading = "Metrics")]
     pub metrics_spool_dir: Option<PathBuf>,
 
-    /// Channel YAML file to overlay before execution.
-    /// The channel can override or add `$vars.*` / `$pipeline.*` /
-    /// `$source.*` / `$record.*` defaults. Reserved system field names
-    /// are rejected.
+    /// Channel id (tenant folder under the workspace `[channel]` root) whose
+    /// overlay to apply before execution. Resolves the tenant's manifest and
+    /// per-target overlay, derives matching groups from its labels, and applies
+    /// the layered `config`/`vars` clobber, the structural `overrides:` op
+    /// stream, and `sources:` per-source patches. See `clinker channels resolve`.
     #[arg(long, help_heading = "Configuration")]
-    pub channel: Option<PathBuf>,
+    pub channel: Option<String>,
 
     /// Force-include a group overlay by name (repeatable). Applies the group's
     /// `overrides` op stream and `config`/`vars` clobber regardless of its
@@ -470,9 +471,10 @@ pub struct ExplainArgs {
     #[arg(long)]
     pub field: Option<String>,
 
-    /// Channel YAML file to apply before provenance lookup
+    /// Channel id (tenant folder under the workspace `[channel]` root) whose
+    /// overlay to apply before provenance lookup, mirroring `clinker run --channel`.
     #[arg(long)]
-    pub channel: Option<PathBuf>,
+    pub channel: Option<String>,
 
     /// Force-include a group overlay by name (repeatable) before provenance
     /// lookup, mirroring `clinker run --group`.
@@ -813,54 +815,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         unsafe { std::env::set_var("CLINKER_ENV", env_name) };
     }
 
-    // Load the channel binding once if `--channel` was supplied. It is loaded
-    // BEFORE the pipeline config because its per-source config patches must be
-    // applied to the parsed config before validation/compile (below). The
-    // overlay for composition config/vars still runs against each `compile()`
-    // result later; the binding is borrowed by the `--explain` arm and the
-    // main run.
-    let channel_binding = match args.channel.as_deref() {
-        Some(path) => Some(clinker_channel::ChannelBinding::load(path).map_err(|e| {
-            PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                "channel '{}': {e}",
-                path.display(),
-            )))
-        })?),
-        None => None,
-    };
-    if let Some(b) = &channel_binding {
-        let target = match &b.target {
-            clinker_channel::ChannelTarget::Pipeline(p) => p,
-            clinker_channel::ChannelTarget::Composition(p) => p,
-        };
-        let canon_target = std::fs::canonicalize(target).ok();
-        let canon_config = std::fs::canonicalize(&args.config).ok();
-        if let (Some(t), Some(c)) = (canon_target.as_ref(), canon_config.as_ref())
-            && t != c
-        {
-            eprintln!(
-                "W104: channel {:?} targets {:?} but run loaded {:?}; proceeding",
-                b.name,
-                target.display(),
-                args.config.display(),
-            );
-        }
-    }
-
-    // Apply the channel's source-config patches (schema / array_paths /
-    // options) to the parsed config before it is validated and compiled, so
-    // every run path — normal run, `--explain`, and `--lineage` — observes the
-    // patched shape. An absent channel (or one with no `sources:` block) is an
-    // empty map, making this equivalent to a plain validated load.
-    let empty_patches = indexmap::IndexMap::new();
-    let source_patches = channel_binding
-        .as_ref()
-        .map(|b| &b.source_patches)
-        .unwrap_or(&empty_patches);
-    let mut pipeline_config =
-        clinker_plan::config::load_config_with_vars_and_patches(&args.config, &[], source_patches)
-            .map_err(PipelineError::Config)?;
-
     // Resolve workspace_root and pipeline_dir ONCE at the entry point so
     // `compile()` never touches the process CWD. The invariant the compile
     // context must uphold is `workspace_root.join(pipeline_dir) ==` the
@@ -917,19 +871,19 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // halves are moved into `compile_ctx` next, so capture the join now.
     let lineage_base_dir = workspace_root.join(&pipeline_dir);
 
-    // Resolve the channel/group overlay stack (op stream + config/vars clobber)
-    // before building the compile context. Groups here are force-included by
-    // name (`--group`); auto-derivation keys off a channel manifest's labels,
-    // which the legacy file-based `--channel` flag does not carry, so on the run
-    // path only explicit `--group` overlays apply (full label-derivation is
-    // available via `clinker channels resolve`). An empty request resolves to
-    // an empty stack, keeping a plain run byte-identical.
+    // Resolve the channel/group overlay stack (op stream + config/vars clobber +
+    // per-source patches) before loading the pipeline config, so the resolved
+    // `sources:` patches can be applied to the parsed config pre-compile. A
+    // `--channel <id>` selects a tenant by computed path (its manifest labels
+    // drive selector-derived group membership); `--group <name>` force-includes
+    // a group regardless of selector. An empty request (no channel, no groups)
+    // resolves to nothing, keeping a plain run byte-identical.
     let target_name = args
         .config
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
-    let overlay_resolution = if args.groups.is_empty() {
+    let overlay_resolution = if args.channel.is_none() && args.groups.is_empty() {
         None
     } else {
         Some(
@@ -938,7 +892,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 &channel_layout,
                 &group_layout,
                 target_name,
-                None,
+                args.channel.as_deref(),
                 &args.groups,
                 !args.no_auto_groups,
             )
@@ -956,6 +910,21 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         eprintln!("clinker: applied overlay — {}", overlay_summary(res));
     }
 
+    // Apply the resolved channel's per-source config patches (schema /
+    // array_paths / options) to the parsed config before it is validated and
+    // compiled, so every run path — normal run, `--explain`, and `--lineage` —
+    // observes the patched shape. An absent channel (or one whose per-target
+    // overlay declares no `sources:` block) is an empty map, making this
+    // equivalent to a plain validated load.
+    let empty_patches = indexmap::IndexMap::new();
+    let source_patches = overlay_resolution
+        .as_ref()
+        .and_then(|res| res.source_patches())
+        .unwrap_or(&empty_patches);
+    let mut pipeline_config =
+        clinker_plan::config::load_config_with_vars_and_patches(&args.config, &[], source_patches)
+            .map_err(PipelineError::Config)?;
+
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
@@ -966,12 +935,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         // ProvenanceDb still records the full layer chain (post-compile
         // overlay), so this drives execution without double-applying to it.
         compile_ctx.config_overrides = res.effective_config_overrides();
-    }
-    if let Some(binding) = &channel_binding {
-        clinker_channel::merge_config_overrides(
-            &mut compile_ctx.config_overrides,
-            binding.effective_config(),
-        );
     }
 
     // Run identity values flow through Output path templates and the
@@ -1012,7 +975,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let template_ctx = clinker_plan::config::path_template::TemplateContext {
         source_name_default: source_name_default.as_deref(),
         source_name_by_node: source_name_by_node.clone(),
-        channel: channel_binding.as_ref().map(|b| b.name.as_str()),
+        channel: overlay_resolution.as_ref().and_then(|r| r.channel_id()),
         pipeline_hash,
         timestamp: Some(&timestamp_str),
         execution_id: Some(&execution_id),
@@ -1056,14 +1019,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 })?;
         if let Some(res) = &overlay_resolution {
             let overlay = res.apply_config_and_vars(&mut compiled_plan, &pipeline_config);
-            abort_on_overlay_errors(&overlay)?;
-        }
-        if let Some(binding) = &channel_binding {
-            let overlay = clinker_channel::apply_channel_overlay(
-                &mut compiled_plan,
-                binding,
-                &pipeline_config,
-            );
             abort_on_overlay_errors(&overlay)?;
         }
         let dag = compiled_plan.dag();
@@ -1186,10 +1141,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             let overlay = res.apply_config_and_vars(&mut compiled_plan, cfg);
             abort_on_overlay_errors(&overlay)?;
         }
-        if let Some(binding) = &channel_binding {
-            let overlay = clinker_channel::apply_channel_overlay(&mut compiled_plan, binding, cfg);
-            abort_on_overlay_errors(&overlay)?;
-        }
 
         let lineage = clinker_lineage::column_lineage(&compiled_plan, &lineage_base_dir);
         let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
@@ -1239,9 +1190,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         .and_then(|m| m.spool_dir.as_deref());
     let spool_dir = metrics::resolve_spool_dir(args.metrics_spool_dir.as_deref(), yaml_spool);
 
-    // Channel-resolved var overrides land here when --channel is set.
-    // Populated below from `apply_channel_overlay` after compile; the
-    // executor layers them atop Transform-declared defaults at init.
+    // Channel/group-resolved var overrides land here when an overlay applies.
+    // Populated below from the overlay resolution's `apply_config_and_vars`
+    // after compile; the executor layers them atop Transform-declared defaults
+    // at init.
     let mut channel_static_vars: indexmap::IndexMap<String, clinker_record::Value> =
         Default::default();
     let mut channel_pipeline_vars: indexmap::IndexMap<String, clinker_record::Value> =
@@ -1300,22 +1252,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 transform_name: String::new(),
                 messages: diags.iter().map(|d| d.message.clone()).collect(),
             })?;
-    // Group/channel-folder overlay: config/vars clobber at the lower layers.
-    // Applied before the legacy channel-file overlay so the latter (the
-    // highest layer) still wins any shared key.
+    // Channel/group overlay: config/vars clobber over the compiled plan's
+    // provenance, resolving the four scoped var registries into the runtime
+    // values the executor layers atop Transform-declared defaults at init.
     if let Some(res) = &overlay_resolution {
         let overlay = res.apply_config_and_vars(&mut compiled_plan, &pipeline_config);
-        abort_on_overlay_errors(&overlay)?;
-        channel_static_vars.extend(overlay.static_vars);
-        channel_pipeline_vars.extend(overlay.pipeline_vars);
-        for (src, inner) in overlay.source_vars {
-            channel_source_vars.entry(src).or_default().extend(inner);
-        }
-        channel_record_vars.extend(overlay.record_vars);
-    }
-    if let Some(binding) = &channel_binding {
-        let overlay =
-            clinker_channel::apply_channel_overlay(&mut compiled_plan, binding, &pipeline_config);
         abort_on_overlay_errors(&overlay)?;
         channel_static_vars.extend(overlay.static_vars);
         channel_pipeline_vars.extend(overlay.pipeline_vars);
@@ -2428,24 +2369,13 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
         clinker_plan::yaml::from_str(&interpolated)
             .map_err(|e| format!("YAML parse error: {e}"))?;
 
-    // Apply the channel's source-config patches before compile, so provenance
-    // is computed against the same patched plan a `run` would execute — no
-    // explain path compiles an unpatched config. Uses the shared
-    // `apply_source_patches` primitive that the run/`--explain`/`--lineage`
-    // paths reach through `load_config_with_vars_and_patches`.
-    if let Some(channel_path) = &args.channel {
-        let binding = clinker_channel::ChannelBinding::load(channel_path)
-            .map_err(|e| format!("channel '{}': {e}", channel_path.display()))?;
-        clinker_plan::config::apply_source_patches(&mut pipeline_config, &binding.source_patches)
-            .map_err(|e| format!("{e}"))?;
-    }
-
     // Resolve workspace root and pipeline_dir so composition `use:` paths
     // resolve correctly. The workspace root is the base_dir (default: CWD),
     // and pipeline_dir is the config file's parent relative to workspace_root.
     let workspace_root = args.base_dir.canonicalize()?;
     let config_parent = config_path
         .parent()
+        .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| std::path::Path::new("."))
         .canonicalize()?;
     let pipeline_dir = config_parent
@@ -2453,15 +2383,17 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| std::path::Path::new(""))
         .to_path_buf();
 
-    // Force-included group overlays (`--group`) apply their op stream and
-    // config/vars clobber before provenance is computed, mirroring `run`.
+    // Resolve the channel/group overlay stack. A `--channel <id>` selects a
+    // tenant by computed path (deriving matching groups from its labels);
+    // `--group <name>` force-includes a group. The op stream and `config`/`vars`
+    // clobber apply before provenance is computed, mirroring `run`.
     let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
         .map_err(|e| format!("clinker.toml: {e}"))?;
     let target_name = config_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or_default();
-    let overlay_resolution = if args.groups.is_empty() {
+    let overlay_resolution = if args.channel.is_none() && args.groups.is_empty() {
         None
     } else {
         Some(
@@ -2470,13 +2402,21 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
                 &clinker_toml.channel,
                 &clinker_toml.group,
                 target_name,
-                None,
+                args.channel.as_deref(),
                 &args.groups,
                 !args.no_auto_groups,
             )
             .map_err(|e| format!("overlay resolution failed: {e}"))?,
         )
     };
+
+    // Apply the resolved channel's per-source config patches before compile, so
+    // provenance is computed against the same patched plan a `run` would
+    // execute — no explain path compiles an unpatched config.
+    if let Some(patches) = overlay_resolution.as_ref().and_then(|r| r.source_patches()) {
+        clinker_plan::config::apply_source_patches(&mut pipeline_config, patches)
+            .map_err(|e| format!("{e}"))?;
+    }
 
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(&workspace_root, pipeline_dir);
@@ -2551,10 +2491,11 @@ fn format_overlay_value(v: &serde_json::Value) -> String {
 
 /// Compile the effective (post-overlay) plan for a target under a resolution.
 ///
-/// Applies the structural op stream pre-compile (via `overlay_ops`) and the
-/// `config`/`vars` clobber post-compile, returning the config, the compiled
-/// plan, and the overlay result (whose diagnostics carry any `E113`/`E109`).
-/// A compile failure (e.g. a dangling splice anchor) is a hard `Err`.
+/// Applies the resolved per-source `sources:` patches and the structural op
+/// stream pre-compile (via `overlay_ops`) and the `config`/`vars` clobber
+/// post-compile, returning the config, the compiled plan, and the overlay
+/// result (whose diagnostics carry any `E113`/`E109`). A compile failure (e.g.
+/// a dangling splice anchor) is a hard `Err`.
 fn compile_effective_plan(
     base_path: &std::path::Path,
     workspace_root: &std::path::Path,
@@ -2571,8 +2512,17 @@ fn compile_effective_plan(
         .map_err(|e| format!("cannot read {}: {e}", base_path.display()))?;
     let interpolated = clinker_plan::config::interpolate_env_vars(&yaml, &[])
         .map_err(|e| format!("environment variable interpolation failed: {e}"))?;
-    let config: clinker_plan::config::PipelineConfig = clinker_plan::yaml::from_str(&interpolated)
-        .map_err(|e| format!("YAML parse error: {e}"))?;
+    let mut config: clinker_plan::config::PipelineConfig =
+        clinker_plan::yaml::from_str(&interpolated)
+            .map_err(|e| format!("YAML parse error: {e}"))?;
+
+    // Per-source patches shape the parsed config before compile, so the
+    // effective DAG this reports reflects the same schema / array_paths /
+    // options changes a `run --channel` would execute.
+    if let Some(patches) = res.source_patches() {
+        clinker_plan::config::apply_source_patches(&mut config, patches)
+            .map_err(|e| e.to_string())?;
+    }
 
     let base_parent = base_path
         .parent()

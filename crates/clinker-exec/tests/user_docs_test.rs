@@ -36,14 +36,14 @@ fn test_user_docs_files_exist() {
         );
     }
 
-    // 2. Channel authoring guide (5 bullets)
+    // 2. Channel/group overlay guide
     let channel_lib = std::fs::read_to_string(root.join("crates/clinker-channel/src/lib.rs"))
         .expect("clinker-channel lib.rs must exist");
     let channel_topics = [
-        "Channel Authoring Guide",
-        "_channel:",
-        "fixed",
-        "default",
+        "Channel/Group Overlay System",
+        "Layout",
+        "Layer stack",
+        "overrides:",
         "DottedPath",
     ];
     for topic in &channel_topics {

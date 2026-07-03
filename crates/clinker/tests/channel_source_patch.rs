@@ -1,11 +1,13 @@
-//! End-to-end coverage for the channel `sources:` config-patch block (#550).
+//! End-to-end coverage for the channel `sources:` config-patch block.
 //!
-//! A channel patches a source's parsed config (schema column ops, `array_paths`
-//! ops, scalar `options`) before the pipeline is validated and compiled, so a
-//! run behaves as if the source YAML had been hand-edited. These tests shell
-//! out to the built `clinker` binary and assert the patch takes effect on the
-//! normal run path, is reflected by `--explain`, and that a bad patch fails at
-//! compile time with the documented diagnostic.
+//! A channel's per-target overlay patches a source's parsed config (schema
+//! column ops, `array_paths` ops, scalar `options`) before the pipeline is
+//! validated and compiled, so a run behaves as if the source YAML had been
+//! hand-edited. These tests shell out to the built `clinker` binary and drive
+//! the channel by tenant id (`--channel <id>`), resolving the tenant folder
+//! under the workspace `channel/` root. They assert the patch takes effect on
+//! the normal run path, is reflected by `--explain`, and that a bad patch fails
+//! at compile time with the documented diagnostic.
 
 use std::path::Path;
 use std::process::Command;
@@ -19,7 +21,19 @@ fn write(dir: &Path, name: &str, contents: &str) {
     std::fs::write(dir.join(name), contents).expect("write fixture file");
 }
 
-/// Run `clinker run <pipeline>` (plus any extra args) inside `dir`.
+/// Write a per-target overlay for tenant `id` overlaying `pipe.yaml`, at the
+/// computed path `channel/<id>/pipe.channel.yaml`. `body` is the overlay YAML
+/// below the authoritative `channel.target` header (e.g. a `sources:` block).
+fn write_channel(dir: &Path, id: &str, body: &str) {
+    let tenant = dir.join("channel").join(id);
+    std::fs::create_dir_all(&tenant).expect("create tenant dir");
+    let yaml = format!("channel:\n  target: ../../pipe.yaml\n{body}");
+    std::fs::write(tenant.join("pipe.channel.yaml"), yaml).expect("write overlay");
+}
+
+/// Run `clinker run pipe.yaml` (plus any extra args) inside `dir`. With
+/// `pipe.yaml` at the workspace root, the workspace root resolves to `dir`, so
+/// `channel/` folders resolve there.
 fn run_in(dir: &Path, extra: &[&str]) -> std::process::Output {
     Command::new(clinker_bin())
         .arg("run")
@@ -67,9 +81,6 @@ nodes:
 ";
 
 const CSV_CHANNEL: &str = "\
-channel:
-  name: fix
-  target: ./pipe.yaml
 sources:
   src:
     schema:
@@ -88,7 +99,7 @@ fn csv_schema_patch_enables_run_and_is_visible_downstream() {
         "id,cust_id,amount,region\n1,alice,100,west\n2,bob,250,east\n",
     );
     write(p, "pipe.yaml", CSV_PIPELINE);
-    write(p, "fix.channel.yaml", CSV_CHANNEL);
+    write_channel(p, "fix", CSV_CHANNEL);
 
     // Base pipeline: `customer_id` / `region` are not declared and `amount` is
     // a string, so it fails to compile.
@@ -99,7 +110,7 @@ fn csv_schema_patch_enables_run_and_is_visible_downstream() {
     );
 
     // Channel patch makes it valid; output proves the physical→logical mapping.
-    let patched = run_in(p, &["--channel", "fix.channel.yaml"]);
+    let patched = run_in(p, &["--channel", "fix"]);
     assert!(
         patched.status.success(),
         "patched run failed:\n{}",
@@ -192,7 +203,7 @@ fn csv_schema_patch_is_reflected_by_explain() {
     let p = dir.path();
     write(p, "in.csv", "id,cust_id,amount,region\n1,alice,100,west\n");
     write(p, "pipe.yaml", CSV_PIPELINE);
-    write(p, "fix.channel.yaml", CSV_CHANNEL);
+    write_channel(p, "fix", CSV_CHANNEL);
 
     // --explain compiles the same patched config: base fails, channel succeeds.
     let base = run_in(p, &["--explain"]);
@@ -200,7 +211,7 @@ fn csv_schema_patch_is_reflected_by_explain() {
         !base.status.success(),
         "base --explain should fail without the channel patch"
     );
-    let patched = run_in(p, &["--channel", "fix.channel.yaml", "--explain"]);
+    let patched = run_in(p, &["--channel", "fix", "--explain"]);
     assert!(
         patched.status.success(),
         "patched --explain failed:\n{}",
@@ -247,13 +258,10 @@ nodes:
       path: out.csv
 ",
     );
-    write(
+    write_channel(
         p,
-        "jfix.channel.yaml",
+        "jfix",
         "\
-channel:
-  name: jfix
-  target: ./pipe.yaml
 sources:
   src:
     options:
@@ -272,7 +280,7 @@ sources:
 
     // Channel: record_path override selects the three-row array, and the
     // array_paths explode fans each record out per tag → 4 rows.
-    let patched = run_in(p, &["--channel", "jfix.channel.yaml"]);
+    let patched = run_in(p, &["--channel", "jfix"]);
     assert!(
         patched.status.success(),
         "patched json run failed:\n{}",
@@ -292,20 +300,17 @@ fn unknown_source_name_fails_at_compile() {
     let p = dir.path();
     write(p, "in.csv", "id,amount,region\n1,100,west\n");
     write(p, "pipe.yaml", CSV_PIPELINE);
-    write(
+    write_channel(
         p,
-        "bad.channel.yaml",
+        "bad",
         "\
-channel:
-  name: bad
-  target: ./pipe.yaml
 sources:
   ghost:
     schema:
       id: remove
 ",
     );
-    let out = run_in(p, &["--channel", "bad.channel.yaml"]);
+    let out = run_in(p, &["--channel", "bad"]);
     assert!(!out.status.success(), "run with unknown source should fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("E230"), "stderr:\n{stderr}");
@@ -317,20 +322,17 @@ fn unknown_column_op_fails_at_compile() {
     let p = dir.path();
     write(p, "in.csv", "id,amount,region\n1,100,west\n");
     write(p, "pipe.yaml", CSV_PIPELINE);
-    write(
+    write_channel(
         p,
-        "bad.channel.yaml",
+        "bad",
         "\
-channel:
-  name: bad
-  target: ./pipe.yaml
 sources:
   src:
     schema:
       not_a_column: { retype: int }
 ",
     );
-    let out = run_in(p, &["--channel", "bad.channel.yaml"]);
+    let out = run_in(p, &["--channel", "bad"]);
     assert!(!out.status.success(), "run with unknown column should fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("E231"), "stderr:\n{stderr}");
@@ -366,21 +368,18 @@ fn channel_patch_changes_pipeline_hash_and_empty_patch_does_not() {
     let p = dir.path();
     write(p, "in.csv", "id,amount\n1,100\n");
     write(p, "pipe.yaml", HASH_PIPELINE);
-    write(
+    write_channel(
         p,
-        "a.channel.yaml",
-        "channel:\n  name: a\n  target: ./pipe.yaml\nsources:\n  src:\n    schema:\n      amount: { retype: int }\n",
+        "a",
+        "sources:\n  src:\n    schema:\n      amount: { retype: int }\n",
     );
-    write(
+    write_channel(
         p,
-        "b.channel.yaml",
-        "channel:\n  name: b\n  target: ./pipe.yaml\nsources:\n  src:\n    schema:\n      amount: { retype: float }\n",
+        "b",
+        "sources:\n  src:\n    schema:\n      amount: { retype: float }\n",
     );
-    write(
-        p,
-        "empty.channel.yaml",
-        "channel:\n  name: e\n  target: ./pipe.yaml\n",
-    );
+    // An overlay that declares no `sources:` block contributes no patch.
+    write_channel(p, "e", "");
 
     // Extract the `{pipeline_hash}` token from the single out_*.csv the run
     // wrote, then clear it before the next run.
@@ -406,14 +405,15 @@ fn channel_patch_changes_pipeline_hash_and_empty_patch_does_not() {
     };
 
     let base = hash_after(&[]);
-    let empty = hash_after(&["--channel", "empty.channel.yaml"]);
-    let patch_a = hash_after(&["--channel", "a.channel.yaml"]);
-    let patch_b = hash_after(&["--channel", "b.channel.yaml"]);
+    let empty = hash_after(&["--channel", "e"]);
+    let patch_a = hash_after(&["--channel", "a"]);
+    let patch_b = hash_after(&["--channel", "b"]);
 
-    // An empty patch map leaves the pipeline hash byte-identical to the base.
+    // An overlay with no source patches leaves the pipeline hash byte-identical
+    // to the base.
     assert_eq!(
         empty, base,
-        "empty channel must not change the pipeline hash"
+        "an empty-patch channel must not change the pipeline hash"
     );
     // A patched run has a distinct identity from the base...
     assert_ne!(patch_a, base, "patched run must differ from base");
@@ -454,10 +454,10 @@ nodes:
       path: out.csv
 ",
     );
-    write(
+    write_channel(
         p,
-        "bad.channel.yaml",
-        "channel:\n  name: bad\n  target: ./pipe.yaml\nsources:\n  ghost:\n    schema:\n      id: remove\n",
+        "bad",
+        "sources:\n  ghost:\n    schema:\n      id: remove\n",
     );
     let out = Command::new(clinker_bin())
         .arg("explain")
@@ -465,7 +465,7 @@ nodes:
         .arg("--field")
         .arg("out.name")
         .arg("--channel")
-        .arg("bad.channel.yaml")
+        .arg("bad")
         .current_dir(p)
         .output()
         .expect("spawn clinker explain");

@@ -137,8 +137,9 @@ impl CompiledPlan {
         &mut self.provenance
     }
 
-    /// The channel identity stamped by [`apply_channel_overlay`], if any.
-    /// `None` for base pipeline compilations (no channel applied).
+    /// The channel identity stamped by the channel/group overlay resolution
+    /// (`OverlayResolution::apply_config_and_vars`), if any. `None` for base
+    /// pipeline compilations (no channel applied).
     pub fn channel_identity(&self) -> Option<&ChannelIdentity> {
         self.channel_identity.as_ref()
     }

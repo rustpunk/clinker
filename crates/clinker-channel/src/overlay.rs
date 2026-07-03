@@ -1,10 +1,12 @@
-//! Channel overlay merge.
+//! Channel/group value-clobber merge.
 //!
-//! Applies a [`ChannelBinding`] to a [`CompiledPlan`] as a layered **clobber**
-//! over the plan's
+//! Applies an overlay layer's `config:` / `vars:` surface to a
+//! [`CompiledPlan`] as a layered **clobber** over the plan's
 //! [`ProvenanceDb`](clinker_plan::config::composition::ProvenanceDb): a higher
 //! layer's value fully *replaces* the lower one (never a deep-merge), and each
-//! resolved value maps to exactly one winning layer.
+//! resolved value maps to exactly one winning layer. The layer stack is driven
+//! by [`crate::resolve`], which resolves the group / channel-wide / per-target
+//! layers and calls these engines per layer.
 //!
 //! # Layer stack
 //!
@@ -18,20 +20,16 @@
 //!
 //! - **PipelineDefault** is the base layer, already recorded in the plan's
 //!   `ProvenanceDb` by composition compile.
-//! - **Group** (selector-derived) and **ChannelWide** (`channel.cfg.yaml`
-//!   manifest) layers plug into the same [`apply_config_clobber`] engine — it
-//!   resolves at any `LayerKind`, so those layers need no new resolution logic
-//!   once their sources are wired in by later stages.
-//! - **ChannelPerTarget** is the per-target `.channel.yaml` binding this
-//!   function overlays. Its `config.default` / `config.fixed` split maps to the
-//!   within-layer `fixed` lock flag: a `fixed` value cannot be overridden by
-//!   any higher-precedence layer.
+//! - **Group** (selector-derived), **ChannelWide** (`channel.cfg.yaml`
+//!   manifest), and **ChannelPerTarget** (per-target overlay) layers all plug
+//!   into the same [`apply_config_clobber`] engine — it resolves at any
+//!   `LayerKind`, so no layer needs bespoke resolution logic. A `fixed:` value
+//!   locks within its layer against every higher-precedence layer.
 //!
 //! Also resolves channel-supplied var overrides/adds for the four scoped
 //! registries (`$vars.*`, `$pipeline.*`, `$source.*`, `$record.*`) against the
 //! pipeline's declarations (these flow to the executor as runtime values via
-//! `PipelineRunParams`, not into the AST), and stamps a [`ChannelIdentity`] for
-//! cache-keying.
+//! `PipelineRunParams`, not into the AST).
 
 use std::collections::HashMap;
 
@@ -46,10 +44,9 @@ use clinker_plan::config::{
     PipelineConfig, ScopedVarDecl, ScopedVarType, check_scoped_var_default,
     coerce_scoped_var_default, reserved_names_for,
 };
-use clinker_plan::plan::{ChannelIdentity, CompiledPlan};
 use clinker_record::Value;
 
-use crate::binding::{ChannelBinding, ChannelTarget, DottedPath};
+use crate::dotted::DottedPath;
 use crate::error::ChannelError;
 use crate::manifest::ChannelVars;
 
@@ -68,108 +65,6 @@ pub struct ChannelOverlayResult {
     /// applied to every record at materialization.
     pub record_vars: IndexMap<String, Value>,
     pub diagnostics: Vec<Diagnostic>,
-}
-
-/// Apply a channel binding to a compiled plan.
-///
-/// Performs three things:
-///
-/// 1. Clobbers `config.default` / `config.fixed` onto the plan's
-///    [`ProvenanceDb`](clinker_plan::config::composition::ProvenanceDb) at the
-///    `ChannelPerTarget` layer. `default` is applied first (non-fixed), then
-///    `fixed` (locking), so a key present in both resolves to the fixed value
-///    (fixed wins over default within the layer). A key matching no plan
-///    parameter is a hard error (E113).
-/// 2. Resolves the channel's `vars:` block against the pipeline's
-///    declared registries — typecheck on override (E107), reserved
-///    name guard (E110), unknown source-node guard (E111),
-///    composition-target guard (E109).
-/// 3. Stamps `ChannelIdentity` on the plan.
-///
-/// Returns the typed var maps even when diagnostics include errors;
-/// callers should refuse to execute if any `Severity::Error` is present.
-pub fn apply_channel_overlay(
-    plan: &mut CompiledPlan,
-    binding: &ChannelBinding,
-    config: &PipelineConfig,
-) -> ChannelOverlayResult {
-    let mut result = ChannelOverlayResult::default();
-
-    // A per-target `.channel.yaml` overlays the ChannelPerTarget layer, the
-    // highest in the stack. `default` first (non-fixed) then `fixed` (locking):
-    // for a key present in both, the fixed value wins by replacing in place and
-    // setting the lock, matching the historical `fixed > default` precedence.
-    apply_config_clobber(
-        plan.provenance_mut(),
-        &binding.config_default,
-        LayerKind::ChannelPerTarget,
-        false,
-        &binding.name,
-        &mut result.diagnostics,
-    );
-    apply_config_clobber(
-        plan.provenance_mut(),
-        &binding.config_fixed,
-        LayerKind::ChannelPerTarget,
-        true,
-        &binding.name,
-        &mut result.diagnostics,
-    );
-
-    let composition_target = matches!(binding.target, ChannelTarget::Composition(_));
-    let has_var_overrides = !binding.vars_static.is_empty()
-        || !binding.vars_pipeline.is_empty()
-        || !binding.vars_source.is_empty()
-        || !binding.vars_record.is_empty();
-
-    if composition_target && has_var_overrides {
-        let target_path = match &binding.target {
-            ChannelTarget::Composition(p) => p.display().to_string(),
-            ChannelTarget::Pipeline(_) => unreachable!(),
-        };
-        result.diagnostics.push(Diagnostic::error(
-            "E109",
-            format!(
-                "channel {:?}: var overrides not supported on composition channels (target: {})",
-                binding.name, target_path,
-            ),
-            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
-        ));
-    } else {
-        result.static_vars = resolve_static_overrides(
-            &binding.name,
-            &binding.vars_static,
-            config,
-            &mut result.diagnostics,
-        );
-        result.pipeline_vars = resolve_scoped_overrides(
-            &binding.name,
-            &binding.vars_pipeline,
-            config,
-            VarScope::Pipeline,
-            &mut result.diagnostics,
-        );
-        result.record_vars = resolve_scoped_overrides(
-            &binding.name,
-            &binding.vars_record,
-            config,
-            VarScope::Record,
-            &mut result.diagnostics,
-        );
-        result.source_vars = resolve_source_overrides(
-            &binding.name,
-            &binding.vars_source,
-            config,
-            &mut result.diagnostics,
-        );
-    }
-
-    plan.set_channel_identity(ChannelIdentity {
-        name: binding.name.clone(),
-        content_hash: binding.channel_hash,
-    });
-
-    result
 }
 
 /// Clobber a config map onto a plan's provenance as one layer.
@@ -260,20 +155,6 @@ impl EffectiveConfig {
         }
     }
 
-    /// Apply one layer's already-validated dotted-keyed `config:` map.
-    pub(crate) fn apply_dotted(
-        &mut self,
-        config: &IndexMap<DottedPath, serde_json::Value>,
-        kind: LayerKind,
-        fixed: bool,
-    ) {
-        for (dotted, value) in config {
-            if let (Some(node), param) = dotted.segments() {
-                self.insert(node, param, value, kind, fixed);
-            }
-        }
-    }
-
     fn insert(
         &mut self,
         node: &str,
@@ -315,18 +196,6 @@ impl EffectiveConfig {
     }
 }
 
-/// Merge `higher` config overrides over `base`, resolving each `(node, param)`
-/// to the higher map's value. Used to layer the legacy channel-file binding
-/// (highest precedence) over the channel/group folder resolution.
-pub fn merge_config_overrides(base: &mut ConfigOverrides, higher: ConfigOverrides) {
-    for (node, params) in higher {
-        let entry = base.entry(node).or_default();
-        for (param, value) in params {
-            entry.insert(param, value);
-        }
-    }
-}
-
 /// Validate a raw `alias.param` config map into [`DottedPath`] keys, cloning
 /// the values. The first malformed key fails the whole map.
 ///
@@ -347,8 +216,8 @@ pub(crate) fn validate_config_keys(
 /// registries and **merge** the results into `out` with later-layer-wins
 /// semantics (a key an earlier layer set is overwritten by this layer).
 ///
-/// Reuses the same per-registry validators the per-target [`apply_channel_overlay`]
-/// path uses, so every layer (group, channel-wide, per-target) resolves vars
+/// Reuses the same per-registry validators every overlay layer uses, so groups,
+/// the channel-wide manifest, and the per-target overlay resolve vars
 /// identically. Callers apply layers in ascending precedence order so the
 /// highest layer wins each key. `source_label` names the layer for diagnostics
 /// (e.g. a group or channel name).
