@@ -8,8 +8,9 @@ use std::str::FromStr;
 /// (banker's rounding). Unbiased over a stream of values — the accounting
 /// standard and `rust_decimal`'s own default — so summing rounded amounts does
 /// not systematically drift up or down the way round-half-away-from-zero does.
-/// Applied when coercing a value into a scaled `decimal` column and when
-/// dividing/averaging to a target scale.
+/// Applied when coercing a value into a scaled `decimal` column and by the
+/// `round()` / `round_to()` builtins. `avg` and `decimal / decimal` compute at
+/// full precision and are not rounded to a scale here.
 pub const DECIMAL_ROUNDING: RoundingStrategy = RoundingStrategy::MidpointNearestEven;
 
 /// Round a `Decimal` to `scale` fractional digits using [`DECIMAL_ROUNDING`],

@@ -20,6 +20,7 @@ mod dispatch {
     use cxl::typecheck::pass::{AggregateMode, type_check_with_mode};
     use cxl::typecheck::types::Type;
     use indexmap::IndexMap;
+    use rust_decimal::Decimal;
 
     use crate::aggregation::{AggregatorConfig, AggregatorGroupState, HashAggregator};
     use clinker_plan::config::ErrorStrategy;
@@ -930,6 +931,320 @@ nodes:
         );
         agg.flush(&ctx_for(&stable, &file, 0), &mut out).unwrap();
         assert_eq!(out.len(), groups as usize, "one row per group at the end");
+    }
+
+    // ===================================================================
+    // Exact `decimal` aggregation, end-to-end through the real
+    // Parser -> resolve -> typecheck -> extract_aggregates -> HashAggregator
+    // path. Before the typecheck guard accepted `Type::Decimal`, these
+    // pipelines were rejected at compile time, so `build_aggregator` (which
+    // `.expect("typecheck")`s) would have panicked here.
+    // ===================================================================
+
+    /// Collect a finalized aggregator's output rows into a `(key, decimal)`
+    /// map, keyed by the first output column rendered as a string. Works for
+    /// both string and decimal group keys.
+    fn decimal_totals_by_key(
+        out: &[crate::aggregation::SortRow],
+        total_idx: usize,
+    ) -> Vec<(String, Decimal)> {
+        out.iter()
+            .map(|(rec, _)| {
+                let key = rec.values()[0].to_string();
+                let total = match &rec.values()[total_idx] {
+                    Value::Decimal(d) => *d,
+                    other => panic!("expected a decimal total, got {other:?}"),
+                };
+                (key, total)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_sum_decimal_exact_total_to_the_cent_e2e() {
+        // 100 pennies == $1.00 exactly. The decimal accumulator lands on the
+        // cent; the binary-float path does not (0.01 is not representable in
+        // IEEE-754, so 100 additions drift off 1.0).
+        let input = make_schema(&["k", "amount"]);
+        let mut agg = build_aggregator(
+            &[("k", Type::String), ("amount", Type::Decimal)],
+            &["k"],
+            "emit k = k\nemit total = sum(amount)",
+            "decimal_sum_e2e",
+            64 * 1024 * 1024,
+            None,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        for i in 0..100u64 {
+            let r = make_record(
+                &input,
+                vec![
+                    Value::String("g".into()),
+                    Value::Decimal(Decimal::new(1, 2)),
+                ], // 0.01
+            );
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
+        }
+        let ctx = ctx_for(&stable, &file, 0);
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+        agg.finalize(&ctx, &mut out).expect("finalize");
+        assert_eq!(out.len(), 1, "one group");
+        assert_eq!(
+            out[0].0.values()[1],
+            Value::Decimal(Decimal::new(100, 2)),
+            "exact monetary total 1.00 to the cent"
+        );
+
+        // The binary-float path drifts off the exact cent — the whole reason
+        // the decimal type exists.
+        let mut float_sum = 0.0_f64;
+        for _ in 0..100 {
+            float_sum += 0.01;
+        }
+        assert_ne!(
+            float_sum, 1.0_f64,
+            "binary float drifts ({float_sum:?}); the decimal total stays exact"
+        );
+    }
+
+    #[test]
+    fn test_avg_decimal_exact_e2e() {
+        // avg(0.10, 0.20, 0.30) == 0.60 / 3 == 0.20 exactly.
+        let input = make_schema(&["k", "amount"]);
+        let mut agg = build_aggregator(
+            &[("k", Type::String), ("amount", Type::Decimal)],
+            &["k"],
+            "emit k = k\nemit average = avg(amount)",
+            "decimal_avg_e2e",
+            64 * 1024 * 1024,
+            None,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        for (i, c) in [10i64, 20, 30].iter().enumerate() {
+            let r = make_record(
+                &input,
+                vec![
+                    Value::String("g".into()),
+                    Value::Decimal(Decimal::new(*c, 2)),
+                ],
+            );
+            agg.add_record(&r, i as u64, &ctx_for(&stable, &file, i as u64))
+                .unwrap();
+        }
+        let ctx = ctx_for(&stable, &file, 0);
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+        agg.finalize(&ctx, &mut out).expect("finalize");
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].0.values()[1],
+            Value::Decimal(Decimal::new(20, 2)),
+            "exact decimal average 0.20"
+        );
+
+        // avg over decimals computes at full precision (no binary float): the
+        // exact average of three equal-weight cents is exact, and a repeating
+        // quotient keeps every digit rather than collapsing to an f64.
+        let mut agg2 = build_aggregator(
+            &[("k", Type::String), ("amount", Type::Decimal)],
+            &["k"],
+            "emit k = k\nemit average = avg(amount)",
+            "decimal_avg_repeating_e2e",
+            64 * 1024 * 1024,
+            None,
+        );
+        // avg(1.00, 1.00, 2.00) == 4.00 / 3 == 1.3333... at full precision.
+        for (i, c) in [100i64, 100, 200].iter().enumerate() {
+            let r = make_record(
+                &input,
+                vec![
+                    Value::String("g".into()),
+                    Value::Decimal(Decimal::new(*c, 2)),
+                ],
+            );
+            agg2.add_record(&r, i as u64, &ctx_for(&stable, &file, i as u64))
+                .unwrap();
+        }
+        let mut out2: Vec<crate::aggregation::SortRow> = Vec::new();
+        agg2.finalize(&ctx, &mut out2).expect("finalize");
+        let expected = Decimal::from(4) / Decimal::from(3);
+        assert_eq!(
+            out2[0].0.values()[1],
+            Value::Decimal(expected),
+            "avg computes the exact full-precision quotient 4/3"
+        );
+        assert!(
+            expected.scale() > 2,
+            "the exact quotient keeps its full scale"
+        );
+    }
+
+    #[test]
+    fn test_group_by_decimal_sum_e2e() {
+        // Per-group exact decimal totals.
+        let input = make_schema(&["k", "amount"]);
+        let mut agg = build_aggregator(
+            &[("k", Type::String), ("amount", Type::Decimal)],
+            &["k"],
+            "emit k = k\nemit total = sum(amount)",
+            "decimal_group_sum_e2e",
+            64 * 1024 * 1024,
+            None,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        // group "a": 1.11 + 2.22 == 3.33 ; group "b": 0.01 + 0.02 == 0.03.
+        let rows = [("a", 111i64), ("b", 1), ("a", 222), ("b", 2)];
+        for (i, (k, c)) in rows.iter().enumerate() {
+            let r = make_record(
+                &input,
+                vec![
+                    Value::String((*k).into()),
+                    Value::Decimal(Decimal::new(*c, 2)),
+                ],
+            );
+            agg.add_record(&r, i as u64, &ctx_for(&stable, &file, i as u64))
+                .unwrap();
+        }
+        let ctx = ctx_for(&stable, &file, 0);
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+        agg.finalize(&ctx, &mut out).expect("finalize");
+        let totals = decimal_totals_by_key(&out, 1);
+        assert_eq!(totals.len(), 2, "two groups");
+        let a = totals.iter().find(|(k, _)| k == "a").expect("group a");
+        let b = totals.iter().find(|(k, _)| k == "b").expect("group b");
+        assert_eq!(a.1, Decimal::new(333, 2), "group a total 3.33");
+        assert_eq!(b.1, Decimal::new(3, 2), "group b total 0.03");
+    }
+
+    #[test]
+    fn test_min_max_decimal_e2e() {
+        // min/max preserve exact decimal ordering (no numeric guard blocks
+        // them, and comparison is value-exact).
+        let input = make_schema(&["k", "amount"]);
+        let mut agg = build_aggregator(
+            &[("k", Type::String), ("amount", Type::Decimal)],
+            &["k"],
+            "emit k = k\nemit lo = min(amount)\nemit hi = max(amount)",
+            "decimal_min_max_e2e",
+            64 * 1024 * 1024,
+            None,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        for (i, c) in [125i64, 999, 1, 500].iter().enumerate() {
+            let r = make_record(
+                &input,
+                vec![
+                    Value::String("g".into()),
+                    Value::Decimal(Decimal::new(*c, 2)),
+                ],
+            );
+            agg.add_record(&r, i as u64, &ctx_for(&stable, &file, i as u64))
+                .unwrap();
+        }
+        let ctx = ctx_for(&stable, &file, 0);
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+        agg.finalize(&ctx, &mut out).expect("finalize");
+        assert_eq!(
+            out[0].0.values()[1],
+            Value::Decimal(Decimal::new(1, 2)),
+            "min 0.01"
+        );
+        assert_eq!(
+            out[0].0.values()[2],
+            Value::Decimal(Decimal::new(999, 2)),
+            "max 9.99"
+        );
+    }
+
+    #[test]
+    fn test_spilled_decimal_group_by_preserves_exactness_and_identity_e2e() {
+        // Force a spill and confirm two things survive the spill-merge:
+        //   (1) per-group decimal sums are exact (postcard+LZ4 serde of
+        //       `decimal_sum` round-trips the 16-byte form), and
+        //   (2) decimal group identity is scale-normalized — `2.50` and `2.5`
+        //       collapse into ONE group both in memory and through the exact,
+        //       order-preserving spilled group-sort key.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let input = make_schema(&["price", "amount"]);
+        let mut agg = build_aggregator(
+            &[("price", Type::Decimal), ("amount", Type::Decimal)],
+            &["price"],
+            "emit price = price\nemit total = sum(amount)",
+            "decimal_spill_group_e2e",
+            1024, // tiny budget forces spill under many groups
+            Some(tmp.path().to_path_buf()),
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        let mut i = 0u64;
+        // 250 distinct whole-dollar prices, each one 0.10 amount -> total 0.10.
+        for p in 1..=250i64 {
+            let r = make_record(
+                &input,
+                vec![
+                    Value::Decimal(Decimal::new(p * 100, 2)), // $p.00
+                    Value::Decimal(Decimal::new(10, 2)),      // 0.10
+                ],
+            );
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
+            i += 1;
+        }
+        // Same value at different scales must collapse into ONE group:
+        //   price 2.50 (+0.10) and price 2.5 (+0.15) -> group 2.5, total 0.25.
+        // 2.5 is distinct from every $p.00 price above.
+        for (m, s, amt_m, amt_s) in [(250i64, 2u32, 10i64, 2u32), (25, 1, 15, 2)] {
+            let r = make_record(
+                &input,
+                vec![
+                    Value::Decimal(Decimal::new(m, s)),
+                    Value::Decimal(Decimal::new(amt_m, amt_s)),
+                ],
+            );
+            agg.add_record(&r, i, &ctx_for(&stable, &file, i)).unwrap();
+            i += 1;
+        }
+        assert!(
+            !agg.spill_files().is_empty(),
+            "250+ decimal groups under a 1 KiB budget must spill"
+        );
+        let ctx = ctx_for(&stable, &file, 0);
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+        agg.finalize(&ctx, &mut out).expect("finalize after spill");
+        // 250 whole-dollar groups + the single collapsed 2.5 group = 251.
+        assert_eq!(
+            out.len(),
+            251,
+            "2.50 and 2.5 must collapse to one group across the spill merge"
+        );
+
+        let mut found_collapsed = false;
+        for (rec, _) in &out {
+            let (price, total) = match (&rec.values()[0], &rec.values()[1]) {
+                (Value::Decimal(p), Value::Decimal(t)) => (*p, *t),
+                other => panic!("expected decimal price/total, got {other:?}"),
+            };
+            if price == Decimal::new(25, 1) {
+                assert_eq!(
+                    total,
+                    Decimal::new(25, 2),
+                    "collapsed 2.50/2.5 group summed exactly to 0.25"
+                );
+                found_collapsed = true;
+            } else {
+                assert_eq!(
+                    total,
+                    Decimal::new(10, 2),
+                    "each whole-dollar group total is exactly 0.10 through the spill"
+                );
+            }
+        }
+        assert!(
+            found_collapsed,
+            "the scale-normalized 2.5 group must survive the spill merge"
+        );
     }
 }
 
