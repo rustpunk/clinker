@@ -40,9 +40,7 @@ mod tests {
             producer: "https://example/producer".to_string(),
             schema_url: "https://example/schema".to_string(),
             event_type,
-            run: Run {
-                run_id: "0190b7e0-0000-7000-8000-000000000000".to_string(),
-            },
+            run: Run::new("0190b7e0-0000-7000-8000-000000000000"),
             job: Job {
                 namespace: "clinker".to_string(),
                 name: "orders".to_string(),

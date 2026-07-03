@@ -351,7 +351,6 @@ pub fn explain_code(code: &str) -> Option<&'static str> {
         "E102" => Some(include_str!("../../../../docs/explain/E102.md")),
         "E103" => Some(include_str!("../../../../docs/explain/E103.md")),
         "E104" => Some(include_str!("../../../../docs/explain/E104.md")),
-        "E105" => Some(include_str!("../../../../docs/explain/E105.md")),
         "E106" => Some(include_str!("../../../../docs/explain/E106.md")),
         "E107" => Some(include_str!("../../../../docs/explain/E107.md")),
         "E108" => Some(include_str!("../../../../docs/explain/E108.md")),
@@ -483,13 +482,6 @@ mod tests {
     }
 
     #[test]
-    fn test_explain_code_e105() {
-        let doc = explain_code("E105").unwrap();
-        assert!(!doc.is_empty());
-        assert!(doc.contains("E105"));
-    }
-
-    #[test]
     fn test_explain_code_e319() {
         let doc = explain_code("E319").unwrap();
         assert!(doc.contains("E319"));
@@ -617,12 +609,12 @@ mod tests {
     #[test]
     fn test_explain_docs_all_have_required_sections() {
         let codes = [
-            "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "E150b", "E150c",
-            "E150d", "E150e", "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308",
-            "E309", "E310", "E311", "E312", "E313", "E319", "E320", "E321", "E323", "E330", "E331",
-            "E332", "E333", "E334", "E335", "E336", "E337", "E338", "E339", "E340", "E341", "E342",
-            "E343", "E344", "E345", "E346", "E347", "E348", "E349", "E350", "E351", "E352", "E353",
-            "E354", "E355", "E15Y", "W101", "W302", "W305", "W306",
+            "E101", "E102", "E103", "E104", "E106", "E107", "E108", "E150b", "E150c", "E150d",
+            "E150e", "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308", "E309",
+            "E310", "E311", "E312", "E313", "E319", "E320", "E321", "E323", "E330", "E331", "E332",
+            "E333", "E334", "E335", "E336", "E337", "E338", "E339", "E340", "E341", "E342", "E343",
+            "E344", "E345", "E346", "E347", "E348", "E349", "E350", "E351", "E352", "E353", "E354",
+            "E355", "E15Y", "W101", "W302", "W305", "W306",
         ];
         let required_sections = [
             "## What it means",

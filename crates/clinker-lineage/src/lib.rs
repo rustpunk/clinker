@@ -14,7 +14,11 @@
 //! source for value-carrying reads, and as INDIRECT influence for reads in a
 //! route / cull / combine predicate; see that module's documented limitations for
 //! the cases still out of scope. The [`emit`] module assembles a built lineage into
-//! a `START`/`COMPLETE` run-event pair ready for [`openlineage::write_ndjson`].
+//! run events ready for [`openlineage::write_ndjson`]: a static `START`/`COMPLETE`
+//! pair for the plan-derived `--lineage` export ([`emit::run_events`]), or live
+//! run-lifecycle events tied to an actual execution — a `START` at run begin and a
+//! terminal `COMPLETE` / `FAIL` / `ABORT` carrying real run stats, driven by
+//! [`emit::LiveRunEmitter`].
 //!
 //! The model is pinned to OpenLineage core spec `2-0-2` and the
 //! `ColumnLineageDatasetFacet` `1-2-0`. No general-purpose Rust OpenLineage client
@@ -29,10 +33,12 @@ pub mod openlineage;
 
 pub use builder::{OutputColumnLineage, PlanColumnLineage, column_lineage};
 pub use dataset::{DatasetId, FALLBACK_NAMESPACE, FILE_NAMESPACE, dataset_identity};
-pub use emit::run_events;
+pub use emit::{LiveRunEmitter, RunStats, Terminal, run_events, start_event, terminal_event};
 pub use openlineage::{
-    CLINKER_PIPELINE_FACET_SCHEMA_URL, COLUMN_LINEAGE_FACET_SCHEMA_URL, ColumnLineageDatasetFacet,
-    Dataset, DatasetFacets, EventType, FieldLineage, InputField, JOB_NAMESPACE, Job, JobFacets,
-    OPENLINEAGE_SCHEMA_URL, PRODUCER, PipelineJobFacet, Run, RunEvent, Transformation,
-    TransformationSubtype, TransformationType, write_ndjson,
+    CLINKER_PIPELINE_FACET_SCHEMA_URL, CLINKER_RUN_STATS_FACET_SCHEMA_URL,
+    COLUMN_LINEAGE_FACET_SCHEMA_URL, ColumnLineageDatasetFacet, Dataset, DatasetFacets,
+    ERROR_MESSAGE_FACET_SCHEMA_URL, ErrorMessageRunFacet, EventType, FieldLineage, InputField,
+    JOB_NAMESPACE, Job, JobFacets, OPENLINEAGE_SCHEMA_URL, PRODUCER, PipelineJobFacet, Run,
+    RunEvent, RunFacets, RunStatsFacet, Transformation, TransformationSubtype, TransformationType,
+    write_ndjson,
 };

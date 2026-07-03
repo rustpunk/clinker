@@ -112,7 +112,7 @@ EXAMPLES:
   clinker explain pipeline.yaml --field orders.amount.scale --channel acme_prod
 
   # Look up error code documentation
-  clinker explain --code E105"
+  clinker explain --code E103"
     )]
     Explain(ExplainArgs),
     /// Channel/group overlay tooling: resolve one effective plan, or lint the
@@ -343,6 +343,22 @@ pub struct RunArgs {
     )]
     pub lineage: Option<PathBuf>,
 
+    /// Run the pipeline and emit live OpenLineage run events (a START at run
+    /// begin, then a terminal COMPLETE / FAIL / ABORT with real timing and row
+    /// counts) as NDJSON to a file path, or `-` for stdout. Unlike --lineage
+    /// (a static plan-only export that exits without reading data), this
+    /// processes data, so it cannot be combined with --lineage, --explain,
+    /// --dry-run, or -n. Prefer a file path for a clean NDJSON stream: with `-`,
+    /// the run's own stdout output (e.g. the spill-volume summary) interleaves
+    /// with the events.
+    #[arg(
+        long = "lineage-events",
+        value_name = "PATH",
+        help_heading = "Metrics",
+        conflicts_with_all = ["lineage", "explain", "dry_run", "dry_run_n"]
+    )]
+    pub lineage_events: Option<PathBuf>,
+
     /// Validate config and CXL without processing data
     #[arg(long, help_heading = "Validation")]
     pub dry_run: bool,
@@ -492,7 +508,7 @@ pub struct ExplainArgs {
     #[arg(long = "no-auto-groups")]
     pub no_auto_groups: bool,
 
-    /// Error/warning code to look up (e.g. "E105")
+    /// Error/warning code to look up (e.g. "E103")
     #[arg(long)]
     pub code: Option<String>,
 
@@ -1129,9 +1145,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Plan-derived OpenLineage column lineage. Like --explain, compile the plan
     // and emit without reading any data, then exit. The export is static: its
     // runId is this invocation's execution_id and does NOT identify a
-    // data-processing run (live run-lifecycle emission with real timing is a
-    // follow-up). Compiles from the pre-template snapshot so output dataset
-    // names are the declared paths, not this run's resolved ones.
+    // data-processing run (for live run-lifecycle events with real timing and row
+    // counts, run the pipeline with --lineage-events instead). Compiles from the
+    // pre-template snapshot so output dataset names are the declared paths, not
+    // this run's resolved ones.
     if let Some(path) = &args.lineage {
         let cfg = lineage_config
             .as_ref()
@@ -1572,6 +1589,48 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         spill_disk_cap_bytes,
         spill_compress: storage_config.spill.compress,
     };
+    // Live run-lifecycle lineage (--lineage-events). Unlike --lineage (a static,
+    // plan-only export that exits before reading data), this rides the actual run:
+    // build the plan-derived column lineage once from the overlaid `compiled_plan`,
+    // open the NDJSON sink, and emit a START now — before the executor runs — so a
+    // mid-run crash still leaves an observable open run. The terminal
+    // COMPLETE/FAIL/ABORT is emitted at the run boundaries below; the emitter's
+    // Drop closes any started-but-unterminated run out as FAIL, covering the
+    // early-return output-commit paths between here and the success terminal.
+    let mut lineage_emitter: Option<clinker_lineage::LiveRunEmitter<Box<dyn std::io::Write>>> =
+        None;
+    let mut lineage_started_at: Option<chrono::DateTime<chrono::Utc>> = None;
+    if let Some(path) = &args.lineage_events {
+        let lineage = clinker_lineage::column_lineage(&compiled_plan, &lineage_base_dir);
+        let source_hash = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
+        let job =
+            clinker_lineage::Job::for_pipeline(pipeline_config.pipeline.name.clone(), source_hash);
+        let started_at = chrono::Utc::now();
+        let start_time = started_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let writer: Box<dyn std::io::Write> = if path.as_os_str() == std::ffi::OsStr::new("-") {
+            // Unlocked stdout handle: locking per write avoids deadlocking the run's
+            // own stdout prints (the spill-volume summary and completion line).
+            Box::new(std::io::stdout())
+        } else {
+            Box::new(std::fs::File::create(path).map_err(|e| {
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                    "cannot open --lineage-events output {}: {e}",
+                    path.display()
+                )))
+            })?)
+        };
+        let mut emitter = clinker_lineage::LiveRunEmitter::new(
+            writer,
+            lineage,
+            job,
+            execution_id.clone(),
+            start_time,
+        );
+        emitter.emit_start().map_err(PipelineError::Io)?;
+        lineage_started_at = Some(started_at);
+        lineage_emitter = Some(emitter);
+    }
+
     // The executor recompiles `compiled_plan.config()` — already the effective,
     // post-overlay config — so the context it recompiles under must NOT carry
     // the overlay ops again (they would double-apply and collide). For a plain
@@ -1585,6 +1644,29 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     ) {
         Ok(report) => report,
         Err(e) => {
+            // Live lineage: the executor failed — close the run out as FAIL with the
+            // error message before propagating. Best-effort: a lineage-sink write
+            // failure must not mask the real pipeline error.
+            if let Some(emitter) = lineage_emitter.as_mut() {
+                let now = chrono::Utc::now();
+                let duration_ms = lineage_started_at
+                    .map(|s| (now - s).num_milliseconds().max(0))
+                    .unwrap_or(0);
+                let event_time = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+                let stats = clinker_lineage::RunStats {
+                    duration_ms,
+                    ..Default::default()
+                };
+                if let Err(err) = emitter.emit_terminal(
+                    &event_time,
+                    clinker_lineage::Terminal::Fail {
+                        error: e.to_string(),
+                    },
+                    stats,
+                ) {
+                    tracing::warn!(error = %err, "failed to write FAIL lineage event");
+                }
+            }
             // A failed run keeps its staged copies so the operator can inspect
             // the exact inputs the failure saw (cleanup = on_success); only
             // cleanup = always reaps them on failure.
@@ -1804,6 +1886,34 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     } else {
         0
     };
+
+    // Live lineage: the run finished — close it out at the true run boundary
+    // (outputs persisted, DLQ written). An interrupted drain is an ABORT; every
+    // other outcome — including a DLQ-partial success — is a COMPLETE, so the
+    // column-lineage facets and the run's final row counts ride the terminal
+    // event. Best-effort: a lineage-sink write failure must not fail a run whose
+    // data outputs are already committed.
+    if let Some(emitter) = lineage_emitter.as_mut() {
+        let stats = clinker_lineage::RunStats {
+            records_read: counters.total_count,
+            records_written: counters.records_written,
+            records_dlq: counters.dlq_count,
+            duration_ms: (report.finished_at - report.started_at)
+                .num_milliseconds()
+                .max(0),
+        };
+        let outcome = if report.interrupted {
+            clinker_lineage::Terminal::Abort
+        } else {
+            clinker_lineage::Terminal::Complete
+        };
+        let event_time = report
+            .finished_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        if let Err(err) = emitter.emit_terminal(&event_time, outcome, stats) {
+            tracing::warn!(error = %err, "failed to write terminal lineage event");
+        }
+    }
 
     // Staging cleanup, keyed on a clean exit. A zero exit code is the
     // "exited cleanly" signal `cleanup = on_success` removes after; an
@@ -2350,8 +2460,8 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
             None => {
                 return Err(format!(
-                    "unknown diagnostic code '{code}'. Valid codes: E101-E108, E150b-E150e, \
-                     E15Y, E300/E301/E303-E313/E319, E320/E321/E323, E330-E354, \
+                    "unknown diagnostic code '{code}'. Valid codes: E101-E104, E106-E108, \
+                     E150b-E150e, E15Y, E300/E301/E303-E313/E319, E320/E321/E323, E330-E354, \
                      W101/W302/W305/W306"
                 )
                 .into());
@@ -2614,8 +2724,12 @@ fn render_resolved(
             .layer_value(LayerKind::PipelineDefault)
             .map(format_overlay_value)
             .unwrap_or_else(|| "<none>".to_string());
+        // Surface the per-value lock: a `fixed:` overlay value holds against
+        // every higher-precedence layer, so the winning layer here may be a
+        // lower one than plain precedence would pick.
+        let lock = if win.fixed { " (fixed)" } else { "" };
         rows.push(format!(
-            "  {node}.{param} = {}  [{}]  (base: {})",
+            "  {node}.{param} = {}  [{}]{lock}  (base: {})",
             format_overlay_value(&resolved.value),
             win.kind,
             base

@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::facet::{ColumnLineageDatasetFacet, PipelineJobFacet};
+use super::facet::{
+    ColumnLineageDatasetFacet, ErrorMessageRunFacet, PipelineJobFacet, RunStatsFacet,
+};
 
 /// A single OpenLineage run-state event.
 ///
@@ -42,12 +44,43 @@ pub enum EventType {
     Other,
 }
 
-/// Identity of one run of a [`Job`].
+/// Identity of one run of a [`Job`], with any run-level facets.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Run {
     /// Run identity as a UUID string (the spec constrains this to `format: uuid`).
     #[serde(rename = "runId")]
     pub run_id: String,
+    /// Run-level facets. `None` on a `START` and on the static plan-derived
+    /// export; a live terminal event carries run stats (and an error facet on
+    /// `FAIL`) here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facets: Option<RunFacets>,
+}
+
+impl Run {
+    /// A run identity carrying no run facets — the shape used by a `START` event
+    /// and by the static plan-derived export.
+    pub fn new(run_id: impl Into<String>) -> Self {
+        Run {
+            run_id: run_id.into(),
+            facets: None,
+        }
+    }
+}
+
+/// The facet bundle attached to a [`Run`].
+///
+/// `clinker_runStats` is a producer-defined facet carrying whole-run record
+/// counts and timing; `errorMessage` is the standard OpenLineage failure facet,
+/// present only on a `FAIL` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RunFacets {
+    /// Clinker run-statistics facet (producer-defined).
+    #[serde(rename = "clinker_runStats", skip_serializing_if = "Option::is_none")]
+    pub run_stats: Option<RunStatsFacet>,
+    /// Standard OpenLineage error-message facet, on a `FAIL` event only.
+    #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<ErrorMessageRunFacet>,
 }
 
 /// The job (pipeline) a [`Run`] is an execution of.
@@ -149,9 +182,7 @@ mod tests {
             producer: PRODUCER.to_string(),
             schema_url: OPENLINEAGE_SCHEMA_URL.to_string(),
             event_type: EventType::Complete,
-            run: Run {
-                run_id: "0190b7e0-0000-7000-8000-000000000000".to_string(),
-            },
+            run: Run::new("0190b7e0-0000-7000-8000-000000000000"),
             job: Job {
                 namespace: "clinker".to_string(),
                 name: "orders".to_string(),
@@ -264,5 +295,40 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let back: RunEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(event, back);
+    }
+
+    #[test]
+    fn run_facets_serialize_under_spec_keys_and_round_trip() {
+        use crate::openlineage::{ErrorMessageRunFacet, RunStatsFacet};
+        let mut event = sample_event();
+        event.run.facets = Some(RunFacets {
+            run_stats: Some(RunStatsFacet::new(100, 97, 3, 1234)),
+            error_message: Some(ErrorMessageRunFacet::new("source read failed")),
+        });
+        let v = serde_json::to_value(&event).unwrap();
+        // Run facets nest under `run.facets` with the spec-cased keys.
+        let stats = &v["run"]["facets"]["clinker_runStats"];
+        assert_eq!(stats["recordsRead"], 100);
+        assert_eq!(stats["recordsWritten"], 97);
+        assert_eq!(stats["recordsDlq"], 3);
+        assert_eq!(stats["durationMs"], 1234);
+        assert!(stats.get("_producer").is_some());
+        assert!(stats.get("_schemaURL").is_some());
+        let err = &v["run"]["facets"]["errorMessage"];
+        assert_eq!(err["message"], "source read failed");
+        assert_eq!(err["programmingLanguage"], "rust");
+        // stackTrace is omitted when absent rather than serialized as null.
+        assert!(err.get("stackTrace").is_none());
+        // Round-trips through the wire form unchanged.
+        let json = serde_json::to_string(&event).unwrap();
+        let back: RunEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+    }
+
+    #[test]
+    fn run_facets_omitted_when_absent() {
+        // A run with no facets omits the `facets` key rather than emitting null.
+        let v = serde_json::to_value(sample_event()).unwrap();
+        assert!(v["run"].get("facets").is_none());
     }
 }

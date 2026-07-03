@@ -40,27 +40,35 @@ evidence.
   document the deliberate recompile step with its invariants.
 - Priority: High
 
-### 2. Should the folder overlay gain a `resources:` surface and per-value `fixed`/`default` locking?
+### 2. Should the folder overlay gain a `resources:` surface? (per-value `fixed` locking now done)
 
-- Question: The folder overlay (`ChannelManifest` / `OverlayFile`) carries flat
-  `config` / `vars` / `overrides` / `sources`, but no `resources:` surface and no
-  per-value `fixed`/`default` lock. Both existed only on the retired file-based
-  channel path. Should the folder model reintroduce either, and if so with what
-  precedence/provenance semantics?
-- Why it matters: Config resolves by fixed layer precedence (higher layer wins),
-  but a lower layer cannot lock a value against a higher one. The `fixed`
-  provenance plumbing (`ResolvedValue::apply_layer_fixed`) is preserved and
-  reachable, but no overlay YAML feeds it. Resource overrides have no folder
-  surface at all.
+- Resolved (per-value `fixed` lock): The folder overlay now carries a `fixed:`
+  block beside `config:` on every layer file (group, channel manifest, per-target
+  overlay). A `fixed:` value applies via `ResolvedValue::apply_layer_fixed`, so a
+  lower layer can lock a value against every higher layer; the `$config` fold and
+  `channels resolve` (a `(fixed)` marker) both honor it. See issue #772 and
+  `docs/user/src/pipelines/channels.md` ("Locking a value: `fixed`").
+- Open (resources fork): A `resources:` overlay surface is still absent, and
+  restoring it is a genuine scope fork. The retired file-based `resources:` split
+  was parsed into `ChannelBinding.resources_default` / `resources_fixed` but
+  **never applied** — it took effect in no version. The broader composition
+  resource subsystem is declaration-only: `_compose.resources_schema` and the
+  call-site node `resources:` field parse, but `validate_resources`
+  (`bind_schema.rs`) is a stub, resources get no `ProvenanceDb` entry, no
+  production code constructs `Resource::File`, and nothing consumes a resolved
+  resource at runtime. So a `resources:` overlay that merely round-trips would be
+  an inert authoring surface, while making it "take effect" means building a new
+  supply→resolution→consumption subsystem — a scope decision, not a wiring task.
+- Why it matters: Deciding requires choosing between (a) deferring resources to a
+  dedicated issue that designs the resource runtime, (b) restoring a parse-only /
+  validated surface that does not affect execution, or (c) building the full
+  subsystem now. These have materially different scope.
 - Files/modules involved: `crates/clinker-channel/src/manifest.rs`,
   `crates/clinker-channel/src/resolve.rs`,
-  `crates/clinker-channel/src/overlay.rs`,
   `crates/clinker-plan/src/config/composition/resource.rs`,
-  `docs/user/src/pipelines/channels.md`.
-- Suggested way to resolve it: Decide whether a `fixed:` lock and a `resources:`
-  overlay are active scope for the folder model. If active, wire them at the
-  layer boundary with diagnostics and precedence/provenance tests; if future-only,
-  document them as reserved.
+  `crates/clinker-plan/src/plan/bind_schema.rs` (`validate_resources` stub).
+- Suggested way to resolve it: Route the `resources:` surface through a Decision
+  Gate; it is closely related to open question 9 (resource-kind breadth).
 - Priority: Medium
 
 ### 3. Should pipeline-target channel config keys be validated before overlay application?
