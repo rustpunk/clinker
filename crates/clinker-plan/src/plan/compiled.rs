@@ -33,6 +33,8 @@ use super::execution::ExecutionPlanDag;
 use super::statistics::StatisticsCatalog;
 use crate::config::PipelineConfig;
 use crate::config::composition::ProvenanceDb;
+use clinker_format::SourceSchema;
+use indexmap::IndexMap;
 
 /// Content-hash identity for a compiled channel overlay.
 ///
@@ -63,6 +65,13 @@ pub struct CompiledPlan {
     /// from `PipelineConfig.source_hash` at compile time. Zero array
     /// for in-memory configs that did not flow through file load.
     pipeline_hash: [u8; 32],
+    /// Resolved unified [`SourceSchema`] per source node, keyed by node
+    /// name. Every source's `schema:` — including an external
+    /// `.schema.yaml` ([`SourceSchema::File`]) — is resolved to its inline
+    /// form exactly once at compile time and retained here, so the ingest
+    /// path (and, ahead, `patch_schema` / per-attribute provenance) reads
+    /// the schema from the plan rather than re-reading the file at runtime.
+    bound_schemas: IndexMap<String, SourceSchema>,
 }
 
 impl CompiledPlan {
@@ -73,6 +82,7 @@ impl CompiledPlan {
     pub(crate) fn from_compile(
         dag: ExecutionPlanDag,
         config: PipelineConfig,
+        bound_schemas: IndexMap<String, SourceSchema>,
         artifacts: CompileArtifacts,
     ) -> Self {
         let pipeline_hash = config.source_hash;
@@ -90,6 +100,7 @@ impl CompiledPlan {
             provenance,
             channel_identity: None,
             pipeline_hash,
+            bound_schemas,
         }
     }
 
@@ -155,5 +166,15 @@ impl CompiledPlan {
     /// file load (e.g. `parse_config`-driven tests).
     pub fn pipeline_hash(&self) -> &[u8; 32] {
         &self.pipeline_hash
+    }
+
+    /// Resolved unified [`SourceSchema`] per source node, keyed by node name.
+    ///
+    /// Every source's `schema:` is resolved to its inline form (an external
+    /// `.schema.yaml` [`SourceSchema::File`] is read once, at compile time)
+    /// and retained here. Consumers read the schema from the plan rather than
+    /// re-reading the file at runtime.
+    pub fn bound_schemas(&self) -> &IndexMap<String, SourceSchema> {
+        &self.bound_schemas
     }
 }

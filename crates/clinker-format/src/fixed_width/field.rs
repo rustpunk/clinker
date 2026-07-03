@@ -251,21 +251,27 @@ pub fn parse_field_value(field: &ResolvedField, raw: &str, row: u64) -> Result<V
 
 /// Coerce trimmed text to a scalar [`Value`] of the given [`Type`].
 ///
-/// Format-neutral: the caller owns the row/field framing. This is the single
-/// canonical typed coercion shared by every fixed-width parse path. Boolean
-/// matching is ASCII-case-insensitive (`TRUE`/`true`/`YES`/`Y`/`1` → true).
-///
-/// Only `Int` / `Float` / `Bool` / `Date` are parsed to a typed value here;
-/// every other type (`String`, `Map`, `Array`, `DateTime`, `Numeric`, `Any`,
-/// `Null`) carries the text through verbatim as a `Value::String`. This matches
-/// the historical fixed-width behavior: the positional reader never produced a
-/// typed `DateTime`, and the wrapping `CoercingReader` re-coerces `DateTime` /
-/// `Numeric` from the string. `Nullable(T)` is peeled to `T`.
+/// Format-neutral: the caller owns the row/field framing. This is the single,
+/// complete coercion for every positional (fixed-width / multi-record) parse
+/// path — the value emitted here is final, so no downstream re-coercion runs.
+/// Boolean matching is ASCII-case-insensitive (`TRUE`/`true`/`YES`/`Y`/`1` →
+/// true). `Date` / `DateTime` honor the column's `format:` strftime string;
+/// with no explicit `format:`, `Date` uses the ISO `%Y-%m-%d` and `DateTime`
+/// falls back to the shared default datetime chain
+/// ([`coerce_to_datetime`](clinker_record::coercion::coerce_to_datetime) —
+/// ISO-`T`, space-separated, and US variants), the same set the CSV/native
+/// coercion path applies, so a positional `date_time` column parses the common
+/// serializations rather than only strict ISO-`T`. `Numeric` parses as `int`
+/// then falls back to `float`. `String` / `Any` / `Null` carry the text through
+/// verbatim as a `Value::String`. `Map` / `Array` are rejected — a positional
+/// field is a flat byte range and cannot yield a native composite; those types
+/// belong to a JSON/XML source. `Nullable(T)` is peeled to `T`.
 ///
 /// # Errors
 ///
 /// Returns the human-readable failure message (caller wraps it in a
-/// format-specific error) when the text does not parse as `ty`.
+/// format-specific error) when the text does not parse as `ty`, or when `ty`
+/// is a `Map` / `Array` a positional field cannot represent.
 pub fn coerce_scalar(ty: &Type, format: Option<&str>, raw: &str) -> Result<Value, String> {
     match ty.unwrap_nullable() {
         Type::Int => raw
@@ -276,6 +282,11 @@ pub fn coerce_scalar(ty: &Type, format: Option<&str>, raw: &str) -> Result<Value
             .parse::<f64>()
             .map(Value::Float)
             .map_err(|e| format!("cannot parse '{raw}' as float: {e}")),
+        Type::Numeric => raw
+            .parse::<i64>()
+            .map(Value::Integer)
+            .or_else(|_| raw.parse::<f64>().map(Value::Float))
+            .map_err(|e| format!("cannot parse '{raw}' as number: {e}")),
         Type::Bool => match raw.to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" | "y" => Ok(Value::Bool(true)),
             "false" | "0" | "no" | "n" => Ok(Value::Bool(false)),
@@ -287,6 +298,26 @@ pub fn coerce_scalar(ty: &Type, format: Option<&str>, raw: &str) -> Result<Value
                 .map(Value::Date)
                 .map_err(|e| format!("cannot parse '{raw}' as date with format '{fmt}': {e}"))
         }
+        Type::DateTime => {
+            // Honor an explicit `format:` (single format); otherwise fall back
+            // to the shared default datetime chain — the same set the
+            // CSV/native coercion path uses — so a positional `date_time`
+            // column parses the common serializations (ISO-`T`, space-separated,
+            // US) it did before this became a real reader-side parse.
+            let chain: Vec<&str> = format.into_iter().collect();
+            clinker_record::coercion::coerce_to_datetime(&Value::String(raw.into()), &chain)
+                .map_err(|e| e.to_string())
+        }
+        Type::Map => Err(
+            "a positional (fixed-width / multi-record) field cannot carry a `map` value; \
+             declare this column on a native JSON/XML source"
+                .to_string(),
+        ),
+        Type::Array => Err(
+            "a positional (fixed-width / multi-record) field cannot carry an `array` value; \
+             declare this column on a native JSON/XML source"
+                .to_string(),
+        ),
         _ => Ok(Value::String(raw.into())),
     }
 }
@@ -302,5 +333,93 @@ fn invalid_field(name: &str, problem: &str) -> FormatError {
     FormatError::InvalidRecord {
         row: 0,
         message: format!("field '{name}': fixed-width field {problem}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::NaiveDate;
+
+    #[test]
+    fn coerce_scalar_datetime_honors_format() {
+        // The positional parse now produces a real `Value::DateTime`, honoring
+        // the column's `format:` string — no punt-to-String / re-coerce.
+        let v = coerce_scalar(&Type::DateTime, Some("%Y%m%d%H%M%S"), "20240115103000").unwrap();
+        let expected = Value::DateTime(
+            NaiveDate::from_ymd_opt(2024, 1, 15)
+                .unwrap()
+                .and_hms_opt(10, 30, 0)
+                .unwrap(),
+        );
+        assert_eq!(v, expected);
+    }
+
+    #[test]
+    fn coerce_scalar_datetime_default_chain_accepts_common_serializations() {
+        // With no explicit `format:`, the default chain matches the CSV/native
+        // path — ISO-`T`, space-separated, and US variants all parse — so a
+        // positional `date_time` column keeps the parseable set it had when this
+        // was a punt-to-String plus lenient re-coercion.
+        let expected = Value::DateTime(
+            NaiveDate::from_ymd_opt(2024, 1, 15)
+                .unwrap()
+                .and_hms_opt(10, 30, 0)
+                .unwrap(),
+        );
+        for raw in [
+            "2024-01-15T10:30:00",
+            "2024-01-15 10:30:00",
+            "01/15/2024 10:30:00",
+        ] {
+            assert_eq!(
+                coerce_scalar(&Type::DateTime, None, raw).unwrap(),
+                expected,
+                "default datetime chain should accept {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn coerce_scalar_datetime_bad_input_errors() {
+        // A value matching neither an explicit format nor the default chain is a
+        // loud parse error (positional formats are strict), not a silent String.
+        assert!(coerce_scalar(&Type::DateTime, Some("%Y%m%d%H%M%S"), "not-a-time").is_err());
+        assert!(coerce_scalar(&Type::DateTime, None, "definitely not a datetime").is_err());
+    }
+
+    #[test]
+    fn coerce_scalar_numeric_int_then_float() {
+        assert_eq!(
+            coerce_scalar(&Type::Numeric, None, "42").unwrap(),
+            Value::Integer(42)
+        );
+        assert_eq!(
+            coerce_scalar(&Type::Numeric, None, "3.5").unwrap(),
+            Value::Float(3.5)
+        );
+        assert!(coerce_scalar(&Type::Numeric, None, "abc").is_err());
+    }
+
+    #[test]
+    fn coerce_scalar_map_and_array_are_rejected() {
+        // A positional field cannot represent a native composite — declaring one
+        // is an author error, not a silent String pass-through.
+        assert!(coerce_scalar(&Type::Map, None, "{}").is_err());
+        assert!(coerce_scalar(&Type::Array, None, "[]").is_err());
+        // Nullable is peeled first, so the rejection still fires.
+        assert!(coerce_scalar(&Type::nullable(Type::Array), None, "[]").is_err());
+    }
+
+    #[test]
+    fn coerce_scalar_string_any_pass_through() {
+        assert_eq!(
+            coerce_scalar(&Type::String, None, "hello").unwrap(),
+            Value::String("hello".into())
+        );
+        assert_eq!(
+            coerce_scalar(&Type::Any, None, "raw").unwrap(),
+            Value::String("raw".into())
+        );
     }
 }

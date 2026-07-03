@@ -216,11 +216,15 @@ impl RestRecordSource {
         self.advance_cursor(&bytes)?;
 
         let reader = decode_body(&self.format, self.array_paths.as_deref(), bytes.body)?;
+        // A REST body decodes to native/untyped records (JSON), so this is the
+        // sole coercion pass (`pretyped: false`) — declared types and each
+        // column's `format:` are applied here.
         let coercing = CoercingReader::new(
             reader,
             &self.schema_decl,
             self.on_unmapped.clone(),
             &self.source_name,
+            false,
         )?;
         self.current_page = Some(Box::new(coercing));
         self.current_page_records = 0;

@@ -2226,18 +2226,48 @@ impl PipelineConfig {
         // through keeps an empty set, which the reader treats as "skip the
         // pre-scan entirely".
         let mut runtime_config = self.clone();
+        // Resolved unified `SourceSchema` per source, retained on the plan.
+        let mut bound_schemas: indexmap::IndexMap<String, clinker_format::SourceSchema> =
+            indexmap::IndexMap::new();
         for spanned in runtime_config.nodes.iter_mut() {
             if let PipelineNode::Source {
                 header,
                 config: body,
             } = &mut spanned.value
-                && let Some(paths) = declared_doc_paths.get(&header.name)
             {
-                body.source.declared_doc_paths = paths.clone();
+                if let Some(paths) = declared_doc_paths.get(&header.name) {
+                    body.source.declared_doc_paths = paths.clone();
+                }
+                // Resolve any external `.schema.yaml` (`SourceSchema::File`)
+                // still present to its inline form. File-loaded pipelines
+                // already resolved these at config-load time (folding the
+                // content into `source_hash`); this covers an in-memory config
+                // compiled without the file loader. Resolving here — and
+                // retaining the result in `bound_schemas` — means the executor's
+                // ingest path reads the schema from the plan and never re-reads
+                // the file at runtime.
+                if let clinker_format::SourceSchema::File(path) = &body.schema {
+                    match crate::schema::load_source_schema(std::path::Path::new(path)) {
+                        Ok(inline) => body.schema = inline,
+                        Err(e) => {
+                            diags.push(Diagnostic::error(
+                                "E157",
+                                format!(
+                                    "source {:?} declares an external schema file {:?} that \
+                                     failed to load: {e}",
+                                    header.name, path
+                                ),
+                                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                            ));
+                            return Err(diags);
+                        }
+                    }
+                }
+                bound_schemas.insert(header.name.clone(), body.schema.clone());
             }
         }
 
-        let plan = CompiledPlan::from_compile(dag, runtime_config, artifacts);
+        let plan = CompiledPlan::from_compile(dag, runtime_config, bound_schemas, artifacts);
         Ok((plan, diags))
     }
 

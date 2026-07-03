@@ -1,3 +1,4 @@
+mod bound_schemas;
 mod ck_aligned_partition;
 mod ck_lattice;
 mod combine_body_typed_on_node;

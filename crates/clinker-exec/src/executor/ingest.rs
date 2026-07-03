@@ -38,25 +38,20 @@ fn build_format_reader(
     schema: &SourceSchema,
     source: ReopenableSource,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
-    // Resolve an external `.schema.yaml` (`SourceSchema::File`) to its inline
-    // form so the reader sees a concrete column / multi-record schema. Moving
-    // this resolution to compile time (and folding it into `source_hash`) is a
-    // follow-on; here it stays behavior-equivalent to the previous per-file
-    // load.
-    let resolved_file;
-    let schema = match schema {
-        SourceSchema::File(path) => {
-            resolved_file = clinker_plan::schema::load_source_schema(std::path::Path::new(path))
-                .map_err(|e| {
-                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                        "source {:?}: failed to load schema file '{path}': {e}",
-                        input.name
-                    )))
-                })?;
-            &resolved_file
-        }
-        other => other,
-    };
+    // External `.schema.yaml` (`SourceSchema::File`) references are resolved to
+    // their inline form once at compile time (config load + `compile`), so the
+    // reader never touches disk here. A `File` surviving to runtime is a
+    // resolution-invariant breach, surfaced loudly rather than silently
+    // re-reading the file.
+    if let SourceSchema::File(path) = schema {
+        return Err(PipelineError::Internal {
+            op: "build_format_reader",
+            node: input.name.clone(),
+            detail: format!(
+                "external schema file '{path}' was not resolved to an inline form before runtime"
+            ),
+        });
+    }
 
     match &input.format {
         clinker_plan::config::InputFormat::Csv(opts) => match schema {
@@ -223,13 +218,19 @@ fn wrap_with_schema_coercion(
     };
 
     // The unified `schema:` is resolved to its effective column list (single-
-    // record columns, or the multi-record superset), loading an external
-    // `.schema.yaml` (`File`) to its inline form first so a CSV/JSON/XML source
-    // pointing at a shared schema file is still type-coerced and has its
-    // `on_unmapped` policy enforced — matching the compile-time column seeding
-    // in `bind_schema`. A `generated` schema seeds no inline columns, so it is
-    // not wrapped (its reader synthesizes and types its own positional columns).
+    // record columns, or the multi-record superset). Its `File` form was
+    // already resolved inline at compile time, so this reads no file. A
+    // `generated` schema seeds no inline columns, so it is not wrapped (its
+    // reader synthesizes and types its own positional columns).
     let columns = coercible_columns(schema, source_name)?;
+
+    // Positional formats (single fixed-width, and either multi-record backend)
+    // parse their bytes into final typed values in the reader itself, so the
+    // coercing wrapper must not re-coerce them; the untyped/native formats
+    // (single-record CSV, JSON, XML) are coerced here. This is the sole
+    // coercion pass for the latter.
+    let pretyped = matches!(format, clinker_plan::config::InputFormat::FixedWidth(_))
+        || matches!(schema, SourceSchema::MultiRecord { .. });
 
     match columns {
         Some(columns) if !columns.is_empty() => {
@@ -261,6 +262,7 @@ fn wrap_with_schema_coercion(
                 &columns,
                 policy,
                 source_name,
+                pretyped,
             )
             .map_err(|e| PipelineError::Compilation {
                 transform_name: source_name.to_string(),
@@ -273,28 +275,28 @@ fn wrap_with_schema_coercion(
 }
 
 /// The effective column list a [`CoercingReader`](crate::pipeline::schema_coerce)
-/// projects onto, resolving an external `.schema.yaml` ([`SourceSchema::File`])
-/// to its inline form first. `None` when the schema seeds no inline columns
-/// (`Generated` — the reader synthesizes its own positional columns).
+/// projects onto. `None` when the schema seeds no inline columns (`Generated` —
+/// the reader synthesizes its own positional columns).
+///
+/// External `.schema.yaml` ([`SourceSchema::File`]) references are resolved to
+/// their inline form at compile time, so `File` never reaches here.
 ///
 /// # Errors
 ///
-/// Returns a config-validation error when an external schema file cannot be
-/// loaded or parsed.
+/// Returns [`PipelineError::Internal`] if an unresolved `File` schema reaches
+/// runtime (a compile-time resolution-invariant breach).
 fn coercible_columns(
     schema: &SourceSchema,
     source_name: &str,
 ) -> Result<Option<Vec<Column>>, PipelineError> {
     match schema {
-        SourceSchema::File(path) => {
-            let inner = clinker_plan::schema::load_source_schema(std::path::Path::new(path))
-                .map_err(|e| {
-                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                        "source {source_name:?}: failed to load schema file '{path}': {e}"
-                    )))
-                })?;
-            Ok(inner.bound_columns())
-        }
+        SourceSchema::File(path) => Err(PipelineError::Internal {
+            op: "coercible_columns",
+            node: source_name.to_string(),
+            detail: format!(
+                "external schema file '{path}' was not resolved to an inline form before runtime"
+            ),
+        }),
         other => Ok(other.bound_columns()),
     }
 }
@@ -1380,26 +1382,18 @@ mod tests {
     use clinker_record::{Schema, SchemaBuilder, Value};
     use indexmap::IndexMap;
 
-    /// An external-file (`SourceSchema::File`) schema resolves to typed columns
-    /// for the `CoercingReader`, so a CSV/JSON/XML source pointing at a shared
-    /// `.schema.yaml` is still type-coerced (matching the compile-time seeding
-    /// in `bind_schema`) rather than silently passed through as raw strings.
+    /// An external-file (`SourceSchema::File`) schema is resolved to its inline
+    /// form once at compile time (config load + `compile`), so `File` never
+    /// reaches the runtime coercion path. If one does, it is a resolution-
+    /// invariant breach surfaced loudly rather than a silent re-read.
     #[test]
-    fn coercible_columns_resolves_external_file_schema() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cols.schema.yaml");
-        std::fs::write(
-            &path,
-            "- { name: amount, type: int }\n- { name: name, type: string }\n",
-        )
-        .unwrap();
-        let schema = SourceSchema::File(path.to_string_lossy().into_owned());
-        let columns = coercible_columns(&schema, "src")
-            .expect("file schema loads")
-            .expect("file schema yields inline columns");
-        assert_eq!(columns.len(), 2);
-        assert_eq!(columns[0].name, "amount");
-        assert_eq!(columns[0].ty, cxl::typecheck::Type::Int);
+    fn coercible_columns_rejects_unresolved_file_schema() {
+        let schema = SourceSchema::File("cols.schema.yaml".to_string());
+        let err = coercible_columns(&schema, "src").unwrap_err();
+        assert!(
+            matches!(err, PipelineError::Internal { .. }),
+            "expected Internal invariant breach, got {err:?}"
+        );
     }
 
     /// A `generated` schema seeds no inline columns for the coercion path (its
