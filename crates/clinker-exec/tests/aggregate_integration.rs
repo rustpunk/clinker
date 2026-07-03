@@ -916,3 +916,67 @@ nodes:
         "zeta: count(*)>1 false, max(name)>'M' true: {output}"
     );
 }
+
+#[test]
+fn test_e2e_decimal_sum_avg() {
+    // Full pipeline: a `decimal` CSV source column -> aggregate sum/avg over
+    // the decimal -> CSV output. This exercises the typecheck guard fix end to
+    // end: before the guard accepted `Type::Decimal`, `sum(amount)` /
+    // `avg(amount)` failed to compile and `run_single`'s `.expect("compile")`
+    // would panic.
+    //
+    // It also pins the observable output precision:
+    //   * `sum` stays exact at the column scale (`4.00`, `0.30`);
+    //   * `avg` is the exact full-precision quotient — a computed decimal is
+    //     NOT re-rounded to an output-column scale, so `4.00 / 3` prints all
+    //     28 digits rather than `1.33`. (To round, a user rounds explicitly in
+    //     CXL; a `decimal` source column, by contrast, rounds on ingest.)
+    let yaml = r#"
+pipeline:
+  name: agg_decimal
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: in.csv
+    schema:
+      - { name: dept, type: string }
+      - { name: amount, type: decimal, scale: 2 }
+- type: aggregate
+  name: by_dept
+  input: src
+  config:
+    group_by:
+    - dept
+    cxl: 'emit dept = dept
+
+      emit total = sum(amount)
+
+      emit average = avg(amount)
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
+    type: csv
+    path: out.csv
+    include_unmapped: true
+"#;
+    // dept x: 1.00 + 1.00 + 2.00 = 4.00; avg = 4.00 / 3 (repeating).
+    // dept y: 0.10 + 0.20 = 0.30; avg = 0.15 (exact).
+    let csv = "dept,amount\nx,1.00\nx,1.00\nx,2.00\ny,0.10\ny,0.20\n";
+    let (report, output) = run_single(yaml, csv);
+    assert_eq!(report.dlq_entries.len(), 0, "no DLQ entries");
+    assert_eq!(report.counters.ok_count, 2, "two output groups");
+    assert_eq!(
+        sorted_body_lines(&output),
+        vec![
+            "x,4.00,1.3333333333333333333333333333".to_string(),
+            "y,0.30,0.15".to_string(),
+        ],
+    );
+}

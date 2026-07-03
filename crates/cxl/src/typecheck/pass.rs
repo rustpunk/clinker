@@ -847,12 +847,19 @@ impl<'a> TypeChecker<'a> {
                     self.check_expr(arg, is_predicate_fn);
                 }
 
-                // Check numeric requirement for sum/cumulative_sum/avg
+                // Check numeric requirement for sum/cumulative_sum/avg.
+                // `Decimal` is accepted: the window sum/cumulative_sum/avg
+                // slices accumulate decimals exactly (see `window_context`), so
+                // an exact decimal window total/average stays exact rather than
+                // routing through binary float.
                 if matches!(&**function, "sum" | "cumulative_sum" | "avg") {
                     for arg in args {
                         let arg_ty = self.get_type(arg.node_id());
                         let inner = arg_ty.unwrap_nullable();
-                        if !matches!(inner, Type::Int | Type::Float | Type::Numeric | Type::Any) {
+                        if !matches!(
+                            inner,
+                            Type::Int | Type::Float | Type::Decimal | Type::Numeric | Type::Any
+                        ) {
                             self.error(
                                 arg.span(),
                                 format!(
@@ -860,7 +867,7 @@ impl<'a> TypeChecker<'a> {
                                     function, arg_ty
                                 ),
                                 Some(
-                                    "Use a numeric field or convert with .to_int() / .to_float()"
+                                    "Use a numeric field or convert with .to_int() / .to_float() / .to_decimal()"
                                         .into(),
                                 ),
                             );
@@ -935,19 +942,26 @@ impl<'a> TypeChecker<'a> {
 
                 let ty = aggregate_return_type(name, &arg_types);
 
-                // Numeric-only guard for sum/avg/weighted_avg (same pattern as
-                // window sum/avg).
+                // Numeric guard for sum/avg (same pattern as window sum/avg).
+                // `Decimal` is accepted: the SumState/AvgState decimal paths
+                // aggregate exactly, so an exact monetary total/average stays
+                // in the decimal domain instead of being pushed through the
+                // binary-float rounding decimal exists to avoid. weighted_avg
+                // additionally rejects `decimal` — its accumulator has no exact
+                // path yet and would silently drop decimal rows.
                 match &**name {
                     "sum" | "avg" => {
                         if let Some(arg_ty) = arg_types.first() {
                             let inner = arg_ty.unwrap_nullable();
-                            if !matches!(inner, Type::Int | Type::Float | Type::Numeric | Type::Any)
-                            {
+                            if !matches!(
+                                inner,
+                                Type::Int | Type::Float | Type::Decimal | Type::Numeric | Type::Any
+                            ) {
                                 self.error(
                                     *span,
                                     format!("{name}() requires a Numeric argument, got {arg_ty}"),
                                     Some(
-                                        "Use a numeric field or convert with .to_int() / .to_float()"
+                                        "Use a numeric field or convert with .to_int() / .to_float() / .to_decimal()"
                                             .into(),
                                     ),
                                 );
@@ -961,6 +975,26 @@ impl<'a> TypeChecker<'a> {
                                 "weighted_avg() requires exactly two arguments (value, weight)"
                                     .into(),
                                 None,
+                            );
+                        } else if let Some(dec_arg) = arg_types
+                            .iter()
+                            .find(|t| matches!(t.unwrap_nullable(), Type::Decimal))
+                        {
+                            // No exact decimal weighted-average accumulator
+                            // exists yet; the float path returns Null for a
+                            // decimal value OR weight (the accumulator's
+                            // `numeric()` conversion skips a decimal in either
+                            // position). Reject loudly rather than silently lose
+                            // the total, and point at the exact routes.
+                            self.error(
+                                *span,
+                                format!(
+                                    "weighted_avg() over a decimal value or weight is not supported yet, got {dec_arg}"
+                                ),
+                                Some(
+                                    "Cast with .to_float() for a binary-float weighted average, or use sum()/avg() which stay exact over decimals"
+                                        .into(),
+                                ),
                             );
                         }
                     }
@@ -1663,6 +1697,77 @@ mod tests {
         );
         // avg over int/float is still Float.
         assert_eq!(aggregate_return_type("avg", &[Type::Int]), Type::Float);
+    }
+
+    #[test]
+    fn test_sum_avg_over_decimal_column_typechecks() {
+        // Regression for the numeric guard: `sum`/`avg` over a `decimal`
+        // column must typecheck and keep the result in the decimal domain.
+        // Before the fix the guard omitted `Type::Decimal`, so the exact
+        // monetary total was rejected with "requires a Numeric argument" and
+        // the fix-it hint steered users to `.to_float()` — reintroducing the
+        // binary-float drift the decimal type exists to prevent.
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Decimal);
+        cols.insert("dept".into(), Type::String);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let fields = ["amount", "dept"];
+
+        for (src, want) in [
+            ("emit total = sum(amount)", Type::Decimal),
+            ("emit average = avg(amount)", Type::Decimal),
+        ] {
+            let parsed = Parser::parse(src);
+            assert!(parsed.errors.is_empty());
+            let resolved = resolve_program(parsed.ast, &fields, parsed.node_count).unwrap();
+            let typed = type_check_with_mode(resolved, &schema, agg_mode(&["dept"]))
+                .unwrap_or_else(|d| {
+                    panic!(
+                        "`{src}` must typecheck over a decimal column, got: {:?}",
+                        d.iter().map(|e| &e.message).collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(
+                first_emit_expr_type(&typed),
+                want,
+                "result type for `{src}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_weighted_avg_over_decimal_rejected() {
+        // weighted_avg has no exact decimal accumulator yet; its float path
+        // silently drops a decimal in EITHER the value or the weight position
+        // (the accumulator's `numeric()` conversion skips a decimal), returning
+        // Null. Typecheck must reject it loudly rather than let a monetary
+        // weighted average be silently wrong — for a decimal value AND a
+        // decimal weight.
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Decimal);
+        cols.insert("price".into(), Type::Decimal);
+        cols.insert("qty".into(), Type::Int);
+        cols.insert("dept".into(), Type::String);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let fields = ["amount", "price", "qty", "dept"];
+
+        for src in [
+            "emit wa = weighted_avg(amount, qty)", // decimal value
+            "emit wa = weighted_avg(qty, price)",  // decimal weight
+        ] {
+            let parsed = Parser::parse(src);
+            assert!(parsed.errors.is_empty());
+            let resolved = resolve_program(parsed.ast, &fields, parsed.node_count).unwrap();
+            let errs = type_check_with_mode(resolved, &schema, agg_mode(&["dept"]))
+                .expect_err("weighted_avg over a decimal must be rejected");
+            assert!(
+                errs.iter().any(|d| d
+                    .message
+                    .contains("weighted_avg() over a decimal value or weight is not supported")),
+                "`{src}` expected a weighted_avg decimal rejection, got: {:?}",
+                errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

@@ -200,8 +200,11 @@ accounting). Writers emit the value at that scale, so `2.5` stored in a
   - `amount.to_float() * rate` — opt into binary float precision.
   - `rate.to_decimal() * amount` — bring the float into exact decimal math
     (the float→decimal step is the one acknowledged lossy conversion).
-- **Division and `avg`** compute at full precision and round to the target
-  column's `scale` when the result lands in a scaled decimal column.
+- **Division and `avg`** compute at full precision — the exact quotient, not a
+  binary-float approximation. A computed decimal keeps its full precision and
+  is not automatically rounded to a fixed number of places; round it explicitly
+  when you need fixed cents. (A `decimal` *source* column, separately, rounds
+  its parsed values to the declared `scale` on read, using banker's rounding.)
 
 Comparisons follow the same rule: `decimal < int` is fine, `decimal < float`
 requires a cast.
@@ -227,6 +230,22 @@ $ cxl eval -e 'emit total = ("19.99".to_decimal() * 3) + "4.80".to_decimal()'
 `19.99 * 3 = 59.97`, `+ 4.80 = 64.77` — exact, with no binary-float drift.
 (In a pipeline, declare the source columns `type: decimal` instead of casting;
 JSON output renders a decimal as a scale-preserving string.)
+
+### Aggregating decimals
+
+`sum`, `avg`, `min`, `max`, `count`, and `distinct` all work over a `decimal`
+column and stay exact — no binary float ever touches a running total:
+
+- `sum(amount)` and `avg(amount)` return a `decimal`. The sum is the exact
+  total to the cent; the average is the exact full-precision quotient.
+- `min` / `max` return the exact extremum, and `count` returns an integer.
+- Group-by and `distinct` keys are scale-normalized: two decimals that are
+  numerically equal group together regardless of scale, so `2.50` and `2.5`
+  fall in one group. This holds even when the aggregation spills to disk.
+
+`weighted_avg` does not yet support decimals and rejects a decimal value at
+compile time — cast with `.to_float()` for a binary-float weighted average, or
+use `sum` / `avg`, which stay exact over decimals.
 
 ## Type unification rules
 

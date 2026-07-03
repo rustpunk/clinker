@@ -190,9 +190,10 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
             }
         }
         if saw_decimal && count > 0 {
-            // Exact decimal quotient at full precision (rounding to a column
-            // scale happens when it lands in a scaled decimal column). Integer
-            // rows fold into the numerator exactly so they are not lost.
+            // Exact decimal quotient at full precision — a computed decimal is
+            // not re-rounded to an output-column scale (round explicitly in CXL
+            // to fix places). Integer rows fold into the numerator exactly so
+            // they are not lost.
             let numerator = add_i128_to_decimal(dec_total, int_acc);
             return match numerator.checked_div(rust_decimal::Decimal::from(count)) {
                 Some(avg) => Value::Decimal(avg),
