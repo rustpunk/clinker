@@ -1545,7 +1545,7 @@ fn run_time_windowed_aggregate(
                 .get(*idx as usize)
                 .cloned()
                 .unwrap_or(Value::Null);
-            match value_to_group_key(&val, field_name, None, row_num) {
+            match value_to_group_key(&val, field_name, row_num) {
                 Ok(Some(gk)) => key.push(gk),
                 Ok(None) => key.push(GroupByKey::Null),
                 Err(e) => {

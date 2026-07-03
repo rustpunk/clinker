@@ -3,7 +3,6 @@ use clinker_exec::pipeline::arena::Arena;
 use clinker_exec::pipeline::index::SecondaryIndex;
 use clinker_record::{MinimalRecord, RecordStorage, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 // ── Arena construction ─────────────────────────────────────────────
@@ -93,9 +92,7 @@ fn bench_index_build(c: &mut Criterion) {
             &record_count,
             |b, _| {
                 b.iter(|| {
-                    let idx =
-                        SecondaryIndex::build(&arena, &["group".to_string()], &HashMap::new())
-                            .unwrap();
+                    let idx = SecondaryIndex::build(&arena, &["group".to_string()]).unwrap();
                     black_box(&idx);
                 });
             },
@@ -121,7 +118,7 @@ fn bench_index_lookup(c: &mut Criterion) {
         })
         .collect();
     let arena = Arena::from_parts(schema, minimals);
-    let idx = SecondaryIndex::build(&arena, &["group".to_string()], &HashMap::new()).unwrap();
+    let idx = SecondaryIndex::build(&arena, &["group".to_string()]).unwrap();
 
     // Build lookup keys
     let keys: Vec<Vec<clinker_record::GroupByKey>> = (0..num_groups)

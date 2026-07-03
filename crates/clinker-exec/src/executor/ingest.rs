@@ -21,6 +21,7 @@ use clinker_format::x12::reader::{X12Reader, X12ReaderConfig};
 use clinker_format::xml::reader::{
     NamespaceMode, XmlArrayMode, XmlArrayPath, XmlReader, XmlReaderConfig,
 };
+use clinker_format::{Column, SourceSchema};
 use clinker_plan::config::PipelineConfig;
 use clinker_plan::error::PipelineError;
 
@@ -34,30 +35,48 @@ use clinker_plan::error::PipelineError;
 /// code uses trait methods (`schema()`, `next_record()`).
 fn build_format_reader(
     input: &clinker_plan::config::SourceConfig,
+    schema: &SourceSchema,
     source: ReopenableSource,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
-    match &input.format {
-        clinker_plan::config::InputFormat::Csv(opts) => {
-            // A CSV source declaring `records:` in its `format_schema` is a
-            // multi-record flat file: one row per line on a discriminator-
-            // driven superset schema. A plain CSV (or one with no
-            // `format_schema`) stays on the single-schema reader.
-            match multi_record_schema(input, "csv")? {
-                Some(def) => build_multi_record_reader(
-                    input,
-                    def,
-                    MultiRecordKind::Csv(opts.as_ref()),
-                    open_one_shot(&source)?,
-                ),
-                None => {
-                    let config = build_csv_reader_config(opts.as_ref())?;
-                    Ok(Box::new(CsvReader::from_reader(
-                        open_one_shot(&source)?,
-                        config,
+    // Resolve an external `.schema.yaml` (`SourceSchema::File`) to its inline
+    // form so the reader sees a concrete column / multi-record schema. Moving
+    // this resolution to compile time (and folding it into `source_hash`) is a
+    // follow-on; here it stays behavior-equivalent to the previous per-file
+    // load.
+    let resolved_file;
+    let schema = match schema {
+        SourceSchema::File(path) => {
+            resolved_file = clinker_plan::schema::load_source_schema(std::path::Path::new(path))
+                .map_err(|e| {
+                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                        "source {:?}: failed to load schema file '{path}': {e}",
+                        input.name
                     )))
-                }
-            }
+                })?;
+            &resolved_file
         }
+        other => other,
+    };
+
+    match &input.format {
+        clinker_plan::config::InputFormat::Csv(opts) => match schema {
+            // A CSV source whose `schema:` is a multi-record schema is a
+            // discriminator-driven flat file: one row per line on a superset
+            // schema. Any other schema shape stays on the single-schema reader.
+            SourceSchema::MultiRecord { .. } => build_multi_record_reader(
+                input,
+                schema,
+                MultiRecordKind::Csv(opts.as_ref()),
+                open_one_shot(&source)?,
+            ),
+            _ => {
+                let config = build_csv_reader_config(opts.as_ref())?;
+                Ok(Box::new(CsvReader::from_reader(
+                    open_one_shot(&source)?,
+                    config,
+                )))
+            }
+        },
         clinker_plan::config::InputFormat::Json(opts) => {
             let config = build_json_reader_config(
                 opts.as_ref(),
@@ -74,28 +93,38 @@ fn build_format_reader(
             );
             Ok(Box::new(XmlReader::from_source(source, config)?))
         }
-        clinker_plan::config::InputFormat::FixedWidth(opts) => {
-            // A fixed-width source declaring `records:` is a multi-record flat
-            // file (header/trailer/body byte-range discrimination); a `fields:`
-            // schema stays on the single-layout reader.
-            match multi_record_schema(input, "fixed-width")? {
-                Some(def) => build_multi_record_reader(
-                    input,
-                    def,
-                    MultiRecordKind::FixedWidth(opts.as_ref()),
+        clinker_plan::config::InputFormat::FixedWidth(opts) => match schema {
+            // A multi-record `schema:` is a header/trailer/body byte-range flat
+            // file; a plain column list stays on the single-layout reader.
+            SourceSchema::MultiRecord { .. } => build_multi_record_reader(
+                input,
+                schema,
+                MultiRecordKind::FixedWidth(opts.as_ref()),
+                open_one_shot(&source)?,
+            ),
+            SourceSchema::Columns(cols) => {
+                let config = build_fw_reader_config(opts.as_ref());
+                Ok(Box::new(FixedWidthReader::new(
                     open_one_shot(&source)?,
-                ),
-                None => {
-                    let fields = extract_field_defs(input)?;
-                    let config = build_fw_reader_config(opts.as_ref());
-                    Ok(Box::new(FixedWidthReader::new(
-                        open_one_shot(&source)?,
-                        fields,
-                        config,
-                    )?))
-                }
+                    cols.clone(),
+                    config,
+                )?))
             }
-        }
+            SourceSchema::Generated(_) => Err(PipelineError::Config(
+                clinker_plan::config::ConfigError::Validation(format!(
+                    "source {:?}: a fixed-width source needs a column-list or multi-record \
+                     schema, not a `generated` schema",
+                    input.name
+                )),
+            )),
+            SourceSchema::File(_) => Err(PipelineError::Internal {
+                op: "build_format_reader",
+                node: input.name.clone(),
+                detail: "SourceSchema::File was not resolved to an inline form before format \
+                         dispatch"
+                    .into(),
+            }),
+        },
         clinker_plan::config::InputFormat::Edifact(opts) => {
             let config = build_edifact_reader_config(opts.as_ref());
             Ok(Box::new(EdifactReader::new(
@@ -134,21 +163,23 @@ fn open_one_shot(source: &ReopenableSource) -> Result<Box<dyn Read + Send>, Pipe
 /// transparently.
 fn build_multi_file_reader(
     input: &clinker_plan::config::SourceConfig,
+    schema: &SourceSchema,
     files: Vec<crate::source::multi_file::FileSlot>,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
     use crate::source::multi_file::{FactoryFn, MultiFileFormatReader};
 
-    // The factory closure captures the source config by clone so each
-    // file gets a fresh format reader configured identically. Format
+    // The factory closure captures the source config + unified schema by clone
+    // so each file gets a fresh format reader configured identically. Format
     // construction errors map to the wrapper's `Schema` variant via
     // `clinker_format::FormatError` so they bubble through the trait
     // boundary intact.
     let owned_config = input.clone();
+    let owned_schema = schema.clone();
     let factory: Box<FactoryFn> = Box::new(
         move |source: ReopenableSource,
               _idx: usize|
               -> Result<Box<dyn FormatReader>, clinker_format::FormatError> {
-            build_format_reader(&owned_config, source).map_err(|e| {
+            build_format_reader(&owned_config, &owned_schema, source).map_err(|e| {
                 clinker_format::FormatError::SchemaInference(format!(
                     "format reader construction failed: {e}"
                 ))
@@ -168,9 +199,9 @@ fn wrap_with_schema_coercion(
     use clinker_plan::config::PipelineNode;
     use clinker_plan::config::pipeline_node::OnUnmapped;
 
-    // Find the source node's schema declaration + on_unmapped policy
-    // + format. Format is needed for the auto_widen-on-fixed-width
-    // structural-inertness diagnostic below.
+    // Find the source node's schema + on_unmapped policy + format. Format is
+    // needed for the auto_widen-on-fixed-width structural-inertness diagnostic
+    // below.
     let body_data = config.nodes.iter().find_map(|s| {
         if let PipelineNode::Source {
             header,
@@ -179,7 +210,7 @@ fn wrap_with_schema_coercion(
             && header.name == source_name
         {
             return Some((
-                &body.schema.columns,
+                &body.schema,
                 body.on_unmapped.clone(),
                 body.source.format.clone(),
             ));
@@ -187,8 +218,21 @@ fn wrap_with_schema_coercion(
         None
     });
 
-    match body_data {
-        Some((columns, policy, format)) if !columns.is_empty() => {
+    let Some((schema, policy, format)) = body_data else {
+        return Ok(reader);
+    };
+
+    // The unified `schema:` is resolved to its effective column list (single-
+    // record columns, or the multi-record superset), loading an external
+    // `.schema.yaml` (`File`) to its inline form first so a CSV/JSON/XML source
+    // pointing at a shared schema file is still type-coerced and has its
+    // `on_unmapped` policy enforced — matching the compile-time column seeding
+    // in `bind_schema`. A `generated` schema seeds no inline columns, so it is
+    // not wrapped (its reader synthesizes and types its own positional columns).
+    let columns = coercible_columns(schema, source_name)?;
+
+    match columns {
+        Some(columns) if !columns.is_empty() => {
             // Fixed-width format: the reader's schema is constructed
             // positionally from the user-declared `FieldDef` list,
             // so the reader cannot ever produce an "undeclared
@@ -214,7 +258,7 @@ fn wrap_with_schema_coercion(
             }
             let coercing = crate::pipeline::schema_coerce::CoercingReader::new(
                 reader,
-                columns,
+                &columns,
                 policy,
                 source_name,
             )
@@ -226,6 +270,47 @@ fn wrap_with_schema_coercion(
         }
         _ => Ok(reader),
     }
+}
+
+/// The effective column list a [`CoercingReader`](crate::pipeline::schema_coerce)
+/// projects onto, resolving an external `.schema.yaml` ([`SourceSchema::File`])
+/// to its inline form first. `None` when the schema seeds no inline columns
+/// (`Generated` — the reader synthesizes its own positional columns).
+///
+/// # Errors
+///
+/// Returns a config-validation error when an external schema file cannot be
+/// loaded or parsed.
+fn coercible_columns(
+    schema: &SourceSchema,
+    source_name: &str,
+) -> Result<Option<Vec<Column>>, PipelineError> {
+    match schema {
+        SourceSchema::File(path) => {
+            let inner = clinker_plan::schema::load_source_schema(std::path::Path::new(path))
+                .map_err(|e| {
+                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                        "source {source_name:?}: failed to load schema file '{path}': {e}"
+                    )))
+                })?;
+            Ok(inner.bound_columns())
+        }
+        other => Ok(other.bound_columns()),
+    }
+}
+
+/// Borrow a source node's unified `schema:` ([`SourceSchema`]) from the compiled
+/// plan, keyed by node identity (`header.name`) — the same key every other
+/// source lookup on the ingest path uses.
+fn source_schema<'a>(config: &'a PipelineConfig, source_name: &str) -> Option<&'a SourceSchema> {
+    use clinker_plan::config::PipelineNode;
+    config.nodes.iter().find_map(|s| match &s.value {
+        PipelineNode::Source {
+            header,
+            config: body,
+        } if header.name == source_name => Some(&body.schema),
+        _ => None,
+    })
 }
 
 /// Convert a record value at a declared watermark column into the
@@ -308,7 +393,13 @@ pub(super) fn ingest_source(
                     )),
                 ));
             }
-            let raw_reader = build_multi_file_reader(&src_cfg, files)?;
+            let schema = source_schema(&config, &src_cfg.name).ok_or_else(|| {
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                    "source '{}' not found in the compiled plan while building its reader",
+                    src_cfg.name
+                )))
+            })?;
+            let raw_reader = build_multi_file_reader(&src_cfg, schema, files)?;
             let src_reader = wrap_with_schema_coercion(raw_reader, &config, &src_cfg.name)?;
             // The file arm reaches the shared driver through the blanket
             // `RecordSource for Box<dyn FormatReader>` impl.
@@ -904,69 +995,8 @@ fn apply_envelope_events(
 /// definition stays single-record. Returns a config validation error when the
 /// source declares no `format_schema` (the formats that need one — fixed-width
 /// always, multi-record CSV — both require it).
-fn load_format_schema(
-    input: &clinker_plan::config::SourceConfig,
-    format_label: &str,
-) -> Result<clinker_record::schema_def::SchemaDefinition, PipelineError> {
-    let schema_source = input.schema.as_ref().ok_or_else(|| {
-        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-            "{format_label} format requires an explicit `format_schema`"
-        )))
-    })?;
-    match schema_source {
-        clinker_plan::config::SchemaSource::Inline(def) => Ok(def.clone()),
-        clinker_plan::config::SchemaSource::FilePath(path) => {
-            clinker_plan::schema::load_schema(std::path::Path::new(path)).map_err(|e| {
-                PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-                    "failed to load schema from '{path}': {e}",
-                )))
-            })
-        }
-    }
-}
-
-/// Return the source's format-layer schema when it declares multiple record
-/// types (`records:`), routing the source to the discriminator-driven
-/// multi-record reader; `None` when the source declares no `format_schema` or
-/// a single-record `fields:` definition (the single-schema reader path).
-fn multi_record_schema(
-    input: &clinker_plan::config::SourceConfig,
-    format_label: &str,
-) -> Result<Option<clinker_record::schema_def::SchemaDefinition>, PipelineError> {
-    if input.schema.is_none() {
-        return Ok(None);
-    }
-    let def = load_format_schema(input, format_label)?;
-    Ok(def.records.is_some().then_some(def))
-}
-
-/// Extract the single-record `Vec<FieldDef>` a fixed-width source declares,
-/// with `inherits:` merged and field constraints validated.
-///
-/// Routes through [`clinker_plan::schema::resolve_schema`] so a fixed-width
-/// field declaring `inherits:` resolves against the schema's `defs:` templates
-/// (positions, types, padding) instead of reaching the reader unresolved — the
-/// same resolution the multi-record path gets.
-///
-/// # Errors
-///
-/// Returns a config validation error when the fixed-width source declares no
-/// `format_schema`, its definition carries no `fields:` list, or an
-/// inherits / field-constraint check fails.
-fn extract_field_defs(
-    input: &clinker_plan::config::SourceConfig,
-) -> Result<Vec<clinker_record::schema_def::FieldDef>, PipelineError> {
-    let def = load_format_schema(input, "fixed-width")?;
-    let resolved = clinker_plan::schema::resolve_schema(def).map_err(|e| {
-        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-            "fixed-width schema: {e}"
-        )))
-    })?;
-    Ok(resolved.fields)
-}
-
 /// Build a multi-record flat-file reader (CSV or fixed-width) from a
-/// `records:` schema definition.
+/// [`SourceSchema::MultiRecord`] schema.
 ///
 /// The `kind` selects the discriminator semantics: a fixed-width source reads
 /// the discriminator byte range and per-field byte ranges; a CSV source reads
@@ -974,23 +1004,29 @@ fn extract_field_defs(
 ///
 /// # Errors
 ///
-/// Returns a config validation error when the definition omits its
-/// `discriminator:` block, or [`PipelineError::Compilation`] when the reader
-/// rejects the discriminator / record-type declarations.
+/// Returns a config validation error when the schema is not a multi-record
+/// schema, or [`PipelineError::Compilation`] when the reader rejects the
+/// discriminator / record-type declarations.
 fn build_multi_record_reader(
     input: &clinker_plan::config::SourceConfig,
-    def: clinker_record::schema_def::SchemaDefinition,
+    schema: &SourceSchema,
     kind: MultiRecordKind,
     reader: Box<dyn Read + Send>,
 ) -> Result<Box<dyn FormatReader>, PipelineError> {
-    // Resolve the record types — merging each type's `inherits:` and validating
-    // its field constraints — so a multi-record schema gets the same resolution
-    // a single-record one does, instead of reaching the reader raw.
-    let resolved = clinker_plan::schema::resolve_records(def).map_err(|e| {
-        PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
-            "multi-record schema: {e}"
-        )))
-    })?;
+    let SourceSchema::MultiRecord {
+        discriminator,
+        record_types,
+        structure,
+    } = schema
+    else {
+        return Err(PipelineError::Config(
+            clinker_plan::config::ConfigError::Validation(format!(
+                "source {:?}: internal error — multi-record reader built from a non-multi-record \
+                 schema",
+                input.name
+            )),
+        ));
+    };
     // The header record-type tags are the `record_type` extracts the source's
     // `envelope:` config declares. The reader learns them at construction so
     // its bounded header pre-scan runs before any body record, and a header
@@ -1002,9 +1038,9 @@ fn build_multi_record_reader(
         messages: vec![format!("multi-record reader init error: {e}")],
     };
     let spec = clinker_format::multi_record::MultiRecordSpec {
-        discriminator: resolved.discriminator,
-        record_types: resolved.record_types,
-        structure: resolved.structure,
+        discriminator: discriminator.clone(),
+        record_types: record_types.clone(),
+        structure: structure.clone().unwrap_or_default(),
         header_tags,
     };
     let built: Box<dyn FormatReader> = match kind {
@@ -1343,6 +1379,36 @@ mod tests {
     use clinker_format::EnvelopeEvent;
     use clinker_record::{Schema, SchemaBuilder, Value};
     use indexmap::IndexMap;
+
+    /// An external-file (`SourceSchema::File`) schema resolves to typed columns
+    /// for the `CoercingReader`, so a CSV/JSON/XML source pointing at a shared
+    /// `.schema.yaml` is still type-coerced (matching the compile-time seeding
+    /// in `bind_schema`) rather than silently passed through as raw strings.
+    #[test]
+    fn coercible_columns_resolves_external_file_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cols.schema.yaml");
+        std::fs::write(
+            &path,
+            "- { name: amount, type: int }\n- { name: name, type: string }\n",
+        )
+        .unwrap();
+        let schema = SourceSchema::File(path.to_string_lossy().into_owned());
+        let columns = coercible_columns(&schema, "src")
+            .expect("file schema loads")
+            .expect("file schema yields inline columns");
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].name, "amount");
+        assert_eq!(columns[0].ty, cxl::typecheck::Type::Int);
+    }
+
+    /// A `generated` schema seeds no inline columns for the coercion path (its
+    /// reader synthesizes and types its own positional columns).
+    #[test]
+    fn coercible_columns_none_for_generated() {
+        let schema = SourceSchema::Generated(clinker_format::GeneratedSchema::default());
+        assert!(coercible_columns(&schema, "src").unwrap().is_none());
+    }
 
     /// A scripted step: emit a record, or queue an envelope boundary the
     /// driver drains around the surrounding `next_record` call.

@@ -381,19 +381,9 @@ nodes:
     name: src
     type: fixed_width
     path: input.dat
-    format_schema:
-      fields:
-      - name: name
-        type: string
-        start: 0
-        width: 10
-      - name: age
-        type: integer
-        start: 10
-        width: 5
     schema:
-      - { name: name, type: string }
-      - { name: age, type: string }
+      - { name: name, type: string, start: 0, width: 10 }
+      - { name: age, type: int, start: 10, width: 5 }
 
 - type: output
   name: dest
@@ -441,13 +431,8 @@ nodes:
     type: fixed_width
     path: output.dat
     schema:
-      fields:
-      - name: name
-        type: string
-        width: 10
-      - name: age
-        type: integer
-        width: 5
+      - { name: name, type: string, width: 10 }
+      - { name: age, type: int, width: 5 }
     include_unmapped: true
 "#;
     let csv_input = "name,age\nAlice,30\nBob,25\n";

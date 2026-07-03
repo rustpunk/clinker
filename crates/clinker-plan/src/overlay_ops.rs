@@ -2496,7 +2496,8 @@ nodes:
         match &nodes.iter().find(|n| n.value.name() == name).unwrap().value {
             PipelineNode::Source { config, .. } => config
                 .schema
-                .columns
+                .as_columns()
+                .expect("single-record schema")
                 .iter()
                 .map(|c| (c.name.clone(), c.ty.clone()))
                 .collect(),
@@ -2549,7 +2550,8 @@ schema:
             PipelineNode::Source { config, .. } => {
                 let col = config
                     .schema
-                    .columns
+                    .as_columns()
+                    .expect("single-record schema")
                     .iter()
                     .find(|c| c.name == "customer_id")
                     .expect("renamed column");

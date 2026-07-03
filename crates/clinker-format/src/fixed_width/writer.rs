@@ -1,10 +1,12 @@
 use std::io::Write;
 
-use clinker_record::schema_def::{FieldDef, FieldType, Justify, LineSeparator, TruncationPolicy};
+use clinker_record::schema_def::{Justify, LineSeparator, TruncationPolicy};
 use clinker_record::{DocumentContext, Record, Value};
+use cxl::typecheck::Type;
 
 use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
 use crate::error::FormatError;
+use crate::schema::Column;
 use crate::traits::FormatWriter;
 
 /// Configuration for the fixed-width writer.
@@ -57,7 +59,7 @@ pub struct FixedWidthWriter<W: Write> {
 impl<W: Write> FixedWidthWriter<W> {
     pub fn new(
         writer: W,
-        fields: Vec<FieldDef>,
+        fields: Vec<Column>,
         config: FixedWidthWriterConfig,
     ) -> Result<Self, FormatError> {
         let resolved: Vec<WriteField> = fields
@@ -75,8 +77,8 @@ impl<W: Write> FixedWidthWriter<W> {
                     })?;
 
                 let is_numeric = matches!(
-                    f.field_type,
-                    Some(FieldType::Integer) | Some(FieldType::Float)
+                    f.ty.unwrap_nullable(),
+                    Type::Int | Type::Float | Type::Numeric
                 );
 
                 let justify = f.justify.clone().unwrap_or(if is_numeric {
@@ -317,32 +319,11 @@ fn value_to_envelope_cell(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clinker_record::schema_def::FieldDef;
     use clinker_record::{Record, Schema, Value};
     use std::sync::Arc;
 
-    fn field(name: &str) -> FieldDef {
-        FieldDef {
-            name: name.into(),
-            field_type: None,
-            required: None,
-            format: None,
-            coerce: None,
-            default: None,
-            allowed_values: None,
-            alias: None,
-            inherits: None,
-            start: None,
-            width: None,
-            end: None,
-            justify: None,
-            pad: None,
-            trim: None,
-            truncation: None,
-            precision: None,
-            scale: None,
-            path: None,
-        }
+    fn field(name: &str) -> Column {
+        Column::bare(name, Type::String)
     }
 
     fn make_record(cols: &[&str], vals: Vec<Value>) -> Record {
@@ -355,7 +336,7 @@ mod tests {
         let fields = vec![
             {
                 let mut f = field("id");
-                f.field_type = Some(FieldType::Integer);
+                f.ty = Type::Int;
                 f.start = Some(0);
                 f.width = Some(5);
                 f.justify = Some(Justify::Right);
@@ -364,14 +345,14 @@ mod tests {
             },
             {
                 let mut f = field("name");
-                f.field_type = Some(FieldType::String);
+                f.ty = Type::String;
                 f.start = Some(5);
                 f.width = Some(10);
                 f
             },
             {
                 let mut f = field("amount");
-                f.field_type = Some(FieldType::Float);
+                f.ty = Type::Float;
                 f.start = Some(15);
                 f.width = Some(8);
                 f.justify = Some(Justify::Right);
@@ -404,7 +385,7 @@ mod tests {
     fn test_fixedwidth_write_left_justify() {
         let fields = vec![{
             let mut f = field("name");
-            f.field_type = Some(FieldType::String);
+            f.ty = Type::String;
             f.start = Some(0);
             f.width = Some(10);
             f.justify = Some(Justify::Left);
@@ -428,7 +409,7 @@ mod tests {
     fn test_fixedwidth_write_right_justify() {
         let fields = vec![{
             let mut f = field("amount");
-            f.field_type = Some(FieldType::Integer);
+            f.ty = Type::Int;
             f.start = Some(0);
             f.width = Some(8);
             f.justify = Some(Justify::Right);
@@ -452,7 +433,7 @@ mod tests {
     fn test_fixedwidth_write_truncate_warning() {
         let fields = vec![{
             let mut f = field("name");
-            f.field_type = Some(FieldType::String);
+            f.ty = Type::String;
             f.start = Some(0);
             f.width = Some(5);
             f.truncation = Some(TruncationPolicy::Warn);
@@ -482,7 +463,7 @@ mod tests {
     fn test_fixedwidth_write_truncate_numeric_error() {
         let fields = vec![{
             let mut f = field("amount");
-            f.field_type = Some(FieldType::Integer);
+            f.ty = Type::Int;
             f.start = Some(0);
             f.width = Some(3);
             // Default truncation for numeric is Error
@@ -511,7 +492,7 @@ mod tests {
         let write_fields = vec![
             {
                 let mut f = field("id");
-                f.field_type = Some(FieldType::Integer);
+                f.ty = Type::Int;
                 f.start = Some(0);
                 f.width = Some(5);
                 f.justify = Some(Justify::Right);
@@ -520,7 +501,7 @@ mod tests {
             },
             {
                 let mut f = field("name");
-                f.field_type = Some(FieldType::String);
+                f.ty = Type::String;
                 f.start = Some(5);
                 f.width = Some(10);
                 f.justify = Some(Justify::Left);
@@ -599,7 +580,7 @@ mod tests {
         // schema). A computed footer count is rejected at plan time for
         // fixed-width (E346), so the spec here carries none.
         let mut amount = field("amount");
-        amount.field_type = Some(FieldType::Integer);
+        amount.ty = Type::Int;
         amount.width = Some(5);
         amount.justify = Some(Justify::Right);
         amount.pad = Some("0".into());

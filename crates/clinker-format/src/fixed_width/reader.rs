@@ -1,7 +1,7 @@
 //! Fixed-width record reader.
 //!
 //! The schema is constructed positionally from the user-declared
-//! `FieldDef` list (`width` / `start..end` byte ranges). Bytes
+//! [`Column`] list (`width` / `start..end` byte ranges). Bytes
 //! outside the declared ranges are structurally invisible to the
 //! reader — there is no "extra column" concept the way CSV's
 //! header row or JSON's per-record key set has one.
@@ -22,7 +22,8 @@ use std::sync::Arc;
 
 use crate::bom::SkipBom;
 use crate::fixed_width::field::{self, ResolvedField};
-use clinker_record::schema_def::{FieldDef, LineSeparator};
+use crate::schema::Column;
+use clinker_record::schema_def::LineSeparator;
 use clinker_record::{Record, Schema, SchemaBuilder};
 
 use crate::error::FormatError;
@@ -60,12 +61,12 @@ pub struct FixedWidthReader<R: Read> {
 impl<R: Read> FixedWidthReader<R> {
     pub fn new(
         reader: R,
-        fields: Vec<FieldDef>,
+        fields: Vec<Column>,
         config: FixedWidthReaderConfig,
     ) -> Result<Self, FormatError> {
         let resolved: Vec<ResolvedField> = fields
             .iter()
-            .map(ResolvedField::from_field_def)
+            .map(ResolvedField::from_column)
             .collect::<Result<_, _>>()?;
 
         let schema = fields
@@ -118,30 +119,11 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use clinker_record::Value;
-    use clinker_record::schema_def::{FieldDef, FieldType, Justify};
+    use clinker_record::schema_def::Justify;
+    use cxl::typecheck::Type;
 
-    fn field(name: &str) -> FieldDef {
-        FieldDef {
-            name: name.into(),
-            field_type: None,
-            required: None,
-            format: None,
-            coerce: None,
-            default: None,
-            allowed_values: None,
-            alias: None,
-            inherits: None,
-            start: None,
-            width: None,
-            end: None,
-            justify: None,
-            pad: None,
-            trim: None,
-            truncation: None,
-            precision: None,
-            scale: None,
-            path: None,
-        }
+    fn field(name: &str) -> Column {
+        Column::bare(name, Type::String)
     }
 
     #[test]
@@ -155,7 +137,7 @@ mod tests {
         let fields = vec![
             {
                 let mut f = field("id");
-                f.field_type = Some(FieldType::Integer);
+                f.ty = Type::Int;
                 f.start = Some(0);
                 f.width = Some(5);
                 f.justify = Some(Justify::Right);
@@ -164,14 +146,14 @@ mod tests {
             },
             {
                 let mut f = field("name");
-                f.field_type = Some(FieldType::String);
+                f.ty = Type::String;
                 f.start = Some(5);
                 f.width = Some(20);
                 f
             },
             {
                 let mut f = field("date");
-                f.field_type = Some(FieldType::String);
+                f.ty = Type::String;
                 f.start = Some(25);
                 f.width = Some(8);
                 f
@@ -202,7 +184,7 @@ mod tests {
         let fields = vec![
             {
                 let mut f = field("id");
-                f.field_type = Some(FieldType::Integer);
+                f.ty = Type::Int;
                 f.start = Some(0);
                 f.width = Some(5);
                 f.justify = Some(Justify::Right);
@@ -211,14 +193,14 @@ mod tests {
             },
             {
                 let mut f = field("name");
-                f.field_type = Some(FieldType::String);
+                f.ty = Type::String;
                 f.start = Some(5);
                 f.width = Some(20);
                 f
             },
             {
                 let mut f = field("date");
-                f.field_type = Some(FieldType::String);
+                f.ty = Type::String;
                 f.start = Some(25);
                 f.width = Some(8);
                 f
@@ -242,7 +224,7 @@ mod tests {
         let fields = vec![
             {
                 let mut f = field("id");
-                f.field_type = Some(FieldType::Integer);
+                f.ty = Type::Int;
                 f.start = Some(0);
                 f.end = Some(5); // end - start = 5 = same as width: 5
                 f.justify = Some(Justify::Right);
@@ -251,14 +233,14 @@ mod tests {
             },
             {
                 let mut f = field("name");
-                f.field_type = Some(FieldType::String);
+                f.ty = Type::String;
                 f.start = Some(5);
                 f.end = Some(25); // end - start = 20
                 f
             },
             {
                 let mut f = field("date");
-                f.field_type = Some(FieldType::String);
+                f.ty = Type::String;
                 f.start = Some(25);
                 f.end = Some(33); // end - start = 8
                 f
@@ -279,7 +261,7 @@ mod tests {
 
         let fields = vec![{
             let mut f = field("name");
-            f.field_type = Some(FieldType::String);
+            f.ty = Type::String;
             f.start = Some(0);
             f.width = Some(8);
             // trim defaults to true
@@ -298,7 +280,7 @@ mod tests {
 
         let fields = vec![{
             let mut f = field("name");
-            f.field_type = Some(FieldType::String);
+            f.ty = Type::String;
             f.start = Some(0);
             f.width = Some(8);
             f.trim = Some(false);
@@ -317,7 +299,7 @@ mod tests {
 
         let fields = vec![{
             let mut f = field("amount");
-            f.field_type = Some(FieldType::Integer);
+            f.ty = Type::Int;
             f.start = Some(0);
             f.width = Some(5);
             f.justify = Some(Justify::Right);
@@ -337,7 +319,7 @@ mod tests {
 
         let fields = vec![{
             let mut f = field("amount");
-            f.field_type = Some(FieldType::Integer);
+            f.ty = Type::Int;
             f.start = Some(0);
             f.width = Some(5);
             f.justify = Some(Justify::Right);
@@ -357,7 +339,7 @@ mod tests {
 
         let fields = vec![{
             let mut f = field("dt");
-            f.field_type = Some(FieldType::Date);
+            f.ty = Type::Date;
             f.start = Some(0);
             f.width = Some(8);
             f.format = Some("%Y%m%d".into());
@@ -379,7 +361,7 @@ mod tests {
 
         let fields = vec![{
             let mut f = field("name");
-            f.field_type = Some(FieldType::String);
+            f.ty = Type::String;
             f.start = Some(0);
             f.width = Some(5);
             f
@@ -407,7 +389,7 @@ mod tests {
         let fields = vec![
             {
                 let mut f = field("id");
-                f.field_type = Some(FieldType::Integer);
+                f.ty = Type::Int;
                 f.start = Some(0);
                 f.width = Some(5);
                 f.justify = Some(Justify::Right);
@@ -416,7 +398,7 @@ mod tests {
             },
             {
                 let mut f = field("name");
-                f.field_type = Some(FieldType::String);
+                f.ty = Type::String;
                 f.start = Some(5);
                 f.width = Some(5);
                 f

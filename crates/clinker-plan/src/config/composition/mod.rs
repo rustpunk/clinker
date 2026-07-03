@@ -67,10 +67,11 @@
 //! Provenance tracking: [`ResolvedValue`], [`ProvenanceLayer`],
 //! [`LayerKind`], [`ProvenanceDb`].
 
-use crate::config::pipeline_node::{PipelineNode, SchemaDecl};
+use crate::config::pipeline_node::PipelineNode;
 use crate::yaml::{Spanned, YamlError};
 use clinker_core_types::span::{FileId, Span};
 use clinker_core_types::{Diagnostic, LabeledSpan, Severity};
+use clinker_format::Column;
 use indexmap::IndexMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -168,13 +169,13 @@ pub struct ScopedVarsSchema {
 /// the port must carry at least these columns, but may carry extras
 /// (pass-through). `None` means accept-any — the port has no declared shape.
 ///
-/// The schema carries typed column declarations via [`SchemaDecl`] — the
-/// same `[{name, type}]` shape used by `SourceBody`. Types drive
-/// composition-load-time type-checking.
+/// The schema carries typed column declarations as a [`Column`] list — the
+/// same `[{name, type}]` shape a single-record `SourceBody` schema uses. Types
+/// drive composition-load-time type-checking.
 #[derive(Debug, Clone)]
 pub struct PortDecl {
-    /// Minimum-required typed schema. `None` = accept any row shape.
-    pub schema: Option<SchemaDecl>,
+    /// Minimum-required typed columns. `None` = accept any row shape.
+    pub schema: Option<Vec<Column>>,
     pub description: Option<String>,
     pub required: bool,
 }

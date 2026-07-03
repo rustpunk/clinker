@@ -186,7 +186,7 @@ nodes:
     build_rest_source(
         cfg,
         &body.source,
-        &body.schema.columns,
+        body.schema.as_columns().expect("single-record schema"),
         body.on_unmapped.clone(),
     )
     .expect("build rest reader")
@@ -345,7 +345,7 @@ nodes:
     build_rest_source(
         cfg,
         &body.source,
-        &body.schema.columns,
+        body.schema.as_columns().expect("single-record schema"),
         body.on_unmapped.clone(),
     )
     .expect("build wrapped rest reader")
@@ -467,7 +467,7 @@ nodes:
     let mut reader = build_rest_source(
         cfg,
         &body.source,
-        &body.schema.columns,
+        body.schema.as_columns().expect("single-record schema"),
         body.on_unmapped.clone(),
     )
     .expect("build cursor_token reader");

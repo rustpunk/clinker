@@ -1,9 +1,7 @@
-//! Input/output format selectors and the schema-source enum.
+//! Input/output format selectors.
 
 use super::*;
-use clinker_record::schema_def::SchemaDefinition;
-use serde::de::{self, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Serialize};
 
 /// Adjacently tagged format enum for inputs.
 /// `type` selects the format, `options` provides format-specific settings.
@@ -106,51 +104,6 @@ pub enum FormatKind {
     Xml,
     #[serde(rename = "fixed_width")]
     FixedWidth,
-}
-
-/// Schema source -- file path or inline definition.
-/// Custom Deserialize: YAML string -> FilePath, YAML map -> Inline(SchemaDefinition).
-#[derive(Debug, Clone, Serialize)]
-#[allow(clippy::large_enum_variant)]
-pub enum SchemaSource {
-    FilePath(String),
-    Inline(SchemaDefinition),
-}
-
-impl<'de> Deserialize<'de> for SchemaSource {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct SchemaSourceVisitor;
-
-        impl<'de> Visitor<'de> for SchemaSourceVisitor {
-            type Value = SchemaSource;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter
-                    .write_str("a schema file path (string) or an inline schema definition (map)")
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                Ok(SchemaSource::FilePath(v.to_owned()))
-            }
-
-            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
-            where
-                A: MapAccess<'de>,
-            {
-                let def =
-                    SchemaDefinition::deserialize(de::value::MapAccessDeserializer::new(map))?;
-                Ok(SchemaSource::Inline(def))
-            }
-        }
-
-        deserializer.deserialize_any(SchemaSourceVisitor)
-    }
 }
 
 /// Merge ordering discipline across declared inputs.

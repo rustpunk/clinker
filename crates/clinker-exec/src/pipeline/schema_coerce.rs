@@ -35,7 +35,8 @@ use clinker_record::{FieldMetadata, Record, Schema, SchemaBuilder, Value, coerci
 use cxl::typecheck::Type;
 use indexmap::IndexMap;
 
-use clinker_plan::config::pipeline_node::{ColumnDecl, OnUnmapped, WIDENED_SIDECAR_COLUMN};
+use clinker_format::Column;
+use clinker_plan::config::pipeline_node::{OnUnmapped, WIDENED_SIDECAR_COLUMN};
 
 /// Wraps a `FormatReader` and reprojects every record onto the
 /// user-declared `Arc<Schema>` (plus the `$widened` engine-stamped
@@ -87,7 +88,7 @@ impl CoercingReader {
     /// `schema:` block, and the per-Source `on_unmapped` policy.
     pub fn new(
         mut inner: Box<dyn FormatReader>,
-        schema_decl: &[ColumnDecl],
+        schema_decl: &[Column],
         policy: OnUnmapped,
         source_name: &str,
     ) -> Result<Self, FormatError> {
@@ -137,7 +138,7 @@ impl CoercingReader {
                 }
             })
             .collect();
-        let mut long_unique: Vec<bool> = schema_decl.iter().map(|c| c.long_unique).collect();
+        let mut long_unique: Vec<bool> = schema_decl.iter().map(|c| c.is_long_unique()).collect();
 
         let mut builder = SchemaBuilder::new();
         for c in schema_decl {
@@ -338,31 +339,22 @@ mod tests {
         ))
     }
 
-    fn col(name: &str, ty: Type) -> ColumnDecl {
-        ColumnDecl {
-            name: name.to_string(),
-            ty,
-            long_unique: false,
-            source_name: None,
-        }
+    fn col(name: &str, ty: Type) -> Column {
+        Column::bare(name, ty)
     }
 
-    fn col_unique(name: &str, ty: Type) -> ColumnDecl {
-        ColumnDecl {
-            name: name.to_string(),
-            ty,
-            long_unique: true,
-            source_name: None,
+    fn col_unique(name: &str, ty: Type) -> Column {
+        Column {
+            long_unique: Some(true),
+            ..Column::bare(name, ty)
         }
     }
 
     /// A declared column aliasing a differently-named physical source column.
-    fn col_from(name: &str, source_name: &str, ty: Type) -> ColumnDecl {
-        ColumnDecl {
-            name: name.to_string(),
-            ty,
-            long_unique: false,
+    fn col_from(name: &str, source_name: &str, ty: Type) -> Column {
+        Column {
             source_name: Some(source_name.to_string()),
+            ..Column::bare(name, ty)
         }
     }
 

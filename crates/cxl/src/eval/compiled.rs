@@ -837,7 +837,7 @@ fn build_distinct_key(
                 Some(v) => v,
                 None => resolver.resolve(name).unwrap_or(&clinker_record::NULL),
             };
-            match value_to_group_key(val, name, None, 0) {
+            match value_to_group_key(val, name, 0) {
                 Ok(Some(gk)) => Ok(vec![gk]),
                 Ok(None) => Ok(vec![GroupByKey::Null]),
                 Err(e) => Err(group_key_error_to_eval_error(e)),
@@ -846,7 +846,7 @@ fn build_distinct_key(
         None => {
             let mut key = Vec::new();
             for (name, val) in resolver.iter_fields() {
-                match value_to_group_key(val, name, None, 0) {
+                match value_to_group_key(val, name, 0) {
                     Ok(Some(gk)) => key.push(gk),
                     Ok(None) => key.push(GroupByKey::Null),
                     Err(e) => return Err(group_key_error_to_eval_error(e)),

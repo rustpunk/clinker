@@ -1,11 +1,9 @@
 //! Deterministic fixed-width payload generator for benchmarks.
 
 use crate::FieldKind;
-use clinker_record::schema_def::{FieldDef, FieldType, Justify};
 
 /// Lightweight field descriptor for benchmark fixed-width data.
 ///
-/// Use `Into<FieldDef>` to convert for production reader consumption (Phase 3).
 /// Derives `Hash` for blake3 cache key computation (D-7).
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct BenchFieldSpec {
@@ -16,51 +14,19 @@ pub struct BenchFieldSpec {
     pub justify: BenchJustify,
 }
 
-/// Field type for benchmark generation (maps to `clinker_record::FieldType`).
+/// Field type for benchmark generation — selects the generator's per-field
+/// justification and value shape.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum BenchFieldType {
     Integer,
     String,
 }
 
-/// Justification for benchmark generation (maps to `clinker_record::Justify`).
+/// Justification for benchmark generation.
 #[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
 pub enum BenchJustify {
     Left,
     Right,
-}
-
-impl From<&BenchFieldSpec> for FieldDef {
-    fn from(spec: &BenchFieldSpec) -> Self {
-        FieldDef {
-            name: spec.name.clone(),
-            field_type: Some(match spec.field_type {
-                BenchFieldType::Integer => FieldType::Integer,
-                BenchFieldType::String => FieldType::String,
-            }),
-            start: Some(spec.start),
-            width: Some(spec.width),
-            justify: Some(match spec.justify {
-                BenchJustify::Left => Justify::Left,
-                BenchJustify::Right => Justify::Right,
-            }),
-            // FieldDef does not derive Default — explicit None for all remaining fields
-            required: None,
-            format: None,
-            coerce: None,
-            default: None,
-            allowed_values: None,
-            alias: None,
-            inherits: None,
-            end: None,
-            pad: None,
-            trim: None,
-            truncation: None,
-            precision: None,
-            scale: None,
-            path: None,
-        }
-    }
 }
 
 /// Generate deterministic fixed-width bytes and field layout.
@@ -182,24 +148,5 @@ mod tests {
         let (b, specs_b) = generate_fixed_width(50, &ft, 6, 42);
         assert_eq!(a, b);
         assert_eq!(specs_a, specs_b);
-    }
-
-    /// Verify From<&BenchFieldSpec> for FieldDef produces a valid FieldDef
-    /// with the expected fixed-width fields populated.
-    #[test]
-    fn test_bench_field_spec_into_field_def() {
-        let spec = BenchFieldSpec {
-            name: "f0".to_string(),
-            start: 0,
-            width: 10,
-            field_type: BenchFieldType::Integer,
-            justify: BenchJustify::Right,
-        };
-        let def: FieldDef = FieldDef::from(&spec);
-        assert_eq!(def.name, "f0");
-        assert_eq!(def.start, Some(0));
-        assert_eq!(def.width, Some(10));
-        assert_eq!(def.field_type, Some(FieldType::Integer));
-        assert_eq!(def.justify, Some(Justify::Right));
     }
 }

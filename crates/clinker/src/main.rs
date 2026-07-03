@@ -1306,10 +1306,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 // reader is a row yielder driven on the ingest thread; the
                 // `{source_file}` fan-out side-table gets no file paths, so
                 // the `<source:NAME>` synthetic id is the stable identity.
+                let rest_columns = body.schema.bound_columns().unwrap_or_default();
                 let reader = clinker_net::build_rest_source(
                     rest_cfg.clone(),
                     source,
-                    &body.schema.columns,
+                    &rest_columns,
                     body.on_unmapped.clone(),
                 )
                 .map_err(clinker_plan::error::PipelineError::Format)?;
@@ -1665,7 +1666,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             let input_schema = {
                 let mut builder = clinker_record::SchemaBuilder::new();
                 if let Some(body) = pipeline_config.source_bodies().next() {
-                    for col in &body.schema.columns {
+                    for col in body.schema.bound_columns().unwrap_or_default() {
                         builder = builder.with_field(col.name.as_str());
                     }
                 }

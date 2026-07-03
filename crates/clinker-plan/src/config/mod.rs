@@ -21,6 +21,7 @@ pub mod utils;
 
 pub use crate::plan::index::AnalyticWindowSpec;
 pub use aggregate::*;
+pub use clinker_format::{Column, Discriminator, RecordType, SourceSchema, StructureConstraint};
 pub use compile_context::{CompileContext, ConfigOverrides};
 pub use composition::{
     CompositionFile, CompositionSignature, CompositionSymbolTable, LayerKind, NodeRef, OutputAlias,

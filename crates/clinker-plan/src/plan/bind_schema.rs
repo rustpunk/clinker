@@ -34,7 +34,7 @@ use crate::config::composition::{
 use crate::config::node_header::CombineHeader;
 use crate::config::pipeline_node::{
     CombineBody, CopyFrom, CullBody, MatchMode, OnUnmapped, PipelineNode, PropagateCkSpec,
-    ReshapeBody, SchemaDecl,
+    ReshapeBody,
 };
 use crate::plan::combine::{
     CombineInput, DecomposedPredicate, decompose_predicate, select_driving_input,
@@ -45,6 +45,7 @@ use crate::plan::{EntityRef, PlanNodeId};
 use crate::yaml::Spanned;
 use clinker_core_types::span::{FileId, Span};
 use clinker_core_types::{Diagnostic, LabeledSpan};
+use clinker_format::{Column, SourceSchema};
 
 /// Maximum composition nesting depth.
 ///
@@ -2127,9 +2128,13 @@ fn bind_schema_inner(
 
         match node {
             PipelineNode::Source { config, .. } => {
-                let schema_decl: &SchemaDecl = &config.schema;
+                // Resolve the unified `schema:` (single-record column list,
+                // multi-record superset, external file, or engine-generated)
+                // to the effective column list this source seeds its row from.
+                let resolved_columns =
+                    resolve_source_columns(&config.schema, name.as_str(), span, diags);
                 let (columns, missing) = columns_from_decl(
-                    schema_decl,
+                    &resolved_columns,
                     config.correlation_key.as_ref(),
                     &config.on_unmapped,
                 );
@@ -2153,7 +2158,7 @@ fn bind_schema_inner(
                 // source's declared schema AND have an event-time-
                 // coercible CXL type (DateTime or Date).
                 if let Some(wm) = config.source.watermark.as_ref() {
-                    let declared = schema_decl.columns.iter().find(|c| c.name == wm.column);
+                    let declared = resolved_columns.iter().find(|c| c.name == wm.column);
                     match declared {
                         None => diags.push(
                             Diagnostic::error(
@@ -3560,8 +3565,7 @@ fn build_input_port_rows(
 /// qualifiers — qualification is a Combine-only concept.
 fn port_columns(decl: &PortDecl) -> IndexMap<QualifiedField, Type> {
     match &decl.schema {
-        Some(schema) => schema
-            .columns
+        Some(columns) => columns
             .iter()
             .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
             .collect(),
@@ -3808,6 +3812,49 @@ where
     builder.build()
 }
 
+/// Resolve a source's unified [`SourceSchema`] to the effective ordered column
+/// list its runtime row is seeded from:
+///
+/// - `Columns` — the declared single-record columns directly.
+/// - `MultiRecord` — the discriminator-led superset over every record type
+///   (matching the multi-record reader's static superset schema).
+/// - `File` — the external `.schema.yaml`, loaded and resolved at compile time
+///   (an I/O or parse failure emits E157 and seeds no columns).
+/// - `Generated` — engine-synthesized positional columns (EDI/HL7/SWIFT). Their
+///   exact set is synthesized by the reader at runtime; declaring it at compile
+///   is a later-phase concern, so the source seeds only its engine-stamped tail
+///   columns for now.
+fn resolve_source_columns(
+    schema: &SourceSchema,
+    name: &str,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) -> Vec<Column> {
+    match schema {
+        SourceSchema::Columns(cols) => cols.clone(),
+        SourceSchema::MultiRecord { record_types, .. } => {
+            clinker_format::multi_record_superset(record_types)
+        }
+        SourceSchema::Generated(_) => Vec::new(),
+        SourceSchema::File(path) => {
+            match crate::schema::load_source_schema(std::path::Path::new(path)) {
+                Ok(inner) => resolve_source_columns(&inner, name, span, diags),
+                Err(e) => {
+                    diags.push(Diagnostic::error(
+                        "E157",
+                        format!(
+                            "source {name:?} declares an external schema file {path:?} that \
+                             failed to load: {e}"
+                        ),
+                        LabeledSpan::primary(span, String::new()),
+                    ));
+                    Vec::new()
+                }
+            }
+        }
+    }
+}
+
 /// Build the `Row.declared` map for a Source from its author-declared
 /// `schema:` block, tail-appending engine-stamped columns:
 ///
@@ -3826,12 +3873,11 @@ where
 /// E153 for each such name — every CK field a source declares MUST be
 /// in that source's own schema.
 fn columns_from_decl(
-    decl: &SchemaDecl,
+    columns: &[Column],
     correlation_key: Option<&crate::config::CorrelationKey>,
     on_unmapped: &OnUnmapped,
 ) -> (IndexMap<QualifiedField, Type>, Vec<String>) {
-    let mut cols: IndexMap<QualifiedField, Type> = decl
-        .columns
+    let mut cols: IndexMap<QualifiedField, Type> = columns
         .iter()
         .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
         .collect();
@@ -3851,8 +3897,7 @@ fn columns_from_decl(
     let mut missing: Vec<String> = Vec::new();
     if let Some(ck) = correlation_key {
         for field in ck.fields() {
-            match decl
-                .columns
+            match columns
                 .iter()
                 .find(|c| c.name.as_str() == field)
                 .map(|c| c.ty.clone())

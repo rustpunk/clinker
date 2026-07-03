@@ -17,7 +17,8 @@
 //! discrimination) reuse this same framework as additional handlers.
 
 use super::*;
-use crate::config::pipeline_node::{ColumnDecl, PipelineNode, SchemaDecl, SourceBody};
+use crate::config::pipeline_node::{PipelineNode, SourceBody};
+use clinker_format::{Column, SourceSchema};
 use cxl::typecheck::Type;
 use indexmap::IndexMap;
 use serde::de;
@@ -82,7 +83,7 @@ pub struct AddColumnPatch {
     /// CXL type of the new column.
     #[serde(rename = "type")]
     pub ty: Type,
-    /// Mirrors [`ColumnDecl::long_unique`] — advisory storage hint.
+    /// Mirrors [`clinker_format::Column::long_unique`] — advisory storage hint.
     #[serde(default)]
     pub long_unique: bool,
 }
@@ -289,40 +290,48 @@ fn unknown_column(src: &str, col: &str, op: &str) -> ConfigError {
 /// keyed-map grammar (`add` / `rename` / `retype` / `remove`) and its E231–E233
 /// diagnostics identically. `src` names the source for the diagnostic text.
 pub(crate) fn apply_schema_ops(
-    schema: &mut SchemaDecl,
+    schema: &mut SourceSchema,
     ops: &IndexMap<String, SchemaColumnOp>,
     src: &str,
 ) -> Result<(), ConfigError> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    // The keyed column ops target a single-record column list. A multi-record,
+    // generated, or external-file schema has no flat column list to patch here.
+    let columns = schema.as_columns_mut().ok_or_else(|| {
+        ConfigError::Validation(format!(
+            "[E237] channel schema patch on source '{src}': column ops apply only to a \
+             single-record (column-list) schema, not a multi-record / generated / file schema"
+        ))
+    })?;
     for (col, op) in ops {
         match op {
             SchemaColumnOp::Remove => {
-                let idx = schema
-                    .columns
+                let idx = columns
                     .iter()
                     .position(|c| c.name == *col)
                     .ok_or_else(|| unknown_column(src, col, "remove"))?;
-                schema.columns.remove(idx);
+                columns.remove(idx);
             }
             SchemaColumnOp::Retype(ty) => {
-                let column = schema
-                    .columns
+                let column = columns
                     .iter_mut()
                     .find(|c| c.name == *col)
                     .ok_or_else(|| unknown_column(src, col, "retype"))?;
                 column.ty = ty.clone();
             }
             SchemaColumnOp::Rename(to) => {
-                if !schema.columns.iter().any(|c| c.name == *col) {
+                if !columns.iter().any(|c| c.name == *col) {
                     return Err(unknown_column(src, col, "rename"));
                 }
-                if to != col && schema.columns.iter().any(|c| c.name == *to) {
+                if to != col && columns.iter().any(|c| c.name == *to) {
                     return Err(ConfigError::Validation(format!(
                         "[E233] channel schema patch on source '{src}': rename of '{col}' to \
                          '{to}' collides with an existing column"
                     )));
                 }
-                let column = schema
-                    .columns
+                let column = columns
                     .iter_mut()
                     .find(|c| c.name == *col)
                     .expect("existence checked above");
@@ -340,17 +349,15 @@ pub(crate) fn apply_schema_ops(
                 column.name = to.clone();
             }
             SchemaColumnOp::Add(add) => {
-                if schema.columns.iter().any(|c| c.name == *col) {
+                if columns.iter().any(|c| c.name == *col) {
                     return Err(ConfigError::Validation(format!(
                         "[E232] channel schema patch on source '{src}': add of column '{col}' \
                          that already exists"
                     )));
                 }
-                schema.columns.push(ColumnDecl {
-                    name: col.clone(),
-                    ty: add.ty.clone(),
-                    long_unique: add.long_unique,
-                    source_name: None,
+                columns.push(Column {
+                    long_unique: add.long_unique.then_some(true),
+                    ..Column::bare(col.clone(), add.ty.clone())
                 });
             }
         }
@@ -513,7 +520,8 @@ nodes:
             .next()
             .expect("one source")
             .schema
-            .columns
+            .as_columns()
+            .expect("single-record schema")
             .iter()
             .map(|c| (c.name.clone(), c.ty.clone()))
             .collect()
@@ -542,13 +550,14 @@ nodes:
     }
 
     /// Fetch a column by exposed name from the single source.
-    fn column_named<'a>(config: &'a PipelineConfig, name: &str) -> &'a ColumnDecl {
+    fn column_named<'a>(config: &'a PipelineConfig, name: &str) -> &'a Column {
         config
             .source_bodies()
             .next()
             .expect("one source")
             .schema
-            .columns
+            .as_columns()
+            .expect("single-record schema")
             .iter()
             .find(|c| c.name == name)
             .expect("column present")
@@ -626,11 +635,12 @@ nodes:
         let body = config.source_bodies().next().unwrap();
         let col = body
             .schema
-            .columns
+            .as_columns()
+            .expect("single-record schema")
             .iter()
             .find(|c| c.name == "uuid")
             .unwrap();
-        assert!(col.long_unique);
+        assert!(col.is_long_unique());
     }
 
     #[test]
@@ -724,6 +734,44 @@ nodes:
         )
         .unwrap();
         assert_eq!(columns(&config)[0].0, "amount");
+    }
+
+    /// A column-keyed schema patch targets a single-record (column-list) schema.
+    /// Targeting a multi-record source is rejected with E237 (enriched
+    /// multi-record patching is a later phase), not silently ignored.
+    #[test]
+    fn schema_patch_on_multi_record_source_errors_e237() {
+        let yaml = "\
+pipeline:
+  name: patch_test
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: fixed_width
+      path: /tmp/in.dat
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - { id: detail, tag: D, columns: [ { name: amount, type: int, start: 1, width: 9 } ] }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: /tmp/out.csv
+";
+        let mut config: PipelineConfig =
+            crate::yaml::from_str(yaml).expect("parse multi-record pipeline");
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("schema:\n  amount: { retype: float }\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E237"), "{err}");
     }
 
     #[test]

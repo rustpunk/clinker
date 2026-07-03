@@ -24,9 +24,10 @@ use std::time::Duration;
 use clinker_exec::pipeline::schema_coerce::CoercingReader;
 use clinker_exec::pipeline::shutdown::ShutdownToken;
 use clinker_exec::source::RecordSource;
+use clinker_format::Column;
 use clinker_format::traits::FormatReader;
 use clinker_format::{EnvelopeConfig, FormatError};
-use clinker_plan::config::pipeline_node::{ColumnDecl, OnUnmapped, WIDENED_SIDECAR_COLUMN};
+use clinker_plan::config::pipeline_node::{OnUnmapped, WIDENED_SIDECAR_COLUMN};
 use clinker_plan::config::{InputFormat, RestAuth, RestPagination, RestSourceConfig, SourceConfig};
 use clinker_record::{FieldMetadata, Record, Schema, SchemaBuilder, Value};
 use indexmap::IndexMap;
@@ -47,7 +48,7 @@ pub(crate) struct RestRecordSource {
     cfg: RestSourceConfig,
     format: InputFormat,
     array_paths: Option<Vec<clinker_plan::config::ArrayPathConfig>>,
-    schema_decl: Vec<ColumnDecl>,
+    schema_decl: Vec<Column>,
     on_unmapped: OnUnmapped,
     source_name: String,
     /// Output schema = authored columns (+ `$widened` sidecar under
@@ -114,7 +115,7 @@ impl RestRecordSource {
     pub(crate) fn new(
         cfg: RestSourceConfig,
         source: &SourceConfig,
-        schema_decl: &[ColumnDecl],
+        schema_decl: &[Column],
         on_unmapped: OnUnmapped,
     ) -> Result<Self, FormatError> {
         let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -459,7 +460,7 @@ impl RecordSource for RestRecordSource {
 /// `on_unmapped` policy, mirroring [`CoercingReader`]'s own output schema:
 /// the authored columns followed by the `$widened` engine-stamped sidecar
 /// column when the policy reserves it (`AutoWiden`).
-fn build_output_schema(schema_decl: &[ColumnDecl], on_unmapped: &OnUnmapped) -> Arc<Schema> {
+fn build_output_schema(schema_decl: &[Column], on_unmapped: &OnUnmapped) -> Arc<Schema> {
     let mut builder = SchemaBuilder::with_capacity(schema_decl.len() + 1);
     for c in schema_decl {
         builder = builder.with_field(c.name.as_str());

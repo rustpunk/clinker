@@ -137,13 +137,10 @@ nodes:
       options:
         encoding: iso-8859-1
       schema:
-        - { name: record_type, type: string }
-        - { name: batch_id, type: string }
-      format_schema:
         discriminator: { field: record_type }
         records:
-          - { id: header, tag: H, fields: [ { name: record_type }, { name: batch_id } ] }
-          - { id: detail, tag: D, fields: [ { name: record_type }, { name: batch_id } ] }
+          - { id: header, tag: H, columns: [ { name: record_type, type: string }, { name: batch_id, type: string } ] }
+          - { id: detail, tag: D, columns: [ { name: record_type, type: string }, { name: batch_id, type: string } ] }
   - type: output
     name: out
     input: src

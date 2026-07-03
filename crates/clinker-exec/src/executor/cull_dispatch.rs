@@ -919,7 +919,7 @@ fn partition_key(
         .enumerate()
         .map(|(idx, f)| {
             let v = record.get(f).unwrap_or(&Value::Null);
-            match clinker_record::value_to_group_key(v, f, None, idx as u64) {
+            match clinker_record::value_to_group_key(v, f, idx as u64) {
                 Ok(Some(gk)) => Ok(gk),
                 Ok(None) => Ok(GroupByKey::Null),
                 Err(e) => Err(PipelineError::Internal {
@@ -1032,7 +1032,7 @@ mod tests {
         // And the keys match the canonical aggregate construction exactly, so
         // the buffer and the decision aggregate can never diverge.
         let canon = |v: &Value| {
-            clinker_record::value_to_group_key(v, "account", None, 0)
+            clinker_record::value_to_group_key(v, "account", 0)
                 .unwrap()
                 .map(|gk| vec![gk])
                 .unwrap_or_else(|| vec![GroupByKey::Null])

@@ -95,13 +95,6 @@ pub struct SourceConfig {
     #[serde(skip)]
     pub declared_doc_paths: Vec<cxl::analyzer::doc_paths::DocPath>,
 
-    /// Format-layer schema pointer (e.g. fixed-width field layouts).
-    /// Distinct from the CXL-type-level `SourceBody.schema` declared
-    /// at the parent `SourceBody` scope — this one points at on-disk
-    /// format metadata, the other declares column CXL types for
-    /// compile-time typecheck.
-    #[serde(rename = "format_schema", skip_serializing_if = "Option::is_none")]
-    pub schema: Option<SchemaSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub array_paths: Option<Vec<ArrayPathConfig>>,
     /// Record-level sortedness inside the file (used by combine/aggregate

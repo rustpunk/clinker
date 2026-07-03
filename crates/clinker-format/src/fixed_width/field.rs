@@ -4,18 +4,20 @@
 //! multi-record [`crate::multi_record::MultiRecordReader`] both slice a line
 //! into byte-positioned fields, strip padding by justification, and coerce the
 //! trimmed text to a declared type. Hosting that logic here keeps the two
-//! readers byte-for-byte identical — a declared `type: integer` (or `float`,
-//! or `boolean`) parses the same way regardless of whether the file is single-
-//! or multi-record — instead of two forks that drift apart.
+//! readers byte-for-byte identical — a declared `type: int` (or `float`, or
+//! `bool`) parses the same way regardless of whether the file is single- or
+//! multi-record — instead of two forks that drift apart.
 
 use std::io::{BufRead, BufReader, Read};
 
 use chrono::NaiveDate;
 
 use clinker_record::Value;
-use clinker_record::schema_def::{FieldDef, FieldType, Justify, LineSeparator};
+use clinker_record::schema_def::{Justify, LineSeparator};
+use cxl::typecheck::Type;
 
 use crate::error::FormatError;
+use crate::schema::Column;
 
 /// A fixed-width field resolved to a concrete byte range and parse policy.
 ///
@@ -27,7 +29,7 @@ pub struct ResolvedField {
     pub name: String,
     pub start: usize,
     pub width: usize,
-    pub field_type: Option<FieldType>,
+    pub ty: Type,
     pub format: Option<String>,
     pub justify: Option<Justify>,
     pub pad: String,
@@ -35,14 +37,14 @@ pub struct ResolvedField {
 }
 
 impl ResolvedField {
-    /// Resolve a [`FieldDef`] into a byte-positioned field.
+    /// Resolve a [`Column`] into a byte-positioned field.
     ///
     /// # Errors
     ///
     /// Returns [`FormatError::InvalidRecord`] when the field omits `start`,
     /// declares both `width` and `end`, declares neither, declares `end <
     /// start`, or resolves to a zero width.
-    pub fn from_field_def(f: &FieldDef) -> Result<Self, FormatError> {
+    pub fn from_column(f: &Column) -> Result<Self, FormatError> {
         let start = f
             .start
             .ok_or_else(|| invalid_field(&f.name, "must have 'start'"))?;
@@ -71,7 +73,7 @@ impl ResolvedField {
             name: f.name.clone(),
             start,
             width,
-            field_type: f.field_type.clone(),
+            ty: f.ty.clone(),
             format: f.format.clone(),
             justify: f.justify.clone(),
             pad: f.pad.clone().unwrap_or_else(|| " ".into()),
@@ -239,66 +241,53 @@ pub fn parse_field_value(field: &ResolvedField, raw: &str, row: u64) -> Result<V
     if raw.is_empty() {
         return Ok(Value::Null);
     }
-    match &field.field_type {
-        Some(FieldType::String) | None => Ok(Value::String(raw.into())),
-        Some(ty) => coerce_scalar(ty, field.format.as_deref(), raw).map_err(|message| {
-            FormatError::InvalidRecord {
-                row,
-                message: with_field(&field.name, &message),
-            }
-        }),
-    }
+    coerce_scalar(&field.ty, field.format.as_deref(), raw).map_err(|message| {
+        FormatError::InvalidRecord {
+            row,
+            message: with_field(&field.name, &message),
+        }
+    })
 }
 
-/// Coerce trimmed text to a scalar [`Value`] of the given type.
+/// Coerce trimmed text to a scalar [`Value`] of the given [`Type`].
 ///
 /// Format-neutral: the caller owns the row/field framing. This is the single
 /// canonical typed coercion shared by every fixed-width parse path. Boolean
 /// matching is ASCII-case-insensitive (`TRUE`/`true`/`YES`/`Y`/`1` → true).
-/// `String`/`Object`/`Array` are caller concerns and are not reachable here
-/// (the field parse handles them).
+///
+/// Only `Int` / `Float` / `Bool` / `Date` are parsed to a typed value here;
+/// every other type (`String`, `Map`, `Array`, `DateTime`, `Numeric`, `Any`,
+/// `Null`) carries the text through verbatim as a `Value::String`. This matches
+/// the historical fixed-width behavior: the positional reader never produced a
+/// typed `DateTime`, and the wrapping `CoercingReader` re-coerces `DateTime` /
+/// `Numeric` from the string. `Nullable(T)` is peeled to `T`.
 ///
 /// # Errors
 ///
 /// Returns the human-readable failure message (caller wraps it in a
 /// format-specific error) when the text does not parse as `ty`.
-pub fn coerce_scalar(ty: &FieldType, format: Option<&str>, raw: &str) -> Result<Value, String> {
-    match ty {
-        FieldType::Integer => raw
+pub fn coerce_scalar(ty: &Type, format: Option<&str>, raw: &str) -> Result<Value, String> {
+    match ty.unwrap_nullable() {
+        Type::Int => raw
             .parse::<i64>()
             .map(Value::Integer)
-            .map_err(|e| format!("cannot parse '{raw}' as integer: {e}")),
-        FieldType::Float => raw
+            .map_err(|e| format!("cannot parse '{raw}' as int: {e}")),
+        Type::Float => raw
             .parse::<f64>()
             .map(Value::Float)
-            .map_err(|e| format!("cannot parse '{raw}' as {}: {e}", ty_name(ty))),
-        FieldType::Boolean => match raw.to_ascii_lowercase().as_str() {
+            .map_err(|e| format!("cannot parse '{raw}' as float: {e}")),
+        Type::Bool => match raw.to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" | "y" => Ok(Value::Bool(true)),
             "false" | "0" | "no" | "n" => Ok(Value::Bool(false)),
-            _ => Err(format!("cannot parse '{raw}' as boolean")),
+            _ => Err(format!("cannot parse '{raw}' as bool")),
         },
-        FieldType::Date => {
+        Type::Date => {
             let fmt = format.unwrap_or("%Y-%m-%d");
             NaiveDate::parse_from_str(raw, fmt)
                 .map(Value::Date)
                 .map_err(|e| format!("cannot parse '{raw}' as date with format '{fmt}': {e}"))
         }
-        FieldType::String | FieldType::Object | FieldType::Array => Ok(Value::String(raw.into())),
-        FieldType::DateTime => Ok(Value::String(raw.into())),
-    }
-}
-
-/// Lowercase name of a field type for diagnostics.
-fn ty_name(ty: &FieldType) -> &'static str {
-    match ty {
-        FieldType::Integer => "integer",
-        FieldType::Float => "float",
-        FieldType::Boolean => "boolean",
-        FieldType::Date => "date",
-        FieldType::DateTime => "datetime",
-        FieldType::String => "string",
-        FieldType::Object => "object",
-        FieldType::Array => "array",
+        _ => Ok(Value::String(raw.into())),
     }
 }
 

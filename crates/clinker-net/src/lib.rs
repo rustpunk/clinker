@@ -28,7 +28,7 @@ use rest::RestRecordSource;
 pub fn build_rest_source(
     cfg: clinker_plan::config::RestSourceConfig,
     source: &clinker_plan::config::SourceConfig,
-    schema_decl: &[clinker_plan::config::pipeline_node::ColumnDecl],
+    schema_decl: &[clinker_format::Column],
     on_unmapped: clinker_plan::config::pipeline_node::OnUnmapped,
 ) -> Result<Box<dyn clinker_exec::source::RecordSource>, FormatError> {
     let reader = RestRecordSource::new(cfg, source, schema_decl, on_unmapped)?;

@@ -11,6 +11,7 @@ pub mod fixed_width;
 pub mod hl7;
 pub mod json;
 pub mod multi_record;
+pub mod schema;
 pub(crate) mod segment_tokenizer;
 pub mod source;
 pub mod splitting;
@@ -28,6 +29,10 @@ pub use envelope::{
 };
 pub use envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
 pub use error::FormatError;
+pub use schema::{
+    Column, Discriminator, GeneratedSchema, RECORD_TYPE_COLUMN, RecordType, SourceSchema,
+    StructureConstraint, multi_record_superset,
+};
 pub use source::ReopenableSource;
 pub use traits::{FormatReader, FormatWriter};
 
