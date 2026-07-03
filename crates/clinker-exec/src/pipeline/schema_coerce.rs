@@ -131,7 +131,7 @@ impl CoercingReader {
         // declared rather than widened.
         let declared_names: HashSet<Box<str>> = schema_decl
             .iter()
-            .map(|c| c.source_name.as_deref().unwrap_or(c.name.as_str()).into())
+            .map(|c| c.physical_name().into())
             .collect();
 
         // Per-column physical name is only materialized when some column

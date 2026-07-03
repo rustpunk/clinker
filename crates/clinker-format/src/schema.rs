@@ -307,8 +307,7 @@ impl<'de> Deserialize<'de> for SourceSchema {
             {
                 // Forward the map straight into a derived struct so saphyr spans
                 // survive (no `Content` buffering), then dispatch on which keys
-                // were present. This is the same span-preserving pattern the
-                // old `SchemaSource` visitor used.
+                // were present.
                 let repr = MapRepr::deserialize(MapAccessDeserializer::new(map))?;
                 repr.into_source_schema::<A::Error>()
             }

@@ -274,16 +274,6 @@ impl SchemaProvenanceDb {
         srcs
     }
 
-    /// Number of tracked leaves.
-    pub fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    /// Whether the table is empty.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     /// Apply one layer's contribution to a leaf, at the merge. Creates the leaf
     /// if no lower layer seeded it (an attribute introduced by an override),
     /// else layers onto the existing provenance chain.
