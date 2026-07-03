@@ -196,7 +196,7 @@ fn literal_to_value(lit: &LiteralValue) -> Value {
 }
 
 fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value, AggregateEvalError> {
-    use Value::{Bool, Float, Integer, Null};
+    use Value::{Bool, Decimal, Float, Integer, Null};
     let v = match (op, l, r) {
         (BinOp::Add, Integer(a), Integer(b)) => Integer(a.saturating_add(b)),
         (BinOp::Sub, Integer(a), Integer(b)) => Integer(a.saturating_sub(b)),
@@ -219,6 +219,52 @@ fn eval_binary(op: BinOp, l: Value, r: Value) -> Result<Value, AggregateEvalErro
         }
         (BinOp::Div, Integer(a), Float(b)) => Float(a as f64 / b),
         (BinOp::Div, Float(a), Integer(b)) => Float(a / b as f64),
+        // Exact decimal arithmetic in the aggregate finalize residual (e.g.
+        // `emit total = sum(amount) * 2`). `decimal ⊗ int` widens the int
+        // exactly; `decimal ⊗ float` never reaches here (typecheck rejects it).
+        // Saturating add/sub/mul mirror this evaluator's integer path; div/mod
+        // by zero yield Null like the integer arms.
+        (BinOp::Add, Decimal(a), Decimal(b)) => Decimal(a.saturating_add(b)),
+        (BinOp::Sub, Decimal(a), Decimal(b)) => Decimal(a.saturating_sub(b)),
+        (BinOp::Mul, Decimal(a), Decimal(b)) => Decimal(a.saturating_mul(b)),
+        (BinOp::Div, Decimal(_), Decimal(b)) if b.is_zero() => Null,
+        (BinOp::Div, Decimal(a), Decimal(b)) => a.checked_div(b).map(Decimal).unwrap_or(Null),
+        (BinOp::Mod, Decimal(_), Decimal(b)) if b.is_zero() => Null,
+        (BinOp::Mod, Decimal(a), Decimal(b)) => a.checked_rem(b).map(Decimal).unwrap_or(Null),
+        (BinOp::Add, Decimal(a), Integer(b)) | (BinOp::Add, Integer(b), Decimal(a)) => {
+            Decimal(a.saturating_add(rust_decimal::Decimal::from(b)))
+        }
+        (BinOp::Sub, Decimal(a), Integer(b)) => {
+            Decimal(a.saturating_sub(rust_decimal::Decimal::from(b)))
+        }
+        (BinOp::Sub, Integer(a), Decimal(b)) => {
+            Decimal(rust_decimal::Decimal::from(a).saturating_sub(b))
+        }
+        (BinOp::Mul, Decimal(a), Integer(b)) | (BinOp::Mul, Integer(b), Decimal(a)) => {
+            Decimal(a.saturating_mul(rust_decimal::Decimal::from(b)))
+        }
+        (BinOp::Div, Decimal(_), Integer(0)) => Null,
+        (BinOp::Div, Decimal(a), Integer(b)) => a
+            .checked_div(rust_decimal::Decimal::from(b))
+            .map(Decimal)
+            .unwrap_or(Null),
+        (BinOp::Div, Integer(_), Decimal(b)) if b.is_zero() => Null,
+        (BinOp::Div, Integer(a), Decimal(b)) => rust_decimal::Decimal::from(a)
+            .checked_div(b)
+            .map(Decimal)
+            .unwrap_or(Null),
+        // `decimal % int` typechecks (unifies to Decimal), so the residual
+        // evaluator supports it too (e.g. `sum(amount) % 100`).
+        (BinOp::Mod, Decimal(_), Integer(0)) => Null,
+        (BinOp::Mod, Decimal(a), Integer(b)) => a
+            .checked_rem(rust_decimal::Decimal::from(b))
+            .map(Decimal)
+            .unwrap_or(Null),
+        (BinOp::Mod, Integer(_), Decimal(b)) if b.is_zero() => Null,
+        (BinOp::Mod, Integer(a), Decimal(b)) => rust_decimal::Decimal::from(a)
+            .checked_rem(b)
+            .map(Decimal)
+            .unwrap_or(Null),
         (BinOp::Eq, a, b) => Bool(a == b),
         (BinOp::Neq, a, b) => Bool(a != b),
         // Ordered comparisons delegate to the same `compare_values` the row
@@ -255,6 +301,7 @@ fn eval_unary(op: UnaryOp, v: Value) -> Result<Value, AggregateEvalError> {
     Ok(match (op, v) {
         (UnaryOp::Neg, Value::Integer(n)) => Value::Integer(n.saturating_neg()),
         (UnaryOp::Neg, Value::Float(f)) => Value::Float(-f),
+        (UnaryOp::Neg, Value::Decimal(d)) => Value::Decimal(-d),
         (UnaryOp::Not, Value::Bool(b)) => Value::Bool(!b),
         (_, Value::Null) => Value::Null,
         _ => {

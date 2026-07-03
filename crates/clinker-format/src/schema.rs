@@ -87,11 +87,13 @@ pub struct Column {
     /// single coercion path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
-    /// Decimal precision (total significant digits). Backed by `float` today;
-    /// a real `Decimal` type is a committed follow-on.
+    /// Decimal precision (total significant digits). An attribute of a
+    /// `type: decimal` column (validation/formatting metadata), not a type
+    /// parameter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precision: Option<u8>,
-    /// Decimal scale (fractional digits).
+    /// Decimal scale (fractional digits). For a `type: decimal` column, the
+    /// coercion path rounds parsed values to this scale (banker's rounding).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<u8>,
     /// Whether the column must be present/non-null.
@@ -462,14 +464,13 @@ mod tests {
     }
 
     #[test]
-    fn decimal_token_rejected_as_float_with_scale() {
-        // `decimal` is not a cxl type token; a decimal is `float` + precision/scale.
-        let err = serde_json::from_str::<SourceSchema>(r#"[{"name":"price","type":"decimal"}]"#);
-        assert!(err.is_err(), "`type: decimal` must be rejected");
+    fn decimal_token_is_a_real_type_with_scale() {
+        // `decimal` is now a first-class exact type; `precision`/`scale` stay
+        // column attributes (not type parameters).
         let ok: SourceSchema =
-            from_json(r#"[{"name":"price","type":"float","precision":10,"scale":2}]"#);
+            from_json(r#"[{"name":"price","type":"decimal","precision":10,"scale":2}]"#);
         let c = &ok.as_columns().unwrap()[0];
-        assert_eq!(c.ty, Type::Float);
+        assert_eq!(c.ty, Type::Decimal);
         assert_eq!(c.precision, Some(10));
         assert_eq!(c.scale, Some(2));
     }

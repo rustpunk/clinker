@@ -88,6 +88,7 @@ const TAG_DATE: u8 = 0x05;
 const TAG_DATETIME: u8 = 0x06;
 const TAG_ARRAY: u8 = 0x07;
 const TAG_MAP: u8 = 0x08;
+const TAG_DECIMAL: u8 = 0x09;
 const TAG_NULL: u8 = 0xFF;
 
 /// Canonicalize an `f64` for hashing and equality. Collapses `-0.0 → +0.0`
@@ -160,6 +161,13 @@ fn hash_value_into<H: Hasher>(v: &Value, h: &mut H) {
         Value::Float(f) => {
             h.write_u8(TAG_FLOAT);
             h.write_u64(canonical_f64(*f).to_bits());
+        }
+        Value::Decimal(d) => {
+            h.write_u8(TAG_DECIMAL);
+            // Hash the NORMALIZED 16-byte form so equal values of differing
+            // scale (2.50 vs 2.5) hash identically — matching `GroupByKey` and
+            // `value_equal_canonicalized` below.
+            h.write(&d.normalize().serialize());
         }
         Value::String(s) => {
             h.write_u8(TAG_STRING);
@@ -241,6 +249,9 @@ fn value_equal_canonicalized(a: &Value, b: &Value) -> bool {
         (Value::Float(x), Value::Float(y)) => {
             canonical_f64(*x).to_bits() == canonical_f64(*y).to_bits()
         }
+        // Exact value equality (2.50 == 2.5), consistent with the normalized
+        // Decimal hash above.
+        (Value::Decimal(x), Value::Decimal(y)) => x == y,
         (Value::String(x), Value::String(y)) => x == y,
         (Value::Date(x), Value::Date(y)) => x == y,
         (Value::DateTime(x), Value::DateTime(y)) => x == y,

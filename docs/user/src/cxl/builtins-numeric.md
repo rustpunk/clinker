@@ -2,6 +2,11 @@
 
 CXL provides 8 built-in methods for numeric operations. These methods work on both Integer and Float values (the `Numeric` receiver type). All return `null` when the receiver is `null`.
 
+`abs`, `ceil`, `floor`, `round`, and `round_to` also accept an exact
+[`decimal`](types.md#the-decimal-type) receiver and return an exact decimal
+result — `d.round(2)` rounds `d` to two fractional digits using banker's
+rounding, staying in the decimal domain rather than converting to a float.
+
 ## abs() -> Numeric
 
 Returns the absolute value. Preserves the original type (Int stays Int, Float stays Float).

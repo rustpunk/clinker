@@ -2,7 +2,10 @@ use std::path::Path;
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime, Timelike};
 use clinker_record::Value;
+use clinker_record::coercion::{DECIMAL_ROUNDING, coerce_to_decimal};
 use regex::Regex;
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 
 use super::context::{EvalContext, MAX_STRING_OUTPUT};
 use super::error::EvalError;
@@ -270,16 +273,21 @@ pub fn dispatch_method(
         "abs" => Ok(Some(match receiver {
             Value::Integer(n) => Value::Integer(n.abs()),
             Value::Float(f) => Value::Float(f.abs()),
+            // Exact decimal abs stays in the decimal domain.
+            Value::Decimal(d) => Value::Decimal(d.abs()),
             _ => Value::Null,
         })),
         "ceil" => Ok(Some(match receiver {
             Value::Float(f) => Value::Integer(f.ceil() as i64),
             Value::Integer(n) => Value::Integer(*n),
+            // Decimal ceil/floor stay exact decimals (whole-valued).
+            Value::Decimal(d) => Value::Decimal(d.ceil()),
             _ => Value::Null,
         })),
         "floor" => Ok(Some(match receiver {
             Value::Float(f) => Value::Integer(f.floor() as i64),
             Value::Integer(n) => Value::Integer(*n),
+            Value::Decimal(d) => Value::Decimal(d.floor()),
             _ => Value::Null,
         })),
         "round" => {
@@ -290,6 +298,10 @@ pub fn dispatch_method(
                     Value::Float((f * factor).round() / factor)
                 }
                 Value::Integer(n) => Value::Integer(*n),
+                // Exact banker's rounding to the requested fractional digits.
+                Value::Decimal(d) => Value::Decimal(
+                    d.round_dp_with_strategy(decimals.max(0) as u32, DECIMAL_ROUNDING),
+                ),
                 _ => Value::Null,
             }))
         }
@@ -300,6 +312,9 @@ pub fn dispatch_method(
                     let factor = 10f64.powi(decimals as i32);
                     Value::Float((f * factor).round() / factor)
                 }
+                Value::Decimal(d) => Value::Decimal(
+                    d.round_dp_with_strategy(decimals.max(0) as u32, DECIMAL_ROUNDING),
+                ),
                 _ => Value::Null,
             }))
         }
@@ -418,6 +433,10 @@ pub fn dispatch_method(
         "to_int" => Ok(Some(match receiver {
             Value::Integer(n) => Value::Integer(*n),
             Value::Float(f) => Value::Integer(*f as i64),
+            // Truncate the fractional part toward zero, matching float→int.
+            Value::Decimal(d) => d.trunc().to_i64().map(Value::Integer).ok_or_else(|| {
+                EvalError::conversion_failed(format!("{}", ValueDisplay(receiver)), "Int", span)
+            })?,
             Value::String(s) => s
                 .parse::<i64>()
                 .map(Value::Integer)
@@ -434,6 +453,10 @@ pub fn dispatch_method(
         "to_float" => Ok(Some(match receiver {
             Value::Float(f) => Value::Float(*f),
             Value::Integer(n) => Value::Float(*n as f64),
+            // Exact→binary conversion (the acknowledged lossy direction).
+            Value::Decimal(d) => d.to_f64().map(Value::Float).ok_or_else(|| {
+                EvalError::conversion_failed(format!("{}", ValueDisplay(receiver)), "Float", span)
+            })?,
             Value::String(s) => s
                 .parse::<f64>()
                 .map(Value::Float)
@@ -446,6 +469,13 @@ pub fn dispatch_method(
                 ));
             }
         })),
+        // Explicit cast to the exact `decimal` type. `int`/`string` convert
+        // exactly; `float` goes through `Decimal::from_f64_retain` — the one
+        // acknowledged lossy direction, made explicit precisely because
+        // `decimal * float` is otherwise a type error.
+        "to_decimal" => Ok(Some(coerce_to_decimal(receiver, None).map_err(|_| {
+            EvalError::conversion_failed(format!("{}", ValueDisplay(receiver)), "Decimal", span)
+        })?)),
         "to_string" => Ok(Some(Value::String(
             format!("{}", ValueDisplay(receiver)).into(),
         ))),
@@ -530,6 +560,10 @@ pub fn dispatch_method(
             Value::String(s) => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Null),
             _ => Value::Null,
         })),
+        // Lenient cast to decimal: a parse/convert failure yields Null.
+        "try_decimal" => Ok(Some(
+            coerce_to_decimal(receiver, None).unwrap_or(Value::Null),
+        )),
         "try_bool" => Ok(Some(match receiver {
             Value::Bool(b) => Value::Bool(*b),
             Value::String(s) => match s.to_lowercase().as_str() {
@@ -989,6 +1023,10 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
         (Value::Integer(x), Value::Float(y)) => (*x as f64).partial_cmp(y),
         (Value::Float(x), Value::Integer(y)) => x.partial_cmp(&(*y as f64)),
+        // Exact decimal ordering, incl. widening int into decimal context.
+        (Value::Decimal(x), Value::Decimal(y)) => Some(x.cmp(y)),
+        (Value::Decimal(x), Value::Integer(y)) => Some(x.cmp(&Decimal::from(*y))),
+        (Value::Integer(x), Value::Decimal(y)) => Some(Decimal::from(*x).cmp(y)),
         _ => None,
     }
 }
@@ -1013,6 +1051,7 @@ impl std::fmt::Display for ValueDisplay<'_> {
             Value::Bool(b) => write!(f, "{}", b),
             Value::Integer(n) => write!(f, "{}", n),
             Value::Float(v) => write!(f, "{}", v),
+            Value::Decimal(d) => write!(f, "{}", d),
             Value::String(s) => write!(f, "{}", s),
             Value::Date(d) => write!(f, "{}", d),
             Value::DateTime(dt) => write!(f, "{}", dt),

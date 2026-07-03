@@ -84,6 +84,10 @@ pub struct CoercingReader {
     /// coercion, indexed alongside `targets`. `None` uses the default format
     /// chain. The `$widened` sidecar slot is always `None`.
     formats: Vec<Option<String>>,
+    /// Per-output-column decimal `scale`, indexed alongside `targets`. Used
+    /// only by the `Type::Decimal` coercion arm (rounds to this scale); `None`
+    /// for non-decimal columns and the `$widened` sidecar slot.
+    scales: Vec<Option<u8>>,
     /// Per-output-column `long_unique` storage hint, indexed alongside
     /// `targets`. When set for a column, its string values are stored in
     /// the header-free `Box`-backed [`FieldStr`](clinker_record::FieldStr)
@@ -169,6 +173,7 @@ impl CoercingReader {
             .collect();
         let mut formats: Vec<Option<String>> =
             schema_decl.iter().map(|c| c.format.clone()).collect();
+        let mut scales: Vec<Option<u8>> = schema_decl.iter().map(|c| c.scale).collect();
         let mut long_unique: Vec<bool> = schema_decl.iter().map(|c| c.is_long_unique()).collect();
 
         let mut builder = SchemaBuilder::new();
@@ -185,6 +190,7 @@ impl CoercingReader {
                 builder.with_field_meta(WIDENED_SIDECAR_COLUMN, FieldMetadata::widened_sidecar());
             targets.push(None);
             formats.push(None);
+            scales.push(None);
             long_unique.push(false);
             Some(idx)
         } else {
@@ -200,6 +206,7 @@ impl CoercingReader {
             output_schema,
             targets,
             formats,
+            scales,
             long_unique,
             widened_idx,
             policy,
@@ -266,7 +273,8 @@ impl CoercingReader {
             let raw = record.get(physical).cloned().unwrap_or(Value::Null);
             let coerced = match &self.targets[i] {
                 Some(target) => {
-                    coerce_value(&raw, target, self.formats[i].as_deref()).unwrap_or(raw)
+                    coerce_value(&raw, target, self.formats[i].as_deref(), self.scales[i])
+                        .unwrap_or(raw)
                 }
                 None => raw,
             };
@@ -346,13 +354,22 @@ fn unwrap_nullable(ty: &Type) -> &Type {
 /// `date_time`; `None` falls back to the coercion module's default format
 /// chain. Native `Map` / `Array` (and any other type) return `None`, so a
 /// JSON/XML composite passes through untouched.
-fn coerce_value(value: &Value, target: &Type, format: Option<&str>) -> Option<Value> {
+fn coerce_value(
+    value: &Value,
+    target: &Type,
+    format: Option<&str>,
+    scale: Option<u8>,
+) -> Option<Value> {
     // `Option<&str>::into_iter` yields the one format when present, else
     // nothing — an empty chain selects the default formats.
     let chain: Vec<&str> = format.into_iter().collect();
     match target {
         Type::Int => coercion::coerce_to_int_lenient(value),
         Type::Float => coercion::coerce_to_float_lenient(value),
+        // Exact base-10 parse into `Value::Decimal`, rounded to the column
+        // scale. A native JSON number already parsed to `f64` is the one lossy
+        // input; a CSV string parses exactly.
+        Type::Decimal => coercion::coerce_to_decimal_lenient(value, scale),
         Type::Bool => coercion::coerce_to_bool_lenient(value),
         Type::Date => coercion::coerce_to_date_lenient(value, &chain),
         Type::DateTime => coercion::coerce_to_datetime_lenient(value, &chain),

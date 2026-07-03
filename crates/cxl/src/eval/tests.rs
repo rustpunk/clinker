@@ -96,6 +96,92 @@ fn eval_single(src: &str, fields: &[&str], record: HashMap<String, Value>) -> Va
     output.into_values().next().unwrap_or(Value::Null)
 }
 
+fn dec(mantissa: i64, scale: u32) -> Value {
+    Value::Decimal(rust_decimal::Decimal::new(mantissa, scale))
+}
+
+#[test]
+fn test_eval_decimal_addition_is_exact() {
+    // The canonical exactness case: 0.10 + 0.20 == 0.30 (a binary-float sum
+    // gives 0.30000000000000004).
+    let v = eval_single(
+        "emit total = a + b",
+        &["a", "b"],
+        HashMap::from([("a".into(), dec(10, 2)), ("b".into(), dec(20, 2))]),
+    );
+    assert_eq!(v, dec(30, 2));
+}
+
+#[test]
+fn test_eval_decimal_times_int_is_exact() {
+    // decimal * int widens the int exactly: 2.50 * 3 == 7.50.
+    let v = eval_single(
+        "emit total = price * qty",
+        &["price", "qty"],
+        HashMap::from([
+            ("price".into(), dec(250, 2)),
+            ("qty".into(), Value::Integer(3)),
+        ]),
+    );
+    assert_eq!(v, dec(750, 2));
+}
+
+#[test]
+fn test_eval_cast_to_decimal_and_back() {
+    // to_decimal on strings is exact; round-trip through to_float / to_int.
+    let v = eval_single(
+        "emit total = a.to_decimal() + b.to_decimal()",
+        &["a", "b"],
+        HashMap::from([
+            ("a".into(), Value::String("0.10".into())),
+            ("b".into(), Value::String("0.20".into())),
+        ]),
+    );
+    assert_eq!(v, dec(30, 2));
+
+    // decimal -> float
+    let f = eval_single(
+        "emit v = x.to_float()",
+        &["x"],
+        HashMap::from([("x".into(), dec(250, 2))]),
+    );
+    assert_eq!(f, Value::Float(2.5));
+
+    // decimal -> int truncates toward zero
+    let i = eval_single(
+        "emit v = x.to_int()",
+        &["x"],
+        HashMap::from([("x".into(), dec(299, 2))]),
+    );
+    assert_eq!(i, Value::Integer(2));
+
+    // decimal -> string preserves scale
+    let s = eval_single(
+        "emit v = x.to_string()",
+        &["x"],
+        HashMap::from([("x".into(), dec(250, 2))]),
+    );
+    assert_eq!(s, Value::String("2.50".into()));
+}
+
+#[test]
+fn test_eval_decimal_comparison_and_round() {
+    // Exact comparison, and banker's rounding via .round(2).
+    let gt = eval_single(
+        "emit v = a > b",
+        &["a", "b"],
+        HashMap::from([("a".into(), dec(1050, 2)), ("b".into(), dec(1049, 2))]),
+    );
+    assert_eq!(gt, Value::Bool(true));
+
+    let r = eval_single(
+        "emit v = x.round(2)",
+        &["x"],
+        HashMap::from([("x".into(), dec(2125, 3))]), // 2.125 -> 2.12 (half-even)
+    );
+    assert_eq!(r, dec(212, 2));
+}
+
 #[test]
 fn test_eval_arithmetic_null_propagation() {
     // Null + 1 → Null

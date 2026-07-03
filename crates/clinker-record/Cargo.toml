@@ -12,6 +12,7 @@ chrono = { workspace = true }
 ahash = { workspace = true }
 indexmap = { workspace = true }
 smol_str = { workspace = true }
+rust_decimal = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

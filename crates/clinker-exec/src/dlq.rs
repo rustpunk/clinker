@@ -198,6 +198,7 @@ fn value_to_string(value: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         Value::Integer(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
+        Value::Decimal(d) => d.to_string(),
         Value::String(s) => s.to_string(),
         Value::Date(d) => d.format("%Y-%m-%d").to_string(),
         Value::DateTime(dt) => dt.format("%Y-%m-%dT%H:%M:%S").to_string(),

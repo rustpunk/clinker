@@ -96,6 +96,16 @@ clinker-bench-support = { path = "crates/clinker-bench-support" }
 tempfile = "3"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 proptest = "1.11"
+# Exact base-10 fixed-point arithmetic for the `decimal` column type
+# (monetary/financial data). `Decimal` is a 16-byte `Copy + Hash + Eq + Ord`
+# value that fits inside the existing 32-byte `Value` enum. `default-features
+# = false` drops the crate's optional `serde`/`db`/`rand` integrations; only
+# `std` is enabled. Spill (de)serialization goes through the deterministic,
+# exact `Decimal::serialize() -> [u8; 16]` / `deserialize([u8; 16])` pair
+# rather than the crate's serde format, so the `serde` feature is intentionally
+# left off. Pure Rust, no C build step — satisfies the workspace pure-Rust
+# pillar.
+rust_decimal = { version = "1", default-features = false, features = ["std"] }
 
 [workspace.metadata.release]
 shared-version = true

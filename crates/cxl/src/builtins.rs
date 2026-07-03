@@ -4,6 +4,9 @@ pub enum TypeTag {
     String,
     Int,
     Float,
+    /// Exact fixed-point number (`Type::Decimal`). Return tag of `to_decimal`
+    /// and receiver/return of the exact numeric methods on a decimal value.
+    Decimal,
     Bool,
     Date,
     DateTime,
@@ -413,7 +416,7 @@ impl BuiltinRegistry {
             },
         );
 
-        // ── Conversion strict (6) ──
+        // ── Conversion strict (7) ──
         let cs = |name: &'static str,
                   args: Vec<TypeTag>,
                   min: usize,
@@ -435,6 +438,11 @@ impl BuiltinRegistry {
         for (n, d) in [
             cs("to_int", vec![], 0, Some(0), TypeTag::Int),
             cs("to_float", vec![], 0, Some(0), TypeTag::Float),
+            // Explicit cast to the exact `decimal` type. This is the sanctioned
+            // way to bring a `float` into decimal arithmetic (`decimal * float`
+            // is a type error without it); the float→decimal step is the one
+            // acknowledged lossy conversion.
+            cs("to_decimal", vec![], 0, Some(0), TypeTag::Decimal),
             cs("to_string", vec![], 0, Some(0), TypeTag::String),
             cs("to_bool", vec![], 0, Some(0), TypeTag::Bool),
             cs("to_date", vec![TypeTag::String], 0, Some(1), TypeTag::Date),
@@ -449,7 +457,7 @@ impl BuiltinRegistry {
             methods.insert(n, d);
         }
 
-        // ── Conversion lenient (5) ──
+        // ── Conversion lenient (6) ──
         let cl = |name: &'static str,
                   args: Vec<TypeTag>,
                   min: usize,
@@ -471,6 +479,7 @@ impl BuiltinRegistry {
         for (n, d) in [
             cl("try_int", vec![], 0, Some(0), TypeTag::Int),
             cl("try_float", vec![], 0, Some(0), TypeTag::Float),
+            cl("try_decimal", vec![], 0, Some(0), TypeTag::Decimal),
             cl("try_bool", vec![], 0, Some(0), TypeTag::Bool),
             cl("try_date", vec![TypeTag::String], 0, Some(1), TypeTag::Date),
             cl(
@@ -779,6 +788,7 @@ mod tests {
         for name in [
             "to_int",
             "to_float",
+            "to_decimal",
             "to_string",
             "to_bool",
             "to_date",
@@ -797,6 +807,7 @@ mod tests {
         for name in [
             "try_int",
             "try_float",
+            "try_decimal",
             "try_bool",
             "try_date",
             "try_datetime",

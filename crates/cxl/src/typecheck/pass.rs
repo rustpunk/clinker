@@ -28,12 +28,18 @@ fn aggregate_return_type(name: &str, arg_types: &[Type]) -> Type {
             .map(|t| match t.unwrap_nullable() {
                 Type::Int => Type::Int,
                 Type::Float => Type::Float,
+                // Exact aggregation: sum over a decimal stays decimal.
+                Type::Decimal => Type::Decimal,
                 Type::Numeric => Type::Numeric,
                 _ => Type::Numeric,
             })
             .unwrap_or(Type::Numeric),
         "count" => Type::Int,
-        "avg" => Type::Float,
+        // Avg over a decimal is exact (returns decimal); otherwise Float.
+        "avg" => match arg_types.first().map(Type::unwrap_nullable) {
+            Some(Type::Decimal) => Type::Decimal,
+            _ => Type::Float,
+        },
         "weighted_avg" => Type::Float,
         "min" | "max" => arg_types.first().cloned().unwrap_or(Type::Any),
         "collect" => Type::Array,
@@ -1297,11 +1303,49 @@ impl<'a> TypeChecker<'a> {
         op: BinOp,
         lt: &Type,
         rt: &Type,
-        _span: Span,
+        span: Span,
     ) -> Type {
         let lt_inner = lt.unwrap_nullable();
         let rt_inner = rt.unwrap_nullable();
         let either_nullable = lt.is_nullable() || rt.is_nullable();
+
+        // Exactness guard: an exact `decimal` never silently mixes with a
+        // binary `float` in arithmetic or comparison. Require an explicit cast
+        // (`.to_decimal()` / `.to_float()`) so the loss of precision is a
+        // deliberate, visible choice rather than an accidental promotion.
+        let is_decimal_float_mix = matches!(
+            (lt_inner, rt_inner),
+            (Type::Decimal, Type::Float) | (Type::Float, Type::Decimal)
+        );
+        if is_decimal_float_mix
+            && matches!(
+                op,
+                BinOp::Add
+                    | BinOp::Sub
+                    | BinOp::Mul
+                    | BinOp::Div
+                    | BinOp::Mod
+                    | BinOp::Gt
+                    | BinOp::Lt
+                    | BinOp::Gte
+                    | BinOp::Lte
+                    | BinOp::Eq
+                    | BinOp::Neq
+            )
+        {
+            self.diagnostics.push(TypeDiagnostic {
+                span,
+                message: "cannot mix decimal and float without an explicit cast".into(),
+                help: Some(
+                    "decimal arithmetic is exact; convert one operand with \
+                     `.to_decimal()` (exact→exact) or `.to_float()` (exact→binary) \
+                     to make the precision trade-off explicit"
+                        .into(),
+                ),
+                related_span: None,
+                is_warning: false,
+            });
+        }
 
         let result = match op {
             // Arithmetic: result is the unified numeric type
@@ -1385,6 +1429,18 @@ impl<'a> TypeChecker<'a> {
             // Check against schema-declared type
             if let ColumnLookup::Declared(declared) = self.schema.lookup(field) {
                 for constraint in constraints {
+                    // A `Numeric` constraint is the "used in arithmetic" marker
+                    // (`amount + 1`), which a `decimal` column satisfies even
+                    // though `Decimal` deliberately does not unify with the
+                    // `int|float` `Numeric` union (that non-unification is what
+                    // forces the explicit cast on `decimal * float`). Treat the
+                    // arithmetic-usage marker as satisfied so decimal columns
+                    // participate in arithmetic without a spurious conflict.
+                    if matches!(constraint.inferred_type, Type::Numeric)
+                        && matches!(declared.unwrap_nullable(), Type::Decimal)
+                    {
+                        continue;
+                    }
                     if declared.unify(&constraint.inferred_type).is_none() {
                         self.diagnostics.push(TypeDiagnostic {
                             span: constraint.span,
@@ -1541,6 +1597,72 @@ mod tests {
         // 1 + 2.0 infers Float (promotion)
         let typed2 = typecheck_ok("emit b = 1 + 2.0", &[], &empty_row());
         assert_eq!(first_emit_expr_type(&typed2), Type::Float);
+    }
+
+    #[test]
+    fn test_typecheck_decimal_plus_int_widens_to_decimal() {
+        // `amount + 1` on a decimal column typechecks (the int literal widens
+        // into decimal context) and the result stays Decimal.
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Decimal);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let typed = typecheck_ok("emit total = amount + 1", &["amount"], &schema);
+        assert_eq!(first_emit_expr_type(&typed), Type::Decimal);
+    }
+
+    #[test]
+    fn test_typecheck_decimal_times_float_is_error() {
+        // Mixing exact decimal with binary float is a hard error without a cast.
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Decimal);
+        cols.insert("rate".into(), Type::Float);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let errs = typecheck_err("emit total = amount * rate", &["amount", "rate"], &schema);
+        assert!(
+            errs.iter()
+                .any(|d| d.message.contains("cannot mix decimal and float")),
+            "expected a decimal/float mix diagnostic, got: {:?}",
+            errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_decimal_cast_to_float_allows_mix() {
+        // An explicit `.to_float()` cast makes the decimal×float mix legal and
+        // the result is Float.
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Decimal);
+        cols.insert("rate".into(), Type::Float);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let typed = typecheck_ok(
+            "emit total = amount.to_float() * rate",
+            &["amount", "rate"],
+            &schema,
+        );
+        assert_eq!(first_emit_expr_type(&typed), Type::Float);
+    }
+
+    #[test]
+    fn test_aggregate_return_type_decimal() {
+        // sum/avg/min/max over a decimal stay exact decimal.
+        assert_eq!(
+            aggregate_return_type("sum", &[Type::Decimal]),
+            Type::Decimal
+        );
+        assert_eq!(
+            aggregate_return_type("avg", &[Type::Decimal]),
+            Type::Decimal
+        );
+        assert_eq!(
+            aggregate_return_type("min", &[Type::Decimal]),
+            Type::Decimal
+        );
+        assert_eq!(
+            aggregate_return_type("max", &[Type::Decimal]),
+            Type::Decimal
+        );
+        // avg over int/float is still Float.
+        assert_eq!(aggregate_return_type("avg", &[Type::Int]), Type::Float);
     }
 
     #[test]
