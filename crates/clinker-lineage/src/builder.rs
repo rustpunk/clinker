@@ -86,7 +86,7 @@ use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 
 use clinker_plan::config::pipeline_node::MatchMode;
-use clinker_plan::config::{RecordType, SourceSchema};
+use clinker_plan::config::{RECORD_TYPE_COLUMN, RecordType, SourceSchema};
 use clinker_plan::plan::combine::encode_chain_column;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_plan::plan::{
@@ -688,10 +688,17 @@ fn seed_multi_record_source(
 ) {
     // Column name → the record-type datasets declaring it, in record-type
     // declaration order. A name shared by several record types lists each owner.
+    // The reserved `record_type` discriminator lead is never owned by a record
+    // type: `multi_record_superset` unifies any same-named column into that one
+    // lead slot, so a (runtime-invalid) config declaring such a column must not
+    // pull the discriminator onto a record-type dataset — keep it on the base.
     let mut owners: HashMap<&str, Vec<DatasetId>> = HashMap::new();
     for rt in record_types {
         let ds = DatasetId::record_type(base, &rt.id);
         for col in &rt.columns {
+            if col.name == RECORD_TYPE_COLUMN {
+                continue;
+            }
             owners
                 .entry(col.name.as_str())
                 .or_default()
@@ -4296,5 +4303,55 @@ nodes:
                 "a generated source must not split into per-record-type datasets: {input:?}"
             );
         }
+    }
+
+    /// A record type that declares a column literally named `record_type` (the
+    /// reserved discriminator lead) must not pull the discriminator onto a
+    /// record-type dataset: `multi_record_superset` unifies it into the single
+    /// lead slot, and lineage keeps that lead on the base file dataset while a
+    /// normal column still lands on its record type.
+    #[test]
+    fn record_type_named_column_stays_on_base_dataset() {
+        let yaml = r#"
+pipeline: { name: mr_reserved }
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: fixed_width
+      path: data/src.txt
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - id: only
+            tag: O
+            columns:
+              - { name: record_type, type: string, start: 1, width: 2 }
+              - { name: payload, type: string, start: 3, width: 5 }
+  - type: transform
+    name: project
+    input: src
+    config:
+      cxl: |
+        emit rt = record_type
+        emit payload = payload
+  - type: output
+    name: out
+    input: project
+    config: { name: out, type: csv, path: out/out.csv }
+"#;
+        let lineage = lineage_of(yaml);
+        let base = "/w/data/src.txt";
+        let only = format!("{base}#only");
+        let out = only_output(&lineage);
+        let fields = &out.facet.fields;
+
+        use TransformationSubtype::Identity;
+        // The reserved discriminator lead stays on the base dataset even though a
+        // record type declared a same-named column.
+        assert_field(fields, "rt", &[direct(base, "record_type", Identity)]);
+        // A normal column still lands on its own record-type dataset.
+        assert_field(fields, "payload", &[direct(&only, "payload", Identity)]);
     }
 }
