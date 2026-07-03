@@ -150,9 +150,9 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Important public modules: `binding`, `error`, `overlay`, `staging_copy`.
 - Internal dependencies: `clinker-core-types`, `clinker-plan`, `clinker-record`.
 - Architecturally important external dependencies: `serde-saphyr`, `serde`, `serde_json`, `blake3`, `indexmap`, `tracing`, `thiserror`, `walkdir`, `uuid`, `tempfile`, `fs4`, Unix `nix`.
-- Known tests/examples/benches: `crates/clinker-channel/tests/channel_binding_test.rs`, `channel_merge_test.rs`, `channel_var_overlay_test.rs`, `staging_reuse_concurrent.rs`; `crates/clinker-channel/benches/channel_merge.rs`; example channel YAML under `examples/pipelines/channels/`.
+- Known tests/examples/benches: `crates/clinker-channel/tests/overlay_resolution_test.rs`, `discovery_test.rs`, `channel_manifest_test.rs`, `group_parse_test.rs`, `source_patch_parse_test.rs`, `staging_reuse_concurrent.rs`; `crates/clinker-channel/benches/channel_merge.rs`; the multitenant overlay workspace under `examples/multitenant/`.
 - Confidence: High.
-- Evidence: `crates/clinker-channel/src/lib.rs` channel authoring guide; re-exports `ChannelBinding`, `ChannelTarget`, `DottedPath`, `scan_workspace_channels`, `validate_channel_bindings`, `apply_channel_overlay`, and `SourceStager`.
+- Evidence: `crates/clinker-channel/src/lib.rs` channel/group overlay guide; re-exports `resolve`, `OverlayResolution`, `resolve_channel_overlay`, `scan_channels`, `scan_groups`, `DottedPath`, `ChannelManifest`, `OverlayFile`, `Group`, and `SourceStager`.
 
 ### clinker-net
 

@@ -95,7 +95,7 @@ Verified API surfaces future agents should recognize:
 - `clinker_exec::source::{RecordSource, SourceInput}` for non-file source integration.
 - `clinker_format::{FormatReader, FormatWriter, FormatError, EnvelopeConfig, EnvelopeEvent, EnvelopeFramer, ReopenableSource}`.
 - `clinker_record::{Record, RecordPayload, Value, Schema, SchemaBuilder, RecordStorage, RecordView, DocumentContext, PipelineCounters}`.
-- `clinker_channel::{ChannelBinding, ChannelTarget, DottedPath, scan_workspace_channels, validate_channel_bindings, apply_channel_overlay, SourceStager}`.
+- `clinker_channel::{resolve, OverlayResolution, resolve_channel_overlay, scan_channels, scan_groups, DottedPath, ChannelManifest, OverlayFile, Group, ChannelOverlayResult, SourceStager}`.
 - `clinker_net::build_rest_source`.
 - `clinker_schema::{parse_schema, parse_schema_file, build_workspace_schema_index, validate_pipeline}`.
 - CLI commands in `crates/clinker/src/main.rs`: `run`, `metrics collect`, and `explain`.

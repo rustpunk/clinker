@@ -368,18 +368,23 @@ overrides:
 ### Running with overlays
 
 ```
+# Run as a tenant: resolves the channel folder and derives matching groups
+# from its labels.
+clinker run pipeline/order_fulfillment.yaml --channel globex --base-dir .
+
+# Force-include a group by name, with or without a channel.
 clinker run pipeline/order_fulfillment.yaml --group enterprise --base-dir .
 ```
 
-`run` applies groups by name from the workspace (rooted at `--base-dir`, default
-the current directory) and folds their resolved overrides into the plan before
-execution. Overlay flags shared across `run` and `explain`:
+`run` resolves the overlay stack from the workspace (rooted at `--base-dir`,
+default the current directory) and folds the resolved overrides into the plan
+before execution. Overlay flags shared across `run` and `explain`:
 
 | Flag | Meaning |
 |------|---------|
 | `--group <NAME>` | Force-include a group overlay by name (repeatable), with or without a channel. |
 | `--no-auto-groups` | Suppress selector-derived group membership; only explicit `--group` overlays apply. |
-| `--channel <FILE>` | Apply a single channel file's value overlay. See the [legacy note](#legacy-channel-file-path) below. |
+| `--channel <ID>` | Apply a tenant channel by id (its folder under the channel root), resolved by computed path. Derives matching groups from the channel's labels and applies the layered `config`/`vars` clobber, the `overrides:` op stream, and `sources:` per-source patches. |
 
 `explain --field <alias.param> --group <NAME>` reports the same overlay stack for
 provenance lookups, mirroring `run`.
@@ -499,14 +504,7 @@ not collide.
 
 ## Known behavior notes
 
-One current gap is tracked as a follow-up issue; it surfaces in the overlay
-tooling today:
-
-- **A legacy single-file channel path still coexists.**<a id="legacy-channel-file-path"></a>
-  `run --channel <FILE>` / `explain --channel <FILE>` accept a single channel
-  *file* and apply its value overlay through the older post-compile path. Because
-  a bare channel file carries no manifest labels, selector-derived groups do not
-  auto-apply on `run` — only explicit `--group` overlays do (the folder-based
-  `channels resolve` / `lint`, which take a channel *id*, do derive groups from
-  labels). Ripping the legacy file path so label-derivation works uniformly on
-  `run` is tracked in issue #764.
+- **Per-value locking is not yet a folder-overlay surface.** The layer stack
+  resolves by fixed semantic precedence (a higher layer wins), but an overlay
+  cannot yet mark a value as `fixed` to lock it against a higher layer. Config
+  maps are a flat `alias.param: value` clobber at every layer.

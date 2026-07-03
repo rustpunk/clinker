@@ -39,7 +39,7 @@ use serde_json::Value as JsonValue;
 use clinker_core_types::Diagnostic;
 use clinker_plan::config::composition::{LayerKind, ProvenanceDb};
 
-use crate::binding::DottedPath;
+use crate::dotted::DottedPath;
 use crate::error::ChannelError;
 use crate::group::Group;
 use crate::selector::{LabelSelector, SelectorError};

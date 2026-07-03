@@ -25,6 +25,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 use clinker_plan::config::ScopedVarDecl;
+use clinker_plan::config::SourceConfigPatch;
 use clinker_plan::overlay_ops::OverlayOp;
 use clinker_plan::yaml::Spanned;
 
@@ -84,6 +85,8 @@ pub struct ManifestHeader {
 /// config: { fraud_check.threshold: 0.95 }
 /// vars:   { static: { currency: { type: string, default: "USD" } } }
 /// overrides: [ ... ]
+/// sources:
+///   orders: { schema: { amount: { retype: float } }, options: { delimiter: "|" } }
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,6 +105,15 @@ pub struct OverlayFile {
     /// location — see [`ChannelManifest::overrides`].
     #[serde(default)]
     pub overrides: Vec<Spanned<OverlayOp>>,
+    /// Per-source config patches, keyed by source-node name. Applied to the
+    /// parsed pipeline config before validation/compile (via
+    /// [`apply_source_patches`](clinker_plan::config::apply_source_patches)), so
+    /// the run behaves as if the source YAML had been hand-edited: CXL-typed
+    /// column ops (`schema`), nested-array explosion/join (`array_paths`), and
+    /// scalar per-format input `options`. Scoped to this one target, so
+    /// source-node names resolve unambiguously against the overlaid pipeline.
+    #[serde(default)]
+    pub sources: IndexMap<String, SourceConfigPatch>,
 }
 
 /// The `channel:` header of an overlay file.

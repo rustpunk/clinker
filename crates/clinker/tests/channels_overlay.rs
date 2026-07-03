@@ -294,6 +294,87 @@ fn run_with_group_splices_composition_into_consumed_path() {
     );
 }
 
+#[test]
+fn run_with_channel_derives_group_and_applies_to_output() {
+    // `--channel globex` resolves the tenant folder and derives the `enterprise`
+    // group from globex's `tier: enterprise` label, so the group's `screen`
+    // composition splices into the consumed path exactly as `--group enterprise`
+    // does — but reached through the channel dimension. The output proves the
+    // derived group's overlay flows to the executed rows.
+    let tmp = tempfile::tempdir().unwrap();
+    build_workspace(tmp.path(), false);
+
+    let out = Command::new(clinker_bin())
+        .current_dir(tmp.path())
+        .arg("run")
+        .arg(pipeline_path(tmp.path()))
+        .args(["--base-dir", tmp.path().to_str().unwrap()])
+        .args(["--channel", "globex"])
+        .output()
+        .expect("spawn clinker");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "run --channel must succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("channel globex") && stderr.contains("enterprise"),
+        "run --channel must report the channel and its derived group.\nstderr: {stderr}"
+    );
+
+    // `screen` (spliced by the derived `enterprise` group) zeroed the
+    // at-or-above-100 amount (`a1`: 150 → 0) and passed the rest through
+    // (`a2`: 20) — the channel's auto-derived group reached the executed output.
+    let output = std::fs::read_to_string(tmp.path().join("out.csv")).expect("read out.csv");
+    assert!(
+        output.contains("a1,0"),
+        "the channel's derived group must zero a1 (150 → 0).\nout.csv:\n{output}"
+    );
+    assert!(
+        output.contains("a2,20"),
+        "a2's amount must pass through unchanged.\nout.csv:\n{output}"
+    );
+    assert!(
+        !output.contains("a1,150"),
+        "a1's unscreened amount must not survive.\nout.csv:\n{output}"
+    );
+}
+
+#[test]
+fn run_channel_composition_target_resolves_by_bare_stem() {
+    // A composition target `score.comp.yaml` must resolve its per-target overlay
+    // by the bare stem `score`, not `score.comp`. If the run path keyed the
+    // lookup by the last extension it would disagree with the overlay's declared
+    // target stem and hard-fail overlay resolution; the run must instead get past
+    // resolution (and fail later, on its own terms, because a composition file is
+    // not a runnable pipeline).
+    let tmp = tempfile::tempdir().unwrap();
+    build_workspace(tmp.path(), false);
+    write(
+        tmp.path(),
+        "channel/globex/score.comp.yaml",
+        "channel:\n  target: ../../composition/score.comp.yaml\n",
+    );
+
+    let out = Command::new(clinker_bin())
+        .current_dir(tmp.path())
+        .arg("run")
+        .arg(tmp.path().join("composition/score.comp.yaml"))
+        .args(["--base-dir", tmp.path().to_str().unwrap()])
+        .args(["--channel", "globex"])
+        .output()
+        .expect("spawn clinker");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("overlay resolution failed") && !stderr.contains("target stem"),
+        "the composition overlay must resolve by its bare stem, not fail on a \
+         stem mismatch.\nstderr: {stderr}"
+    );
+}
+
 /// Split a `channels resolve` stdout at the effective-DAG boundary, keeping the
 /// deterministic overlay report (the DAG text below carries volatile stats).
 fn overlay_report(stdout: &str) -> String {

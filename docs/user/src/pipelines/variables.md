@@ -313,10 +313,9 @@ nodes:
       cxl: |
         emit id = id
 
-# channels/acme-prod.channel.yaml
+# channel/acme-prod/orders.channel.yaml
 channel:
-  name: acme-prod
-  target: ./pipelines/orders.yaml
+  target: ../../pipelines/orders.yaml
 vars:
   static:
     fuzzy_threshold: { type: float, default: 0.95 }
@@ -328,6 +327,9 @@ vars:
   record:
     tier: { type: string, default: "platinum" }
 ```
+
+The overlay lives in the tenant's folder (`channel/acme-prod/`) and is applied
+with `--channel acme-prod`; the `channel.target` field is authoritative.
 
 Override semantics (entry name already declared) require the channel's
 `type` to match the declared type — mismatches produce **E107**. Add

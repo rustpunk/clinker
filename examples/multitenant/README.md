@@ -47,10 +47,12 @@ ordered structural op list (`overrides:`).
   selector (`tier == "enterprise"`) auto-applies it to any channel labelled
   `tier: enterprise`. `channels resolve` lists the injected node; `channels
   lint` compiles it.
-- **A channel that overrides a field and patches a schema.**
+- **A channel that overrides a field and inherits a group.**
   `channel/globex/order_fulfillment.channel.yaml` raises `risk.threshold` to
-  `0.95` (the highest layer wins) and declares an extra `channel_note` source
-  column via a `patch_schema` op.
+  `0.95` (the highest layer wins). Because `globex` is labelled `tier:
+  enterprise`, the `enterprise` group's selector matches, so `run --channel
+  globex` splices in `fraud_check` automatically — order `ord-1004` is held for
+  review and written as `0` where the base pipeline writes it unchanged.
 
 ## Commands
 
@@ -67,6 +69,10 @@ clinker channels resolve pipeline/order_fulfillment.yaml --group enterprise --ba
 
 # Run the base pipeline.
 clinker run pipeline/order_fulfillment.yaml --base-dir .
+
+# Run as a tenant: resolves the channel folder, derives the enterprise group
+# from globex's labels, and applies the overlays to the executed output.
+clinker run pipeline/order_fulfillment.yaml --channel globex --base-dir .
 
 # Run with the enterprise group applied (injects fraud_check, raises threshold).
 clinker run pipeline/order_fulfillment.yaml --group enterprise --base-dir .
