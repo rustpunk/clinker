@@ -63,24 +63,55 @@ impl<'a> PartitionWindowContext<'a> {
     fn sum_slice(&self, field: &str, positions: &[u64]) -> Value {
         let mut total = 0.0f64;
         let mut has_numeric = false;
+        // Exact accumulator engaged when any value is a decimal. Integer rows
+        // are tracked exactly in `int_acc` so that if a decimal is present they
+        // can be folded into the exact total rather than lost (a decimal column
+        // is type-homogeneous, but a computed field fed to `$window.sum` can mix
+        // `Integer` and `Decimal` via `if flag then amount else 1`).
+        let mut dec_total = rust_decimal::Decimal::ZERO;
+        let mut int_acc: i128 = 0;
+        let mut saw_decimal = false;
         for &pos in positions {
             match self.arena.resolve_field(pos, field) {
                 Some(Value::Integer(i)) => {
                     total += *i as f64;
+                    int_acc += *i as i128;
                     has_numeric = true;
                 }
                 Some(Value::Float(f)) => {
                     total += *f;
                     has_numeric = true;
                 }
+                Some(Value::Decimal(d)) => {
+                    dec_total = dec_total.checked_add(*d).unwrap_or(dec_total);
+                    saw_decimal = true;
+                }
                 _ => {}
             }
         }
-        if has_numeric {
+        if saw_decimal {
+            // Fold the exact integer contributions in (ints widen exactly;
+            // floats cannot coexist with decimals per typecheck).
+            Value::Decimal(add_i128_to_decimal(dec_total, int_acc))
+        } else if has_numeric {
             Value::Float(total)
         } else {
             Value::Null
         }
+    }
+}
+
+/// Add an `i128` integer accumulator to a `Decimal` exactly, leaving the
+/// decimal unchanged if the integer is out of `Decimal`'s range (a
+/// defensive, effectively-unreachable path — integer contributions to a
+/// window sum cannot approach 10^28).
+fn add_i128_to_decimal(dec: rust_decimal::Decimal, int_acc: i128) -> rust_decimal::Decimal {
+    if int_acc == 0 {
+        return dec;
+    }
+    match rust_decimal::prelude::FromPrimitive::from_i128(int_acc) {
+        Some(d) => dec.checked_add(d).unwrap_or(dec),
+        None => dec,
     }
 }
 
@@ -136,18 +167,37 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
     fn avg(&self, field: &str) -> Value {
         let mut total = 0.0f64;
         let mut count = 0u64;
+        let mut dec_total = rust_decimal::Decimal::ZERO;
+        let mut int_acc: i128 = 0;
+        let mut saw_decimal = false;
         for &pos in self.partition {
             match self.arena.resolve_field(pos, field) {
                 Some(Value::Integer(i)) => {
                     total += *i as f64;
+                    int_acc += *i as i128;
                     count += 1;
                 }
                 Some(Value::Float(f)) => {
                     total += *f;
                     count += 1;
                 }
+                Some(Value::Decimal(d)) => {
+                    dec_total = dec_total.checked_add(*d).unwrap_or(dec_total);
+                    saw_decimal = true;
+                    count += 1;
+                }
                 _ => {}
             }
+        }
+        if saw_decimal && count > 0 {
+            // Exact decimal quotient at full precision (rounding to a column
+            // scale happens when it lands in a scaled decimal column). Integer
+            // rows fold into the numerator exactly so they are not lost.
+            let numerator = add_i128_to_decimal(dec_total, int_acc);
+            return match numerator.checked_div(rust_decimal::Decimal::from(count)) {
+                Some(avg) => Value::Decimal(avg),
+                None => Value::Null,
+            };
         }
         if count > 0 {
             Value::Float(total / count as f64)
@@ -297,6 +347,10 @@ fn val_less_than(a: &Value, b: &Value) -> bool {
         (Value::Float(x), Value::Float(y)) => x < y,
         (Value::Integer(x), Value::Float(y)) => (*x as f64) < *y,
         (Value::Float(x), Value::Integer(y)) => *x < (*y as f64),
+        // Exact decimal ordering, incl. widening int into decimal context.
+        (Value::Decimal(x), Value::Decimal(y)) => x < y,
+        (Value::Decimal(x), Value::Integer(y)) => *x < rust_decimal::Decimal::from(*y),
+        (Value::Integer(x), Value::Decimal(y)) => rust_decimal::Decimal::from(*x) < *y,
         (Value::String(x), Value::String(y)) => x < y,
         (Value::Date(x), Value::Date(y)) => x < y,
         (Value::DateTime(x), Value::DateTime(y)) => x < y,
@@ -311,6 +365,8 @@ fn value_hash_key(val: &Value) -> String {
         Value::Bool(b) => format!("b:{}", b),
         Value::Integer(i) => format!("i:{}", i),
         Value::Float(f) => format!("f:{}", f.to_bits()),
+        // Normalize so equal decimals of differing scale share one dedup key.
+        Value::Decimal(d) => format!("dec:{}", d.normalize()),
         Value::String(s) => format!("s:{}", s),
         Value::Date(d) => format!("d:{}", d),
         Value::DateTime(dt) => format!("dt:{}", dt),

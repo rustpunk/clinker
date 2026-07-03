@@ -5,6 +5,7 @@
 //! groups on these keys lives.
 
 use chrono::{NaiveDate, NaiveDateTime};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::value::Value;
@@ -21,6 +22,12 @@ pub enum GroupByKey {
     Int(i64),
     /// f64::to_bits() — default numeric path. -0.0 canonicalized to 0.0.
     Float(u64),
+    /// Exact `decimal` key: the 16-byte form of the value NORMALIZED (trailing
+    /// zeros stripped) so `2.50` and `2.5` produce identical bytes and thus
+    /// group and hash together. Decimal is a separate exact domain — it is
+    /// never widened to `Float`, so a decimal `42` and an integer `42` do not
+    /// share a group.
+    Decimal([u8; 16]),
     Bool(bool),
     Date(NaiveDate),
     DateTime(NaiveDateTime),
@@ -50,6 +57,8 @@ impl GroupByKey {
             GroupByKey::Date(d) => Value::Date(*d),
             GroupByKey::DateTime(dt) => Value::DateTime(*dt),
             GroupByKey::Float(bits) => Value::Float(f64::from_bits(*bits)),
+            // Reconstruct the exact (normalized) decimal from its 16-byte form.
+            GroupByKey::Decimal(bytes) => Value::Decimal(Decimal::deserialize(*bytes)),
         }
     }
 }
@@ -125,6 +134,10 @@ pub fn value_to_group_key(
             Ok(Some(GroupByKey::Float((*i as f64).to_bits())))
         }
 
+        // Exact decimal key: normalize first so equal values with differing
+        // scale (2.50 vs 2.5) produce byte-identical keys.
+        Value::Decimal(d) => Ok(Some(GroupByKey::Decimal(d.normalize().serialize()))),
+
         // Materialize an owned `Box<str>` key from the field-value string;
         // `GroupByKey` keys must own independently of the source `Value`.
         Value::String(s) => Ok(Some(GroupByKey::Str(Box::from(s.as_str())))),
@@ -147,6 +160,40 @@ pub fn value_to_group_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_group_by_key_decimal_scale_insensitive() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        // 2.50 and 2.5 are the same value: they must produce equal, equally
+        // hashing keys (normalized), and round-trip back to an equal Value.
+        let k1 = value_to_group_key(&Value::Decimal(Decimal::new(250, 2)), "amt", 0)
+            .unwrap()
+            .unwrap();
+        let k2 = value_to_group_key(&Value::Decimal(Decimal::new(25, 1)), "amt", 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(k1, k2, "equal decimals of differing scale share one key");
+
+        let mut h1 = DefaultHasher::new();
+        let mut h2 = DefaultHasher::new();
+        k1.hash(&mut h1);
+        k2.hash(&mut h2);
+        assert_eq!(h1.finish(), h2.finish());
+
+        assert_eq!(k1.to_value(), Value::Decimal(Decimal::new(25, 1)));
+
+        // A decimal `42` and an integer `42` are DISTINCT domains — different
+        // keys (integer widens to Float, decimal stays Decimal).
+        let dec = value_to_group_key(&Value::Decimal(Decimal::new(42, 0)), "amt", 0)
+            .unwrap()
+            .unwrap();
+        let int = value_to_group_key(&Value::Integer(42), "amt", 0)
+            .unwrap()
+            .unwrap();
+        assert_ne!(dec, int);
+    }
 
     #[test]
     fn test_group_by_key_eq_hash() {

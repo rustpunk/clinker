@@ -10,6 +10,7 @@ CXL has 9 value types. Every field value, literal, and expression result is one 
 | Bool | `bool` | `true` or `false` |
 | Integer | `i64` | 64-bit signed integer |
 | Float | `f64` | 64-bit double-precision float |
+| Decimal | `Decimal` | Exact base-10 fixed-point number for money/financials |
 | String | `Box<str>` | UTF-8 text |
 | Date | `NaiveDate` | Calendar date without timezone |
 | DateTime | `NaiveDateTime` | Date and time without timezone |
@@ -115,6 +116,7 @@ When declaring column types in YAML pipeline schemas, use these type names:
 | `string` | String | Text values |
 | `int` | Integer | 64-bit integers |
 | `float` | Float | 64-bit floats |
+| `decimal` | Decimal | Exact base-10 fixed-point (money) — see below |
 | `bool` | Bool | Boolean values |
 | `date` | Date | Calendar dates |
 | `date_time` | DateTime | Date and time |
@@ -162,6 +164,69 @@ $ cxl eval -e 'emit result = null + 5'
 ```
 
 **Nullable(A) + B unifies to Nullable(unified):** When a nullable value meets a non-nullable value, the result type wraps the unified inner type in Nullable.
+
+## The `decimal` type
+
+`float` is an IEEE-754 binary float: it cannot represent most base-10 fractions
+exactly, so `0.1 + 0.2` is `0.30000000000000004`, not `0.3`. That rounding is
+unacceptable for money. The `decimal` type is an **exact base-10 fixed-point**
+number — `0.10 + 0.20` is exactly `0.30` — and is the correct type for
+monetary amounts, prices, tax, and any figure that must round like decimal
+arithmetic on paper.
+
+Declare a decimal column with `type: decimal` and a `scale` (the number of
+fractional digits). `precision` (total significant digits) is optional
+validation metadata:
+
+```yaml
+schema:
+  - { name: amount, type: decimal, scale: 2 }
+  - { name: tax_rate, type: decimal, scale: 4 }
+```
+
+A `decimal` column parses its raw text into an exact value and rounds it to the
+column `scale` (round-half-to-even, the unbiased "banker's rounding" used in
+accounting). Writers emit the value at that scale, so `2.5` stored in a
+`scale: 2` column is written `2.50`.
+
+### Arithmetic rules
+
+- **`decimal ⊗ decimal → decimal`** — exact.
+- **`decimal ⊗ int → decimal`** — the integer widens exactly, so `amount + 1`
+  and `price * quantity` stay exact decimals.
+- **`decimal ⊗ float` is a type error.** Mixing an exact decimal with a binary
+  float would silently lose precision, so CXL rejects it and asks for an
+  explicit cast. Choose the trade-off deliberately:
+  - `amount.to_float() * rate` — opt into binary float precision.
+  - `rate.to_decimal() * amount` — bring the float into exact decimal math
+    (the float→decimal step is the one acknowledged lossy conversion).
+- **Division and `avg`** compute at full precision and round to the target
+  column's `scale` when the result lands in a scaled decimal column.
+
+Comparisons follow the same rule: `decimal < int` is fine, `decimal < float`
+requires a cast.
+
+### Casting
+
+`x.to_decimal()` converts an int, string, or float into a decimal (`try_decimal`
+is the lenient form that yields `null` on failure). `d.to_int()`,
+`d.to_float()`, and `d.to_string()` convert a decimal back out.
+
+### Worked example — an exact invoice total
+
+```bash
+$ cxl eval -e 'emit total = ("19.99".to_decimal() * 3) + "4.80".to_decimal()'
+```
+
+```json
+{
+  "total": "64.77"
+}
+```
+
+`19.99 * 3 = 59.97`, `+ 4.80 = 64.77` — exact, with no binary-float drift.
+(In a pipeline, declare the source columns `type: decimal` instead of casting;
+JSON output renders a decimal as a scale-preserving string.)
 
 ## Type unification rules
 

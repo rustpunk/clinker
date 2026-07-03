@@ -613,6 +613,7 @@ fn value_to_element(value: &Value, column: &str) -> Result<String, FormatError> 
         Value::Bool(b) => b.to_string(),
         Value::Integer(i) => i.to_string(),
         Value::Float(f) => f.to_string(),
+        Value::Decimal(d) => d.to_string(),
         Value::String(s) => s.to_string(),
         Value::Date(d) => d.to_string(),
         Value::DateTime(dt) => dt.to_string(),

@@ -361,6 +361,11 @@ fn clinker_to_json(val: &Value) -> serde_json::Value {
         Value::Float(f) => serde_json::Number::from_f64(*f)
             .map(Jv::Number)
             .unwrap_or(Jv::Null),
+        // JSON has no exact-decimal type, and a JSON number would collapse the
+        // scale (2.50 -> 2.5) and risk binary-float reinterpretation by
+        // consumers. Emit the scale-preserving string form to keep the value
+        // exact end-to-end.
+        Value::Decimal(d) => Jv::String(d.to_string()),
         Value::String(s) => Jv::String(s.to_string()),
         Value::Date(d) => Jv::String(d.to_string()),
         Value::DateTime(dt) => Jv::String(dt.to_string()),

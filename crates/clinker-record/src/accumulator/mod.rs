@@ -13,9 +13,19 @@
 
 use std::cmp::Ordering;
 
+use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
 use serde::{Deserialize, Serialize};
 
 use crate::value::Value;
+
+/// Convert an `i128` integer accumulator to an exact `Decimal`, or `None` when
+/// it exceeds `Decimal`'s ~7.9e28 range. Used to fold an integer running sum
+/// into the exact decimal path; the `None` case is surfaced as an overflow
+/// rather than panicking (`Decimal::from_i128_with_scale` would panic).
+fn i128_to_decimal(n: i128) -> Option<Decimal> {
+    Decimal::from_i128(n)
+}
 
 pub mod error;
 pub use error::AccumulatorError;
@@ -46,11 +56,22 @@ pub struct SumState {
     pub float_sum: f64,
     /// Kahan compensation term (running residual).
     pub compensation: f64,
+    /// Exact running sum for `decimal` inputs. A `decimal` aggregate is
+    /// type-homogeneous (typecheck keeps a column decimal), so this path and
+    /// the int/float paths are not mixed in practice; `is_decimal` selects it.
+    #[serde(with = "crate::decimal_serde")]
+    pub decimal_sum: Decimal,
+    /// Set once a `decimal` sum exceeds `Decimal`'s ~7.9e28 range; finalize
+    /// then surfaces `SumOverflow` rather than a silently-wrong total.
+    pub decimal_overflow: bool,
     /// False until first non-null value observed.
     pub has_value: bool,
     /// True while all observed values have been integers. Flips false on
     /// first Float, and the finalize path returns Float thereafter.
     pub is_integer: bool,
+    /// True once a `decimal` value has been observed; finalize then returns
+    /// an exact `Value::Decimal`.
+    pub is_decimal: bool,
 }
 
 impl Default for SumState {
@@ -59,8 +80,11 @@ impl Default for SumState {
             int_sum: 0,
             float_sum: 0.0,
             compensation: 0.0,
+            decimal_sum: Decimal::ZERO,
+            decimal_overflow: false,
             has_value: false,
             is_integer: true,
+            is_decimal: false,
         }
     }
 }
@@ -84,6 +108,13 @@ impl SumState {
                     // Already in float mode: also accumulate in float path.
                     self.kahan_add(*n as f64);
                 }
+                if self.is_decimal {
+                    // Already in exact-decimal mode: fold the integer in
+                    // exactly too, so an integer observed after a decimal
+                    // (`sum(if flag then amount else 1)`) is not lost at
+                    // finalize, which returns `decimal_sum`.
+                    self.decimal_add(Decimal::from(*n));
+                }
             }
             Value::Float(f) => {
                 self.has_value = true;
@@ -95,10 +126,54 @@ impl SumState {
                 }
                 self.kahan_add(*f);
             }
+            Value::Decimal(d) => {
+                self.has_value = true;
+                self.enter_decimal_mode();
+                self.decimal_add(*d);
+            }
             _ => {
                 // Non-numeric: skip (SQL SUM on non-numeric is undefined;
                 // typecheck rejects at plan time, so this is defence-in-depth).
             }
+        }
+    }
+
+    /// Switch to the exact decimal path, folding the integers already summed
+    /// into the decimal accumulator so subsequent integers (added incrementally
+    /// by the `add`/`sub` integer arms) and decimals compose exactly. A decimal
+    /// aggregate is type-homogeneous per typecheck, so `int_sum` is normally 0
+    /// here; folding it in keeps the result exact if the paths ever mix (via a
+    /// conditional whose branches unify `Decimal` and `Int`). An `int_sum` too
+    /// large to represent as a `Decimal` sets the overflow flag rather than
+    /// panicking.
+    fn enter_decimal_mode(&mut self) {
+        if !self.is_decimal {
+            self.is_decimal = true;
+            match i128_to_decimal(self.int_sum) {
+                Some(d) => self.decimal_sum = d,
+                None => {
+                    self.decimal_sum = Decimal::ZERO;
+                    self.decimal_overflow = true;
+                }
+            }
+        }
+    }
+
+    fn decimal_add(&mut self, d: Decimal) {
+        match self.decimal_sum.checked_add(d) {
+            Some(sum) => self.decimal_sum = sum,
+            None => self.decimal_overflow = true,
+        }
+    }
+
+    /// This state's exact decimal total: `decimal_sum` (which already folds its
+    /// integers) when in decimal mode, else its integer sum promoted to a
+    /// decimal. `None` when a pure-integer sum is too large to represent.
+    fn decimal_contribution(&self) -> Option<Decimal> {
+        if self.is_decimal {
+            Some(self.decimal_sum)
+        } else {
+            i128_to_decimal(self.int_sum)
         }
     }
 
@@ -107,6 +182,27 @@ impl SumState {
             return;
         }
         self.has_value = true;
+        // Combine the exact decimal totals BEFORE mutating `int_sum`, so each
+        // side's contribution is read from its own (un-merged) integer sum —
+        // avoiding both the double-count (folding `other`'s integers twice) and
+        // the drop (losing an integer-only `other` when `self` is decimal).
+        if self.is_decimal || other.is_decimal {
+            // Read each side's contribution BEFORE flipping `self.is_decimal`,
+            // so an integer-only `self` promotes its `int_sum` rather than
+            // reading an unseeded `decimal_sum`.
+            let self_dec = self.decimal_contribution();
+            let other_dec = other.decimal_contribution();
+            self.is_decimal = true;
+            match (self_dec, other_dec) {
+                (Some(a), Some(b)) => match a.checked_add(b) {
+                    Some(sum) => self.decimal_sum = sum,
+                    None => self.decimal_overflow = true,
+                },
+                // An integer-only side whose sum exceeds Decimal's range.
+                _ => self.decimal_overflow = true,
+            }
+            self.decimal_overflow |= other.decimal_overflow;
+        }
         self.int_sum += other.int_sum;
         if !other.is_integer {
             if self.is_integer {
@@ -124,6 +220,12 @@ impl SumState {
     fn finalize(&self) -> Result<Value, AccumulatorError> {
         if !self.has_value {
             return Ok(Value::Null);
+        }
+        if self.is_decimal {
+            if self.decimal_overflow {
+                return Err(AccumulatorError::SumOverflow { field: None });
+            }
+            return Ok(Value::Decimal(self.decimal_sum));
         }
         if self.is_integer {
             let n = i64::try_from(self.int_sum)
@@ -154,6 +256,10 @@ fn sum_state_sub(s: &mut SumState, value: &Value) {
             if !s.is_integer {
                 s.kahan_add(-(*n as f64));
             }
+            if s.is_decimal {
+                // Symmetric with the decimal fold in `add`'s integer arm.
+                s.decimal_add(-Decimal::from(*n));
+            }
         }
         Value::Float(f) => {
             if s.is_integer {
@@ -167,6 +273,10 @@ fn sum_state_sub(s: &mut SumState, value: &Value) {
                 s.compensation = 0.0;
             }
             s.kahan_add(-(*f));
+        }
+        Value::Decimal(d) => {
+            s.enter_decimal_mode();
+            s.decimal_add(-*d);
         }
         _ => {}
     }
@@ -235,8 +345,18 @@ pub struct AvgState {
     pub int_sum: i128,
     pub float_sum: f64,
     pub compensation: f64,
+    /// Exact running sum for `decimal` inputs (see `SumState::decimal_sum`).
+    #[serde(with = "crate::decimal_serde")]
+    pub decimal_sum: Decimal,
+    /// Set if the exact decimal running sum overflowed; finalize then returns
+    /// `Null` rather than a silently-wrong (biased) average, since avg has no
+    /// error channel.
+    pub decimal_overflow: bool,
     pub count: u64,
     pub is_integer: bool,
+    /// True once a `decimal` value has been observed; finalize then returns an
+    /// exact `Value::Decimal` quotient.
+    pub is_decimal: bool,
     pub has_value: bool,
 }
 
@@ -246,8 +366,11 @@ impl Default for AvgState {
             int_sum: 0,
             float_sum: 0.0,
             compensation: 0.0,
+            decimal_sum: Decimal::ZERO,
+            decimal_overflow: false,
             count: 0,
             is_integer: true,
+            is_decimal: false,
             has_value: false,
         }
     }
@@ -271,6 +394,11 @@ impl AvgState {
                 if !self.is_integer {
                     self.kahan_add(*n as f64);
                 }
+                if self.is_decimal {
+                    // Fold integers observed after decimal mode into the exact
+                    // sum, so they are not lost from the decimal quotient.
+                    self.decimal_add(Decimal::from(*n));
+                }
             }
             Value::Float(f) => {
                 self.has_value = true;
@@ -282,7 +410,44 @@ impl AvgState {
                 }
                 self.kahan_add(*f);
             }
+            Value::Decimal(d) => {
+                self.has_value = true;
+                self.count += 1;
+                self.enter_decimal_mode();
+                self.decimal_add(*d);
+            }
             _ => {}
+        }
+    }
+
+    /// Enter the exact decimal path, seeding from the integers already summed
+    /// (fallible — an out-of-range integer sum sets the overflow flag rather
+    /// than panicking).
+    fn enter_decimal_mode(&mut self) {
+        if !self.is_decimal {
+            self.is_decimal = true;
+            match i128_to_decimal(self.int_sum) {
+                Some(d) => self.decimal_sum = d,
+                None => {
+                    self.decimal_sum = Decimal::ZERO;
+                    self.decimal_overflow = true;
+                }
+            }
+        }
+    }
+
+    fn decimal_add(&mut self, d: Decimal) {
+        match self.decimal_sum.checked_add(d) {
+            Some(sum) => self.decimal_sum = sum,
+            None => self.decimal_overflow = true,
+        }
+    }
+
+    fn decimal_contribution(&self) -> Option<Decimal> {
+        if self.is_decimal {
+            Some(self.decimal_sum)
+        } else {
+            i128_to_decimal(self.int_sum)
         }
     }
 
@@ -291,6 +456,24 @@ impl AvgState {
             return;
         }
         self.has_value = true;
+        // Combine exact decimal totals from each side's own integer sum BEFORE
+        // mutating `int_sum` (see `SumState::merge`), so an integer-only side is
+        // neither double-counted nor dropped.
+        if self.is_decimal || other.is_decimal {
+            // Read contributions before flipping `self.is_decimal` (see
+            // `SumState::merge`).
+            let self_dec = self.decimal_contribution();
+            let other_dec = other.decimal_contribution();
+            self.is_decimal = true;
+            match (self_dec, other_dec) {
+                (Some(a), Some(b)) => match a.checked_add(b) {
+                    Some(sum) => self.decimal_sum = sum,
+                    None => self.decimal_overflow = true,
+                },
+                _ => self.decimal_overflow = true,
+            }
+            self.decimal_overflow |= other.decimal_overflow;
+        }
         self.count += other.count;
         self.int_sum += other.int_sum;
         if !other.is_integer {
@@ -304,10 +487,23 @@ impl AvgState {
         }
     }
 
-    /// Avg always returns Float per typecheck rule.
+    /// Avg returns Float for int/float inputs; for `decimal` inputs it returns
+    /// an exact `Value::Decimal` quotient at full division precision (rounding
+    /// to a declared `scale` happens when the value lands in a scaled decimal
+    /// column, matching intermediate `decimal / decimal` division semantics).
+    /// An overflowed decimal sum yields `Null` (avg has no error channel).
     fn finalize(&self) -> Value {
         if !self.has_value || self.count == 0 {
             return Value::Null;
+        }
+        if self.is_decimal {
+            if self.decimal_overflow {
+                return Value::Null;
+            }
+            return match self.decimal_sum.checked_div(Decimal::from(self.count)) {
+                Some(avg) => Value::Decimal(avg),
+                None => Value::Null,
+            };
         }
         let sum = if self.is_integer {
             self.int_sum as f64
@@ -686,6 +882,7 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Bool(x), Bool(y)) => x == y,
         (Integer(x), Integer(y)) => x == y,
         (Float(x), Float(y)) => x.to_bits() == y.to_bits(),
+        (Decimal(x), Decimal(y)) => x == y,
         (String(x), String(y)) => x == y,
         (Date(x), Date(y)) => x == y,
         (DateTime(x), DateTime(y)) => x == y,

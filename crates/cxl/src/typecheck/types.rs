@@ -15,6 +15,12 @@ pub enum Type {
     Bool,
     Int,
     Float,
+    /// Exact base-10 fixed-point number (`Value::Decimal`). A first-class type,
+    /// distinct from `Float`: decimal arithmetic is exact and never silently
+    /// mixes with `Float` (that requires an explicit cast). The YAML/CXL token
+    /// is `decimal`; `precision`/`scale` are column attributes, not type
+    /// parameters, so the type itself is just `Decimal`.
+    Decimal,
     String,
     Date,
     DateTime,
@@ -60,6 +66,7 @@ impl Type {
             TypeTag::String => Type::String,
             TypeTag::Int => Type::Int,
             TypeTag::Float => Type::Float,
+            TypeTag::Decimal => Type::Decimal,
             TypeTag::Bool => Type::Bool,
             TypeTag::Date => Type::Date,
             TypeTag::DateTime => Type::DateTime,
@@ -89,6 +96,13 @@ impl Type {
             // Int promotes to Float
             (Type::Int, Type::Float) | (Type::Float, Type::Int) => Some(Type::Float),
 
+            // Int widens INTO a decimal arithmetic context (exact): `amount + 1`
+            // typechecks as `Decimal`. Decimal does NOT unify with `Float` or
+            // `Numeric` (which admits `Float`): mixing exact decimal with binary
+            // float requires an explicit cast, so that pairing stays `None` and
+            // the binary-op checker raises a diagnostic.
+            (Type::Decimal, Type::Int) | (Type::Int, Type::Decimal) => Some(Type::Decimal),
+
             // Nullable unification
             (Type::Nullable(a), Type::Nullable(b)) => a.unify(b).map(Type::nullable),
             (Type::Nullable(a), b) | (b, Type::Nullable(a)) => a.unify(b).map(Type::nullable),
@@ -108,6 +122,7 @@ impl Type {
             Type::Bool => "Bool",
             Type::Int => "Int",
             Type::Float => "Float",
+            Type::Decimal => "Decimal",
             Type::String => "String",
             Type::Date => "Date",
             Type::DateTime => "DateTime",
@@ -166,6 +181,24 @@ mod tests {
     #[test]
     fn test_unify_int_float_promotes() {
         assert_eq!(Type::Int.unify(&Type::Float), Some(Type::Float));
+    }
+
+    #[test]
+    fn test_unify_decimal() {
+        // Decimal unifies with Decimal and widens Int into decimal context.
+        assert_eq!(Type::Decimal.unify(&Type::Decimal), Some(Type::Decimal));
+        assert_eq!(Type::Decimal.unify(&Type::Int), Some(Type::Decimal));
+        assert_eq!(Type::Int.unify(&Type::Decimal), Some(Type::Decimal));
+    }
+
+    #[test]
+    fn test_unify_decimal_float_rejected() {
+        // Decimal never unifies with Float or Numeric — mixing requires an
+        // explicit cast, so the pairing is incompatible.
+        assert_eq!(Type::Decimal.unify(&Type::Float), None);
+        assert_eq!(Type::Float.unify(&Type::Decimal), None);
+        assert_eq!(Type::Decimal.unify(&Type::Numeric), None);
+        assert_eq!(Type::Numeric.unify(&Type::Decimal), None);
     }
 
     #[test]

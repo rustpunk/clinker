@@ -114,6 +114,7 @@ fn format_value(val: &Value, out: &mut String) {
         Value::String(s) => out.push_str(s),
         Value::Integer(i) => out.push_str(&i.to_string()),
         Value::Float(f) => out.push_str(&f.to_string()),
+        Value::Decimal(d) => out.push_str(&d.to_string()),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Null => out.push_str("null"),
         Value::Date(d) => out.push_str(&d.to_string()),

@@ -90,6 +90,10 @@ struct TypeField {
     name: String,
     ty: Type,
     format: Option<String>,
+    /// Decimal scale (fractional digits) for a `decimal` column; `None`
+    /// otherwise. Threaded into `coerce_scalar` so a decimal value is rounded
+    /// to the column scale at parse.
+    scale: Option<u8>,
     /// Fixed-width byte-positioned field, or `None` for a CSV field.
     fixed: Option<ResolvedField>,
     /// CSV column index, or `None` for a fixed-width field.
@@ -678,6 +682,7 @@ fn resolve_fixed_width(
                 name: f.name.clone(),
                 ty: f.ty.clone(),
                 format: f.format.clone(),
+                scale: f.scale,
                 fixed: Some(resolved),
                 csv_column: None,
                 trim: f.trim.unwrap_or(true),
@@ -741,6 +746,7 @@ fn resolve_csv(
                 name: f.name.clone(),
                 ty: f.ty.clone(),
                 format: f.format.clone(),
+                scale: f.scale,
                 fixed: None,
                 csv_column: Some(csv_idx),
                 trim: f.trim.unwrap_or(true),
@@ -882,7 +888,7 @@ fn extract_field_value(tf: &TypeField, line: &ScannedLine, row: u64) -> Result<V
     if raw.is_empty() {
         return Ok(Value::Null);
     }
-    field::coerce_scalar(&tf.ty, tf.format.as_deref(), &raw).map_err(|m| {
+    field::coerce_scalar(&tf.ty, tf.format.as_deref(), tf.scale, &raw).map_err(|m| {
         FormatError::InvalidRecord {
             row,
             message: format!("field '{}': {m}", tf.name),

@@ -27,7 +27,7 @@ Because the typecheck phase produces a fully-typed program, an error here is a g
 
 ## The type lattice
 
-CXL has 9 value types, and unification operates over them plus two compile-time-only constructs (`Numeric` and `Any`) and the `Nullable(T)` wrapper. The concrete value types and their Rust backings:
+CXL has 10 value types, and unification operates over them plus two compile-time-only constructs (`Numeric` and `Any`) and the `Nullable(T)` wrapper. The concrete value types and their Rust backings:
 
 | Type | Rust backing | Description |
 |------|-------------|-------------|
@@ -35,6 +35,7 @@ CXL has 9 value types, and unification operates over them plus two compile-time-
 | Bool | `bool` | `true` or `false` |
 | Integer | `i64` | 64-bit signed integer |
 | Float | `f64` | 64-bit double-precision float |
+| Decimal | `rust_decimal::Decimal` | Exact base-10 fixed-point number (16 bytes) for monetary/financial data |
 | String | `Box<str>` | UTF-8 text |
 | Date | `NaiveDate` | Calendar date without timezone |
 | DateTime | `NaiveDateTime` | Date and time without timezone |
@@ -59,6 +60,8 @@ When two types meet in an expression — the two operands of a binary operator, 
 3. **`Numeric` resolves to the concrete type.** `Numeric + Int` produces `Int`; `Numeric + Float` produces `Float`. The `Numeric` union collapses to whichever concrete numeric type it meets, rather than staying an unresolved union in the result.
 
 4. **`Int` promotes to `Float`.** `Int + Float` produces `Float`. When the two concrete numeric types differ, the result is the wider one — integer arithmetic against a float yields a float, matching the runtime promotion the evaluator performs.
+
+4a. **`Int` widens into `Decimal`, but `Float` does not.** `Decimal + Int` produces `Decimal` — an integer literal or column joins exact decimal arithmetic without loss, so `amount + 1` typechecks as `Decimal`. `Decimal` deliberately does **not** unify with `Float` or `Numeric` (which admits `Float`): mixing an exact base-10 value with a binary float is a hard type error that requires an explicit cast (`.to_decimal()` to stay exact, `.to_float()` to opt into binary precision). This is what preserves the decimal type's exactness guarantee — a lossy float can never silently contaminate a decimal computation. The same rule governs comparisons: `decimal > float` is rejected, `decimal > int` is fine.
 
 5. **`Null` wraps.** `Null + T` produces `Nullable(T)`. Any operation involving the `Null` type produces a nullable result: meeting `Null` cannot guarantee a non-null outcome, so the result type carries the `Nullable` marker. (Runtime behavior matches — e.g. `null + 5` evaluates to `null` — and the type reflects that the result may be absent.)
 

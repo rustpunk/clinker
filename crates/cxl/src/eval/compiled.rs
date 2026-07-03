@@ -55,6 +55,7 @@ use std::sync::Arc;
 
 use clinker_record::{GroupByKey, RecordStorage, Value, value_to_group_key};
 use regex::Regex;
+use rust_decimal::Decimal;
 
 use crate::ast::{BinOp, EmitTarget, Expr, LiteralValue, Statement, TraceLevel, UnaryOp};
 use crate::lexer::Span;
@@ -1681,6 +1682,8 @@ fn apply_unary(op: UnaryOp, val: Value, span: Span) -> Result<Value, EvalError> 
                 .map(Value::Integer)
                 .ok_or_else(|| EvalError::integer_overflow("negation", span)),
             Value::Float(f) => Ok(Value::Float(-f)),
+            // `Decimal` is symmetric (MIN == -MAX), so negation never overflows.
+            Value::Decimal(d) => Ok(Value::Decimal(-d)),
             Value::Null => Ok(Value::Null),
             _ => Ok(Value::Null),
         },
@@ -1710,6 +1713,7 @@ fn apply_arith_or_cmp(
             "subtraction",
             i64::checked_sub,
             |a, b| a - b,
+            |a, b| a.checked_sub(b),
         ),
         BinOp::Mul => eval_arith(
             left,
@@ -1718,17 +1722,34 @@ fn apply_arith_or_cmp(
             "multiplication",
             i64::checked_mul,
             |a, b| a * b,
+            |a, b| a.checked_mul(b),
         ),
         BinOp::Div => match (left, right) {
             (_, Value::Integer(0)) => Err(EvalError::division_by_zero(span)),
             (_, Value::Float(f)) if *f == 0.0 => Err(EvalError::division_by_zero(span)),
-            _ => eval_arith(left, right, span, "division", i64::checked_div, |a, b| {
-                a / b
-            }),
+            (_, Value::Decimal(d)) if d.is_zero() => Err(EvalError::division_by_zero(span)),
+            _ => eval_arith(
+                left,
+                right,
+                span,
+                "division",
+                i64::checked_div,
+                |a, b| a / b,
+                |a, b| a.checked_div(b),
+            ),
         },
         BinOp::Mod => match (left, right) {
             (_, Value::Integer(0)) => Err(EvalError::division_by_zero(span)),
-            _ => eval_arith(left, right, span, "modulo", i64::checked_rem, |a, b| a % b),
+            (_, Value::Decimal(d)) if d.is_zero() => Err(EvalError::division_by_zero(span)),
+            _ => eval_arith(
+                left,
+                right,
+                span,
+                "modulo",
+                i64::checked_rem,
+                |a, b| a % b,
+                |a, b| a.checked_rem(b),
+            ),
         },
         BinOp::Gt => Ok(Value::Bool(
             compare_values(left, right) == Some(std::cmp::Ordering::Greater),
@@ -1759,9 +1780,27 @@ fn eval_add(left: &Value, right: &Value, span: Span) -> Result<Value, EvalError>
         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(a + b)),
         (Value::Integer(a), Value::Float(b)) => Ok(Value::Float(*a as f64 + b)),
         (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(a + *b as f64)),
+        // Exact decimal addition. `decimal + int` widens the int exactly;
+        // `decimal + float` never reaches here — typecheck rejects it, forcing
+        // an explicit cast — so it falls through to the null arm.
+        (Value::Decimal(a), Value::Decimal(b)) => decimal_result(a.checked_add(*b), span),
+        (Value::Decimal(a), Value::Integer(b)) => {
+            decimal_result(a.checked_add(Decimal::from(*b)), span)
+        }
+        (Value::Integer(a), Value::Decimal(b)) => {
+            decimal_result(Decimal::from(*a).checked_add(*b), span)
+        }
         (Value::String(a), Value::String(b)) => Ok(Value::String(format!("{}{}", a, b).into())),
         _ => Ok(Value::Null),
     }
+}
+
+/// Wrap a checked decimal result: `Some` → `Value::Decimal`, `None` (overflow /
+/// division by zero already guarded upstream) → an overflow diagnostic.
+fn decimal_result(result: Option<Decimal>, span: Span) -> Result<Value, EvalError> {
+    result
+        .map(Value::Decimal)
+        .ok_or_else(|| EvalError::integer_overflow("decimal", span))
 }
 
 fn eval_arith(
@@ -1771,6 +1810,7 @@ fn eval_arith(
     op_name: &'static str,
     int_op: impl Fn(i64, i64) -> Option<i64>,
     float_op: impl Fn(f64, f64) -> f64,
+    decimal_op: impl Fn(Decimal, Decimal) -> Option<Decimal>,
 ) -> Result<Value, EvalError> {
     match (left, right) {
         (Value::Integer(a), Value::Integer(b)) => int_op(*a, *b)
@@ -1779,6 +1819,17 @@ fn eval_arith(
         (Value::Float(a), Value::Float(b)) => Ok(Value::Float(float_op(*a, *b))),
         (Value::Integer(a), Value::Float(b)) => Ok(Value::Float(float_op(*a as f64, *b))),
         (Value::Float(a), Value::Integer(b)) => Ok(Value::Float(float_op(*a, *b as f64))),
+        // Exact decimal arithmetic. `decimal ⊗ int` widens the int exactly;
+        // `decimal ⊗ float` is a typecheck error (never reaches here). Division
+        // keeps full quotient precision — rounding to a target scale happens at
+        // the column boundary, matching the aggregate `avg` semantics.
+        (Value::Decimal(a), Value::Decimal(b)) => decimal_result(decimal_op(*a, *b), span),
+        (Value::Decimal(a), Value::Integer(b)) => {
+            decimal_result(decimal_op(*a, Decimal::from(*b)), span)
+        }
+        (Value::Integer(a), Value::Decimal(b)) => {
+            decimal_result(decimal_op(Decimal::from(*a), *b), span)
+        }
         _ => Ok(Value::Null),
     }
 }
@@ -1791,6 +1842,11 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Float(x), Value::Float(y)) => x == y,
         (Value::Integer(x), Value::Float(y)) => (*x as f64) == *y,
         (Value::Float(x), Value::Integer(y)) => *x == (*y as f64),
+        // Decimal equality is exact; `decimal == int` widens the int exactly.
+        // `decimal == float` is a typecheck error, so it never reaches here.
+        (Value::Decimal(x), Value::Decimal(y)) => x == y,
+        (Value::Decimal(x), Value::Integer(y)) => *x == Decimal::from(*y),
+        (Value::Integer(x), Value::Decimal(y)) => Decimal::from(*x) == *y,
         (Value::String(x), Value::String(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         (Value::Date(x), Value::Date(y)) => x == y,
@@ -1814,6 +1870,11 @@ pub fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::Float(x), Value::Float(y)) => x.partial_cmp(y),
         (Value::Integer(x), Value::Float(y)) => (*x as f64).partial_cmp(y),
         (Value::Float(x), Value::Integer(y)) => x.partial_cmp(&(*y as f64)),
+        // Exact decimal ordering; `decimal <=> int` widens the int exactly.
+        // `decimal <=> float` is a typecheck error (never reaches here).
+        (Value::Decimal(x), Value::Decimal(y)) => Some(x.cmp(y)),
+        (Value::Decimal(x), Value::Integer(y)) => Some(x.cmp(&Decimal::from(*y))),
+        (Value::Integer(x), Value::Decimal(y)) => Some(Decimal::from(*x).cmp(y)),
         (Value::String(x), Value::String(y)) => Some(x.cmp(y)),
         (Value::Date(x), Value::Date(y)) => Some(x.cmp(y)),
         (Value::DateTime(x), Value::DateTime(y)) => Some(x.cmp(y)),

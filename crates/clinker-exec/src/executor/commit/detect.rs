@@ -376,6 +376,7 @@ fn format_group_key(key: &[GroupByKey]) -> String {
             GroupByKey::Bool(b) => b.to_string(),
             GroupByKey::Int(i) => i.to_string(),
             GroupByKey::Float(bits) => f64::from_bits(*bits).to_string(),
+            GroupByKey::Decimal(_) => k.to_value().to_string(),
             GroupByKey::Str(s) => format!("{s:?}"),
             GroupByKey::Date(d) => d.to_string(),
             GroupByKey::DateTime(ts) => ts.to_string(),

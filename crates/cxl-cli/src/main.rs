@@ -531,6 +531,8 @@ fn value_to_json(v: Value) -> serde_json::Value {
         Value::Bool(b) => serde_json::Value::Bool(b),
         Value::Integer(n) => serde_json::json!(n),
         Value::Float(f) => serde_json::json!(f),
+        // Scale-preserving string form (JSON has no exact-decimal type).
+        Value::Decimal(d) => serde_json::Value::String(d.to_string()),
         Value::String(s) => serde_json::Value::String(s.to_string()),
         Value::Date(d) => serde_json::Value::String(d.format("%Y-%m-%d").to_string()),
         Value::DateTime(dt) => {

@@ -1,6 +1,6 @@
 # Conversion Methods
 
-CXL provides two families of conversion methods: **strict** (6 methods) and **lenient** (5 methods). Strict conversions raise an error on failure, halting pipeline execution. Lenient conversions return `null` on failure, allowing graceful handling of dirty data.
+CXL provides two families of conversion methods: **strict** (7 methods) and **lenient** (6 methods). Strict conversions raise an error on failure, halting pipeline execution. Lenient conversions return `null` on failure, allowing graceful handling of dirty data.
 
 All conversion methods accept any receiver type (`Any`).
 
@@ -60,6 +60,28 @@ $ cxl eval -e 'emit result = 42.to_float()'
 ```json
 {
   "result": 42.0
+}
+```
+
+### to_decimal() -> Decimal
+
+Converts the receiver to an exact [`decimal`](types.md#the-decimal-type). Errors on failure.
+
+- Integer: converts exactly
+- String: parses base-10 exactly (`"19.99"` → `19.99`, never via a binary float)
+- Float: converts via the binary value — this is the one lossy direction, made
+  explicit precisely because `decimal * float` is otherwise a type error
+
+Use `to_decimal()` to bring a value into exact decimal arithmetic. JSON output
+renders a decimal as a scale-preserving string.
+
+```bash
+$ cxl eval -e 'emit result = "0.10".to_decimal() + "0.20".to_decimal()'
+```
+
+```json
+{
+  "result": "0.30"
 }
 ```
 
@@ -182,6 +204,21 @@ $ cxl eval -e 'emit a = "3.14".try_float()' -e 'emit b = "N/A".try_float()'
 ```json
 {
   "a": 3.14,
+  "b": null
+}
+```
+
+### try_decimal() -> Decimal
+
+Attempts to convert to an exact [`decimal`](types.md#the-decimal-type). Returns `null` on failure.
+
+```bash
+$ cxl eval -e 'emit a = "19.99".try_decimal()' -e 'emit b = "N/A".try_decimal()'
+```
+
+```json
+{
+  "a": "19.99",
   "b": null
 }
 ```
