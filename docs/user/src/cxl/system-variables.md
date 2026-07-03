@@ -96,6 +96,33 @@ emit currency = $vars.output_currency
 
 Variables provide a clean way to externalize configuration from CXL logic. Combined with [channels](../pipelines/channels.md), different variable sets can parameterize the same pipeline for different environments or clients.
 
+## $config.* -- Composition config parameters
+<a id="config-composition-config-parameters"></a>
+
+`$config.<param>` reads a [composition](../pipelines/compositions.md)'s declared config parameter from **inside that composition's body**. It is only available in a composition body — a top-level pipeline declares no config schema, so `$config.*` there is a compile error.
+
+Each parameter is declared in the composition's `_compose.config_schema:` block, then read from the body's CXL:
+
+```yaml
+# in fraud_check.comp.yaml
+_compose:
+  name: fraud_check
+  config_schema:
+    threshold: { type: float, default: 0.8 }
+nodes:
+  - type: transform
+    name: flag
+    input: inp
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit flagged = score >= $config.threshold
+```
+
+Unlike `$vars.*` (which flows to the executor as a runtime value), `$config.<param>` is **constant-folded at compile time**: each reference is replaced by the value resolved for that instantiation, so two call sites of the same composition with different `config:` compile to different bodies. The resolution precedence, highest first, is a [channel/group](../pipelines/channels.md) `config:` clobber, then the call site's `config:`, then the signature default.
+
+Because the value is resolved per instantiation, overriding a config knob via a channel or group `config:` value clobber changes what the composition body computes — the override is applied to execution, and the winning layer is still recorded in the provenance side-table for `channels resolve` / `explain --field`.
+
 ## $record.* -- Per-record scoped state
 
 `$record.*` is a per-record key-value store that travels with the record through the pipeline but never serializes as an output column. It is the mechanism for tagging records with quality flags, routing hints, or audit information that should not appear in the final output unless explicitly re-emitted as a regular column.

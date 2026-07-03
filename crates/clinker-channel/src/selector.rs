@@ -281,6 +281,7 @@ fn reject_non_label(expr: &Expr) -> Result<(), SelectorError> {
         // non-deterministic) and have no place in a label selector.
         Expr::PipelineAccess { .. } => Err(SelectorError::ForbiddenReference("$pipeline")),
         Expr::VarsAccess { .. } => Err(SelectorError::ForbiddenReference("$vars")),
+        Expr::ConfigAccess { .. } => Err(SelectorError::ForbiddenReference("$config")),
         Expr::SourceAccess { .. } | Expr::QualifiedSourceAccess { .. } => {
             Err(SelectorError::ForbiddenReference("$source"))
         }

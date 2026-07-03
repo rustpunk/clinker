@@ -651,6 +651,7 @@ fn format_expr(expr: &cxl::ast::Expr) -> String {
         cxl::ast::Expr::Wildcard { .. } => "_".into(),
         cxl::ast::Expr::PipelineAccess { field, .. } => format!("$pipeline.{}", field),
         cxl::ast::Expr::VarsAccess { key, .. } => format!("$vars.{}", key),
+        cxl::ast::Expr::ConfigAccess { param, .. } => format!("$config.{}", param),
         cxl::ast::Expr::SourceAccess { field, .. } => format!("$source.{}", field),
         cxl::ast::Expr::QualifiedSourceAccess {
             input_name, field, ..

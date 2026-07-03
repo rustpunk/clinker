@@ -1090,7 +1090,7 @@ impl Parser {
             Token::Dollar => {
                 self.advance(); // consume '$'
                 let ns = self.expect_ident(
-                    "system namespace (pipeline, vars, source, record, window, doc)",
+                    "system namespace (pipeline, vars, config, source, record, window, doc)",
                 )?;
                 self.expect_token(&Token::Dot, "'.'")?;
 
@@ -1112,6 +1112,16 @@ impl Parser {
                         Ok(Expr::VarsAccess {
                             node_id: nid,
                             key: key.into(),
+                            span: Span::new(start.start as usize, end.end as usize),
+                        })
+                    }
+                    "config" => {
+                        let nid = self.alloc_id();
+                        let param = self.expect_ident("config parameter name")?;
+                        let end = self.prev_span();
+                        Ok(Expr::ConfigAccess {
+                            node_id: nid,
+                            param: param.into(),
                             span: Span::new(start.start as usize, end.end as usize),
                         })
                     }
@@ -1191,9 +1201,10 @@ impl Parser {
                     }
                     other => Err(self.error(
                         &format!("unknown system namespace '${other}'"),
-                        "Valid system namespaces are: pipeline, source, record, window, doc",
-                        "Use $pipeline.field, $source.field, $record.field, $window.fn(), or \
-                         $doc.<section>.<field>",
+                        "Valid system namespaces are: pipeline, vars, config, source, record, \
+                         window, doc",
+                        "Use $pipeline.field, $vars.key, $config.param, $source.field, \
+                         $record.field, $window.fn(), or $doc.<section>.<field>",
                     )),
                 }
             }
@@ -2062,6 +2073,41 @@ mod tests {
             }
             _ => panic!("expected PipelineAccess"),
         }
+    }
+
+    #[test]
+    fn test_parse_config_access() {
+        let r = parse_ok("let x = $config.threshold");
+        let expr = let_expr(&r);
+        match expr {
+            Expr::ConfigAccess { param, .. } => {
+                assert_eq!(&**param, "threshold");
+            }
+            _ => panic!("expected ConfigAccess"),
+        }
+    }
+
+    #[test]
+    fn test_fold_config_program_replaces_config_access() {
+        use crate::ast::{LiteralValue, fold_config_program};
+        let r = parse_ok("filter amount >= $config.min_amount");
+        let mut program = r.ast;
+        fold_config_program(&mut program, &|param| match param {
+            "min_amount" => Some(LiteralValue::Float(100.0)),
+            _ => None,
+        });
+        // No `ConfigAccess` may remain after folding.
+        let mut fields = std::collections::HashSet::new();
+        crate::ast::program_support_into(&program, &mut fields);
+        let rendered = format!("{:?}", program);
+        assert!(
+            !rendered.contains("ConfigAccess"),
+            "fold must replace every $config read with a literal: {rendered}"
+        );
+        assert!(
+            rendered.contains("Float(100.0)"),
+            "folded literal must carry the resolved value: {rendered}"
+        );
     }
 
     #[test]

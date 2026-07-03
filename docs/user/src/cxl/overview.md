@@ -40,6 +40,7 @@ CXL provides built-in namespaces for accessing pipeline state, metadata, and win
 - `$record.*` -- per-record scoped state (travels with the record, never an output column)
 - `$window.*` -- window function calls
 - `$vars.*` -- static, channel-overridable configuration
+- `$config.*` -- a composition's config parameters, read inside its body (constant-folded per instantiation)
 
 ```bash
 $ cxl eval -e 'emit name = $pipeline.name'

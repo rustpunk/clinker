@@ -770,6 +770,7 @@ fn collect_qualifier_ranges_expr(
         | Expr::FieldRef { .. }
         | Expr::PipelineAccess { .. }
         | Expr::VarsAccess { .. }
+        | Expr::ConfigAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::RecordAccess { .. }
         | Expr::QualifiedSourceAccess { .. }

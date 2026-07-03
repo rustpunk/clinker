@@ -74,7 +74,7 @@ pub use discovery::{
 pub use error::ChannelError;
 pub use group::Group;
 pub use manifest::{ChannelManifest, ChannelVars, ManifestHeader, OverlayFile, OverlayHeader};
-pub use overlay::{ChannelOverlayResult, apply_channel_overlay};
+pub use overlay::{ChannelOverlayResult, apply_channel_overlay, merge_config_overrides};
 pub use resolve::{
     AppliedGroup, GroupSource, InjectedNode, OverlayResolution, ResolveError, resolve,
 };

@@ -129,6 +129,7 @@ pub fn walk_expr<V: Visitor + ?Sized>(visitor: &mut V, expr: &Expr) {
         | Expr::QualifiedFieldRef { .. }
         | Expr::PipelineAccess { .. }
         | Expr::VarsAccess { .. }
+        | Expr::ConfigAccess { .. }
         | Expr::SourceAccess { .. }
         | Expr::QualifiedSourceAccess { .. }
         | Expr::RecordAccess { .. }

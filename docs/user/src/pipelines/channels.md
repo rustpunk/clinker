@@ -101,6 +101,13 @@ config:
   scorer.threshold: 0.95     # override the `threshold` knob of the `scorer` composition node
 ```
 
+The override changes executed behavior, not just the rendered provenance: the
+composition body reads the knob as [`$config.<param>`](../cxl/system-variables.md#config-composition-config-parameters),
+which the planner constant-folds to the resolved value for that instantiation at
+compile time. The winning layer is still recorded in the provenance side-table,
+so `channels resolve` / `explain --field` continue to report which layer supplied
+the value.
+
 A `config:` key that matches no parameter in the compiled plan is a hard error
 ([E113](#diagnostics)) — a misspelled or stale key aborts the run rather than
 silently doing nothing.
@@ -492,17 +499,8 @@ not collide.
 
 ## Known behavior notes
 
-Two current gaps are tracked as follow-up issues; both surface in the overlay
+One current gap is tracked as a follow-up issue; it surfaces in the overlay
 tooling today:
-
-- **`config:` value overrides are provenance-only, not yet applied at runtime.**
-  A `config:` value clobber currently writes to the compiled plan's provenance
-  side-table — so `channels resolve` and `explain --field` *report* the
-  overridden value and its winning layer — but lowering and the executor do not
-  yet read it, so the overridden composition parameter does not change executed
-  behavior. `vars:` overrides and the structural `overrides:` ops *do* reach
-  runtime. This is inherited from the value-clobber mechanism; making `config:`
-  values functional at runtime is tracked in issue #765.
 
 - **A legacy single-file channel path still coexists.**<a id="legacy-channel-file-path"></a>
   `run --channel <FILE>` / `explain --channel <FILE>` accept a single channel

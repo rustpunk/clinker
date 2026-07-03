@@ -251,6 +251,23 @@ pub enum Expr {
         key: Box<str>,
         span: Span,
     },
+    /// Composition configuration parameter: `$config.<param>`. Reads a
+    /// value declared in the enclosing composition's `_compose.config_schema`
+    /// and resolved for this instantiation (signature default, call-site
+    /// `config:`, or channel/group `config:` clobber). Valid only inside a
+    /// composition body; a top-level pipeline declares no config schema, so
+    /// the resolver rejects `$config.*` there.
+    ///
+    /// This variant never reaches evaluation: the planner constant-folds
+    /// each `$config.<param>` to the instantiation's resolved value (an
+    /// [`Expr::Literal`]) at compile time, so two instantiations with
+    /// different config compile to different bodies with no runtime
+    /// plumbing.
+    ConfigAccess {
+        node_id: NodeId,
+        param: Box<str>,
+        span: Span,
+    },
     /// Per-record source provenance: `$source.file`, `$source.row`.
     /// Distinct namespace from `$pipeline.*` (pipeline-stable per-run state)
     /// because per-record values cannot be pipeline-scope when one Source
@@ -377,6 +394,7 @@ impl Expr {
             | Expr::WindowCall { span, .. }
             | Expr::PipelineAccess { span, .. }
             | Expr::VarsAccess { span, .. }
+            | Expr::ConfigAccess { span, .. }
             | Expr::SourceAccess { span, .. }
             | Expr::RecordAccess { span, .. }
             | Expr::QualifiedSourceAccess { span, .. }
@@ -406,6 +424,7 @@ impl Expr {
             | Expr::WindowCall { node_id, .. }
             | Expr::PipelineAccess { node_id, .. }
             | Expr::VarsAccess { node_id, .. }
+            | Expr::ConfigAccess { node_id, .. }
             | Expr::SourceAccess { node_id, .. }
             | Expr::RecordAccess { node_id, .. }
             | Expr::QualifiedSourceAccess { node_id, .. }
@@ -502,6 +521,7 @@ impl Expr {
             Expr::Closure { body, .. } => body.support_into(fields),
             Expr::PipelineAccess { .. }
             | Expr::VarsAccess { .. }
+            | Expr::ConfigAccess { .. }
             | Expr::SourceAccess { .. }
             | Expr::RecordAccess { .. }
             | Expr::QualifiedSourceAccess { .. }
@@ -563,6 +583,123 @@ pub fn program_support_into(program: &Program, fields: &mut std::collections::Ha
                 program_support_into(&inner, fields);
             }
         }
+    }
+}
+
+/// Constant-fold every `$config.<param>` ([`Expr::ConfigAccess`]) in a
+/// [`Program`] to the literal value `resolve` returns for that param.
+///
+/// The planner calls this once per composition instantiation, after the
+/// body program has typechecked, so `$config` never reaches evaluation:
+/// two instantiations with different resolved config fold to different
+/// literals — and therefore different compiled bodies — with no runtime
+/// plumbing. `resolve` returns `None` only for a param outside the
+/// composition's declared config schema; the resolver has already
+/// rejected such a read, so a valid typechecked program never leaves a
+/// `ConfigAccess` unfolded.
+pub fn fold_config_program(program: &mut Program, resolve: &impl Fn(&str) -> Option<LiteralValue>) {
+    for stmt in &mut program.statements {
+        fold_config_stmt(stmt, resolve);
+    }
+}
+
+fn fold_config_stmt(stmt: &mut Statement, resolve: &impl Fn(&str) -> Option<LiteralValue>) {
+    match stmt {
+        Statement::Emit { expr, .. }
+        | Statement::Let { expr, .. }
+        | Statement::ExprStmt { expr, .. } => fold_config_expr(expr, resolve),
+        Statement::Filter { predicate, .. } => fold_config_expr(predicate, resolve),
+        Statement::Trace { guard, message, .. } => {
+            if let Some(g) = guard.as_mut() {
+                fold_config_expr(g, resolve);
+            }
+            fold_config_expr(message, resolve);
+        }
+        Statement::EmitEach { source, body, .. } | Statement::ExplodeOuter { source, body, .. } => {
+            fold_config_expr(source, resolve);
+            for inner in body.iter_mut() {
+                fold_config_stmt(inner, resolve);
+            }
+        }
+        Statement::Distinct { .. } | Statement::UseStmt { .. } => {}
+    }
+}
+
+/// Recursively fold `$config.<param>` inside one expression, mirroring the
+/// recursion shape of [`walk_expr`](crate::analyzer::visitor::walk_expr).
+fn fold_config_expr(expr: &mut Expr, resolve: &impl Fn(&str) -> Option<LiteralValue>) {
+    match expr {
+        Expr::ConfigAccess {
+            node_id,
+            param,
+            span,
+        } => {
+            if let Some(value) = resolve(param) {
+                *expr = Expr::Literal {
+                    node_id: *node_id,
+                    value,
+                    span: *span,
+                };
+            }
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
+            fold_config_expr(lhs, resolve);
+            fold_config_expr(rhs, resolve);
+        }
+        Expr::Unary { operand, .. } => fold_config_expr(operand, resolve),
+        Expr::MethodCall { receiver, args, .. } => {
+            fold_config_expr(receiver, resolve);
+            for a in args.iter_mut() {
+                fold_config_expr(a, resolve);
+            }
+        }
+        Expr::Match { subject, arms, .. } => {
+            if let Some(s) = subject.as_deref_mut() {
+                fold_config_expr(s, resolve);
+            }
+            for arm in arms.iter_mut() {
+                fold_config_expr(&mut arm.pattern, resolve);
+                fold_config_expr(&mut arm.body, resolve);
+            }
+        }
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            fold_config_expr(condition, resolve);
+            fold_config_expr(then_branch, resolve);
+            if let Some(e) = else_branch.as_deref_mut() {
+                fold_config_expr(e, resolve);
+            }
+        }
+        Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+            for a in args.iter_mut() {
+                fold_config_expr(a, resolve);
+            }
+        }
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
+            fold_config_expr(receiver, resolve);
+            fold_config_expr(index, resolve);
+        }
+        Expr::Closure { body, .. } => fold_config_expr(body, resolve),
+        // Leaves and non-`$config` namespaces hold no `ConfigAccess`.
+        Expr::Literal { .. }
+        | Expr::FieldRef { .. }
+        | Expr::QualifiedFieldRef { .. }
+        | Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
+        | Expr::SourceAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::RecordAccess { .. }
+        | Expr::DocAccess { .. }
+        | Expr::Now { .. }
+        | Expr::Wildcard { .. }
+        | Expr::AggSlot { .. }
+        | Expr::GroupKey { .. } => {}
     }
 }
 

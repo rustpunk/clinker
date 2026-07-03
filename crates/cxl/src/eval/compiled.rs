@@ -913,6 +913,18 @@ fn compile_expr<S: RecordStorage + 'static>(typed: &TypedProgram, expr: &Expr) -
                     .unwrap_or(Value::Null))
             })
         }
+        Expr::ConfigAccess { param, .. } => {
+            // `$config.<param>` is a compile-time constant: the planner folds
+            // every occurrence to an `Expr::Literal` after typecheck (see
+            // `fold_config_program`), so no `ConfigAccess` ever reaches
+            // lowering. Reaching here means a body CXL program was lowered
+            // without folding — a planner invariant violation, not a runtime
+            // condition.
+            unreachable!(
+                "$config.{param} reached evaluation unfolded; the planner must \
+                 constant-fold every $config reference before lowering"
+            )
+        }
         Expr::SourceAccess { field, .. } => {
             let field = field.to_string();
             Box::new(move |frame| Ok(frame.ctx.resolve_source(&field).unwrap_or(Value::Null)))

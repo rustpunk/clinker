@@ -49,7 +49,8 @@ use crate::error::ChannelError;
 use crate::group::Group;
 use crate::manifest::{ChannelManifest, ChannelVars};
 use crate::overlay::{
-    ChannelOverlayResult, apply_config_clobber, resolve_vars_layer, validate_config_keys,
+    ChannelOverlayResult, EffectiveConfig, apply_config_clobber, resolve_vars_layer,
+    validate_config_keys,
 };
 use crate::{apply_group_config, scan_groups};
 
@@ -163,6 +164,33 @@ impl OverlayResolution {
             .as_ref()
             .and_then(|c| c.per_target.as_ref())
             .map(|o| o.path.as_path())
+    }
+
+    /// Resolve the winning composition `config:` value per node for the
+    /// pre-compile `$config.<param>` fold, keyed
+    /// `composition-node-name -> param -> value`.
+    ///
+    /// Applies the same layers in the same ascending-precedence order as
+    /// [`Self::apply_config_and_vars`] (groups by priority → channel-wide →
+    /// per-target), so the folded value matches the layer the `ProvenanceDb`
+    /// renders as `[WON]`. The map feeds
+    /// [`CompileContext::config_overrides`](clinker_plan::config::CompileContext);
+    /// the provenance chain is still recorded separately by
+    /// `apply_config_and_vars`, so this does not double-apply the override.
+    pub fn effective_config_overrides(&self) -> clinker_plan::config::ConfigOverrides {
+        let mut eff = EffectiveConfig::default();
+        for applied in &self.applied_groups {
+            eff.apply(&applied.group.config, applied.layer, false);
+        }
+        if let Some(ctx) = &self.channel {
+            if let Some(manifest) = &ctx.manifest {
+                eff.apply(&manifest.config, LayerKind::ChannelWide, false);
+            }
+            if let Some(overlay) = &ctx.per_target {
+                eff.apply(&overlay.overlay.config, LayerKind::ChannelPerTarget, false);
+            }
+        }
+        eff.into_overrides()
     }
 
     /// Apply the value-clobber surface (`config` + `vars`) of every layer over a
