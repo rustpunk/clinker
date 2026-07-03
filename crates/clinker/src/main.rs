@@ -90,8 +90,11 @@ NDJSON archives.")]
     #[command(
         long_about = "\
 Inspect field-level provenance chains or look up error/warning code documentation.\n\n\
-Use --field to trace where a composition config value comes from across all \
-configuration layers (composition defaults, channel defaults, channel fixed). \
+Use --field to trace where a resolved value comes from across all configuration \
+layers. A two-part `node.param` path traces a composition config value \
+(composition defaults, channel defaults, channel fixed); a three-part \
+`source.column.attribute` path traces a source-schema attribute across the \
+Base < Pipeline < Group < Channel schema layers. \
 Use --code to look up the documentation for a diagnostic code (composition codes \
 E101–E108, combine codes E300-E319 and W302/W305/W306, memory codes E310-E312, \
 spill codes E320/E321, EDI output-split codes E323/E338, storage-validation \
@@ -104,6 +107,9 @@ EXAMPLES:
 
   # Show provenance with a channel overlay applied
   clinker explain pipeline.yaml --field enrich1.fuzzy_threshold --channel acme_prod
+
+  # Trace a source-schema attribute across the Base/Pipeline/Group/Channel layers
+  clinker explain pipeline.yaml --field orders.amount.scale --channel acme_prod
 
   # Look up error code documentation
   clinker explain --code E105"

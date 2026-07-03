@@ -43,3 +43,14 @@ pub use traits::{FormatReader, FormatWriter};
 pub use edifact::reader::DEFAULT_MAX_ELEMENTS as EDIFACT_DEFAULT_MAX_ELEMENTS;
 pub use hl7::reader::DEFAULT_MAX_FIELDS as HL7_DEFAULT_MAX_FIELDS;
 pub use x12::reader::DEFAULT_MAX_ELEMENTS as X12_DEFAULT_MAX_ELEMENTS;
+
+// Positional-column synthesis for `SourceSchema::Generated` EDI/HL7/SWIFT
+// sources. Each function is the single source of truth for its format's
+// column layout: the runtime reader's schema derives its names from the same
+// list the planner seeds a Generated source's compile-time bind from, so the
+// typechecked row and the runtime record schema never disagree.
+pub use edifact::reader::generated_columns as edifact_generated_columns;
+pub use hl7::Hl7FieldSplit;
+pub use hl7::reader::generated_columns as hl7_generated_columns;
+pub use swift::reader::generated_columns as swift_generated_columns;
+pub use x12::reader::generated_columns as x12_generated_columns;

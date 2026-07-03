@@ -206,12 +206,12 @@ declared record types carries the section's payload; the matched header
 row's named fields become the section's fields.
 
 ```yaml
-format_schema:
+schema:
   discriminator: { start: 0, width: 1 }
   records:
-    - { id: header,  tag: H, fields: [ { name: batch_id, type: string, start: 1, width: 9 } ] }
-    - { id: detail,  tag: D, fields: [ { name: amount,   type: integer, start: 1, width: 9 } ] }
-    - { id: trailer, tag: T, fields: [ { name: count,    type: integer, start: 1, width: 9 } ] }
+    - { id: header,  tag: H, columns: [ { name: batch_id, type: string, start: 1, width: 9 } ] }
+    - { id: detail,  tag: D, columns: [ { name: amount,   type: int, start: 1, width: 9 } ] }
+    - { id: trailer, tag: T, columns: [ { name: count,    type: int, start: 1, width: 9 } ] }
   structure:
     - { record: trailer, count: count }
 envelope:

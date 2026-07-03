@@ -59,13 +59,6 @@ impl GroupByKey {
 pub enum GroupKeyError {
     /// NaN value in a group_by / distinct field.
     NanInGroupBy { field: String, row: u64 },
-    /// Float value in an integer-pinned field.
-    TypeMismatch {
-        field: String,
-        expected: &'static str,
-        got: &'static str,
-        row: u64,
-    },
     /// Unsupported type (e.g. Array) used as group key.
     UnsupportedType {
         field: String,
@@ -82,18 +75,6 @@ impl std::fmt::Display for GroupKeyError {
                     f,
                     "NaN in group_by field '{}' at row {} — pipeline must halt (exit code 3)",
                     field, row
-                )
-            }
-            GroupKeyError::TypeMismatch {
-                field,
-                expected,
-                got,
-                row,
-            } => {
-                write!(
-                    f,
-                    "type mismatch in group_by field '{}' at row {}: expected {}, got {}",
-                    field, row, expected, got
                 )
             }
             GroupKeyError::UnsupportedType {

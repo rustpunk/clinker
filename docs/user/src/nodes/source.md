@@ -45,9 +45,14 @@ schema:
 | `date` | Calendar date |
 | `date_time` | Date with time component |
 | `array` | Ordered sequence of values |
-| `numeric` | Union of `int` and `float` -- resolved during type unification |
 | `any` | Unknown type -- field used in type-agnostic contexts |
 | `nullable(T)` | Nullable wrapper around any inner type (e.g. `nullable(int)`) |
+
+A source column's declared type must be **concrete**: `numeric` — the
+inference-only `int | float` union CXL resolves during type unification — is
+**not** a valid source column type. Declaring one is rejected at compile with
+[**E158**](../ops/exit-codes.md#plan-time-diagnostic-codes); declare `int` or
+`float` explicitly.
 
 ### `long_unique` — storage hint for high-cardinality text
 
@@ -145,7 +150,7 @@ The per-source `on_unmapped` policy decides what to do with input fields the sou
       mode: auto_widen     # default; other values: drop, reject
     schema:
       - { name: order_id, type: string }
-      - { name: amount, type: numeric }
+      - { name: amount, type: float }
 ```
 
 See [Auto-Widen & Schema Drift](../formats/auto-widen.md) for the full

@@ -665,6 +665,32 @@ pub struct Hl7InputOptions {
     pub split_fields: Option<Vec<Hl7FieldSplitOption>>,
 }
 
+impl Hl7InputOptions {
+    /// Resolve the declared composite-field splits to the format-native
+    /// [`clinker_format::Hl7FieldSplit`] list: each option's `fNN` field name is
+    /// parsed to its 1-based wire position, and an option whose name does not
+    /// parse is dropped defensively (config validation rejects a bad name with a
+    /// source span before this runs). Shared by the runtime reader construction
+    /// and the compile-time bind of a `SourceSchema::Generated` HL7 source, so
+    /// both observe the same split-leaf columns.
+    pub fn resolved_splits(&self) -> Vec<clinker_format::Hl7FieldSplit> {
+        self.split_fields
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|s| {
+                s.field_position()
+                    .map(|field_index| clinker_format::Hl7FieldSplit {
+                        field_index,
+                        repetitions: s.repetitions,
+                        components: s.components,
+                        subcomponents: s.subcomponents,
+                    })
+            })
+            .collect()
+    }
+}
+
 /// SWIFT MT input options.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]

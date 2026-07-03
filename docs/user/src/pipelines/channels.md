@@ -274,6 +274,12 @@ downstream CXL and the output see the new name carrying the original column's
 data. A missing column, an add that collides with an existing name, or a rename
 onto an existing name are all errors ([E231–E233](#diagnostics)).
 
+To see which layer set a given attribute on a patched column, trace it with
+`clinker explain <pipeline> --field <source>.<column>.<attribute>` (optionally
+`--channel <name>`); the output names the winning `Base < Pipeline < Group <
+Channel` layer and each shadowed one. See
+[Field provenance](../ops/explain.md#field-provenance).
+
 ## Groups and selectors
 
 A group (`group/<name>.group.yaml`) is a reusable overlay layer that sits

@@ -2131,8 +2131,13 @@ fn bind_schema_inner(
                 // Resolve the unified `schema:` (single-record column list,
                 // multi-record superset, external file, or engine-generated)
                 // to the effective column list this source seeds its row from.
-                let resolved_columns =
-                    resolve_source_columns(&config.schema, name.as_str(), span, diags);
+                let resolved_columns = resolve_source_columns(
+                    &config.schema,
+                    &config.source.format,
+                    name.as_str(),
+                    span,
+                    diags,
+                );
                 let (columns, missing) = columns_from_decl(
                     &resolved_columns,
                     config.correlation_key.as_ref(),
@@ -3820,12 +3825,13 @@ where
 ///   (matching the multi-record reader's static superset schema).
 /// - `File` — the external `.schema.yaml`, loaded and resolved at compile time
 ///   (an I/O or parse failure emits E157 and seeds no columns).
-/// - `Generated` — engine-synthesized positional columns (EDI/HL7/SWIFT). Their
-///   exact set is synthesized by the reader at runtime; declaring it at compile
-///   is a later-phase concern, so the source seeds only its engine-stamped tail
-///   columns for now.
+/// - `Generated` — engine-synthesized positional columns (EDI/HL7/SWIFT),
+///   synthesized here at compile time from the source's declared format and its
+///   count options via [`generated_source_columns`], so a Generated source's
+///   typechecked row carries exactly the columns the runtime reader emits.
 fn resolve_source_columns(
     schema: &SourceSchema,
+    format: &crate::config::InputFormat,
     name: &str,
     span: Span,
     diags: &mut Vec<Diagnostic>,
@@ -3835,10 +3841,10 @@ fn resolve_source_columns(
         SourceSchema::MultiRecord { record_types, .. } => {
             clinker_format::multi_record_superset(record_types)
         }
-        SourceSchema::Generated(_) => Vec::new(),
+        SourceSchema::Generated(_) => generated_source_columns(format),
         SourceSchema::File(path) => {
             match crate::schema::load_source_schema(std::path::Path::new(path)) {
-                Ok(inner) => resolve_source_columns(&inner, name, span, diags),
+                Ok(inner) => resolve_source_columns(&inner, format, name, span, diags),
                 Err(e) => {
                     diags.push(Diagnostic::error(
                         "E157",
@@ -3852,6 +3858,52 @@ fn resolve_source_columns(
                 }
             }
         }
+    }
+}
+
+/// Synthesize the engine-generated positional columns for a
+/// [`SourceSchema::Generated`] source from its declared EDI-family format and
+/// count options. This is the compile-time twin of the runtime reader's own
+/// schema synthesis — both draw the layout from the same
+/// `clinker_format::*_generated_columns` functions — so a Generated source's
+/// typechecked row carries exactly the columns the reader emits at runtime
+/// (`seg_id`/`e01…` for EDIFACT/X12, `f01…`/split leaves for HL7,
+/// `block,tag,value` for SWIFT). A non-EDI format cannot carry a `generated`
+/// schema (config validation rejects that with E159 before this runs), so its
+/// arm synthesizes nothing.
+fn generated_source_columns(format: &crate::config::InputFormat) -> Vec<Column> {
+    use crate::config::InputFormat;
+    match format {
+        InputFormat::Edifact(opts) => {
+            let max = opts
+                .as_ref()
+                .and_then(|o| o.max_elements)
+                .unwrap_or(clinker_format::EDIFACT_DEFAULT_MAX_ELEMENTS);
+            clinker_format::edifact_generated_columns(max)
+        }
+        InputFormat::X12(opts) => {
+            let max = opts
+                .as_ref()
+                .and_then(|o| o.max_elements)
+                .unwrap_or(clinker_format::X12_DEFAULT_MAX_ELEMENTS);
+            clinker_format::x12_generated_columns(max)
+        }
+        InputFormat::Hl7(opts) => {
+            let max = opts
+                .as_ref()
+                .and_then(|o| o.max_fields)
+                .unwrap_or(clinker_format::HL7_DEFAULT_MAX_FIELDS);
+            let splits = opts
+                .as_ref()
+                .map(|o| o.resolved_splits())
+                .unwrap_or_default();
+            clinker_format::hl7_generated_columns(max, &splits)
+        }
+        InputFormat::Swift(_) => clinker_format::swift_generated_columns(),
+        InputFormat::Csv(_)
+        | InputFormat::Json(_)
+        | InputFormat::Xml(_)
+        | InputFormat::FixedWidth(_) => Vec::new(),
     }
 }
 

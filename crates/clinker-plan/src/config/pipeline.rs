@@ -2268,6 +2268,34 @@ impl PipelineConfig {
                         }
                     }
                 }
+                // A `generated` schema is engine-synthesized positional columns
+                // for the EDI-family formats only; every other format has no
+                // positional column model to generate, so pairing one with
+                // `generated` is a config error rather than a silently empty
+                // schema.
+                if matches!(body.schema, clinker_format::SourceSchema::Generated(_))
+                    && !matches!(
+                        body.source.format,
+                        crate::config::InputFormat::Edifact(_)
+                            | crate::config::InputFormat::X12(_)
+                            | crate::config::InputFormat::Hl7(_)
+                            | crate::config::InputFormat::Swift(_)
+                    )
+                {
+                    diags.push(Diagnostic::error(
+                        "E159",
+                        format!(
+                            "source {:?} declares a `generated` schema, but its format {:?} has \
+                             no engine-generated positional column model; `generated` is valid \
+                             only for the EDI-family formats (edifact, x12, hl7, swift). Declare \
+                             an explicit column list instead.",
+                            header.name,
+                            body.source.format.format_name(),
+                        ),
+                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    ));
+                    return Err(diags);
+                }
                 // A resolved source column type must be concrete: `numeric` is
                 // the inference-only Int|Float union and must resolve (via
                 // authoring-time inference) or be rejected before it reaches the

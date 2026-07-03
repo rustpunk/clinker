@@ -14,8 +14,8 @@
 //! - **CSV** with `has_header: false` — pure concat, no header semantics.
 //! - **NDJSON / JSON array / XML** — record-at-a-time with no per-file
 //!   framing visible to the wrapper; pure concatenation is safe.
-//! - **Fixed-width** — schema is loaded once from `format_schema`, files
-//!   are concatenated.
+//! - **Fixed-width** — the unified `schema:` is resolved once at compile
+//!   time, files are concatenated.
 //!
 //! Per-record source-file tagging: [`Self::current_file`] returns the
 //! `Arc<str>` for the file that produced the most-recently-emitted

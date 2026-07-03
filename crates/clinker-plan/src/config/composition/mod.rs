@@ -215,7 +215,7 @@ pub struct ParamDecl {
     pub param_type: ParamType,
     pub required: bool,
     /// Default value as a serde-json [`Value`](serde_json::Value), matching
-    /// the existing `FieldDef.default` convention.
+    /// the `Column.default` convention.
     pub default: Option<serde_json::Value>,
     /// Optional enum constraint (`enum: [a, b, c]`).
     pub enum_values: Option<Vec<serde_json::Value>>,

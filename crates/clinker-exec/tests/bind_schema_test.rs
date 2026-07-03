@@ -889,3 +889,166 @@ nodes:
         "parse error must mention `correlation_key`, got: {msg}"
     );
 }
+
+/// A `SourceSchema::Generated` EDIFACT source synthesizes its positional
+/// columns at compile time from the format's `max_elements` (default 32), so
+/// the bound source row carries `seg_id`/`msg_ref`/`msg_type`/`e01…e32` as
+/// concrete `string` columns — not the empty row the Phase-1 stub produced.
+/// This is what lets a downstream CXL expression reference `e01` as a concrete
+/// `string` instead of degrading it to `Any`.
+#[test]
+fn test_bind_schema_generated_edifact_synthesizes_positional_columns() {
+    let yaml = r#"
+pipeline:
+  name: gen-edifact
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: edifact
+      path: dummy.edi
+      schema: { generated: {} }
+  - type: output
+    name: out
+    input: interchange
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let (artifacts, config) = bind_yaml(yaml);
+    let row = typed_output_row(&config, &artifacts, "interchange")
+        .expect("generated edifact source must have a bound row");
+    for col in ["seg_id", "msg_ref", "msg_type", "e01", "e32"] {
+        assert!(row.has_field(col), "generated edifact row missing {col:?}");
+    }
+    // Default max_elements is 32, so e33 is past the range and absent.
+    assert!(
+        !row.has_field("e33"),
+        "e33 is past the default max_elements"
+    );
+    // The positional column binds as a concrete `string`, not `Any` — the
+    // whole point of synthesizing the schema at compile time.
+    assert!(
+        matches!(
+            row.lookup("e01"),
+            cxl::typecheck::ColumnLookup::Declared(cxl::typecheck::Type::String)
+        ),
+        "e01 must bind as a concrete String, got {:?}",
+        row.lookup("e01"),
+    );
+    assert_eq!(row.tail, cxl::typecheck::RowTail::Closed);
+}
+
+/// A `SourceSchema::Generated` HL7 source honors `max_fields` and applies the
+/// declared composite-field splits when synthesizing its compile-time columns,
+/// so the split-leaf columns (`f08_c1`/`f08_c2`) — not the verbatim `f08` —
+/// are what the bound row and the runtime reader schema both expose.
+#[test]
+fn test_bind_schema_generated_hl7_applies_field_splits() {
+    let yaml = r#"
+pipeline:
+  name: gen-hl7
+nodes:
+  - type: source
+    name: messages
+    config:
+      name: messages
+      type: hl7
+      path: dummy.hl7
+      options:
+        max_fields: 12
+        split_fields:
+          - { field: f08, components: 2 }
+      schema: { generated: {} }
+  - type: output
+    name: out
+    input: messages
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let (artifacts, config) = bind_yaml(yaml);
+    let row = typed_output_row(&config, &artifacts, "messages")
+        .expect("generated hl7 source must have a bound row");
+    assert!(row.has_field("f08_c1"), "split leaf f08_c1 must be present");
+    assert!(row.has_field("f08_c2"), "split leaf f08_c2 must be present");
+    assert!(
+        !row.has_field("f08"),
+        "split f08 is replaced by its component leaves"
+    );
+    assert!(row.has_field("f01"), "verbatim f01 must be present");
+    assert!(
+        row.has_field("f12"),
+        "verbatim f12 must be present (max_fields=12)"
+    );
+    assert!(!row.has_field("f13"), "f13 is past max_fields=12");
+}
+
+/// A `SourceSchema::Generated` SWIFT source binds the fixed `[block, tag,
+/// value]` column triple (SWIFT is record-per-line, not element-positional).
+#[test]
+fn test_bind_schema_generated_swift_binds_fixed_triple() {
+    let yaml = r#"
+pipeline:
+  name: gen-swift
+nodes:
+  - type: source
+    name: mt
+    config:
+      name: mt
+      type: swift
+      path: dummy.mt
+      schema: { generated: {} }
+  - type: output
+    name: out
+    input: mt
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let (artifacts, config) = bind_yaml(yaml);
+    let row = typed_output_row(&config, &artifacts, "mt")
+        .expect("generated swift source must have a bound row");
+    for col in ["block", "tag", "value"] {
+        assert!(row.has_field(col), "generated swift row missing {col:?}");
+    }
+}
+
+/// A `generated` schema is valid only for the EDI-family formats. Pairing it
+/// with a non-EDI format (here CSV) is rejected at compile with E159 rather
+/// than silently binding an empty schema.
+#[test]
+fn test_generated_schema_on_non_edi_format_is_rejected() {
+    let yaml = r#"
+pipeline:
+  name: gen-csv-bad
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: dummy.csv
+      schema: { generated: {} }
+  - type: output
+    name: out
+    input: rows
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config: PipelineConfig = clinker_plan::yaml::from_str(yaml).expect("fixture must parse");
+    let diags = config
+        .compile(&CompileContext::default())
+        .expect_err("generated schema on a csv source must fail to compile");
+    let rendered = format!("{diags:?}");
+    assert!(
+        rendered.contains("E159"),
+        "expected E159 for generated-on-non-EDI, got: {rendered}"
+    );
+}

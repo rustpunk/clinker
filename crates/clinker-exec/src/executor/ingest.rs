@@ -10,7 +10,6 @@ use clinker_format::ReopenableSource;
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::edifact::reader::{EdifactReader, EdifactReaderConfig};
 use clinker_format::fixed_width::reader::{FixedWidthReader, FixedWidthReaderConfig};
-use clinker_format::hl7::Hl7FieldSplit;
 use clinker_format::hl7::reader::{Hl7Reader, Hl7ReaderConfig};
 use clinker_format::json::reader::{
     ArrayPathMode, ArrayPathSpec, JsonMode, JsonReader, JsonReaderConfig,
@@ -235,10 +234,10 @@ fn wrap_with_schema_coercion(
     match columns {
         Some(columns) if !columns.is_empty() => {
             // Fixed-width format: the reader's schema is constructed
-            // positionally from the user-declared `FieldDef` list,
-            // so the reader cannot ever produce an "undeclared
-            // field" — every byte that isn't covered by a FieldDef
-            // is structurally invisible. `auto_widen`'s sidecar
+            // positionally from the user-declared column list, so the
+            // reader cannot ever produce an "undeclared field" — every
+            // byte that isn't covered by a declared column is
+            // structurally invisible. `auto_widen`'s sidecar
             // therefore stays Null forever for fixed-width sources.
             // Surface the inertness once per source at compile time
             // so a user who set `auto_widen` (the engine-wide
@@ -989,14 +988,6 @@ fn apply_envelope_events(
     Ok(())
 }
 
-/// Load the format-layer [`SchemaDefinition`] a source declares under
-/// `format_schema`, resolving the inline or file-path form.
-///
-/// Used by the CSV and fixed-width arms: a definition carrying `records:` /
-/// `discriminator:` routes to the multi-record reader, while a `fields:`
-/// definition stays single-record. Returns a config validation error when the
-/// source declares no `format_schema` (the formats that need one — fixed-width
-/// always, multi-record CSV — both require it).
 /// Build a multi-record flat-file reader (CSV or fixed-width) from a
 /// [`SourceSchema::MultiRecord`] schema.
 ///
@@ -1330,23 +1321,11 @@ fn build_hl7_reader_config(
         if let Some(max) = opts.max_fields {
             config.max_fields = max;
         }
-        if let Some(splits) = &opts.split_fields {
-            // Config validation already rejected an unparseable `field` name,
-            // a position past `max_fields`, and a zero axis width, so a field
-            // that fails to parse here is dropped defensively rather than
-            // surfaced — the split simply contributes no columns.
-            config.split_fields = splits
-                .iter()
-                .filter_map(|s| {
-                    s.field_position().map(|field_index| Hl7FieldSplit {
-                        field_index,
-                        repetitions: s.repetitions,
-                        components: s.components,
-                        subcomponents: s.subcomponents,
-                    })
-                })
-                .collect();
-        }
+        // `resolved_splits` parses each `fNN` field name to its wire position
+        // and drops an unparseable one defensively (config validation already
+        // surfaced it with a span). Shared with the compile-time Generated-HL7
+        // bind so the reader and the typechecked row agree on split-leaf columns.
+        config.split_fields = opts.resolved_splits();
     }
     config
 }

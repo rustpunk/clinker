@@ -26,7 +26,9 @@ use crate::edifact::tokenizer::{ParsedSegment, SegmentTokenizer, split_segment};
 use crate::edifact::{RAW_ELEMENTS_KEY, unz_echo_matches_unb};
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
 use crate::error::FormatError;
+use crate::schema::Column;
 use crate::traits::FormatReader;
+use cxl::typecheck::Type;
 
 /// Default ceiling on the number of positional element columns the
 /// record schema exposes. A segment carrying more data elements than
@@ -436,17 +438,34 @@ impl<R: Read + Send> FormatReader for EdifactReader<R> {
     }
 }
 
-/// Build the static positional schema `[seg_id, msg_ref, msg_type,
-/// e01..e<max>]`. All columns are string-typed; element text is stored
-/// verbatim so the round-trip is lossless.
-fn build_schema(max_elements: usize) -> Arc<Schema> {
-    let mut columns: Vec<Box<str>> = Vec::with_capacity(3 + max_elements);
-    columns.push(Box::from("seg_id"));
-    columns.push(Box::from("msg_ref"));
-    columns.push(Box::from("msg_type"));
+/// The engine-synthesized positional columns for an EDIFACT `Generated`
+/// source: `[seg_id, msg_ref, msg_type, e01..e<max_elements>]`, every column
+/// `string`-typed. Single source of truth for the EDIFACT positional schema —
+/// the runtime reader's [`build_schema`] derives its column names from this
+/// list, and the planner seeds the compile-time bind of a
+/// [`SourceSchema::Generated`](crate::SourceSchema) EDIFACT source from the
+/// same list, so the runtime schema and the typechecked row never disagree on
+/// which columns a segment produces.
+pub fn generated_columns(max_elements: usize) -> Vec<Column> {
+    let mut columns = Vec::with_capacity(3 + max_elements);
+    columns.push(Column::bare("seg_id", Type::String));
+    columns.push(Column::bare("msg_ref", Type::String));
+    columns.push(Column::bare("msg_type", Type::String));
     for i in 0..max_elements {
-        columns.push(positional_key(i).into_boxed_str());
+        columns.push(Column::bare(positional_key(i), Type::String));
     }
+    columns
+}
+
+/// Build the static positional schema `[seg_id, msg_ref, msg_type,
+/// e01..e<max>]`. Column names come from [`generated_columns`] so element text
+/// is stored verbatim (lossless round-trip) and the reader schema stays in
+/// lockstep with the planner's Generated-source bind.
+fn build_schema(max_elements: usize) -> Arc<Schema> {
+    let columns = generated_columns(max_elements)
+        .into_iter()
+        .map(|c| c.name.into_boxed_str())
+        .collect();
     Arc::new(Schema::new(columns))
 }
 
