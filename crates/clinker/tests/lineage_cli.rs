@@ -259,3 +259,209 @@ fn base_dir_anchors_dataset_names_at_the_pipeline_directory() {
         "dataset name must include the pipeline subdir, got: {name}"
     );
 }
+
+// --- Live run-lifecycle emission (`--lineage-events`) ---------------------------
+//
+// Unlike `--lineage` (a static, plan-only export that exits without reading data),
+// `--lineage-events` rides an actual run: it emits a START before the run and a
+// terminal COMPLETE / FAIL / ABORT after, carrying real timing and row counts. The
+// event *assembly* is unit-tested in `clinker-lineage`; these tests pin the CLI
+// wiring against a real execution.
+
+/// Write a `source -> transform -> output` pipeline plus a three-row input CSV
+/// into `dir`, and return the pipeline path. When `memory_limit` is `Some`, it is
+/// injected as `pipeline.memory.limit`; a value whose binary-suffix scaling
+/// overflows `u64` makes the executor reject the run at its startup gate — a
+/// deterministic fatal error raised after the run has begun.
+fn write_runnable_pipeline(dir: &Path, memory_limit: Option<&str>) -> PathBuf {
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&data_dir).expect("mkdir data");
+    std::fs::write(
+        data_dir.join("in.csv"),
+        "id,amount\nid0,10\nid1,20\nid2,30\n",
+    )
+    .expect("write input csv");
+
+    let memory_block = match memory_limit {
+        Some(limit) => format!("  memory:\n    limit: \"{limit}\"\n"),
+        None => String::new(),
+    };
+    let yaml = format!(
+        r#"pipeline:
+  name: live_lineage_fixture
+{memory_block}nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: ./data/in.csv
+      options: {{ has_header: true }}
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: amount, type: int }}
+  - type: transform
+    name: xf
+    input: src
+    config:
+      cxl: "emit doubled = amount * 2"
+  - type: output
+    name: out
+    input: xf
+    config:
+      name: out
+      type: csv
+      path: ./out.csv
+      include_unmapped: true
+error_handling:
+  strategy: fail_fast
+"#
+    );
+    let path = dir.join("pipeline.yaml");
+    std::fs::write(&path, yaml).expect("write pipeline");
+    path
+}
+
+/// Run `clinker run pipeline.yaml --lineage-events events.ndjson` with the working
+/// directory set to the pipeline's tempdir — so the input, the primary output, and
+/// the events file all resolve inside it and no artifact leaks into the crate tree.
+/// Returns the parsed NDJSON events plus whether the process exited successfully.
+fn run_lineage_events(pipeline: &Path) -> (bool, Vec<serde_json::Value>) {
+    let dir = pipeline.parent().expect("pipeline has a parent dir");
+    let status = Command::new(clinker_bin())
+        .arg("run")
+        .arg("pipeline.yaml")
+        .args(["--lineage-events", "events.ndjson"])
+        .current_dir(dir)
+        .status()
+        .expect("spawn clinker");
+    let contents =
+        std::fs::read_to_string(dir.join("events.ndjson")).expect("read lineage-events file");
+    let events: Vec<serde_json::Value> = contents
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).expect("event line is JSON"))
+        .collect();
+    (status.success(), events)
+}
+
+#[test]
+fn lineage_events_successful_run_emits_start_then_complete() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pipeline = write_runnable_pipeline(dir.path(), None);
+    let (success, events) = run_lineage_events(&pipeline);
+    assert!(success, "a valid run must exit cleanly");
+
+    assert_eq!(
+        events.len(),
+        2,
+        "a successful run emits exactly START then COMPLETE, got:\n{events:#?}"
+    );
+    let (start, complete) = (&events[0], &events[1]);
+    assert_eq!(start["eventType"], "START");
+    assert_eq!(complete["eventType"], "COMPLETE");
+
+    // Same runId across the pair, and it is the run's execution_id (a UUID).
+    let run_id = start["run"]["runId"].as_str().expect("runId string");
+    assert_eq!(
+        complete["run"]["runId"].as_str(),
+        Some(run_id),
+        "START and COMPLETE must share one runId"
+    );
+    uuid::Uuid::parse_str(run_id).expect("runId is a UUID (the execution_id)");
+
+    // Live events carry distinct begin/end timestamps (not one shared clock like
+    // the static export).
+    let t_start = start["eventTime"].as_str().expect("START eventTime");
+    let t_complete = complete["eventTime"].as_str().expect("COMPLETE eventTime");
+    assert!(t_start.ends_with('Z') && t_complete.ends_with('Z'));
+
+    // The column-lineage facet rides on the COMPLETE output.
+    let facet = &complete["outputs"][0]["facets"]["columnLineage"];
+    assert!(
+        facet.is_object(),
+        "COMPLETE output must carry the columnLineage facet, got:\n{complete:#?}"
+    );
+    // `doubled = amount * 2` is DIRECT lineage from the source `amount` column.
+    let doubled = &facet["fields"]["doubled"]["inputFields"][0];
+    assert_eq!(doubled["field"], "amount");
+    assert_eq!(doubled["transformations"][0]["type"], "DIRECT");
+
+    // Real, non-zero row counts ride the clinker run-stats facet.
+    let stats = &complete["run"]["facets"]["clinker_runStats"];
+    assert_eq!(stats["recordsRead"], 3, "three input rows were read");
+    assert_eq!(stats["recordsWritten"], 3, "three rows were written");
+    assert_eq!(stats["recordsDlq"], 0);
+    assert!(
+        stats["durationMs"].as_i64().expect("durationMs") >= 0,
+        "durationMs is a real elapsed measurement"
+    );
+    // A clean run has no error facet.
+    assert!(complete["run"]["facets"].get("errorMessage").is_none());
+}
+
+#[test]
+fn lineage_events_failing_run_emits_start_then_fail() {
+    // An overflowing `memory.limit` is rejected at the executor's startup gate,
+    // which runs *inside* the executor call — after the emitter has written the
+    // START to the sink. The executor returns an error, which closes the run out
+    // as FAIL. `17179869184G` = 2^34 GiB = 2^64 bytes, one past `u64::MAX`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pipeline = write_runnable_pipeline(dir.path(), Some("17179869184G"));
+    let (success, events) = run_lineage_events(&pipeline);
+    assert!(!success, "an overflowing memory.limit must exit non-zero");
+
+    assert_eq!(
+        events.len(),
+        2,
+        "a failing run emits exactly START then FAIL, got:\n{events:#?}"
+    );
+    let (start, fail) = (&events[0], &events[1]);
+    assert_eq!(start["eventType"], "START");
+    assert_eq!(fail["eventType"], "FAIL");
+    assert_eq!(
+        start["run"]["runId"].as_str(),
+        fail["run"]["runId"].as_str(),
+        "START and FAIL must share one runId"
+    );
+
+    // FAIL carries the error message in the standard error facet.
+    let message = fail["run"]["facets"]["errorMessage"]["message"]
+        .as_str()
+        .expect("FAIL carries an errorMessage facet");
+    assert!(
+        !message.is_empty(),
+        "the FAIL error message must be populated"
+    );
+    assert_eq!(
+        fail["run"]["facets"]["errorMessage"]["programmingLanguage"],
+        "rust"
+    );
+    // A failed run did not fully produce its output, so no column-lineage facet.
+    assert!(
+        fail["outputs"][0]["facets"].is_null() || fail["outputs"][0].get("facets").is_none(),
+        "FAIL output must not carry a columnLineage facet, got:\n{fail:#?}"
+    );
+}
+
+#[test]
+fn lineage_events_conflicts_with_lineage() {
+    // --lineage exits before running; --lineage-events requires an actual run.
+    // Combining them would silently drop one, so clap must reject the pair.
+    let pipeline = repo_root().join("examples/pipelines/audit_join.yaml");
+    let output = Command::new(clinker_bin())
+        .args(["run"])
+        .arg(&pipeline)
+        .args(["--lineage", "-", "--lineage-events", "-"])
+        .output()
+        .expect("spawn clinker");
+    assert!(
+        !output.status.success(),
+        "--lineage + --lineage-events must be rejected"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot be used with"),
+        "expected a clap conflict error, got:\n{stderr}"
+    );
+}

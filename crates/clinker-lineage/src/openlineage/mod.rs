@@ -7,10 +7,10 @@ mod event;
 mod facet;
 mod ndjson;
 
-pub use event::{Dataset, DatasetFacets, EventType, Job, JobFacets, Run, RunEvent};
+pub use event::{Dataset, DatasetFacets, EventType, Job, JobFacets, Run, RunEvent, RunFacets};
 pub use facet::{
-    ColumnLineageDatasetFacet, FieldLineage, InputField, PipelineJobFacet, Transformation,
-    TransformationSubtype, TransformationType,
+    ColumnLineageDatasetFacet, ErrorMessageRunFacet, FieldLineage, InputField, PipelineJobFacet,
+    RunStatsFacet, Transformation, TransformationSubtype, TransformationType,
 };
 pub use ndjson::write_ndjson;
 
@@ -32,3 +32,16 @@ pub const JOB_NAMESPACE: &str = "clinker";
 /// at the clinker producer rather than `openlineage.io`.
 pub const CLINKER_PIPELINE_FACET_SCHEMA_URL: &str =
     "https://github.com/rustpunk/clinker/spec/facets/PipelineJobFacet.json";
+
+/// Schema URL for the standard OpenLineage error-message run facet (the
+/// facet-level `_schemaURL`). Pinned to `ErrorMessageRunFacet` `1-0-0`; carried on
+/// a `FAIL` run event to convey the failure message.
+pub const ERROR_MESSAGE_FACET_SCHEMA_URL: &str =
+    "https://openlineage.io/spec/facets/1-0-0/ErrorMessageRunFacet.json";
+
+/// Schema URL for the clinker-specific run-statistics run facet (the facet-level
+/// `_schemaURL`). OpenLineage has no standard run-level record-count facet, so —
+/// like [`CLINKER_PIPELINE_FACET_SCHEMA_URL`] — this points at the clinker
+/// producer rather than `openlineage.io`.
+pub const CLINKER_RUN_STATS_FACET_SCHEMA_URL: &str =
+    "https://github.com/rustpunk/clinker/spec/facets/RunStatsFacet.json";
