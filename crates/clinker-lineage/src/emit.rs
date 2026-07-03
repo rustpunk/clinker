@@ -275,8 +275,13 @@ impl<W: Write> LiveRunEmitter<W> {
             outcome,
             stats,
         );
-        write_ndjson(std::slice::from_ref(&event), &mut self.writer)?;
+        // Record the caller's terminal decision *before* attempting the write. A
+        // partial/failed write must never let Drop append a second, contradictory
+        // terminal (a spurious `FAIL` after a real `COMPLETE`) — once the caller
+        // has chosen the terminal state, the run is closed out regardless of a
+        // sink hiccup, and the write error is surfaced for the caller to log.
         self.terminal_emitted = true;
+        write_ndjson(std::slice::from_ref(&event), &mut self.writer)?;
         Ok(())
     }
 }
@@ -593,6 +598,55 @@ mod tests {
         assert_eq!(
             events[1]["run"]["facets"]["errorMessage"]["message"],
             "boom"
+        );
+    }
+
+    /// A writer that succeeds for the first `fail_at - 1` writes, then errors on
+    /// every write from the `fail_at`-th onward. Lets a test make the START write
+    /// succeed but the terminal write fail.
+    struct FailOnNthWrite {
+        fail_at: usize,
+        count: usize,
+    }
+
+    impl Write for FailOnNthWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.count += 1;
+            if self.count >= self.fail_at {
+                Err(io::Error::other("sink failed"))
+            } else {
+                Ok(buf.len())
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_terminal_write_is_not_retried_as_fail_by_drop() {
+        // Regression guard: a terminal write that errors must still mark the run
+        // closed, so Drop does not append a second, contradictory terminal (a
+        // spurious FAIL after a real COMPLETE). START succeeds (write #1); the
+        // COMPLETE write fails (write #2).
+        let mut emitter = LiveRunEmitter::new(
+            FailOnNthWrite {
+                fail_at: 2,
+                count: 0,
+            },
+            sample_lineage(),
+            sample_job(),
+            "run-1",
+            "2020-02-22T22:42:42Z",
+        );
+        emitter.emit_start().expect("START write succeeds");
+        let err = emitter.emit_terminal("2020-02-22T22:43:00Z", Terminal::Complete, stats());
+        assert!(err.is_err(), "the terminal write must surface its error");
+        // The terminal decision is recorded despite the write error, so the Drop
+        // safety net will not fire a second FAIL for this run.
+        assert!(
+            emitter.terminal_emitted,
+            "a recorded terminal must not be retried by Drop"
         );
     }
 }

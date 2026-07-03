@@ -65,6 +65,8 @@ clinker run pipeline.yaml --lineage-events events.ndjson
 
 Unlike `--lineage` (which exits before reading data), this processes data, so it cannot be combined with `--lineage`, `--explain`, `--dry-run`, or `-n`.
 
+> **Prefer a file path for a clean stream.** With `-` (stdout), the run's own stdout output — for example the per-stage spill-volume summary — interleaves with the event lines, so stdout is not pure NDJSON. Writing to a file keeps the events unmixed.
+
 A run emits a `START` when it begins, then exactly one terminal event when it ends:
 
 - **`START`** -- written and flushed **before** the run body executes, so a crash mid-run still leaves an observable open run. It carries the input and output datasets by identity (no facets yet).

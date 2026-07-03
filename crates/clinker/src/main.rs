@@ -348,7 +348,9 @@ pub struct RunArgs {
     /// counts) as NDJSON to a file path, or `-` for stdout. Unlike --lineage
     /// (a static plan-only export that exits without reading data), this
     /// processes data, so it cannot be combined with --lineage, --explain,
-    /// --dry-run, or -n.
+    /// --dry-run, or -n. Prefer a file path for a clean NDJSON stream: with `-`,
+    /// the run's own stdout output (e.g. the spill-volume summary) interleaves
+    /// with the events.
     #[arg(
         long = "lineage-events",
         value_name = "PATH",
