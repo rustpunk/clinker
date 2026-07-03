@@ -196,13 +196,16 @@ impl OverlayResolution {
         let mut eff = EffectiveConfig::default();
         for applied in &self.applied_groups {
             eff.apply(&applied.group.config, applied.layer, false);
+            eff.apply(&applied.group.fixed, applied.layer, true);
         }
         if let Some(ctx) = &self.channel {
             if let Some(manifest) = &ctx.manifest {
                 eff.apply(&manifest.config, LayerKind::ChannelWide, false);
+                eff.apply(&manifest.fixed, LayerKind::ChannelWide, true);
             }
             if let Some(overlay) = &ctx.per_target {
                 eff.apply(&overlay.overlay.config, LayerKind::ChannelPerTarget, false);
+                eff.apply(&overlay.overlay.fixed, LayerKind::ChannelPerTarget, true);
             }
         }
         eff.into_overrides()
@@ -244,6 +247,7 @@ impl OverlayResolution {
                 clobber_config(
                     plan,
                     &manifest.config,
+                    &manifest.fixed,
                     LayerKind::ChannelWide,
                     &ctx.id,
                     &mut result,
@@ -255,6 +259,7 @@ impl OverlayResolution {
                 clobber_config(
                     plan,
                     &overlay.overlay.config,
+                    &overlay.overlay.fixed,
                     LayerKind::ChannelPerTarget,
                     &ctx.id,
                     &mut result,
@@ -271,13 +276,32 @@ impl OverlayResolution {
     }
 }
 
-/// Clobber one raw `config` map (string keys validated into dotted paths) onto
-/// a plan's provenance at `layer`. A malformed key is a hard error surfaced as
-/// a diagnostic; an unknown-but-well-formed key is `E113` from the clobber.
+/// Clobber a channel layer's value-clobber surface — the non-fixed `config` map
+/// and the locked `fixed` map — onto a plan's provenance at `layer`. `config`
+/// applies non-fixed (a higher layer may override it); `fixed` applies with the
+/// layer `fixed` lock set so it holds against every higher-precedence layer. A
+/// key present in both is clobbered `fixed`-last and thus wins within the layer.
 fn clobber_config(
     plan: &mut CompiledPlan,
     config: &indexmap::IndexMap<String, serde_json::Value>,
+    fixed: &indexmap::IndexMap<String, serde_json::Value>,
     layer: LayerKind,
+    source_label: &str,
+    result: &mut ChannelOverlayResult,
+) {
+    clobber_config_map(plan, config, layer, false, source_label, result);
+    clobber_config_map(plan, fixed, layer, true, source_label, result);
+}
+
+/// Clobber one raw config map (string keys validated into dotted paths) onto a
+/// plan's provenance at `layer`, with the layer `fixed` lock set per `fixed`. A
+/// malformed key is a hard error surfaced as a diagnostic; an
+/// unknown-but-well-formed key is `E113` from the clobber.
+fn clobber_config_map(
+    plan: &mut CompiledPlan,
+    config: &indexmap::IndexMap<String, serde_json::Value>,
+    layer: LayerKind,
+    fixed: bool,
     source_label: &str,
     result: &mut ChannelOverlayResult,
 ) {
@@ -286,7 +310,7 @@ fn clobber_config(
             plan.provenance_mut(),
             &validated,
             layer,
-            false,
+            fixed,
             source_label,
             &mut result.diagnostics,
         ),

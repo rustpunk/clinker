@@ -19,7 +19,6 @@
 //! | `E102`      | error    | Composition body references undeclared port          |
 //! | `E103`      | error    | Call site or channel binds undeclared input/config/resource |
 //! | `E104`      | error    | Call site or channel missing required input/config   |
-//! | `E105`      | error    | Channel binding references undeclared config key     |
 //! | `E106`      | error    | Name collision after composition expansion           |
 //! | `E107`      | error    | Cycle detected in flat post-expansion graph          |
 //! | `E108`      | error    | Composition body references enclosing scope (IsolatedFromAbove) |
@@ -304,8 +303,7 @@ mod diagnostic_tests {
     fn test_error_registry_e101_through_e108_documented() {
         let source = include_str!("diagnostic.rs");
         for code in [
-            "E101", "E102", "E103", "E104", "E105", "E106", "E107", "E108", "E109", "E111", "E112",
-            "E113",
+            "E101", "E102", "E103", "E104", "E106", "E107", "E108", "E109", "E111", "E112", "E113",
         ] {
             let pattern = format!("`{code}`");
             assert!(

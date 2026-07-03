@@ -254,9 +254,13 @@ fn evaluate_group(
 /// plan parameter is reported as an `E113` diagnostic by the clobber, exactly as
 /// for a channel layer.
 ///
-/// Group `config:` has no `fixed`/`default` split (only the per-target overlay
-/// does), so every group value applies non-fixed. This is the single apply used
-/// by both the derived path and the standalone `--group` path.
+/// A group carries both a non-fixed `config:` map and a `fixed:` map: the
+/// former applies non-fixed (a higher layer may override it), the latter with
+/// the layer `fixed` lock set so it holds against every higher-precedence layer
+/// (other groups, channel-wide, per-target). Both share the `alias.param`
+/// grammar; a key present in both applies `fixed` (it is clobbered last within
+/// the layer). This is the single apply used by both the derived path and the
+/// standalone `--group` path.
 pub fn apply_group_config(
     provenance: &mut ProvenanceDb,
     group: &Group,
@@ -272,6 +276,8 @@ pub fn apply_group_config(
         &group.name,
         diagnostics,
     );
+    let fixed = validate_group_config_keys(&group.fixed)?;
+    crate::overlay::apply_config_clobber(provenance, &fixed, layer, true, &group.name, diagnostics);
     Ok(())
 }
 
@@ -316,6 +322,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), v.clone()))
                 .collect(),
+            fixed: IndexMap::new(),
             vars: Default::default(),
             overrides: Vec::new(),
         }

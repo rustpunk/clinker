@@ -38,6 +38,7 @@ use crate::error::ChannelError;
 ///   name: globex
 /// labels: { region: west, tier: enterprise }
 /// config: { fraud_check.threshold: 0.9 }
+/// fixed:  { fraud_check.mode: strict }   # locked against the per-target layer
 /// vars:
 ///   static: { currency: { type: string, default: "USD" } }
 /// ```
@@ -53,9 +54,17 @@ pub struct ChannelManifest {
     pub labels: IndexMap<String, serde_json::Value>,
     /// Channel-wide config clobber values, keyed by `alias.param` dotted
     /// path. Keys stay raw strings here; dotted-path validation is a later
-    /// stage's concern.
+    /// stage's concern. Applied non-fixed, so a higher-precedence layer may
+    /// still override them.
     #[serde(default)]
     pub config: IndexMap<String, serde_json::Value>,
+    /// Channel-wide **fixed** (locked) config values, same `alias.param`
+    /// dotted-path grammar as [`Self::config`]. Applied with the layer `fixed`
+    /// lock set: a fixed value at this `ChannelWide` layer cannot be overridden
+    /// by any higher-precedence layer (the per-target overlay). For a key
+    /// present in both maps, the `fixed` entry wins within the layer.
+    #[serde(default)]
+    pub fixed: IndexMap<String, serde_json::Value>,
     /// Channel-wide var overlays, using the same four scopes a pipeline's
     /// `vars:` block uses.
     #[serde(default)]
@@ -94,8 +103,15 @@ pub struct OverlayFile {
     /// The overlay header — carries the authoritative `target`.
     pub channel: OverlayHeader,
     /// Per-target config clobber values, keyed by `alias.param` dotted path.
+    /// Applied non-fixed at the highest `ChannelPerTarget` layer.
     #[serde(default)]
     pub config: IndexMap<String, serde_json::Value>,
+    /// Per-target **fixed** (locked) config values, same `alias.param`
+    /// dotted-path grammar as [`Self::config`]. Applied with the layer `fixed`
+    /// lock set at the `ChannelPerTarget` layer. For a key present in both
+    /// maps, the `fixed` entry wins within the layer.
+    #[serde(default)]
+    pub fixed: IndexMap<String, serde_json::Value>,
     /// Per-target var overlays, using the same four scopes a pipeline's
     /// `vars:` block uses.
     #[serde(default)]

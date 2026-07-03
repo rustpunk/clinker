@@ -99,7 +99,7 @@ Update these when changing related behavior:
 - `docs/user/src/pipelines/variables.md`
 - `docs/user/src/ops/storage.md`
 - `docs/engine/src/storage-internals.md`
-- `docs/explain/E105.md`, `docs/explain/E335.md`, `docs/explain/E336.md`, `docs/explain/E337.md`
+- `docs/explain/E335.md`, `docs/explain/E336.md`, `docs/explain/E337.md`
 - `examples/pipelines/channels/*/*.channel.yaml` and nearby pipeline examples
 - `docs/ai/20_CRATE_MAP.md`, `docs/ai/30_DESIGN_RULES.md`, `docs/ai/40_COMMON_PATTERNS.md`, `docs/ai/80_OPEN_QUESTIONS.md`
 
