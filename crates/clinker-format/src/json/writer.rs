@@ -109,26 +109,32 @@ impl<W: Write> JsonWriter<W> {
     /// `preserve_nulls: false` omits keys with Null values. Engine-stamped
     /// columns are stripped from the default output; callers opt in via
     /// `include_engine_stamped`.
-    fn record_to_json(&self, record: &Record) -> serde_json::Value {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::Json`] when a field holds a non-finite float
+    /// (NaN or an infinity), which JSON cannot represent.
+    fn record_to_json(&self, record: &Record) -> Result<serde_json::Value, FormatError> {
         use serde_json::{Map, Value as Jv};
 
         let mut obj = Map::with_capacity(record.field_count());
-        let emit = |obj: &mut Map<String, Jv>, col: &str, val: &Value| {
+        let emit = |obj: &mut Map<String, Jv>, col: &str, val: &Value| -> Result<(), FormatError> {
             if !self.config.preserve_nulls && val.is_null() {
-                return;
+                return Ok(());
             }
-            obj.insert(col.to_string(), clinker_to_json(val));
+            obj.insert(col.to_string(), clinker_to_json(val)?);
+            Ok(())
         };
         if self.config.include_engine_stamped {
             for (col, val) in record.iter_all_fields() {
-                emit(&mut obj, col, val);
+                emit(&mut obj, col, val)?;
             }
         } else {
             for (col, val) in record.iter_user_fields() {
-                emit(&mut obj, col, val);
+                emit(&mut obj, col, val)?;
             }
         }
-        Jv::Object(obj)
+        Ok(Jv::Object(obj))
     }
 
     /// Serialize a JSON value with the configured pretty/compact mode.
@@ -146,19 +152,24 @@ impl<W: Write> JsonWriter<W> {
     /// optional trailing computed-count entry. `null` is always emitted for a
     /// section (envelope sections are small typed metadata, not body records),
     /// so the round-trip stays faithful regardless of `preserve_nulls`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::Json`] when a section field holds a non-finite
+    /// float (NaN or an infinity), which JSON cannot represent.
     fn section_object(
         fields: &indexmap::IndexMap<Box<str>, Value>,
         count: Option<(&str, i64)>,
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value, FormatError> {
         use serde_json::{Map, Value as Jv};
         let mut obj = Map::new();
         for (name, value) in fields {
-            obj.insert(name.to_string(), clinker_to_json(value));
+            obj.insert(name.to_string(), clinker_to_json(value)?);
         }
         if let Some((field, n)) = count {
             obj.insert(field.to_string(), Jv::Number(n.into()));
         }
-        Jv::Object(obj)
+        Ok(Jv::Object(obj))
     }
 
     /// Append one body record to the currently-open document object's `body`
@@ -175,7 +186,7 @@ impl<W: Write> JsonWriter<W> {
     /// depth safety net: it raises a clean error rather than writing record
     /// bytes outside any `{...,"body":[` object (which would be malformed JSON).
     fn write_enveloped_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        let json_val = self.record_to_json(record);
+        let json_val = self.record_to_json(record)?;
         let serialized = self.serialize_value(&json_val)?;
         let env = self
             .envelope
@@ -209,7 +220,7 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
             return self.write_enveloped_record(record);
         }
 
-        let json_val = self.record_to_json(record);
+        let json_val = self.record_to_json(record)?;
         let serialized = self.serialize_value(&json_val)?;
 
         match self.config.format {
@@ -276,7 +287,8 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
         let header = env
             .framer
             .header_fields(doc)
-            .map(|fields| Self::section_object(fields, None));
+            .map(|fields| Self::section_object(fields, None))
+            .transpose()?;
         let any_doc_written = env.any_doc_written;
         // Outer framing between document objects: `[\n` / `,\n` (array) or a
         // newline separator (ndjson).
@@ -332,6 +344,7 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
             env.framer
                 .footer_fields(doc)
                 .map(|fields| Self::section_object(fields, env.framer.footer_count()))
+                .transpose()?
         };
         if let Some(footer) = footer {
             let s = self.serialize_value(&footer)?;
@@ -352,15 +365,27 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
     }
 }
 
-fn clinker_to_json(val: &Value) -> serde_json::Value {
+/// Converts a clinker [`Value`] to a `serde_json::Value`.
+///
+/// # Errors
+///
+/// Returns [`FormatError::Json`] for a non-finite float (NaN or an infinity):
+/// JSON numbers cannot represent them, and mapping to `null` would be
+/// indistinguishable from a source null on read-back.
+fn clinker_to_json(val: &Value) -> Result<serde_json::Value, FormatError> {
     use serde_json::Value as Jv;
-    match val {
+    Ok(match val {
         Value::Null => Jv::Null,
         Value::Bool(b) => Jv::Bool(*b),
         Value::Integer(i) => Jv::Number((*i).into()),
         Value::Float(f) => serde_json::Number::from_f64(*f)
             .map(Jv::Number)
-            .unwrap_or(Jv::Null),
+            .ok_or_else(|| {
+                FormatError::Json(format!(
+                    "non-finite float {f} has no JSON representation; \
+                     filter or replace the value before the JSON output"
+                ))
+            })?,
         // JSON has no exact-decimal type, and a JSON number would collapse the
         // scale (2.50 -> 2.5) and risk binary-float reinterpretation by
         // consumers. Emit the scale-preserving string form to keep the value
@@ -369,15 +394,15 @@ fn clinker_to_json(val: &Value) -> serde_json::Value {
         Value::String(s) => Jv::String(s.to_string()),
         Value::Date(d) => Jv::String(d.to_string()),
         Value::DateTime(dt) => Jv::String(dt.to_string()),
-        Value::Array(arr) => Jv::Array(arr.iter().map(clinker_to_json).collect()),
+        Value::Array(arr) => Jv::Array(arr.iter().map(clinker_to_json).collect::<Result<_, _>>()?),
         Value::Map(m) => {
             let obj = m
                 .iter()
-                .map(|(k, v)| (k.to_string(), clinker_to_json(v)))
-                .collect();
+                .map(|(k, v)| Ok((k.to_string(), clinker_to_json(v)?)))
+                .collect::<Result<_, FormatError>>()?;
             Jv::Object(obj)
         }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -567,6 +592,69 @@ mod tests {
         assert_eq!(r2.get("age"), Some(&Value::Integer(25)));
     }
 
+    #[test]
+    fn test_json_write_finite_float_roundtrips_exactly() {
+        let schema = Arc::new(Schema::new(vec!["reading".into()]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::Float(2.5)]);
+        let config = JsonWriterConfig {
+            format: JsonOutputMode::Ndjson,
+            ..Default::default()
+        };
+        let output = write_records(config, &[record], &schema);
+        let parsed: serde_json::Value = serde_json::from_str(output.trim()).unwrap();
+        assert_eq!(parsed["reading"], serde_json::json!(2.5));
+    }
+
+    #[test]
+    fn test_json_write_rejects_non_finite_floats() {
+        let schema = Arc::new(Schema::new(vec!["reading".into()]));
+        for (val, rendered) in [
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+        ] {
+            let record = Record::new(Arc::clone(&schema), vec![Value::Float(val)]);
+            let mut buf = Vec::new();
+            let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), JsonWriterConfig::default());
+            let err = w.write_record(&record).unwrap_err();
+            match err {
+                FormatError::Json(msg) => assert!(
+                    msg.contains(&format!("non-finite float {rendered}")),
+                    "expected the non-finite message for {rendered}, got: {msg}"
+                ),
+                other => panic!("expected FormatError::Json for {rendered}, got {other:?}"),
+            }
+            drop(w);
+            assert!(
+                buf.is_empty(),
+                "no partial bytes for a rejected record, got: {:?}",
+                String::from_utf8_lossy(&buf)
+            );
+        }
+    }
+
+    #[test]
+    fn test_json_write_rejects_non_finite_float_nested_in_array() {
+        let schema = Arc::new(Schema::new(vec!["readings".into()]));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::Array(vec![
+                Value::Float(1.0),
+                Value::Float(f64::INFINITY),
+            ])],
+        );
+        let mut buf = Vec::new();
+        let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), JsonWriterConfig::default());
+        let err = w.write_record(&record).unwrap_err();
+        match err {
+            FormatError::Json(msg) => assert!(
+                msg.contains("non-finite float inf"),
+                "expected the non-finite message, got: {msg}"
+            ),
+            other => panic!("expected FormatError::Json, got {other:?}"),
+        }
+    }
+
     use crate::envelope_writer::test_doc_with_sections as doc_with_sections;
 
     fn amount_record(schema: &Arc<Schema>, n: i64) -> Record {
@@ -681,6 +769,56 @@ mod tests {
         let d0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(d0["header"]["batch_id"], "A");
         assert_eq!(d0["body"], serde_json::json!([{"amount":10}]));
+    }
+
+    #[test]
+    fn json_envelope_rejects_non_finite_float_in_section() {
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let config = JsonWriterConfig {
+            format: JsonOutputMode::Array,
+            envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let doc = doc_with_sections(&[("Head", &[("ratio", Value::Float(f64::NAN))])]);
+        let mut buf = Vec::new();
+        let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), config);
+        let err = w.begin_document(&doc).unwrap_err();
+        match err {
+            FormatError::Json(msg) => assert!(
+                msg.contains("non-finite float NaN"),
+                "expected the non-finite message, got: {msg}"
+            ),
+            other => panic!("expected FormatError::Json, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_envelope_rejects_non_finite_float_in_body_record() {
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let config = JsonWriterConfig {
+            format: JsonOutputMode::Array,
+            envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let doc = doc_with_sections(&[("Head", &[("batch_id", Value::String("A".into()))])]);
+        let mut buf = Vec::new();
+        let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), config);
+        w.begin_document(&doc).unwrap();
+        let record = Record::new(Arc::clone(&schema), vec![Value::Float(f64::NEG_INFINITY)]);
+        let err = w.write_record(&record).unwrap_err();
+        match err {
+            FormatError::Json(msg) => assert!(
+                msg.contains("non-finite float -inf"),
+                "expected the non-finite message, got: {msg}"
+            ),
+            other => panic!("expected FormatError::Json, got {other:?}"),
+        }
     }
 
     #[test]
