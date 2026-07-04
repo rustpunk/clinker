@@ -342,6 +342,68 @@ nodes:
 }
 
 #[test]
+fn x12_custom_delimiter_round_trip_is_byte_identical() {
+    // An interchange declaring '|' element, '^' sub-element, and '!'
+    // terminator delimiters in its ISA header must reconstruct with those
+    // exact bytes when the output echoes the header from the source's
+    // `$doc` section — not with the writer's `*`/`:`/`~` defaults.
+    let custom = "ISA|00|          |00|          |ZZ|SENDER         \
+        |ZZ|RECEIVER       |240101|1200|U|00401|000000001|0|P|^!\
+        GS|PO|SENDER|RECEIVER|20240101|1200|1|X|004010!\
+        ST|850|0001!\
+        BEG|00|NE|PO12345||20240101!\
+        PO1|1|10|EA|9.99!\
+        SE|4|0001!\
+        GE|1|1!\
+        IEA|1|000000001!";
+    let yaml = r#"
+pipeline:
+  name: x12_custom_delims
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: x12
+      glob: ./*.x12
+      envelope:
+        sections:
+          interchange:
+            extract: { segment: "ISA" }
+            fields:
+              e13: string
+      schema:
+        - { name: seg_id, type: string }
+        - { name: set_ref, type: string }
+        - { name: set_type, type: string }
+        - { name: e01, type: string }
+        - { name: e02, type: string }
+        - { name: e03, type: string }
+        - { name: e04, type: string }
+        - { name: e05, type: string }
+  - type: output
+    name: out
+    input: interchange
+    config:
+      name: out
+      type: x12
+      path: out.x12
+      include_unmapped: true
+      options:
+        interchange_from_doc: interchange
+        group_header: ["PO", "SENDER", "RECEIVER", "20240101", "1200", "1", "X", "004010"]
+        segment_newline: false
+"#;
+    let (report, output) =
+        run(yaml, "interchange", custom, "po.x12", "out").expect("run custom-delimiter round-trip");
+    assert_eq!(report.counters.dlq_count, 0);
+    assert_eq!(
+        output, custom,
+        "custom-delimiter interchange must round-trip byte-for-byte"
+    );
+}
+
+#[test]
 fn x12_multi_set_multi_group_round_trips() {
     // A two-group interchange: the first group holds two transaction sets,
     // the second holds one. The reader surfaces each GS/ST as a nested
