@@ -246,6 +246,11 @@ pub struct XmlOutputOptions {
     pub root_element: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record_element: Option<String>,
+    /// Field-name prefix marking a field as an XML attribute of its
+    /// enclosing element rather than a child element (default `@`,
+    /// mirroring the XML source option so attribute fields round-trip).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attribute_prefix: Option<String>,
     /// Per-document envelope reconstruction. With this set and
     /// `reconstruct_envelope: true`, each document is wrapped in its own
     /// `<record_element-doc>`-style frame carrying the header section, the
@@ -425,4 +430,25 @@ pub struct SwiftOutputOptions {
     /// Name of a `$doc` section to echo the block-5 body from.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trailer_from_doc: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xml_output_options_parse_attribute_prefix() {
+        let opts: XmlOutputOptions =
+            crate::yaml::from_str("record_element: row\nattribute_prefix: \"_\"\n").unwrap();
+        assert_eq!(opts.attribute_prefix, Some("_".to_string()));
+        assert_eq!(opts.record_element, Some("row".to_string()));
+    }
+
+    #[test]
+    fn xml_output_options_attribute_prefix_absent_is_none() {
+        // Genuinely optional — an omitted prefix leaves `None`, so the
+        // writer applies its documented `@` default.
+        let opts: XmlOutputOptions = crate::yaml::from_str("record_element: row\n").unwrap();
+        assert_eq!(opts.attribute_prefix, None);
+    }
 }
