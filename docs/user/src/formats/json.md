@@ -63,3 +63,12 @@ far below this ceiling in practice — the cap exists to convert an unbounded
 mistake into a clear error. See
 [Document Envelope Context](../pipelines/envelope-and-doc-context.md) for
 the full model.
+
+## Non-finite floats
+
+JSON numbers cannot represent `NaN`, `+infinity`, or `-infinity`. Writing a
+record (or an envelope section field) that holds a non-finite float to a
+JSON output fails with a JSON error naming the value, rather than silently
+substituting `null` — a substituted `null` would be indistinguishable from
+a genuine source null on read-back. Filter such records or replace the
+value in a transform before the JSON output.

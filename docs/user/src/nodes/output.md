@@ -137,6 +137,10 @@ When `false`, null values are written as empty strings. When `true`, nulls are p
 - `array` (default) -- writes a single JSON array containing all records.
 - `ndjson` -- writes one JSON object per line.
 
+JSON numbers cannot represent non-finite floats; a record carrying `NaN` or
+an infinity fails the write with a JSON error instead of silently becoming
+`null`. See [JSON Format](../formats/json.md#non-finite-floats).
+
 ### XML
 
 ```yaml
