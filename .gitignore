@@ -4,7 +4,7 @@
 !.claude/skills/post-impl-followup/
 lancedb/
 docs/internal/
-docs/book/
+docs/*/book/
 !docs/ai/
 !docs/ai/**
 target/
