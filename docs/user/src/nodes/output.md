@@ -167,7 +167,10 @@ When `false`, null values are written as empty strings. When `true`, nulls are p
       line_separator: crlf
 ```
 
-Fixed-width output requires a format schema defining field positions and widths.
+Fixed-width output requires a format schema defining field positions and
+widths. Fields land at their declared byte ranges with gaps space-filled —
+see [Fixed-Width Format](../formats/fixed-width.md#writing-fixed-width-output)
+for the layout semantics.
 
 ### EDIFACT
 

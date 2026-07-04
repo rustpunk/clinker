@@ -52,25 +52,7 @@ impl ResolvedField {
             .start
             .ok_or_else(|| invalid_field(&f.name, "must have 'start'"))?;
 
-        let width = match (f.width, f.end) {
-            (Some(_), Some(_)) => {
-                return Err(invalid_field(
-                    &f.name,
-                    "'width' and 'end' are mutually exclusive — declare one",
-                ));
-            }
-            (Some(w), None) => w,
-            (None, Some(end)) => end
-                .checked_sub(start)
-                .ok_or_else(|| invalid_field(&f.name, "'end' must be >= 'start'"))?,
-            (None, None) => {
-                return Err(invalid_field(&f.name, "must have 'width' or 'end'"));
-            }
-        };
-
-        if width == 0 {
-            return Err(invalid_field(&f.name, "width must be > 0"));
-        }
+        let width = resolve_width(f, start)?;
 
         Ok(ResolvedField {
             name: f.name.clone(),
@@ -89,6 +71,39 @@ impl ResolvedField {
     pub fn end(&self) -> usize {
         self.start + self.width
     }
+}
+
+/// Resolve a column's declared `width` / `end` into a concrete byte width
+/// from `start`, the one resolution shared by the read and write paths so a
+/// schema means the same byte ranges in both directions.
+///
+/// # Errors
+///
+/// Returns [`FormatError::InvalidRecord`] when the column declares both
+/// `width` and `end`, declares neither, declares `end < start`, or resolves
+/// to a zero width.
+pub fn resolve_width(f: &Column, start: usize) -> Result<usize, FormatError> {
+    let width = match (f.width, f.end) {
+        (Some(_), Some(_)) => {
+            return Err(invalid_field(
+                &f.name,
+                "'width' and 'end' are mutually exclusive — declare one",
+            ));
+        }
+        (Some(w), None) => w,
+        (None, Some(end)) => end
+            .checked_sub(start)
+            .ok_or_else(|| invalid_field(&f.name, "'end' must be >= 'start'"))?,
+        (None, None) => {
+            return Err(invalid_field(&f.name, "must have 'width' or 'end'"));
+        }
+    };
+
+    if width == 0 {
+        return Err(invalid_field(&f.name, "width must be > 0"));
+    }
+
+    Ok(width)
 }
 
 /// Read one physical record line into `buf`, returning `false` at end of input.
@@ -343,8 +358,8 @@ fn with_field(name: &str, message: &str) -> String {
 }
 
 /// Build an [`FormatError::InvalidRecord`] for a construction-time field defect
-/// (row 0 — no record is being read yet).
-fn invalid_field(name: &str, problem: &str) -> FormatError {
+/// (row 0 — no record is being read or written yet).
+pub(crate) fn invalid_field(name: &str, problem: &str) -> FormatError {
     FormatError::InvalidRecord {
         row: 0,
         message: format!("field '{name}': fixed-width field {problem}"),
