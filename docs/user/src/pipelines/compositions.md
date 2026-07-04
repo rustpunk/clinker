@@ -56,6 +56,17 @@ composition:
 
 A composition body reads its own config parameters as [`$config.<param>`](../cxl/system-variables.md#config-composition-config-parameters). The planner constant-folds each reference to the value resolved for that instantiation — the call site's `config:` value, or a [channel/group](channels.md) `config:` override, or the declared default — so the same composition used with different `config:` compiles to different bodies. Because the resolution happens per instantiation, a channel or group `config:` override changes what the body computes, not just the reported provenance.
 
+### Body validation
+
+Nodes inside a composition body are validated with the same node-scoped
+config checks as top-level pipeline nodes. A body node that would be
+rejected at the top level — an `envelope` wiring the not-yet-supported
+`trailer:` port, a `transform` declaring a reserved variable name or a
+default that does not match its declared type, an invalid log
+directive, or a `batch_size: 0` — fails compilation with an `E115`
+diagnostic naming the composition call site, the body file, and the
+violation. Run `clinker explain --code E115` for details.
+
 ## Advanced wiring
 
 For compositions with multiple input or output ports, the node supports explicit port bindings:

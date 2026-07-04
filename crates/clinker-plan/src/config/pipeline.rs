@@ -4652,27 +4652,77 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         }
     }
 
+    // Node-scoped checks (wired Envelope trailer, Transform `declares:`,
+    // log directives, per-Transform `batch_size`) live in
+    // `validate_node_configs`, which composition-body binding also runs
+    // over `.comp.yaml` body nodes — a body node is held to exactly the
+    // same checks as a top-level node. Surface the first violation as
+    // the validation error, matching the fail-fast shape of the checks
+    // above.
+    if let Some(violation) = validate_node_configs(&config.nodes).into_iter().next() {
+        return Err(ConfigError::Validation(violation.message));
+    }
+
+    validate_unique_scoped_declarations(config)?;
+
+    // Reject a zero pipeline-level `batch_size`: a zero-event batch
+    // never flushes, so it would accumulate a whole stage in memory —
+    // the inverse of the streaming handoff's purpose. Omitting the knob
+    // (`None`) inherits the built-in default and is the common case.
+    // The per-Transform override is checked in `validate_node_configs`.
+    if config.pipeline.batch_size == Some(0) {
+        return Err(ConfigError::Validation(
+            "pipeline.batch_size must be >= 1 (omit it to use the default)".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// A node-scoped config violation found by [`validate_node_configs`]:
+/// the offending node's index in the validated slice plus the same
+/// human-readable message top-level validation reports.
+pub(crate) struct NodeConfigViolation {
+    /// Index into the node slice passed to [`validate_node_configs`],
+    /// so callers can anchor a diagnostic span to the offending node.
+    pub(crate) node_index: usize,
+    pub(crate) message: String,
+}
+
+/// Node-scoped config checks that need only the node list — no
+/// source/output/pipeline context. Shared by top-level
+/// [`validate_config`] (which surfaces the first violation as
+/// [`ConfigError::Validation`]) and composition-body binding (which
+/// surfaces every violation as an `E115` diagnostic), so a node inside
+/// a `.comp.yaml` body cannot bypass a check a top-level node would
+/// fail.
+pub(crate) fn validate_node_configs(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeConfigViolation> {
+    let mut violations = Vec::new();
+
     // Reject a wired `trailer:` port on an Envelope node. A wired `header:` is
-    // now a real port (it replaces each body grain's ambient envelope with a
+    // a real port (it replaces each body grain's ambient envelope with a
     // grain-matched header record), but `trailer:` has no draining path yet, so
     // a wired value would silently do nothing. The undeclared-producer case for
-    // a wired `header:` is caught earlier by the unified input-reference pass
+    // a wired `header:` is caught by the unified input-reference pass
     // (E004), exactly as for any other consumer input.
-    for spanned in &config.nodes {
+    for (node_index, spanned) in nodes.iter().enumerate() {
         if let PipelineNode::Envelope { header, .. } = &spanned.value
             && header.trailer.is_some()
         {
-            return Err(ConfigError::Validation(format!(
-                "envelope node '{}': explicit `trailer` input wiring is not yet supported — \
-                 omit it to frame with the body's own envelope",
-                header.name
-            )));
+            violations.push(NodeConfigViolation {
+                node_index,
+                message: format!(
+                    "envelope node '{}': explicit `trailer` input wiring is not yet supported — \
+                     omit it to frame with the body's own envelope",
+                    header.name
+                ),
+            });
         }
     }
 
     // Validate per-Transform `declares:` entries: reserved-name
     // collisions per-scope, and default-type matches.
-    for spanned in &config.nodes {
+    for (node_index, spanned) in nodes.iter().enumerate() {
         let PipelineNode::Transform {
             header,
             config: body,
@@ -4687,26 +4737,38 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                 pipeline_node::VarScope::Record => "record",
             };
             if reserved_names_for(entry.scope).contains(&entry.name.as_str()) {
-                return Err(ConfigError::Validation(format!(
-                    "transform '{}': declares: '{}' is a reserved ${} member name and cannot be used as a variable",
-                    header.name, entry.name, scope_label,
-                )));
+                violations.push(NodeConfigViolation {
+                    node_index,
+                    message: format!(
+                        "transform '{}': declares: '{}' is a reserved ${} member name and cannot be used as a variable",
+                        header.name, entry.name, scope_label,
+                    ),
+                });
             }
-            if let Some(default) = &entry.default {
-                check_scoped_var_default(
+            if let Some(default) = &entry.default
+                && let Err(err) = check_scoped_var_default(
                     &format!("transform '{}' declares", header.name),
                     &entry.name,
                     entry.var_type,
                     default,
-                )?;
+                )
+            {
+                violations.push(NodeConfigViolation {
+                    node_index,
+                    // `check_scoped_var_default` only ever constructs the
+                    // `Validation` variant; unwrap it so the message is not
+                    // double-prefixed when the caller re-wraps it.
+                    message: match err {
+                        ConfigError::Validation(msg) => msg,
+                        other => other.to_string(),
+                    },
+                });
             }
         }
     }
 
-    validate_unique_scoped_declarations(config)?;
-
     // Validate log directives on Transform nodes.
-    for spanned in &config.nodes {
+    for (node_index, spanned) in nodes.iter().enumerate() {
         if let PipelineNode::Transform {
             header,
             config: body,
@@ -4716,49 +4778,50 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             for (i, d) in directives.iter().enumerate() {
                 if let Some(every) = d.every {
                     if every == 0 {
-                        return Err(ConfigError::Validation(format!(
-                            "transform '{}': log directive #{}: every must be >= 1",
-                            header.name,
-                            i + 1,
-                        )));
-                    }
-                    if d.when != LogTiming::PerRecord {
-                        return Err(ConfigError::Validation(format!(
-                            "transform '{}': log directive #{}: 'every' is only valid with when: per_record",
-                            header.name,
-                            i + 1,
-                        )));
+                        violations.push(NodeConfigViolation {
+                            node_index,
+                            message: format!(
+                                "transform '{}': log directive #{}: every must be >= 1",
+                                header.name,
+                                i + 1,
+                            ),
+                        });
+                    } else if d.when != LogTiming::PerRecord {
+                        violations.push(NodeConfigViolation {
+                            node_index,
+                            message: format!(
+                                "transform '{}': log directive #{}: 'every' is only valid with when: per_record",
+                                header.name,
+                                i + 1,
+                            ),
+                        });
                     }
                 }
             }
         }
     }
 
-    // Reject a zero `batch_size` at both the pipeline level and any
-    // per-Transform override: a zero-event batch never flushes, so it
-    // would accumulate a whole stage in memory — the inverse of the
-    // streaming handoff's purpose. Omitting the knob (`None`) inherits
-    // the built-in default and is the common case.
-    if config.pipeline.batch_size == Some(0) {
-        return Err(ConfigError::Validation(
-            "pipeline.batch_size must be >= 1 (omit it to use the default)".to_string(),
-        ));
-    }
-    for spanned in &config.nodes {
+    // Reject a zero per-Transform `batch_size` override — same
+    // never-flushes hazard as the pipeline-level knob, checked in
+    // `validate_config`.
+    for (node_index, spanned) in nodes.iter().enumerate() {
         if let PipelineNode::Transform {
             header,
             config: body,
         } = &spanned.value
             && body.batch_size == Some(0)
         {
-            return Err(ConfigError::Validation(format!(
-                "transform '{}': batch_size must be >= 1 (omit it to inherit pipeline.batch_size)",
-                header.name,
-            )));
+            violations.push(NodeConfigViolation {
+                node_index,
+                message: format!(
+                    "transform '{}': batch_size must be >= 1 (omit it to inherit pipeline.batch_size)",
+                    header.name,
+                ),
+            });
         }
     }
 
-    Ok(())
+    violations
 }
 
 /// Validate an HL7 source's `split_fields` declarations: each names a

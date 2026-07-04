@@ -1,3 +1,4 @@
+mod body_node_config_validation;
 mod bound_schemas;
 mod ck_aligned_partition;
 mod ck_lattice;
