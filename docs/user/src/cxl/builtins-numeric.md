@@ -6,6 +6,9 @@ CXL provides 8 built-in methods for numeric operations. These methods work on bo
 [`decimal`](types.md#the-decimal-type) receiver and return an exact decimal
 result — `d.round(2)` rounds `d` to two fractional digits using banker's
 rounding, staying in the decimal domain rather than converting to a float.
+The type checker infers `decimal` for these calls as well, so the result
+composes with other decimals without a cast:
+`amount.round_to(2) + fee` typechecks when both columns are `decimal`.
 
 ## abs() -> Numeric
 
@@ -82,6 +85,8 @@ $ cxl eval -e 'emit result = (-3.2).floor()'
 ## round([decimals: Int]) -> Float
 
 Rounds to the specified number of decimal places. Default is 0 decimal places.
+On a `decimal` receiver the result is a `decimal` (exact banker's rounding),
+not a float.
 
 ```bash
 $ cxl eval -e 'emit result = 3.456.round()'
@@ -106,6 +111,8 @@ $ cxl eval -e 'emit result = 3.456.round(2)'
 ## round_to(decimals: Int) -> Float
 
 Rounds to the specified number of decimal places. Unlike `round()`, the `decimals` argument is required.
+On a `decimal` receiver the result is a `decimal` (exact banker's rounding),
+not a float.
 
 ```bash
 $ cxl eval -e 'emit result = 3.14159.round_to(3)'
