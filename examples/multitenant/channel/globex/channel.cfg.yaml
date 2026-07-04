@@ -4,13 +4,15 @@
 #   - `labels:` are identity, never a pipeline override. The `tier: enterprise`
 #     label makes the `enterprise` group's selector match, so globex gets the
 #     fraud_check injection automatically.
-#   - channel-wide `config:` applies to every pipeline this tenant runs; it sits
-#     above the group layer, so 0.9 clobbers the group's 0.8.
+#   - `fixed:` locks a value channel-wide: unlike a plain `config:` clobber it
+#     holds against every *higher* layer, so the per-target overlay's 0.95 is
+#     ignored and 0.9 wins. `channels resolve` marks the winning value with
+#     `(fixed)`.
 
 channel:
   name: globex
 
 labels: { tier: enterprise, region: west }
 
-config:
+fixed:
   risk.threshold: 0.9

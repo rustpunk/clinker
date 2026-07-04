@@ -1,9 +1,26 @@
 # Per-target overlay: initech's customization of the order_fulfillment
-# pipeline. A minimal channel that overrides a single config field and adds no
-# structural ops.
+# pipeline. It overrides one config field and drops one stage.
+#
+#   - `config:` clobbers `risk.threshold` to 0.7 (nothing locks it, so this
+#     highest layer wins over the channel-wide 0.6).
+#   - `overrides:` bypasses `normalize`: initech's feed is already canonical,
+#     so the trim/uppercase stage is dead weight. `bypass` is sugar for
+#     removing a 1-in/1-out node and auto-rewiring its sole consumer
+#     (`handling_fee`) onto its sole upstream (`orders`); a fan-in/fan-out
+#     node needs the explicit `remove` op with a spelled-out `rewire:` map,
+#     and swapping a node's definition wholesale is `replace`.
+#
+# The bypass is visible two ways: the effective DAG of
+# `channels resolve --channel initech` shows `handling_fee` reading `orders`
+# directly, and `run --channel initech` keeps the raw lowercase order ids
+# where every other variant writes them uppercased.
 
 channel:
   target: ../../pipeline/order_fulfillment.yaml
 
 config:
   risk.threshold: 0.7
+
+overrides:
+  - op: bypass
+    target: normalize
