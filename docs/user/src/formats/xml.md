@@ -34,6 +34,48 @@ rules.
 | `namespace_handling` | `strip` | `strip` removes namespace prefixes from element and attribute names; `qualify` preserves the namespace-qualified names. |
 | `max_index_bytes` | `64MB` | Cap on the bytes the envelope pre-scan retains while extracting declared `$doc.*` sections. |
 
+## Writing XML
+
+The XML writer expands dotted field names to nested elements and applies
+the same `attribute_prefix` convention in reverse: a field whose final
+path segment carries the prefix is emitted as an XML **attribute** of its
+enclosing element instead of a child element. A top-level `@id` attaches
+to the record element's start tag; a nested `Address.@type` attaches to
+the `<Address>` element. Records read from an XML source therefore
+round-trip — `<Record id="7"><name>A</name></Record>` reads and writes
+back unchanged, and the writer never emits an `@`-named element.
+
+```yaml
+- type: output
+  name: xml_out
+  input: processed
+  config:
+    name: xml_out
+    type: xml
+    path: "./output/result.xml"
+    options:
+      root_element: "Root"              # default Root
+      record_element: "Record"          # default Record
+      attribute_prefix: "@"             # matches the source-side prefix
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `root_element` | `Root` | Name of the document root element wrapping all records. |
+| `record_element` | `Record` | Name of the element emitted per record. |
+| `attribute_prefix` | `@` | Prefix marking a field as an attribute of its enclosing element. Set it to the same value as the source-side prefix when round-tripping; an empty string disables attribute classification (every field emits as an element). |
+
+Attribute handling details:
+
+- A **null** attribute field is dropped even under `preserve_nulls: true` —
+  a null element round-trips as a self-closing tag, but an attribute has
+  no form that reads back as null.
+- A field with children nested under an attribute-prefixed segment
+  (e.g. `@a.b`) is rejected with a format error: an XML attribute is a
+  leaf and cannot contain elements.
+- An element with only attribute fields and no children self-closes:
+  `Address.@type` alone emits `<Address type="home"/>`.
+
 ## Nested arrays
 
 When a record element contains repeated child elements, the

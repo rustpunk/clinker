@@ -1,5 +1,6 @@
 //! XML writer with configurable root/record elements, dotted field expansion
-//! to nested elements, null handling, and proper escaping.
+//! to nested elements, attribute-prefixed fields emitted as XML attributes,
+//! null handling, and proper escaping.
 //!
 //! Under `reconstruct_envelope`, each document is wrapped in a `<Document>`
 //! element inside the root: `begin_document` opens `<Document>` and emits the
@@ -24,6 +25,14 @@ pub struct XmlWriterConfig {
     pub root_element: String,
     pub record_element: String,
     pub preserve_nulls: bool,
+    /// Field-name prefix that marks a field as an XML attribute of its
+    /// enclosing element rather than a child element. Mirrors the reader's
+    /// `attribute_prefix` (default `@`) so attribute-derived fields
+    /// round-trip: a top-level `@id` attaches to the record element's start
+    /// tag, a nested `Address.@type` attaches to the `<Address>` branch.
+    /// An empty prefix disables attribute classification entirely — every
+    /// field emits as an element.
+    pub attribute_prefix: String,
     /// Whether engine-stamped schema columns (`$ck.<field>` correlation
     /// snapshots) emit as nested elements. Defaults to `false` so
     /// engine-internal namespaces stay out of the XML output.
@@ -41,6 +50,7 @@ impl Default for XmlWriterConfig {
             root_element: "Root".into(),
             record_element: "Record".into(),
             preserve_nulls: false,
+            attribute_prefix: "@".into(),
             include_engine_stamped: false,
             envelope: None,
         }
@@ -96,12 +106,19 @@ impl<W: Write> XmlWriter<W> {
         if let Some((field, ref v)) = count_value {
             pairs.push((field, v));
         }
-        let tree = build_field_tree(&pairs, self.config.preserve_nulls)?;
-        let start = BytesStart::new(wrapper);
+        let tree = build_field_tree(
+            &pairs,
+            self.config.preserve_nulls,
+            &self.config.attribute_prefix,
+        )?;
+        let mut start = BytesStart::new(wrapper);
+        for (key, value) in &tree.attrs {
+            start.push_attribute((key.as_str(), value.as_str()));
+        }
         self.writer
             .write_event(Event::Start(start))
             .map_err(|e| FormatError::Xml(e.to_string()))?;
-        self.write_field_tree(&tree)?;
+        self.write_field_tree(&tree.children)?;
         let end = BytesEnd::new(wrapper);
         self.writer
             .write_event(Event::End(end))
@@ -120,20 +137,23 @@ impl<W: Write> XmlWriter<W> {
         Ok(())
     }
 
-    /// Collects schema fields as (name, value) pairs, then writes them as
-    /// nested XML elements. Engine-stamped columns are stripped from the
-    /// default output; callers opt in via `include_engine_stamped`.
-    fn write_fields(&mut self, record: &Record) -> Result<(), FormatError> {
+    /// Collects schema fields as (name, value) pairs and builds the record's
+    /// element body — attributes plus child nodes — before any bytes are
+    /// emitted, so record-level attributes can ride the record start tag.
+    /// Engine-stamped columns are stripped from the default output; callers
+    /// opt in via `include_engine_stamped`.
+    fn build_record_tree(&self, record: &Record) -> Result<ElementBody, FormatError> {
         let fields: Vec<(&str, &Value)> = if self.config.include_engine_stamped {
             record.iter_all_fields().collect()
         } else {
             record.iter_user_fields().collect()
         };
 
-        let tree = build_field_tree(&fields, self.config.preserve_nulls)?;
-        self.write_field_tree(&tree)?;
-
-        Ok(())
+        build_field_tree(
+            &fields,
+            self.config.preserve_nulls,
+            &self.config.attribute_prefix,
+        )
     }
 
     /// Recursively write a field tree as nested XML elements.
@@ -162,16 +182,27 @@ impl<W: Write> XmlWriter<W> {
                             .map_err(|e| FormatError::Xml(e.to_string()))?;
                     }
                 }
-                FieldNode::Branch { name, children } => {
-                    let start = BytesStart::new(name.as_str());
-                    self.writer
-                        .write_event(Event::Start(start))
-                        .map_err(|e| FormatError::Xml(e.to_string()))?;
-                    self.write_field_tree(children)?;
-                    let end = BytesEnd::new(name.as_str());
-                    self.writer
-                        .write_event(Event::End(end))
-                        .map_err(|e| FormatError::Xml(e.to_string()))?;
+                FieldNode::Branch { name, body } => {
+                    let mut start = BytesStart::new(name.as_str());
+                    for (key, value) in &body.attrs {
+                        start.push_attribute((key.as_str(), value.as_str()));
+                    }
+                    if body.children.is_empty() {
+                        // Attribute-only branch: nothing nests inside, so the
+                        // element self-closes carrying its attributes.
+                        self.writer
+                            .write_event(Event::Empty(start))
+                            .map_err(|e| FormatError::Xml(e.to_string()))?;
+                    } else {
+                        self.writer
+                            .write_event(Event::Start(start))
+                            .map_err(|e| FormatError::Xml(e.to_string()))?;
+                        self.write_field_tree(&body.children)?;
+                        let end = BytesEnd::new(name.as_str());
+                        self.writer
+                            .write_event(Event::End(end))
+                            .map_err(|e| FormatError::Xml(e.to_string()))?;
+                    }
                 }
             }
         }
@@ -181,14 +212,23 @@ impl<W: Write> XmlWriter<W> {
 
 impl<W: Write + Send> FormatWriter for XmlWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
+        // The tree is built before the record start tag is emitted:
+        // attribute-classified fields must be known when the tag opens, and
+        // a rejected field (map payload, malformed attribute path) must not
+        // leave a dangling half-written record behind.
+        let tree = self.build_record_tree(record)?;
+
         self.write_header()?;
 
-        let start = BytesStart::new(&*self.config.record_element);
+        let mut start = BytesStart::new(&*self.config.record_element);
+        for (key, value) in &tree.attrs {
+            start.push_attribute((key.as_str(), value.as_str()));
+        }
         self.writer
             .write_event(Event::Start(start))
             .map_err(|e| FormatError::Xml(e.to_string()))?;
 
-        self.write_fields(record)?;
+        self.write_field_tree(&tree.children)?;
 
         let end = BytesEnd::new(&*self.config.record_element);
         self.writer
@@ -262,64 +302,119 @@ impl<W: Write + Send> FormatWriter for XmlWriter<W> {
 
 // ── Field tree for dotted name → nested element expansion ────────────
 
-enum FieldNode {
-    Leaf {
-        name: String,
-        text: String,
-    },
-    Branch {
-        name: String,
-        children: Vec<FieldNode>,
-    },
+/// One element's content: the attributes attached to its start tag plus its
+/// child nodes. The whole body is materialized before the element's start
+/// tag is emitted, because attributes have to be known at that point.
+#[derive(Default)]
+struct ElementBody {
+    attrs: Vec<(String, String)>,
+    children: Vec<FieldNode>,
 }
 
-/// Build a tree from dotted field names. Fields with shared prefixes
-/// are grouped under a single parent branch.
-/// E.g., `Address.City` and `Address.State` → Branch("Address", [Leaf("City"), Leaf("State")])
+enum FieldNode {
+    Leaf { name: String, text: String },
+    Branch { name: String, body: ElementBody },
+}
+
+/// Build an element body from dotted field names. Fields with shared
+/// prefixes are grouped under a single parent branch
+/// (`Address.City` + `Address.State` → one `Address` branch with two leaf
+/// children), and a field whose final segment carries the attribute prefix
+/// becomes an attribute of its enclosing element instead of a child
+/// (`@id` → attribute on the returned body, `Address.@type` → attribute on
+/// the `Address` branch).
+///
+/// Null attribute fields are dropped even under `preserve_nulls` — a null
+/// element round-trips as a self-closing tag, but an attribute has no
+/// present-but-empty form that reads back as null.
 ///
 /// Returns `FormatError::UnserializableMapValue` if any field carries
 /// a `Value::Map` payload — XML elements have no canonical scalar
 /// serialization for a map, and `value_to_text` raises from the Map
-/// arm directly.
+/// arm directly. Returns `FormatError::Xml` for a malformed attribute
+/// path (a prefixed segment with children nested under it, or a bare
+/// prefix with no attribute name).
 fn build_field_tree(
     fields: &[(&str, &Value)],
     preserve_nulls: bool,
-) -> Result<Vec<FieldNode>, FormatError> {
-    let mut roots: Vec<FieldNode> = Vec::new();
+    attribute_prefix: &str,
+) -> Result<ElementBody, FormatError> {
+    let mut root = ElementBody::default();
 
     for &(name, val) in fields {
-        if val.is_null() && !preserve_nulls {
+        if val.is_null() && (!preserve_nulls || is_attribute_path(name, attribute_prefix)) {
             continue;
         }
         let text = value_to_text(name, val)?;
-        insert_field(&mut roots, name, &text);
+        insert_field(&mut root, name, name, &text, attribute_prefix)?;
     }
 
-    Ok(roots)
+    Ok(root)
+}
+
+/// True when the path's final segment is attribute-classified — i.e. a
+/// non-empty prefix marks it as an attribute of its enclosing element.
+fn is_attribute_path(path: &str, attribute_prefix: &str) -> bool {
+    !attribute_prefix.is_empty()
+        && path
+            .rsplit('.')
+            .next()
+            .is_some_and(|segment| segment.starts_with(attribute_prefix))
 }
 
 /// Insert a dotted field name into the tree, creating branches as needed.
-fn insert_field(nodes: &mut Vec<FieldNode>, path: &str, text: &str) {
+/// An attribute-prefixed segment must be the path's final segment (an
+/// attribute is a leaf — nothing can nest under it); `field` is the full
+/// original field name, carried for error messages.
+fn insert_field(
+    body: &mut ElementBody,
+    field: &str,
+    path: &str,
+    text: &str,
+    attribute_prefix: &str,
+) -> Result<(), FormatError> {
     if let Some((first, rest)) = path.split_once('.') {
+        if !attribute_prefix.is_empty() && first.starts_with(attribute_prefix) {
+            return Err(FormatError::Xml(format!(
+                "field '{field}': attribute-prefixed segment '{first}' \
+                 cannot have fields nested under it — an XML attribute is a leaf"
+            )));
+        }
         // Find or create a branch for `first`
-        let branch = nodes
+        let branch = body
+            .children
             .iter_mut()
             .find(|n| matches!(n, FieldNode::Branch { name, .. } if name == first));
-        if let Some(FieldNode::Branch { children, .. }) = branch {
-            insert_field(children, rest, text);
+        if let Some(FieldNode::Branch {
+            body: branch_body, ..
+        }) = branch
+        {
+            insert_field(branch_body, field, rest, text, attribute_prefix)
         } else {
-            let mut children = Vec::new();
-            insert_field(&mut children, rest, text);
-            nodes.push(FieldNode::Branch {
+            let mut branch_body = ElementBody::default();
+            insert_field(&mut branch_body, field, rest, text, attribute_prefix)?;
+            body.children.push(FieldNode::Branch {
                 name: first.to_string(),
-                children,
+                body: branch_body,
             });
+            Ok(())
         }
+    } else if !attribute_prefix.is_empty() && path.starts_with(attribute_prefix) {
+        let attr_name = &path[attribute_prefix.len()..];
+        if attr_name.is_empty() {
+            return Err(FormatError::Xml(format!(
+                "field '{field}': attribute prefix '{attribute_prefix}' \
+                 carries no attribute name"
+            )));
+        }
+        body.attrs.push((attr_name.to_string(), text.to_string()));
+        Ok(())
     } else {
-        nodes.push(FieldNode::Leaf {
+        body.children.push(FieldNode::Leaf {
             name: path.to_string(),
             text: text.to_string(),
         });
+        Ok(())
     }
 }
 
@@ -583,6 +678,192 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_xml_write_attribute_prefixed_field_as_record_attribute() {
+        let schema = Arc::new(Schema::new(vec!["@id".into(), "name".into()]));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(7), Value::String("A".into())],
+        );
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert_eq!(
+            output,
+            r#"<Root><Record id="7"><name>A</name></Record></Root>"#
+        );
+    }
+
+    #[test]
+    fn test_xml_write_nested_attribute_attaches_to_branch() {
+        let schema = Arc::new(Schema::new(vec![
+            "Address.@type".into(),
+            "Address.City".into(),
+        ]));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::String("home".into()), Value::String("NYC".into())],
+        );
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert_eq!(
+            output,
+            r#"<Root><Record><Address type="home"><City>NYC</City></Address></Record></Root>"#
+        );
+    }
+
+    #[test]
+    fn test_xml_write_attribute_only_branch_self_closes() {
+        let schema = Arc::new(Schema::new(vec!["Address.@type".into()]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::String("home".into())]);
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert_eq!(
+            output,
+            r#"<Root><Record><Address type="home"/></Record></Root>"#
+        );
+    }
+
+    #[test]
+    fn test_xml_write_custom_attribute_prefix() {
+        let schema = Arc::new(Schema::new(vec!["_id".into(), "name".into()]));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(7), Value::String("A".into())],
+        );
+        let config = XmlWriterConfig {
+            attribute_prefix: "_".into(),
+            ..Default::default()
+        };
+        let output = write_records(config, &[record], &schema);
+        assert_eq!(
+            output,
+            r#"<Root><Record id="7"><name>A</name></Record></Root>"#
+        );
+    }
+
+    #[test]
+    fn test_xml_write_default_prefix_leaves_underscore_field_as_element() {
+        // Only the configured prefix classifies a field as an attribute;
+        // `_id` is a valid element name under the default `@` prefix.
+        let schema = Arc::new(Schema::new(vec!["_id".into()]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(7)]);
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert_eq!(output, "<Root><Record><_id>7</_id></Record></Root>");
+    }
+
+    #[test]
+    fn test_xml_write_empty_prefix_disables_attribute_classification() {
+        let schema = Arc::new(Schema::new(vec!["_id".into()]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(7)]);
+        let config = XmlWriterConfig {
+            attribute_prefix: String::new(),
+            ..Default::default()
+        };
+        let output = write_records(config, &[record], &schema);
+        assert_eq!(output, "<Root><Record><_id>7</_id></Record></Root>");
+    }
+
+    #[test]
+    fn test_xml_write_null_attribute_dropped_even_with_preserve_nulls() {
+        // A null element round-trips as a self-closing tag; an attribute
+        // has no form that reads back as null, so it is dropped instead of
+        // being emitted as an empty string.
+        let schema = Arc::new(Schema::new(vec!["@id".into(), "name".into()]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::Null, Value::Null]);
+        let config = XmlWriterConfig {
+            preserve_nulls: true,
+            ..Default::default()
+        };
+        let output = write_records(config, &[record], &schema);
+        assert_eq!(output, "<Root><Record><name/></Record></Root>");
+    }
+
+    #[test]
+    fn test_xml_write_attribute_value_escaped() {
+        let schema = Arc::new(Schema::new(vec!["@note".into()]));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::String(r#"a & "b" <c>"#.into())],
+        );
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert!(output.contains("&amp;"), "& should be escaped: {output}");
+        assert!(output.contains("&quot;"), "\" should be escaped: {output}");
+        assert!(output.contains("&lt;"), "< should be escaped: {output}");
+        assert!(
+            !output.contains(r#"a & "b""#),
+            "raw attribute value should not appear: {output}"
+        );
+    }
+
+    #[test]
+    fn test_xml_write_map_valued_attribute_rejected() {
+        use indexmap::IndexMap;
+        let schema = Arc::new(Schema::new(vec!["@meta".into()]));
+        let mut sidecar: IndexMap<Box<str>, Value> = IndexMap::new();
+        sidecar.insert("a".into(), Value::Integer(1));
+        let record = Record::new(Arc::clone(&schema), vec![Value::Map(Box::new(sidecar))]);
+        let mut buf = Vec::new();
+        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::UnserializableMapValue { format, column } => {
+                assert_eq!(format, "XML");
+                assert_eq!(column, "@meta");
+            }
+            other => panic!("expected UnserializableMapValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_xml_write_attribute_segment_with_children_rejected() {
+        // `@a.b` would need `@a` to be an element to hold `b` — an
+        // attribute is a leaf, so the field is rejected instead of
+        // emitting an `<@a>` element (invalid XML name).
+        let schema = Arc::new(Schema::new(vec!["@a.b".into()]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
+        let mut buf = Vec::new();
+        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::Xml(msg) => {
+                assert!(
+                    msg.contains("'@a.b'") && msg.contains("'@a'"),
+                    "message names the field and offending segment: {msg}"
+                );
+            }
+            other => panic!("expected FormatError::Xml, got {other:?}"),
+        }
+        drop(writer);
+        assert!(
+            buf.is_empty(),
+            "rejected record must not leave partial output behind"
+        );
+    }
+
+    #[test]
+    fn test_xml_attribute_roundtrip_reader_writer() {
+        // The reader flattens attributes to `@`-prefixed fields; writing
+        // those records back must restore them as attributes, never emit
+        // an `@`-named element.
+        let input = r#"<Root><Record id="7" status="open"><name>A</name><Address type="home"><City>NYC</City></Address></Record></Root>"#;
+        let cursor = std::io::Cursor::new(input.as_bytes().to_vec());
+        let mut reader = XmlReader::from_reader(
+            cursor,
+            XmlReaderConfig {
+                record_path: Some("Root/Record".into()),
+                ..Default::default()
+            },
+        )
+        .expect("XML buffer read");
+        let schema = reader.schema().unwrap();
+        let record = reader.next_record().unwrap().unwrap();
+        assert!(reader.next_record().unwrap().is_none());
+
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert_eq!(output, input);
+        assert!(
+            !output.contains("<@"),
+            "no @-named element may be emitted: {output}"
+        );
+    }
+
     use crate::envelope_writer::test_doc_with_sections as doc_with_sections;
 
     #[test]
@@ -631,6 +912,42 @@ mod tests {
         // The whole thing is valid XML wrapped in the root.
         assert!(
             out.contains("<Root>") && out.contains("</Root>"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn xml_envelope_section_attribute_field_attaches_to_wrapper() {
+        // Attribute-prefixed section fields (an XML envelope section read
+        // with attributes) attach to the section wrapper's start tag.
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let config = XmlWriterConfig {
+            envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                footer_from_doc: None,
+                footer_record_count_field: None,
+            }),
+            ..Default::default()
+        };
+        let doc = doc_with_sections(&[(
+            "Head",
+            &[
+                ("@version", Value::String("1.1".into())),
+                ("batch_id", Value::String("A".into())),
+            ],
+        )]);
+        let mut buf = Vec::new();
+        {
+            let mut w = XmlWriter::new(&mut buf, Arc::clone(&schema), config);
+            w.begin_document(&doc).unwrap();
+            w.write_record(&Record::new(Arc::clone(&schema), vec![Value::Integer(10)]))
+                .unwrap();
+            w.end_document(&doc).unwrap();
+            w.flush().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains(r#"<header version="1.1"><batch_id>A</batch_id></header>"#),
             "got: {out}"
         );
     }

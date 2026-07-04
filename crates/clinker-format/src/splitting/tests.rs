@@ -818,9 +818,7 @@ fn test_splitting_writer_xml_produces_valid_files() {
     let xml_config = XmlWriterConfig {
         root_element: "items".into(),
         record_element: "item".into(),
-        preserve_nulls: false,
-        include_engine_stamped: false,
-        envelope: None,
+        ..Default::default()
     };
 
     let xml_factory: WriterFactory = Box::new(

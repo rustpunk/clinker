@@ -98,6 +98,9 @@ fn build_xml_writer_config(
         if let Some(ref rec) = opts.record_element {
             config.record_element = rec.clone();
         }
+        if let Some(ref prefix) = opts.attribute_prefix {
+            config.attribute_prefix = prefix.clone();
+        }
     }
     config
 }
@@ -500,5 +503,27 @@ fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
     match parent.to_str() {
         Some(p) if !p.is_empty() => format!("{p}/{filename}"),
         _ => filename,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xml_writer_config_plumbs_attribute_prefix() {
+        let opts = clinker_plan::config::XmlOutputOptions {
+            attribute_prefix: Some("_".into()),
+            ..Default::default()
+        };
+        let config = build_xml_writer_config(Some(&opts));
+        assert_eq!(config.attribute_prefix, "_");
+    }
+
+    #[test]
+    fn xml_writer_config_defaults_attribute_prefix_to_at_sign() {
+        // Matches the XML reader's default so attribute fields round-trip
+        // without any output-side configuration.
+        assert_eq!(build_xml_writer_config(None).attribute_prefix, "@");
     }
 }
