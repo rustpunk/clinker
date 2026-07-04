@@ -8,7 +8,9 @@
 //! config time (diagnostic `E339`); (4) a batch/file envelope surfaces
 //! file-level `$doc` fields and a BTS count mismatch fails the run;
 //! (5) opt-in composite-field splitting exposes component columns to CXL and
-//! re-assembles them byte-identically on an HL7→HL7 round-trip.
+//! re-assembles them byte-identically on an HL7→HL7 round-trip; (6) a
+//! message declaring non-default delimiters re-emits byte-identically with
+//! its own declared set.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -238,6 +240,55 @@ nodes:
         tags,
         vec!["MSH", "PID", "OBR", "OBX", "OBX"],
         "round-trip segment tags; hl7 output was: {output}"
+    );
+}
+
+#[test]
+fn hl7_custom_delimiters_round_trip_byte_identically() {
+    // A message declaring non-default delimiters (field '#', component '@',
+    // repetition '*', escape '/', sub-component '$') must re-emit with the
+    // set its own MSH declared — field joining, MSH-2 echo, and escaping
+    // all use it — not the conventional |^~\& defaults. OBX-5 carries an
+    // escaped custom field separator (`/F/` → literal '#') to prove the
+    // re-escape uses the adopted set.
+    let custom = [
+        "MSH#@*/$#LAB#HOSP#EHR#HOSP#20240102093000##ORU@R01#ORU0001#P#2.5",
+        "PID#1##PATID123@@@HOSP@MR##DOE@JOHN",
+        "OBX#1#TX#note##a/F/b@c",
+    ]
+    .join("\r");
+    let yaml = r#"
+pipeline:
+  name: hl7_custom_delims
+nodes:
+  - type: source
+    name: messages
+    config:
+      name: messages
+      type: hl7
+      glob: ./*.hl7
+      schema:
+        - { name: seg_id, type: string }
+  - type: output
+    name: out
+    input: messages
+    config:
+      name: out
+      type: hl7
+      path: out.hl7
+      include_unmapped: true
+      options:
+        segment_newline: false
+"#;
+    let (report, output) =
+        run(yaml, "messages", &custom, "custom.hl7", "out").expect("run custom-delimiter echo");
+    assert_eq!(report.counters.dlq_count, 0);
+    // Byte-identical echo; the writer terminates the final segment with the
+    // carriage return the fixture omits.
+    assert_eq!(
+        output,
+        format!("{custom}\r"),
+        "custom-delimiter HL7 round trip must be byte-faithful"
     );
 }
 
