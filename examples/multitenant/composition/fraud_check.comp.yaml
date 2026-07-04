@@ -4,9 +4,11 @@
 # carry it. `channels resolve --group enterprise` lists it under "Injected
 # nodes", and `channels lint` compiles it as part of every enterprise overlay.
 #
-# `sensitivity` is a declared config knob the injecting group supplies; its
-# resolved value shows up in `channels resolve`. The screen reads normalized
-# orders and holds a suspiciously large one by zeroing its amount.
+# `sensitivity` is a declared config knob the injecting group supplies; the
+# body reads it as `$config.sensitivity`, which the planner constant-folds to
+# the resolved value per instantiation, and `channels resolve` reports which
+# layer supplied it. The screen holds a suspiciously large order by zeroing
+# its amount; higher sensitivity lowers the hold cutoff.
 
 _compose:
   name: fraud_check
@@ -31,4 +33,4 @@ nodes:
     config:
       cxl: |
         emit order_id = order_id
-        emit amount = if amount >= 2000.0 then 0.0 else amount
+        emit amount = if amount >= (1.0 - $config.sensitivity) * 10000.0 then 0.0 else amount

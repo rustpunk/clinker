@@ -1,16 +1,20 @@
 # Base order-fulfillment pipeline (the pipeline-default layer).
 #
-# It reads orders, normalizes the fields, scores each order through the `risk`
-# composition, and writes the result. Tenants customize it via group and
-# channel overlays without editing this file:
+# It reads orders, canonicalizes the fields, adds a flat handling fee, scores
+# each order through the `risk` composition, and writes the result. Tenants
+# customize it via group and channel overlays without editing this file:
 #
 #   - the `enterprise` group splices a `fraud_check` screening composition in
 #     after `normalize` and raises `risk.threshold`;
-#   - the `globex` channel raises `risk.threshold` further and declares an
-#     extra source column via a schema patch.
+#   - the `globex` channel locks `risk.threshold` channel-wide with `fixed:`
+#     and re-shapes the `amount` source column via a `patch_schema` op;
+#   - the `initech` channel bypasses `normalize` (its feed is already
+#     canonical), so its output keeps the raw lowercase order ids.
 #
-# `risk.threshold` is the per-tenant knob the overlays clobber; `normalize` is
-# the stable splice anchor the group's `add` op targets.
+# `risk.threshold` is the per-tenant knob the overlays clobber (the `risk`
+# composition folds it into its CXL as `$config.threshold`); `normalize` is
+# the stable splice anchor the group's `add` op targets and the node initech's
+# `bypass` op removes.
 
 pipeline:
   name: order_fulfillment
@@ -30,20 +34,28 @@ nodes:
 
   - type: transform
     name: normalize
-    description: Trim identifiers and pass the order fields through
+    description: Canonicalize order ids (trim + uppercase)
     input: orders
     config:
       cxl: |
-        emit order_id = order_id.trim()
+        emit order_id = order_id.trim().upper()
         emit amount = amount
+
+  - type: transform
+    name: handling_fee
+    description: Add the flat per-order handling fee
+    input: normalize
+    config:
+      cxl: |
+        emit amount = amount + 25.0
 
   - type: composition
     name: risk
     description: Score each order for value/risk
-    input: normalize
+    input: handling_fee
     use: ../composition/risk_score.comp.yaml
     inputs:
-      inp: normalize
+      inp: handling_fee
     config:
       threshold: 0.5
 
