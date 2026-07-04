@@ -171,7 +171,10 @@ an infinity fails the write with a JSON error instead of silently becoming
       line_separator: crlf
 ```
 
-Fixed-width output requires a format schema defining field positions and widths.
+Fixed-width output requires a format schema defining field positions and
+widths. Fields land at their declared byte ranges with gaps space-filled —
+see [Fixed-Width Format](../formats/fixed-width.md#writing-fixed-width-output)
+for the layout semantics.
 
 ### EDIFACT
 

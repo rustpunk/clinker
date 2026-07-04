@@ -33,6 +33,19 @@ declaration carries both the byte range and the CXL type, the physical layout
 and the types can never drift apart. A layout shared across pipelines can live
 in an external `.schema.yaml` file referenced by `schema: layout.schema.yaml`.
 
+## Writing fixed-width output
+
+A fixed-width **output** node declares the same column layout in its
+`schema:`. The writer places every field at its declared byte range —
+`start` plus `width` (or `end`), resolved exactly as the reader slices —
+regardless of the order the columns are declared in, so a file written
+with a schema reads back under that same schema. Byte ranges the layout
+leaves undeclared (a gap between fields) are filled with spaces. A column
+that omits `start` continues at the previous column's end, so a
+width-only schema lays its fields out sequentially. Two columns whose
+byte ranges overlap have no consistent layout; the writer rejects such a
+schema when the output opens, naming both columns and their ranges.
+
 ## Options
 
 | Option | Default | Description |
