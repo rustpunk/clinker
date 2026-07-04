@@ -525,6 +525,40 @@ schema:
   - { name: customer_id, type: string, source_name: cust_id }
 ```
 
+### Format-structure patches (X12 / HL7 v2)
+
+Beyond the format-agnostic ops above, a `sources:` patch can reshape the
+format-layer structures an X12 or HL7 source declares in its `options:` block —
+with keyed add/modify/remove grammar instead of blob-replacing the whole
+options map:
+
+```yaml
+sources:
+  interchange:                             # an X12 source
+    group_section:                         # the GS functional-group declaration
+      name: fg                             # rename the section (omit to keep)
+      fields:
+        e04: int                           # set/add a typed field
+        e05: remove                        # drop a declared field
+    set_section: remove                    # drop the whole ST declaration
+  messages:                                # an HL7 v2 source
+    split_fields:                          # keyed by positional field name
+      f08: { components: 3 }               # add-or-modify a composite split
+      f03: remove                          # drop a declared split
+```
+
+`group_section` / `set_section` patch the X12 nested-envelope declarations (the
+`GS` functional-group and `ST` transaction-set levels); `split_fields` patches
+the HL7 composite-field splits, keyed by positional field name and resolved by
+wire position (`f8` and `f08` address the same split). Each op applies only to
+a source of the matching format (anything else is E238). The set form is a
+partial modify on an existing declaration — an omitted `name` or axis width
+keeps its current value — and creates the declaration when absent, in which
+case `name` (X12) or `components` (HL7) is required (E240). Removing a
+declaration, field, or split the source does not carry is E239. These ops
+apply after the `options` merge, so they layer on top of an `options` value
+that replaces the same declaration in one patch.
+
 `sources:` patches target **top-level** source nodes; a source declared inside a
 composition body is not reachable this way (patching it fails with E230). When a
 patch changes the effective source config, the run's pipeline identity differs
@@ -544,3 +578,7 @@ not collide.
 | **E234** | An `array_paths` `remove` of a path with no matching entry. |
 | **E235** | An `options` patch sets an unknown or mistyped option key for the source's format. |
 | **E236** | A renamed/aliased column's exposed name collides with a real input field, which would mislocate that field. Raised at read time. |
+| **E237** | A `schema` patch on a multi-record / generated / external-file schema — column ops apply only to a single-record column list. |
+| **E238** | A `group_section` / `set_section` patch on a non-X12 source, or a `split_fields` patch on a non-HL7 source. |
+| **E239** | A `remove` of a nested-section declaration, declared section field, or field split the source does not carry. |
+| **E240** | A malformed format-structure patch: creating a nested section without a `name`, adding a split without `components`, a split key that is not a positional `fNN` name, or a zero axis width. |

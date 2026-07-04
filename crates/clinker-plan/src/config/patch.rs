@@ -10,16 +10,18 @@
 //! the span-aware `Spanned<PipelineNode>` structure is preserved, never
 //! round-tripped through a span-losing intermediate value.
 //!
-//! v1 handles the format-agnostic schema-shaping surfaces: the CXL-typed
+//! Handled surfaces: the format-agnostic schema-shaping ops — the CXL-typed
 //! column list (`schema`), nested-array explosion/join (`array_paths`), and
-//! scalar per-format input options (`options`). Deeper format-layer layouts
-//! (fixed-width/positional field schemas, X12/HL7 nested sections, multi-record
+//! scalar per-format input options (`options`) — plus the format-structure
+//! ops for X12 nested-envelope declarations (`group_section` / `set_section`)
+//! and HL7 composite-field splits (`split_fields`). Deeper format-layer
+//! layouts (fixed-width/positional field schemas, multi-record
 //! discrimination) reuse this same framework as additional handlers.
 
 use super::*;
 use crate::config::composition::SchemaProvRecorder;
 use crate::config::pipeline_node::{PipelineNode, SourceBody};
-use clinker_format::{Column, SourceSchema};
+use clinker_format::{Column, EnvelopeFieldType, NestedEnvelopeSection, SourceSchema};
 use clinker_record::schema_def::{Justify, TruncationPolicy};
 use cxl::typecheck::Type;
 use indexmap::IndexMap;
@@ -44,12 +46,32 @@ pub struct SourceConfigPatch {
     /// source's current options and re-validated through the format's option
     /// struct, so an unknown key is rejected exactly as in hand-written config.
     pub options: IndexMap<String, serde_json::Value>,
+    /// Op on the X12 `GS` functional-group nested-envelope declaration
+    /// (`set`/modify/`remove`). Applies only to an `x12` source. Applied after
+    /// the `options` merge, so a keyed op layers on top of an `options`-blob
+    /// replacement of the same declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_section: Option<NestedSectionOp>,
+    /// Op on the X12 `ST` transaction-set nested-envelope declaration,
+    /// mirroring `group_section`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub set_section: Option<NestedSectionOp>,
+    /// HL7 composite-field split ops keyed by positional field name (`f08`):
+    /// set-by-key (add-or-modify) or `remove`. Applies only to an `hl7`
+    /// source, after the `options` merge.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub split_fields: IndexMap<String, SplitFieldOp>,
 }
 
 impl SourceConfigPatch {
     /// Whether this patch carries no ops — a no-op the apply pass can skip.
     pub fn is_empty(&self) -> bool {
-        self.schema.is_empty() && self.array_paths.is_empty() && self.options.is_empty()
+        self.schema.is_empty()
+            && self.array_paths.is_empty()
+            && self.options.is_empty()
+            && self.group_section.is_none()
+            && self.set_section.is_none()
+            && self.split_fields.is_empty()
     }
 }
 
@@ -322,11 +344,183 @@ impl<'de> Deserialize<'de> for ArrayPathOp {
     }
 }
 
+/// One op on an X12 nested-envelope declaration (`group_section` /
+/// `set_section`) — a whole [`NestedEnvelopeSection`], not a keyed map,
+/// because each X12 source carries at most one declaration per level.
+///
+/// YAML forms:
+///
+/// ```yaml
+/// group_section: remove                       # drop the declaration
+/// group_section:                              # set / modify
+///   name: fg                                  # optional on an existing declaration
+///   fields:
+///     e06: string                             # set/add a typed field
+///     e05: remove                             # drop a declared field
+/// ```
+///
+/// On an **existing** declaration an omitted `name` keeps the current one and
+/// each field op applies individually; on an **absent** declaration the op
+/// creates it, so `name` is required and a field `remove` is an error.
+/// `Serialize` is derived for config-identity hashing only.
+#[derive(Debug, Clone, Serialize)]
+pub enum NestedSectionOp {
+    /// Drop the declaration entirely, reverting the level to its default
+    /// positional section.
+    Remove,
+    /// Create the declaration or modify the existing one.
+    Set {
+        /// Section name `$doc.<name>.<field>` resolves under. `None` = keep
+        /// current (existing declaration only).
+        name: Option<String>,
+        /// Per-field ops, keyed by positional element name (`e06`).
+        fields: IndexMap<String, EnvelopeFieldOp>,
+    },
+}
+
+impl<'de> Deserialize<'de> for NestedSectionOp {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Two accepted YAML shapes:
+        //   remove                       (bare scalar)
+        //   { name?, fields? }           (declaration map)
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SetMap {
+            #[serde(default)]
+            name: Option<String>,
+            #[serde(default)]
+            fields: IndexMap<String, EnvelopeFieldOp>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Scalar(String),
+            Map(SetMap),
+        }
+
+        match Either::deserialize(d)? {
+            Either::Scalar(s) if s == "remove" => Ok(NestedSectionOp::Remove),
+            Either::Scalar(other) => Err(de::Error::custom(format!(
+                "unknown nested-section op {other:?}; the bare scalar form only accepts \
+                 `remove` — use `{{ name: <section>, fields: {{ e06: string }} }}` to set or \
+                 modify the declaration"
+            ))),
+            Either::Map(m) => Ok(NestedSectionOp::Set {
+                name: m.name,
+                fields: m.fields,
+            }),
+        }
+    }
+}
+
+/// One per-field op inside a [`NestedSectionOp::Set`]'s `fields` map: set the
+/// field's envelope type, or drop the field from the declaration.
+/// `Serialize` is derived for config-identity hashing only.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub enum EnvelopeFieldOp {
+    /// Drop the keyed field from the declaration.
+    Remove,
+    /// Set (add-or-replace) the keyed field's envelope type.
+    Set(EnvelopeFieldType),
+}
+
+impl<'de> Deserialize<'de> for EnvelopeFieldOp {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // A bare scalar: `remove`, or an envelope field type name.
+        let s = String::deserialize(d)?;
+        if s == "remove" {
+            return Ok(EnvelopeFieldOp::Remove);
+        }
+        EnvelopeFieldType::deserialize(de::value::StrDeserializer::<D::Error>::new(&s))
+            .map(EnvelopeFieldOp::Set)
+            .map_err(|_| {
+                de::Error::custom(format!(
+                    "unknown envelope field op {s:?}; use a field type (`string`, `int`, \
+                     `float`, `bool`, `date`, `date_time`) to set the field, or `remove` to \
+                     drop it"
+                ))
+            })
+    }
+}
+
+/// One HL7 composite-field split op, keyed by positional field name (`f08`).
+///
+/// YAML forms (the map key is the field name):
+///
+/// ```yaml
+/// f08: { components: 3 }                     # add-or-modify a split
+/// f03: remove                                # drop a declared split
+/// ```
+///
+/// The key resolves by wire position, so `f8` and `f08` address the same
+/// split. `Serialize` is derived for config-identity hashing only.
+#[derive(Debug, Clone, Serialize)]
+pub enum SplitFieldOp {
+    /// Drop the keyed split declaration, restoring the verbatim `fNN` column.
+    Remove,
+    /// Add-or-modify the keyed split. Each axis is optional so a partial
+    /// modify keeps the omitted axis: on an **existing** split an omitted
+    /// axis retains its current width; on a **new** split `components` is
+    /// required and an omitted `subcomponents`/`repetitions` defaults to 1,
+    /// exactly as in hand-written config.
+    Set {
+        /// Component columns (the `^` axis); `None` = keep current /
+        /// required (new).
+        components: Option<usize>,
+        /// Sub-component columns per component (the `&` axis); `None` =
+        /// keep current / 1 (new).
+        subcomponents: Option<usize>,
+        /// Repetition columns (the `~` axis); `None` = keep current / 1
+        /// (new).
+        repetitions: Option<usize>,
+    },
+}
+
+impl<'de> Deserialize<'de> for SplitFieldOp {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Two accepted YAML shapes:
+        //   remove                                     (bare scalar)
+        //   { components?, subcomponents?, repetitions? }   (split map)
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SetMap {
+            #[serde(default)]
+            components: Option<usize>,
+            #[serde(default)]
+            subcomponents: Option<usize>,
+            #[serde(default)]
+            repetitions: Option<usize>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Scalar(String),
+            Map(SetMap),
+        }
+
+        match Either::deserialize(d)? {
+            Either::Scalar(s) if s == "remove" => Ok(SplitFieldOp::Remove),
+            Either::Scalar(other) => Err(de::Error::custom(format!(
+                "unknown split_fields op {other:?}; the bare scalar form only accepts `remove` \
+                 — use `{{ components: <n>, subcomponents: <n>, repetitions: <n> }}` to add or \
+                 modify a split"
+            ))),
+            Either::Map(m) => Ok(SplitFieldOp::Set {
+                components: m.components,
+                subcomponents: m.subcomponents,
+                repetitions: m.repetitions,
+            }),
+        }
+    }
+}
+
 /// Apply channel source-config patches to the parsed config in place.
 ///
 /// Runs after parse and before `validate_config`, so the patched config is
 /// the one validated and compiled. Each entry names a source node; an unknown
-/// source name or an ill-formed op is a config error (E230–E235) reported
+/// source name or an ill-formed op is a config error (E230–E240) reported
 /// before the pipeline compiles.
 pub fn apply_source_patches(
     config: &mut PipelineConfig,
@@ -356,6 +550,22 @@ pub fn apply_source_patches(
         apply_schema_ops(&mut body.schema, &patch.schema, src_name, None)?;
         apply_array_path_ops(&mut body.source, &patch.array_paths, src_name)?;
         apply_option_ops(&mut body.source, &patch.options, src_name)?;
+        // Format-structure ops apply after the options merge so a keyed op
+        // layers deterministically on top of an `options`-blob replacement of
+        // the same declaration in the same patch.
+        apply_nested_section_op(
+            &mut body.source,
+            patch.group_section.as_ref(),
+            X12SectionSlot::Group,
+            src_name,
+        )?;
+        apply_nested_section_op(
+            &mut body.source,
+            patch.set_section.as_ref(),
+            X12SectionSlot::Set,
+            src_name,
+        )?;
+        apply_split_field_ops(&mut body.source, &patch.split_fields, src_name)?;
     }
     Ok(())
 }
@@ -659,6 +869,230 @@ fn options_rejected(src: &str, fmt: &str, err: &serde_json::Error) -> ConfigErro
 fn options_internal(src: &str, err: &serde_json::Error) -> ConfigError {
     ConfigError::Validation(format!(
         "[E235] channel options patch on source '{src}': could not read current options: {err}"
+    ))
+}
+
+/// Which X12 nested-envelope declaration a [`NestedSectionOp`] targets.
+#[derive(Clone, Copy)]
+enum X12SectionSlot {
+    /// The `GS` functional-group level (`group_section`).
+    Group,
+    /// The `ST` transaction-set level (`set_section`).
+    Set,
+}
+
+impl X12SectionSlot {
+    /// The patch key, used verbatim in diagnostics.
+    fn key(self) -> &'static str {
+        match self {
+            X12SectionSlot::Group => "group_section",
+            X12SectionSlot::Set => "set_section",
+        }
+    }
+
+    /// The targeted declaration on the source's X12 options.
+    fn slot(self, opts: &mut X12InputOptions) -> &mut Option<NestedEnvelopeSection> {
+        match self {
+            X12SectionSlot::Group => &mut opts.group_section,
+            X12SectionSlot::Set => &mut opts.set_section,
+        }
+    }
+}
+
+/// Apply one `group_section` / `set_section` op to the source's X12 options
+/// in place. A non-X12 source is rejected (E238); a `remove` of an absent
+/// declaration or field is E239; creating a declaration without a `name` is
+/// E240.
+fn apply_nested_section_op(
+    source: &mut SourceConfig,
+    op: Option<&NestedSectionOp>,
+    which: X12SectionSlot,
+    src: &str,
+) -> Result<(), ConfigError> {
+    let Some(op) = op else {
+        return Ok(());
+    };
+    let fmt = source.format.format_name();
+    let InputFormat::X12(opts) = &mut source.format else {
+        return Err(ConfigError::Validation(format!(
+            "[E238] channel {key} patch on source '{src}': X12 nested-envelope section ops \
+             apply only to an `x12` source (source format is {fmt})",
+            key = which.key(),
+        )));
+    };
+    match op {
+        NestedSectionOp::Remove => {
+            let removed = opts.as_mut().and_then(|o| which.slot(o).take());
+            if removed.is_none() {
+                return Err(ConfigError::Validation(format!(
+                    "[E239] channel {key} patch on source '{src}': remove of a declaration the \
+                     source does not carry",
+                    key = which.key(),
+                )));
+            }
+        }
+        NestedSectionOp::Set { name, fields } => {
+            let slot = which.slot(opts.get_or_insert_with(Default::default));
+            match slot {
+                Some(existing) => {
+                    if let Some(n) = name {
+                        existing.name = n.clone();
+                    }
+                    for (field, field_op) in fields {
+                        match field_op {
+                            EnvelopeFieldOp::Set(ty) => {
+                                existing.fields.insert(field.clone(), *ty);
+                            }
+                            EnvelopeFieldOp::Remove => {
+                                if existing.fields.shift_remove(field).is_none() {
+                                    return Err(unknown_nested_field(src, which, field));
+                                }
+                            }
+                        }
+                    }
+                }
+                None => {
+                    let name = name.clone().ok_or_else(|| {
+                        ConfigError::Validation(format!(
+                            "[E240] channel {key} patch on source '{src}': the source declares \
+                             no {key} yet, so the patch creates one and must carry a `name`",
+                            key = which.key(),
+                        ))
+                    })?;
+                    let mut new_fields = IndexMap::new();
+                    for (field, field_op) in fields {
+                        match field_op {
+                            EnvelopeFieldOp::Set(ty) => {
+                                new_fields.insert(field.clone(), *ty);
+                            }
+                            EnvelopeFieldOp::Remove => {
+                                return Err(unknown_nested_field(src, which, field));
+                            }
+                        }
+                    }
+                    *slot = Some(NestedEnvelopeSection {
+                        name,
+                        fields: new_fields,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unknown_nested_field(src: &str, which: X12SectionSlot, field: &str) -> ConfigError {
+    ConfigError::Validation(format!(
+        "[E239] channel {key} patch on source '{src}': remove of unknown field '{field}'",
+        key = which.key(),
+    ))
+}
+
+/// Apply field-name-keyed composite-split ops to the source's HL7 options in
+/// place. A non-HL7 source is rejected (E238); a `remove` of an undeclared
+/// split is E239; a malformed op — a key that is not a positional `fNN` name,
+/// an added split without `components`, or a zero axis width — is E240. Keys
+/// resolve by wire position, so `f8` addresses a split declared as `f08`.
+/// Bounds against `max_fields` and duplicate-target detection stay with
+/// `validate_config`, which runs on the patched result.
+fn apply_split_field_ops(
+    source: &mut SourceConfig,
+    ops: &IndexMap<String, SplitFieldOp>,
+    src: &str,
+) -> Result<(), ConfigError> {
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let fmt = source.format.format_name();
+    let InputFormat::Hl7(opts) = &mut source.format else {
+        return Err(ConfigError::Validation(format!(
+            "[E238] channel split_fields patch on source '{src}': HL7 composite-field split \
+             ops apply only to an `hl7` source (source format is {fmt})"
+        )));
+    };
+    for (field, op) in ops {
+        let position = Hl7FieldSplitOption::parse_field_position(field).ok_or_else(|| {
+            ConfigError::Validation(format!(
+                "[E240] channel split_fields patch on source '{src}': {field:?} is not a \
+                 positional `fNN` column name (e.g. `f08`)"
+            ))
+        })?;
+        match op {
+            SplitFieldOp::Remove => {
+                let Some(entries) = opts.as_mut().and_then(|o| o.split_fields.as_mut()) else {
+                    return Err(unknown_split_field(src, field));
+                };
+                let Some(idx) = entries
+                    .iter()
+                    .position(|s| s.field_position() == Some(position))
+                else {
+                    return Err(unknown_split_field(src, field));
+                };
+                entries.remove(idx);
+            }
+            SplitFieldOp::Set {
+                components,
+                subcomponents,
+                repetitions,
+            } => {
+                // Only the widths this op itself writes are checked here, so
+                // the diagnostic blames the patch and never a pre-existing
+                // declaration (validate_config re-checks the whole result).
+                for (axis, provided) in [
+                    ("components", components),
+                    ("subcomponents", subcomponents),
+                    ("repetitions", repetitions),
+                ] {
+                    if *provided == Some(0) {
+                        return Err(ConfigError::Validation(format!(
+                            "[E240] channel split_fields patch on source '{src}': split field \
+                             '{field}' sets `{axis}: 0`; every axis width must be at least 1"
+                        )));
+                    }
+                }
+                let entries = opts
+                    .get_or_insert_with(Default::default)
+                    .split_fields
+                    .get_or_insert_with(Vec::new);
+                if let Some(existing) = entries
+                    .iter_mut()
+                    .find(|s| s.field_position() == Some(position))
+                {
+                    // Partial modify: an omitted axis keeps its current width.
+                    if let Some(c) = components {
+                        existing.components = *c;
+                    }
+                    if let Some(s) = subcomponents {
+                        existing.subcomponents = *s;
+                    }
+                    if let Some(r) = repetitions {
+                        existing.repetitions = *r;
+                    }
+                } else {
+                    let components = components.ok_or_else(|| {
+                        ConfigError::Validation(format!(
+                            "[E240] channel split_fields patch on source '{src}': the source \
+                             declares no split for field '{field}' yet, so the patch adds one \
+                             and must carry `components`"
+                        ))
+                    })?;
+                    entries.push(Hl7FieldSplitOption {
+                        field: field.clone(),
+                        components,
+                        subcomponents: subcomponents.unwrap_or(1),
+                        repetitions: repetitions.unwrap_or(1),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unknown_split_field(src: &str, field: &str) -> ConfigError {
+    ConfigError::Validation(format!(
+        "[E239] channel split_fields patch on source '{src}': remove of a split the source \
+         does not declare for field '{field}'"
     ))
 }
 
@@ -1362,5 +1796,392 @@ nodes:
             "{}",
             err.0
         );
+    }
+
+    /// An X12 source declaring a typed `group_section` (`set_section` left
+    /// undeclared), feeding one output.
+    fn x12_pipeline() -> PipelineConfig {
+        let yaml = "\
+pipeline:
+  name: patch_test
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: x12
+      path: /tmp/in.x12
+      options:
+        group_section:
+          name: grp
+          fields:
+            e06: string
+      schema:
+        - { name: seg_id, type: string }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: /tmp/out.csv
+";
+        crate::yaml::from_str(yaml).expect("parse x12 pipeline")
+    }
+
+    fn x12_options(config: &PipelineConfig) -> &X12InputOptions {
+        match &config.source_configs().next().expect("one source").format {
+            InputFormat::X12(Some(opts)) => opts,
+            other => panic!("expected x12 options, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_section_modify_patches_name_and_fields() {
+        let mut config = x12_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml(
+                "group_section:\n  name: fg\n  fields:\n    e06: int\n    e07: string\n",
+            ),
+        )
+        .unwrap();
+        let section = x12_options(&config).group_section.as_ref().unwrap();
+        assert_eq!(section.name, "fg");
+        assert_eq!(section.fields.get("e06"), Some(&EnvelopeFieldType::Int));
+        assert_eq!(section.fields.get("e07"), Some(&EnvelopeFieldType::String));
+        assert_eq!(section.fields.len(), 2);
+    }
+
+    #[test]
+    fn nested_section_modify_keeps_omitted_name() {
+        // A field-only modify must not clobber the declaration's name.
+        let mut config = x12_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("group_section:\n  fields:\n    e07: date\n"),
+        )
+        .unwrap();
+        let section = x12_options(&config).group_section.as_ref().unwrap();
+        assert_eq!(section.name, "grp");
+        assert_eq!(section.fields.get("e06"), Some(&EnvelopeFieldType::String));
+        assert_eq!(section.fields.get("e07"), Some(&EnvelopeFieldType::Date));
+    }
+
+    #[test]
+    fn nested_section_field_remove_drops_field() {
+        let mut config = x12_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("group_section:\n  fields:\n    e06: remove\n"),
+        )
+        .unwrap();
+        let section = x12_options(&config).group_section.as_ref().unwrap();
+        assert_eq!(section.name, "grp");
+        assert!(section.fields.is_empty());
+    }
+
+    #[test]
+    fn nested_section_field_remove_unknown_errors_e239() {
+        let mut config = x12_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("group_section:\n  fields:\n    e99: remove\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E239"), "{err}");
+    }
+
+    #[test]
+    fn nested_section_remove_drops_declaration() {
+        let mut config = x12_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("group_section: remove\n"),
+        )
+        .unwrap();
+        assert!(x12_options(&config).group_section.is_none());
+    }
+
+    #[test]
+    fn nested_section_remove_absent_errors_e239() {
+        // `set_section` is not declared on the fixture source.
+        let mut config = x12_pipeline();
+        let err = apply(&mut config, "src", patch_from_yaml("set_section: remove\n")).unwrap_err();
+        assert!(err.to_string().contains("E239"), "{err}");
+    }
+
+    #[test]
+    fn nested_section_create_sets_declaration() {
+        let mut config = x12_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml(
+                "set_section:\n  name: txn\n  fields:\n    e01: string\n    e02: int\n",
+            ),
+        )
+        .unwrap();
+        let section = x12_options(&config).set_section.as_ref().unwrap();
+        assert_eq!(section.name, "txn");
+        assert_eq!(section.fields.get("e01"), Some(&EnvelopeFieldType::String));
+        assert_eq!(section.fields.get("e02"), Some(&EnvelopeFieldType::Int));
+    }
+
+    #[test]
+    fn nested_section_create_requires_name_e240() {
+        let mut config = x12_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("set_section:\n  fields:\n    e01: string\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E240"), "{err}");
+    }
+
+    #[test]
+    fn nested_section_create_with_field_remove_errors_e239() {
+        // A field `remove` while creating a new declaration removes a field
+        // that cannot exist yet.
+        let mut config = x12_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("set_section:\n  name: txn\n  fields:\n    e01: remove\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E239"), "{err}");
+    }
+
+    #[test]
+    fn nested_section_on_non_x12_errors_e238() {
+        let mut config = csv_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("group_section:\n  name: fg\n"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("E238"), "{msg}");
+        assert!(msg.contains("csv"), "names the actual format: {msg}");
+    }
+
+    #[test]
+    fn nested_section_unknown_key_rejected_at_parse() {
+        let err =
+            crate::yaml::from_str::<SourceConfigPatch>("group_section:\n  nam: fg\n").unwrap_err();
+        let msg = format!("{}", err.0);
+        assert!(msg.contains("nam") || msg.contains("unknown"), "{msg}");
+    }
+
+    #[test]
+    fn nested_section_unknown_field_type_rejected_at_parse() {
+        let err = crate::yaml::from_str::<SourceConfigPatch>(
+            "group_section:\n  fields:\n    e01: strin\n",
+        )
+        .unwrap_err();
+        let msg = format!("{}", err.0);
+        assert!(msg.contains("strin"), "{msg}");
+    }
+
+    #[test]
+    fn nested_section_applies_after_options_blob() {
+        // A patch carrying BOTH an `options`-blob replacement of the
+        // declaration and a keyed op: the keyed op wins because it applies
+        // after the options merge.
+        let mut config = x12_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml(
+                "options:\n  group_section: { name: blob, fields: { e01: string } }\ngroup_section:\n  name: keyed\n",
+            ),
+        )
+        .unwrap();
+        let section = x12_options(&config).group_section.as_ref().unwrap();
+        assert_eq!(section.name, "keyed");
+        // The blob-replaced fields survive the field-less keyed rename.
+        assert_eq!(section.fields.get("e01"), Some(&EnvelopeFieldType::String));
+        assert_eq!(section.fields.len(), 1);
+    }
+
+    /// An HL7 source declaring one composite-field split (`f03`), feeding one
+    /// output.
+    fn hl7_pipeline() -> PipelineConfig {
+        let yaml = "\
+pipeline:
+  name: patch_test
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: hl7
+      path: /tmp/in.hl7
+      options:
+        split_fields:
+          - { field: f03, components: 5 }
+      schema:
+        - { name: seg_id, type: string }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: /tmp/out.csv
+";
+        crate::yaml::from_str(yaml).expect("parse hl7 pipeline")
+    }
+
+    fn hl7_splits(config: &PipelineConfig) -> Vec<(String, usize, usize, usize)> {
+        match &config.source_configs().next().expect("one source").format {
+            InputFormat::Hl7(Some(opts)) => opts
+                .split_fields
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| (s.field, s.components, s.subcomponents, s.repetitions))
+                .collect(),
+            other => panic!("expected hl7 options, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_fields_add_new_entry() {
+        let mut config = hl7_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_fields:\n  f08: { components: 2 }\n"),
+        )
+        .unwrap();
+        let splits = hl7_splits(&config);
+        assert_eq!(splits.len(), 2);
+        // New entry: omitted subcomponents/repetitions default to 1, exactly
+        // as in hand-written config.
+        assert!(splits.contains(&("f08".to_string(), 2, 1, 1)), "{splits:?}");
+    }
+
+    #[test]
+    fn split_fields_partial_modify_keeps_omitted_axes() {
+        let mut config = hl7_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_fields:\n  f03: { subcomponents: 2 }\n"),
+        )
+        .unwrap();
+        // components stays 5 — a partial modify must not reset it.
+        assert_eq!(hl7_splits(&config), vec![("f03".to_string(), 5, 2, 1)]);
+    }
+
+    #[test]
+    fn split_fields_key_resolves_by_wire_position() {
+        // `f3` and `f03` name the same wire position, so the patch modifies
+        // the existing declaration rather than adding a duplicate split.
+        let mut config = hl7_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_fields:\n  f3: { repetitions: 4 }\n"),
+        )
+        .unwrap();
+        assert_eq!(hl7_splits(&config), vec![("f03".to_string(), 5, 1, 4)]);
+    }
+
+    #[test]
+    fn split_fields_remove_entry() {
+        let mut config = hl7_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_fields:\n  f03: remove\n"),
+        )
+        .unwrap();
+        assert!(hl7_splits(&config).is_empty());
+    }
+
+    #[test]
+    fn split_fields_remove_unknown_errors_e239() {
+        let mut config = hl7_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_fields:\n  f09: remove\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E239"), "{err}");
+    }
+
+    #[test]
+    fn split_fields_add_requires_components_e240() {
+        let mut config = hl7_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_fields:\n  f08: { repetitions: 2 }\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E240"), "{err}");
+    }
+
+    #[test]
+    fn split_fields_malformed_key_errors_e240() {
+        let mut config = hl7_pipeline();
+        for key in ["q08", "f", "f0", "f1x"] {
+            let err = apply(
+                &mut config,
+                "src",
+                patch_from_yaml(&format!("split_fields:\n  {key}: {{ components: 2 }}\n")),
+            )
+            .unwrap_err();
+            assert!(err.to_string().contains("E240"), "key {key:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn split_fields_zero_axis_errors_e240() {
+        let mut config = hl7_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_fields:\n  f03: { components: 0 }\n"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("E240"), "{msg}");
+        assert!(msg.contains("components"), "names the zero axis: {msg}");
+    }
+
+    #[test]
+    fn split_fields_on_non_hl7_errors_e238() {
+        let mut config = csv_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_fields:\n  f08: { components: 2 }\n"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("E238"), "{msg}");
+        assert!(msg.contains("csv"), "names the actual format: {msg}");
+    }
+
+    #[test]
+    fn patch_with_only_structure_ops_is_not_empty() {
+        // If `is_empty` misses a format-structure op the apply pass would
+        // silently skip it.
+        assert!(!patch_from_yaml("group_section: remove\n").is_empty());
+        assert!(!patch_from_yaml("set_section:\n  name: txn\n").is_empty());
+        assert!(!patch_from_yaml("split_fields:\n  f01: remove\n").is_empty());
+        assert!(SourceConfigPatch::default().is_empty());
     }
 }
