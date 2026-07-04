@@ -75,9 +75,12 @@ pub trait FormatReader: Send {
     /// The ingest driver calls this after dead-lettering a whole file for a
     /// structural-integrity failure under `dlq_granularity: document`, to keep
     /// reading the remaining files of a multi-file source instead of stopping
-    /// the source at the first malformed file. The structural-count failures
-    /// that trigger it fire at the file's closing trailer, so the abandoned
-    /// file is already fully consumed — no unread records of it are lost.
+    /// the source at the first malformed file. A trailer-count failure fires
+    /// at the file's closing trailer, so the abandoned file is fully
+    /// consumed; a mid-file structural-validation failure (an unknown
+    /// record-type discriminator, a body record after the trailer) abandons
+    /// the file's unread remainder — either way the whole file is already
+    /// condemned, so no record that should stream is lost.
     ///
     /// Default impl returns `Ok(false)`: a single-file reader has no next file.
     /// Wrappers holding an inner reader (`CoercingReader`) must delegate;
