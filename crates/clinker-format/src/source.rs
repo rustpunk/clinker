@@ -128,18 +128,23 @@ impl ReopenableSource {
     /// # Errors
     ///
     /// Returns the underlying [`std::io::Error`] if draining a `OneShot` fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a `OneShot`'s reader was already taken by a prior
-    /// [`open`](Self::open) — a multi-pass reader must convert before opening.
+    /// Returns [`std::io::ErrorKind::InvalidInput`] if a `OneShot`'s reader was
+    /// already taken by a prior [`open`](Self::open) — a multi-pass reader must
+    /// convert before opening. A poisoned reader slot (a panic mid-open on
+    /// another thread) surfaces as an opaque [`std::io::Error`].
     pub fn into_reopenable(self) -> std::io::Result<Self> {
         match self {
             ReopenableSource::OneShot(slot) => {
                 let reader = slot
                     .into_inner()
-                    .expect("ReopenableSource mutex poisoned")
-                    .expect("one-shot reader already taken; convert before the first open");
+                    .map_err(|_| std::io::Error::other("one-shot reader slot poisoned"))?
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "one-shot reader already taken; convert via into_reopenable \
+                             before the first open",
+                        )
+                    })?;
                 Self::buffer(reader)
             }
             already => Ok(already),
@@ -156,12 +161,9 @@ impl ReopenableSource {
     /// # Errors
     ///
     /// Returns the underlying [`std::io::Error`] if a `Path` source fails to
-    /// open. `Buffered` never fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a `OneShot` is opened more than once without first converting
-    /// via [`into_reopenable`](Self::into_reopenable).
+    /// open, or [`std::io::ErrorKind::InvalidInput`] if a `OneShot` is opened
+    /// more than once without first converting via
+    /// [`into_reopenable`](Self::into_reopenable). `Buffered` never fails.
     pub fn open(&self) -> std::io::Result<Box<dyn Read + Send>> {
         Ok(self.open_with_identity()?.0)
     }
@@ -179,12 +181,10 @@ impl ReopenableSource {
     /// # Errors
     ///
     /// Returns the underlying [`std::io::Error`] if a `Path` source fails to
-    /// open or its metadata cannot be read.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a `OneShot` is opened more than once without first converting
-    /// via [`into_reopenable`](Self::into_reopenable).
+    /// open or its metadata cannot be read, or
+    /// [`std::io::ErrorKind::InvalidInput`] if a `OneShot` is opened more than
+    /// once without first converting via
+    /// [`into_reopenable`](Self::into_reopenable).
     pub fn open_with_identity(&self) -> std::io::Result<(Box<dyn Read + Send>, SourceIdentity)> {
         match self {
             ReopenableSource::Path(path) => {
@@ -209,9 +209,14 @@ impl ReopenableSource {
             ReopenableSource::OneShot(slot) => {
                 let reader = slot
                     .lock()
-                    .expect("ReopenableSource mutex poisoned")
+                    .map_err(|_| std::io::Error::other("one-shot reader slot poisoned"))?
                     .take()
-                    .expect("one-shot source opened twice; convert via into_reopenable first");
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "one-shot source opened twice; convert via into_reopenable first",
+                        )
+                    })?;
                 Ok((
                     reader,
                     SourceIdentity {
@@ -322,9 +327,28 @@ mod tests {
         let mut a = String::new();
         src.open().unwrap().read_to_string(&mut a).unwrap();
         assert_eq!(a, "once");
-        // The reader was taken; a second open without converting must panic.
-        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| src.open()));
-        assert!(second.is_err(), "a second one-shot open must panic");
+        // The reader was taken; a second open without converting is misuse and
+        // must surface as a typed error, not a panic.
+        let err = match src.open() {
+            Ok(_) => panic!("a second one-shot open must return an error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn into_reopenable_after_open_returns_invalid_input() {
+        let src = ReopenableSource::one_shot(Box::new(Cursor::new(b"gone".to_vec())));
+        let mut a = String::new();
+        src.open().unwrap().read_to_string(&mut a).unwrap();
+        assert_eq!(a, "gone");
+        // The reader is gone; converting now cannot buffer anything and must
+        // surface as a typed error, not a panic.
+        let err = match src.into_reopenable() {
+            Ok(_) => panic!("converting an already-opened one-shot must return an error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
     }
 
     #[test]
