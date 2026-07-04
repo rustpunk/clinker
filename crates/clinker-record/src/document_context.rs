@@ -288,23 +288,49 @@ impl EnvelopeRecord {
     /// Build a child envelope: this record's columns unioned with `child`'s,
     /// `child` shadowing on a same-name collision (innermost-wins). A colliding
     /// section keeps the ancestor's column position but takes the child's
-    /// payload; a fresh child section appends after the ancestors — matching the
-    /// `IndexMap::insert` order the flattened side-table used.
+    /// payload; a fresh child section appends after the ancestors — the order
+    /// an insertion-ordered map union produces.
+    ///
+    /// Reuses an existing `Arc<Schema>` instead of rebuilding one wherever the
+    /// merge cannot change the section list: an empty child keeps the
+    /// ancestor's schema outright (the per-message grain mint passes an empty
+    /// child, so a K-message file would otherwise rebuild the flattened
+    /// ancestor schema K times), and an empty ancestor keeps the child's. The
+    /// general path constructs the merged column/value vectors directly —
+    /// no scratch map, one schema construction, one pass over each side.
     fn merged_with(&self, child: EnvelopeRecord) -> EnvelopeRecord {
-        let mut merged: IndexMap<Box<str>, Value> =
-            IndexMap::with_capacity(self.sections.len() + child.sections.len());
-        for (name, payload) in self.schema.columns().iter().zip(self.sections.iter()) {
-            merged.insert(name.clone(), payload.clone());
+        if child.is_empty() {
+            return self.clone();
         }
+        if self.is_empty() {
+            return child;
+        }
+        let mut columns: Vec<Box<str>> =
+            Vec::with_capacity(self.sections.len() + child.sections.len());
+        let mut values: Vec<Value> = Vec::with_capacity(self.sections.len() + child.sections.len());
+        columns.extend(self.schema.columns().iter().cloned());
+        values.extend(self.sections.iter().cloned());
         for (name, payload) in child
             .schema
             .columns()
             .iter()
             .zip(child.sections.into_iter())
         {
-            merged.insert(name.clone(), payload);
+            match self.schema.index(name) {
+                Some(idx) => values[idx] = payload,
+                None => {
+                    columns.push(name.clone());
+                    values.push(payload);
+                }
+            }
         }
-        EnvelopeRecord::from_sections(merged)
+        // Column uniqueness holds by construction: each side's schema is
+        // duplicate-free, and every child name already present on the
+        // ancestor overwrote its payload in place rather than appending.
+        EnvelopeRecord {
+            schema: Arc::new(Schema::new(columns)),
+            sections: values,
+        }
     }
 }
 
@@ -836,6 +862,122 @@ mod tests {
         assert_eq!(
             child.get_section_field("meta", "level"),
             Some(Value::String("transaction".into()))
+        );
+    }
+
+    #[test]
+    fn merged_with_empty_child_reuses_ancestor_schema_arc() {
+        // The grain-mint pattern (`child_frame(id, EnvelopeRecord::empty())`)
+        // adds no sections, so the merged envelope must share the ancestor's
+        // schema allocation — refcount bump, no rebuild — and compare equal
+        // to the ancestor record.
+        let mut sections = IndexMap::new();
+        sections.insert(
+            Box::from("file_header"),
+            make_section(&[("sender", Value::String("LAB".into()))]),
+        );
+        let ancestor = envelope(sections);
+        let merged = ancestor.merged_with(EnvelopeRecord::empty());
+        assert!(
+            Arc::ptr_eq(&ancestor.schema, &merged.schema),
+            "an empty child must reuse the ancestor's Arc<Schema>, not rebuild it"
+        );
+        assert_eq!(merged, ancestor);
+
+        // The same reuse surfaces through the context path: a grain-minting
+        // child level shares the file-level schema allocation.
+        let file_doc = DocumentContext::new(DocumentId::next(), Arc::from("m.hl7"), ancestor);
+        let message = file_doc.child_frame(DocumentId::next(), EnvelopeRecord::empty());
+        assert!(Arc::ptr_eq(
+            &file_doc.envelope_record().schema,
+            &message.envelope_record().schema
+        ));
+    }
+
+    #[test]
+    fn merged_with_empty_ancestor_reuses_child_schema_arc() {
+        let mut sections = IndexMap::new();
+        sections.insert(
+            Box::from("group"),
+            make_section(&[("functional_id", Value::String("HC".into()))]),
+        );
+        let child = envelope(sections);
+        let child_schema = Arc::clone(&child.schema);
+        let expected = child.clone();
+        let merged = EnvelopeRecord::empty().merged_with(child);
+        assert!(
+            Arc::ptr_eq(&merged.schema, &child_schema),
+            "an empty ancestor must keep the child's Arc<Schema>, not rebuild it"
+        );
+        assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn merged_with_append_only_matches_map_union_construction() {
+        // Append-only merge (no name collision) must be structurally equal to
+        // the insertion-ordered map union built through `from_sections`:
+        // ancestors first in declared order, fresh child sections appended.
+        let mut isa_gs = IndexMap::new();
+        isa_gs.insert(
+            Box::from("interchange"),
+            make_section(&[("control_ref", Value::String("000000001".into()))]),
+        );
+        isa_gs.insert(
+            Box::from("group"),
+            make_section(&[("functional_id", Value::String("HC".into()))]),
+        );
+        let mut st = IndexMap::new();
+        st.insert(
+            Box::from("transaction"),
+            make_section(&[("set_id", Value::String("837".into()))]),
+        );
+
+        let mut union = isa_gs.clone();
+        for (name, payload) in st.clone() {
+            union.insert(name, payload);
+        }
+        let expected = envelope(union);
+
+        let merged = envelope(isa_gs).merged_with(envelope(st));
+        assert_eq!(merged, expected);
+        let names: Vec<&str> = merged.schema.columns().iter().map(|c| c.as_ref()).collect();
+        assert_eq!(names, vec!["interchange", "group", "transaction"]);
+    }
+
+    #[test]
+    fn merged_with_collision_matches_map_union_construction() {
+        // A colliding section keeps the ancestor's position but takes the
+        // child's payload (innermost wins); fresh sections still append —
+        // exactly the map-union semantics, pinned against `from_sections`.
+        let mut outer = IndexMap::new();
+        outer.insert(
+            Box::from("meta"),
+            make_section(&[("level", Value::String("interchange".into()))]),
+        );
+        outer.insert(Box::from("head"), make_section(&[("k", Value::Integer(1))]));
+        let mut inner = IndexMap::new();
+        inner.insert(
+            Box::from("meta"),
+            make_section(&[("level", Value::String("transaction".into()))]),
+        );
+        inner.insert(Box::from("foot"), make_section(&[("k", Value::Integer(2))]));
+
+        let mut union = outer.clone();
+        for (name, payload) in inner.clone() {
+            union.insert(name, payload);
+        }
+        let expected = envelope(union);
+
+        let merged = envelope(outer).merged_with(envelope(inner));
+        assert_eq!(merged, expected);
+        // Collision keeps the ancestor position ("meta" stays first) and the
+        // child payload; the fresh "foot" appends after all ancestors.
+        let names: Vec<&str> = merged.schema.columns().iter().map(|c| c.as_ref()).collect();
+        assert_eq!(names, vec!["meta", "head", "foot"]);
+        let meta_idx = merged.schema.index("meta").expect("meta column");
+        assert_eq!(
+            merged.sections[meta_idx],
+            make_section(&[("level", Value::String("transaction".into()))]),
         );
     }
 
