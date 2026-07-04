@@ -1,13 +1,16 @@
 //! Streaming XML reader using quick-xml's pull parser.
 //!
 //! Navigates to `record_path`, extracts attributes with configurable prefix,
-//! flattens nested elements with `.` separator, handles namespaces.
+//! flattens nested elements with `.` separator, handles namespaces, and
+//! applies `array_paths` explode/join to repeated child elements.
 //!
 //! **O(1 record) memory, no whole-document buffer:** the body walks the
 //! document element-at-a-time from a freshly re-opened `BufReader` —
 //! quick-xml's `read_event_into` pulls one event at a time, so only a single
 //! record's `element_stack` plus the event buffer is live at once, never the
-//! whole input.
+//! whole input. An array-path explode fans one record element out into
+//! several records; the expansion queue is bounded by that one element's
+//! fan-out, never the whole input.
 //!
 //! Envelope-aware sources run a streaming pre-scan before any body record
 //! emits: it walks the document once over its *own* freshly re-opened reader,
@@ -20,7 +23,9 @@
 //! whole-file byte buffer is retained for a file-backed input. See
 //! [`crate::xml::streaming`] for the event-driven pruned-extraction pass.
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read};
+use std::ops::Range;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -91,6 +96,48 @@ pub enum XmlArrayMode {
     Join,
 }
 
+/// One record element's raw extraction: flattened `(key, value)` pairs in
+/// document order with repeated keys intact, plus the field ranges covered
+/// by each configured array path's element occurrences.
+struct RawRecord {
+    fields: Vec<(String, String)>,
+    /// Index-aligned with `XmlReaderConfig::array_paths`: for each configured
+    /// path, the half-open ranges into `fields` spanning each occurrence of
+    /// that element, in document order. An occurrence with no extracted
+    /// fields (`<Item></Item>`) contributes an empty range, so an explode
+    /// still emits a record for it.
+    array_instances: Vec<Vec<Range<usize>>>,
+}
+
+impl RawRecord {
+    /// A raw record with no array-path occurrences — an attributes-only
+    /// record element has no child elements for a path to match.
+    fn without_instances(fields: Vec<(String, String)>, path_count: usize) -> Self {
+        RawRecord {
+            fields,
+            array_instances: vec![Vec::new(); path_count],
+        }
+    }
+}
+
+/// A flattened field tagged with its index in the original extraction, so
+/// array-path occurrence ranges (recorded against that original order) stay
+/// meaningful across the sequential per-path fan-out.
+type IndexedField = (usize, String, String);
+
+/// An array-path element currently being extracted. Configured paths never
+/// nest (validated at construction), so at most one occurrence is open at a
+/// time.
+struct OpenInstance {
+    /// Index into `XmlReaderConfig::array_paths`.
+    path: usize,
+    /// First field index belonging to this occurrence.
+    fields_from: usize,
+    /// `element_stack` length while this occurrence's element is open; the
+    /// occurrence closes when the stack shrinks below it.
+    stack_len: usize,
+}
+
 /// A quick-xml pull parser over a re-opened, BOM-stripped `BufReader`.
 ///
 /// Both the body parser and the envelope pre-scan parse over this same reader
@@ -110,7 +157,7 @@ pub(crate) type BodyParser = XmlParser<BufReader<Box<dyn Read + Send>>>;
 /// The envelope pre-scan retains only the declared sections' subtrees, each
 /// bounded by `max_index_bytes` (charged incrementally, aborting mid-parse on
 /// an oversized section), so held memory is O(declared sections) plus one
-/// live record while the reader exists.
+/// live record's array-path expansion while the reader exists.
 pub struct XmlReader {
     /// The re-openable byte source. Body iteration and the envelope pre-scan
     /// each open their own fresh [`Read`] from it, so no whole-document buffer
@@ -131,8 +178,11 @@ pub struct XmlReader {
     matched_depth: usize,
     /// Current XML depth (incremented on Start, decremented on End).
     xml_depth: usize,
-    /// Pending records from first-record schema inference.
-    pending: Option<Record>,
+    /// Expanded records awaiting emission: schema inference reads the first
+    /// record element eagerly, and an array-path explode fans one element
+    /// out into several records. Bounded by one element's expansion, never
+    /// the whole input.
+    pending: VecDeque<Record>,
     /// Whether we've finished all records.
     done: bool,
 }
@@ -153,6 +203,28 @@ impl XmlReader {
         source: ReopenableSource,
         config: XmlReaderConfig,
     ) -> Result<Self, FormatError> {
+        // Array paths must name disjoint element groups: occurrence tracking
+        // during extraction assigns each field to at most one configured
+        // path, and a duplicated path would fan the same group out twice.
+        // Reject the ambiguous configs before reading any input.
+        for (i, a) in config.array_paths.iter().enumerate() {
+            for b in &config.array_paths[i + 1..] {
+                if a.path == b.path {
+                    return Err(FormatError::Xml(format!(
+                        "array_paths: path {:?} is declared more than once",
+                        a.path
+                    )));
+                }
+                if under_array_path(&a.path, &b.path) || under_array_path(&b.path, &a.path) {
+                    return Err(FormatError::Xml(format!(
+                        "array_paths: paths {:?} and {:?} nest; XML array paths \
+                         must name disjoint (non-nested) element groups",
+                        a.path, b.path
+                    )));
+                }
+            }
+        }
+
         // XML runs two passes (envelope pre-scan + body stream), so the source
         // must be re-openable. A `Path`/`Buffered` source passes through; a
         // pathless `OneShot` is buffered here, on the reader-building thread —
@@ -176,7 +248,7 @@ impl XmlReader {
             path_segments,
             matched_depth: 0,
             xml_depth: 0,
-            pending: None,
+            pending: VecDeque::new(),
             done: false,
         })
     }
@@ -241,7 +313,7 @@ impl XmlReader {
 
     /// Navigate to the record_path and read one complete record element.
     /// Returns None when no more records exist.
-    fn read_next_record_raw(&mut self) -> Result<Option<Vec<(String, String)>>, FormatError> {
+    fn read_next_record_raw(&mut self) -> Result<Option<RawRecord>, FormatError> {
         if self.done {
             return Ok(None);
         }
@@ -264,16 +336,16 @@ impl XmlReader {
                             if self.matched_depth == self.path_segments.len() {
                                 let attrs =
                                     extract_attributes_static(&self.config.attribute_prefix, e)?;
-                                let fields = self.extract_record_fields(attrs)?;
-                                return Ok(Some(fields));
+                                let raw = self.extract_record_fields(attrs)?;
+                                return Ok(Some(raw));
                             }
                         } else {
                             self.skip_subtree()?;
                         }
                     } else {
                         let attrs = extract_attributes_static(&self.config.attribute_prefix, e)?;
-                        let fields = self.extract_record_fields(attrs)?;
-                        return Ok(Some(fields));
+                        let raw = self.extract_record_fields(attrs)?;
+                        return Ok(Some(raw));
                     }
                 }
                 Event::Empty(ref e) => {
@@ -285,11 +357,17 @@ impl XmlReader {
                         {
                             let fields =
                                 extract_attributes_static(&self.config.attribute_prefix, e)?;
-                            return Ok(Some(fields));
+                            return Ok(Some(RawRecord::without_instances(
+                                fields,
+                                self.config.array_paths.len(),
+                            )));
                         }
                     } else {
                         let fields = extract_attributes_static(&self.config.attribute_prefix, e)?;
-                        return Ok(Some(fields));
+                        return Ok(Some(RawRecord::without_instances(
+                            fields,
+                            self.config.array_paths.len(),
+                        )));
                     }
                 }
                 Event::End(_) => {
@@ -315,13 +393,18 @@ impl XmlReader {
         }
     }
 
-    /// Extract all fields from a record element (attributes + nested children).
-    /// Uses a separate buffer to avoid borrow conflicts with self.parser.
+    /// Extract all fields from a record element (attributes + nested children),
+    /// tracking the field ranges each configured array path's element
+    /// occurrences cover. Uses a separate buffer to avoid borrow conflicts
+    /// with self.parser.
     fn extract_record_fields(
         &mut self,
         start_attrs: Vec<(String, String)>,
-    ) -> Result<Vec<(String, String)>, FormatError> {
+    ) -> Result<RawRecord, FormatError> {
         let mut fields = start_attrs;
+        let mut array_instances: Vec<Vec<Range<usize>>> =
+            vec![Vec::new(); self.config.array_paths.len()];
+        let mut open_instance: Option<OpenInstance> = None;
         let record_depth = self.xml_depth;
         let mut element_stack: Vec<String> = Vec::new();
         // Raw source form of the current text node, accumulated across the
@@ -350,8 +433,20 @@ impl XmlReader {
                     self.xml_depth += 1;
                     let name = elem_name_static(&self.config.namespace_handling, &e.name());
                     element_stack.push(name);
-                    let child_attrs = extract_attributes_static(&self.config.attribute_prefix, e)?;
                     let prefix = element_stack.join(".");
+                    // Opening an element named by an array path starts a new
+                    // occurrence; the attributes pushed below are its first
+                    // fields. Paths never nest, so one open slot suffices.
+                    if open_instance.is_none()
+                        && let Some(pi) = self.array_path_index(&prefix)
+                    {
+                        open_instance = Some(OpenInstance {
+                            path: pi,
+                            fields_from: fields.len(),
+                            stack_len: element_stack.len(),
+                        });
+                    }
+                    let child_attrs = extract_attributes_static(&self.config.attribute_prefix, e)?;
                     for (key, val) in child_attrs {
                         fields.push((format!("{prefix}.{key}"), val));
                     }
@@ -362,6 +457,12 @@ impl XmlReader {
                         break;
                     }
                     element_stack.pop();
+                    if let Some(ref open) = open_instance
+                        && element_stack.len() < open.stack_len
+                    {
+                        array_instances[open.path].push(open.fields_from..fields.len());
+                        open_instance = None;
+                    }
                 }
                 Event::Empty(ref e) => {
                     let name = elem_name_static(&self.config.namespace_handling, &e.name());
@@ -370,10 +471,18 @@ impl XmlReader {
                     } else {
                         format!("{}.{name}", element_stack.join("."))
                     };
+                    let instance_from = fields.len();
                     fields.push((prefix.clone(), String::new()));
                     let child_attrs = extract_attributes_static(&self.config.attribute_prefix, e)?;
                     for (key, val) in child_attrs {
                         fields.push((format!("{prefix}.{key}"), val));
+                    }
+                    // A self-closing element named by an array path is a
+                    // complete occurrence on its own.
+                    if open_instance.is_none()
+                        && let Some(pi) = self.array_path_index(&prefix)
+                    {
+                        array_instances[pi].push(instance_from..fields.len());
                     }
                 }
                 Event::Text(ref t) => {
@@ -399,7 +508,71 @@ impl XmlReader {
             }
         }
 
-        Ok(fields)
+        // EOF inside an unclosed occurrence (malformed input): keep the
+        // fields read so far rather than dropping them.
+        if let Some(open) = open_instance {
+            array_instances[open.path].push(open.fields_from..fields.len());
+        }
+
+        Ok(RawRecord {
+            fields,
+            array_instances,
+        })
+    }
+
+    /// Index of the configured array path exactly matching this dotted
+    /// element path, if any.
+    fn array_path_index(&self, dotted: &str) -> Option<usize> {
+        self.config
+            .array_paths
+            .iter()
+            .position(|ap| ap.path == dotted)
+    }
+
+    /// Expand one raw record through the configured array paths, applied in
+    /// declaration order. `join` collapses each repeated flattened key under
+    /// the path into one separator-joined value at its first position;
+    /// `explode` emits one output per element occurrence, duplicating every
+    /// field outside the path onto each. A record with no occurrence of a
+    /// path passes through that path unchanged. Memory is bounded by one
+    /// record's fan-out (the product of exploded occurrence counts).
+    fn apply_array_paths(&self, raw: RawRecord) -> Vec<Vec<(String, String)>> {
+        if self.config.array_paths.is_empty() {
+            return vec![raw.fields];
+        }
+
+        let mut result: Vec<Vec<IndexedField>> = vec![
+            raw.fields
+                .into_iter()
+                .enumerate()
+                .map(|(i, (k, v))| (i, k, v))
+                .collect(),
+        ];
+        for (ap, instances) in self.config.array_paths.iter().zip(&raw.array_instances) {
+            let mut next = Vec::new();
+            for rec in result {
+                match ap.mode {
+                    XmlArrayMode::Join => {
+                        next.push(join_array_path(rec, &ap.path, &ap.separator));
+                    }
+                    XmlArrayMode::Explode => {
+                        // No occurrence in this record: XML cannot
+                        // distinguish an empty repetition from an absent
+                        // element, so the record passes through unchanged.
+                        if instances.is_empty() {
+                            next.push(rec);
+                        } else {
+                            explode_array_path(&rec, instances, &mut next);
+                        }
+                    }
+                }
+            }
+            result = next;
+        }
+        result
+            .into_iter()
+            .map(|rec| rec.into_iter().map(|(_, k, v)| (k, v)).collect())
+            .collect()
     }
 
     /// Skip an entire subtree (from current Start to its matching End).
@@ -456,7 +629,7 @@ impl FormatReader for XmlReader {
 
         let first = self.read_next_record_raw()?;
         let first = match first {
-            Some(fields) => fields,
+            Some(raw) => raw,
             None => {
                 let s = SchemaBuilder::new().build();
                 self.schema = Some(Arc::clone(&s));
@@ -465,9 +638,16 @@ impl FormatReader for XmlReader {
             }
         };
 
-        // Infer schema from first record's field names (preserving order)
+        // Infer schema from the first expanded record's field names
+        // (preserving order). Array paths apply before inference, so an
+        // explode's fanned-out columns and a join's collapsed column are
+        // what the schema reflects.
+        let expanded = self.apply_array_paths(first);
+        let empty = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        let schema = first
+        let schema = expanded
+            .first()
+            .unwrap_or(&empty)
             .iter()
             .filter_map(|(k, _)| {
                 if seen.insert(k.clone()) {
@@ -480,8 +660,11 @@ impl FormatReader for XmlReader {
             .build();
         self.schema = Some(Arc::clone(&schema));
 
-        // Buffer the first record
-        self.pending = Some(self.fields_to_record(first)?);
+        // Buffer every record the first element expanded to.
+        for fields in expanded {
+            let record = self.fields_to_record(fields)?;
+            self.pending.push_back(record);
+        }
 
         Ok(schema)
     }
@@ -491,14 +674,18 @@ impl FormatReader for XmlReader {
             self.schema()?;
         }
 
-        if let Some(pending) = self.pending.take() {
-            return Ok(Some(pending));
-        }
-
-        let fields = self.read_next_record_raw()?;
-        match fields {
-            Some(f) => Ok(Some(self.fields_to_record(f)?)),
-            None => Ok(None),
+        loop {
+            if let Some(record) = self.pending.pop_front() {
+                return Ok(Some(record));
+            }
+            let raw = match self.read_next_record_raw()? {
+                Some(r) => r,
+                None => return Ok(None),
+            };
+            for fields in self.apply_array_paths(raw) {
+                let record = self.fields_to_record(fields)?;
+                self.pending.push_back(record);
+            }
         }
     }
 
@@ -690,6 +877,83 @@ pub(crate) fn finalize_text_run(raw: &str) -> Result<String, FormatError> {
     let trimmed = raw.trim_matches(is_xml_whitespace);
     let value = escape::unescape(trimmed).map_err(|e| FormatError::Xml(e.to_string()))?;
     Ok(value.into_owned())
+}
+
+/// True when a flattened key sits at or under an array path: the key IS the
+/// path (the element's own text) or extends it past a dot (its children and
+/// attributes). Also the nesting test between two configured paths, since a
+/// path is itself a dotted element path.
+fn under_array_path(key: &str, path: &str) -> bool {
+    key.strip_prefix(path)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+/// Collapse every repeated flattened key under `path` into one field whose
+/// value is the occurrences' values joined with `sep`, placed at the key's
+/// first position. A key occurring once keeps its value (a join of one).
+/// Fields outside the path pass through unchanged.
+fn join_array_path(rec: Vec<IndexedField>, path: &str, sep: &str) -> Vec<IndexedField> {
+    let mut joined: IndexMap<String, String> = IndexMap::new();
+    for (_, key, value) in &rec {
+        if under_array_path(key, path) {
+            match joined.entry(key.clone()) {
+                indexmap::map::Entry::Occupied(mut e) => {
+                    let acc = e.get_mut();
+                    acc.push_str(sep);
+                    acc.push_str(value);
+                }
+                indexmap::map::Entry::Vacant(e) => {
+                    e.insert(value.clone());
+                }
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(rec.len());
+    for (idx, key, value) in rec {
+        if under_array_path(&key, path) {
+            // First occurrence carries the joined value; later occurrences
+            // were already folded into it.
+            if let Some(v) = joined.swap_remove(&key) {
+                out.push((idx, key, v));
+            }
+        } else {
+            out.push((idx, key, value));
+        }
+    }
+    out
+}
+
+/// Fan one record out to one output per element occurrence of an exploded
+/// path: each output keeps that occurrence's fields plus every field outside
+/// the path's occurrences. Occurrence fields are spliced where the first
+/// occurrence sat, so all fanned-out siblings share one column order.
+fn explode_array_path(
+    rec: &[IndexedField],
+    instances: &[Range<usize>],
+    out: &mut Vec<Vec<IndexedField>>,
+) {
+    let anchor = instances[0].start;
+    for instance in instances {
+        let mut head: Vec<IndexedField> = Vec::new();
+        let mut inside: Vec<IndexedField> = Vec::new();
+        let mut tail: Vec<IndexedField> = Vec::new();
+        for field in rec {
+            let idx = field.0;
+            if instance.contains(&idx) {
+                inside.push(field.clone());
+            } else if instances.iter().any(|r| r.contains(&idx)) {
+                // A different occurrence of this path: not part of this output.
+                continue;
+            } else if idx < anchor {
+                head.push(field.clone());
+            } else {
+                tail.push(field.clone());
+            }
+        }
+        head.extend(inside);
+        head.extend(tail);
+        out.push(head);
+    }
 }
 
 /// Resolve the current text run and push it, if non-empty, as a field keyed by
@@ -1199,30 +1463,283 @@ mod tests {
         assert_eq!(r1.get("Address.State"), Some(&Value::String("NY".into())));
     }
 
+    /// A reader config over `record_path` with the given array paths.
+    fn array_path_config(record_path: &str, paths: Vec<XmlArrayPath>) -> XmlReaderConfig {
+        XmlReaderConfig {
+            record_path: Some(record_path.into()),
+            array_paths: paths,
+            ..Default::default()
+        }
+    }
+
+    fn explode(path: &str) -> XmlArrayPath {
+        XmlArrayPath {
+            path: path.into(),
+            mode: XmlArrayMode::Explode,
+            separator: ",".into(),
+        }
+    }
+
+    fn join(path: &str, separator: &str) -> XmlArrayPath {
+        XmlArrayPath {
+            path: path.into(),
+            mode: XmlArrayMode::Join,
+            separator: separator.into(),
+        }
+    }
+
+    fn column_names(schema: &Schema) -> Vec<&str> {
+        schema.columns().iter().map(|c| &**c).collect()
+    }
+
     #[test]
     fn test_xml_array_paths_explode() {
-        // Repeating <Item> elements — each becomes a separate field (accumulated)
-        // For true explode, we'd need array_paths config. For now, test that
-        // repeating elements produce the last value (simple case).
-        let xml = r#"<Root><Order><id>1</id><Item><name>A</name></Item><Item><name>B</name></Item></Order></Root>"#;
-        let mut r = reader_from_str(xml, default_config_with_path("Root/Order"));
-        let _s = r.schema().unwrap();
+        // Repeated <Item> children fan out into one record per occurrence;
+        // the parent's fields are duplicated onto each, and the exploded
+        // fields keep their full dotted names.
+        let xml = r#"<Root><Order><id>1</id><Item><name>A</name><qty>2</qty></Item><Item><name>B</name><qty>3</qty></Item></Order></Root>"#;
+        let config = array_path_config("Root/Order", vec![explode("Item")]);
+        let mut r = reader_from_str(xml, config);
+        let s = r.schema().unwrap();
+        // Schema reflects the first exploded record's columns.
+        assert_eq!(column_names(&s), ["id", "Item.name", "Item.qty"]);
+
         let r1 = r.next_record().unwrap().unwrap();
-        // Both items write to "Item.name" — last one wins in the simple model
         assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
-        // Item.name will have one of the values (last write wins)
-        assert!(r1.get("Item.name").is_some());
+        assert_eq!(r1.get("Item.name"), Some(&Value::String("A".into())));
+        assert_eq!(r1.get("Item.qty"), Some(&Value::Integer(2)));
+
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(r2.get("Item.name"), Some(&Value::String("B".into())));
+        assert_eq!(r2.get("Item.qty"), Some(&Value::Integer(3)));
+
+        assert!(r.next_record().unwrap().is_none());
     }
 
     #[test]
     fn test_xml_array_paths_join() {
-        // Multiple child elements with same name — values concatenated by last-write
-        let xml = r#"<Root><Row><Tag>a</Tag><Tag>b</Tag><Tag>c</Tag></Row></Root>"#;
-        let mut r = reader_from_str(xml, default_config_with_path("Root/Row"));
-        let _s = r.schema().unwrap();
+        // Repeated scalar children collapse into one separator-joined field;
+        // a custom separator is honored.
+        let xml = r#"<Root><Row><id>7</id><Tag>a</Tag><Tag>b</Tag><Tag>c</Tag></Row></Root>"#;
+        let config = array_path_config("Root/Row", vec![join("Tag", "|")]);
+        let mut r = reader_from_str(xml, config);
+        let s = r.schema().unwrap();
+        assert_eq!(column_names(&s), ["id", "Tag"]);
+
         let r1 = r.next_record().unwrap().unwrap();
-        // With simple extraction, repeated "Tag" fields — last value wins
-        assert!(r1.get("Tag").is_some());
+        assert_eq!(r1.get("id"), Some(&Value::Integer(7)));
+        assert_eq!(r1.get("Tag"), Some(&Value::String("a|b|c".into())));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn xml_array_paths_join_container_joins_each_subfield() {
+        // Joining a container element concatenates each repeated flattened
+        // key under it independently, in document order.
+        let xml = r#"<Root><Order><id>1</id><Item><name>A</name><qty>2</qty></Item><Item><name>B</name><qty>3</qty></Item></Order></Root>"#;
+        let config = array_path_config("Root/Order", vec![join("Item", ",")]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(r1.get("Item.name"), Some(&Value::String("A,B".into())));
+        assert_eq!(r1.get("Item.qty"), Some(&Value::String("2,3".into())));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn xml_array_paths_explode_repeated_scalar() {
+        // A repeated scalar element explodes to one record per value, keyed
+        // by the element's own path.
+        let xml = r#"<Root><Row><id>7</id><Tag>a</Tag><Tag>b</Tag></Row></Root>"#;
+        let config = array_path_config("Root/Row", vec![explode("Tag")]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(7)));
+        assert_eq!(r1.get("Tag"), Some(&Value::String("a".into())));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("id"), Some(&Value::Integer(7)));
+        assert_eq!(r2.get("Tag"), Some(&Value::String("b".into())));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn xml_array_paths_explode_carries_instance_attributes() {
+        // Attributes on the repeated element belong to their occurrence, not
+        // to the shared parent fields.
+        let xml = r#"<Root><Order><id>1</id><Item sku="X"><name>A</name></Item><Item sku="Y"><name>B</name></Item></Order></Root>"#;
+        let config = array_path_config("Root/Order", vec![explode("Item")]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("Item.@sku"), Some(&Value::String("X".into())));
+        assert_eq!(r1.get("Item.name"), Some(&Value::String("A".into())));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("Item.@sku"), Some(&Value::String("Y".into())));
+        assert_eq!(r2.get("Item.name"), Some(&Value::String("B".into())));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn xml_array_paths_explode_empty_occurrence_yields_parent_only_record() {
+        // An occurrence with no content (`<Item></Item>`) still fans out to
+        // its own record — one carrying just the parent fields.
+        let xml =
+            r#"<Root><Order><id>1</id><Item><name>A</name></Item><Item></Item></Order></Root>"#;
+        let config = array_path_config("Root/Order", vec![explode("Item")]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(r1.get("Item.name"), Some(&Value::String("A".into())));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(r2.get("Item.name"), None);
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn xml_array_paths_explode_absent_element_passes_record_through() {
+        // XML cannot distinguish an empty repetition from an absent element,
+        // so a record with no occurrence of the path is emitted unchanged.
+        let xml = r#"<Root><Order><id>1</id></Order></Root>"#;
+        let config = array_path_config("Root/Order", vec![explode("Item")]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn xml_array_paths_explode_matches_dotted_nested_path() {
+        // The path is the repeated element's dotted path relative to the
+        // record element, matching the flattened field names.
+        let xml = r#"<Root><Order><id>1</id><Items><Item><name>A</name></Item><Item><name>B</name></Item></Items></Order></Root>"#;
+        let config = array_path_config("Root/Order", vec![explode("Items.Item")]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("Items.Item.name"), Some(&Value::String("A".into())));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("Items.Item.name"), Some(&Value::String("B".into())));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn xml_unmatched_repeated_keys_keep_first_value() {
+        // Repeated keys NOT named by any array path keep the existing
+        // duplicate-key collapse: the first value wins, on every fanned-out
+        // record.
+        let xml = r#"<Root><Row><Dup>x</Dup><Dup>y</Dup><Tag>a</Tag><Tag>b</Tag></Row></Root>"#;
+        let config = array_path_config("Root/Row", vec![explode("Tag")]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("Dup"), Some(&Value::String("x".into())));
+        assert_eq!(r1.get("Tag"), Some(&Value::String("a".into())));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("Dup"), Some(&Value::String("x".into())));
+        assert_eq!(r2.get("Tag"), Some(&Value::String("b".into())));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn xml_array_paths_compose_across_disjoint_paths() {
+        // Paths apply in declaration order over the fan-out: the joined Tag
+        // value lands on every exploded Item record.
+        let xml = r#"<Root><Order><id>1</id><Item><name>A</name></Item><Item><name>B</name></Item><Tag>x</Tag><Tag>y</Tag></Order></Root>"#;
+        let config = array_path_config("Root/Order", vec![explode("Item"), join("Tag", ",")]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("Item.name"), Some(&Value::String("A".into())));
+        assert_eq!(r1.get("Tag"), Some(&Value::String("x,y".into())));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("Item.name"), Some(&Value::String("B".into())));
+        assert_eq!(r2.get("Tag"), Some(&Value::String("x,y".into())));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn xml_two_explode_paths_fan_out_cartesian() {
+        // Two exploded paths multiply, mirroring the JSON reader's
+        // sequential fan-out: every A occurrence pairs with every B
+        // occurrence.
+        let xml = r#"<Root><Order><A>1</A><A>2</A><B>x</B><B>y</B></Order></Root>"#;
+        let config = array_path_config("Root/Order", vec![explode("A"), explode("B")]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let mut pairs = Vec::new();
+        while let Some(rec) = r.next_record().unwrap() {
+            pairs.push((rec.get("A").cloned(), rec.get("B").cloned()));
+        }
+        let expected: Vec<(Option<Value>, Option<Value>)> =
+            [(1, "x"), (1, "y"), (2, "x"), (2, "y")]
+                .into_iter()
+                .map(|(a, b)| (Some(Value::Integer(a)), Some(Value::String(b.into()))))
+                .collect();
+        assert_eq!(pairs, expected);
+    }
+
+    #[test]
+    fn xml_explode_spans_multiple_record_elements() {
+        // The expansion queue drains per record element: two Orders with two
+        // Items each yield four records, in document order.
+        let xml = r#"<Root>
+            <Order><id>1</id><Item><name>A</name></Item><Item><name>B</name></Item></Order>
+            <Order><id>2</id><Item><name>C</name></Item><Item><name>D</name></Item></Order>
+        </Root>"#;
+        let config = array_path_config("Root/Order", vec![explode("Item")]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let mut rows = Vec::new();
+        while let Some(rec) = r.next_record().unwrap() {
+            rows.push((rec.get("id").cloned(), rec.get("Item.name").cloned()));
+        }
+        let expected: Vec<(Option<Value>, Option<Value>)> =
+            [(1, "A"), (1, "B"), (2, "C"), (2, "D")]
+                .into_iter()
+                .map(|(id, name)| (Some(Value::Integer(id)), Some(Value::String(name.into()))))
+                .collect();
+        assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn xml_nested_array_paths_rejected_at_construction() {
+        // One configured path extending another means their element groups
+        // nest; occurrence tracking assumes disjoint groups, so the config
+        // is rejected before any input is read.
+        let xml = r#"<Root><Order><Item><part>p</part></Item></Order></Root>"#;
+        let config = array_path_config("Root/Order", vec![explode("Item"), explode("Item.part")]);
+        let err = match XmlReader::from_reader(Cursor::new(xml.as_bytes().to_vec()), config) {
+            Ok(_) => panic!("nested array paths must be rejected"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, FormatError::Xml(msg) if msg.contains("nest")));
+    }
+
+    #[test]
+    fn xml_duplicate_array_paths_rejected_at_construction() {
+        let xml = r#"<Root><Order><Item>a</Item></Order></Root>"#;
+        let config = array_path_config("Root/Order", vec![explode("Item"), join("Item", ",")]);
+        let err = match XmlReader::from_reader(Cursor::new(xml.as_bytes().to_vec()), config) {
+            Ok(_) => panic!("duplicate array paths must be rejected"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, FormatError::Xml(msg) if msg.contains("more than once")));
     }
 
     #[test]

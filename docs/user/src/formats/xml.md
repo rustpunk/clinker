@@ -39,8 +39,60 @@ rules.
 When a record element contains repeated child elements, the
 [`array_paths`](../nodes/source.md#array-paths) field on the source
 controls whether each repetition **explodes** into its own record or
-**joins** into a delimited string. That field is shared with the JSON
-reader and documented on the Source Nodes page.
+**joins** into a delimited string. The field is shared with the JSON
+reader; the XML-specific matching rules are below.
+
+An entry's `path` is the repeated element's dotted path **relative to the
+record element** — the same form the flattened field names use. For a
+record element `<Order>` containing repeated `<Item>` children, the path
+is `Item`; for `<Order><Items><Item>…`, it is `Items.Item`.
+
+```yaml
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: xml
+    path: "./data/orders.xml"
+    options:
+      record_path: "Orders/Order"
+    schema:
+      - { name: id, type: int }
+      - { name: "Item.name", type: string }
+      - { name: "Item.qty", type: int }
+      - { name: "Tag", type: string }
+    array_paths:
+      - path: "Item"
+        mode: explode          # one output record per <Item> occurrence
+      - path: "Tag"
+        mode: join             # <Tag>a</Tag><Tag>b</Tag> -> "a,b"
+        separator: ","
+```
+
+**`explode`** emits one output record per occurrence of the element. Each
+output carries that occurrence's fields — which keep their full dotted
+names (`Item.name`, `Item.@sku`), including the element's attributes —
+plus every field outside the path, duplicated onto each record. An
+occurrence with no content (`<Item></Item>`) still emits a record, one
+carrying only the fields outside the path. A record with **no** occurrence
+of the element passes through unchanged: XML cannot distinguish an empty
+repetition from an absent element.
+
+**`join`** concatenates values instead of fanning out. Every repeated
+flattened field at or under the path is collapsed independently into a
+single field whose value joins the occurrences' values with `separator`
+(default `,`), in document order: repeated `<Tag>` text joins under `Tag`,
+and repeated `<Item><name>` children join under `Item.name`.
+
+Entries apply in declaration order, so a join's collapsed value lands on
+every record an earlier explode fanned out, and two exploded paths
+multiply. Paths must name **disjoint** element groups — a duplicated path,
+or one path extending another (`Item` and `Item.part`), is rejected when
+the source opens.
+
+Repeated fields *not* named by any array path keep the default
+duplicate-key collapse: the first value wins and later repetitions are
+dropped.
 
 ## Bounding envelope retention: `max_index_bytes`
 
