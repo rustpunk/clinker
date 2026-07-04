@@ -6,7 +6,12 @@
 //! output and re-parses identically (single-message ORDERS and a
 //! representative multi-message INVOIC with composite elements and line
 //! groups); (3) the `edifact`+`split` combination is rejected at config
-//! time; (4) a UNT count mismatch surfaces as a run failure.
+//! time; (4) a UNT count mismatch surfaces as a run failure; (5) the
+//! `UNB`-negotiated character repertoire holds at the pipeline level — a
+//! UNOC (Latin-1) interchange with high bytes in header and body
+//! round-trips byte-for-byte and surfaces decoded `$doc` text, while a
+//! high byte under UNOA, invalid UTF-8 under UNOY, and an unsupported
+//! syntax level each fail the run loudly.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -67,6 +72,22 @@ fn run(
     file_name: &str,
     out_name: &str,
 ) -> Result<(clinker_exec::executor::ExecutionReport, String), String> {
+    let (report, bytes) = run_bytes(yaml, source_name, fixture.as_bytes(), file_name, out_name)?;
+    Ok((report, String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+/// Drive a pipeline over a raw-byte fixture, returning the report and the
+/// raw output bytes. Used for non-UTF-8 (charset) interchanges — a UNOC
+/// (Latin-1) fixture carries high bytes that are not valid UTF-8, so both
+/// the fixture and the output must be handled byte-for-byte rather than as
+/// a `String`.
+fn run_bytes(
+    yaml: &str,
+    source_name: &str,
+    fixture: &[u8],
+    file_name: &str,
+    out_name: &str,
+) -> Result<(clinker_exec::executor::ExecutionReport, Vec<u8>), String> {
     let config = parse_config(yaml).map_err(|e| format!("parse: {e:?}"))?;
     let plan = config
         .compile(&CompileContext::default())
@@ -74,7 +95,7 @@ fn run(
 
     let file = FileSlot::new(
         PathBuf::from(file_name),
-        Box::new(Cursor::new(fixture.as_bytes().to_vec())),
+        Box::new(Cursor::new(fixture.to_vec())),
     );
     let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
         source_name.to_string(),
@@ -97,7 +118,7 @@ fn run(
 
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
         .map_err(|e| format!("run: {e:?}"))?;
-    Ok((report, buf.as_string()))
+    Ok((report, buf.contents()))
 }
 
 #[test]
@@ -525,4 +546,250 @@ nodes:
     assert!(output.contains("UNH,M1"), "UNH row seg_id/e01: {output}");
     assert!(output.contains("BGM,220"), "BGM row seg_id/e01: {output}");
     assert!(output.contains("NAD,BY"), "NAD row seg_id/e01: {output}");
+}
+
+/// A UNOC (Latin-1) ORDERS interchange whose UNB sender identification and
+/// body `NAD` elements carry Latin-1 high bytes: 0xE9 (é) in the sender and
+/// body, 0xF1 (ñ) in a second body element. Not valid UTF-8, so it must be
+/// built as raw bytes.
+fn unoc_orders_with_high_bytes() -> Vec<u8> {
+    let mut input = b"UNB+UNOC:3+Caf".to_vec();
+    input.push(0xE9); // é in the sender identification
+    input.extend_from_slice(
+        b"+RECEIVER+240101:1200+REF1'\
+          UNH+M1+ORDERS:D:96A:UN'NAD+BY+Caf",
+    );
+    input.push(0xE9); // é in a body element
+    input.extend_from_slice(b"+A");
+    input.push(0xF1); // ñ in a second body element
+    input.extend_from_slice(b"o'UNT+3+M1'UNZ+1+REF1'");
+    input
+}
+
+#[test]
+fn edifact_unoc_high_bytes_round_trip_byte_for_byte() {
+    // EDIFACT → EDIFACT under UNOC (Latin-1) with high bytes in both the
+    // UNB header and the body. The reader negotiates the repertoire from
+    // the raw UNB, the writer re-derives it from the UNB it echoes out of
+    // `$doc`, and both header and body re-encode to the same single bytes —
+    // so the emitted interchange is byte-identical to the input, exactly as
+    // the character-set docs promise.
+    let yaml = r#"
+pipeline:
+  name: edifact_unoc_round_trip
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: edifact
+      glob: ./*.edi
+      envelope:
+        sections:
+          unb:
+            extract: { segment: "UNB" }
+            fields:
+              e05: string
+      schema:
+        - { name: seg_id, type: string }
+        - { name: msg_ref, type: string }
+        - { name: msg_type, type: string }
+        - { name: e01, type: string }
+        - { name: e02, type: string }
+        - { name: e03, type: string }
+  - type: output
+    name: out
+    input: interchange
+    config:
+      name: out
+      type: edifact
+      path: out.edi
+      include_unmapped: true
+      options:
+        interchange_from_doc: unb
+        segment_newline: false
+"#;
+    let input = unoc_orders_with_high_bytes();
+    let (report, output) =
+        run_bytes(yaml, "interchange", &input, "orders.edi", "out").expect("run UNOC round-trip");
+    assert_eq!(report.counters.dlq_count, 0);
+    // Two body segments: UNH, NAD.
+    assert_eq!(report.counters.total_count, 2);
+    assert_eq!(
+        output, input,
+        "UNOC interchange did not round-trip byte-for-byte"
+    );
+}
+
+#[test]
+fn edifact_unoc_doc_context_surfaces_decoded_sender() {
+    // The UNB sender identification carries a Latin-1 high byte under UNOC.
+    // A Transform reading `$doc.unb.e02` must see the decoded text ("Café",
+    // one codepoint for the 0xE9 byte) on every body record, and the CSV
+    // sink re-encodes it as UTF-8 — proving the negotiated repertoire flows
+    // through document-context extraction, CXL, and a text sink.
+    let yaml = r#"
+pipeline:
+  name: edifact_unoc_doc
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: edifact
+      glob: ./*.edi
+      envelope:
+        sections:
+          unb:
+            extract: { segment: "UNB" }
+            fields:
+              e02: string
+      schema:
+        - { name: seg_id, type: string }
+        - { name: msg_ref, type: string }
+        - { name: e01, type: string }
+  - type: transform
+    name: tag
+    input: interchange
+    config:
+      cxl: |
+        emit seg = seg_id
+        emit sender = $doc.unb.e02
+  - type: output
+    name: out
+    input: tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: false
+      include_header: false
+"#;
+    let input = unoc_orders_with_high_bytes();
+    let (report, output) = run_bytes(yaml, "interchange", &input, "orders.edi", "out")
+        .expect("run UNOC $doc pipeline");
+    assert_eq!(report.counters.dlq_count, 0);
+    // Two body segments: UNH, NAD.
+    assert_eq!(report.counters.total_count, 2);
+
+    // The CSV output is UTF-8 text even though the input was Latin-1, and
+    // the decoded sender resolves on every body row as one é codepoint,
+    // not mojibake from a byte-wise placeholder decode.
+    let csv = String::from_utf8(output).expect("CSV output must be valid UTF-8");
+    let rows: Vec<&str> = csv.lines().map(str::trim).collect();
+    assert_eq!(
+        rows,
+        vec!["UNH,Café", "NAD,Café"],
+        "decoded $doc.unb.e02 sender did not surface on every body row"
+    );
+}
+
+#[test]
+fn edifact_unoa_high_byte_fails_the_run() {
+    // The same high body byte under a UNOA (ASCII) syntax identifier must
+    // fail the run loudly rather than reinterpret the byte.
+    let mut input = b"UNB+UNOA:1+SENDER+RECEIVER+240101:1200+REF1'\
+        UNH+M1+ORDERS:D:96A:UN'NAD+BY+Caf"
+        .to_vec();
+    input.push(0xE9);
+    input.extend_from_slice(b"'UNT+3+M1'UNZ+1+REF1'");
+    let yaml = r#"
+pipeline:
+  name: edifact_unoa_high_byte
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: edifact
+      glob: ./*.edi
+      schema:
+        - { name: seg_id, type: string }
+  - type: output
+    name: out
+    input: interchange
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let err = run_bytes(yaml, "interchange", &input, "orders.edi", "out")
+        .expect_err("UNOA high byte must fail the run");
+    assert!(
+        err.contains("outside the ASCII") && err.contains("0xE9"),
+        "error should name the ASCII repertoire violation and the byte: {err}"
+    );
+}
+
+#[test]
+fn edifact_unoy_invalid_utf8_fails_the_run() {
+    // Under UNOY (UTF-8) a lone 0xE9 is an invalid sequence; the run must
+    // fail naming the UTF-8 violation, not substitute a replacement
+    // character.
+    let mut input = b"UNB+UNOY:4+SENDER+RECEIVER+240101:1200+REF1'\
+        UNH+M1+ORDERS:D:96A:UN'NAD+BY+Caf"
+        .to_vec();
+    input.push(0xE9);
+    input.extend_from_slice(b"'UNT+3+M1'UNZ+1+REF1'");
+    let yaml = r#"
+pipeline:
+  name: edifact_unoy_invalid_utf8
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: edifact
+      glob: ./*.edi
+      schema:
+        - { name: seg_id, type: string }
+  - type: output
+    name: out
+    input: interchange
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let err = run_bytes(yaml, "interchange", &input, "orders.edi", "out")
+        .expect_err("invalid UTF-8 under UNOY must fail the run");
+    assert!(
+        err.contains("not valid UTF-8"),
+        "error should name the UTF-8 violation: {err}"
+    );
+}
+
+#[test]
+fn edifact_unsupported_syntax_level_fails_the_run() {
+    // A UNB declaring a syntax level with no mapped repertoire (UNOD) must
+    // fail the run with an error naming the level, never guessing a
+    // fallback encoding.
+    let input = "UNB+UNOD:4+SENDER+RECEIVER+240101:1200+REF1'\
+        UNH+M1+ORDERS:D:96A:UN'BGM+220'UNT+3+M1'UNZ+1+REF1'";
+    let yaml = r#"
+pipeline:
+  name: edifact_unsupported_level
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: edifact
+      glob: ./*.edi
+      schema:
+        - { name: seg_id, type: string }
+  - type: output
+    name: out
+    input: interchange
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let err = run(yaml, "interchange", input, "orders.edi", "out")
+        .expect_err("unsupported syntax level must fail the run");
+    assert!(
+        err.contains("UNOD") && err.contains("unsupported"),
+        "error should name the unsupported level: {err}"
+    );
 }
