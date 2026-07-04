@@ -254,7 +254,9 @@ the planner rejects this with
 
 ## Array paths
 
-For nested data (JSON/XML sources with embedded arrays), `array_paths` controls how nested arrays are handled:
+For nested data (JSON/XML sources with embedded repetition), `array_paths`
+controls whether each repetition becomes its own record or collapses into
+a delimited string:
 
 ```yaml
 - type: source
@@ -269,12 +271,38 @@ For nested data (JSON/XML sources with embedded arrays), `array_paths` controls 
       - { name: line_item, type: string }
       - { name: line_amount, type: float }
     array_paths:
-      - path: "$.line_items"
+      - path: "line_items"
         mode: explode         # One output record per array element
-      - path: "$.tags"
+      - path: "tags"
         mode: join            # Concatenate array elements into a string
         separator: ","
 ```
 
-- `explode` (default) -- produces one output record per array element, with parent fields repeated.
-- `join` -- concatenates array elements into a single string using the specified `separator`.
+- `explode` (default) -- produces one output record per array element,
+  with parent fields repeated onto each.
+- `join` -- concatenates the array's elements into a single string using
+  the specified `separator` (default `,`).
+
+Entries apply in declaration order: a join's collapsed value lands on
+every record an earlier explode fanned out, and two exploded paths
+multiply.
+
+The `path` is a flattened field name, in the same dotted form the source's
+field names use — there is no `$.` sigil.
+
+**JSON** — the path names the field holding the array (`line_items`, or
+`order.line_items` for an array nested under an object). Exploding an
+array of objects hoists each element's keys onto the output record
+(`{"line_item": …}` becomes a top-level `line_item` field); exploding an
+array of scalars keeps the value under the path's own name. An empty
+array explodes to no records (the parent record is suppressed) and joins
+to an empty string; a record without the field passes through unchanged.
+
+**XML** — the path is the repeated child element's dotted path relative to
+the record element (`Item`, or `Items.Item` when nested). Exploded fields
+keep their full dotted names (`Item.name`); join collapses each repeated
+flattened field under the path independently. Repetition and absence are
+indistinguishable in XML, so a record without the element always passes
+through unchanged, and paths must name disjoint (non-nested) element
+groups. See [XML Format](../formats/xml.md#nested-arrays) for the full
+rules.
