@@ -933,6 +933,15 @@ fn explode_array_path(
     out: &mut Vec<Vec<IndexedField>>,
 ) {
     let anchor = instances[0].start;
+    // Any-occurrence membership, precomputed once: probing every range from
+    // inside the per-occurrence loop would make the fan-out quadratic in the
+    // occurrence count. Ranges are recorded in document order, so the last
+    // range's end spans them all.
+    let span = instances.last().map_or(0, |r| r.end);
+    let mut in_occurrence = vec![false; span];
+    for range in instances {
+        in_occurrence[range.clone()].fill(true);
+    }
     for instance in instances {
         let mut head: Vec<IndexedField> = Vec::new();
         let mut inside: Vec<IndexedField> = Vec::new();
@@ -941,7 +950,7 @@ fn explode_array_path(
             let idx = field.0;
             if instance.contains(&idx) {
                 inside.push(field.clone());
-            } else if instances.iter().any(|r| r.contains(&idx)) {
+            } else if idx < span && in_occurrence[idx] {
                 // A different occurrence of this path: not part of this output.
                 continue;
             } else if idx < anchor {
