@@ -7,9 +7,13 @@
 #   - `priority:` breaks ties when several groups match one channel (higher
 #     wins).
 #   - `config:` clobbers the base `risk.threshold` for every enterprise tenant
-#     (verify with `explain --field risk.threshold --group enterprise`).
+#     (verify with `explain --field risk.threshold --group enterprise`). The
+#     composition folds the resolved value into its CXL, so the override
+#     changes which orders are marked `high_value`, not just the provenance.
 #   - `overrides:` splices the `fraud_check` screening composition into the plan
 #     after `normalize` (shown under "Injected nodes" by `channels resolve`).
+#     The `config:` on the op sets the injected node's `sensitivity` knob:
+#     0.8 folds to a hold cutoff of (1.0 - 0.8) * 10000 = 2000.
 
 group:
   name: enterprise

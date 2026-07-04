@@ -1,9 +1,12 @@
 # Reusable scoring sub-pipeline used by the base pipeline as node `risk`.
 #
 # `threshold` is a declared config knob: the base pipeline sets it to 0.5, and
-# group/channel overlays clobber it per tenant. The resolved value is what
-# `clinker channels resolve` and `clinker explain --field risk.threshold`
-# report per layer (see group/enterprise and channel/globex).
+# group/channel overlays clobber it per tenant. The body reads it as
+# `$config.threshold`, which the planner constant-folds to the resolved value
+# per instantiation — so an overlay changes what `high_value` computes, not
+# just the provenance that `clinker channels resolve` and
+# `clinker explain --field risk.threshold` report per layer (see
+# group/enterprise and channel/globex).
 
 _compose:
   name: risk_score
@@ -29,4 +32,4 @@ nodes:
       cxl: |
         emit order_id = order_id
         emit amount = amount
-        emit high_value = amount >= 1000.0
+        emit high_value = amount >= $config.threshold * 2000.0
