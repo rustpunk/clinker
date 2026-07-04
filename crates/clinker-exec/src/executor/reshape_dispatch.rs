@@ -766,7 +766,14 @@ fn write_spill_slice<'a>(
         .finish()
         .map_err(|e| reshape_spill_error(node_name, e))?;
     let bytes = std::fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
-    budget.record_spill_bytes(node_name, bytes);
+    if budget.record_spill_bytes(node_name, bytes) {
+        return Err(PipelineError::spill_cap_exceeded(
+            node_name,
+            budget.max_spill_bytes(),
+            bytes,
+            budget.cumulative_spill_bytes(),
+        ));
+    }
     Ok(file)
 }
 
@@ -1266,6 +1273,51 @@ mod tests {
         assert!(
             detail.contains("single Reshape correlation group"),
             "the diagnostic must name the giant-group limitation: {detail}"
+        );
+    }
+
+    // The disk-spill cap must abort the spill instead of writing past
+    // `storage.spill.disk_cap_bytes`. The bug discarded the overflow signal
+    // `record_spill_bytes` returns, so eviction kept writing unbounded.
+    #[test]
+    fn spill_past_disk_cap_fails_with_spill_cap_exceeded() {
+        let schema = schema();
+        let spill_root = tempfile::tempdir().unwrap();
+        let arb = arbitrator(512);
+        arb.set_max_spill_bytes(1);
+        let handle = ConsumerHandle::new();
+        let mut buffer = ReshapeGroupBuffer::new(Arc::clone(&schema), true);
+        // One group, ~5 KiB resident against a 512 B soft limit, so the
+        // spill loop must evict — and the first flush already exceeds the
+        // one-byte disk cap.
+        for row_num in 0..64u64 {
+            let payload = format!("{row_num:063}");
+            buffer.push(single_group_key(), rec(&schema, "g", &payload), row_num);
+        }
+        handle.set_bytes(buffer.resident_bytes() as u64);
+        let err = buffer
+            .spill_until_under_budget("rs", &arb, spill_root.path(), &handle)
+            .expect_err("a one-byte disk cap must abort the first spill write");
+        match &err {
+            PipelineError::SpillCapExceeded {
+                node,
+                cap,
+                attempted,
+                current,
+            } => {
+                assert_eq!(node, "rs");
+                assert_eq!(*cap, 1, "reported cap must equal the configured quota");
+                assert!(*attempted > 0, "the overflowing flush must report its size");
+                assert!(
+                    *current > *cap,
+                    "cumulative spilled ({current}) must exceed the cap ({cap})"
+                );
+            }
+            other => panic!("disk-cap overflow must surface SpillCapExceeded; got {other:?}"),
+        }
+        assert!(
+            arb.cumulative_spill_bytes() > 1,
+            "cumulative_spill_bytes must reflect the overflowing write"
         );
     }
 }

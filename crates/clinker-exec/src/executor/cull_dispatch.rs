@@ -879,7 +879,14 @@ fn write_spill_slice<'a>(
         .finish()
         .map_err(|e| cull_spill_error(node_name, e))?;
     let bytes = std::fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
-    budget.record_spill_bytes(node_name, bytes);
+    if budget.record_spill_bytes(node_name, bytes) {
+        return Err(PipelineError::spill_cap_exceeded(
+            node_name,
+            budget.max_spill_bytes(),
+            bytes,
+            budget.cumulative_spill_bytes(),
+        ));
+    }
     Ok(file)
 }
 
@@ -1001,10 +1008,22 @@ fn cull_giant_group_error(node_name: &str, group_bytes: u64, hard_limit: u64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pipeline::memory::NoOpPolicy;
     use clinker_record::Schema;
 
     fn record(schema: &Arc<Schema>, account: Value) -> Record {
         Record::new(Arc::clone(schema), vec![account])
+    }
+
+    /// An arbitrator whose soft limit is `soft_bytes` and whose seeded peak
+    /// RSS is well below it, so spilling is driven purely by the buffer's own
+    /// resident-byte total rather than the live process RSS.
+    fn arbitrator(soft_bytes: u64) -> MemoryArbitrator {
+        // soft = limit * 0.80, so limit = soft / 0.80.
+        let limit = (soft_bytes as f64 / 0.80) as u64;
+        let arb = MemoryArbitrator::with_policy(limit, 0.80, Box::new(NoOpPolicy));
+        arb.set_peak_rss_for_test(1);
+        arb
     }
 
     // The decision aggregate groups by `value_to_group_key`, which keeps an
@@ -1039,5 +1058,54 @@ mod tests {
         };
         assert_eq!(empty, canon(&Value::String("".into())));
         assert_eq!(null, canon(&Value::Null));
+    }
+
+    // The disk-spill cap must abort the spill instead of writing past
+    // `storage.spill.disk_cap_bytes`. The bug discarded the overflow signal
+    // `record_spill_bytes` returns, so eviction kept writing unbounded.
+    #[test]
+    fn spill_past_disk_cap_fails_with_spill_cap_exceeded() {
+        let schema: Arc<Schema> = Arc::new(Schema::new(vec!["account".into()]));
+        let spill_root = tempfile::tempdir().unwrap();
+        let arb = arbitrator(512);
+        arb.set_max_spill_bytes(1);
+        let handle = ConsumerHandle::new();
+        let mut buffer = CullGroupBuffer::new(Arc::clone(&schema), true);
+        // One group, ~5 KiB resident against a 512 B soft limit, so the
+        // spill loop must evict — and the first flush already exceeds the
+        // one-byte disk cap.
+        for row_num in 0..64u64 {
+            let payload = format!("{row_num:063}");
+            buffer.push(
+                vec![GroupByKey::Str("g".into())],
+                record(&schema, Value::String(payload.into())),
+                row_num,
+            );
+        }
+        handle.set_bytes(buffer.resident_bytes() as u64);
+        let err = buffer
+            .spill_until_under_budget("cl", &arb, spill_root.path(), &handle)
+            .expect_err("a one-byte disk cap must abort the first spill write");
+        match &err {
+            PipelineError::SpillCapExceeded {
+                node,
+                cap,
+                attempted,
+                current,
+            } => {
+                assert_eq!(node, "cl");
+                assert_eq!(*cap, 1, "reported cap must equal the configured quota");
+                assert!(*attempted > 0, "the overflowing flush must report its size");
+                assert!(
+                    *current > *cap,
+                    "cumulative spilled ({current}) must exceed the cap ({cap})"
+                );
+            }
+            other => panic!("disk-cap overflow must surface SpillCapExceeded; got {other:?}"),
+        }
+        assert!(
+            arb.cumulative_spill_bytes() > 1,
+            "cumulative_spill_bytes must reflect the overflowing write"
+        );
     }
 }
