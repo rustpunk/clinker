@@ -807,7 +807,24 @@ impl<'a> TypeChecker<'a> {
 
                 // Look up return type from registry
                 let ty = if let Some(def) = self.registry.lookup_method(method) {
-                    Type::from_type_tag(def.return_type)
+                    // An exact-decimal receiver stays in the decimal domain
+                    // for the numeric methods whose evaluation is closed over
+                    // decimals: abs, whole-valued ceil/floor, and banker's
+                    // rounding for round/round_to. The registry declares
+                    // these over the general Numeric receiver with
+                    // Float/Int/Numeric results; taking that at face value
+                    // here would poison decimal composition downstream,
+                    // because decimal deliberately never unifies with float
+                    // or the Numeric supertype. clamp/min/max are excluded:
+                    // their evaluation may return an argument value, so the
+                    // result is not guaranteed to be a decimal.
+                    if matches!(recv_ty.unwrap_nullable(), Type::Decimal)
+                        && matches!(&**method, "abs" | "ceil" | "floor" | "round" | "round_to")
+                    {
+                        Type::Decimal
+                    } else {
+                        Type::from_type_tag(def.return_type)
+                    }
                 } else {
                     Type::Any
                 };
@@ -1674,6 +1691,69 @@ mod tests {
             &schema,
         );
         assert_eq!(first_emit_expr_type(&typed), Type::Float);
+    }
+
+    #[test]
+    fn test_typecheck_decimal_receiver_numeric_methods_stay_decimal() {
+        // The registry types these methods over the general Numeric receiver
+        // (round/round_to → Float, ceil/floor → Int, abs → Numeric), but their
+        // evaluation keeps a decimal receiver in the decimal domain, so the
+        // inferred type must too.
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Decimal);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        for src in [
+            "emit v = amount.round_to(2)",
+            "emit v = amount.round(2)",
+            "emit v = amount.abs()",
+            "emit v = amount.ceil()",
+            "emit v = amount.floor()",
+        ] {
+            let typed = typecheck_ok(src, &["amount"], &schema);
+            assert_eq!(
+                first_emit_expr_type(&typed),
+                Type::Decimal,
+                "result type for `{src}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_typecheck_decimal_round_to_composes_with_decimal() {
+        // Regression: `round_to` used to take the registry's Float return at
+        // face value on a decimal receiver, so composing the result with
+        // another decimal was rejected as a decimal/float mix.
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Decimal);
+        cols.insert("fee".into(), Type::Decimal);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let typed = typecheck_ok(
+            "emit total = amount.round_to(2) + fee",
+            &["amount", "fee"],
+            &schema,
+        );
+        assert_eq!(first_emit_expr_type(&typed), Type::Decimal);
+    }
+
+    #[test]
+    fn test_typecheck_float_round_to_unchanged() {
+        // Float receivers keep the registry's Float return type.
+        let mut cols = IndexMap::new();
+        cols.insert("rate".into(), Type::Float);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let typed = typecheck_ok("emit v = rate.round_to(2)", &["rate"], &schema);
+        assert_eq!(first_emit_expr_type(&typed), Type::Float);
+    }
+
+    #[test]
+    fn test_typecheck_nullable_decimal_round_to_is_nullable_decimal() {
+        // Null propagation still applies on top of the decimal
+        // specialization: a nullable decimal receiver yields decimal?.
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::nullable(Type::Decimal));
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let typed = typecheck_ok("emit v = amount.round_to(2)", &["amount"], &schema);
+        assert_eq!(first_emit_expr_type(&typed), Type::nullable(Type::Decimal));
     }
 
     #[test]

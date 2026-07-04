@@ -183,6 +183,30 @@ fn test_eval_decimal_comparison_and_round() {
 }
 
 #[test]
+fn test_eval_decimal_round_to_stays_decimal_and_composes() {
+    // round_to on a decimal rounds exactly (banker's rounding) and stays in
+    // the decimal domain rather than converting to a binary float.
+    let r = eval_single(
+        "emit v = x.round_to(2)",
+        &["x"],
+        HashMap::from([("x".into(), dec(19995, 3))]), // 19.995 -> 20.00 (half-even)
+    );
+    assert_eq!(r, dec(2000, 2));
+
+    // The rounded decimal composes with another decimal without a cast, and
+    // the sum is exact.
+    let total = eval_single(
+        "emit total = amount.round_to(2) + fee",
+        &["amount", "fee"],
+        HashMap::from([
+            ("amount".into(), dec(2125, 3)), // 2.125 -> 2.12 (half-even)
+            ("fee".into(), dec(50, 2)),
+        ]),
+    );
+    assert_eq!(total, dec(262, 2));
+}
+
+#[test]
 fn test_eval_arithmetic_null_propagation() {
     // Null + 1 → Null
     let v = eval_single(
