@@ -26,6 +26,11 @@ sources:
             checksum: string
 ```
 
+Like the rest of the pipeline config, the `envelope:` block is strict:
+an unknown key at any level (a misspelled `sections:`, `extract:`, or
+`fields:`) is rejected at plan parse time with a diagnostic naming the
+bad key, rather than being silently ignored.
+
 A downstream transform reads any declared section field on every body
 record:
 

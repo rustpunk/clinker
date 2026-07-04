@@ -1150,3 +1150,74 @@ nodes:
         "non-primary port source `zip_lookup` must carry the downstream `$doc` path, got {zip_paths:?}"
     );
 }
+
+/// A pipeline whose single source declares an `envelope:` block containing
+/// `body` in place of the envelope's `sections:` / a section's `extract:` /
+/// `fields:` keys — supplied by the caller so each test targets one nesting
+/// level.
+fn envelope_typo_yaml(body: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: envelope_typo
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: xml
+      glob: ./*.xml
+      options:
+        record_path: doc/records/record
+      envelope:
+{body}
+      schema:
+        - {{ name: amount, type: int }}
+  - type: output
+    name: out
+    input: payments
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    )
+}
+
+#[test]
+fn test_unknown_envelope_top_level_key_fails_at_parse_time() {
+    // A misspelled `sections:` must fail at plan parse time — a silently
+    // ignored envelope block would drop every declared section and change
+    // document-context behavior without any diagnostic.
+    let yaml = envelope_typo_yaml(
+        r#"        sectionz:
+          Head:
+            extract: { xml_path: "/doc/Head" }
+            fields:
+              batch_id: string"#,
+    );
+    let err = parse_config(&yaml).expect_err("misspelled `sections:` must fail to parse");
+    assert!(
+        err.to_string().contains("sectionz"),
+        "error must name the unknown envelope key, got: {err}"
+    );
+}
+
+#[test]
+fn test_unknown_envelope_section_key_fails_at_parse_time() {
+    // A typo inside a declared section (here `extractt:`) must fail at plan
+    // parse time instead of leaving the section without its extraction rule.
+    let yaml = envelope_typo_yaml(
+        r#"        sections:
+          Head:
+            extract: { xml_path: "/doc/Head" }
+            extractt: { xml_path: "/doc/Head" }
+            fields:
+              batch_id: string"#,
+    );
+    let err = parse_config(&yaml).expect_err("unknown key inside a section must fail to parse");
+    assert!(
+        err.to_string().contains("extractt"),
+        "error must name the unknown section key, got: {err}"
+    );
+}
