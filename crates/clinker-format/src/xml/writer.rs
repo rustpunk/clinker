@@ -8,11 +8,14 @@
 //! between; `end_document` emits a `<footer>` element (section fields plus the
 //! streaming record count) and closes `</Document>`. No document is buffered.
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::sync::Arc;
 
 use quick_xml::Writer as XmlEmitter;
+use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
+use quick_xml::name::QName;
 
 use clinker_record::{DocumentContext, Record, Schema, Value};
 
@@ -112,9 +115,7 @@ impl<W: Write> XmlWriter<W> {
             &self.config.attribute_prefix,
         )?;
         let mut start = BytesStart::new(wrapper);
-        for (key, value) in &tree.attrs {
-            start.push_attribute((key.as_str(), value.as_str()));
-        }
+        push_attributes(&mut start, &tree.attrs);
         self.writer
             .write_event(Event::Start(start))
             .map_err(|e| FormatError::Xml(e.to_string()))?;
@@ -184,9 +185,7 @@ impl<W: Write> XmlWriter<W> {
                 }
                 FieldNode::Branch { name, body } => {
                     let mut start = BytesStart::new(name.as_str());
-                    for (key, value) in &body.attrs {
-                        start.push_attribute((key.as_str(), value.as_str()));
-                    }
+                    push_attributes(&mut start, &body.attrs);
                     if body.children.is_empty() {
                         // Attribute-only branch: nothing nests inside, so the
                         // element self-closes carrying its attributes.
@@ -221,9 +220,7 @@ impl<W: Write + Send> FormatWriter for XmlWriter<W> {
         self.write_header()?;
 
         let mut start = BytesStart::new(&*self.config.record_element);
-        for (key, value) in &tree.attrs {
-            start.push_attribute((key.as_str(), value.as_str()));
-        }
+        push_attributes(&mut start, &tree.attrs);
         self.writer
             .write_event(Event::Start(start))
             .map_err(|e| FormatError::Xml(e.to_string()))?;
@@ -350,6 +347,44 @@ fn build_field_tree(
     }
 
     Ok(root)
+}
+
+/// Push name/value attributes onto an element's start tag, escaping each
+/// value.
+///
+/// quick-xml's `(&str, &str)` attribute conversion escapes only the five
+/// predefined entities, leaving literal tab / CR / LF untouched — a
+/// conformant parser then collapses those to spaces (XML attribute-value
+/// normalization), silently altering values that carry literal whitespace.
+/// They are written as character references instead, which both clinker's
+/// reader and any conformant parser resolve back to the exact bytes.
+fn push_attributes(start: &mut BytesStart, attrs: &[(String, String)]) {
+    for (key, value) in attrs {
+        start.push_attribute(Attribute {
+            key: QName(key.as_bytes()),
+            value: Cow::Owned(escape_attribute_value(value).into_bytes()),
+        });
+    }
+}
+
+/// Escape an attribute value: the five predefined entities plus literal
+/// tab / CR / LF as character references (see [`push_attributes`]).
+fn escape_attribute_value(raw: &str) -> String {
+    let mut escaped = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&apos;"),
+            '\t' => escaped.push_str("&#9;"),
+            '\n' => escaped.push_str("&#10;"),
+            '\r' => escaped.push_str("&#13;"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 /// True when the path's final segment is attribute-classified — i.e. a
@@ -780,15 +815,45 @@ mod tests {
         let schema = Arc::new(Schema::new(vec!["@note".into()]));
         let record = Record::new(
             Arc::clone(&schema),
-            vec![Value::String(r#"a & "b" <c>"#.into())],
+            vec![Value::String("a & \"b\" <c>\td\ne".into())],
         );
         let output = write_records(XmlWriterConfig::default(), &[record], &schema);
-        assert!(output.contains("&amp;"), "& should be escaped: {output}");
-        assert!(output.contains("&quot;"), "\" should be escaped: {output}");
-        assert!(output.contains("&lt;"), "< should be escaped: {output}");
-        assert!(
-            !output.contains(r#"a & "b""#),
-            "raw attribute value should not appear: {output}"
+        assert_eq!(
+            output,
+            r#"<Root><Record note="a &amp; &quot;b&quot; &lt;c&gt;&#9;d&#10;e"></Record></Root>"#
+        );
+    }
+
+    #[test]
+    fn test_xml_attribute_whitespace_roundtrips_exactly() {
+        // Literal tab / LF in an attribute value are written as character
+        // references — a conformant parser would collapse the raw characters
+        // to spaces (attribute-value normalization), but references resolve
+        // back to the exact bytes.
+        let schema = Arc::new(Schema::new(vec!["@note".into(), "name".into()]));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![
+                Value::String("line1\nline2\tend".into()),
+                Value::String("A".into()),
+            ],
+        );
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+
+        let cursor = std::io::Cursor::new(output.into_bytes());
+        let mut reader = XmlReader::from_reader(
+            cursor,
+            XmlReaderConfig {
+                record_path: Some("Root/Record".into()),
+                ..Default::default()
+            },
+        )
+        .expect("XML buffer read");
+        let _s = reader.schema().unwrap();
+        let read_back = reader.next_record().unwrap().unwrap();
+        assert_eq!(
+            read_back.get("@note"),
+            Some(&Value::String("line1\nline2\tend".into()))
         );
     }
 
