@@ -65,10 +65,11 @@ impl<W: Write> CsvWriter<W> {
             .clone()
             .and_then(OutputEnvelopeSpec::into_framer);
         // Envelope header/footer rows carry a different field count than the
-        // body rows (a section's fields vs the record schema), so the writer
+        // body rows (a section's fields vs the writer schema), so the writer
         // must accept ragged records when framing is active. The non-envelope
-        // path keeps the strict equal-length default, preserving today's
-        // behavior and its UnequalLengths guard against schema drift.
+        // path keeps the strict equal-length default; body rows match the
+        // header length by construction (both derive from the pinned schema),
+        // so the guard is a backstop rather than a drift detector.
         let inner = csv::WriterBuilder::new()
             .delimiter(config.delimiter)
             .flexible(framer.is_some())
