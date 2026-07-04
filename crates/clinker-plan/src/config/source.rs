@@ -732,7 +732,16 @@ impl Hl7FieldSplitOption {
     /// `None` when it is not an `f`-prefixed digit run or names position 0.
     /// Config validation rejects a `None` before the reader is built.
     pub fn field_position(&self) -> Option<usize> {
-        let rest = self.field.strip_prefix('f')?;
+        Self::parse_field_position(&self.field)
+    }
+
+    /// Parse a 1-based wire field position from a positional `fNN` column
+    /// name (`f08` → 8), or `None` when the name is not an `f`-prefixed
+    /// digit run or names position 0. Shared with the channel `split_fields`
+    /// patch handler so a patch key resolves exactly like a declared
+    /// `field:` name.
+    pub fn parse_field_position(name: &str) -> Option<usize> {
+        let rest = name.strip_prefix('f')?;
         if rest.is_empty() || !rest.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }
