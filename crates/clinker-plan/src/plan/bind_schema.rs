@@ -1929,24 +1929,57 @@ fn bind_cull(
     // line cannot do. Each rule's node ids are relocated into a dense,
     // collision-free span so the resolver/typechecker side-tables (indexed by
     // `NodeId`) stay consistent; the OR-chain and wrapping emit mint fresh ids
-    // above every relocated rule. Lowering runs `extract_aggregates` over the
-    // result and stamps it onto `PlanNode::Cull.compiled`/`.typed`. `rules` is
-    // non-empty (rejected above).
+    // above every relocated rule. Each rule's byte-offset spans are likewise
+    // rebased from its parse-wrapper coordinates into `decision_src` — the
+    // reconstructed one-line source stamped on the typed program — so a
+    // runtime eval-error caret (whose offsets are relative to that stamped
+    // source) underlines the failing rule's text rather than an off-by-prefix
+    // slice. Lowering runs `extract_aggregates` over the result and stamps it
+    // onto `PlanNode::Cull.compiled`/`.typed`. `rules` is non-empty (rejected
+    // above).
     let agg_mode = AggregateMode::GroupBy {
         group_by_fields: config.partition_by.iter().cloned().collect(),
     };
 
+    // Build the decision source as the rules are parsed, so it is the single
+    // coordinate space every predicate's spans rebase into. It is stamped as
+    // the typed program's display source (eval-error / explain rendering) and
+    // is never re-parsed, so a rule's `#` comment inside it is inert. Each
+    // rule is parenthesized and joined by ` or `, matching the AST-level
+    // OR-fold below.
+    let mut decision_src = format!(
+        "emit {} = ",
+        crate::config::pipeline_node::CULL_DROP_DECISION_COLUMN
+    );
     let mut disjuncts: Vec<Expr> = Vec::with_capacity(config.rules.len());
     let mut next_id: u32 = 0;
     let mut parse_failed = false;
-    for rule in &config.rules {
+    for (i, rule) in config.rules.iter().enumerate() {
+        if i > 0 {
+            decision_src.push_str(" or ");
+        }
+        decision_src.push('(');
+        // Byte offset where this rule's source text begins in `decision_src`
+        // (just past the opening paren) — the target coordinate the parsed
+        // predicate's spans rebase onto.
+        let source_start = decision_src.len() as u32;
+        decision_src.push_str(&rule.drop_group_when.source);
+        decision_src.push(')');
+
         match parse_cull_rule_predicate(
             &format!("{name}:{}:drop_group_when", rule.name),
             &rule.drop_group_when.source,
             next_id,
             span,
         ) {
-            Ok((predicate, node_count)) => {
+            Ok((mut predicate, node_count)) => {
+                // The predicate's spans are relative to a source beginning
+                // right after `CULL_RULE_PARSE_PREFIX`; shift them so they
+                // index `decision_src` instead. `source_start` is always past
+                // that prefix (the decision prefix is strictly longer), so the
+                // delta is non-negative.
+                let delta = source_start - CULL_RULE_PARSE_PREFIX.len() as u32;
+                cxl::ast::rebase_expr_spans(&mut predicate, delta);
                 disjuncts.push(predicate);
                 next_id += node_count;
             }
@@ -1993,20 +2026,6 @@ fn bind_cull(
         }],
         span: cxl::lexer::Span::default(),
     };
-
-    // Reconstruct the single-line decision source for the typed program's
-    // display text (eval-error / explain rendering). It is never re-parsed,
-    // so a rule's `#` comment inside it is inert.
-    let decision_src = format!(
-        "emit {} = {}",
-        crate::config::pipeline_node::CULL_DROP_DECISION_COLUMN,
-        config
-            .rules
-            .iter()
-            .map(|r| format!("({})", r.drop_group_when.source))
-            .collect::<Vec<_>>()
-            .join(" or ")
-    );
 
     // Typecheck the combined program first — the happy path needs only this
     // one pass. On failure, re-typecheck each rule on its own (same aggregate
@@ -4242,15 +4261,24 @@ fn typecheck_parsed_program(
         })
 }
 
+/// Wrapper a single Cull rule predicate is parsed inside. The rule source is
+/// appended verbatim, so a parsed predicate's byte-offset spans are relative
+/// to a source that begins immediately after this prefix. `bind_cull` shifts
+/// those spans by the distance to where the rule's text lands in the
+/// reconstructed decision source, so keep the two uses in lockstep.
+const CULL_RULE_PARSE_PREFIX: &str = "emit __cull_pred = ";
+
 /// Parse one Cull rule's `drop_group_when` predicate into a stand-alone
 /// expression, relocating its node ids past `base_id`.
 ///
-/// The predicate is parsed as its own `emit __cull_pred = <source>`
+/// The predicate is parsed as its own [`CULL_RULE_PARSE_PREFIX`]`<source>`
 /// program, so a trailing `#` line-comment terminates at end-of-line
 /// within this rule instead of swallowing later disjuncts. The single
 /// emit's right-hand side is extracted and its node ids shifted by
 /// `base_id`, so the caller can OR several rule predicates into one
-/// dense-id-space decision program.
+/// dense-id-space decision program. The predicate's byte-offset spans
+/// stay in this wrapper's coordinate space; the caller rebases them into
+/// the reconstructed decision source via [`cxl::ast::rebase_expr_spans`].
 /// Returns the relocated predicate and the rule program's node count (the
 /// id span the caller must skip). `Err` is an E200 parse diagnostic
 /// already attributed to `node_name`.
@@ -4261,7 +4289,7 @@ fn parse_cull_rule_predicate(
     base_id: u32,
     span: Span,
 ) -> Result<(Expr, u32), Diagnostic> {
-    let parsed = cxl::parser::Parser::parse(&format!("emit __cull_pred = {source}"));
+    let parsed = cxl::parser::Parser::parse(&format!("{CULL_RULE_PARSE_PREFIX}{source}"));
     if !parsed.errors.is_empty() {
         let messages: Vec<String> = parsed.errors.iter().map(|e| e.message.clone()).collect();
         return Err(Diagnostic::error(

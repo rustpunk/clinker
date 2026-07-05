@@ -823,6 +823,121 @@ pub fn offset_node_ids(expr: &mut Expr, base: u32) {
     }
 }
 
+/// Add `delta` to every source [`Span`] in `expr` and all of its
+/// sub-expressions (and match-arm spans), in place.
+///
+/// A predicate parsed on its own numbers its byte offsets from the start of
+/// its private `emit … = <source>` wrapper. Splicing that predicate into a
+/// larger reconstructed source string — the text a caller stamps as a
+/// program's display source, against which runtime eval-error spans are
+/// resolved — requires shifting every span by the byte distance to where the
+/// predicate's text actually lands in the combined string. Without the shift
+/// a diagnostic caret underlines the wrong bytes of the reconstructed source.
+/// This is the span-space companion of [`offset_node_ids`], which relocates
+/// the id-space; a caller that splices a predicate typically does both so the
+/// result is self-consistent in ids and byte offsets alike.
+///
+/// `delta` of zero is a no-op. Offsets saturate rather than wrap at
+/// [`u32::MAX`]; a real source stays far below that ceiling
+/// ([`crate::lexer::MAX_SOURCE_LEN`] caps it at 64KB).
+pub fn rebase_expr_spans(expr: &mut Expr, delta: u32) {
+    if delta == 0 {
+        return;
+    }
+    fn shift(span: &mut Span, delta: u32) {
+        span.start = span.start.saturating_add(delta);
+        span.end = span.end.saturating_add(delta);
+    }
+    match expr {
+        Expr::Binary { span, lhs, rhs, .. } | Expr::Coalesce { span, lhs, rhs, .. } => {
+            shift(span, delta);
+            rebase_expr_spans(lhs, delta);
+            rebase_expr_spans(rhs, delta);
+        }
+        Expr::Unary { span, operand, .. } => {
+            shift(span, delta);
+            rebase_expr_spans(operand, delta);
+        }
+        Expr::MethodCall {
+            span,
+            receiver,
+            args,
+            ..
+        } => {
+            shift(span, delta);
+            rebase_expr_spans(receiver, delta);
+            for a in args.iter_mut() {
+                rebase_expr_spans(a, delta);
+            }
+        }
+        Expr::Match {
+            span,
+            subject,
+            arms,
+            ..
+        } => {
+            shift(span, delta);
+            if let Some(s) = subject.as_deref_mut() {
+                rebase_expr_spans(s, delta);
+            }
+            for arm in arms.iter_mut() {
+                shift(&mut arm.span, delta);
+                rebase_expr_spans(&mut arm.pattern, delta);
+                rebase_expr_spans(&mut arm.body, delta);
+            }
+        }
+        Expr::IfThenElse {
+            span,
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            shift(span, delta);
+            rebase_expr_spans(condition, delta);
+            rebase_expr_spans(then_branch, delta);
+            if let Some(e) = else_branch.as_deref_mut() {
+                rebase_expr_spans(e, delta);
+            }
+        }
+        Expr::WindowCall { span, args, .. } | Expr::AggCall { span, args, .. } => {
+            shift(span, delta);
+            for a in args.iter_mut() {
+                rebase_expr_spans(a, delta);
+            }
+        }
+        Expr::IndexAccess {
+            span,
+            receiver,
+            index,
+            ..
+        } => {
+            shift(span, delta);
+            rebase_expr_spans(receiver, delta);
+            rebase_expr_spans(index, delta);
+        }
+        Expr::Closure { span, body, .. } => {
+            shift(span, delta);
+            rebase_expr_spans(body, delta);
+        }
+        // Leaf variants: shift the span, no children to descend.
+        Expr::Literal { span, .. }
+        | Expr::FieldRef { span, .. }
+        | Expr::QualifiedFieldRef { span, .. }
+        | Expr::PipelineAccess { span, .. }
+        | Expr::VarsAccess { span, .. }
+        | Expr::ConfigAccess { span, .. }
+        | Expr::SourceAccess { span, .. }
+        | Expr::RecordAccess { span, .. }
+        | Expr::QualifiedSourceAccess { span, .. }
+        | Expr::DocAccess { span, .. }
+        | Expr::Now { span, .. }
+        | Expr::Wildcard { span, .. }
+        | Expr::AggSlot { span, .. }
+        | Expr::GroupKey { span, .. } => shift(span, delta),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MatchArm {
     pub node_id: NodeId,
@@ -1470,5 +1585,155 @@ mod offset_node_ids_tests {
         assert_eq!(arms[0].node_id.0, 13);
         assert_eq!(arms[0].pattern.node_id().0, 14);
         assert_eq!(arms[0].body.node_id().0, 15);
+    }
+}
+
+#[cfg(test)]
+mod rebase_expr_spans_tests {
+    use super::*;
+    use crate::parser::Parser;
+
+    /// Recursively collect every `Span` reachable from `e` (including
+    /// match-arm spans), mirroring the recursion shape of
+    /// [`rebase_expr_spans`] so the two stay in lockstep.
+    fn collect_spans(e: &Expr, out: &mut Vec<Span>) {
+        out.push(e.span());
+        match e {
+            Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
+                collect_spans(lhs, out);
+                collect_spans(rhs, out);
+            }
+            Expr::Unary { operand, .. } => collect_spans(operand, out),
+            Expr::MethodCall { receiver, args, .. } => {
+                collect_spans(receiver, out);
+                for a in args {
+                    collect_spans(a, out);
+                }
+            }
+            Expr::Match { subject, arms, .. } => {
+                if let Some(s) = subject {
+                    collect_spans(s, out);
+                }
+                for arm in arms {
+                    out.push(arm.span);
+                    collect_spans(&arm.pattern, out);
+                    collect_spans(&arm.body, out);
+                }
+            }
+            Expr::IfThenElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_spans(condition, out);
+                collect_spans(then_branch, out);
+                if let Some(e) = else_branch {
+                    collect_spans(e, out);
+                }
+            }
+            Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+                for a in args {
+                    collect_spans(a, out);
+                }
+            }
+            Expr::IndexAccess {
+                receiver, index, ..
+            } => {
+                collect_spans(receiver, out);
+                collect_spans(index, out);
+            }
+            Expr::Closure { body, .. } => collect_spans(body, out),
+            _ => {}
+        }
+    }
+
+    fn rhs_of(source: &str) -> Expr {
+        let parsed = Parser::parse(&format!("emit out = {source}"));
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let stmt = parsed.ast.statements.into_iter().next().expect("one stmt");
+        match stmt {
+            Statement::Emit { expr, .. } => expr,
+            _ => panic!("not an emit"),
+        }
+    }
+
+    /// Every span in a parsed expression shifts by exactly `delta`, and the
+    /// span count is unchanged — a pure relocation of the byte-offset space.
+    #[test]
+    fn shifts_every_span_by_delta() {
+        // Covers Binary, AggCall, IfThenElse, FieldRef and Literal arms.
+        let mut expr = rhs_of("sum(if amount > 0 then amount else 0) > count(id)");
+        let mut before = Vec::new();
+        collect_spans(&expr, &mut before);
+
+        rebase_expr_spans(&mut expr, 100);
+
+        let mut after = Vec::new();
+        collect_spans(&expr, &mut after);
+        assert_eq!(before.len(), after.len(), "span count is preserved");
+        for (b, a) in before.iter().zip(&after) {
+            assert_eq!(a.start, b.start + 100, "each span start shifts by delta");
+            assert_eq!(a.end, b.end + 100, "each span end shifts by delta");
+        }
+    }
+
+    /// A delta of zero leaves every span untouched.
+    #[test]
+    fn zero_delta_is_a_noop() {
+        let mut expr = rhs_of("a + b * c");
+        let mut before = Vec::new();
+        collect_spans(&expr, &mut before);
+        rebase_expr_spans(&mut expr, 0);
+        let mut after = Vec::new();
+        collect_spans(&expr, &mut after);
+        assert_eq!(before, after);
+    }
+
+    /// Match-arm spans relocate alongside the arms' pattern/body exprs, so a
+    /// directly constructed `Match` shifts wholesale.
+    #[test]
+    fn shifts_match_arm_spans() {
+        let mut expr = Expr::Match {
+            node_id: NodeId(1),
+            subject: Some(Box::new(Expr::FieldRef {
+                node_id: NodeId(2),
+                name: "status".into(),
+                span: Span::new(3, 9),
+            })),
+            arms: vec![MatchArm {
+                node_id: NodeId(3),
+                pattern: Expr::Literal {
+                    node_id: NodeId(4),
+                    value: LiteralValue::String("x".into()),
+                    span: Span::new(10, 13),
+                },
+                body: Expr::Literal {
+                    node_id: NodeId(5),
+                    value: LiteralValue::Int(1),
+                    span: Span::new(14, 15),
+                },
+                span: Span::new(10, 15),
+            }],
+            span: Span::new(0, 20),
+        };
+        rebase_expr_spans(&mut expr, 10);
+        let Expr::Match {
+            span,
+            subject,
+            arms,
+            ..
+        } = &expr
+        else {
+            panic!("expected Match");
+        };
+        assert_eq!((span.start, span.end), (10, 30));
+        let subj = subject.as_ref().unwrap().span();
+        assert_eq!((subj.start, subj.end), (13, 19));
+        assert_eq!((arms[0].span.start, arms[0].span.end), (20, 25));
+        let pat = arms[0].pattern.span();
+        assert_eq!((pat.start, pat.end), (20, 23));
+        let body = arms[0].body.span();
+        assert_eq!((body.start, body.end), (24, 25));
     }
 }
