@@ -44,6 +44,15 @@ use crate::executor::{PipelineExecutor, PipelineRunParams, SourceReaders, single
 // process baseline RSS, which the default `pause` policy rejects at startup
 // (E312); the spill policy never pauses a producer and so spills mid-run as
 // this test intends rather than being rejected.
+//
+// A fused passthrough Transform sits between the Source and the Aggregate so
+// the Aggregate streaming-ingests its input per record (a fused
+// Source→Transform is a certified streaming producer). Without it a direct
+// Source→Aggregate would materialize its whole (spilled-under-pressure) input
+// into RAM, which the re-materialized-drain budget gate aborts — the Aggregate
+// would never reach its own hash spill. Streaming the input keeps the working
+// set to one batch, so the group-table spill this test targets is the first
+// (and only) spill open, exactly the seam it intercepts.
 const PIPELINE_YAML: &str = r#"
 pipeline:
   name: spill_dir_unavailable_midrun
@@ -58,9 +67,16 @@ nodes:
       schema:
         - { name: k, type: string }
         - { name: v, type: int }
+  - type: transform
+    name: norm
+    input: events
+    config:
+      cxl: |
+        emit k = k
+        emit v = v
   - type: aggregate
     name: by_key
-    input: events
+    input: norm
     config:
       group_by:
         - k

@@ -67,7 +67,7 @@ pub(crate) fn dispatch_transform(
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
     ) = if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
-        own_buf.drain_split()?
+        own_buf.drain_split_metered(&ctx.memory_budget, name.as_str())?
     } else {
         let predecessors: Vec<NodeIndex> = current_dag
             .graph
@@ -81,7 +81,9 @@ pub(crate) fn dispatch_transform(
                 .find_map(|p| drain_node_buffer_slot(ctx, *p))
         };
         match pred_buf {
-            Some(nb) => nb.drain_split()?,
+            // Meter the re-materialized drain so a spill-backed input cannot
+            // re-inflate into RAM past the hard limit uncharged.
+            Some(nb) => nb.drain_split_metered(&ctx.memory_budget, name.as_str())?,
             None => (Vec::new(), Vec::new()),
         }
     };
