@@ -812,263 +812,269 @@ pub(crate) fn dispatch_combine(
     let inline_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
         crate::pipeline::combine::CombineHashConsumer::new(inline_consumer_handle.clone()),
     ));
-
-    // Hash-build phase — drain the build buffer into the
-    // pipeline-scoped MemoryArbitrator-governed
-    // CombineHashTable. The stage timer covers the full
-    // build walk; on a budget abort the timer is dropped
-    // without recording (matches the `StageTimer` "no
-    // report on error" contract documented at its
-    // definition). Arc-clone the pipeline-scoped handle
-    // so subsequent `&mut ctx` borrows for cursor advance
-    // are not blocked by an immutable borrow of `ctx`.
-    let budget = ctx.memory_budget.clone();
-    // Per-source cursor advance for both build and driver.
-    // Source→Combine direct paths bypass the Transform /
-    // Aggregate advance points so the cursor never moved off
-    // zero for those records; this is the operator-entry
-    // advance that catches the gap. The inline arm's driver
-    // loop below does not advance per-row inline, so this is
-    // the single advance point for driver and build alike.
-    for (rec, rn) in &driver_buf {
-        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
-    }
-    for (rec, rn) in &build_buf {
-        advance_cursor(ctx, &source_name_arc_of(rec), *rn);
-    }
-    let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
-    let build_records_in = build_records.len() as u64;
-    let estimated_rows = Some(build_records.len());
-    let hash_table_ctx = ctx.merged_eval_ctx();
-    let build_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
-        name: name.clone(),
-    });
-    let hash_table = CombineHashTable::build(
-        build_records,
-        &build_extractor,
-        &hash_table_ctx,
-        &budget,
-        estimated_rows,
-    )
-    .map_err(|e| PipelineError::MemoryBudgetExceeded {
-        node: name.clone(),
-        used: budget.peak_rss().unwrap_or(0),
-        limit: budget.hard_limit(),
-        source: BudgetCategory::Arena,
-        detail: Some(format!("combine build: {e}")),
-    })?;
-    let build_records_out = hash_table.len() as u64;
-    // Mirror the freshly-built table's footprint into the
-    // consumer handle so the arbitrator's pull-mode
-    // `current_usage` reads the inline-combine's in-memory
-    // bytes for the duration of the probe loop. The probe
-    // loop is read-only on the table so no further updates
-    // are needed; arm exit below unregisters the consumer.
-    inline_consumer_handle.set_bytes(hash_table.memory_bytes() as u64);
-    ctx.collector
-        .record(build_timer.finish(build_records_in, build_records_out));
-
-    // Body typed program (only used when the body is not empty —
-    // `match: collect` and body-less synthetic N-ary steps leave it
-    // `None`). Read off the node; shared with the streaming-probe thread
-    // via the kernel.
-    let body_program = body_typed_on_node.clone();
-
-    // The probe matching kernel — owns the materialized hash table and
-    // every per-combine artifact the probe reads, and holds no
-    // `&mut ExecutorContext`. The materialized loop below and the
-    // streaming-probe thread both drive it, so the two paths return a
-    // byte-identical result set.
-    let kernel = CombineProbeKernel {
-        name,
-        hash_table: &hash_table,
-        resolver_mapping: &resolver_mapping,
-        probe_extractor: &probe_extractor,
-        decomposed,
-        body_program,
-        combine_output_schema: combine_output_schema.clone(),
-        build_qualifier: &build_qualifier,
-        match_mode: *match_mode,
-        on_miss: *on_miss,
-        propagate_ck,
-        fail_fast: ctx.strategy == ErrorStrategy::FailFast,
-    };
-
-    // Per-driver probe loop. Stage timer covers the full per-driver
-    // iteration; on early-return via the 10K-cadence E310 abort or a
-    // residual/body eval error, the timer is dropped without recording.
-    let mut probe_records_in = driver_buf.len() as u64;
-    let probe_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::CombineProbe {
-        name: name.clone(),
-    });
-    let output_records: Vec<(Record, u64)> = if let Some(driver_producer) = streaming_probe_driver {
-        // Streaming-probe path: the build side is materialized into the
-        // hash table above; now spawn the probe consumer on its own thread,
-        // redispatch the driver producer to stream into the bounded channel,
-        // and collect the probe output. The kernel + `&budget` move into the
-        // thread; counter/cursor/DLQ effects replay onto `ctx` after the
-        // join inside the helper.
-        let streamed = run_streaming_combine_probe(
-            ctx,
-            current_dag,
-            node_idx,
-            driver_producer,
-            name,
-            &kernel,
+    // Every exit past this registration must unregister the
+    // consumer, so the hash-build-through-admit body runs inside a
+    // closure whose Result is captured: the clean return, the
+    // streaming-handoff early return, and every `?` early-return
+    // funnel through the single `unregister_consumer` call below, so
+    // a finished inline hash-combine never lingers in the arbitrator's
+    // registry.
+    let result = (|| -> Result<(), PipelineError> {
+        // Hash-build phase — drain the build buffer into the
+        // pipeline-scoped MemoryArbitrator-governed
+        // CombineHashTable. The stage timer covers the full
+        // build walk; on a budget abort the timer is dropped
+        // without recording (matches the `StageTimer` "no
+        // report on error" contract documented at its
+        // definition). Arc-clone the pipeline-scoped handle
+        // so subsequent `&mut ctx` borrows for cursor advance
+        // are not blocked by an immutable borrow of `ctx`.
+        let budget = ctx.memory_budget.clone();
+        // Per-source cursor advance for both build and driver.
+        // Source→Combine direct paths bypass the Transform /
+        // Aggregate advance points so the cursor never moved off
+        // zero for those records; this is the operator-entry
+        // advance that catches the gap. The inline arm's driver
+        // loop below does not advance per-row inline, so this is
+        // the single advance point for driver and build alike.
+        for (rec, rn) in &driver_buf {
+            advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+        }
+        for (rec, rn) in &build_buf {
+            advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+        }
+        let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
+        let build_records_in = build_records.len() as u64;
+        let estimated_rows = Some(build_records.len());
+        let hash_table_ctx = ctx.merged_eval_ctx();
+        let build_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
+            name: name.clone(),
+        });
+        let hash_table = CombineHashTable::build(
+            build_records,
+            &build_extractor,
+            &hash_table_ctx,
             &budget,
-        )?;
-        // The driver streamed its records over the channel, so the input
-        // count comes from the probe thread rather than a pre-drained Vec.
-        probe_records_in = streamed.input_count;
-        // The driver's punctuations arrived over the channel during the
-        // probe and were collected by the probe thread. Reconcile them now
-        // with the retained build-side punctuations — same fold as the
-        // materialized path, so a document spanning both inputs collapses
-        // to one open + one close and a side-local document forwards its
-        // close.
-        combined_puncts = crate::executor::stream_event::reconcile_document_boundaries(
-            streamed
-                .driver_puncts
-                .into_iter()
-                .chain(std::mem::take(&mut build_puncts_retained)),
-        );
-        streamed.output_records
-    } else {
-        let mut output_records = Vec::with_capacity(driver_buf.len());
-        let mut emitted_since_check: usize = 0;
-        let mut probe_counters = ProbeCounters::default();
-        // Reused across every probe iteration to avoid an allocation per
-        // driver row. `KeyExtractor::extract_into` pushes onto the end; the
-        // kernel clears it before each call.
-        let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(probe_extractor.len());
+            estimated_rows,
+        )
+        .map_err(|e| PipelineError::MemoryBudgetExceeded {
+            node: name.clone(),
+            used: budget.peak_rss().unwrap_or(0),
+            limit: budget.hard_limit(),
+            source: BudgetCategory::Arena,
+            detail: Some(format!("combine build: {e}")),
+        })?;
+        let build_records_out = hash_table.len() as u64;
+        // Mirror the freshly-built table's footprint into the
+        // consumer handle so the arbitrator's pull-mode
+        // `current_usage` reads the inline-combine's in-memory
+        // bytes for the duration of the probe loop. The probe
+        // loop is read-only on the table so no further updates
+        // are needed; arm exit below unregisters the consumer.
+        inline_consumer_handle.set_bytes(hash_table.memory_bytes() as u64);
+        ctx.collector
+            .record(build_timer.finish(build_records_in, build_records_out));
 
-        for (probe_record, rn) in driver_buf {
-            let source_file_arc = source_file_arc_of(&probe_record);
-            let source_name_arc = source_name_arc_of(&probe_record);
-            let before = output_records.len();
-            let eval_ctx = ctx.eval_ctx_for_record(
-                &source_file_arc,
-                &source_name_arc,
-                rn,
-                probe_record.doc_ctx(),
-            );
-            let step = kernel.probe_row(
-                &eval_ctx,
-                &probe_record,
-                rn,
-                &mut probe_keys_buf,
-                &mut probe_counters,
-                &mut output_records,
-            )?;
-            if let ProbeRowStep::Deferred(f) = step {
-                let f = *f;
-                dispatch_combine_output_error(
+        // Body typed program (only used when the body is not empty —
+        // `match: collect` and body-less synthetic N-ary steps leave it
+        // `None`). Read off the node; shared with the streaming-probe thread
+        // via the kernel.
+        let body_program = body_typed_on_node.clone();
+
+        // The probe matching kernel — owns the materialized hash table and
+        // every per-combine artifact the probe reads, and holds no
+        // `&mut ExecutorContext`. The materialized loop below and the
+        // streaming-probe thread both drive it, so the two paths return a
+        // byte-identical result set.
+        let kernel = CombineProbeKernel {
+            name,
+            hash_table: &hash_table,
+            resolver_mapping: &resolver_mapping,
+            probe_extractor: &probe_extractor,
+            decomposed,
+            body_program,
+            combine_output_schema: combine_output_schema.clone(),
+            build_qualifier: &build_qualifier,
+            match_mode: *match_mode,
+            on_miss: *on_miss,
+            propagate_ck,
+            fail_fast: ctx.strategy == ErrorStrategy::FailFast,
+        };
+
+        // Per-driver probe loop. Stage timer covers the full per-driver
+        // iteration; on early-return via the 10K-cadence E310 abort or a
+        // residual/body eval error, the timer is dropped without recording.
+        let mut probe_records_in = driver_buf.len() as u64;
+        let probe_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::CombineProbe {
+            name: name.clone(),
+        });
+        let output_records: Vec<(Record, u64)> =
+            if let Some(driver_producer) = streaming_probe_driver {
+                // Streaming-probe path: the build side is materialized into the
+                // hash table above; now spawn the probe consumer on its own thread,
+                // redispatch the driver producer to stream into the bounded channel,
+                // and collect the probe output. The kernel + `&budget` move into the
+                // thread; counter/cursor/DLQ effects replay onto `ctx` after the
+                // join inside the helper.
+                let streamed = run_streaming_combine_probe(
                     ctx,
+                    current_dag,
                     node_idx,
-                    &f.probe_record,
-                    f.rn,
-                    f.matched_build.as_ref(),
+                    driver_producer,
                     name,
-                    f.error,
+                    &kernel,
+                    &budget,
                 )?;
-                // A deferred failure routes the whole driver row to the DLQ;
-                // no output rows survive for it.
-                output_records.truncate(before);
-                continue;
-            }
-            emitted_since_check += output_records.len() - before;
+                // The driver streamed its records over the channel, so the input
+                // count comes from the probe thread rather than a pre-drained Vec.
+                probe_records_in = streamed.input_count;
+                // The driver's punctuations arrived over the channel during the
+                // probe and were collected by the probe thread. Reconcile them now
+                // with the retained build-side punctuations — same fold as the
+                // materialized path, so a document spanning both inputs collapses
+                // to one open + one close and a side-local document forwards its
+                // close.
+                combined_puncts = crate::executor::stream_event::reconcile_document_boundaries(
+                    streamed
+                        .driver_puncts
+                        .into_iter()
+                        .chain(std::mem::take(&mut build_puncts_retained)),
+                );
+                streamed.output_records
+            } else {
+                let mut output_records = Vec::with_capacity(driver_buf.len());
+                let mut emitted_since_check: usize = 0;
+                let mut probe_counters = ProbeCounters::default();
+                // Reused across every probe iteration to avoid an allocation per
+                // driver row. `KeyExtractor::extract_into` pushes onto the end; the
+                // kernel clears it before each call.
+                let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(probe_extractor.len());
 
-            // Budget check every 10K emitted records to bound memory under
-            // fan-out. The build phase polls `should_abort` every 10K
-            // inserts inside `CombineHashTable::build`; this covers the
-            // symmetric probe-side risk where a small build × large driver
-            // fan-out can blow RSS even though the table itself is bounded.
-            if emitted_since_check >= 10_000 && budget.should_abort() {
-                return Err(PipelineError::MemoryBudgetExceeded {
-                    node: name.clone(),
-                    used: budget.peak_rss().unwrap_or(0),
-                    limit: budget.hard_limit(),
-                    source: BudgetCategory::Arena,
-                    detail: Some("combine probe RSS abort".to_string()),
-                });
-            }
-            if emitted_since_check >= 10_000 {
-                emitted_since_check = 0;
-            }
+                for (probe_record, rn) in driver_buf {
+                    let source_file_arc = source_file_arc_of(&probe_record);
+                    let source_name_arc = source_name_arc_of(&probe_record);
+                    let before = output_records.len();
+                    let eval_ctx = ctx.eval_ctx_for_record(
+                        &source_file_arc,
+                        &source_name_arc,
+                        rn,
+                        probe_record.doc_ctx(),
+                    );
+                    let step = kernel.probe_row(
+                        &eval_ctx,
+                        &probe_record,
+                        rn,
+                        &mut probe_keys_buf,
+                        &mut probe_counters,
+                        &mut output_records,
+                    )?;
+                    if let ProbeRowStep::Deferred(f) = step {
+                        let f = *f;
+                        dispatch_combine_output_error(
+                            ctx,
+                            node_idx,
+                            &f.probe_record,
+                            f.rn,
+                            f.matched_build.as_ref(),
+                            name,
+                            f.error,
+                        )?;
+                        // A deferred failure routes the whole driver row to the DLQ;
+                        // no output rows survive for it.
+                        output_records.truncate(before);
+                        continue;
+                    }
+                    emitted_since_check += output_records.len() - before;
+
+                    // Budget check every 10K emitted records to bound memory under
+                    // fan-out. The build phase polls `should_abort` every 10K
+                    // inserts inside `CombineHashTable::build`; this covers the
+                    // symmetric probe-side risk where a small build × large driver
+                    // fan-out can blow RSS even though the table itself is bounded.
+                    if emitted_since_check >= 10_000 && budget.should_abort() {
+                        return Err(PipelineError::MemoryBudgetExceeded {
+                            node: name.clone(),
+                            used: budget.peak_rss().unwrap_or(0),
+                            limit: budget.hard_limit(),
+                            source: BudgetCategory::Arena,
+                            detail: Some("combine probe RSS abort".to_string()),
+                        });
+                    }
+                    if emitted_since_check >= 10_000 {
+                        emitted_since_check = 0;
+                    }
+                }
+
+                // Fold the probe kernel's `distinct` / `filtered` skip counts into
+                // the run counters — applied after the loop, the same place the
+                // per-row `ctx.counters.*` increments used to live.
+                ctx.counters.filtered_count += probe_counters.filtered;
+                ctx.counters.distinct_count += probe_counters.distinct;
+                output_records
+            };
+
+        let probe_records_out = output_records.len() as u64;
+        ctx.collector
+            .record(probe_timer.finish(probe_records_in, probe_records_out));
+
+        // Streaming-Output handoff: an inline hash build-probe combine
+        // whose sole downstream is a streaming-eligible Output
+        // installed its sender under our `node_idx`. The build side is
+        // already fully materialized in the hash table and the whole
+        // probe emit is already collected into `output_records`, so
+        // this does not shrink the combine's own working set; what it
+        // saves is the second copy — hand `output_records` straight to
+        // the writer thread over the bounded channel rather than
+        // admitting a charged `node_buffers` slot the Output would
+        // re-drain, and overlap the writer with the next topo node.
+        // The eligibility predicate certified this combine roots no
+        // window and tees to no deferred region, so the helper calls
+        // below are correctly skipped. The reconciled document boundaries
+        // are forwarded on the inline path just like the materialized arms,
+        // so a per-document Aggregate reached through this streamed handoff
+        // flushes per document; a terminal writer downstream consumes them
+        // harmlessly. The per-fold snapshot is dropped here; the
+        // hash-table consumer is released by the shared unregister
+        // funnel every exit from this arm passes through.
+        if let Some(sender) = ctx.take_streaming_sender(node_idx) {
+            let batch_size = ctx.batch_size;
+            let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
+            let charge = ctx
+                .streaming_charge_handle(node_idx, name, spill_allowed)
+                .expect("streaming sender implies a registered charge consumer");
+            stream_linear_producer_emit(
+                &sender,
+                batch_size,
+                name,
+                output_records,
+                combined_puncts,
+                &charge,
+            )?;
+            ctx.combine_input_snapshots.remove(&node_idx);
+            return Ok(());
         }
 
-        // Fold the probe kernel's `distinct` / `filtered` skip counts into
-        // the run counters — applied after the loop, the same place the
-        // per-row `ctx.counters.*` increments used to live.
-        ctx.counters.filtered_count += probe_counters.filtered;
-        ctx.counters.distinct_count += probe_counters.distinct;
-        output_records
-    };
-
-    let probe_records_out = output_records.len() as u64;
-    ctx.collector
-        .record(probe_timer.finish(probe_records_in, probe_records_out));
-
-    // Streaming-Output handoff: an inline hash build-probe combine
-    // whose sole downstream is a streaming-eligible Output
-    // installed its sender under our `node_idx`. The build side is
-    // already fully materialized in the hash table and the whole
-    // probe emit is already collected into `output_records`, so
-    // this does not shrink the combine's own working set; what it
-    // saves is the second copy — hand `output_records` straight to
-    // the writer thread over the bounded channel rather than
-    // admitting a charged `node_buffers` slot the Output would
-    // re-drain, and overlap the writer with the next topo node.
-    // The eligibility predicate certified this combine roots no
-    // window and tees to no deferred region, so the helper calls
-    // below are correctly skipped. The reconciled document boundaries
-    // are forwarded on the inline path just like the materialized arms,
-    // so a per-document Aggregate reached through this streamed handoff
-    // flushes per document; a terminal writer downstream consumes them
-    // harmlessly. The per-fold snapshot and hash-table consumer are
-    // still released before the streaming return.
-    if let Some(sender) = ctx.take_streaming_sender(node_idx) {
-        let batch_size = ctx.batch_size;
-        let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-        let charge = ctx
-            .streaming_charge_handle(node_idx, name, spill_allowed)
-            .expect("streaming sender implies a registered charge consumer");
-        stream_linear_producer_emit(
-            &sender,
-            batch_size,
+        finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
+        tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
+        let nb = admit_node_buffer(
+            ctx,
             name,
+            node_idx,
             output_records,
             combined_puncts,
-            &charge,
+            node_buffer_spill_allowed(current_dag, node_idx),
         )?;
+        ctx.node_buffers.insert(node_idx, nb);
+        // Drop the per-fold cursor snapshot: every emitted record
+        // has cleared into `node_buffers` without rewind, so the
+        // snapshot is no longer needed. The rewind path on a
+        // Combine-output-row failure reads and restores this entry
+        // before clearing.
         ctx.combine_input_snapshots.remove(&node_idx);
-        ctx.memory_budget.unregister_consumer(inline_consumer_id);
-        return Ok(());
-    }
-
-    finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
-    tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-    let nb = admit_node_buffer(
-        ctx,
-        name,
-        node_idx,
-        output_records,
-        combined_puncts,
-        node_buffer_spill_allowed(current_dag, node_idx),
-    )?;
-    ctx.node_buffers.insert(node_idx, nb);
-    // Drop the per-fold cursor snapshot: every emitted record
-    // has cleared into `node_buffers` without rewind, so the
-    // snapshot is no longer needed. The rewind path on a
-    // Combine-output-row failure reads and restores this entry
-    // before clearing.
-    ctx.combine_input_snapshots.remove(&node_idx);
-    // The hash table goes out of scope when this arm returns;
-    // unregister its consumer so the arbitrator's registry
-    // tracks live tables only.
+        Ok(())
+    })();
     ctx.memory_budget.unregister_consumer(inline_consumer_id);
-
-    Ok(())
+    result
 }
 
 /// Result of a streaming-probe run handed back to [`dispatch_combine`]:

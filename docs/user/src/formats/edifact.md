@@ -147,7 +147,9 @@ such interchanges still validate and round-trip with the trailer echoing
 the correct reference.
 
 A missing `UNZ` at end of input is a truncation error; content after the
-`UNZ` trailer is rejected.
+`UNZ` trailer is rejected — including a lone stray release character with
+no following segment, which is treated as unterminated (truncated) content
+rather than silently dropped.
 
 ### Routing a count mismatch to the DLQ
 

@@ -145,10 +145,16 @@ pub(crate) fn read_raw_segment<R: BufRead>(
     loop {
         let buf = reader.fill_buf()?;
         if buf.is_empty() {
-            // A release char dangling at EOF has nothing to escape and no
-            // following byte to carry, so the segment ends exactly at the
-            // bytes already accumulated — the dangling release is dropped,
-            // never counted toward an empty-vs-pending decision.
+            // A release char dangling at EOF has nothing to escape, but it is
+            // still a byte the producer wrote, so it is flushed into the
+            // segment as literal trailing content rather than discarded. A
+            // lone dangling release therefore reads as unterminated content
+            // (one byte pending, no terminator) instead of a clean end of
+            // stream — under RejectUnterminated that surfaces as truncation,
+            // so a stray release byte after the trailer cannot silently vanish.
+            if let Some(rel) = pending_release.take() {
+                raw.push(rel);
+            }
             if raw.is_empty() {
                 return Ok(None);
             }

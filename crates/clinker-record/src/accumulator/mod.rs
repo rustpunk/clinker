@@ -409,6 +409,12 @@ impl AvgState {
                     self.compensation = 0.0;
                 }
                 self.kahan_add(*f);
+                if self.is_decimal {
+                    // A binary float observed after decimal mode lands only in
+                    // the Kahan float sum, which the decimal quotient never
+                    // reads; poison rather than silently drop it from the avg.
+                    self.decimal_overflow = true;
+                }
             }
             Value::Decimal(d) => {
                 self.has_value = true;
@@ -422,10 +428,16 @@ impl AvgState {
 
     /// Enter the exact decimal path, seeding from the integers already summed
     /// (fallible — an out-of-range integer sum sets the overflow flag rather
-    /// than panicking).
+    /// than panicking). A binary float accumulated before the first decimal row
+    /// (an `Any`-typed column that mixed a float and a decimal — typed columns
+    /// cannot) cannot widen to an exact decimal; the seed pulls in only the
+    /// integer sum, so poison the result rather than silently drop the float.
     fn enter_decimal_mode(&mut self) {
         if !self.is_decimal {
             self.is_decimal = true;
+            if !self.is_integer {
+                self.decimal_overflow = true;
+            }
             match i128_to_decimal(self.int_sum) {
                 Some(d) => self.decimal_sum = d,
                 None => {
@@ -464,6 +476,13 @@ impl AvgState {
             // `SumState::merge`).
             let self_dec = self.decimal_contribution();
             let other_dec = other.decimal_contribution();
+            // A float-mode side (not decimal, not integer-only) contributes only
+            // its integer sum above; its binary-float total cannot widen to an
+            // exact decimal. Combining one into the decimal domain would silently
+            // drop it, so poison the result to Null instead.
+            if (!self.is_decimal && !self.is_integer) || (!other.is_decimal && !other.is_integer) {
+                self.decimal_overflow = true;
+            }
             self.is_decimal = true;
             match (self_dec, other_dec) {
                 (Some(a), Some(b)) => match a.checked_add(b) {
