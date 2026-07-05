@@ -478,25 +478,43 @@ fn real_run_warns_when_estimate_exceeds_eighty_percent_of_cap() {
 
 #[test]
 fn real_run_logs_per_stage_actual_spill() {
-    // A real run that spills (1 MiB memory budget over a sized input) prints the
-    // per-stage actual-spill section at end-of-run so an operator can compare it
-    // against the --explain estimate (#176 AC#3).
+    // A real run that spills prints the per-stage actual-spill section at
+    // end-of-run so an operator can compare it against the --explain estimate
+    // (#176 AC#3).
     let tmp = tempdir_path();
     let pipeline = tmp.join("pipeline.yaml");
-    // Inline a 1 MiB memory budget so the node-buffer admission spills.
+    // Inline a 1 MiB memory budget so the aggregate's group table spills.
     // `backpressure: spill` is required: 1 MiB is below the binary's
     // baseline RSS, which the default `pause` policy rejects at startup
     // (E312); the spill policy never pauses a producer and so spills as
     // this test intends rather than being rejected.
-    let yaml = AGG_PIPELINE_YAML.replace(
-        "pipeline:\n  name: storage_obs\n",
-        "pipeline:\n  name: storage_obs\n  memory: { limit: \"1M\", backpressure: spill }\n",
-    );
+    //
+    // A fused passthrough Transform (`norm`) sits between the Source and the
+    // Aggregate so the Aggregate streaming-ingests its input per record. Without
+    // it a direct Source→Aggregate materializes its whole (spilled-under-budget)
+    // input into one Vec, which the #674 re-materialized-drain gate aborts (E310,
+    // BudgetCategory::NodeBuffer) before the Aggregate ever reaches its own
+    // group-table spill. Streaming the input keeps the working set to one batch,
+    // so the only spill is the group-table spill this test targets.
+    let yaml = AGG_PIPELINE_YAML
+        .replace(
+            "pipeline:\n  name: storage_obs\n",
+            "pipeline:\n  name: storage_obs\n  memory: { limit: \"1M\", backpressure: spill }\n",
+        )
+        .replace(
+            "  - type: aggregate\n    name: dept_totals\n    input: orders\n",
+            "  - type: transform\n    name: norm\n    input: orders\n    config:\n      cxl: |\n        emit department = department\n        emit amount = amount\n  - type: aggregate\n    name: dept_totals\n    input: norm\n",
+        );
     std::fs::write(&pipeline, &yaml).expect("write pipeline yaml");
-    // A larger input raises the chance the 1 MiB budget trips a spill.
+    // Every row a distinct department: 50_000 groups dwarf the budget-derived
+    // group-count cap (max_groups = 60% of the 1 MiB budget / est-bytes-per-group
+    // ≈ a few thousand), so the group table crosses the cap and spills before
+    // EOF. That cap is derived from the configured budget, not process RSS, so
+    // the spill fires deterministically on every host — unlike the prior
+    // RSS-driven node-buffer spill this test used to rely on.
     let mut body = String::from("department,amount\n");
     for i in 0..50_000 {
-        body.push_str(&format!("dept{},{}\n", i % 50, i * 3));
+        body.push_str(&format!("dept{},{}\n", i, i * 3));
     }
     std::fs::write(tmp.join("orders.csv"), body).expect("write orders.csv");
 
@@ -515,15 +533,21 @@ fn real_run_logs_per_stage_actual_spill() {
         String::from_utf8_lossy(&output.stderr),
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // RSS-based spill is platform/host dependent; only assert the per-stage
-    // actuals section when a spill actually happened (the section is omitted on
-    // a fully in-memory run by design).
-    if stdout.contains("=== Spill Volume (actual, per stage) ===") {
-        assert!(
-            stdout.contains("Total:") && stdout.contains("bytes"),
-            "the actual-spill section must report a per-stage total; got:\n{stdout}"
-        );
-    }
+    // The group-table spill is budget-derived and deterministic, so the
+    // per-stage actuals section must be present on every host.
+    assert!(
+        stdout.contains("=== Spill Volume (actual, per stage) ==="),
+        "the high-cardinality aggregate must spill its group table under the 1 MiB \
+         budget, so the per-stage actual-spill section must be printed; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("dept_totals"),
+        "the spilling Aggregate stage must be named in the actual-spill section; got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("Total:") && stdout.contains("bytes"),
+        "the actual-spill section must report a per-stage total; got:\n{stdout}"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
