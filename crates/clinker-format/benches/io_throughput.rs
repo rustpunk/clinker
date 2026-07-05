@@ -4,6 +4,8 @@ use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
 use clinker_format::json::reader::{JsonReader, JsonReaderConfig};
 use clinker_format::json::writer::{JsonWriter, JsonWriterConfig};
 use clinker_format::traits::{FormatReader, FormatWriter};
+use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
+use clinker_record::{Record, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::io::Cursor;
 use std::sync::Arc;
@@ -177,6 +179,89 @@ fn bench_json_write(c: &mut Criterion) {
     group.finish();
 }
 
+// ── XML Write ──────────────────────────────────────────────────────
+
+/// Build `count` records over a dotted + attribute schema (shared-prefix
+/// branches with their own attributes), the shape the precompiled tree plan
+/// targets. Values vary per record so the fill path does real work.
+fn dotted_records(count: usize) -> (Arc<Schema>, Vec<Record>) {
+    let schema = Arc::new(Schema::new(vec![
+        "@id".into(),
+        "name".into(),
+        "Address.@type".into(),
+        "Address.City".into(),
+        "Address.State".into(),
+        "Contact.Email".into(),
+        "Contact.Phone".into(),
+    ]));
+    let records = (0..count)
+        .map(|i| {
+            Record::new(
+                Arc::clone(&schema),
+                vec![
+                    Value::Integer(i as i64),
+                    Value::String(format!("name{i}").into()),
+                    Value::String("home".into()),
+                    Value::String(format!("city{i}").into()),
+                    Value::String("NY".into()),
+                    Value::String(format!("user{i}@example.com").into()),
+                    Value::String("555-0100".into()),
+                ],
+            )
+        })
+        .collect();
+    (schema, records)
+}
+
+fn bench_xml_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("xml_write");
+
+    // Flat-wide: many top-level fields. The old per-record tree build paid an
+    // O(fields^2) sibling scan here, which the plan eliminates.
+    let mut factory = RecordFactory::new(50, 16, 0.0, 42);
+    let flat_records = factory.generate(MEDIUM);
+    let flat_schema = factory.schema().clone();
+    group.throughput(Throughput::Elements(MEDIUM as u64));
+    group.bench_with_input(
+        BenchmarkId::from_parameter("flat_50f"),
+        &flat_records,
+        |b, recs| {
+            b.iter(|| {
+                let buf = Vec::with_capacity(MEDIUM * 50 * 20);
+                let mut writer =
+                    XmlWriter::new(buf, Arc::clone(&flat_schema), XmlWriterConfig::default());
+                for rec in recs {
+                    writer.write_record(rec).unwrap();
+                }
+                writer.flush().unwrap();
+                black_box(writer);
+            });
+        },
+    );
+
+    // Dotted + attribute: nested branches with attributes, the classic XML
+    // shape whose per-node name allocation the plan removes.
+    let (dotted_schema, dotted_records) = dotted_records(MEDIUM);
+    group.bench_with_input(
+        BenchmarkId::from_parameter("dotted_7f"),
+        &dotted_records,
+        |b, recs| {
+            b.iter(|| {
+                let buf = Vec::with_capacity(MEDIUM * 200);
+                let mut writer =
+                    XmlWriter::new(buf, Arc::clone(&dotted_schema), XmlWriterConfig::default());
+                for rec in recs {
+                    writer.write_record(rec).unwrap();
+                }
+                writer.flush().unwrap();
+                black_box(writer);
+            });
+        },
+    );
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_csv_read,
@@ -184,5 +269,6 @@ criterion_group!(
     bench_json_ndjson_read,
     bench_json_array_read,
     bench_json_write,
+    bench_xml_write,
 );
 criterion_main!(benches);
