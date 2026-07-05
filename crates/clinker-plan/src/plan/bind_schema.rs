@@ -1900,38 +1900,6 @@ fn bind_cull(
         ok = false;
     }
 
-    // Reject a `#` line-comment in any rule predicate. The rules are
-    // OR-combined into ONE single-line decision expression (`(r1) or (r2)`),
-    // and a CXL `#` comment runs to end-of-line — on that single line it would
-    // swallow every following disjunct and the closing paren. The disjunction
-    // has nowhere else to go (CXL `or` cannot span a newline, and an aggregate
-    // predicate cannot move into a `let` — let RHSs must be row-pure), so the
-    // honest fix is to reject the comment with a rule-named diagnostic rather
-    // than surface a baffling parse error against the synthetic combined
-    // program. A `#…#` date literal lexes as a date token, not a comment, so
-    // it is unaffected.
-    for rule in &config.rules {
-        if cxl::lexer::Lexer::tokenize(&rule.drop_group_when.source)
-            .iter()
-            .any(|(t, _)| *t == cxl::lexer::Token::Comment)
-        {
-            diags.push(
-                Diagnostic::error(
-                    "E200",
-                    format!(
-                        "cull {name:?} rule {:?}: drop_group_when may not contain a `#` comment — \
-                         the rule predicates are combined into a single expression where a line \
-                         comment would swallow the other rules",
-                        rule.name
-                    ),
-                    LabeledSpan::primary(span, String::new()),
-                )
-                .with_help("remove the `#` comment from the predicate"),
-            );
-            ok = false;
-        }
-    }
-
     if !ok {
         return;
     }
@@ -1948,26 +1916,96 @@ fn bind_cull(
 
     // Build the decision program the runtime evaluates per group: a group is
     // removed when ANY rule's `drop_group_when` holds, so the decision is the
-    // OR of every rule's predicate in one `emit`. The aggregates (`count`,
-    // `sum`, …) sit directly in the emit body, where `extract_aggregates`
-    // folds them at lowering; they cannot move into a `let` (let RHSs must be
-    // row-pure) and `or` cannot span a newline, so the disjunction is a single
-    // line — which is why a `#` comment in any rule is rejected above. Emit
-    // target = `CULL_DROP_DECISION_COLUMN`; lowering runs `extract_aggregates`
-    // over this program and stamps it onto `PlanNode::Cull.compiled`/`.typed`.
-    // `rules` is non-empty (rejected above).
+    // OR of every rule's predicate emitted to `CULL_DROP_DECISION_COLUMN`. The
+    // aggregates (`count`, `sum`, …) sit directly in the emit body, where
+    // `extract_aggregates` folds them at lowering.
+    //
+    // Each rule is parsed on its own — as an `emit __cull_pred = <predicate>`
+    // program — and the parsed predicate expressions are OR-combined at the
+    // AST level rather than by joining rule source strings into one `(r1) or
+    // (r2)` line. Per-rule parsing keeps a trailing `#` line-comment (which
+    // runs to end-of-line) scoped to its own rule instead of swallowing the
+    // following disjuncts and the closing paren, which a single joined source
+    // line cannot do. Each rule's node ids are relocated into a dense,
+    // collision-free span so the resolver/typechecker side-tables (indexed by
+    // `NodeId`) stay consistent; the OR-chain and wrapping emit mint fresh ids
+    // above every relocated rule. Lowering runs `extract_aggregates` over the
+    // result and stamps it onto `PlanNode::Cull.compiled`/`.typed`. `rules` is
+    // non-empty (rejected above).
     let agg_mode = AggregateMode::GroupBy {
         group_by_fields: config.partition_by.iter().cloned().collect(),
     };
-    let disjunction = config
-        .rules
-        .iter()
-        .map(|r| format!("({})", r.drop_group_when.source))
-        .collect::<Vec<_>>()
-        .join(" or ");
+
+    let mut disjuncts: Vec<Expr> = Vec::with_capacity(config.rules.len());
+    let mut next_id: u32 = 0;
+    let mut parse_failed = false;
+    for rule in &config.rules {
+        match parse_cull_rule_predicate(
+            &format!("{name}:{}:drop_group_when", rule.name),
+            &rule.drop_group_when.source,
+            next_id,
+            span,
+        ) {
+            Ok((predicate, node_count)) => {
+                disjuncts.push(predicate);
+                next_id += node_count;
+            }
+            Err(d) => {
+                diags.push(d);
+                parse_failed = true;
+            }
+        }
+    }
+    if parse_failed {
+        return;
+    }
+
+    // OR-fold the parsed rule predicates left-to-right, minting one fresh
+    // `NodeId` per inserted `or`. A single-rule Cull needs no `or`: its lone
+    // predicate is the decision body.
+    let body = disjuncts
+        .into_iter()
+        .reduce(|lhs, rhs| {
+            let node_id = cxl::ast::NodeId(next_id);
+            next_id += 1;
+            let or_span = lhs.span();
+            Expr::Binary {
+                node_id,
+                op: cxl::ast::BinOp::Or,
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                span: or_span,
+            }
+        })
+        .expect("cull rules are non-empty");
+
+    let body_span = body.span();
+    let emit_id = cxl::ast::NodeId(next_id);
+    next_id += 1;
+    let node_count = next_id;
+    let decision_program = cxl::ast::Program {
+        statements: vec![Statement::Emit {
+            node_id: emit_id,
+            name: crate::config::pipeline_node::CULL_DROP_DECISION_COLUMN.into(),
+            expr: body,
+            target: cxl::ast::EmitTarget::Field,
+            span: body_span,
+        }],
+        span: cxl::lexer::Span::default(),
+    };
+
+    // Reconstruct the single-line decision source for the typed program's
+    // display text (eval-error / explain rendering). It is never re-parsed,
+    // so a rule's `#` comment inside it is inert.
     let decision_src = format!(
-        "emit {} = {disjunction}",
-        crate::config::pipeline_node::CULL_DROP_DECISION_COLUMN
+        "emit {} = {}",
+        crate::config::pipeline_node::CULL_DROP_DECISION_COLUMN,
+        config
+            .rules
+            .iter()
+            .map(|r| format!("({})", r.drop_group_when.source))
+            .collect::<Vec<_>>()
+            .join(" or ")
     );
 
     // Typecheck the combined program first — the happy path needs only this
@@ -1976,9 +2014,11 @@ fn bind_cull(
     // diagnostic to the offending rule; fall back to the combined diagnostic
     // if no single rule reproduces it. Either way, skip lowering (the node is
     // absent from `cull_decision_typed`).
-    match typecheck_cxl(
+    match typecheck_parsed_program(
         &format!("{name}:drop_group_when"),
-        &decision_src,
+        decision_program,
+        node_count,
+        std::sync::Arc::from(decision_src.as_str()),
         upstream,
         agg_mode.clone(),
         span,
@@ -1990,12 +2030,9 @@ fn bind_cull(
         Err(combined) => {
             let mut attributed = false;
             for rule in &config.rules {
-                if let Err(d) = typecheck_cxl(
+                if let Err(d) = typecheck_cull_rule(
                     &format!("{name}:{}:drop_group_when", rule.name),
-                    &format!(
-                        "emit __cull_pred = ({}) or false",
-                        rule.drop_group_when.source
-                    ),
+                    &rule.drop_group_when.source,
                     upstream,
                     agg_mode.clone(),
                     span,
@@ -4054,6 +4091,40 @@ fn typecheck_cxl(
             LabeledSpan::primary(span, String::new()),
         ));
     }
+    typecheck_parsed_program(
+        node_name,
+        parse_result.ast,
+        parse_result.node_count,
+        std::sync::Arc::from(source),
+        schema,
+        mode,
+        span,
+        scoped_vars,
+    )
+}
+
+/// Resolve + typecheck an already-parsed CXL `program` against `schema`,
+/// attaching `source` as the typed program's display text.
+///
+/// Split out from [`typecheck_cxl`] so callers that synthesize a program
+/// directly (rather than from one source string) can enter after parse —
+/// notably `bind_cull`, which OR-combines each rule's independently parsed
+/// predicate at the AST level. `node_count` must exceed every `NodeId` in
+/// `program` (the resolver/typechecker size their per-node side-tables by
+/// it); a synthesizing caller is responsible for keeping ids dense and
+/// below it.
+#[allow(clippy::result_large_err)]
+#[allow(clippy::too_many_arguments)]
+fn typecheck_parsed_program(
+    node_name: &str,
+    program: cxl::ast::Program,
+    node_count: u32,
+    source: Arc<str>,
+    schema: &Row,
+    mode: AggregateMode,
+    span: Span,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
+) -> Result<TypedProgram, Diagnostic> {
     // Collect unqualified field names for CXL resolve. In the non-combine
     // case all fields are bare; in the combine case (C.1.1+) qualified
     // fields collapse to their `.name` — the resolver only needs to know
@@ -4062,9 +4133,9 @@ fn typecheck_cxl(
     // typecheck/pass.rs, not resolve).
     let field_refs: Vec<&str> = schema.field_names().map(|qf| qf.name.as_ref()).collect();
     let resolved = cxl::resolve::resolve_program_with_modules_and_vars(
-        parse_result.ast,
+        program,
         &field_refs,
-        parse_result.node_count,
+        node_count,
         &std::collections::HashMap::new(),
         scoped_vars,
     )
@@ -4085,7 +4156,7 @@ fn typecheck_cxl(
     cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode, scoped_vars)
         .map(|mut typed| {
             fold_body_config(&mut typed, scoped_vars);
-            typed.with_source(std::sync::Arc::from(source))
+            typed.with_source(source)
         })
         .map_err(|diags| {
             let errors: Vec<String> = diags
@@ -4108,6 +4179,119 @@ fn typecheck_cxl(
                 LabeledSpan::primary(span, String::new()),
             )
         })
+}
+
+/// Parse one Cull rule's `drop_group_when` predicate into a stand-alone
+/// expression, relocating its node ids past `base_id`.
+///
+/// The predicate is parsed as its own `emit __cull_pred = <source>`
+/// program, so a trailing `#` line-comment terminates at end-of-line
+/// within this rule instead of swallowing later disjuncts. The single
+/// emit's right-hand side is extracted and its node ids shifted by
+/// `base_id`, so the caller can OR several rule predicates into one
+/// dense-id-space decision program.
+/// Returns the relocated predicate and the rule program's node count (the
+/// id span the caller must skip). `Err` is an E200 parse diagnostic
+/// already attributed to `node_name`.
+#[allow(clippy::result_large_err)]
+fn parse_cull_rule_predicate(
+    node_name: &str,
+    source: &str,
+    base_id: u32,
+    span: Span,
+) -> Result<(Expr, u32), Diagnostic> {
+    let parsed = cxl::parser::Parser::parse(&format!("emit __cull_pred = {source}"));
+    if !parsed.errors.is_empty() {
+        let messages: Vec<String> = parsed.errors.iter().map(|e| e.message.clone()).collect();
+        return Err(Diagnostic::error(
+            "E200",
+            format!("CXL parse error in {node_name:?}: {}", messages.join("; ")),
+            LabeledSpan::primary(span, String::new()),
+        ));
+    }
+    // The wrapper is exactly one field emit of a single expression; a rule
+    // source that parsed into anything else (extra statements, a scoped-state
+    // emit) is not a group predicate.
+    let mut statements = parsed.ast.statements;
+    let single = (statements.len() == 1).then(|| statements.pop()).flatten();
+    let mut predicate = match single {
+        Some(Statement::Emit {
+            expr,
+            target: cxl::ast::EmitTarget::Field,
+            ..
+        }) => expr,
+        _ => {
+            return Err(Diagnostic::error(
+                "E200",
+                format!(
+                    "CXL parse error in {node_name:?}: drop_group_when must be a single \
+                     expression"
+                ),
+                LabeledSpan::primary(span, String::new()),
+            ));
+        }
+    };
+    cxl::ast::offset_node_ids(&mut predicate, base_id);
+    Ok((predicate, parsed.node_count))
+}
+
+/// Typecheck one Cull rule's predicate in isolation, to attribute a
+/// diagnostic to the offending rule when the OR-combined program failed.
+///
+/// The predicate is wrapped as `<predicate> or false` (built on the AST, so
+/// a `#` comment stays scoped to the predicate) to force a boolean operand,
+/// surfacing a non-boolean predicate as the same type error the combined
+/// program raises. Returns `Ok` if this rule alone typechecks cleanly,
+/// `Err` with the attributed diagnostic otherwise.
+#[allow(clippy::result_large_err)]
+fn typecheck_cull_rule(
+    node_name: &str,
+    source: &str,
+    schema: &Row,
+    mode: AggregateMode,
+    span: Span,
+    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
+) -> Result<TypedProgram, Diagnostic> {
+    let (predicate, mut next_id) = parse_cull_rule_predicate(node_name, source, 0, span)?;
+    let body_span = predicate.span();
+    let false_id = cxl::ast::NodeId(next_id);
+    next_id += 1;
+    let or_id = cxl::ast::NodeId(next_id);
+    next_id += 1;
+    let emit_id = cxl::ast::NodeId(next_id);
+    next_id += 1;
+    let body = Expr::Binary {
+        node_id: or_id,
+        op: cxl::ast::BinOp::Or,
+        lhs: Box::new(predicate),
+        rhs: Box::new(Expr::Literal {
+            node_id: false_id,
+            value: cxl::ast::LiteralValue::Bool(false),
+            span: body_span,
+        }),
+        span: body_span,
+    };
+    let program = cxl::ast::Program {
+        statements: vec![Statement::Emit {
+            node_id: emit_id,
+            name: "__cull_pred".into(),
+            expr: body,
+            target: cxl::ast::EmitTarget::Field,
+            span: body_span,
+        }],
+        span: cxl::lexer::Span::default(),
+    };
+    let display = format!("emit __cull_pred = ({source}) or false");
+    typecheck_parsed_program(
+        node_name,
+        program,
+        next_id,
+        std::sync::Arc::from(display.as_str()),
+        schema,
+        mode,
+        span,
+        scoped_vars,
+    )
 }
 
 /// Compile an Envelope node's declarative header/footer synthesis against the

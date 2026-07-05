@@ -106,15 +106,13 @@ nodes:
     );
 }
 
-/// A `#` line-comment in a Cull rule predicate is rejected at compile time
-/// with a clear, rule-named diagnostic. The rules are OR-combined into a
-/// single-line decision expression (aggregate predicates cannot move into
-/// `let`s and CXL `or` cannot span a newline), where a `#` comment would
-/// otherwise swallow the following disjuncts and the closing paren — so the
-/// binder rejects the comment up front instead of emitting a baffling parse
-/// error against the synthetic combined program.
+/// A `#` line-comment in a Cull rule predicate compiles: each rule is parsed
+/// independently, so a trailing comment terminates at its own end-of-line
+/// instead of swallowing the following disjuncts, and the parsed predicates
+/// are OR-combined at the AST level. The commented rule and its uncommented
+/// neighbour both fold into the decision aggregate.
 #[test]
-fn cull_rule_with_line_comment_rejected() {
+fn cull_rule_with_line_comment_compiles() {
     let yaml = r#"
 pipeline:
   name: cull_comment
@@ -155,17 +153,109 @@ nodes:
       type: csv
       path: audit.csv
 "#;
+    let compiled = compile_ok(yaml);
+    let g = &compiled.dag().graph;
+    let idx = g
+        .node_indices()
+        .find(|&i| g[i].name() == "cd")
+        .expect("cull node `cd` present");
+    let PlanNode::Cull {
+        typed,
+        compiled: agg,
+        ..
+    } = &g[idx]
+    else {
+        panic!("node `cd` is not a Cull");
+    };
+    assert!(
+        !typed.program.statements.is_empty(),
+        "cull decision program should carry statements"
+    );
+    let emit_names: Vec<&str> = agg.emits.iter().map(|e| e.output_name.as_ref()).collect();
+    assert!(
+        emit_names.contains(&CULL_DROP_DECISION_COLUMN),
+        "cull decision aggregate should emit {CULL_DROP_DECISION_COLUMN:?}, got {emit_names:?}"
+    );
+    // Both rules contribute a `sum` aggregate to the OR-combined decision, so
+    // the extracted aggregate carries at least two bindings.
+    assert!(
+        agg.bindings.len() >= 2,
+        "both rules' aggregates should fold into the decision, got {} bindings",
+        agg.bindings.len()
+    );
+}
+
+/// An error inside a `#`-commented rule is still attributed to that rule by
+/// name: the OR-combined program fails, then the per-rule attribution
+/// fallback re-typechecks each rule independently (comment-tolerant), so the
+/// offending rule surfaces by name even though its predicate carries a
+/// trailing comment. The uncommented sibling rule is well-formed, so only
+/// the bad rule is named.
+#[test]
+fn cull_error_in_commented_rule_names_the_rule() {
+    let yaml = r#"
+pipeline:
+  name: cull_comment_error
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: int }
+        - { name: status, type: string }
+  - type: cull
+    name: cd
+    input: src
+    config:
+      partition_by: [id]
+      removed_to: removed
+      rules:
+        - name: bad_rule
+          drop_group_when: "sum(nonexistent) > 0  # references a missing column"
+        - name: drop_big
+          drop_group_when: "sum(amount) > 100"
+  - type: output
+    name: out
+    input: cd
+    config:
+      name: out
+      type: csv
+      path: out.csv
+  - type: output
+    name: audit
+    input: cd.removed
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#;
     let diags = parse_config(yaml)
         .expect("parse_config")
         .compile(&CompileContext::default())
-        .expect_err("compile should reject the `#` comment");
-    // A precise, rule-attributed diagnostic — not a parse error citing the
-    // synthetic combined program.
+        .expect_err("a predicate referencing an unknown column must fail to compile");
+    // The diagnostic names both the offending rule (only the per-rule
+    // attribution path, which is comment-tolerant, adds the rule name) and
+    // the unknown column.
     assert!(
         diags.iter().any(|d| d.code == "E200"
-            && d.message.contains("drop_errors")
-            && d.message.contains("`#` comment")),
-        "expected an E200 naming rule `drop_errors` and the `#` comment, got {:?}",
+            && d.message.contains("bad_rule")
+            && d.message.contains("nonexistent")),
+        "expected an E200 naming rule `bad_rule` and the unknown column, got {:?}",
+        diags
+            .iter()
+            .map(|d| (d.code.clone(), d.message.clone()))
+            .collect::<Vec<_>>()
+    );
+    // The well-formed sibling rule is not blamed.
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.message.contains("drop_big") && d.message.contains("nonexistent")),
+        "the well-formed rule `drop_big` must not be blamed, got {:?}",
         diags
             .iter()
             .map(|d| (d.code.clone(), d.message.clone()))

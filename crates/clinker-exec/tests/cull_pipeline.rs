@@ -214,6 +214,165 @@ fn removed_port_carries_unwidened_schema() {
     );
 }
 
+/// The single-rule error cull with a trailing `#` line-comment on its
+/// `drop_group_when`. Comments run to end-of-line and were once rejected at
+/// compile time; each rule is now parsed independently, so the comment is
+/// scoped to its own rule. Behaviour must match [`ERROR_CULL_PIPELINE`]
+/// exactly — the comment is inert.
+const ERROR_CULL_PIPELINE_COMMENTED: &str = r#"
+pipeline:
+  name: cull_errors
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: test.csv
+      schema:
+        - { name: account, type: string }
+        - { name: amount, type: int }
+        - { name: status, type: string }
+  - type: cull
+    name: drop_bad
+    input: events
+    config:
+      partition_by: [account]
+      removed_to: removed
+      rules:
+        - name: drop_error_groups
+          drop_group_when: "sum(if status == 'error' then 1 else 0) > 0  # any error row in the group"
+  - type: output
+    name: out
+    input: drop_bad
+    config:
+      name: out
+      type: csv
+      path: out.csv
+  - type: output
+    name: audit
+    input: drop_bad.removed
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#;
+
+#[test]
+fn comment_in_predicate_behaves_identically() {
+    // A `#`-commented predicate produces output byte-identical to the same
+    // predicate without the comment — the comment affects only source text,
+    // never the compiled decision.
+    let csv = "account,amount,status\n\
+               A,100,ok\n\
+               A,200,error\n\
+               B,300,ok\n\
+               B,400,ok\n";
+    let plain = run_cull(ERROR_CULL_PIPELINE, csv);
+    let commented = run_cull(ERROR_CULL_PIPELINE_COMMENTED, csv);
+
+    assert_eq!(
+        commented.main, plain.main,
+        "commented predicate must yield the same main output"
+    );
+    assert_eq!(
+        commented.removed, plain.removed,
+        "commented predicate must yield the same removed output"
+    );
+    assert_eq!(commented.dlq_count, plain.dlq_count);
+    // Sanity: the shared expectation is that account A (one error row) is
+    // removed and account B flows to main.
+    assert!(commented.main.contains("B,300,ok"));
+    assert!(!commented.main.contains("A,"));
+    assert!(commented.removed.contains("A,100,ok"));
+    assert!(commented.removed.contains("A,200,error"));
+}
+
+/// A two-rule cull where one rule's predicate carries a trailing `#`
+/// comment. The rules OR-combine: a group is removed if it holds an error
+/// row (commented rule) OR its summed amount exceeds a threshold (plain
+/// rule). Each rule contributes independently.
+const MULTI_RULE_COMMENTED_PIPELINE: &str = r#"
+pipeline:
+  name: cull_multi_rule
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: test.csv
+      schema:
+        - { name: account, type: string }
+        - { name: amount, type: int }
+        - { name: status, type: string }
+  - type: cull
+    name: drop_bad
+    input: events
+    config:
+      partition_by: [account]
+      removed_to: removed
+      rules:
+        - name: drop_error_groups
+          drop_group_when: "sum(if status == 'error' then 1 else 0) > 0  # any error row"
+        - name: drop_big_groups
+          drop_group_when: "sum(amount) > 500"
+  - type: output
+    name: out
+    input: drop_bad
+    config:
+      name: out
+      type: csv
+      path: out.csv
+  - type: output
+    name: audit
+    input: drop_bad.removed
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#;
+
+#[test]
+fn multi_rule_one_commented_or_combines() {
+    // A: has an error row -> removed by the commented rule (sum amount 300,
+    //    below the 500 threshold, so only the error rule fires).
+    // B: clean, summed amount 900 > 500 -> removed by the plain rule.
+    // C: clean, summed amount 100 -> kept (neither rule fires).
+    let csv = "account,amount,status\n\
+               A,100,ok\n\
+               A,200,error\n\
+               B,500,ok\n\
+               B,400,ok\n\
+               C,100,ok\n";
+    let out = run_cull(MULTI_RULE_COMMENTED_PIPELINE, csv);
+
+    assert_eq!(out.dlq_count, 0);
+
+    // Only account C survives to the main output.
+    let main_data: Vec<&str> = out.main.lines().skip(1).filter(|l| !l.is_empty()).collect();
+    assert_eq!(main_data, vec!["C,100,ok"], "main output: {}", out.main);
+
+    // A (error rule) and B (threshold rule) are both removed — four rows.
+    let mut removed_data: Vec<&str> = out
+        .removed
+        .lines()
+        .skip(1)
+        .filter(|l| !l.is_empty())
+        .collect();
+    removed_data.sort_unstable();
+    assert_eq!(
+        removed_data,
+        vec!["A,100,ok", "A,200,error", "B,400,ok", "B,500,ok"],
+        "removed output: {}",
+        out.removed
+    );
+}
+
 /// Count-threshold cull parameterized on the memory limit, with the `spill`
 /// backpressure policy so a sub-baseline limit forces the disk path. A group
 /// is removed when it holds more than 100 rows.
