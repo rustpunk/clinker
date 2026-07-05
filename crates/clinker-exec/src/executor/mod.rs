@@ -1610,6 +1610,7 @@ mod tests {
     use super::*;
 
     mod aggregation;
+    mod combine_consumer_lifecycle;
     mod composition_port_admission_overshoot;
     mod deferred_dispatch;
     mod diamond_node_buffer_overshoot;
