@@ -788,6 +788,68 @@ mod tests {
         );
     }
 
+    /// A streaming spill whose file crosses the arbitrator's disk quota
+    /// aborts the run with the structured `SpillCapExceeded` (E320) surface
+    /// instead of continuing to fill the disk. Pins the soft threshold so the
+    /// batch takes the spill path, then sets the disk cap to one byte so the
+    /// spilled run's file overflows on its first write. The overflow is a
+    /// disk-cap abort, never masqueraded as an out-of-memory E310.
+    #[test]
+    fn streaming_spill_past_disk_cap_aborts_with_e320() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy, assert_spill_cap_overflow};
+
+        let arbitrator = Arc::new(MemoryArbitrator::with_policy(
+            64 * 1024 * 1024,
+            0.80,
+            Box::new(NoOpPolicy),
+        ));
+        // Force the streaming charge path onto the spill branch (the charge
+        // path polls `should_spill_self`, no pausing round)...
+        arbitrator.set_limit(1);
+        arbitrator.set_peak_rss_for_test(u64::MAX);
+        assert!(arbitrator.should_spill_self());
+        // ...then choke the disk quota so the first spilled run overflows.
+        arbitrator.set_max_spill_bytes(1);
+
+        let spill_dir = tempfile::tempdir().expect("temp dir");
+        let spill_root: Arc<std::path::Path> = Arc::from(spill_dir.path());
+        let handle = ConsumerHandle::new();
+        let charge = StreamingChargeHandle::new(
+            handle.clone(),
+            Arc::clone(&arbitrator),
+            spill_root,
+            "stream-spill-cap".to_string(),
+            true,
+            clinker_plan::config::CompressMode::On,
+            2,
+        );
+
+        // A records-only batch spills as a single run; that run's file
+        // crosses the one-byte cap.
+        let mut batch = EventBatch::with_capacity(4);
+        for i in 0..3 {
+            batch.push_record(rec(i), i as u64);
+        }
+
+        let routed: Arc<std::sync::Mutex<Vec<StreamEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let routed_sink = Arc::clone(&routed);
+        let result = charge.charge_and_route(batch, move |event| {
+            routed_sink.lock().unwrap().push(event);
+            Ok(())
+        });
+
+        assert_spill_cap_overflow(result, &arbitrator, "stream-spill-cap", 1, spill_dir.path());
+
+        // The aborting run forwards nothing downstream: the overflow fires
+        // before any spilled record is re-read from disk and sent.
+        let out = Arc::try_unwrap(routed).unwrap().into_inner().unwrap();
+        assert!(
+            out.is_empty(),
+            "no records escape downstream once the disk cap trips"
+        );
+    }
+
     #[test]
     fn batch_len_counts_records_and_punctuations() {
         let ctx = synthetic_document_context();
