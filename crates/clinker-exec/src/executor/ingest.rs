@@ -1148,21 +1148,20 @@ enum MultiRecordKind<'a> {
 ///
 /// A declared `encoding` is resolved to a [`Charset`] here so an unsupported
 /// value fails at startup with the name the user must fix, rather than being
-/// silently dropped (the reader otherwise always decoded as UTF-8).
+/// silently dropped (the reader otherwise always decoded as UTF-8). A declared
+/// `delimiter` / `quote_char` is likewise resolved to its single byte, failing
+/// at startup on an empty, multi-character, or non-ASCII value rather than
+/// truncating it to a single (possibly wrong) byte.
 fn build_csv_reader_config(
     opts: Option<&clinker_plan::config::CsvInputOptions>,
 ) -> Result<CsvReaderConfig, PipelineError> {
     let mut config = CsvReaderConfig::default();
     if let Some(opts) = opts {
-        if let Some(ref d) = opts.delimiter
-            && let Some(b) = d.as_bytes().first()
-        {
-            config.delimiter = *b;
+        if let Some(ref d) = opts.delimiter {
+            config.delimiter = crate::executor::util::csv_single_byte("delimiter", d)?;
         }
-        if let Some(ref q) = opts.quote_char
-            && let Some(b) = q.as_bytes().first()
-        {
-            config.quote_char = *b;
+        if let Some(ref q) = opts.quote_char {
+            config.quote_char = crate::executor::util::csv_single_byte("quote_char", q)?;
         }
         if let Some(h) = opts.has_header {
             config.has_header = h;
@@ -1780,6 +1779,61 @@ nodes:
         assert!(
             msg.contains("shift_jis") && msg.contains("iso-8859-1"),
             "error must name the unsupported value and the supported set: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_csv_reader_config_resolves_single_byte_delimiter_and_quote() {
+        let opts = clinker_plan::config::CsvInputOptions {
+            delimiter: Some("|".to_string()),
+            quote_char: Some("'".to_string()),
+            ..Default::default()
+        };
+        let cfg =
+            build_csv_reader_config(Some(&opts)).expect("single-byte delimiter/quote resolve");
+        assert_eq!(cfg.delimiter, b'|');
+        assert_eq!(cfg.quote_char, b'\'');
+    }
+
+    #[test]
+    fn build_csv_reader_config_resolves_tab_delimiter() {
+        let opts = clinker_plan::config::CsvInputOptions {
+            delimiter: Some("\t".to_string()),
+            ..Default::default()
+        };
+        let cfg = build_csv_reader_config(Some(&opts)).expect("tab delimiter resolves");
+        assert_eq!(cfg.delimiter, b'\t');
+    }
+
+    #[test]
+    fn build_csv_reader_config_rejects_multichar_delimiter() {
+        let opts = clinker_plan::config::CsvInputOptions {
+            delimiter: Some("||".to_string()),
+            ..Default::default()
+        };
+        let Err(err) = build_csv_reader_config(Some(&opts)) else {
+            panic!("a multi-character delimiter must fail config build");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("delimiter") && msg.contains("one ASCII byte"),
+            "error must name the option and the requirement: {msg}"
+        );
+    }
+
+    #[test]
+    fn build_csv_reader_config_rejects_non_ascii_quote() {
+        let opts = clinker_plan::config::CsvInputOptions {
+            quote_char: Some("→".to_string()),
+            ..Default::default()
+        };
+        let Err(err) = build_csv_reader_config(Some(&opts)) else {
+            panic!("a non-ASCII quote_char must fail config build");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("quote_char") && msg.contains("one ASCII byte"),
+            "error must name the option: {msg}"
         );
     }
 }

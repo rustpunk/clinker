@@ -49,22 +49,27 @@ impl From<HashMap<String, Box<dyn Write + Send>>> for WriterRegistry {
     }
 }
 
-/// Build a CsvWriterConfig from CSV output options and the top-level include_header flag.
+/// Build a `CsvWriterConfig` from CSV output options and the top-level
+/// `include_header` flag.
+///
+/// Errors when a configured `delimiter` is not exactly one ASCII byte,
+/// mirroring the reader-side guard so an empty, multi-character, or non-ASCII
+/// value fails before any output bytes are written rather than being
+/// truncated to its first byte.
 fn build_csv_writer_config(
     opts: Option<&clinker_plan::config::CsvOutputOptions>,
     include_header: Option<bool>,
-) -> CsvWriterConfig {
+) -> Result<CsvWriterConfig, PipelineError> {
     let mut config = CsvWriterConfig::default();
     if let Some(h) = include_header {
         config.include_header = h;
     }
     if let Some(opts) = opts
         && let Some(ref d) = opts.delimiter
-        && let Some(b) = d.as_bytes().first()
     {
-        config.delimiter = *b;
+        config.delimiter = crate::executor::util::csv_single_byte("delimiter", d)?;
     }
-    config
+    Ok(config)
 }
 
 /// Build a JsonWriterConfig from JSON output options.
@@ -245,10 +250,10 @@ fn build_writer_factory(
     field_defs: Option<Vec<clinker_format::Column>>,
     include_engine_stamped: bool,
     reconstruct_envelope: bool,
-) -> WriterFactory {
+) -> Result<WriterFactory, PipelineError> {
     match format {
         OutputFormat::Csv(opts) => {
-            let mut csv_config = build_csv_writer_config(opts.as_ref(), include_header);
+            let mut csv_config = build_csv_writer_config(opts.as_ref(), include_header)?;
             csv_config.include_engine_stamped = include_engine_stamped;
             csv_config.envelope = resolve_envelope_spec(
                 reconstruct_envelope,
@@ -257,7 +262,7 @@ fn build_writer_factory(
             if repeat_header {
                 let shared_header: Arc<Mutex<Option<Vec<Box<str>>>>> = Arc::new(Mutex::new(None));
                 let call_count = Arc::new(AtomicU32::new(0));
-                Box::new(move |counting_writer, schema| {
+                Ok(Box::new(move |counting_writer, schema| {
                     let seq = call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let inner_csv =
                         CsvWriter::new(counting_writer, schema.clone(), csv_config.clone());
@@ -276,15 +281,15 @@ fn build_writer_factory(
                         }
                         Ok(Box::new(csv))
                     }
-                })
+                }))
             } else {
-                Box::new(move |counting_writer, schema| {
+                Ok(Box::new(move |counting_writer, schema| {
                     Ok(Box::new(CsvWriter::new(
                         counting_writer,
                         schema,
                         csv_config.clone(),
                     )))
-                })
+                }))
             }
         }
         OutputFormat::Json(opts) => {
@@ -294,13 +299,13 @@ fn build_writer_factory(
                 reconstruct_envelope,
                 opts.as_ref().and_then(|o| o.envelope.as_ref()),
             );
-            Box::new(move |counting_writer, schema| {
+            Ok(Box::new(move |counting_writer, schema| {
                 Ok(Box::new(JsonWriter::new(
                     counting_writer,
                     schema,
                     json_config.clone(),
                 )))
-            })
+            }))
         }
         OutputFormat::Xml(opts) => {
             let mut xml_config = build_xml_writer_config(opts.as_ref());
@@ -309,13 +314,13 @@ fn build_writer_factory(
                 reconstruct_envelope,
                 opts.as_ref().and_then(|o| o.envelope.as_ref()),
             );
-            Box::new(move |counting_writer, schema| {
+            Ok(Box::new(move |counting_writer, schema| {
                 Ok(Box::new(XmlWriter::new(
                     counting_writer,
                     schema,
                     xml_config.clone(),
                 )))
-            })
+            }))
         }
         OutputFormat::FixedWidth(opts) => {
             let mut fw_config = build_fw_writer_config(opts.as_ref());
@@ -327,23 +332,23 @@ fn build_writer_factory(
                 "fixed-width writer factory requires field_defs — \
                  build_format_writer must validate schema before calling",
             );
-            Box::new(move |counting_writer, _schema| {
+            Ok(Box::new(move |counting_writer, _schema| {
                 Ok(Box::new(FixedWidthWriter::new(
                     counting_writer,
                     fields.clone(),
                     fw_config.clone(),
                 )?))
-            })
+            }))
         }
         OutputFormat::Edifact(opts) => {
             let edi_config = build_edifact_writer_config(opts.as_ref());
-            Box::new(move |counting_writer, schema| {
+            Ok(Box::new(move |counting_writer, schema| {
                 Ok(Box::new(EdifactWriter::new(
                     counting_writer,
                     schema,
                     edi_config.clone(),
                 )))
-            })
+            }))
         }
         OutputFormat::X12(opts) => {
             // Resolve the writer config (including charset) once here so the
@@ -355,7 +360,7 @@ fn build_writer_factory(
             // first per-split writer is built (at the first record) — still
             // pre-output and never a corrupt interchange, just not at setup.
             let x12_config = build_x12_writer_config(opts.as_ref());
-            Box::new(move |counting_writer, schema| {
+            Ok(Box::new(move |counting_writer, schema| {
                 let config = x12_config
                     .as_ref()
                     .map_err(|e| clinker_format::FormatError::X12(e.to_string()))?;
@@ -364,27 +369,27 @@ fn build_writer_factory(
                     schema,
                     config.clone(),
                 )))
-            })
+            }))
         }
         OutputFormat::Hl7(opts) => {
             let hl7_config = build_hl7_writer_config(opts.as_ref());
-            Box::new(move |counting_writer, schema| {
+            Ok(Box::new(move |counting_writer, schema| {
                 Ok(Box::new(Hl7Writer::new(
                     counting_writer,
                     schema,
                     hl7_config.clone(),
                 )))
-            })
+            }))
         }
         OutputFormat::Swift(opts) => {
             let swift_config = build_swift_writer_config(opts.as_ref());
-            Box::new(move |counting_writer, schema| {
+            Ok(Box::new(move |counting_writer, schema| {
                 Ok(Box::new(SwiftWriter::new(
                     counting_writer,
                     schema,
                     swift_config.clone(),
                 )))
-            })
+            }))
         }
     }
 }
@@ -413,7 +418,7 @@ pub(crate) fn build_format_writer(
         field_defs,
         output.include_correlation_keys,
         output.reconstruct_envelope,
-    );
+    )?;
 
     if let Some(ref split) = output.split {
         let policy = build_split_policy(split);
@@ -525,5 +530,40 @@ mod tests {
         // Matches the XML reader's default so attribute fields round-trip
         // without any output-side configuration.
         assert_eq!(build_xml_writer_config(None).attribute_prefix, "@");
+    }
+
+    #[test]
+    fn csv_writer_config_defaults_delimiter_to_comma() {
+        // With no options the writer keeps the RFC 4180 comma so an existing
+        // pipeline's output is byte-identical.
+        let config = build_csv_writer_config(None, None).expect("no options resolves");
+        assert_eq!(config.delimiter, b',');
+    }
+
+    #[test]
+    fn csv_writer_config_resolves_single_byte_delimiter() {
+        let opts = clinker_plan::config::CsvOutputOptions {
+            delimiter: Some("|".into()),
+            ..Default::default()
+        };
+        let config =
+            build_csv_writer_config(Some(&opts), None).expect("single-byte delimiter resolves");
+        assert_eq!(config.delimiter, b'|');
+    }
+
+    #[test]
+    fn csv_writer_config_rejects_multichar_delimiter() {
+        let opts = clinker_plan::config::CsvOutputOptions {
+            delimiter: Some("||".into()),
+            ..Default::default()
+        };
+        let Err(err) = build_csv_writer_config(Some(&opts), None) else {
+            panic!("a multi-character output delimiter must fail config build");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("delimiter") && msg.contains("one ASCII byte"),
+            "error must name the option and the requirement: {msg}"
+        );
     }
 }

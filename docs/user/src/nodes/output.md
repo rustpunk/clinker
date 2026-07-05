@@ -119,6 +119,11 @@ When `false`, null values are written as empty strings. When `true`, nulls are p
       delimiter: "|"
 ```
 
+`delimiter` is a single byte on the wire, so it must be **exactly one ASCII
+character** (for example `,`, `|`, or `\t`). An empty, multi-character, or
+non-ASCII value is rejected at plan validation rather than silently truncated
+to its first byte.
+
 ### JSON
 
 ```yaml

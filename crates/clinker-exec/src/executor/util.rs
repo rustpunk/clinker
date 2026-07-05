@@ -10,6 +10,31 @@ use indexmap::IndexMap;
 
 use clinker_plan::config::PipelineConfig;
 
+/// Resolve a CSV `delimiter` / `quote_char` string to the single ASCII byte
+/// the byte-oriented CSV reader and writer accept.
+///
+/// Plan validation already rejects any other shape, so on the run path this
+/// only ever sees a one-byte value; it exists as the lowering-side guard that
+/// turns a would-be first-byte truncation of an empty, multi-character, or
+/// non-ASCII value into a startup config error rather than silently applying
+/// the wrong byte. `field` names the option (`"delimiter"` / `"quote_char"`)
+/// for the diagnostic. Pure and non-blocking: no I/O, no allocation on the
+/// success path.
+pub(crate) fn csv_single_byte(
+    field: &str,
+    value: &str,
+) -> Result<u8, clinker_plan::error::PipelineError> {
+    let mut chars = value.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii() => Ok(c as u8),
+        _ => Err(clinker_plan::error::PipelineError::Config(
+            clinker_plan::config::ConfigError::Validation(format!(
+                "CSV {field} {value:?} must be exactly one ASCII byte"
+            )),
+        )),
+    }
+}
+
 /// Resolve the dispatch order for a topological pass via the memory
 /// arbitrator's [`next_runnable`](crate::pipeline::memory::MemoryArbitrator::next_runnable)
 /// instead of walking `topo_order` blindly.
