@@ -169,15 +169,33 @@ impl<'de, 'a, 't> DeserializeSeed<'de> for NodeSeed<'a, 't> {
     type Value = ();
 
     fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
-        if let Some(target) = self.targets.iter().find(|t| t.segments.len() == self.depth) {
-            // This node terminates a declared pointer — build it whole,
-            // charging bytes as the subtree is constructed.
+        // Collect every target whose pointer terminates at this node. Two or
+        // more sections may alias one pointer (distinct names projecting
+        // different `fields` from a single header), so each terminating name
+        // must be recorded — not just the first.
+        let terminating: Vec<&SectionTarget> = self
+            .targets
+            .iter()
+            .copied()
+            .filter(|t| t.segments.len() == self.depth)
+            .collect();
+        if !terminating.is_empty() {
+            // Build the shared subtree once, charging its bytes a single time
+            // (the cap message names the first-declared alias), then record it
+            // under every terminating name in declaration order. The common
+            // single-section case moves the built value; extra aliases clone.
             let value = CountingValueSeed {
-                section: &target.name,
+                section: &terminating[0].name,
                 state: self.state,
             }
             .deserialize(deserializer)?;
-            self.state.matched.insert(target.name.clone(), value);
+            let (last, init) = terminating.split_last().expect("non-empty checked above");
+            for target in init {
+                self.state
+                    .matched
+                    .insert(target.name.clone(), value.clone());
+            }
+            self.state.matched.insert(last.name.clone(), value);
             return Ok(());
         }
         // No target terminates here; descend. `deserialize_any` lets the

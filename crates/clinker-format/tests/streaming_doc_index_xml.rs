@@ -792,3 +792,79 @@ fn deeply_nested_document_streams_without_stack_overflow() {
     assert_eq!(rec.get(&leaf_key), Some(&Value::String("deep".into())));
     assert!(reader.next_record().unwrap().is_none());
 }
+
+/// Two sections declaring the SAME element path under different names each
+/// project a different `fields` subset of the one `Start` element (which
+/// carries its own attribute and children). Both must be retained and
+/// independently field-projected — a shared path must not drop the
+/// later-declared alias (the pre-scan formerly kept only the first target
+/// matching a path).
+#[test]
+fn prescan_records_every_alias_of_a_shared_start_element_path() {
+    let xml = r#"<doc><Meta id="5"><batch_id>B-1</batch_id><record_count>3</record_count></Meta><records><record><x>1</x></record></records></doc>"#.to_string();
+    let ident: SectionSpec = (
+        "Ident",
+        "/doc/Meta",
+        &[
+            ("@id", EnvelopeFieldType::Int),
+            ("batch_id", EnvelopeFieldType::String),
+        ],
+    );
+    let counts: SectionSpec = (
+        "Counts",
+        "/doc/Meta",
+        &[("record_count", EnvelopeFieldType::Int)],
+    );
+    let specs: &[SectionSpec] = &[ident, counts];
+    let cfg = envelope_config(specs);
+
+    let mut reader = reader(xml, specs, "doc/records/record", 64 * 1_000_000);
+    let sections = reader.prepare_document(&cfg).expect("pre-scan");
+
+    // The first alias resolves the element's own attribute and a child,
+    // projecting only its declared fields.
+    let ident_map = unwrap_map(sections.get("Ident").expect("first alias retained"));
+    assert_eq!(ident_map.get("@id"), Some(&Value::Integer(5)));
+    assert_eq!(
+        ident_map.get("batch_id"),
+        Some(&Value::String("B-1".into()))
+    );
+    assert!(
+        ident_map.get("record_count").is_none(),
+        "the first alias projects only its declared fields"
+    );
+
+    // The second alias, sharing the same path, resolves independently.
+    let counts_map = unwrap_map(sections.get("Counts").expect("second alias retained"));
+    assert_eq!(counts_map.get("record_count"), Some(&Value::Integer(3)));
+    assert!(counts_map.get("@id").is_none());
+    assert!(
+        counts_map.get("batch_id").is_none(),
+        "the second alias projects only its declared fields"
+    );
+}
+
+/// The same shared-path fidelity holds for an EMPTY section element
+/// `<Meta id="5" run="R-1"/>` (attributes only, no children). Both aliases
+/// must record the attribute payload, each projecting its declared subset —
+/// the `Empty`-element branch must not drop the later alias either.
+#[test]
+fn prescan_records_every_alias_of_a_shared_empty_element_path() {
+    let xml = r#"<doc><Meta id="5" run="R-1"/><records><record><x>1</x></record></records></doc>"#
+        .to_string();
+    let by_id: SectionSpec = ("ById", "/doc/Meta", &[("@id", EnvelopeFieldType::Int)]);
+    let by_run: SectionSpec = ("ByRun", "/doc/Meta", &[("@run", EnvelopeFieldType::String)]);
+    let specs: &[SectionSpec] = &[by_id, by_run];
+    let cfg = envelope_config(specs);
+
+    let mut reader = reader(xml, specs, "doc/records/record", 64 * 1_000_000);
+    let sections = reader.prepare_document(&cfg).expect("pre-scan");
+
+    let by_id_map = unwrap_map(sections.get("ById").expect("first alias retained"));
+    assert_eq!(by_id_map.get("@id"), Some(&Value::Integer(5)));
+    assert!(by_id_map.get("@run").is_none());
+
+    let by_run_map = unwrap_map(sections.get("ByRun").expect("second alias retained"));
+    assert_eq!(by_run_map.get("@run"), Some(&Value::String("R-1".into())));
+    assert!(by_run_map.get("@id").is_none());
+}
