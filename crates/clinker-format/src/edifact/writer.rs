@@ -492,6 +492,15 @@ impl<W: Write + Send> FormatWriter for EdifactWriter<W> {
         self.writer.flush().map_err(FormatError::Io)?;
         Ok(())
     }
+
+    /// Drain the underlying sink without emitting the interchange trailer, so
+    /// byte-limit split accounting stays non-finalizing. Plan validation
+    /// rejects byte splitting for this single-envelope format; this keeps the
+    /// trait contract honest regardless, with the `UNZ` trailer written only by
+    /// [`Self::flush`].
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        self.writer.flush().map_err(FormatError::Io)
+    }
 }
 
 /// Whether a schema column name is a positional EDIFACT element column

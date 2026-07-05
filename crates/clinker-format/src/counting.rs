@@ -119,6 +119,13 @@ impl FormatWriter for CountedFormatWriter {
         self.inner.flush()
     }
 
+    /// Forward to the wrapped writer so byte-limit split accounting reaches the
+    /// real format writer's non-finalizing drain rather than falling back to
+    /// this shim's finalizing `flush`.
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        self.inner.flush_bytes()
+    }
+
     fn bytes_written(&self) -> Option<u64> {
         Some(self.counter.bytes_written())
     }

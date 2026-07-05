@@ -359,6 +359,15 @@ impl<W: Write + Send> FormatWriter for SwiftWriter<W> {
         self.writer.flush().map_err(FormatError::Io)?;
         Ok(())
     }
+
+    /// Drain the underlying sink without closing block 4 or emitting the block-5
+    /// trailer, so byte-limit split accounting stays non-finalizing. Plan
+    /// validation rejects byte splitting for this single-message format; this
+    /// keeps the trait contract honest regardless, with the trailers written
+    /// only by [`Self::flush`].
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        self.writer.flush().map_err(FormatError::Io)
+    }
 }
 
 /// Reject a block-4 value whose folded continuation lines cannot be framed
