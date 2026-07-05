@@ -243,9 +243,12 @@ column and stay exact — no binary float ever touches a running total:
   numerically equal group together regardless of scale, so `2.50` and `2.5`
   fall in one group. This holds even when the aggregation spills to disk.
 
-`weighted_avg` does not yet support decimals and rejects a decimal value at
-compile time — cast with `.to_float()` for a binary-float weighted average, or
-use `sum` / `avg`, which stay exact over decimals.
+`weighted_avg` also stays exact over decimals: a decimal value or weight (or
+both) gives an exact `sum(value * weight) / sum(weight)` at full division
+precision, and a zero total weight returns null. A decimal in one position
+mixed with a binary `float` in the other is a type error, matching the
+`decimal ⊗ float` arithmetic rule — cast with `.to_decimal()` or `.to_float()`
+so the value and weight share one numeric domain.
 
 ## Type unification rules
 

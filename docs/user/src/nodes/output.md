@@ -297,6 +297,8 @@ Split output into multiple files based on record count, byte size, or group boun
 
 At least one of `max_records` or `max_bytes` should be specified for splitting to have any effect.
 
+For formats whose output wraps the whole file in framing -- a JSON array or an XML root element -- each split file is a complete, independently valid document: the framing is closed at rotation and reopened for the next file.
+
 ### Oversize group policies
 
 - `warn` (default) -- log a warning and allow the oversized file.

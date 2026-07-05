@@ -42,6 +42,11 @@ impl SectionTarget {
     /// A leading `/` introduces each segment; `~1` decodes to `/` and `~0`
     /// to `~`, matching `serde_json::Value::pointer`. The empty pointer
     /// `""` yields no segments (it names the root).
+    ///
+    /// Callers must pre-validate the pointer grammar (empty or leading `/`):
+    /// this constructor is infallible and a slashless non-empty pointer would
+    /// decode to zero segments, silently aliasing the whole-document pointer.
+    /// The reader rejects that case before building a target.
     pub(crate) fn new(name: String, pointer: &str) -> Self {
         let segments = if pointer.is_empty() {
             Vec::new()

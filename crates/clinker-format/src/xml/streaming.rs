@@ -76,7 +76,8 @@ impl SectionTarget {
 ///
 /// # Errors
 ///
-/// Returns [`FormatError::Xml`] on an XML parse failure, or naming the
+/// Returns [`FormatError::Xml`] on an XML parse failure, when the input ends
+/// with an element still open (a truncated document), or naming the
 /// offending section and the cap when a declared section's retained bytes
 /// cross `max_index_bytes` mid-parse.
 pub(crate) fn extract_sections(
@@ -159,7 +160,21 @@ pub(crate) fn extract_sections(
             Event::End(_) => {
                 path_stack.pop();
             }
-            Event::Eof => break,
+            Event::Eof => {
+                // A clean end pops the descent stack empty. A non-empty stack
+                // means the document was cut off inside an open element, so a
+                // declared section could be silently partial — fail loud
+                // instead of returning a truncated pre-scan.
+                if !path_stack.is_empty() {
+                    return Err(FormatError::Xml(format!(
+                        "unexpected end of XML document during envelope pre-scan: \
+                         element {:?} was still open when the input ended \
+                         (missing closing tag)",
+                        path_stack.join("/")
+                    )));
+                }
+                break;
+            }
             _ => {}
         }
     }
@@ -227,8 +242,10 @@ fn path_matches(stack: &[String], segs: &[String]) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`FormatError::Xml`] on a parse failure, or naming `section` and
-/// the cap when the retained bytes cross `max_index_bytes` mid-subtree.
+/// Returns [`FormatError::Xml`] on a parse failure, when the input ends
+/// before the section's closing tag (a truncated document), or naming
+/// `section` and the cap when the retained bytes cross `max_index_bytes`
+/// mid-subtree.
 fn read_section_payload(
     parser: &mut BodyParser,
     buf: &mut Vec<u8>,
@@ -317,7 +334,21 @@ fn read_section_payload(
                     }
                 }
             }
-            Event::Eof => return Ok(fields),
+            Event::Eof => {
+                // The section element's own `End` returns above; an EOF here
+                // means the input was cut off before that close, so the
+                // section payload is truncated. Name the deepest open element
+                // and fail loud rather than returning partial section fields.
+                let open = if element_stack.is_empty() {
+                    section.to_string()
+                } else {
+                    format!("{section}.{}", element_stack.join("."))
+                };
+                return Err(FormatError::Xml(format!(
+                    "unexpected end of XML document inside envelope section {open:?}: \
+                     the input ended before its closing tag"
+                )));
+            }
             _ => {}
         }
     }

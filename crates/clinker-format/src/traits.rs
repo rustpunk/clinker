@@ -102,6 +102,28 @@ pub trait FormatWriter: Send {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError>;
     fn flush(&mut self) -> Result<(), FormatError>;
 
+    /// Push bytes buffered inside this writer through to the underlying I/O
+    /// sink *without* emitting the document's closing framing. Called by
+    /// [`SplittingWriter`](crate::splitting::SplittingWriter) after every
+    /// record when a byte limit is configured, so the shared byte counter
+    /// reflects the true on-disk size before the next rotation check.
+    ///
+    /// Distinct from [`Self::flush`] on purpose: for the whole-file-framed
+    /// formats `flush` finalizes the document (JSON's closing `]`, XML's
+    /// closing root element, an EDI interchange trailer), and finalizing after
+    /// every record would close the document mid-stream — later records then
+    /// land after the close and corrupt the file. The default forwards to
+    /// [`Self::flush`], correct for record-oriented writers whose `flush`
+    /// emits no closing framing (CSV, fixed-width); finalizing formats
+    /// override it to drain only the underlying sink.
+    ///
+    /// # Errors
+    ///
+    /// Surfaces any I/O error draining the buffer.
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        self.flush()
+    }
+
     /// Emit any per-document opening framing (an envelope header) before the
     /// document's first body record streams. Called by the Output dispatch
     /// arm on the first record of each document (boundaries are detected from

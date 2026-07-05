@@ -46,11 +46,32 @@ width-only schema lays its fields out sequentially. Two columns whose
 byte ranges overlap have no consistent layout; the writer rejects such a
 schema when the output opens, naming both columns and their ranges.
 
+Widths are **byte counts**, matching how the reader slices. When a value
+is longer than its field, truncation cuts at a UTF-8 character boundary at
+or below the width, so a multi-byte character is never split: the emitted
+cell is always valid UTF-8 of exactly `width` bytes (it may hold fewer
+*characters* than the width when a trailing multi-byte character does not
+fit, with the freed bytes pad-filled). Because padding fills exact byte
+counts, `pad` must be a single-byte (ASCII) character; a multi-byte `pad`
+is rejected when the output opens. Under `truncation: error` an over-long
+value is still a hard error before any slicing.
+
 ## Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `line_separator` | platform | Line-ending style (`lf` / `crlf`) used to split the file into records. |
+
+Under `lf` or `crlf`, the reader buffers each physical line only up to the
+declared record width plus a line-terminator allowance. A physical line wider
+than the declared width — trailing filler beyond the last declared field, or a
+schema that maps only a prefix of a wider fixed-length record — reads its
+declared-width portion; the remaining bytes are discarded up to the next line
+terminator and the reader continues with the following record. Because the
+buffered portion is capped, a malformed file (a corrupt or missing newline)
+cannot grow a single record until end of input: memory stays bounded regardless
+of how long the physical line runs. A final line with no trailing newline reads
+normally as long as its declared fields fit within the width.
 
 ## Schema drift
 

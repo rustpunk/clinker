@@ -475,6 +475,156 @@ fn test_weighted_avg_zero_weight() {
     assert_eq!(a.finalize().unwrap(), Value::Null);
 }
 
+// ---------- WeightedAvg over decimals (exactness) ----------
+
+#[test]
+fn test_weighted_avg_decimal_is_exact() {
+    // (0.10 + 0.20 + 0.30) / 3 = 0.60 / 3 = 0.20 exactly. The binary-float
+    // path drifts: 0.1 + 0.2 + 0.3 is 0.6000000000000001, / 3 is not 0.2.
+    let mut a = weighted_avg();
+    a.add_weighted(&dec(10, 2), &Value::Integer(1));
+    a.add_weighted(&dec(20, 2), &Value::Integer(1));
+    a.add_weighted(&dec(30, 2), &Value::Integer(1));
+    assert_eq!(a.finalize().unwrap(), dec(20, 2));
+}
+
+#[test]
+fn test_weighted_avg_decimal_value_and_weight_exact() {
+    // Both operands decimal: (2.00*3.00 + 4.00*1.00) / (3.00 + 1.00)
+    //                        = 10.00 / 4.00 = 2.50, exactly.
+    let mut a = weighted_avg();
+    a.add_weighted(&dec(200, 2), &dec(300, 2));
+    a.add_weighted(&dec(400, 2), &dec(100, 2));
+    assert_eq!(a.finalize().unwrap(), dec(250, 2));
+}
+
+#[test]
+fn test_weighted_avg_decimal_value_int_weight_exact() {
+    // The canonical `weighted_avg(price, qty)` shape: decimal value, integer
+    // weight. (0.10*3 + 0.20*1) / (3 + 1) = 0.50 / 4 = 0.125, exactly.
+    let mut a = weighted_avg();
+    a.add_weighted(&dec(10, 2), &Value::Integer(3));
+    a.add_weighted(&dec(20, 2), &Value::Integer(1));
+    assert_eq!(a.finalize().unwrap(), dec(125, 3));
+}
+
+#[test]
+fn test_weighted_avg_int_value_decimal_weight_exact() {
+    // Integer value, decimal weight: (3*0.5 + 1*0.5) / (0.5 + 0.5)
+    //                                = 2.0 / 1.0 = 2.0, exactly.
+    let mut a = weighted_avg();
+    a.add_weighted(&Value::Integer(3), &dec(5, 1));
+    a.add_weighted(&Value::Integer(1), &dec(5, 1));
+    assert_eq!(a.finalize().unwrap(), dec(20, 1));
+}
+
+#[test]
+fn test_weighted_avg_decimal_then_integer_not_lost() {
+    // An integer row observed AFTER decimal mode (e.g.
+    // `weighted_avg(if flag then amount else 2, w)`) must fold into the exact
+    // sums, not vanish. (0.50*1 + 2*1) / (1 + 1) = 2.50 / 2 = 1.25.
+    let mut a = weighted_avg();
+    a.add_weighted(&dec(50, 2), &Value::Integer(1));
+    a.add_weighted(&Value::Integer(2), &Value::Integer(1));
+    assert_eq!(a.finalize().unwrap(), dec(125, 2));
+}
+
+#[test]
+fn test_weighted_avg_decimal_merge_with_integer_only_state_either_order() {
+    // Merging an integer-only partial into a decimal partial (and vice versa)
+    // must give the same exact result regardless of merge direction:
+    // (0.50 + 2) / (1 + 1) = 2.50 / 2 = 1.25.
+    let build_dec = || {
+        let mut a = weighted_avg();
+        a.add_weighted(&dec(50, 2), &Value::Integer(1)); // 0.50 weighted, weight 1
+        a
+    };
+    let build_int = || {
+        let mut b = weighted_avg();
+        b.add_weighted(&Value::Integer(2), &Value::Integer(1)); // 2 weighted, weight 1
+        b
+    };
+    let mut ab = build_dec();
+    ab.merge(&build_int());
+    assert_eq!(ab.finalize().unwrap(), dec(125, 2));
+    let mut ba = build_int();
+    ba.merge(&build_dec());
+    assert_eq!(ba.finalize().unwrap(), dec(125, 2)); // order-independent
+}
+
+#[test]
+fn test_weighted_avg_decimal_merge_both_decimal_exact() {
+    // Two decimal partials combine exactly:
+    // (10.50*2 + 1.50*2) / (2 + 2) = 24.00 / 4 = 6.00.
+    let mut a = weighted_avg();
+    a.add_weighted(&dec(1050, 2), &Value::Integer(2));
+    let mut b = weighted_avg();
+    b.add_weighted(&dec(150, 2), &Value::Integer(2));
+    a.merge(&b);
+    assert_eq!(a.finalize().unwrap(), dec(600, 2));
+}
+
+#[test]
+fn test_weighted_avg_decimal_mixed_with_float_is_null() {
+    // A float mixed with a decimal cannot fold exactly (reachable only on an
+    // untyped column; typecheck rejects the mix for typed columns). The result
+    // is Null rather than a silently-wrong average.
+    let mut a = weighted_avg();
+    a.add_weighted(&dec(200, 2), &Value::Float(2.0));
+    assert_eq!(a.finalize().unwrap(), Value::Null);
+}
+
+#[test]
+fn test_weighted_avg_float_then_decimal_is_null() {
+    // A binary float accumulated BEFORE the first decimal row cannot widen into
+    // the exact decimal sums (only the integer accumulators are seeded on the
+    // switch). Poison to Null rather than silently dropping the float total and
+    // reporting the decimal-only quotient. Reachable only on an untyped column.
+    let mut a = weighted_avg();
+    a.add_weighted(&Value::Float(1.5), &Value::Integer(1)); // float path first
+    a.add_weighted(&dec(250, 2), &Value::Integer(1)); // then a decimal row
+    // The true weighted avg is (1.5 + 2.5) / 2 = 2.0; dropping the float total
+    // would report 2.5. Neither is honest, so finalize returns Null.
+    assert_eq!(a.finalize().unwrap(), Value::Null);
+}
+
+#[test]
+fn test_weighted_avg_merge_float_mode_with_decimal_mode_is_null() {
+    // Merging a float-mode partial (its exact contribution reads only its
+    // integer sums) into a decimal-mode partial — or vice versa — would drop
+    // the float side's total. Both merge directions poison to Null.
+    let build_float = || {
+        let mut s = weighted_avg();
+        s.add_weighted(&Value::Float(1.5), &Value::Integer(1));
+        s
+    };
+    let build_decimal = || {
+        let mut s = weighted_avg();
+        s.add_weighted(&dec(250, 2), &Value::Integer(1));
+        s
+    };
+    let mut df = build_decimal();
+    df.merge(&build_float());
+    assert_eq!(df.finalize().unwrap(), Value::Null);
+    let mut fd = build_float();
+    fd.merge(&build_decimal());
+    assert_eq!(fd.finalize().unwrap(), Value::Null);
+}
+
+#[test]
+fn test_weighted_avg_decimal_spill_roundtrip() {
+    // The accumulator state serializes exactly (decimal via the 16-byte form),
+    // so a spilled-and-reloaded WeightedAvg finalizes identically.
+    // (10.50*2 + 1.50*2) / (2 + 2) = 24.00 / 4 = 6.00.
+    let mut a = weighted_avg();
+    a.add_weighted(&dec(1050, 2), &Value::Integer(2));
+    a.add_weighted(&dec(150, 2), &Value::Integer(2));
+    let bytes = postcard::to_stdvec(&a).unwrap();
+    let restored: AccumulatorEnum = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(restored.finalize().unwrap(), dec(600, 2));
+    assert_eq!(restored, a);
+}
+
 // ---------- Serde round-trip ----------
 
 #[test]

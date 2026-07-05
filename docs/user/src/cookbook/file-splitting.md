@@ -99,6 +99,8 @@ Split by file size instead of record count:
 
 The splitter estimates the current file size and starts a new file when the limit is approached. The actual file size may slightly exceed the limit because the current record is always completed before splitting.
 
+Byte-based splitting works with every output format. For formats that wrap the whole file in framing -- a JSON array or an XML root element -- each rotation closes the current file's framing and reopens it in the next, so every chunk is a complete, independently valid document (its own `[ ... ]` array or `<Root> ... </Root>` tree), never a fragment.
+
 ## Combined limits
 
 Use both `max_records` and `max_bytes` together -- whichever limit is reached first triggers a new file:

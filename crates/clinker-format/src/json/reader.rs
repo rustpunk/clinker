@@ -404,7 +404,23 @@ impl FormatReader for JsonReader {
                 continue;
             }
             let pointer = match &section.extract {
-                EnvelopeExtract::JsonPointer(p) => p.as_str(),
+                EnvelopeExtract::JsonPointer(p) => {
+                    // A slashless non-empty pointer decodes to zero segments,
+                    // identical to the whole-document pointer `""`, and would
+                    // silently match the root instead of the intended section.
+                    // Plan validation rejects this at authoring time; guard
+                    // here too so any caller that bypasses the plan (a direct
+                    // reader construction) fails loud rather than matching the
+                    // wrong node.
+                    if !p.is_empty() && !p.starts_with('/') {
+                        return Err(FormatError::Json(format!(
+                            "envelope section {name:?}: `json_pointer` {p:?} is not a valid \
+                             RFC 6901 pointer — a pointer must be empty (the whole document) or \
+                             start with `/`."
+                        )));
+                    }
+                    p.as_str()
+                }
                 EnvelopeExtract::XmlPath(_) => {
                     return Err(FormatError::Json(format!(
                         "envelope section {name:?}: declared `xml_path` extract \

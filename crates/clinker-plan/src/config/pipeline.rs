@@ -4312,6 +4312,30 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         if let InputFormat::Hl7(Some(opts)) = &input.format {
             validate_hl7_split_fields(&input.name, opts)?;
         }
+
+        // A `json_pointer` extract must be a valid RFC 6901 pointer: either
+        // empty (the whole document) or a `/`-introduced path. A slashless
+        // value like `Head` decodes to zero segments — indistinguishable from
+        // the empty pointer — and would silently match the root document
+        // instead of the intended section. Reject it at authoring time so a
+        // typo fails on `--explain` rather than materializing the wrong
+        // metadata at runtime.
+        if let Some(envelope) = &input.envelope {
+            for (section_name, section) in &envelope.sections {
+                if let clinker_format::EnvelopeExtract::JsonPointer(pointer) = &section.extract
+                    && !pointer.is_empty()
+                    && !pointer.starts_with('/')
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "[E222] source '{source}': envelope section '{section_name}' declares \
+                         `json_pointer: {pointer:?}`, which is not a valid RFC 6901 pointer — a \
+                         pointer must be empty (the whole document) or start with `/` (e.g. \
+                         `/{pointer}`)",
+                        source = input.name,
+                    )));
+                }
+            }
+        }
     }
 
     // Single-envelope output formats wrap every record in one frame whose
