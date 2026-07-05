@@ -1150,3 +1150,84 @@ nodes:
         "non-primary port source `zip_lookup` must carry the downstream `$doc` path, got {zip_paths:?}"
     );
 }
+
+/// A JSON envelope `json_pointer` extract must be a valid RFC 6901 pointer:
+/// empty (the whole document) or `/`-introduced. A slashless value decodes
+/// to zero segments and would silently match the root, so plan validation
+/// rejects it with E222 naming the source, section, and offending pointer.
+#[test]
+fn test_slashless_json_pointer_rejected_at_validation() {
+    let yaml = r#"
+pipeline:
+  name: json_pointer_validate
+nodes:
+  - type: source
+    name: docs
+    config:
+      name: docs
+      type: json
+      glob: ./*.json
+      options:
+        record_path: records
+      envelope:
+        sections:
+          Head:
+            extract: { json_pointer: "Head" }
+            fields:
+              batch_id: string
+      schema:
+        - { name: amount, type: int }
+  - type: output
+    name: out
+    input: docs
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let err = parse_config(yaml).expect_err("a slashless json_pointer must fail plan validation");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("E222"),
+        "expected an E222 diagnostic, got: {msg}"
+    );
+    assert!(
+        msg.contains("docs") && msg.contains("Head") && msg.contains("\"Head\""),
+        "E222 must name the source, section, and offending pointer, got: {msg}"
+    );
+}
+
+/// The empty pointer `""` names the whole document and stays accepted:
+/// validation gates only the slashless non-empty case.
+#[test]
+fn test_empty_json_pointer_accepted_at_validation() {
+    let yaml = r#"
+pipeline:
+  name: json_pointer_root
+nodes:
+  - type: source
+    name: docs
+    config:
+      name: docs
+      type: json
+      glob: ./*.json
+      options:
+        record_path: records
+      envelope:
+        sections:
+          Whole:
+            extract: { json_pointer: "" }
+            fields:
+              batch_id: string
+      schema:
+        - { name: amount, type: int }
+  - type: output
+    name: out
+    input: docs
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    parse_config(yaml).expect("the empty (whole-document) json_pointer must validate");
+}
