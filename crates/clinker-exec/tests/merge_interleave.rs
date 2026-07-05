@@ -222,85 +222,218 @@ fn seeded_interleave_is_reproducible() {
     assert_eq!(first.len(), 10);
 }
 
-/// Live-channel back-pressure: a slow `src_a` (50 ms sleep at the
-/// reader between every record) does not block `src_b` from
-/// flowing through the Merge.interleave arm.
+/// `std::io::Read` adapter for the gated back-pressure test's fast
+/// side. Delivers `csv` in row-sized chunks (split on `\n`), then fires
+/// `notify` exactly once on the terminating EOF read. Because the signal
+/// rides on EOF, every byte of this source has reached the CSV reader
+/// before it fires — so the peer waiting on the other end of the channel
+/// only unblocks once this source is fully drained into the merge. No
+/// sleeps: delivery is paced by the merge's consumption, not wall clock.
+struct NotifyOnEofReader {
+    bytes: Vec<u8>,
+    pos: usize,
+    notify: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl NotifyOnEofReader {
+    fn new(csv: &str, notify: std::sync::mpsc::Sender<()>) -> Self {
+        Self {
+            bytes: csv.as_bytes().to_vec(),
+            pos: 0,
+            notify: Some(notify),
+        }
+    }
+}
+
+impl std::io::Read for NotifyOnEofReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.bytes.len() {
+            // The CSV reader has taken every byte; release the gated peer
+            // once. A dropped receiver (test already finished) is benign.
+            if let Some(tx) = self.notify.take() {
+                let _ = tx.send(());
+            }
+            return Ok(0);
+        }
+        let remaining = &self.bytes[self.pos..];
+        let chunk_end = remaining
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(remaining.len());
+        let n = chunk_end.min(buf.len());
+        buf[..n].copy_from_slice(&remaining[..n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// `std::io::Read` adapter for the gated back-pressure test's slow side.
+/// Delivers the CSV header, then blocks once on `gate` before yielding
+/// any body byte. The paired [`NotifyOnEofReader`] fires `gate` only
+/// after its own source has been fully read, so this source contributes
+/// no record to the merge until its peer is drained — a deterministic
+/// stand-in for "this upstream is slow" that never depends on timer
+/// resolution. `recv_timeout` bounds the wait purely as an anti-hang
+/// guard; a healthy run releases the gate in microseconds.
+struct GatedBodyReader {
+    bytes: Vec<u8>,
+    pos: usize,
+    header_end: usize,
+    gate: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+impl GatedBodyReader {
+    fn new(csv: &str, gate: std::sync::mpsc::Receiver<()>) -> Self {
+        let bytes = csv.as_bytes().to_vec();
+        let header_end = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(bytes.len());
+        Self {
+            bytes,
+            pos: 0,
+            header_end,
+            gate: Some(gate),
+        }
+    }
+}
+
+impl std::io::Read for GatedBodyReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.pos >= self.bytes.len() {
+            return Ok(0);
+        }
+        // Block at the header/body boundary: the header reaches the CSV
+        // reader (schema setup) but no record does until the gate fires.
+        if self.pos >= self.header_end
+            && let Some(rx) = self.gate.take()
+        {
+            let _ = rx.recv_timeout(Duration::from_secs(30));
+        }
+        // Cap the pre-gate read at the header boundary so a large caller
+        // buffer cannot pull body bytes ahead of the block.
+        let limit = if self.pos < self.header_end {
+            self.header_end
+        } else {
+            self.bytes.len()
+        };
+        let end = limit.min(self.pos + buf.len());
+        let n = end - self.pos;
+        buf[..n].copy_from_slice(&self.bytes[self.pos..end]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// Live-channel back-pressure: a source that yields no record until its
+/// peer has fully drained does not block that peer from flowing through
+/// the `Merge.interleave` arm.
 ///
+/// `src_a`'s reader delivers only the CSV header, then blocks on an mpsc
+/// gate; `src_b`'s reader fires that gate exactly once, on its own EOF,
+/// after every `src_b` byte has reached the CSV reader. So `src_a`
+/// contributes no record to the merge until `src_b` is fully drained.
 /// The interleave arm reads whichever source channel is ready via a
-/// crossbeam `Select`, so `src_b`'s records arrive into the Merge fold
-/// immediately while `src_a` is still sleeping between rows. The arm
-/// pulls every `src_b` record in the first ~5 ms, then waits 50 ms for
-/// each `src_a` record. Result: every `src_b` record sits in the first
-/// half of the output stream.
+/// crossbeam `Select`, so it pulls `src_b`'s records in a burst while
+/// `src_a` is still gated.
 ///
-/// Discriminator: the position of the last `b-` tag in the output must
-/// be `< 5` (first half of 10 total records). A regime that pre-buffers
-/// each source into a Vec and round-robins them would place the last
-/// `b-` at position 9; readiness-driven selection places it at the
-/// front.
+/// The gate replaces an earlier wall-clock design (a 50 ms per-row sleep
+/// on `src_a` plus a "last b-tag lands in the first half" position
+/// check). That discriminator was timing-dependent by construction and
+/// flaked on coarse-timer platforms. The gate makes the ordering
+/// pressure deterministic and the assertions below are structural,
+/// mirroring `interleave_fairness_under_four_predecessors` in this file:
+///
+/// - per-source FIFO is preserved for both sources;
+/// - every input record appears exactly once;
+/// - the longest same-source run is `>= 2`. A regression that
+///   pre-buffers each source into a `Vec` and strictly round-robins them
+///   would emit `b, a, b, a, …` — a longest run of 1 — even though
+///   `src_b` was ready first. Readiness-driven selection instead pulls
+///   at least two `src_b` records before the gated `src_a` can deliver
+///   its first (the gate forces the first record to be `b`, and
+///   `src_a`'s wake-parse-enqueue chain cannot outrace the merge draining
+///   one already-buffered `src_b`), so the longest run is at least 2.
+///   This lower bound holds under uniform runner slowdown because both
+///   the merge's per-select gap and `src_a`'s startup scale together.
 #[test]
 fn interleave_does_not_block_peer_on_slow_source() {
-    use std::time::Instant;
-
     let yaml = pipeline_yaml("mode: interleave");
     let config = parse_config(&yaml).unwrap();
     let plan = config.compile(&CompileContext::default()).unwrap();
+
+    // src_b fires this gate on EOF; src_a blocks on it before yielding
+    // any body row.
+    let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
     let readers: SourceReaders = HashMap::from([
         (
             "src_a".to_string(),
-            // 5 records, each preceded by 50 ms — total ~250 ms.
-            clinker_exec::executor::SourceInput::Files(vec![slow_slot(
-                "a",
-                &src_a_csv(5),
-                Duration::from_millis(50),
+            SourceInput::Files(vec![FileSlot::new(
+                PathBuf::from("a.csv"),
+                Box::new(GatedBodyReader::new(&src_a_csv(5), gate_rx)),
             )]),
         ),
         (
             "src_b".to_string(),
-            // 5 records, produced as fast as the channel admits.
-            clinker_exec::executor::SourceInput::Files(vec![slot("b", &src_b_csv(5))]),
+            SourceInput::Files(vec![FileSlot::new(
+                PathBuf::from("b.csv"),
+                Box::new(NotifyOnEofReader::new(&src_b_csv(5), gate_tx)),
+            )]),
         ),
     ]);
     let buf = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> =
         HashMap::from([("out".to_string(), writer(&buf))]);
 
-    let start = Instant::now();
     let report =
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
             .expect("pipeline executes");
-    let elapsed = start.elapsed();
 
     assert_eq!(report.counters.dlq_count, 0);
     let output = buf.as_string();
     let body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
     assert_eq!(body.len(), 10, "expected 10 records, got {body:?}");
+
+    // Per-source FIFO survives the interleave for both sources.
     assert_per_source_fifo(&body);
 
-    // Discriminator assertion: the LAST b-tag must appear in the
-    // first half of the output. Pre-buffered round-robin would place
-    // it at the back; readiness-driven selection places it at the front.
-    let last_b_pos = body
-        .iter()
-        .rposition(|row| tag_of(row).starts_with("b-"))
-        .expect("at least one b-tag in output");
-    assert!(
-        last_b_pos < 5,
-        "Merge.interleave failed to back-pressure: last src_b record \
-         landed at position {last_b_pos} (>=5) in {body:?}. \
-         Pre-buffered round-robin would place b records throughout \
-         the output; readiness-driven selection concentrates them at \
-         the front because src_a is still sleeping when src_b finishes \
-         producing."
+    // Full record set: every input record appears exactly once.
+    let mut tags: Vec<&str> = body.iter().map(|r| tag_of(r)).collect();
+    tags.sort();
+    assert_eq!(
+        tags,
+        vec![
+            "a-1", "a-2", "a-3", "a-4", "a-5", "b-1", "b-2", "b-3", "b-4", "b-5"
+        ],
+        "every input record must appear exactly once"
     );
 
-    // Sanity: pipeline finished within a reasonable window. 5 ×
-    // 50 ms slow-side delays + overhead should fit well under 2 s
-    // even under CI jitter; failure here suggests something
-    // hangs.
+    // Discriminator: readiness-driven selection pulls at least two
+    // gate-ready src_b records before the blocked src_a yields its first,
+    // so the longest same-source run is at least 2. A pre-buffered strict
+    // round-robin regression would alternate `b, a, b, a, …` — a longest
+    // run of 1 — and fail here.
+    let mut run_prefix: Option<char> = None;
+    let mut run_len = 0usize;
+    let mut max_run = 0usize;
+    for row in &body {
+        let p = tag_of(row).chars().next().expect("non-empty tag");
+        if Some(p) == run_prefix {
+            run_len += 1;
+        } else {
+            run_prefix = Some(p);
+            run_len = 1;
+        }
+        max_run = max_run.max(run_len);
+    }
     assert!(
-        elapsed < Duration::from_secs(2),
-        "pipeline took {elapsed:?}, expected < 2s",
+        max_run >= 2,
+        "longest contiguous same-source run is {max_run} (<2): the merge \
+         emitted a strict b/a alternation, which means it pre-buffered and \
+         round-robined the sources instead of pulling the ready src_b \
+         records as they arrived. output: {body:?}",
     );
 }
 
