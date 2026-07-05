@@ -1,22 +1,23 @@
-//! Non-inline Combine branch consumer lifecycle.
+//! Combine branch consumer lifecycle.
 //!
-//! The IEJoin, GraceHash, and SortMerge combine branches each register a
-//! `MemoryConsumer` with the pipeline-scoped arbitrator before running
-//! their kernel. Each branch must unregister that consumer when it exits —
-//! on the clean path and on every `?` early-return between registration
-//! and the arm's return — or the wrapper lingers in the arbitrator's
-//! registry for the rest of the run, growing the victim-selection surface
-//! and (once the handle carries live bytes) charging finished join state
-//! into `sum_consumer_usage`.
+//! The inline `HashBuildProbe`, IEJoin, GraceHash, and SortMerge combine
+//! branches each register a `MemoryConsumer` with the pipeline-scoped
+//! arbitrator before running their kernel. Each branch must unregister that
+//! consumer when it exits — on the clean path and on every `?` early-return
+//! between registration and the arm's return — or the wrapper lingers in the
+//! arbitrator's registry for the rest of the run, growing the
+//! victim-selection surface and (once the handle carries live bytes)
+//! charging finished join state into `sum_consumer_usage`.
 //!
 //! Each test forces one strategy through the planner (a two-range
 //! predicate selects IEJoin, a single-range presorted predicate selects
 //! SortMerge, a `strategy: grace_hash` hint on a pure-equi predicate
-//! selects GraceHash), asserts the compiled node actually carries that
+//! selects GraceHash, a pure-equi predicate with no hint selects the inline
+//! HashBuildProbe branch), asserts the compiled node actually carries that
 //! strategy so the run is not vacuous, then runs with an injected
-//! arbitrator and asserts the registry is empty afterward. The final test
-//! drives a branch to a hard error (`on_miss: error` with an unmatched
-//! driver row) and asserts the registry is still empty — proving the
+//! arbitrator and asserts the registry is empty afterward. The error-exit
+//! tests drive a branch to a hard error (`on_miss: error` with an unmatched
+//! driver row) and assert the registry is still empty — proving the
 //! unregister funnels through the error exit too.
 
 use super::*;
@@ -474,6 +475,189 @@ nodes:
         arb.consumer_count(),
         0,
         "the IEJoin branch's consumer must be unregistered even when the branch exits via error"
+    );
+    assert_eq!(arb.sum_consumer_usage(), 0);
+}
+
+/// A pure-equi predicate with no `strategy` hint and inputs well under the
+/// grace-hash threshold routes to the inline `HashBuildProbe` branch. After
+/// the probe completes and its output drains downstream, the arbitrator
+/// registry must hold no inline-combine consumer.
+#[test]
+fn inline_hash_branch_unregisters_its_consumer_on_clean_exit() {
+    let yaml = r#"
+pipeline:
+  name: combine_lifecycle_inline_hash
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: product_id, type: string }
+- type: source
+  name: products
+  config:
+    name: products
+    type: csv
+    path: products.csv
+    schema:
+      - { name: product_id, type: string }
+      - { name: name, type: string }
+- type: combine
+  name: enriched
+  input:
+    orders: orders
+    products: products
+  config:
+    where: "orders.product_id == products.product_id"
+    match: first
+    on_miss: null_fields
+    cxl: |
+      emit order_id = orders.order_id
+      emit product_id = orders.product_id
+      emit name = products.name
+    propagate_ck: driver
+- type: output
+  name: out
+  input: enriched
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+    assert!(
+        matches!(
+            compiled_combine_strategy(yaml, "enriched"),
+            CombineStrategy::HashBuildProbe
+        ),
+        "a pure-equi predicate with no strategy hint must select the inline HashBuildProbe branch \
+         for this test to exercise it"
+    );
+
+    let arb = quiet_arbitrator();
+    let report = run(
+        yaml,
+        HashMap::from([
+            csv_reader("orders", ORDERS_EQUI_CSV),
+            csv_reader("products", PRODUCTS_EQUI_CSV),
+        ]),
+        sink_writer("out"),
+        Arc::clone(&arb),
+    )
+    .expect("pipeline must run");
+
+    assert_eq!(
+        report.counters.total_count, 4,
+        "both sources must ingest so the inline HashBuildProbe branch actually runs"
+    );
+    assert_eq!(
+        arb.consumer_count(),
+        0,
+        "the inline HashBuildProbe branch's consumer must be unregistered after the branch exits"
+    );
+    assert_eq!(arb.sum_consumer_usage(), 0);
+}
+
+const ORDERS_EQUI_DISJOINT_CSV: &str = "\
+order_id,product_id
+o1,p1
+o2,p2
+";
+
+const PRODUCTS_EQUI_DISJOINT_CSV: &str = "\
+product_id,name
+p8,sprocket
+p9,flange
+";
+
+/// The unregister must also cover the inline branch's error exit: an inline
+/// `HashBuildProbe` combine whose `on_miss: error` fires on an unmatched
+/// driver row returns through the probe kernel's `?`, and the branch must
+/// still unregister its consumer before propagating the error. The build
+/// side has already mirrored its hash-table bytes into the consumer handle
+/// when the probe row misses, so a leaked consumer would keep that finished
+/// join state summed into the registry for the rest of the run. The two
+/// inputs share no join key, so the first driver row misses regardless of
+/// which side the planner drives from.
+#[test]
+fn inline_hash_branch_unregisters_its_consumer_on_error_exit() {
+    let yaml = r#"
+pipeline:
+  name: combine_lifecycle_inline_hash_error
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: product_id, type: string }
+- type: source
+  name: products
+  config:
+    name: products
+    type: csv
+    path: products.csv
+    schema:
+      - { name: product_id, type: string }
+      - { name: name, type: string }
+- type: combine
+  name: enriched
+  input:
+    orders: orders
+    products: products
+  config:
+    where: "orders.product_id == products.product_id"
+    match: first
+    on_miss: error
+    cxl: |
+      emit order_id = orders.order_id
+      emit product_id = orders.product_id
+      emit name = products.name
+    propagate_ck: driver
+- type: output
+  name: out
+  input: enriched
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+    assert!(
+        matches!(
+            compiled_combine_strategy(yaml, "enriched"),
+            CombineStrategy::HashBuildProbe
+        ),
+        "a pure-equi predicate with no strategy hint must select the inline HashBuildProbe branch \
+         for this test to exercise its error exit"
+    );
+
+    let arb = quiet_arbitrator();
+    let result = run(
+        yaml,
+        HashMap::from([
+            csv_reader("orders", ORDERS_EQUI_DISJOINT_CSV),
+            csv_reader("products", PRODUCTS_EQUI_DISJOINT_CSV),
+        ]),
+        sink_writer("out"),
+        Arc::clone(&arb),
+    );
+
+    assert!(
+        matches!(result, Err(PipelineError::CombineMissingMatch { .. })),
+        "the unmatched driver row under on_miss: error must fail the run, got {result:?}"
+    );
+    assert_eq!(
+        arb.consumer_count(),
+        0,
+        "the inline HashBuildProbe branch's consumer must be unregistered even when the branch \
+         exits via error"
     );
     assert_eq!(arb.sum_consumer_usage(), 0);
 }
