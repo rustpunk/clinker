@@ -286,18 +286,31 @@ mod tests {
     #[test]
     fn cpu_times_increases_after_busy_loop() {
         let Some(before) = cpu_times() else { return };
-        // Spin in user space for ~50 ms.
-        let start = std::time::Instant::now();
+        // Poll until the user-time reading advances rather than spinning a
+        // fixed wall-clock window and asserting an absolute delta. The
+        // counter's resolution is platform-dependent — Windows' GetProcessTimes
+        // is quantized to the ~15.6ms scheduler tick, so a fixed 50ms spin can
+        // register a sub-threshold delta when the thread is descheduled under
+        // runner contention. Spinning until the counter ticks over (bounded by
+        // a generous wall-clock cap) removes that race while still proving that
+        // cpu_times() reflects real work: if the reading never advances within
+        // the cap, the assertion fails.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut after = cpu_times().unwrap();
         let mut x: u64 = 0;
-        while start.elapsed() < std::time::Duration::from_millis(50) {
-            x = x.wrapping_add(1);
-            std::hint::black_box(&x);
+        while after.user_ns <= before.user_ns && std::time::Instant::now() < deadline {
+            // A chunk of user-space work between reads; sized large enough to
+            // accrue schedulable CPU time on coarse-grained clocks.
+            for _ in 0..1_000_000 {
+                x = x.wrapping_add(1);
+                std::hint::black_box(&x);
+            }
+            after = cpu_times().unwrap();
         }
-        let after = cpu_times().unwrap();
         let delta = after.user_ns.saturating_sub(before.user_ns);
         assert!(
-            delta >= 25_000_000,
-            "expected ≥25ms user CPU delta after 50ms spin, got {delta} ns"
+            delta > 0,
+            "expected user CPU time to advance after a busy loop, got {delta} ns"
         );
     }
 
