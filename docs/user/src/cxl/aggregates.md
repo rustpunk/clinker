@@ -14,7 +14,7 @@ CXL provides 7 aggregate functions. These are called as free-standing function c
 | `min(expr)` | Any | Any | Minimum value |
 | `max(expr)` | Any | Any | Maximum value |
 | `collect(expr)` | Any | Array | All values collected into an array |
-| `weighted_avg(value, weight)` | Numeric, Numeric | Float | Weighted arithmetic mean |
+| `weighted_avg(value, weight)` | Numeric, Numeric | Float / Decimal | Weighted arithmetic mean |
 
 ## YAML aggregate node
 
@@ -98,7 +98,7 @@ cxl: |
   emit all_order_ids = collect(order_id)
 ```
 
-### weighted_avg(value, weight) -> Float
+### weighted_avg(value, weight) -> Float or Decimal
 
 Computes a weighted average: `sum(value * weight) / sum(weight)`. Takes two arguments.
 
@@ -106,6 +106,13 @@ Computes a weighted average: `sum(value * weight) / sum(weight)`. Takes two argu
 cxl: |
   emit weighted_price = weighted_avg(unit_price, quantity)
 ```
+
+Returns Float for int/float inputs. When either the value or the weight is a
+`decimal`, the result is an exact `decimal` computed entirely in the decimal
+domain (no binary float touches the running totals), at full division
+precision. A zero total weight returns null. Mixing a `decimal` with a binary
+`float` across the two arguments is a type error -- cast with `.to_decimal()`
+or `.to_float()` so both share one numeric domain.
 
 ## Aggregates vs. windows
 
