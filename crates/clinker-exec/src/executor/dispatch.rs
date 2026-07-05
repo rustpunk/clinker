@@ -1528,7 +1528,29 @@ pub(crate) fn admit_node_buffer(
     // dispatch order moves: finishing a chain's blocking consumer before
     // charging the next chain's source keeps fewer slots live at once.
     ctx.memory_budget.sample_peak_consumer_usage();
-    if !spill_allowed || !ctx.memory_budget.should_spill() {
+    if !spill_allowed {
+        // A non-spillable slot (multi-consumer fan-out / composition
+        // input-port edge) cannot be evicted: its consumer clones the
+        // resident rows via `NodeBuffer::clone_memory_only`, which panics on
+        // a spill-backed variant, and the rows are already fully
+        // materialized, non-back-pressureable, and drained synchronously.
+        // Admitting one while already over the hard limit would blow the
+        // budget with no recourse — no spill, no pause, no block — so
+        // hard-gate it here, mirroring the route cross-region tee admission
+        // precedent (`route_dispatch`). A spillable over-budget slot must
+        // still spill rather than abort, so only this arm gates.
+        if ctx.memory_budget.should_abort() {
+            return Err(PipelineError::MemoryBudgetExceeded {
+                node: node_name.to_string(),
+                used: ctx.memory_budget.peak_rss().unwrap_or(0),
+                limit: ctx.memory_budget.hard_limit(),
+                source: clinker_plan::BudgetCategory::Arena,
+                detail: Some("non-spillable node-buffer admission".to_string()),
+            });
+        }
+        return Ok(NodeBuffer::memory_from_records_and_puncts(rows, puncts));
+    }
+    if !ctx.memory_budget.should_spill() {
         return Ok(NodeBuffer::memory_from_records_and_puncts(rows, puncts));
     }
     // Resolve the spill compression mode against this slot's schema width and
