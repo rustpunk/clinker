@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use clinker_record::{Record, SchemaBuilder, Value};
+use clinker_record::{Record, SchemaBuilder, Value, round_decimal_to_scale};
+use cxl::typecheck::Type;
 use indexmap::IndexMap;
 
 use clinker_plan::config::OutputConfig;
@@ -117,6 +118,7 @@ pub fn project_output_from_record(
         // echoing the source `UNB` header) can still resolve
         // `$doc.<section>.<field>` after projection drops engine columns.
         out.set_doc_ctx(Arc::clone(input_record.doc_ctx()));
+        round_declared_output_decimals(&mut out, config);
         return out;
     }
 
@@ -193,7 +195,51 @@ pub fn project_output_from_record(
     // envelope context forward so document-reconstructing writers still
     // resolve `$doc.<section>.<field>` on the projected record.
     out.set_doc_ctx(Arc::clone(input_record.doc_ctx()));
+    round_declared_output_decimals(&mut out, config);
     out
+}
+
+/// Enforce a declared output-column `scale` at the write boundary: each
+/// `Value::Decimal` landing in a column the output `schema:` declares as
+/// `type: decimal` with a `scale` is rescaled to that many fractional digits
+/// with the house banker's rounding ([`round_decimal_to_scale`], round-half-to-
+/// even) — bit-identical to what a source column's `scale` does on ingest.
+///
+/// This is the write side of the decimal boundary contract: decimals compute at
+/// full precision inside the pipeline (`avg`, `a / b` keep every digit) and are
+/// pinned to a declared scale only at the edge they are declared on. An output
+/// without a `schema:`, or a column without `scale`, is left at full precision.
+///
+/// Keyed by the post-mapping (output-facing) column names, so it runs after the
+/// rename/exclude rewrite has produced the final record. Only `Value::Decimal`
+/// in a `decimal`-declared, scaled column is touched — no other type coercion is
+/// performed, and a non-decimal value or a decimal in an unscaled column passes
+/// through untouched. Blocking/streaming: pure per-record transform, no
+/// buffering; cost is proportional to the declared column count and is skipped
+/// entirely for the schema-less outputs (CSV/JSON without a `schema:` block).
+fn round_declared_output_decimals(record: &mut Record, config: &OutputConfig) {
+    let Some(columns) = config.schema.as_ref().and_then(|s| s.as_columns()) else {
+        return;
+    };
+    for col in columns {
+        let Some(scale) = col.scale else {
+            continue;
+        };
+        // A nullable declaration (`type: { nullable: decimal }`) still names a
+        // decimal column — unwrap it the same way the fixed-width writer
+        // classifies numeric fields.
+        if !matches!(col.ty.unwrap_nullable(), Type::Decimal) {
+            continue;
+        }
+        // Copy the decimal out (it is `Copy`) so the immutable `get` borrow is
+        // released before the `set`; a non-decimal value in the slot is left
+        // untouched.
+        let rounded = match record.get(&col.name) {
+            Some(&Value::Decimal(d)) => round_decimal_to_scale(d, Some(scale)),
+            _ => continue,
+        };
+        record.set(&col.name, Value::Decimal(rounded));
+    }
 }
 
 #[cfg(test)]
@@ -609,6 +655,186 @@ mod tests {
             result.doc_ctx().get_section_field("unb", "e01"),
             Some(Value::String("UNOA:1".into())),
             "fast path must carry the source document context forward"
+        );
+    }
+
+    // ── Output-column decimal `scale` enforcement (write boundary) ──
+
+    use clinker_format::{Column, SourceSchema};
+    use rust_decimal::Decimal;
+
+    /// A minimal fast-path Output config (no mapping/exclude, no correlation
+    /// keys) carrying an optional output `schema:`. `cxl_emit_names = None`
+    /// keeps every user field, so a declared decimal column reaches the
+    /// rounding pass.
+    fn scale_config(schema: Option<SourceSchema>) -> OutputConfig {
+        OutputConfig {
+            name: "out".into(),
+            format: clinker_plan::config::OutputFormat::Csv(None),
+            path: "/tmp/out.csv".into(),
+            include_unmapped: false,
+            include_header: None,
+            mapping: None,
+            exclude: None,
+            sort_order: None,
+            preserve_nulls: None,
+            include_correlation_keys: false,
+            correlation_fanout_policy: None,
+            if_exists: Default::default(),
+            unique_suffix_width: 0,
+            write_meta: false,
+            reconstruct_envelope: false,
+            schema,
+            split: None,
+            notes: None,
+        }
+    }
+
+    fn decimal_col(name: &str, scale: Option<u8>) -> Column {
+        Column {
+            scale,
+            ..Column::bare(name, Type::Decimal)
+        }
+    }
+
+    fn one_field_record(name: &str, value: Value) -> Record {
+        let schema = Arc::new(Schema::new(vec![name.into()]));
+        Record::new(schema, vec![value])
+    }
+
+    /// A full-precision computed quotient (4 / 3 keeps 28 digits) is rescaled to
+    /// the declared output-column scale with banker's rounding: `1.33`.
+    #[test]
+    fn output_scale_rounds_computed_decimal() {
+        let quotient = Decimal::from(4)
+            .checked_div(Decimal::from(3))
+            .expect("4 / 3");
+        let input = one_field_record("average", Value::Decimal(quotient));
+        let schema = SourceSchema::Columns(vec![decimal_col("average", Some(2))]);
+        let out = project_output_from_record(&input, &scale_config(Some(schema)), None);
+        assert_eq!(
+            out.get("average"),
+            Some(&Value::Decimal(Decimal::new(133, 2)))
+        );
+    }
+
+    /// The write boundary uses the same round-half-to-even as ingest: a `.xx5`
+    /// midpoint rounds to the even neighbor (`2.125` → `2.12`), not away from
+    /// zero.
+    #[test]
+    fn output_scale_uses_bankers_midpoint() {
+        let input = one_field_record("m", Value::Decimal(Decimal::new(2125, 3)));
+        let schema = SourceSchema::Columns(vec![decimal_col("m", Some(2))]);
+        let out = project_output_from_record(&input, &scale_config(Some(schema)), None);
+        assert_eq!(out.get("m"), Some(&Value::Decimal(Decimal::new(212, 2))));
+
+        let input = one_field_record("m", Value::Decimal(Decimal::new(2135, 3)));
+        let schema = SourceSchema::Columns(vec![decimal_col("m", Some(2))]);
+        let out = project_output_from_record(&input, &scale_config(Some(schema)), None);
+        assert_eq!(out.get("m"), Some(&Value::Decimal(Decimal::new(214, 2))));
+    }
+
+    /// The write boundary only rounds off excess precision; it never pads a
+    /// shorter-scale value up. This is bit-identical to ingest (`2.5` coerced
+    /// into a `scale: 2` source column also stays `2.5`) — both edges route
+    /// through the same `round_decimal_to_scale`. Decimal equality ignores
+    /// scale, so the string form is the load-bearing assertion.
+    #[test]
+    fn output_scale_does_not_pad_shorter_scale() {
+        let input = one_field_record("v", Value::Decimal(Decimal::new(25, 1)));
+        let schema = SourceSchema::Columns(vec![decimal_col("v", Some(2))]);
+        let out = project_output_from_record(&input, &scale_config(Some(schema)), None);
+        let Some(Value::Decimal(d)) = out.get("v") else {
+            panic!("expected a decimal");
+        };
+        assert_eq!(
+            d.to_string(),
+            "2.5",
+            "already within scale — left untouched"
+        );
+    }
+
+    /// A `decimal` column with no declared `scale` keeps full precision — the
+    /// contract only fires where the user declared a scale.
+    #[test]
+    fn output_decimal_without_scale_keeps_full_precision() {
+        let quotient = Decimal::from(4)
+            .checked_div(Decimal::from(3))
+            .expect("4 / 3");
+        let input = one_field_record("average", Value::Decimal(quotient));
+        let schema = SourceSchema::Columns(vec![decimal_col("average", None)]);
+        let out = project_output_from_record(&input, &scale_config(Some(schema)), None);
+        assert_eq!(out.get("average"), Some(&Value::Decimal(quotient)));
+    }
+
+    /// A schema-less output (CSV/JSON without a `schema:` block) never rounds —
+    /// today's full-precision behavior is preserved.
+    #[test]
+    fn output_without_schema_keeps_full_precision() {
+        let quotient = Decimal::from(4)
+            .checked_div(Decimal::from(3))
+            .expect("4 / 3");
+        let input = one_field_record("average", Value::Decimal(quotient));
+        let out = project_output_from_record(&input, &scale_config(None), None);
+        assert_eq!(out.get("average"), Some(&Value::Decimal(quotient)));
+    }
+
+    /// Scope guard: only a `Value::Decimal` in a decimal-declared column is
+    /// touched. A `Value::Float` that lands in such a column is NOT coerced —
+    /// write-side type coercion is deliberately out of scope.
+    #[test]
+    fn output_scale_leaves_non_decimal_value_untouched() {
+        let input = one_field_record("average", Value::Float(1.3333));
+        let schema = SourceSchema::Columns(vec![decimal_col("average", Some(2))]);
+        let out = project_output_from_record(&input, &scale_config(Some(schema)), None);
+        assert_eq!(out.get("average"), Some(&Value::Float(1.3333)));
+    }
+
+    /// The rounding pass runs on the slow path too (mapping/exclude rewrite),
+    /// keyed by the post-mapping output name: a field renamed to a scaled
+    /// decimal column is rescaled.
+    #[test]
+    fn output_scale_applies_after_mapping_rename() {
+        let quotient = Decimal::from(4)
+            .checked_div(Decimal::from(3))
+            .expect("4 / 3");
+        let input = one_field_record("raw_avg", Value::Decimal(quotient));
+        let mut mapping = IndexMap::new();
+        mapping.insert("raw_avg".to_string(), "average".to_string());
+        let mut config = scale_config(Some(SourceSchema::Columns(vec![decimal_col(
+            "average",
+            Some(2),
+        )])));
+        config.mapping = Some(mapping);
+        let out = project_output_from_record(&input, &config, None);
+        assert!(out.get("raw_avg").is_none(), "field was renamed");
+        assert_eq!(
+            out.get("average"),
+            Some(&Value::Decimal(Decimal::new(133, 2)))
+        );
+    }
+
+    /// A nullable decimal column (`type: { nullable: decimal }`) still rounds —
+    /// the underlying type is unwrapped before the decimal check, matching how
+    /// the writers classify a nullable numeric field.
+    #[test]
+    fn output_scale_rounds_nullable_decimal_column() {
+        let quotient = Decimal::from(4)
+            .checked_div(Decimal::from(3))
+            .expect("4 / 3");
+        let input = one_field_record("average", Value::Decimal(quotient));
+        let col = Column {
+            scale: Some(2),
+            ..Column::bare("average", Type::nullable(Type::Decimal))
+        };
+        let out = project_output_from_record(
+            &input,
+            &scale_config(Some(SourceSchema::Columns(vec![col]))),
+            None,
+        );
+        assert_eq!(
+            out.get("average"),
+            Some(&Value::Decimal(Decimal::new(133, 2)))
         );
     }
 }

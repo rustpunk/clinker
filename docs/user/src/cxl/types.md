@@ -184,10 +184,14 @@ schema:
   - { name: tax_rate, type: decimal, scale: 4 }
 ```
 
-A `decimal` column parses its raw text into an exact value and rounds it to the
-column `scale` (round-half-to-even, the unbiased "banker's rounding" used in
-accounting). Writers emit the value at that scale, so `2.5` stored in a
-`scale: 2` column is written `2.50`.
+A `decimal` column parses its raw text into an exact value and rounds off any
+excess precision to the column `scale` (round-half-to-even, the unbiased
+"banker's rounding" used in accounting), so a `scale: 2` column stores `2.567`
+as `2.57`. This is one edge of a **boundary contract**: a declared `scale` pins
+a value to that many places at the boundary it is declared on — a source
+column's scale on read, an output column's scale on write (see [Aggregating
+decimals](#aggregating-decimals)) — while decimals keep full precision *inside*
+the pipeline.
 
 ### Arithmetic rules
 
@@ -201,10 +205,14 @@ accounting). Writers emit the value at that scale, so `2.5` stored in a
   - `rate.to_decimal() * amount` — bring the float into exact decimal math
     (the float→decimal step is the one acknowledged lossy conversion).
 - **Division and `avg`** compute at full precision — the exact quotient, not a
-  binary-float approximation. A computed decimal keeps its full precision and
-  is not automatically rounded to a fixed number of places; round it explicitly
-  when you need fixed cents. (A `decimal` *source* column, separately, rounds
-  its parsed values to the declared `scale` on read, using banker's rounding.)
+  binary-float approximation. Inside the pipeline a computed decimal keeps every
+  digit; it is pinned to a fixed number of places only at a boundary that
+  declares a `scale`. Declaring the *output* column `type: decimal` with a
+  `scale` rounds the value to that many places on write (banker's rounding),
+  exactly as a `decimal` *source* column rounds on read — so `avg(amount)`
+  emitted into a `scale: 2` output column writes `1.33`, not the full quotient.
+  With no declared output scale the full precision is preserved; use an explicit
+  round in CXL when you need fixed places mid-pipeline.
 
 Comparisons follow the same rule: `decimal < int` is fine, `decimal < float`
 requires a cast.
@@ -242,6 +250,16 @@ column and stay exact — no binary float ever touches a running total:
 - Group-by and `distinct` keys are scale-normalized: two decimals that are
   numerically equal group together regardless of scale, so `2.50` and `2.5`
   fall in one group. This holds even when the aggregation spills to disk.
+
+To pin an aggregate result to fixed places on the way out, declare the **output**
+column `type: decimal` with a `scale`: the value is rounded to that scale on
+write (banker's rounding), so `avg(amount)` over `1.00, 1.00, 2.00` writes `1.33`
+into a `scale: 2` output column while `sum(amount)` stays `4.00`. An output
+column with no declared scale keeps the full-precision quotient. This applies to
+every format — CSV, JSON, and fixed-width — because the rounding happens as the
+record is projected onto the output. For fixed-width output it is often
+required: a full-precision quotient overflows a narrow numeric field, which is a
+hard error, whereas the rounded value fits.
 
 `weighted_avg` also stays exact over decimals: a decimal value or weight (or
 both) gives an exact `sum(value * weight) / sum(weight)` at full division
