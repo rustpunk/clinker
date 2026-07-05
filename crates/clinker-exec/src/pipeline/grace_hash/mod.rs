@@ -259,11 +259,11 @@ pub(crate) struct GraceHashExecutor {
     partitions: Vec<PartitionState>,
     spill_dir: PathBuf,
     hash_state: RandomState,
-    /// Bytes written across every spill commit this executor has
-    /// performed. Drained by [`Self::take_spilled_bytes`] so the
-    /// caller can fold the delta into [`MemoryArbitrator::record_spill_bytes`]
-    /// and surface E310 on disk-quota overflow.
-    spilled_bytes: u64,
+    /// Combine node name, used to attribute each spill commit's bytes to
+    /// the right stage in [`MemoryArbitrator::record_spill_bytes`] and to
+    /// tag the E320 `SpillCapExceeded` surface raised when a commit crosses
+    /// the disk quota.
+    name: String,
     /// Shared with the arbitrator's `GraceHashConsumer` wrapper.
     /// `add_build_record` adds the admitted record's bytes;
     /// `spill_partition` subtracts the evicted partition's
@@ -277,6 +277,30 @@ pub(crate) struct GraceHashExecutor {
     spill_compress: bool,
 }
 
+/// Charge one finished spill file's `written` bytes against the run's
+/// disk quota at the moment the file is committed, attributing them to
+/// stage `name`. Returns [`GraceSpillError::CapExceeded`] when this commit
+/// pushed the cumulative on-disk total past the configured cap so the
+/// caller aborts here rather than after the whole build or probe phase has
+/// finished writing — the per-commit enforcement the inter-partition
+/// repartition path already applies. A free function rather than a method
+/// so callers holding a `&mut self.partitions` iterator can charge through
+/// a disjoint borrow of `self.name`.
+fn charge_grace_spill(
+    budget: &MemoryArbitrator,
+    name: &str,
+    written: u64,
+) -> Result<(), GraceSpillError> {
+    if budget.record_spill_bytes(name, written) {
+        return Err(GraceSpillError::CapExceeded {
+            attempted: written,
+            cap: budget.disk_quota(),
+            cumulative: budget.cumulative_spill_bytes(),
+        });
+    }
+    Ok(())
+}
+
 impl GraceHashExecutor {
     /// Build a fresh executor sized for `partition_bits`. The caller
     /// supplies the spill directory — a path inside the pipeline-scoped
@@ -288,6 +312,7 @@ impl GraceHashExecutor {
         spill_dir: &Path,
         consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
         spill_compress: bool,
+        name: &str,
     ) -> std::io::Result<Self> {
         let assigner = PartitionAssigner::new(partition_bits.max(1));
         let n = assigner.num_partitions();
@@ -304,7 +329,7 @@ impl GraceHashExecutor {
             partitions,
             spill_dir: spill_dir.to_path_buf(),
             hash_state: RandomState::new(),
-            spilled_bytes: 0,
+            name: name.to_string(),
             consumer_handle,
             spill_compress,
         })
@@ -314,14 +339,6 @@ impl GraceHashExecutor {
     /// Borrowed reference into the caller-owned `Arc<TempDir>`.
     pub(crate) fn spill_dir_path(&self) -> &Path {
         &self.spill_dir
-    }
-
-    /// Drain the cumulative spill-bytes counter and return it. The
-    /// caller folds the result into
-    /// [`MemoryArbitrator::record_spill_bytes`] after each operation that
-    /// may have spilled (build, probe finalize, repartition).
-    pub(crate) fn take_spilled_bytes(&mut self) -> u64 {
-        std::mem::take(&mut self.spilled_bytes)
     }
 
     /// Hash state shared by every partition. Build and probe must hash
@@ -392,7 +409,6 @@ impl GraceHashExecutor {
                 )?;
                 w.write_record(&record)?;
                 let (new_path, written) = w.finish()?;
-                self.spilled_bytes = self.spilled_bytes.saturating_add(written);
                 if let PartitionState::OnDisk {
                     build_files,
                     build_count,
@@ -404,6 +420,7 @@ impl GraceHashExecutor {
                     *build_count += 1;
                     distinct_sketch.add(hash);
                 }
+                charge_grace_spill(budget, &self.name, written)?;
             }
         }
 
@@ -432,7 +449,7 @@ impl GraceHashExecutor {
             let Some((idx, _)) = victim else {
                 return Ok(());
             };
-            self.spill_partition(idx)?;
+            self.spill_partition(idx, budget)?;
             if !budget.should_spill() {
                 return Ok(());
             }
@@ -443,7 +460,11 @@ impl GraceHashExecutor {
     /// in-memory record to a fresh spill file. The HLL sketch is
     /// preserved verbatim across the transition so the reload-phase
     /// BNL branch can read partition cardinality without rebuilding.
-    fn spill_partition(&mut self, idx: usize) -> Result<(), GraceSpillError> {
+    fn spill_partition(
+        &mut self,
+        idx: usize,
+        budget: &MemoryArbitrator,
+    ) -> Result<(), GraceSpillError> {
         let assigner_bits = self.assigner.hash_bits();
         let hash_bits = assigner_bits;
         let partition_id = idx as u16;
@@ -471,7 +492,6 @@ impl GraceHashExecutor {
             writer.write_record(&r)?;
         }
         let (path, written) = writer.finish()?;
-        self.spilled_bytes = self.spilled_bytes.saturating_add(written);
         self.partitions[idx] = PartitionState::OnDisk {
             build_files: vec![path],
             probe_writer: None,
@@ -486,6 +506,7 @@ impl GraceHashExecutor {
         // operator's live state without wrapping if estimate drift
         // ever exceeds the running total.
         self.consumer_handle.sub_bytes(bytes_estimated as u64);
+        charge_grace_spill(budget, &self.name, written)?;
         Ok(())
     }
 
@@ -596,9 +617,14 @@ impl GraceHashExecutor {
 
     /// Finalize any open probe writers so their LZ4 frames are valid
     /// before the reload phase reopens them. Build-side writers were
-    /// already finalized in `spill_partition`.
-    pub(crate) fn finalize_probe_spills(&mut self) -> Result<(), GraceSpillError> {
-        let mut written_total: u64 = 0;
+    /// already finalized in `spill_partition`. Each finished file is
+    /// charged against the disk quota as it is committed, so a probe phase
+    /// that overshoots aborts at the crossing partition rather than after
+    /// every open writer has been flushed.
+    pub(crate) fn finalize_probe_spills(
+        &mut self,
+        budget: &MemoryArbitrator,
+    ) -> Result<(), GraceSpillError> {
         for state in &mut self.partitions {
             if let PartitionState::OnDisk {
                 probe_writer,
@@ -608,11 +634,10 @@ impl GraceHashExecutor {
                 && let Some(w) = probe_writer.take()
             {
                 let (path, written) = (*w).finish()?;
-                written_total = written_total.saturating_add(written);
                 probe_files.push(path);
+                charge_grace_spill(budget, &self.name, written)?;
             }
         }
-        self.spilled_bytes = self.spilled_bytes.saturating_add(written_total);
         Ok(())
     }
 
@@ -748,13 +773,18 @@ pub(crate) fn execute_combine_grace_hash(
         .or_else(|| output_schema.cloned())
         .unwrap_or_else(|| Arc::new(Schema::new(Vec::new())));
 
-    let mut executor =
-        GraceHashExecutor::new(partition_bits, spill_dir, consumer_handle, spill_compress)
-            .map_err(|e| PipelineError::Internal {
-                op: "combine",
-                node: name.to_string(),
-                detail: format!("grace hash spill dir bind failed: {e}"),
-            })?;
+    let mut executor = GraceHashExecutor::new(
+        partition_bits,
+        spill_dir,
+        consumer_handle,
+        spill_compress,
+        name,
+    )
+    .map_err(|e| PipelineError::Internal {
+        op: "combine",
+        node: name.to_string(),
+        detail: format!("grace hash spill dir bind failed: {e}"),
+    })?;
 
     // ── Build phase ────────────────────────────────────────────────────
     //
@@ -854,15 +884,6 @@ pub(crate) fn execute_combine_grace_hash(
         }
     }
     executor.finish_build(&build_extractor, ctx, budget, name)?;
-    let build_spilled = executor.take_spilled_bytes();
-    if budget.record_spill_bytes(name, build_spilled) {
-        return Err(PipelineError::spill_cap_exceeded(
-            name,
-            budget.disk_quota(),
-            build_spilled,
-            budget.cumulative_spill_bytes(),
-        ));
-    }
 
     // ── Probe phase ───────────────────────────────────────────────────
     let mut output_records: Vec<(Record, RecordOrder)> = Vec::new();
@@ -942,17 +963,8 @@ pub(crate) fn execute_combine_grace_hash(
     }
 
     executor
-        .finalize_probe_spills()
+        .finalize_probe_spills(budget)
         .map_err(|e| grace_spill_error(e, name, "probe finalize failed"))?;
-    let probe_spilled = executor.take_spilled_bytes();
-    if budget.record_spill_bytes(name, probe_spilled) {
-        return Err(PipelineError::spill_cap_exceeded(
-            name,
-            budget.disk_quota(),
-            probe_spilled,
-            budget.cumulative_spill_bytes(),
-        ));
-    }
 
     // ── Reload phase ──────────────────────────────────────────────────
     // Process every spilled partition pair. A reloaded partition that
