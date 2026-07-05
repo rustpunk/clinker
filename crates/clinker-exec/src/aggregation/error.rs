@@ -105,15 +105,31 @@ pub enum HashAggError {
         prev_key_debug: String,
         next_key_debug: String,
     },
+    /// A single input record's buffered contributions alone exceed the
+    /// entire memory budget. Buffer-mode aggregation must hold every raw
+    /// contribution resident to recompute `BufferRequired` bindings (`min`,
+    /// `max`, `avg`) after a retraction, so a row larger than the whole
+    /// budget has no in-budget representation and spilling cannot rescue it —
+    /// the next add of the same shape repeats the overflow. Routed by the
+    /// executor dispatch arm by error strategy: `FailFast` surfaces
+    /// `E310 MemoryBudgetExceeded`; `Continue` / `BestEffort` sends the
+    /// offending record to the DLQ. `row_charge` is the record's estimated
+    /// buffered footprint in bytes; `budget` is the configured memory limit
+    /// in bytes.
+    #[error(
+        "buffered aggregate row footprint ({row_charge} bytes) exceeds the entire memory budget ({budget} bytes)"
+    )]
+    OversizedRow { row_charge: usize, budget: usize },
 }
 
 /// Map a `HashAggError` to a `PipelineError` for the executor dispatch
 /// arm. Accumulator-finalize errors get a dedicated typed variant; a
 /// mid-run spill-directory fault maps to `PipelineError::Spill` so it
 /// renders with the same `DirUnavailable` diagnostic the node-buffer and
-/// sort paths use; the remaining cases are wrapped in `PipelineError::Eval`
-/// (data errors) or `PipelineError::Internal` (engine bugs / unsupported
-/// residuals).
+/// sort paths use; an oversized single buffered row maps to
+/// `PipelineError::MemoryBudgetExceeded` (E310); the remaining cases are
+/// wrapped in `PipelineError::Eval` (data errors) or `PipelineError::Internal`
+/// (engine bugs / unsupported residuals).
 impl From<HashAggError> for PipelineError {
     fn from(e: HashAggError) -> Self {
         match e {
@@ -163,6 +179,22 @@ impl From<HashAggError> for PipelineError {
                     "internal Clinker bug — LoserTree produced out-of-order keys: prev={prev_key_debug} next={next_key_debug}"
                 ),
             },
+            // A single row larger than the whole budget is a legitimate
+            // tiny-budget / oversized-record condition, not a Clinker bug, so
+            // it maps to E310 (`MemoryBudgetExceeded`) rather than `Internal`.
+            // `node` is left empty for the dispatch arm to stamp with the
+            // aggregate node name, matching the other budget-error sites.
+            HashAggError::OversizedRow { row_charge, budget } => {
+                PipelineError::MemoryBudgetExceeded {
+                    node: String::new(),
+                    used: row_charge as u64,
+                    limit: budget as u64,
+                    source: clinker_plan::BudgetCategory::Arena,
+                    detail: Some(format!(
+                        "a single buffered aggregate row's {row_charge}-byte footprint exceeds the whole {budget}-byte memory budget; raise memory.limit"
+                    )),
+                }
+            }
         }
     }
 }

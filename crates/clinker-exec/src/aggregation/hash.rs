@@ -658,8 +658,10 @@ impl HashAggregator {
     ///
     /// 5. Evaluate every binding's argument into a `Vec<Value>` and
     ///    apply the hard-limit guard before mutating per-group state:
-    ///    if a single record's contribution exceeds the entire memory
-    ///    budget, spilling cannot rescue us and the panic fires.
+    ///    a single record whose contribution exceeds the entire memory
+    ///    budget cannot be held or spilled, so it returns
+    ///    `HashAggError::OversizedRow` for the dispatch arm to route by
+    ///    error strategy.
     /// 6. Push the per-row values onto `BufferedGroupState.contributions`
     ///    and charge `O(n_bindings × value_size)` into `value_heap_bytes`.
     /// 7. Same dual-threshold spill trigger as fold-mode.
@@ -761,18 +763,15 @@ impl HashAggregator {
         // Hard-limit guard. A single record whose contributions alone
         // exceed the entire memory budget cannot be held in memory and
         // cannot be salvaged by spilling — the very next add of the same
-        // shape will repeat the overflow. Panic loudly. The relaxed-
-        // correlation-key commit step's degrade-fallback surface will
-        // replace this guard with a strict-collateral DLQ path for the
-        // affected groups when it lands.
+        // shape would repeat the overflow. Surface a typed error the
+        // dispatch arm routes by error strategy (FailFast aborts with E310;
+        // Continue/BestEffort routes the offending record to the DLQ)
+        // rather than admitting an unaffordable contribution.
         if self.memory_budget > 0 && row_charge > self.memory_budget {
-            panic!(
-                "buffered contributions exceeded hard limit (row_charge={}, budget={}); \
-                 relaxed-correlation-key group cannot be recomputed; this is a runtime \
-                 guard until the relaxed-correlation-key commit step's degrade-fallback \
-                 lands",
-                row_charge, self.memory_budget
-            );
+            return Err(HashAggError::OversizedRow {
+                row_charge,
+                budget: self.memory_budget,
+            });
         }
         // Source identity is extracted at ingest so the buffer path's
         // retract walk can scope rewinds per source, matching the
@@ -2331,15 +2330,13 @@ mod spill_trigger_tests {
     }
 
     #[test]
-    #[should_panic(expected = "buffered contributions exceeded hard limit")]
-    fn test_buffer_mode_panics_when_single_row_exceeds_budget() {
+    fn test_buffer_mode_oversized_row_returns_typed_error() {
         // Hard-limit guard. A single record's contributions exceeding
         // the entire memory budget is the unaffordable case — spilling
         // cannot help because the just-charged row is already over the
         // hard limit and the next add of the same shape repeats the
-        // overflow. This test exercises the dedicated panic path; the
-        // `#[should_panic]` is the consumer of the runtime guard, not a
-        // demotion of a previously asserting test.
+        // overflow. The aggregator returns a typed `OversizedRow` the
+        // dispatch arm routes by error strategy, never a panic.
         let input = make_schema(&["k", "s"]);
         // Budget intentionally tiny; single record String alone exceeds it.
         let mut agg = build_test_aggregator_relaxed(
@@ -2358,12 +2355,21 @@ mod spill_trigger_tests {
             &input,
             vec![Value::String("k1".into()), Value::String(big.into())],
         );
-        // The first add_record triggers a soft spill (budget > 0 and
-        // value_heap_bytes far exceeds 40% of 16) which drains. Spill
-        // does not actually rescue because the just-charged row's
-        // contribution already exceeded the entire budget; the
-        // post-spill hard-limit guard fires the panic.
-        let _ = agg.add_record(&r, 0, &ctx_for(&stable, &file, 0));
+        // The guard fires before the row is admitted: `add_record` returns
+        // `OversizedRow` carrying the offending footprint and the budget.
+        let err = agg
+            .add_record(&r, 0, &ctx_for(&stable, &file, 0))
+            .expect_err("a 2 KiB row under a 16-byte budget must return OversizedRow");
+        match err {
+            HashAggError::OversizedRow { row_charge, budget } => {
+                assert_eq!(budget, 16, "guard reports the configured 16-byte budget");
+                assert!(
+                    row_charge > budget,
+                    "row_charge {row_charge} must exceed budget {budget}"
+                );
+            }
+            other => panic!("expected OversizedRow, got {other:?}"),
+        }
     }
 
     // ----------------------------------------------------------------
