@@ -34,6 +34,17 @@ rules.
 | `namespace_handling` | `strip` | `strip` removes namespace prefixes from element and attribute names; `qualify` preserves the namespace-qualified names. |
 | `max_index_bytes` | `64MB` | Cap on the bytes the envelope pre-scan retains while extracting declared `$doc.*` sections. |
 
+## Truncated input
+
+A truncated XML document — one whose input ends before an open element's
+closing tag — is rejected with a format error rather than yielding the
+partial fields read so far. This holds for a record cut off mid-element, a
+skipped-over sibling subtree cut off before it closes, and an envelope
+section cut off during the pre-scan (which then attaches no `$doc`
+metadata). This matches the general contract that a
+[truncated stream always aborts](../pipelines/error-handling.md#malformed-envelopes-structural-validation)
+rather than silently dropping data.
+
 ## Writing XML
 
 The XML writer expands dotted field names to nested elements and applies
