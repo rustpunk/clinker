@@ -97,23 +97,18 @@ impl<W: Write> FixedWidthWriter<W> {
                 Justify::Left
             });
 
-            // Widths are byte counts (the reader slices by byte), so padding
-            // must fill exact byte counts. A pad character wider than one byte
-            // would overflow the declared width — each push adds `len_utf8()`
-            // bytes — so reject it at construction rather than emit a cell that
-            // no longer matches its byte range. An empty or absent `pad`
-            // defaults to a space.
+            // Widths are byte counts (the reader slices by byte), so a declared
+            // `pad` must be a single ASCII byte: a multi-byte character would
+            // overflow the cell (each push adds `len_utf8()` bytes) and a
+            // multi-character pad has no clean single-byte fill. Rejected at
+            // construction (the same guard the reader applies). An empty or
+            // absent `pad` defaults to a space.
+            field::validate_pad(&f.name, f.pad.as_deref())?;
             let pad_char = f
                 .pad
                 .as_deref()
                 .and_then(|s| s.chars().next())
                 .unwrap_or(' ');
-            if pad_char.len_utf8() != 1 {
-                return Err(field::invalid_field(
-                    &f.name,
-                    "'pad' must be a single-byte character so padding fills exact byte widths",
-                ));
-            }
 
             let truncation = f.truncation.clone().unwrap_or(if is_numeric {
                 TruncationPolicy::Error
@@ -717,6 +712,42 @@ mod tests {
                 );
                 assert!(
                     message.contains("'name'"),
+                    "message should name the field: {message}"
+                );
+            }
+            other => panic!("expected InvalidRecord, got {other:?}"),
+        }
+    }
+
+    /// A multi-CHARACTER pad (all-ASCII, e.g. `"0 "`) is also rejected at
+    /// construction: the pad contract is single-byte end-to-end (#806), so the
+    /// writer no longer silently honors only its first character.
+    #[test]
+    fn test_fixedwidth_write_multichar_pad_rejected() {
+        let fields = vec![{
+            let mut f = field("id");
+            f.ty = Type::Int;
+            f.start = Some(0);
+            f.width = Some(5);
+            f.justify = Some(Justify::Right);
+            // Two ASCII bytes: previously accepted, honoring only '0'.
+            f.pad = Some("0 ".into());
+            f
+        }];
+
+        let mut buf = Vec::new();
+        let err = FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default())
+            .err()
+            .expect("multi-character pad must be rejected at construction");
+        match err {
+            FormatError::InvalidRecord { row, message } => {
+                assert_eq!(row, 0);
+                assert!(
+                    message.contains("single-byte"),
+                    "message should state the single-byte constraint: {message}"
+                );
+                assert!(
+                    message.contains("'id'"),
                     "message should name the field: {message}"
                 );
             }

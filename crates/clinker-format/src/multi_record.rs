@@ -738,6 +738,10 @@ fn resolve_csv(
         let mut fields = Vec::with_capacity(rt.columns.len());
         for (csv_idx, f) in rt.columns.iter().enumerate() {
             reject_record_type_field(&f.name).map_err(|m| FormatError::Csv(csv_error(&m)))?;
+            // A CSV field's `pad` is stripped one character at a time on read,
+            // so it must be a single ASCII byte — the same rule the fixed-width
+            // resolver applies via `ResolvedField::from_column`.
+            field::validate_pad(&f.name, f.pad.as_deref())?;
             let column = builder
                 .intern(f)
                 .map_err(|m| FormatError::Csv(csv_error(&m)))?;
@@ -925,12 +929,14 @@ fn csv_field_text(rec: &csv::StringRecord, idx: usize, tf: &TypeField) -> String
     if !tf.trim {
         return raw.to_string();
     }
-    if tf.pad.is_empty() {
+    // `pad` is at most one character (validated at schema resolution); an empty
+    // pad means "no pad character — whitespace-trim only".
+    let Some(pad_char) = tf.pad.chars().next() else {
         return raw.trim().to_string();
-    }
+    };
     let stripped = match tf.justify {
-        Some(Justify::Right) => raw.trim_start_matches(tf.pad.as_str()),
-        Some(Justify::Left) | None => raw.trim_end_matches(tf.pad.as_str()),
+        Some(Justify::Right) => raw.trim_start_matches(pad_char),
+        Some(Justify::Left) | None => raw.trim_end_matches(pad_char),
     };
     stripped.trim().to_string()
 }
@@ -1294,16 +1300,22 @@ mod tests {
     }
 
     #[test]
-    fn multi_char_pad_is_stripped_as_a_unit() {
-        // A left-justified field padded with the multi-char string "ab":
-        // "42abab" strips trailing "ab" runs as a unit → "42". The old reader
-        // honored only the first pad char, so a multi-char pad leaked.
+    fn multi_char_pad_is_rejected_at_construction() {
+        // The pad contract is single-byte end-to-end (#806): a multi-character
+        // pad has no clean single-byte round-trip, so it is rejected at field
+        // resolution rather than honored as a multi-char strip unit.
         let mut field = fw_field("v", 0, 6, Type::Int);
         field.justify = Some(Justify::Left);
         field.pad = Some("ab".into());
-        let resolved = ResolvedField::from_column(&field).unwrap();
-        let v = field::extract_value(&resolved, b"42abab", 1).unwrap();
-        assert_eq!(v, Value::Integer(42));
+        let err = ResolvedField::from_column(&field).unwrap_err();
+        match err {
+            FormatError::InvalidRecord { row, message } => {
+                assert_eq!(row, 0);
+                assert!(message.contains("single-byte"), "{message}");
+                assert!(message.contains("'v'"), "{message}");
+            }
+            other => panic!("expected InvalidRecord, got {other:?}"),
+        }
     }
 
     #[test]

@@ -61,6 +61,11 @@ impl ResolvedField {
             .checked_add(width)
             .ok_or_else(|| invalid_field(&f.name, "'start' + width overflows"))?;
 
+        // The reader strips `pad` a single character at a time, and the writer
+        // fills exact byte widths with it, so both sides require a single-byte
+        // pad — enforced here at construction, mirroring the writer's guard.
+        validate_pad(&f.name, f.pad.as_deref())?;
+
         Ok(ResolvedField {
             name: f.name.clone(),
             start,
@@ -298,23 +303,49 @@ pub fn field_text(field: &ResolvedField, line: &[u8], row: u64) -> Result<String
 
 /// Strip a field's padding and surrounding whitespace per its justification.
 ///
-/// A right-justified field strips leading pad runs; a left-justified (default)
-/// field strips trailing pad runs. The full multi-character `pad` string is
-/// stripped as a unit — a `pad: "0 "` strips `"0 "` runs, not just `'0'` —
-/// before a final whitespace trim. With `trim: false` the raw slice is
-/// returned verbatim.
+/// A right-justified field strips leading pad; a left-justified (default) field
+/// strips trailing pad. `pad` is a single ASCII byte (enforced at construction
+/// by [`validate_pad`]), so this trims that one character, then applies a final
+/// whitespace trim. An empty `pad` trims whitespace only. With `trim: false`
+/// the raw slice is returned verbatim.
 pub fn strip_padding<'a>(raw: &'a str, field: &ResolvedField) -> &'a str {
     if !field.trim {
         return raw;
     }
-    if field.pad.is_empty() {
+    // `pad` is at most one character (validated at construction); an empty pad
+    // means "no pad character — whitespace-trim only".
+    let Some(pad_char) = field.pad.chars().next() else {
         return raw.trim();
-    }
+    };
     let stripped = match field.justify {
-        Some(Justify::Right) => raw.trim_start_matches(field.pad.as_str()),
-        Some(Justify::Left) | None => raw.trim_end_matches(field.pad.as_str()),
+        Some(Justify::Right) => raw.trim_start_matches(pad_char),
+        Some(Justify::Left) | None => raw.trim_end_matches(pad_char),
     };
     stripped.trim()
+}
+
+/// Validate a declared fixed-width / positional `pad`: it must be a single
+/// ASCII byte so padding fills exact byte widths on write and strips as a
+/// single character on read. An absent or empty pad is accepted — it defaults
+/// to a space on write and whitespace-trims on read. A multi-byte character
+/// (e.g. `·`) or a multi-character pad (e.g. `"0 "`) is rejected at
+/// construction: neither fills a one-byte cell, and a multi-character pad has
+/// no clean single-byte round-trip. Format-neutral (shared by the fixed-width
+/// and CSV positional field resolvers), so the message names no one format.
+pub(crate) fn validate_pad(name: &str, pad: Option<&str>) -> Result<(), FormatError> {
+    if let Some(p) = pad
+        && !p.is_empty()
+        && p.len() != 1
+    {
+        return Err(FormatError::InvalidRecord {
+            row: 0,
+            message: format!(
+                "field '{name}': `pad` must be a single-byte (ASCII) character so padding \
+                 fills exact byte widths and strips as a single character (got {p:?})"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Parse a field's stripped text into its declared [`Value`] type.
@@ -440,7 +471,67 @@ pub(crate) fn invalid_field(name: &str, problem: &str) -> FormatError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::Column;
     use chrono::NaiveDate;
+
+    fn pad_column(name: &str, pad: &str) -> Column {
+        Column {
+            start: Some(0),
+            width: Some(6),
+            pad: Some(pad.into()),
+            ..Column::bare(name, Type::String)
+        }
+    }
+
+    /// `ResolvedField::from_column` rejects a declared multi-byte pad (`·` is
+    /// two UTF-8 bytes) at construction — the reader-side half of the
+    /// single-byte-pad contract (#806).
+    #[test]
+    fn from_column_rejects_multi_byte_pad() {
+        let err = ResolvedField::from_column(&pad_column("v", "·")).unwrap_err();
+        match err {
+            FormatError::InvalidRecord { row, message } => {
+                assert_eq!(row, 0);
+                assert!(message.contains("single-byte"), "{message}");
+                assert!(message.contains("'v'"), "{message}");
+            }
+            other => panic!("expected InvalidRecord, got {other:?}"),
+        }
+    }
+
+    /// A multi-CHARACTER ASCII pad (`"0 "`) is likewise rejected at
+    /// construction: the reader once stripped it as a unit, but the contract
+    /// is single-byte end-to-end (#806).
+    #[test]
+    fn from_column_rejects_multi_char_pad() {
+        let err = ResolvedField::from_column(&pad_column("v", "0 ")).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidRecord { row: 0, .. }));
+    }
+
+    /// An absent or empty pad is accepted (whitespace-trim on read).
+    #[test]
+    fn from_column_accepts_absent_and_empty_pad() {
+        assert!(validate_pad("v", None).is_ok());
+        assert!(validate_pad("v", Some("")).is_ok());
+        assert!(validate_pad("v", Some("0")).is_ok());
+    }
+
+    /// A single-character zero pad round-trips through strip: a right-justified
+    /// `"000042"` strips the leading zeros to `"42"`, and a left-justified
+    /// `"42    "` strips trailing spaces — one character at a time, never a
+    /// multi-character unit.
+    #[test]
+    fn single_char_pad_strips_one_character() {
+        let right = ResolvedField::from_column(&Column {
+            justify: Some(Justify::Right),
+            ..pad_column("v", "0")
+        })
+        .unwrap();
+        assert_eq!(strip_padding("000042", &right), "42");
+
+        let left = ResolvedField::from_column(&pad_column("v", " ")).unwrap();
+        assert_eq!(strip_padding("42    ", &left), "42");
+    }
 
     #[test]
     fn coerce_scalar_datetime_honors_format() {
