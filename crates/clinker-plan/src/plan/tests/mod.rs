@@ -4,6 +4,8 @@ mod ck_aligned_partition;
 mod ck_lattice;
 mod combine_body_typed_on_node;
 mod combine_where_scoped_key;
+mod composition_binding_fatal;
+mod composition_source_patch;
 mod config_fold;
 mod cull_reshape_compiled_on_node;
 mod cull_validation;

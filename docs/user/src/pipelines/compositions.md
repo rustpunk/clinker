@@ -17,6 +17,20 @@ A composition node in your pipeline references an external `.comp.yaml` file:
 
 The `use:` field points to the composition definition file. The `config:` block passes parameters that customize the composition's behavior for this specific invocation.
 
+### Resolving the `use:` path
+
+A `use:` value names a `.comp.yaml` in the workspace. It is resolved
+relative to the directory of the pipeline file being compiled, then
+against the set of `.comp.yaml` files discovered under the workspace root,
+finally falling back to a filename match. A `use:` that resolves to no
+`.comp.yaml` — a typo, a wrong relative prefix, or a file that does not
+exist — fails compilation with a spanned `E103` diagnostic naming the
+composition node. The whole run aborts loudly; it does not silently drop
+the composition and write an empty output. The same holds for the other
+composition-binding errors (`E102`–`E109`): an ill-bound call site fails
+compile rather than producing a run that writes zero records. Run
+`clinker explain --code E103` for details.
+
 ## Composition definition file
 
 A `.comp.yaml` file declares the composition's interface -- what fields it requires from upstream and what fields it produces:
