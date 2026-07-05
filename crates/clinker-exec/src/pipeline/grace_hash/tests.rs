@@ -142,6 +142,7 @@ fn pipeline_temp_dir_owns_spill_files_on_drop() {
         pipeline_dir.path(),
         crate::pipeline::memory::ConsumerHandle::new(),
         true,
+        "grace_test",
     )
     .unwrap();
     let schema = schema_with(&["k"]);
@@ -149,7 +150,7 @@ fn pipeline_temp_dir_owns_spill_files_on_drop() {
     let rec = record_for(&schema, vec![Value::Integer(7)]);
     let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
     exec.add_build_record(rec, 0, &budget).unwrap();
-    exec.spill_partition(0).unwrap();
+    exec.spill_partition(0, &budget).unwrap();
     let spilled_inside = std::fs::read_dir(&pipeline_path).unwrap().count();
     assert!(spilled_inside >= 1, "spill_partition must commit a file");
     drop(exec);
@@ -181,13 +182,14 @@ fn pipeline_temp_dir_cleans_on_panic_unwind() {
             pipeline_dir.path(),
             crate::pipeline::memory::ConsumerHandle::new(),
             true,
+            "grace_test",
         )
         .unwrap();
         let schema = schema_with(&["k"]);
         let rec = record_for(&schema, vec![Value::Integer(99)]);
         let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
         exec.add_build_record(rec, 0, &budget).unwrap();
-        exec.spill_partition(0).unwrap();
+        exec.spill_partition(0, &budget).unwrap();
         panic!("simulated mid-spill panic");
     }));
     assert!(result.is_err(), "panic must propagate out");
@@ -212,6 +214,7 @@ fn spill_activates_under_tiny_budget() {
         dir.path(),
         crate::pipeline::memory::ConsumerHandle::new(),
         true,
+        "grace_test",
     )
     .unwrap();
     let budget = tiny_budget();
@@ -253,7 +256,8 @@ fn spill_activates_on_charged_bytes_without_rss() {
         .tempdir()
         .unwrap();
     let consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-    let mut exec = GraceHashExecutor::new(4, dir.path(), consumer_handle.clone(), true).unwrap();
+    let mut exec =
+        GraceHashExecutor::new(4, dir.path(), consumer_handle.clone(), true, "grace_test").unwrap();
 
     // 1 GiB hard limit → 800 MiB soft limit, above any host's test RSS,
     // so the RSS arm of `should_spill` cannot trip. Register the handle so
@@ -305,6 +309,7 @@ fn lazy_probe_spill_routes_to_partition_file() {
         dir.path(),
         crate::pipeline::memory::ConsumerHandle::new(),
         true,
+        "grace_test",
     )
     .unwrap();
     let budget = tiny_budget();
@@ -330,7 +335,7 @@ fn lazy_probe_spill_routes_to_partition_file() {
         .unwrap();
     assert!(matches!(outcome, ProbeOutcome::Spilled));
 
-    exec.finalize_probe_spills().unwrap();
+    exec.finalize_probe_spills(&budget).unwrap();
     match &exec.partitions[0] {
         PartitionState::OnDisk {
             probe_files,
@@ -980,6 +985,375 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
     );
 }
 
+/// Per-commit enforcement on the build-side eviction path: a 1-byte cap
+/// trips `spill_largest_building` -> `spill_partition` at the FIRST
+/// partition it evicts, aborting mid-build rather than after the whole
+/// build stream has been drained (the phase-boundary bug). At the method
+/// boundary the old code returned `Ok` on every record and only the
+/// driver's phase-end tally could fail; now the commit itself fails.
+#[test]
+fn build_eviction_spill_commit_trips_disk_cap_mid_stream() {
+    use crate::pipeline::grace_spill::{GraceSpillError, grace_spill_error};
+
+    let schema = schema_with(&["k", "v"]);
+    let dir = tempfile::Builder::new()
+        .prefix("gh-cap-build-")
+        .tempdir()
+        .unwrap();
+    let mut exec = GraceHashExecutor::new(
+        4,
+        dir.path(),
+        crate::pipeline::memory::ConsumerHandle::new(),
+        true,
+        "join_build",
+    )
+    .unwrap();
+
+    // Tiny soft limit so `should_spill` fires continuously; 1-byte cap so
+    // the first eviction commit overshoots; hard limit huge so
+    // `should_abort` never fires.
+    let budget = tiny_budget();
+    budget.set_max_spill_bytes(1);
+
+    let total = 4096usize;
+    let mut fed = 0usize;
+    let mut hit: Option<GraceSpillError> = None;
+    for i in 0..total as i64 {
+        let rec = record_for(
+            &schema,
+            vec![
+                Value::Integer(i),
+                Value::String(format!("row-{i:08}-pad-pad-pad").into()),
+            ],
+        );
+        let hash = (i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        match exec.add_build_record(rec, hash, &budget) {
+            Ok(()) => fed += 1,
+            Err(e) => {
+                hit = Some(e);
+                break;
+            }
+        }
+    }
+
+    let err = hit.expect("1-byte cap must abort the build-side eviction");
+    match &err {
+        GraceSpillError::CapExceeded {
+            attempted,
+            cap,
+            cumulative,
+        } => {
+            assert!(
+                *attempted > 0,
+                "the overflowing commit must report its size"
+            );
+            assert_eq!(*cap, 1, "cap must equal the configured quota");
+            assert!(
+                *cumulative > *cap,
+                "cumulative ({cumulative}) must exceed cap ({cap})"
+            );
+        }
+        other => panic!("build eviction overshoot must surface CapExceeded; got {other:?}"),
+    }
+
+    // Per-commit, not phase-boundary: the abort landed before the whole
+    // 4096-record stream was consumed.
+    assert!(
+        fed < total,
+        "cap must abort mid-stream, not after the full feed ({fed} of {total})"
+    );
+
+    // Exactly one commit was charged — the crossing eviction — and it was
+    // attributed to the executor's stage name. A phase-boundary check
+    // would instead have let every partition's eviction accumulate first.
+    let per_stage = budget.per_stage_spill_bytes();
+    assert_eq!(
+        per_stage.len(),
+        1,
+        "only the single crossing commit should be charged, got {per_stage:?}"
+    );
+    assert_eq!(
+        budget.cumulative_spill_bytes(),
+        per_stage["join_build"],
+        "cumulative must equal the single crossing commit's bytes"
+    );
+
+    // Field-destructure of the mapped E320 surface, mirroring the driver's
+    // `grace_spill_error` mapping.
+    match grace_spill_error(err, "join_build", "build add") {
+        PipelineError::SpillCapExceeded {
+            node,
+            cap,
+            attempted,
+            current,
+        } => {
+            assert_eq!(node, "join_build");
+            assert_eq!(cap, 1);
+            assert!(attempted > 0);
+            assert!(current > cap);
+        }
+        other => panic!("mapper must yield SpillCapExceeded; got {other:?}"),
+    }
+}
+
+/// Per-commit enforcement on the build-side OnDisk immediate-write path:
+/// once a partition is already spilled, each subsequent record streams to
+/// its own file and must charge the cap on that commit. A 1-byte cap trips
+/// on the FIRST such record rather than accumulating a fresh file per row
+/// until the phase ends.
+#[test]
+fn build_ondisk_immediate_write_commit_trips_disk_cap() {
+    use crate::pipeline::grace_spill::{GraceSpillError, grace_spill_error};
+
+    let schema = schema_with(&["k", "v"]);
+    let dir = tempfile::Builder::new()
+        .prefix("gh-cap-ondisk-")
+        .tempdir()
+        .unwrap();
+    let mut exec = GraceHashExecutor::new(
+        4,
+        dir.path(),
+        crate::pipeline::memory::ConsumerHandle::new(),
+        true,
+        "join_ondisk",
+    )
+    .unwrap();
+
+    // A budget that does NOT auto-spill (soft limit ~8 GiB) so the test
+    // controls exactly when a commit happens; the cap starts unlimited so
+    // the manual pre-spill lands without tripping.
+    let budget = MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+
+    // Top 4 bits select the partition under 4 hash-bits; 0x0…1 -> 0.
+    let hash_p0 = 0x0000_0000_0000_0001u64;
+    // Seed partition 0 and drive it OnDisk by hand — no cap trip yet.
+    exec.add_build_record(
+        record_for(
+            &schema,
+            vec![Value::Integer(0), Value::String("seed".into())],
+        ),
+        hash_p0,
+        &budget,
+    )
+    .unwrap();
+    exec.spill_partition(0, &budget).unwrap();
+    assert!(
+        matches!(exec.partitions[0], PartitionState::OnDisk { .. }),
+        "manual spill must place partition 0 on disk"
+    );
+    let after_pre_spill = budget.cumulative_spill_bytes();
+    assert!(after_pre_spill > 0, "pre-spill must have committed a file");
+
+    // Clamp the cap to 1 byte. The next record routed to the OnDisk
+    // partition streams straight to a fresh file and charges on commit,
+    // which must trip immediately.
+    budget.set_max_spill_bytes(1);
+
+    let total = 8usize;
+    let mut fed = 0usize;
+    let mut hit: Option<GraceSpillError> = None;
+    for i in 1..=total as i64 {
+        let rec = record_for(
+            &schema,
+            vec![Value::Integer(i), Value::String(format!("row-{i}").into())],
+        );
+        match exec.add_build_record(rec, hash_p0, &budget) {
+            Ok(()) => fed += 1,
+            Err(e) => {
+                hit = Some(e);
+                break;
+            }
+        }
+    }
+
+    let err = hit.expect("1-byte cap must abort the OnDisk immediate write");
+    match &err {
+        GraceSpillError::CapExceeded {
+            attempted,
+            cap,
+            cumulative,
+        } => {
+            assert!(
+                *attempted > 0,
+                "the immediate-write commit must report its size"
+            );
+            assert_eq!(*cap, 1);
+            assert!(
+                *cumulative > *cap,
+                "cumulative ({cumulative}) must exceed cap ({cap})"
+            );
+            assert!(
+                *cumulative > after_pre_spill,
+                "the immediate-write commit must add to the pre-spill total"
+            );
+        }
+        other => panic!("OnDisk immediate write overshoot must surface CapExceeded; got {other:?}"),
+    }
+    assert_eq!(
+        fed, 0,
+        "the FIRST OnDisk record must trip the cap, before the rest of the stream"
+    );
+
+    match grace_spill_error(err, "join_ondisk", "build write") {
+        PipelineError::SpillCapExceeded {
+            node,
+            cap,
+            attempted,
+            current,
+        } => {
+            assert_eq!(node, "join_ondisk");
+            assert_eq!(cap, 1);
+            assert!(attempted > 0);
+            assert!(current > cap);
+        }
+        other => panic!("mapper must yield SpillCapExceeded; got {other:?}"),
+    }
+}
+
+/// Per-commit enforcement on the probe-finalize path: each partition's
+/// buffered probe writer is committed and charged in turn, so a 1-byte cap
+/// trips on the FIRST partition finalized and leaves later partitions'
+/// writers unflushed — rather than finalizing every open writer and only
+/// then checking the total.
+#[test]
+fn probe_finalize_spill_commit_trips_disk_cap_per_partition() {
+    use crate::pipeline::grace_spill::{GraceSpillError, grace_spill_error};
+
+    let schema = schema_with(&["k"]);
+    let dir = tempfile::Builder::new()
+        .prefix("gh-cap-probe-")
+        .tempdir()
+        .unwrap();
+    let mut exec = GraceHashExecutor::new(
+        4,
+        dir.path(),
+        crate::pipeline::memory::ConsumerHandle::new(),
+        true,
+        "join_probe",
+    )
+    .unwrap();
+    let budget = MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+
+    // Top 4 bits select the partition: 0x0…1 -> 0, 0x1000… -> 1.
+    let hash_p0 = 0x0000_0000_0000_0001u64;
+    let hash_p1 = 0x1000_0000_0000_0000u64;
+
+    // Drive partitions 0 and 1 OnDisk by hand (cap unlimited during build).
+    exec.add_build_record(
+        record_for(&schema, vec![Value::Integer(0)]),
+        hash_p0,
+        &budget,
+    )
+    .unwrap();
+    exec.add_build_record(
+        record_for(&schema, vec![Value::Integer(1)]),
+        hash_p1,
+        &budget,
+    )
+    .unwrap();
+    exec.spill_partition(0, &budget).unwrap();
+    exec.spill_partition(1, &budget).unwrap();
+    assert!(matches!(exec.partitions[0], PartitionState::OnDisk { .. }));
+    assert!(matches!(exec.partitions[1], PartitionState::OnDisk { .. }));
+
+    // Route a probe record into each OnDisk partition — buffered in the
+    // partition's probe writer, not yet committed to disk.
+    assert!(matches!(
+        exec.probe_record(
+            &record_for(&schema, vec![Value::Integer(10)]),
+            &[Value::Integer(10)],
+            hash_p0
+        )
+        .unwrap(),
+        ProbeOutcome::Spilled
+    ));
+    assert!(matches!(
+        exec.probe_record(
+            &record_for(&schema, vec![Value::Integer(20)]),
+            &[Value::Integer(20)],
+            hash_p1
+        )
+        .unwrap(),
+        ProbeOutcome::Spilled
+    ));
+
+    // Clamp the cap; finalize must commit each probe file and trip on the
+    // first partition, leaving the later partition's writer open.
+    budget.set_max_spill_bytes(1);
+    let err = exec
+        .finalize_probe_spills(&budget)
+        .expect_err("1-byte cap must abort probe finalize");
+    match &err {
+        GraceSpillError::CapExceeded {
+            attempted,
+            cap,
+            cumulative,
+        } => {
+            assert!(
+                *attempted > 0,
+                "the finalized probe file must report its size"
+            );
+            assert_eq!(*cap, 1);
+            assert!(
+                *cumulative > *cap,
+                "cumulative ({cumulative}) must exceed cap ({cap})"
+            );
+        }
+        other => panic!("probe finalize overshoot must surface CapExceeded; got {other:?}"),
+    }
+
+    // Per-commit early abort: exactly one probe writer was finalized (its
+    // file committed) and the other partition's writer is still open,
+    // untouched after the loop returned on the first crossing.
+    let committed = exec
+        .partitions
+        .iter()
+        .filter(|p| {
+            matches!(
+                p,
+                PartitionState::OnDisk { probe_writer: None, probe_files, .. }
+                    if !probe_files.is_empty()
+            )
+        })
+        .count();
+    let open = exec
+        .partitions
+        .iter()
+        .filter(|p| {
+            matches!(
+                p,
+                PartitionState::OnDisk {
+                    probe_writer: Some(_),
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(
+        committed, 1,
+        "only the crossing partition's probe file was committed"
+    );
+    assert_eq!(
+        open, 1,
+        "the later partition's probe writer stays open — finalize aborted mid-stream"
+    );
+
+    match grace_spill_error(err, "join_probe", "probe finalize") {
+        PipelineError::SpillCapExceeded {
+            node,
+            cap,
+            attempted,
+            current,
+        } => {
+            assert_eq!(node, "join_probe");
+            assert_eq!(cap, 1);
+            assert!(attempted > 0);
+            assert!(current > cap);
+        }
+        other => panic!("mapper must yield SpillCapExceeded; got {other:?}"),
+    }
+}
+
 /// Round-trip records through the spill writer/reader by calling
 /// `add_build_record`, `spill_largest_building`, then reloading via
 /// `drain_spilled` + `GraceSpillReader`.
@@ -995,6 +1369,7 @@ fn build_spill_reload_records_match() {
         dir.path(),
         crate::pipeline::memory::ConsumerHandle::new(),
         true,
+        "grace_test",
     )
     .unwrap();
     let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy)); // never spills via budget
@@ -1011,7 +1386,7 @@ fn build_spill_reload_records_match() {
     }
     // Force-spill every partition.
     for idx in 0..exec.partitions.len() {
-        let _ = exec.spill_partition(idx);
+        let _ = exec.spill_partition(idx, &budget);
     }
     let spilled = exec.drain_spilled();
     let mut reloaded: Vec<Record> = Vec::new();

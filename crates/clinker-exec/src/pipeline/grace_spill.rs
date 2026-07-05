@@ -162,6 +162,20 @@ pub(crate) enum GraceSpillError {
     /// A byte-stream fault during write/finalize, or an internal
     /// state-machine violation surfaced as an `io::Error`.
     Io(std::io::Error),
+    /// The cumulative on-disk spill total crossed the configured
+    /// `[storage.spill] max_bytes` quota when this commit's bytes were
+    /// charged. Distinct from [`Self::DiskFull`]: the volume still has
+    /// room, but the run's own policy ceiling was reached. `attempted` is
+    /// this commit's byte count, `cap` the configured quota, and
+    /// `cumulative` the running total after the charge. The mapper turns it
+    /// into the E320 `SpillCapExceeded` surface so the run aborts at the
+    /// commit that crossed the cap rather than after the whole phase has
+    /// finished writing.
+    CapExceeded {
+        attempted: u64,
+        cap: u64,
+        cumulative: u64,
+    },
 }
 
 impl From<std::io::Error> for GraceSpillError {
@@ -194,13 +208,19 @@ impl GraceSpillWriter {
 /// A mid-run directory fault or a full-volume fault becomes
 /// `PipelineError::Spill`, so it renders with the same `DirUnavailable` /
 /// `DiskFull` diagnostic the node-buffer, sort, and aggregate spill paths
-/// emit; a genuine byte fault or state-machine violation becomes
+/// emit; a disk-quota overshoot becomes `PipelineError::SpillCapExceeded`
+/// (E320); a genuine byte fault or state-machine violation becomes
 /// `PipelineError::Internal`.
 pub(crate) fn grace_spill_error(e: GraceSpillError, node: &str, detail: &str) -> PipelineError {
     match e {
         GraceSpillError::DirUnavailable(spill) | GraceSpillError::DiskFull(spill) => {
             PipelineError::Spill(spill)
         }
+        GraceSpillError::CapExceeded {
+            attempted,
+            cap,
+            cumulative,
+        } => PipelineError::spill_cap_exceeded(node, cap, attempted, cumulative),
         GraceSpillError::Io(io) => PipelineError::Internal {
             op: "combine",
             node: node.to_string(),
