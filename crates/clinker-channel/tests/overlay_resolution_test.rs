@@ -26,7 +26,7 @@ use clinker_core_types::{Diagnostic, Severity};
 use clinker_plan::config::composition::LayerKind;
 use clinker_plan::config::{
     ChannelLayout, CompileContext, GroupLayout, InputFormat, PipelineConfig, ShardScheme,
-    apply_source_patches,
+    SourceSchema, apply_source_patches,
 };
 use clinker_plan::plan::CompiledPlan;
 use clinker_record::Value;
@@ -881,6 +881,92 @@ fn per_target_source_schema_patch_applies() {
             .expect("per-target overlay present")
             .is_empty()
     );
+}
+
+/// A multi-record fixed-width pipeline whose source node identity (`ledger`)
+/// matches the channel patch target below. Kept separate from `BASE_PIPELINE`
+/// (single-record CSV) because `records:` / `discriminator:` ops apply only to
+/// a multi-record schema.
+const MULTI_RECORD_PIPELINE: &str = r#"
+pipeline:
+  name: ledger_import
+nodes:
+  - type: source
+    name: ledger
+    config:
+      name: ledger
+      type: fixed_width
+      path: ledger.dat
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - { id: detail, tag: D, columns: [ { name: amount, type: int, start: 1, width: 9 } ] }
+          - { id: trailer, tag: T, columns: [ { name: count, type: int, start: 1, width: 9 } ] }
+  - type: output
+    name: out
+    input: ledger
+    config: { name: out, type: csv, path: out.csv }
+"#;
+
+#[test]
+fn per_target_source_multi_record_patch_applies() {
+    // A channel `sources:` block carrying `records:` / `discriminator:` ops
+    // resolves through the overlay carrier into a typed patch and reshapes a
+    // multi-record source's discriminator and record types.
+    let ws = workspace();
+    write(
+        &ws.path().join("channel/mrpatch/base.channel.yaml"),
+        &per_target_overlay(
+            "sources:\n  ledger:\n    discriminator: { start: 2 }\n    records:\n      detail: { tag: X }\n      trailer: remove\n      header: { add: { tag: H, columns: [ { name: hdr_id, type: string, start: 1, width: 8 } ] } }\n",
+        ),
+    );
+
+    let res = resolve(
+        ws.path(),
+        &channel_layout(),
+        &group_layout(),
+        "base",
+        Some("mrpatch"),
+        &[],
+        true,
+    )
+    .expect("resolve");
+    let patches = res
+        .source_patches()
+        .expect("per-target overlay carries patches");
+    assert!(!patches.is_empty(), "sources: block yields a patch");
+
+    let mut config: PipelineConfig =
+        clinker_plan::yaml::from_str(MULTI_RECORD_PIPELINE).expect("parse multi-record pipeline");
+    apply_source_patches(&mut config, patches).expect("apply source patches");
+
+    let body = config.source_bodies().next().expect("one source");
+    match &body.schema {
+        SourceSchema::MultiRecord {
+            discriminator,
+            record_types,
+            ..
+        } => {
+            // Discriminator merge kept the base width and moved the start.
+            assert_eq!(discriminator.start, Some(2));
+            assert_eq!(discriminator.width, Some(1));
+            // `detail` retagged, `trailer` dropped, `header` added.
+            let ids: Vec<&str> = record_types.iter().map(|rt| rt.id.as_str()).collect();
+            assert_eq!(ids, vec!["detail", "header"]);
+            let detail = record_types
+                .iter()
+                .find(|rt| rt.id == "detail")
+                .expect("detail present");
+            assert_eq!(detail.tag, "X");
+            let header = record_types
+                .iter()
+                .find(|rt| rt.id == "header")
+                .expect("header added");
+            assert_eq!(header.tag, "H");
+            assert_eq!(header.columns[0].name, "hdr_id");
+        }
+        other => panic!("expected multi-record schema, got {other:?}"),
+    }
 }
 
 #[test]

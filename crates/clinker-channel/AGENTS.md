@@ -12,7 +12,7 @@ Root `AGENTS.md` still applies. This file adds local guidance for `clinker-chann
 - Derive matching groups for a channel from its manifest `labels` via CXL boolean selectors, ordered by priority.
 - Resolve the four-layer overlay stack (`PipelineDefault < Group(s) < ChannelWide < ChannelPerTarget`) into one `OverlayResolution`: a structural `overrides:` op stream (applied pre-compile via `CompileContext::overlay_ops`) plus a `config`/`vars` value clobber (applied post-compile over the plan's provenance).
 - Validate `DottedPath` config keys and resolve channel `vars:` overrides/adds for `$vars`, `$pipeline`, `$source`, and `$record`.
-- Carry per-target `sources:` config patches (schema / array_paths / options) for `apply_source_patches`.
+- Carry per-target `sources:` config patches (schema / array_paths / options / group_section / set_section / split_fields / records / discriminator) for `apply_source_patches`.
 - Stamp `ChannelIdentity` on compiled plans.
 - Stage selected source files to local disk with stable cache paths, manifests, locks, reuse, cleanup, and crash purge.
 
