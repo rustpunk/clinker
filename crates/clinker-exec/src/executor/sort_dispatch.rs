@@ -90,7 +90,7 @@ pub(crate) fn dispatch_sort(
     let spill_compress = ctx
         .spill_compress
         .resolve_for_schema(schema.column_count(), ctx.batch_size as u64);
-    let mut buf: SortBuffer<u64> = SortBuffer::new(
+    let buf: SortBuffer<u64> = SortBuffer::new(
         sort_fields.clone(),
         mem_limit,
         Some(ctx.spill_root_path.to_path_buf()),
@@ -100,28 +100,18 @@ pub(crate) fn dispatch_sort(
 
     let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
     let sort_count = input_records.len() as u64;
-    // CPU-bound: sort buffer push + per-batch comparison + spill
-    // I/O. The kernel owns its input (`input_records`, `buf`) and
-    // borrows nothing from `ctx`, so it runs on the shared Rayon
-    // pool; output order is fully determined by the sort itself,
-    // so pool scheduling cannot perturb it.
-    let sorted = ctx.kernel_pool.install(|| {
-        for (record, row_num) in input_records {
-            buf.push(record, row_num);
-            if buf.should_spill() {
-                buf.sort_and_spill().map_err(|e| {
-                    PipelineError::Io(std::io::Error::other(format!(
-                        "sort enforcer '{name}' spill failed: {e}"
-                    )))
-                })?;
-            }
-        }
-        buf.finish().map_err(|e| {
-            PipelineError::Io(std::io::Error::other(format!(
-                "sort enforcer '{name}' finish failed: {e}"
-            )))
-        })
-    })?;
+    // Cloned out of `ctx` so the kernel closure owns it: every spilled run
+    // (including the residue `finish` flushes) is charged against the disk
+    // quota, aborting with E320 the moment the cumulative total crosses
+    // `storage.spill.disk_cap_bytes`.
+    let budget = std::sync::Arc::clone(&ctx.memory_budget);
+    // CPU-bound: sort buffer push + per-batch comparison + spill I/O. The
+    // kernel owns its input (`input_records`, `buf`, `budget`) and borrows
+    // nothing from `ctx`, so it runs on the shared Rayon pool; output order is
+    // fully determined by the sort itself, so pool scheduling cannot perturb it.
+    let sorted = ctx
+        .kernel_pool
+        .install(move || drain_into_sort_buffer(buf, input_records, name, &budget))?;
 
     // Individually-sorted runs from `SortBuffer` are folded into one globally
     // ordered run through the same LoserTree k-way merge that aggregation spill
@@ -144,6 +134,59 @@ pub(crate) fn dispatch_sort(
     )?;
     ctx.node_buffers.insert(node_idx, nb);
 
+    Ok(())
+}
+
+/// Drain `input` into `buf`, spilling sorted runs when the buffer exceeds its
+/// budget and charging every spilled run — including the residue flushed by
+/// `finish` — against the arbitrator's disk quota. Returns the buffer's sorted
+/// output, or [`PipelineError::SpillCapExceeded`] (E320) when a spilled run
+/// crosses the configured `storage.spill.disk_cap_bytes`.
+///
+/// CPU-bound: the per-run sort runs on the caller's Rayon pool.
+fn drain_into_sort_buffer(
+    mut buf: crate::pipeline::sort_buffer::SortBuffer<u64>,
+    input: Vec<(Record, u64)>,
+    node_name: &str,
+    budget: &crate::pipeline::memory::MemoryArbitrator,
+) -> Result<crate::pipeline::sort_buffer::SortedOutput<u64>, PipelineError> {
+    for (record, row_num) in input {
+        buf.push(record, row_num);
+        if buf.should_spill() {
+            let written = buf.sort_and_spill().map_err(|e| {
+                PipelineError::Io(std::io::Error::other(format!(
+                    "sort enforcer '{node_name}' spill failed: {e}"
+                )))
+            })?;
+            charge_enforcer_spill(budget, node_name, written)?;
+        }
+    }
+    let (sorted, residue) = buf.finish().map_err(|e| {
+        PipelineError::Io(std::io::Error::other(format!(
+            "sort enforcer '{node_name}' finish failed: {e}"
+        )))
+    })?;
+    charge_enforcer_spill(budget, node_name, residue)?;
+    Ok(sorted)
+}
+
+/// Charge `written` spilled bytes for `node_name` against the disk quota,
+/// returning [`PipelineError::SpillCapExceeded`] (E320) once the running
+/// cumulative total crosses `storage.spill.disk_cap_bytes`. A zero-byte write
+/// (nothing flushed) charges nothing.
+fn charge_enforcer_spill(
+    budget: &crate::pipeline::memory::MemoryArbitrator,
+    node_name: &str,
+    written: u64,
+) -> Result<(), PipelineError> {
+    if written > 0 && budget.record_spill_bytes(node_name, written) {
+        return Err(PipelineError::spill_cap_exceeded(
+            node_name.to_string(),
+            budget.max_spill_bytes(),
+            written,
+            budget.cumulative_spill_bytes(),
+        ));
+    }
     Ok(())
 }
 
@@ -312,7 +355,7 @@ mod tests {
         buf.push(rec(&schema, 40, 6), 6);
         buf.sort_and_spill().unwrap();
 
-        let files = match buf.finish().unwrap() {
+        let files = match buf.finish().unwrap().0 {
             SortedOutput::Spilled(files) => {
                 assert_eq!(files.len(), 3, "three explicit flushes → three runs");
                 files
@@ -362,5 +405,59 @@ mod tests {
         for (record, row_num) in &merged {
             assert_eq!(record.get("id"), Some(&Value::Integer(*row_num as i64)));
         }
+    }
+
+    /// The enforcer sort must abort the spill instead of writing past
+    /// `storage.spill.disk_cap_bytes`: each spilled run is charged against the
+    /// arbitrator's disk quota, and the first run that crosses a one-byte cap
+    /// surfaces E320. Before the fix the enforcer sort never charged the
+    /// arbitrator, so it could spill unbounded regardless of the configured cap.
+    #[test]
+    fn enforcer_sort_spill_past_disk_cap_fails_with_spill_cap_exceeded() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+
+        let schema = schema();
+        let budget = MemoryArbitrator::with_policy(64 * 1024, 0.80, Box::new(NoOpPolicy));
+        budget.set_max_spill_bytes(1);
+        let spill_root = tempfile::tempdir().unwrap();
+        // threshold=1 → every push spills, so the first run already crosses the
+        // one-byte disk cap.
+        let buf: SortBuffer<u64> = SortBuffer::new(
+            sort_by_k_asc(),
+            1,
+            Some(spill_root.path().to_path_buf()),
+            true,
+            schema.clone(),
+        );
+        let input: Vec<(Record, u64)> = (0..6)
+            .map(|i| (rec(&schema, (i as i64 + 1) * 10, i as i64), i))
+            .collect();
+
+        // `SortedOutput` is not `Debug`, so match rather than `expect_err`.
+        let err = match drain_into_sort_buffer(buf, input, "enforce", &budget) {
+            Ok(_) => panic!("a one-byte disk cap must abort the enforcer sort spill"),
+            Err(e) => e,
+        };
+        match err {
+            PipelineError::SpillCapExceeded {
+                node,
+                cap,
+                attempted,
+                current,
+            } => {
+                assert_eq!(node, "enforce");
+                assert_eq!(cap, 1, "reported cap equals the configured quota");
+                assert!(attempted > 0, "the overflowing run reports its size");
+                assert!(
+                    current > cap,
+                    "cumulative spilled ({current}) must exceed the cap ({cap})"
+                );
+            }
+            other => panic!("disk-cap overflow must surface SpillCapExceeded; got {other:?}"),
+        }
+        assert!(
+            budget.cumulative_spill_bytes() > 1,
+            "cumulative_spill_bytes must reflect the overflowing write"
+        );
     }
 }

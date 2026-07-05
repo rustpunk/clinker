@@ -635,6 +635,7 @@ fn execute_combine_sort_merge_with_stats(
             budget,
             spill_compress,
             &consumer_handle,
+            spill_dir,
         )?;
         sort_build_pairs_externally(
             &mut build_pairs,
@@ -643,6 +644,7 @@ fn execute_combine_sort_merge_with_stats(
             budget,
             spill_compress,
             &consumer_handle,
+            spill_dir,
         )?;
         stats.phase_a_sort_invocations = 2;
     } else {
@@ -832,6 +834,7 @@ fn sort_driver_pairs_externally(
     budget: &MemoryArbitrator,
     spill_compress: bool,
     consumer_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
+    spill_dir: &Path,
 ) -> Result<(), PipelineError> {
     if pairs.is_empty() {
         return Ok(());
@@ -861,7 +864,7 @@ fn sort_driver_pairs_externally(
     let mut buf: SortBuffer<RecordOrder> = SortBuffer::new(
         vec![sort_field],
         spill_threshold,
-        None,
+        Some(spill_dir.to_path_buf()),
         spill_compress,
         schema,
     );
@@ -883,21 +886,37 @@ fn sort_driver_pairs_externally(
         local_charged = local_charged.saturating_add(delta);
         if buf.should_spill() {
             let pre_spill = buf.bytes_used() as u64;
-            buf.sort_and_spill().map_err(|e| {
+            let written = buf.sort_and_spill().map_err(|e| {
                 PipelineError::Io(std::io::Error::other(format!(
                     "sort-merge driver phase A spill failed: {e}"
                 )))
             })?;
             consumer_handle.sub_bytes(pre_spill);
             local_charged = local_charged.saturating_sub(pre_spill);
+            if written > 0 && budget.record_spill_bytes(name, written) {
+                return Err(PipelineError::spill_cap_exceeded(
+                    name,
+                    budget.disk_quota(),
+                    written,
+                    budget.cumulative_spill_bytes(),
+                ));
+            }
         }
     }
 
-    let sorted = buf.finish().map_err(|e| {
+    let (sorted, residue) = buf.finish().map_err(|e| {
         PipelineError::Io(std::io::Error::other(format!(
             "sort-merge driver phase A finish failed: {e}"
         )))
     })?;
+    if residue > 0 && budget.record_spill_bytes(name, residue) {
+        return Err(PipelineError::spill_cap_exceeded(
+            name,
+            budget.disk_quota(),
+            residue,
+            budget.cumulative_spill_bytes(),
+        ));
+    }
 
     match sorted {
         SortedOutput::InMemory(out) => {
@@ -966,6 +985,7 @@ fn sort_build_pairs_externally(
     budget: &MemoryArbitrator,
     spill_compress: bool,
     consumer_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
+    spill_dir: &Path,
 ) -> Result<(), PipelineError> {
     if pairs.is_empty() {
         return Ok(());
@@ -989,7 +1009,7 @@ fn sort_build_pairs_externally(
     let mut buf: SortBuffer<()> = SortBuffer::new(
         vec![sort_field],
         spill_threshold,
-        None,
+        Some(spill_dir.to_path_buf()),
         spill_compress,
         schema,
     );
@@ -1004,21 +1024,37 @@ fn sort_build_pairs_externally(
         local_charged = local_charged.saturating_add(delta);
         if buf.should_spill() {
             let pre_spill = buf.bytes_used() as u64;
-            buf.sort_and_spill().map_err(|e| {
+            let written = buf.sort_and_spill().map_err(|e| {
                 PipelineError::Io(std::io::Error::other(format!(
                     "sort-merge build phase A spill failed: {e}"
                 )))
             })?;
             consumer_handle.sub_bytes(pre_spill);
             local_charged = local_charged.saturating_sub(pre_spill);
+            if written > 0 && budget.record_spill_bytes(name, written) {
+                return Err(PipelineError::spill_cap_exceeded(
+                    name,
+                    budget.disk_quota(),
+                    written,
+                    budget.cumulative_spill_bytes(),
+                ));
+            }
         }
     }
 
-    let sorted = buf.finish().map_err(|e| {
+    let (sorted, residue) = buf.finish().map_err(|e| {
         PipelineError::Io(std::io::Error::other(format!(
             "sort-merge build phase A finish failed: {e}"
         )))
     })?;
+    if residue > 0 && budget.record_spill_bytes(name, residue) {
+        return Err(PipelineError::spill_cap_exceeded(
+            name,
+            budget.disk_quota(),
+            residue,
+            budget.cumulative_spill_bytes(),
+        ));
+    }
 
     match sorted {
         SortedOutput::InMemory(out) => {
@@ -2182,5 +2218,136 @@ mod tests {
             records_b.is_empty(),
             "empty outer side must emit zero records; got: {records_b:?}"
         );
+    }
+
+    /// Build `n` phase A driver pairs whose sort key `k` is an Integer and
+    /// whose wide `pad` column pushes the accumulated buffer past the phase A
+    /// 16 KiB spill-threshold floor after a handful of records.
+    fn phase_a_driver_pairs(n: usize) -> Vec<(Record, RecordOrder, Value)> {
+        let schema = schema_with(&["k", "pad"]);
+        let pad = "x".repeat(1024);
+        (0..n)
+            .map(|i| {
+                let r = rec(
+                    &schema,
+                    vec![Value::Integer(i as i64), Value::String(pad.as_str().into())],
+                );
+                (r, i as RecordOrder, Value::Integer(i as i64))
+            })
+            .collect()
+    }
+
+    /// Phase A driver external sort must charge each spilled run against the
+    /// disk quota and abort with E320 once a run crosses the cap. Before the
+    /// fix the driver-side phase A sort spilled with zero disk-cap accounting,
+    /// so it could write past `storage.spill.disk_cap_bytes` unbounded.
+    #[test]
+    fn phase_a_driver_spill_past_disk_cap_fails_with_spill_cap_exceeded() {
+        let mut pairs = phase_a_driver_pairs(64);
+        let budget = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
+        budget.set_max_spill_bytes(1);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = crate::pipeline::memory::ConsumerHandle::new();
+        let err = sort_driver_pairs_externally(
+            &mut pairs,
+            "sm",
+            &Some("k".to_string()),
+            &budget,
+            true,
+            &handle,
+            dir.path(),
+        )
+        .expect_err("a one-byte disk cap must abort the driver phase A spill");
+        match err {
+            PipelineError::SpillCapExceeded {
+                node,
+                cap,
+                attempted,
+                current,
+            } => {
+                assert_eq!(node, "sm");
+                assert_eq!(cap, 1, "reported cap equals the configured quota");
+                assert!(attempted > 0, "the overflowing run reports its size");
+                assert!(current > cap, "cumulative spilled must exceed the cap");
+            }
+            other => panic!("expected SpillCapExceeded; got {other:?}"),
+        }
+        drop(dir);
+    }
+
+    /// The build side mirrors the driver: each phase A spilled run is charged
+    /// and the disk cap is enforced.
+    #[test]
+    fn phase_a_build_spill_past_disk_cap_fails_with_spill_cap_exceeded() {
+        let schema = schema_with(&["k", "pad"]);
+        let pad = "x".repeat(1024);
+        let mut pairs: Vec<(Record, Value)> = (0..64i64)
+            .map(|i| {
+                let r = rec(
+                    &schema,
+                    vec![Value::Integer(i), Value::String(pad.as_str().into())],
+                );
+                (r, Value::Integer(i))
+            })
+            .collect();
+        let budget = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
+        budget.set_max_spill_bytes(1);
+        let dir = tempfile::tempdir().unwrap();
+        let handle = crate::pipeline::memory::ConsumerHandle::new();
+        let err = sort_build_pairs_externally(
+            &mut pairs,
+            "sm",
+            &Some("k".to_string()),
+            &budget,
+            true,
+            &handle,
+            dir.path(),
+        )
+        .expect_err("a one-byte disk cap must abort the build phase A spill");
+        match err {
+            PipelineError::SpillCapExceeded {
+                node, cap, current, ..
+            } => {
+                assert_eq!(node, "sm");
+                assert_eq!(cap, 1);
+                assert!(current > cap);
+            }
+            other => panic!("expected SpillCapExceeded; got {other:?}"),
+        }
+        drop(dir);
+    }
+
+    /// Phase A must spill into the CONFIGURED spill root, not the OS temp dir.
+    /// A configured root removed before the spill surfaces DirUnavailable; if
+    /// the sort instead fell back to `std::env::temp_dir()` (the bug) the spill
+    /// would succeed against the healthy OS temp dir and no error would surface.
+    #[test]
+    fn phase_a_spills_into_configured_root_not_env_temp() {
+        let mut pairs = phase_a_driver_pairs(64);
+        let budget = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
+        let scratch = tempfile::tempdir().unwrap();
+        let spill_root = scratch.path().join("configured-root");
+        std::fs::create_dir(&spill_root).unwrap();
+        std::fs::remove_dir(&spill_root).unwrap();
+        let handle = crate::pipeline::memory::ConsumerHandle::new();
+        let err = sort_driver_pairs_externally(
+            &mut pairs,
+            "sm",
+            &Some("k".to_string()),
+            &budget,
+            true,
+            &handle,
+            &spill_root,
+        )
+        .expect_err(
+            "phase A must spill into the configured (now-removed) root and fail \
+             DirUnavailable, proving it does not fall back to the OS temp dir",
+        );
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("became unavailable mid-run"),
+            "expected DirUnavailable from the configured root; got: {rendered}"
+        );
+        drop(scratch);
     }
 }

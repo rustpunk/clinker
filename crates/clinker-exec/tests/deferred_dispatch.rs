@@ -245,40 +245,38 @@ nodes:
         ..Default::default()
     };
     let config = clinker_plan::config::parse_config(yaml).expect("parse");
-    // The pipeline either errors at the producer's region tee (E310 from
-    // `tee_emit_to_region_input_buffers`) or at the source's arena
-    // build (E310 from the source-rooted Phase-0 arena). Either path
-    // surfaces the E310 admission failure shape; assert the err string
-    // carries that signature.
     let result = common::run_config(&config, readers, writers, &params);
     let err = result.expect_err(
         "tight memory limit must surface as a typed admission failure on the \
          deferred buffer's projection or upstream spill path",
     );
-    // The deferred-buffer admission path raises a typed
-    // MemoryBudgetExceeded directly; an upstream sort enforcer that
-    // spilled past the budget surfaces a distinct "spill files"
-    // Compilation message with the same "memory.limit too small"
-    // semantic. Either is an acceptable observation that memory
-    // accounting fired; the test pins the failure-shape contract for
-    // the deferred buffer by destructuring on MemoryBudgetExceeded
-    // when reachable and on the spill-fallback Compilation arm
-    // otherwise.
+    // The contract this pins is that memory accounting fires and surfaces a
+    // typed error under a starvation budget — never a silent success. Under
+    // `backpressure: spill` the budget does not reject at admission; it forces
+    // operators to spill, and the failure surfaces at whichever operator hits a
+    // wall spilling cannot clear:
+    //   - the deferred-buffer arena projection raises MemoryBudgetExceeded
+    //     (BudgetCategory::Arena) directly, or
+    //   - the relaxed-CK (correlation-key) aggregate spills its group table and
+    //     then reaches its unsupported spilled-finalize path — retract-mode
+    //     finalize runs only on in-memory state — surfacing a typed
+    //     `Internal` "spilled groups" error.
+    // The enforcer correlation-sort no longer contributes a surface here: it
+    // now k-way merges its multi-run spill rather than rejecting it, so a
+    // spilling sort passes through cleanly and the pressure lands downstream.
     match &err {
         clinker_plan::error::PipelineError::MemoryBudgetExceeded {
             source: clinker_plan::BudgetCategory::Arena,
             ..
         } => {}
-        clinker_plan::error::PipelineError::Compilation { messages, .. }
-            if messages
-                .iter()
-                .any(|m| m.contains("memory.limit too small")) => {}
-        clinker_plan::error::PipelineError::Io(io_err)
-            if io_err.to_string().contains("memory.limit too small") => {}
+        clinker_plan::error::PipelineError::Internal { op, detail, .. }
+            if *op == "aggregation"
+                && detail
+                    .contains("finalize_in_place called on aggregator with spilled groups") => {}
         other => panic!(
             "memory-overflow surface must carry MemoryBudgetExceeded \
-             (BudgetCategory::Arena) or the spill-fallback admission \
-             message; got: {other:?}"
+             (BudgetCategory::Arena) or the relaxed-CK aggregate spilled-finalize \
+             limitation; got: {other:?}"
         ),
     }
     let _ = BTreeSet::<&str>::new();
