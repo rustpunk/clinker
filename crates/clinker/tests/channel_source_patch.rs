@@ -476,3 +476,140 @@ nodes:
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("E230"), "stderr:\n{stderr}");
 }
+
+// ── Composition-body source patches ─────────────────────────────────────────
+//
+// A channel `sources:` key qualified `<composition>.<source>` patches a source
+// declared inside that composition's body. The body is expanded only during
+// compile, so the patch is deferred and applied when the body is re-read. A
+// body-declared source binds (its schema seeds the body) but does not run
+// today, so these drive the compile-only `--explain` path — which flows through
+// the same channel resolution and body-source patch application a run would.
+
+/// The invoking pipeline: a composition `enrich` whose body reads its own
+/// declared source `ref`.
+const COMP_PIPELINE: &str = "\
+pipeline:
+  name: body_source_patch
+nodes:
+  - type: source
+    name: drv
+    config:
+      name: drv
+      type: csv
+      path: drv.csv
+      schema:
+        - { name: x, type: int }
+  - type: composition
+    name: enrich
+    input: drv
+    use: ./compositions/with_ref.comp.yaml
+    inputs:
+      driver: drv
+  - type: output
+    name: out
+    input: enrich
+    config:
+      name: out
+      type: csv
+      path: out.csv
+";
+
+/// Write a `with_ref.comp.yaml` under `dir/compositions/` whose body source
+/// `ref` declares `ref_schema`. The body transform emits `label = code`, so the
+/// body binds only when the source carries a `code` column.
+fn write_comp(dir: &Path, ref_schema: &str) {
+    let comp_dir = dir.join("compositions");
+    std::fs::create_dir_all(&comp_dir).expect("create compositions dir");
+    let yaml = format!(
+        "\
+_compose:
+  name: with_ref
+  inputs:
+    driver:
+      schema:
+        - {{ name: x, type: int }}
+  outputs:
+    out: shape
+  config_schema: {{}}
+
+nodes:
+  - type: source
+    name: ref
+    config:
+      name: ref
+      type: csv
+      path: ref.csv
+      schema:
+{ref_schema}
+  - type: transform
+    name: shape
+    input: ref
+    config:
+      cxl: |
+        emit label = code
+"
+    );
+    std::fs::write(comp_dir.join("with_ref.comp.yaml"), yaml).expect("write comp");
+}
+
+/// A channel `sources:` patch qualified `enrich.ref` reaches the source inside
+/// composition `enrich`'s body: the body fails to compile without it (the
+/// source lacks `code`) and compiles with it (the patch renames `raw` -> `code`).
+#[test]
+fn channel_patches_composition_body_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p = dir.path();
+    write(p, "pipe.yaml", COMP_PIPELINE);
+    write_comp(p, "        - { name: raw, type: string }");
+    write_channel(
+        p,
+        "fix",
+        "sources:\n  enrich.ref:\n    schema:\n      raw: { rename: code }\n",
+    );
+
+    // Base compile fails: the body source has no `code` column for `shape`.
+    let base = run_in(p, &["--explain"]);
+    assert!(
+        !base.status.success(),
+        "base --explain should fail before the body source is patched"
+    );
+
+    // The qualified channel patch renames the body source column, so the body
+    // binds and the effective plan compiles.
+    let patched = run_in(p, &["--channel", "fix", "--explain"]);
+    assert!(
+        patched.status.success(),
+        "patched --explain failed:\n{}",
+        String::from_utf8_lossy(&patched.stderr)
+    );
+}
+
+/// A channel patch whose composition exists but whose inner source name does
+/// not fails compile with E230, naming the missing source — not silently
+/// ignored.
+#[test]
+fn channel_patch_unknown_body_source_fails_with_e230() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p = dir.path();
+    write(p, "pipe.yaml", COMP_PIPELINE);
+    // A valid body source, so the only error is the unknown patch target.
+    write_comp(p, "        - { name: code, type: string }");
+    write_channel(
+        p,
+        "bad",
+        "sources:\n  enrich.ghost:\n    schema:\n      code: remove\n",
+    );
+
+    let out = run_in(p, &["--channel", "bad", "--explain"]);
+    assert!(
+        !out.status.success(),
+        "a patch on an unknown body source should fail compile"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("E230"), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("ghost"),
+        "E230 must name the missing source:\n{stderr}"
+    );
+}

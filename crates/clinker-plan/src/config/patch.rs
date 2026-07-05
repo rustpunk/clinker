@@ -20,6 +20,7 @@
 use super::*;
 use crate::config::composition::SchemaProvRecorder;
 use crate::config::pipeline_node::{PipelineNode, SourceBody};
+use crate::yaml::Spanned;
 use clinker_format::{
     Column, Discriminator, EnvelopeFieldType, NestedEnvelopeSection, RecordType, SourceSchema,
 };
@@ -698,75 +699,187 @@ pub struct DiscriminatorPatch {
     pub field: Option<String>,
 }
 
+/// Deferred channel `sources:` patches addressed at a source declared inside a
+/// composition body, keyed `composition-node-name -> inner-source-name ->
+/// patch`. Mirrors [`ConfigOverrides`](crate::config::ConfigOverrides).
+///
+/// A qualified `<composition>.<source>` patch key cannot be applied at patch
+/// time: the composition body is expanded only during compile, so its source
+/// nodes are not in `config.nodes` yet. [`apply_source_patches`] validates the
+/// composition alias and stashes the patch here; `bind_composition` applies it
+/// to the freshly re-read body before the body binds.
+pub type BodySourcePatchMap = IndexMap<String, IndexMap<String, SourceConfigPatch>>;
+
 /// Apply channel source-config patches to the parsed config in place.
 ///
 /// Runs after parse and before `validate_config`, so the patched config is
-/// the one validated and compiled. Each entry names a source node; an unknown
-/// source name or an ill-formed op is a config error (E230–E245) reported
+/// the one validated and compiled. A plain key names a top-level source node; a
+/// qualified `<composition>.<source>` key names a source inside that
+/// composition's body and is deferred to compile (see [`BodySourcePatchMap`]).
+/// An unknown target or an ill-formed op is a config error (E230–E245) reported
 /// before the pipeline compiles.
 pub fn apply_source_patches(
     config: &mut PipelineConfig,
     patches: &IndexMap<String, SourceConfigPatch>,
 ) -> Result<(), ConfigError> {
-    // Whether the pipeline calls any composition. Sources declared inside a
-    // composition body are not present in `config.nodes` at patch time (the
-    // body is expanded only during compile), so a patch targeting one cannot be
-    // resolved here — the unknown-source error explains that rather than
-    // implying a typo. Computed once so the per-source lookup can stay a plain
-    // borrow.
+    // Whether the pipeline calls any composition. A plain patch key that names
+    // no top-level source gets a hint pointing at the qualified-key form when
+    // the pipeline has compositions, rather than implying a bare typo. Computed
+    // once so the per-source lookup can stay a plain borrow.
     let has_composition = config
         .nodes
         .iter()
         .any(|n| matches!(n.value, PipelineNode::Composition { .. }));
 
-    for (src_name, patch) in patches {
+    for (key, patch) in patches {
+        // A qualified `<composition>.<source>` key targets a source inside a
+        // composition body. That body is expanded only during compile, so the
+        // target cannot resolve against `config.nodes` here; validate the
+        // composition alias now and defer the patch to `bind_composition`,
+        // which applies it after re-reading the body.
+        if let Some((alias, inner)) = split_qualified_key(key)? {
+            if !is_composition_node(config, alias) {
+                return Err(unknown_composition_alias(key, alias));
+            }
+            config
+                .body_source_patches
+                .entry(alias.to_string())
+                .or_default()
+                .insert(inner.to_string(), patch.clone());
+            continue;
+        }
+
         if patch.is_empty() {
             // Still resolve the source so an empty patch on a typo'd name
             // fails rather than passing silently.
-            source_body_mut(config, src_name)
-                .ok_or_else(|| unknown_source(src_name, has_composition))?;
+            source_body_mut(config, key).ok_or_else(|| unknown_source(key, has_composition))?;
             continue;
         }
-        let body = source_body_mut(config, src_name)
-            .ok_or_else(|| unknown_source(src_name, has_composition))?;
-        apply_schema_ops(&mut body.schema, &patch.schema, src_name, None)?;
-        apply_array_path_ops(&mut body.source, &patch.array_paths, src_name)?;
-        apply_option_ops(&mut body.source, &patch.options, src_name)?;
-        // Format-structure ops apply after the options merge so a keyed op
-        // layers deterministically on top of an `options`-blob replacement of
-        // the same declaration in the same patch.
-        apply_nested_section_op(
-            &mut body.source,
-            patch.group_section.as_ref(),
-            X12SectionSlot::Group,
-            src_name,
-        )?;
-        apply_nested_section_op(
-            &mut body.source,
-            patch.set_section.as_ref(),
-            X12SectionSlot::Set,
-            src_name,
-        )?;
-        apply_split_field_ops(&mut body.source, &patch.split_fields, src_name)?;
-        apply_record_ops(
-            &mut body.schema,
-            &patch.records,
-            patch.discriminator.as_ref(),
-            src_name,
-        )?;
+        let body =
+            source_body_mut(config, key).ok_or_else(|| unknown_source(key, has_composition))?;
+        apply_patch_to_source_body(body, patch, key)?;
     }
     Ok(())
 }
 
-/// Locate a source node's body by its node identity (`header.name`).
+/// Apply every op carried by `patch` to one source's parsed body in place.
+///
+/// The shared core of the top-level channel `sources:` pass and the deferred
+/// composition-body pass: both resolve a source node — top-level or inside an
+/// expanded body — to its [`SourceBody`] and layer the identical op grammar
+/// over it, so a body source patches byte-for-byte the way a top-level one
+/// does. `src` names the source for the op diagnostics.
+///
+/// Format-structure ops apply after the `options` merge so a keyed op layers
+/// deterministically on top of an `options`-blob replacement of the same
+/// declaration in the same patch.
+pub(crate) fn apply_patch_to_source_body(
+    body: &mut SourceBody,
+    patch: &SourceConfigPatch,
+    src: &str,
+) -> Result<(), ConfigError> {
+    apply_schema_ops(&mut body.schema, &patch.schema, src, None)?;
+    apply_array_path_ops(&mut body.source, &patch.array_paths, src)?;
+    apply_option_ops(&mut body.source, &patch.options, src)?;
+    apply_nested_section_op(
+        &mut body.source,
+        patch.group_section.as_ref(),
+        X12SectionSlot::Group,
+        src,
+    )?;
+    apply_nested_section_op(
+        &mut body.source,
+        patch.set_section.as_ref(),
+        X12SectionSlot::Set,
+        src,
+    )?;
+    apply_split_field_ops(&mut body.source, &patch.split_fields, src)?;
+    apply_record_ops(
+        &mut body.schema,
+        &patch.records,
+        patch.discriminator.as_ref(),
+        src,
+    )?;
+    Ok(())
+}
+
+/// Split a channel `sources:` key into an optional `(composition, source)`
+/// pair. Node names cannot contain dots, so a single dot marks a
+/// composition-body target and no dot marks a plain top-level source.
+///
+/// - `Ok(None)` — no dot: a plain top-level source key.
+/// - `Ok(Some((composition, source)))` — exactly one dot.
+/// - `Err(_)` — an empty segment, or more than one dot (a source inside a
+///   nested composition body, which is not addressable).
+fn split_qualified_key(key: &str) -> Result<Option<(&str, &str)>, ConfigError> {
+    match key.split_once('.') {
+        None => Ok(None),
+        Some((alias, rest)) => {
+            if rest.contains('.') {
+                return Err(nested_body_source(key));
+            }
+            if alias.is_empty() || rest.is_empty() {
+                return Err(malformed_qualified_key(key));
+            }
+            Ok(Some((alias, rest)))
+        }
+    }
+}
+
+/// Whether a composition call-site node by this name exists in the pipeline.
+fn is_composition_node(config: &PipelineConfig, name: &str) -> bool {
+    config.nodes.iter().any(|spanned| {
+        matches!(&spanned.value, PipelineNode::Composition { header, .. } if header.name == name)
+    })
+}
+
+fn unknown_composition_alias(key: &str, alias: &str) -> ConfigError {
+    ConfigError::Validation(format!(
+        "[E230] channel source patch key '{key}' targets a source in composition '{alias}', \
+         but no composition node by that name exists in the pipeline"
+    ))
+}
+
+fn nested_body_source(key: &str) -> ConfigError {
+    ConfigError::Validation(format!(
+        "[E230] channel source patch key '{key}': a source inside a nested composition body is \
+         not addressable; use '<composition>.<source>' to patch a source one level inside a \
+         composition body"
+    ))
+}
+
+fn malformed_qualified_key(key: &str) -> ConfigError {
+    ConfigError::Validation(format!(
+        "[E230] channel source patch key '{key}' is malformed; use '<source>' for a top-level \
+         source or '<composition>.<source>' for a source inside a composition body"
+    ))
+}
+
+/// Split a `[CODE] message` diagnostic string into its bracketed E-code and the
+/// remaining message. Channel-patch [`ConfigError`]s embed their stable E-code
+/// as a `[E2xx]` prefix; the composition-body patch pass re-emits an op failure
+/// as a structured `Diagnostic` and lifts the code back out here, so a
+/// body-source op error carries the same code a top-level one would. Falls back
+/// to the generic source-patch code when no prefix is present.
+pub(crate) fn split_diagnostic_code(msg: &str) -> (&str, &str) {
+    match msg.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
+        Some((code, tail)) => (code, tail.trim_start()),
+        None => ("E230", msg),
+    }
+}
+
+/// Locate a source node's body by its node identity (`header.name`) in a node
+/// list. Shared by the top-level patch pass and the composition-body pass.
 ///
 /// The channel system keys sources by node identity — the `name:` on the node
 /// header — which can differ from the nested `config.name:`. Every other
 /// channel block (`vars.source`, E111) resolves the same way, so the patch
 /// target resolves by `header.name` for consistency.
-fn source_body_mut<'a>(config: &'a mut PipelineConfig, name: &str) -> Option<&'a mut SourceBody> {
-    config
-        .nodes
+pub(crate) fn source_body_in_nodes<'a>(
+    nodes: &'a mut [Spanned<PipelineNode>],
+    name: &str,
+) -> Option<&'a mut SourceBody> {
+    nodes
         .iter_mut()
         .find_map(|spanned| match &mut spanned.value {
             PipelineNode::Source {
@@ -777,11 +890,14 @@ fn source_body_mut<'a>(config: &'a mut PipelineConfig, name: &str) -> Option<&'a
         })
 }
 
+fn source_body_mut<'a>(config: &'a mut PipelineConfig, name: &str) -> Option<&'a mut SourceBody> {
+    source_body_in_nodes(&mut config.nodes, name)
+}
+
 fn unknown_source(src_name: &str, has_composition: bool) -> ConfigError {
     let hint = if has_composition {
-        " (a source declared inside a composition body is not yet patchable by a \
-         channel `sources:` block — patch the composition's own source, or lift it \
-         to the top-level pipeline)"
+        " (to patch a source declared inside a composition body, qualify the key as \
+         `<composition-node>.<source>`)"
     } else {
         ""
     };
@@ -1919,6 +2035,106 @@ nodes:
             msg.contains("composition"),
             "expected a composition-body hint: {msg}"
         );
+    }
+
+    /// A pipeline that invokes a composition named `comp`, for the qualified
+    /// `<composition>.<source>` body-source patch-key tests.
+    fn composition_call_pipeline() -> PipelineConfig {
+        let yaml = "\
+pipeline:
+  name: qualified_patch_test
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: /tmp/in.csv
+      schema:
+        - { name: id, type: string }
+  - type: composition
+    name: comp
+    input: src
+    use: ./thing.comp.yaml
+    inputs:
+      driver: src
+  - type: output
+    name: out
+    input: comp
+    config:
+      name: out
+      type: csv
+      path: /tmp/out.csv
+";
+        crate::yaml::from_str(yaml).expect("parse composition pipeline")
+    }
+
+    #[test]
+    fn qualified_key_defers_body_source_patch() {
+        // `comp.ref` names the composition `comp` (present) and its body source
+        // `ref`; the patch is stashed for compile, not applied to any top-level
+        // source.
+        let mut config = composition_call_pipeline();
+        apply(
+            &mut config,
+            "comp.ref",
+            patch_from_yaml("schema:\n  id: remove\n"),
+        )
+        .expect("a qualified patch on a real composition defers cleanly");
+        let deferred = config
+            .body_source_patches
+            .get("comp")
+            .expect("deferred under the composition node name");
+        assert!(
+            deferred.contains_key("ref"),
+            "deferred patch keyed by the inner source name"
+        );
+    }
+
+    #[test]
+    fn qualified_key_unknown_composition_errors_e230() {
+        let mut config = composition_call_pipeline();
+        let err = apply(
+            &mut config,
+            "ghost.ref",
+            patch_from_yaml("schema:\n  id: remove\n"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("E230"), "{msg}");
+        assert!(
+            msg.contains("ghost"),
+            "must name the missing composition: {msg}"
+        );
+    }
+
+    #[test]
+    fn nested_multidot_key_rejected_e230() {
+        let mut config = composition_call_pipeline();
+        let err = apply(
+            &mut config,
+            "comp.inner.ref",
+            patch_from_yaml("schema:\n  id: remove\n"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("E230"), "{msg}");
+        assert!(
+            msg.contains("nested"),
+            "must explain a nested body source is not addressable: {msg}"
+        );
+    }
+
+    #[test]
+    fn empty_segment_qualified_key_rejected_e230() {
+        let mut config = composition_call_pipeline();
+        let err = apply(
+            &mut config,
+            "comp.",
+            patch_from_yaml("schema:\n  id: remove\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E230"), "{err}");
     }
 
     /// A JSON source declaring a `record_path` option and one array-path entry.

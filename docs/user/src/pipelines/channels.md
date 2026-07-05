@@ -595,11 +595,38 @@ unknown record-type id is E242, adding an id that already exists is E243, a
 merged discriminator that is neither pure byte-range nor pure field is E244, and
 a discriminator tag shared by two record types after the patch is E245.
 
-`sources:` patches target **top-level** source nodes; a source declared inside a
-composition body is not reachable this way (patching it fails with E230). When a
-patch changes the effective source config, the run's pipeline identity differs
-from the base and from other patched variants, so their outputs and lineage do
-not collide.
+### Sources inside a composition body
+
+A plain `sources:` key names a **top-level** source node. To patch a source
+declared inside a composition body, qualify the key with the composition
+call-site node name: `<composition-node>.<source>`. The composition body is
+expanded during compile, so the patch is applied to the body's source when the
+body is bound — before the body typechecks — exactly as a top-level patch shapes
+a top-level source before it binds:
+
+```yaml
+sources:
+  enrich.lookups:                          # source `lookups` inside composition node `enrich`
+    schema:
+      code: { rename: lookup_code }
+```
+
+Resolution is one level deep: the qualifier must name a composition node in the
+pipeline (an unknown composition — or a nested `a.b.c` key naming a source inside
+a *nested* composition body — is E230), and the source half must name a source
+node declared in that composition's body (an unknown one is E230, naming the body
+file). A plain unqualified key still targets a top-level source, and a name that
+matches no top-level source still fails with E230 — now hinting at the qualified
+form when the pipeline has compositions.
+
+> **Note:** a body-declared source binds (its schema seeds the body) but is not
+> yet fed at runtime — the engine ingests only top-level sources — so a channel
+> patch to a body source is applied and observable at compile (`--explain`),
+> while a data run through a body source awaits body-source runtime support.
+
+When a patch changes the effective source config, the run's pipeline identity
+differs from the base and from other patched variants, so their outputs and
+lineage do not collide.
 
 ## Diagnostics
 
@@ -607,7 +634,7 @@ not collide.
 |------|---------|
 | **E113** | A `config:` / override key matches no composition parameter in the compiled plan. A misspelled or stale key aborts the run instead of silently doing nothing. |
 | **E114** | An overlay op failed to apply (missing splice anchor, duplicate node name, missing/removed `target`, invalid `set` field, invalid `bypass` node). The diagnostic is anchored to the offending op's source span, not the base pipeline. |
-| **E230** | A source patch (`sources.<src>` or `patch_schema`) targets a source-node name not present in the pipeline. |
+| **E230** | A source patch (`sources.<src>` or `patch_schema`) targets a source that does not exist: an unknown top-level source, an unknown composition for a qualified `<composition>.<source>` key, a `<composition>.<source>` naming no source in that composition's body, or a nested (`a.b.c`) key. |
 | **E231** | A schema `rename` / `modify` / `remove` of a column that does not exist. |
 | **E232** | A schema `add` of a column name that already exists. |
 | **E233** | A schema `rename` whose target name collides with an existing column. |

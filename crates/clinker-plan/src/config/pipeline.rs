@@ -36,6 +36,14 @@ pub struct PipelineConfig {
     /// sidecars without needing to re-read the source.
     #[serde(skip)]
     pub source_hash: [u8; 32],
+    /// Channel `sources:` patches whose qualified key (`<composition>.<source>`)
+    /// addressed a source declared inside a composition body. Those bodies are
+    /// not expanded into `nodes` at patch time, so `apply_source_patches`
+    /// stashes them here for `bind_composition` to apply after re-reading each
+    /// body. Empty for a plain pipeline or a channel that only patches
+    /// top-level sources.
+    #[serde(skip)]
+    pub body_source_patches: crate::config::patch::BodySourcePatchMap,
 }
 
 /// Pipeline-level metadata and global settings.
@@ -708,10 +716,25 @@ impl PipelineConfig {
         // populating CompileArtifacts.composition_bodies.
         let scoped_vars_registry =
             build_scoped_vars_registry(self.pipeline.vars.as_ref(), &self.nodes);
+        // Channel `sources:` patches addressed at a source inside a composition
+        // body were deferred by `apply_source_patches` (the body is expanded
+        // only here). Thread them to `bind_composition` through the compile
+        // context so each body binds in its patched form. A plain pipeline —
+        // or a channel that only patches top-level sources — leaves the map
+        // empty and reuses the incoming context untouched.
+        let patched_ctx;
+        let bind_ctx = if self.body_source_patches.is_empty() {
+            ctx
+        } else {
+            let mut c = ctx.clone();
+            c.body_source_patches = self.body_source_patches.clone();
+            patched_ctx = c;
+            &patched_ctx
+        };
         let mut artifacts = crate::plan::bind_schema::bind_schema(
             &self.nodes,
             &mut diags,
-            ctx,
+            bind_ctx,
             &symbol_table,
             &ctx.pipeline_dir,
             scoped_vars_registry,

@@ -64,6 +64,14 @@ pub struct CompileContext {
     /// means "no overlay": the compile path is byte-identical to a plain
     /// pipeline.
     pub config_overrides: ConfigOverrides,
+    /// Channel `sources:` patches addressed at a source declared inside a
+    /// composition body, keyed `composition-node-name -> inner-source-name ->
+    /// patch`. `apply_source_patches` cannot apply these at patch time (the
+    /// body is expanded only during compile), so it stashes them on the config;
+    /// `compile` threads them here so `bind_composition` can apply each to the
+    /// freshly re-read body before it binds. Empty (the default) means "no
+    /// deferred body-source patches": the compile path is unchanged.
+    pub body_source_patches: crate::config::patch::BodySourcePatchMap,
 }
 
 impl CompileContext {
@@ -77,6 +85,7 @@ impl CompileContext {
             allow_absolute_paths: false,
             overlay_ops: Vec::new(),
             config_overrides: ConfigOverrides::new(),
+            body_source_patches: crate::config::patch::BodySourcePatchMap::new(),
         }
     }
 
@@ -91,6 +100,7 @@ impl CompileContext {
             allow_absolute_paths: false,
             overlay_ops: Vec::new(),
             config_overrides: ConfigOverrides::new(),
+            body_source_patches: crate::config::patch::BodySourcePatchMap::new(),
         }
     }
 
@@ -109,13 +119,16 @@ impl CompileContext {
         // Drop only the structural ops. `config_overrides` must survive: the
         // effective plan produced by splicing the ops is recompiled through
         // this context, and its composition bodies still fold `$config`
-        // against the resolved value clobbers.
+        // against the resolved value clobbers. `body_source_patches` is
+        // re-derived from the effective config by the recursive compile, so it
+        // need not carry here, but preserving it keeps the context faithful.
         Self {
             workspace_root: self.workspace_root.clone(),
             pipeline_dir: self.pipeline_dir.clone(),
             allow_absolute_paths: self.allow_absolute_paths,
             overlay_ops: Vec::new(),
             config_overrides: self.config_overrides.clone(),
+            body_source_patches: self.body_source_patches.clone(),
         }
     }
 }
@@ -130,6 +143,7 @@ impl Default for CompileContext {
             allow_absolute_paths: false,
             overlay_ops: Vec::new(),
             config_overrides: ConfigOverrides::new(),
+            body_source_patches: crate::config::patch::BodySourcePatchMap::new(),
         }
     }
 }

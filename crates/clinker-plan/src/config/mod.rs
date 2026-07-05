@@ -38,9 +38,9 @@ pub use fs_type::{FsKind, case_sensitive_dir, classify, collision_key, same_devi
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use output::*;
 pub use patch::{
-    ArrayPathOp, ColumnPatch, DiscriminatorPatch, EnvelopeFieldOp, NestedSectionOp, RecordTypeAdd,
-    RecordTypeOp, RecordTypePatch, SchemaColumnOp, SourceConfigPatch, SplitFieldOp,
-    apply_source_patches,
+    ArrayPathOp, BodySourcePatchMap, ColumnPatch, DiscriminatorPatch, EnvelopeFieldOp,
+    NestedSectionOp, RecordTypeAdd, RecordTypeOp, RecordTypePatch, SchemaColumnOp,
+    SourceConfigPatch, SplitFieldOp, apply_source_patches,
 };
 pub use pipeline::*;
 pub use pipeline_node::{
