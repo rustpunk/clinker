@@ -133,7 +133,7 @@ Only force `streaming` when you are certain the input is sorted by the group-by 
 
 An aggregate that keeps `min`, `max`, `avg`, or another value-buffering binding holds each contributing row's raw values until the group finalizes. If a **single input row's** buffered footprint is larger than the entire `memory.limit`, no amount of spilling can hold it — spill would only re-read the same oversized row. The engine surfaces this per-row overflow rather than absorbing it:
 
-- With `error_handling.strategy: fail` (the default), the run aborts with `E310 MemoryBudgetExceeded`, naming the aggregate stage and reporting the offending row's byte footprint against the budget.
+- With `error_handling.strategy: fail_fast` (the default), the run aborts with `E310 MemoryBudgetExceeded`, naming the aggregate stage and reporting the offending row's byte footprint against the budget.
 - With `strategy: continue` (or `best_effort`), the offending record is routed to the dead-letter queue under the `aggregate_finalize` category, and the run proceeds.
 
 This is almost always a sign the budget is set far too low for the record shape — raise `memory.limit` so a typical row fits comfortably.

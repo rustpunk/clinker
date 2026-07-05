@@ -262,6 +262,84 @@ impl NodeBuffer {
         Ok((records, puncts))
     }
 
+    /// Like [`Self::drain_split`], but aborts when the growing re-materialized
+    /// record vector alone exceeds the entire memory budget, so a spill-backed
+    /// slot cannot re-inflate a working set larger than the budget uncharged.
+    ///
+    /// [`Self::drain_split`] streams a `Spilled`/`Mixed` slot's records off
+    /// disk straight into a `Vec` with no arbitrator charge and no hard-limit
+    /// poll — the slot's admission charge was discharged when its consumer
+    /// unregistered it, so the bytes landing back in memory here are
+    /// invisible to the budget. A slot that spilled precisely because it
+    /// outgrew the budget would then re-materialize a Vec larger than the
+    /// whole budget with no gate. Every ~1024 records this estimates the
+    /// resident footprint and, when it exceeds the hard limit outright,
+    /// surfaces a typed `MemoryBudgetExceeded` (E310, tagged
+    /// `BudgetCategory::NodeBuffer`) naming the draining stage.
+    ///
+    /// The gate is the re-materialized footprint against the *hard limit
+    /// itself*, deliberately not [`MemoryArbitrator::should_abort`]: that
+    /// poll trips on whole-process RSS, which for any budget below the
+    /// process baseline (the very condition that made the upstream slot spill)
+    /// is always over — it would abort every legitimate spill round-trip
+    /// whose finite re-materialized set still fits the budget. Aborting only
+    /// when a single re-materialized buffer is itself bigger than the whole
+    /// budget keeps the "spillable stages complete" guarantee for the common
+    /// case while still catching the genuinely unaffordable one.
+    ///
+    /// Wired into the single-consumer Transform and Aggregate drain sites,
+    /// whose owned buffer has no separate budget gate of its own. Sort,
+    /// Combine, Cull, and Reshape keep [`Self::drain_split`] because they gate
+    /// their own re-materialized working set downstream.
+    pub(crate) fn drain_split_metered(
+        self,
+        budget: &crate::pipeline::memory::MemoryArbitrator,
+        node: &str,
+    ) -> Result<DrainedEvents, PipelineError> {
+        // Only a spill-backed slot re-inflates uncharged; a pure `Memory`
+        // slot's bytes were never off the budget, so skip the per-batch poll
+        // and reuse the plain drain for it.
+        if matches!(self, Self::Memory(_)) {
+            return self.drain_split();
+        }
+        let hard = budget.hard_limit();
+        let mut records: Vec<(Record, u64)> = Vec::with_capacity(self.len_hint());
+        let mut puncts: Vec<Punctuation> = Vec::new();
+        let mut since_check: usize = 0;
+        for event in self.drain() {
+            match event? {
+                StreamEvent::Record(r, rn) => {
+                    records.push((r, rn));
+                    since_check += 1;
+                    if since_check >= 1024 {
+                        since_check = 0;
+                        let cols = records
+                            .last()
+                            .map(|(r, _)| r.schema().column_count())
+                            .unwrap_or(0);
+                        let bytes = record_byte_cost(cols).saturating_mul(records.len() as u64);
+                        // `hard == 0` means "unlimited" (no configured budget),
+                        // so never abort in that case.
+                        if hard > 0 && bytes > hard {
+                            return Err(PipelineError::MemoryBudgetExceeded {
+                                node: node.to_string(),
+                                used: bytes,
+                                limit: hard,
+                                source: clinker_plan::BudgetCategory::NodeBuffer,
+                                detail: Some(format!(
+                                    "re-materializing spilled node buffer for `{node}` \
+                                     exceeded the memory budget"
+                                )),
+                            });
+                        }
+                    }
+                }
+                StreamEvent::Punctuation(p) => puncts.push(p),
+            }
+        }
+        Ok((records, puncts))
+    }
+
     /// Build a `Memory` variant from a records vector and the
     /// punctuations preserved from the input drain. Punctuations are
     /// appended at the tail of the event stream so that document
@@ -776,6 +854,65 @@ mod tests {
             .expect("pass-through ok");
         assert!(matches!(passed, NodeBuffer::Spilled { .. }));
         assert_eq!(file_bytes, 0);
+    }
+
+    #[test]
+    fn drain_split_metered_aborts_when_rematerialization_exceeds_budget() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        let s = schema();
+        // >1024 records so the per-batch poll fires at least once. Spilled to
+        // disk, so the metered drain re-materializes them off disk uncharged
+        // absent the gate.
+        let rows: Vec<(Record, u64)> = (0..1100).map(|i| (rec(&s, i, "v"), i as u64)).collect();
+        let nb = NodeBuffer::Spilled {
+            chunks: vec![spill_chunk(rows)],
+            pending_puncts: Vec::new(),
+        };
+        // A 1-byte hard limit: the growing re-materialized vector crosses it
+        // at the first 1024-record poll.
+        let arb = MemoryArbitrator::with_policy(1, 0.80, Box::new(NoOpPolicy));
+        match nb.drain_split_metered(&arb, "spilled_stage") {
+            Err(PipelineError::MemoryBudgetExceeded { node, source, .. }) => {
+                assert_eq!(node, "spilled_stage", "the error names the draining stage");
+                assert_eq!(
+                    source,
+                    clinker_plan::BudgetCategory::NodeBuffer,
+                    "the re-materialized node-buffer drain is tagged NodeBuffer"
+                );
+            }
+            other => panic!("expected E310 NodeBuffer; got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn drain_split_metered_matches_drain_split_under_ample_budget() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        let s = schema();
+        let ctx = synthetic_document_context();
+        // >1024 rows so the metered poll fires but a 100 GiB limit keeps it
+        // from aborting; the output must match the plain drain exactly.
+        let rows: Vec<(Record, u64)> = (0..1100).map(|i| (rec(&s, i, "v"), i as u64)).collect();
+        let make = || NodeBuffer::Spilled {
+            chunks: vec![spill_chunk(rows.clone())],
+            pending_puncts: vec![Punctuation::document_close(Arc::clone(&ctx))],
+        };
+        let arb =
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let (metered_recs, metered_puncts) = make()
+            .drain_split_metered(&arb, "stage")
+            .expect("ample-budget metered drain");
+        let (plain_recs, plain_puncts) = make().drain_split().expect("plain drain");
+        let metered_rns: Vec<u64> = metered_recs.iter().map(|(_, rn)| *rn).collect();
+        let plain_rns: Vec<u64> = plain_recs.iter().map(|(_, rn)| *rn).collect();
+        assert_eq!(
+            metered_rns, plain_rns,
+            "metered drain yields the same records in the same order as the plain drain"
+        );
+        assert_eq!(
+            metered_puncts.len(),
+            plain_puncts.len(),
+            "metered drain preserves the trailing punctuations"
+        );
     }
 
     #[test]
