@@ -248,6 +248,14 @@ impl<W: Write + Send> FormatWriter for XmlWriter<W> {
         Ok(())
     }
 
+    /// Drain the underlying sink without emitting the closing root element, so
+    /// byte-limit split accounting can observe the size mid-document. The
+    /// closing root tag is written only by [`Self::flush`] at end of file /
+    /// rotation.
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        self.writer.get_mut().flush().map_err(FormatError::Io)
+    }
+
     fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
         if self.framer.is_none() {
             return Ok(());

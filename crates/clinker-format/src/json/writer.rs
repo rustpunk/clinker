@@ -277,6 +277,14 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
         Ok(())
     }
 
+    /// Drain the underlying sink without writing the closing array bytes, so
+    /// byte-limit split accounting can observe the size mid-document. The
+    /// finalizing `]` (or `[]` for an empty file) is emitted only by
+    /// [`Self::flush`] at end of file / rotation.
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        self.writer.flush().map_err(FormatError::Io)
+    }
+
     fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
         let Some(env) = self.envelope.as_mut() else {
             return Ok(());

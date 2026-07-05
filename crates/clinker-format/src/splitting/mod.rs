@@ -265,10 +265,13 @@ impl FormatWriter for SplittingWriter {
         self.current_writer.as_mut().unwrap().write_record(record)?;
         self.records_in_file += 1;
 
-        // Flush format writer's internal buffer to push bytes through to CountingWriter.
-        // Required for accurate byte-limit checking (format writers may buffer internally).
+        // Push the format writer's internally buffered bytes through to the
+        // CountingWriter so the byte-limit check sees the true on-disk size.
+        // Uses the non-finalizing drain rather than `flush`: a finalizing flush
+        // would close the JSON array / XML root / envelope trailer here, and the
+        // next record would then land after the closed document, corrupting it.
         if self.policy.max_bytes.is_some() {
-            self.current_writer.as_mut().unwrap().flush()?;
+            self.current_writer.as_mut().unwrap().flush_bytes()?;
         }
 
         Ok(())
@@ -277,6 +280,17 @@ impl FormatWriter for SplittingWriter {
     fn flush(&mut self) -> Result<(), FormatError> {
         if let Some(ref mut writer) = self.current_writer {
             writer.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Drain the active inner writer's buffered bytes without finalizing its
+    /// document, keeping the non-finalizing contract intact when a split sink
+    /// is itself driven by byte accounting. With no active writer there is
+    /// nothing to drain.
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        if let Some(ref mut writer) = self.current_writer {
+            writer.flush_bytes()?;
         }
         Ok(())
     }

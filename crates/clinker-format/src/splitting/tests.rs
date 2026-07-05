@@ -872,6 +872,198 @@ fn test_splitting_writer_xml_produces_valid_files() {
     assert_eq!(count_items(&contents[2]), 1);
 }
 
+/// Byte-limited splitting of JSON *array* output: each rotated file must be a
+/// self-contained, valid JSON array. Regression guard for the finalizing
+/// `flush()` closing the array after every record during byte accounting,
+/// which stranded later records after the closing `]`.
+#[test]
+fn test_splitting_writer_json_array_byte_split_valid_files() {
+    use crate::json::writer::{JsonOutputMode, JsonWriter, JsonWriterConfig};
+
+    let schema = make_schema(&["id", "name"]);
+    let registry = FileRegistry::new();
+    let policy = SplitPolicy {
+        max_records: None,
+        max_bytes: Some(60),
+        group_key: None,
+        repeat_header: false,
+        oversize_group: OversizeGroupPolicy::default(),
+    };
+
+    let json_config = JsonWriterConfig {
+        format: JsonOutputMode::Array,
+        pretty: false,
+        preserve_nulls: false,
+        include_engine_stamped: false,
+        envelope: None,
+    };
+
+    let json_factory: WriterFactory = Box::new(
+        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: Arc<Schema>| {
+            Ok(
+                Box::new(JsonWriter::new(counting, schema, json_config.clone()))
+                    as Box<dyn FormatWriter>,
+            )
+        },
+    );
+
+    let mut writer = SplittingWriter::new(
+        registry.file_factory(),
+        json_factory,
+        Arc::clone(&schema),
+        policy,
+    );
+
+    for i in 0..10 {
+        let record = make_record(
+            &schema,
+            vec![Value::Integer(i), Value::String(format!("nm{i}").into())],
+        );
+        writer.write_record(&record).unwrap();
+    }
+    writer.flush().unwrap();
+
+    assert!(
+        registry.file_count() > 1,
+        "byte limit should have split into multiple files"
+    );
+    let contents = registry.file_contents();
+
+    let mut total_records = 0;
+    let mut multi_record_file_seen = false;
+    for (idx, content) in contents.iter().enumerate() {
+        // Each file must parse as one JSON array — with the bug, a file holding
+        // two or more records contains a premature `]` and fails to parse.
+        let parsed: serde_json::Value = serde_json::from_str(content)
+            .unwrap_or_else(|e| panic!("file {idx} is not valid JSON: {e}\n{content}"));
+        let arr = parsed
+            .as_array()
+            .unwrap_or_else(|| panic!("file {idx} is not a JSON array: {content}"));
+        // The array brackets appear exactly once per file — record payloads
+        // carry no brackets, so a stray finalizing flush would show up as extra
+        // `]` occurrences.
+        assert_eq!(
+            content.matches('[').count(),
+            1,
+            "file {idx}: exactly one opening bracket: {content}"
+        );
+        assert_eq!(
+            content.matches(']').count(),
+            1,
+            "file {idx}: exactly one closing bracket: {content}"
+        );
+        if arr.len() > 1 {
+            multi_record_file_seen = true;
+        }
+        for obj in arr {
+            assert!(obj.get("id").is_some(), "file {idx}: record missing id");
+            assert!(obj.get("name").is_some(), "file {idx}: record missing name");
+        }
+        total_records += arr.len();
+    }
+    assert_eq!(
+        total_records, 10,
+        "all records preserved across split files"
+    );
+    assert!(
+        multi_record_file_seen,
+        "at least one file must hold multiple records to exercise the mid-document corruption path",
+    );
+}
+
+/// Byte-limited splitting of XML output: each rotated file must be a single
+/// well-formed document with exactly one root element. Regression guard for the
+/// finalizing `flush()` closing the root after every record during byte
+/// accounting, which stranded later records outside the root.
+#[test]
+fn test_splitting_writer_xml_byte_split_valid_files() {
+    use crate::xml::writer::{XmlWriter, XmlWriterConfig};
+
+    let schema = make_schema(&["id", "val"]);
+    let registry = FileRegistry::new();
+    let policy = SplitPolicy {
+        max_records: None,
+        max_bytes: Some(120),
+        group_key: None,
+        repeat_header: false,
+        oversize_group: OversizeGroupPolicy::default(),
+    };
+
+    let xml_config = XmlWriterConfig {
+        root_element: "items".into(),
+        record_element: "item".into(),
+        ..Default::default()
+    };
+
+    let xml_factory: WriterFactory = Box::new(
+        move |counting: CountingWriter<Box<dyn Write + Send>>, schema: Arc<Schema>| {
+            Ok(
+                Box::new(XmlWriter::new(counting, schema, xml_config.clone()))
+                    as Box<dyn FormatWriter>,
+            )
+        },
+    );
+
+    let mut writer = SplittingWriter::new(
+        registry.file_factory(),
+        xml_factory,
+        Arc::clone(&schema),
+        policy,
+    );
+
+    for i in 0..10 {
+        let record = make_record(
+            &schema,
+            vec![Value::Integer(i), Value::String(format!("v{i}").into())],
+        );
+        writer.write_record(&record).unwrap();
+    }
+    writer.flush().unwrap();
+
+    assert!(
+        registry.file_count() > 1,
+        "byte limit should have split into multiple files"
+    );
+    let contents = registry.file_contents();
+
+    let mut total_items = 0;
+    let mut multi_record_file_seen = false;
+    for (idx, content) in contents.iter().enumerate() {
+        // Exactly one root open/close per file — with the bug, a finalizing
+        // flush after each record emits multiple `</items>` and strands later
+        // records outside the root element.
+        assert_eq!(
+            content.matches("<items>").count(),
+            1,
+            "file {idx}: exactly one root open tag: {content}"
+        );
+        assert_eq!(
+            content.matches("</items>").count(),
+            1,
+            "file {idx}: exactly one root close tag: {content}"
+        );
+        // The whole file parses as well-formed XML from start to EOF.
+        let mut reader = quick_xml::Reader::from_str(content);
+        loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Eof) => break,
+                Ok(_) => {}
+                Err(e) => panic!("file {idx} is not well-formed XML: {e}\n{content}"),
+            }
+        }
+        let items = content.matches("<item>").count();
+        if items > 1 {
+            multi_record_file_seen = true;
+        }
+        total_items += items;
+    }
+    assert_eq!(total_items, 10, "all records preserved across split files");
+    assert!(
+        multi_record_file_seen,
+        "at least one file must hold multiple records to exercise the mid-document corruption path",
+    );
+}
+
 /// A `FormatWriter` that records per-document hook calls into shared state,
 /// for proving `SplittingWriter` forwards framing to its active inner writer.
 struct HookProbe {
