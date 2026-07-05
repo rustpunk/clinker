@@ -143,6 +143,55 @@ fn test_avg_decimal_merge_with_integer_only_state() {
 }
 
 #[test]
+fn test_avg_float_then_decimal_is_null() {
+    // A binary float accumulated BEFORE the first decimal row cannot widen into
+    // the exact decimal sum (only the integer sum is seeded on the switch).
+    // Poison to Null rather than silently dropping the float and reporting the
+    // decimal-only quotient. Reachable only on an untyped column; typecheck
+    // rejects a float/decimal mix for typed columns.
+    let mut a = avg();
+    add_all(&mut a, &[Value::Float(1.5), dec(250, 2)]);
+    // The true avg is (1.5 + 2.5) / 2 = 2.0; dropping the float would report
+    // 2.5 / 2 = 1.25. Neither is honest, so finalize returns Null.
+    assert_eq!(a.finalize().unwrap(), Value::Null);
+}
+
+#[test]
+fn test_avg_decimal_then_float_is_null() {
+    // A binary float observed AFTER decimal mode lands only in the Kahan float
+    // sum, which the decimal quotient never reads. Poison to Null rather than
+    // silently dropping it. Reachable only on an untyped column.
+    let mut a = avg();
+    add_all(&mut a, &[dec(200, 2), Value::Float(1.5)]);
+    // The true avg is (2.0 + 1.5) / 2 = 1.75; dropping the float would report
+    // 2.0 / 2 = 1.0. Neither is honest, so finalize returns Null.
+    assert_eq!(a.finalize().unwrap(), Value::Null);
+}
+
+#[test]
+fn test_avg_merge_float_mode_with_decimal_mode_is_null() {
+    // Merging a float-mode partial (its exact contribution reads only its
+    // integer sum) into a decimal-mode partial — or vice versa — would drop the
+    // float side's total. Both merge directions poison to Null.
+    let build_float = || {
+        let mut s = avg();
+        add_all(&mut s, &[Value::Float(1.5)]);
+        s
+    };
+    let build_decimal = || {
+        let mut s = avg();
+        add_all(&mut s, &[dec(250, 2)]);
+        s
+    };
+    let mut df = build_decimal();
+    df.merge(&build_float());
+    assert_eq!(df.finalize().unwrap(), Value::Null);
+    let mut fd = build_float();
+    fd.merge(&build_decimal());
+    assert_eq!(fd.finalize().unwrap(), Value::Null);
+}
+
+#[test]
 fn test_sum_decimal_spill_roundtrip() {
     // The accumulator state serializes exactly (decimal via the 16-byte form),
     // so a spilled-and-reloaded Sum finalizes identically.
