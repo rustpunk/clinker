@@ -19,7 +19,7 @@ use crate::resolve::scoped_vars::{ScopedVarType, ScopedVarsRegistry};
 /// - `avg(...)` → Float
 /// - `min(T)` / `max(T)` → T (preserving input type)
 /// - `collect(T)` → Array (element type is currently erased)
-/// - `weighted_avg(_, _)` → Float
+/// - `weighted_avg(value, weight)` → Decimal if either arg is decimal, else Float
 /// - Unknown names → Any (caller emits a diagnostic via the parser lookahead set)
 fn aggregate_return_type(name: &str, arg_types: &[Type]) -> Type {
     match name {
@@ -40,7 +40,18 @@ fn aggregate_return_type(name: &str, arg_types: &[Type]) -> Type {
             Some(Type::Decimal) => Type::Decimal,
             _ => Type::Float,
         },
-        "weighted_avg" => Type::Float,
+        // weighted_avg over a decimal value or weight is exact (returns
+        // decimal); otherwise Float.
+        "weighted_avg" => {
+            if arg_types
+                .iter()
+                .any(|t| matches!(t.unwrap_nullable(), Type::Decimal))
+            {
+                Type::Decimal
+            } else {
+                Type::Float
+            }
+        }
         "min" | "max" => arg_types.first().cloned().unwrap_or(Type::Any),
         "collect" => Type::Array,
         _ => Type::Any,
@@ -964,8 +975,8 @@ impl<'a> TypeChecker<'a> {
                 // aggregate exactly, so an exact monetary total/average stays
                 // in the decimal domain instead of being pushed through the
                 // binary-float rounding decimal exists to avoid. weighted_avg
-                // additionally rejects `decimal` — its accumulator has no exact
-                // path yet and would silently drop decimal rows.
+                // aggregates decimals exactly too, and only rejects a decimal
+                // mixed with a binary float (the two cannot combine exactly).
                 match &**name {
                     "sum" | "avg" => {
                         if let Some(arg_ty) = arg_types.first() {
@@ -993,26 +1004,31 @@ impl<'a> TypeChecker<'a> {
                                     .into(),
                                 None,
                             );
-                        } else if let Some(dec_arg) = arg_types
-                            .iter()
-                            .find(|t| matches!(t.unwrap_nullable(), Type::Decimal))
-                        {
-                            // No exact decimal weighted-average accumulator
-                            // exists yet; the float path returns Null for a
-                            // decimal value OR weight (the accumulator's
-                            // `numeric()` conversion skips a decimal in either
-                            // position). Reject loudly rather than silently lose
-                            // the total, and point at the exact routes.
-                            self.error(
-                                *span,
-                                format!(
-                                    "weighted_avg() over a decimal value or weight is not supported yet, got {dec_arg}"
-                                ),
-                                Some(
-                                    "Cast with .to_float() for a binary-float weighted average, or use sum()/avg() which stay exact over decimals"
+                        } else {
+                            // A decimal value or weight now aggregates exactly
+                            // (the accumulator has an exact decimal path). But a
+                            // decimal in one position mixed with a binary float
+                            // in the other cannot combine exactly — reject it
+                            // the same way `decimal * float` is rejected in
+                            // ordinary arithmetic, rather than silently drop the
+                            // total.
+                            let has_decimal = arg_types
+                                .iter()
+                                .any(|t| matches!(t.unwrap_nullable(), Type::Decimal));
+                            let has_float = arg_types
+                                .iter()
+                                .any(|t| matches!(t.unwrap_nullable(), Type::Float));
+                            if has_decimal && has_float {
+                                self.error(
+                                    *span,
+                                    "weighted_avg() cannot mix a decimal argument with a float argument"
                                         .into(),
-                                ),
-                            );
+                                    Some(
+                                        "Convert with .to_decimal() or .to_float() so the value and weight share one numeric domain"
+                                            .into(),
+                                    ),
+                                );
+                            }
                         }
                     }
                     _ => {}
@@ -1777,6 +1793,20 @@ mod tests {
         );
         // avg over int/float is still Float.
         assert_eq!(aggregate_return_type("avg", &[Type::Int]), Type::Float);
+        // weighted_avg stays decimal when either the value OR the weight is
+        // decimal, and Float when neither is.
+        assert_eq!(
+            aggregate_return_type("weighted_avg", &[Type::Decimal, Type::Int]),
+            Type::Decimal
+        );
+        assert_eq!(
+            aggregate_return_type("weighted_avg", &[Type::Int, Type::Decimal]),
+            Type::Decimal
+        );
+        assert_eq!(
+            aggregate_return_type("weighted_avg", &[Type::Int, Type::Int]),
+            Type::Float
+        );
     }
 
     #[test]
@@ -1816,13 +1846,10 @@ mod tests {
     }
 
     #[test]
-    fn test_weighted_avg_over_decimal_rejected() {
-        // weighted_avg has no exact decimal accumulator yet; its float path
-        // silently drops a decimal in EITHER the value or the weight position
-        // (the accumulator's `numeric()` conversion skips a decimal), returning
-        // Null. Typecheck must reject it loudly rather than let a monetary
-        // weighted average be silently wrong — for a decimal value AND a
-        // decimal weight.
+    fn test_weighted_avg_over_decimal_typechecks() {
+        // weighted_avg now has an exact decimal accumulator, so a decimal value
+        // or weight (or both) typechecks and keeps the result in the decimal
+        // domain instead of being rejected.
         let mut cols = IndexMap::new();
         cols.insert("amount".into(), Type::Decimal);
         cols.insert("price".into(), Type::Decimal);
@@ -1832,19 +1859,54 @@ mod tests {
         let fields = ["amount", "price", "qty", "dept"];
 
         for src in [
-            "emit wa = weighted_avg(amount, qty)", // decimal value
-            "emit wa = weighted_avg(qty, price)",  // decimal weight
+            "emit wa = weighted_avg(amount, qty)", // decimal value, int weight
+            "emit wa = weighted_avg(qty, price)",  // int value, decimal weight
+            "emit wa = weighted_avg(amount, price)", // decimal value and weight
+        ] {
+            let parsed = Parser::parse(src);
+            assert!(parsed.errors.is_empty());
+            let resolved = resolve_program(parsed.ast, &fields, parsed.node_count).unwrap();
+            let typed = type_check_with_mode(resolved, &schema, agg_mode(&["dept"]))
+                .unwrap_or_else(|d| {
+                    panic!(
+                        "`{src}` must typecheck over a decimal column, got: {:?}",
+                        d.iter().map(|e| &e.message).collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(
+                first_emit_expr_type(&typed),
+                Type::Decimal,
+                "result type for `{src}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_weighted_avg_decimal_float_mix_rejected() {
+        // A decimal in one position and a binary float in the other cannot
+        // combine exactly, mirroring the `decimal * float` arithmetic rule, so
+        // the mix is rejected loudly rather than silently dropped.
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Decimal);
+        cols.insert("rate".into(), Type::Float);
+        cols.insert("dept".into(), Type::String);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let fields = ["amount", "rate", "dept"];
+
+        for src in [
+            "emit wa = weighted_avg(amount, rate)", // decimal value, float weight
+            "emit wa = weighted_avg(rate, amount)", // float value, decimal weight
         ] {
             let parsed = Parser::parse(src);
             assert!(parsed.errors.is_empty());
             let resolved = resolve_program(parsed.ast, &fields, parsed.node_count).unwrap();
             let errs = type_check_with_mode(resolved, &schema, agg_mode(&["dept"]))
-                .expect_err("weighted_avg over a decimal must be rejected");
+                .expect_err("weighted_avg mixing decimal and float must be rejected");
             assert!(
                 errs.iter().any(|d| d
                     .message
-                    .contains("weighted_avg() over a decimal value or weight is not supported")),
-                "`{src}` expected a weighted_avg decimal rejection, got: {:?}",
+                    .contains("cannot mix a decimal argument with a float argument")),
+                "`{src}` expected a decimal/float mix rejection, got: {:?}",
                 errs.iter().map(|d| &d.message).collect::<Vec<_>>()
             );
         }
