@@ -6,6 +6,9 @@
 //! through the permutation, and emits the ordered run. The dispatcher's
 //! `Sort` arm is a single delegating call into [`dispatch_sort`].
 
+use std::cmp::Ordering;
+use std::sync::Arc;
+
 use clinker_record::Record;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
@@ -15,6 +18,10 @@ use crate::executor::dispatch::{
     tee_emit_to_region_input_buffers,
 };
 use crate::executor::{parse_memory_limit, stage_metrics};
+use crate::pipeline::loser_tree::LoserTree;
+use crate::pipeline::sort::compare_records_by_fields;
+use crate::pipeline::spill::{SpillFile, SpillReader};
+use clinker_plan::config::SortField;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
@@ -116,43 +123,14 @@ pub(crate) fn dispatch_sort(
         })
     })?;
 
-    let mut out: Vec<(Record, u64)> = Vec::with_capacity(sort_count as usize);
-    match sorted {
-        SortedOutput::InMemory(pairs) => {
-            for (record, row_num) in pairs {
-                out.push((record, row_num));
-            }
-        }
-        SortedOutput::Spilled(files) => {
-            // Spill files are individually sorted but not
-            // globally merged. For correctness when multiple
-            // spill files exist, a k-way merge is required.
-            // Single-file fast path is exact.
-            if files.len() > 1 {
-                return Err(PipelineError::Io(std::io::Error::other(format!(
-                    "sort enforcer '{name}' produced {} spill files; \
-                             k-way merge for enforcer sort is not yet implemented \
-                             (memory.limit too small for input)",
-                    files.len()
-                ))));
-            }
-            for file in files {
-                let reader = file.reader().map_err(|e| {
-                    PipelineError::Io(std::io::Error::other(format!(
-                        "sort enforcer '{name}' spill read failed: {e}"
-                    )))
-                })?;
-                for entry in reader {
-                    let (record, row_num) = entry.map_err(|e| {
-                        PipelineError::Io(std::io::Error::other(format!(
-                            "sort enforcer '{name}' spill decode failed: {e}"
-                        )))
-                    })?;
-                    out.push((record, row_num));
-                }
-            }
-        }
-    }
+    // Individually-sorted runs from `SortBuffer` are folded into one globally
+    // ordered run through the same LoserTree k-way merge that aggregation spill
+    // uses; a single in-memory run is already globally ordered and needs no
+    // merge.
+    let out: Vec<(Record, u64)> = match sorted {
+        SortedOutput::InMemory(pairs) => pairs,
+        SortedOutput::Spilled(files) => merge_sorted_runs(files, sort_fields)?,
+    };
     ctx.collector
         .record(sort_timer.finish(sort_count, sort_count));
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &out)?;
@@ -167,4 +145,222 @@ pub(crate) fn dispatch_sort(
     ctx.node_buffers.insert(node_idx, nb);
 
     Ok(())
+}
+
+/// One entry in the enforcer-sort k-way merge: a spilled record and the
+/// `row_num` payload carried through the sort permutation. `Ord` delegates to
+/// [`compare_records_by_fields`] — the exact field comparator `SortBuffer`
+/// formed each run with — so the merged order is byte-identical to a single
+/// in-memory sort. The memcmp key on
+/// [`crate::pipeline::loser_tree::MergeEntry`] is deliberately not used here:
+/// it is not provably equal to the field comparator across Integer/Decimal or
+/// float ordering, so merging on it could silently mis-order cross-type keys.
+struct Run {
+    sort_by: Arc<[SortField]>,
+    record: Record,
+    row_num: u64,
+}
+
+impl PartialEq for Run {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Run {}
+
+impl PartialOrd for Run {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Run {
+    fn cmp(&self, other: &Self) -> Ordering {
+        compare_records_by_fields(&self.record, &other.record, &self.sort_by)
+    }
+}
+
+/// Pull the next `(record, row_num)` from one spilled run, wrapping it as a
+/// [`Run`] merge entry, or `None` at end of stream.
+fn next_run(
+    reader: &mut SpillReader<u64>,
+    sort_by: &Arc<[SortField]>,
+) -> Result<Option<Run>, PipelineError> {
+    match reader.next() {
+        None => Ok(None),
+        Some(Ok((record, row_num))) => Ok(Some(Run {
+            sort_by: Arc::clone(sort_by),
+            record,
+            row_num,
+        })),
+        Some(Err(e)) => Err(PipelineError::Io(std::io::Error::other(format!(
+            "sort enforcer spill decode failed: {e}"
+        )))),
+    }
+}
+
+/// K-way merge the individually-sorted spill runs into one globally-ordered
+/// run via a [`LoserTree`], preserving each record's `row_num` payload.
+///
+/// `SortBuffer` spills runs in input order (run 0 earliest) with a stable
+/// per-run sort, and the loser tree breaks ties by lower stream index, so
+/// equal keys emit in input order — the merged run is byte-identical to the
+/// single in-memory sort the buffer would have produced without spilling.
+///
+/// Memory model: holds one resident record per open run plus the fully
+/// materialized output, matching the already-accepted single-run spill path.
+fn merge_sorted_runs(
+    files: Vec<SpillFile<u64>>,
+    sort_by: &[SortField],
+) -> Result<Vec<(Record, u64)>, PipelineError> {
+    let sort_by: Arc<[SortField]> = Arc::from(sort_by.to_vec());
+    // Each reader owns its own file handle; `files` is held for the whole
+    // merge so the spill temp files outlive every read.
+    let mut readers: Vec<SpillReader<u64>> = files
+        .iter()
+        .map(|f| f.reader())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            PipelineError::Io(std::io::Error::other(format!(
+                "sort enforcer spill read failed: {e}"
+            )))
+        })?;
+
+    // Seed the tree with one entry per run.
+    let mut initial: Vec<Option<Run>> = Vec::with_capacity(readers.len());
+    for reader in &mut readers {
+        initial.push(next_run(reader, &sort_by)?);
+    }
+    let mut tree = LoserTree::new(initial);
+
+    let mut out: Vec<(Record, u64)> = Vec::new();
+    while tree.winner().is_some() {
+        let idx = tree.winner_index();
+        // The loser tree exposes only `&T`; clone the winning record and copy
+        // its `row_num` out before refilling from the winning run. This
+        // per-record clone mirrors the aggregation spill merge.
+        let (record, row_num) = {
+            let winner = tree.winner().expect("winner present under loop guard");
+            (winner.record.clone(), winner.row_num)
+        };
+        out.push((record, row_num));
+        let next = next_run(&mut readers[idx], &sort_by)?;
+        tree.replace_winner(next);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
+    use clinker_plan::config::SortOrder;
+    use clinker_record::{Schema, Value};
+    use rust_decimal::Decimal;
+
+    fn schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec!["k".into(), "id".into()]))
+    }
+
+    /// A record whose sort key `k` is a `Decimal` (mantissa/10) and whose
+    /// `id` mirrors the carried `row_num` for readback.
+    fn rec(schema: &Arc<Schema>, k_mantissa: i64, id: i64) -> Record {
+        Record::new(
+            schema.clone(),
+            vec![
+                Value::Decimal(Decimal::new(k_mantissa, 1)),
+                Value::Integer(id),
+            ],
+        )
+    }
+
+    fn sort_by_k_asc() -> Vec<SortField> {
+        vec![SortField {
+            field: "k".into(),
+            order: SortOrder::Asc,
+            null_order: None,
+        }]
+    }
+
+    /// Multiple individually-sorted spill runs — with a `Decimal` sort key,
+    /// duplicate keys spanning different runs, and unsorted input within each
+    /// run — must k-way merge into one globally-ordered run that preserves
+    /// every record's `row_num` payload and emits equal keys in input order
+    /// (stable). This is the correctness the enforcer sort lost when it
+    /// rejected multi-run spills instead of merging them.
+    #[test]
+    fn merge_sorted_runs_globally_orders_stably_and_preserves_row_num() {
+        let schema = schema();
+        let sort_by = sort_by_k_asc();
+        // budget=1 is the spill-everything threshold; runs are flushed
+        // explicitly below so each carries several unsorted records.
+        let mut buf: SortBuffer<u64> =
+            SortBuffer::new(sort_by.clone(), 1, None, true, schema.clone());
+
+        // Run A: keys 3.0, 1.0, 2.0 (row_num 0,1,2).
+        buf.push(rec(&schema, 30, 0), 0);
+        buf.push(rec(&schema, 10, 1), 1);
+        buf.push(rec(&schema, 20, 2), 2);
+        buf.sort_and_spill().unwrap();
+        // Run B: keys 2.0, 1.0 (row_num 3,4) — duplicates 2.0 and 1.0 from A.
+        buf.push(rec(&schema, 20, 3), 3);
+        buf.push(rec(&schema, 10, 4), 4);
+        buf.sort_and_spill().unwrap();
+        // Run C: keys 2.0, 4.0 (row_num 5,6) — duplicate 2.0 from A and B.
+        buf.push(rec(&schema, 20, 5), 5);
+        buf.push(rec(&schema, 40, 6), 6);
+        buf.sort_and_spill().unwrap();
+
+        let files = match buf.finish().unwrap() {
+            SortedOutput::Spilled(files) => {
+                assert_eq!(files.len(), 3, "three explicit flushes → three runs");
+                files
+            }
+            SortedOutput::InMemory(_) => panic!("expected Spilled after three flushes"),
+        };
+
+        let merged = merge_sorted_runs(files, &sort_by).unwrap();
+
+        // Every input record survives the merge exactly once.
+        assert_eq!(merged.len(), 7);
+
+        // Globally ordered on the Decimal key, ascending.
+        let keys: Vec<Decimal> = merged
+            .iter()
+            .map(|(r, _)| match r.get("k") {
+                Some(Value::Decimal(d)) => *d,
+                other => panic!("expected Decimal key, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                Decimal::new(10, 1),
+                Decimal::new(10, 1),
+                Decimal::new(20, 1),
+                Decimal::new(20, 1),
+                Decimal::new(20, 1),
+                Decimal::new(30, 1),
+                Decimal::new(40, 1),
+            ],
+            "runs must merge into ascending Decimal order"
+        );
+
+        // Stable: for equal keys, records emit in input order (run 0 earliest,
+        // then input order within a run). The carried row_num payload proves it
+        // and that no record picked up another's payload through the merge.
+        let row_nums: Vec<u64> = merged.iter().map(|(_, rn)| *rn).collect();
+        assert_eq!(
+            row_nums,
+            vec![1, 4, 2, 3, 5, 0, 6],
+            "equal keys must emit in input order and carry their own row_num"
+        );
+
+        // The payload identity matches the record's `id` column for every row,
+        // confirming the pairing survived both the spill envelope and the merge.
+        for (record, row_num) in &merged {
+            assert_eq!(record.get("id"), Some(&Value::Integer(*row_num as i64)));
+        }
+    }
 }
