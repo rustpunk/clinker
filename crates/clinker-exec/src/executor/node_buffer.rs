@@ -15,7 +15,9 @@
 //! that did not spill. Producer-side spill is wired in
 //! `executor/node_buffer_spill.rs` and gated on
 //! `MemoryArbitrator::should_spill()` at every bulk admission site via
-//! `admit_node_buffer`.
+//! `admit_node_buffer`. A slot that stays resident and is later elected
+//! as a spill victim under sustained pressure is flushed by the
+//! dispatcher's per-node sweep through [`NodeBuffer::spill_resident_memory`].
 
 use std::vec::IntoIter as VecIntoIter;
 
@@ -197,6 +199,26 @@ impl NodeBuffer {
         }
     }
 
+    /// Column count of the slot's first resident record, or `0` when the
+    /// slot holds no in-memory record. Cheap — stops at the first record
+    /// without allocating — so the spill sweep can resolve the on-disk
+    /// compression mode against the slot's schema width before consuming
+    /// the buffer.
+    pub(crate) fn first_record_column_count(&self) -> usize {
+        let mem_slice = match self {
+            Self::Memory(v) => v.as_slice(),
+            Self::Mixed { mem, .. } => mem.as_slice(),
+            Self::Spilled { .. } => &[],
+        };
+        mem_slice
+            .iter()
+            .find_map(|e| match e {
+                StreamEvent::Record(r, _) => Some(r.schema().column_count()),
+                StreamEvent::Punctuation(_) => None,
+            })
+            .unwrap_or(0)
+    }
+
     /// Heuristic in-memory footprint of the slot, read by the
     /// `NodeBufferConsumer` wrapper's `current_usage` to drive the
     /// arbitrator's pull-mode attribution and Priority-policy victim
@@ -258,6 +280,60 @@ impl NodeBuffer {
             events.push(StreamEvent::punctuation(p));
         }
         Self::Memory(events)
+    }
+
+    /// Convert a resident `Memory` slot into a `Spilled` slot by flushing
+    /// its records to a single on-disk chunk, returning the new variant
+    /// alongside the chunk's on-disk byte size for the caller's disk-quota
+    /// accounting.
+    ///
+    /// The arbitrator's resident-slot spill sweep
+    /// (`dispatch::service_node_buffer_spill_requests`) calls this when it
+    /// elects a live `node_buffers` slot as a spill victim: the slot's
+    /// records leave RAM for disk and the caller discharges the slot's
+    /// in-memory charge. Punctuations never spill — they move to the
+    /// `Spilled` variant's `pending_puncts` sidecar and drain after the
+    /// spill chunk, preserving the "punctuation trails its document"
+    /// order. A slot holding only punctuations (no records) stays `Memory`
+    /// (no empty spill file) and reports `0` spilled bytes.
+    ///
+    /// Only a `Memory` slot spills through this path: a `Spilled` slot is
+    /// already on disk and a `Mixed` slot is the document-DLQ-only shape.
+    /// Both return unchanged with `0` bytes — the sweep only ever hands
+    /// this a `Memory` slot (it filters on the variant before electing a
+    /// victim), and the pass-through arm keeps the method total for any
+    /// future caller.
+    pub(crate) fn spill_resident_memory(
+        self,
+        spill_dir: Option<&std::path::Path>,
+        compress: bool,
+    ) -> Result<(Self, u64), PipelineError> {
+        let Self::Memory(events) = self else {
+            return Ok((self, 0));
+        };
+        let mut records: Vec<(Record, u64)> = Vec::with_capacity(events.len());
+        let mut puncts: Vec<Punctuation> = Vec::new();
+        for event in events {
+            match event {
+                StreamEvent::Record(r, rn) => records.push((r, rn)),
+                StreamEvent::Punctuation(p) => puncts.push(p),
+            }
+        }
+        match crate::executor::node_buffer_spill::spill_node_buffer(records, spill_dir, compress)? {
+            Some((file, count)) => {
+                let file_bytes = std::fs::metadata(file.path()).map(|m| m.len()).unwrap_or(0);
+                Ok((
+                    Self::Spilled {
+                        chunks: vec![(file, count)],
+                        pending_puncts: puncts,
+                    },
+                    file_bytes,
+                ))
+            }
+            // Punctuation-only slot: nothing to spill, keep the puncts
+            // resident so their document boundaries still drain.
+            None => Ok((Self::memory_from_records_and_puncts(Vec::new(), puncts), 0)),
+        }
     }
 
     /// Consume the buffer, returning an iterator that yields memory
@@ -348,9 +424,15 @@ impl Iterator for NodeBufferDrain {
 /// `Arc<ConsumerHandle>` shared with the dispatcher: every producer
 /// push updates `handle.bytes` to track `NodeBuffer::estimated_memory_bytes()`;
 /// every consumer drain decrements it. `try_spill` flips the handle's
-/// spill-request flag; the dispatcher reads it at the next admission
-/// boundary and routes through the existing `spill_node_buffer`
-/// (postcard, optionally LZ4-framed, via `SpillWriter<u64>`) path.
+/// spill-request flag but performs no I/O itself; the dispatcher's
+/// per-node sweep `dispatch::service_node_buffer_spill_requests` reads
+/// the flag via `take_spill_request` at the next `dispatch_plan_node`
+/// turn and, for a resident `Memory` slot with a single drain consumer,
+/// spills it through `NodeBuffer::spill_resident_memory` (postcard,
+/// optionally LZ4-framed, via `SpillWriter<u64>`). A non-spillable slot
+/// (fan-out / composition input-port edge, whose consumer would reach
+/// `clone_memory_only`) is skipped by that sweep and hard-gated at
+/// admission instead.
 ///
 /// `spill_priority = 0`: cheapest victim. Inter-stage buffers are
 /// already row-oriented and write straight through `SpillWriter<u64>`;
@@ -630,6 +712,70 @@ mod tests {
         drop(nb);
 
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn spill_resident_memory_converts_records_to_spilled_preserving_puncts() {
+        let s = schema();
+        let ctx = synthetic_document_context();
+        let mut nb = NodeBuffer::Memory(Vec::new());
+        nb.push(rec(&s, 1, "a"), 10);
+        nb.push(rec(&s, 2, "b"), 11);
+        nb.push_event(StreamEvent::punctuation(Punctuation::document_close(ctx)));
+
+        let (spilled, file_bytes) = nb
+            .spill_resident_memory(None, true)
+            .expect("resident spill ok");
+        assert!(matches!(spilled, NodeBuffer::Spilled { .. }));
+        assert!(
+            file_bytes > 0,
+            "a non-empty record run must report its on-disk byte size"
+        );
+
+        // Records stream back from disk in arrival order, then the trailing
+        // punctuation — the spill sidecar preserves the document boundary.
+        let drained: Vec<_> = spilled.drain().collect::<Result<_, _>>().unwrap();
+        assert_eq!(drained.len(), 3);
+        assert_eq!(rec_row_num(&drained[0]), 10);
+        assert_eq!(rec_row_num(&drained[1]), 11);
+        assert!(matches!(drained[2], StreamEvent::Punctuation(_)));
+    }
+
+    #[test]
+    fn spill_resident_memory_keeps_punct_only_slot_in_memory() {
+        let ctx = synthetic_document_context();
+        let nb = NodeBuffer::Memory(vec![StreamEvent::punctuation(Punctuation::document_close(
+            ctx,
+        ))]);
+
+        let (kept, file_bytes) = nb
+            .spill_resident_memory(None, true)
+            .expect("punct-only spill ok");
+        // No records to spill: the slot stays resident with zero spilled
+        // bytes so the sweep records nothing against the disk quota and the
+        // document boundary still drains.
+        assert!(matches!(kept, NodeBuffer::Memory(_)));
+        assert_eq!(file_bytes, 0);
+        let drained: Vec<_> = kept.drain().collect::<Result<_, _>>().unwrap();
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(drained[0], StreamEvent::Punctuation(_)));
+    }
+
+    #[test]
+    fn spill_resident_memory_passes_through_already_spilled_slot() {
+        let s = schema();
+        let nb = NodeBuffer::Spilled {
+            chunks: vec![spill_chunk(vec![(rec(&s, 1, "a"), 1)])],
+            pending_puncts: Vec::new(),
+        };
+        // An already-spilled slot is on disk: the helper leaves it untouched
+        // and reports zero fresh spilled bytes (the sweep never hands it one,
+        // but the arm keeps the method total).
+        let (passed, file_bytes) = nb
+            .spill_resident_memory(None, true)
+            .expect("pass-through ok");
+        assert!(matches!(passed, NodeBuffer::Spilled { .. }));
+        assert_eq!(file_bytes, 0);
     }
 
     #[test]
