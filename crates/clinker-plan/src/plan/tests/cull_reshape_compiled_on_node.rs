@@ -106,6 +106,116 @@ nodes:
     );
 }
 
+/// A multi-rule Cull's decision program stamps the reconstructed one-line
+/// decision source, and each disjunct's spans index that exact string:
+/// slicing the stamped source at the OR body's `lhs` / `rhs` spans recovers
+/// each rule's `drop_group_when` verbatim. This keeps a runtime eval-error
+/// caret — whose byte offsets are resolved against the stamped source — over
+/// the rule text that actually failed, rather than an off-by-prefix slice.
+#[test]
+fn cull_decision_disjunct_spans_index_the_stamped_source() {
+    // These two literals must match the `drop_group_when` values in the YAML
+    // below exactly; the test asserts each disjunct's span slices back to them.
+    let rule0_src = "sum(if status == 'error' then 1 else 0) > 0";
+    let rule1_src = "sum(amount) > 100";
+    let yaml = r#"
+pipeline:
+  name: cull_spans
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: int }
+        - { name: status, type: string }
+  - type: cull
+    name: cd
+    input: src
+    config:
+      partition_by: [id]
+      removed_to: removed
+      rules:
+        - name: drop_errors
+          drop_group_when: "sum(if status == 'error' then 1 else 0) > 0"
+        - name: drop_big
+          drop_group_when: "sum(amount) > 100"
+  - type: output
+    name: out
+    input: cd
+    config:
+      name: out
+      type: csv
+      path: out.csv
+  - type: output
+    name: audit
+    input: cd.removed
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#;
+    let compiled = compile_ok(yaml);
+    let g = &compiled.dag().graph;
+    let idx = g
+        .node_indices()
+        .find(|&i| g[i].name() == "cd")
+        .expect("cull node `cd` present");
+    let PlanNode::Cull { typed, .. } = &g[idx] else {
+        panic!("node `cd` is not a Cull");
+    };
+
+    // The decision program stamps the reconstructed one-line source.
+    let src = typed
+        .source
+        .as_deref()
+        .expect("cull decision program stamps its display source");
+    let expected = format!("emit {CULL_DROP_DECISION_COLUMN} = ({rule0_src}) or ({rule1_src})");
+    assert_eq!(
+        src, expected,
+        "decision source is the parenthesized OR of the rule predicates"
+    );
+
+    // The single emit's body is the OR of the two rule predicates.
+    let stmt = typed
+        .program
+        .statements
+        .first()
+        .expect("decision program carries one emit");
+    let cxl::ast::Statement::Emit { expr, .. } = stmt else {
+        panic!("decision program statement is not an emit");
+    };
+    let cxl::ast::Expr::Binary {
+        op: cxl::ast::BinOp::Or,
+        lhs,
+        rhs,
+        ..
+    } = expr
+    else {
+        panic!("two-rule decision body is not an OR");
+    };
+
+    // Each disjunct's top-level span slices the stamped source back to the
+    // exact rule predicate it was parsed from.
+    let slice = |e: &cxl::ast::Expr| -> &str {
+        let s = e.span();
+        &src[s.start as usize..s.end as usize]
+    };
+    assert_eq!(
+        slice(lhs),
+        rule0_src,
+        "left disjunct span must slice the stamped source to rule 0"
+    );
+    assert_eq!(
+        slice(rhs),
+        rule1_src,
+        "right disjunct span must slice the stamped source to rule 1"
+    );
+}
+
 /// A `#` line-comment in a Cull rule predicate compiles: each rule is parsed
 /// independently, so a trailing comment terminates at its own end-of-line
 /// instead of swallowing the following disjuncts, and the parsed predicates
