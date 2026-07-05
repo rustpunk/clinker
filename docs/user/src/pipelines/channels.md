@@ -559,6 +559,42 @@ declaration, field, or split the source does not carry is E239. These ops
 apply after the `options` merge, so they layer on top of an `options` value
 that replaces the same declaration in one patch.
 
+### Multi-record patches (discriminator-driven flat files)
+
+A multi-record flat file interleaves several record layouts in one file, each
+identified by a discriminator tag. A `sources:` patch reshapes that layout with
+`records:` (keyed by record-type id) and a `discriminator:` merge, so a tenant's
+record set can differ from the base without editing the pipeline:
+
+```yaml
+sources:
+  ledger:                                  # a multi-record source
+    discriminator: { start: 2 }            # move the tag byte range (partial merge)
+    records:
+      detail:  { tag: X }                  # retag; a nested `columns:` reshapes fields
+      trailer: remove                      # drop a record type
+      header:                              # add a record type (map key = its id)
+        add:
+          tag: H
+          columns:
+            - { name: hdr_id, type: string, start: 1, width: 8 }
+```
+
+A `records` entry follows the same keyed grammar as `schema`: a bare `remove`
+drops the record type, `{ add: { tag, columns, ... } }` declares a new one, and
+a bare attribute map modifies an existing one. A modify sets any subset of the
+record type's `tag` / `parent` / `join_key` / `description` and carries a nested
+`columns:` map that runs the column-op grammar (`modify` / `rename` / `add` /
+`remove`) against that record type's own fields. The `discriminator:` op merges
+field by field onto the current discriminator — a named field overwrites, an
+omitted one is kept — and the merged result must be a byte range (`start` +
+optional `width`) XOR a `field`.
+
+These ops apply only to a multi-record schema (E241). Modifying or removing an
+unknown record-type id is E242, adding an id that already exists is E243, a
+merged discriminator that is neither pure byte-range nor pure field is E244, and
+a discriminator tag shared by two record types after the patch is E245.
+
 `sources:` patches target **top-level** source nodes; a source declared inside a
 composition body is not reachable this way (patching it fails with E230). When a
 patch changes the effective source config, the run's pipeline identity differs
@@ -582,3 +618,8 @@ not collide.
 | **E238** | A `group_section` / `set_section` patch on a non-X12 source, or a `split_fields` patch on a non-HL7 source. |
 | **E239** | A `remove` of a nested-section declaration, declared section field, or field split the source does not carry. |
 | **E240** | A malformed format-structure patch: creating a nested section without a `name`, adding a split without `components`, a split key that is not a positional `fNN` name, or a zero axis width. |
+| **E241** | A `records` / `discriminator` patch on a single-record / generated / external-file schema — these ops apply only to a multi-record schema. |
+| **E242** | A `records` `modify` / `remove` of a record-type id the source does not declare. |
+| **E243** | A `records` `add` of a record-type id that already exists. |
+| **E244** | A merged `discriminator` that is neither a pure byte range (`start` + optional `width`) nor a pure `field`. |
+| **E245** | Two record types share a discriminator tag after the patch, which would make the reader's discriminator dispatch ambiguous. |

@@ -127,9 +127,10 @@ pub struct OverlayFile {
     /// the run behaves as if the source YAML had been hand-edited: CXL-typed
     /// column ops (`schema`), nested-array explosion/join (`array_paths`),
     /// scalar per-format input `options`, X12 nested-envelope declarations
-    /// (`group_section` / `set_section`), and HL7 composite-field splits
-    /// (`split_fields`). Scoped to this one target, so source-node names
-    /// resolve unambiguously against the overlaid pipeline.
+    /// (`group_section` / `set_section`), HL7 composite-field splits
+    /// (`split_fields`), and multi-record flat-file record types
+    /// (`records` / `discriminator`). Scoped to this one target, so source-node
+    /// names resolve unambiguously against the overlaid pipeline.
     #[serde(default)]
     pub sources: IndexMap<String, SourceConfigPatch>,
 }

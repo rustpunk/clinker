@@ -12,16 +12,17 @@
 //!
 //! Handled surfaces: the format-agnostic schema-shaping ops — the CXL-typed
 //! column list (`schema`), nested-array explosion/join (`array_paths`), and
-//! scalar per-format input options (`options`) — plus the format-structure
-//! ops for X12 nested-envelope declarations (`group_section` / `set_section`)
-//! and HL7 composite-field splits (`split_fields`). Deeper format-layer
-//! layouts (fixed-width/positional field schemas, multi-record
-//! discrimination) reuse this same framework as additional handlers.
+//! scalar per-format input options (`options`) — the format-structure ops for
+//! X12 nested-envelope declarations (`group_section` / `set_section`) and HL7
+//! composite-field splits (`split_fields`), and the multi-record flat-file ops
+//! for discriminator-driven record types (`records` / `discriminator`).
 
 use super::*;
 use crate::config::composition::SchemaProvRecorder;
 use crate::config::pipeline_node::{PipelineNode, SourceBody};
-use clinker_format::{Column, EnvelopeFieldType, NestedEnvelopeSection, SourceSchema};
+use clinker_format::{
+    Column, Discriminator, EnvelopeFieldType, NestedEnvelopeSection, RecordType, SourceSchema,
+};
 use clinker_record::schema_def::{Justify, TruncationPolicy};
 use cxl::typecheck::Type;
 use indexmap::IndexMap;
@@ -61,6 +62,15 @@ pub struct SourceConfigPatch {
     /// source, after the `options` merge.
     #[serde(skip_serializing_if = "IndexMap::is_empty")]
     pub split_fields: IndexMap<String, SplitFieldOp>,
+    /// Multi-record `records` ops keyed by record-type id (`modify` / `add` /
+    /// `remove`). Applies only to a multi-record (discriminator-driven) schema.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub records: IndexMap<String, RecordTypeOp>,
+    /// Partial merge onto a multi-record source's `discriminator` block. Every
+    /// field is optional; a named field overwrites, an omitted one is kept, and
+    /// the merged result must be byte-range XOR field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discriminator: Option<DiscriminatorPatch>,
 }
 
 impl SourceConfigPatch {
@@ -72,6 +82,8 @@ impl SourceConfigPatch {
             && self.group_section.is_none()
             && self.set_section.is_none()
             && self.split_fields.is_empty()
+            && self.records.is_empty()
+            && self.discriminator.is_none()
     }
 }
 
@@ -516,11 +528,181 @@ impl<'de> Deserialize<'de> for SplitFieldOp {
     }
 }
 
+/// One op on a multi-record source's `records` list, keyed by record-type id.
+///
+/// YAML forms (the map key is the record-type id):
+///
+/// ```yaml
+/// detail:  { tag: X, columns: { amount: { type: float } } }  # modify
+/// trailer: remove                                             # drop the type
+/// header:  { add: { tag: H, columns: [ { name: id, type: string } ] } }  # add
+/// ```
+///
+/// A `modify` sets any subset of the record type's `tag` / `parent` /
+/// `join_key` / `description`, plus a nested column-keyed op map that reshapes
+/// that type's own columns through the same grammar as the top-level `schema`
+/// surface. An `add` declares a whole new record type (its id is the map key).
+/// `Serialize` is derived for config-identity hashing only.
+#[derive(Debug, Clone, Serialize)]
+pub enum RecordTypeOp {
+    /// Drop the keyed record type.
+    Remove,
+    /// Set a subset of the keyed record type's attributes and reshape its
+    /// columns.
+    Modify(RecordTypePatch),
+    /// Declare a new record type named by the map key.
+    Add(RecordTypeAdd),
+}
+
+/// A partial [`RecordType`]: any subset of a record type's attributes plus a
+/// nested column-op map. The payload of a [`RecordTypeOp::Modify`]. Each scalar
+/// is `Option<_>` so a modify sets only the attributes it names and keeps the
+/// rest; `columns` carries the same keyed column-op grammar as the top-level
+/// `schema` surface. `Serialize` is for config-identity hashing only.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RecordTypePatch {
+    /// Discriminator tag the reader matches this type's lines on. `None` keeps
+    /// the current tag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    /// Parent record-type id (field inheritance). `None` keeps the current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Join key field. `None` keeps the current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub join_key: Option<String>,
+    /// Human description. `None` keeps the current.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Column-name-keyed ops reshaping this record type's own columns.
+    #[serde(skip_serializing_if = "IndexMap::is_empty")]
+    pub columns: IndexMap<String, SchemaColumnOp>,
+}
+
+/// The payload of a [`RecordTypeOp::Add`]: a whole new record type minus its id
+/// (which is the map key). `tag` and `columns` are required, matching a
+/// hand-written `records:` entry; the rest are optional. `deny_unknown_fields`
+/// turns a typo into an error. `Serialize` is for config-identity hashing only.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordTypeAdd {
+    /// Discriminator tag the reader matches this record type's lines on.
+    pub tag: String,
+    /// Human description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Parent record-type id (field inheritance).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Join key field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_key: Option<String>,
+    /// The record type's full column list.
+    pub columns: Vec<Column>,
+}
+
+impl<'de> Deserialize<'de> for RecordTypeOp {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Accepted YAML shapes:
+        //   remove                                              (bare scalar)
+        //   { add: { tag, columns, ... } }                      (add op)
+        //   { tag?, parent?, join_key?, description?, columns? } (modify op)
+        // `add` is the op selector; every other key belongs to the modify leaf.
+        // Mixing `add` with modify attributes is rejected.
+        #[derive(Deserialize, Default)]
+        #[serde(deny_unknown_fields, default)]
+        struct OpMap {
+            add: Option<RecordTypeAdd>,
+            // Modify leaf: inlined so `deny_unknown_fields` still rejects a typo
+            // (a `#[serde(flatten)]` would disable that check and drop spans).
+            tag: Option<String>,
+            parent: Option<String>,
+            join_key: Option<String>,
+            description: Option<String>,
+            columns: IndexMap<String, SchemaColumnOp>,
+        }
+
+        impl OpMap {
+            fn has_modify(&self) -> bool {
+                self.tag.is_some()
+                    || self.parent.is_some()
+                    || self.join_key.is_some()
+                    || self.description.is_some()
+                    || !self.columns.is_empty()
+            }
+            fn modify_leaf(self) -> RecordTypePatch {
+                RecordTypePatch {
+                    tag: self.tag,
+                    parent: self.parent,
+                    join_key: self.join_key,
+                    description: self.description,
+                    columns: self.columns,
+                }
+            }
+        }
+
+        // `OpMap` is boxed in the map arm: it carries a full column list, so an
+        // unboxed variant would leave `Either` lopsided.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Scalar(String),
+            Map(Box<OpMap>),
+        }
+
+        match Either::deserialize(d)? {
+            Either::Scalar(s) if s == "remove" => Ok(RecordTypeOp::Remove),
+            Either::Scalar(other) => Err(de::Error::custom(format!(
+                "unknown records op {other:?}; the bare scalar form only accepts `remove` — use \
+                 `{{ add: {{ tag: <tag>, columns: [ ... ] }} }}` to add a record type, or a bare \
+                 attribute map like `{{ tag: <tag>, columns: {{ ... }} }}` to modify"
+            ))),
+            Either::Map(m) => {
+                let m = *m;
+                let has_add = m.add.is_some();
+                let has_modify = m.has_modify();
+                match (has_add, has_modify) {
+                    (true, false) => Ok(RecordTypeOp::Add(m.add.expect("add present"))),
+                    (false, true) => Ok(RecordTypeOp::Modify(m.modify_leaf())),
+                    (false, false) => Err(de::Error::custom(
+                        "empty records op; use `remove`, `{ add: { tag: <tag>, columns: [ ... ] } }`, \
+                         or a bare attribute map (`tag` / `parent` / `join_key` / `description` / \
+                         `columns`) to modify",
+                    )),
+                    (true, true) => Err(de::Error::custom(
+                        "ambiguous records op; `add` and a bare-attribute modify are mutually \
+                         exclusive — use exactly one",
+                    )),
+                }
+            }
+        }
+    }
+}
+
+/// A partial [`Discriminator`]: a channel's merge onto a multi-record source's
+/// discriminator. Every field is optional and overwrites the current when
+/// named; an omitted field is kept. The merged result must be byte-range XOR
+/// field (E244). `deny_unknown_fields` turns a typo into an error; `Serialize`
+/// is for config-identity hashing only.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct DiscriminatorPatch {
+    /// Byte-range start offset (fixed-width discrimination).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<usize>,
+    /// Byte-range width (fixed-width discrimination).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<usize>,
+    /// Discriminator field name (CSV discrimination).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
+}
+
 /// Apply channel source-config patches to the parsed config in place.
 ///
 /// Runs after parse and before `validate_config`, so the patched config is
 /// the one validated and compiled. Each entry names a source node; an unknown
-/// source name or an ill-formed op is a config error (E230–E240) reported
+/// source name or an ill-formed op is a config error (E230–E245) reported
 /// before the pipeline compiles.
 pub fn apply_source_patches(
     config: &mut PipelineConfig,
@@ -566,6 +748,12 @@ pub fn apply_source_patches(
             src_name,
         )?;
         apply_split_field_ops(&mut body.source, &patch.split_fields, src_name)?;
+        apply_record_ops(
+            &mut body.schema,
+            &patch.records,
+            patch.discriminator.as_ref(),
+            src_name,
+        )?;
     }
     Ok(())
 }
@@ -626,7 +814,7 @@ pub(crate) fn apply_schema_ops(
     schema: &mut SourceSchema,
     ops: &IndexMap<String, SchemaColumnOp>,
     src: &str,
-    mut recorder: Option<&mut SchemaProvRecorder<'_>>,
+    recorder: Option<&mut SchemaProvRecorder<'_>>,
 ) -> Result<(), ConfigError> {
     if ops.is_empty() {
         return Ok(());
@@ -639,6 +827,21 @@ pub(crate) fn apply_schema_ops(
              single-record (column-list) schema, not a multi-record / generated / file schema"
         ))
     })?;
+    apply_column_ops(columns, ops, src, recorder)
+}
+
+/// Apply the keyed column-op grammar (`modify` / `rename` / `add` / `remove`)
+/// to a flat column list in place — the core shared by the single-record
+/// `schema` surface ([`apply_schema_ops`], which wraps this with the E237
+/// schema-kind guard) and the per-record-type column ops of a multi-record
+/// `records` modify. `src` names the source for diagnostics; `recorder` records
+/// per-attribute provenance when present.
+fn apply_column_ops(
+    columns: &mut Vec<Column>,
+    ops: &IndexMap<String, SchemaColumnOp>,
+    src: &str,
+    mut recorder: Option<&mut SchemaProvRecorder<'_>>,
+) -> Result<(), ConfigError> {
     for (col, op) in ops {
         match op {
             SchemaColumnOp::Remove => {
@@ -1093,6 +1296,155 @@ fn unknown_split_field(src: &str, field: &str) -> ConfigError {
     ConfigError::Validation(format!(
         "[E239] channel split_fields patch on source '{src}': remove of a split the source \
          does not declare for field '{field}'"
+    ))
+}
+
+/// Apply a channel's multi-record `records` / `discriminator` ops to a source's
+/// schema in place. Requires a [`SourceSchema::MultiRecord`] schema (E241 on a
+/// single-record / generated / file schema). The discriminator patch merges
+/// field by field and the merged result must be byte-range XOR field (E244).
+/// Record ops resolve by record-type id: `modify` / `remove` of an unknown id
+/// is E242, `add` of an existing id is E243, and a tag shared across record
+/// types after the ops is E245. A `modify`'s nested column ops reuse the same
+/// column-op core as the single-record `schema` surface.
+fn apply_record_ops(
+    schema: &mut SourceSchema,
+    ops: &IndexMap<String, RecordTypeOp>,
+    discriminator: Option<&DiscriminatorPatch>,
+    src: &str,
+) -> Result<(), ConfigError> {
+    if ops.is_empty() && discriminator.is_none() {
+        return Ok(());
+    }
+    let SourceSchema::MultiRecord {
+        discriminator: disc,
+        record_types,
+        ..
+    } = schema
+    else {
+        return Err(ConfigError::Validation(format!(
+            "[E241] channel records patch on source '{src}': `records` / `discriminator` ops \
+             apply only to a multi-record schema, not a single-record / generated / file schema"
+        )));
+    };
+
+    if let Some(dp) = discriminator {
+        // Partial merge: a named field overwrites, an omitted one is kept. The
+        // merged result is then re-checked for the byte-range XOR field shape.
+        if let Some(start) = dp.start {
+            disc.start = Some(start);
+        }
+        if let Some(width) = dp.width {
+            disc.width = Some(width);
+        }
+        if let Some(field) = &dp.field {
+            disc.field = Some(field.clone());
+        }
+        validate_discriminator(disc, src)?;
+    }
+
+    for (id, op) in ops {
+        match op {
+            RecordTypeOp::Remove => {
+                let idx = record_types
+                    .iter()
+                    .position(|rt| rt.id == *id)
+                    .ok_or_else(|| unknown_record_type(src, id, "remove"))?;
+                record_types.remove(idx);
+            }
+            RecordTypeOp::Modify(patch) => {
+                let rt = record_types
+                    .iter_mut()
+                    .find(|rt| rt.id == *id)
+                    .ok_or_else(|| unknown_record_type(src, id, "modify"))?;
+                if let Some(tag) = &patch.tag {
+                    rt.tag = tag.clone();
+                }
+                if let Some(parent) = &patch.parent {
+                    rt.parent = Some(parent.clone());
+                }
+                if let Some(join_key) = &patch.join_key {
+                    rt.join_key = Some(join_key.clone());
+                }
+                if let Some(description) = &patch.description {
+                    rt.description = Some(description.clone());
+                }
+                // Reuse the single-record column-op core on this record type's
+                // own column list; the id threads into the diagnostic label so a
+                // column error names the offending record type. Multi-record
+                // schema provenance is not modeled, so no recorder is passed.
+                let ctx = format!("{src} records.{id}");
+                apply_column_ops(&mut rt.columns, &patch.columns, &ctx, None)?;
+            }
+            RecordTypeOp::Add(add) => {
+                if record_types.iter().any(|rt| rt.id == *id) {
+                    return Err(ConfigError::Validation(format!(
+                        "[E243] channel records patch on source '{src}': add of record type \
+                         '{id}' that already exists"
+                    )));
+                }
+                record_types.push(RecordType {
+                    id: id.clone(),
+                    tag: add.tag.clone(),
+                    description: add.description.clone(),
+                    parent: add.parent.clone(),
+                    join_key: add.join_key.clone(),
+                    columns: add.columns.clone(),
+                });
+            }
+        }
+    }
+
+    // Tags must stay unique across record types so the reader's discriminator
+    // dispatch is unambiguous; a collision an `add` or `modify` introduces is
+    // caught here rather than deep in the reader. A discriminator-only patch
+    // leaves tags untouched, so it skips this check.
+    if !ops.is_empty() {
+        check_tag_uniqueness(record_types, src)?;
+    }
+    Ok(())
+}
+
+/// Reject a merged discriminator that is not exactly one of byte-range or field
+/// (E244), mirroring the reader's fixed-width-vs-CSV dispatch: byte-range needs
+/// a `start` (width defaults to 1), field needs a `field` name, and the two
+/// modes are mutually exclusive.
+fn validate_discriminator(disc: &Discriminator, src: &str) -> Result<(), ConfigError> {
+    let has_byte = disc.start.is_some() || disc.width.is_some();
+    let has_field = disc.field.is_some();
+    let malformed = |reason: &str| {
+        ConfigError::Validation(format!(
+            "[E244] channel discriminator patch on source '{src}': merged discriminator {reason}; \
+             a discriminator is a byte range (`start` + optional `width`) XOR a `field`"
+        ))
+    };
+    match (has_byte, has_field) {
+        (true, true) => Err(malformed("names both a byte range and a `field`")),
+        (false, false) => Err(malformed("names neither a byte range nor a `field`")),
+        (true, false) if disc.start.is_none() => {
+            Err(malformed("sets a byte `width` without a `start` offset"))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Reject two record types sharing a discriminator tag after the ops (E245).
+fn check_tag_uniqueness(record_types: &[RecordType], src: &str) -> Result<(), ConfigError> {
+    for (i, rt) in record_types.iter().enumerate() {
+        if record_types[..i].iter().any(|other| other.tag == rt.tag) {
+            return Err(ConfigError::Validation(format!(
+                "[E245] channel records patch on source '{src}': discriminator tag '{tag}' is \
+                 declared by more than one record type after the patch",
+                tag = rt.tag
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn unknown_record_type(src: &str, id: &str, op: &str) -> ConfigError {
+    ConfigError::Validation(format!(
+        "[E242] channel records patch on source '{src}': {op} of unknown record type '{id}'"
     ))
 }
 
@@ -2183,5 +2535,393 @@ nodes:
         assert!(!patch_from_yaml("set_section:\n  name: txn\n").is_empty());
         assert!(!patch_from_yaml("split_fields:\n  f01: remove\n").is_empty());
         assert!(SourceConfigPatch::default().is_empty());
+    }
+
+    // ── Multi-record `records` / `discriminator` ────────────────────────
+
+    /// A fixed-width multi-record source with a byte-range discriminator and two
+    /// record types (`detail` tag `D`, `trailer` tag `T`), feeding one output.
+    fn multi_record_pipeline() -> PipelineConfig {
+        let yaml = "\
+pipeline:
+  name: patch_test
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: fixed_width
+      path: /tmp/in.dat
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - { id: detail, tag: D, columns: [ { name: amount, type: int, start: 1, width: 9 } ] }
+          - { id: trailer, tag: T, columns: [ { name: count, type: int, start: 1, width: 9 } ] }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: /tmp/out.csv
+";
+        crate::yaml::from_str(yaml).expect("parse multi-record pipeline")
+    }
+
+    /// A CSV multi-record source with a field-mode discriminator.
+    fn multi_record_csv_pipeline() -> PipelineConfig {
+        let yaml = "\
+pipeline:
+  name: patch_test
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: /tmp/in.csv
+      schema:
+        discriminator: { field: rec_type }
+        records:
+          - { id: detail, tag: D, columns: [ { name: rec_type, type: string }, { name: amount, type: float } ] }
+          - { id: trailer, tag: T, columns: [ { name: rec_type, type: string }, { name: count, type: int } ] }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: /tmp/out.csv
+";
+        crate::yaml::from_str(yaml).expect("parse csv multi-record pipeline")
+    }
+
+    fn multi_record(config: &PipelineConfig) -> (&Discriminator, &[RecordType]) {
+        match &config.source_bodies().next().expect("one source").schema {
+            SourceSchema::MultiRecord {
+                discriminator,
+                record_types,
+                ..
+            } => (discriminator, record_types),
+            other => panic!("expected multi-record schema, got {other:?}"),
+        }
+    }
+
+    fn record_type<'a>(record_types: &'a [RecordType], id: &str) -> &'a RecordType {
+        record_types
+            .iter()
+            .find(|rt| rt.id == id)
+            .unwrap_or_else(|| panic!("record type {id:?} present"))
+    }
+
+    #[test]
+    fn records_modify_changes_tag() {
+        let mut config = multi_record_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("records:\n  detail: { tag: X }\n"),
+        )
+        .unwrap();
+        let (_disc, rts) = multi_record(&config);
+        assert_eq!(record_type(rts, "detail").tag, "X");
+        // A field-only modify keeps the rest of the record type intact.
+        assert_eq!(record_type(rts, "detail").columns.len(), 1);
+    }
+
+    #[test]
+    fn records_modify_sets_parent_and_join_key() {
+        let mut config = multi_record_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("records:\n  trailer: { parent: detail, join_key: batch_id }\n"),
+        )
+        .unwrap();
+        let (_disc, rts) = multi_record(&config);
+        let trailer = record_type(rts, "trailer");
+        assert_eq!(trailer.parent.as_deref(), Some("detail"));
+        assert_eq!(trailer.join_key.as_deref(), Some("batch_id"));
+        // The tag is untouched by an attribute-only modify.
+        assert_eq!(trailer.tag, "T");
+    }
+
+    #[test]
+    fn records_modify_reshapes_nested_columns() {
+        // A modify's `columns` map runs the same column-op grammar as the
+        // top-level `schema` surface, scoped to this record type.
+        let mut config = multi_record_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml(
+                "records:\n  detail:\n    columns:\n      amount: { type: float }\n      note: { add: { type: string, start: 10, width: 4 } }\n",
+            ),
+        )
+        .unwrap();
+        let (_disc, rts) = multi_record(&config);
+        let detail = record_type(rts, "detail");
+        assert_eq!(
+            detail
+                .columns
+                .iter()
+                .find(|c| c.name == "amount")
+                .unwrap()
+                .ty,
+            Type::Float
+        );
+        let note = detail
+            .columns
+            .iter()
+            .find(|c| c.name == "note")
+            .expect("added column present");
+        assert_eq!(note.ty, Type::String);
+        assert_eq!(note.start, Some(10));
+        assert_eq!(note.width, Some(4));
+        // Only `detail` was touched; `trailer` is unchanged.
+        assert_eq!(record_type(rts, "trailer").columns.len(), 1);
+    }
+
+    #[test]
+    fn records_add_new_record_type() {
+        let mut config = multi_record_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml(
+                "records:\n  header:\n    add:\n      tag: H\n      parent: detail\n      columns:\n        - { name: hdr_id, type: string, start: 1, width: 8 }\n",
+            ),
+        )
+        .unwrap();
+        let (_disc, rts) = multi_record(&config);
+        assert_eq!(rts.len(), 3);
+        let header = record_type(rts, "header");
+        assert_eq!(header.tag, "H");
+        assert_eq!(header.parent.as_deref(), Some("detail"));
+        assert_eq!(header.columns.len(), 1);
+        assert_eq!(header.columns[0].name, "hdr_id");
+    }
+
+    #[test]
+    fn records_remove_record_type() {
+        let mut config = multi_record_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("records:\n  trailer: remove\n"),
+        )
+        .unwrap();
+        let (_disc, rts) = multi_record(&config);
+        let ids: Vec<&str> = rts.iter().map(|rt| rt.id.as_str()).collect();
+        assert_eq!(ids, vec!["detail"]);
+    }
+
+    #[test]
+    fn records_modify_unknown_id_errors_e242() {
+        let mut config = multi_record_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("records:\n  ghost: { tag: G }\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E242"), "{err}");
+    }
+
+    #[test]
+    fn records_remove_unknown_id_errors_e242() {
+        let mut config = multi_record_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("records:\n  ghost: remove\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E242"), "{err}");
+    }
+
+    #[test]
+    fn records_add_existing_id_errors_e243() {
+        let mut config = multi_record_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml(
+                "records:\n  detail:\n    add:\n      tag: Z\n      columns:\n        - { name: x, type: int, start: 1, width: 2 }\n",
+            ),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E243"), "{err}");
+    }
+
+    #[test]
+    fn records_add_tag_collision_errors_e245() {
+        // A new record type reusing an existing tag would make the reader's
+        // discriminator dispatch ambiguous.
+        let mut config = multi_record_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml(
+                "records:\n  header:\n    add:\n      tag: D\n      columns:\n        - { name: hdr_id, type: string, start: 1, width: 8 }\n",
+            ),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E245"), "{err}");
+    }
+
+    #[test]
+    fn records_modify_tag_collision_errors_e245() {
+        let mut config = multi_record_pipeline();
+        // Retagging `trailer` to `D` collides with `detail`.
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("records:\n  trailer: { tag: D }\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E245"), "{err}");
+    }
+
+    #[test]
+    fn records_modify_nested_unknown_column_errors_and_names_record() {
+        let mut config = multi_record_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("records:\n  detail:\n    columns:\n      ghost: { type: float }\n"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        // The reused column-op core raises E231 for the unknown column...
+        assert!(msg.contains("E231"), "{msg}");
+        // ...and the diagnostic names the offending record type.
+        assert!(msg.contains("records.detail"), "{msg}");
+    }
+
+    #[test]
+    fn discriminator_merge_moves_byte_range() {
+        let mut config = multi_record_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("discriminator: { start: 2, width: 3 }\n"),
+        )
+        .unwrap();
+        let (disc, _rts) = multi_record(&config);
+        assert_eq!(disc.start, Some(2));
+        assert_eq!(disc.width, Some(3));
+        assert_eq!(disc.field, None);
+    }
+
+    #[test]
+    fn discriminator_partial_merge_keeps_omitted_field() {
+        let mut config = multi_record_pipeline();
+        // Setting only `width` keeps the base `start: 0`.
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("discriminator: { width: 4 }\n"),
+        )
+        .unwrap();
+        let (disc, _rts) = multi_record(&config);
+        assert_eq!(disc.start, Some(0));
+        assert_eq!(disc.width, Some(4));
+    }
+
+    #[test]
+    fn discriminator_field_merge_on_csv() {
+        let mut config = multi_record_csv_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("discriminator: { field: kind }\n"),
+        )
+        .unwrap();
+        let (disc, _rts) = multi_record(&config);
+        assert_eq!(disc.field.as_deref(), Some("kind"));
+        assert_eq!(disc.start, None);
+        assert_eq!(disc.width, None);
+    }
+
+    #[test]
+    fn discriminator_merge_mixing_modes_errors_e244() {
+        // The byte-range base plus a `field` merge yields a discriminator that
+        // is neither pure byte-range nor pure field.
+        let mut config = multi_record_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("discriminator: { field: rec_type }\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E244"), "{err}");
+    }
+
+    #[test]
+    fn records_op_on_single_record_source_errors_e241() {
+        let mut config = csv_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("records:\n  detail: { tag: X }\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E241"), "{err}");
+    }
+
+    #[test]
+    fn discriminator_op_on_single_record_source_errors_e241() {
+        let mut config = csv_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("discriminator: { field: kind }\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E241"), "{err}");
+    }
+
+    #[test]
+    fn records_op_ambiguous_add_with_modify_rejected_at_parse() {
+        let err = crate::yaml::from_str::<SourceConfigPatch>(
+            "records:\n  detail: { add: { tag: H, columns: [] }, tag: X }\n",
+        )
+        .unwrap_err();
+        let msg = format!("{}", err.0);
+        assert!(
+            msg.contains("exactly one") || msg.contains("ambiguous"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn records_add_without_columns_rejected_at_parse() {
+        // `columns` is required on an `add`, matching a hand-written `records:`
+        // entry: an add missing it fails to deserialize (the untagged op grammar
+        // surfaces this as a no-matching-variant error rather than propagating
+        // the inner missing-field message).
+        let err =
+            crate::yaml::from_str::<SourceConfigPatch>("records:\n  header: { add: { tag: H } }\n")
+                .unwrap_err();
+        let msg = format!("{}", err.0);
+        assert!(
+            msg.contains("columns") || msg.contains("missing") || msg.contains("variant"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn records_bare_scalar_other_than_remove_rejected_at_parse() {
+        let err =
+            crate::yaml::from_str::<SourceConfigPatch>("records:\n  detail: nope\n").unwrap_err();
+        let msg = format!("{}", err.0);
+        assert!(msg.contains("nope") || msg.contains("remove"), "{msg}");
+    }
+
+    #[test]
+    fn patch_with_only_multi_record_ops_is_not_empty() {
+        assert!(!patch_from_yaml("records:\n  detail: remove\n").is_empty());
+        assert!(!patch_from_yaml("discriminator: { start: 1 }\n").is_empty());
     }
 }
