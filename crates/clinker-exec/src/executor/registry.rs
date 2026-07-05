@@ -478,7 +478,6 @@ fn build_split_policy(split: &clinker_plan::config::SplitConfig) -> SplitPolicy 
         max_records: split.max_records,
         max_bytes: split.max_bytes,
         group_key: split.group_key.clone(),
-        repeat_header: split.repeat_header,
         oversize_group: match split.oversize_group {
             clinker_plan::config::SplitOversizeGroupPolicy::Warn => OversizeGroupPolicy::Warn,
             clinker_plan::config::SplitOversizeGroupPolicy::Error => OversizeGroupPolicy::Error,

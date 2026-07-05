@@ -38,12 +38,8 @@ use clinker_record::{Record, Schema};
 /// pre-scan plus its body stream) can open the source twice without buffering
 /// the whole file. One-pass formats (CSV, fixed-width, XML, EDI) open it once
 /// and ignore the re-open capability.
-///
-/// `file_index` lets the factory differentiate the first file from
-/// subsequent files when format-specific bookkeeping requires it
-/// (currently unused — every format builds the same way per file).
 pub type FactoryFn =
-    dyn FnMut(ReopenableSource, usize) -> Result<Box<dyn FormatReader>, FormatError> + Send;
+    dyn FnMut(ReopenableSource) -> Result<Box<dyn FormatReader>, FormatError> + Send;
 
 /// One file slot in the multi-file stream.
 ///
@@ -160,7 +156,7 @@ impl MultiFileFormatReader {
         );
         self.current_file = Arc::from(slot.path.to_string_lossy().into_owned());
         self.cursor += 1;
-        let reader = (self.factory)(slot.source, idx)?;
+        let reader = (self.factory)(slot.source)?;
         self.active = Some(reader);
         Ok(true)
     }
@@ -302,7 +298,7 @@ mod tests {
 
     fn csv_factory() -> Box<FactoryFn> {
         Box::new(
-            |source: ReopenableSource, _idx: usize| -> Result<Box<dyn FormatReader>, FormatError> {
+            |source: ReopenableSource| -> Result<Box<dyn FormatReader>, FormatError> {
                 Ok(Box::new(CsvReader::from_reader(
                     source.open()?,
                     CsvReaderConfig::default(),

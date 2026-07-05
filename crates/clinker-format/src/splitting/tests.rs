@@ -185,7 +185,6 @@ fn test_split_by_record_count() {
         max_records: Some(30),
         max_bytes: None,
         group_key: None,
-        repeat_header: true,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -222,7 +221,6 @@ fn test_split_by_byte_size() {
         max_records: None,
         max_bytes: Some(50),
         group_key: None,
-        repeat_header: false,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -267,7 +265,6 @@ fn test_split_preserves_key_groups() {
         max_records: Some(15),
         max_bytes: None,
         group_key: Some("dept".into()),
-        repeat_header: true,
         oversize_group: OversizeGroupPolicy::Allow,
     };
 
@@ -312,7 +309,6 @@ fn test_split_oversize_group_warn() {
         max_records: Some(5),
         max_bytes: None,
         group_key: Some("dept".into()),
-        repeat_header: true,
         oversize_group: OversizeGroupPolicy::Warn,
     };
 
@@ -347,7 +343,6 @@ fn test_split_oversize_group_error() {
         max_records: Some(3),
         max_bytes: None,
         group_key: Some("dept".into()),
-        repeat_header: true,
         oversize_group: OversizeGroupPolicy::Error,
     };
 
@@ -386,7 +381,6 @@ fn test_split_csv_repeat_header() {
         max_records: Some(2),
         max_bytes: None,
         group_key: None,
-        repeat_header: true,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -430,7 +424,6 @@ fn test_split_csv_header_consistent() {
         max_records: Some(2),
         max_bytes: None,
         group_key: None,
-        repeat_header: true,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -470,7 +463,6 @@ fn test_split_csv_header_excluded_from_count() {
         max_records: Some(3),
         max_bytes: None,
         group_key: None,
-        repeat_header: true,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -523,7 +515,6 @@ fn test_split_both_limits_either_triggers() {
         max_records: Some(1000), // high record limit
         max_bytes: Some(30),     // low byte limit
         group_key: None,
-        repeat_header: false,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -559,7 +550,6 @@ fn test_split_no_group_key_mechanical() {
         max_records: Some(5),
         max_bytes: None,
         group_key: None, // no group key
-        repeat_header: false,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -596,7 +586,6 @@ fn test_split_zero_records_no_file() {
         max_records: Some(10),
         max_bytes: None,
         group_key: None,
-        repeat_header: true,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -624,7 +613,6 @@ fn test_split_null_key_treated_as_group() {
         max_records: Some(3),
         max_bytes: None,
         group_key: Some("dept".into()),
-        repeat_header: false,
         oversize_group: OversizeGroupPolicy::Allow,
     };
 
@@ -667,7 +655,6 @@ fn test_split_by_byte_size_only() {
         max_records: None,
         max_bytes: Some(20),
         group_key: None,
-        repeat_header: false,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -709,7 +696,6 @@ fn test_split_single_record_one_file() {
         max_records: Some(10),
         max_bytes: None,
         group_key: None,
-        repeat_header: true,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -740,7 +726,6 @@ fn test_splitting_writer_json_produces_valid_files() {
         max_records: Some(3),
         max_bytes: None,
         group_key: None,
-        repeat_header: false,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -811,7 +796,6 @@ fn test_splitting_writer_xml_produces_valid_files() {
         max_records: Some(3),
         max_bytes: None,
         group_key: None,
-        repeat_header: false,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -886,7 +870,6 @@ fn test_splitting_writer_json_array_byte_split_valid_files() {
         max_records: None,
         max_bytes: Some(60),
         group_key: None,
-        repeat_header: false,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -985,7 +968,6 @@ fn test_splitting_writer_xml_byte_split_valid_files() {
         max_records: None,
         max_bytes: Some(120),
         group_key: None,
-        repeat_header: false,
         oversize_group: OversizeGroupPolicy::default(),
     };
 
@@ -1082,7 +1064,6 @@ fn hook_probe_splitter() -> (SplittingWriter, Arc<Mutex<Vec<String>>>) {
         max_records: None,
         max_bytes: None,
         group_key: None,
-        repeat_header: false,
         oversize_group: OversizeGroupPolicy::default(),
     };
     let writer = SplittingWriter::new(registry.file_factory(), writer_factory, schema, policy);
