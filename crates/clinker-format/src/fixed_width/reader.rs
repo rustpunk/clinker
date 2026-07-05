@@ -422,6 +422,31 @@ mod tests {
     }
 
     #[test]
+    fn test_fixedwidth_lf_missing_newline_is_bounded_record_error() {
+        // A line-separated (LF) source whose line never terminates must fail with
+        // a typed, row-tagged record error rather than buffering the whole input
+        // into one record — the bounded-memory guarantee on malformed input.
+        let data = vec![b'x'; 10_000];
+        let fields = vec![{
+            let mut f = field("name");
+            f.ty = Type::String;
+            f.start = Some(0);
+            f.width = Some(8);
+            f
+        }];
+        let mut reader =
+            FixedWidthReader::new(&data[..], fields, FixedWidthReaderConfig::default()).unwrap();
+        let err = reader.next_record().unwrap_err();
+        match err {
+            FormatError::InvalidRecord { row, message } => {
+                assert_eq!(row, 1);
+                assert!(message.contains("overruns"), "message: {message}");
+            }
+            other => panic!("expected InvalidRecord, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_schema_zero_width_field_rejected() {
         let fields = vec![{
             let mut f = field("bad");
