@@ -85,7 +85,8 @@ pub trait RecordSource: Send {
     /// Abandon the current file and advance to the next, returning `Ok(true)`
     /// when a next file opened or `Ok(false)` when none remain. Mirrors
     /// [`FormatReader::advance_to_next_file`]: the ingest driver calls this
-    /// after dead-lettering a whole file for a structural-count failure under
+    /// after dead-lettering a whole file for a document-structural failure
+    /// (a trailer count mismatch or a multi-record validation failure) under
     /// `dlq_granularity: document`, so a multi-file source keeps reading its
     /// remaining files past the malformed one. The default returns `Ok(false)`
     /// for single-file and pathless transports.

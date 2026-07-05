@@ -91,6 +91,58 @@ impl Delimiters {
             subcomponent: b'&',
         }
     }
+
+    /// Build a delimiter set from its five-byte wire declaration — the
+    /// field separator followed by the four encoding characters (component,
+    /// repetition, escape, sub-component), exactly as they appear after an
+    /// `MSH`/`FHS`/`BHS` tag. Rejects a declaration that is not exactly
+    /// five bytes or whose bytes are not mutually distinct: a collision
+    /// (e.g. a short `MSH-2` that leaves the sub-component slot pointing at
+    /// the next field separator) would silently corrupt every split, so it
+    /// must fail loudly instead. The error is the bare reason; callers wrap
+    /// it with their own context.
+    pub(crate) fn from_declaration(declaration: &[u8]) -> Result<Self, String> {
+        let bytes: [u8; 5] = declaration.try_into().map_err(|_| {
+            format!(
+                "an HL7 delimiter declaration is exactly five bytes (the field separator plus \
+                 the four encoding characters), found {} bytes",
+                declaration.len()
+            )
+        })?;
+        for (a, &da) in bytes.iter().enumerate() {
+            for &db in &bytes[a + 1..] {
+                if da == db {
+                    return Err(format!(
+                        "the field separator and the four encoding characters (component, \
+                         repetition, escape, sub-component) must be five distinct bytes, \
+                         found {:?}",
+                        String::from_utf8_lossy(&bytes)
+                    ));
+                }
+            }
+        }
+        Ok(Self {
+            field: bytes[0],
+            component: bytes[1],
+            repetition: bytes[2],
+            escape: bytes[3],
+            subcomponent: bytes[4],
+        })
+    }
+
+    /// The five-byte wire declaration of this set, in the order a header
+    /// segment declares it: field separator, then the four encoding
+    /// characters (component, repetition, escape, sub-component). The exact
+    /// inverse of [`Self::from_declaration`].
+    pub(crate) fn declaration(&self) -> [u8; 5] {
+        [
+            self.field,
+            self.component,
+            self.repetition,
+            self.escape,
+            self.subcomponent,
+        ]
+    }
 }
 
 /// Streaming HL7 segment reader.
@@ -173,36 +225,24 @@ impl<R: BufRead> SegmentTokenizer<R> {
                 raw.len()
             )));
         }
-        let field = raw[3];
-        let encoding = &raw[4..8];
         // The five service delimiters must be mutually distinct. A short
         // MSH-2 (e.g. `MSH|^~\|...`, which omits the sub-component char)
         // leaves `raw[7]` pointing at the next field separator, so a naive
         // read would set `subcomponent == field` and silently corrupt every
-        // split. The byte after the four encoding characters (`raw[8]`, when
-        // present) must be the field separator that ends MSH-2; reject a
-        // header where it is not, or where any two delimiters collide.
-        let delims = [field, encoding[0], encoding[1], encoding[2], encoding[3]];
-        for (a, &da) in delims.iter().enumerate() {
-            for &db in &delims[a + 1..] {
-                if da == db {
-                    return Err(FormatError::Hl7(format!(
-                        "HL7 header declares colliding delimiters: the field separator and the \
-                         four encoding characters (component, repetition, escape, sub-component) \
-                         must be five distinct bytes, found {:?}. A short MSH-2 that omits an \
-                         encoding character is the usual cause.",
-                        String::from_utf8_lossy(&raw[3..8])
-                    )));
-                }
-            }
-        }
+        // split.
+        let delims = Delimiters::from_declaration(&raw[3..8]).map_err(|reason| {
+            FormatError::Hl7(format!(
+                "HL7 header declares colliding delimiters: {reason}. A short MSH-2 that omits \
+                 an encoding character is the usual cause."
+            ))
+        })?;
         // A conformant MSH-2 ends at the next field separator. If the byte
         // after the four encoding characters is present and is not the field
         // separator, the encoding-characters field is longer than four bytes
         // (an unsupported extended encoding set), which would misalign every
         // later field.
         if let Some(&after) = raw.get(8)
-            && after != field
+            && after != delims.field
         {
             return Err(FormatError::Hl7(format!(
                 "HL7 header MSH-2 encoding-characters field is not the expected four bytes \
@@ -211,13 +251,7 @@ impl<R: BufRead> SegmentTokenizer<R> {
                 after as char
             )));
         }
-        self.delimiters = Delimiters {
-            field,
-            component: encoding[0],
-            repetition: encoding[1],
-            escape: encoding[2],
-            subcomponent: encoding[3],
-        };
+        self.delimiters = delims;
         self.initialized = true;
 
         let text = String::from_utf8(raw).map_err(|e| {
@@ -471,6 +505,30 @@ mod tests {
 
     fn tok(data: &[u8]) -> SegmentTokenizer<Cursor<Vec<u8>>> {
         SegmentTokenizer::new(Cursor::new(data.to_vec()))
+    }
+
+    #[test]
+    fn delimiter_declaration_round_trips() {
+        let d = Delimiters::from_declaration(b"#@*/$").unwrap();
+        assert_eq!(d.field, b'#');
+        assert_eq!(d.component, b'@');
+        assert_eq!(d.repetition, b'*');
+        assert_eq!(d.escape, b'/');
+        assert_eq!(d.subcomponent, b'$');
+        assert_eq!(&d.declaration(), b"#@*/$");
+        assert_eq!(&Delimiters::default_set().declaration(), b"|^~\\&");
+    }
+
+    #[test]
+    fn delimiter_declaration_wrong_length_rejected() {
+        let err = Delimiters::from_declaration(b"#@*/").unwrap_err();
+        assert!(err.contains("five bytes"), "{err}");
+    }
+
+    #[test]
+    fn delimiter_declaration_collision_rejected() {
+        let err = Delimiters::from_declaration(b"##*/$").unwrap_err();
+        assert!(err.contains("five distinct bytes"), "{err}");
     }
 
     #[test]

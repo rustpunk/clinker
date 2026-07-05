@@ -69,6 +69,16 @@ Input columns the schema does not name are governed by the source's
 [`on_unmapped`](../formats/auto-widen.md) policy, the same as every other
 format.
 
+## Writing CSV
+
+On output, the writer emits one row per record with cells in the
+**output schema's column order** — the same order as the header row —
+regardless of how an upstream node ordered the record's fields. An
+output-schema column the record does not carry emits an empty cell,
+the same as an explicit null; record fields the output schema does not
+name are not written. See [Output Nodes](../nodes/output.md) for
+header control, field mapping, and null handling.
+
 ## Multi-record files (header / trailer / body)
 
 Some CSV exports interleave **multiple record types** in one file — a
@@ -127,6 +137,7 @@ own `type` / `trim` / `pad`, the same as a single-record CSV field.
 - **Blank lines** (empty or whitespace-only, common after concatenation)
   are skipped rather than parsed.
 - An **unknown discriminator value** (a tag no `records:` entry declares)
-  is a structural-integrity failure: it [aborts the run](../../explain/E345.md)
-  by default, or under `dlq_granularity: document` condemns the whole
-  file to the dead-letter sink and the run continues.
+  is a structural-integrity failure, classified separately from a trailer
+  count mismatch: it [aborts the run](../../explain/E345.md) by default,
+  or under `dlq_granularity: document` condemns the whole file to the
+  dead-letter sink and the run continues.

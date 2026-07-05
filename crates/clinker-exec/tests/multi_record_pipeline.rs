@@ -239,13 +239,13 @@ fn two_files_keep_independent_doc_context_and_trailer_counts() {
     );
 }
 
-#[test]
-fn unknown_tag_under_document_dlq_condemns_the_file_not_the_run() {
-    // An unknown discriminator value is a structural-count error: under
-    // `dlq_granularity: document` it dead-letters the whole file rather than
-    // aborting the run, so the run completes and the bad file's records land in
-    // the DLQ instead of the success sink.
-    let yaml = r#"
+/// A document-DLQ variant of the pipeline: the same `H`/`D`/`T` layout with
+/// the trailer's declared count validated by `structure:`, but the source
+/// opts into `dlq_granularity: document` under a `continue` strategy, so a
+/// structural failure (an unknown tag, a trailer count mismatch) condemns
+/// the offending file to the DLQ instead of aborting the run.
+fn document_dlq_yaml() -> &'static str {
+    r#"
 pipeline:
   name: multi_record_dlq
 error_handling:
@@ -262,9 +262,12 @@ nodes:
         on_no_match: skip
       schema:
         discriminator: { start: 0, width: 1 }
+        structure:
+          - { record: trailer, count: count }
         records:
           - { id: header,  tag: H, columns: [ { name: batch_id, type: string, start: 1, width: 9 } ] }
           - { id: detail,  tag: D, columns: [ { name: id, type: int, start: 1, width: 5 }, { name: amount, type: int, start: 6, width: 4 } ] }
+          - { id: trailer, tag: T, columns: [ { name: count, type: int, start: 1, width: 5 } ] }
   - type: transform
     name: tag
     input: payments
@@ -279,20 +282,41 @@ nodes:
       name: out
       type: csv
       path: out.csv
-"#;
-    // One detail, then an unknown `X` tag → the document is condemned.
-    let bad = "D00001 100\nX99999 999\n";
-    let config = parse_config(yaml).expect("parse dlq pipeline");
+"#
+}
+
+/// Run one in-memory fixed-width file through the document-DLQ pipeline,
+/// returning the execution report and the success-sink contents. The run
+/// itself must complete: under `dlq_granularity: document` a structural
+/// failure condemns the file, not the run.
+fn run_document_dlq(fixture: &str) -> (clinker_exec::executor::ExecutionReport, String) {
+    run_document_dlq_multi(&[("bad.txt", fixture)])
+}
+
+/// Run an ordered list of `(name, body)` in-memory fixed-width files through
+/// the document-DLQ pipeline as a single multi-file glob source, returning the
+/// execution report and the success-sink contents. Files stream in the given
+/// order (the multi-file reader preserves slot order), so this exercises
+/// cross-file document boundaries under the `document` opt-in.
+fn run_document_dlq_multi(
+    files: &[(&str, &str)],
+) -> (clinker_exec::executor::ExecutionReport, String) {
+    let config = parse_config(document_dlq_yaml()).expect("parse dlq pipeline");
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile dlq pipeline");
-    let slot = FileSlot::new(
-        PathBuf::from("bad.txt"),
-        Box::new(Cursor::new(bad.as_bytes().to_vec())),
-    );
+    let slots: Vec<FileSlot> = files
+        .iter()
+        .map(|(name, body)| {
+            FileSlot::new(
+                PathBuf::from(*name),
+                Box::new(Cursor::new(body.as_bytes().to_vec())),
+            )
+        })
+        .collect();
     let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
         "payments".to_string(),
-        clinker_exec::executor::SourceInput::Files(vec![slot]),
+        clinker_exec::executor::SourceInput::Files(slots),
     )]);
     let out = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -306,20 +330,150 @@ nodes:
         shutdown_token: None,
         ..Default::default()
     };
-    // The run must COMPLETE (not abort) — the unknown tag condemns the file.
     let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
         .expect("document-DLQ run must complete, not abort");
+    (report, out.as_string())
+}
+
+#[test]
+fn unknown_tag_aborts_the_run_by_default() {
+    // Under the default `dlq_granularity: record` an unknown discriminator
+    // aborts the run at the offending line — the document-DLQ disposition is
+    // strictly opt-in.
+    let bad_tag = "HBATCH0001\nD00001 100\nX99999 999\nT00001    \n";
+    let err = run(pipeline_yaml(), bad_tag).expect_err("an unknown tag must abort the run");
     assert!(
-        report.counters.dlq_count >= 1,
-        "the condemned file's records must reach the DLQ; counters={:?}",
-        report.counters
+        err.contains("E345") && err.contains("unknown record-type discriminator"),
+        "error should name the unknown-tag failure: {err}"
     );
-    // The already-streamed detail row is rejected with the file, so the success
-    // sink holds no body rows.
-    let sink = out.as_string();
+}
+
+#[test]
+fn unknown_tag_under_document_dlq_condemns_the_file_not_the_run() {
+    // An unknown discriminator value is a document-structural failure: under
+    // `dlq_granularity: document` it dead-letters the whole file rather than
+    // aborting the run, so the run completes and the bad file's records land
+    // in the DLQ instead of the success sink.
+    //
+    // One detail, then an unknown `X` tag → the document is condemned.
+    let (report, sink) = run_document_dlq("D00001 100\nX99999 999\n");
+    let triggers: Vec<_> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    assert_eq!(
+        triggers.len(),
+        1,
+        "exactly one root-cause trigger for the condemned file"
+    );
+    assert_eq!(
+        triggers[0].category,
+        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+    );
+    assert!(
+        triggers[0].error_message.contains("E345")
+            && triggers[0]
+                .error_message
+                .contains("unknown record-type discriminator"),
+        "the trigger names the unknown tag, got {:?}",
+        triggers[0].error_message
+    );
+    assert_eq!(
+        report.dlq_entries.iter().filter(|e| !e.trigger).count(),
+        1,
+        "the one already-streamed detail row is rejected with the file"
+    );
+    // The already-streamed detail row is rejected with the file, so the
+    // success sink holds no body rows.
     let body: Vec<&str> = sink.lines().skip(1).collect();
     assert!(
         body.is_empty(),
         "condemned file's records must not reach the success sink: {body:?}"
+    );
+}
+
+#[test]
+fn trailer_count_mismatch_under_document_dlq_condemns_the_file_not_the_run() {
+    // The trailer claims 5 body records where only 2 streamed. Under
+    // `dlq_granularity: document` the count mismatch condemns the file to the
+    // DLQ — the same disposition as an unknown tag — and the run completes
+    // instead of aborting.
+    let (report, sink) = run_document_dlq("D00001 100\nD00002 200\nT00005    \n");
+    let triggers: Vec<_> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    assert_eq!(
+        triggers.len(),
+        1,
+        "exactly one root-cause trigger for the condemned file"
+    );
+    assert_eq!(
+        triggers[0].category,
+        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+    );
+    assert!(
+        triggers[0].error_message.contains("declares count 5"),
+        "the trigger names the count mismatch, got {:?}",
+        triggers[0].error_message
+    );
+    assert_eq!(
+        report.dlq_entries.iter().filter(|e| !e.trigger).count(),
+        2,
+        "both already-streamed detail rows are rejected with the file"
+    );
+    let body: Vec<&str> = sink.lines().skip(1).collect();
+    assert!(
+        body.is_empty(),
+        "condemned file's records must not reach the success sink: {body:?}"
+    );
+}
+
+#[test]
+fn bad_first_line_in_later_file_condemns_that_file_not_the_clean_predecessor() {
+    // A multi-file glob [clean, bad-first-line]: the clean file streams fully
+    // and EOFs with its document still open (the driver closes a file's
+    // document only when the next file's first record arrives). The reader then
+    // advances into the second file and its FIRST body line carries an unknown
+    // tag, so the structural failure fires while `current_source_file()` already
+    // names the second file but the open level stack still belongs to the clean
+    // first file. The reject must condemn the ACTUALLY-malformed file, not the
+    // clean predecessor whose records were merely still buffered: the clean
+    // file's row must reach the success sink and only the bad file must
+    // dead-letter, with no collaterals (no record of the bad file ever
+    // streamed).
+    let (report, sink) = run_document_dlq_multi(&[
+        ("good.txt", "D00001 100\nT00001    \n"),
+        ("bad.txt", "X99999 999\n"),
+    ]);
+
+    // The clean predecessor's detail row reaches the sink — it was NOT
+    // collaterally condemned under the bad file's trigger.
+    let body: Vec<&str> = sink.lines().skip(1).collect();
+    assert_eq!(
+        body.len(),
+        1,
+        "the clean file's one detail row must reach the success sink, got {body:?}"
+    );
+
+    // Exactly one root-cause trigger, for the bad file's unknown tag, and no
+    // collaterals: the bad file streamed no record before failing.
+    let triggers: Vec<_> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    assert_eq!(
+        triggers.len(),
+        1,
+        "exactly one trigger, for the actually-malformed file"
+    );
+    assert_eq!(
+        triggers[0].category,
+        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+    );
+    assert!(
+        triggers[0].error_message.contains("E345")
+            && triggers[0]
+                .error_message
+                .contains("unknown record-type discriminator"),
+        "the trigger names the unknown tag, got {:?}",
+        triggers[0].error_message
+    );
+    assert_eq!(
+        report.dlq_entries.iter().filter(|e| !e.trigger).count(),
+        0,
+        "the bad file streamed no record before failing, so it has no collaterals \
+         and the clean file's record is not swept in as one"
     );
 }

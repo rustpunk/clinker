@@ -38,9 +38,12 @@ impl Default for CsvWriterConfig {
 
 /// Streaming CSV writer wrapping `csv::Writer`.
 ///
-/// Writes schema fields in schema order, then overflow fields in
-/// sorted key order (deterministic output). Header row is written
-/// on first `write_record()` call if `include_header` is true.
+/// Emits cells in the writer's pinned schema order — never the
+/// record's own schema order — so values stay aligned with the header
+/// even when an upstream projection or widening reordered the
+/// record's fields. Fields the record lacks emit an empty cell.
+/// Header row is written on first `write_record()` call if
+/// `include_header` is true.
 ///
 /// Under `reconstruct_envelope`, `begin_document` emits the header section's
 /// field values as one CSV row before the document's body, and `end_document`
@@ -62,10 +65,11 @@ impl<W: Write> CsvWriter<W> {
             .clone()
             .and_then(OutputEnvelopeSpec::into_framer);
         // Envelope header/footer rows carry a different field count than the
-        // body rows (a section's fields vs the record schema), so the writer
+        // body rows (a section's fields vs the writer schema), so the writer
         // must accept ragged records when framing is active. The non-envelope
-        // path keeps the strict equal-length default, preserving today's
-        // behavior and its UnequalLengths guard against schema drift.
+        // path keeps the strict equal-length default; body rows match the
+        // header length by construction (both derive from the pinned schema),
+        // so the guard is a backstop rather than a drift detector.
         let inner = csv::WriterBuilder::new()
             .delimiter(config.delimiter)
             .flexible(framer.is_some())
@@ -131,15 +135,20 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
             self.header_written = true;
         }
 
-        let iter: Box<dyn Iterator<Item = (&str, &clinker_record::Value)>> =
-            if self.config.include_engine_stamped {
-                Box::new(record.iter_all_fields())
-            } else {
-                Box::new(record.iter_user_fields())
+        // Body cells follow the writer's pinned schema — the same
+        // column set and order the header row was built from — not
+        // the record's own schema, which an upstream projection or
+        // widening may order differently for the same fields. Fields
+        // the record lacks emit an empty cell (an explicit Null),
+        // matching the fixed-width writer's missing-field policy.
+        let columns = filtered_header_columns(&self.schema, self.config.include_engine_stamped);
+        let mut fields: Vec<String> = Vec::with_capacity(columns.len());
+        for col in columns {
+            let cell = match record.get(col) {
+                Some(v) => value_to_csv_cell(col, v)?,
+                None => String::new(),
             };
-        let mut fields: Vec<String> = Vec::with_capacity(record.field_count());
-        for (col, v) in iter {
-            fields.push(value_to_csv_cell(col, v)?);
+            fields.push(cell);
         }
 
         self.inner.write_record(&fields)?;
@@ -423,9 +432,9 @@ mod tests {
 
     #[test]
     fn test_csv_writer_widened_schema_emit_order() {
-        // Widened schema controls output order; the fixture now declares
-        // every emitted column up front, so record.set always lands at a
-        // known slot and iter_all_fields walks them in schema order.
+        // Widened schema controls output order; the fixture declares
+        // every emitted column up front, so record.set always lands at
+        // a known slot and the writer walks them in schema order.
         let schema = make_schema(&["id", "zulu", "alpha", "mike"]);
         let record = make_record(
             &schema,
@@ -438,6 +447,67 @@ mod tests {
         );
         let output = write_to_string(&schema, CsvWriterConfig::default(), &[record]);
         assert_eq!(output, "id,zulu,alpha,mike\n1,z,a,m\n");
+    }
+
+    /// Body cells follow the writer's pinned schema order, so a record
+    /// whose own schema orders the same fields differently still lands
+    /// each value under its header column.
+    #[test]
+    fn test_csv_writer_record_schema_order_differs_from_writer_schema() {
+        let writer_schema = make_schema(&["a", "b"]);
+        let record_schema = make_schema(&["b", "a"]);
+        let record = make_record(
+            &record_schema,
+            vec![Value::String("B".into()), Value::String("A".into())],
+        );
+        let output = write_to_string(&writer_schema, CsvWriterConfig::default(), &[record]);
+        assert_eq!(output, "a,b\nA,B\n");
+    }
+
+    /// A writer-schema column absent from the record emits an empty
+    /// cell, keeping later columns aligned with the header.
+    #[test]
+    fn test_csv_writer_missing_field_emits_empty_cell() {
+        let writer_schema = make_schema(&["a", "b", "c"]);
+        let record_schema = make_schema(&["c", "a"]);
+        let record = make_record(
+            &record_schema,
+            vec![Value::String("C".into()), Value::String("A".into())],
+        );
+        let output = write_to_string(&writer_schema, CsvWriterConfig::default(), &[record]);
+        assert_eq!(output, "a,b,c\nA,,C\n");
+    }
+
+    /// Engine-stamped stripping is keyed off the writer's pinned
+    /// schema — the same schema the header filter consults — so a
+    /// record schema lacking the stamp metadata cannot smuggle the
+    /// column's value into the body row.
+    #[test]
+    fn test_csv_writer_engine_stamp_filter_uses_writer_schema() {
+        let writer_schema = make_schema_with_engine_stamp("id", "$ck.id");
+        // Same columns, but this record's schema carries no metadata.
+        let record_schema = make_schema(&["id", "$ck.id"]);
+        let record = make_record(&record_schema, vec![Value::Integer(7), Value::Integer(7)]);
+        let output = write_to_string(&writer_schema, CsvWriterConfig::default(), &[record]);
+        assert_eq!(output, "id\n7\n");
+    }
+
+    /// Record fields the writer schema does not declare are not
+    /// emitted — the pinned schema is the output contract.
+    #[test]
+    fn test_csv_writer_ignores_fields_outside_writer_schema() {
+        let writer_schema = make_schema(&["a", "b"]);
+        let record_schema = make_schema(&["a", "extra", "b"]);
+        let record = make_record(
+            &record_schema,
+            vec![
+                Value::String("A".into()),
+                Value::String("X".into()),
+                Value::String("B".into()),
+            ],
+        );
+        let output = write_to_string(&writer_schema, CsvWriterConfig::default(), &[record]);
+        assert_eq!(output, "a,b\nA,B\n");
     }
 
     #[test]

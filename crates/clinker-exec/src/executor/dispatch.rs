@@ -559,6 +559,26 @@ pub(crate) struct ExecutorContext<'a> {
     /// surfaces as a defense-in-depth Internal error.
     pub(crate) source_records:
         HashMap<String, crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>>,
+    /// Arbitrator registration for each declared Source's ingest-channel
+    /// consumer, keyed by Source node name in lockstep with
+    /// [`Self::source_records`]. Ownership follows the receiver: the arm
+    /// that removes a source's receiver (the Source arm, a fused
+    /// `Merge.interleave`, or a fused Transform) also releases this entry
+    /// via [`Self::release_source_consumer`] at receiver disconnect,
+    /// zeroing the mirrored queue charge and unregistering the wrapper so
+    /// the drained channel stops counting toward `sum_consumer_usage`.
+    /// Body-scope walks (composition / commit) swap `source_records` to an
+    /// empty map, so no body arm can reach a live receiver — this map
+    /// therefore never needs the body-scope save/restore its sibling
+    /// consumer-id maps get. Entries still present after the walk (error
+    /// unwind, interrupt before dispatch) are swept at top-scope teardown.
+    pub(crate) source_consumers: HashMap<
+        String,
+        (
+            crate::pipeline::memory::ConsumerId,
+            std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+        ),
+    >,
     /// Source-node names whose receivers have been moved out of
     /// `source_records` by a downstream Merge.interleave fusion. The
     /// Source dispatch arm checks this set at entry and returns
@@ -1188,6 +1208,23 @@ impl<'a> ExecutorContext<'a> {
                 .sum();
             self.source_count_per_source
                 .insert(Arc::clone(merged_key), Some(total));
+        }
+    }
+
+    /// Release the arbitrator registration for `source_name`'s ingest
+    /// channel once its receiver has disconnected. The producer mirrors
+    /// `queue depth × per-record bytes` into the shared handle on every
+    /// push and never zeroes it, so without this release the last push's
+    /// estimate stays summed into `sum_consumer_usage` for the rest of the
+    /// run — memory that has already moved downstream keeps influencing
+    /// spill victim selection and abort checks. Call only after `recv`
+    /// reports disconnect: the producer has dropped its sender by then, so
+    /// zeroing cannot race a concurrent `set_bytes`. The `remove` makes the
+    /// release single-shot; a repeat call for the same source is a no-op.
+    pub(crate) fn release_source_consumer(&mut self, source_name: &str) {
+        if let Some((id, handle)) = self.source_consumers.remove(source_name) {
+            handle.set_bytes(0);
+            self.memory_budget.unregister_consumer(id);
         }
     }
 
@@ -2213,13 +2250,16 @@ pub(crate) fn merge_fused_interleave(
                 }
             }
             None => {
-                // Source closed. Stamp finalized per-source count
-                // and drop the receiver slot so subsequent
-                // iterations skip it.
+                // Source closed. Stamp finalized per-source count, drop
+                // the receiver slot so subsequent iterations skip it, and
+                // release the source's arbitrator registration — its
+                // channel is drained, so its queue estimate must leave
+                // `sum_consumer_usage`.
                 let count = per_source_counts[i];
                 let name_arc = Arc::clone(&states[i].source_name_arc);
                 receivers[i] = None;
                 ctx.finalize_source_count(&name_arc, count);
+                ctx.release_source_consumer(&states[i].source_name_string);
             }
         }
     }
@@ -2609,6 +2649,7 @@ pub(crate) fn transform_fused_consume(
     loop_result?;
     event_batcher.finish()?;
     ctx.finalize_source_count(&source_name_arc, count);
+    ctx.release_source_consumer(source_name_owned.as_str());
     if timeout.is_some() && ctx.watermarks.is_idle(source_name_owned.as_str()) {
         tracing::debug!(
             target: "clinker::watermark",

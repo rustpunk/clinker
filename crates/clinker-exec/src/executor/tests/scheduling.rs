@@ -466,12 +466,14 @@ fn run_with_arbitrator(
     .expect("pipeline executes")
 }
 
-/// The Source ingest consumer is the only consumer a single-source run
-/// intentionally leaves registered for the arbitrator's lifetime (its
-/// registration id is discarded at the Source dispatch arm, never
-/// unregistered). Every other consumer — Aggregate wrappers included — must
-/// be gone once the run drains.
-const SURVIVING_SOURCE_CONSUMERS: usize = 1;
+/// A fully-drained single-source run leaves an empty consumer registry.
+/// The Source ingest consumer is released the moment its receiver
+/// disconnects — in lockstep with every operator consumer (Aggregate
+/// wrappers included) releasing as its state finalizes — so nothing an
+/// operator or a source registered survives the drain. The expected
+/// post-run registry size these release tests assert against is therefore
+/// zero.
+const CONSUMERS_AFTER_DRAINED_RUN: usize = 0;
 
 /// A single `Source -> Aggregate -> Output` chain whose `collect`
 /// accumulator folds each group's values into an `Array`, charging a
@@ -543,22 +545,26 @@ fn finalized_strict_aggregate_releases_its_consumer() {
         "the strict aggregate must have charged a non-zero footprint at peak"
     );
 
-    // Only the Source ingest consumer may outlive the run. A regression
-    // that drops the arm-exit unregister leaves two consumers, with the
-    // finalized aggregate still charging its `collect` arrays.
+    // No consumer may outlive the drained run: the finalized aggregate
+    // releases at its arm exit and the Source ingest consumer releases at
+    // receiver disconnect. A regression that drops either unregister leaves
+    // a consumer behind — the finalized aggregate still charging its
+    // `collect` arrays, or the drained source still charging its last queue
+    // estimate.
     assert_eq!(
         arbitrator.consumer_count(),
-        SURVIVING_SOURCE_CONSUMERS,
-        "after the Aggregate finalized, only the Source consumer should remain registered — the \
-         finalized AggregateConsumer must have been unregistered (a regression leaves two)"
+        CONSUMERS_AFTER_DRAINED_RUN,
+        "after the Aggregate finalized and the source drained, the registry must be empty — both \
+         the finalized AggregateConsumer and the Source ingest consumer must have been \
+         unregistered (a regression leaves one behind)"
     );
     // The accounting check: post-run registered usage is strictly below
     // the in-flight peak, because that peak summed the Source ingest
     // consumer AND the live aggregate together while the aggregate folded,
-    // whereas only the Source consumer survives the drain. A regression
-    // that retained the finalized aggregate would keep its bytes summed in,
-    // so post-run usage would instead match the peak rather than fall below
-    // it.
+    // whereas neither survives the drain — post-run usage is zero. A
+    // regression that retained the finalized aggregate would keep its bytes
+    // summed in, so post-run usage would instead match the peak rather than
+    // fall below it.
     let post_run_usage = arbitrator.sum_consumer_usage();
     assert!(
         post_run_usage < report.peak_consumer_usage_bytes,
@@ -629,10 +635,11 @@ fn finalized_time_windowed_aggregate_releases_every_window_consumer() {
 
     assert_eq!(
         arbitrator.consumer_count(),
-        SURVIVING_SOURCE_CONSUMERS,
-        "every per-window AggregateConsumer must be unregistered as its window finalizes — only \
-         the Source consumer should outlive the run; a regression that released only the last \
-         window (or none) leaves extra consumers registered"
+        CONSUMERS_AFTER_DRAINED_RUN,
+        "every per-window AggregateConsumer must be unregistered as its window finalizes and the \
+         Source ingest consumer as its receiver drains — the registry must be empty; a regression \
+         that released only the last window (or none), or that left the source registered, leaves \
+         consumers behind"
     );
 }
 
@@ -697,8 +704,9 @@ nodes:
 /// successfully-finalized relaxed aggregate releases its consumer at the
 /// top-scope teardown that drains that map after the walk; a degraded one
 /// releases it at the `remove` that discards the aggregator mid-run. Either
-/// way no `AggregateConsumer` survives the run, so only the Source consumer
-/// remains. A regression that drops the parked aggregator without
+/// way no `AggregateConsumer` survives the run, and the Source ingest
+/// consumer releases at its receiver's disconnect, so the registry drains
+/// to empty. A regression that drops the parked aggregator without
 /// unregistering its consumer would leave the relaxed aggregate's
 /// `value_heap_bytes` summed into `sum_consumer_usage` for the rest of the
 /// run, with an extra consumer in the registry. The huge budget keeps the
@@ -724,10 +732,10 @@ fn finalized_relaxed_ck_aggregate_releases_its_consumer() {
 
     assert_eq!(
         arbitrator.consumer_count(),
-        SURVIVING_SOURCE_CONSUMERS,
-        "after the run drains, the relaxed Aggregate's consumer must be unregistered — only the \
-         Source consumer should outlive the run; a regression that drops the parked aggregator \
-         without unregistering its consumer leaves its accumulated bytes summed into \
-         sum_consumer_usage for the rest of the run"
+        CONSUMERS_AFTER_DRAINED_RUN,
+        "after the run drains, the relaxed Aggregate's consumer and the Source ingest consumer \
+         must both be unregistered — the registry must be empty; a regression that drops the \
+         parked aggregator without unregistering its consumer leaves its accumulated bytes summed \
+         into sum_consumer_usage for the rest of the run"
     );
 }

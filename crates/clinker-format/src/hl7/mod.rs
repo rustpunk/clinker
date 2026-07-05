@@ -55,3 +55,17 @@ pub use writer::{Hl7Writer, Hl7WriterConfig};
 /// envelope field and never surfaces in CXL `$doc.<section>.<field>`
 /// typechecking.
 pub(crate) const RAW_FIELDS_KEY: &str = "$raw";
+
+/// Engine-internal key under which the reader stashes the message's
+/// five-byte delimiter declaration (field separator plus the four encoding
+/// characters, in wire order) in the message `$doc` section, so the writer
+/// re-emits each message with the delimiter set its header declared rather
+/// than the conventional defaults. Engine-namespaced by the `$` prefix for
+/// the same reason as [`RAW_FIELDS_KEY`].
+pub(crate) const DELIMITERS_KEY: &str = "$delims";
+
+/// The fixed name of the message-level `$doc` section the reader opens per
+/// `MSH` message. Shared between the reader (which builds the section) and
+/// the writer (which reads the delimiter stamp back out of it) so the two
+/// sides can never drift apart on the name.
+pub(crate) const MESSAGE_SECTION: &str = "transaction_set";

@@ -636,41 +636,68 @@ fn drive_record_source(
                     break;
                 }
                 Err(other) => {
-                    // An envelope trailer's declared count did not match the
-                    // body the reader streamed (X12 SE/GE/IEA, EDIFACT
-                    // UNT/UNZ, HL7 BTS/FTS). Under `dlq_granularity:
-                    // document` this condemns the WHOLE source file rather
-                    // than aborting the run: the count is only known here, at
-                    // the trailer, AFTER every body record it counts has
-                    // already streamed, so the document cannot be rejected
-                    // before its first record. Instead, tag the file's
-                    // close with a structural-reject payload carrying a
-                    // representative document record; the consumer-side
-                    // Source arm marks the file failed through the #97
-                    // reject seam, and #97's per-file Output buffer rejects
-                    // every already-streamed record of the file at its
-                    // close. Genuine corruption (truncation, bad delimiters,
-                    // control-number echo mismatch) is NOT a `StructuralCount`
-                    // and keeps aborting even under the opt-in.
-                    if other.is_structural_count()
+                    // Two error classes condemn the WHOLE source file rather
+                    // than aborting the run under `dlq_granularity: document`:
+                    // an envelope trailer's declared count disagreeing with
+                    // the body the reader streamed (X12 SE/GE/IEA, EDIFACT
+                    // UNT/UNZ, HL7 BTS/FTS, a multi-record trailer), and a
+                    // multi-record structural-validation failure (an unknown
+                    // record-type discriminator, a body record after the
+                    // trailer). A trailer count is only known at the trailer,
+                    // AFTER every body record it counts has already streamed,
+                    // so the document cannot be rejected before its first
+                    // record. Instead, tag the file's close with a
+                    // structural-reject payload carrying a representative
+                    // document record; the consumer-side Source arm marks the
+                    // file failed through the #97 reject seam, and #97's
+                    // per-file Output buffer rejects every already-streamed
+                    // record of the file at its close. Genuine corruption
+                    // (truncation, bad delimiters, control-number echo
+                    // mismatch) is neither class and keeps aborting even
+                    // under the opt-in.
+                    if other.is_document_structural()
                         && src_cfg.dlq_granularity == clinker_plan::config::DlqGranularity::Document
                     {
                         let file_arc = src_reader
                             .current_source_file()
                             .cloned()
                             .unwrap_or_else(|| Arc::clone(&static_source_file));
+                        // A malformed file whose FIRST body record fails — an
+                        // unknown record-type tag on an early line of file N>=2
+                        // of a multi-file source — condemns a file the driver
+                        // has NOT yet opened a document for: the reader already
+                        // advanced `current_source_file()` to the condemned
+                        // file, but the open level stack still belongs to the
+                        // PREVIOUS (clean) file, because the driver only closes
+                        // a file's document when the next file's first record
+                        // arrives and here an error arrived first. Close that
+                        // prior file's stack CLEANLY so the reject rides the
+                        // condemned file's OWN synthesized context (below), not
+                        // the clean predecessor's document close: the reject
+                        // seam keys on the representative record's `$source.file`
+                        // stamp, so the file grain stays correct either way, but
+                        // letting a clean file's close carry a foreign reject
+                        // payload leaves the boundary stream internally
+                        // inconsistent. A single-file source, and a condemned
+                        // file whose own records already opened its document,
+                        // leave the base owned by `file_arc`, so this is a
+                        // no-op.
+                        if stack_belongs_to_other_file(&doc_stack, &file_arc) {
+                            close_open_levels(&mut stream, &mut doc_stack)?;
+                        }
                         // The document context the reject keys on. A malformed
                         // file that streamed at least one body record has its
                         // level stack open, so use the innermost level. A
                         // ZERO-body malformed envelope (a trailer claiming a
                         // count with no body segment — X12 `ISA … IEA*5~`,
                         // EDIFACT `UNB … UNZ` with no `UNH`, HL7 `BHS`/`BTS`
-                        // with no `MSH`) never drained its queued `OpenLevel`
-                        // into the stack, so synthesize a file-level context
-                        // from the file grain instead. Either way the
-                        // representative record carries a real (non-synthetic)
-                        // document id and the file's `$source.file` stamp, so
-                        // the document-DLQ reject keys at the file grain.
+                        // with no `MSH`), and a first-record failure whose
+                        // prior-file stack was just closed above, leave the
+                        // stack empty, so synthesize a file-level context from
+                        // the file grain instead. Either way the representative
+                        // record carries a real (non-synthetic) document id and
+                        // the file's `$source.file` stamp, so the document-DLQ
+                        // reject keys at the file grain.
                         let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
                             Arc::new(clinker_record::DocumentContext::new(
                                 clinker_record::DocumentId::next(),
@@ -695,9 +722,12 @@ fn drive_record_source(
                             &doc_ctx,
                             reject,
                         )?;
-                        // The trailer-count error fires at the file's closing
-                        // segment, so this file is fully consumed. Advance to
-                        // the next file of a multi-file source and keep
+                        // A trailer-count error fires at the file's closing
+                        // segment (fully consumed); a mid-file validation
+                        // failure (unknown tag, body after trailer) abandons
+                        // the file's unread remainder — either way the whole
+                        // file is already condemned above. Advance to the
+                        // next file of a multi-file source and keep
                         // streaming — dead-lettering one malformed file must
                         // not silently drop the clean files after it (that
                         // would turn the prior loud run-abort into a silent

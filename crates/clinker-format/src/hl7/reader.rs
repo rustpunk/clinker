@@ -43,11 +43,11 @@ use crate::envelope::{
     EnvelopeConfig, EnvelopeEvent, EnvelopeExtract, FrameRole, coerce_section_fields,
 };
 use crate::error::FormatError;
-use crate::hl7::RAW_FIELDS_KEY;
 use crate::hl7::field_split::Hl7FieldSplit;
 use crate::hl7::tokenizer::{
     Delimiters, ParsedSegment, SegmentTokenizer, raw_field, split_segment,
 };
+use crate::hl7::{DELIMITERS_KEY, MESSAGE_SECTION, RAW_FIELDS_KEY};
 use crate::schema::Column;
 use crate::traits::FormatReader;
 use cxl::typecheck::Type;
@@ -424,8 +424,9 @@ impl<R: Read> Hl7Reader<R> {
         // multi-message file reconstructs one output envelope per message and
         // dead-letters per message rather than collapsing the whole file into
         // one frame.
+        let delims = self.tokenizer.delimiters();
         self.pending_events.push(EnvelopeEvent::OpenLevel {
-            sections: message_section(msh),
+            sections: message_section(msh, &delims),
             frame: FrameRole::NewFrame,
         });
         self.open_message = Some(OpenMessage {
@@ -607,19 +608,27 @@ impl<R: Read + Send> FormatReader for Hl7Reader<R> {
     }
 }
 
-/// Build the `MSH` message-level `$doc` section under a fixed
-/// `transaction_set` name keyed by positional `fNN` fields, plus the raw
-/// field list under the engine-internal key for lossless writer
-/// reconstruction of an echoed `MSH` header.
-fn message_section(msh: &ParsedSegment) -> IndexMap<Box<str>, Value> {
-    let mut sections = positional_section("transaction_set", &msh.fields);
-    if let Some(Value::Map(fields)) = sections.get_mut("transaction_set") {
+/// Build the `MSH` message-level `$doc` section under the fixed
+/// [`MESSAGE_SECTION`] name keyed by positional `fNN` fields, plus two
+/// engine-internal keys: the raw field list for lossless writer
+/// reconstruction of an echoed `MSH` header, and the message's delimiter
+/// declaration so the writer re-emits the message with the delimiter set
+/// its header declared.
+fn message_section(msh: &ParsedSegment, delims: &Delimiters) -> IndexMap<Box<str>, Value> {
+    let mut sections = positional_section(MESSAGE_SECTION, &msh.fields);
+    if let Some(Value::Map(fields)) = sections.get_mut(MESSAGE_SECTION) {
         let raw: Vec<Value> = msh
             .fields
             .iter()
             .map(|f| Value::String(f.as_str().into()))
             .collect();
         fields.insert(Box::from(RAW_FIELDS_KEY), Value::Array(raw));
+        // HL7 delimiters are printable ASCII in practice; a pathological
+        // non-UTF-8 byte degrades through the lossy conversion and is then
+        // rejected by the writer's declaration parse rather than silently
+        // corrupting the output.
+        let declaration = String::from_utf8_lossy(&delims.declaration()).into_owned();
+        fields.insert(Box::from(DELIMITERS_KEY), Value::String(declaration.into()));
     }
     sections
 }
@@ -895,6 +904,45 @@ mod tests {
         // MSH-9 (message type) is f08; MSH-10 (control id) is f09.
         assert_eq!(set.get("f08"), Some(&Value::String("ADT^A01".into())));
         assert_eq!(set.get("f09"), Some(&Value::String("MSG001".into())));
+    }
+
+    #[test]
+    fn message_section_carries_delimiter_stamp() {
+        let mut r = reader(&adt_message());
+        let _ = r.next_record().unwrap().unwrap();
+        let events = r.take_envelope_events();
+        let EnvelopeEvent::OpenLevel { sections, .. } = &events[0] else {
+            panic!("expected message OpenLevel");
+        };
+        let set = match sections.get(MESSAGE_SECTION).unwrap() {
+            Value::Map(m) => m,
+            other => panic!("expected map, got {other:?}"),
+        };
+        assert_eq!(
+            set.get(DELIMITERS_KEY),
+            Some(&Value::String("|^~\\&".into()))
+        );
+    }
+
+    #[test]
+    fn message_section_stamp_reflects_custom_delimiters() {
+        // Field '#', component '@', repetition '*', escape '/', sub '$'.
+        let msh = "MSH#@*/$#SENDAPP#SENDFAC#RCVAPP#RCVFAC#202401##ADT@A01#M1#P#2.5";
+        let data = format!("{msh}\rPID#1");
+        let mut r = reader(&data);
+        let _ = r.next_record().unwrap().unwrap();
+        let events = r.take_envelope_events();
+        let EnvelopeEvent::OpenLevel { sections, .. } = &events[0] else {
+            panic!("expected message OpenLevel");
+        };
+        let set = match sections.get(MESSAGE_SECTION).unwrap() {
+            Value::Map(m) => m,
+            other => panic!("expected map, got {other:?}"),
+        };
+        assert_eq!(
+            set.get(DELIMITERS_KEY),
+            Some(&Value::String("#@*/$".into()))
+        );
     }
 
     #[test]
@@ -1282,6 +1330,77 @@ mod tests {
             Some(&Value::String("PATID^^^MRN~ALT^^^MR".into()))
         );
         assert_eq!(recs2[2].get("f05"), Some(&Value::String("a|b".into())));
+    }
+
+    /// A custom-delimiter file must round-trip byte-identically: the reader
+    /// stamps the discovered delimiter set into the message's `$doc`
+    /// section, and the writer adopts it — joining fields on the custom
+    /// field separator and escaping with the custom escape character
+    /// instead of the conventional defaults.
+    #[test]
+    fn custom_delimiter_round_trip_re_emits_declared_set() {
+        use crate::hl7::writer::{Hl7Writer, Hl7WriterConfig};
+        use crate::traits::FormatWriter;
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
+
+        // Field '#', component '@', repetition '*', escape '/', sub '$'.
+        // OBX-5 carries an escaped field separator (`/F/` → literal '#').
+        let msh = "MSH#@*/$#SEND#FAC#RCV#FAC#202401##ADT@A01#M1#P#2.5";
+        let input = format!("{msh}\rPID#1##PATID@@@MRN\rOBX#1#TX#note##a/F/b");
+
+        let mut r = reader(&input);
+        let mut body_recs: Vec<Record> = Vec::new();
+        let mut msg_sections = None;
+        while let Some(rec) = r.next_record().unwrap() {
+            for ev in r.take_envelope_events() {
+                if let EnvelopeEvent::OpenLevel { sections, .. } = ev {
+                    msg_sections = Some(sections);
+                }
+            }
+            body_recs.push(rec);
+        }
+        assert_eq!(body_recs.len(), 3); // MSH, PID, OBX
+        // The escaped custom field separator decodes to a literal '#'.
+        assert_eq!(body_recs[2].get("f05"), Some(&Value::String("a#b".into())));
+
+        // Attach the message-level document the reader produced — the same
+        // sections the executor's ingest driver would layer onto every body
+        // record — and re-emit through the writer.
+        let ctx = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("custom.hl7"),
+            EnvelopeRecord::from_sections(msg_sections.expect("MSH opens a message level")),
+        ));
+        let schema = r.schema().unwrap();
+        let out = {
+            let mut buf = Vec::new();
+            let mut w = Hl7Writer::new(
+                std::io::Cursor::new(&mut buf),
+                Arc::clone(&schema),
+                Hl7WriterConfig::default(),
+            );
+            for rec in &body_recs {
+                let mut rec = rec.clone();
+                rec.set_doc_ctx(Arc::clone(&ctx));
+                w.write_record(&rec).unwrap();
+            }
+            w.flush().unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+
+        // Byte-identical echo (the writer terminates the final segment with
+        // the carriage return the fixture omits), including the '#' field
+        // joining, the verbatim MSH-2 '@*/$', and the /F/ re-escape.
+        assert_eq!(out, format!("{input}\r"));
+
+        // The emitted file re-parses to the same decoded values.
+        let recs2 = collect(&out);
+        assert_eq!(recs2.len(), 3);
+        assert_eq!(recs2[2].get("f05"), Some(&Value::String("a#b".into())));
+        assert_eq!(
+            recs2[1].get("f03"),
+            Some(&Value::String("PATID@@@MRN".into()))
+        );
     }
 
     /// A split composite field must re-assemble byte-identically on write:

@@ -414,110 +414,120 @@ pub(crate) fn dispatch_combine(
             // `SortConsumer` (priority 20); the handle's bytes
             // start at zero and gain wiring once IEJoin's build
             // path is plumbed.
-            ctx.memory_budget.register_consumer(Arc::new(
+            let ie_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
                 crate::pipeline::sort_buffer::SortConsumer::new(
                     crate::pipeline::memory::ConsumerHandle::new(),
                 ),
             ));
-            // Advance per-source `rollback_cursors` for every
-            // build-side record before its `row_num` is dropped
-            // in the `(r, _)` map. Source→Combine direct paths
-            // (no intermediate Transform/Aggregate to advance the
-            // cursor on the way through) would otherwise leave
-            // the build source's cursor anchored at zero. Same
-            // pass advances driver-side cursors for symmetry —
-            // a Source→Combine direct driver has the same gap.
-            for (rec, rn) in &driver_buf {
-                advance_cursor(ctx, &source_name_arc_of(rec), *rn);
-            }
-            for (rec, rn) in &build_buf {
-                advance_cursor(ctx, &source_name_arc_of(rec), *rn);
-            }
-            let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
-            let build_records_in = build_records.len() as u64;
-            let build_timer =
-                stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
-                    name: name.clone(),
-                });
-            let build_records_out = build_records.len() as u64;
-            ctx.collector
-                .record(build_timer.finish(build_records_in, build_records_out));
-            let probe_records_in = driver_buf.len() as u64;
-            let probe_timer =
-                stage_metrics::StageTimer::new(stage_metrics::StageName::CombineProbe {
-                    name: name.clone(),
-                });
-            let body_typed = body_typed_on_node.as_ref();
-            let combine_output_schema_arc = combine_output_schema.clone();
-            let iejoin_ctx = ctx.merged_eval_ctx();
-            // CPU-bound IEJoin kernel — partition + range-walk +
-            // materialize. The kernel owns its inputs
-            // (`driver_buf`, `build_records`) and borrows only
-            // `&ctx.memory_budget` + the local `iejoin_ctx`, so
-            // it runs on the shared Rayon pool. Row order is
-            // determined by the kernel's deterministic
-            // partition-then-merge, not by pool scheduling.
-            let kernel_out = ctx.kernel_pool.install(|| {
-                execute_combine_iejoin(IEJoinExec {
-                    name,
-                    build_qualifier: &build_qualifier,
-                    driver_records: driver_buf,
-                    build_records,
-                    decomposed,
-                    body_program: body_typed,
-                    resolver_mapping: &resolver_mapping,
-                    output_schema: combine_output_schema_arc.as_ref(),
-                    match_mode: *match_mode,
-                    on_miss: *on_miss,
-                    partition_bits,
-                    propagate_ck,
-                    ctx: &iejoin_ctx,
-                    budget: &ctx.memory_budget,
-                    strategy: ctx.strategy,
-                })
-            })?;
-            let crate::pipeline::combine::CombineKernelOutput {
-                records: output_records,
-                output_eval_failures,
-            } = kernel_out;
-            // Route each deferred output-stage eval failure through
-            // the same `combine_output_row` path the inline arm
-            // uses. This MUST run before the snapshot is dropped
-            // below — `dispatch_combine_output_error` reads the
-            // installed pre-fold snapshot to rewind each
-            // contributing source's rollback cursor.
-            for f in output_eval_failures {
-                dispatch_combine_output_error(
+            // Every exit past this registration must unregister the
+            // consumer, so the kernel-install-through-admit body runs
+            // inside a closure whose Result is captured: the clean return
+            // and every `?` early-return funnel through the single
+            // `unregister_consumer` call below, so a finished IEJoin branch
+            // never lingers in the arbitrator's registry.
+            let result = (|| -> Result<(), PipelineError> {
+                // Advance per-source `rollback_cursors` for every
+                // build-side record before its `row_num` is dropped
+                // in the `(r, _)` map. Source→Combine direct paths
+                // (no intermediate Transform/Aggregate to advance the
+                // cursor on the way through) would otherwise leave
+                // the build source's cursor anchored at zero. Same
+                // pass advances driver-side cursors for symmetry —
+                // a Source→Combine direct driver has the same gap.
+                for (rec, rn) in &driver_buf {
+                    advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                }
+                for (rec, rn) in &build_buf {
+                    advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                }
+                let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
+                let build_records_in = build_records.len() as u64;
+                let build_timer =
+                    stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
+                        name: name.clone(),
+                    });
+                let build_records_out = build_records.len() as u64;
+                ctx.collector
+                    .record(build_timer.finish(build_records_in, build_records_out));
+                let probe_records_in = driver_buf.len() as u64;
+                let probe_timer =
+                    stage_metrics::StageTimer::new(stage_metrics::StageName::CombineProbe {
+                        name: name.clone(),
+                    });
+                let body_typed = body_typed_on_node.as_ref();
+                let combine_output_schema_arc = combine_output_schema.clone();
+                let iejoin_ctx = ctx.merged_eval_ctx();
+                // CPU-bound IEJoin kernel — partition + range-walk +
+                // materialize. The kernel owns its inputs
+                // (`driver_buf`, `build_records`) and borrows only
+                // `&ctx.memory_budget` + the local `iejoin_ctx`, so
+                // it runs on the shared Rayon pool. Row order is
+                // determined by the kernel's deterministic
+                // partition-then-merge, not by pool scheduling.
+                let kernel_out = ctx.kernel_pool.install(|| {
+                    execute_combine_iejoin(IEJoinExec {
+                        name,
+                        build_qualifier: &build_qualifier,
+                        driver_records: driver_buf,
+                        build_records,
+                        decomposed,
+                        body_program: body_typed,
+                        resolver_mapping: &resolver_mapping,
+                        output_schema: combine_output_schema_arc.as_ref(),
+                        match_mode: *match_mode,
+                        on_miss: *on_miss,
+                        partition_bits,
+                        propagate_ck,
+                        ctx: &iejoin_ctx,
+                        budget: &ctx.memory_budget,
+                        strategy: ctx.strategy,
+                    })
+                })?;
+                let crate::pipeline::combine::CombineKernelOutput {
+                    records: output_records,
+                    output_eval_failures,
+                } = kernel_out;
+                // Route each deferred output-stage eval failure through
+                // the same `combine_output_row` path the inline arm
+                // uses. This MUST run before the snapshot is dropped
+                // below — `dispatch_combine_output_error` reads the
+                // installed pre-fold snapshot to rewind each
+                // contributing source's rollback cursor.
+                for f in output_eval_failures {
+                    dispatch_combine_output_error(
+                        ctx,
+                        node_idx,
+                        &f.probe_record,
+                        f.row,
+                        f.matched_build.as_ref(),
+                        name,
+                        f.error,
+                    )?;
+                }
+                let probe_records_out = output_records.len() as u64;
+                ctx.collector
+                    .record(probe_timer.finish(probe_records_in, probe_records_out));
+                finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
+                tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
+                let nb = admit_node_buffer(
                     ctx,
-                    node_idx,
-                    &f.probe_record,
-                    f.row,
-                    f.matched_build.as_ref(),
                     name,
-                    f.error,
+                    node_idx,
+                    output_records,
+                    combined_puncts,
+                    node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
-            }
-            let probe_records_out = output_records.len() as u64;
-            ctx.collector
-                .record(probe_timer.finish(probe_records_in, probe_records_out));
-            finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
-            tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-            let nb = admit_node_buffer(
-                ctx,
-                name,
-                node_idx,
-                output_records,
-                combined_puncts,
-                node_buffer_spill_allowed(current_dag, node_idx),
-            )?;
-            ctx.node_buffers.insert(node_idx, nb);
-            // Combine arm clean-exit: drop the per-fold cursor
-            // snapshot. Every emitted record has cleared into
-            // `node_buffers` without rewind, so the snapshot is
-            // no longer needed. Mirrors the inline arm's
-            // post-emit clear.
-            ctx.combine_input_snapshots.remove(&node_idx);
-            return Ok(());
+                ctx.node_buffers.insert(node_idx, nb);
+                // Combine arm clean-exit: drop the per-fold cursor
+                // snapshot. Every emitted record has cleared into
+                // `node_buffers` without rewind, so the snapshot is
+                // no longer needed. Mirrors the inline arm's
+                // post-emit clear.
+                ctx.combine_input_snapshots.remove(&node_idx);
+                Ok(())
+            })();
+            ctx.memory_budget.unregister_consumer(ie_consumer_id);
+            return result;
         }
         Dispatch::Grace(partition_bits) => {
             // Single ConsumerHandle shared between the
@@ -527,120 +537,130 @@ pub(crate) fn dispatch_combine(
             // sum into the handle's counter on every admit /
             // spill_partition transition.
             let grace_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-            ctx.memory_budget.register_consumer(Arc::new(
+            let grace_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
                 crate::pipeline::grace_hash::GraceHashConsumer::new(grace_consumer_handle.clone()),
             ));
-            // Same per-source cursor advance the IEJoin arm
-            // performs; Source→Combine direct paths on either
-            // side need the explicit walk because the build /
-            // driver bufs flow directly out of `node_buffers`
-            // with no operator in between to advance.
-            for (rec, rn) in &driver_buf {
-                advance_cursor(ctx, &source_name_arc_of(rec), *rn);
-            }
-            for (rec, rn) in &build_buf {
-                advance_cursor(ctx, &source_name_arc_of(rec), *rn);
-            }
-            let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
-            let build_records_in = build_records.len() as u64;
-            let build_timer =
-                stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
-                    name: name.clone(),
-                });
-            let build_records_out = build_records.len() as u64;
-            ctx.collector
-                .record(build_timer.finish(build_records_in, build_records_out));
-            let probe_records_in = driver_buf.len() as u64;
-            let probe_timer =
-                stage_metrics::StageTimer::new(stage_metrics::StageName::CombineProbe {
-                    name: name.clone(),
-                });
-            let body_typed = body_typed_on_node.as_ref();
-            let combine_output_schema_arc = combine_output_schema.clone();
-            // Resolve the spill compression mode against the combine's output
-            // schema width and the run's batch size, so the grace-hash
-            // partition spill files match what `--explain` projects. `auto`
-            // skips LZ4 on narrow combines where the per-frame fixed cost
-            // outweighs the savings.
-            let grace_column_count = combine_output_schema_arc
-                .as_ref()
-                .map(|s| s.column_count())
-                .unwrap_or(0);
-            let grace_spill_compress = ctx
-                .spill_compress
-                .resolve_for_schema(grace_column_count, ctx.batch_size as u64);
-            let grace_ctx = ctx.merged_eval_ctx();
-            // CPU-bound grace-hash join kernel: partition build +
-            // probe + spill I/O. The kernel owns its inputs and
-            // borrows only `&ctx.memory_budget`, the local
-            // `grace_ctx`, and the spill dir, so it runs on the
-            // shared Rayon pool. Emitted-row order is fixed by the
-            // kernel's deterministic partition-then-probe walk.
-            let kernel_out = ctx.kernel_pool.install(|| {
-                execute_combine_grace_hash(GraceHashExec {
-                    name,
-                    build_qualifier: &build_qualifier,
-                    driver_records: driver_buf,
-                    build_records,
-                    decomposed,
-                    body_program: body_typed,
-                    resolver_mapping: &resolver_mapping,
-                    output_schema: combine_output_schema_arc.as_ref(),
-                    match_mode: *match_mode,
-                    on_miss: *on_miss,
-                    partition_bits,
-                    propagate_ck,
-                    ctx: &grace_ctx,
-                    budget: &ctx.memory_budget,
-                    spill_dir: ctx.spill_root_path.as_ref(),
-                    spill_compress: grace_spill_compress,
-                    consumer_handle: grace_consumer_handle,
-                    strategy: ctx.strategy,
-                    stats_sink: crate::pipeline::grace_hash::GraceStatsSink {
-                        catalog: std::sync::Arc::clone(&ctx.runtime_statistics),
-                        node: build_upstream,
-                        column: &build_qualifier,
-                    },
-                })
-            })?;
-            let crate::pipeline::combine::CombineKernelOutput {
-                records: output_records,
-                output_eval_failures,
-            } = kernel_out;
-            // Route each deferred output-stage eval failure through
-            // the `combine_output_row` path while the pre-fold
-            // snapshot is still installed (the rewind reads it).
-            for f in output_eval_failures {
-                dispatch_combine_output_error(
+            // Every exit past this registration must unregister the
+            // consumer, so the kernel-install-through-admit body runs
+            // inside a closure whose Result is captured: the clean return
+            // and every `?` early-return funnel through the single
+            // `unregister_consumer` call below, so a finished grace-hash
+            // branch never lingers in the arbitrator's registry.
+            let result = (|| -> Result<(), PipelineError> {
+                // Same per-source cursor advance the IEJoin arm
+                // performs; Source→Combine direct paths on either
+                // side need the explicit walk because the build /
+                // driver bufs flow directly out of `node_buffers`
+                // with no operator in between to advance.
+                for (rec, rn) in &driver_buf {
+                    advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                }
+                for (rec, rn) in &build_buf {
+                    advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                }
+                let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
+                let build_records_in = build_records.len() as u64;
+                let build_timer =
+                    stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
+                        name: name.clone(),
+                    });
+                let build_records_out = build_records.len() as u64;
+                ctx.collector
+                    .record(build_timer.finish(build_records_in, build_records_out));
+                let probe_records_in = driver_buf.len() as u64;
+                let probe_timer =
+                    stage_metrics::StageTimer::new(stage_metrics::StageName::CombineProbe {
+                        name: name.clone(),
+                    });
+                let body_typed = body_typed_on_node.as_ref();
+                let combine_output_schema_arc = combine_output_schema.clone();
+                // Resolve the spill compression mode against the combine's output
+                // schema width and the run's batch size, so the grace-hash
+                // partition spill files match what `--explain` projects. `auto`
+                // skips LZ4 on narrow combines where the per-frame fixed cost
+                // outweighs the savings.
+                let grace_column_count = combine_output_schema_arc
+                    .as_ref()
+                    .map(|s| s.column_count())
+                    .unwrap_or(0);
+                let grace_spill_compress = ctx
+                    .spill_compress
+                    .resolve_for_schema(grace_column_count, ctx.batch_size as u64);
+                let grace_ctx = ctx.merged_eval_ctx();
+                // CPU-bound grace-hash join kernel: partition build +
+                // probe + spill I/O. The kernel owns its inputs and
+                // borrows only `&ctx.memory_budget`, the local
+                // `grace_ctx`, and the spill dir, so it runs on the
+                // shared Rayon pool. Emitted-row order is fixed by the
+                // kernel's deterministic partition-then-probe walk.
+                let kernel_out = ctx.kernel_pool.install(|| {
+                    execute_combine_grace_hash(GraceHashExec {
+                        name,
+                        build_qualifier: &build_qualifier,
+                        driver_records: driver_buf,
+                        build_records,
+                        decomposed,
+                        body_program: body_typed,
+                        resolver_mapping: &resolver_mapping,
+                        output_schema: combine_output_schema_arc.as_ref(),
+                        match_mode: *match_mode,
+                        on_miss: *on_miss,
+                        partition_bits,
+                        propagate_ck,
+                        ctx: &grace_ctx,
+                        budget: &ctx.memory_budget,
+                        spill_dir: ctx.spill_root_path.as_ref(),
+                        spill_compress: grace_spill_compress,
+                        consumer_handle: grace_consumer_handle,
+                        strategy: ctx.strategy,
+                        stats_sink: crate::pipeline::grace_hash::GraceStatsSink {
+                            catalog: std::sync::Arc::clone(&ctx.runtime_statistics),
+                            node: build_upstream,
+                            column: &build_qualifier,
+                        },
+                    })
+                })?;
+                let crate::pipeline::combine::CombineKernelOutput {
+                    records: output_records,
+                    output_eval_failures,
+                } = kernel_out;
+                // Route each deferred output-stage eval failure through
+                // the `combine_output_row` path while the pre-fold
+                // snapshot is still installed (the rewind reads it).
+                for f in output_eval_failures {
+                    dispatch_combine_output_error(
+                        ctx,
+                        node_idx,
+                        &f.probe_record,
+                        f.row,
+                        f.matched_build.as_ref(),
+                        name,
+                        f.error,
+                    )?;
+                }
+                let probe_records_out = output_records.len() as u64;
+                ctx.collector
+                    .record(probe_timer.finish(probe_records_in, probe_records_out));
+                finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
+                tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
+                let nb = admit_node_buffer(
                     ctx,
-                    node_idx,
-                    &f.probe_record,
-                    f.row,
-                    f.matched_build.as_ref(),
                     name,
-                    f.error,
+                    node_idx,
+                    output_records,
+                    combined_puncts,
+                    node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
-            }
-            let probe_records_out = output_records.len() as u64;
-            ctx.collector
-                .record(probe_timer.finish(probe_records_in, probe_records_out));
-            finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
-            tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-            let nb = admit_node_buffer(
-                ctx,
-                name,
-                node_idx,
-                output_records,
-                combined_puncts,
-                node_buffer_spill_allowed(current_dag, node_idx),
-            )?;
-            ctx.node_buffers.insert(node_idx, nb);
-            // Combine arm clean-exit: drop the per-fold cursor
-            // snapshot. Mirrors the inline arm's post-emit
-            // clear so non-inline strategies do not leak
-            // stale snapshot entries across runs.
-            ctx.combine_input_snapshots.remove(&node_idx);
-            return Ok(());
+                ctx.node_buffers.insert(node_idx, nb);
+                // Combine arm clean-exit: drop the per-fold cursor
+                // snapshot. Mirrors the inline arm's post-emit
+                // clear so non-inline strategies do not leak
+                // stale snapshot entries across runs.
+                ctx.combine_input_snapshots.remove(&node_idx);
+                Ok(())
+            })();
+            ctx.memory_budget.unregister_consumer(grace_consumer_id);
+            return result;
         }
         Dispatch::SortMerge => {
             // Single ConsumerHandle shared between the
@@ -650,123 +670,133 @@ pub(crate) fn dispatch_combine(
             // matching-run accumulator size into the handle's
             // counter at every push / spill transition.
             let sm_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-            ctx.memory_budget.register_consumer(Arc::new(
+            let sm_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
                 crate::pipeline::sort_merge_join::SortMergeConsumer::new(
                     sm_consumer_handle.clone(),
                 ),
             ));
-            // SortMerge is selected by the planner only
-            // for pure-range predicates whose inputs
-            // already arrive sorted on the range key
-            // prefix. The kernel's `presorted: true`
-            // path skips Phase A external sort and walks
-            // the inputs in place via the two-cursor
-            // merge.
-            // Same per-source cursor advance the IEJoin /
-            // Grace arms perform; Source→Combine direct paths
-            // on either side need the explicit walk because
-            // the build / driver bufs flow directly out of
-            // `node_buffers` with no operator in between to
-            // advance.
-            for (rec, rn) in &driver_buf {
-                advance_cursor(ctx, &source_name_arc_of(rec), *rn);
-            }
-            for (rec, rn) in &build_buf {
-                advance_cursor(ctx, &source_name_arc_of(rec), *rn);
-            }
-            let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
-            let build_records_in = build_records.len() as u64;
-            let build_timer =
-                stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
-                    name: name.clone(),
-                });
-            let build_records_out = build_records.len() as u64;
-            ctx.collector
-                .record(build_timer.finish(build_records_in, build_records_out));
-            let probe_records_in = driver_buf.len() as u64;
-            let probe_timer =
-                stage_metrics::StageTimer::new(stage_metrics::StageName::CombineProbe {
-                    name: name.clone(),
-                });
-            let body_typed = body_typed_on_node.as_ref();
-            let combine_output_schema_arc = combine_output_schema.clone();
-            // Resolve the spill compression mode against the combine's output
-            // schema width and the run's batch size, so Phase A spill runs
-            // match what `--explain` projects. `auto` skips LZ4 on narrow
-            // combines where the per-frame fixed cost outweighs the savings.
-            let sm_column_count = combine_output_schema_arc
-                .as_ref()
-                .map(|s| s.column_count())
-                .unwrap_or(0);
-            let sm_spill_compress = ctx
-                .spill_compress
-                .resolve_for_schema(sm_column_count, ctx.batch_size as u64);
-            let sm_ctx = ctx.merged_eval_ctx();
-            // CPU-bound sort-merge join kernel: two-cursor merge
-            // over pre-sorted inputs. The kernel owns its inputs
-            // and borrows only `&ctx.memory_budget`, the local
-            // `sm_ctx`, and the spill dir, so it runs on the
-            // shared Rayon pool. The two-cursor merge emits in a
-            // deterministic order independent of pool scheduling.
-            let kernel_out = ctx.kernel_pool.install(|| {
-                execute_combine_sort_merge(SortMergeExec {
-                    name,
-                    build_qualifier: &build_qualifier,
-                    driver_records: driver_buf,
-                    build_records,
-                    decomposed,
-                    body_program: body_typed,
-                    resolver_mapping: &resolver_mapping,
-                    output_schema: combine_output_schema_arc.as_ref(),
-                    match_mode: *match_mode,
-                    on_miss: *on_miss,
-                    presorted: true,
-                    propagate_ck,
-                    ctx: &sm_ctx,
-                    budget: &ctx.memory_budget,
-                    spill_dir: ctx.spill_root_path.as_ref(),
-                    spill_compress: sm_spill_compress,
-                    consumer_handle: sm_consumer_handle,
-                    strategy: ctx.strategy,
-                })
-            })?;
-            let crate::pipeline::combine::CombineKernelOutput {
-                records: output_records,
-                output_eval_failures,
-            } = kernel_out;
-            // Route each deferred output-stage eval failure through
-            // the `combine_output_row` path while the pre-fold
-            // snapshot is still installed (the rewind reads it).
-            for f in output_eval_failures {
-                dispatch_combine_output_error(
+            // Every exit past this registration must unregister the
+            // consumer, so the kernel-install-through-admit body runs
+            // inside a closure whose Result is captured: the clean return
+            // and every `?` early-return funnel through the single
+            // `unregister_consumer` call below, so a finished sort-merge
+            // branch never lingers in the arbitrator's registry.
+            let result = (|| -> Result<(), PipelineError> {
+                // SortMerge is selected by the planner only
+                // for pure-range predicates whose inputs
+                // already arrive sorted on the range key
+                // prefix. The kernel's `presorted: true`
+                // path skips Phase A external sort and walks
+                // the inputs in place via the two-cursor
+                // merge.
+                // Same per-source cursor advance the IEJoin /
+                // Grace arms perform; Source→Combine direct paths
+                // on either side need the explicit walk because
+                // the build / driver bufs flow directly out of
+                // `node_buffers` with no operator in between to
+                // advance.
+                for (rec, rn) in &driver_buf {
+                    advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                }
+                for (rec, rn) in &build_buf {
+                    advance_cursor(ctx, &source_name_arc_of(rec), *rn);
+                }
+                let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
+                let build_records_in = build_records.len() as u64;
+                let build_timer =
+                    stage_metrics::StageTimer::new(stage_metrics::StageName::CombineBuild {
+                        name: name.clone(),
+                    });
+                let build_records_out = build_records.len() as u64;
+                ctx.collector
+                    .record(build_timer.finish(build_records_in, build_records_out));
+                let probe_records_in = driver_buf.len() as u64;
+                let probe_timer =
+                    stage_metrics::StageTimer::new(stage_metrics::StageName::CombineProbe {
+                        name: name.clone(),
+                    });
+                let body_typed = body_typed_on_node.as_ref();
+                let combine_output_schema_arc = combine_output_schema.clone();
+                // Resolve the spill compression mode against the combine's output
+                // schema width and the run's batch size, so Phase A spill runs
+                // match what `--explain` projects. `auto` skips LZ4 on narrow
+                // combines where the per-frame fixed cost outweighs the savings.
+                let sm_column_count = combine_output_schema_arc
+                    .as_ref()
+                    .map(|s| s.column_count())
+                    .unwrap_or(0);
+                let sm_spill_compress = ctx
+                    .spill_compress
+                    .resolve_for_schema(sm_column_count, ctx.batch_size as u64);
+                let sm_ctx = ctx.merged_eval_ctx();
+                // CPU-bound sort-merge join kernel: two-cursor merge
+                // over pre-sorted inputs. The kernel owns its inputs
+                // and borrows only `&ctx.memory_budget`, the local
+                // `sm_ctx`, and the spill dir, so it runs on the
+                // shared Rayon pool. The two-cursor merge emits in a
+                // deterministic order independent of pool scheduling.
+                let kernel_out = ctx.kernel_pool.install(|| {
+                    execute_combine_sort_merge(SortMergeExec {
+                        name,
+                        build_qualifier: &build_qualifier,
+                        driver_records: driver_buf,
+                        build_records,
+                        decomposed,
+                        body_program: body_typed,
+                        resolver_mapping: &resolver_mapping,
+                        output_schema: combine_output_schema_arc.as_ref(),
+                        match_mode: *match_mode,
+                        on_miss: *on_miss,
+                        presorted: true,
+                        propagate_ck,
+                        ctx: &sm_ctx,
+                        budget: &ctx.memory_budget,
+                        spill_dir: ctx.spill_root_path.as_ref(),
+                        spill_compress: sm_spill_compress,
+                        consumer_handle: sm_consumer_handle,
+                        strategy: ctx.strategy,
+                    })
+                })?;
+                let crate::pipeline::combine::CombineKernelOutput {
+                    records: output_records,
+                    output_eval_failures,
+                } = kernel_out;
+                // Route each deferred output-stage eval failure through
+                // the `combine_output_row` path while the pre-fold
+                // snapshot is still installed (the rewind reads it).
+                for f in output_eval_failures {
+                    dispatch_combine_output_error(
+                        ctx,
+                        node_idx,
+                        &f.probe_record,
+                        f.row,
+                        f.matched_build.as_ref(),
+                        name,
+                        f.error,
+                    )?;
+                }
+                let probe_records_out = output_records.len() as u64;
+                ctx.collector
+                    .record(probe_timer.finish(probe_records_in, probe_records_out));
+                finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
+                tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
+                let nb = admit_node_buffer(
                     ctx,
-                    node_idx,
-                    &f.probe_record,
-                    f.row,
-                    f.matched_build.as_ref(),
                     name,
-                    f.error,
+                    node_idx,
+                    output_records,
+                    combined_puncts,
+                    node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
-            }
-            let probe_records_out = output_records.len() as u64;
-            ctx.collector
-                .record(probe_timer.finish(probe_records_in, probe_records_out));
-            finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
-            tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-            let nb = admit_node_buffer(
-                ctx,
-                name,
-                node_idx,
-                output_records,
-                combined_puncts,
-                node_buffer_spill_allowed(current_dag, node_idx),
-            )?;
-            ctx.node_buffers.insert(node_idx, nb);
-            // Combine arm clean-exit: drop the per-fold cursor
-            // snapshot. Mirrors the inline arm's post-emit
-            // clear.
-            ctx.combine_input_snapshots.remove(&node_idx);
-            return Ok(());
+                ctx.node_buffers.insert(node_idx, nb);
+                // Combine arm clean-exit: drop the per-fold cursor
+                // snapshot. Mirrors the inline arm's post-emit
+                // clear.
+                ctx.combine_input_snapshots.remove(&node_idx);
+                Ok(())
+            })();
+            ctx.memory_budget.unregister_consumer(sm_consumer_id);
+            return result;
         }
         Dispatch::Inline => {}
     }

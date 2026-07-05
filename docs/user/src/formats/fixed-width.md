@@ -115,6 +115,7 @@ file is never buffered.
   with the single-record fixed-width reader, so a declared `type` parses
   identically on both paths.
 - An **unknown discriminator value** (a tag no `records:` entry declares)
-  is a structural-integrity failure: it [aborts the run](../../explain/E345.md)
-  by default, or under `dlq_granularity: document` condemns the whole
-  file to the dead-letter sink and the run continues.
+  is a structural-integrity failure, classified separately from a trailer
+  count mismatch: it [aborts the run](../../explain/E345.md) by default,
+  or under `dlq_granularity: document` condemns the whole file to the
+  dead-letter sink and the run continues.

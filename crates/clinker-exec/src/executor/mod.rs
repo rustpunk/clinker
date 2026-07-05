@@ -191,6 +191,19 @@ struct DagExecResources {
     /// the Source dispatch arm.
     source_records:
         HashMap<String, crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>>,
+    /// Arbitrator registration for each declared Source's ingest-channel
+    /// consumer, keyed by Source node name in lockstep with
+    /// `source_records`. The dispatch arm that takes a source's receiver
+    /// out of `source_records` also owns this entry and releases it at
+    /// receiver disconnect, so a drained source's queue estimate leaves
+    /// `sum_consumer_usage` instead of freezing until arbitrator drop.
+    source_consumers: HashMap<
+        String,
+        (
+            crate::pipeline::memory::ConsumerId,
+            Arc<crate::pipeline::memory::ConsumerHandle>,
+        ),
+    >,
     /// Single + fan-out output writers, split into the dispatcher's
     /// `writers` / `fan_out_writers` maps at context construction.
     writers: WriterRegistry,
@@ -609,6 +622,13 @@ impl PipelineExecutor {
         let mut ingest_handles: Vec<
             std::thread::JoinHandle<Result<IngestTaskOutcome, PipelineError>>,
         > = Vec::with_capacity(source_configs.len());
+        let mut source_consumers: HashMap<
+            String,
+            (
+                crate::pipeline::memory::ConsumerId,
+                Arc<crate::pipeline::memory::ConsumerHandle>,
+            ),
+        > = HashMap::with_capacity(source_configs.len());
         for src_cfg in &source_configs {
             // Pre-declare so the report's `iter_declared_sources` view
             // emits a per-source rollup entry even when ingest produces
@@ -626,17 +646,27 @@ impl PipelineExecutor {
             // wrapper (BackPressurePreferred / Priority pause target)
             // and the SourceIngestChannel that mirrors the channel queue
             // depth × per-record bytes into the handle's counter on
-            // every `push`. The arbitrator owns the boxed wrapper for the
-            // run; arbitrator Drop releases it on pipeline teardown.
+            // every `push`. The registration travels with the receiver:
+            // whichever dispatch arm drains this source's channel releases
+            // the wrapper at receiver disconnect, so a drained source
+            // stops contributing its last queue estimate to
+            // `sum_consumer_usage` — downstream spill / abort decisions
+            // would otherwise keep seeing bytes that already moved on.
             let source_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
             let (stream, rx) = crate::executor::source_stream::SourceIngestChannel::new(
                 crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
                 source_consumer_handle.clone(),
             );
-            let _source_consumer_id = memory_budget.register_consumer(Arc::new(
-                crate::executor::source_stream::SourceConsumer::new(source_consumer_handle),
+            let source_consumer_id = memory_budget.register_consumer(Arc::new(
+                crate::executor::source_stream::SourceConsumer::new(Arc::clone(
+                    &source_consumer_handle,
+                )),
             ));
             source_records.insert(src_cfg.name.clone(), rx);
+            source_consumers.insert(
+                src_cfg.name.clone(),
+                (source_consumer_id, source_consumer_handle),
+            );
             let src_cfg_owned = src_cfg.clone();
             let config_clone = config.clone();
             // Per-thread clone of the run's cancellation handle. A network
@@ -690,6 +720,7 @@ impl PipelineExecutor {
             },
             DagExecResources {
                 source_records,
+                source_consumers,
                 writers,
                 spill_root,
                 watermarks,
@@ -876,6 +907,7 @@ impl PipelineExecutor {
         } = inputs;
         let DagExecResources {
             source_records,
+            source_consumers,
             mut writers,
             spill_root,
             watermarks,
@@ -1186,6 +1218,7 @@ impl PipelineExecutor {
             node_buffer_consumer_ids: HashMap::new(),
             window_arena_consumer_ids: HashMap::new(),
             source_records,
+            source_consumers,
             fused_sources,
             fused_transforms,
             record_var_seed: &record_var_seed,
@@ -1354,6 +1387,24 @@ impl PipelineExecutor {
         // zero forever. The peak charged usage was already sampled at the
         // producer-side charges, so the report read survives this.
         for (_, (id, _)) in std::mem::take(&mut ctx.streaming_charge_consumers) {
+            ctx.memory_budget.unregister_consumer(id);
+        }
+
+        // Sources the walk never drained — an error unwind or an interrupt
+        // before their dispatch turn — still hold their ingest-channel
+        // registration. Release them here so the registry does not outlive
+        // the walk with a frozen queue estimate summed in. On a completed
+        // walk this map is empty: each drain arm released its entry at
+        // receiver disconnect. `resume` before unregister is load-bearing:
+        // an arbitration round may have paused an undrained source's ingest
+        // thread, and once the wrapper leaves the registry nothing else can
+        // unpark it — the thread would sit parked forever and the caller's
+        // ingest-thread join would hang. `set_bytes(0)` keeps the shared
+        // handle's mirrored estimate truthful; the unregister is what drops
+        // the consumer out of `sum_consumer_usage`.
+        for (_, (id, handle)) in std::mem::take(&mut ctx.source_consumers) {
+            handle.resume();
+            handle.set_bytes(0);
             ctx.memory_budget.unregister_consumer(id);
         }
 
@@ -1559,11 +1610,13 @@ mod tests {
     use super::*;
 
     mod aggregation;
+    mod combine_consumer_lifecycle;
     mod composition_port_admission_overshoot;
     mod deferred_dispatch;
     mod diamond_node_buffer_overshoot;
     mod multi_output;
     mod nested_composition_overshoot;
     mod scheduling;
+    mod source_consumer_release;
     mod spill_dir_unavailable_midrun;
 }

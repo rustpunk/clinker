@@ -41,14 +41,33 @@ pub enum FormatError {
     Swift(String),
     /// An envelope trailer's declared structural COUNT did not match the
     /// body the reader streamed: X12 `SE`/`GE`/`IEA`, EDIFACT `UNT`/`UNZ`,
-    /// or HL7 `BTS`/`FTS`. Distinct from the format-specific variants above
-    /// (which also cover truncation, bad delimiters, and control-number echo
-    /// mismatches) so the executor can route ONLY a count mismatch to the
-    /// document-level DLQ under `dlq_granularity: document`, while genuine
-    /// corruption keeps aborting the run. `format` names the spec for the
-    /// DLQ stage label; `message` is the precise count-mismatch description
-    /// the reader built at the trailer.
+    /// HL7 `BTS`/`FTS`, or a multi-record flat-file trailer. Distinct from
+    /// the format-specific variants above (which also cover truncation, bad
+    /// delimiters, and control-number echo mismatches) so a trailer count
+    /// claim never reads as genuine corruption, and distinct from
+    /// [`FormatError::StructuralValidation`] so a count mismatch stays
+    /// distinguishable from a document that broke a non-count structural
+    /// rule. Both structural classes route to the document-level DLQ under
+    /// `dlq_granularity: document` (see
+    /// [`FormatError::is_document_structural`]); genuine corruption keeps
+    /// aborting the run. `format` names the spec for the DLQ stage label;
+    /// `message` is the precise count-mismatch description the reader built
+    /// at the trailer.
     StructuralCount {
+        format: &'static str,
+        message: String,
+    },
+    /// A multi-record flat file broke a structural rule that is NOT a
+    /// trailer count claim: a line's record-type discriminator matched no
+    /// declared `records:` entry (E345), or a body record appeared after
+    /// the trailer that closes the document. Kept apart from
+    /// [`FormatError::StructuralCount`] so callers can tell a malformed tag
+    /// from a count mismatch, while both classes share the document-level
+    /// DLQ disposition under `dlq_granularity: document` (see
+    /// [`FormatError::is_document_structural`]). `format` names the spec
+    /// for the DLQ stage label; `message` is the precise description the
+    /// reader built at the offending line.
+    StructuralValidation {
         format: &'static str,
         message: String,
     },
@@ -114,6 +133,9 @@ impl fmt::Display for FormatError {
             Self::Swift(msg) => write!(f, "SWIFT error: {msg}"),
             Self::StructuralCount { format, message } => {
                 write!(f, "{format} structural count error: {message}")
+            }
+            Self::StructuralValidation { format, message } => {
+                write!(f, "{format} structural validation error: {message}")
             }
             Self::InvalidRecord { row, message } => {
                 write!(f, "invalid record at row {row}: {message}")
@@ -184,11 +206,37 @@ impl FormatError {
         }
     }
 
-    /// `true` for a [`FormatError::StructuralCount`] — the only class the
-    /// executor reclassifies from run-aborting to document-DLQ under
-    /// `dlq_granularity: document`. Every other variant keeps aborting.
+    /// Build a [`FormatError::StructuralValidation`] for a multi-record
+    /// flat-file structural failure that is not a trailer count claim (an
+    /// unknown record-type discriminator, a body record after the trailer
+    /// that closes the document).
+    pub fn multi_record_structural_validation(message: impl Into<String>) -> Self {
+        Self::StructuralValidation {
+            format: "multi-record",
+            message: message.into(),
+        }
+    }
+
+    /// `true` only for a [`FormatError::StructuralCount`] — an envelope
+    /// trailer's declared count disagreeing with the body the reader
+    /// streamed. For the document-DLQ routing decision use
+    /// [`FormatError::is_document_structural`], which also admits
+    /// [`FormatError::StructuralValidation`].
     pub fn is_structural_count(&self) -> bool {
         matches!(self, Self::StructuralCount { .. })
+    }
+
+    /// `true` for the error classes the executor reclassifies from
+    /// run-aborting to document-DLQ under `dlq_granularity: document`: a
+    /// trailer count mismatch ([`FormatError::StructuralCount`]) or a
+    /// non-count structural failure of a multi-record document
+    /// ([`FormatError::StructuralValidation`]). Every other variant keeps
+    /// aborting the run.
+    pub fn is_document_structural(&self) -> bool {
+        matches!(
+            self,
+            Self::StructuralCount { .. } | Self::StructuralValidation { .. }
+        )
     }
 }
 

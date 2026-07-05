@@ -513,7 +513,7 @@ impl<R: Read> MultiRecordReader<R> {
             // A body row after a constrained trailer is content past the
             // document's close — a structural error, not a silently-counted row.
             if self.trailer_seen {
-                return Err(FormatError::multi_record_structural_count(format!(
+                return Err(FormatError::multi_record_structural_validation(format!(
                     "line {}: body record of type '{}' appears after the trailer that closes \
                      the document",
                     self.physical_row, id
@@ -527,13 +527,13 @@ impl<R: Read> MultiRecordReader<R> {
 
     /// Build the E345 error for an unknown discriminator value.
     ///
-    /// Classed as a structural-count error so the source ingest driver routes
-    /// it through the document-level dead-letter seam under
-    /// `dlq_granularity: document` (condemning the file) instead of always
-    /// aborting the run. Per-record dead-lettering of a single unknown-tag row
-    /// is tracked separately.
+    /// Classed as a structural-validation error — distinguishable from a
+    /// trailer count mismatch — so the source ingest driver routes it through
+    /// the document-level dead-letter seam under `dlq_granularity: document`
+    /// (condemning the file) instead of always aborting the run. Per-record
+    /// dead-lettering of a single unknown-tag row is tracked separately.
     fn unknown_tag_error(&self, tag: &str) -> FormatError {
-        FormatError::multi_record_structural_count(format!(
+        FormatError::multi_record_structural_validation(format!(
             "E345 line {}: unknown record-type discriminator {tag:?} — no `records:` entry \
              declares this tag. Declare a record type with `tag: {tag}`, or set \
              `dlq_granularity: document` to dead-letter the file. \
@@ -1087,14 +1087,28 @@ mod tests {
     }
 
     #[test]
-    fn unknown_tag_is_a_structural_count_error_with_e345() {
+    fn unknown_tag_is_a_structural_validation_error_with_e345() {
         let data = b"D00001 100\nX99999 999\n";
         let mut reader = fw_reader(&data[..], fw_types(), Vec::new(), Vec::new()).unwrap();
         assert!(reader.next_record().unwrap().is_some());
         let err = reader.next_record().unwrap_err();
         assert!(
-            err.is_structural_count(),
+            matches!(
+                err,
+                FormatError::StructuralValidation {
+                    format: "multi-record",
+                    ..
+                }
+            ),
+            "an unknown tag is a validation failure, not a count mismatch: {err:?}"
+        );
+        assert!(
+            err.is_document_structural(),
             "must route through the document DLQ seam"
+        );
+        assert!(
+            !err.is_structural_count(),
+            "must stay distinguishable from a trailer count mismatch"
         );
         let msg = err.to_string();
         assert!(msg.contains("E345"), "expected E345 in: {msg}");
@@ -1148,6 +1162,10 @@ mod tests {
         let reader = fw_reader(&data[..], fw_types(), trailer_constraint(), Vec::new()).unwrap();
         let err = drain_err(reader);
         assert!(err.is_structural_count());
+        assert!(
+            err.is_document_structural(),
+            "must route through the document DLQ seam"
+        );
         let msg = err.to_string();
         assert!(msg.contains("declares count 5"), "msg: {msg}");
         assert!(msg.contains("2 body records"), "msg: {msg}");
@@ -1164,12 +1182,20 @@ mod tests {
     }
 
     #[test]
-    fn post_trailer_body_row_is_a_structural_error() {
-        // A detail row after the trailer that closes the document.
+    fn post_trailer_body_row_is_a_structural_validation_error() {
+        // A detail row after the trailer that closes the document is content
+        // past the document close, not a count claim.
         let data = b"D00001 100\nT00001    \nD00002 200\n";
         let reader = fw_reader(&data[..], fw_types(), trailer_constraint(), Vec::new()).unwrap();
         let err = drain_err(reader);
-        assert!(err.is_structural_count());
+        assert!(
+            matches!(err, FormatError::StructuralValidation { .. }),
+            "content past the document close is a validation failure: {err:?}"
+        );
+        assert!(
+            err.is_document_structural(),
+            "must route through the document DLQ seam"
+        );
         assert!(err.to_string().contains("after the trailer"), "{err}");
     }
 

@@ -40,6 +40,12 @@ When a file opens with an `FHS` or `BHS` header instead of `MSH`, the
 delimiters are read from that header; HL7 requires the file's `FHS`/`BHS`
 encoding characters to match its messages' `MSH`.
 
+The discovered delimiter set travels with each message through the
+pipeline, and an HL7 Output re-emits every message with the set its header
+declared — a custom-delimiter file round-trips byte-faithfully, never
+silently rewritten to the conventional `|^~\&` (see
+[Writing HL7](#writing-hl7)).
+
 ### The MSH off-by-one
 
 `MSH-1` *is* the field separator, so it is implicit — it never appears as a
@@ -258,6 +264,14 @@ too — the writer groups them by field and re-assembles the wire value from
 the column names alone, so no output option is needed to round-trip a split
 source. The reader-stamped `set_ref`/`set_type` echoes and engine-internal
 `$`-namespaced columns are excluded automatically.
+
+The writer re-emits each message with the delimiter set its source header
+declared: the reader stamps the discovered field separator and encoding
+characters into the message's document context, and the writer adopts that
+set at every `MSH` — field joining, escaping, and split re-assembly all use
+it, so a custom-delimiter message round-trips byte-faithfully. A record
+that did not come from an HL7 source (or whose document context was
+dropped upstream) is written with the conventional `|^~\&` set.
 
 ```yaml
 nodes:
