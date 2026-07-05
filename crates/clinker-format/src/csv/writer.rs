@@ -273,6 +273,30 @@ impl<W: Write + Send> FormatWriter for HeaderCapturingCsvWriter<W> {
     fn flush(&mut self) -> Result<(), FormatError> {
         self.inner.flush()
     }
+
+    /// Forward the non-finalizing drain to the inner CSV writer so byte-limit
+    /// split accounting sees the true on-disk size (see the wrapper-delegation
+    /// contract on [`FormatWriter::flush_bytes`]).
+    fn flush_bytes(&mut self) -> Result<(), FormatError> {
+        self.inner.flush_bytes()
+    }
+
+    /// Forward per-document opening framing to the inner CSV writer; without
+    /// this the envelope header row would be silently dropped when a split CSV
+    /// output reconstructs an envelope.
+    fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        self.inner.begin_document(doc)
+    }
+
+    /// Forward per-document closing framing to the inner CSV writer; see
+    /// [`Self::begin_document`].
+    fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+        self.inner.end_document(doc)
+    }
+
+    fn bytes_written(&self) -> Option<u64> {
+        self.inner.bytes_written()
+    }
 }
 
 /// The indices into `schema.columns()` of the columns the CSV writer emits,
@@ -694,6 +718,45 @@ mod tests {
         }
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out, "A\n10\n20\nSUM,2\n", "got: {out}");
+    }
+
+    /// `HeaderCapturingCsvWriter` must forward `begin_document`/`end_document`
+    /// to its inner CSV writer: with an envelope spec the inner writer emits a
+    /// header row on begin and a footer row on end, so the wrapped output must
+    /// match the un-wrapped enveloped writer's framing rather than dropping it.
+    #[test]
+    fn header_capturing_csv_writer_forwards_document_framing() {
+        let schema = make_schema(&["amount"]);
+        let config = CsvWriterConfig {
+            include_header: false,
+            envelope: Some(OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                footer_from_doc: Some("Foot".into()),
+                footer_record_count_field: Some("count".into()),
+            }),
+            ..Default::default()
+        };
+        let doc = doc_with_sections(&[
+            ("Head", &[("batch_id", Value::String("A".into()))]),
+            ("Foot", &[("checksum", Value::String("SUM".into()))]),
+        ]);
+        let mut buf = Vec::new();
+        {
+            let inner = CsvWriter::new(&mut buf, Arc::clone(&schema), config);
+            let shared_header = Arc::new(Mutex::new(None));
+            let mut writer =
+                HeaderCapturingCsvWriter::new(inner, Arc::clone(&schema), shared_header);
+            writer.begin_document(&doc).unwrap();
+            writer
+                .write_record(&make_record(&schema, vec![Value::Integer(10)]))
+                .unwrap();
+            writer
+                .write_record(&make_record(&schema, vec![Value::Integer(20)]))
+                .unwrap();
+            writer.end_document(&doc).unwrap();
+            writer.flush().unwrap();
+        }
+        assert_eq!(String::from_utf8(buf).unwrap(), "A\n10\n20\nSUM,2\n");
     }
 
     #[test]

@@ -117,6 +117,13 @@ pub trait FormatWriter: Send {
     /// emits no closing framing (CSV, fixed-width); finalizing formats
     /// override it to drain only the underlying sink.
     ///
+    /// Wrapper writers that hold an inner writer
+    /// ([`CountedFormatWriter`](crate::counting::CountedFormatWriter),
+    /// [`SplittingWriter`](crate::splitting::SplittingWriter),
+    /// `HeaderCapturingCsvWriter`) must delegate to the inner writer's
+    /// `flush_bytes` — taking this default would replace a finalizing inner
+    /// writer's non-finalizing drain with its finalizing `flush`.
+    ///
     /// # Errors
     ///
     /// Surfaces any I/O error draining the buffer.
@@ -138,6 +145,12 @@ pub trait FormatWriter: Send {
     /// (every writer today) ignores document boundaries entirely, leaving its
     /// output byte-identical to the boundary-unaware path.
     ///
+    /// Wrapper writers that hold an inner writer
+    /// ([`CountedFormatWriter`](crate::counting::CountedFormatWriter),
+    /// [`SplittingWriter`](crate::splitting::SplittingWriter),
+    /// `HeaderCapturingCsvWriter`) must forward this hook to the inner writer,
+    /// or an enveloped inner writer's per-document framing is silently dropped.
+    ///
     /// # Errors
     ///
     /// Surfaces any I/O error emitting the opening framing.
@@ -151,7 +164,8 @@ pub trait FormatWriter: Send {
     /// `source_file` differs, or the input is exhausted — paired with the
     /// [`Self::begin_document`] that opened it.
     ///
-    /// Default impl is a no-op, mirroring [`Self::begin_document`].
+    /// Default impl is a no-op, mirroring [`Self::begin_document`]; wrapper
+    /// writers holding an inner writer must forward it for the same reason.
     ///
     /// # Errors
     ///
@@ -164,7 +178,71 @@ pub trait FormatWriter: Send {
     /// Returns `None` if byte counting is not enabled for this writer.
     /// Used by `SplittingWriter` for byte-limit rotation and by `StageMetrics`
     /// for per-stage write accounting.
+    ///
+    /// A wrapper writer holding an inner writer must forward this hook so a
+    /// byte-counting inner writer's total is not masked by this `None` default.
     fn bytes_written(&self) -> Option<u64> {
         None
+    }
+}
+
+/// Shared test fixtures for the `FormatWriter` wrapper-delegation contract.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::{Arc, Mutex};
+
+    use clinker_record::{DocumentContext, Record};
+
+    use crate::error::FormatError;
+    use crate::traits::FormatWriter;
+
+    /// A `FormatWriter` that appends a label for every lifecycle hook it
+    /// receives into a shared log, so a wrapper test can prove the wrapper
+    /// delegates each hook to its inner writer rather than silently taking a
+    /// trait default. Labels: `write`, `flush`, `flush_bytes`, `begin:<file>`,
+    /// `end:<file>`. Shared by the `CountedFormatWriter` and `SplittingWriter`
+    /// delegation tests so both assert against one fixture.
+    pub(crate) struct HookProbe {
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl HookProbe {
+        /// Build a probe that records into `log`, letting a caller (e.g. a
+        /// split writer factory) construct the probe while retaining its own
+        /// handle on the shared log.
+        pub(crate) fn with_log(log: Arc<Mutex<Vec<String>>>) -> Self {
+            Self { log }
+        }
+
+        fn record(&self, entry: impl Into<String>) {
+            self.log.lock().unwrap().push(entry.into());
+        }
+    }
+
+    impl FormatWriter for HookProbe {
+        fn write_record(&mut self, _record: &Record) -> Result<(), FormatError> {
+            self.record("write");
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), FormatError> {
+            self.record("flush");
+            Ok(())
+        }
+
+        fn flush_bytes(&mut self) -> Result<(), FormatError> {
+            self.record("flush_bytes");
+            Ok(())
+        }
+
+        fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+            self.record(format!("begin:{}", doc.source_file()));
+            Ok(())
+        }
+
+        fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
+            self.record(format!("end:{}", doc.source_file()));
+            Ok(())
+        }
     }
 }
