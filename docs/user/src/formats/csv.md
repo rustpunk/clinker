@@ -137,6 +137,7 @@ own `type` / `trim` / `pad`, the same as a single-record CSV field.
 - **Blank lines** (empty or whitespace-only, common after concatenation)
   are skipped rather than parsed.
 - An **unknown discriminator value** (a tag no `records:` entry declares)
-  is a structural-integrity failure: it [aborts the run](../../explain/E345.md)
-  by default, or under `dlq_granularity: document` condemns the whole
-  file to the dead-letter sink and the run continues.
+  is a structural-integrity failure, classified separately from a trailer
+  count mismatch: it [aborts the run](../../explain/E345.md) by default,
+  or under `dlq_granularity: document` condemns the whole file to the
+  dead-letter sink and the run continues.

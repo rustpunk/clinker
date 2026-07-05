@@ -94,7 +94,7 @@ The `_cxl_dlq_error_category` column contains one of these values:
 | `late_record` | A record arrived at a time-windowed aggregate after its event-time window had already closed |
 | `expansion_limit_exceeded` | A transform's `emit each` fan-out produced more output records than its `max_expansion` ceiling allows |
 | `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key, residual, or matched / `on_miss: null_fields` body); the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. Routed to the DLQ under `continue` / `best_effort` across every Combine join mode; `fail_fast` propagates the eval error |
-| `structural_validation` | An envelope trailer's declared count did not match the body the reader streamed (X12 `SE`/`GE`/`IEA`, EDIFACT `UNT`/`UNZ`, HL7 `BTS`/`FTS`). The root-cause `trigger: true` entry for a malformed envelope rejected under a source's `dlq_granularity: document` policy; every already-streamed record of the same file is a `document_rejected` collateral |
+| `structural_validation` | An envelope trailer's declared count did not match the body the reader streamed (X12 `SE`/`GE`/`IEA`, EDIFACT `UNT`/`UNZ`, HL7 `BTS`/`FTS`, a multi-record flat-file trailer), or a multi-record flat file broke a non-count structural rule (an unknown record-type discriminator, a body record after the trailer). The root-cause `trigger: true` entry for a malformed document rejected under a source's `dlq_granularity: document` policy; every already-streamed record of the same file is a `document_rejected` collateral |
 
 ## Advanced options
 
@@ -177,9 +177,9 @@ This is the document-shaped analogue of [correlation keys](#correlation-key): us
 
 ### Malformed envelopes (structural validation)
 
-Envelope formats carry their own structural-integrity claims: an X12 interchange declares a segment count in each `SE`/`GE`/`IEA` trailer, EDIFACT in each `UNT`/`UNZ`, HL7 batch/file in each `BTS`/`FTS`. When the declared count does not match the body the reader actually streamed, the file is structurally invalid.
+Envelope formats carry their own structural-integrity claims: an X12 interchange declares a segment count in each `SE`/`GE`/`IEA` trailer, EDIFACT in each `UNT`/`UNZ`, HL7 batch/file in each `BTS`/`FTS`, and a multi-record flat file's trailer record declares a body count via its `structure:` constraint. When the declared count does not match the body the reader actually streamed, the file is structurally invalid. A multi-record flat file can also break a **non-count structural rule** — a line whose record-type discriminator matches no declared `records:` entry (E345), or a body record appearing after the trailer that closes the document; these are classified separately from a count mismatch but carry the same disposition.
 
-Under `dlq_granularity: document`, such a count mismatch dead-letters the **whole source file** to the DLQ rather than aborting the run:
+Under `dlq_granularity: document`, such a structural failure dead-letters the **whole source file** to the DLQ rather than aborting the run:
 
 - the file's records dead-letter as one `structural_validation` root-cause entry (`_cxl_dlq_trigger = true`) plus a `document_rejected` collateral for every other already-streamed record of the file;
 - **no** record of the malformed file reaches the success sink.
@@ -203,7 +203,7 @@ The opt-in is the same `dlq_granularity: document` knob that governs per-record 
 
 **Multiple files keep flowing.** When a `glob` / `paths` source matches several files and one is malformed, only that file dead-letters — ingestion continues to the remaining files, so the clean files after a bad one still reach the sink. (This is unlike the default `record` granularity, where a count mismatch aborts the whole run and no file's records are written.) Dead-lettering one malformed file never silently drops the good files around it.
 
-**Default behavior unchanged.** Under the default `dlq_granularity: record`, a structural count mismatch still **aborts the run** exactly as before — the document-DLQ disposition is strictly opt-in. Genuine corruption that is *not* a count mismatch (a truncated stream, a bad delimiter, a control-number echo mismatch, a segment after the interchange trailer) **always aborts**, even under the `document` opt-in: only the trailer-count claims are reclassified to the DLQ; structural corruption that makes the stream un-parseable is never silently dead-lettered.
+**Default behavior unchanged.** Under the default `dlq_granularity: record`, a structural failure still **aborts the run** exactly as before — the document-DLQ disposition is strictly opt-in. Genuine corruption (a truncated stream, a bad delimiter, a control-number echo mismatch, a segment after an X12/EDIFACT/HL7 envelope trailer) **always aborts**, even under the `document` opt-in: only the trailer-count claims and the multi-record structural failures above are reclassified to the DLQ; structural corruption that makes the stream un-parseable is never silently dead-lettered.
 
 > **Cryptographic integrity (checksums / signatures) is not yet validated.** Envelope formats can also carry a SHA-256 body hash, a JWS-signed JSON payload, or an XML Signature. Clinker extracts these envelope sections but does not yet verify them. Tracked for a future release.
 

@@ -1009,8 +1009,9 @@ fn x12_count_mismatch_aborts_under_record_granularity() {
 fn x12_genuine_corruption_aborts_even_under_opt_in() {
     // Genuine corruption that is NOT a count mismatch — here a segment
     // appearing AFTER the IEA interchange trailer — keeps aborting even under
-    // the `document` opt-in. Only `StructuralCount` is reclassified to the
-    // document DLQ; structural corruption stays run-aborting.
+    // the `document` opt-in. Only document-structural errors (a trailer
+    // count claim, a multi-record validation failure) are reclassified to
+    // the document DLQ; structural corruption stays run-aborting.
     let corrupt = format!(
         "{ISA}\
         GS*PO*SENDER*RECEIVER*20240101*1200*1*X*004010~\
