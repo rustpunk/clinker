@@ -278,13 +278,18 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
         // construction), so a cursor walk left-to-right space-fills any byte
         // range the schema leaves undeclared and lands every cell at the
         // position the reader slices.
+        // A record missing a schema field emits a Null cell; borrow a shared
+        // Null rather than cloning the record's value per field (`format_value`
+        // only needs `&Value`, and Array/Map values would otherwise be
+        // deep-cloned just to be discarded or rejected).
+        let null = Value::Null;
         let mut cursor = 0usize;
         for field in &self.fields {
             write_gap(&mut self.writer, field.start - cursor)?;
 
-            let value = record.get(&field.name).cloned().unwrap_or(Value::Null);
+            let value = record.get(&field.name).unwrap_or(&null);
 
-            let formatted = self.format_value(field, &value)?;
+            let formatted = self.format_value(field, value)?;
 
             // Check truncation
             if formatted.len() > field.width {
@@ -453,6 +458,60 @@ mod tests {
         let output = String::from_utf8(buf).unwrap();
         // id(5) + name(10) + amount(8) = 23 chars + \n
         assert_eq!(output, "00042Alice         99.5\n");
+    }
+
+    /// Multiple records over a multi-field schema emit byte-exact output,
+    /// including a record whose value for a field is missing (borrowed Null
+    /// cell) — the value path the clone elimination touches.
+    #[test]
+    fn test_fixedwidth_write_multi_record_output_identity() {
+        let fields = vec![
+            {
+                let mut f = field("id");
+                f.ty = Type::Int;
+                f.start = Some(0);
+                f.width = Some(5);
+                f.justify = Some(Justify::Right);
+                f.pad = Some("0".into());
+                f
+            },
+            {
+                let mut f = field("name");
+                f.ty = Type::String;
+                f.start = Some(5);
+                f.width = Some(10);
+                f
+            },
+        ];
+
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+            writer
+                .write_record(&make_record(
+                    &["id", "name"],
+                    vec![Value::Integer(1), Value::String("Alice".into())],
+                ))
+                .unwrap();
+            writer
+                .write_record(&make_record(
+                    &["id", "name"],
+                    vec![Value::Integer(22), Value::String("Bob".into())],
+                ))
+                .unwrap();
+            // Record missing `name`: its cell is a borrowed Null (empty, padded).
+            writer
+                .write_record(&make_record(&["id"], vec![Value::Integer(333)]))
+                .unwrap();
+            writer.flush().unwrap();
+        }
+
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            output,
+            "00001Alice     \n00022Bob       \n00333          \n"
+        );
     }
 
     #[test]

@@ -216,35 +216,7 @@ mod tests {
         assert!(bytes > 0, "should have written some bytes");
     }
 
-    /// A `FormatWriter` that records every hook call, so a wrapper test can
-    /// prove per-document framing reaches the inner writer.
-    struct HookProbe {
-        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl FormatWriter for HookProbe {
-        fn write_record(&mut self, _record: &Record) -> Result<(), FormatError> {
-            self.log.lock().unwrap().push("write".into());
-            Ok(())
-        }
-        fn flush(&mut self) -> Result<(), FormatError> {
-            Ok(())
-        }
-        fn begin_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("begin:{}", doc.source_file()));
-            Ok(())
-        }
-        fn end_document(&mut self, doc: &DocumentContext) -> Result<(), FormatError> {
-            self.log
-                .lock()
-                .unwrap()
-                .push(format!("end:{}", doc.source_file()));
-            Ok(())
-        }
-    }
+    use crate::traits::test_support::HookProbe;
 
     #[test]
     fn counted_format_writer_forwards_document_hooks_to_inner() {
@@ -253,9 +225,7 @@ mod tests {
         use clinker_record::{DocumentId, EnvelopeRecord};
 
         let log = Arc::new(Mutex::new(Vec::new()));
-        let probe = HookProbe {
-            log: Arc::clone(&log),
-        };
+        let probe = HookProbe::with_log(Arc::clone(&log));
         let mut counted = CountedFormatWriter::new(Box::new(probe), SharedByteCounter::new());
 
         let doc = DocumentContext::new(
@@ -272,6 +242,24 @@ mod tests {
             *log.lock().unwrap(),
             vec!["begin:file.x12", "end:file.x12"],
             "begin/end_document forward through the counting wrapper",
+        );
+    }
+
+    #[test]
+    fn counted_format_writer_forwards_flush_bytes_to_inner() {
+        use std::sync::{Arc, Mutex};
+
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let probe = HookProbe::with_log(Arc::clone(&log));
+        let mut counted = CountedFormatWriter::new(Box::new(probe), SharedByteCounter::new());
+
+        // `flush_bytes` must reach the inner writer's non-finalizing drain, not
+        // fall back to the finalizing `flush` default.
+        counted.flush_bytes().unwrap();
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["flush_bytes"],
+            "flush_bytes forwards through the counting wrapper without finalizing",
         );
     }
 }

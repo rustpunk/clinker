@@ -71,6 +71,19 @@ pub struct XmlWriter<W: Write> {
     header_written: bool,
     /// Per-document envelope framer, present only when `config.envelope` is.
     framer: Option<EnvelopeFramer>,
+    /// Precompiled element-tree shape for the record body, memoized by schema
+    /// identity. The tree SHAPE (dotted-branch nesting, attribute-vs-element
+    /// classification, element names, ordering, attribute-name validity) is a
+    /// pure function of the schema's column names + config, independent of
+    /// per-record values, so it is built once and reused across records. Built
+    /// lazily on the first `write_record` from `record.schema()` and rebuilt on
+    /// a schema-identity change, so a multi-schema output stays correct.
+    plan_cache: Option<PlanCache>,
+    /// Reusable per-record value buffer, one slot per field in iterator order.
+    /// Each slot's `String` capacity is retained across records so filling a
+    /// record's values reuses the allocation rather than building a fresh owned
+    /// tree. Bounded by the widest single record.
+    fill: FillBuf,
 }
 
 impl<W: Write> XmlWriter<W> {
@@ -85,7 +98,53 @@ impl<W: Write> XmlWriter<W> {
             config,
             header_written: false,
             framer,
+            plan_cache: None,
+            fill: FillBuf::new(),
         }
+    }
+
+    /// Ensure `plan_cache` holds a tree plan for this record's schema. The plan
+    /// is rebuilt only when the schema identity changes (`Arc::ptr_eq`), so a
+    /// single-schema stream builds it once. Attribute-name validation happens
+    /// here (at build time), before any bytes are written, so a malformed
+    /// attribute name still fails `write_record` cleanly.
+    fn ensure_plan(&mut self, record: &Record) -> Result<(), FormatError> {
+        let schema = record.schema();
+        let current = self
+            .plan_cache
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(&c.schema, schema));
+        if !current {
+            self.plan_cache = Some(build_plan_cache(record, &self.config)?);
+        }
+        Ok(())
+    }
+
+    /// Fill the reusable `fill` buffer with this record's rendered field values
+    /// and per-field presence, in the same iterator order the plan indexes.
+    /// Runs before any bytes are emitted, so a `Value::Map` field (rejected by
+    /// [`write_value_text`]) fails the record without leaving partial output.
+    fn fill_values(&mut self, record: &Record) -> Result<(), FormatError> {
+        let Self {
+            plan_cache,
+            fill,
+            config,
+            ..
+        } = self;
+        let cache = plan_cache.as_ref().expect("plan built before fill_values");
+        let flags = &cache.field_is_attr;
+        let preserve = config.preserve_nulls;
+        fill.reset(flags.len());
+        if config.include_engine_stamped {
+            for (i, (name, val)) in record.iter_all_fields().enumerate() {
+                fill_slot(&mut fill.slots[i], flags[i], preserve, name, val)?;
+            }
+        } else {
+            for (i, (name, val)) in record.iter_user_fields().enumerate() {
+                fill_slot(&mut fill.slots[i], flags[i], preserve, name, val)?;
+            }
+        }
+        Ok(())
     }
 
     /// Emit a `<wrapper>…</wrapper>` element whose children are the section's
@@ -136,25 +195,6 @@ impl<W: Write> XmlWriter<W> {
                 .map_err(|e| FormatError::Xml(e.to_string()))?;
         }
         Ok(())
-    }
-
-    /// Collects schema fields as (name, value) pairs and builds the record's
-    /// element body — attributes plus child nodes — before any bytes are
-    /// emitted, so record-level attributes can ride the record start tag.
-    /// Engine-stamped columns are stripped from the default output; callers
-    /// opt in via `include_engine_stamped`.
-    fn build_record_tree(&self, record: &Record) -> Result<ElementBody, FormatError> {
-        let fields: Vec<(&str, &Value)> = if self.config.include_engine_stamped {
-            record.iter_all_fields().collect()
-        } else {
-            record.iter_user_fields().collect()
-        };
-
-        build_field_tree(
-            &fields,
-            self.config.preserve_nulls,
-            &self.config.attribute_prefix,
-        )
     }
 
     /// Recursively write a field tree as nested XML elements.
@@ -211,28 +251,42 @@ impl<W: Write> XmlWriter<W> {
 
 impl<W: Write + Send> FormatWriter for XmlWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        // The tree is built before the record start tag is emitted:
-        // attribute-classified fields must be known when the tag opens, and
-        // a rejected field (map payload, malformed attribute path) must not
-        // leave a dangling half-written record behind.
-        let tree = self.build_record_tree(record)?;
+        // Both the plan build and the value fill run before the record start
+        // tag is emitted: attribute-classified fields must be known when the
+        // tag opens, and a rejected field (map payload, malformed attribute
+        // name) must not leave a dangling half-written record behind.
+        self.ensure_plan(record)?;
+        self.fill_values(record)?;
 
         self.write_header()?;
 
-        let mut start = BytesStart::new(&*self.config.record_element);
-        push_attributes(&mut start, &tree.attrs);
-        self.writer
-            .write_event(Event::Start(start))
-            .map_err(|e| FormatError::Xml(e.to_string()))?;
+        // Disjoint field borrows: the sink writes (`writer`) need the plan
+        // (`plan_cache`) and the filled values (`fill`) live at the same time.
+        let Self {
+            writer,
+            plan_cache,
+            fill,
+            config,
+            framer,
+            ..
+        } = self;
+        let plan = &plan_cache.as_ref().expect("plan built above").plan;
 
-        self.write_field_tree(&tree.children)?;
+        let mut start = BytesStart::new(&*config.record_element);
+        for attr in &plan.root.attrs {
+            if fill.emits(attr.field) {
+                push_one_attribute(&mut start, &attr.name, fill.text(attr.field));
+            }
+        }
+        writer.write_event(Event::Start(start)).map_err(xml_err)?;
 
-        let end = BytesEnd::new(&*self.config.record_element);
-        self.writer
-            .write_event(Event::End(end))
-            .map_err(|e| FormatError::Xml(e.to_string()))?;
+        emit_body(writer, &plan.root, fill)?;
 
-        if let Some(framer) = self.framer.as_mut() {
+        writer
+            .write_event(Event::End(BytesEnd::new(&*config.record_element)))
+            .map_err(xml_err)?;
+
+        if let Some(framer) = framer.as_mut() {
             framer.count_record();
         }
         Ok(())
@@ -368,11 +422,24 @@ fn build_field_tree(
 /// reader and any conformant parser resolve back to the exact bytes.
 fn push_attributes(start: &mut BytesStart, attrs: &[(String, String)]) {
     for (key, value) in attrs {
-        start.push_attribute(Attribute {
-            key: QName(key.as_bytes()),
-            value: Cow::Owned(escape_attribute_value(value).into_bytes()),
-        });
+        push_one_attribute(start, key, value);
     }
+}
+
+/// Push a single name/value attribute onto an element's start tag, escaping the
+/// value (see [`push_attributes`] for why literal whitespace is emitted as
+/// character references).
+fn push_one_attribute(start: &mut BytesStart, key: &str, value: &str) {
+    start.push_attribute(Attribute {
+        key: QName(key.as_bytes()),
+        value: Cow::Owned(escape_attribute_value(value).into_bytes()),
+    });
+}
+
+/// Map an emitter error into [`FormatError::Xml`]. The emitter surfaces
+/// `std::io::Error`; its `Display` carries the underlying cause.
+fn xml_err<E: std::fmt::Display>(e: E) -> FormatError {
+    FormatError::Xml(e.to_string())
 }
 
 /// Escape an attribute value: the five predefined entities plus literal
@@ -530,27 +597,338 @@ fn insert_field(
 /// Array elements that themselves contain a `Value::Map` propagate
 /// the same rejection (the array is joined element-wise).
 fn value_to_text(col: &str, val: &Value) -> Result<String, FormatError> {
-    Ok(match val {
-        Value::Null => String::new(),
-        Value::Bool(b) => b.to_string(),
-        Value::Integer(i) => i.to_string(),
-        Value::Float(f) => f.to_string(),
-        Value::Decimal(d) => d.to_string(),
-        Value::String(s) => s.to_string(),
-        Value::Date(d) => d.to_string(),
-        Value::DateTime(dt) => dt.to_string(),
-        Value::Array(arr) => arr
-            .iter()
-            .map(|v| value_to_text(col, v))
-            .collect::<Result<Vec<_>, _>>()?
-            .join(","),
+    let mut buf = String::new();
+    write_value_text(&mut buf, col, val)?;
+    Ok(buf)
+}
+
+/// Render a clinker Value as XML text content into `buf` (appending). Shares
+/// its logic with [`value_to_text`] so the record fast path and the envelope
+/// section path stay byte-identical. `Value::Map` is rejected exactly as
+/// `value_to_text` documents.
+fn write_value_text(buf: &mut String, col: &str, val: &Value) -> Result<(), FormatError> {
+    use std::fmt::Write as _;
+    match val {
+        Value::Null => {}
+        Value::Bool(b) => {
+            let _ = write!(buf, "{b}");
+        }
+        Value::Integer(i) => {
+            let _ = write!(buf, "{i}");
+        }
+        Value::Float(f) => {
+            let _ = write!(buf, "{f}");
+        }
+        Value::Decimal(d) => {
+            let _ = write!(buf, "{d}");
+        }
+        Value::String(s) => buf.push_str(s.as_str()),
+        Value::Date(d) => {
+            let _ = write!(buf, "{d}");
+        }
+        Value::DateTime(dt) => {
+            let _ = write!(buf, "{dt}");
+        }
+        Value::Array(arr) => {
+            for (idx, v) in arr.iter().enumerate() {
+                if idx > 0 {
+                    buf.push(',');
+                }
+                write_value_text(buf, col, v)?;
+            }
+        }
         Value::Map(_) => {
             return Err(FormatError::UnserializableMapValue {
                 format: "XML",
                 column: col.to_string(),
             });
         }
+    }
+    Ok(())
+}
+
+// ── Precompiled record tree plan ─────────────────────────────────────
+
+/// A record's precompiled element-tree shape: the record element's body
+/// (attributes + child nodes) with per-node element names and the field index
+/// each terminal reads its value from. Built once per schema identity.
+struct TreePlan {
+    root: PlanBody,
+}
+
+/// One element's precompiled body: the attributes on its start tag plus its
+/// child nodes. Values are not stored — each terminal carries the field index
+/// to read from the per-record fill buffer.
+#[derive(Default)]
+struct PlanBody {
+    attrs: Vec<PlanAttr>,
+    children: Vec<PlanNode>,
+}
+
+/// A precompiled attribute: its (validated) XML name and the field index whose
+/// value fills it.
+struct PlanAttr {
+    name: String,
+    field: usize,
+}
+
+/// A precompiled child node: a leaf element or a nested branch.
+enum PlanNode {
+    Leaf { name: String, field: usize },
+    Branch { name: String, body: PlanBody },
+}
+
+/// The memoized plan plus the identity it was built for. `field_is_attr` marks,
+/// per field iterator position, whether that field is an attribute (drops null
+/// unconditionally) versus an element leaf (drops null only when
+/// `preserve_nulls` is false).
+struct PlanCache {
+    schema: Arc<Schema>,
+    plan: TreePlan,
+    field_is_attr: Vec<bool>,
+}
+
+/// Build the tree plan for a record's schema. Walks the fields in iterator
+/// order (position = field index) and classifies each into the element tree,
+/// validating attribute names up front. Mirrors [`build_field_tree`]'s shape
+/// exactly so output stays byte-identical.
+fn build_plan_cache(record: &Record, config: &XmlWriterConfig) -> Result<PlanCache, FormatError> {
+    let names: Vec<&str> = if config.include_engine_stamped {
+        record.iter_all_fields().map(|(name, _)| name).collect()
+    } else {
+        record.iter_user_fields().map(|(name, _)| name).collect()
+    };
+    let mut root = PlanBody::default();
+    let mut field_is_attr = vec![false; names.len()];
+    for (i, name) in names.iter().enumerate() {
+        plan_insert_field(
+            &mut root,
+            i,
+            name,
+            name,
+            &config.attribute_prefix,
+            &mut field_is_attr,
+        )?;
+    }
+    Ok(PlanCache {
+        schema: Arc::clone(record.schema()),
+        plan: TreePlan { root },
+        field_is_attr,
     })
+}
+
+/// Insert a dotted field name into the plan, creating branches as needed —
+/// the plan-time twin of [`insert_field`], storing the field index in place of
+/// a rendered value. Attribute-prefixed segments must be terminal, and
+/// attribute names are validated here (once) rather than per record.
+fn plan_insert_field(
+    body: &mut PlanBody,
+    field_index: usize,
+    field: &str,
+    path: &str,
+    attribute_prefix: &str,
+    field_is_attr: &mut [bool],
+) -> Result<(), FormatError> {
+    if let Some((first, rest)) = path.split_once('.') {
+        if !attribute_prefix.is_empty() && first.starts_with(attribute_prefix) {
+            return Err(FormatError::Xml(format!(
+                "field '{field}': attribute-prefixed segment '{first}' \
+                 cannot have fields nested under it — an XML attribute is a leaf"
+            )));
+        }
+        let branch = body
+            .children
+            .iter_mut()
+            .find(|n| matches!(n, PlanNode::Branch { name, .. } if name == first));
+        if let Some(PlanNode::Branch {
+            body: branch_body, ..
+        }) = branch
+        {
+            plan_insert_field(
+                branch_body,
+                field_index,
+                field,
+                rest,
+                attribute_prefix,
+                field_is_attr,
+            )
+        } else {
+            let mut branch_body = PlanBody::default();
+            plan_insert_field(
+                &mut branch_body,
+                field_index,
+                field,
+                rest,
+                attribute_prefix,
+                field_is_attr,
+            )?;
+            body.children.push(PlanNode::Branch {
+                name: first.to_string(),
+                body: branch_body,
+            });
+            Ok(())
+        }
+    } else if !attribute_prefix.is_empty() && path.starts_with(attribute_prefix) {
+        let attr_name = &path[attribute_prefix.len()..];
+        if attr_name.is_empty() {
+            return Err(FormatError::Xml(format!(
+                "field '{field}': attribute prefix '{attribute_prefix}' \
+                 carries no attribute name"
+            )));
+        }
+        if !is_valid_xml_name(attr_name) {
+            return Err(FormatError::Xml(format!(
+                "field '{field}': attribute name '{attr_name}' is not a \
+                 well-formed XML name"
+            )));
+        }
+        field_is_attr[field_index] = true;
+        body.attrs.push(PlanAttr {
+            name: attr_name.to_string(),
+            field: field_index,
+        });
+        Ok(())
+    } else {
+        body.children.push(PlanNode::Leaf {
+            name: path.to_string(),
+            field: field_index,
+        });
+        Ok(())
+    }
+}
+
+/// Per-record scratch, one slot per field in iterator order. Slot `String`
+/// capacity is retained across records (only the length is reset) so filling a
+/// record reuses allocations. `emits` records whether the field appears in
+/// output for this record (null handling); `text` holds its rendered value.
+struct FillBuf {
+    slots: Vec<FillSlot>,
+}
+
+#[derive(Default)]
+struct FillSlot {
+    text: String,
+    emits: bool,
+}
+
+impl FillBuf {
+    fn new() -> Self {
+        Self { slots: Vec::new() }
+    }
+
+    /// Ensure at least `n` slots exist (reusing existing `String` capacity),
+    /// ready to be overwritten for the current record. Every index in `0..n`
+    /// is written by `fill_values` before it is read, so stale contents beyond
+    /// a shrink never surface.
+    fn reset(&mut self, n: usize) {
+        if self.slots.len() < n {
+            self.slots.resize_with(n, FillSlot::default);
+        }
+    }
+
+    fn emits(&self, field: usize) -> bool {
+        self.slots[field].emits
+    }
+
+    fn text(&self, field: usize) -> &str {
+        &self.slots[field].text
+    }
+}
+
+/// Fill a single slot with a field's presence and rendered text. A field is
+/// dropped (`emits = false`) when it is a null attribute, or a null element
+/// under `preserve_nulls: false`; otherwise its text is rendered (a preserved
+/// null element renders to the empty string, emitted as a self-closing tag).
+fn fill_slot(
+    slot: &mut FillSlot,
+    is_attr: bool,
+    preserve_nulls: bool,
+    name: &str,
+    val: &Value,
+) -> Result<(), FormatError> {
+    let skip = if is_attr {
+        val.is_null()
+    } else {
+        val.is_null() && !preserve_nulls
+    };
+    slot.emits = !skip;
+    slot.text.clear();
+    if !skip {
+        write_value_text(&mut slot.text, name, val)?;
+    }
+    Ok(())
+}
+
+/// Emit a body's child nodes (its start-tag attributes are handled by the
+/// caller). A branch is emitted only when it has at least one emitting
+/// attribute or child, and self-closes when it has no emitting children —
+/// matching the pruning `build_field_tree` performs by never inserting a
+/// dropped field.
+fn emit_body<W: Write>(
+    writer: &mut XmlEmitter<W>,
+    body: &PlanBody,
+    fill: &FillBuf,
+) -> Result<(), FormatError> {
+    for child in &body.children {
+        match child {
+            PlanNode::Leaf { name, field } => {
+                if !fill.emits(*field) {
+                    continue;
+                }
+                let text = fill.text(*field);
+                if text.is_empty() {
+                    writer
+                        .write_event(Event::Empty(BytesStart::new(name.as_str())))
+                        .map_err(xml_err)?;
+                } else {
+                    writer
+                        .write_event(Event::Start(BytesStart::new(name.as_str())))
+                        .map_err(xml_err)?;
+                    writer
+                        .write_event(Event::Text(BytesText::new(text)))
+                        .map_err(xml_err)?;
+                    writer
+                        .write_event(Event::End(BytesEnd::new(name.as_str())))
+                        .map_err(xml_err)?;
+                }
+            }
+            PlanNode::Branch { name, body } => {
+                let has_attrs = body.attrs.iter().any(|a| fill.emits(a.field));
+                let has_children = body.children.iter().any(|c| node_emits(c, fill));
+                if !has_attrs && !has_children {
+                    continue;
+                }
+                let mut start = BytesStart::new(name.as_str());
+                for attr in &body.attrs {
+                    if fill.emits(attr.field) {
+                        push_one_attribute(&mut start, &attr.name, fill.text(attr.field));
+                    }
+                }
+                if has_children {
+                    writer.write_event(Event::Start(start)).map_err(xml_err)?;
+                    emit_body(writer, body, fill)?;
+                    writer
+                        .write_event(Event::End(BytesEnd::new(name.as_str())))
+                        .map_err(xml_err)?;
+                } else {
+                    writer.write_event(Event::Empty(start)).map_err(xml_err)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether a node contributes any output for the current record: a leaf emits
+/// per its fill slot; a branch emits when any attribute or descendant does.
+fn node_emits(node: &PlanNode, fill: &FillBuf) -> bool {
+    match node {
+        PlanNode::Leaf { field, .. } => fill.emits(*field),
+        PlanNode::Branch { body, .. } => {
+            body.attrs.iter().any(|a| fill.emits(a.field))
+                || body.children.iter().any(|c| node_emits(c, fill))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1056,6 +1434,98 @@ mod tests {
         assert!(
             !output.contains("<@"),
             "no @-named element may be emitted: {output}"
+        );
+    }
+
+    #[test]
+    fn test_xml_write_wide_dotted_and_attribute_golden() {
+        // Golden byte-exact output for a wide schema mixing top-level fields,
+        // record attributes, and shared-prefix dotted branches with their own
+        // attributes — the shape the precompiled plan targets.
+        let schema = Arc::new(Schema::new(vec![
+            "@id".into(),
+            "name".into(),
+            "Address.@type".into(),
+            "Address.City".into(),
+            "Address.State".into(),
+            "Contact.Email".into(),
+        ]));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![
+                Value::Integer(7),
+                Value::String("Alice".into()),
+                Value::String("home".into()),
+                Value::String("NYC".into()),
+                Value::String("NY".into()),
+                Value::String("a@example.com".into()),
+            ],
+        );
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert_eq!(
+            output,
+            r#"<Root><Record id="7"><name>Alice</name><Address type="home"><City>NYC</City><State>NY</State></Address><Contact><Email>a@example.com</Email></Contact></Record></Root>"#
+        );
+    }
+
+    #[test]
+    fn test_xml_write_plan_reused_across_records() {
+        // The plan is memoized by schema identity, so many records of one
+        // schema reuse it. Each record must still render its own values.
+        let schema = Arc::new(Schema::new(vec!["Address.City".into(), "name".into()]));
+        let records: Vec<Record> = [("NYC", "Alice"), ("LA", "Bob"), ("SF", "Carol")]
+            .into_iter()
+            .map(|(city, name)| {
+                Record::new(
+                    Arc::clone(&schema),
+                    vec![Value::String(city.into()), Value::String(name.into())],
+                )
+            })
+            .collect();
+        let output = write_records(XmlWriterConfig::default(), &records, &schema);
+        assert_eq!(
+            output,
+            "<Root>\
+             <Record><Address><City>NYC</City></Address><name>Alice</name></Record>\
+             <Record><Address><City>LA</City></Address><name>Bob</name></Record>\
+             <Record><Address><City>SF</City></Address><name>Carol</name></Record>\
+             </Root>"
+        );
+    }
+
+    #[test]
+    fn test_xml_write_all_null_branch_suppressed_across_records() {
+        // Under preserve_nulls:false a branch whose descendants are all null is
+        // never opened; a later record filling the same branch still emits it.
+        // Exercises per-record presence pruning over the shared plan.
+        let schema = Arc::new(Schema::new(vec![
+            "Address.City".into(),
+            "Address.State".into(),
+            "name".into(),
+        ]));
+        let all_null_branch = Record::new(
+            Arc::clone(&schema),
+            vec![Value::Null, Value::Null, Value::String("Alice".into())],
+        );
+        let branch_present = Record::new(
+            Arc::clone(&schema),
+            vec![
+                Value::String("NYC".into()),
+                Value::Null,
+                Value::String("Bob".into()),
+            ],
+        );
+        let output = write_records(
+            XmlWriterConfig::default(),
+            &[all_null_branch, branch_present],
+            &schema,
+        );
+        assert_eq!(
+            output,
+            "<Root>\
+             <Record><name>Alice</name></Record>\
+             <Record><Address><City>NYC</City></Address><name>Bob</name></Record>\
+             </Root>"
         );
     }
 

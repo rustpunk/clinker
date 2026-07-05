@@ -1,10 +1,15 @@
 use clinker_bench_support::{CsvPayload, MEDIUM, RecordFactory, SMALL};
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
+use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
 use clinker_format::json::reader::{JsonReader, JsonReaderConfig};
 use clinker_format::json::writer::{JsonWriter, JsonWriterConfig};
+use clinker_format::schema::Column;
 use clinker_format::traits::{FormatReader, FormatWriter};
+use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
+use clinker_record::{Record, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use cxl::typecheck::Type;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -146,20 +151,159 @@ fn bench_json_array_read(c: &mut Criterion) {
 
 fn bench_json_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("json_write");
-    for record_count in [SMALL, MEDIUM] {
-        let mut factory = RecordFactory::new(10, 16, 0.0, 42);
+    // (label, record_count, field_count, string_len). The first two rows keep
+    // the original 10-field/16-char shape as the no-regression oracle; the
+    // wide (many-field) and long-value rows are where eliminating the
+    // per-record `serde_json::Value` tree pays off.
+    for (label, record_count, field_count, string_len) in [
+        ("small_10f_16c", SMALL, 10, 16),
+        ("medium_10f_16c", MEDIUM, 10, 16),
+        ("medium_50f_16c", MEDIUM, 50, 16),
+        ("medium_10f_256c", MEDIUM, 10, 256),
+    ] {
+        let mut factory = RecordFactory::new(field_count, string_len, 0.0, 42);
         let records = factory.generate(record_count);
         let schema = factory.schema().clone();
 
         group.throughput(Throughput::Elements(record_count as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(label), &records, |b, recs| {
+            b.iter(|| {
+                let buf = Vec::with_capacity(record_count * field_count * string_len);
+                let mut writer =
+                    JsonWriter::new(buf, Arc::clone(&schema), JsonWriterConfig::default());
+                for rec in recs {
+                    writer.write_record(rec).unwrap();
+                }
+                writer.flush().unwrap();
+                black_box(writer);
+            });
+        });
+    }
+    group.finish();
+}
+
+// ── XML Write ──────────────────────────────────────────────────────
+
+/// Build `count` records over a dotted + attribute schema (shared-prefix
+/// branches with their own attributes), the shape the precompiled tree plan
+/// targets. Values vary per record so the fill path does real work.
+fn dotted_records(count: usize) -> (Arc<Schema>, Vec<Record>) {
+    let schema = Arc::new(Schema::new(vec![
+        "@id".into(),
+        "name".into(),
+        "Address.@type".into(),
+        "Address.City".into(),
+        "Address.State".into(),
+        "Contact.Email".into(),
+        "Contact.Phone".into(),
+    ]));
+    let records = (0..count)
+        .map(|i| {
+            Record::new(
+                Arc::clone(&schema),
+                vec![
+                    Value::Integer(i as i64),
+                    Value::String(format!("name{i}").into()),
+                    Value::String("home".into()),
+                    Value::String(format!("city{i}").into()),
+                    Value::String("NY".into()),
+                    Value::String(format!("user{i}@example.com").into()),
+                    Value::String("555-0100".into()),
+                ],
+            )
+        })
+        .collect();
+    (schema, records)
+}
+
+fn bench_xml_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("xml_write");
+
+    // Flat-wide: many top-level fields. The old per-record tree build paid an
+    // O(fields^2) sibling scan here, which the plan eliminates.
+    let mut factory = RecordFactory::new(50, 16, 0.0, 42);
+    let flat_records = factory.generate(MEDIUM);
+    let flat_schema = factory.schema().clone();
+    group.throughput(Throughput::Elements(MEDIUM as u64));
+    group.bench_with_input(
+        BenchmarkId::from_parameter("flat_50f"),
+        &flat_records,
+        |b, recs| {
+            b.iter(|| {
+                let buf = Vec::with_capacity(MEDIUM * 50 * 20);
+                let mut writer =
+                    XmlWriter::new(buf, Arc::clone(&flat_schema), XmlWriterConfig::default());
+                for rec in recs {
+                    writer.write_record(rec).unwrap();
+                }
+                writer.flush().unwrap();
+                black_box(writer);
+            });
+        },
+    );
+
+    // Dotted + attribute: nested branches with attributes, the classic XML
+    // shape whose per-node name allocation the plan removes.
+    let (dotted_schema, dotted_records) = dotted_records(MEDIUM);
+    group.bench_with_input(
+        BenchmarkId::from_parameter("dotted_7f"),
+        &dotted_records,
+        |b, recs| {
+            b.iter(|| {
+                let buf = Vec::with_capacity(MEDIUM * 200);
+                let mut writer =
+                    XmlWriter::new(buf, Arc::clone(&dotted_schema), XmlWriterConfig::default());
+                for rec in recs {
+                    writer.write_record(rec).unwrap();
+                }
+                writer.flush().unwrap();
+                black_box(writer);
+            });
+        },
+    );
+
+    group.finish();
+}
+
+// ── Fixed-width Write ──────────────────────────────────────────────
+
+fn bench_fixed_width_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fixed_width_write");
+    for field_count in [10usize, 50] {
+        // Columns f0..fN matching RecordFactory output: even fields are ints
+        // (width 10), odd fields strings (width 20) — wide enough that the
+        // seeded values never trip the numeric truncation-error policy.
+        let columns: Vec<Column> = (0..field_count)
+            .map(|i| {
+                let (ty, width) = if i % 2 == 0 {
+                    (Type::Int, 10)
+                } else {
+                    (Type::String, 20)
+                };
+                // Omit `start` so columns lay out sequentially (each continues
+                // at the previous column's end).
+                let mut col = Column::bare(format!("f{i}"), ty);
+                col.width = Some(width);
+                col
+            })
+            .collect();
+
+        let mut factory = RecordFactory::new(field_count, 16, 0.0, 42);
+        let records = factory.generate(MEDIUM);
+
+        group.throughput(Throughput::Elements(MEDIUM as u64));
         group.bench_with_input(
-            BenchmarkId::from_parameter(record_count),
+            BenchmarkId::from_parameter(format!("{field_count}f")),
             &records,
             |b, recs| {
                 b.iter(|| {
-                    let buf = Vec::with_capacity(record_count * 200);
-                    let mut writer =
-                        JsonWriter::new(buf, Arc::clone(&schema), JsonWriterConfig::default());
+                    let buf = Vec::with_capacity(MEDIUM * field_count * 20);
+                    let mut writer = FixedWidthWriter::new(
+                        buf,
+                        columns.clone(),
+                        FixedWidthWriterConfig::default(),
+                    )
+                    .unwrap();
                     for rec in recs {
                         writer.write_record(rec).unwrap();
                     }
@@ -179,5 +323,7 @@ criterion_group!(
     bench_json_ndjson_read,
     bench_json_array_read,
     bench_json_write,
+    bench_xml_write,
+    bench_fixed_width_write,
 );
 criterion_main!(benches);

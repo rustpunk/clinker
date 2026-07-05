@@ -1064,48 +1064,19 @@ fn test_splitting_writer_xml_byte_split_valid_files() {
     );
 }
 
-/// A `FormatWriter` that records per-document hook calls into shared state,
-/// for proving `SplittingWriter` forwards framing to its active inner writer.
-struct HookProbe {
-    log: Arc<Mutex<Vec<String>>>,
-}
+use crate::traits::test_support::HookProbe;
 
-impl FormatWriter for HookProbe {
-    fn write_record(&mut self, _record: &Record) -> Result<(), FormatError> {
-        self.log.lock().unwrap().push("write".into());
-        Ok(())
-    }
-    fn flush(&mut self) -> Result<(), FormatError> {
-        Ok(())
-    }
-    fn begin_document(&mut self, doc: &clinker_record::DocumentContext) -> Result<(), FormatError> {
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("begin:{}", doc.source_file()));
-        Ok(())
-    }
-    fn end_document(&mut self, doc: &clinker_record::DocumentContext) -> Result<(), FormatError> {
-        self.log
-            .lock()
-            .unwrap()
-            .push(format!("end:{}", doc.source_file()));
-        Ok(())
-    }
-}
-
-#[test]
-fn splitting_writer_forwards_document_hooks_to_active_inner() {
-    use clinker_record::{DocumentId, EnvelopeRecord};
-
+/// Build a `SplittingWriter` whose inner writer is a shared [`HookProbe`], plus
+/// the log it records into. `max_bytes: None` so `write_record` performs no
+/// implicit `flush_bytes`, keeping the log a faithful record of the hooks the
+/// test itself drives.
+fn hook_probe_splitter() -> (SplittingWriter, Arc<Mutex<Vec<String>>>) {
     let schema = make_schema(&["id"]);
     let registry = FileRegistry::new();
     let log = Arc::new(Mutex::new(Vec::new()));
     let log_for_factory = Arc::clone(&log);
     let writer_factory: WriterFactory = Box::new(move |_counting, _schema| {
-        Ok(Box::new(HookProbe {
-            log: Arc::clone(&log_for_factory),
-        }) as Box<dyn FormatWriter>)
+        Ok(Box::new(HookProbe::with_log(Arc::clone(&log_for_factory))) as Box<dyn FormatWriter>)
     });
     let policy = SplitPolicy {
         max_records: None,
@@ -1114,7 +1085,15 @@ fn splitting_writer_forwards_document_hooks_to_active_inner() {
         repeat_header: false,
         oversize_group: OversizeGroupPolicy::default(),
     };
-    let mut writer = SplittingWriter::new(registry.file_factory(), writer_factory, schema, policy);
+    let writer = SplittingWriter::new(registry.file_factory(), writer_factory, schema, policy);
+    (writer, log)
+}
+
+#[test]
+fn splitting_writer_forwards_document_hooks_to_active_inner() {
+    use clinker_record::{DocumentId, EnvelopeRecord};
+
+    let (mut writer, log) = hook_probe_splitter();
 
     let doc = DocumentContext::new(
         DocumentId::next(),
@@ -1130,6 +1109,29 @@ fn splitting_writer_forwards_document_hooks_to_active_inner() {
         *log.lock().unwrap(),
         vec!["begin:file.x12", "end:file.x12"],
         "begin/end_document forward to the splitter's active inner writer",
+    );
+}
+
+#[test]
+fn splitting_writer_forwards_flush_bytes_to_active_inner() {
+    use clinker_record::{DocumentId, EnvelopeRecord};
+
+    let (mut writer, log) = hook_probe_splitter();
+
+    let doc = DocumentContext::new(
+        DocumentId::next(),
+        Arc::from("file.x12"),
+        EnvelopeRecord::empty(),
+    );
+    // Open the first file via `begin_document`, then `flush_bytes` must reach
+    // the active inner writer's non-finalizing drain.
+    writer.begin_document(&doc).unwrap();
+    writer.flush_bytes().unwrap();
+
+    assert_eq!(
+        *log.lock().unwrap(),
+        vec!["begin:file.x12", "flush_bytes"],
+        "flush_bytes forwards to the splitter's active inner writer",
     );
 }
 

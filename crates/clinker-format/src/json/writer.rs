@@ -69,6 +69,12 @@ pub struct JsonWriter<W: Write> {
     /// Per-document envelope framer + state machine, present only when
     /// `config.envelope` is. Drives the per-document-object reframe.
     envelope: Option<EnvelopeState>,
+    /// Reusable serialization buffer. Each record is serialized straight into
+    /// this `Vec` (via a borrowing `serde::Serialize` impl, no intermediate
+    /// `serde_json::Value` tree) and then written to the sink; the allocation
+    /// is retained across records so per-record cost is amortized. Bounded by
+    /// the widest single record, never the whole stream.
+    scratch: Vec<u8>,
 }
 
 /// Per-document-object framing state for the envelope reframe. Tracks the
@@ -102,39 +108,39 @@ impl<W: Write> JsonWriter<W> {
             config,
             records_written: 0,
             envelope,
+            scratch: Vec::new(),
         }
     }
 
-    /// Serializes a record to a JSON object in schema-column order.
-    /// `preserve_nulls: false` omits keys with Null values. Engine-stamped
-    /// columns are stripped from the default output; callers opt in via
-    /// `include_engine_stamped`.
+    /// Serialize a record as a JSON object into the reusable `scratch` buffer
+    /// in schema-column order. `preserve_nulls: false` omits keys with Null
+    /// values. Engine-stamped columns are stripped from the default output;
+    /// callers opt in via `include_engine_stamped`. Keys borrow the schema's
+    /// column names and values borrow the record's [`Value`]s, so no
+    /// intermediate `serde_json::Value` tree is built.
+    ///
+    /// The buffer is cleared first, and the sink is written only by the caller
+    /// on success, so a mid-record error (non-finite float) leaves no partial
+    /// bytes downstream.
     ///
     /// # Errors
     ///
     /// Returns [`FormatError::Json`] when a field holds a non-finite float
     /// (NaN or an infinity), which JSON cannot represent.
-    fn record_to_json(&self, record: &Record) -> Result<serde_json::Value, FormatError> {
-        use serde_json::{Map, Value as Jv};
-
-        let mut obj = Map::with_capacity(record.field_count());
-        let emit = |obj: &mut Map<String, Jv>, col: &str, val: &Value| -> Result<(), FormatError> {
-            if !self.config.preserve_nulls && val.is_null() {
-                return Ok(());
-            }
-            obj.insert(col.to_string(), clinker_to_json(val)?);
-            Ok(())
+    fn serialize_record(&mut self, record: &Record) -> Result<(), FormatError> {
+        use serde::Serialize as _;
+        self.scratch.clear();
+        let obj = RecordObjectSer {
+            record,
+            preserve_nulls: self.config.preserve_nulls,
+            include_engine_stamped: self.config.include_engine_stamped,
         };
-        if self.config.include_engine_stamped {
-            for (col, val) in record.iter_all_fields() {
-                emit(&mut obj, col, val)?;
-            }
+        let result = if self.config.pretty {
+            obj.serialize(&mut serde_json::Serializer::pretty(&mut self.scratch))
         } else {
-            for (col, val) in record.iter_user_fields() {
-                emit(&mut obj, col, val)?;
-            }
-        }
-        Ok(Jv::Object(obj))
+            obj.serialize(&mut serde_json::Serializer::new(&mut self.scratch))
+        };
+        result.map_err(|e| FormatError::Json(e.to_string()))
     }
 
     /// Serialize a JSON value with the configured pretty/compact mode.
@@ -186,11 +192,13 @@ impl<W: Write> JsonWriter<W> {
     /// depth safety net: it raises a clean error rather than writing record
     /// bytes outside any `{...,"body":[` object (which would be malformed JSON).
     fn write_enveloped_record(&mut self, record: &Record) -> Result<(), FormatError> {
-        let json_val = self.record_to_json(record)?;
-        let serialized = self.serialize_value(&json_val)?;
+        self.serialize_record(record)?;
+        // Read the framer state through a shared borrow that ends before the
+        // sink writes, so the `envelope`, `writer`, and `scratch` field borrows
+        // stay disjoint.
         let env = self
             .envelope
-            .as_mut()
+            .as_ref()
             .expect("write_enveloped_record only called with an envelope state");
         if !env.doc_open {
             return Err(FormatError::Json(
@@ -199,13 +207,18 @@ impl<W: Write> JsonWriter<W> {
                     .to_string(),
             ));
         }
-        if env.framer.record_count() > 0 {
+        let need_comma = env.framer.record_count() > 0;
+        if need_comma {
             self.writer.write_all(b",").map_err(FormatError::Io)?;
         }
         self.writer
-            .write_all(serialized.as_bytes())
+            .write_all(&self.scratch)
             .map_err(FormatError::Io)?;
-        env.framer.count_record();
+        self.envelope
+            .as_mut()
+            .expect("envelope state present after doc-open guard")
+            .framer
+            .count_record();
         Ok(())
     }
 }
@@ -220,8 +233,7 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
             return self.write_enveloped_record(record);
         }
 
-        let json_val = self.record_to_json(record)?;
-        let serialized = self.serialize_value(&json_val)?;
+        self.serialize_record(record)?;
 
         match self.config.format {
             JsonOutputMode::Array => {
@@ -231,7 +243,7 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
                     self.writer.write_all(b",\n").map_err(FormatError::Io)?;
                 }
                 self.writer
-                    .write_all(serialized.as_bytes())
+                    .write_all(&self.scratch)
                     .map_err(FormatError::Io)?;
             }
             JsonOutputMode::Ndjson => {
@@ -239,7 +251,7 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
                     self.writer.write_all(b"\n").map_err(FormatError::Io)?;
                 }
                 self.writer
-                    .write_all(serialized.as_bytes())
+                    .write_all(&self.scratch)
                     .map_err(FormatError::Io)?;
             }
         }
@@ -411,6 +423,94 @@ fn clinker_to_json(val: &Value) -> Result<serde_json::Value, FormatError> {
             Jv::Object(obj)
         }
     })
+}
+
+/// Borrows a record and serializes its fields as a JSON object directly to the
+/// target serializer, with no intermediate `serde_json::Value` tree. Keys
+/// borrow the schema's column names; values borrow the record's [`Value`]s via
+/// [`ValueSer`]. Mirrors the field selection of the (removed) `record_to_json`:
+/// honors `preserve_nulls` (skips null fields when false) and
+/// `include_engine_stamped` (whether `$`-namespaced correlation columns
+/// appear).
+struct RecordObjectSer<'a> {
+    record: &'a Record,
+    preserve_nulls: bool,
+    include_engine_stamped: bool,
+}
+
+impl serde::Serialize for RecordObjectSer<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        // `None` length hint: serde_json ignores it, and the exact post-null-
+        // skip entry count would need a second pass over the fields.
+        let mut map = serializer.serialize_map(None)?;
+        if self.include_engine_stamped {
+            for (col, val) in self.record.iter_all_fields() {
+                if !self.preserve_nulls && val.is_null() {
+                    continue;
+                }
+                map.serialize_entry(col, &ValueSer(val))?;
+            }
+        } else {
+            for (col, val) in self.record.iter_user_fields() {
+                if !self.preserve_nulls && val.is_null() {
+                    continue;
+                }
+                map.serialize_entry(col, &ValueSer(val))?;
+            }
+        }
+        map.end()
+    }
+}
+
+/// Borrows a clinker [`Value`] and serializes it directly, mirroring
+/// [`clinker_to_json`] variant-for-variant without allocating an intermediate
+/// `serde_json::Value`. A non-finite float is rejected with the same message
+/// `clinker_to_json` raises, surfaced through the serializer's error type so it
+/// arrives at the caller as [`FormatError::Json`] with identical text.
+struct ValueSer<'a>(&'a Value);
+
+impl serde::Serialize for ValueSer<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error as _, SerializeMap, SerializeSeq};
+        match self.0 {
+            Value::Null => serializer.serialize_unit(),
+            Value::Bool(b) => serializer.serialize_bool(*b),
+            Value::Integer(i) => serializer.serialize_i64(*i),
+            Value::Float(f) => {
+                // serde_json's default would silently coerce a non-finite float
+                // to `null`, indistinguishable from a source null on read-back;
+                // reject with the same text `clinker_to_json` uses.
+                if !f.is_finite() {
+                    return Err(S::Error::custom(format!(
+                        "non-finite float {f} has no JSON representation; \
+                         filter or replace the value before the JSON output"
+                    )));
+                }
+                serializer.serialize_f64(*f)
+            }
+            // JSON has no exact-decimal type; emit the scale-preserving string
+            // form (matches `clinker_to_json`).
+            Value::Decimal(d) => serializer.serialize_str(&d.to_string()),
+            Value::String(s) => serializer.serialize_str(s.as_str()),
+            Value::Date(d) => serializer.serialize_str(&d.to_string()),
+            Value::DateTime(dt) => serializer.serialize_str(&dt.to_string()),
+            Value::Array(arr) => {
+                let mut seq = serializer.serialize_seq(Some(arr.len()))?;
+                for v in arr {
+                    seq.serialize_element(&ValueSer(v))?;
+                }
+                seq.end()
+            }
+            Value::Map(m) => {
+                let mut map = serializer.serialize_map(Some(m.len()))?;
+                for (k, v) in m.iter() {
+                    map.serialize_entry(k.as_ref(), &ValueSer(v))?;
+                }
+                map.end()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -598,6 +698,51 @@ mod tests {
         assert_eq!(r1.get("active"), Some(&Value::Bool(true)));
         assert_eq!(r2.get("name"), Some(&Value::String("Bob".into())));
         assert_eq!(r2.get("age"), Some(&Value::Integer(25)));
+    }
+
+    #[test]
+    fn test_json_write_wide_and_long_value_roundtrip() {
+        // Exercises the buffer-reuse serialize path across a reused writer with
+        // a wide schema and a long string value, then reads back to confirm the
+        // scratch buffer is fully rewritten per record (no stale-byte bleed) and
+        // the round-trip is faithful.
+        let cols: Vec<Box<str>> = (0..40).map(|i| format!("c{i}").into()).collect();
+        let schema = Arc::new(Schema::new(cols));
+        let long = "x".repeat(500);
+        let mk = |seed: i64, tail: &str| {
+            let mut vals: Vec<Value> = (0..40).map(|i| Value::Integer(seed + i as i64)).collect();
+            // Overwrite one column with a long string to stress the value path.
+            vals[17] = Value::String(format!("{long}-{tail}").into());
+            Record::new(Arc::clone(&schema), vals)
+        };
+        let records = vec![mk(0, "first"), mk(100, "second")];
+        let config = JsonWriterConfig {
+            format: JsonOutputMode::Ndjson,
+            preserve_nulls: true,
+            ..Default::default()
+        };
+        let written = write_records(config, &records, &schema);
+
+        let mut reader = JsonReader::from_reader(
+            std::io::Cursor::new(written.into_bytes()),
+            JsonReaderConfig::default(),
+        )
+        .unwrap();
+        let _s = reader.schema().unwrap();
+        let r0 = reader.next_record().unwrap().unwrap();
+        let r1 = reader.next_record().unwrap().unwrap();
+        assert!(reader.next_record().unwrap().is_none());
+        assert_eq!(r0.get("c0"), Some(&Value::Integer(0)));
+        assert_eq!(r0.get("c39"), Some(&Value::Integer(39)));
+        assert_eq!(
+            r0.get("c17"),
+            Some(&Value::String(format!("{long}-first").into()))
+        );
+        assert_eq!(r1.get("c0"), Some(&Value::Integer(100)));
+        assert_eq!(
+            r1.get("c17"),
+            Some(&Value::String(format!("{long}-second").into()))
+        );
     }
 
     #[test]
