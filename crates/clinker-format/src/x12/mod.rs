@@ -43,3 +43,14 @@ pub use writer::{X12Writer, X12WriterConfig};
 /// envelope field and never surfaces in CXL `$doc.<section>.<field>`
 /// typechecking.
 pub(crate) const RAW_ELEMENTS_KEY: &str = "$raw";
+
+/// Engine-internal key under which the reader stashes the discovered
+/// delimiter set beside the raw `ISA` elements, as a three-element array of
+/// integer bytes `[element, subelement, terminator]`. The element separator
+/// and segment terminator are not `ISA` data elements — they live between
+/// and after them — so the raw element list alone cannot reproduce a
+/// custom-delimited wire shape; the writer adopts this set when echoing the
+/// header via `interchange_from_doc`. Engine-namespaced like
+/// [`RAW_ELEMENTS_KEY`]: not user-declarable and invisible to CXL `$doc`
+/// typechecking.
+pub(crate) const DELIMITERS_KEY: &str = "$delims";

@@ -913,3 +913,132 @@ fn per_target_source_options_patch_applies() {
         other => panic!("expected csv options, got {other:?}"),
     }
 }
+
+/// A pipeline carrying the format-structure patch surfaces: an X12 source
+/// with a typed `GS` declaration and an HL7 source with one composite-field
+/// split.
+const EDI_PIPELINE: &str = r#"
+pipeline:
+  name: edi
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: x12
+      path: po.x12
+      options:
+        group_section:
+          name: grp
+          fields:
+            e06: string
+      schema:
+        - { name: seg_id, type: string }
+  - type: source
+    name: messages
+    config:
+      name: messages
+      type: hl7
+      path: msgs.hl7
+      options:
+        split_fields:
+          - { field: f03, components: 5 }
+      schema:
+        - { name: seg_id, type: string }
+  - type: output
+    name: out_x12
+    input: interchange
+    config: { name: out_x12, type: csv, path: out1.csv }
+  - type: output
+    name: out_hl7
+    input: messages
+    config: { name: out_hl7, type: csv, path: out2.csv }
+"#;
+
+#[test]
+fn per_target_source_format_structure_patch_applies() {
+    let ws = workspace();
+    write(&ws.path().join("pipeline/edi.yaml"), EDI_PIPELINE);
+    write(
+        &ws.path().join("channel/patch/edi.channel.yaml"),
+        "channel:\n  target: ../../pipeline/edi.yaml\n\
+         sources:\n\
+         \x20 interchange:\n\
+         \x20   group_section:\n\
+         \x20     name: fg\n\
+         \x20     fields:\n\
+         \x20       e04: int\n\
+         \x20   set_section:\n\
+         \x20     name: txn\n\
+         \x20     fields:\n\
+         \x20       e01: string\n\
+         \x20 messages:\n\
+         \x20   split_fields:\n\
+         \x20     f08: { components: 3 }\n\
+         \x20     f03: remove\n",
+    );
+
+    let res = resolve(
+        ws.path(),
+        &channel_layout(),
+        &group_layout(),
+        "edi",
+        Some("patch"),
+        &[],
+        true,
+    )
+    .expect("resolve");
+    let patches = res
+        .source_patches()
+        .expect("per-target overlay carries patches");
+
+    let yaml = fs::read_to_string(ws.path().join("pipeline/edi.yaml")).expect("read edi pipeline");
+    let mut config: PipelineConfig = clinker_plan::yaml::from_str(&yaml).expect("parse");
+    apply_source_patches(&mut config, patches).expect("apply source patches");
+
+    let x12 = config
+        .source_configs()
+        .find(|s| s.name == "interchange")
+        .expect("x12 source");
+    match &x12.format {
+        InputFormat::X12(Some(opts)) => {
+            // The keyed modify renamed the GS declaration and added a typed
+            // field alongside the base one.
+            let group = opts.group_section.as_ref().expect("group_section kept");
+            assert_eq!(group.name, "fg");
+            assert_eq!(
+                serde_json::to_value(&group.fields).expect("serialize fields"),
+                json!({ "e06": "string", "e04": "int" })
+            );
+            // The set op created the previously-undeclared ST declaration.
+            let set = opts.set_section.as_ref().expect("set_section created");
+            assert_eq!(set.name, "txn");
+            assert_eq!(
+                serde_json::to_value(&set.fields).expect("serialize fields"),
+                json!({ "e01": "string" })
+            );
+        }
+        other => panic!("expected x12 options, got {other:?}"),
+    }
+
+    let hl7 = config
+        .source_configs()
+        .find(|s| s.name == "messages")
+        .expect("hl7 source");
+    match &hl7.format {
+        InputFormat::Hl7(Some(opts)) => {
+            let splits = opts.split_fields.as_deref().expect("splits declared");
+            assert_eq!(splits.len(), 1, "f03 removed, f08 added: {splits:?}");
+            assert_eq!(splits[0].field, "f08");
+            assert_eq!(
+                (
+                    splits[0].components,
+                    splits[0].subcomponents,
+                    splits[0].repetitions
+                ),
+                (3, 1, 1)
+            );
+        }
+        other => panic!("expected hl7 options, got {other:?}"),
+    }
+}

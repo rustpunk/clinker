@@ -2740,6 +2740,36 @@ fn bind_composition(
             None => return,
         };
 
+    // 7b. Body nodes never flow through top-level config validation
+    // (`validate_config` sees only the call-site pipeline's own nodes),
+    // so run the shared node-scoped checks here. Without this pass a
+    // body Envelope with a wired `trailer:` — or a Transform with a
+    // reserved `declares:` name, a mistyped declare default, a zero
+    // `batch_size`, or an invalid log directive — reaches the executor
+    // and dies as an internal error instead of a compile diagnostic.
+    // Emit one E115 per violation and abandon the body, mirroring the
+    // other early-outs.
+    {
+        let violations = crate::config::pipeline::validate_node_configs(&body_file.nodes);
+        if !violations.is_empty() {
+            for violation in violations {
+                diags.push(Diagnostic::error(
+                    "E115",
+                    format!(
+                        "composition node {node_name:?}: body file {}: {}",
+                        resolved_path.display(),
+                        violation.message
+                    ),
+                    LabeledSpan::primary(
+                        span_for_node(&body_file.nodes[violation.node_index]),
+                        String::new(),
+                    ),
+                ));
+            }
+            return;
+        }
+    }
+
     // 8. Enter nested scope.
     let body_id = artifacts.fresh_body_id();
 

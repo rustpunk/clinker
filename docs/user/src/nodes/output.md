@@ -154,7 +154,13 @@ an infinity fails the write with a JSON error instead of silently becoming
     options:
       root_element: "data"
       record_element: "row"
+      attribute_prefix: "@"    # emit @-prefixed fields as XML attributes
 ```
+
+Fields whose final path segment carries the `attribute_prefix` (default
+`@`, matching the XML source option) are emitted as XML attributes of
+their enclosing element, so attribute fields read from an XML source
+round-trip. See [XML Format](../formats/xml.md#writing-xml) for details.
 
 ### Fixed-width
 
@@ -171,7 +177,10 @@ an infinity fails the write with a JSON error instead of silently becoming
       line_separator: crlf
 ```
 
-Fixed-width output requires a format schema defining field positions and widths.
+Fixed-width output requires a format schema defining field positions and
+widths. Fields land at their declared byte ranges with gaps space-filled —
+see [Fixed-Width Format](../formats/fixed-width.md#writing-fixed-width-output)
+for the layout semantics.
 
 ### EDIFACT
 

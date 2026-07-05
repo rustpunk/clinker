@@ -39,14 +39,15 @@ use clinker_record::{Record, Schema, Value};
 use crate::charset::Charset;
 use crate::error::FormatError;
 use crate::traits::FormatWriter;
-use crate::x12::RAW_ELEMENTS_KEY;
 use crate::x12::tokenizer::Delimiters;
+use crate::x12::{DELIMITERS_KEY, RAW_ELEMENTS_KEY};
 
-/// Default X12 service delimiters used when no `ISA` header dictates
-/// otherwise: `*` element, `:` sub-element, `~` terminator. When the
-/// header is echoed from a `$doc` section, its `ISA16` sub-element byte
-/// overrides the default; the literal-`interchange` path keeps these
-/// defaults.
+/// Default X12 service delimiters: `*` element, `:` sub-element, `~`
+/// terminator. A `$doc` section produced by the X12 reader carries the
+/// source interchange's discovered delimiter set, which the
+/// `interchange_from_doc` path adopts wholesale before the first segment
+/// is written; the literal-`interchange` path and a hand-authored section
+/// (no delimiter stamp) keep these defaults.
 fn default_delimiters() -> Delimiters {
     Delimiters {
         element: b'*',
@@ -207,15 +208,45 @@ impl<W: Write> X12Writer<W> {
         self.header_written = true;
 
         let isa_elements = self.resolve_isa_elements(record)?;
+        // Adopting the source delimiter set must precede the first
+        // write_segment so the ISA itself — and every segment after it —
+        // emits with the original bytes, keeping the header's declared
+        // delimiters self-consistent with the interchange on re-read.
+        self.adopt_doc_delimiters(record)?;
         // The ISA control number (ISA13, element index 12) is echoed in
         // the IEA trailer; default to empty when the header is short.
         self.isa_control_number = isa_elements.get(12).cloned().unwrap_or_default();
         // The ISA is written verbatim with the writer's element separator
         // and terminator; its fields are fixed-width control values, never
-        // trailing-empty. ISA16 declares the sub-element separator, but the
-        // writer keeps the element separator and terminator at their
-        // defaults so the header is self-consistent on re-read.
+        // trailing-empty.
         self.write_segment("ISA", &isa_elements)?;
+        Ok(())
+    }
+
+    /// Adopt the source interchange's delimiter set when echoing the
+    /// header from a `$doc` section the X12 reader produced. The reader
+    /// stashes the discovered `[element, subelement, terminator]` bytes
+    /// beside the raw `ISA` elements; adopting them here means the whole
+    /// reconstructed interchange — header, envelopes, and body — emits
+    /// with the original bytes, and the delimiter-in-data rejection checks
+    /// the bytes actually in effect. The literal-`interchange` path and a
+    /// section without the stamp (hand-authored `$doc` fields) keep the
+    /// defaults.
+    fn adopt_doc_delimiters(&mut self, record: &Record) -> Result<(), FormatError> {
+        if self.config.interchange.is_some() {
+            return Ok(());
+        }
+        let Some(section) = &self.config.interchange_from_doc else {
+            return Ok(());
+        };
+        let Some(stamp) = record.doc_ctx().get_section_field(section, DELIMITERS_KEY) else {
+            return Ok(());
+        };
+        self.delims = Delimiters::from_doc_value(&stamp).map_err(|e| {
+            FormatError::X12(format!(
+                "section {section:?}: malformed delimiter stamp {DELIMITERS_KEY:?}: {e}"
+            ))
+        })?;
         Ok(())
     }
 
@@ -751,40 +782,175 @@ mod tests {
         assert!(out.contains("IEA*1*000000001~"), "{out}");
     }
 
-    #[test]
-    fn isa_echoed_from_doc_section() {
-        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord, Value as RecVal};
+    /// Build a document context carrying an `interchange` section with the
+    /// given raw `ISA` element list and, optionally, a delimiter stamp —
+    /// the shape the X12 reader's `prepare_document` produces.
+    fn doc_ctx_with_isa(
+        elements: &[&str],
+        stamp: Option<Value>,
+    ) -> Arc<clinker_record::DocumentContext> {
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
         use indexmap::IndexMap;
 
-        let s = schema();
-        let raw = RecVal::Array(
-            ISA_ELEMENTS
+        let raw = Value::Array(
+            elements
                 .iter()
-                .map(|e| RecVal::String((*e).into()))
+                .map(|e| Value::String((*e).into()))
                 .collect(),
         );
-        let mut isa: IndexMap<Box<str>, RecVal> = IndexMap::new();
+        let mut isa: IndexMap<Box<str>, Value> = IndexMap::new();
         isa.insert(super::RAW_ELEMENTS_KEY.into(), raw);
-        let mut sections: IndexMap<Box<str>, RecVal> = IndexMap::new();
-        sections.insert("interchange".into(), RecVal::Map(Box::new(isa)));
-        let ctx = Arc::new(DocumentContext::new(
+        if let Some(v) = stamp {
+            isa.insert(super::DELIMITERS_KEY.into(), v);
+        }
+        let mut sections: IndexMap<Box<str>, Value> = IndexMap::new();
+        sections.insert("interchange".into(), Value::Map(Box::new(isa)));
+        Arc::new(DocumentContext::new(
             DocumentId::next(),
             Arc::from("orders.x12"),
             EnvelopeRecord::from_sections(sections),
-        ));
+        ))
+    }
 
-        let mut record = body(&s, "BEG", "0001", "850", &["00"]);
-        record.set_doc_ctx(ctx);
-
-        let cfg = X12WriterConfig {
+    fn from_doc_config() -> X12WriterConfig {
+        X12WriterConfig {
             interchange_from_doc: Some("interchange".into()),
             group_header: Some(GS_HEADER.iter().map(|s| s.to_string()).collect()),
             segment_newline: false,
             ..Default::default()
-        };
-        let out = write_all(cfg, &[record], &s);
+        }
+    }
+
+    #[test]
+    fn isa_echoed_from_doc_section() {
+        let s = schema();
+        let mut record = body(&s, "BEG", "0001", "850", &["00"]);
+        record.set_doc_ctx(doc_ctx_with_isa(ISA_ELEMENTS, None));
+
+        let out = write_all(from_doc_config(), &[record], &s);
         assert!(out.contains("000000001"), "{out}");
         assert!(out.contains("IEA*1*000000001~"), "{out}");
+        // A section without a delimiter stamp (hand-authored `$doc` fields)
+        // keeps the default `*`/`~` delimiters.
+        assert!(out.starts_with("ISA*00*"), "{out}");
+    }
+
+    /// The [`ISA_ELEMENTS`] fixture under `|`/`^`/`!` delimiters — `ISA16`
+    /// (the declared sub-element separator) is `^` instead of `:`.
+    const CUSTOM_DELIM_ISA_ELEMENTS: &[&str] = &[
+        "00",
+        "          ",
+        "00",
+        "          ",
+        "ZZ",
+        "SENDER         ",
+        "ZZ",
+        "RECEIVER       ",
+        "240101",
+        "1200",
+        "U",
+        "00401",
+        "000000001",
+        "0",
+        "P",
+        "^",
+    ];
+
+    fn custom_delims() -> Delimiters {
+        Delimiters {
+            element: b'|',
+            subelement: b'^',
+            terminator: b'!',
+        }
+    }
+
+    #[test]
+    fn doc_delimiter_stamp_reconstructs_with_source_delimiters() {
+        // A section carrying the reader's delimiter stamp emits the whole
+        // interchange — ISA, envelopes, and body — with the source's
+        // delimiter bytes, not the writer defaults.
+        let s = schema();
+        let mut record = body(&s, "BEG", "0001", "850", &["00"]);
+        record.set_doc_ctx(doc_ctx_with_isa(
+            CUSTOM_DELIM_ISA_ELEMENTS,
+            Some(custom_delims().to_doc_value()),
+        ));
+
+        let out = write_all(from_doc_config(), &[record], &s);
+        assert_eq!(
+            out,
+            "ISA|00|          |00|          |ZZ|SENDER         \
+             |ZZ|RECEIVER       |240101|1200|U|00401|000000001|0|P|^!\
+             GS|PO|SENDER|RECEIVER|20240101|1200|1|X|004010!\
+             ST|850|0001!BEG|00!SE|3|0001!GE|1|1!IEA|1|000000001!"
+        );
+    }
+
+    #[test]
+    fn literal_interchange_ignores_doc_delimiter_stamp() {
+        // The literal `interchange` config wins over the doc section
+        // entirely, delimiters included: output keeps the defaults even
+        // when the record's context carries a custom stamp.
+        let s = schema();
+        let mut record = body(&s, "BEG", "0001", "850", &["00"]);
+        record.set_doc_ctx(doc_ctx_with_isa(
+            CUSTOM_DELIM_ISA_ELEMENTS,
+            Some(custom_delims().to_doc_value()),
+        ));
+
+        let mut cfg = literal_config();
+        cfg.interchange_from_doc = Some("interchange".into());
+        let out = write_all(cfg, &[record], &s);
+        assert!(out.starts_with("ISA*00*"), "{out}");
+        assert!(out.contains("IEA*1*000000001~"), "{out}");
+        assert!(!out.contains('|'), "custom bytes must not leak: {out}");
+    }
+
+    #[test]
+    fn adopted_delimiters_drive_delimiter_in_data_rejection() {
+        // Under the adopted '|' element separator, a '*' in data is plain
+        // text; a '|' is the structural byte that must be rejected.
+        let s = schema();
+        let stamped_body = |element: &str| {
+            let mut record = body(&s, "BEG", "0001", "850", &[element]);
+            record.set_doc_ctx(doc_ctx_with_isa(
+                CUSTOM_DELIM_ISA_ELEMENTS,
+                Some(custom_delims().to_doc_value()),
+            ));
+            record
+        };
+
+        let out = write_all(from_doc_config(), &[stamped_body("A*B")], &s);
+        assert!(out.contains("BEG|A*B!"), "{out}");
+
+        let mut buf = Vec::new();
+        let mut w = X12Writer::new(Cursor::new(&mut buf), Arc::clone(&s), from_doc_config());
+        let err = w.write_record(&stamped_body("A|B")).unwrap_err();
+        assert!(
+            matches!(&err, FormatError::X12(m) if m.contains("element") && m.contains("no escape")),
+            "expected rejection on the adopted element byte, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn malformed_delimiter_stamp_errors() {
+        // The stamp key is engine-internal, so a non-conforming value is
+        // corruption — rejected with a precise error, never silently
+        // defaulted.
+        let s = schema();
+        let mut record = body(&s, "BEG", "0001", "850", &["00"]);
+        record.set_doc_ctx(doc_ctx_with_isa(
+            ISA_ELEMENTS,
+            Some(Value::String("junk".into())),
+        ));
+
+        let mut buf = Vec::new();
+        let mut w = X12Writer::new(Cursor::new(&mut buf), Arc::clone(&s), from_doc_config());
+        let err = w.write_record(&record).unwrap_err();
+        assert!(
+            matches!(&err, FormatError::X12(m) if m.contains("malformed delimiter stamp")),
+            "expected a stamp-shape error, got {err:?}"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ use cxl::typecheck::Type;
 
 use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
 use crate::error::FormatError;
+use crate::fixed_width::field;
 use crate::schema::Column;
 use crate::traits::FormatWriter;
 
@@ -33,6 +34,9 @@ impl Default for FixedWidthWriterConfig {
 /// Pre-resolved field for writing.
 struct WriteField {
     name: String,
+    /// 0-based byte offset of the field's first cell byte within the record,
+    /// resolved with the same semantics the reader slices by.
+    start: usize,
     width: usize,
     justify: Justify,
     pad_char: char,
@@ -41,6 +45,13 @@ struct WriteField {
 
 /// Schema-driven fixed-width record writer.
 /// Type-aware truncation: numeric -> Error, string -> Warn (configurable per field).
+///
+/// Every field is emitted at its declared byte range (`start` plus
+/// `width`/`end`, resolved with the reader's semantics), independent of
+/// declaration order; gaps between declared ranges are space-filled so a
+/// written record reads back under the same schema. Overlapping ranges are
+/// rejected at construction. A column omitting `start` continues at the
+/// previous column's end (sequential layout).
 ///
 /// Under `reconstruct_envelope`, `begin_document` emits the header section's
 /// field values as one leading line and `end_document` the footer's as one
@@ -62,52 +73,73 @@ impl<W: Write> FixedWidthWriter<W> {
         fields: Vec<Column>,
         config: FixedWidthWriterConfig,
     ) -> Result<Self, FormatError> {
-        let resolved: Vec<WriteField> = fields
-            .iter()
-            .map(|f| {
-                let width = f
-                    .width
-                    .or_else(|| f.end.and_then(|e| e.checked_sub(f.start.unwrap_or(0))))
-                    .ok_or_else(|| FormatError::InvalidRecord {
-                        row: 0,
-                        message: format!(
-                            "field '{}': fixed-width field must have 'width' or 'end'",
-                            f.name
-                        ),
-                    })?;
+        // Byte positions resolve exactly as the reader's (`start` plus
+        // `width`/`end`), so what this writer emits at a range is what the
+        // reader slices back out. A column omitting `start` continues at the
+        // previous column's end, keeping a width-only schema sequential.
+        let mut resolved: Vec<WriteField> = Vec::with_capacity(fields.len());
+        let mut next_start = 0usize;
+        for f in &fields {
+            let start = f.start.unwrap_or(next_start);
+            let width = field::resolve_width(f, start)?;
+            next_start = start
+                .checked_add(width)
+                .ok_or_else(|| field::invalid_field(&f.name, "'start' + width overflows"))?;
 
-                let is_numeric = matches!(
-                    f.ty.unwrap_nullable(),
-                    Type::Int | Type::Float | Type::Decimal | Type::Numeric
-                );
+            let is_numeric = matches!(
+                f.ty.unwrap_nullable(),
+                Type::Int | Type::Float | Type::Decimal | Type::Numeric
+            );
 
-                let justify = f.justify.clone().unwrap_or(if is_numeric {
-                    Justify::Right
-                } else {
-                    Justify::Left
-                });
+            let justify = f.justify.clone().unwrap_or(if is_numeric {
+                Justify::Right
+            } else {
+                Justify::Left
+            });
 
-                let pad_char = f
-                    .pad
-                    .as_deref()
-                    .and_then(|s| s.chars().next())
-                    .unwrap_or(' ');
+            let pad_char = f
+                .pad
+                .as_deref()
+                .and_then(|s| s.chars().next())
+                .unwrap_or(' ');
 
-                let truncation = f.truncation.clone().unwrap_or(if is_numeric {
-                    TruncationPolicy::Error
-                } else {
-                    TruncationPolicy::Warn
-                });
+            let truncation = f.truncation.clone().unwrap_or(if is_numeric {
+                TruncationPolicy::Error
+            } else {
+                TruncationPolicy::Warn
+            });
 
-                Ok(WriteField {
-                    name: f.name.clone(),
-                    width,
-                    justify,
-                    pad_char,
-                    truncation,
-                })
-            })
-            .collect::<Result<_, FormatError>>()?;
+            resolved.push(WriteField {
+                name: f.name.clone(),
+                start,
+                width,
+                justify,
+                pad_char,
+                truncation,
+            });
+        }
+
+        // Emit in byte order regardless of declaration order. Overlapping
+        // ranges have no consistent byte layout — later bytes would clobber
+        // earlier ones — so they are a construction defect, not a per-record
+        // surprise.
+        resolved.sort_by_key(|f| f.start);
+        for pair in resolved.windows(2) {
+            let (prev, next) = (&pair[0], &pair[1]);
+            if next.start < prev.start + prev.width {
+                return Err(field::invalid_field(
+                    &next.name,
+                    &format!(
+                        "range {}..{} overlaps field '{}' ({}..{})",
+                        next.start,
+                        next.start + next.width,
+                        prev.name,
+                        prev.start,
+                        prev.start + prev.width
+                    ),
+                ));
+            }
+        }
 
         let framer = config
             .envelope
@@ -218,7 +250,14 @@ impl<W: Write> FixedWidthWriter<W> {
 
 impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
+        // Fields are sorted by `start` and non-overlapping (enforced at
+        // construction), so a cursor walk left-to-right space-fills any byte
+        // range the schema leaves undeclared and lands every cell at the
+        // position the reader slices.
+        let mut cursor = 0usize;
         for field in &self.fields {
+            write_gap(&mut self.writer, field.start - cursor)?;
+
             let value = record.get(&field.name).cloned().unwrap_or(Value::Null);
 
             let formatted = self.format_value(field, &value)?;
@@ -243,20 +282,14 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
                             "field '{}': value '{}' truncated to {} chars",
                             field.name, formatted, field.width
                         ));
-                        let padded = self.pad_and_justify(field, &formatted);
-                        self.writer.write_all(padded.as_bytes())?;
-                        continue;
                     }
-                    TruncationPolicy::Silent => {
-                        let padded = self.pad_and_justify(field, &formatted);
-                        self.writer.write_all(padded.as_bytes())?;
-                        continue;
-                    }
+                    TruncationPolicy::Silent => {}
                 }
             }
 
             let padded = self.pad_and_justify(field, &formatted);
             self.writer.write_all(padded.as_bytes())?;
+            cursor = field.start + field.width;
         }
 
         // Write line separator
@@ -301,6 +334,19 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
         }
         Ok(())
     }
+}
+
+/// Space-fill the `len`-byte gap between the write cursor and the next
+/// field's start, in bounded chunks so an arbitrarily wide gap stays O(1)
+/// memory with no per-record allocation.
+fn write_gap<W: Write>(writer: &mut W, mut len: usize) -> Result<(), FormatError> {
+    const FILL: [u8; 64] = [b' '; 64];
+    while len > 0 {
+        let n = len.min(FILL.len());
+        writer.write_all(&FILL[..n])?;
+        len -= n;
+    }
+    Ok(())
 }
 
 /// Stringify an envelope section value for a fixed-width header/trailer line.
@@ -573,6 +619,274 @@ mod tests {
             }
             other => panic!("expected UnserializableMapValue, got {other:?}"),
         }
+    }
+
+    /// A schema whose declared ranges leave a gap emits the gap as spaces so
+    /// each field lands at the byte position the reader slices — the
+    /// round-trip the sequential emitter used to break by writing the fields
+    /// adjacent. `b` declares `end` (not `width`) to pin end-resolution to
+    /// the same byte range on both sides.
+    #[test]
+    fn test_fixedwidth_write_gapped_starts_roundtrip() {
+        use crate::fixed_width::reader::{FixedWidthReader, FixedWidthReaderConfig};
+        use crate::traits::FormatReader;
+
+        let fields = vec![
+            {
+                let mut f = field("a");
+                f.ty = Type::String;
+                f.start = Some(0);
+                f.width = Some(2);
+                f
+            },
+            {
+                let mut f = field("b");
+                f.ty = Type::String;
+                f.start = Some(5);
+                f.end = Some(7);
+                f
+            },
+        ];
+        let read_fields = fields.clone();
+
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+            let rec = make_record(
+                &["a", "b"],
+                vec![Value::String("AB".into()), Value::String("CD".into())],
+            );
+            writer.write_record(&rec).unwrap();
+            writer.flush().unwrap();
+        }
+
+        let output = String::from_utf8(buf.clone()).unwrap();
+        assert_eq!(output, "AB   CD\n", "bytes 2..5 must be space-filled");
+
+        let mut reader = FixedWidthReader::new(
+            buf.as_slice(),
+            read_fields,
+            FixedWidthReaderConfig::default(),
+        )
+        .unwrap();
+        let roundtrip = reader.next_record().unwrap().unwrap();
+        assert_eq!(roundtrip.get("a"), Some(&Value::String("AB".into())));
+        assert_eq!(roundtrip.get("b"), Some(&Value::String("CD".into())));
+    }
+
+    /// Fields declared out of byte order are emitted at their declared
+    /// positions, not in declaration order.
+    #[test]
+    fn test_fixedwidth_write_out_of_order_starts_roundtrip() {
+        use crate::fixed_width::reader::{FixedWidthReader, FixedWidthReaderConfig};
+        use crate::traits::FormatReader;
+
+        let fields = vec![
+            {
+                let mut f = field("b");
+                f.ty = Type::String;
+                f.start = Some(5);
+                f.width = Some(5);
+                f
+            },
+            {
+                let mut f = field("a");
+                f.ty = Type::String;
+                f.start = Some(0);
+                f.width = Some(5);
+                f
+            },
+        ];
+        let read_fields = fields.clone();
+
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+            let rec = make_record(
+                &["a", "b"],
+                vec![Value::String("Alice".into()), Value::String("Bob".into())],
+            );
+            writer.write_record(&rec).unwrap();
+            writer.flush().unwrap();
+        }
+
+        let output = String::from_utf8(buf.clone()).unwrap();
+        assert_eq!(output, "AliceBob  \n", "a occupies 0..5, b occupies 5..10");
+
+        let mut reader = FixedWidthReader::new(
+            buf.as_slice(),
+            read_fields,
+            FixedWidthReaderConfig::default(),
+        )
+        .unwrap();
+        let roundtrip = reader.next_record().unwrap().unwrap();
+        assert_eq!(roundtrip.get("a"), Some(&Value::String("Alice".into())));
+        assert_eq!(roundtrip.get("b"), Some(&Value::String("Bob".into())));
+    }
+
+    /// A gap wider than the fill chunk is still fully space-filled (exercises
+    /// the chunked gap writer across more than one chunk).
+    #[test]
+    fn test_fixedwidth_write_wide_gap_fully_space_filled() {
+        let fields = vec![
+            {
+                let mut f = field("a");
+                f.ty = Type::String;
+                f.start = Some(0);
+                f.width = Some(2);
+                f
+            },
+            {
+                let mut f = field("b");
+                f.ty = Type::String;
+                f.start = Some(100);
+                f.width = Some(2);
+                f
+            },
+        ];
+
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+            let rec = make_record(
+                &["a", "b"],
+                vec![Value::String("XX".into()), Value::String("YY".into())],
+            );
+            writer.write_record(&rec).unwrap();
+            writer.flush().unwrap();
+        }
+
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output.len(), 103, "2 + 98-space gap + 2 + newline");
+        assert_eq!(&output[..2], "XX");
+        assert!(
+            output[2..100].bytes().all(|b| b == b' '),
+            "bytes 2..100 must all be spaces"
+        );
+        assert_eq!(&output[100..102], "YY");
+    }
+
+    /// Overlapping declared ranges have no consistent byte layout and are a
+    /// typed construction error naming both fields.
+    #[test]
+    fn test_fixedwidth_write_overlapping_fields_rejected() {
+        let fields = vec![
+            {
+                let mut f = field("a");
+                f.ty = Type::String;
+                f.start = Some(0);
+                f.width = Some(5);
+                f
+            },
+            {
+                let mut f = field("b");
+                f.ty = Type::String;
+                f.start = Some(3);
+                f.width = Some(5);
+                f
+            },
+        ];
+
+        let mut buf = Vec::new();
+        let err = FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default())
+            .err()
+            .expect("overlapping ranges must be rejected at construction");
+        match err {
+            FormatError::InvalidRecord { row, message } => {
+                assert_eq!(row, 0, "construction defect reports row 0");
+                assert!(
+                    message.contains("'b'") && message.contains("'a'"),
+                    "message should name both fields: {message}"
+                );
+                assert!(
+                    message.contains("3..8") && message.contains("0..5"),
+                    "message should carry both ranges: {message}"
+                );
+            }
+            other => panic!("expected InvalidRecord, got {other:?}"),
+        }
+    }
+
+    /// The writer enforces the reader's `width`/`end` mutual exclusivity, so
+    /// a schema that would be rejected on read is rejected on write too.
+    #[test]
+    fn test_fixedwidth_write_width_and_end_together_rejected() {
+        let fields = vec![{
+            let mut f = field("a");
+            f.ty = Type::String;
+            f.start = Some(0);
+            f.width = Some(5);
+            f.end = Some(5);
+            f
+        }];
+
+        let mut buf = Vec::new();
+        let err = FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default())
+            .err()
+            .expect("width+end together must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mutually exclusive"),
+            "error should state the exclusivity: {msg}"
+        );
+    }
+
+    /// Columns that omit `start` keep the sequential layout: each continues
+    /// at the previous column's end.
+    #[test]
+    fn test_fixedwidth_write_startless_schema_stays_sequential() {
+        let fields = vec![
+            {
+                let mut f = field("a");
+                f.ty = Type::String;
+                f.width = Some(3);
+                f
+            },
+            {
+                let mut f = field("b");
+                f.ty = Type::Int;
+                f.width = Some(4);
+                f
+            },
+        ];
+
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+            let rec = make_record(
+                &["a", "b"],
+                vec![Value::String("x".into()), Value::Integer(42)],
+            );
+            writer.write_record(&rec).unwrap();
+            writer.flush().unwrap();
+        }
+
+        let output = String::from_utf8(buf).unwrap();
+        assert_eq!(output, "x    42\n", "a at 0..3, b at 3..7, no gap");
+    }
+
+    /// A declared range whose end exceeds `usize::MAX` cannot exist; it is a
+    /// typed construction error rather than an arithmetic wrap.
+    #[test]
+    fn test_fixedwidth_write_range_end_overflow_rejected() {
+        let fields = vec![{
+            let mut f = field("a");
+            f.ty = Type::String;
+            f.start = Some(usize::MAX);
+            f.width = Some(2);
+            f
+        }];
+
+        let mut buf = Vec::new();
+        let err = FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default())
+            .err()
+            .expect("overflowing range must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("overflows"), "error should say so: {msg}");
     }
 
     use crate::envelope_writer::test_doc_with_sections as doc_with_sections;

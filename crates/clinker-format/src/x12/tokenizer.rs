@@ -27,6 +27,8 @@
 
 use std::io::{BufRead, Read};
 
+use clinker_record::Value;
+
 use crate::charset::Charset;
 use crate::error::FormatError;
 use crate::segment_tokenizer::{
@@ -72,6 +74,50 @@ pub(crate) struct Delimiters {
     pub subelement: u8,
     /// Segment terminator.
     pub terminator: u8,
+}
+
+impl Delimiters {
+    /// Encode the delimiter set as its `$doc` carrier value: a
+    /// three-element array of integer bytes `[element, subelement,
+    /// terminator]`. Bytes, not characters — a delimiter byte (a `\n`
+    /// terminator, say) need not be printable text.
+    pub(crate) fn to_doc_value(self) -> Value {
+        Value::Array(vec![
+            Value::Integer(i64::from(self.element)),
+            Value::Integer(i64::from(self.subelement)),
+            Value::Integer(i64::from(self.terminator)),
+        ])
+    }
+
+    /// Decode a delimiter set from its `$doc` carrier value. The key is
+    /// engine-namespaced and only ever written by [`Self::to_doc_value`],
+    /// so any other shape signals a corrupted document context; the error
+    /// message describes the malformation for the caller to wrap.
+    pub(crate) fn from_doc_value(value: &Value) -> Result<Self, String> {
+        let Value::Array(items) = value else {
+            return Err(format!(
+                "expected a three-element byte array, found {value:?}"
+            ));
+        };
+        let byte = |i: usize, role: &str| -> Result<u8, String> {
+            match items.get(i) {
+                Some(Value::Integer(n)) => u8::try_from(*n)
+                    .map_err(|_| format!("{role} delimiter {n} is not a byte (0..=255)")),
+                other => Err(format!("{role} delimiter is {other:?}, expected a byte")),
+            }
+        };
+        if items.len() != 3 {
+            return Err(format!(
+                "expected a three-element byte array, found {} elements",
+                items.len()
+            ));
+        }
+        Ok(Self {
+            element: byte(0, "element")?,
+            subelement: byte(1, "sub-element")?,
+            terminator: byte(2, "segment-terminator")?,
+        })
+    }
 }
 
 /// Streaming X12 segment reader.
@@ -484,6 +530,55 @@ mod tests {
         let _ = t.read_isa_header().unwrap();
         let err = t.next_segment().unwrap_err();
         assert!(matches!(err, FormatError::X12(m) if m.contains("cap")));
+    }
+
+    #[test]
+    fn delimiter_doc_value_round_trips() {
+        let d = Delimiters {
+            element: b'|',
+            subelement: b'^',
+            terminator: b'\n',
+        };
+        assert_eq!(
+            d.to_doc_value(),
+            Value::Array(vec![
+                Value::Integer(124),
+                Value::Integer(94),
+                Value::Integer(10),
+            ])
+        );
+        assert_eq!(Delimiters::from_doc_value(&d.to_doc_value()).unwrap(), d);
+    }
+
+    #[test]
+    fn delimiter_doc_value_rejects_malformed_shapes() {
+        // Non-array carrier.
+        assert!(Delimiters::from_doc_value(&Value::String("junk".into())).is_err());
+        // Wrong arity.
+        assert!(
+            Delimiters::from_doc_value(&Value::Array(
+                vec![Value::Integer(42), Value::Integer(58),]
+            ))
+            .is_err()
+        );
+        // Out-of-byte-range integer.
+        assert!(
+            Delimiters::from_doc_value(&Value::Array(vec![
+                Value::Integer(300),
+                Value::Integer(58),
+                Value::Integer(126),
+            ]))
+            .is_err()
+        );
+        // Non-integer element.
+        assert!(
+            Delimiters::from_doc_value(&Value::Array(vec![
+                Value::String("*".into()),
+                Value::Integer(58),
+                Value::Integer(126),
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

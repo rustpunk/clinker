@@ -39,8 +39,8 @@ use crate::envelope::{
 use crate::error::FormatError;
 use crate::schema::Column;
 use crate::traits::FormatReader;
-use crate::x12::RAW_ELEMENTS_KEY;
 use crate::x12::tokenizer::{ParsedSegment, SegmentTokenizer, split_isa, split_segment};
+use crate::x12::{DELIMITERS_KEY, RAW_ELEMENTS_KEY};
 use cxl::typecheck::Type;
 
 /// Default ceiling on the number of positional element columns the record
@@ -533,6 +533,15 @@ impl<R: Read + Send> FormatReader for X12Reader<R> {
                 .map(|e| Value::String(e.as_str().into()))
                 .collect();
             typed.insert(Box::from(RAW_ELEMENTS_KEY), Value::Array(raw_elements));
+            // The element separator and segment terminator are not ISA data
+            // elements — they sit between and after them — so the raw list
+            // alone cannot reproduce a custom-delimited wire shape. Carry
+            // the discovered delimiter set beside it so the writer emits
+            // the reconstructed interchange with the original bytes.
+            typed.insert(
+                Box::from(DELIMITERS_KEY),
+                self.tokenizer.delimiters().to_doc_value(),
+            );
             out.insert(Box::from(name.as_str()), Value::Map(Box::new(typed)));
         }
         Ok(out)
@@ -1168,6 +1177,111 @@ mod tests {
         let mut r = reader(&interchange());
         let err = r.prepare_document(&cfg).unwrap_err();
         assert!(matches!(err, FormatError::X12(m) if m.contains("non-`segment`")));
+    }
+
+    #[test]
+    fn prepare_document_stamps_discovered_delimiters() {
+        // The ISA section carries the discovered delimiter set as integer
+        // bytes beside the raw element list, so a writer can reproduce the
+        // wire shape — the separator and terminator are not ISA elements.
+        let cfg = isa_section(&[("e13", EnvelopeFieldType::String)]);
+        let mut r = reader(&interchange());
+        let sections = r.prepare_document(&cfg).unwrap();
+        let interchange = match sections.get("interchange").unwrap() {
+            Value::Map(m) => m,
+            other => panic!("expected map, got {other:?}"),
+        };
+        assert_eq!(
+            interchange.get(DELIMITERS_KEY),
+            Some(&Value::Array(vec![
+                Value::Integer(i64::from(b'*')),
+                Value::Integer(i64::from(b':')),
+                Value::Integer(i64::from(b'~')),
+            ])),
+            "delimiter stamp must carry [element, subelement, terminator] bytes"
+        );
+    }
+
+    /// The [`interchange`] fixture under custom delimiters: `|` element,
+    /// `^` sub-element, `!` terminator.
+    fn custom_delim_interchange() -> String {
+        let isa = "ISA|00|          |00|          |ZZ|SENDER         \
+            |ZZ|RECEIVER       |240101|1200|U|00401|000000001|0|P|^!";
+        assert_eq!(isa.len(), 106, "custom ISA fixture must be 106 bytes");
+        format!(
+            "{isa}\
+            GS|PO|SENDER|RECEIVER|20240101|1200|1|X|004010!\
+            ST|850|0001!\
+            BEG|00|NE|PO12345||20240101!\
+            PO1|1|10|EA|9.99!\
+            SE|4|0001!\
+            GE|1|1!\
+            IEA|1|000000001!"
+        )
+    }
+
+    /// The headline delimiter acceptance: a custom-delimiter interchange
+    /// read into `$doc` and re-emitted via `interchange_from_doc`
+    /// reproduces the input byte-for-byte — element separator, sub-element
+    /// separator, and segment terminator all preserved.
+    #[test]
+    fn custom_delimiter_round_trip_is_byte_identical() {
+        use crate::traits::FormatWriter;
+        use crate::x12::writer::{X12Writer, X12WriterConfig};
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
+
+        let input = custom_delim_interchange();
+
+        let cfg = isa_section(&[("e13", EnvelopeFieldType::String)]);
+        let mut r = reader(&input);
+        let sections = r.prepare_document(&cfg).unwrap();
+        let body_recs: Vec<Record> = std::iter::from_fn(|| r.next_record().unwrap()).collect();
+        assert_eq!(body_recs.len(), 3); // ST, BEG, PO1
+
+        let ctx = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("orders.x12"),
+            EnvelopeRecord::from_sections(sections),
+        ));
+        let schema = r.schema().unwrap();
+        let out = {
+            let mut buf = Vec::new();
+            let mut w = X12Writer::new(
+                std::io::Cursor::new(&mut buf),
+                Arc::clone(&schema),
+                X12WriterConfig {
+                    interchange_from_doc: Some("interchange".into()),
+                    group_header: Some(vec![
+                        "PO".into(),
+                        "SENDER".into(),
+                        "RECEIVER".into(),
+                        "20240101".into(),
+                        "1200".into(),
+                        "1".into(),
+                        "X".into(),
+                        "004010".into(),
+                    ]),
+                    segment_newline: false,
+                    ..Default::default()
+                },
+            );
+            for rec in &body_recs {
+                let mut rec = rec.clone();
+                rec.set_doc_ctx(Arc::clone(&ctx));
+                w.write_record(&rec).unwrap();
+            }
+            w.flush().unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        assert_eq!(
+            out, input,
+            "custom delimiters must round-trip byte-for-byte"
+        );
+
+        // The emitted interchange re-parses cleanly under its own header.
+        let recs2 = collect(&out);
+        assert_eq!(recs2.len(), 3);
+        assert_eq!(recs2[2].get("seg_id"), Some(&Value::String("PO1".into())));
     }
 
     /// Full reader → `$doc` → writer → reader round-trip exercising the
