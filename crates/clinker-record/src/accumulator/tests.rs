@@ -575,6 +575,43 @@ fn test_weighted_avg_decimal_mixed_with_float_is_null() {
 }
 
 #[test]
+fn test_weighted_avg_float_then_decimal_is_null() {
+    // A binary float accumulated BEFORE the first decimal row cannot widen into
+    // the exact decimal sums (only the integer accumulators are seeded on the
+    // switch). Poison to Null rather than silently dropping the float total and
+    // reporting the decimal-only quotient. Reachable only on an untyped column.
+    let mut a = weighted_avg();
+    a.add_weighted(&Value::Float(1.5), &Value::Integer(1)); // float path first
+    a.add_weighted(&dec(250, 2), &Value::Integer(1)); // then a decimal row
+    // The true weighted avg is (1.5 + 2.5) / 2 = 2.0; dropping the float total
+    // would report 2.5. Neither is honest, so finalize returns Null.
+    assert_eq!(a.finalize().unwrap(), Value::Null);
+}
+
+#[test]
+fn test_weighted_avg_merge_float_mode_with_decimal_mode_is_null() {
+    // Merging a float-mode partial (its exact contribution reads only its
+    // integer sums) into a decimal-mode partial — or vice versa — would drop
+    // the float side's total. Both merge directions poison to Null.
+    let build_float = || {
+        let mut s = weighted_avg();
+        s.add_weighted(&Value::Float(1.5), &Value::Integer(1));
+        s
+    };
+    let build_decimal = || {
+        let mut s = weighted_avg();
+        s.add_weighted(&dec(250, 2), &Value::Integer(1));
+        s
+    };
+    let mut df = build_decimal();
+    df.merge(&build_float());
+    assert_eq!(df.finalize().unwrap(), Value::Null);
+    let mut fd = build_float();
+    fd.merge(&build_decimal());
+    assert_eq!(fd.finalize().unwrap(), Value::Null);
+}
+
+#[test]
 fn test_weighted_avg_decimal_spill_roundtrip() {
     // The accumulator state serializes exactly (decimal via the 16-byte form),
     // so a spilled-and-reloaded WeightedAvg finalizes identically.

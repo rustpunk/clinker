@@ -108,19 +108,22 @@ pub fn resolve_width(f: &Column, start: usize) -> Result<usize, FormatError> {
 
 /// Read one physical record line into `buf`, returning `false` at end of input.
 ///
-/// `Lf` / `CrLf` read up to (and strip) the newline, but the read is bounded to
-/// the declared record width plus a line-terminator allowance: a line-separated
-/// file with a missing terminator cannot buffer the rest of the input into one
-/// record, preserving the engine's bounded-memory guarantee on malformed input.
-/// A line that fills the cap without a terminator overruns the declared width
-/// and is rejected. `None` reads exactly `record_length` bytes (a delimiter-free
-/// fixed block). A short final block under `None` is an incomplete-record error.
+/// `Lf` / `CrLf` read up to (and strip) the newline, but the buffered read is
+/// bounded to the declared record width plus a line-terminator allowance: a
+/// line-separated file with a missing terminator cannot buffer the rest of the
+/// input into one record, preserving the engine's bounded-memory guarantee on
+/// malformed input. A physical line wider than the declared width — trailing
+/// filler beyond the last declared field, or a partial-schema read of a
+/// fixed-LRECL extract — fills the cap before its terminator; the declared
+/// fields are already captured, so the overrun is discarded up to the next
+/// newline (in bounded memory) and the line resyncs to the following record.
+/// `None` reads exactly `record_length` bytes (a delimiter-free fixed block). A
+/// short final block under `None` is an incomplete-record error.
 ///
 /// # Errors
 ///
 /// Returns [`FormatError::Io`] on a read fault, or [`FormatError::InvalidRecord`]
-/// at `row + 1` when a `None`-separated block ends mid-record, or when an `Lf` /
-/// `CrLf` line overruns the declared width with no line terminator.
+/// at `row + 1` when a `None`-separated block ends mid-record.
 pub fn read_physical_line<R: Read>(
     reader: &mut BufReader<R>,
     separator: &LineSeparator,
@@ -131,7 +134,7 @@ pub fn read_physical_line<R: Read>(
     buf.clear();
     match separator {
         LineSeparator::Lf => {
-            if !read_capped_line(reader, record_length, row, buf)? {
+            if !read_capped_line(reader, record_length, buf)? {
                 return Ok(false);
             }
             if buf.last() == Some(&b'\n') {
@@ -139,7 +142,7 @@ pub fn read_physical_line<R: Read>(
             }
         }
         LineSeparator::CrLf => {
-            if !read_capped_line(reader, record_length, row, buf)? {
+            if !read_capped_line(reader, record_length, buf)? {
                 return Ok(false);
             }
             if buf.ends_with(b"\r\n") {
@@ -171,21 +174,23 @@ pub fn read_physical_line<R: Read>(
     Ok(true)
 }
 
-/// Read up to one newline-terminated line into `buf`, bounded to the declared
-/// record width so a line-separated file missing a terminator cannot buffer the
-/// rest of the input into a single record. Returns `Ok(false)` at clean EOF
-/// (nothing read); the trailing newline, if present, is left on `buf` for the
-/// caller to strip per its separator.
+/// Read up to one newline-terminated line into `buf`, bounding the buffered
+/// portion to the declared record width so a line-separated file missing a
+/// terminator cannot buffer the rest of the input into a single record. Returns
+/// `Ok(false)` at clean EOF (nothing read); the trailing newline, if present, is
+/// left on `buf` for the caller to strip per its separator.
 ///
 /// The cap admits a full record, a CR/LF terminator, and one sentinel byte, so a
 /// well-formed line — even one carrying a full-width record plus `\r\n` — always
-/// fits. Consuming the whole cap without reaching a newline means the physical
-/// line overruns the declared width: a record error at `row + 1`, not an
-/// unbounded read.
+/// fits within `buf`. A physical line wider than the declared width fills the cap
+/// before its terminator: the declared fields have already been captured, so the
+/// buffer is trimmed to the record width and the filler is discarded up to the
+/// next newline via [`discard_to_newline`], keeping the working buffer bounded
+/// regardless of physical line width and leaving the reader positioned at the
+/// following record.
 fn read_capped_line<R: Read>(
     reader: &mut BufReader<R>,
     record_length: usize,
-    row: u64,
     buf: &mut Vec<u8>,
 ) -> Result<bool, FormatError> {
     let cap = record_length + 3;
@@ -196,15 +201,33 @@ fn read_capped_line<R: Read>(
         return Ok(false);
     }
     if n == cap && buf.last() != Some(&b'\n') {
-        return Err(FormatError::InvalidRecord {
-            row: row + 1,
-            message: format!(
-                "line-separated record overruns the declared {record_length}-byte \
-                 width with no line terminator"
-            ),
-        });
+        // The physical line is wider than the declared record (trailing filler,
+        // or a schema that maps only a prefix of a fixed-LRECL extract). Keep the
+        // declared-width prefix and drop the overrun up to the next newline so
+        // the following record starts clean.
+        buf.truncate(record_length);
+        discard_to_newline(reader)?;
     }
     Ok(true)
+}
+
+/// Consume and drop bytes up to and including the next newline (or clean EOF)
+/// without buffering them into a record, so the reader resyncs to the next
+/// physical line after an over-width record. Memory stays bounded by the
+/// [`BufReader`]'s own buffer — the discarded bytes are never collected.
+fn discard_to_newline<R: Read>(reader: &mut BufReader<R>) -> Result<(), FormatError> {
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok(()); // EOF before any further newline.
+        }
+        let newline = chunk.iter().position(|&b| b == b'\n');
+        let consumed = newline.map_or(chunk.len(), |i| i + 1);
+        reader.consume(consumed);
+        if newline.is_some() {
+            return Ok(());
+        }
+    }
 }
 
 /// `true` when a line carries no field content — empty, or only whitespace.
@@ -566,58 +589,82 @@ mod tests {
     }
 
     #[test]
-    fn lf_line_missing_newline_over_cap_errors_and_stays_bounded() {
+    fn lf_line_missing_newline_over_cap_reads_prefix_and_stays_bounded() {
         // A line-separated (LF) input whose line never terminates must not buffer
-        // past the declared width: a typed record error with 1-based row context,
-        // and the read buffer never exceeds the cap regardless of input length.
+        // past the declared width: the declared-width prefix reads and the rest
+        // is discarded to EOF, so the read buffer never exceeds the cap
+        // regardless of input length.
         let record_length = 8;
         let data = vec![b'x'; 4096];
         let mut reader = BufReader::new(&data[..]);
         let mut buf = Vec::new();
-        let err = read_physical_line(&mut reader, &LineSeparator::Lf, record_length, 0, &mut buf)
-            .unwrap_err();
-        match err {
-            FormatError::InvalidRecord { row, message } => {
-                assert_eq!(row, 1, "row is 1-based for the overrunning line");
-                assert!(message.contains("overruns"), "message: {message}");
-            }
-            other => panic!("expected InvalidRecord, got {other:?}"),
-        }
+        assert!(
+            read_physical_line(&mut reader, &LineSeparator::Lf, record_length, 0, &mut buf)
+                .unwrap()
+        );
+        assert_eq!(buf, vec![b'x'; record_length], "declared-width prefix kept");
         assert!(
             buf.len() <= record_length + 3,
             "read buffer bounded to the cap, got {}",
             buf.len()
         );
+        // The whole (single, unterminated) physical line was consumed: EOF next.
+        assert!(
+            !read_physical_line(&mut reader, &LineSeparator::Lf, record_length, 1, &mut buf)
+                .unwrap()
+        );
     }
 
     #[test]
-    fn lf_line_one_byte_over_cap_without_terminator_errors() {
-        // The tightest boundary: 8 non-newline bytes then a newline at byte 9,
-        // one past the 8-byte cap (record width 5). The read fills the cap with
-        // no terminator → overrun, not a truncated read of the terminated line.
-        let mut reader = BufReader::new(&b"AAAAAAAA\nrest"[..]);
+    fn lf_wide_terminated_line_reads_prefix_and_resyncs_to_next_record() {
+        // The finding's shape: a physical line far wider than the declared width
+        // (trailing filler the schema does not map) but properly terminated. The
+        // declared-width prefix reads, the filler is discarded to the newline,
+        // and the following record starts clean — a previously-valid file shape.
+        let mut reader = BufReader::new(&b"AAAAAAAA\nBBB\n"[..]);
         let mut buf = Vec::new();
-        let err = read_physical_line(&mut reader, &LineSeparator::Lf, 5, 0, &mut buf).unwrap_err();
-        assert!(matches!(err, FormatError::InvalidRecord { row: 1, .. }));
-        assert!(buf.len() <= 5 + 3);
+        // Record width 5 → cap 8; first line is 8 'A' + '\n' (filler past width).
+        assert!(read_physical_line(&mut reader, &LineSeparator::Lf, 5, 0, &mut buf).unwrap());
+        assert_eq!(buf, b"AAAAA", "declared-width prefix kept");
+        assert!(read_physical_line(&mut reader, &LineSeparator::Lf, 5, 1, &mut buf).unwrap());
+        assert_eq!(
+            buf, b"BBB",
+            "reader resynced to the next record after filler"
+        );
+        assert!(!read_physical_line(&mut reader, &LineSeparator::Lf, 5, 2, &mut buf).unwrap());
     }
 
     #[test]
-    fn crlf_line_missing_newline_over_cap_errors_with_row_context() {
+    fn lf_line_one_byte_over_cap_reads_prefix_and_resyncs() {
+        // The tightest boundary: 8 non-newline bytes then a newline at byte 9,
+        // one past the 8-byte cap (record width 5). The prefix reads and the
+        // reader resyncs to the following record rather than rejecting the line.
+        let mut reader = BufReader::new(&b"AAAAAAAA\nrest\n"[..]);
+        let mut buf = Vec::new();
+        assert!(read_physical_line(&mut reader, &LineSeparator::Lf, 5, 0, &mut buf).unwrap());
+        assert_eq!(buf, b"AAAAA");
+        assert!(buf.len() <= 5 + 3);
+        assert!(read_physical_line(&mut reader, &LineSeparator::Lf, 5, 1, &mut buf).unwrap());
+        assert_eq!(buf, b"rest");
+    }
+
+    #[test]
+    fn crlf_wide_line_reads_prefix_and_stays_bounded() {
         let record_length = 5;
         let data = vec![b'a'; 512];
         let mut reader = BufReader::new(&data[..]);
         let mut buf = Vec::new();
-        // `row` is the pre-increment physical row; the error reports `row + 1`.
-        let err = read_physical_line(
-            &mut reader,
-            &LineSeparator::CrLf,
-            record_length,
-            3,
-            &mut buf,
-        )
-        .unwrap_err();
-        assert!(matches!(err, FormatError::InvalidRecord { row: 4, .. }));
+        assert!(
+            read_physical_line(
+                &mut reader,
+                &LineSeparator::CrLf,
+                record_length,
+                3,
+                &mut buf
+            )
+            .unwrap()
+        );
+        assert_eq!(buf, vec![b'a'; record_length], "declared-width prefix kept");
         assert!(buf.len() <= record_length + 3);
     }
 }

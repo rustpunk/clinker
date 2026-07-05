@@ -1011,17 +1011,21 @@ impl<'a> TypeChecker<'a> {
                             // in the other cannot combine exactly — reject it
                             // the same way `decimal * float` is rejected in
                             // ordinary arithmetic, rather than silently drop the
-                            // total.
+                            // total. `Numeric` admits `Float` at runtime and
+                            // does not unify with `Decimal` (see `Type::unify`),
+                            // so it is rejected against a decimal too; `Any`
+                            // stays permissive here and is poisoned to Null at
+                            // runtime if it resolves to a conflicting mix.
                             let has_decimal = arg_types
                                 .iter()
                                 .any(|t| matches!(t.unwrap_nullable(), Type::Decimal));
-                            let has_float = arg_types
-                                .iter()
-                                .any(|t| matches!(t.unwrap_nullable(), Type::Float));
+                            let has_float = arg_types.iter().any(|t| {
+                                matches!(t.unwrap_nullable(), Type::Float | Type::Numeric)
+                            });
                             if has_decimal && has_float {
                                 self.error(
                                     *span,
-                                    "weighted_avg() cannot mix a decimal argument with a float argument"
+                                    "weighted_avg() cannot mix a decimal argument with a float or numeric argument"
                                         .into(),
                                     Some(
                                         "Convert with .to_decimal() or .to_float() so the value and weight share one numeric domain"
@@ -1905,8 +1909,41 @@ mod tests {
             assert!(
                 errs.iter().any(|d| d
                     .message
-                    .contains("cannot mix a decimal argument with a float argument")),
+                    .contains("cannot mix a decimal argument with a float or numeric argument")),
                 "`{src}` expected a decimal/float mix rejection, got: {:?}",
+                errs.iter().map(|d| &d.message).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn test_weighted_avg_decimal_numeric_mix_rejected() {
+        // `numeric` admits a binary float at runtime and does not unify with
+        // `decimal`, so mixing a decimal argument with a `numeric` one is
+        // rejected at typecheck the same way a decimal/float mix is — otherwise
+        // the plan compiles and a fractional weight silently poisons the group
+        // to Null at runtime.
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Decimal);
+        cols.insert("qty".into(), Type::Numeric);
+        cols.insert("dept".into(), Type::String);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let fields = ["amount", "qty", "dept"];
+
+        for src in [
+            "emit wa = weighted_avg(amount, qty)", // decimal value, numeric weight
+            "emit wa = weighted_avg(qty, amount)", // numeric value, decimal weight
+        ] {
+            let parsed = Parser::parse(src);
+            assert!(parsed.errors.is_empty());
+            let resolved = resolve_program(parsed.ast, &fields, parsed.node_count).unwrap();
+            let errs = type_check_with_mode(resolved, &schema, agg_mode(&["dept"]))
+                .expect_err("weighted_avg mixing decimal and numeric must be rejected");
+            assert!(
+                errs.iter().any(|d| d
+                    .message
+                    .contains("cannot mix a decimal argument with a float or numeric argument")),
+                "`{src}` expected a decimal/numeric mix rejection, got: {:?}",
                 errs.iter().map(|d| &d.message).collect::<Vec<_>>()
             );
         }

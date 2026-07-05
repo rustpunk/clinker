@@ -749,8 +749,10 @@ impl WeightedAvgState {
         // quotient). A `decimal·int` product widens exactly via `Decimal::from`
         // and `decimal·decimal` is exact. A decimal mixed with a binary float
         // is a typecheck error, so that combination reaches this path only on
-        // an untyped column, where `decimal_add_weighted` poisons the result to
-        // Null rather than emitting a silently-wrong average.
+        // an untyped column, where the result is poisoned to Null rather than
+        // emitting a silently-wrong average — `decimal_add_weighted` catches a
+        // float in the same row, and `enter_decimal_mode` catches a float
+        // accumulated before this first decimal row.
         if self.is_decimal || v.is_decimal() || w.is_decimal() {
             self.enter_decimal_mode();
             self.decimal_add_weighted(&v, &w);
@@ -789,9 +791,16 @@ impl WeightedAvgState {
     /// integers already accumulated (`Σ vᵢ·wᵢ` and `Σ wᵢ`). Fallible — an
     /// integer sum beyond `Decimal`'s ~7.9e28 range sets the overflow flag
     /// rather than panicking (`Decimal::from_i128_with_scale` would panic).
+    /// Float contributions accumulated before the first decimal row (an
+    /// `Any`-typed column that mixed a binary float and a decimal — typed
+    /// columns cannot) cannot widen to an exact decimal; the seed only pulls in
+    /// the integer sums, so poison the result rather than silently drop them.
     fn enter_decimal_mode(&mut self) {
         if !self.is_decimal {
             self.is_decimal = true;
+            if !self.is_integer {
+                self.decimal_overflow = true;
+            }
             match i128_to_decimal(self.int_weighted_sum) {
                 Some(d) => self.decimal_weighted_sum = d,
                 None => {
@@ -869,6 +878,13 @@ impl WeightedAvgState {
             let other_weighted = other.decimal_weighted_contribution();
             let self_weight = self.decimal_weight_contribution();
             let other_weight = other.decimal_weight_contribution();
+            // A float-mode side (not decimal, not integer-only) contributes
+            // only its integer sums above; its binary-float totals cannot widen
+            // to an exact decimal. Combining one into the decimal domain would
+            // silently drop them, so poison the result to Null instead.
+            if (!self.is_decimal && !self.is_integer) || (!other.is_decimal && !other.is_integer) {
+                self.decimal_overflow = true;
+            }
             self.is_decimal = true;
             match (self_weighted, other_weighted) {
                 (Some(a), Some(b)) => match a.checked_add(b) {

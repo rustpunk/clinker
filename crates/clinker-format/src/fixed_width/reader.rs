@@ -422,10 +422,11 @@ mod tests {
     }
 
     #[test]
-    fn test_fixedwidth_lf_missing_newline_is_bounded_record_error() {
-        // A line-separated (LF) source whose line never terminates must fail with
-        // a typed, row-tagged record error rather than buffering the whole input
-        // into one record — the bounded-memory guarantee on malformed input.
+    fn test_fixedwidth_lf_missing_newline_reads_prefix_and_stays_bounded() {
+        // A line-separated (LF) source whose line never terminates must not buffer
+        // the whole input into one record. The declared-width prefix reads and the
+        // remaining bytes are discarded to end of input, so a malformed file stays
+        // within the bounded-memory guarantee rather than growing a single record.
         let data = vec![b'x'; 10_000];
         let fields = vec![{
             let mut f = field("name");
@@ -436,14 +437,33 @@ mod tests {
         }];
         let mut reader =
             FixedWidthReader::new(&data[..], fields, FixedWidthReaderConfig::default()).unwrap();
-        let err = reader.next_record().unwrap_err();
-        match err {
-            FormatError::InvalidRecord { row, message } => {
-                assert_eq!(row, 1);
-                assert!(message.contains("overruns"), "message: {message}");
-            }
-            other => panic!("expected InvalidRecord, got {other:?}"),
-        }
+        let rec = reader.next_record().unwrap().unwrap();
+        assert_eq!(rec.get("name"), Some(&Value::String("xxxxxxxx".into())));
+        // The single unterminated physical line was fully consumed.
+        assert!(reader.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_fixedwidth_lf_wide_lines_read_prefix_and_resync() {
+        // Physical lines wider than the mapped schema (trailing filler the schema
+        // does not declare) read their declared-width prefix and resync to the
+        // next record at the newline — a common fixed-LRECL extract shape. The
+        // 8-byte name prefix is followed by filler bytes the schema never maps.
+        let data = format!("{:<8}ignored-filler\n{:<8}more-filler\n", "Alice", "Bob").into_bytes();
+        let fields = vec![{
+            let mut f = field("name");
+            f.ty = Type::String;
+            f.start = Some(0);
+            f.width = Some(8);
+            f
+        }];
+        let mut reader =
+            FixedWidthReader::new(&data[..], fields, FixedWidthReaderConfig::default()).unwrap();
+        let rec1 = reader.next_record().unwrap().unwrap();
+        assert_eq!(rec1.get("name"), Some(&Value::String("Alice".into())));
+        let rec2 = reader.next_record().unwrap().unwrap();
+        assert_eq!(rec2.get("name"), Some(&Value::String("Bob".into())));
+        assert!(reader.next_record().unwrap().is_none());
     }
 
     #[test]

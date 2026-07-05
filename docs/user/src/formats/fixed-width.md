@@ -62,13 +62,16 @@ value is still a hard error before any slicing.
 |--------|---------|-------------|
 | `line_separator` | platform | Line-ending style (`lf` / `crlf`) used to split the file into records. |
 
-Under `lf` or `crlf`, the reader bounds each physical line to the declared
-record width plus a line-terminator allowance. A line that runs past that width
-without a line terminator is rejected as a record error carrying its row number,
-rather than buffered into memory — this keeps a malformed file (a corrupt or
-missing newline) from growing a single record until end of input. A final line
-with no trailing newline still reads normally as long as it fits within the
-declared width.
+Under `lf` or `crlf`, the reader buffers each physical line only up to the
+declared record width plus a line-terminator allowance. A physical line wider
+than the declared width — trailing filler beyond the last declared field, or a
+schema that maps only a prefix of a wider fixed-length record — reads its
+declared-width portion; the remaining bytes are discarded up to the next line
+terminator and the reader continues with the following record. Because the
+buffered portion is capped, a malformed file (a corrupt or missing newline)
+cannot grow a single record until end of input: memory stays bounded regardless
+of how long the physical line runs. A final line with no trailing newline reads
+normally as long as its declared fields fit within the width.
 
 ## Schema drift
 
