@@ -1,12 +1,15 @@
 use clinker_bench_support::{CsvPayload, MEDIUM, RecordFactory, SMALL};
 use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::csv::writer::{CsvWriter, CsvWriterConfig};
+use clinker_format::fixed_width::writer::{FixedWidthWriter, FixedWidthWriterConfig};
 use clinker_format::json::reader::{JsonReader, JsonReaderConfig};
 use clinker_format::json::writer::{JsonWriter, JsonWriterConfig};
+use clinker_format::schema::Column;
 use clinker_format::traits::{FormatReader, FormatWriter};
 use clinker_format::xml::writer::{XmlWriter, XmlWriterConfig};
 use clinker_record::{Record, Schema, Value};
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use cxl::typecheck::Type;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -262,6 +265,57 @@ fn bench_xml_write(c: &mut Criterion) {
     group.finish();
 }
 
+// ── Fixed-width Write ──────────────────────────────────────────────
+
+fn bench_fixed_width_write(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fixed_width_write");
+    for field_count in [10usize, 50] {
+        // Columns f0..fN matching RecordFactory output: even fields are ints
+        // (width 10), odd fields strings (width 20) — wide enough that the
+        // seeded values never trip the numeric truncation-error policy.
+        let columns: Vec<Column> = (0..field_count)
+            .map(|i| {
+                let (ty, width) = if i % 2 == 0 {
+                    (Type::Int, 10)
+                } else {
+                    (Type::String, 20)
+                };
+                // Omit `start` so columns lay out sequentially (each continues
+                // at the previous column's end).
+                let mut col = Column::bare(format!("f{i}"), ty);
+                col.width = Some(width);
+                col
+            })
+            .collect();
+
+        let mut factory = RecordFactory::new(field_count, 16, 0.0, 42);
+        let records = factory.generate(MEDIUM);
+
+        group.throughput(Throughput::Elements(MEDIUM as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(format!("{field_count}f")),
+            &records,
+            |b, recs| {
+                b.iter(|| {
+                    let buf = Vec::with_capacity(MEDIUM * field_count * 20);
+                    let mut writer = FixedWidthWriter::new(
+                        buf,
+                        columns.clone(),
+                        FixedWidthWriterConfig::default(),
+                    )
+                    .unwrap();
+                    for rec in recs {
+                        writer.write_record(rec).unwrap();
+                    }
+                    writer.flush().unwrap();
+                    black_box(writer);
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_csv_read,
@@ -270,5 +324,6 @@ criterion_group!(
     bench_json_array_read,
     bench_json_write,
     bench_xml_write,
+    bench_fixed_width_write,
 );
 criterion_main!(benches);
