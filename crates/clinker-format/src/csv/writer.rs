@@ -54,6 +54,15 @@ pub struct CsvWriter<W: Write> {
     schema: Arc<Schema>,
     config: CsvWriterConfig,
     header_written: bool,
+    /// Indices into `schema.columns()` of the columns actually emitted (after
+    /// engine-stamped filtering), computed once at construction. Both the
+    /// header row and every body row derive their column set from this, so no
+    /// per-record filtering allocation is needed.
+    column_indices: Vec<usize>,
+    /// Reusable per-record cell buffer, one `String` per emitted column. Each
+    /// row clears and rewrites these in place, retaining their capacity across
+    /// records rather than allocating a fresh row vector every record.
+    row_buf: Vec<String>,
     /// Per-document envelope framer, present only when `config.envelope` is.
     framer: Option<EnvelopeFramer>,
 }
@@ -74,11 +83,15 @@ impl<W: Write> CsvWriter<W> {
             .delimiter(config.delimiter)
             .flexible(framer.is_some())
             .from_writer(writer);
+        let column_indices = filtered_column_indices(&schema, config.include_engine_stamped);
+        let row_buf = vec![String::new(); column_indices.len()];
         Self {
             inner,
             schema,
             config,
             header_written: false,
+            column_indices,
+            row_buf,
             framer,
         }
     }
@@ -129,30 +142,42 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
         // header row, giving documents inconsistent layouts (header row only
         // on the first). The per-document envelope header section replaces it.
         if self.config.include_header && !self.header_written && self.framer.is_none() {
-            let header: Vec<&str> =
-                filtered_header_columns(&self.schema, self.config.include_engine_stamped);
+            // One-time header row, derived from the precomputed column indices.
+            let header: Vec<&str> = self
+                .column_indices
+                .iter()
+                .map(|&i| self.schema.columns()[i].as_ref())
+                .collect();
             self.inner.write_record(&header)?;
             self.header_written = true;
         }
 
-        // Body cells follow the writer's pinned schema — the same
-        // column set and order the header row was built from — not
-        // the record's own schema, which an upstream projection or
-        // widening may order differently for the same fields. Fields
-        // the record lacks emit an empty cell (an explicit Null),
-        // matching the fixed-width writer's missing-field policy.
-        let columns = filtered_header_columns(&self.schema, self.config.include_engine_stamped);
-        let mut fields: Vec<String> = Vec::with_capacity(columns.len());
-        for col in columns {
-            let cell = match record.get(col) {
-                Some(v) => value_to_csv_cell(col, v)?,
-                None => String::new(),
-            };
-            fields.push(cell);
+        // Body cells follow the writer's pinned schema — the same column set
+        // and order the header row was built from — not the record's own
+        // schema, which an upstream projection or widening may order
+        // differently for the same fields. Fields the record lacks emit an
+        // empty cell (an explicit Null), matching the fixed-width writer's
+        // missing-field policy. Each cell is written into the reusable row
+        // buffer (cleared first, so a failed map cell never leaves stale bytes).
+        let Self {
+            inner,
+            schema,
+            column_indices,
+            row_buf,
+            framer,
+            ..
+        } = self;
+        let columns = schema.columns();
+        for (slot, &idx) in row_buf.iter_mut().zip(column_indices.iter()) {
+            let col = columns[idx].as_ref();
+            slot.clear();
+            if let Some(v) = record.get(col) {
+                write_csv_cell(slot, col, v)?;
+            }
         }
 
-        self.inner.write_record(&fields)?;
-        if let Some(framer) = self.framer.as_mut() {
+        inner.write_record(&*row_buf)?;
+        if let Some(framer) = framer.as_mut() {
             framer.count_record();
         }
         Ok(())
@@ -250,9 +275,10 @@ impl<W: Write + Send> FormatWriter for HeaderCapturingCsvWriter<W> {
     }
 }
 
-/// Build the CSV header name list from `schema`, optionally including
-/// engine-stamped columns.
-fn filtered_header_columns(schema: &Arc<Schema>, include_engine_stamped: bool) -> Vec<&str> {
+/// The indices into `schema.columns()` of the columns the CSV writer emits,
+/// after filtering engine-stamped columns unless opted in. Computed once and
+/// reused for both the header row and every body row.
+fn filtered_column_indices(schema: &Arc<Schema>, include_engine_stamped: bool) -> Vec<usize> {
     schema
         .columns()
         .iter()
@@ -263,11 +289,21 @@ fn filtered_header_columns(schema: &Arc<Schema>, include_engine_stamped: bool) -
                     .field_metadata(*i)
                     .is_none_or(|m| !m.is_engine_stamped())
         })
-        .map(|(_, c)| c.as_ref())
+        .map(|(i, _)| i)
         .collect()
 }
 
-/// Serialize a Value to a CSV cell string.
+/// Serialize a Value into a CSV cell string. Thin owned-`String` wrapper over
+/// [`write_csv_cell`], used by the envelope section-row path (not the record
+/// hot path).
+fn value_to_csv_cell(col: &str, value: &Value) -> Result<String, FormatError> {
+    let mut buf = String::new();
+    write_csv_cell(&mut buf, col, value)?;
+    Ok(buf)
+}
+
+/// Append a Value's CSV cell rendering to `buf`. Sharing one renderer keeps the
+/// record hot path and the envelope section path byte-identical.
 ///
 /// `Value::Map` has no canonical scalar serialization for a CSV cell
 /// (silently JSON-encoding hides routing bugs — e.g. a `$widened`
@@ -276,25 +312,37 @@ fn filtered_header_columns(schema: &Arc<Schema>, include_engine_stamped: bool) -
 /// `FormatError::UnserializableMapValue` carrying the offending
 /// column. CSV is the single point of truth for map rejection on
 /// this path; there is no upstream pre-walk.
-fn value_to_csv_cell(col: &str, value: &Value) -> Result<String, FormatError> {
-    Ok(match value {
-        Value::Null => String::new(),
-        Value::Bool(b) => if *b { "true" } else { "false" }.into(),
-        Value::Integer(n) => n.to_string(),
-        Value::Float(f) => f.to_string(),
+fn write_csv_cell(buf: &mut String, col: &str, value: &Value) -> Result<(), FormatError> {
+    use std::fmt::Write as _;
+    match value {
+        Value::Null => {}
+        Value::Bool(b) => buf.push_str(if *b { "true" } else { "false" }),
+        Value::Integer(n) => {
+            let _ = write!(buf, "{n}");
+        }
+        Value::Float(f) => {
+            let _ = write!(buf, "{f}");
+        }
         // A decimal carries its own (column) scale; Display preserves it.
-        Value::Decimal(d) => d.to_string(),
-        Value::String(s) => s.to_string(),
-        Value::Date(d) => d.format("%Y-%m-%d").to_string(),
-        Value::DateTime(dt) => dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
-        Value::Array(arr) => serde_json::to_string(arr).unwrap_or_default(),
+        Value::Decimal(d) => {
+            let _ = write!(buf, "{d}");
+        }
+        Value::String(s) => buf.push_str(s.as_str()),
+        Value::Date(d) => {
+            let _ = write!(buf, "{}", d.format("%Y-%m-%d"));
+        }
+        Value::DateTime(dt) => {
+            let _ = write!(buf, "{}", dt.format("%Y-%m-%dT%H:%M:%S"));
+        }
+        Value::Array(arr) => buf.push_str(&serde_json::to_string(arr).unwrap_or_default()),
         Value::Map(_) => {
             return Err(FormatError::UnserializableMapValue {
                 format: "CSV",
                 column: col.to_string(),
             });
         }
-    })
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -508,6 +556,29 @@ mod tests {
         );
         let output = write_to_string(&writer_schema, CsvWriterConfig::default(), &[record]);
         assert_eq!(output, "a,b\nA,B\n");
+    }
+
+    /// The reusable row buffer must be cleared per cell, so a short value
+    /// following a long value in the same column carries no leftover bytes —
+    /// the canonical buffer-reuse bug.
+    #[test]
+    fn test_csv_writer_row_buffer_reuse_no_stale_bytes() {
+        let schema = make_schema(&["v", "w"]);
+        let records = vec![
+            make_record(
+                &schema,
+                vec![
+                    Value::String("a-very-long-value-here".into()),
+                    Value::String("xxxxxxxx".into()),
+                ],
+            ),
+            make_record(
+                &schema,
+                vec![Value::String("hi".into()), Value::String("y".into())],
+            ),
+        ];
+        let output = write_to_string(&schema, CsvWriterConfig::default(), &records);
+        assert_eq!(output, "v,w\na-very-long-value-here,xxxxxxxx\nhi,y\n");
     }
 
     #[test]
