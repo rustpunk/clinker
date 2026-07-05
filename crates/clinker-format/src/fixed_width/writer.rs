@@ -97,11 +97,23 @@ impl<W: Write> FixedWidthWriter<W> {
                 Justify::Left
             });
 
+            // Widths are byte counts (the reader slices by byte), so padding
+            // must fill exact byte counts. A pad character wider than one byte
+            // would overflow the declared width — each push adds `len_utf8()`
+            // bytes — so reject it at construction rather than emit a cell that
+            // no longer matches its byte range. An empty or absent `pad`
+            // defaults to a space.
             let pad_char = f
                 .pad
                 .as_deref()
                 .and_then(|s| s.chars().next())
                 .unwrap_or(' ');
+            if pad_char.len_utf8() != 1 {
+                return Err(field::invalid_field(
+                    &f.name,
+                    "'pad' must be a single-byte character so padding fills exact byte widths",
+                ));
+            }
 
             let truncation = f.truncation.clone().unwrap_or(if is_numeric {
                 TruncationPolicy::Error
@@ -222,15 +234,24 @@ impl<W: Write> FixedWidthWriter<W> {
         })
     }
 
+    /// Fit `value` into the field's exact byte width, padding or truncating on
+    /// a UTF-8 character boundary. Widths are byte counts (the reader slices by
+    /// byte), so an over-long value is cut at the largest character boundary at
+    /// or below `width` — never mid-codepoint — and the remainder pad-filled.
+    /// The result is always valid UTF-8 of exactly `width` bytes; `pad_char` is
+    /// a single byte (enforced at construction), so it lands on an exact count.
     fn pad_and_justify(&self, field: &WriteField, value: &str) -> String {
-        if value.len() >= field.width {
-            return value[..field.width].to_string();
+        let mut cut = value.len().min(field.width);
+        while !value.is_char_boundary(cut) {
+            cut -= 1;
         }
+        let kept = &value[..cut];
+        let padding = field.width - cut;
 
-        let padding = field.width - value.len();
         match field.justify {
             Justify::Left => {
-                let mut s = value.to_string();
+                let mut s = String::with_capacity(field.width);
+                s.push_str(kept);
                 for _ in 0..padding {
                     s.push(field.pad_char);
                 }
@@ -241,7 +262,7 @@ impl<W: Write> FixedWidthWriter<W> {
                 for _ in 0..padding {
                     s.push(field.pad_char);
                 }
-                s.push_str(value);
+                s.push_str(kept);
                 s
             }
         }
@@ -269,7 +290,7 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
                         return Err(FormatError::InvalidRecord {
                             row: 0,
                             message: format!(
-                                "field '{}': value '{}' ({} chars) exceeds width {} — truncation policy is 'error'",
+                                "field '{}': value '{}' ({} bytes) exceeds width {} — truncation policy is 'error'",
                                 field.name,
                                 formatted,
                                 formatted.len(),
@@ -279,7 +300,7 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
                     }
                     TruncationPolicy::Warn => {
                         self.truncation_warnings.push(format!(
-                            "field '{}': value '{}' truncated to {} chars",
+                            "field '{}': value '{}' truncated to {} bytes",
                             field.name, formatted, field.width
                         ));
                     }
@@ -507,6 +528,114 @@ mod tests {
         assert_eq!(output, "LongN\n"); // truncated to 5 chars
         assert_eq!(warning_count, 1);
         assert!(warning_msg.contains("truncated"));
+    }
+
+    /// A non-ASCII value whose UTF-8 encoding overruns the field's byte width
+    /// is cut at a character boundary — never mid-codepoint — so the emitted
+    /// cell stays valid UTF-8 of exactly `width` bytes instead of panicking on
+    /// a non-boundary byte slice. `"café"` is 5 bytes (`é` is 2), so a width-4
+    /// field keeps `"caf"` and pads the remaining byte.
+    #[test]
+    fn test_fixedwidth_write_truncate_non_ascii_warn_byte_safe() {
+        let fields = vec![{
+            let mut f = field("name");
+            f.ty = Type::String;
+            f.start = Some(0);
+            f.width = Some(4);
+            f.truncation = Some(TruncationPolicy::Warn);
+            f
+        }];
+
+        let mut buf = Vec::new();
+        let warning_msg;
+        {
+            let mut writer =
+                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+            let rec = make_record(&["name"], vec![Value::String("café".into())]);
+            writer.write_record(&rec).unwrap();
+            writer.flush().unwrap();
+            warning_msg = writer.truncation_warnings()[0].clone();
+        }
+
+        // Valid UTF-8 of exactly the byte width — the partial `é` is dropped,
+        // not split, and the freed byte is space-padded.
+        let output = String::from_utf8(buf).expect("output must be valid UTF-8");
+        assert_eq!(output, "caf \n");
+        // Diagnostics report byte counts, not char counts.
+        assert!(
+            warning_msg.contains("bytes"),
+            "warning should say bytes: {warning_msg}"
+        );
+        assert!(
+            !warning_msg.contains("chars"),
+            "warning must not say chars: {warning_msg}"
+        );
+    }
+
+    /// A multi-byte character that does not fit in the byte width at all yields
+    /// an all-pad cell of exactly `width` bytes rather than panicking. Silent
+    /// truncation emits no warning but still produces a byte-exact cell.
+    #[test]
+    fn test_fixedwidth_write_truncate_non_ascii_silent_byte_safe() {
+        let fields = vec![{
+            let mut f = field("flag");
+            f.ty = Type::String;
+            f.start = Some(0);
+            f.width = Some(1);
+            f.truncation = Some(TruncationPolicy::Silent);
+            f
+        }];
+
+        let mut buf = Vec::new();
+        let warning_count;
+        {
+            let mut writer =
+                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+            // `é` is 2 bytes; width 1 cannot hold it, so the cell is one pad byte.
+            let rec = make_record(&["flag"], vec![Value::String("é".into())]);
+            writer.write_record(&rec).unwrap();
+            writer.flush().unwrap();
+            warning_count = writer.truncation_warnings().len();
+        }
+
+        let output = String::from_utf8(buf).expect("output must be valid UTF-8");
+        assert_eq!(output, " \n");
+        assert_eq!(warning_count, 0, "silent truncation emits no warning");
+    }
+
+    /// A multi-byte `pad` character cannot fill an exact byte width — each push
+    /// would add more than one byte — so it is rejected at construction with a
+    /// typed field error naming the constraint.
+    #[test]
+    fn test_fixedwidth_write_multibyte_pad_rejected() {
+        let fields = vec![{
+            let mut f = field("name");
+            f.ty = Type::String;
+            f.start = Some(0);
+            f.width = Some(5);
+            // U+00B7 MIDDLE DOT is 2 UTF-8 bytes.
+            f.pad = Some("·".into());
+            f
+        }];
+
+        let mut buf = Vec::new();
+        let err = FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default())
+            .err()
+            .expect("multi-byte pad must be rejected at construction");
+        match err {
+            FormatError::InvalidRecord { row, message } => {
+                assert_eq!(row, 0, "construction defect reports row 0");
+                assert!(
+                    message.contains("single-byte"),
+                    "message should state the single-byte constraint: {message}"
+                );
+                assert!(
+                    message.contains("'name'"),
+                    "message should name the field: {message}"
+                );
+            }
+            other => panic!("expected InvalidRecord, got {other:?}"),
+        }
     }
 
     #[test]
