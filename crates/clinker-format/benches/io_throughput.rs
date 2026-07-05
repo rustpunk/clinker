@@ -146,28 +146,33 @@ fn bench_json_array_read(c: &mut Criterion) {
 
 fn bench_json_write(c: &mut Criterion) {
     let mut group = c.benchmark_group("json_write");
-    for record_count in [SMALL, MEDIUM] {
-        let mut factory = RecordFactory::new(10, 16, 0.0, 42);
+    // (label, record_count, field_count, string_len). The first two rows keep
+    // the original 10-field/16-char shape as the no-regression oracle; the
+    // wide (many-field) and long-value rows are where eliminating the
+    // per-record `serde_json::Value` tree pays off.
+    for (label, record_count, field_count, string_len) in [
+        ("small_10f_16c", SMALL, 10, 16),
+        ("medium_10f_16c", MEDIUM, 10, 16),
+        ("medium_50f_16c", MEDIUM, 50, 16),
+        ("medium_10f_256c", MEDIUM, 10, 256),
+    ] {
+        let mut factory = RecordFactory::new(field_count, string_len, 0.0, 42);
         let records = factory.generate(record_count);
         let schema = factory.schema().clone();
 
         group.throughput(Throughput::Elements(record_count as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(record_count),
-            &records,
-            |b, recs| {
-                b.iter(|| {
-                    let buf = Vec::with_capacity(record_count * 200);
-                    let mut writer =
-                        JsonWriter::new(buf, Arc::clone(&schema), JsonWriterConfig::default());
-                    for rec in recs {
-                        writer.write_record(rec).unwrap();
-                    }
-                    writer.flush().unwrap();
-                    black_box(writer);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(label), &records, |b, recs| {
+            b.iter(|| {
+                let buf = Vec::with_capacity(record_count * field_count * string_len);
+                let mut writer =
+                    JsonWriter::new(buf, Arc::clone(&schema), JsonWriterConfig::default());
+                for rec in recs {
+                    writer.write_record(rec).unwrap();
+                }
+                writer.flush().unwrap();
+                black_box(writer);
+            });
+        });
     }
     group.finish();
 }
