@@ -103,6 +103,30 @@ Set to `false` to omit the CSV header row.
 
 When `false`, null values are written as empty strings. When `true`, nulls are preserved in the output format's native null representation (e.g., `null` in JSON).
 
+### Rounding decimals to a declared scale
+
+An Output node's optional `schema:` may declare a column `type: decimal` with a
+`scale`. A `decimal` value landing in that column is rounded to the declared
+number of fractional places on write, using banker's rounding — the same
+boundary contract a `decimal` *source* column applies on read.
+
+```yaml
+    schema:
+      - { name: dept,    type: string }
+      - { name: total,   type: decimal, scale: 2 }
+      - { name: average, type: decimal, scale: 2 }
+```
+
+Decimals compute at full precision *inside* the pipeline (division and `avg`
+keep every digit), so a declared output scale is how you pin a computed result
+to fixed places at the sink: `avg(amount)` over `1.00, 1.00, 2.00` writes `1.33`
+into a `scale: 2` column, while `sum(amount)` — already at scale 2 — stays
+`4.00`. This works for every format (CSV, JSON, fixed-width); an output column
+with no declared scale, or an output with no `schema:` block at all, keeps the
+full-precision value. Only `decimal` values in `decimal`-declared columns are
+affected — no other type is coerced. See [Decimal — arithmetic
+rules](../cxl/types.md#arithmetic-rules) for the full boundary-contract model.
+
 ## Output format options
 
 ### CSV
@@ -118,6 +142,11 @@ When `false`, null values are written as empty strings. When `true`, nulls are p
     options:
       delimiter: "|"
 ```
+
+`delimiter` is a single byte on the wire, so it must be **exactly one ASCII
+character** (for example `,`, `|`, or `\t`). An empty, multi-character, or
+non-ASCII value is rejected at plan validation rather than silently truncated
+to its first byte.
 
 ### JSON
 

@@ -167,9 +167,10 @@ pub fn parse_config_with_vars(
     Ok(config)
 }
 
-/// Resolve every source's external `.schema.yaml` ([`SourceSchema::File`](crate::config::SourceSchema))
-/// to its inline form, in place, and fold each resolved schema's canonical
-/// content into `config.source_hash`.
+/// Resolve every external `.schema.yaml` ([`SourceSchema::File`](crate::config::SourceSchema))
+/// reference — on both `source` and `output` nodes — to its inline form, in
+/// place, and fold each resolved schema's canonical content into
+/// `config.source_hash`.
 ///
 /// `source_hash` is otherwise BLAKE3 over the interpolated YAML text only, so a
 /// referenced `.schema.yaml`'s content is absent from the pipeline identity and
@@ -177,50 +178,75 @@ pub fn parse_config_with_vars(
 /// output paths and conflating lineage across schema revisions. Folding the
 /// resolved content in (mirroring the channel-patch fold) closes that blind
 /// spot. Resolving in place means the config that flows to `compile` and the
-/// runtime carries inline columns, so no source schema file is re-read
-/// downstream.
+/// runtime carries inline columns, so no schema file is re-read downstream.
+///
+/// Output `schema:` references are resolved here for the same reason. The
+/// executor's write boundary reads the output schema's inline columns directly —
+/// fixed-width column widths and the declared-decimal `scale` rounding both go
+/// through [`SourceSchema::as_columns`], which yields `None` for an unresolved
+/// `File`. Resolving at load time means those passes see the declared columns
+/// whether the schema was written inline or referenced as a file, instead of the
+/// file form silently skipping the scale rounding.
 ///
 /// A config with no external schemas leaves `source_hash` byte-identical.
 fn resolve_and_hash_external_schemas(config: &mut PipelineConfig) -> Result<(), ConfigError> {
     // Pass 1: load each external schema file once (immutable walk), collecting
-    // its resolved inline form and canonical bytes for the identity fold.
+    // its resolved inline form and canonical bytes for the identity fold. Both a
+    // source `schema:` and an output `schema:` (fixed-width column widths or a
+    // declared-decimal `scale`) may name an external file.
     let mut resolved: Vec<(usize, crate::config::SourceSchema, Vec<u8>)> = Vec::new();
     for (idx, spanned) in config.nodes.iter().enumerate() {
-        if let crate::config::PipelineNode::Source {
-            header,
-            config: body,
-        } = &spanned.value
-            && let crate::config::SourceSchema::File(path) = &body.schema
-        {
-            let inline =
-                crate::schema::load_source_schema(std::path::Path::new(path)).map_err(|e| {
-                    ConfigError::Validation(format!(
-                        "source {:?}: failed to load schema file '{path}': {e}",
-                        header.name
-                    ))
-                })?;
-            let serialized = serde_json::to_vec(&inline).map_err(|e| {
+        let (path, node_label) = match &spanned.value {
+            crate::config::PipelineNode::Source {
+                header,
+                config: body,
+            } => match &body.schema {
+                crate::config::SourceSchema::File(path) => {
+                    (path.clone(), format!("source {:?}", header.name))
+                }
+                _ => continue,
+            },
+            crate::config::PipelineNode::Output {
+                header,
+                config: body,
+            } => match &body.output.schema {
+                Some(crate::config::SourceSchema::File(path)) => {
+                    (path.clone(), format!("output {:?}", header.name))
+                }
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let inline =
+            crate::schema::load_source_schema(std::path::Path::new(&path)).map_err(|e| {
                 ConfigError::Validation(format!(
-                    "internal: external schema identity hashing for source {:?}: {e}",
-                    header.name
+                    "{node_label}: failed to load schema file '{path}': {e}"
                 ))
             })?;
-            resolved.push((idx, inline, serialized));
-        }
+        let serialized = serde_json::to_vec(&inline).map_err(|e| {
+            ConfigError::Validation(format!(
+                "internal: external schema identity hashing for {node_label}: {e}"
+            ))
+        })?;
+        resolved.push((idx, inline, serialized));
     }
     if resolved.is_empty() {
         return Ok(());
     }
     // Pass 2: fold the resolved content into the identity hash and write the
-    // inline schema back onto each source node.
+    // inline schema back onto each node.
     let mut hasher = blake3::Hasher::new();
     hasher.update(&config.source_hash);
     for (idx, inline, serialized) in resolved {
         hasher.update(&serialized);
-        if let crate::config::PipelineNode::Source { config: body, .. } =
-            &mut config.nodes[idx].value
-        {
-            body.schema = inline;
+        match &mut config.nodes[idx].value {
+            crate::config::PipelineNode::Source { config: body, .. } => {
+                body.schema = inline;
+            }
+            crate::config::PipelineNode::Output { config: body, .. } => {
+                body.output.schema = Some(inline);
+            }
+            _ => {}
         }
     }
     config.source_hash = *hasher.finalize().as_bytes();
@@ -295,6 +321,13 @@ mod external_schema_tests {
             .expect("source node present")
     }
 
+    fn output_schema(config: &PipelineConfig) -> Option<&crate::config::SourceSchema> {
+        config.nodes.iter().find_map(|n| match &n.value {
+            crate::config::PipelineNode::Output { config, .. } => config.output.schema.as_ref(),
+            _ => None,
+        })
+    }
+
     fn write_pipeline_referencing(
         dir: &std::path::Path,
         schema_path: &std::path::Path,
@@ -347,6 +380,63 @@ mod external_schema_tests {
         assert_ne!(
             config2.source_hash, hash_v1,
             "editing the external schema file must change source_hash"
+        );
+    }
+
+    /// An output node's external `.schema.yaml` (`SourceSchema::File`) is
+    /// resolved to its inline column list at config-load time, exactly like a
+    /// source's. Without this the write-boundary passes that read the output
+    /// schema through `as_columns()` — fixed-width column widths and the
+    /// declared-decimal `scale` rounding — silently skip a file-referenced
+    /// schema, diverging from the same schema written inline.
+    #[test]
+    fn external_output_schema_file_resolves_inline_and_folds_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let schema_path = dir.path().join("out_cols.schema.yaml");
+        std::fs::write(
+            &schema_path,
+            "- { name: average, type: decimal, scale: 2 }\n- { name: name, type: string }\n",
+        )
+        .unwrap();
+        // A source with an inline schema and an output referencing the external
+        // schema file — isolating the output-node resolution path.
+        let pipeline = format!(
+            "pipeline:\n  name: ext_output_schema_test\n\
+             nodes:\n  - type: source\n    name: src\n    config:\n      \
+             name: src\n      type: csv\n      path: /tmp/in.csv\n      \
+             schema:\n        - {{ name: average, type: decimal, scale: 2 }}\n        \
+             - {{ name: name, type: string }}\n  - type: output\n    name: out\n    \
+             input: src\n    config:\n      name: out\n      type: csv\n      \
+             path: /tmp/out.csv\n      schema: '{}'\n",
+            schema_path.display()
+        );
+        let pipeline_path = dir.path().join("pipeline.yaml");
+        std::fs::write(&pipeline_path, pipeline).unwrap();
+
+        // Resolution: the output `File` reference is replaced by inline columns,
+        // so `as_columns()` (which the write boundary calls) now returns them.
+        let config = parse_config_with_vars(&pipeline_path, &[]).unwrap();
+        let cols = output_schema(&config)
+            .expect("output schema present")
+            .as_columns()
+            .expect("external output schema resolved to an inline column list");
+        assert_eq!(cols.len(), 2);
+        assert_eq!(cols[0].name, "average");
+        assert_eq!(cols[0].ty, cxl::typecheck::Type::Decimal);
+        assert_eq!(cols[0].scale, Some(2));
+        let hash_v1 = config.source_hash;
+
+        // Hash fold: editing the referenced output schema changes the pipeline
+        // identity even though the pipeline YAML text is byte-identical.
+        std::fs::write(
+            &schema_path,
+            "- { name: average, type: decimal, scale: 4 }\n- { name: name, type: string }\n",
+        )
+        .unwrap();
+        let config2 = parse_config_with_vars(&pipeline_path, &[]).unwrap();
+        assert_ne!(
+            config2.source_hash, hash_v1,
+            "editing the external output schema file must change source_hash"
         );
     }
 

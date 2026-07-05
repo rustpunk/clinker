@@ -4313,6 +4313,19 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             validate_hl7_split_fields(&input.name, opts)?;
         }
 
+        // A CSV `delimiter` / `quote_char` lowers to a single byte on the
+        // reader; reject any value that would truncate lossily so the failure
+        // is a plan diagnostic rather than a wrong byte silently applied at
+        // runtime.
+        if let InputFormat::Csv(Some(opts)) = &input.format {
+            if let Some(delimiter) = &opts.delimiter {
+                validate_csv_byte_option("source", &input.name, "delimiter", delimiter)?;
+            }
+            if let Some(quote_char) = &opts.quote_char {
+                validate_csv_byte_option("source", &input.name, "quote_char", quote_char)?;
+            }
+        }
+
         // A `json_pointer` extract must be a valid RFC 6901 pointer: either
         // empty (the whole document) or a `/`-introduced path. A slashless
         // value like `Head` decodes to zero segments — indistinguishable from
@@ -4351,6 +4364,14 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
     // rejections in lockstep; a fourth single-envelope format is one match
     // arm, not a fourth copied loop.
     for output in config.output_configs() {
+        // The CSV writer lowers `delimiter` to a single byte; reject a lossy
+        // value here for the same reason the source side does.
+        if let OutputFormat::Csv(Some(opts)) = &output.format
+            && let Some(delimiter) = &opts.delimiter
+        {
+            validate_csv_byte_option("output", &output.name, "delimiter", delimiter)?;
+        }
+
         // Each indivisible-envelope format maps to its diagnostic code, the
         // `format:` token a user wrote, and the structural-envelope phrase
         // naming why it can't be split; splittable formats yield `None`.
@@ -4905,6 +4926,33 @@ fn validate_hl7_split_fields(source_name: &str, opts: &Hl7InputOptions) -> Resul
     Ok(())
 }
 
+/// Reject a CSV `delimiter` / `quote_char` that is not exactly one ASCII byte.
+///
+/// The byte-oriented CSV reader and writer each take a single byte, so an
+/// empty, multi-character, or non-ASCII value would otherwise be silently
+/// truncated to its first byte at runtime (`"||"` acting as `|`, a `"→"`
+/// applying one byte of its UTF-8 encoding). Catching it here at plan time —
+/// before any reader or writer is constructed — turns that lossy surprise into
+/// a diagnostic naming the node, the option, and the offending value.
+/// `node_kind` is `"source"` or `"output"`; `field` is `"delimiter"` or
+/// `"quote_char"`.
+fn validate_csv_byte_option(
+    node_kind: &str,
+    node_name: &str,
+    field: &str,
+    value: &str,
+) -> Result<(), ConfigError> {
+    let mut chars = value.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) if c.is_ascii() => Ok(()),
+        _ => Err(ConfigError::Validation(format!(
+            "{node_kind} '{node_name}': `{field}: {value:?}` must be exactly one ASCII byte \
+             (for example `,`, `|`, or `\\t`); the CSV reader and writer take a single-byte \
+             {field}, so an empty, multi-character, or non-ASCII value cannot be applied"
+        ))),
+    }
+}
+
 /// Auto-extend every strict `PlanNode::Aggregation.group_by` with the
 /// `$ck.<field>` shadow column when the user-declared correlation-key
 /// field is already listed AND the parent's lattice carries that CK
@@ -5116,4 +5164,149 @@ fn extend_aggregate_group_by_with_shadow_in_body(
         parent_ck_set.insert(idx, ck);
     }
     extend_aggregate_group_by_with_shadow_for_graph(&mut body.graph, &parent_ck_set);
+}
+
+#[cfg(test)]
+mod csv_byte_option_validation_tests {
+    use crate::config::parse_config;
+
+    /// Minimal single-source, single-output CSV pipeline whose *source* carries
+    /// a caller-supplied `options:` body (each line indented eight spaces to sit
+    /// under the node's `options:` key).
+    fn source_options_pipeline(options_body: &str) -> String {
+        format!(
+            r#"
+pipeline:
+  name: csv_byte_option
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - {{ name: a, type: string }}
+      options:
+{options_body}
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+        )
+    }
+
+    /// Same shape, but the caller-supplied `options:` body lives on the
+    /// *output* node so the output-side delimiter check is exercised.
+    fn output_options_pipeline(options_body: &str) -> String {
+        format!(
+            r#"
+pipeline:
+  name: csv_byte_option
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - {{ name: a, type: string }}
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      options:
+{options_body}
+"#
+        )
+    }
+
+    #[test]
+    fn source_delimiter_empty_rejected() {
+        let err = parse_config(&source_options_pipeline("        delimiter: \"\""))
+            .expect_err("empty delimiter must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("delimiter") && msg.contains("one ASCII byte"),
+            "msg: {msg}"
+        );
+    }
+
+    #[test]
+    fn source_delimiter_multichar_rejected() {
+        let err = parse_config(&source_options_pipeline("        delimiter: \"||\""))
+            .expect_err("multi-character delimiter must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("\"||\"") && msg.contains("one ASCII byte"),
+            "msg must name the offending value: {msg}"
+        );
+    }
+
+    #[test]
+    fn source_delimiter_non_ascii_rejected() {
+        let err = parse_config(&source_options_pipeline("        delimiter: \"→\""))
+            .expect_err("non-ASCII delimiter must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("delimiter") && msg.contains("one ASCII byte"),
+            "msg: {msg}"
+        );
+    }
+
+    #[test]
+    fn source_delimiter_single_ascii_accepted() {
+        parse_config(&source_options_pipeline("        delimiter: \"|\""))
+            .expect("a single-byte pipe delimiter is valid");
+    }
+
+    #[test]
+    fn source_delimiter_tab_accepted() {
+        // A YAML double-quoted `"\t"` decodes to one tab byte (0x09) — a valid
+        // single-byte ASCII delimiter that must pass.
+        parse_config(&source_options_pipeline("        delimiter: \"\\t\""))
+            .expect("a tab delimiter is valid");
+    }
+
+    #[test]
+    fn source_quote_char_non_ascii_rejected() {
+        let err = parse_config(&source_options_pipeline("        quote_char: \"→\""))
+            .expect_err("non-ASCII quote_char must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("quote_char") && msg.contains("one ASCII byte"),
+            "msg: {msg}"
+        );
+    }
+
+    #[test]
+    fn source_quote_char_single_ascii_accepted() {
+        parse_config(&source_options_pipeline("        quote_char: \"'\""))
+            .expect("a single-byte quote char is valid");
+    }
+
+    #[test]
+    fn output_delimiter_multichar_rejected() {
+        let err = parse_config(&output_options_pipeline("        delimiter: \"||\""))
+            .expect_err("multi-character output delimiter must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("output 'out'") && msg.contains("one ASCII byte"),
+            "msg must name the output and the requirement: {msg}"
+        );
+    }
+
+    #[test]
+    fn output_delimiter_single_ascii_accepted() {
+        parse_config(&output_options_pipeline("        delimiter: \"|\""))
+            .expect("a single-byte output delimiter is valid");
+    }
 }

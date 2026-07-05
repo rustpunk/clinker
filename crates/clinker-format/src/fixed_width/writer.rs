@@ -218,8 +218,11 @@ impl<W: Write> FixedWidthWriter<W> {
             Value::String(s) => s.to_string(),
             Value::Integer(i) => i.to_string(),
             Value::Float(f) => f.to_string(),
-            // The decimal already carries its column scale (coercion rounds to
-            // it), and Display renders that scale, e.g. `2.50`.
+            // Rendered at the decimal's own scale via Display, e.g. `2.50`. A
+            // value routed into a `scale`-declared output column is already
+            // rescaled to that scale at the output-projection boundary (the
+            // write-side twin of source-ingest rounding), so the writer renders
+            // it verbatim rather than reinterpreting the field's scale here.
             Value::Decimal(d) => d.to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => d.format("%Y%m%d").to_string(),

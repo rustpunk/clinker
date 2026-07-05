@@ -33,10 +33,15 @@ standard [RFC 4180](https://www.rfc-editor.org/rfc/rfc4180) defaults.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `delimiter` | `,` | Field separator. Set to `\t` for TSV, `;` for semicolon-delimited exports. |
-| `quote_char` | `"` | Quote character that escapes delimiters and newlines inside a field. |
+| `delimiter` | `,` | Field separator, **exactly one ASCII byte**. Set to `\t` for TSV, `;` for semicolon-delimited exports. |
+| `quote_char` | `"` | Quote character that escapes delimiters and newlines inside a field, **exactly one ASCII byte**. |
 | `has_header` | `true` | When `true`, the first line names the columns and is consumed, not emitted. When `false`, fields bind to `schema:` positionally. |
 | `encoding` | `utf-8` | Character set each field — including the header row — is decoded through. Supported values are `utf-8` (the default) and `iso-8859-1` (aliases `latin-1`, `latin1`). See [Encoding](#encoding). |
+
+`delimiter` and `quote_char` are each a single byte on the wire, so each must
+be **exactly one ASCII character**. An empty, multi-character, or non-ASCII
+value (for example `"||"` or `"→"`) is rejected at plan validation — it is
+never silently truncated to its first byte.
 
 ## Encoding
 

@@ -190,10 +190,12 @@ impl<'a> WindowContext<'a, Arena> for PartitionWindowContext<'a> {
             }
         }
         if saw_decimal && count > 0 {
-            // Exact decimal quotient at full precision — a computed decimal is
-            // not re-rounded to an output-column scale (round explicitly in CXL
-            // to fix places). Integer rows fold into the numerator exactly so
-            // they are not lost.
+            // Exact decimal quotient at full precision — inside the pipeline a
+            // computed decimal keeps every digit. A declared `scale` rounds only
+            // at the boundary it is declared on: a source column's `scale` on
+            // read, an output column's `scale` on write (applied in the output
+            // projection); mid-pipeline places still take an explicit CXL round.
+            // Integer rows fold into the numerator exactly so they are not lost.
             let numerator = add_i128_to_decimal(dec_total, int_acc);
             return match numerator.checked_div(rust_decimal::Decimal::from(count)) {
                 Some(avg) => Value::Decimal(avg),
