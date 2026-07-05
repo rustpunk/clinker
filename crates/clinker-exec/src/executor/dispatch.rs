@@ -1528,7 +1528,29 @@ pub(crate) fn admit_node_buffer(
     // dispatch order moves: finishing a chain's blocking consumer before
     // charging the next chain's source keeps fewer slots live at once.
     ctx.memory_budget.sample_peak_consumer_usage();
-    if !spill_allowed || !ctx.memory_budget.should_spill() {
+    if !spill_allowed {
+        // A non-spillable slot (multi-consumer fan-out / composition
+        // input-port edge) cannot be evicted: its consumer clones the
+        // resident rows via `NodeBuffer::clone_memory_only`, which panics on
+        // a spill-backed variant, and the rows are already fully
+        // materialized, non-back-pressureable, and drained synchronously.
+        // Admitting one while already over the hard limit would blow the
+        // budget with no recourse — no spill, no pause, no block — so
+        // hard-gate it here, mirroring the route cross-region tee admission
+        // precedent (`route_dispatch`). A spillable over-budget slot must
+        // still spill rather than abort, so only this arm gates.
+        if ctx.memory_budget.should_abort() {
+            return Err(PipelineError::MemoryBudgetExceeded {
+                node: node_name.to_string(),
+                used: ctx.memory_budget.peak_rss().unwrap_or(0),
+                limit: ctx.memory_budget.hard_limit(),
+                source: clinker_plan::BudgetCategory::Arena,
+                detail: Some("non-spillable node-buffer admission".to_string()),
+            });
+        }
+        return Ok(NodeBuffer::memory_from_records_and_puncts(rows, puncts));
+    }
+    if !ctx.memory_budget.should_spill() {
         return Ok(NodeBuffer::memory_from_records_and_puncts(rows, puncts));
     }
     // Resolve the spill compression mode against this slot's schema width and
@@ -2683,6 +2705,128 @@ pub(crate) fn transform_fused_consume(
     Ok(())
 }
 
+/// Service any pending node-buffer spill requests before dispatching the
+/// next node.
+///
+/// When [`MemoryArbitrator::should_spill`] trips at an admission boundary it
+/// elects a victim and, for a non-back-pressureable consumer, calls
+/// `try_spill`, which only flips the slot's [`ConsumerHandle`] spill-request
+/// flag — it performs no I/O. This sweep is the missing servicing half: it
+/// reads each live slot's flag via `take_spill_request` and, for a resident
+/// `NodeBuffer::Memory` slot whose topology permits spilling
+/// (single drain consumer — [`node_buffer_spill_allowed`]), flushes it to
+/// disk through [`NodeBuffer::spill_resident_memory`], discharges the slot's
+/// in-memory charge, and records the file against the arbitrator's disk
+/// quota (surfacing the `SpillCapExceeded` (E320) disk-cap error on an
+/// over-quota total, exactly as the admission and streaming spill paths do).
+///
+/// Non-spillable slots (multi-consumer fan-out / composition input-port
+/// edges, whose consumer would reach `NodeBuffer::clone_memory_only` and
+/// panic on a spill-backed variant) are deliberately skipped: their
+/// over-budget case is caught by the hard-limit admission gate in
+/// [`admit_node_buffer`], not by spilling. Clearing the flag on such a slot
+/// is harmless — a still-pressured arbitrator simply re-elects and re-flags
+/// it on its next poll.
+///
+/// Thin `ExecutorContext` adapter over [`service_pending_node_buffer_spills`],
+/// which holds the testable core (the full context is impractical to build
+/// for a unit test, and the RSS-vs-charged interplay makes the false→true
+/// `should_spill` transition non-deterministic through a live run).
+fn service_node_buffer_spill_requests(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+) -> Result<(), PipelineError> {
+    service_pending_node_buffer_spills(
+        &mut ctx.node_buffers,
+        &ctx.node_buffer_consumer_ids,
+        &ctx.memory_budget,
+        ctx.spill_root_path.as_ref(),
+        ctx.spill_compress,
+        ctx.batch_size,
+        |idx| node_buffer_spill_allowed(current_dag, idx),
+        |idx| current_dag.graph[idx].name().to_string(),
+    )
+}
+
+/// Spill every resident `node_buffers` slot whose consumer flagged a
+/// spill request, discharging its in-memory charge and recording the
+/// file against the arbitrator's disk quota.
+///
+/// The `ExecutorContext`-free core of [`service_node_buffer_spill_requests`]:
+/// it takes the slot map, the per-slot consumer registry, the arbitrator,
+/// and the run's spill settings directly, plus `is_spill_allowed` /
+/// `node_name` resolvers the caller derives from the live DAG. Splitting it
+/// out lets a white-box test drive the resident-slot spill path
+/// deterministically — a live pipeline run cannot, because the RSS-vs-
+/// charged arms of `should_spill` cannot be made to transition false→true
+/// between two admissions with real record footprints.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn service_pending_node_buffer_spills(
+    node_buffers: &mut HashMap<NodeIndex, NodeBuffer>,
+    consumer_ids: &HashMap<
+        NodeIndex,
+        (
+            crate::pipeline::memory::ConsumerId,
+            Arc<crate::pipeline::memory::ConsumerHandle>,
+        ),
+    >,
+    arbitrator: &crate::pipeline::memory::MemoryArbitrator,
+    spill_root: &std::path::Path,
+    spill_compress: clinker_plan::config::CompressMode,
+    batch_size: usize,
+    is_spill_allowed: impl Fn(NodeIndex) -> bool,
+    node_name: impl Fn(NodeIndex) -> String,
+) -> Result<(), PipelineError> {
+    // Phase 1: collect the slots whose consumer flagged a spill request and
+    // that are eligible to spill (resident `Memory` + single-drain
+    // topology). `take_spill_request` read-and-clears the flag for every
+    // flagged slot, spillable or not, so a non-spillable flag does not spin.
+    let mut to_spill: Vec<NodeIndex> = Vec::new();
+    for (idx, (_id, handle)) in consumer_ids {
+        if handle.take_spill_request()
+            && matches!(node_buffers.get(idx), Some(NodeBuffer::Memory(_)))
+            && is_spill_allowed(*idx)
+        {
+            to_spill.push(*idx);
+        }
+    }
+    // Phase 2: flush each elected slot. Single-threaded dispatch means
+    // nothing mutated the slot between the two phases, so it is still the
+    // `Memory` variant Phase 1 saw.
+    for idx in to_spill {
+        let Some(handle) = consumer_ids
+            .get(&idx)
+            .map(|(_id, handle)| Arc::clone(handle))
+        else {
+            continue;
+        };
+        let Some(buffer) = node_buffers.remove(&idx) else {
+            continue;
+        };
+        let name = node_name(idx);
+        // Resolve the compression mode against this slot's schema width and
+        // the run's batch size, matching the admission path so the on-disk
+        // format agrees with what `--explain` projects.
+        let column_count = buffer.first_record_column_count();
+        let compress = spill_compress.resolve_for_schema(column_count, batch_size as u64);
+        let (spilled, file_bytes) = buffer.spill_resident_memory(Some(spill_root), compress)?;
+        node_buffers.insert(idx, spilled);
+        if file_bytes > 0 {
+            // Rows are on disk now; the slot's in-memory charge is zero.
+            handle.set_bytes(0);
+            if arbitrator.record_spill_bytes(&name, file_bytes) {
+                return Err(PipelineError::spill_cap_exceeded(
+                    name,
+                    arbitrator.max_spill_bytes(),
+                    file_bytes,
+                    arbitrator.cumulative_spill_bytes(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Execute one DAG node by routing it to its arm.
 ///
 /// Reads the node by `node_idx` from `current_dag.graph` and dispatches
@@ -2699,6 +2843,11 @@ pub(crate) fn dispatch_plan_node(
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
 ) -> Result<(), PipelineError> {
+    // Service any spill requests the arbitrator flagged on resident slots at
+    // a prior admission boundary before doing this node's work, so an
+    // elected victim actually frees its memory instead of only carrying a
+    // flag no one reads.
+    service_node_buffer_spill_requests(ctx, current_dag)?;
     // Single deferred-region guard: skip every non-producer member on
     // the forward pass so the producer's narrow emit can be parked for
     // commit-time replay. The flag flips when the commit-time deferred

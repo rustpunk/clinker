@@ -156,7 +156,9 @@ pub(crate) fn dispatch_aggregation(
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
     ) = match drain_node_buffer_slot(ctx, pred) {
-        Some(nb) => nb.drain_split()?,
+        // Meter the re-materialized drain so a spill-backed predecessor cannot
+        // re-inflate into RAM past the hard limit uncharged.
+        Some(nb) => nb.drain_split_metered(&ctx.memory_budget, name)?,
         None => (Vec::new(), Vec::new()),
     };
 
@@ -1277,7 +1279,10 @@ fn run_streaming_aggregate_ingest(
                             return Err(e.into());
                         }
                         Err(e) => match strategy {
-                            ErrorStrategy::FailFast => return Err(e.into()),
+                            // Stamp the aggregate node name so an `OversizedRow`
+                            // → E310 abort names the stage that overran, matching
+                            // the materialized arm's attribution.
+                            ErrorStrategy::FailFast => return Err(agg_hash_error_into(name, e)),
                             ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
                                 effects.add_errors.push((
                                     record,
@@ -1922,6 +1927,26 @@ fn add_to_window(
     handle_aggregate_add_error(ctx, win_ctx.name, record, row_num, e)
 }
 
+/// Convert a `HashAggError` to `PipelineError`, stamping the aggregate node
+/// name into a `MemoryBudgetExceeded` whose `node` the error taxonomy left
+/// empty.
+///
+/// The `OversizedRow → E310` mapping in `aggregation/error.rs` deliberately
+/// leaves `node` empty for the dispatch arm to fill — matching the sibling
+/// budget-error sites — so an aborting oversized-row error renders as
+/// `E310 <aggregate>: ...`, naming the stage that overran exactly as the
+/// memory docs promise. Every other `PipelineError` shape passes through
+/// unchanged (they already carry their own attribution or none is owed).
+fn agg_hash_error_into(name: &str, e: crate::aggregation::HashAggError) -> PipelineError {
+    let mut err: PipelineError = e.into();
+    if let PipelineError::MemoryBudgetExceeded { node, .. } = &mut err
+        && node.is_empty()
+    {
+        *node = name.to_string();
+    }
+    err
+}
+
 /// Shared per-record `add_record` error handler for every materialized
 /// ingest arm — the strict per-document path, the relaxed-CK path, and
 /// the tumbling/hopping/session windowed arms. `FailFast` surfaces the
@@ -1941,7 +1966,9 @@ fn handle_aggregate_add_error(
         return Err(e.into());
     }
     match ctx.config.error_handling.strategy {
-        ErrorStrategy::FailFast => Err(e.into()),
+        // Stamp the aggregate node name so an `OversizedRow` → E310 abort
+        // names the stage that overran.
+        ErrorStrategy::FailFast => Err(agg_hash_error_into(name, e)),
         ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
             let stage = Some(clinker_core_types::dlq::stage_aggregate(name));
             let routed = record_error_to_buffer_if_grouped(

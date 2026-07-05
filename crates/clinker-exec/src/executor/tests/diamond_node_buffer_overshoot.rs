@@ -50,6 +50,21 @@ fn spill_tripped_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> 
     Arc::new(arb)
 }
 
+/// Build a pipeline-scoped arbitrator seeded above the *hard* limit
+/// (`should_abort` true) with a generous disk quota so the disk-cap (E320)
+/// path can never fire first — isolating the non-spillable hard-budget
+/// admission gate.
+fn abort_seeded_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
+    let arb = crate::pipeline::memory::MemoryArbitrator::with_policy(
+        HARD_LIMIT,
+        SPILL_FRAC,
+        Box::new(crate::pipeline::memory::Priority),
+    );
+    // 150 GiB: above the 100 GiB hard limit, so `should_abort` is true.
+    arb.set_peak_rss_for_test(150 * 1024 * 1024 * 1024);
+    Arc::new(arb)
+}
+
 const PIPELINE_YAML: &str = r#"
 pipeline:
   name: diamond_node_buffer_overshoot
@@ -156,5 +171,72 @@ fn diamond_branch_admission_overshoots_spill_quota_as_node_buffer() {
             );
         }
         other => panic!("expected SpillCapExceeded; got: {other:?}"),
+    }
+}
+
+#[test]
+fn diamond_fanout_admission_over_hard_limit_aborts_as_arena() {
+    let config = clinker_plan::config::parse_config(PIPELINE_YAML).expect("parse pipeline YAML");
+
+    let mut csv = String::from("id,region\n");
+    for i in 0..50 {
+        csv.push_str(&format!("id_{i},a\n"));
+    }
+    let readers: crate::executor::SourceReaders = HashMap::from([(
+        "events".to_string(),
+        crate::executor::single_file_reader(
+            "events.csv",
+            Box::new(std::io::Cursor::new(csv.into_bytes())),
+        ),
+    )]);
+
+    let out = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(out.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+
+    let params = PipelineRunParams {
+        execution_id: "diamond-node-buffer-nonspillable-abort".to_string(),
+        batch_id: "batch-0".to_string(),
+        ..Default::default()
+    };
+
+    let err = PipelineExecutor::run_with_readers_writers_with_arbitrator(
+        &config,
+        readers,
+        writers.into(),
+        &params,
+        clinker_plan::config::CompileContext::default(),
+        abort_seeded_arbitrator(),
+    )
+    .expect_err("a non-spillable fan-out admission over the hard limit must abort");
+
+    // `stage_split` fans out to two branches, so it is non-spillable
+    // (`clone_memory_only` cannot serve two consumers from a spill-backed
+    // variant). Over the hard limit it can neither spill nor pause nor
+    // block, so the admission gate aborts with the memory-budget E310 —
+    // tagged `Arena`, matching the sibling non-spillable-admission gates —
+    // rather than the disk-cap E320 (which the generous quota forecloses)
+    // or a silent over-budget admission.
+    match err {
+        PipelineError::MemoryBudgetExceeded {
+            node,
+            source,
+            limit,
+            ..
+        } => {
+            assert_eq!(
+                node, "stage_split",
+                "the first non-spillable admission is the fan-out producer",
+            );
+            assert_eq!(
+                source,
+                clinker_plan::BudgetCategory::Arena,
+                "a non-spillable node-buffer admission aborts under the Arena tag",
+            );
+            assert_eq!(limit, HARD_LIMIT, "the reported limit is the hard budget");
+        }
+        other => panic!("expected MemoryBudgetExceeded {{ Arena }}; got: {other:?}"),
     }
 }

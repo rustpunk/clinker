@@ -729,14 +729,16 @@ pub(crate) fn reject_unclosed_failed_documents(
 /// Drain a clean document's bucket records in ARRIVAL order — spill chunks
 /// (older) first, then the resident in-memory tail (newer).
 ///
-/// [`NodeBuffer::drain`] yields the in-memory events BEFORE the spill chunks,
-/// which is correct for an inter-stage slot (whose mem tail is the
-/// pre-spill head) but inverted for a document-DLQ bucket: a bucket that
-/// spilled and then accumulated a resident tail under relaxed pressure
-/// (`NodeBuffer::Mixed`) holds its NEWEST records in the mem tail. The
-/// success sink is order-sensitive, so this splits the bucket and re-orders
-/// to arrival sequence. Spill rows stream from disk lazily; a decode failure
-/// surfaces as a `PipelineError` item.
+/// [`NodeBuffer::drain`] yields the in-memory events BEFORE the spill chunks.
+/// For a `Mixed` bucket that is arrival-INVERTED: `NodeBuffer::Mixed` is only
+/// ever produced by `push_event` after a spill, so its mem tail holds the
+/// document's NEWEST records, which `drain` would emit ahead of the older
+/// spilled body. (There is no `Mixed` whose mem is a pre-spill head — an
+/// inter-stage slot never reaches `Mixed` at all.) The success sink is
+/// order-sensitive, so this splits the bucket and re-orders to arrival
+/// sequence: spill chunks (older) first, then the resident tail (newer).
+/// Spill rows stream from disk lazily; a decode failure surfaces as a
+/// `PipelineError` item.
 fn drain_records_in_arrival_order(
     buffer: NodeBuffer,
 ) -> impl Iterator<Item = Result<(Record, u64), PipelineError>> {

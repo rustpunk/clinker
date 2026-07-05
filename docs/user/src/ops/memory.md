@@ -87,9 +87,10 @@ A per-transform override is available on a Transform's `config.batch_size` (see 
 
 You don't manage memory by hand — the engine does it within the budget you set. What this means in practice:
 
-- **Pipelines always complete if disk space is available, regardless of input size.** When a blocking stage (sort, hash Aggregate, large Combine) outgrows the budget, it spills to disk instead of failing.
+- **Spillable stages always complete if disk space is available, regardless of input size.** When a blocking stage (sort, hash Aggregate, large Combine) outgrows the budget, it spills to disk instead of failing.
 - **Performance degrades gracefully.** Under pressure you'll see slower execution and possibly disk I/O — not a crash.
 - **The limit is a soft ceiling, not a hard wall.** Momentary spikes may briefly exceed it before the engine reacts. Only if memory blows past the limit outright does the run abort with `E310 MemoryBudgetExceeded`, which names the stage that overran.
+- **A few handoff buffers are memory-only and can trip `E310`.** A stage that fans out to more than one consumer, or that feeds a composition's input port, must hold its rows in memory for those consumers to read (they cannot share a spilled file), so it never spills. If such a buffer alone would breach the hard limit it aborts with `E310 MemoryBudgetExceeded` rather than exceeding the budget. This is the one case where a larger input cannot be rescued by more disk — raise `memory.limit`, or restructure so the shared stage feeds a single consumer.
 
 Some stages **stream** (they hold only a small in-flight slice of records) and some **materialize** (they hold a whole stage's worth before emitting). `clinker run --explain` annotates each node with `buffer: streaming` or `buffer: materialized` so you can see which stages will dominate the budget before you run. See [Streaming vs. Blocking Stages](streaming-vs-blocking.md) for which is which.
 
@@ -133,7 +134,7 @@ Only force `streaming` when you are certain the input is sorted by the group-by 
 
 An aggregate that keeps `min`, `max`, `avg`, or another value-buffering binding holds each contributing row's raw values until the group finalizes. If a **single input row's** buffered footprint is larger than the entire `memory.limit`, no amount of spilling can hold it — spill would only re-read the same oversized row. The engine surfaces this per-row overflow rather than absorbing it:
 
-- With `error_handling.strategy: fail` (the default), the run aborts with `E310 MemoryBudgetExceeded`, naming the aggregate stage and reporting the offending row's byte footprint against the budget.
+- With `error_handling.strategy: fail_fast` (the default), the run aborts with `E310 MemoryBudgetExceeded`, naming the aggregate stage and reporting the offending row's byte footprint against the budget.
 - With `strategy: continue` (or `best_effort`), the offending record is routed to the dead-letter queue under the `aggregate_finalize` category, and the run proceeds.
 
 This is almost always a sign the budget is set far too low for the record shape — raise `memory.limit` so a typical row fits comfortably.

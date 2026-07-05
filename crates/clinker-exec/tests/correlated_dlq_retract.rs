@@ -1272,3 +1272,65 @@ nodes:
         }
     }
 }
+
+/// Under the default `fail_fast` strategy the oversized-row admission guard
+/// aborts with `E310 MemoryBudgetExceeded` whose `node` names the aggregate
+/// stage that overran — not the empty node the `OversizedRow → E310` mapping
+/// leaves for the dispatch arm to fill. This pins the "names the aggregate
+/// stage" promise the memory docs make against the rendered diagnostic.
+#[test]
+fn oversized_buffer_row_failfast_names_the_aggregate_stage() {
+    // Same sub-baseline budget + non-pausing `spill` policy as the lenient
+    // test above so the run reaches the per-row admission guard; `fail_fast`
+    // (the default, so no `error_handling` block) turns the guard's
+    // `OversizedRow` into an E310 abort instead of a DLQ route.
+    let yaml = r#"
+pipeline:
+  name: oversized_failfast
+  memory: { limit: "1", backpressure: spill }
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    correlation_key: order_id
+    type: csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: department, type: string }
+      - { name: amount, type: int }
+- type: aggregate
+  name: dept_stats
+  input: src
+  config:
+    group_by: [department]
+    cxl: 'emit department = department
+
+      emit lo = min(amount)
+
+      '
+- type: output
+  name: out
+  input: dept_stats
+  config:
+    name: out
+    path: output.csv
+    type: csv
+    include_unmapped: true
+"#;
+    let csv = "order_id,department,amount\nO1,HR,10\nO2,HR,20\n";
+
+    match run_pipeline(yaml, csv) {
+        Err(PipelineError::MemoryBudgetExceeded { node, .. }) => {
+            assert_eq!(
+                node, "dept_stats",
+                "the E310 oversized-row abort must name the aggregate stage",
+            );
+        }
+        other => panic!(
+            "expected a MemoryBudgetExceeded naming the aggregate under fail_fast; \
+             got: {other:?}"
+        ),
+    }
+}

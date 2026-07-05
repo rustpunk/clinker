@@ -1616,7 +1616,9 @@ mod tests {
     mod diamond_node_buffer_overshoot;
     mod multi_output;
     mod nested_composition_overshoot;
+    mod resident_node_buffer_spill;
     mod scheduling;
     mod source_consumer_release;
+    mod spill_backed_drain_overshoot;
     mod spill_dir_unavailable_midrun;
 }
