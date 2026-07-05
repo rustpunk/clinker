@@ -46,6 +46,16 @@ width-only schema lays its fields out sequentially. Two columns whose
 byte ranges overlap have no consistent layout; the writer rejects such a
 schema when the output opens, naming both columns and their ranges.
 
+Widths are **byte counts**, matching how the reader slices. When a value
+is longer than its field, truncation cuts at a UTF-8 character boundary at
+or below the width, so a multi-byte character is never split: the emitted
+cell is always valid UTF-8 of exactly `width` bytes (it may hold fewer
+*characters* than the width when a trailing multi-byte character does not
+fit, with the freed bytes pad-filled). Because padding fills exact byte
+counts, `pad` must be a single-byte (ASCII) character; a multi-byte `pad`
+is rejected when the output opens. Under `truncation: error` an over-long
+value is still a hard error before any slicing.
+
 ## Options
 
 | Option | Default | Description |
