@@ -482,4 +482,24 @@ mod tests {
         };
         assert!(msg.contains("width"), "error should mention width: {msg}");
     }
+
+    /// A declared range whose end exceeds `usize::MAX` cannot exist; the reader
+    /// rejects it at construction so `field.end()` stays a non-wrapping add on
+    /// the per-record read path, matching the write path's guard.
+    #[test]
+    fn test_fixedwidth_read_range_end_overflow_rejected() {
+        let fields = vec![{
+            let mut f = field("bad");
+            f.start = Some(usize::MAX);
+            f.width = Some(2);
+            f
+        }];
+
+        let result = FixedWidthReader::new(&b""[..], fields, FixedWidthReaderConfig::default());
+        let msg = match result {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected error for overflowing range"),
+        };
+        assert!(msg.contains("overflows"), "error should say so: {msg}");
+    }
 }

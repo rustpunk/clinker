@@ -54,6 +54,13 @@ impl ResolvedField {
 
         let width = resolve_width(f, start)?;
 
+        // `end()` is computed once per record on the hot read path, so the range
+        // must be provably representable at construction to keep that a plain add
+        // rather than a wrap. Mirrors the write path's identical guard.
+        start
+            .checked_add(width)
+            .ok_or_else(|| invalid_field(&f.name, "'start' + width overflows"))?;
+
         Ok(ResolvedField {
             name: f.name.clone(),
             start,
