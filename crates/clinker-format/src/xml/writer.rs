@@ -405,6 +405,56 @@ fn is_attribute_path(path: &str, attribute_prefix: &str) -> bool {
             .is_some_and(|segment| segment.starts_with(attribute_prefix))
 }
 
+/// True when `c` may begin an XML 1.0 `Name` (the `NameStartChar`
+/// production). Covers the full Unicode ranges so an attribute name that
+/// round-tripped from a source document with non-ASCII names is not
+/// rejected on write-back.
+fn is_xml_name_start_char(c: char) -> bool {
+    matches!(c,
+        ':' | 'A'..='Z' | '_' | 'a'..='z'
+        | '\u{C0}'..='\u{D6}'
+        | '\u{D8}'..='\u{F6}'
+        | '\u{F8}'..='\u{2FF}'
+        | '\u{370}'..='\u{37D}'
+        | '\u{37F}'..='\u{1FFF}'
+        | '\u{200C}'..='\u{200D}'
+        | '\u{2070}'..='\u{218F}'
+        | '\u{2C00}'..='\u{2FEF}'
+        | '\u{3001}'..='\u{D7FF}'
+        | '\u{F900}'..='\u{FDCF}'
+        | '\u{FDF0}'..='\u{FFFD}'
+        | '\u{10000}'..='\u{EFFFF}'
+    )
+}
+
+/// True when `c` may appear after the first character of an XML 1.0 `Name`
+/// (the `NameChar` production).
+fn is_xml_name_char(c: char) -> bool {
+    is_xml_name_start_char(c)
+        || matches!(c,
+            '-' | '.' | '0'..='9'
+            | '\u{B7}'
+            | '\u{0300}'..='\u{036F}'
+            | '\u{203F}'..='\u{2040}'
+        )
+}
+
+/// True when `name` is a well-formed XML 1.0 `Name`: a `NameStartChar`
+/// followed by zero or more `NameChar`. Empty names are rejected.
+///
+/// quick-xml wraps attribute names as raw bytes (`QName`) without any
+/// well-formedness check, so an illegal name (e.g. one containing a space
+/// or `=`) would otherwise be written verbatim into the start tag and
+/// corrupt the document.
+fn is_valid_xml_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if is_xml_name_start_char(first) => {}
+        _ => return false,
+    }
+    chars.all(is_xml_name_char)
+}
+
 /// Insert a dotted field name into the tree, creating branches as needed.
 /// An attribute-prefixed segment must be the path's final segment (an
 /// attribute is a leaf — nothing can nest under it); `field` is the full
@@ -448,6 +498,12 @@ fn insert_field(
             return Err(FormatError::Xml(format!(
                 "field '{field}': attribute prefix '{attribute_prefix}' \
                  carries no attribute name"
+            )));
+        }
+        if !is_valid_xml_name(attr_name) {
+            return Err(FormatError::Xml(format!(
+                "field '{field}': attribute name '{attr_name}' is not a \
+                 well-formed XML name"
             )));
         }
         body.attrs.push((attr_name.to_string(), text.to_string()));
@@ -908,6 +964,72 @@ mod tests {
             buf.is_empty(),
             "rejected record must not leave partial output behind"
         );
+    }
+
+    /// Assert that writing a single record whose only field is `field`
+    /// fails with `FormatError::Xml` mentioning both the field and the
+    /// stripped attribute name, and leaves no partial bytes behind.
+    fn assert_attribute_name_rejected(field: &str, attr_name: &str) {
+        let schema = Arc::new(Schema::new(vec![field.into()]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
+        let mut buf = Vec::new();
+        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::Xml(msg) => {
+                assert!(
+                    msg.contains(field) && msg.contains(attr_name),
+                    "message names the field and offending attribute name: {msg}"
+                );
+                assert!(
+                    msg.contains("well-formed XML name"),
+                    "message explains the failure is a malformed name: {msg}"
+                );
+            }
+            other => panic!("expected FormatError::Xml, got {other:?}"),
+        }
+        drop(writer);
+        assert!(
+            buf.is_empty(),
+            "rejected record must not leave partial output behind"
+        );
+    }
+
+    #[test]
+    fn test_xml_write_attribute_name_with_whitespace_rejected() {
+        // A space is not an XML NameChar; writing it unvalidated would emit
+        // `<Record foo bar="1">`, splitting one attribute into two tokens.
+        assert_attribute_name_rejected("@foo bar", "foo bar");
+    }
+
+    #[test]
+    fn test_xml_write_attribute_name_with_metacharacters_rejected() {
+        for (field, name) in [
+            ("@a=b", "a=b"),
+            ("@a\"b", "a\"b"),
+            ("@a/b", "a/b"),
+            ("@a>b", "a>b"),
+        ] {
+            assert_attribute_name_rejected(field, name);
+        }
+    }
+
+    #[test]
+    fn test_xml_write_attribute_name_starting_with_digit_rejected() {
+        // A digit is a NameChar but not a NameStartChar, so `1st` cannot
+        // begin an XML name.
+        assert_attribute_name_rejected("@1st", "1st");
+    }
+
+    #[test]
+    fn test_xml_write_attribute_name_with_unicode_start_char_accepted() {
+        // `é` (U+00E9) is a valid NameStartChar, so a non-ASCII attribute
+        // name that round-tripped from a source document writes back
+        // unchanged rather than being rejected.
+        let schema = Arc::new(Schema::new(vec!["@café".into()]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert_eq!(output, r#"<Root><Record café="1"></Record></Root>"#);
     }
 
     #[test]
