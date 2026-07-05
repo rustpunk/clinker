@@ -166,6 +166,176 @@ fn unknown_inner_source_fails_at_bind_with_e230() {
     );
 }
 
+/// Build a workspace whose pipeline has a top-level composition `enrich` (body
+/// source `ref`, patch target) alongside a top-level composition `wrap` whose
+/// body contains a *nested* composition node that also happens to be named
+/// `enrich` but resolves to a different body with no source `ref`. Exercises the
+/// name-collision path: a patch keyed `enrich.ref` must reach only the top-level
+/// `enrich` body, never the same-named nested node inside `wrap`'s body.
+fn workspace_with_shadowed_nested_enrich() -> (tempfile::TempDir, PipelineConfig) {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let comp_dir = workspace.path().join("compositions");
+    std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
+
+    // Top-level `enrich` target: body source `ref` (schema `raw`) feeds a
+    // transform that reads `code`, so the body binds only once a patch renames
+    // `raw` -> `code`.
+    std::fs::write(
+        comp_dir.join("with_ref.comp.yaml"),
+        r#"_compose:
+  name: with_ref
+  inputs:
+    driver:
+      schema:
+        - { name: x, type: int }
+  outputs:
+    out: shape
+  config_schema: {}
+
+nodes:
+  - type: source
+    name: ref
+    config:
+      name: ref
+      type: csv
+      path: ref.csv
+      schema:
+        - { name: raw, type: string }
+  - type: transform
+    name: shape
+    input: ref
+    config:
+      cxl: |
+        emit label = code
+"#,
+    )
+    .expect("write with_ref");
+
+    // `wrap`'s body holds a nested composition node named `enrich` that resolves
+    // to `passthru.comp.yaml` — a body with NO source `ref`. If the deferred
+    // `enrich.ref` patch leaked into this nested node it would fail to find `ref`
+    // and abort the compile with E230.
+    std::fs::write(
+        comp_dir.join("wrap.comp.yaml"),
+        r#"_compose:
+  name: wrap
+  inputs:
+    driver:
+      schema:
+        - { name: x, type: int }
+  outputs:
+    out: wrap_tag
+  config_schema: {}
+
+nodes:
+  - type: composition
+    name: enrich
+    input: driver
+    use: ./passthru.comp.yaml
+    inputs:
+      driver: driver
+  - type: transform
+    name: wrap_tag
+    input: enrich
+    config:
+      cxl: |
+        emit y2 = y
+"#,
+    )
+    .expect("write wrap");
+
+    std::fs::write(
+        comp_dir.join("passthru.comp.yaml"),
+        r#"_compose:
+  name: passthru
+  inputs:
+    driver:
+      schema:
+        - { name: x, type: int }
+  outputs:
+    out: proj
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: proj
+    input: driver
+    config:
+      cxl: |
+        emit y = x
+"#,
+    )
+    .expect("write passthru");
+
+    let pipelines_dir = workspace.path().join("pipelines");
+    std::fs::create_dir_all(&pipelines_dir).expect("mkdir pipelines");
+
+    let yaml = r#"
+pipeline:
+  name: shadowed_nested_enrich_demo
+nodes:
+  - type: source
+    name: drv
+    config:
+      name: drv
+      type: csv
+      path: drv.csv
+      schema:
+        - { name: x, type: int }
+  - type: composition
+    name: enrich
+    input: drv
+    use: ../compositions/with_ref.comp.yaml
+    inputs:
+      driver: drv
+  - type: composition
+    name: wrap
+    input: drv
+    use: ../compositions/wrap.comp.yaml
+    inputs:
+      driver: drv
+  - type: output
+    name: out_enrich
+    input: enrich
+    config:
+      name: out_enrich
+      type: csv
+      path: out_enrich.csv
+  - type: output
+    name: out_wrap
+    input: wrap
+    config:
+      name: out_wrap
+      type: csv
+      path: out_wrap.csv
+"#;
+    let config: PipelineConfig = crate::config::parse_config(yaml).expect("parse pipeline");
+    (workspace, config)
+}
+
+/// A patch keyed `enrich.ref` must reach only the top-level composition `enrich`,
+/// not a same-named composition node nested inside another body. Without the
+/// top-level gate, `bind_composition` matches the patch on the nested `enrich`
+/// (bound at depth >= 1) and applies it to a body that declares no source `ref`,
+/// aborting the compile with a spurious E230. With the gate, only the top-level
+/// `enrich` body is patched and the whole pipeline compiles.
+#[test]
+fn body_source_patch_does_not_leak_into_shadowed_nested_composition() {
+    let (ws, mut config) = workspace_with_shadowed_nested_enrich();
+    apply_source_patches(
+        &mut config,
+        &qualified("enrich.ref", "schema:\n  raw: { rename: code }\n"),
+    )
+    .expect("apply defers the qualified patch");
+    let ctx = CompileContext::with_pipeline_dir(ws.path(), PathBuf::from("pipelines"));
+    config.compile(&ctx).unwrap_or_else(|d| {
+        panic!(
+            "the `enrich.ref` patch must target only the top-level `enrich` body \
+             and leave the same-named nested composition untouched: {d:?}"
+        )
+    });
+}
+
 /// A schema op that is ill-formed against the body source (removing a column
 /// that does not exist) fails compile with the same stable op code (E231) a
 /// top-level source patch would produce, re-anchored to the composition.
