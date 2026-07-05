@@ -1286,6 +1286,84 @@ impl MemoryArbitrator {
     }
 }
 
+/// Shared oracle for the disk-spill-cap (E320) overflow surface, so every
+/// spill site that charges files against the arbitrator's disk quota proves
+/// the identical invariants against one assertion.
+///
+/// Given the `Result` a spill call returned, the arbitrator it charged, and
+/// the configured spill root it wrote into, this checks that:
+/// - the error carries the [`PipelineError::SpillCapExceeded`] shape naming
+///   the spilling operator, with a positive `attempted` flush size and a
+///   `current` total past the `cap` (kept distinct from an out-of-memory
+///   E310);
+/// - the error's `current` mirrors the arbitrator's own
+///   `cumulative_spill_bytes`, which exceeds the cap and is attributed to the
+///   operator's node in the per-stage breakdown that `--explain` reads back;
+/// - the abort reclaims the overflowing flush's temp file, leaving no spill
+///   file orphaned under the configured spill root.
+#[cfg(test)]
+pub(crate) fn assert_spill_cap_overflow(
+    result: Result<(), clinker_plan::error::PipelineError>,
+    arbitrator: &MemoryArbitrator,
+    expected_node: &str,
+    expected_cap: u64,
+    spill_root: &std::path::Path,
+) {
+    use clinker_plan::error::PipelineError;
+
+    let err = result.expect_err("a flush past the disk cap must abort the run");
+    let PipelineError::SpillCapExceeded {
+        node,
+        cap,
+        attempted,
+        current,
+    } = &err
+    else {
+        panic!("disk-cap overflow must surface SpillCapExceeded; got {err:?}");
+    };
+    assert_eq!(
+        node, expected_node,
+        "the aborting error names the spilling operator"
+    );
+    assert_eq!(
+        *cap, expected_cap,
+        "the reported cap equals the configured quota"
+    );
+    assert!(
+        *attempted > 0,
+        "the overflowing flush reports its on-disk byte size"
+    );
+    assert!(
+        *current > *cap,
+        "cumulative spilled ({current}) must exceed the cap ({cap})"
+    );
+
+    assert_eq!(
+        *current,
+        arbitrator.cumulative_spill_bytes(),
+        "the error's current mirrors the arbitrator's cumulative total"
+    );
+    assert!(
+        arbitrator.cumulative_spill_bytes() > expected_cap,
+        "the arbitrator's cumulative total reflects the overflowing flush"
+    );
+    assert!(
+        arbitrator
+            .per_stage_spill_bytes()
+            .get(expected_node)
+            .is_some_and(|&bytes| bytes > 0),
+        "the overflowing flush is charged to the spilling operator's stage"
+    );
+
+    let leaked = std::fs::read_dir(spill_root)
+        .expect("the configured spill root is readable")
+        .count();
+    assert_eq!(
+        leaked, 0,
+        "the disk-cap abort leaves no spill file orphaned under the spill root"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
