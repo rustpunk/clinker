@@ -378,6 +378,10 @@ fn compute_drop_decisions(
             spill_compress: false,
             transform_name: format!("cull:{name}"),
             consumer_handle: handle,
+            // The predicate aggregate runs in-memory (`budget: 0`,
+            // `spill_dir: None`) so it never spills, but `AggregatorConfig`
+            // requires an arbitrator; the run's shared one is the natural fit.
+            arbitrator: Arc::clone(&ctx.memory_budget),
         },
     )?;
 

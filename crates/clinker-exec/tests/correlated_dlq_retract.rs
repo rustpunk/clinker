@@ -1190,26 +1190,22 @@ O5,ENG,200
     assert!(output.contains("ENG,300"), "ENG total=300, got: {output}");
 }
 
-/// Degrade-fallback when a single record's buffer-mode contribution
-/// exceeds the entire memory budget. The aggregate runs in buffer-mode
-/// (a `BufferRequired` binding like `min`) with a memory.limit so
-/// small that any single row's per-binding charge breaches it. Today's
-/// runtime guard panics with a documented message describing the
-/// scenario; the orchestrator's degrade-fallback path is supposed to
-/// translate this into a runtime DLQ outcome treating the affected
-/// group as strict-collateral, but that translation is wired only at
-/// the per-group recompute step (see `recompute_aggregates`'s
-/// `degraded` collection), not at admission time.
+/// A single record's buffer-mode contribution that exceeds the entire
+/// memory budget must surface as a typed error or DLQ outcome, never a
+/// panic. The aggregate runs in buffer-mode (a `BufferRequired` binding
+/// like `min`) with a memory.limit so small that any single row's
+/// per-binding charge breaches it. The admission guard returns a typed
+/// `OversizedRow`, which the dispatch arm routes by error strategy: under
+/// `continue` the offending records go to the DLQ; a 100%-DLQ run can
+/// additionally trip the DLQ-rate ceiling (E315), which is itself a typed
+/// `PipelineError`.
 ///
-/// This test runs the pipeline using `std::panic::catch_unwind` so a
-/// runtime crash surfaces as a test FAILURE that points at the
-/// degrade-fallback gap rather than aborting the harness. If the
-/// pipeline completes (memory pressure manifested differently before
-/// reaching the per-row guard, e.g. via spill), the test asserts the
-/// expected DLQ shape; if the panic fires, the test surfaces the
-/// finding so the bug can be addressed in a dedicated commit.
+/// The test calls `run_pipeline` directly — no `catch_unwind` — so a panic
+/// would fail the test outright. It accepts either a clean run whose output
+/// or DLQ reflects the pressure, or a typed error; both are the
+/// architecturally-correct shapes, and neither is a crash.
 #[test]
-fn degrade_fallback_runtime_protection_or_documented_panic() {
+fn oversized_buffer_row_surfaces_typed_error_or_dlq_never_panics() {
     // `backpressure: spill` keeps the bare `Priority` policy: the 1-byte
     // budget is below the process baseline RSS, which the default `pause`
     // policy rejects at startup (E312), but this test needs the run to
@@ -1254,61 +1250,25 @@ nodes:
 "#;
     let csv = "order_id,department,amount\nO1,HR,10\nO2,HR,20\nO3,ENG,100\n";
 
-    let yaml_owned = yaml.to_string();
-    let csv_owned = csv.to_string();
-    // Run on a worker thread so a runtime guard panic surfaces as the
-    // join's Err arm rather than aborting the test harness; the join
-    // payload IS the panic payload.
-    let outcome: Result<Result<RunOutput, PipelineError>, Box<dyn std::any::Any + Send>> =
-        std::thread::spawn(move || run_pipeline(&yaml_owned, &csv_owned)).join();
-    match outcome {
-        Ok(Ok((counters, _dlq, output))) => {
-            // Pipeline completed cleanly. Memory pressure was absorbed
-            // by spill or a larger-than-expected per-row charge fit
-            // under the budget. The aggregator's output is still
-            // structurally valid — the degrade-fallback path was not
-            // exercised but no data was lost or corrupted.
+    // Direct call: a panic in the admission path would unwind through this
+    // frame and fail the test, which is exactly the regression this guards.
+    match run_pipeline(yaml, csv) {
+        Ok((counters, _dlq, output)) => {
+            // Clean run. Under `continue` the oversized rows route to the
+            // DLQ; a run that instead absorbed the pressure (spill) still
+            // produces structurally valid output. Either way no data is
+            // lost silently.
             assert!(
-                counters.dlq_count == 0 || !output.is_empty(),
+                counters.dlq_count >= 1 || !output.is_empty(),
                 "tiny-budget pipeline produced empty output AND zero DLQ entries; \
-                 expected either successful processing or surfaced failures"
+                 expected either DLQ-routed oversized rows or successful processing"
             );
         }
-        Ok(Err(_e)) => {
-            // Pipeline returned a typed error. The runtime gracefully
-            // surfaced the memory-budget exhaustion through the
-            // PipelineError type rather than crashing — the executor's
-            // structural fallback worked. This is the architecturally-
-            // correct shape: a typed error reaches the caller and the
-            // DLQ machinery decides at a higher level whether to route
-            // affected records through the DLQ. The panic guard at
-            // `add_record_buffered` would NOT be the right shape; a
-            // typed error IS the right shape, and we observe it here.
-        }
-        Err(panic_payload) => {
-            // The runtime guard at `add_record_buffered` (or any other
-            // sibling guard) fired. This is a real bug: a tiny-memory-
-            // budget pipeline should surface a typed runtime error or
-            // route the affected group's records to the DLQ as
-            // strict-collateral, not abort the executor. The
-            // architectural-rigor policy requires this be surfaced —
-            // it is NOT papered over with a `#[should_panic]` shim.
-            let msg = if let Some(s) = panic_payload.downcast_ref::<&'static str>() {
-                (*s).to_string()
-            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "<non-string panic payload>".to_string()
-            };
-            panic!(
-                "BUG SURFACED: degrade-fallback runtime path crashed instead of \
-                 routing through the typed-error/DLQ surface. The aggregator's \
-                 buffer-mode admission guard (or another runtime guard) panicked: \
-                 {msg}\n\
-                 Convert the panic to a runtime error that flows into the typed \
-                 PipelineError surface or into the DLQ via the orchestrator's \
-                 `relaxed_aggregator_degrade` list."
-            );
+        Err(_e) => {
+            // Typed error is the architecturally-correct hard-abort shape:
+            // the admission guard's `OversizedRow` maps to E310 under
+            // FailFast, and a 100%-DLQ run can trip E315 even under
+            // `continue`. Both are typed `PipelineError`s, not a crash.
         }
     }
 }

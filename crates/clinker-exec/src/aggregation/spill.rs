@@ -220,10 +220,17 @@ impl AggSpillWriter {
         Ok(())
     }
 
-    pub(super) fn finish(self) -> Result<AggSpillFile, HashAggError> {
+    /// Finalize the spill file and return the committed handle alongside its
+    /// on-disk byte length. The length is read from the persisted temp path
+    /// after the sink flushes (including any LZ4 frame tail), so a compressed
+    /// spill charges its actual post-compression size — the shape the disk-cap
+    /// accounting in [`super::HashAggregator::spill`] charges against the
+    /// arbitrator, mirroring the reshape/cull spill paths.
+    pub(super) fn finish(self) -> Result<(AggSpillFile, u64), HashAggError> {
         let temp_file = self.sink.into_temp_file()?;
         let path = temp_file.into_temp_path();
-        Ok(AggSpillFile { path })
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        Ok((AggSpillFile { path }, bytes))
     }
 }
 
@@ -328,7 +335,7 @@ mod tests {
         for (compress, expected_tag) in [(true, FORMAT_TAG_LZ4), (false, FORMAT_TAG_UNCOMPRESSED)] {
             let mut writer = AggSpillWriter::new(None, compress).unwrap();
             writer.write_entry(&sample_entry(vec![1, 2, 3])).unwrap();
-            let file = writer.finish().unwrap();
+            let (file, _len) = writer.finish().unwrap();
             let bytes = std::fs::read(&file.path).unwrap();
             assert_eq!(
                 bytes[0], expected_tag,
@@ -362,7 +369,7 @@ mod tests {
             for i in 0u8..5 {
                 writer.write_entry(&sample_entry(vec![i])).unwrap();
             }
-            let file = writer.finish().unwrap();
+            let (file, _len) = writer.finish().unwrap();
             let mut reader = file.reader().unwrap();
             let mut read_keys = Vec::new();
             while let Some(entry) = reader.next_entry().unwrap() {
@@ -372,6 +379,30 @@ mod tests {
                 read_keys,
                 (0u8..5).map(|i| vec![i]).collect::<Vec<_>>(),
                 "compress={compress}: entries must round-trip in input order"
+            );
+        }
+    }
+
+    // `finish` reports the spill file's actual on-disk byte length so the
+    // disk-spill cap charges the exact bytes committed. The reported length
+    // must equal the file's size on disk and be non-zero for a file carrying
+    // real entries, in both the uncompressed and LZ4-framed formats.
+    #[test]
+    fn finish_reports_on_disk_byte_length() {
+        for compress in [true, false] {
+            let mut writer = AggSpillWriter::new(None, compress).unwrap();
+            for i in 0u8..8 {
+                writer.write_entry(&sample_entry(vec![i])).unwrap();
+            }
+            let (file, reported) = writer.finish().unwrap();
+            let actual = std::fs::metadata(&file.path).unwrap().len();
+            assert_eq!(
+                reported, actual,
+                "compress={compress}: finish must report the on-disk byte length"
+            );
+            assert!(
+                reported > 0,
+                "compress={compress}: a spill with entries must have a non-zero length"
             );
         }
     }
