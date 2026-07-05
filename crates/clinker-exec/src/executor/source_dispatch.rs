@@ -181,6 +181,7 @@ pub(crate) fn dispatch_source(
             }
         }
         ctx.finalize_source_count(&source_name_arc, count);
+        ctx.release_source_consumer(name.as_str());
         if timeout.is_some() && ctx.watermarks.is_idle(name.as_str()) {
             tracing::debug!(
                 target: "clinker::watermark",
