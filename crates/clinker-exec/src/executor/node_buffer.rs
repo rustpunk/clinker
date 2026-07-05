@@ -287,19 +287,24 @@ impl NodeBuffer {
     /// invisible to the budget. A slot that spilled precisely because it
     /// outgrew the budget would then re-materialize a Vec larger than the
     /// whole budget with no gate. Every ~1024 records this estimates the
-    /// resident footprint and, when it exceeds the hard limit outright,
-    /// surfaces a typed `MemoryBudgetExceeded` (E310, tagged
-    /// `BudgetCategory::NodeBuffer`) naming the draining stage.
+    /// resident footprint, adds every other registered consumer's charged
+    /// bytes, and when that joint total exceeds the hard limit surfaces a
+    /// typed `MemoryBudgetExceeded` (E310, tagged `BudgetCategory::NodeBuffer`)
+    /// naming the draining stage.
     ///
-    /// The gate is the re-materialized footprint against the *hard limit
-    /// itself*, deliberately not [`MemoryArbitrator::should_abort`]: that
-    /// poll trips on whole-process RSS, which for any budget below the
-    /// process baseline (the very condition that made the upstream slot spill)
-    /// is always over — it would abort every legitimate spill round-trip
-    /// whose finite re-materialized set still fits the budget. Aborting only
-    /// when a single re-materialized buffer is itself bigger than the whole
-    /// budget keeps the "spillable stages complete" guarantee for the common
-    /// case while still catching the genuinely unaffordable one.
+    /// The gate sums this vector's footprint with
+    /// [`MemoryArbitrator::sum_consumer_usage`] rather than testing the vector
+    /// alone: a live consumer already charged near the limit and this growing
+    /// vector can jointly breach the budget while each stays under it
+    /// individually. That charged-byte sum is RSS-independent, deliberately
+    /// not [`MemoryArbitrator::should_abort`]: `should_abort` also polls
+    /// whole-process RSS, which for any budget below the process baseline (the
+    /// very condition that made the upstream slot spill) is always over — it
+    /// would abort every legitimate spill round-trip whose finite working set
+    /// still fits the budget. Gating on the charged-byte sum keeps the
+    /// "spillable stages complete" guarantee for the common case, catches the
+    /// genuinely unaffordable one, and holds identically on targets where
+    /// `rss_bytes()` returns `None`.
     ///
     /// Wired into the single-consumer Transform and Aggregate drain sites,
     /// whose owned buffer has no separate budget gate of its own. Sort,
@@ -332,12 +337,22 @@ impl NodeBuffer {
                             .map(|(r, _)| r.schema().column_count())
                             .unwrap_or(0);
                         let bytes = record_byte_cost(cols).saturating_mul(records.len() as u64);
+                        // Gate on the re-materialized footprint PLUS every other
+                        // registered consumer's charged bytes, not this vector
+                        // alone: during a drain a consumer already charged near
+                        // the limit and this growing vector can jointly breach
+                        // the budget while each stays under it individually.
+                        // Summing registered consumers is RSS-independent, so it
+                        // holds where `rss_bytes()` returns `None` and does not
+                        // false-positive on the sub-baseline budgets that made
+                        // the upstream slot spill in the first place.
                         // `hard == 0` means "unlimited" (no configured budget),
                         // so never abort in that case.
-                        if hard > 0 && bytes > hard {
+                        let combined = bytes.saturating_add(budget.sum_consumer_usage());
+                        if hard > 0 && combined > hard {
                             return Err(PipelineError::MemoryBudgetExceeded {
                                 node: node.to_string(),
-                                used: bytes,
+                                used: combined,
                                 limit: hard,
                                 source: clinker_plan::BudgetCategory::NodeBuffer,
                                 detail: Some(format!(
@@ -985,6 +1000,116 @@ mod tests {
             metered_puncts.len(),
             plain_puncts.len(),
             "metered drain preserves the trailing punctuations"
+        );
+    }
+
+    /// A registered consumer that reports a fixed charged footprint, so a
+    /// test can stage `sum_consumer_usage()` at a chosen value without
+    /// standing up a real spilling operator. `try_spill` is unreachable here:
+    /// `drain_split_metered` only reads `hard_limit()` and
+    /// `sum_consumer_usage()`, never selects a victim.
+    struct FixedUsageConsumer(u64);
+
+    impl crate::pipeline::memory::MemoryConsumer for FixedUsageConsumer {
+        fn current_usage(&self) -> u64 {
+            self.0
+        }
+        fn spill_priority(&self) -> i32 {
+            0
+        }
+        fn try_spill(
+            &self,
+            _target_bytes: u64,
+        ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+            Ok(0)
+        }
+        fn can_back_pressure(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn drain_split_metered_aborts_on_joint_consumer_plus_rematerialization_overshoot() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        let s = schema();
+        // >1024 records so exactly one per-batch poll fires, at 1024 accumulated
+        // records; the re-materialized footprint at that poll is deterministic.
+        let rows: Vec<(Record, u64)> = (0..1100).map(|i| (rec(&s, i, "v"), i as u64)).collect();
+        let nb = NodeBuffer::Spilled {
+            chunks: vec![spill_chunk(rows)],
+            pending_puncts: Vec::new(),
+        };
+
+        // Footprint the metered drain estimates at its first (and only) poll.
+        let poll_footprint = record_byte_cost(s.column_count()) * 1024;
+        // A consumer already charged exactly one footprint, and a hard limit
+        // halfway between one footprint and two. The re-materialized vector
+        // alone stays under the limit and the consumer alone stays under it,
+        // but their sum (two footprints) breaches it — the joint-overshoot the
+        // sum-aware gate exists to catch, invisible to a bytes-only test.
+        let hard = poll_footprint + poll_footprint / 2;
+        let arb = MemoryArbitrator::with_policy(hard, 0.80, Box::new(NoOpPolicy));
+        arb.register_consumer(Arc::new(FixedUsageConsumer(poll_footprint)));
+
+        match nb.drain_split_metered(&arb, "joint_stage") {
+            Err(PipelineError::MemoryBudgetExceeded {
+                node,
+                source,
+                used,
+                limit,
+                ..
+            }) => {
+                assert_eq!(node, "joint_stage", "the error names the draining stage");
+                assert_eq!(
+                    source,
+                    clinker_plan::BudgetCategory::NodeBuffer,
+                    "a re-materialized node-buffer drain is tagged NodeBuffer"
+                );
+                assert_eq!(limit, hard, "the reported limit is the hard budget");
+                assert_eq!(
+                    used,
+                    poll_footprint * 2,
+                    "used is the re-materialized footprint PLUS the charged consumer, \
+                     not either side alone"
+                );
+                assert!(
+                    poll_footprint < hard,
+                    "precondition: the re-materialized footprint alone is under the limit"
+                );
+            }
+            other => panic!(
+                "a joint consumer + re-materialization overshoot must abort E310 NodeBuffer; \
+                 got: {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn drain_split_metered_completes_when_joint_footprint_fits() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        let s = schema();
+        let rows: Vec<(Record, u64)> = (0..1100).map(|i| (rec(&s, i, "v"), i as u64)).collect();
+        let nb = NodeBuffer::Spilled {
+            chunks: vec![spill_chunk(rows)],
+            pending_puncts: Vec::new(),
+        };
+
+        let poll_footprint = record_byte_cost(s.column_count()) * 1024;
+        // The same charged consumer, but a budget generous enough that the
+        // joint footprint (two footprints) still fits: each side individually
+        // under AND their sum under → the drain completes and yields every
+        // record. Guards against the gate over-firing on a legitimate drain.
+        let hard = poll_footprint * 3;
+        let arb = MemoryArbitrator::with_policy(hard, 0.80, Box::new(NoOpPolicy));
+        arb.register_consumer(Arc::new(FixedUsageConsumer(poll_footprint)));
+
+        let (recs, _puncts) = nb
+            .drain_split_metered(&arb, "joint_stage")
+            .expect("a joint footprint under the budget must complete");
+        assert_eq!(
+            recs.len(),
+            1100,
+            "every re-materialized record drains through when the joint footprint fits"
         );
     }
 
