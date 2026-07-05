@@ -99,6 +99,16 @@ mod dispatch {
             spill_compress: true,
             transform_name: transform_name.to_string(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            // Unlimited disk-spill cap (`max_spill_bytes` defaults to
+            // `u64::MAX`), so these builders spill without tripping E320; the
+            // disk-cap path is exercised end-to-end through the full pipeline.
+            arbitrator: std::sync::Arc::new(
+                crate::pipeline::memory::MemoryArbitrator::with_policy(
+                    0,
+                    0.8,
+                    crate::pipeline::memory::MemoryArbitrator::default_policy(),
+                ),
+            ),
         })
     }
 
@@ -1687,6 +1697,16 @@ mod two_phase_bytes_spill {
             spill_compress: true,
             transform_name: transform_name.to_string(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            // Unlimited disk-spill cap (`max_spill_bytes` defaults to
+            // `u64::MAX`), so these builders spill without tripping E320; the
+            // disk-cap path is exercised end-to-end through the full pipeline.
+            arbitrator: std::sync::Arc::new(
+                crate::pipeline::memory::MemoryArbitrator::with_policy(
+                    0,
+                    0.8,
+                    crate::pipeline::memory::MemoryArbitrator::default_policy(),
+                ),
+            ),
         })
     }
 

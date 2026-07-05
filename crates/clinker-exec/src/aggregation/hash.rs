@@ -178,6 +178,12 @@ pub struct HashAggregator {
     /// `handle.spill_requested`, which the hot loop is expected to
     /// read at batch boundaries once that integration lands.
     consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+    /// Shared arbitrator for disk-spill-cap accounting. Each `spill()`
+    /// charges the committed spill file's on-disk byte size against it via
+    /// `record_spill_bytes`; crossing `storage.spill.disk_cap_bytes` surfaces
+    /// [`HashAggError::SpillCapExceeded`] (E320), the same accounting the
+    /// reshape and cull spill paths perform.
+    arbitrator: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
 }
 
 /// Construction parameters shared by [`HashAggregator::new`] and
@@ -221,6 +227,12 @@ pub struct AggregatorConfig {
     /// Shared handle mirroring `value_heap_bytes` into the
     /// pipeline-scoped arbitrator's pull-mode accounting.
     pub consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
+    /// Shared arbitrator the spill path charges each spill file's on-disk
+    /// byte size against, so aggregate spill volume counts toward the
+    /// pipeline-wide disk-spill cap (E320) and the per-stage `--explain`
+    /// calibration — the same accounting the reshape and cull spill paths
+    /// perform.
+    pub arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
 }
 
 impl HashAggregator {
@@ -240,6 +252,7 @@ impl HashAggregator {
             spill_compress,
             transform_name,
             consumer_handle,
+            arbitrator,
         } = config;
         let group_by_indices = compiled.group_by_indices.clone();
         let group_by_fields = compiled.group_by_fields.clone();
@@ -300,6 +313,7 @@ impl HashAggregator {
             buffered_groups: hashbrown::HashMap::new(),
             buffer_mode,
             consumer_handle,
+            arbitrator,
         }
     }
 
@@ -402,6 +416,14 @@ impl HashAggregator {
     /// spill writer.
     pub fn spill_files(&self) -> &[AggSpillFile] {
         &self.spill_files
+    }
+
+    /// Borrow the disk-spill-cap arbitrator so a test can seed a finite
+    /// `max_spill_bytes` and drive the aggregate's own spill-cap path in
+    /// isolation, without an upstream node-buffer racing it to a shared cap.
+    #[cfg(test)]
+    fn arbitrator_for_test(&self) -> &std::sync::Arc<crate::pipeline::memory::MemoryArbitrator> {
+        &self.arbitrator
     }
 
     /// True when the aggregator's output schema carries a synthetic
@@ -1007,7 +1029,10 @@ impl HashAggregator {
     ///    Postcard is a compact binary format with no self-describing
     ///    framing of its own; the explicit length prefix delimits records
     ///    inside the (optionally framed) record stream.
-    /// 4. Push the resulting `AggSpillFile` onto `self.spill_files`.
+    /// 4. Charge the committed spill file's on-disk byte size against the
+    ///    arbitrator's disk-spill accounting; a cap breach returns
+    ///    [`HashAggError::SpillCapExceeded`] (E320). Otherwise push the
+    ///    `AggSpillFile` onto `self.spill_files`.
     /// 5. Reset `value_heap_bytes = 0`.
     fn spill(&mut self) -> Result<(), HashAggError> {
         // 1. Drain. Buffer-mode aggregators write `SpillState::Buffered`
@@ -1067,7 +1092,24 @@ impl HashAggregator {
             writer.write_entry(&entry)?;
         }
 
-        let spill_file = writer.finish()?;
+        let (spill_file, spilled_bytes) = writer.finish()?;
+        // Charge the spill file's on-disk size against the arbitrator's
+        // per-stage and pipeline-wide totals so `--explain` calibration and
+        // the disk-spill cap both see aggregate spill volume. A cap breach is
+        // resource exhaustion: surface E320 rather than keep writing. The
+        // just-committed file drops here (auto-deleted via `TempPath`) since
+        // the run is aborting — mirrors the reshape/cull spill paths.
+        if self
+            .arbitrator
+            .record_spill_bytes(&self.transform_name, spilled_bytes)
+        {
+            return Err(HashAggError::SpillCapExceeded {
+                node: self.transform_name.clone(),
+                cap: self.arbitrator.max_spill_bytes(),
+                attempted: spilled_bytes,
+                current: self.arbitrator.cumulative_spill_bytes(),
+            });
+        }
         self.spill_files.push(spill_file);
 
         // 5. All per-group value heap bytes are now off-process.
@@ -1478,6 +1520,18 @@ mod spill_trigger_tests {
 
     /// Compile a CXL aggregate snippet against input_fields, returning a
     /// fully initialized HashAggregator ready for `add_record` calls.
+    /// An arbitrator with an unlimited disk-spill cap (`max_spill_bytes`
+    /// defaults to `u64::MAX`), so aggregators these builders produce spill
+    /// freely without tripping E320. Tests that exercise the cap seed a
+    /// finite quota through the full pipeline path instead.
+    fn unlimited_test_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
+        Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            0,
+            0.8,
+            crate::pipeline::memory::MemoryArbitrator::default_policy(),
+        ))
+    }
+
     fn build_test_aggregator(
         input_fields: &[(&str, Type)],
         group_by: &[&str],
@@ -1566,6 +1620,7 @@ mod spill_trigger_tests {
             spill_compress: true,
             transform_name: "test_agg".to_string(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            arbitrator: unlimited_test_arbitrator(),
         })
     }
 
@@ -2372,6 +2427,64 @@ mod spill_trigger_tests {
         }
     }
 
+    #[test]
+    fn spill_past_disk_cap_returns_spill_cap_exceeded() {
+        // Mirrors the reshape/cull disk-cap unit tests: a one-byte disk cap
+        // must abort the aggregate's first spill flush with SpillCapExceeded
+        // (E320) rather than writing past the quota. Drives the aggregator
+        // directly so the assertion targets the aggregate's own spill charge,
+        // not an upstream node-buffer that would trip a shared cap first in a
+        // full pipeline.
+        let spill_dir = tempfile::tempdir().unwrap();
+        let mut agg = build_test_aggregator(
+            &[("k", Type::String), ("v", Type::Int)],
+            &["k"],
+            "emit k = k\nemit total = sum(v)",
+            // Tiny budget: the group-count threshold forces a spill within a
+            // few distinct keys.
+            1024,
+            Some(spill_dir.path().to_path_buf()),
+        );
+        // One-byte disk cap: the first spill's on-disk bytes already cross it.
+        agg.arbitrator_for_test().set_max_spill_bytes(1);
+
+        let input = make_schema(&["k", "v"]);
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+        // Many distinct keys drive the group-count spill trigger deterministically.
+        let mut caught = None;
+        for i in 0..2000u64 {
+            let r = make_record(
+                &input,
+                vec![
+                    Value::String(format!("k{i}").into()),
+                    Value::Integer(i as i64),
+                ],
+            );
+            if let Err(e) = agg.add_record(&r, i, &ctx_for(&stable, &file, i)) {
+                caught = Some(e);
+                break;
+            }
+        }
+        match caught.expect("a one-byte disk cap must abort a spill during ingest") {
+            HashAggError::SpillCapExceeded {
+                node,
+                cap,
+                attempted,
+                current,
+            } => {
+                assert_eq!(node, "test_agg", "E320 must name the aggregate node");
+                assert_eq!(cap, 1, "reported cap must equal the configured quota");
+                assert!(attempted > 0, "the overflowing flush must report its size");
+                assert!(
+                    current > cap,
+                    "cumulative spilled ({current}) must exceed the cap ({cap})"
+                );
+            }
+            other => panic!("expected SpillCapExceeded, got {other:?}"),
+        }
+    }
+
     // ----------------------------------------------------------------
     // Buffer-mode retract round-trip — feed N, retract M, finalize_in_place
     // equals feed-(N-M)-from-scratch byte-identically. One test per
@@ -2843,6 +2956,7 @@ mod spill_trigger_tests {
             spill_compress: true,
             transform_name: transform_name.to_string(),
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
+            arbitrator: unlimited_test_arbitrator(),
         })
     }
 

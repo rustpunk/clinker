@@ -120,6 +120,24 @@ pub enum HashAggError {
         "buffered aggregate row footprint ({row_charge} bytes) exceeds the entire memory budget ({budget} bytes)"
     )]
     OversizedRow { row_charge: usize, budget: usize },
+    /// The cumulative on-disk size of the run's aggregate spill files crossed
+    /// the configured `storage.spill.disk_cap_bytes` quota. Distinct from a
+    /// memory-budget overflow (E310): a run can sit well inside its RSS
+    /// envelope yet exhaust local disk through an unbounded stream of spill
+    /// files. This is resource exhaustion, so it always hard-aborts the run
+    /// regardless of error strategy — never routed to the DLQ, matching the
+    /// reshape and cull spill-cap paths. `node` names the aggregate; `cap` is
+    /// the configured quota; `attempted` is the byte count of the flush that
+    /// crossed it; `current` is the cumulative total after that flush.
+    #[error(
+        "aggregate `{node}` spill exceeded the {cap}-byte disk cap (this flush {attempted} bytes, cumulative {current} bytes)"
+    )]
+    SpillCapExceeded {
+        node: String,
+        cap: u64,
+        attempted: u64,
+        current: u64,
+    },
 }
 
 /// Map a `HashAggError` to a `PipelineError` for the executor dispatch
@@ -127,8 +145,9 @@ pub enum HashAggError {
 /// mid-run spill-directory fault maps to `PipelineError::Spill` so it
 /// renders with the same `DirUnavailable` diagnostic the node-buffer and
 /// sort paths use; an oversized single buffered row maps to
-/// `PipelineError::MemoryBudgetExceeded` (E310); the remaining cases are
-/// wrapped in `PipelineError::Eval` (data errors) or `PipelineError::Internal`
+/// `PipelineError::MemoryBudgetExceeded` (E310); a spill-cap breach maps to
+/// `PipelineError::SpillCapExceeded` (E320); the remaining cases are wrapped
+/// in `PipelineError::Eval` (data errors) or `PipelineError::Internal`
 /// (engine bugs / unsupported residuals).
 impl From<HashAggError> for PipelineError {
     fn from(e: HashAggError) -> Self {
@@ -195,6 +214,12 @@ impl From<HashAggError> for PipelineError {
                     )),
                 }
             }
+            HashAggError::SpillCapExceeded {
+                node,
+                cap,
+                attempted,
+                current,
+            } => PipelineError::spill_cap_exceeded(node, cap, attempted, current),
         }
     }
 }

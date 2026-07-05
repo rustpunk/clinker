@@ -263,6 +263,7 @@ pub(crate) fn dispatch_aggregation(
                 spill_compress,
                 transform_name: name.clone(),
                 consumer_handle: agg_consumer_handle,
+                arbitrator: Arc::clone(&ctx.memory_budget),
             },
         )?;
 
@@ -624,6 +625,7 @@ impl DocAggregatorFactory {
                 spill_compress: self.spill_compress,
                 transform_name: self.transform_name.clone(),
                 consumer_handle: handle,
+                arbitrator: Arc::clone(&self.arbitrator),
             },
         )?;
         Ok((stream, consumer_id))
@@ -1263,6 +1265,17 @@ fn run_streaming_aggregate_ingest(
                     let stream = tables.entry_or_make(record.doc_ctx().id(), &factory)?;
                     match stream.add_record(&record, rn, &eval_ctx, &mut out_rows) {
                         Ok(()) => effects.cursor_advances.push((source_name_arc, rn)),
+                        // A spill-cap breach hard-aborts under every strategy —
+                        // resource exhaustion never routes to the DLQ, matching
+                        // the materialized `handle_aggregate_add_error` arm.
+                        Err(e)
+                            if matches!(
+                                e,
+                                crate::aggregation::HashAggError::SpillCapExceeded { .. }
+                            ) =>
+                        {
+                            return Err(e.into());
+                        }
                         Err(e) => match strategy {
                             ErrorStrategy::FailFast => return Err(e.into()),
                             ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
@@ -1457,6 +1470,7 @@ impl WindowedAggContext<'_> {
                 spill_compress,
                 transform_name: self.name.to_string(),
                 consumer_handle: agg_consumer_handle,
+                arbitrator: Arc::clone(&ctx.memory_budget),
             },
         )?;
         Ok((stream, agg_consumer_id))
@@ -1919,6 +1933,13 @@ fn handle_aggregate_add_error(
     row_num: u64,
     e: crate::aggregation::HashAggError,
 ) -> Result<(), PipelineError> {
+    // A spill-cap breach is resource exhaustion, not a per-record data fault:
+    // writing more spill files cannot recover, so it aborts the run under
+    // every error strategy and never routes to the DLQ — matching the
+    // reshape and cull spill-cap paths.
+    if matches!(e, crate::aggregation::HashAggError::SpillCapExceeded { .. }) {
+        return Err(e.into());
+    }
     match ctx.config.error_handling.strategy {
         ErrorStrategy::FailFast => Err(e.into()),
         ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
