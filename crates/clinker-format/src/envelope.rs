@@ -87,6 +87,7 @@ pub enum FrameRole {
 /// none. Examples that all parse the same way: `Head` / `Foot`,
 /// `batch_metadata` / `eob_summary`, `preamble` / `trailer`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvelopeConfig {
     /// Map from user-chosen section name to its extract + schema.
     /// Insertion-ordered so diagnostics list sections in the order the
@@ -111,6 +112,7 @@ impl EnvelopeConfig {
 /// gives the typed schema the CXL typechecker consults when binding
 /// `$doc.<section>.<field>` references.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnvelopeSection {
     pub extract: EnvelopeExtract,
     #[serde(default)]
@@ -240,4 +242,56 @@ pub(crate) fn coerce_section_fields(
         out.insert(Box::from(field.as_str()), coerced);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_config_parses_valid_sections() {
+        let config: EnvelopeConfig = serde_json::from_str(
+            r#"{
+                "sections": {
+                    "Head": {
+                        "extract": { "xml_path": "/doc/Head" },
+                        "fields": { "batch_id": "string" }
+                    }
+                }
+            }"#,
+        )
+        .expect("valid envelope config must parse");
+        assert_eq!(config.sections.len(), 1);
+        let section = &config.sections["Head"];
+        assert!(matches!(&section.extract, EnvelopeExtract::XmlPath(p) if p == "/doc/Head"));
+        assert_eq!(
+            section.fields.get("batch_id"),
+            Some(&EnvelopeFieldType::String)
+        );
+    }
+
+    #[test]
+    fn envelope_config_rejects_unknown_top_level_key() {
+        let err = serde_json::from_str::<EnvelopeConfig>(r#"{ "sectionz": {} }"#)
+            .expect_err("a misspelled `sections` key must fail to parse");
+        assert!(
+            err.to_string().contains("sectionz"),
+            "error must name the unknown key, got: {err}"
+        );
+    }
+
+    #[test]
+    fn envelope_section_rejects_unknown_key() {
+        let err = serde_json::from_str::<EnvelopeSection>(
+            r#"{
+                "extract": { "xml_path": "/doc/Head" },
+                "extractt": { "xml_path": "/doc/Head" }
+            }"#,
+        )
+        .expect_err("an unknown key inside a section must fail to parse");
+        assert!(
+            err.to_string().contains("extractt"),
+            "error must name the unknown key, got: {err}"
+        );
+    }
 }
