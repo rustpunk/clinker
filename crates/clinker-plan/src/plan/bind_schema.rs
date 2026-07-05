@@ -2771,11 +2771,72 @@ fn bind_composition(
     };
 
     // 7. Re-read body from disk.
-    let body_file =
+    let mut body_file =
         match read_and_parse_body(&signature.source_path, artifacts, node_name, span, diags) {
             Some(f) => f,
             None => return,
         };
+
+    // 7a. Apply any channel `sources:` patch addressed at a source declared
+    // inside this composition body (qualified key `<this-node>.<inner-source>`).
+    // These could not be applied at patch time because the body is expanded
+    // only here; apply them to the freshly re-read body so its source nodes
+    // carry the channel's schema / options / array changes before the body
+    // binds, exactly as a top-level source patch shapes a top-level source
+    // before it binds. An unknown inner source or a failed op abandons the
+    // body with a spanned diagnostic naming the call site and body file.
+    //
+    // Gate on `depth == 0`: a qualified key names a TOP-LEVEL composition node
+    // (`apply_source_patches` validates the alias against `config.nodes` only,
+    // and a two-dot key naming a source inside a *nested* body is rejected).
+    // The patch map is keyed by bare node name, so without this gate a patch
+    // keyed for a top-level composition would also match a same-named
+    // composition node nested inside another body and mutate the wrong body.
+    // `depth` is 0 here only for top-level call sites — it is incremented at
+    // step 8 before recursing into a body — so this restricts application to
+    // the top-level composition the qualified key actually addresses.
+    if bind_ctx.depth == 0
+        && let Some(inner_patches) = bind_ctx.ctx.body_source_patches.get(node_name)
+    {
+        for (inner_source, patch) in inner_patches {
+            let Some(source_body) =
+                crate::config::patch::source_body_in_nodes(&mut body_file.nodes, inner_source)
+            else {
+                // Match the channel-patch family: the E-code is embedded in the
+                // message so it survives the messages-only compile-error render,
+                // as the top-level `[E230]` unknown-source error does.
+                diags.push(Diagnostic::error(
+                    "E230",
+                    format!(
+                        "[E230] composition node {node_name:?}: body file {}: channel source \
+                         patch targets unknown source {inner_source:?}: no source node by that \
+                         name in the composition body",
+                        resolved_path.display()
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                ));
+                return;
+            };
+            if let Err(err) =
+                crate::config::patch::apply_patch_to_source_body(source_body, patch, inner_source)
+            {
+                let raw = match err {
+                    crate::config::ConfigError::Validation(m) => m,
+                    other => other.to_string(),
+                };
+                let (code, detail) = crate::config::patch::split_diagnostic_code(&raw);
+                diags.push(Diagnostic::error(
+                    code,
+                    format!(
+                        "[{code}] composition node {node_name:?}: body file {}: {detail}",
+                        resolved_path.display()
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                ));
+                return;
+            }
+        }
+    }
 
     // 7b. Body nodes never flow through top-level config validation
     // (`validate_config` sees only the call-site pipeline's own nodes),

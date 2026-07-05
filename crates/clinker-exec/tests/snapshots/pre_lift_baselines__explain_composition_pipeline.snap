@@ -8,21 +8,13 @@ Mode: Streaming
 Indices to build: 0
 Transforms: 0
 Output projections: 1
-DAG nodes: 4
+DAG nodes: 5
 arbitration: BackPressurePreferred -> Priority
 
 Source DAG:
   Tier 0: customers_src, addresses_src
 
 === Physical Properties ===
-
-output.enriched_out:
-  ordering: <none>
-  ordering_provenance: NoOrdering
-  partitioning: Single
-  partitioning_provenance: SingleStream
-  buffer: streaming
-  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
 source.addresses_src:
   ordering: <none>
@@ -48,11 +40,39 @@ source.customers_src:
   buffer: materialized
   arbitration: spill_priority=N/A, can_back_pressure=true, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
 
+composition.enrich1:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+  buffer: materialized
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
+
+output.enriched_out:
+  ordering: <none>
+  ordering_provenance: NoOrdering
+  partitioning: Single
+  partitioning_provenance: SingleStream
+  buffer: streaming
+  arbitration: spill_priority=N/A, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B, predicted_subtree_reclaim=0B
+
 === Buffer Edges ===
 
 edge source.addresses_src -> composition.addr_norm:
   buffer: node_buffer (slot=1)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: source)
+
+edge source.addresses_src -> composition.enrich1:
+  buffer: node_buffer (slot=1)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: source)
+
+edge source.customers_src -> composition.enrich1:
+  buffer: node_buffer (slot=0)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: source)
+
+edge composition.enrich1 -> output.enriched_out:
+  buffer: node_buffer (slot=2)
+  arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: composition)
 
 === CXL Expressions ===
 
@@ -66,7 +86,8 @@ Worker threads: 4
 
 === DAG Topology ===
 
-  ● [output] enriched_out (line:48)
   ● [source] addresses_src (line:17)
-  │ [composition:body=<ID>] addr_norm (line:39)
+  │ [composition:body=<ID>] addr_norm (line:40)
   ● [source] customers_src (line:7)
+  │ [composition:body=<ID>] enrich1 (line:29)
+  │ [output] enriched_out (line:49)

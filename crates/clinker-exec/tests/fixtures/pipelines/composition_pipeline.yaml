@@ -35,6 +35,7 @@ nodes:
       addresses: addresses_src
     config:
       fuzzy_threshold: 0.9
+      lookup_table: "customers_lookup.csv"
 
   - type: composition
     name: addr_norm
