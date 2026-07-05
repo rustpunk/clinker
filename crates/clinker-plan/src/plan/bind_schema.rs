@@ -2033,15 +2033,19 @@ fn bind_cull(
     // diagnostic to the offending rule; fall back to the combined diagnostic
     // if no single rule reproduces it. Either way, skip lowering (the node is
     // absent from `cull_decision_typed`).
+    let decision_label = format!("{name}:drop_group_when");
+    let decision_ctx = CxlTypecheckCtx {
+        node_name: &decision_label,
+        schema: upstream,
+        mode: &agg_mode,
+        span,
+        scoped_vars,
+    };
     match typecheck_parsed_program(
-        &format!("{name}:drop_group_when"),
+        &decision_ctx,
         decision_program,
         node_count,
         std::sync::Arc::from(decision_src.as_str()),
-        upstream,
-        agg_mode.clone(),
-        span,
-        scoped_vars,
     ) {
         Ok(typed) => {
             artifacts.cull_decision_typed.insert(id, Arc::new(typed));
@@ -2049,14 +2053,15 @@ fn bind_cull(
         Err(combined) => {
             let mut attributed = false;
             for rule in &config.rules {
-                if let Err(d) = typecheck_cull_rule(
-                    &format!("{name}:{}:drop_group_when", rule.name),
-                    &rule.drop_group_when.source,
-                    upstream,
-                    agg_mode.clone(),
+                let rule_label = format!("{name}:{}:drop_group_when", rule.name);
+                let rule_ctx = CxlTypecheckCtx {
+                    node_name: &rule_label,
+                    schema: upstream,
+                    mode: &agg_mode,
                     span,
                     scoped_vars,
-                ) {
+                };
+                if let Err(d) = typecheck_cull_rule(&rule_ctx, &rule.drop_group_when.source) {
                     diags.push(d);
                     attributed = true;
                 }
@@ -4149,6 +4154,21 @@ fn upstream_target_name(input: &crate::config::node_header::NodeInput) -> Option
     Some(input_target(input))
 }
 
+/// The invariant context a CXL program is typechecked against: node label
+/// (diagnostic attribution), upstream `schema`, aggregate `mode`, diagnostic
+/// `span`, and the `scoped_vars` registry. Bundled so the synthesizing entry
+/// points ([`typecheck_parsed_program`], [`typecheck_cull_rule`]) stay below
+/// clippy's argument threshold and share one context value across a node's
+/// several rule-level checks; the program-specific inputs (AST, node count,
+/// display source) stay direct arguments.
+struct CxlTypecheckCtx<'a> {
+    node_name: &'a str,
+    schema: &'a Row,
+    mode: &'a AggregateMode,
+    span: Span,
+    scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
+}
+
 #[allow(clippy::result_large_err)]
 fn typecheck_cxl(
     node_name: &str,
@@ -4171,15 +4191,18 @@ fn typecheck_cxl(
             LabeledSpan::primary(span, String::new()),
         ));
     }
-    typecheck_parsed_program(
+    let ctx = CxlTypecheckCtx {
         node_name,
+        schema,
+        mode: &mode,
+        span,
+        scoped_vars,
+    };
+    typecheck_parsed_program(
+        &ctx,
         parse_result.ast,
         parse_result.node_count,
         std::sync::Arc::from(source),
-        schema,
-        mode,
-        span,
-        scoped_vars,
     )
 }
 
@@ -4194,17 +4217,19 @@ fn typecheck_cxl(
 /// it); a synthesizing caller is responsible for keeping ids dense and
 /// below it.
 #[allow(clippy::result_large_err)]
-#[allow(clippy::too_many_arguments)]
 fn typecheck_parsed_program(
-    node_name: &str,
+    ctx: &CxlTypecheckCtx<'_>,
     program: cxl::ast::Program,
     node_count: u32,
     source: Arc<str>,
-    schema: &Row,
-    mode: AggregateMode,
-    span: Span,
-    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) -> Result<TypedProgram, Diagnostic> {
+    let CxlTypecheckCtx {
+        node_name,
+        schema,
+        mode,
+        span,
+        scoped_vars,
+    } = *ctx;
     // Collect unqualified field names for CXL resolve. In the non-combine
     // case all fields are bare; in the combine case (C.1.1+) qualified
     // fields collapse to their `.name` — the resolver only needs to know
@@ -4233,7 +4258,7 @@ fn typecheck_parsed_program(
             LabeledSpan::primary(span, String::new()),
         )
     })?;
-    cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode, scoped_vars)
+    cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode.clone(), scoped_vars)
         .map(|mut typed| {
             fold_body_config(&mut typed, scoped_vars);
             typed.with_source(source)
@@ -4334,14 +4359,10 @@ fn parse_cull_rule_predicate(
 /// `Err` with the attributed diagnostic otherwise.
 #[allow(clippy::result_large_err)]
 fn typecheck_cull_rule(
-    node_name: &str,
+    ctx: &CxlTypecheckCtx<'_>,
     source: &str,
-    schema: &Row,
-    mode: AggregateMode,
-    span: Span,
-    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) -> Result<TypedProgram, Diagnostic> {
-    let (predicate, mut next_id) = parse_cull_rule_predicate(node_name, source, 0, span)?;
+    let (predicate, mut next_id) = parse_cull_rule_predicate(ctx.node_name, source, 0, ctx.span)?;
     let body_span = predicate.span();
     let false_id = cxl::ast::NodeId(next_id);
     next_id += 1;
@@ -4372,14 +4393,10 @@ fn typecheck_cull_rule(
     };
     let display = format!("emit __cull_pred = ({source}) or false");
     typecheck_parsed_program(
-        node_name,
+        ctx,
         program,
         next_id,
         std::sync::Arc::from(display.as_str()),
-        schema,
-        mode,
-        span,
-        scoped_vars,
     )
 }
 
