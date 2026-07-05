@@ -56,6 +56,17 @@ counts, `pad` must be a single-byte (ASCII) character; a multi-byte `pad`
 is rejected when the output opens. Under `truncation: error` an over-long
 value is still a hard error before any slicing.
 
+A `type: decimal` output column with a `scale` rounds its values to that
+many fractional places on write (banker's rounding), the same contract a
+`decimal` source column applies on read. This matters here: a computed
+decimal such as `avg(amount)` is a full-precision quotient that would
+overflow a narrow numeric field — a hard error under the default
+`truncation: error` for numeric fields — so declaring the field's `scale`
+shrinks it to fixed places that fit. For example, `avg` over `1.00, 1.00,
+2.00` written into `{ name: average, type: decimal, scale: 2, width: 6 }`
+emits `1.33`; without the `scale` the 28-digit quotient overflows the
+6-byte field and fails.
+
 ## Options
 
 | Option | Default | Description |

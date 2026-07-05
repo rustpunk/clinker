@@ -925,12 +925,15 @@ fn test_e2e_decimal_sum_avg() {
     // `avg(amount)` failed to compile and `run_single`'s `.expect("compile")`
     // would panic.
     //
-    // It also pins the observable output precision:
+    // It also pins the observable output precision for a SCHEMA-LESS output
+    // (no output `schema:` block, so no declared output-column scale):
     //   * `sum` stays exact at the column scale (`4.00`, `0.30`);
-    //   * `avg` is the exact full-precision quotient — a computed decimal is
-    //     NOT re-rounded to an output-column scale, so `4.00 / 3` prints all
-    //     28 digits rather than `1.33`. (To round, a user rounds explicitly in
-    //     CXL; a `decimal` source column, by contrast, rounds on ingest.)
+    //   * `avg` is the exact full-precision quotient — with no declared output
+    //     scale to pin it, `4.00 / 3` prints all 28 digits rather than `1.33`.
+    //     A declared output-column scale would round it (see
+    //     `test_e2e_decimal_avg_rounds_to_output_scale`); a `decimal` source
+    //     column rounds on ingest. Inside the pipeline decimals stay full
+    //     precision either way.
     let yaml = r#"
 pipeline:
   name: agg_decimal
@@ -979,4 +982,182 @@ nodes:
             "y,0.30,0.15".to_string(),
         ],
     );
+}
+
+#[test]
+fn test_e2e_decimal_avg_rounds_to_output_scale() {
+    // Same aggregate as `test_e2e_decimal_sum_avg`, but the CSV output now
+    // declares a `schema:` giving `average` a `type: decimal, scale: 2`. The
+    // declared scale is a write-boundary contract — the full-precision quotient
+    // is rounded (banker's rounding) to two places on the way out, so `4.00 / 3`
+    // writes `1.33` rather than the 28-digit quotient. `sum` is already exact at
+    // scale 2 (`4.00`) and is unchanged.
+    let yaml = r#"
+pipeline:
+  name: agg_decimal_scaled_out
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: in.csv
+    schema:
+      - { name: dept, type: string }
+      - { name: amount, type: decimal, scale: 2 }
+- type: aggregate
+  name: by_dept
+  input: src
+  config:
+    group_by:
+    - dept
+    cxl: 'emit dept = dept
+
+      emit total = sum(amount)
+
+      emit average = avg(amount)
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
+    type: csv
+    path: out.csv
+    include_unmapped: true
+    schema:
+      - { name: dept, type: string }
+      - { name: total, type: decimal, scale: 2 }
+      - { name: average, type: decimal, scale: 2 }
+"#;
+    let csv = "dept,amount\nx,1.00\nx,1.00\nx,2.00\ny,0.10\ny,0.20\n";
+    let (report, output) = run_single(yaml, csv);
+    assert_eq!(report.dlq_entries.len(), 0, "no DLQ entries");
+    assert_eq!(report.counters.ok_count, 2, "two output groups");
+    assert_eq!(
+        sorted_body_lines(&output),
+        vec!["x,4.00,1.33".to_string(), "y,0.30,0.15".to_string()],
+        "declared output-column scale rounds the computed avg on write",
+    );
+}
+
+#[test]
+fn test_e2e_decimal_avg_rounds_to_output_scale_json() {
+    // The write-boundary rounding is format-agnostic — it runs in the shared
+    // output projection, so a JSON (ndjson) output honors the declared
+    // `average` scale identically. JSON renders a decimal as a scale-preserving
+    // string, so `1.33` appears verbatim and the 28-digit quotient never does.
+    let yaml = r#"
+pipeline:
+  name: agg_decimal_scaled_json
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: in.csv
+    schema:
+      - { name: dept, type: string }
+      - { name: amount, type: decimal, scale: 2 }
+- type: aggregate
+  name: by_dept
+  input: src
+  config:
+    group_by:
+    - dept
+    cxl: 'emit dept = dept
+
+      emit average = avg(amount)
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
+    type: json
+    options:
+      format: ndjson
+    path: out.json
+    include_unmapped: true
+    schema:
+      - { name: dept, type: string }
+      - { name: average, type: decimal, scale: 2 }
+"#;
+    let csv = "dept,amount\nx,1.00\nx,1.00\nx,2.00\ny,0.10\ny,0.20\n";
+    let (report, output) = run_single(yaml, csv);
+    assert_eq!(report.dlq_entries.len(), 0, "no DLQ entries");
+    assert!(
+        output.contains(r#""average":"1.33""#),
+        "ndjson must carry the rounded avg for dept x: {output}"
+    );
+    assert!(
+        output.contains(r#""average":"0.15""#),
+        "ndjson must carry the exact avg for dept y: {output}"
+    );
+    assert!(
+        !output.contains("1.3333"),
+        "the full-precision quotient must not survive the declared scale: {output}"
+    );
+}
+
+#[test]
+fn test_e2e_decimal_avg_rounds_to_output_scale_fixed_width() {
+    // Fixed-width makes the contract load-bearing: a numeric field that
+    // overflows its width is a hard error (truncation policy `error`), so a
+    // 28-digit quotient is unwritable into a 6-wide decimal field. Rounding the
+    // computed avg to the declared `scale: 2` on write shrinks it to `1.33`,
+    // which fits. A single group keeps the output a single deterministic line.
+    let yaml = r#"
+pipeline:
+  name: agg_decimal_scaled_fw
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: in.csv
+    schema:
+      - { name: dept, type: string }
+      - { name: amount, type: decimal, scale: 2 }
+- type: aggregate
+  name: by_dept
+  input: src
+  config:
+    group_by:
+    - dept
+    cxl: 'emit dept = dept
+
+      emit total = sum(amount)
+
+      emit average = avg(amount)
+
+      '
+- type: output
+  name: out
+  input: by_dept
+  config:
+    name: out
+    type: fixed_width
+    path: out.dat
+    include_unmapped: true
+    schema:
+      - { name: dept, type: string, width: 4 }
+      - { name: total, type: decimal, scale: 2, width: 8 }
+      - { name: average, type: decimal, scale: 2, width: 6 }
+"#;
+    let csv = "dept,amount\nx,1.00\nx,1.00\nx,2.00\n";
+    let (report, output) = run_single(yaml, csv);
+    assert_eq!(
+        report.dlq_entries.len(),
+        0,
+        "the rounded avg fits the field — no error/DLQ"
+    );
+    assert_eq!(report.counters.ok_count, 1, "one output group");
+    // dept "x" left-justified in 4; total "4.00" and average "1.33" numeric
+    // right-justified in 8 and 6.
+    assert_eq!(output, "x       4.00  1.33\n");
 }
