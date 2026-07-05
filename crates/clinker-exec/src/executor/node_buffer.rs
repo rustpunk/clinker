@@ -66,8 +66,22 @@ pub(crate) enum NodeBuffer {
         chunks: Vec<(SpillFile<u64>, u64)>,
         pending_puncts: Vec<Punctuation>,
     },
-    /// A mem tail accumulated after a partial spill. Drain order is
-    /// mem events first, then spill chunks, then `pending_puncts`.
+    /// A spill followed by a resident mem tail. The sole producer of this
+    /// variant is [`Self::push_event`] on an already-`Spilled` slot, which
+    /// seeds `mem` with events that arrived *after* the spill — so `mem` is
+    /// always the POST-spill tail, never a pre-spill head.
+    ///
+    /// [`Self::drain`] yields `mem` first, then the spill chunks, then
+    /// `pending_puncts` — declaration order, not arrival order. Because
+    /// `mem` is the post-spill tail, that drain is arrival-INVERTED for
+    /// `Mixed`: the newer resident rows come out ahead of the older spilled
+    /// rows. An order-sensitive consumer of a `Mixed` slot must therefore
+    /// drain spill-chunks-first itself; the only one that both produces and
+    /// consumes `Mixed` is the document-DLQ bucket flush
+    /// (`document_dlq::drain_records_in_arrival_order`), which does exactly
+    /// that. Inter-stage `node_buffers` slots are only ever built as
+    /// `Memory` or `Spilled` and never `push_event`-ed, so they never reach
+    /// `Mixed` and their `drain` order is unambiguous.
     Mixed {
         mem: Vec<StreamEvent>,
         spills: Vec<(SpillFile<u64>, u64)>,
@@ -418,6 +432,16 @@ impl NodeBuffer {
     /// events first, then per-spill-file records in vector order, and
     /// finally any trailing punctuations that did not spill.
     ///
+    /// This is *declaration* order, which equals arrival order for `Memory`
+    /// and `Spilled` but is arrival-INVERTED for `Mixed`: a `Mixed` slot's
+    /// `mem` is always the post-spill tail (see the `Mixed` variant docs),
+    /// so its newer resident rows drain ahead of its older spilled rows. A
+    /// consumer that needs arrival order out of a possibly-`Mixed` slot must
+    /// drain the spill chunks first itself — the document-DLQ bucket flush is
+    /// the only such consumer, via
+    /// `document_dlq::drain_records_in_arrival_order`. Inter-stage slots are
+    /// never `Mixed`, so this order is unambiguous for them.
+    ///
     /// Spill rows stream from disk via `SpillReader<u64>` without
     /// materializing the spill. Spill-open and per-row decode failures
     /// surface as `PipelineError::Spill` items so the executor's
@@ -719,6 +743,55 @@ mod tests {
         assert_eq!(rec_row_num(&drained[0]), 200);
         assert_eq!(rec_row_num(&drained[1]), 100);
         assert!(matches!(drained[2], StreamEvent::Punctuation(_)));
+    }
+
+    /// Pins the load-bearing `Mixed` invariant the drain-order docs rest on:
+    /// `push_event` is the only producer of `Mixed`, and it seeds `mem` with
+    /// the POST-spill tail — so every real `Mixed` has mem row-numbers that
+    /// arrived *after* the spilled rows, and `drain` (mem-first) is therefore
+    /// arrival-INVERTED. A `Mixed` whose mem is a pre-spill head does not
+    /// exist, and inter-stage slots (built only as `Memory` / `Spilled`,
+    /// never `push_event`-ed) never reach `Mixed` at all — so only the
+    /// document-DLQ flush, which reorders spill-first, must compensate.
+    #[test]
+    fn mixed_mem_is_post_spill_tail_so_drain_is_arrival_inverted() {
+        let s = schema();
+        // Spill the older rows (arrival 10, 11), then push a newer row
+        // (arrival 20) after the spill — the sole way a `Mixed` is built.
+        let mut nb = NodeBuffer::Spilled {
+            chunks: vec![spill_chunk(vec![
+                (rec(&s, 1, "old-a"), 10),
+                (rec(&s, 2, "old-b"), 11),
+            ])],
+            pending_puncts: Vec::new(),
+        };
+        nb.push(rec(&s, 3, "new"), 20);
+
+        let NodeBuffer::Mixed { mem, spills, .. } = &nb else {
+            panic!("push_event on a Spilled slot must promote to Mixed");
+        };
+        // The mem tail holds only the post-spill arrival, and its row number
+        // is strictly greater than every spilled row's — mem is the tail,
+        // never a head.
+        let mem_rns: Vec<u64> = mem
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::Record(_, rn) => Some(*rn),
+                StreamEvent::Punctuation(_) => None,
+            })
+            .collect();
+        assert_eq!(mem_rns, vec![20], "mem holds exactly the post-spill tail");
+        assert_eq!(spills.len(), 1, "the pre-spill body stays on disk");
+
+        // drain() yields mem (newer) before the spill chunk (older): the
+        // documented arrival-INVERSION for every real `Mixed`.
+        let drained: Vec<_> = nb.drain().collect::<Result<_, _>>().unwrap();
+        let drained_rns: Vec<u64> = drained.iter().map(rec_row_num).collect();
+        assert_eq!(
+            drained_rns,
+            vec![20, 10, 11],
+            "drain is mem-first, so the newer tail precedes the older spilled body"
+        );
     }
 
     #[test]
