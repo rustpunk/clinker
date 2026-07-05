@@ -80,9 +80,32 @@ On output, the writer emits one row per record with cells in the
 **output schema's column order** — the same order as the header row —
 regardless of how an upstream node ordered the record's fields. An
 output-schema column the record does not carry emits an empty cell,
-the same as an explicit null; record fields the output schema does not
-name are not written. See [Output Nodes](../nodes/output.md) for
-header control, field mapping, and null handling.
+the same as an explicit null; with `include_unmapped: false` a record
+field the output schema does not name is not written. See
+[Output Nodes](../nodes/output.md) for header control, field mapping,
+and null handling.
+
+### Header widening under auto-widen
+
+When [`auto_widen`](auto-widen.md) is in effect and the Output leaves
+`include_unmapped` at its default of `true`, different records can carry
+different carried-along columns. The header must still be shared by every
+row, so Clinker widens it to the **union of every record's columns** in
+first-seen order: a column that first appears on a later record still gets
+its own header slot, and the earlier rows write an empty cell for it. This
+pre-scan runs on the buffered output path, where the record batch is
+materialized.
+
+An output that streams under a bounded-memory budget cannot pre-scan the
+whole batch: a CSV output fused directly after a `Merge`/`Transform`, or one
+reconstructing an envelope (which suppresses the shared header and streams a
+headerless body), commits its columns to the first record. A later record
+carrying a column that first record lacked then fails the run with a
+`SchemaDrift` error naming the column, rather than silently dropping it.
+Declare the column in the source or output `schema:` so every record carries
+it, or route to a self-describing format (JSON / NDJSON / XML). A
+`reconstruct_envelope` CSV output therefore requires a stable body shape —
+every record must carry the same columns.
 
 ## Multi-record files (header / trailer / body)
 

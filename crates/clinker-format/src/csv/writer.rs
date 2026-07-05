@@ -23,6 +23,21 @@ pub struct CsvWriterConfig {
     /// path. `Some` is set by the executor only when the Output declares
     /// `reconstruct_envelope: true` with a non-empty envelope config.
     pub envelope: Option<OutputEnvelopeSpec>,
+    /// Raise [`FormatError::SchemaDrift`] when a record carries a user column
+    /// the pinned schema does not name, instead of silently skipping it.
+    ///
+    /// Set by the executor to the Output's `include_unmapped`: when the user
+    /// asked to carry every column through (`include_unmapped: true`), a
+    /// record column with no header slot is a data-loss drift that must fail
+    /// loudly. The buffered Output arm pre-widens the header to the batch
+    /// union, so this guard is a no-op there; it earns its keep on the
+    /// bounded-memory paths that pin the header to the first record (the
+    /// streaming fused arm and envelope framing), where a union is impossible.
+    ///
+    /// Left `false` (the default) the writer keeps the "output schema is the
+    /// column contract — extra record fields are not written" behavior, which
+    /// `include_unmapped: false` relies on to narrow output deliberately.
+    pub error_on_undeclared_columns: bool,
 }
 
 impl Default for CsvWriterConfig {
@@ -32,6 +47,7 @@ impl Default for CsvWriterConfig {
             include_header: true,
             include_engine_stamped: false,
             envelope: None,
+            error_on_undeclared_columns: false,
         }
     }
 }
@@ -133,6 +149,29 @@ impl<W: Write> CsvWriter<W> {
 
 impl<W: Write + Send> FormatWriter for CsvWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
+        // In lossless mode (`include_unmapped: true`), a record column with no
+        // header slot is a data-loss drift that must fail loudly rather than
+        // be silently written narrower (issue #805). This never trips on the
+        // buffered Output arm — its header is the batch union of every
+        // record's columns — but it is the loud-drift backstop on the
+        // bounded-memory paths that pin the header to the first record (the
+        // streaming fused arm and envelope framing), where a union cannot be
+        // pre-scanned. `iter_user_fields` excludes engine stamps and the
+        // `$widened` sidecar, so only a genuine undeclared column trips it.
+        // When the flag is off, the pinned schema stays a deliberate column
+        // contract (extra fields are not written) — the `include_unmapped:
+        // false` narrowing behavior.
+        if self.config.error_on_undeclared_columns {
+            for (name, _) in record.iter_user_fields() {
+                if !self.schema.contains(name) {
+                    return Err(FormatError::SchemaDrift {
+                        format: "CSV",
+                        column: name.to_string(),
+                    });
+                }
+            }
+        }
+
         // Header is built from the writer's pinned schema. Engine-stamped
         // columns (today: `$ck.<field>`) are stripped unless the Output
         // node opts in.
@@ -783,5 +822,109 @@ mod tests {
             writer.flush().unwrap();
         }
         assert_eq!(String::from_utf8(buf).unwrap(), "10\n");
+    }
+
+    /// In lossless mode (`error_on_undeclared_columns: true`, mirroring
+    /// `include_unmapped: true`) a record carrying a user column the pinned
+    /// schema lacks raises SchemaDrift rather than silently writing a narrower
+    /// row. This is the bounded-memory backstop for paths that pin the header
+    /// to the first record and cannot pre-scan a union (issue #805).
+    #[test]
+    fn csv_undeclared_column_is_schema_drift_in_lossless_mode() {
+        let writer_schema = make_schema(&["amount"]);
+        let config = CsvWriterConfig {
+            error_on_undeclared_columns: true,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&writer_schema), config);
+        // Record carries a `region` column the pinned schema lacks.
+        let drift_schema = make_schema(&["amount", "region"]);
+        let record = make_record(
+            &drift_schema,
+            vec![Value::Integer(10), Value::String("US".into())],
+        );
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::SchemaDrift { format, column } => {
+                assert_eq!(format, "CSV");
+                assert_eq!(column, "region");
+            }
+            other => panic!("expected SchemaDrift, got {other:?}"),
+        }
+    }
+
+    /// The same guard fires under envelope framing (the header is suppressed
+    /// and the body streams headerless, so a union is impossible there too).
+    #[test]
+    fn csv_envelope_schema_drift_is_loud() {
+        let writer_schema = make_schema(&["amount"]);
+        let config = CsvWriterConfig {
+            include_header: false,
+            error_on_undeclared_columns: true,
+            envelope: Some(OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                footer_from_doc: None,
+                footer_record_count_field: None,
+            }),
+            ..Default::default()
+        };
+        let doc = doc_with_sections(&[("Head", &[("batch_id", Value::String("A".into()))])]);
+        let mut buf = Vec::new();
+        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&writer_schema), config);
+        writer.begin_document(&doc).unwrap();
+        let drift_schema = make_schema(&["amount", "region"]);
+        let record = make_record(
+            &drift_schema,
+            vec![Value::Integer(10), Value::String("US".into())],
+        );
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::SchemaDrift { column, .. } => assert_eq!(column, "region"),
+            other => panic!("expected SchemaDrift, got {other:?}"),
+        }
+    }
+
+    /// A record whose columns are all within the pinned schema writes normally
+    /// even in lossless mode — the drift guard is not a false positive on the
+    /// no-drift case (including a record missing a declared column).
+    #[test]
+    fn csv_lossless_mode_no_drift_writes_normally() {
+        let schema = make_schema(&["a", "b"]);
+        let config = CsvWriterConfig {
+            error_on_undeclared_columns: true,
+            ..Default::default()
+        };
+        // Second record is missing `b` — a legitimate absent (empty) cell, not
+        // drift.
+        let records = vec![
+            make_record(
+                &schema,
+                vec![Value::String("A".into()), Value::String("B".into())],
+            ),
+            make_record(&make_schema(&["a"]), vec![Value::String("A2".into())]),
+        ];
+        let output = write_to_string(&schema, config, &records);
+        assert_eq!(output, "a,b\nA,B\nA2,\n");
+    }
+
+    /// With the guard off (the `include_unmapped: false` narrowing contract),
+    /// a record field outside the pinned schema is silently not written — the
+    /// output schema stays the deliberate column contract.
+    #[test]
+    fn csv_undeclared_column_dropped_when_guard_off() {
+        let writer_schema = make_schema(&["a", "b"]);
+        let record_schema = make_schema(&["a", "extra", "b"]);
+        let record = make_record(
+            &record_schema,
+            vec![
+                Value::String("A".into()),
+                Value::String("X".into()),
+                Value::String("B".into()),
+            ],
+        );
+        // Default config: error_on_undeclared_columns is false.
+        let output = write_to_string(&writer_schema, CsvWriterConfig::default(), &[record]);
+        assert_eq!(output, "a,b\nA,B\n");
     }
 }

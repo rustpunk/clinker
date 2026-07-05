@@ -274,6 +274,25 @@ impl<W: Write> FixedWidthWriter<W> {
 
 impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
     fn write_record(&mut self, record: &Record) -> Result<(), FormatError> {
+        // A fixed-width layout gives every column a declared byte range, so a
+        // record carrying a user column the layout does not declare — the
+        // shape `auto_widen` produces when a later record surfaces a column
+        // the declared schema lacks — has nowhere to land. Reject it loudly as
+        // SchemaDrift before emitting any byte, rather than writing a
+        // silently-narrower line (the data loss the never-silent-loss contract
+        // forbids). Engine stamps and the `$widened` sidecar are excluded by
+        // `iter_user_fields`, so only a genuine undeclared user column trips
+        // this. Checked before the emit loop so a rejected record leaves no
+        // partial line behind.
+        for (name, _) in record.iter_user_fields() {
+            if !self.fields.iter().any(|f| f.name.as_str() == name) {
+                return Err(FormatError::SchemaDrift {
+                    format: "fixed-width",
+                    column: name.to_string(),
+                });
+            }
+        }
+
         // Fields are sorted by `start` and non-overlapping (enforced at
         // construction), so a cursor walk left-to-right space-fills any byte
         // range the schema leaves undeclared and lands every cell at the
@@ -287,6 +306,11 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
         for field in &self.fields {
             write_gap(&mut self.writer, field.start - cursor)?;
 
+            // By-name lookup is load-bearing, not a cacheable column position:
+            // output projection rebuilds the record's schema per row, and
+            // auto-widen sidecar keys append in per-row insertion order, so a
+            // field's positional index can differ row to row. Resolving by
+            // name keeps every cell aligned to its declared byte range.
             let value = record.get(&field.name).unwrap_or(&null);
 
             let formatted = self.format_value(field, value)?;
@@ -1078,6 +1102,78 @@ mod tests {
             .expect("overflowing range must be rejected");
         let msg = err.to_string();
         assert!(msg.contains("overflows"), "error should say so: {msg}");
+    }
+
+    /// A record carrying a user column the fixed-width layout does not declare
+    /// — the shape `auto_widen` produces when a later record surfaces a column
+    /// the first lacked — is a loud SchemaDrift, not a silently-narrower line
+    /// (issue #805). Checked before any byte is emitted, so the drifting
+    /// record leaves no partial line behind.
+    #[test]
+    fn test_fixedwidth_write_undeclared_column_is_schema_drift() {
+        let fields = vec![{
+            let mut f = field("id");
+            f.ty = Type::Int;
+            f.start = Some(0);
+            f.width = Some(5);
+            f
+        }];
+        let mut buf = Vec::new();
+        let mut writer =
+            FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+        // Record carries `region` beyond the declared `id`.
+        let record = make_record(
+            &["id", "region"],
+            vec![Value::Integer(7), Value::String("US".into())],
+        );
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::SchemaDrift { format, column } => {
+                assert_eq!(format, "fixed-width");
+                assert_eq!(column, "region");
+            }
+            other => panic!("expected SchemaDrift, got {other:?}"),
+        }
+        drop(writer);
+        assert!(
+            buf.is_empty(),
+            "a drifting record must not leave a partial line behind"
+        );
+    }
+
+    /// A record whose columns are all declared, or a subset of the declared
+    /// layout, writes normally — the drift guard is not a false positive,
+    /// including on a record missing a declared field (a legitimate absent,
+    /// pad-filled cell).
+    #[test]
+    fn test_fixedwidth_write_declared_subset_is_not_drift() {
+        let fields = vec![
+            {
+                let mut f = field("id");
+                f.ty = Type::Int;
+                f.start = Some(0);
+                f.width = Some(3);
+                f
+            },
+            {
+                let mut f = field("name");
+                f.ty = Type::String;
+                f.start = Some(3);
+                f.width = Some(5);
+                f
+            },
+        ];
+        let mut buf = Vec::new();
+        {
+            let mut writer =
+                FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+            // Record declares only `id` — `name` is a legitimate absent cell.
+            writer
+                .write_record(&make_record(&["id"], vec![Value::Integer(7)]))
+                .unwrap();
+            writer.flush().unwrap();
+        }
+        assert_eq!(String::from_utf8(buf).unwrap(), "  7     \n");
     }
 
     use crate::envelope_writer::test_doc_with_sections as doc_with_sections;

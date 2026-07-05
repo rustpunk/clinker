@@ -18,7 +18,7 @@ When an input file carries columns the source's declared `schema:` block does no
       - { name: amount, type: float }
 ```
 
-- **`auto_widen`** *(default)* — undeclared input fields are carried along with each record and re-expanded to top-level columns at the output (when the Output node's `include_unmapped` is left at its default of `true`). Nothing is lost, and you don't have to declare every column up front.
+- **`auto_widen`** *(default)* — undeclared input fields are carried along with each record and re-expanded to top-level columns at the output (when the Output node's `include_unmapped` is left at its default of `true`). Nothing is silently lost, and you don't have to declare every column up front. How a widened column reaches the output depends on the output format — self-describing formats (JSON / NDJSON / XML) carry it per record, tabular CSV widens its header to the union of every record's columns, and fixed-width (a positional layout with no room for undeclared columns) fails loudly rather than dropping it. See [Output controls](#output-controls) below.
 - **`drop`** — undeclared input fields are silently stripped at read time. The source carries only its declared `schema:`.
 - **`reject`** — any record carrying a field not in the declared schema fails the source with a diagnostic naming the offending field. The strict choice when unexpected columns should be treated as errors.
 
@@ -35,7 +35,7 @@ Carried-along columns follow these rules through each node type:
 | Combine       | The driver's carried columns ride through; build-side ones are dropped. To keep a build-side field, emit it explicitly in the combine body via `<build_qualifier>.<field>`. |
 | Route / Merge | Passed through. `Merge` requires every input to share the same `on_unmapped` policy — mixing fails with **E315** (see below). |
 | Composition   | The body inherits the parent's carried columns and whatever the body's last node carries flows back out. |
-| Output        | Expanded to top-level columns when `include_unmapped: true` (the default); stripped when `false`. |
+| Output        | Expanded to top-level columns when `include_unmapped: true` (the default); stripped when `false`. How a widened column reaches a CSV / XML / fixed-width writer depends on the format — see [Schema drift across records](#schema-drift-across-records-tabular-formats). |
 
 ## Output controls
 
@@ -65,9 +65,18 @@ input.csv:    id,extra,city
 output.json:  {"id": "1", "extra": "foo", "city": "Paris"}
 ```
 
+### Schema drift across records (tabular formats)
+
+Different records can carry different auto-widened columns — for example a `Merge` of two sources where one carries `region` and the other `category`, so `region` appears only on the first source's rows and `category` only on the second's. Each output format handles that heterogeneity differently:
+
+- **JSON / NDJSON / XML** are self-describing: each record writes its own keys/elements, so a column present on only some records is simply absent from the others. Nothing is lost.
+- **CSV** needs one header shared by every row. When the output can be materialized (the common buffered path), Clinker pre-scans the batch and writes a header that is the **union of every record's columns**, in first-seen order; rows that lack a later-appearing column write an empty cell for it. Nothing is lost.
+- On a **bounded-memory CSV path** — a streaming output fused directly after a `Merge`/`Transform`, or an envelope-reconstructing output — the writer commits its header to the first record before it has seen the rest, so a union is impossible. A later record carrying a column the header lacks then fails the run loudly with a **`SchemaDrift`** error naming the format and column, rather than silently writing a narrower row. Declare the column in the source (or output) `schema:` so every record carries it, or route to a self-describing format.
+- **Fixed-width** is positional — every column occupies a declared byte range, and there is no room for an undeclared one — so any carried-along column reaching a fixed-width output is a `SchemaDrift` error. Fixed-width sources never auto-widen (see below), so this only arises when a fixed-width *output* sits downstream of a source that does.
+
 ### Writer errors on unexpanded columns
 
-The CSV, XML, and fixed-width writers can only write flat scalar columns. If carried-along columns reach one of these writers without being expanded — which happens when you set `include_unmapped: false` but a nested value is still present — the write fails with an `UnserializableMapValue` error naming the format and column. (JSON has no such limit; it writes nested values natively.)
+The CSV, XML, and fixed-width writers can only write flat scalar columns. If a `$widened` sidecar map reaches one of these writers without being expanded — which happens when you set `include_unmapped: false` but a nested value is still present — the write fails with an `UnserializableMapValue` error naming the format and column. (JSON has no such limit; it writes nested values natively.)
 
 The fix is to either leave `include_unmapped` at its default of `true`, so the columns are expanded to top-level before writing, or to convert the value to a scalar in CXL before emitting it. The error message lists both routes.
 
