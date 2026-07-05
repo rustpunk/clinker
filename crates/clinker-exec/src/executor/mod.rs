@@ -1614,6 +1614,7 @@ mod tests {
     mod composition_port_admission_overshoot;
     mod deferred_dispatch;
     mod diamond_node_buffer_overshoot;
+    mod iejoin_pre_output_budget;
     mod multi_output;
     mod nested_composition_overshoot;
     mod scheduling;
