@@ -32,11 +32,22 @@
 //!
 //! **Memory model:** the IEJoin scan materializes both partition sides,
 //! the L1/L2 vectors (`signed_idx, op1_key, op2_key` triples), the
-//! permutation P, and the bit array. The caller's [`MemoryArbitrator`] is
-//! polled every 10K emitted matched pairs; abort returns a typed
-//! `PipelineError::MemoryBudgetExceeded` carrying the combine node's
-//! name and `BudgetCategory::Arena` — the same shape every other
-//! budget-checked operator surface uses.
+//! permutation P, and the bit array. IEJoin has NO spill path, so this
+//! pre-output working set is what the budget has to bound. Its byte
+//! footprint is estimated from the routed index / range-key / sort-array
+//! counts and gated through [`MemoryArbitrator::should_abort_local`] at
+//! partition-build completion and again per equality group before the
+//! range walk — an RSS-independent check that aborts a doomed join before
+//! the sort arrays are even built, on hosts where `rss_bytes()` is
+//! unavailable. The estimate is also mirrored into a registered
+//! [`ConsumerHandle`] so the arbitrator's pull-mode `current_usage` sees
+//! the live footprint. The accumulated output buffer is polled separately
+//! every 10K emitted matched pairs. Every abort returns a typed
+//! `PipelineError::MemoryBudgetExceeded` carrying the combine node's name
+//! and `BudgetCategory::Arena` — the same shape every other budget-checked
+//! operator surface uses. Because there is no spill path, the arbitrator's
+//! spill / pause signals are never engaged here; the only response to
+//! pressure is a clean abort.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,7 +66,7 @@ use crate::pipeline::combine::{
     CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor, hash_composite_key,
     keys_equal_canonicalized,
 };
-use crate::pipeline::memory::MemoryArbitrator;
+use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
@@ -429,6 +440,14 @@ pub(crate) struct IEJoinExec<'a> {
     pub propagate_ck: &'a clinker_plan::config::pipeline_node::PropagateCkSpec,
     pub ctx: &'a EvalContext<'a>,
     pub budget: &'a MemoryArbitrator,
+    /// Shared handle for the IEJoin's registered `MemoryConsumer` wrapper.
+    /// The kernel mirrors its estimated pre-output working-set bytes into
+    /// this handle at partition-build completion and per equality group, so
+    /// the arbitrator's pull-mode `current_usage` reads the live footprint
+    /// while the join runs. IEJoin has no spill path, so the handle's
+    /// spill / pause flags are never consulted — it carries the byte
+    /// estimate only.
+    pub consumer: &'a Arc<ConsumerHandle>,
     /// Error strategy governing output-stage eval failures. Under
     /// `FailFast` a residual / body eval error propagates immediately;
     /// under `Continue` / `BestEffort` the failing row is deferred to the
@@ -454,6 +473,7 @@ pub(crate) fn execute_combine_iejoin(
         propagate_ck,
         ctx,
         budget,
+        consumer,
         strategy,
     } = args;
     // Recoverable output-stage eval failures deferred to the dispatcher.
@@ -680,6 +700,34 @@ pub(crate) fn execute_combine_iejoin(
         }
     }
 
+    // Pre-output charge #1 — the pre-scan working set. The routed
+    // partition index vectors and the per-record range-key slots are the
+    // state now held on the heap before any range walk starts. Estimate
+    // their bytes, mirror them into the registered consumer handle, and
+    // abort before the first group if they already exceed budget. IEJoin
+    // has no spill path, so an over-budget pre-scan can only be resolved by
+    // a clean abort — `should_abort_local` short-circuits on the local
+    // estimate, so the gate still fires on a host where `rss_bytes()`
+    // returns `None`.
+    let routed_index_count = driver_partitions.iter().map(Vec::len).sum::<usize>()
+        + build_partitions.iter().map(Vec::len).sum::<usize>();
+    let partition_state_bytes = routed_index_count
+        .saturating_mul(std::mem::size_of::<usize>())
+        .saturating_add(
+            driver_range_keys
+                .len()
+                .saturating_add(build_range_keys.len())
+                .saturating_mul(std::mem::size_of::<Option<(i64, i64)>>()),
+        );
+    consumer.set_bytes(partition_state_bytes as u64);
+    if budget.should_abort_local(partition_state_bytes as u64) {
+        return Err(pre_output_budget_error(
+            name,
+            partition_state_bytes as u64,
+            budget.hard_limit(),
+        ));
+    }
+
     let mut matched_driver: Vec<bool> = vec![false; driver_records.len()];
     let mut output_records: Vec<(Record, RecordOrder)> = Vec::new();
     let mut emitted_since_check: usize = 0;
@@ -732,6 +780,30 @@ pub(crate) fn execute_combine_iejoin(
                 .map(|&j| build_range_keys[j].expect("build range keys populated"))
                 .collect();
 
+            // Pre-output charge #2 — this group's transient IEJoin working
+            // set on top of the retained pre-scan state: the two range-key
+            // arrays plus the kernel's L1/L2 sort arrays, permutation
+            // vectors, and visited bit array. Gate it before the range walk
+            // so a group large enough to overflow the budget aborts before
+            // the sort arrays are materialized. The peak is the retained
+            // partition state plus this one group's kernel state (prior
+            // groups' state is already dropped), so mirror that sum into the
+            // handle for the arbitrator's pull-mode view.
+            let group_state_bytes = dkeys
+                .len()
+                .saturating_add(bkeys.len())
+                .saturating_mul(std::mem::size_of::<(i64, i64)>())
+                .saturating_add(iejoin_numeric_state_bytes(dkeys.len(), bkeys.len()));
+            let group_peak_bytes = partition_state_bytes.saturating_add(group_state_bytes);
+            consumer.set_bytes(group_peak_bytes as u64);
+            if budget.should_abort_local(group_peak_bytes as u64) {
+                return Err(pre_output_budget_error(
+                    name,
+                    group_peak_bytes as u64,
+                    budget.hard_limit(),
+                ));
+            }
+
             let pairs: Vec<(usize, usize)> = match op2 {
                 Some(op2v) => iejoin_numeric(&dkeys, &bkeys, op1, op2v),
                 None => {
@@ -741,6 +813,24 @@ pub(crate) fn execute_combine_iejoin(
                     pwmj_numeric(&dl, &bl, op1)
                 }
             };
+
+            // Fold the materialized pair index vector into the group peak —
+            // it is the last pre-output allocation before per-pair emit, so a
+            // high-fan-out band join aborts here before building any output
+            // records.
+            let pairs_peak_bytes = group_peak_bytes.saturating_add(
+                pairs
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(usize, usize)>()),
+            );
+            consumer.set_bytes(pairs_peak_bytes as u64);
+            if budget.should_abort_local(pairs_peak_bytes as u64) {
+                return Err(pre_output_budget_error(
+                    name,
+                    pairs_peak_bytes as u64,
+                    budget.hard_limit(),
+                ));
+            }
 
             for (di_local, bi_local) in pairs {
                 let driver_idx = group_drivers[di_local];
@@ -1218,6 +1308,50 @@ fn group_by_eq_keys(
     out
 }
 
+/// Estimated bytes of the numeric-IEJoin internal working set for a group
+/// of `n_left` driver and `n_right` build range keys: the two
+/// `(signed_idx, op1_key, op2_key)` sort arrays (L1 and L2), the two
+/// `usize` position/permutation vectors, and the visited bit array (one
+/// `u64` word per 64 positions plus one coarse `u64` word per 1024). This
+/// is the state [`iejoin_numeric`] allocates before it materializes any
+/// output pair, so charging it lets the budget abort a doomed band join
+/// before the O(n) sort arrays are even built — the RSS-independent gate
+/// the wasm build and other hosts without a `rss_bytes()` reading rely on.
+/// Saturating arithmetic keeps a pathological count from wrapping the
+/// estimate back under the budget.
+fn iejoin_numeric_state_bytes(n_left: usize, n_right: usize) -> usize {
+    let n_total = n_left.saturating_add(n_right);
+    // L1 + L2: two `Vec<(i64, i64, i64)>` of length n_total.
+    let sort_arrays = n_total
+        .saturating_mul(std::mem::size_of::<(i64, i64, i64)>())
+        .saturating_mul(2);
+    // l1_pos_of_dense + p: two `Vec<usize>` of length n_total.
+    let perm = n_total
+        .saturating_mul(std::mem::size_of::<usize>())
+        .saturating_mul(2);
+    // Bit array: one u64 word per 64 positions plus one coarse u64 word per
+    // 1024 positions — mirrors `IEJoinBitArray::new`.
+    let bit = n_total
+        .div_ceil(64)
+        .saturating_add(n_total.div_ceil(1024).div_ceil(64))
+        .saturating_mul(std::mem::size_of::<u64>());
+    sort_arrays.saturating_add(perm).saturating_add(bit)
+}
+
+/// Build the typed pre-output budget-abort error. IEJoin has no spill
+/// path, so an over-budget pre-output working set surfaces this
+/// `MemoryBudgetExceeded` with `BudgetCategory::Arena` — the same shape the
+/// output-buffer poll and every other budget-checked operator surface use.
+fn pre_output_budget_error(name: &str, used: u64, limit: u64) -> PipelineError {
+    PipelineError::MemoryBudgetExceeded {
+        node: name.to_string(),
+        used,
+        limit,
+        source: BudgetCategory::Arena,
+        detail: Some("iejoin pre-output state exceeded budget".to_string()),
+    }
+}
+
 fn key_eval_error(name: &str, side: &'static str, err: EvalError) -> PipelineError {
     PipelineError::Compilation {
         transform_name: name.to_string(),
@@ -1276,6 +1410,44 @@ mod tests {
         ba.set(50_000);
         let found: Vec<usize> = ba.iter_set_from(0).collect();
         assert_eq!(found, vec![50_000]);
+    }
+
+    #[test]
+    fn test_iejoin_numeric_state_bytes_counts_and_grows() {
+        // Empty input allocates no sort arrays or permutation vectors, and
+        // the two backing bit-array words `IEJoinBitArray::new` always keeps
+        // (`words.max(1)` + `regions.div_ceil(64).max(1)`) are only sized on
+        // a non-empty run — so a zero-length group estimates zero bytes.
+        assert_eq!(iejoin_numeric_state_bytes(0, 0), 0);
+
+        // A concrete group: the estimate must equal the exact per-component
+        // sum the kernel allocates so it tracks real footprint, not a fudge
+        // factor. n_total = 300.
+        let n_total = 300usize;
+        let expected = n_total * std::mem::size_of::<(i64, i64, i64)>() * 2 // L1 + L2
+            + n_total * std::mem::size_of::<usize>() * 2 // l1_pos_of_dense + p
+            + (n_total.div_ceil(64) + n_total.div_ceil(1024).div_ceil(64))
+                * std::mem::size_of::<u64>(); // bit array
+        assert_eq!(iejoin_numeric_state_bytes(100, 200), expected);
+
+        // Strictly monotonic in the total group size — a bigger band join
+        // can only estimate a larger working set, which is what makes the
+        // pre-output abort trip earlier on wider inputs.
+        assert!(iejoin_numeric_state_bytes(1_000, 1_000) > iejoin_numeric_state_bytes(100, 100));
+
+        // The estimate for a non-trivial group must exceed a 1-byte budget,
+        // so `should_abort_local` short-circuits on the local arm WITHOUT
+        // consulting RSS — the RSS-blind backstop the gate exists to
+        // provide. Uses `NoOpPolicy` so no victim selection interferes.
+        let budget =
+            MemoryArbitrator::with_policy(1, 0.8, Box::new(crate::pipeline::memory::NoOpPolicy));
+        let est = iejoin_numeric_state_bytes(500, 500) as u64;
+        assert!(est > 1);
+        assert!(
+            budget.should_abort_local(est),
+            "a {est}-byte working-set estimate must trip a 1-byte budget on the \
+             local arm regardless of RSS availability"
+        );
     }
 
     #[derive(Clone, Copy, Debug)]
