@@ -420,8 +420,31 @@ contains optional **batches** (`BHS`/`BTS`), each containing one or more
 onto the same nested levels — the `FHS` file header is a declared
 `segment: "FHS"` section, while the `BHS` batch and the `MSH` message
 surface automatically as the reader-supplied sections `batch` and
-`transaction_set`. Every tier is optional, so a bare `MSH`-led file simply
-opens one message level. See [HL7 v2 Format](../formats/hl7.md) for the full reference.
+`transaction_set`. Every tier is optional, and a level's section exists
+only when its header segment is present in the input — the reader
+synthesizes a `batch` section only where it reads a `BHS`, and the message
+level only where it reads an `MSH`.
+
+A bare `MSH`-led stream — messages with no `BHS` batch and no `FHS` file
+wrapper — therefore opens only the message level. `$doc.transaction_set.*`
+resolves against each message, but **`$doc.batch.*` resolves to `null`**:
+no `BHS` was read, so no `batch` section was synthesized. Whether a file
+carries a `BHS` batch wrapper is a property of the input bytes, not the
+config, so a `$doc.batch.*` path is never a compile error — it follows the
+same missing-value convention an absent `$doc` section follows (resolve
+`null`, never error), and populates as soon as a `BHS` wrapper is present:
+
+```yaml
+# Bare MSH stream (no BHS/FHS) — only the message level opens:
+- msg_type: $doc.transaction_set.f08   # MSH-9 message type — populated
+- batch_id: $doc.batch.f01             # null — no BHS, so no batch tier
+
+# BHS-wrapped stream — the BHS opens a batch level, so both populate:
+- msg_type: $doc.transaction_set.f08   # MSH-9 message type — populated
+- batch_id: $doc.batch.f01             # BHS field — now populated
+```
+
+See [HL7 v2 Format](../formats/hl7.md) for the full reference.
 
 A reader for such a format opens and closes each nested level as it
 crosses the corresponding envelope boundary mid-file. Each level
