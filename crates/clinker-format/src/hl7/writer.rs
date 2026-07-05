@@ -19,6 +19,14 @@
 //! field is written without escaping, mirroring the reader's verbatim
 //! treatment.
 //!
+//! The writer adopts each message's declared delimiter set — the field
+//! separator and the four encoding characters the reader discovered from
+//! the source header and stamped into the message's `$doc` section — so a
+//! custom-delimiter message re-emits with its own delimiters, and field
+//! joining, escaping, and split-field re-assembly all use the active set.
+//! A record with no stamp (not HL7-sourced, or its document context was
+//! dropped upstream) writes with the conventional `|^~\&` defaults.
+//!
 //! Memory model: streaming and O(1) in held state — only the current
 //! message and batch counts are retained. `flush` is the single
 //! end-of-stream finalizer: it writes the `BTS`/`FTS` trailers (when an
@@ -33,9 +41,9 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, Value};
 
 use crate::error::FormatError;
-use crate::hl7::RAW_FIELDS_KEY;
 use crate::hl7::field_split::{SplitCoord, parse_split_column, reassemble_field};
 use crate::hl7::tokenizer::Delimiters;
+use crate::hl7::{DELIMITERS_KEY, MESSAGE_SECTION, RAW_FIELDS_KEY};
 use crate::traits::FormatWriter;
 
 /// Configuration for the HL7 writer.
@@ -63,6 +71,9 @@ pub struct Hl7WriterConfig {
 pub struct Hl7Writer<W: Write> {
     writer: W,
     config: Hl7WriterConfig,
+    /// The active delimiter set: the conventional defaults until a record's
+    /// message stamp is adopted, then the set the message's source header
+    /// declared (re-adopted at every `MSH`).
     delims: Delimiters,
     /// Wire field columns keyed by the 1-based position parsed from the
     /// column name (`f01` → 1), each paired with its schema index. The
@@ -167,6 +178,38 @@ impl<W: Write> Hl7Writer<W> {
         }
     }
 
+    /// Adopt the delimiter set the record's source message declared,
+    /// stamped by the HL7 reader in the message-level `$doc` section. A
+    /// record carrying no stamp (not HL7-sourced, or its document context
+    /// was dropped upstream) writes with the conventional default set —
+    /// resetting rather than keeping a previously adopted set, so each
+    /// message's delimiters depend only on its own stamp. A stamp that does
+    /// not parse to five mutually-distinct bytes is an error: writing with
+    /// a corrupt set would silently corrupt every segment.
+    fn adopt_delimiters(&mut self, record: &Record) -> Result<(), FormatError> {
+        self.delims = match record
+            .doc_ctx()
+            .get_section_field(MESSAGE_SECTION, DELIMITERS_KEY)
+        {
+            Some(Value::String(declaration)) => {
+                Delimiters::from_declaration(declaration.as_bytes()).map_err(|reason| {
+                    FormatError::Hl7(format!(
+                        "the record's document context carries an invalid HL7 delimiter \
+                         declaration {declaration:?}: {reason}"
+                    ))
+                })?
+            }
+            Some(other) => {
+                return Err(FormatError::Hl7(format!(
+                    "the record's document context carries a non-string HL7 delimiter \
+                     declaration: {other:?}"
+                )));
+            }
+            None => Delimiters::default_set(),
+        };
+        Ok(())
+    }
+
     /// Emit the optional `FHS` file header and `BHS` batch header on the
     /// first record.
     fn write_header(&mut self, record: &Record) -> Result<(), FormatError> {
@@ -175,6 +218,10 @@ impl<W: Write> Hl7Writer<W> {
         }
         self.header_written = true;
 
+        // The FHS/BHS headers must use the same delimiter set as the
+        // messages they wrap, so adopt the first record's declared set
+        // before writing them.
+        self.adopt_delimiters(record)?;
         if let Some(fhs) = self.resolve_file_header(record)? {
             self.write_segment("FHS", &fhs, true)?;
             self.file_open = true;
@@ -261,6 +308,10 @@ impl<W: Write> Hl7Writer<W> {
         let is_msh = seg_id == "MSH";
         if is_msh {
             self.message_count += 1;
+            // An MSH opens a message; the whole message — field joining,
+            // escaping, split re-assembly — writes with the delimiter set
+            // its source header declared.
+            self.adopt_delimiters(record)?;
         }
         let fields = self.record_fields(record)?;
         self.write_segment(&seg_id, &fields, is_msh)?;
@@ -714,6 +765,117 @@ mod tests {
         // FHS-2 encoding chars, then an empty FHS-3, then FILE9 at FHS-4 —
         // the gap is preserved as an empty field, not collapsed.
         assert!(out.starts_with("FHS|^~\\&||FILE9\r"), "{out}");
+    }
+
+    /// Build a document context whose message section carries the given
+    /// delimiter stamp, as the HL7 reader produces for every message.
+    fn stamped_ctx(stamp: Value) -> Arc<clinker_record::DocumentContext> {
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
+        use indexmap::IndexMap;
+
+        let mut msg_doc: IndexMap<Box<str>, Value> = IndexMap::new();
+        msg_doc.insert(super::DELIMITERS_KEY.into(), stamp);
+        let mut sections: IndexMap<Box<str>, Value> = IndexMap::new();
+        sections.insert(super::MESSAGE_SECTION.into(), Value::Map(Box::new(msg_doc)));
+        Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("stamped.hl7"),
+            EnvelopeRecord::from_sections(sections),
+        ))
+    }
+
+    #[test]
+    fn message_stamp_switches_writer_delimiters() {
+        // Stamp: field '#', component '@', repetition '*', escape '/',
+        // sub-component '$'. Every segment of the message must join on '#',
+        // and escaping must use the adopted set: a literal '#' in data
+        // becomes /F/, a literal '/' becomes /E/, and the default '|' is
+        // plain data.
+        let ctx = stamped_ctx(Value::String("#@*/$".into()));
+        let s = schema();
+        let mut msh = record(&s, "MSH", &["@*/$", "SENDAPP"]);
+        msh.set_doc_ctx(Arc::clone(&ctx));
+        let mut obx = record(&s, "OBX", &["1", "TX", "note", "", "a#b/c|d"]);
+        obx.set_doc_ctx(ctx);
+        let out = write_all(Hl7WriterConfig::default(), &[msh, obx], &s);
+        assert!(out.starts_with("MSH#@*/$#SENDAPP\r"), "{out}");
+        assert!(out.contains("OBX#1#TX#note##a/F/b/E/c|d\r"), "{out}");
+    }
+
+    #[test]
+    fn unstamped_msh_resets_to_default_delimiters() {
+        // The first message is stamped with a custom set; the second
+        // carries no stamp and must reset to the defaults rather than
+        // inheriting the previous message's delimiters.
+        let ctx = stamped_ctx(Value::String("#@*/$".into()));
+        let s = schema();
+        let mut msh1 = record(&s, "MSH", &["@*/$", "S1"]);
+        msh1.set_doc_ctx(Arc::clone(&ctx));
+        let mut pid1 = record(&s, "PID", &["1"]);
+        pid1.set_doc_ctx(ctx);
+        let msh2 = record(&s, "MSH", &["^~\\&", "S2"]);
+        let pid2 = record(&s, "PID", &["2"]);
+        let out = write_all(Hl7WriterConfig::default(), &[msh1, pid1, msh2, pid2], &s);
+        assert!(out.contains("MSH#@*/$#S1\r"), "{out}");
+        assert!(out.contains("PID#1\r"), "{out}");
+        assert!(out.contains("MSH|^~\\&|S2\r"), "{out}");
+        assert!(out.contains("PID|2\r"), "{out}");
+    }
+
+    #[test]
+    fn envelope_headers_use_adopted_delimiters() {
+        // Literal FHS/BHS config fields joined with the delimiter set the
+        // first record's stamp declares, and the recomputed BTS/FTS
+        // trailers follow suit.
+        let ctx = stamped_ctx(Value::String("#@*/$".into()));
+        let s = schema();
+        let mut msh = record(&s, "MSH", &["@*/$", "SENDAPP"]);
+        msh.set_doc_ctx(ctx);
+        let cfg = Hl7WriterConfig {
+            file_header: Some(vec!["@*/$".into(), "SENDAPP".into()]),
+            batch_header: Some(vec!["@*/$".into(), "SENDAPP".into()]),
+            segment_newline: false,
+            ..Default::default()
+        };
+        let out = write_all(cfg, &[msh], &s);
+        assert!(out.starts_with("FHS#@*/$#SENDAPP\r"), "{out}");
+        assert!(out.contains("BHS#@*/$#SENDAPP\r"), "{out}");
+        assert!(out.contains("BTS#1\r"), "{out}");
+        assert!(out.contains("FTS#1\r"), "{out}");
+    }
+
+    #[test]
+    fn invalid_delimiter_stamp_errors() {
+        let try_stamp = |stamp: Value| -> Result<(), FormatError> {
+            let s = schema();
+            let mut msh = record(&s, "MSH", &["^~\\&", "S"]);
+            msh.set_doc_ctx(stamped_ctx(stamp));
+            let mut buf = Vec::new();
+            let mut w = Hl7Writer::new(
+                Cursor::new(&mut buf),
+                Arc::clone(&s),
+                Hl7WriterConfig::default(),
+            );
+            w.write_record(&msh)
+        };
+        // Colliding bytes ('#' twice) would corrupt every segment.
+        let err = try_stamp(Value::String("##*/$".into())).unwrap_err();
+        assert!(
+            matches!(err, FormatError::Hl7(ref m) if m.contains("five distinct bytes")),
+            "{err:?}"
+        );
+        // A declaration that is not exactly five bytes.
+        let err = try_stamp(Value::String("#@".into())).unwrap_err();
+        assert!(
+            matches!(err, FormatError::Hl7(ref m) if m.contains("five bytes")),
+            "{err:?}"
+        );
+        // A non-string payload is an engine-side invariant violation.
+        let err = try_stamp(Value::Integer(5)).unwrap_err();
+        assert!(
+            matches!(err, FormatError::Hl7(ref m) if m.contains("non-string")),
+            "{err:?}"
+        );
     }
 
     #[test]
