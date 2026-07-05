@@ -1104,6 +1104,59 @@ mod tests {
         );
     }
 
+    /// A per-document bucket whose spill file crosses the arbitrator's disk
+    /// quota aborts with the structured `SpillCapExceeded` (E320) surface
+    /// rather than continuing to fill the disk. Drives [`spill_bucket_in_place`]
+    /// directly with a one-byte cap so the mem-tail flush overflows on its
+    /// first write — the DLQ bucket path's own disk-cap guard, exercised in
+    /// isolation from any upstream node-buffer spill.
+    #[test]
+    fn bucket_spill_past_disk_cap_aborts_with_e320() {
+        use crate::pipeline::memory::assert_spill_cap_overflow;
+
+        let s = schema();
+        let arbitrator = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            64,
+            0.5,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ));
+        // A one-byte disk quota: the mem-tail flush overflows it on the first
+        // write, regardless of how the soft memory limit is set.
+        arbitrator.set_max_spill_bytes(1);
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let handle = crate::pipeline::memory::ConsumerHandle::new();
+        let consumer_id = arbitrator.register_consumer(Arc::new(
+            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone(), false),
+        ));
+        let mut bucket = DocBucket {
+            buffer: NodeBuffer::Memory(Vec::new()),
+            consumer_id,
+            handle,
+            depth: 1,
+        };
+
+        for i in 0..64u64 {
+            bucket
+                .buffer
+                .push(rec(&s, i as i64, (i * 10) as i64), 1000 + i);
+        }
+
+        let result = spill_bucket_in_place(
+            &mut bucket,
+            &arbitrator,
+            "out",
+            tmp.path(),
+            clinker_plan::config::CompressMode::default(),
+            8,
+            s.column_count(),
+        );
+
+        assert_spill_cap_overflow(result, &arbitrator, "out", 1, tmp.path());
+
+        arbitrator.unregister_consumer(consumer_id);
+    }
+
     /// A clean document whose bucket SPILLED and then accumulated a resident
     /// in-memory tail (a `Mixed` buffer — memory pressure relaxed mid-
     /// document) is drained to the success sink in ARRIVAL order: the spilled

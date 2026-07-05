@@ -106,7 +106,7 @@ mod tests {
         for i in (0..100).rev() {
             buf.push(rec2(&schema, &format!("r{i}"), i), ());
         }
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::InMemory(pairs) => {
                 assert_eq!(pairs.len(), 100);
                 for (i, (r, _)) in pairs.iter().enumerate() {
@@ -126,7 +126,7 @@ mod tests {
         for name in &["alpha", "charlie", "bravo", "delta", "echo"] {
             buf.push(rec2(&schema, name, 0), ());
         }
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::InMemory(pairs) => {
                 let names: Vec<_> = pairs
                     .iter()
@@ -151,7 +151,7 @@ mod tests {
         buf.push(rec3(&schema, "A", 100, 2), ());
         buf.push(rec3(&schema, "A", 300, 3), ());
         buf.push(rec3(&schema, "B", 100, 4), ());
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::InMemory(pairs) => {
                 // A first (ASC), within A: 300 before 100 (DESC)
                 assert_eq!(pairs[0].0.get("dept"), Some(&Value::String("A".into())));
@@ -177,7 +177,7 @@ mod tests {
             (),
         );
         buf.push(rec2(&schema, "c", 10), ());
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::InMemory(pairs) => {
                 assert_eq!(pairs[0].0.get("value"), Some(&Value::Null));
                 assert_eq!(pairs[1].0.get("value"), Some(&Value::Integer(10)));
@@ -199,7 +199,7 @@ mod tests {
             (),
         );
         buf.push(rec2(&schema, "c", 10), ());
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::InMemory(pairs) => {
                 assert_eq!(pairs[0].0.get("value"), Some(&Value::Integer(10)));
                 assert_eq!(pairs[1].0.get("value"), Some(&Value::Integer(30)));
@@ -220,7 +220,7 @@ mod tests {
         buf.push(rec3(&schema, "A", 200, 2), ());
         buf.push(rec3(&schema, "A", 300, 3), ());
         buf.push(rec3(&schema, "A", 400, 4), ());
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::InMemory(pairs) => {
                 for (i, (r, _)) in pairs.iter().enumerate() {
                     assert_eq!(r.get("seq"), Some(&Value::Integer(i as i64 + 1)));
@@ -258,7 +258,7 @@ mod tests {
             buf.push(rec2(&schema, &format!("r{i}"), i), ());
             buf.sort_and_spill().unwrap();
         }
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::Spilled(files) => {
                 assert_eq!(files.len(), 32);
                 // Merge all 32 files (cascade: merge 16, then merge remaining)
@@ -296,7 +296,7 @@ mod tests {
             .collect();
         assert!(!files_before.is_empty(), "spill files should exist");
 
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::Spilled(files) => {
                 // Drop the spill files (RAII cleanup)
                 drop(files);
@@ -339,7 +339,7 @@ mod tests {
             "no spill files should be created for in-memory path"
         );
 
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::InMemory(pairs) => {
                 assert_eq!(pairs.len(), 10);
                 for (i, (r, _)) in pairs.iter().enumerate() {

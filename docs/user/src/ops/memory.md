@@ -129,6 +129,15 @@ To influence strategy selection:
 
 Only force `streaming` when you are certain the input is sorted by the group-by keys. If the data is not sorted, results will be incorrect. Use `auto` when in doubt.
 
+### Oversized single rows
+
+An aggregate that keeps `min`, `max`, `avg`, or another value-buffering binding holds each contributing row's raw values until the group finalizes. If a **single input row's** buffered footprint is larger than the entire `memory.limit`, no amount of spilling can hold it — spill would only re-read the same oversized row. The engine surfaces this per-row overflow rather than absorbing it:
+
+- With `error_handling.strategy: fail` (the default), the run aborts with `E310 MemoryBudgetExceeded`, naming the aggregate stage and reporting the offending row's byte footprint against the budget.
+- With `strategy: continue` (or `best_effort`), the offending record is routed to the dead-letter queue under the `aggregate_finalize` category, and the run proceeds.
+
+This is almost always a sign the budget is set far too low for the record shape — raise `memory.limit` so a typical row fits comfortably.
+
 ## Compositions
 
 A composition (a reusable sub-pipeline included via `use:`) does not get its own memory budget — its operators share the parent pipeline's budget and spill to the same temporary directory. If a budget overrun happens inside a composition, the error names the composition's call-site (e.g. `enrich_call`) so you can locate it, prefixing the message with `in composition 'enrich_call': ...` when the overrun is internal to the body.

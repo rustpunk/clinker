@@ -87,10 +87,12 @@ impl<P: Serialize + DeserializeOwned + Send> SortBuffer<P> {
     }
 
     /// Sort the current in-memory pairs and write them to a spill file.
-    /// Clears the buffer and resets the byte counter.
-    pub fn sort_and_spill(&mut self) -> Result<(), SpillError> {
+    /// Clears the buffer and resets the byte counter. Returns the spilled
+    /// file's on-disk byte length so the caller can charge it against the
+    /// pipeline disk-spill quota; an empty buffer writes nothing and returns 0.
+    pub fn sort_and_spill(&mut self) -> Result<u64, SpillError> {
         if self.pairs.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let sort_by = &self.sort_by;
@@ -109,15 +111,24 @@ impl<P: Serialize + DeserializeOwned + Send> SortBuffer<P> {
             writer.write_pair(&record, &payload)?;
         }
         let spill_file = writer.finish()?;
+        // On-disk length after finalize (the LZ4 frame tail is flushed by
+        // `finish`), matching the byte figure the disk-cap accounting charges
+        // for every other spill op. A stat failure charges 0 rather than
+        // aborting a successful spill.
+        let written = std::fs::metadata(spill_file.path())
+            .map(|m| m.len())
+            .unwrap_or(0);
         self.spill_files.push(spill_file);
         self.bytes_used = 0;
-        Ok(())
+        Ok(written)
     }
 
     /// Finish the sort buffer. If pairs were spilled, remaining in-memory
-    /// pairs are also spilled. Returns either sorted in-memory pairs or a
-    /// list of sorted spill files for merge.
-    pub fn finish(mut self) -> Result<SortedOutput<P>, SpillError> {
+    /// pairs are also spilled. Returns the sorted output — in-memory pairs or
+    /// the list of sorted spill files for merge — paired with the byte length
+    /// of the residue run this call spilled (0 when nothing spilled here), so
+    /// the caller can charge that final run against the disk-spill quota.
+    pub fn finish(mut self) -> Result<(SortedOutput<P>, u64), SpillError> {
         if self.spill_files.is_empty() {
             let sort_by = &self.sort_by;
             // Parallel stable sort on the shared kernel pool; tie-break
@@ -125,12 +136,14 @@ impl<P: Serialize + DeserializeOwned + Send> SortBuffer<P> {
             // the in-memory result is byte-identical.
             self.pairs
                 .par_sort_by(|(a, _), (b, _)| compare_records_by_fields(a, b, sort_by));
-            Ok(SortedOutput::InMemory(self.pairs))
+            Ok((SortedOutput::InMemory(self.pairs), 0))
         } else {
-            if !self.pairs.is_empty() {
-                self.sort_and_spill()?;
-            }
-            Ok(SortedOutput::Spilled(self.spill_files))
+            let residue = if !self.pairs.is_empty() {
+                self.sort_and_spill()?
+            } else {
+                0
+            };
+            Ok((SortedOutput::Spilled(self.spill_files), residue))
         }
     }
 
@@ -256,7 +269,7 @@ mod tests {
         buf.push(make_record(&schema, "Alice", 10), ());
         buf.push(make_record(&schema, "Bob", 20), ());
 
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::InMemory(pairs) => {
                 assert_eq!(pairs.len(), 3);
                 assert_eq!(pairs[0].0.get("value"), Some(&Value::Integer(10)));
@@ -293,7 +306,7 @@ mod tests {
         // Push one more without spilling — finish() will spill it
         buf.push(make_record(&schema, "C", 30), ());
 
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::Spilled(files) => {
                 assert_eq!(files.len(), 3); // 2 manual spills + 1 from finish()
             }
@@ -312,7 +325,7 @@ mod tests {
         buf.sort_and_spill().unwrap();
 
         // Read back and verify sorted
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::Spilled(files) => {
                 let reader = files[0].reader().unwrap();
                 let recs: Vec<Record> = reader.map(|r| r.unwrap().0).collect();
@@ -334,7 +347,7 @@ mod tests {
         buf.push(make_record(&schema, "Charlie", 30), 100);
         buf.push(make_record(&schema, "Alice", 10), 200);
         buf.push(make_record(&schema, "Bob", 20), 300);
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::InMemory(pairs) => {
                 assert_eq!(pairs.len(), 3);
                 // Sorted by value asc: Alice(10,200), Bob(20,300), Charlie(30,100)
@@ -356,7 +369,7 @@ mod tests {
         buf.push(make_record(&schema, "A", 10), 200);
         buf.push(make_record(&schema, "B", 20), 300);
         buf.sort_and_spill().unwrap();
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::Spilled(files) => {
                 let reader = files[0].reader().unwrap();
                 let pairs: Vec<(Record, u64)> = reader.map(|r| r.unwrap()).collect();
@@ -377,7 +390,7 @@ mod tests {
         let schema = test_schema();
         let buf: SortBuffer<()> =
             SortBuffer::new(sort_by_value_asc(), 1_000_000, None, true, schema);
-        match buf.finish().unwrap() {
+        match buf.finish().unwrap().0 {
             SortedOutput::InMemory(pairs) => assert!(pairs.is_empty()),
             SortedOutput::Spilled(_) => panic!("expected InMemory"),
         }
