@@ -138,6 +138,52 @@ nodes:
 }
 
 #[test]
+fn test_unresolvable_composition_use_fails_run_instead_of_empty_output() {
+    // A composition whose `use:` names a `.comp.yaml` that does not exist
+    // in the workspace. Compile must fail with the binding diagnostic so
+    // the run aborts loudly — the earlier behavior omitted the composition
+    // node and let the run "succeed" writing zero records to `out`, a
+    // silent empty output indistinguishable from an empty input.
+    let yaml = r#"
+pipeline:
+  name: composition_executor_unresolvable
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: a, type: int }
+  - type: composition
+    name: missing_call
+    input: src
+    use: ../compositions/does_not_exist.comp.yaml
+    inputs:
+      inp: src
+  - type: output
+    name: out
+    input: missing_call
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse pipeline yaml");
+    let root = fixture_workspace_root();
+    let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
+
+    let diags = config
+        .compile(&ctx)
+        .expect_err("an unresolvable composition `use:` must fail compile, not run empty");
+    assert!(
+        diags.iter().any(|d| d.code == "E103"),
+        "compile must surface E103 for the unresolvable `use:` path; got: {diags:?}"
+    );
+}
+
+#[test]
 fn test_nested_composition_body_executes() {
     // A composition body whose first node is itself a composition.
     // The body executor must recurse into the inner body so the

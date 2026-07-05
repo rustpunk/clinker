@@ -592,8 +592,10 @@ impl PipelineConfig {
     ///
     /// On error, returns the accumulated diagnostics from the topology
     /// pre-pass plus any per-variant lowering errors. Composition binding
-    /// errors (E102–E109) are non-fatal — the composition node is silently
-    /// omitted from the DAG.
+    /// errors (E102–E109) are fatal: an unresolvable `use:` or an
+    /// ill-bound call site fails compile rather than dropping the
+    /// composition node and letting the run write zero records with no
+    /// diagnostic.
     pub fn compile(
         &self,
         ctx: &CompileContext,
@@ -726,10 +728,13 @@ impl PipelineConfig {
             &mut diags,
         );
 
-        // Only abort on non-composition CXL errors (E200/E201) and
-        // source-CK validation errors (E153). Composition binding
-        // errors (E102–E109) are non-fatal for the rest of the pipeline
-        // — the composition node is omitted from the DAG.
+        // Early-abort optimization: CXL type errors (E200/E201), source-CK
+        // validation errors (E153), and DLQ/output-path errors
+        // (E317/E318) make per-variant lowering meaningless, so stop here
+        // rather than lowering a plan that cannot run. Every other
+        // error-severity diagnostic — composition-binding errors
+        // (E102–E109) included — is caught by the post-lowering gate,
+        // which lets lowering accumulate the full diagnostic set first.
         let has_cxl_errors = diags.iter().any(|d| {
             matches!(d.severity, clinker_core_types::Severity::Error)
                 && matches!(d.code.as_str(), "E200" | "E201" | "E153" | "E317" | "E318")
@@ -1829,10 +1834,9 @@ impl PipelineConfig {
         // executor inherits the parent's WindowRuntime via
         // `Arc::clone` at recursion entry. The pass only short-
         // circuits on errors it itself emits (E003 / E150d at body
-        // root); existing E102-E109 from bind_composition stay
-        // non-fatal here, mirroring the post-bind-schema gate above
-        // that lets composition-binding errors land as soft
-        // diagnostics while CXL errors hard-stop.
+        // root). Any E102-E109 from bind_composition are already in
+        // `diags` and are caught by the post-lowering gate below; this
+        // pass only needs to surface the window-rooting errors it adds.
         let pre_pass_diag_count = diags.len();
         crate::plan::execution::resolve_composition_body_windows(&dag, &mut artifacts, &mut diags);
         if diags[pre_pass_diag_count..]
@@ -2209,13 +2213,16 @@ impl PipelineConfig {
             &dag, &artifacts,
         ));
 
-        // If lowering accumulated any non-composition error-severity
-        // diagnostics, return them. Composition binding errors
-        // (E102–E109) are non-fatal — the composition node is silently
-        // omitted from the DAG. Warnings do not block.
-        let has_fatal_errors = diags.iter().any(|d| {
-            matches!(d.severity, clinker_core_types::Severity::Error) && !d.code.starts_with("E10")
-        });
+        // Any error-severity diagnostic accumulated through binding and
+        // lowering is fatal, composition-binding errors (E102–E109)
+        // included. An unresolvable `use:` or an ill-bound call site drops
+        // the composition node from the lowered DAG above; letting compile
+        // still succeed there produced a run that wrote zero records with
+        // no diagnostic — indistinguishable from empty input. Warnings do
+        // not block.
+        let has_fatal_errors = diags
+            .iter()
+            .any(|d| matches!(d.severity, clinker_core_types::Severity::Error));
         if has_fatal_errors {
             return Err(diags);
         }
@@ -3786,8 +3793,10 @@ pub(crate) fn lower_node_to_plan_node(
         }),
         PipelineNode::Composition { .. } => {
             // Look up the body assigned by bind_composition. If binding
-            // failed (E102–E109), there's no entry — silently omit the
-            // node (the binding errors already surfaced in Stage 4.5).
+            // failed (E102–E109), there's no entry — omit the node from
+            // this partial DAG. The binding errors are already in `diags`
+            // and the post-lowering gate turns them into a compile
+            // failure, so the omission is never observed by a run.
             let body_id = artifacts
                 .composition_body_assignments
                 .get(&id)
