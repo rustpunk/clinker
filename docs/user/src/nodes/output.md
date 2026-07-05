@@ -127,6 +127,11 @@ full-precision value. Only `decimal` values in `decimal`-declared columns are
 affected — no other type is coerced. See [Decimal — arithmetic
 rules](../cxl/types.md#arithmetic-rules) for the full boundary-contract model.
 
+The same rounding applies to an Output node declared inside a
+[composition](../pipelines/compositions.md) body. When its `schema:` names an
+external `.schema.yaml` file, the path resolves relative to the composition
+file's own directory (not the invoking pipeline's).
+
 ## Output format options
 
 ### CSV

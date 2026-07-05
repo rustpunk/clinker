@@ -2892,6 +2892,139 @@ fn bind_composition(
         }
     }
 
+    // 7c. A body Source/Output CSV `delimiter` / `quote_char` is only ever
+    // rejected at runtime by the writer's single-byte lowering guard, because
+    // top-level `validate_config` (which runs the same check) sees only the
+    // call-site pipeline's own nodes. Run the shared byte-option check here so
+    // an empty, multi-character, or non-ASCII value on a body node fails at
+    // compile / `--explain` — the same stage a top-level node is rejected at —
+    // rather than after the run has already started producing output. Collect
+    // every violation, then abandon the body, mirroring the E115 pass above.
+    {
+        let mut has_csv_violation = false;
+        for spanned in &body_file.nodes {
+            let node_span = span_for_node(spanned);
+            let mut check = |result: Result<(), crate::config::ConfigError>| {
+                if let Err(err) = result {
+                    let raw = match err {
+                        crate::config::ConfigError::Validation(m) => m,
+                        other => other.to_string(),
+                    };
+                    diags.push(Diagnostic::error(
+                        "E115",
+                        format!(
+                            "composition node {node_name:?}: body file {}: {raw}",
+                            resolved_path.display()
+                        ),
+                        LabeledSpan::primary(node_span, String::new()),
+                    ));
+                    has_csv_violation = true;
+                }
+            };
+            match &spanned.value {
+                PipelineNode::Source { config, .. } => {
+                    if let crate::config::InputFormat::Csv(Some(opts)) = &config.source.format {
+                        if let Some(delimiter) = opts.delimiter.as_deref() {
+                            check(crate::config::pipeline::validate_csv_byte_option(
+                                "source",
+                                &config.source.name,
+                                "delimiter",
+                                delimiter,
+                            ));
+                        }
+                        if let Some(quote_char) = opts.quote_char.as_deref() {
+                            check(crate::config::pipeline::validate_csv_byte_option(
+                                "source",
+                                &config.source.name,
+                                "quote_char",
+                                quote_char,
+                            ));
+                        }
+                    }
+                }
+                PipelineNode::Output { config, .. } => {
+                    if let crate::config::OutputFormat::Csv(Some(opts)) = &config.output.format
+                        && let Some(delimiter) = opts.delimiter.as_deref()
+                    {
+                        check(crate::config::pipeline::validate_csv_byte_option(
+                            "output",
+                            &config.output.name,
+                            "delimiter",
+                            delimiter,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if has_csv_violation {
+            return;
+        }
+    }
+
+    // 7d. Resolve external `.schema.yaml` (`SourceSchema::File`) references on
+    // body Source and Output nodes to their inline column form, each path
+    // resolved relative to the composition file's own directory. Top-level
+    // nodes have their externals resolved at parse time by
+    // `resolve_and_hash_external_schemas`; body files are re-read here and
+    // never pass through that fold. Two consequences motivate resolving them:
+    // a body Output's declared-decimal `scale` and fixed-width column widths
+    // both read through `SourceSchema::as_columns`, which yields `None` for an
+    // unresolved `File`, so the write boundary silently skips scale rounding;
+    // and a body Source's `File` would otherwise resolve against the process
+    // working directory (`resolve_source_columns`) instead of the composition
+    // directory. Resolving in place, before the body binds and lowers, fixes
+    // both. The pipeline-identity fold of the referenced content is
+    // intentionally not mirrored here.
+    {
+        let comp_dir = signature
+            .source_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        // Pass 1: immutable walk loading each external file once.
+        let mut resolved: Vec<(usize, SourceSchema)> = Vec::new();
+        for (idx, spanned) in body_file.nodes.iter().enumerate() {
+            let (rel, node_label) = match &spanned.value {
+                PipelineNode::Source { config, .. } => match &config.schema {
+                    SourceSchema::File(rel) => (rel, format!("source {:?}", config.source.name)),
+                    _ => continue,
+                },
+                PipelineNode::Output { config, .. } => match &config.output.schema {
+                    Some(SourceSchema::File(rel)) => {
+                        (rel, format!("output {:?}", config.output.name))
+                    }
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let path = comp_dir.join(rel);
+            match crate::schema::load_source_schema(&path) {
+                Ok(inline) => resolved.push((idx, inline)),
+                Err(e) => {
+                    diags.push(Diagnostic::error(
+                        "E157",
+                        format!(
+                            "composition node {node_name:?}: body file {}: {node_label} declares \
+                             an external schema file {rel:?} that failed to load: {e}",
+                            resolved_path.display()
+                        ),
+                        LabeledSpan::primary(span_for_node(spanned), String::new()),
+                    ));
+                    return;
+                }
+            }
+        }
+        // Pass 2: write each resolved inline schema back onto its body node.
+        for (idx, inline) in resolved {
+            match &mut body_file.nodes[idx].value {
+                PipelineNode::Source { config, .. } => config.schema = inline,
+                PipelineNode::Output { config, .. } => config.output.schema = Some(inline),
+                _ => {}
+            }
+        }
+    }
+
     // 8. Enter nested scope.
     let body_id = artifacts.fresh_body_id();
 

@@ -81,6 +81,17 @@ directive, or a `batch_size: 0` — fails compilation with an `E115`
 diagnostic naming the composition call site, the body file, and the
 violation. Run `clinker explain --code E115` for details.
 
+A body `source` or `output` that sets a CSV `delimiter` or `quote_char`
+which is not exactly one ASCII byte is likewise rejected at compile time,
+not first at run, with the same one-byte rule top-level nodes get.
+
+A body `source` or `output` whose `schema:` names an external
+`.schema.yaml` file has that path resolved relative to the composition
+file's own directory (not the invoking pipeline's), and the file's columns
+are inlined before the body binds. A body `output` therefore rounds
+`decimal` columns to their declared [`scale`](../nodes/output.md#rounding-decimals-to-a-declared-scale)
+at the write boundary exactly as a top-level output does.
+
 ## Advanced wiring
 
 For compositions with multiple input or output ports, the node supports explicit port bindings:

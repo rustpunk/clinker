@@ -4968,7 +4968,10 @@ fn validate_hl7_split_fields(source_name: &str, opts: &Hl7InputOptions) -> Resul
 /// a diagnostic naming the node, the option, and the offending value.
 /// `node_kind` is `"source"` or `"output"`; `field` is `"delimiter"` or
 /// `"quote_char"`.
-fn validate_csv_byte_option(
+///
+/// `pub(crate)` so composition-body binding can apply the same check to body
+/// Source/Output nodes, which never flow through top-level `validate_config`.
+pub(crate) fn validate_csv_byte_option(
     node_kind: &str,
     node_name: &str,
     field: &str,
