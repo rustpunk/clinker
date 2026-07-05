@@ -703,6 +703,126 @@ fn fold_config_expr(expr: &mut Expr, resolve: &impl Fn(&str) -> Option<LiteralVa
     }
 }
 
+/// Add `base` to every [`NodeId`] in `expr` and all of its
+/// sub-expressions (and match-arm nodes), in place.
+///
+/// Splicing an independently parsed expression into a larger synthetic
+/// program requires relocating its node ids: each parse numbers its
+/// nodes from zero, so two separately parsed exprs share the low ids.
+/// Offsetting one expr past the ids already consumed by the combined
+/// program keeps the per-node side-tables the resolver and typechecker
+/// index by [`NodeId`] (bindings, types, regexes) dense and
+/// collision-free — every distinct node keeps a distinct index below the
+/// combined node count. Spans are left untouched: only the id-space is
+/// relocated, so callers must not treat the shifted ids as byte offsets.
+///
+/// `base` of zero is a no-op. Ids saturate rather than wrap at
+/// [`u32::MAX`], though a real program stays orders of magnitude below
+/// that ceiling.
+pub fn offset_node_ids(expr: &mut Expr, base: u32) {
+    if base == 0 {
+        return;
+    }
+    fn shift(id: &mut NodeId, base: u32) {
+        id.0 = id.0.saturating_add(base);
+    }
+    match expr {
+        Expr::Binary {
+            node_id, lhs, rhs, ..
+        }
+        | Expr::Coalesce {
+            node_id, lhs, rhs, ..
+        } => {
+            shift(node_id, base);
+            offset_node_ids(lhs, base);
+            offset_node_ids(rhs, base);
+        }
+        Expr::Unary {
+            node_id, operand, ..
+        } => {
+            shift(node_id, base);
+            offset_node_ids(operand, base);
+        }
+        Expr::MethodCall {
+            node_id,
+            receiver,
+            args,
+            ..
+        } => {
+            shift(node_id, base);
+            offset_node_ids(receiver, base);
+            for a in args.iter_mut() {
+                offset_node_ids(a, base);
+            }
+        }
+        Expr::Match {
+            node_id,
+            subject,
+            arms,
+            ..
+        } => {
+            shift(node_id, base);
+            if let Some(s) = subject.as_deref_mut() {
+                offset_node_ids(s, base);
+            }
+            for arm in arms.iter_mut() {
+                shift(&mut arm.node_id, base);
+                offset_node_ids(&mut arm.pattern, base);
+                offset_node_ids(&mut arm.body, base);
+            }
+        }
+        Expr::IfThenElse {
+            node_id,
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            shift(node_id, base);
+            offset_node_ids(condition, base);
+            offset_node_ids(then_branch, base);
+            if let Some(e) = else_branch.as_deref_mut() {
+                offset_node_ids(e, base);
+            }
+        }
+        Expr::WindowCall { node_id, args, .. } | Expr::AggCall { node_id, args, .. } => {
+            shift(node_id, base);
+            for a in args.iter_mut() {
+                offset_node_ids(a, base);
+            }
+        }
+        Expr::IndexAccess {
+            node_id,
+            receiver,
+            index,
+            ..
+        } => {
+            shift(node_id, base);
+            offset_node_ids(receiver, base);
+            offset_node_ids(index, base);
+        }
+        Expr::Closure { node_id, body, .. } => {
+            shift(node_id, base);
+            offset_node_ids(body, base);
+        }
+        // Leaf variants: shift the id, no children to descend.
+        Expr::Literal { node_id, .. }
+        | Expr::FieldRef { node_id, .. }
+        | Expr::QualifiedFieldRef { node_id, .. }
+        | Expr::PipelineAccess { node_id, .. }
+        | Expr::VarsAccess { node_id, .. }
+        | Expr::ConfigAccess { node_id, .. }
+        | Expr::SourceAccess { node_id, .. }
+        | Expr::RecordAccess { node_id, .. }
+        | Expr::QualifiedSourceAccess { node_id, .. }
+        | Expr::DocAccess { node_id, .. }
+        | Expr::Now { node_id, .. }
+        | Expr::Wildcard { node_id, .. }
+        | Expr::AggSlot { node_id, .. }
+        | Expr::GroupKey { node_id, .. } => shift(node_id, base),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MatchArm {
     pub node_id: NodeId,
@@ -1204,5 +1324,151 @@ mod support_into_tests {
             f.is_empty(),
             "$widened FieldRef must be excluded; got {f:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod offset_node_ids_tests {
+    use super::*;
+    use crate::parser::Parser;
+
+    /// Recursively collect every `NodeId` reachable from `e`, mirroring the
+    /// recursion shape of [`offset_node_ids`] so the two stay in lockstep.
+    fn collect_ids(e: &Expr, out: &mut Vec<u32>) {
+        out.push(e.node_id().0);
+        match e {
+            Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
+                collect_ids(lhs, out);
+                collect_ids(rhs, out);
+            }
+            Expr::Unary { operand, .. } => collect_ids(operand, out),
+            Expr::MethodCall { receiver, args, .. } => {
+                collect_ids(receiver, out);
+                for a in args {
+                    collect_ids(a, out);
+                }
+            }
+            Expr::Match { subject, arms, .. } => {
+                if let Some(s) = subject {
+                    collect_ids(s, out);
+                }
+                for arm in arms {
+                    out.push(arm.node_id.0);
+                    collect_ids(&arm.pattern, out);
+                    collect_ids(&arm.body, out);
+                }
+            }
+            Expr::IfThenElse {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_ids(condition, out);
+                collect_ids(then_branch, out);
+                if let Some(e) = else_branch {
+                    collect_ids(e, out);
+                }
+            }
+            Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+                for a in args {
+                    collect_ids(a, out);
+                }
+            }
+            Expr::IndexAccess {
+                receiver, index, ..
+            } => {
+                collect_ids(receiver, out);
+                collect_ids(index, out);
+            }
+            Expr::Closure { body, .. } => collect_ids(body, out),
+            _ => {}
+        }
+    }
+
+    fn rhs_of(source: &str) -> Expr {
+        let parsed = Parser::parse(&format!("emit out = {source}"));
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let stmt = parsed.ast.statements.into_iter().next().expect("one stmt");
+        match stmt {
+            Statement::Emit { expr, .. } => expr,
+            _ => panic!("not an emit"),
+        }
+    }
+
+    /// Every node id in a parsed expression shifts by exactly `base`, and
+    /// the node count is unchanged — a pure relocation of the id-space.
+    #[test]
+    fn shifts_every_node_id_by_base() {
+        // Covers Binary, AggCall, IfThenElse, FieldRef and Literal arms.
+        let mut expr = rhs_of("sum(if amount > 0 then amount else 0) > count(id)");
+        let mut before = Vec::new();
+        collect_ids(&expr, &mut before);
+
+        offset_node_ids(&mut expr, 100);
+
+        let mut after = Vec::new();
+        collect_ids(&expr, &mut after);
+        assert_eq!(before.len(), after.len(), "node count is preserved");
+        for (b, a) in before.iter().zip(&after) {
+            assert_eq!(*a, b + 100, "each id shifts by exactly the base");
+        }
+    }
+
+    /// A base of zero leaves every id untouched.
+    #[test]
+    fn zero_base_is_a_noop() {
+        let mut expr = rhs_of("a + b * c");
+        let mut before = Vec::new();
+        collect_ids(&expr, &mut before);
+        offset_node_ids(&mut expr, 0);
+        let mut after = Vec::new();
+        collect_ids(&expr, &mut after);
+        assert_eq!(before, after);
+    }
+
+    /// Match-arm node ids relocate alongside the arms' pattern/body exprs,
+    /// so a directly constructed `Match` shifts wholesale.
+    #[test]
+    fn shifts_match_arm_ids() {
+        let span = Span::new(0, 1);
+        let mut expr = Expr::Match {
+            node_id: NodeId(1),
+            subject: Some(Box::new(Expr::FieldRef {
+                node_id: NodeId(2),
+                name: "status".into(),
+                span,
+            })),
+            arms: vec![MatchArm {
+                node_id: NodeId(3),
+                pattern: Expr::Literal {
+                    node_id: NodeId(4),
+                    value: LiteralValue::String("x".into()),
+                    span,
+                },
+                body: Expr::Literal {
+                    node_id: NodeId(5),
+                    value: LiteralValue::Int(1),
+                    span,
+                },
+                span,
+            }],
+            span,
+        };
+        offset_node_ids(&mut expr, 10);
+        let Expr::Match {
+            node_id,
+            subject,
+            arms,
+            ..
+        } = &expr
+        else {
+            panic!("expected Match");
+        };
+        assert_eq!(node_id.0, 11);
+        assert_eq!(subject.as_ref().unwrap().node_id().0, 12);
+        assert_eq!(arms[0].node_id.0, 13);
+        assert_eq!(arms[0].pattern.node_id().0, 14);
+        assert_eq!(arms[0].body.node_id().0, 15);
     }
 }

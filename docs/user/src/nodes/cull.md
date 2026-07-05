@@ -78,6 +78,20 @@ rules:
 
 A group whose aggregate operand is null (for example `max(...)` over an all-null column) compares as false — a null operand never removes the group and never errors.
 
+### Comments in a predicate
+
+A `drop_group_when` predicate may carry a `#` line-comment to explain the rule inline. Each rule's predicate is parsed on its own, so a trailing comment applies only to that rule:
+
+```yaml
+rules:
+  - name: drop_error_groups
+    drop_group_when: "sum(if status == 'error' then 1 else 0) > 0  # any error row removes the group"
+  - name: high_total
+    drop_group_when: "sum(amount) > 10000                          # large accounts"
+```
+
+The comment is source text only — it never changes the compiled decision. (A `#YYYY-MM-DD#` date literal is unaffected: it lexes as a date, not a comment.)
+
 ## Output ports: main and `removed_to`
 
 Cull has two producer-side output ports, the same mechanism a [Route](route.md) uses for its branches — not the dead-letter queue. Removed records are **valid rows the operator deliberately partitions onto a second stream**, not errors.
