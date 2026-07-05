@@ -336,15 +336,15 @@ impl XmlReader {
                             if self.matched_depth == self.path_segments.len() {
                                 let attrs =
                                     extract_attributes_static(&self.config.attribute_prefix, e)?;
-                                let raw = self.extract_record_fields(attrs)?;
+                                let raw = self.extract_record_fields(&name, attrs)?;
                                 return Ok(Some(raw));
                             }
                         } else {
-                            self.skip_subtree()?;
+                            self.skip_subtree(&name)?;
                         }
                     } else {
                         let attrs = extract_attributes_static(&self.config.attribute_prefix, e)?;
-                        let raw = self.extract_record_fields(attrs)?;
+                        let raw = self.extract_record_fields(&name, attrs)?;
                         return Ok(Some(raw));
                     }
                 }
@@ -377,6 +377,18 @@ impl XmlReader {
                     }
                 }
                 Event::Eof => {
+                    // A clean end leaves every element closed (`xml_depth == 0`).
+                    // A non-zero depth means the input was cut off inside the
+                    // record container or one of its ancestors — a truncated
+                    // document, not an exhausted record set — so fail loud
+                    // rather than reporting a silent end-of-records.
+                    if self.xml_depth > 0 {
+                        return Err(FormatError::Xml(format!(
+                            "unexpected end of XML document: {} element(s) were \
+                             still open when the input ended (missing closing tag)",
+                            self.xml_depth
+                        )));
+                    }
                     self.done = true;
                     return Ok(None);
                 }
@@ -399,6 +411,7 @@ impl XmlReader {
     /// with self.parser.
     fn extract_record_fields(
         &mut self,
+        record_name: &str,
         start_attrs: Vec<(String, String)>,
     ) -> Result<RawRecord, FormatError> {
         let mut fields = start_attrs;
@@ -501,17 +514,22 @@ impl XmlReader {
                     }
                 }
                 Event::Eof => {
-                    self.done = true;
-                    break;
+                    // The record element's own `End` breaks the loop above; an
+                    // EOF here means the input was cut off before that close,
+                    // leaving the record (or an open child) truncated. Name the
+                    // deepest open element so the failure points at the cut.
+                    let open_path = if element_stack.is_empty() {
+                        record_name.to_string()
+                    } else {
+                        format!("{record_name}.{}", element_stack.join("."))
+                    };
+                    return Err(FormatError::Xml(format!(
+                        "unexpected end of XML document inside element {open_path:?}: \
+                         the input ended before its closing tag"
+                    )));
                 }
                 _ => {}
             }
-        }
-
-        // EOF inside an unclosed occurrence (malformed input): keep the
-        // fields read so far rather than dropping them.
-        if let Some(open) = open_instance {
-            array_instances[open.path].push(open.fields_from..fields.len());
         }
 
         Ok(RawRecord {
@@ -576,7 +594,12 @@ impl XmlReader {
     }
 
     /// Skip an entire subtree (from current Start to its matching End).
-    fn skip_subtree(&mut self) -> Result<(), FormatError> {
+    ///
+    /// `element_name` is the subtree's root element, used only to name the
+    /// failure. Returns [`FormatError::Xml`] if the input ends before the
+    /// subtree closes — a truncated document must fail loud rather than
+    /// silently swallow an unfinished, skipped-over element.
+    fn skip_subtree(&mut self, element_name: &str) -> Result<(), FormatError> {
         let target_depth = self.xml_depth;
         loop {
             self.buf.clear();
@@ -593,8 +616,10 @@ impl XmlReader {
                     }
                 }
                 Event::Eof => {
-                    self.done = true;
-                    return Ok(());
+                    return Err(FormatError::Xml(format!(
+                        "unexpected end of XML document while skipping element \
+                         {element_name:?}: the input ended before its closing tag"
+                    )));
                 }
                 _ => {}
             }

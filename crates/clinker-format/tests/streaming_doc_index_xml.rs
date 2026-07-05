@@ -558,6 +558,198 @@ fn malformed_unclosed_element_surfaces_xml_error() {
     );
 }
 
+/// A document truncated *inside an open record element* fails loud rather
+/// than emitting the partial fields read so far. The record's own closing
+/// tag never arrives, so the reader must surface a [`FormatError::Xml`]
+/// naming the cut element — not a silently short record.
+#[test]
+fn truncation_inside_a_record_surfaces_xml_error() {
+    // `<name>` (and the enclosing `<record>`) are never closed before EOF.
+    let xml = r#"<doc><records><record><id>1</id><name>partial"#;
+    let mut reader = XmlReader::from_reader(
+        std::io::Cursor::new(xml.as_bytes().to_vec()),
+        XmlReaderConfig {
+            record_path: Some("doc/records/record".into()),
+            ..Default::default()
+        },
+    )
+    .expect("construction reads no bytes");
+
+    // The truncated first record must never surface as a record: driving the
+    // reader yields a hard `Xml` error, not a partial `Some` or a clean `None`.
+    let mut saw_partial_record = false;
+    let err = loop {
+        match reader.next_record() {
+            Ok(Some(_)) => {
+                saw_partial_record = true;
+                continue;
+            }
+            Ok(None) => panic!("a truncated record must not end cleanly"),
+            Err(e) => break e,
+        }
+    };
+    assert!(
+        !saw_partial_record,
+        "no partial record may be emitted from a truncated document"
+    );
+    match err {
+        FormatError::Xml(msg) => {
+            assert!(
+                msg.contains("record.name"),
+                "error names the cut element path: {msg}"
+            );
+            assert!(
+                msg.contains("ended before its closing tag"),
+                "error states the input ended before the close: {msg}"
+            );
+        }
+        other => panic!("expected FormatError::Xml, got {other:?}"),
+    }
+}
+
+/// A document truncated *inside a non-matching sibling subtree the reader is
+/// skipping* fails loud rather than ending cleanly. The navigation-time
+/// subtree skip must not treat EOF as a valid end of the skipped element.
+#[test]
+fn truncation_inside_a_skipped_subtree_surfaces_xml_error() {
+    // `<meta>` is a sibling the record-path navigation skips; the document is
+    // cut off inside it, before `<meta>` (or `<info>`) closes.
+    let xml = r#"<doc><meta><info>partial"#;
+    let mut reader = XmlReader::from_reader(
+        std::io::Cursor::new(xml.as_bytes().to_vec()),
+        XmlReaderConfig {
+            record_path: Some("doc/records/record".into()),
+            ..Default::default()
+        },
+    )
+    .expect("construction reads no bytes");
+
+    let err = reader
+        .next_record()
+        .expect_err("a subtree skip that hits EOF before its close must fail");
+    match err {
+        FormatError::Xml(msg) => {
+            assert!(
+                msg.contains("skipping element") && msg.contains("meta"),
+                "error names the skipped element: {msg}"
+            );
+            assert!(
+                msg.contains("ended before its closing tag"),
+                "error states the input ended before the close: {msg}"
+            );
+        }
+        other => panic!("expected FormatError::Xml, got {other:?}"),
+    }
+}
+
+/// A document truncated *between records*, after a complete record but before
+/// the record container and root close, streams the complete record and then
+/// fails loud when the reader tries to advance past it — the unclosed
+/// ancestors are a truncated document, not an exhausted record set.
+#[test]
+fn truncation_between_records_surfaces_xml_error() {
+    // One complete `<record>`, then EOF with `<records>` and `<doc>` still open.
+    let xml = r#"<doc><records><record><x>1</x></record>"#;
+    let mut reader = XmlReader::from_reader(
+        std::io::Cursor::new(xml.as_bytes().to_vec()),
+        XmlReaderConfig {
+            record_path: Some("doc/records/record".into()),
+            ..Default::default()
+        },
+    )
+    .expect("construction reads no bytes");
+
+    // The complete record streams first — streaming does not buffer the whole
+    // file to pre-validate it.
+    let first = reader
+        .next_record()
+        .expect("the complete record streams")
+        .expect("one record");
+    assert_eq!(first.get("x"), Some(&Value::Integer(1)));
+
+    // Advancing past it hits EOF with two ancestors still open.
+    let err = reader
+        .next_record()
+        .expect_err("EOF under an unclosed root is a truncated document");
+    match err {
+        FormatError::Xml(msg) => {
+            assert!(
+                msg.contains("2 element(s) were still open"),
+                "error counts the open ancestors: {msg}"
+            );
+        }
+        other => panic!("expected FormatError::Xml, got {other:?}"),
+    }
+}
+
+/// A document truncated *inside a declared envelope section* fails the
+/// envelope pre-scan rather than returning that section's partial fields — no
+/// partial `$doc` metadata is produced from a cut-off section.
+#[test]
+fn truncation_inside_an_envelope_section_surfaces_xml_error() {
+    // `<record_count>` (and the enclosing `<Summary>`) are never closed.
+    let xml = r#"<doc><Summary><record_count>5"#.to_string();
+    let specs: &[SectionSpec] = &[(
+        "Summary",
+        "/doc/Summary",
+        &[("record_count", EnvelopeFieldType::Int)],
+    )];
+    let cfg = envelope_config(specs);
+
+    let mut reader = reader(xml, specs, "doc/records/record", 64 * 1_000_000);
+    let err = reader
+        .prepare_document(&cfg)
+        .expect_err("a section cut off before its close must fail the pre-scan");
+    match err {
+        FormatError::Xml(msg) => {
+            assert!(
+                msg.contains("envelope section") && msg.contains("Summary"),
+                "error names the cut section: {msg}"
+            );
+            assert!(
+                msg.contains("ended before its closing tag"),
+                "error states the input ended before the close: {msg}"
+            );
+        }
+        other => panic!("expected FormatError::Xml, got {other:?}"),
+    }
+}
+
+/// A document truncated *during the envelope pre-scan but outside any declared
+/// section* still fails loud. The top-level streaming walk must not accept an
+/// EOF that leaves elements open, or a declared section that would have
+/// appeared later is silently missed.
+#[test]
+fn truncation_during_prescan_outside_a_section_surfaces_xml_error() {
+    // The declared `Summary` section sits at the document tail, but the input
+    // is cut off inside the body before it ever appears.
+    let xml = r#"<doc><records><record><x>1</x></record>"#.to_string();
+    let specs: &[SectionSpec] = &[(
+        "Summary",
+        "/doc/Summary",
+        &[("record_count", EnvelopeFieldType::Int)],
+    )];
+    let cfg = envelope_config(specs);
+
+    let mut reader = reader(xml, specs, "doc/records/record", 64 * 1_000_000);
+    let err = reader
+        .prepare_document(&cfg)
+        .expect_err("a pre-scan that hits EOF with open elements must fail");
+    match err {
+        FormatError::Xml(msg) => {
+            assert!(
+                msg.contains("envelope pre-scan"),
+                "error identifies the pre-scan: {msg}"
+            );
+            assert!(
+                msg.contains("doc/records"),
+                "error names the open descent path: {msg}"
+            );
+        }
+        other => panic!("expected FormatError::Xml, got {other:?}"),
+    }
+}
+
 /// A deeply nested document (200+ levels) streams to completion without
 /// crashing: clinker's XML walk tracks depth with heap `Vec`s and `usize`
 /// counters, never native recursion, so a deep document cannot overflow the
