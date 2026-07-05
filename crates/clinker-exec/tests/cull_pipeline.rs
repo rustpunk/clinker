@@ -15,6 +15,7 @@ use clinker_plan::config::{CompileContext, parse_config};
 /// The two rendered output streams of a Cull run: the main port (`main`) and
 /// the `removed_to` side-output port (`removed`), plus the run's cumulative
 /// on-disk spill volume.
+#[derive(Debug)]
 struct CullOutputs {
     main: String,
     removed: String,
@@ -23,8 +24,19 @@ struct CullOutputs {
 }
 
 /// Run a single-source → cull → (main output + audit output) pipeline over
-/// `csv_input`, returning both rendered output streams.
+/// `csv_input`, returning both rendered output streams. Panics on run failure;
+/// use [`run_cull_result`] when the run is expected to error.
 fn run_cull(yaml: &str, csv_input: &str) -> CullOutputs {
+    run_cull_result(yaml, csv_input).expect("cull run")
+}
+
+/// Result-returning variant of [`run_cull`]: surfaces the run error instead of
+/// panicking, so a test can assert on a typed [`clinker_plan::error::PipelineError`]
+/// (for example the drop-decision memory-budget gate).
+fn run_cull_result(
+    yaml: &str,
+    csv_input: &str,
+) -> Result<CullOutputs, clinker_plan::error::PipelineError> {
     let config = parse_config(yaml).expect("fixture pipeline must parse");
     let plan = config
         .compile(&CompileContext::default())
@@ -59,14 +71,13 @@ fn run_cull(yaml: &str, csv_input: &str) -> CullOutputs {
         shutdown_token: None,
         ..Default::default()
     };
-    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
-        .expect("cull run");
-    CullOutputs {
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)?;
+    Ok(CullOutputs {
         main: main_buf.as_string(),
         removed: removed_buf.as_string(),
         cumulative_spill_bytes: report.cumulative_spill_bytes,
         dlq_count: report.dlq_entries.len(),
-    }
+    })
 }
 
 /// Group-error cull: per account, a group containing any row whose status is
@@ -503,6 +514,56 @@ fn cull_spills_under_memory_pressure() {
         !spilled.main.contains("BIG,"),
         "the removed BIG group must not reach the main output"
     );
+}
+
+/// Build `groups` single-row partition groups: a huge partition cardinality
+/// over tiny raw records. The raw-record buffer stays small per group (one row
+/// each) and spills freely under a sub-baseline `spill` budget, isolating the
+/// O(groups) drop-decision aggregate as the state under test.
+fn distinct_group_input(groups: usize) -> String {
+    let mut csv = String::from("account,seq\n");
+    for g in 0..groups {
+        csv.push_str(&format!("acct-{g:06},0\n"));
+    }
+    csv
+}
+
+#[test]
+fn cull_decision_state_fails_loud_when_group_cardinality_exceeds_budget() {
+    // 20_000 single-row groups. The raw-record buffer is one tiny row per group
+    // and spills freely under the sub-baseline `spill` budget, but the
+    // per-group drop-decision aggregate is O(distinct groups), runs in-memory,
+    // and can neither spill nor back-pressure. A budget far below that decision
+    // state's footprint must surface a typed memory-budget error naming the
+    // drop-decision state — not an OOM crash, and not a silently-truncated
+    // result. (`count(*) > 100` never fires for one-row groups, so no group is
+    // removed; the failure is purely the unbounded decision state, decoupled
+    // from the raw-buffer spill path exercised by
+    // `cull_spills_under_memory_pressure`.)
+    let csv = distinct_group_input(20_000);
+    let err = run_cull_result(&count_cull_pipeline("32K"), &csv)
+        .expect_err("an O(groups) decision state above the budget must fail loud");
+    match &err {
+        clinker_plan::error::PipelineError::MemoryBudgetExceeded {
+            node,
+            used,
+            limit,
+            detail,
+            ..
+        } => {
+            assert_eq!(node, "drop_big", "the error must name the Cull node");
+            assert!(
+                *used > *limit,
+                "reported use ({used}) must exceed the limit ({limit})"
+            );
+            assert_eq!(
+                detail.as_deref(),
+                Some("Cull drop-decision aggregate state"),
+                "the detail must name the drop-decision state, not the raw buffer",
+            );
+        }
+        other => panic!("expected MemoryBudgetExceeded for the decision state; got {other:?}"),
+    }
 }
 
 #[test]
