@@ -667,3 +667,74 @@ fn envelope_prescan_rejects_a_file_changed_between_passes() {
         other => panic!("expected an Io change error, got {other:?}"),
     }
 }
+
+/// A slashless non-empty JSON pointer decodes to zero segments, aliasing the
+/// whole-document pointer, and would silently match the root instead of the
+/// intended section. The reader rejects it before building a target, naming
+/// the offending section so a config bypassing plan validation still fails
+/// loud.
+#[test]
+fn prescan_rejects_slashless_json_pointer() {
+    let specs: &[SectionSpec] = &[("Head", "Head", &[("batch_id", EnvelopeFieldType::String)])];
+    let json = r#"{"Head":{"batch_id":"B1"},"records":[{"id":1}]}"#;
+    let cfg = envelope_config(specs);
+
+    let mut reader = JsonReader::from_reader(
+        std::io::Cursor::new(json.as_bytes().to_vec()),
+        JsonReaderConfig {
+            record_path: Some("records".into()),
+            declared_doc_paths: declared_paths(specs),
+            max_index_bytes: Some(64 * 1_000_000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let err = reader
+        .prepare_document(&cfg)
+        .expect_err("a slashless json_pointer must be rejected");
+    match err {
+        FormatError::Json(msg) => {
+            assert!(
+                msg.contains("Head") && msg.contains("RFC 6901"),
+                "diagnostic must name the section and the accepted grammar: {msg}"
+            );
+        }
+        other => panic!("expected FormatError::Json, got {other:?}"),
+    }
+}
+
+/// The empty pointer `""` names the whole document and stays valid: the root
+/// object's top-level keys become the section's fields. Kept explicit so the
+/// slashless-rejection guard never regresses into rejecting the legitimate
+/// whole-document case.
+#[test]
+fn prescan_empty_json_pointer_matches_root() {
+    let specs: &[SectionSpec] = &[("Whole", "", &[("batch_id", EnvelopeFieldType::String)])];
+    let json = r#"{"batch_id":"B1","records":[{"id":1}]}"#;
+    let cfg = envelope_config(specs);
+
+    let mut reader = JsonReader::from_reader(
+        std::io::Cursor::new(json.as_bytes().to_vec()),
+        JsonReaderConfig {
+            record_path: Some("records".into()),
+            declared_doc_paths: declared_paths(specs),
+            max_index_bytes: Some(64 * 1_000_000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let sections = reader
+        .prepare_document(&cfg)
+        .expect("the empty (whole-document) pointer must match the root");
+    let whole = match sections.get("Whole").expect("root section retained") {
+        Value::Map(m) => m,
+        other => panic!("expected map, got {other:?}"),
+    };
+    assert_eq!(
+        whole.get("batch_id"),
+        Some(&Value::String("B1".into())),
+        "the root object's top-level field must be extracted"
+    );
+}

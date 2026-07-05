@@ -141,7 +141,7 @@ Each section declares how the reader locates its payload:
 | Format  | `extract:` key   | Value                                            |
 | ------- | ---------------- | ------------------------------------------------ |
 | XML     | `xml_path`       | Slash-path to the section element, e.g. `/doc/Head` |
-| JSON    | `json_pointer`   | RFC 6901 pointer, e.g. `/Head`                   |
+| JSON    | `json_pointer`   | RFC 6901 pointer — empty (whole document) or leading `/`, e.g. `/Head` |
 | EDIFACT | `segment`        | A service-segment tag — only `UNB`               |
 | X12     | `segment`        | A service-segment tag — only `ISA` (GS/ST surface as nested levels) |
 | HL7 v2  | `segment`        | A header-segment tag — only `FHS` (BHS/MSH surface as nested levels) |
@@ -152,6 +152,12 @@ a `segment` extract against XML/JSON, or a `record_type` extract against
 any format other than multi-record CSV / fixed-width is a configuration
 error and fails fast when the source opens, rather than silently
 producing empty sections.
+
+A `json_pointer` must be a valid RFC 6901 pointer: either empty (`""`,
+naming the whole document) or a `/`-introduced path such as `/Head` or
+`/batch/summary`. A slashless value like `Head` is a typo — it would
+decode to zero segments and silently match the root document — so it is
+**rejected at validation** rather than resolving to the wrong metadata.
 
 A **plain** (single-schema) CSV or fixed-width source carries no envelope
 — there is no header/trailer structure to extract, so declaring envelope
