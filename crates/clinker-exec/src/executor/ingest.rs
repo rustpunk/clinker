@@ -662,18 +662,42 @@ fn drive_record_source(
                             .current_source_file()
                             .cloned()
                             .unwrap_or_else(|| Arc::clone(&static_source_file));
+                        // A malformed file whose FIRST body record fails — an
+                        // unknown record-type tag on an early line of file N>=2
+                        // of a multi-file source — condemns a file the driver
+                        // has NOT yet opened a document for: the reader already
+                        // advanced `current_source_file()` to the condemned
+                        // file, but the open level stack still belongs to the
+                        // PREVIOUS (clean) file, because the driver only closes
+                        // a file's document when the next file's first record
+                        // arrives and here an error arrived first. Close that
+                        // prior file's stack CLEANLY so the reject rides the
+                        // condemned file's OWN synthesized context (below), not
+                        // the clean predecessor's document close: the reject
+                        // seam keys on the representative record's `$source.file`
+                        // stamp, so the file grain stays correct either way, but
+                        // letting a clean file's close carry a foreign reject
+                        // payload leaves the boundary stream internally
+                        // inconsistent. A single-file source, and a condemned
+                        // file whose own records already opened its document,
+                        // leave the base owned by `file_arc`, so this is a
+                        // no-op.
+                        if stack_belongs_to_other_file(&doc_stack, &file_arc) {
+                            close_open_levels(&mut stream, &mut doc_stack)?;
+                        }
                         // The document context the reject keys on. A malformed
                         // file that streamed at least one body record has its
                         // level stack open, so use the innermost level. A
                         // ZERO-body malformed envelope (a trailer claiming a
                         // count with no body segment — X12 `ISA … IEA*5~`,
                         // EDIFACT `UNB … UNZ` with no `UNH`, HL7 `BHS`/`BTS`
-                        // with no `MSH`) never drained its queued `OpenLevel`
-                        // into the stack, so synthesize a file-level context
-                        // from the file grain instead. Either way the
-                        // representative record carries a real (non-synthetic)
-                        // document id and the file's `$source.file` stamp, so
-                        // the document-DLQ reject keys at the file grain.
+                        // with no `MSH`), and a first-record failure whose
+                        // prior-file stack was just closed above, leave the
+                        // stack empty, so synthesize a file-level context from
+                        // the file grain instead. Either way the representative
+                        // record carries a real (non-synthetic) document id and
+                        // the file's `$source.file` stamp, so the document-DLQ
+                        // reject keys at the file grain.
                         let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
                             Arc::new(clinker_record::DocumentContext::new(
                                 clinker_record::DocumentId::next(),

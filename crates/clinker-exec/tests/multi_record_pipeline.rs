@@ -290,17 +290,33 @@ nodes:
 /// itself must complete: under `dlq_granularity: document` a structural
 /// failure condemns the file, not the run.
 fn run_document_dlq(fixture: &str) -> (clinker_exec::executor::ExecutionReport, String) {
+    run_document_dlq_multi(&[("bad.txt", fixture)])
+}
+
+/// Run an ordered list of `(name, body)` in-memory fixed-width files through
+/// the document-DLQ pipeline as a single multi-file glob source, returning the
+/// execution report and the success-sink contents. Files stream in the given
+/// order (the multi-file reader preserves slot order), so this exercises
+/// cross-file document boundaries under the `document` opt-in.
+fn run_document_dlq_multi(
+    files: &[(&str, &str)],
+) -> (clinker_exec::executor::ExecutionReport, String) {
     let config = parse_config(document_dlq_yaml()).expect("parse dlq pipeline");
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile dlq pipeline");
-    let slot = FileSlot::new(
-        PathBuf::from("bad.txt"),
-        Box::new(Cursor::new(fixture.as_bytes().to_vec())),
-    );
+    let slots: Vec<FileSlot> = files
+        .iter()
+        .map(|(name, body)| {
+            FileSlot::new(
+                PathBuf::from(*name),
+                Box::new(Cursor::new(body.as_bytes().to_vec())),
+            )
+        })
+        .collect();
     let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
         "payments".to_string(),
-        clinker_exec::executor::SourceInput::Files(vec![slot]),
+        clinker_exec::executor::SourceInput::Files(slots),
     )]);
     let out = SharedBuffer::new();
     let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
@@ -404,5 +420,60 @@ fn trailer_count_mismatch_under_document_dlq_condemns_the_file_not_the_run() {
     assert!(
         body.is_empty(),
         "condemned file's records must not reach the success sink: {body:?}"
+    );
+}
+
+#[test]
+fn bad_first_line_in_later_file_condemns_that_file_not_the_clean_predecessor() {
+    // A multi-file glob [clean, bad-first-line]: the clean file streams fully
+    // and EOFs with its document still open (the driver closes a file's
+    // document only when the next file's first record arrives). The reader then
+    // advances into the second file and its FIRST body line carries an unknown
+    // tag, so the structural failure fires while `current_source_file()` already
+    // names the second file but the open level stack still belongs to the clean
+    // first file. The reject must condemn the ACTUALLY-malformed file, not the
+    // clean predecessor whose records were merely still buffered: the clean
+    // file's row must reach the success sink and only the bad file must
+    // dead-letter, with no collaterals (no record of the bad file ever
+    // streamed).
+    let (report, sink) = run_document_dlq_multi(&[
+        ("good.txt", "D00001 100\nT00001    \n"),
+        ("bad.txt", "X99999 999\n"),
+    ]);
+
+    // The clean predecessor's detail row reaches the sink — it was NOT
+    // collaterally condemned under the bad file's trigger.
+    let body: Vec<&str> = sink.lines().skip(1).collect();
+    assert_eq!(
+        body.len(),
+        1,
+        "the clean file's one detail row must reach the success sink, got {body:?}"
+    );
+
+    // Exactly one root-cause trigger, for the bad file's unknown tag, and no
+    // collaterals: the bad file streamed no record before failing.
+    let triggers: Vec<_> = report.dlq_entries.iter().filter(|e| e.trigger).collect();
+    assert_eq!(
+        triggers.len(),
+        1,
+        "exactly one trigger, for the actually-malformed file"
+    );
+    assert_eq!(
+        triggers[0].category,
+        clinker_core_types::dlq::DlqErrorCategory::StructuralValidation
+    );
+    assert!(
+        triggers[0].error_message.contains("E345")
+            && triggers[0]
+                .error_message
+                .contains("unknown record-type discriminator"),
+        "the trigger names the unknown tag, got {:?}",
+        triggers[0].error_message
+    );
+    assert_eq!(
+        report.dlq_entries.iter().filter(|e| !e.trigger).count(),
+        0,
+        "the bad file streamed no record before failing, so it has no collaterals \
+         and the clean file's record is not swept in as one"
     );
 }
