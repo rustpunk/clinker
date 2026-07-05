@@ -497,4 +497,30 @@ mod tests {
         let err = t.next_segment().unwrap_err();
         assert!(matches!(err, FormatError::Edifact(m) if m.contains("ASCII")));
     }
+
+    #[test]
+    fn dangling_release_after_trailer_is_truncation() {
+        // A complete UNB..UNZ interchange followed by a bare release char
+        // with no terminator: the stray release byte is literal trailing
+        // content, so the read after the trailer reports an unterminated
+        // (truncated) segment rather than a clean end of stream. Stray bytes
+        // after the trailer cannot be silently dropped.
+        let mut t = tok(b"UNB+UNOA:1'UNZ+1+1'?");
+        assert_eq!(t.next_segment().unwrap().unwrap(), "UNB+UNOA:1");
+        assert_eq!(t.next_segment().unwrap().unwrap(), "UNZ+1+1");
+        let err = t.next_segment().unwrap_err();
+        assert!(matches!(err, FormatError::Edifact(msg) if msg.contains("truncated")));
+    }
+
+    #[test]
+    fn clean_trailer_terminated_interchange_ends_at_eof() {
+        // The contrast to the dangling-release case: when the UNZ trailer
+        // carries its terminator and nothing follows, the read after it is a
+        // clean end of stream, not a truncation error — the new rejection
+        // triggers only on the stray byte, not on a well-formed trailer.
+        let mut t = tok(b"UNB+UNOA:1'UNZ+1+1'");
+        assert_eq!(t.next_segment().unwrap().unwrap(), "UNB+UNOA:1");
+        assert_eq!(t.next_segment().unwrap().unwrap(), "UNZ+1+1");
+        assert!(t.next_segment().unwrap().is_none());
+    }
 }
