@@ -21,6 +21,26 @@ use crate::config::{PipelineConfig, RouteMode};
 /// their projection CXL, Aggregate nodes their reduction CXL, and Route
 /// nodes an empty body (their predicates render in the plan block, not
 /// here). Other node kinds carry no CXL source and are skipped.
+/// The `arbitration:` header line for `--explain`. Names the active policy
+/// and, under a pausing policy, the pause/resume hysteresis band so an author
+/// can see the resume watermark before running. The `spill` policy never
+/// pauses, so it renders the policy name alone.
+fn arbitration_annotation(config: &PipelineConfig) -> String {
+    let knob = &config.pipeline.memory.backpressure;
+    let policy = knob.policy_name();
+    if knob.pauses_producers() {
+        let resume = config
+            .pipeline
+            .memory
+            .resume_threshold
+            .unwrap_or(crate::config::utils::DEFAULT_RESUME_THRESHOLD);
+        let spill = crate::config::utils::DEFAULT_SPILL_THRESHOLD;
+        format!("{policy} (pause at {spill:.2}·limit, resume below {resume:.2}·limit)")
+    } else {
+        policy.to_string()
+    }
+}
+
 fn transform_cxl_sources(config: &PipelineConfig) -> Vec<(String, String)> {
     use crate::config::PipelineNode;
     let mut out = Vec::new();
@@ -840,8 +860,8 @@ impl ExecutionPlanDag {
         // every combine node when the catalog is absent — so the output
         // of `explain()` already has no combine block to dedupe.
         let classes = self.classify_node_buffers(config);
-        let policy_name = config.pipeline.memory.backpressure.policy_name();
-        let mut out = self.explain(&classes, policy_name);
+        let annotation = arbitration_annotation(config);
+        let mut out = self.explain(&classes, &annotation);
         self.render_combine_section(&mut out, Some(statistics), total_memory_limit_bytes);
         render_statistics_section(&mut out, statistics);
         out
@@ -1414,8 +1434,8 @@ impl ExecutionPlanDag {
     /// Full `--explain` output combining execution plan with config context.
     pub fn explain_full(&self, config: &PipelineConfig) -> String {
         let classes = self.classify_node_buffers(config);
-        let policy_name = config.pipeline.memory.backpressure.policy_name();
-        let mut out = self.explain(&classes, policy_name);
+        let annotation = arbitration_annotation(config);
+        let mut out = self.explain(&classes, &annotation);
         if let Some(start) = out.find("=== Retraction ===\n") {
             out.truncate(start);
         }

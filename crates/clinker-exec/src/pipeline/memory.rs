@@ -205,12 +205,16 @@ fn peak_rss_bytes_impl() -> Option<u64> {
 /// unsatisfiable: the process already exceeds the ceiling with an empty
 /// pipeline, so no amount of spilling operator state or pausing producers
 /// can ever bring RSS under it. Under a producer-pausing policy (`pause`,
-/// the default, and `both`) this otherwise deadlocks — the arbitration
-/// round parks the Source on a pause that only `resume()` releases, but
-/// `resume()` fires only when RSS drops back under the threshold, which
-/// can never happen — while a blocking consumer waits forever for input.
-/// Converting that hang into an immediate [`PipelineError::UnsatisfiableMemoryBudget`]
-/// (E312) lets the operator fix the config rather than watch the run park.
+/// the default, and `both`) the run cannot make useful progress against
+/// such a budget — the arbitration round pauses producers on every poll
+/// (current pressure never recedes below the resume watermark, since even
+/// an empty pipeline sits above the limit), so the run only thrashes
+/// pause / resume / spill without ever getting under budget. Rejecting it
+/// up front as an immediate [`PipelineError::UnsatisfiableMemoryBudget`]
+/// (E312) lets the operator fix the config rather than watch the run churn.
+/// (The resume controller and its liveness backstop guarantee the walk
+/// still completes rather than deadlocking, so this is a fail-fast on an
+/// unsatisfiable config, not a deadlock-avoidance guard.)
 ///
 /// Scoped to producer-pausing policies on purpose: under `spill` (bare
 /// `Priority`) a sub-baseline budget never pauses, so it spills or aborts
