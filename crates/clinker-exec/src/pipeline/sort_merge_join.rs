@@ -307,21 +307,28 @@ fn is_orderable(v: &Value) -> bool {
     }
 }
 
-/// Compare two range key values under the IEJoin numeric-coercion
-/// convention (i64-encoded, float bit-cast). NULLs and non-orderables
-/// are filtered before this is called.
+/// Compare two range key values by mapping each to a monotone `i64`
+/// *within its own type*: integers as-is, floats through the
+/// order-preserving `float_to_orderable_i64` encoding, dates/datetimes as
+/// their epoch counts. NULLs and non-orderables are filtered before this
+/// is called.
+///
+/// There is no cross-type coercion here: an integer and a float are NOT
+/// brought onto a common numeric scale, so this assumes both keys of an
+/// axis share a type. A mixed int/float range axis is not currently
+/// guarded at plan time and would compare in disjoint encoding spaces.
 fn cmp_range_keys(a: &Value, b: &Value) -> Ordering {
     use chrono::Datelike;
     let ai = match a {
         Value::Integer(i) => *i,
-        Value::Float(f) => f.to_bits() as i64,
+        Value::Float(f) => crate::pipeline::sort_key::float_to_orderable_i64(*f),
         Value::Date(d) => d.num_days_from_ce() as i64,
         Value::DateTime(dt) => dt.and_utc().timestamp_micros(),
         _ => 0,
     };
     let bi = match b {
         Value::Integer(i) => *i,
-        Value::Float(f) => f.to_bits() as i64,
+        Value::Float(f) => crate::pipeline::sort_key::float_to_orderable_i64(*f),
         Value::Date(d) => d.num_days_from_ce() as i64,
         Value::DateTime(dt) => dt.and_utc().timestamp_micros(),
         _ => 0,
@@ -2350,5 +2357,105 @@ mod tests {
             "expected DirUnavailable from the configured root; got: {rendered}"
         );
         drop(scratch);
+    }
+
+    /// Range-key comparison over float `Value`s must agree with native f64
+    /// order across the sign boundary. Isolated in its own module so the
+    /// proptest prelude imports stay local.
+    mod float_range_keys {
+        use super::super::{RangeOp, apply_op, cmp_range_keys};
+        use clinker_record::Value;
+        use proptest::prelude::*;
+        use std::collections::HashSet;
+
+        /// Finite `f64` sample skewed toward small recurring integers (so
+        /// duplicate keys and boundary equality get exercised), the signed
+        /// zeros, subnormals, and a wide continuous spread reaching large
+        /// magnitudes of both signs. The negative values are the whole
+        /// point: the old `f.to_bits() as i64` encoding is only
+        /// non-monotone once the sign bit is set.
+        fn arb_float_key() -> impl Strategy<Value = f64> {
+            prop_oneof![
+                4 => (-8i64..8).prop_map(|n| n as f64),
+                1 => Just(0.0f64),
+                1 => Just(-0.0f64),
+                1 => Just(f64::MIN_POSITIVE),
+                1 => Just(-f64::MIN_POSITIVE),
+                2 => -1.0e6f64..1.0e6,
+            ]
+        }
+
+        fn arb_op() -> impl Strategy<Value = RangeOp> {
+            prop_oneof![
+                Just(RangeOp::Lt),
+                Just(RangeOp::Le),
+                Just(RangeOp::Gt),
+                Just(RangeOp::Ge),
+            ]
+        }
+
+        fn apply_op_f64(a: f64, op: RangeOp, b: f64) -> bool {
+            match op {
+                RangeOp::Lt => a < b,
+                RangeOp::Le => a <= b,
+                RangeOp::Gt => a > b,
+                RangeOp::Ge => a >= b,
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// `apply_op` (and thus `cmp_range_keys`) over float keys must
+            /// match native f64 comparison for every operator, including
+            /// across the sign boundary and the signed-zero pair.
+            #[test]
+            fn apply_op_matches_native_f64(
+                a in arb_float_key(),
+                b in arb_float_key(),
+                op in arb_op(),
+            ) {
+                prop_assert_eq!(
+                    apply_op(&Value::Float(a), op, &Value::Float(b)),
+                    apply_op_f64(a, op, b)
+                );
+                // Ordering agrees too, treating signed zeros as equal.
+                let native = a.partial_cmp(&b).unwrap();
+                prop_assert_eq!(
+                    cmp_range_keys(&Value::Float(a), &Value::Float(b)),
+                    native
+                );
+            }
+
+            /// Float-key range matching via `apply_op` (the predicate the
+            /// Phase-B merge walk applies per candidate pair) must equal the
+            /// brute-force native-f64 nested-loop oracle for every operator.
+            /// This pins the range-key encoding seam; it does not drive the
+            /// Phase-A external sort or the merge walk itself.
+            #[test]
+            fn range_join_matches_nested_loop(
+                left in prop::collection::vec(arb_float_key(), 0..40),
+                right in prop::collection::vec(arb_float_key(), 0..40),
+                op in arb_op(),
+            ) {
+                let mut actual: HashSet<(usize, usize)> = HashSet::new();
+                for (li, &l) in left.iter().enumerate() {
+                    for (ri, &r) in right.iter().enumerate() {
+                        if apply_op(&Value::Float(l), op, &Value::Float(r)) {
+                            actual.insert((li, ri));
+                        }
+                    }
+                }
+                let mut expected: HashSet<(usize, usize)> = HashSet::new();
+                for (li, &l) in left.iter().enumerate() {
+                    for (ri, &r) in right.iter().enumerate() {
+                        if apply_op_f64(l, op, r) {
+                            expected.insert((li, ri));
+                        }
+                    }
+                }
+                prop_assert_eq!(actual, expected);
+            }
+        }
     }
 }

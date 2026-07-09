@@ -1258,7 +1258,7 @@ fn value_to_i64(v: &Value) -> Option<i64> {
         Value::Integer(i) => Some(*i),
         Value::Float(f) => {
             if f.is_finite() {
-                Some(f.to_bits() as i64)
+                Some(crate::pipeline::sort_key::float_to_orderable_i64(*f))
             } else {
                 None
             }
@@ -1471,6 +1471,14 @@ mod tests {
                 TOp::Ge => a >= b,
             }
         }
+        fn apply_f64(self, a: f64, b: f64) -> bool {
+            match self {
+                TOp::Lt => a < b,
+                TOp::Le => a <= b,
+                TOp::Gt => a > b,
+                TOp::Ge => a >= b,
+            }
+        }
         fn to_range(self) -> RangeOp {
             match self {
                 TOp::Lt => RangeOp::Lt,
@@ -1632,6 +1640,92 @@ mod tests {
                     .into_iter()
                     .collect();
             let expected = nested_loop(&left, &right, op1, op2);
+            prop_assert_eq!(actual, expected);
+        }
+    }
+
+    /// One float proptest case: left/right float rows and the two range
+    /// operators of the band predicate.
+    type FloatJoinCase = (Vec<(f64, f64)>, Vec<(f64, f64)>, TOp, TOp);
+
+    /// Brute-force nested-loop join over the ORIGINAL float values. The
+    /// kernel compares `value_to_i64`-encoded keys, so agreement with this
+    /// oracle is exactly the order-preservation property under test.
+    fn nested_loop_f64(
+        left: &[(f64, f64)],
+        right: &[(f64, f64)],
+        op1: TOp,
+        op2: TOp,
+    ) -> HashSet<(usize, usize)> {
+        let mut out = HashSet::new();
+        for (li, l) in left.iter().enumerate() {
+            for (ri, r) in right.iter().enumerate() {
+                if op1.apply_f64(l.0, r.0) && op2.apply_f64(l.1, r.1) {
+                    out.insert((li, ri));
+                }
+            }
+        }
+        out
+    }
+
+    /// Finite `f64` sample skewed toward small recurring integers (so
+    /// duplicate keys and boundary equality get exercised), the signed
+    /// zeros, subnormals, and a wide continuous spread reaching large
+    /// magnitudes of both signs. The negative values are the whole point:
+    /// a raw `to_bits() as i64` encoding is only non-monotone once the
+    /// sign bit is set, so a strategy without negatives cannot catch it.
+    fn arb_float_key() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            4 => (-8i64..8).prop_map(|n| n as f64),
+            1 => Just(0.0f64),
+            1 => Just(-0.0f64),
+            1 => Just(f64::MIN_POSITIVE),
+            1 => Just(-f64::MIN_POSITIVE),
+            2 => -1.0e6f64..1.0e6,
+        ]
+    }
+
+    fn arb_float_inputs() -> impl Strategy<Value = FloatJoinCase> {
+        let op = prop_oneof![Just(TOp::Lt), Just(TOp::Le), Just(TOp::Gt), Just(TOp::Ge)];
+        (
+            prop::collection::vec((arb_float_key(), arb_float_key()), 0..40),
+            prop::collection::vec((arb_float_key(), arb_float_key()), 0..40),
+            op.clone(),
+            op,
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        /// The kernel result over `value_to_i64`-encoded float keys must
+        /// equal the float nested-loop oracle for every operator pair,
+        /// including negatives and signed zeros. Under the old
+        /// `f.to_bits() as i64` arm this diverged: among negative floats a
+        /// larger magnitude encodes to a larger i64, inverting their order,
+        /// and `-0.0` encodes to `i64::MIN` rather than `0` — so range
+        /// matches over negative keys went wrong.
+        #[test]
+        fn proptest_iejoin_float_keys_match_nested_loop(
+            (left, right, op1, op2) in arb_float_inputs()
+        ) {
+            // Every generated value is finite, so `value_to_i64` is `Some`.
+            let enc = |rows: &[(f64, f64)]| -> Vec<(i64, i64)> {
+                rows.iter()
+                    .map(|&(a, b)| {
+                        (
+                            value_to_i64(&Value::Float(a)).unwrap(),
+                            value_to_i64(&Value::Float(b)).unwrap(),
+                        )
+                    })
+                    .collect()
+            };
+            let left_i = enc(&left);
+            let right_i = enc(&right);
+            let actual: HashSet<(usize, usize)> =
+                iejoin_numeric(&left_i, &right_i, op1.to_range(), op2.to_range())
+                    .into_iter()
+                    .collect();
+            let expected = nested_loop_f64(&left, &right, op1, op2);
             prop_assert_eq!(actual, expected);
         }
     }
