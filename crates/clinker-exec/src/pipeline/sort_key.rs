@@ -153,18 +153,44 @@ fn mul_u128_to_u256_be(a: u128, b: u128) -> [u8; 32] {
     out
 }
 
-/// Append the order-preserving 8-byte memcomparable encoding of an `f64`.
-fn encode_f64_order(f: f64, buf: &mut Vec<u8>) {
-    // Canonicalize -0.0 → 0.0 so byte order agrees with semantic equality
-    // (`-0.0 == 0.0` per IEEE). Matches `value_to_group_key`.
+/// Order-preserving `f64` → `u64`: the *unsigned* ordering of the result
+/// matches IEEE-754 ordering over finite values. `-0.0` canonicalizes to
+/// `+0.0` so signed zeros compare equal, agreeing with `value_to_group_key`.
+///
+/// This is the single source of the float bit-twiddle. The memcomparable
+/// byte key ([`encode_f64_order`]) and the range-join kernels' signed
+/// [`float_to_orderable_i64`] both derive from it, so a monotone float
+/// order is guaranteed identically everywhere it matters.
+#[inline]
+fn f64_to_orderable_u64(f: f64) -> u64 {
     let f = if f == 0.0 { 0.0 } else { f };
     let bits = f.to_bits();
-    let encoded = if bits >> 63 == 1 {
-        bits ^ u64::MAX // negative: flip all bits
+    if bits >> 63 == 1 {
+        bits ^ u64::MAX // negative: flip all bits — larger magnitude sorts earlier
     } else {
         bits ^ (1 << 63) // positive/zero: flip sign bit only
-    };
-    buf.extend_from_slice(&encoded.to_be_bytes());
+    }
+}
+
+/// Order-preserving `f64` → `i64`: signed-`i64` comparison of the result
+/// matches IEEE-754 ordering over finite values. `-0.0` encodes equal to
+/// `+0.0`.
+///
+/// The range-join kernels carry keys as `i64` and compare them directly,
+/// so they need a monotone `i64` rather than the memcomparable byte key.
+/// A raw `f.to_bits() as i64` is NOT monotone: IEEE negatives set the sign
+/// bit, so their bit patterns grow as the value shrinks, and any range
+/// predicate over a float column with negative values would match wrongly.
+#[inline]
+pub(crate) fn float_to_orderable_i64(f: f64) -> i64 {
+    // Flip the high bit to turn the unsigned-ordered u64 into a
+    // two's-complement-ordered i64 (smallest u64 → i64::MIN).
+    (f64_to_orderable_u64(f) ^ (1 << 63)) as i64
+}
+
+/// Append the order-preserving 8-byte memcomparable encoding of an `f64`.
+fn encode_f64_order(f: f64, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&f64_to_orderable_u64(f).to_be_bytes());
 }
 
 /// Owning wrapper around a `Vec<SortField>` that encodes and compares
@@ -299,6 +325,62 @@ mod tests {
         let mut buf = Vec::new();
         encode_value(&Value::Decimal(d), &mut buf);
         buf
+    }
+
+    #[test]
+    fn float_to_orderable_i64_preserves_order() {
+        // Smallest positive subnormal and its negation bracket zero more
+        // tightly than any normal value can.
+        let smallest_subnormal = f64::from_bits(1);
+        // Strictly ascending in IEEE order, except the signed-zero pair,
+        // which is equal. Spans both signs, subnormals, and the extremes.
+        let ascending = [
+            f64::MIN,
+            -1.0e300,
+            -2.0,
+            -1.0,
+            -f64::MIN_POSITIVE,
+            -smallest_subnormal,
+            -0.0,
+            0.0,
+            smallest_subnormal,
+            f64::MIN_POSITIVE,
+            1.0,
+            2.0,
+            1.0e300,
+            f64::MAX,
+        ];
+        let encoded: Vec<i64> = ascending
+            .iter()
+            .map(|&f| float_to_orderable_i64(f))
+            .collect();
+        for (i, w) in encoded.windows(2).enumerate() {
+            // Only the -0.0/+0.0 adjacency is an equality; every other
+            // adjacency is a strict increase.
+            let signed_zero_pair = ascending[i] == 0.0 && ascending[i + 1] == 0.0;
+            if signed_zero_pair {
+                assert_eq!(w[0], w[1], "signed zeros must encode to the same i64");
+            } else {
+                assert!(
+                    w[0] < w[1],
+                    "encoding not order-preserving at {}: {} then {} → {} then {}",
+                    i,
+                    ascending[i],
+                    ascending[i + 1],
+                    w[0],
+                    w[1]
+                );
+            }
+        }
+        // The raw `f.to_bits() as i64` this replaced fails two ways, each
+        // pinned by an assert here: `-0.0` maps to `i64::MIN` instead of
+        // `0`, and among negatives a larger magnitude maps to a larger i64,
+        // inverting their order. Cross-sign order happened to survive the
+        // old cast (negatives already sat below positives), so the middle
+        // assert is only a sanity check, not a discriminator.
+        assert_eq!(float_to_orderable_i64(-0.0), float_to_orderable_i64(0.0));
+        assert!(float_to_orderable_i64(-1.0) < float_to_orderable_i64(1.0));
+        assert!(float_to_orderable_i64(-1.0e300) < float_to_orderable_i64(-2.0));
     }
 
     #[test]
