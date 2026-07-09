@@ -1247,6 +1247,19 @@ impl<'a> ExecutorContext<'a> {
     /// registered handle (already released, or a body-port seed source).
     pub(crate) fn activate_source_for_drain(&self, source_name: &str) {
         if let Some((_, handle)) = self.source_consumers.get(source_name) {
+            // Layer 3 spill-nudge: if a prior round paused this source under
+            // genuine pressure, shed reclaimable downstream state (Priority
+            // order) before resuming it, so the resumed producer does not
+            // immediately re-trip the soft limit. Overshoot reduction only —
+            // liveness does not depend on it, so an over-target of 0 (no
+            // current pressure) is a no-op.
+            if handle.is_paused() {
+                let over = self
+                    .memory_budget
+                    .current_pressure()
+                    .saturating_sub(self.memory_budget.soft_limit());
+                self.memory_budget.spill_reclaimable(over);
+            }
             handle.set_active();
             handle.resume();
         }

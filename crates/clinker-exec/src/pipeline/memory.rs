@@ -1448,6 +1448,39 @@ impl MemoryArbitrator {
             }
         }
     }
+
+    /// Best-effort spill of reclaimable (non-back-pressureable) consumers in
+    /// `Priority` order (node-buffer 0 < grace-hash 10 < sort 20 <
+    /// aggregate 30), shedding up to `target_bytes` of downstream state.
+    ///
+    /// Called at a drain arm's progress boundary, just before a Source that
+    /// a prior round paused under pressure is resumed, so the resumed
+    /// producer does not immediately re-trip the soft limit (Spark's "spill
+    /// other consumers before you proceed"). Overshoot reduction only:
+    /// liveness never depends on it — the drain arm makes progress
+    /// regardless — so a partial or zero spill is fine and no error is
+    /// surfaced. `try_spill` flips each victim's `spill_requested` flag,
+    /// which its operator reads at the next batch boundary.
+    pub fn spill_reclaimable(&self, target_bytes: u64) {
+        if target_bytes == 0 {
+            return;
+        }
+        let consumers = self.consumers.load();
+        let mut ordered: Vec<&(ConsumerId, Arc<dyn MemoryConsumer>)> = consumers
+            .iter()
+            .filter(|(_, c)| !c.can_back_pressure())
+            .collect();
+        ordered.sort_by_key(|(_, c)| c.spill_priority());
+        let mut remaining = target_bytes;
+        for (_, consumer) in ordered {
+            if remaining == 0 {
+                break;
+            }
+            if let Ok(freed) = consumer.try_spill(remaining) {
+                remaining = remaining.saturating_sub(freed);
+            }
+        }
+    }
 }
 
 /// Shared oracle for the disk-spill-cap (E320) overflow surface, so every
@@ -3027,6 +3060,37 @@ mod tests {
         assert!(
             !source_handle.is_paused(),
             "poll_arbitration must never pause a back-pressureable producer"
+        );
+    }
+
+    #[test]
+    fn spill_reclaimable_sheds_non_back_pressureable_in_priority_order() {
+        use crate::executor::source_stream::SourceConsumer;
+        // The spill-nudge targets only reclaimable (non-back-pressureable)
+        // consumers and never a Source, so a resumed producer does not
+        // immediately re-trip. A zero target is a no-op.
+        let arb = MemoryArbitrator::with_policy(
+            u64::MAX,
+            0.80,
+            0.70,
+            Box::new(BackPressurePreferred::wrapping(Priority)),
+        );
+        let source_handle = ConsumerHandle::new();
+        arb.register_consumer(Arc::new(SourceConsumer::new(source_handle.clone())));
+        let reclaimable = Arc::new(ReclaimableMock::new(4096, 0));
+        arb.register_consumer(reclaimable.clone());
+
+        arb.spill_reclaimable(0);
+        assert!(!reclaimable.was_spilled(), "a zero target must be a no-op");
+
+        arb.spill_reclaimable(4096);
+        assert!(
+            reclaimable.was_spilled(),
+            "the reclaimable consumer must be asked to spill"
+        );
+        assert!(
+            !source_handle.is_paused(),
+            "the spill-nudge must never touch a back-pressureable Source"
         );
     }
 }
