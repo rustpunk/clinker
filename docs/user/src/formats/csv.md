@@ -97,9 +97,11 @@ pre-scan runs on the buffered output path, where the record batch is
 materialized.
 
 An output that streams under a bounded-memory budget cannot pre-scan the
-whole batch: a CSV output fused directly after a `Merge`/`Transform`, or one
-reconstructing an envelope (which suppresses the shared header and streams a
-headerless body), commits its columns to the first record. A later record
+whole batch: a CSV output fused directly after a `Merge`/`Transform`, a
+single-branch `Route`, a streaming-strategy `Aggregate`, or the probe side of
+a hash-build-probe `Combine`, or one reconstructing an envelope (which
+suppresses the shared header and streams a headerless body), commits its
+columns to the first record. A later record
 carrying a column that first record lacked then fails the run with a
 `SchemaDrift` error naming the column, rather than silently dropping it.
 Declare the column in the source or output `schema:` so every record carries
