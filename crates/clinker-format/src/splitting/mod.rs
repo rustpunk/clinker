@@ -35,9 +35,6 @@ pub struct SplitPolicy {
     pub max_bytes: Option<u64>,
     /// Optional field name — never split mid-group.
     pub group_key: Option<String>,
-    /// Repeat format-specific preamble (e.g. CSV header) in each split file.
-    /// Passed to the writer factory; SplittingWriter itself is format-agnostic.
-    pub repeat_header: bool,
     /// Behavior when a single key group exceeds file limits.
     pub oversize_group: OversizeGroupPolicy,
 }
@@ -211,16 +208,6 @@ impl SplittingWriter {
                 ),
             }),
         }
-    }
-
-    /// Number of split files written so far (including the current one).
-    pub fn file_count(&self) -> u32 {
-        self.file_seq
-    }
-
-    /// Total bytes written across all rotated files plus current file.
-    pub fn total_bytes_written(&self) -> u64 {
-        self.total_bytes + self.byte_counter.bytes_written()
     }
 }
 
