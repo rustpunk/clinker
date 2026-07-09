@@ -1118,7 +1118,7 @@ impl<'a> ExecutorContext<'a> {
             crossbeam_channel::bounded::<crate::executor::stream_event::StreamEvent>(256);
         let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
         let charge_consumer_id = self.memory_budget.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone(), false),
+            crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone()),
         ));
         self.streaming_output_senders.insert(producer_idx, tx);
         self.streaming_charge_consumers
@@ -1541,7 +1541,7 @@ pub(crate) fn admit_node_buffer(
     let handle = crate::pipeline::memory::ConsumerHandle::new();
     handle.set_bytes(bytes);
     let consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-        crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone(), false),
+        crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
     ));
     ctx.node_buffer_consumer_ids
         .insert(node_idx, (consumer_id, handle.clone()));
