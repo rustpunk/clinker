@@ -34,13 +34,17 @@ pub trait FormatReader: Send {
     /// declared field names; the returned map is then attached to
     /// every body record's `Arc<DocumentContext>`.
     ///
-    /// Default impl returns an empty map — readers that don't yet
-    /// support envelope extraction (CSV, fixed-width pending #101) or
-    /// that the config asked nothing of (no declared sections) take
-    /// the no-op path. Format-specific implementations (XML, JSON) are
-    /// added per-reader; if `config.sections` declares an extract rule
-    /// the reader does not support, that reader returns a format
-    /// error surfacing the mismatch at startup rather than mid-stream.
+    /// Default impl returns an empty map — a reader takes the no-op
+    /// path when the config asked nothing of it (no declared sections),
+    /// or when multi-record CSV / fixed-width extraction is not yet
+    /// wired (pending #101). A *plain* single-schema CSV / fixed-width
+    /// source that declares envelope sections never reaches this path:
+    /// the planner rejects it (E356), because a plain flat file carries
+    /// no header/trailer document to pre-scan. Format-specific
+    /// implementations (XML, JSON) are added per-reader; if
+    /// `config.sections` declares an extract rule the reader does not
+    /// support, that reader returns a format error surfacing the
+    /// mismatch at startup rather than mid-stream.
     fn prepare_document(
         &mut self,
         _config: &EnvelopeConfig,

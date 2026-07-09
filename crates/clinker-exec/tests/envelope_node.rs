@@ -227,15 +227,20 @@ nodes:
     name: edi
     config:
       name: edi
-      type: csv
-      path: placeholder.csv
+      # A document-carrying format (XML): only a source that actually buffers a
+      # document may declare an `envelope:`. A plain single-schema CSV/fixed-width
+      # source declaring one is rejected at plan time (E356); the scripted reader
+      # supplies the runtime section value per document, so the format here is
+      # just a stand-in for "a source with a document envelope".
+      type: xml
+      path: placeholder.xml
       # The `interchange` section is declared so the Output's
       # `footer_from_doc: interchange` passes the feeding-source section-name
       # check; the scripted reader supplies its runtime value per document.
       envelope:
         sections:
           interchange:
-            extract: {{ record_type: H }}
+            extract: {{ xml_path: "/doc/interchange" }}
             fields:
               tag: string
       schema:
@@ -730,12 +735,14 @@ nodes:
     name: edi
     config:
       name: edi
-      type: csv
-      path: placeholder.csv
+      # XML stand-in for a document-carrying source: a plain CSV/fixed-width
+      # source may not declare an `envelope:` (E356 rejects it at plan time).
+      type: xml
+      path: placeholder.xml
       envelope:
         sections:
           interchange:
-            extract: { record_type: H }
+            extract: { xml_path: "/doc/interchange" }
             fields:
               tag: string
       schema:
@@ -1648,16 +1655,18 @@ nodes:
     name: edi
     config:
       name: edi
-      type: csv
-      path: placeholder.csv
+      # XML stand-in for a document-carrying source: a plain CSV/fixed-width
+      # source may not declare an `envelope:` (E356 rejects it at plan time).
+      type: xml
+      path: placeholder.xml
       envelope:
         sections:
           preamble:
-            extract: {{ record_type: P }}
+            extract: {{ xml_path: "/doc/preamble" }}
             fields:
               sender: string
           interchange:
-            extract: {{ record_type: H }}
+            extract: {{ xml_path: "/doc/interchange" }}
             fields:
               tag: string
       schema:

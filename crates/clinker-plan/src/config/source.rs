@@ -555,14 +555,6 @@ pub enum ArrayMode {
 }
 
 impl SourceConfig {
-    /// Get CSV input options, if this is a CSV input.
-    pub fn csv_options(&self) -> Option<&CsvInputOptions> {
-        match &self.format {
-            InputFormat::Csv(opts) => opts.as_ref(),
-            _ => None,
-        }
-    }
-
     /// Borrow the literal `path:` for the simple-case source. Returns `""`
     /// for sources using `glob`/`regex`/`paths` matchers — the latter
     /// resolve to a `Vec<PathBuf>` at discovery time and don't have a

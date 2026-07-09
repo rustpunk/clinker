@@ -17,7 +17,7 @@ nodes:
     input: source
     config:
       cxl: |
-        emit out = f0
+        emit f0 = f0
 
   - type: output
     name: sink

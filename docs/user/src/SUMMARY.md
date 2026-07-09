@@ -85,6 +85,7 @@
 - [Metrics & Monitoring](ops/metrics.md)
 - [Exit Codes & Error Diagnosis](ops/exit-codes.md)
 - [Production Deployment](ops/deployment.md)
+- [Running Under a Workflow Orchestrator](ops/orchestrator-contract.md)
 
 # Cookbook
 

@@ -102,6 +102,29 @@ fn run_two_source_merge(
     (report, buf.as_string())
 }
 
+/// Run a single-source pipeline and return the raw run `Result` so a test can
+/// assert a loud write failure (rather than `.expect`-ing success).
+fn run_single_result(
+    yaml: &str,
+    csv_input: &str,
+) -> Result<ExecutionReport, clinker_plan::error::PipelineError> {
+    let config = parse_config(yaml).expect("parse pipeline yaml");
+    let plan = PipelineConfig::compile(&config, &CompileContext::default()).expect("compile");
+    let readers = HashMap::from([(
+        config.source_configs().next().unwrap().name.clone(),
+        clinker_exec::executor::single_file_reader(
+            "test.csv",
+            Box::new(Cursor::new(csv_input.as_bytes().to_vec())),
+        ),
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        config.output_configs().next().unwrap().name.clone(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+}
+
 // ── H1: Aggregate strips $widened payload to Null ─────────────
 
 /// CSV with extra column `notes` flows through an Aggregate
@@ -827,5 +850,240 @@ nodes:
         !cols.contains(&"extra"),
         "with include_unmapped: false, sidecar contents must not be expanded. \
          got header: {header}"
+    );
+}
+
+// ── H9: CSV late-widening — union on the buffered arm ──────────
+
+/// A pipeline whose Output MATERIALIZES its whole input can pre-scan the batch
+/// and widen the CSV header to the UNION of every record's columns. A Transform
+/// between the Merge and the Output is not a fused Source→Transform, so it
+/// disables the streaming fusion and routes the Output through the buffered
+/// records-only arm (while passing the `$widened` sidecar through unchanged).
+/// Two concat-merged sources carry DIFFERENT auto-widened columns (`region` on
+/// src_a, `category` on src_b), so `category` first appears on a record after
+/// the first — yet it still gets a header slot, with the earlier rows blank in
+/// it, rather than being silently dropped (issue #805).
+#[test]
+fn h9_csv_buffered_late_widening_writes_union_header() {
+    let yaml = r#"
+pipeline:
+  name: h9_buffered_union
+nodes:
+- type: source
+  name: src_a
+  config:
+    name: src_a
+    type: csv
+    path: a.csv
+    schema:
+      - { name: id, type: string }
+- type: source
+  name: src_b
+  config:
+    name: src_b
+    type: csv
+    path: b.csv
+    schema:
+      - { name: id, type: string }
+- type: merge
+  name: merged
+  inputs: [src_a, src_b]
+- type: transform
+  name: passthrough
+  input: merged
+  config:
+    cxl: "emit id = id"
+- type: output
+  name: out
+  input: passthrough
+  config:
+    name: out
+    type: csv
+    path: out.csv
+    include_unmapped: true
+"#;
+    // `region` is unmapped on src_a; `category` is unmapped on src_b — each
+    // absorbed into its own `$widened` sidecar and expanded at the sink.
+    let src_a = "id,region\n1,US\n2,EU\n";
+    let src_b = "id,category\n3,hardware\n4,software\n";
+    let (_report, output) = run_two_source_merge(yaml, "src_a", src_a, "src_b", src_b);
+
+    // Concat order (all src_a before src_b) makes the union header, row order,
+    // and blank placement deterministic. `category` (first seen on record 3)
+    // gets its own column; the src_a rows are blank in it, and the src_b rows
+    // blank in `region`.
+    assert_eq!(
+        output, "id,region,category\n1,US,\n2,EU,\n3,,hardware\n4,,software\n",
+        "header is the union of every record's columns; earlier rows blank in \
+         the later-appearing `category` column; nothing dropped. got:\n{output}"
+    );
+}
+
+// ── H9b: CSV drift on a bounded-memory (streaming) arm is loud ──
+
+/// The same two-source drift, but WITHOUT a materializing operator: a bare
+/// `Merge → Output` fuses into the streaming writer, which pins the header to
+/// the first record under a bounded-memory budget and cannot pre-scan a
+/// union. A later record's `category` column therefore has no header slot —
+/// and rather than silently writing a narrower row (the pre-#805 loss), the
+/// run fails loudly with a SchemaDrift naming the drifting column.
+#[test]
+fn h9b_csv_streaming_drift_fails_loud() {
+    let yaml = r#"
+pipeline:
+  name: h9b_streaming_drift
+nodes:
+- type: source
+  name: src_a
+  config:
+    name: src_a
+    type: csv
+    path: a.csv
+    schema:
+      - { name: id, type: string }
+- type: source
+  name: src_b
+  config:
+    name: src_b
+    type: csv
+    path: b.csv
+    schema:
+      - { name: id, type: string }
+- type: merge
+  name: merged
+  inputs: [src_a, src_b]
+- type: output
+  name: out
+  input: merged
+  config:
+    name: out
+    type: csv
+    path: out.csv
+    include_unmapped: true
+"#;
+    let src_a = "id,region\n1,US\n2,EU\n";
+    let src_b = "id,category\n3,hardware\n4,software\n";
+    let config = parse_config(yaml).expect("parse pipeline yaml");
+    let plan = PipelineConfig::compile(&config, &CompileContext::default()).expect("compile");
+    let readers = HashMap::from([
+        (
+            "src_a".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "a.csv",
+                Box::new(Cursor::new(src_a.as_bytes().to_vec())),
+            ),
+        ),
+        (
+            "src_b".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "b.csv",
+                Box::new(Cursor::new(src_b.as_bytes().to_vec())),
+            ),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn Write + Send>,
+    )]);
+    let err =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
+            .expect_err("a streaming CSV output cannot union a drifting column and must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("category"),
+        "the SchemaDrift must name the drifting column; got: {msg}"
+    );
+    assert!(
+        msg.contains("does not declare"),
+        "the error must be the loud SchemaDrift diagnostic; got: {msg}"
+    );
+}
+
+// ── H10: no-drift CSV output is byte-identical (regression) ─────
+
+/// A homogeneous auto-widen batch (every record carries the same sidecar
+/// keys) must produce exactly the output the first-record-pinned writer
+/// produced before the union pre-scan landed — the union of identical column
+/// sets is that same set. Locks the union path against altering the no-drift
+/// common case.
+#[test]
+fn h10_csv_no_drift_output_is_byte_identical() {
+    let yaml = r#"
+pipeline:
+  name: h10_no_drift
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: in.csv
+    schema:
+      - { name: id, type: string }
+      - { name: name, type: string }
+- type: output
+  name: out
+  input: src
+  config:
+    name: out
+    type: csv
+    path: out.csv
+    include_unmapped: true
+"#;
+    let csv = "id,name,city,role\n1,Alice,Paris,admin\n2,Bob,Tokyo,user\n";
+    let (_report, output) = run_single(yaml, csv);
+    assert_eq!(
+        output, "id,name,city,role\n1,Alice,Paris,admin\n2,Bob,Tokyo,user\n",
+        "no drift: union header equals the declared columns plus the (shared) \
+         sidecar keys, and every row is byte-identical. got:\n{output}"
+    );
+}
+
+// ── H11: fixed-width drift is a loud SchemaDrift, not silent ────
+
+/// A fixed-width output cannot place a column its declared byte layout does
+/// not name. When `auto_widen` surfaces such a column (here `region`, absent
+/// from the output `schema:`) under the default `include_unmapped: true`, the
+/// run fails loudly with a SchemaDrift naming the column — never a
+/// silently-narrower line (the never-silent-loss contract).
+#[test]
+fn h11_fixed_width_drift_fails_loud() {
+    let yaml = r#"
+pipeline:
+  name: h11_fw_drift
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: csv
+    path: in.csv
+    schema:
+      - { name: id, type: string }
+- type: output
+  name: out
+  input: src
+  config:
+    name: out
+    type: fixed_width
+    path: out.dat
+    schema:
+      - { name: id, type: string, start: 0, width: 3 }
+"#;
+    let csv = "id,region\n1,US\n2,EU\n";
+    let err = run_single_result(yaml, csv).expect_err(
+        "a fixed-width output receiving an auto-widened `region` column must fail, \
+         not silently drop it",
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("region"),
+        "the SchemaDrift must name the drifting column; got: {msg}"
+    );
+    assert!(
+        msg.contains("does not declare"),
+        "the error must be the loud SchemaDrift diagnostic; got: {msg}"
     );
 }

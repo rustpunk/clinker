@@ -52,9 +52,12 @@ or below the width, so a multi-byte character is never split: the emitted
 cell is always valid UTF-8 of exactly `width` bytes (it may hold fewer
 *characters* than the width when a trailing multi-byte character does not
 fit, with the freed bytes pad-filled). Because padding fills exact byte
-counts, `pad` must be a single-byte (ASCII) character; a multi-byte `pad`
-is rejected when the output opens. Under `truncation: error` an over-long
-value is still a hard error before any slicing.
+counts on write and is stripped one character at a time on read, `pad` must
+be a **single-byte (ASCII) character** — a multi-byte character (such as `·`)
+or a multi-character string (such as `"0 "`) is rejected when the schema is
+resolved, on both the read and write sides. An absent or empty `pad` defaults
+to a space. Under `truncation: error` an over-long value is still a hard error
+before any slicing.
 
 A `type: decimal` output column with a `scale` rounds its values to that
 many fractional places on write (banker's rounding), the same contract a

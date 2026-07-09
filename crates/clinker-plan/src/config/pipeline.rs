@@ -1129,6 +1129,60 @@ impl PipelineConfig {
                 );
             }
         }
+        // E356 — a plain single-schema CSV or fixed-width source that
+        // declares an `envelope:` block. A plain flat file carries no
+        // header/trailer structure to pre-scan, so the declared sections
+        // are never populated and every `$doc.<section>.<field>` against
+        // the source resolves to null. Reject it at plan time, mirroring
+        // the E349 REST case above: both declare an envelope on a
+        // shape/transport that buffers no document, so the declaration is
+        // inert. Multi-record CSV/fixed-width sources (a `discriminator:` +
+        // `records:` block) DO expose an extractable header record and
+        // compile unaffected. The guard fires only on the resolved
+        // single-record `Columns` shape — not the as-yet-unresolved
+        // external `File` schema (which may itself be multi-record, so
+        // rejecting it here would false-positive) nor the synthesized
+        // `Generated` positional form. The transport guard keeps this off
+        // REST sources, where the E349 pass above already owns the
+        // rejection.
+        for body in self.source_bodies() {
+            let source = &body.source;
+            if matches!(source.transport, SourceTransport::File)
+                && matches!(
+                    source.format,
+                    InputFormat::Csv(_) | InputFormat::FixedWidth(_)
+                )
+                && matches!(body.schema, clinker_format::SourceSchema::Columns(_))
+                && source.envelope.is_some()
+            {
+                let primary = doc_node_line_by_name
+                    .get(source.name.as_str())
+                    .map(|&line| Span::line_only(line))
+                    .unwrap_or(Span::SYNTHETIC);
+                let fmt = source.format.format_name();
+                diags.push(
+                    Diagnostic::error(
+                        "E356",
+                        format!(
+                            "the {fmt} source '{}' declares an `envelope:` block, but a plain \
+                             single-schema {fmt} source carries no header/trailer structure to \
+                             extract — the declared sections are inert and every \
+                             `$doc.<section>.<field>` against this source resolves to null",
+                            source.name
+                        ),
+                        LabeledSpan::primary(primary, String::new()),
+                    )
+                    .with_help(
+                        "remove the `envelope:` block from this source, or declare a multi-record \
+                         schema (a `discriminator:` + `records:` block) if the file carries \
+                         header/trailer records; the `record_type` extract that exposes \
+                         `$doc.<section>.<field>` sections applies only to a multi-record CSV / \
+                         fixed-width source"
+                            .to_string(),
+                    ),
+                );
+            }
+        }
         for (doc_path, ref_nodes) in &doc_path_set.by_node {
             for node_id in ref_nodes {
                 let Some(sources) = node_sources.get(node_id) else {
@@ -1173,7 +1227,7 @@ impl PipelineConfig {
         }
         if diags
             .iter()
-            .any(|d| d.code == "E341" || d.code == "E348" || d.code == "E349")
+            .any(|d| d.code == "E341" || d.code == "E348" || d.code == "E349" || d.code == "E356")
         {
             return Err(diags);
         }

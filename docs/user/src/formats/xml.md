@@ -85,11 +85,12 @@ Attribute handling details:
   (e.g. `@a.b`) is rejected with a format error: an XML attribute is a
   leaf and cannot contain elements.
 - The attribute name (the segment after the prefix) must be a well-formed
-  XML name — a letter, `_`, or `:` followed by letters, digits, `-`, `.`,
-  or `:`. A name with a space, `=`, quote, `/`, `>`, or a leading digit
-  (e.g. `@foo bar`, `@1st`) is rejected with a format error rather than
-  emitting a malformed start tag. Non-ASCII letters are accepted, so an
-  attribute name read from a source document round-trips unchanged.
+  XML name — a letter, `_`, or `:` followed by letters, digits, `_`, `-`,
+  `.`, or `:` (plus the XML 1.0 Unicode name ranges). A name with a space,
+  `=`, quote, `/`, `>`, or a leading digit (e.g. `@foo bar`, `@1st`) is
+  rejected with a format error rather than emitting a malformed start tag.
+  Non-ASCII letters are accepted, so an attribute name read from a source
+  document round-trips unchanged.
 - An element with only attribute fields and no children self-closes:
   `Address.@type` alone emits `<Address type="home"/>`.
 

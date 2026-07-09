@@ -147,6 +147,11 @@ absorb expected out-of-order tails before they reach this path.
 
 ## Scheduler integration
 
+For running Clinker under a workflow orchestrator (Temporal, Airflow,
+Dagster) — mapping these exit codes onto a retry policy, plus the
+cancellation and output-atomicity guarantees — see
+[Running Under a Workflow Orchestrator](orchestrator-contract.md).
+
 ### Cron script
 
 ```bash
