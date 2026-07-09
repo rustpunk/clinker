@@ -711,6 +711,239 @@ fn test_rest_without_doc_or_envelope_compiles() {
 }
 
 #[test]
+fn test_plain_csv_envelope_aborts_with_e356() {
+    // A plain (single-schema) CSV source declares an `envelope:` block. A
+    // plain flat file has no header/trailer document to pre-scan, so the
+    // declared sections are inert — rejected at plan time, mirroring the
+    // E349 REST-source case.
+    let yaml = r#"
+pipeline:
+  name: e356_plain_csv
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: csv
+      path: ./payments.csv
+      envelope:
+        sections:
+          Head:
+            extract: { record_type: H }
+            fields:
+              batch_id: string
+      schema:
+        - { name: amount, type: int }
+  - type: output
+    name: out
+    input: payments
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse plain csv pipeline");
+    let err = config
+        .compile(&CompileContext::default())
+        .expect_err("a plain csv source declaring an envelope must fail to compile");
+    let diag = err
+        .iter()
+        .find(|d| d.code == "E356")
+        .unwrap_or_else(|| panic!("expected an E356 diagnostic, got: {err:?}"));
+    assert!(
+        diag.message.contains("csv source") && diag.message.contains("inert"),
+        "E356 must name the csv source and explain the inert envelope: {}",
+        diag.message
+    );
+    assert!(diag.help.is_some(), "E356 must carry help text");
+}
+
+#[test]
+fn test_plain_fixed_width_envelope_aborts_with_e356() {
+    // Same fail-fast for a plain fixed-width source: it, too, is a flat
+    // sequence of body records with no envelope to extract.
+    let yaml = r#"
+pipeline:
+  name: e356_plain_fixed_width
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: fixed_width
+      path: ./payments.txt
+      envelope:
+        sections:
+          Head:
+            extract: { record_type: H }
+            fields:
+              batch_id: string
+      schema:
+        - { name: amount, type: int, start: 0, width: 9 }
+  - type: output
+    name: out
+    input: payments
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse plain fixed-width pipeline");
+    let err = config
+        .compile(&CompileContext::default())
+        .expect_err("a plain fixed-width source declaring an envelope must fail to compile");
+    let diag = err
+        .iter()
+        .find(|d| d.code == "E356")
+        .unwrap_or_else(|| panic!("expected an E356 diagnostic, got: {err:?}"));
+    assert!(
+        diag.message.contains("fixed_width source") && diag.message.contains("inert"),
+        "E356 must name the fixed_width source and explain the inert envelope: {}",
+        diag.message
+    );
+    assert!(diag.help.is_some(), "E356 must carry help text");
+}
+
+#[test]
+fn test_multi_record_fixed_width_envelope_compiles() {
+    // Control: the multi-record case is a separate, real feature and MUST
+    // still compile. A `discriminator:` + `records:` schema exposes a header
+    // record type as a `$doc` section through the `record_type` extract, so
+    // its envelope is a genuine extract rather than an inert declaration —
+    // the E356 guard must not fire on it.
+    let yaml = r#"
+pipeline:
+  name: e356_multi_record_fixed_width
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: fixed_width
+      path: ./payments.txt
+      schema:
+        discriminator: { start: 0, width: 1 }
+        structure:
+          - { record: trailer, count: count }
+        records:
+          - { id: header,  tag: H, columns: [ { name: batch_id, type: string, start: 1, width: 9 } ] }
+          - { id: detail,  tag: D, columns: [ { name: id, type: int, start: 1, width: 5 }, { name: amount, type: int, start: 6, width: 4 } ] }
+          - { id: trailer, tag: T, columns: [ { name: count, type: int, start: 1, width: 5 } ] }
+      envelope:
+        sections:
+          head:
+            extract: { record_type: H }
+            fields:
+              batch_id: string
+  - type: transform
+    name: tag
+    input: payments
+    config:
+      cxl: |
+        emit kind = record_type
+        emit amount = amount
+        emit batch = $doc.head.batch_id
+  - type: output
+    name: out
+    input: tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse multi-record fixed-width pipeline");
+    let result = config.compile(&CompileContext::default());
+    if let Err(err) = &result {
+        assert!(
+            !err.iter().any(|d| d.code == "E356"),
+            "a multi-record fixed-width envelope must not trip E356: {err:?}"
+        );
+    }
+    result.expect("a multi-record fixed-width source declaring an envelope must compile");
+}
+
+#[test]
+fn test_multi_record_csv_envelope_compiles() {
+    // Control, CSV variant: a `discriminator:` + `records:` CSV source with a
+    // `record_type` envelope extract compiles unaffected.
+    let yaml = r#"
+pipeline:
+  name: e356_multi_record_csv
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: csv
+      path: ./payments.csv
+      schema:
+        discriminator: { field: record_type }
+        records:
+          - { id: header, tag: H, columns: [ { name: record_type, type: string }, { name: batch_id, type: string } ] }
+          - { id: detail, tag: D, columns: [ { name: record_type, type: string }, { name: amount, type: int } ] }
+      envelope:
+        sections:
+          head:
+            extract: { record_type: H }
+            fields:
+              batch_id: string
+  - type: transform
+    name: tag
+    input: payments
+    config:
+      cxl: |
+        emit kind = record_type
+        emit batch = $doc.head.batch_id
+  - type: output
+    name: out
+    input: tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse multi-record csv pipeline");
+    let result = config.compile(&CompileContext::default());
+    if let Err(err) = &result {
+        assert!(
+            !err.iter().any(|d| d.code == "E356"),
+            "a multi-record csv envelope must not trip E356: {err:?}"
+        );
+    }
+    result.expect("a multi-record csv source declaring an envelope must compile");
+}
+
+#[test]
+fn test_plain_csv_without_envelope_compiles() {
+    // The guard fires only on a declared envelope: a plain CSV source with no
+    // `envelope:` block is unaffected.
+    let yaml = r#"
+pipeline:
+  name: e356_plain_csv_no_envelope
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: csv
+      path: ./payments.csv
+      schema:
+        - { name: amount, type: int }
+  - type: output
+    name: out
+    input: payments
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse plain csv pipeline");
+    config
+        .compile(&CompileContext::default())
+        .expect("a plain csv source with no envelope must compile");
+}
+
+#[test]
 fn test_negative_literal_doc_index_compiles() {
     // A negated integer literal is a static from-end index, so the path
     // is resolvable and the compile succeeds.

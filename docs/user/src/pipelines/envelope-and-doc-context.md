@@ -148,10 +148,11 @@ Each section declares how the reader locates its payload:
 | Multi-record CSV / fixed-width | `record_type` | A header record-type tag, e.g. `H` |
 
 Declaring an `xml_path` section against a JSON source (or vice versa),
-a `segment` extract against XML/JSON, or a `record_type` extract against
-any format other than multi-record CSV / fixed-width is a configuration
-error and fails fast when the source opens, rather than silently
-producing empty sections.
+a `segment` extract against XML/JSON, a `record_type` extract against
+any format other than multi-record CSV / fixed-width, or any `envelope:`
+block at all on a plain (single-schema) CSV or fixed-width source is a
+configuration error that fails fast rather than silently producing empty
+sections.
 
 A `json_pointer` must be a valid RFC 6901 pointer: either empty (`""`,
 naming the whole document) or a `/`-introduced path such as `/Head` or
@@ -160,10 +161,15 @@ decode to zero segments and silently match the root document — so it is
 **rejected at validation** rather than resolving to the wrong metadata.
 
 A **plain** (single-schema) CSV or fixed-width source carries no envelope
-— there is no header/trailer structure to extract, so declaring envelope
-sections on one is a no-op. The `record_type` extract applies only to a
+— there is no header/trailer structure to extract. Declaring `envelope:`
+sections on one is a configuration error (`E356`): the sections would
+never be populated and every `$doc.<section>.<field>` against the source
+would resolve to `null`, so the compiler **rejects** it rather than
+accepting an inert declaration. Envelope extraction on a flat file — the
+`record_type` extract — applies only to a
 [multi-record](../formats/csv.md#multi-record-files-header--trailer--body)
-source, one declaring a `discriminator:` + `records:` block.
+source, one declaring a `discriminator:` + `records:` block; declare that
+schema if the file genuinely carries header/trailer records.
 
 ### Network (REST) sources carry no `$doc` context
 
