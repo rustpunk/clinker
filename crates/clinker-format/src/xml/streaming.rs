@@ -110,19 +110,28 @@ pub(crate) fn extract_sections(
             Event::Start(ref e) => {
                 let name = elem_name_static(ns, &e.name());
                 path_stack.push(name);
-                if let Some(target) = targets
+                // Several sections may alias one path (distinct names
+                // projecting different `fields` from a single header), so
+                // collect every match rather than only the first.
+                let matching: Vec<&SectionTarget> = targets
                     .iter()
-                    .find(|t| path_matches(&path_stack, &t.segments))
-                {
+                    .filter(|t| path_matches(&path_stack, &t.segments))
+                    .collect();
+                if let Some((last, init)) = matching.split_last() {
                     // The matched section element's OWN attributes belong to
                     // the section, addressable as bare `@attr` (no element
                     // prefix) — exactly as the body reader seeds a record's
                     // start-tag attributes. Seed them before the children so
                     // `<Summary id="5">` exposes `$doc.Summary.@id`; the
                     // children's nested fields follow.
+                    //
+                    // Build the subtree payload once — charging its bytes a
+                    // single time under the first-declared alias — then record
+                    // it under every matching name in declaration order.
+                    let section_name: &str = &matching[0].name;
                     let mut seed: Vec<(String, String)> = Vec::new();
                     for (key, val) in extract_attributes_static(attr_prefix, e)? {
-                        charge.charge(key.len() + val.len(), &target.name)?;
+                        charge.charge(key.len() + val.len(), section_name)?;
                         seed.push((key, val));
                     }
                     let payload = read_section_payload(
@@ -130,11 +139,14 @@ pub(crate) fn extract_sections(
                         &mut buf,
                         &parse_ctx,
                         path_stack.len(),
-                        &target.name,
+                        section_name,
                         &mut charge,
                         seed,
                     )?;
-                    captured.push((target.name.clone(), payload));
+                    for target in init {
+                        captured.push((target.name.clone(), payload.clone()));
+                    }
+                    captured.push((last.name.clone(), payload));
                     // `read_section_payload` consumed the matched subtree up
                     // to its closing `End`; the upcoming loop iteration will
                     // not see that `End`, so pop the element now.
@@ -144,16 +156,27 @@ pub(crate) fn extract_sections(
             Event::Empty(ref e) => {
                 let name = elem_name_static(ns, &e.name());
                 path_stack.push(name);
-                if let Some(target) = targets
+                // An empty element carries only its attributes; several
+                // sections may still alias its path, so record the attribute
+                // payload under every match rather than only the first.
+                let matching: Vec<&SectionTarget> = targets
                     .iter()
-                    .find(|t| path_matches(&path_stack, &t.segments))
-                {
+                    .filter(|t| path_matches(&path_stack, &t.segments))
+                    .collect();
+                if let Some((last, init)) = matching.split_last() {
+                    // Build the attribute payload once — charging its bytes a
+                    // single time under the first-declared alias — then record
+                    // it under every matching name in declaration order.
+                    let section_name: &str = &matching[0].name;
                     let mut payload: Vec<(String, String)> = Vec::new();
                     for (key, val) in extract_attributes_static(attr_prefix, e)? {
-                        charge.charge(key.len() + val.len(), &target.name)?;
+                        charge.charge(key.len() + val.len(), section_name)?;
                         payload.push((key, val));
                     }
-                    captured.push((target.name.clone(), payload));
+                    for target in init {
+                        captured.push((target.name.clone(), payload.clone()));
+                    }
+                    captured.push((last.name.clone(), payload));
                 }
                 path_stack.pop();
             }

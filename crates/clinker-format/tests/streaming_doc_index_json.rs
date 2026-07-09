@@ -738,3 +738,59 @@ fn prescan_empty_json_pointer_matches_root() {
         "the root object's top-level field must be extracted"
     );
 }
+
+/// Two sections declaring the SAME JSON pointer under different names each
+/// project a different `fields` subset of the one header. Both must be
+/// retained and independently field-projected — a shared pointer must not
+/// drop the later-declared alias (the pre-scan formerly kept only the first
+/// target terminating at a pointer).
+#[test]
+fn prescan_records_every_alias_of_a_shared_json_pointer() {
+    let json = r#"{"meta":{"batch_id":"B-1","record_count":5},"records":[{"x":1}]}"#;
+    let ident: SectionSpec = ("Ident", "/meta", &[("batch_id", EnvelopeFieldType::String)]);
+    let counts: SectionSpec = (
+        "Counts",
+        "/meta",
+        &[("record_count", EnvelopeFieldType::Int)],
+    );
+    let specs: &[SectionSpec] = &[ident, counts];
+    let cfg = envelope_config(specs);
+
+    let mut reader = JsonReader::from_reader(
+        std::io::Cursor::new(json.as_bytes().to_vec()),
+        JsonReaderConfig {
+            record_path: Some("records".into()),
+            declared_doc_paths: declared_paths(specs),
+            max_index_bytes: Some(64 * 1_000_000),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let sections = reader.prepare_document(&cfg).expect("pre-scan");
+
+    // The first alias resolves and projects only its declared field.
+    let ident_map = match sections.get("Ident").expect("first alias retained") {
+        Value::Map(m) => m,
+        other => panic!("expected map, got {other:?}"),
+    };
+    assert_eq!(
+        ident_map.get("batch_id"),
+        Some(&Value::String("B-1".into()))
+    );
+    assert!(
+        ident_map.get("record_count").is_none(),
+        "the first alias projects only its declared `fields` subset"
+    );
+
+    // The second alias, sharing the same pointer, resolves independently.
+    let counts_map = match sections.get("Counts").expect("second alias retained") {
+        Value::Map(m) => m,
+        other => panic!("expected map, got {other:?}"),
+    };
+    assert_eq!(counts_map.get("record_count"), Some(&Value::Integer(5)));
+    assert!(
+        counts_map.get("batch_id").is_none(),
+        "the second alias projects only its declared `fields` subset"
+    );
+}

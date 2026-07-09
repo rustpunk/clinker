@@ -1929,24 +1929,57 @@ fn bind_cull(
     // line cannot do. Each rule's node ids are relocated into a dense,
     // collision-free span so the resolver/typechecker side-tables (indexed by
     // `NodeId`) stay consistent; the OR-chain and wrapping emit mint fresh ids
-    // above every relocated rule. Lowering runs `extract_aggregates` over the
-    // result and stamps it onto `PlanNode::Cull.compiled`/`.typed`. `rules` is
-    // non-empty (rejected above).
+    // above every relocated rule. Each rule's byte-offset spans are likewise
+    // rebased from its parse-wrapper coordinates into `decision_src` — the
+    // reconstructed one-line source stamped on the typed program — so a
+    // runtime eval-error caret (whose offsets are relative to that stamped
+    // source) underlines the failing rule's text rather than an off-by-prefix
+    // slice. Lowering runs `extract_aggregates` over the result and stamps it
+    // onto `PlanNode::Cull.compiled`/`.typed`. `rules` is non-empty (rejected
+    // above).
     let agg_mode = AggregateMode::GroupBy {
         group_by_fields: config.partition_by.iter().cloned().collect(),
     };
 
+    // Build the decision source as the rules are parsed, so it is the single
+    // coordinate space every predicate's spans rebase into. It is stamped as
+    // the typed program's display source (eval-error / explain rendering) and
+    // is never re-parsed, so a rule's `#` comment inside it is inert. Each
+    // rule is parenthesized and joined by ` or `, matching the AST-level
+    // OR-fold below.
+    let mut decision_src = format!(
+        "emit {} = ",
+        crate::config::pipeline_node::CULL_DROP_DECISION_COLUMN
+    );
     let mut disjuncts: Vec<Expr> = Vec::with_capacity(config.rules.len());
     let mut next_id: u32 = 0;
     let mut parse_failed = false;
-    for rule in &config.rules {
+    for (i, rule) in config.rules.iter().enumerate() {
+        if i > 0 {
+            decision_src.push_str(" or ");
+        }
+        decision_src.push('(');
+        // Byte offset where this rule's source text begins in `decision_src`
+        // (just past the opening paren) — the target coordinate the parsed
+        // predicate's spans rebase onto.
+        let source_start = decision_src.len() as u32;
+        decision_src.push_str(&rule.drop_group_when.source);
+        decision_src.push(')');
+
         match parse_cull_rule_predicate(
             &format!("{name}:{}:drop_group_when", rule.name),
             &rule.drop_group_when.source,
             next_id,
             span,
         ) {
-            Ok((predicate, node_count)) => {
+            Ok((mut predicate, node_count)) => {
+                // The predicate's spans are relative to a source beginning
+                // right after `CULL_RULE_PARSE_PREFIX`; shift them so they
+                // index `decision_src` instead. `source_start` is always past
+                // that prefix (the decision prefix is strictly longer), so the
+                // delta is non-negative.
+                let delta = source_start - CULL_RULE_PARSE_PREFIX.len() as u32;
+                cxl::ast::rebase_expr_spans(&mut predicate, delta);
                 disjuncts.push(predicate);
                 next_id += node_count;
             }
@@ -1994,35 +2027,25 @@ fn bind_cull(
         span: cxl::lexer::Span::default(),
     };
 
-    // Reconstruct the single-line decision source for the typed program's
-    // display text (eval-error / explain rendering). It is never re-parsed,
-    // so a rule's `#` comment inside it is inert.
-    let decision_src = format!(
-        "emit {} = {}",
-        crate::config::pipeline_node::CULL_DROP_DECISION_COLUMN,
-        config
-            .rules
-            .iter()
-            .map(|r| format!("({})", r.drop_group_when.source))
-            .collect::<Vec<_>>()
-            .join(" or ")
-    );
-
     // Typecheck the combined program first — the happy path needs only this
     // one pass. On failure, re-typecheck each rule on its own (same aggregate
     // mode, with `or false` forcing a boolean operand) purely to attribute the
     // diagnostic to the offending rule; fall back to the combined diagnostic
     // if no single rule reproduces it. Either way, skip lowering (the node is
     // absent from `cull_decision_typed`).
+    let decision_label = format!("{name}:drop_group_when");
+    let decision_ctx = CxlTypecheckCtx {
+        node_name: &decision_label,
+        schema: upstream,
+        mode: &agg_mode,
+        span,
+        scoped_vars,
+    };
     match typecheck_parsed_program(
-        &format!("{name}:drop_group_when"),
+        &decision_ctx,
         decision_program,
         node_count,
         std::sync::Arc::from(decision_src.as_str()),
-        upstream,
-        agg_mode.clone(),
-        span,
-        scoped_vars,
     ) {
         Ok(typed) => {
             artifacts.cull_decision_typed.insert(id, Arc::new(typed));
@@ -2030,14 +2053,15 @@ fn bind_cull(
         Err(combined) => {
             let mut attributed = false;
             for rule in &config.rules {
-                if let Err(d) = typecheck_cull_rule(
-                    &format!("{name}:{}:drop_group_when", rule.name),
-                    &rule.drop_group_when.source,
-                    upstream,
-                    agg_mode.clone(),
+                let rule_label = format!("{name}:{}:drop_group_when", rule.name);
+                let rule_ctx = CxlTypecheckCtx {
+                    node_name: &rule_label,
+                    schema: upstream,
+                    mode: &agg_mode,
                     span,
                     scoped_vars,
-                ) {
+                };
+                if let Err(d) = typecheck_cull_rule(&rule_ctx, &rule.drop_group_when.source) {
                     diags.push(d);
                     attributed = true;
                 }
@@ -2865,6 +2889,139 @@ fn bind_composition(
                 ));
             }
             return;
+        }
+    }
+
+    // 7c. A body Source/Output CSV `delimiter` / `quote_char` is only ever
+    // rejected at runtime by the writer's single-byte lowering guard, because
+    // top-level `validate_config` (which runs the same check) sees only the
+    // call-site pipeline's own nodes. Run the shared byte-option check here so
+    // an empty, multi-character, or non-ASCII value on a body node fails at
+    // compile / `--explain` — the same stage a top-level node is rejected at —
+    // rather than after the run has already started producing output. Collect
+    // every violation, then abandon the body, mirroring the E115 pass above.
+    {
+        let mut has_csv_violation = false;
+        for spanned in &body_file.nodes {
+            let node_span = span_for_node(spanned);
+            let mut check = |result: Result<(), crate::config::ConfigError>| {
+                if let Err(err) = result {
+                    let raw = match err {
+                        crate::config::ConfigError::Validation(m) => m,
+                        other => other.to_string(),
+                    };
+                    diags.push(Diagnostic::error(
+                        "E115",
+                        format!(
+                            "composition node {node_name:?}: body file {}: {raw}",
+                            resolved_path.display()
+                        ),
+                        LabeledSpan::primary(node_span, String::new()),
+                    ));
+                    has_csv_violation = true;
+                }
+            };
+            match &spanned.value {
+                PipelineNode::Source { config, .. } => {
+                    if let crate::config::InputFormat::Csv(Some(opts)) = &config.source.format {
+                        if let Some(delimiter) = opts.delimiter.as_deref() {
+                            check(crate::config::pipeline::validate_csv_byte_option(
+                                "source",
+                                &config.source.name,
+                                "delimiter",
+                                delimiter,
+                            ));
+                        }
+                        if let Some(quote_char) = opts.quote_char.as_deref() {
+                            check(crate::config::pipeline::validate_csv_byte_option(
+                                "source",
+                                &config.source.name,
+                                "quote_char",
+                                quote_char,
+                            ));
+                        }
+                    }
+                }
+                PipelineNode::Output { config, .. } => {
+                    if let crate::config::OutputFormat::Csv(Some(opts)) = &config.output.format
+                        && let Some(delimiter) = opts.delimiter.as_deref()
+                    {
+                        check(crate::config::pipeline::validate_csv_byte_option(
+                            "output",
+                            &config.output.name,
+                            "delimiter",
+                            delimiter,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if has_csv_violation {
+            return;
+        }
+    }
+
+    // 7d. Resolve external `.schema.yaml` (`SourceSchema::File`) references on
+    // body Source and Output nodes to their inline column form, each path
+    // resolved relative to the composition file's own directory. Top-level
+    // nodes have their externals resolved at parse time by
+    // `resolve_and_hash_external_schemas`; body files are re-read here and
+    // never pass through that fold. Two consequences motivate resolving them:
+    // a body Output's declared-decimal `scale` and fixed-width column widths
+    // both read through `SourceSchema::as_columns`, which yields `None` for an
+    // unresolved `File`, so the write boundary silently skips scale rounding;
+    // and a body Source's `File` would otherwise resolve against the process
+    // working directory (`resolve_source_columns`) instead of the composition
+    // directory. Resolving in place, before the body binds and lowers, fixes
+    // both. The pipeline-identity fold of the referenced content is
+    // intentionally not mirrored here.
+    {
+        let comp_dir = signature
+            .source_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        // Pass 1: immutable walk loading each external file once.
+        let mut resolved: Vec<(usize, SourceSchema)> = Vec::new();
+        for (idx, spanned) in body_file.nodes.iter().enumerate() {
+            let (rel, node_label) = match &spanned.value {
+                PipelineNode::Source { config, .. } => match &config.schema {
+                    SourceSchema::File(rel) => (rel, format!("source {:?}", config.source.name)),
+                    _ => continue,
+                },
+                PipelineNode::Output { config, .. } => match &config.output.schema {
+                    Some(SourceSchema::File(rel)) => {
+                        (rel, format!("output {:?}", config.output.name))
+                    }
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let path = comp_dir.join(rel);
+            match crate::schema::load_source_schema(&path) {
+                Ok(inline) => resolved.push((idx, inline)),
+                Err(e) => {
+                    diags.push(Diagnostic::error(
+                        "E157",
+                        format!(
+                            "composition node {node_name:?}: body file {}: {node_label} declares \
+                             an external schema file {rel:?} that failed to load: {e}",
+                            resolved_path.display()
+                        ),
+                        LabeledSpan::primary(span_for_node(spanned), String::new()),
+                    ));
+                    return;
+                }
+            }
+        }
+        // Pass 2: write each resolved inline schema back onto its body node.
+        for (idx, inline) in resolved {
+            match &mut body_file.nodes[idx].value {
+                PipelineNode::Source { config, .. } => config.schema = inline,
+                PipelineNode::Output { config, .. } => config.output.schema = Some(inline),
+                _ => {}
+            }
         }
     }
 
@@ -4130,6 +4287,21 @@ fn upstream_target_name(input: &crate::config::node_header::NodeInput) -> Option
     Some(input_target(input))
 }
 
+/// The invariant context a CXL program is typechecked against: node label
+/// (diagnostic attribution), upstream `schema`, aggregate `mode`, diagnostic
+/// `span`, and the `scoped_vars` registry. Bundled so the synthesizing entry
+/// points ([`typecheck_parsed_program`], [`typecheck_cull_rule`]) stay below
+/// clippy's argument threshold and share one context value across a node's
+/// several rule-level checks; the program-specific inputs (AST, node count,
+/// display source) stay direct arguments.
+struct CxlTypecheckCtx<'a> {
+    node_name: &'a str,
+    schema: &'a Row,
+    mode: &'a AggregateMode,
+    span: Span,
+    scoped_vars: &'a cxl::resolve::ScopedVarsRegistry,
+}
+
 #[allow(clippy::result_large_err)]
 fn typecheck_cxl(
     node_name: &str,
@@ -4152,15 +4324,18 @@ fn typecheck_cxl(
             LabeledSpan::primary(span, String::new()),
         ));
     }
-    typecheck_parsed_program(
+    let ctx = CxlTypecheckCtx {
         node_name,
+        schema,
+        mode: &mode,
+        span,
+        scoped_vars,
+    };
+    typecheck_parsed_program(
+        &ctx,
         parse_result.ast,
         parse_result.node_count,
         std::sync::Arc::from(source),
-        schema,
-        mode,
-        span,
-        scoped_vars,
     )
 }
 
@@ -4175,17 +4350,19 @@ fn typecheck_cxl(
 /// it); a synthesizing caller is responsible for keeping ids dense and
 /// below it.
 #[allow(clippy::result_large_err)]
-#[allow(clippy::too_many_arguments)]
 fn typecheck_parsed_program(
-    node_name: &str,
+    ctx: &CxlTypecheckCtx<'_>,
     program: cxl::ast::Program,
     node_count: u32,
     source: Arc<str>,
-    schema: &Row,
-    mode: AggregateMode,
-    span: Span,
-    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) -> Result<TypedProgram, Diagnostic> {
+    let CxlTypecheckCtx {
+        node_name,
+        schema,
+        mode,
+        span,
+        scoped_vars,
+    } = *ctx;
     // Collect unqualified field names for CXL resolve. In the non-combine
     // case all fields are bare; in the combine case (C.1.1+) qualified
     // fields collapse to their `.name` — the resolver only needs to know
@@ -4214,7 +4391,7 @@ fn typecheck_parsed_program(
             LabeledSpan::primary(span, String::new()),
         )
     })?;
-    cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode, scoped_vars)
+    cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode.clone(), scoped_vars)
         .map(|mut typed| {
             fold_body_config(&mut typed, scoped_vars);
             typed.with_source(source)
@@ -4242,15 +4419,24 @@ fn typecheck_parsed_program(
         })
 }
 
+/// Wrapper a single Cull rule predicate is parsed inside. The rule source is
+/// appended verbatim, so a parsed predicate's byte-offset spans are relative
+/// to a source that begins immediately after this prefix. `bind_cull` shifts
+/// those spans by the distance to where the rule's text lands in the
+/// reconstructed decision source, so keep the two uses in lockstep.
+const CULL_RULE_PARSE_PREFIX: &str = "emit __cull_pred = ";
+
 /// Parse one Cull rule's `drop_group_when` predicate into a stand-alone
 /// expression, relocating its node ids past `base_id`.
 ///
-/// The predicate is parsed as its own `emit __cull_pred = <source>`
+/// The predicate is parsed as its own [`CULL_RULE_PARSE_PREFIX`]`<source>`
 /// program, so a trailing `#` line-comment terminates at end-of-line
 /// within this rule instead of swallowing later disjuncts. The single
 /// emit's right-hand side is extracted and its node ids shifted by
 /// `base_id`, so the caller can OR several rule predicates into one
-/// dense-id-space decision program.
+/// dense-id-space decision program. The predicate's byte-offset spans
+/// stay in this wrapper's coordinate space; the caller rebases them into
+/// the reconstructed decision source via [`cxl::ast::rebase_expr_spans`].
 /// Returns the relocated predicate and the rule program's node count (the
 /// id span the caller must skip). `Err` is an E200 parse diagnostic
 /// already attributed to `node_name`.
@@ -4261,7 +4447,7 @@ fn parse_cull_rule_predicate(
     base_id: u32,
     span: Span,
 ) -> Result<(Expr, u32), Diagnostic> {
-    let parsed = cxl::parser::Parser::parse(&format!("emit __cull_pred = {source}"));
+    let parsed = cxl::parser::Parser::parse(&format!("{CULL_RULE_PARSE_PREFIX}{source}"));
     if !parsed.errors.is_empty() {
         let messages: Vec<String> = parsed.errors.iter().map(|e| e.message.clone()).collect();
         return Err(Diagnostic::error(
@@ -4306,14 +4492,10 @@ fn parse_cull_rule_predicate(
 /// `Err` with the attributed diagnostic otherwise.
 #[allow(clippy::result_large_err)]
 fn typecheck_cull_rule(
-    node_name: &str,
+    ctx: &CxlTypecheckCtx<'_>,
     source: &str,
-    schema: &Row,
-    mode: AggregateMode,
-    span: Span,
-    scoped_vars: &cxl::resolve::ScopedVarsRegistry,
 ) -> Result<TypedProgram, Diagnostic> {
-    let (predicate, mut next_id) = parse_cull_rule_predicate(node_name, source, 0, span)?;
+    let (predicate, mut next_id) = parse_cull_rule_predicate(ctx.node_name, source, 0, ctx.span)?;
     let body_span = predicate.span();
     let false_id = cxl::ast::NodeId(next_id);
     next_id += 1;
@@ -4344,14 +4526,10 @@ fn typecheck_cull_rule(
     };
     let display = format!("emit __cull_pred = ({source}) or false");
     typecheck_parsed_program(
-        node_name,
+        ctx,
         program,
         next_id,
         std::sync::Arc::from(display.as_str()),
-        schema,
-        mode,
-        span,
-        scoped_vars,
     )
 }
 

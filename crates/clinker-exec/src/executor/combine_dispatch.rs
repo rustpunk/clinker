@@ -408,16 +408,21 @@ pub(crate) fn dispatch_combine(
     match dispatch {
         Dispatch::IEJoin(partition_bits) => {
             // Register an IEJoin consumer with the pipeline-
-            // scoped arbitrator. IEJoin reuses the sort-buffer
-            // spill machinery for its build-side bit array and
-            // sort permutation, so it registers under
-            // `SortConsumer` (priority 20); the handle's bytes
-            // start at zero and gain wiring once IEJoin's build
-            // path is plumbed.
+            // scoped arbitrator under `SortConsumer` (priority
+            // 20), sharing a `ConsumerHandle` with the kernel. The
+            // kernel mirrors its estimated pre-output working-set
+            // bytes (routed partition indices, range-key arrays,
+            // and per-group L1/L2 / permutation / bit state) into
+            // this handle, so the arbitrator's pull-mode
+            // `current_usage` reads the live footprint while the
+            // join runs. IEJoin has no spill path, so the
+            // `SortConsumer`'s spill-request flag is never read by
+            // the kernel — the handle carries the byte estimate for
+            // attribution and drives the kernel's own
+            // `should_abort_local` gate.
+            let ie_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
             let ie_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-                crate::pipeline::sort_buffer::SortConsumer::new(
-                    crate::pipeline::memory::ConsumerHandle::new(),
-                ),
+                crate::pipeline::sort_buffer::SortConsumer::new(ie_consumer_handle.clone()),
             ));
             // Every exit past this registration must unregister the
             // consumer, so the kernel-install-through-admit body runs
@@ -480,6 +485,7 @@ pub(crate) fn dispatch_combine(
                         propagate_ck,
                         ctx: &iejoin_ctx,
                         budget: &ctx.memory_budget,
+                        consumer: &ie_consumer_handle,
                         strategy: ctx.strategy,
                     })
                 })?;
@@ -526,6 +532,11 @@ pub(crate) fn dispatch_combine(
                 ctx.combine_input_snapshots.remove(&node_idx);
                 Ok(())
             })();
+            // The pre-output working set is freed once the kernel returns;
+            // zero the handle before unregister so a policy poll in the
+            // teardown window never reads a stale footprint for a consumer
+            // that no longer holds any bytes.
+            ie_consumer_handle.set_bytes(0);
             ctx.memory_budget.unregister_consumer(ie_consumer_id);
             return result;
         }
