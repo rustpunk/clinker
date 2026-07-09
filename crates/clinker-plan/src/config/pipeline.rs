@@ -107,7 +107,16 @@ pub struct PipelineMeta {
 /// behavior keyed on per-operator spill priority. `both` installs
 /// `BackPressurePreferred -> LargestFirst`: pause when possible,
 /// otherwise force the largest holder regardless of priority.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `resume_threshold` tunes the low watermark at which a paused producer
+/// resumes under the pausing policies — the pause/resume hysteresis band
+/// runs from `resume_threshold`·limit up to the 0.80·limit soft threshold.
+/// Omitted → 0.70.
+///
+/// `PartialEq`/`Eq` derive over `Option<f64>` is sound here: the field is
+/// only ever `None` or a plan-time-validated finite value in `(0, 0.80)`,
+/// never `NaN`, so no `Eq`-violating float ever reaches the comparison.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct MemoryConfig {
     /// Hard memory limit for the arbitrator. `None` (omitted) →
@@ -118,6 +127,16 @@ pub struct MemoryConfig {
     /// default).
     #[serde(skip_serializing_if = "BackpressureKnob::is_default")]
     pub backpressure: BackpressureKnob,
+    /// Fraction of the hard `limit` at which a producer paused under memory
+    /// pressure resumes (the low watermark of the pause/resume hysteresis
+    /// band). Must sit strictly below the soft/spill fraction (0.80) and
+    /// above 0. `None` (omitted) → 0.70. Lower = a wider band (a paused
+    /// producer stays paused longer, smoother but slower to re-open);
+    /// higher = a narrower band (faster re-open, more thrash-prone).
+    /// Validated at plan time (E324); resolved to its default by the
+    /// arbitrator builder when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resume_threshold: Option<f64>,
 }
 
 impl MemoryConfig {
@@ -4257,6 +4276,26 @@ pub fn reserved_names_for(scope: pipeline_node::VarScope) -> &'static [&'static 
 
 /// Post-deserialization validation.
 pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
+    // Pipeline-level memory knobs. `resume_threshold` is the low watermark
+    // of the pause/resume hysteresis band; it must sit strictly inside
+    // `(0, spill_threshold)` so the resume point is below the pause point
+    // and a dead zone separates the two (anti-thrash). Rejecting a
+    // set-but-out-of-range value here — before any executor construction —
+    // surfaces a bad fraction on `--explain` and to in-process callers as a
+    // typed plan-time error rather than a runtime surprise. `None` skips the
+    // check and takes the 0.70 default at arbitrator-build time.
+    if let Some(resume) = config.pipeline.memory.resume_threshold {
+        let spill = crate::config::utils::DEFAULT_SPILL_THRESHOLD;
+        if !(resume > 0.0 && resume < spill) {
+            return Err(ConfigError::Validation(format!(
+                "[E324] pipeline.memory.resume_threshold = {resume}: must be greater than 0 \
+                 and less than the soft/spill threshold ({spill}); the resume watermark has to \
+                 sit below the pause threshold to form a hysteresis band. \
+                 See: clinker explain --code E324"
+            )));
+        }
+    }
+
     for input in config.source_configs() {
         // Matcher-exclusivity, gated on transport. A file transport
         // resolves its file set through the discovery layer's
@@ -5343,5 +5382,107 @@ nodes:
     fn output_delimiter_single_ascii_accepted() {
         parse_config(&output_options_pipeline("        delimiter: \"|\""))
             .expect("a single-byte output delimiter is valid");
+    }
+}
+
+#[cfg(test)]
+mod memory_config_resume_threshold_tests {
+    use super::MemoryConfig;
+    use crate::config::parse_config;
+
+    /// Minimal pipeline whose `pipeline.memory` block carries a
+    /// caller-supplied body (each line indented four spaces to sit under the
+    /// `memory:` key).
+    fn memory_pipeline(memory_body: &str) -> String {
+        format!(
+            r#"
+pipeline:
+  name: resume_threshold
+  memory:
+{memory_body}
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - {{ name: a, type: string }}
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+        )
+    }
+
+    #[test]
+    fn omitted_resume_threshold_keeps_memory_config_default() {
+        // An unset knob leaves the whole `memory` block at its default, so
+        // `is_default()` stays truthful and no empty block is emitted.
+        let cfg = MemoryConfig::default();
+        assert!(cfg.resume_threshold.is_none());
+        assert!(cfg.is_default());
+    }
+
+    #[test]
+    fn set_resume_threshold_survives_serde_round_trip_and_unset_is_omitted() {
+        let set = MemoryConfig {
+            resume_threshold: Some(0.6),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&set).expect("serialize");
+        let back: MemoryConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.resume_threshold, Some(0.6));
+        assert_eq!(back, set);
+
+        // An unset value is omitted from serialized output (the
+        // `skip_serializing_if = "Option::is_none"` gate) so a pipeline with
+        // no memory opinions round-trips byte-identically.
+        let unset = MemoryConfig::default();
+        let json = serde_json::to_string(&unset).expect("serialize default");
+        assert!(
+            !json.contains("resume_threshold"),
+            "an unset resume_threshold must not appear in serialized output: {json}"
+        );
+    }
+
+    #[test]
+    fn in_band_resume_threshold_accepted_at_plan_time() {
+        parse_config(&memory_pipeline("    resume_threshold: 0.6"))
+            .expect("a resume_threshold strictly inside (0, 0.80) is valid");
+    }
+
+    #[test]
+    fn out_of_range_resume_threshold_rejected_at_plan_time() {
+        // Each of these violates `0 < resume < 0.80`; all must be rejected
+        // with the E324 range diagnostic before any executor construction.
+        for bad in ["0.9", "0.8", "0.0", "-0.1", "1.5"] {
+            let body = format!("    resume_threshold: {bad}");
+            let err = parse_config(&memory_pipeline(&body))
+                .expect_err(&format!("resume_threshold {bad} must be rejected"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("E324") && msg.contains("resume_threshold"),
+                "rejection must name E324 and the knob for {bad}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn misspelled_resume_threshold_key_rejected_as_unknown_field() {
+        // `deny_unknown_fields` on `MemoryConfig` still rejects a typo'd key
+        // — the new knob does not loosen the strict memory block.
+        let err = parse_config(&memory_pipeline("    resume_treshold: 0.7"))
+            .expect_err("a misspelled memory key must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resume_treshold") || msg.contains("unknown field"),
+            "rejection must flag the unknown field: {msg}"
+        );
     }
 }
