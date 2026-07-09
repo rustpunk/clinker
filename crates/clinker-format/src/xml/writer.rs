@@ -1529,6 +1529,62 @@ mod tests {
         );
     }
 
+    /// XML self-describes each record from its OWN schema, so a column that
+    /// appears only on a later record is emitted on that record and absent on
+    /// the earlier one — no shared header to pin, nothing dropped. This is why
+    /// XML needs no batch-union pass (unlike the CSV writer, issue #805): its
+    /// per-record projection is already lossless under `auto_widen` drift.
+    #[test]
+    fn test_xml_write_late_widening_is_lossless_per_record() {
+        let schema1 = Arc::new(Schema::new(vec!["id".into()]));
+        let schema2 = Arc::new(Schema::new(vec!["id".into(), "region".into()]));
+        let r1 = Record::new(Arc::clone(&schema1), vec![Value::Integer(1)]);
+        let r2 = Record::new(
+            Arc::clone(&schema2),
+            vec![Value::Integer(2), Value::String("US".into())],
+        );
+        let mut buf = Vec::new();
+        {
+            let mut w = XmlWriter::new(&mut buf, Arc::clone(&schema1), XmlWriterConfig::default());
+            w.write_record(&r1).unwrap();
+            w.write_record(&r2).unwrap();
+            w.flush().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            out,
+            "<Root>\
+             <Record><id>1</id></Record>\
+             <Record><id>2</id><region>US</region></Record>\
+             </Root>",
+            "the `region` column appears only on the record that carries it"
+        );
+    }
+
+    /// A dotted group whose members are NON-CONTIGUOUS in the schema
+    /// (`[A.x, b, A.y]`) groups under one `<A>` at the group's FIRST schema
+    /// position — before `<b>` — even when the group's leading member (`A.x`)
+    /// is null and drops out under `preserve_nulls: false`. Pins the
+    /// deterministic element order the shared plan produces regardless of
+    /// per-record null pruning.
+    #[test]
+    fn test_xml_write_non_contiguous_group_null_leader_keeps_group_position() {
+        let schema = Arc::new(Schema::new(vec!["A.x".into(), "b".into(), "A.y".into()]));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![
+                Value::Null,
+                Value::String("B".into()),
+                Value::String("Y".into()),
+            ],
+        );
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert_eq!(
+            output, "<Root><Record><A><y>Y</y></A><b>B</b></Record></Root>",
+            "the <A> group stays at its first-member schema position, before <b>"
+        );
+    }
+
     use crate::envelope_writer::test_doc_with_sections as doc_with_sections;
 
     #[test]
