@@ -1118,7 +1118,7 @@ impl<'a> ExecutorContext<'a> {
             crossbeam_channel::bounded::<crate::executor::stream_event::StreamEvent>(256);
         let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
         let charge_consumer_id = self.memory_budget.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone(), false),
+            crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone()),
         ));
         self.streaming_output_senders.insert(producer_idx, tx);
         self.streaming_charge_consumers
@@ -1223,8 +1223,45 @@ impl<'a> ExecutorContext<'a> {
     /// release single-shot; a repeat call for the same source is a no-op.
     pub(crate) fn release_source_consumer(&mut self, source_name: &str) {
         if let Some((id, handle)) = self.source_consumers.remove(source_name) {
+            // Resume before unregister: a prior arbitration round may have
+            // paused this source's ingest thread, and once the wrapper leaves
+            // the registry nothing else can unpark it — the thread would sit
+            // parked forever and the ingest-thread join would hang. Clearing
+            // the active flag keeps the handle tidy for any late reader.
+            handle.resume();
+            handle.clear_active();
             handle.set_bytes(0);
             self.memory_budget.unregister_consumer(id);
+        }
+    }
+
+    /// Resume-on-entry + active-exemption for a source the walk is about to
+    /// drain. Marks the source's ingest handle active — the resume
+    /// controller's pause step skips an active consumer — and resumes it in
+    /// case a prior arbitration round paused it before its drain turn.
+    ///
+    /// Together these make a paused source unable to stall the single-threaded
+    /// walk: when the walk reaches a source's drain arm it unparks the ingest
+    /// thread here and keeps it exempt for the whole drain, so the `recv()` /
+    /// `select()` it then blocks on is always fed. No-op for a source with no
+    /// registered handle (already released, or a body-port seed source).
+    pub(crate) fn activate_source_for_drain(&self, source_name: &str) {
+        if let Some((_, handle)) = self.source_consumers.get(source_name) {
+            // Layer 3 spill-nudge: if a prior round paused this source under
+            // genuine pressure, shed reclaimable downstream state (Priority
+            // order) before resuming it, so the resumed producer does not
+            // immediately re-trip the soft limit. Overshoot reduction only —
+            // liveness does not depend on it, so an over-target of 0 (no
+            // current pressure) is a no-op.
+            if handle.is_paused() {
+                let over = self
+                    .memory_budget
+                    .current_pressure()
+                    .saturating_sub(self.memory_budget.soft_limit());
+                self.memory_budget.spill_reclaimable(over);
+            }
+            handle.set_active();
+            handle.resume();
         }
     }
 
@@ -1517,7 +1554,7 @@ pub(crate) fn admit_node_buffer(
     let handle = crate::pipeline::memory::ConsumerHandle::new();
     handle.set_bytes(bytes);
     let consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-        crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone(), false),
+        crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
     ));
     ctx.node_buffer_consumer_ids
         .insert(node_idx, (consumer_id, handle.clone()));
@@ -2154,6 +2191,15 @@ pub(crate) fn merge_fused_interleave(
                 },
             )
         };
+    // Resume-on-entry + active-exemption for EVERY predecessor Source: the
+    // `select()` below can block on any of them, so all must be exempt from a
+    // mid-walk pause and unparked if a prior round paused them. Missing even
+    // one reinstates the deadlock — `Select` would block on a paused source
+    // whose ingest thread never refills its channel. Each source's
+    // `release_source_consumer` at close clears its own flag.
+    for state in &states {
+        ctx.activate_source_for_drain(&state.source_name_string);
+    }
     let n = receivers.len();
     loop {
         // Honor cooperative shutdown at the chunk boundary before blocking on
@@ -2463,6 +2509,11 @@ pub(crate) fn transform_fused_consume(
     let timeout = ctx.idle_timeouts.get(source_name_owned.as_str()).copied();
     let has_record_seed = !ctx.record_var_seed.is_empty();
     let source_name_arc: Arc<str> = Arc::from(source_name_owned.as_str());
+    // Resume-on-entry + active-exemption: unpark the upstream Source if a
+    // prior arbitration round paused it, and mark it active so the resume
+    // controller never pauses the producer feeding the fused recv loop below.
+    // `release_source_consumer` at drain end clears the flag and resumes.
+    ctx.activate_source_for_drain(source_name_owned.as_str());
 
     // In materialized mode `output_records` accumulates emitted records
     // (records only), the input to `finalize_node_rooted_windows` and

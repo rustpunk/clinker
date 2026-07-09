@@ -106,6 +106,7 @@ mod dispatch {
                 crate::pipeline::memory::MemoryArbitrator::with_policy(
                     0,
                     0.8,
+                    0.70,
                     crate::pipeline::memory::MemoryArbitrator::default_policy(),
                 ),
             ),
@@ -1704,6 +1705,7 @@ mod two_phase_bytes_spill {
                 crate::pipeline::memory::MemoryArbitrator::with_policy(
                     0,
                     0.8,
+                    0.70,
                     crate::pipeline::memory::MemoryArbitrator::default_policy(),
                 ),
             ),

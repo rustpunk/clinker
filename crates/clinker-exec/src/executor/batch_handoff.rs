@@ -606,6 +606,7 @@ mod tests {
         let arbitrator = Arc::new(MemoryArbitrator::with_policy(
             64 * 1024 * 1024,
             0.80,
+            0.70,
             Box::new(NoOpPolicy),
         ));
         // Force the soft threshold to trip unconditionally. The streaming
@@ -712,6 +713,7 @@ mod tests {
         let arbitrator = Arc::new(MemoryArbitrator::with_policy(
             64 * 1024 * 1024,
             0.80,
+            0.70,
             Box::new(NoOpPolicy),
         ));
         arbitrator.set_limit(1);
@@ -801,6 +803,7 @@ mod tests {
         let arbitrator = Arc::new(MemoryArbitrator::with_policy(
             64 * 1024 * 1024,
             0.80,
+            0.70,
             Box::new(NoOpPolicy),
         ));
         // Force the streaming charge path onto the spill branch (the charge

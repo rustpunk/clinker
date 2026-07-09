@@ -118,6 +118,21 @@ impl<'de> Deserialize<'de> for TimeBound {
 /// value so every consumer agrees on the default budget.
 pub const DEFAULT_MEMORY_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
 
+/// Soft-limit fraction of the hard `memory.limit` at which the arbitrator
+/// begins proactive spill and pauses a back-pressureable producer (the
+/// pause watermark). Plan-time validation and the exec-side arbitrator
+/// builder both read this single value so the soft threshold has one
+/// source of truth instead of a literal duplicated across crates.
+pub const DEFAULT_SPILL_THRESHOLD: f64 = 0.80;
+
+/// Fraction of the hard `memory.limit` at which a producer paused under
+/// memory pressure resumes — the low watermark of the pause/resume
+/// hysteresis band. Sits strictly below [`DEFAULT_SPILL_THRESHOLD`] so the
+/// dead zone between the two damps thrash (a single admit/discharge cycle
+/// cannot cross both thresholds). Applied when `memory.resume_threshold`
+/// is omitted.
+pub const DEFAULT_RESUME_THRESHOLD: f64 = 0.70;
+
 /// Parse the `memory.limit` knob into a byte count.
 ///
 /// Binary units: a trailing `G`/`g`, `M`/`m`, or `K`/`k` multiplies by

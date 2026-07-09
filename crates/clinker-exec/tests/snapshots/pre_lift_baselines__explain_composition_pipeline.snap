@@ -9,7 +9,7 @@ Indices to build: 0
 Transforms: 0
 Output projections: 1
 DAG nodes: 5
-arbitration: BackPressurePreferred -> Priority
+arbitration: BackPressurePreferred -> Priority (pause at 0.80·limit, resume below 0.70·limit)
 
 Source DAG:
   Tier 0: customers_src, addresses_src

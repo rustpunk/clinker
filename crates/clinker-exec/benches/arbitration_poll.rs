@@ -53,7 +53,7 @@ impl MemoryConsumer for FakeConsumer {
 }
 
 fn build_arbitrator(n: usize) -> MemoryArbitrator {
-    let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+    let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
     for i in 0..n {
         let priority = (i % 4) as i32 * 10;
         arbitrator.register_consumer(Arc::new(FakeConsumer::new(priority)));

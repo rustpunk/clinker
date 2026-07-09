@@ -133,6 +133,11 @@ pub(crate) fn dispatch_source(
         let mut last_file: Arc<str> = Arc::clone(&MERGED_SOURCE_FILE);
         let mut count: u64 = 0;
         let mut records_since_check: u32 = 0;
+        // Resume-on-entry + active-exemption: unpark this source if a prior
+        // arbitration round paused it, and mark it active so the resume
+        // controller never pauses the producer feeding the `recv()` below.
+        // `release_source_consumer` at drain end clears the flag and resumes.
+        ctx.activate_source_for_drain(name.as_str());
         loop {
             let item: Option<crate::executor::stream_event::StreamEvent> = match timeout {
                 Some(t) => match rx.recv_timeout(t) {

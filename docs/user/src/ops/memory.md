@@ -65,11 +65,40 @@ When memory use approaches the limit (the soft threshold is 80 % of `limit`), so
 
 | Value | Behavior |
 |-------|----------|
-| `pause` (default) | Where possible, pause an upstream reader so it stops producing until pressure eases; spill to disk only when nothing can be paused. |
+| `pause` (default) | Where possible, pause an upstream reader so it stops producing until pressure eases; when a paused reader is about to be needed, first spill downstream state and then proceed, so a pause never stalls the run. |
 | `spill` | Never pause a producer — always free memory by spilling a stage to disk. |
 | `both` | Pause where possible, otherwise spill whichever stage is holding the most memory. |
 
 `pause` is the right default for most pipelines: pausing a fast Source feeding a slow downstream stage is cheaper than writing its buffered records to disk. Reach for `spill` or `both` only when you have a specific reason to prefer a different posture — for example, `both` when one large stage dominates the budget and you want it spilled first.
+
+### How pause and resume work
+
+Under `pause` (and `both`), a producer paused because memory crossed the soft threshold is **resumed automatically once memory recedes** — it is never left parked. Pause and resume use two watermarks to avoid flapping (a *hysteresis band*):
+
+- **Pause** when live memory rises above the **soft threshold**, `0.80 × limit`.
+- **Resume** when live memory falls back below the lower **resume watermark**, `resume_threshold × limit` (default `0.70 × limit`).
+
+Between the two watermarks nothing changes, so a normal batch-to-batch swing in memory cannot make a producer flap between paused and resumed on every poll.
+
+A paused reader also never blocks the run. When the engine reaches a stage that needs a paused reader's records, it first sheds reclaimable downstream state to disk and then resumes the reader and proceeds — so `pause` throttles producers under pressure but degrades to spill-and-continue at the point it would otherwise wait, rather than stalling.
+
+### `resume_threshold`
+
+`resume_threshold` tunes the low watermark of that band, as a fraction of the hard `limit`:
+
+```yaml
+pipeline:
+  memory:
+    limit: "1G"
+    resume_threshold: 0.65   # optional — defaults to 0.70
+```
+
+- **Default:** `0.70` (omit the field to take it).
+- **Valid range:** strictly greater than `0` and strictly less than the `0.80` soft threshold, so the resume point always sits below the pause point. A value outside `(0, 0.80)` — including `0.0`, a negative, or anything `≥ 0.80` — is rejected at plan time with `E324`. A misspelled key is rejected as an unknown field.
+- **Lower** widens the band: a paused producer stays paused longer (smoother, but slower to re-open).
+- **Higher** narrows the band: faster to re-open, but more prone to flapping.
+
+Only the pausing policies (`pause`, `both`) use this watermark; under `spill` no producer is ever paused, so it has no effect.
 
 ## Streaming batch size (`batch_size`)
 

@@ -33,6 +33,7 @@ fn quiet_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
     Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
         HARD_LIMIT,
         SPILL_FRAC,
+        0.70,
         crate::pipeline::memory::MemoryArbitrator::default_policy(),
     ))
 }

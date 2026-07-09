@@ -50,6 +50,7 @@ fn abort_seeded_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
     let arb = crate::pipeline::memory::MemoryArbitrator::with_policy(
         HARD_LIMIT,
         SPILL_FRAC,
+        0.70,
         Box::new(crate::pipeline::memory::Priority),
     );
     // 1 MiB: above the ~52 KiB soft threshold so the producer spills.

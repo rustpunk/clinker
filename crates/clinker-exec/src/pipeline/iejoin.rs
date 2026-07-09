@@ -1439,8 +1439,12 @@ mod tests {
         // so `should_abort_local` short-circuits on the local arm WITHOUT
         // consulting RSS — the RSS-blind backstop the gate exists to
         // provide. Uses `NoOpPolicy` so no victim selection interferes.
-        let budget =
-            MemoryArbitrator::with_policy(1, 0.8, Box::new(crate::pipeline::memory::NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(
+            1,
+            0.8,
+            0.70,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        );
         let est = iejoin_numeric_state_bytes(500, 500) as u64;
         assert!(est > 1);
         assert!(

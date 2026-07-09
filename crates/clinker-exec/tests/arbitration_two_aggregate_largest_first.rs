@@ -40,7 +40,7 @@ fn largest_first_picks_the_larger_aggregate() {
     // 100 GiB hard limit so real-process RSS cannot push peak_rss
     // above the test-seeded value via `observe()`'s `fetch_max`.
     let arbitrator =
-        MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.50, Box::new(LargestFirst));
+        MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.50, 0.40, Box::new(LargestFirst));
 
     // Smaller aggregate: 64 KiB
     let small_handle = ConsumerHandle::new();
@@ -81,7 +81,7 @@ fn largest_first_picks_a_new_victim_each_round() {
     // 100 GiB hard limit so real-process RSS cannot push peak_rss
     // above the test-seeded value via `observe()`'s `fetch_max`.
     let arbitrator =
-        MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.50, Box::new(LargestFirst));
+        MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.50, 0.40, Box::new(LargestFirst));
 
     let small_handle = ConsumerHandle::new();
     small_handle.set_bytes(64 * 1024);

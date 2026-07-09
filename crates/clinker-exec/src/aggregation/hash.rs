@@ -1528,6 +1528,7 @@ mod spill_trigger_tests {
         Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
             0,
             0.8,
+            0.70,
             crate::pipeline::memory::MemoryArbitrator::default_policy(),
         ))
     }

@@ -1186,7 +1186,7 @@ impl PipelineExecutor {
             // landed — matching `admit_node_buffer`'s posture.
             let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
             let charge_consumer_id = memory_budget.register_consumer(Arc::new(
-                crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone(), false),
+                crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone()),
             ));
             let writer_charge_handle = charge_handle.clone();
             let handle = std::thread::Builder::new()
@@ -1620,6 +1620,7 @@ mod tests {
     mod resident_node_buffer_spill;
     mod scheduling;
     mod source_consumer_release;
+    mod source_pause_liveness;
     mod spill_backed_drain_overshoot;
     mod spill_dir_unavailable_midrun;
 }

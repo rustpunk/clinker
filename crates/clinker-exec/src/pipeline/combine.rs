@@ -1402,7 +1402,7 @@ mod tests {
     }
 
     fn test_budget(limit_bytes: u64) -> MemoryArbitrator {
-        MemoryArbitrator::with_policy(limit_bytes, 0.80, Box::new(NoOpPolicy))
+        MemoryArbitrator::with_policy(limit_bytes, 0.80, 0.70, Box::new(NoOpPolicy))
     }
 
     /// Build a single-column integer-key KeyExtractor that extracts field `name`.

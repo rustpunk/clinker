@@ -42,6 +42,7 @@ fn spill_tripped_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> 
     let arb = crate::pipeline::memory::MemoryArbitrator::with_policy(
         HARD_LIMIT,
         SPILL_FRAC,
+        0.70,
         Box::new(crate::pipeline::memory::Priority),
     );
     // 90 GiB: above the 80 GiB soft limit, below the 100 GiB hard limit.
@@ -58,6 +59,7 @@ fn abort_seeded_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
     let arb = crate::pipeline::memory::MemoryArbitrator::with_policy(
         HARD_LIMIT,
         SPILL_FRAC,
+        0.70,
         Box::new(crate::pipeline::memory::Priority),
     );
     // 150 GiB: above the 100 GiB hard limit, so `should_abort` is true.

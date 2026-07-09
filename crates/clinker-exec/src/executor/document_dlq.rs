@@ -374,7 +374,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         buckets.entry(Arc::clone(key)).or_insert_with(|| {
             let handle = crate::pipeline::memory::ConsumerHandle::new();
             let consumer_id = arbitrator.register_consumer(Arc::new(
-                crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone(), false),
+                crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
             ));
             DocBucket {
                 buffer: NodeBuffer::Memory(Vec::new()),
@@ -1040,13 +1040,14 @@ mod tests {
         let arbitrator = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
             64,
             0.5,
+            0.4,
             Box::new(crate::pipeline::memory::NoOpPolicy),
         ));
         let tmp = tempfile::tempdir().expect("tempdir");
 
         let handle = crate::pipeline::memory::ConsumerHandle::new();
         let consumer_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone(), false),
+            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
         ));
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
@@ -1120,6 +1121,7 @@ mod tests {
         let arbitrator = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
             64,
             0.5,
+            0.4,
             Box::new(crate::pipeline::memory::NoOpPolicy),
         ));
         // A one-byte disk quota: the mem-tail flush overflows it on the first
@@ -1129,7 +1131,7 @@ mod tests {
 
         let handle = crate::pipeline::memory::ConsumerHandle::new();
         let consumer_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone(), false),
+            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
         ));
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),
@@ -1171,12 +1173,13 @@ mod tests {
         let arbitrator = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
             64,
             0.5,
+            0.4,
             Box::new(crate::pipeline::memory::NoOpPolicy),
         ));
         let tmp = tempfile::tempdir().expect("tempdir");
         let handle = crate::pipeline::memory::ConsumerHandle::new();
         let consumer_id = arbitrator.register_consumer(Arc::new(
-            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone(), false),
+            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
         ));
         let mut bucket = DocBucket {
             buffer: NodeBuffer::Memory(Vec::new()),

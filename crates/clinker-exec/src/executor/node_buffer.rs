@@ -557,25 +557,19 @@ impl Iterator for NodeBufferDrain {
 /// side. Preferred first victim under `Priority` and
 /// `BackPressurePreferred::wrapping(Priority)`.
 ///
-/// `can_back_pressure` is dynamic: `true` when the slot's producer
-/// chain terminates at a pauseable Source (no blocking operator
-/// between), `false` otherwise. Stored on construction; the
-/// dispatcher classifies the upstream topology at registration time
-/// since the DAG is static.
+/// `can_back_pressure` is a constant `false`: a node buffer is filled
+/// synchronously by the walk thread via `admit_node_buffer`, so there is
+/// no separate producer thread to park, and the walk cannot resume a pause
+/// it is itself blocked behind. Pressure on a node buffer is relieved by
+/// spilling its resident rows (`try_spill`), never by pausing — only a
+/// Source, fronted by a real producer thread, can honor a pause.
 pub struct NodeBufferConsumer {
     handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
-    back_pressureable: bool,
 }
 
 impl NodeBufferConsumer {
-    pub fn new(
-        handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
-        back_pressureable: bool,
-    ) -> Self {
-        Self {
-            handle,
-            back_pressureable,
-        }
+    pub fn new(handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>) -> Self {
+        Self { handle }
     }
 }
 
@@ -605,15 +599,7 @@ impl crate::pipeline::memory::MemoryConsumer for NodeBufferConsumer {
     }
 
     fn can_back_pressure(&self) -> bool {
-        self.back_pressureable
-    }
-
-    fn pause(&self) {
-        self.handle.pause();
-    }
-
-    fn resume(&self) {
-        self.handle.resume();
+        false
     }
 }
 
@@ -958,7 +944,7 @@ mod tests {
         };
         // A 1-byte hard limit: the growing re-materialized vector crosses it
         // at the first 1024-record poll.
-        let arb = MemoryArbitrator::with_policy(1, 0.80, Box::new(NoOpPolicy));
+        let arb = MemoryArbitrator::with_policy(1, 0.80, 0.70, Box::new(NoOpPolicy));
         match nb.drain_split_metered(&arb, "spilled_stage") {
             Err(PipelineError::MemoryBudgetExceeded { node, source, .. }) => {
                 assert_eq!(node, "spilled_stage", "the error names the draining stage");
@@ -984,8 +970,12 @@ mod tests {
             chunks: vec![spill_chunk(rows.clone())],
             pending_puncts: vec![Punctuation::document_close(Arc::clone(&ctx))],
         };
-        let arb =
-            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let arb = MemoryArbitrator::with_policy(
+            100 * 1024 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        );
         let (metered_recs, metered_puncts) = make()
             .drain_split_metered(&arb, "stage")
             .expect("ample-budget metered drain");
@@ -1048,7 +1038,7 @@ mod tests {
         // but their sum (two footprints) breaches it — the joint-overshoot the
         // sum-aware gate exists to catch, invisible to a bytes-only test.
         let hard = poll_footprint + poll_footprint / 2;
-        let arb = MemoryArbitrator::with_policy(hard, 0.80, Box::new(NoOpPolicy));
+        let arb = MemoryArbitrator::with_policy(hard, 0.80, 0.70, Box::new(NoOpPolicy));
         arb.register_consumer(Arc::new(FixedUsageConsumer(poll_footprint)));
 
         match nb.drain_split_metered(&arb, "joint_stage") {
@@ -1100,7 +1090,7 @@ mod tests {
         // under AND their sum under → the drain completes and yields every
         // record. Guards against the gate over-firing on a legitimate drain.
         let hard = poll_footprint * 3;
-        let arb = MemoryArbitrator::with_policy(hard, 0.80, Box::new(NoOpPolicy));
+        let arb = MemoryArbitrator::with_policy(hard, 0.80, 0.70, Box::new(NoOpPolicy));
         arb.register_consumer(Arc::new(FixedUsageConsumer(poll_footprint)));
 
         let (recs, _puncts) = nb
@@ -1118,23 +1108,10 @@ mod tests {
         use crate::pipeline::memory::{ConsumerHandle, MemoryConsumer};
         let handle = ConsumerHandle::new();
         handle.set_bytes(4096);
-        let consumer = NodeBufferConsumer::new(handle.clone(), false);
+        let consumer = NodeBufferConsumer::new(handle.clone());
         assert_eq!(consumer.current_usage(), 4096);
         assert_eq!(consumer.spill_priority(), 0);
         assert!(!consumer.can_back_pressure());
-    }
-
-    #[test]
-    fn node_buffer_consumer_back_pressureable_routes_pause_to_handle() {
-        use crate::pipeline::memory::{ConsumerHandle, MemoryConsumer};
-        let handle = ConsumerHandle::new();
-        let consumer = NodeBufferConsumer::new(handle.clone(), true);
-        assert!(consumer.can_back_pressure());
-        assert!(!handle.is_paused());
-        consumer.pause();
-        assert!(handle.is_paused());
-        consumer.resume();
-        assert!(!handle.is_paused());
     }
 
     #[test]
@@ -1142,7 +1119,7 @@ mod tests {
         use crate::pipeline::memory::{ConsumerHandle, ConsumerSpillError, MemoryConsumer};
         let handle = ConsumerHandle::new();
         handle.set_bytes(1024);
-        let consumer = NodeBufferConsumer::new(handle.clone(), false);
+        let consumer = NodeBufferConsumer::new(handle.clone());
         // Below-target: handle has 1024, asked for 4096.
         match consumer.try_spill(4096) {
             Err(ConsumerSpillError::BelowTarget { target, freed }) => {

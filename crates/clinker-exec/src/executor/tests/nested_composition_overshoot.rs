@@ -34,6 +34,7 @@ fn spill_tripped_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> 
     let arb = crate::pipeline::memory::MemoryArbitrator::with_policy(
         HARD_LIMIT,
         SPILL_FRAC,
+        0.70,
         Box::new(crate::pipeline::memory::Priority),
     );
     arb.set_peak_rss_for_test(90 * 1024 * 1024 * 1024);

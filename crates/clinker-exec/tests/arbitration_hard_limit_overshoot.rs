@@ -51,7 +51,7 @@ const SOFT_FRAC: f64 = 0.50; // soft = 50 GiB
 
 #[test]
 fn should_abort_trips_when_rss_exceeds_hard_limit() {
-    let arbitrator = MemoryArbitrator::with_policy(HARD_LIMIT, SOFT_FRAC, Box::new(Priority));
+    let arbitrator = MemoryArbitrator::with_policy(HARD_LIMIT, SOFT_FRAC, 0.40, Box::new(Priority));
 
     let handle = ConsumerHandle::new();
     handle.set_bytes(64 * 1024);
@@ -72,7 +72,7 @@ fn should_abort_trips_when_rss_exceeds_hard_limit() {
 fn soft_limit_arbitration_runs_before_hard_limit_aborts() {
     // The arbitrator's two-tier model: soft-limit spill attempts run
     // first; only an honest overshoot of the hard limit aborts.
-    let arbitrator = MemoryArbitrator::with_policy(HARD_LIMIT, SOFT_FRAC, Box::new(Priority));
+    let arbitrator = MemoryArbitrator::with_policy(HARD_LIMIT, SOFT_FRAC, 0.40, Box::new(Priority));
 
     let handle = ConsumerHandle::new();
     handle.set_bytes(64 * 1024);
