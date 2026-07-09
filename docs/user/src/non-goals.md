@@ -74,6 +74,15 @@ job runner inside Clinker itself.
 - For interactive queries against finite data: DuckDB, Polars, or any
   embedded query engine.
 
+Orchestration by Temporal (and the others above) is supported via a
+**shell-out contract** — the orchestrator runs `clinker run` as a child
+process and reads its exit code, logs, and metrics. Clinker embeds no
+Temporal client or worker; that coupling is a decided non-goal
+([issue #622](https://github.com/rustpunk/clinker/issues/622)). See
+[Running Under a Workflow Orchestrator](ops/orchestrator-contract.md) for
+the exit-code, cancellation, and output-atomicity guarantees that contract
+depends on.
+
 ## Not an OLAP / SQL query engine
 
 Clinker is a **per-record expression engine** with explicit `nodes:` in
