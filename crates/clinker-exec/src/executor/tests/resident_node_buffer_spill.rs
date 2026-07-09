@@ -47,7 +47,7 @@ fn memory_slot(s: &Arc<Schema>, rows: &[(i64, &str, u64)]) -> NodeBuffer {
 /// Register a `NodeBufferConsumer` sharing `handle` and return its id, so
 /// the sweep's `consumer_ids` map mirrors the production registration shape.
 fn register(arb: &MemoryArbitrator, handle: &Arc<ConsumerHandle>) -> ConsumerId {
-    arb.register_consumer(Arc::new(NodeBufferConsumer::new(handle.clone(), false)))
+    arb.register_consumer(Arc::new(NodeBufferConsumer::new(handle.clone())))
 }
 
 #[test]
