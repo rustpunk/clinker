@@ -1620,6 +1620,7 @@ mod tests {
     mod resident_node_buffer_spill;
     mod scheduling;
     mod source_consumer_release;
+    mod source_pause_liveness;
     mod spill_backed_drain_overshoot;
     mod spill_dir_unavailable_midrun;
 }
