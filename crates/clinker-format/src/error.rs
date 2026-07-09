@@ -116,6 +116,33 @@ pub enum FormatError {
         format: &'static str,
         column: String,
     },
+    /// A tabular / positional writer (CSV under envelope framing, or
+    /// fixed-width) was handed a record carrying a user column its output
+    /// column set does not declare. Such a writer emits a FIXED column set —
+    /// a fixed-width layout's declared byte ranges, or an envelope-framed
+    /// CSV's first-document header — so a column that `auto_widen` surfaces
+    /// only on a later record has nowhere to land and would otherwise be
+    /// silently dropped (the narrower-row data loss #692 forbids). Raised so
+    /// the drift fails loudly instead.
+    ///
+    /// Distinct from [`FormatError::UnserializableMapValue`], which is about a
+    /// map PAYLOAD in a declared column; this is about a whole column the
+    /// output shape has no slot for. Not document-structural (see
+    /// [`FormatError::is_document_structural`]) — it disposes through the
+    /// per-record write-error path under the configured error strategy.
+    ///
+    /// Routes to fix this at the user level:
+    ///
+    /// - Declare the column in the output (or source) `schema:` so every
+    ///   record carries it and the shared column set covers it.
+    /// - Or route to a self-describing format (JSON / NDJSON / XML) that
+    ///   needs no shared column set. The plain (non-envelope) CSV writer also
+    ///   avoids this: it pre-scans the batch and widens its header to the
+    ///   union of every record's columns.
+    SchemaDrift {
+        format: &'static str,
+        column: String,
+    },
 }
 
 impl fmt::Display for FormatError {
@@ -163,6 +190,17 @@ impl fmt::Display for FormatError {
                  If this is the `$widened` auto_widen sidecar, set `include_unmapped: true` on \
                  the Output node to expand the map to top-level columns before write. If the \
                  user emitted a map explicitly, coerce to a scalar in CXL before the emit."
+            ),
+            Self::SchemaDrift { format, column } => write!(
+                f,
+                "{format} writer received a record carrying column {column:?}, which the \
+                 writer's output column set does not declare. A tabular / positional writer \
+                 emits a fixed column set (a fixed-width layout's declared byte ranges, or an \
+                 envelope-framed CSV's first-document header), so a column that `auto_widen` \
+                 surfaced only on a later record cannot be placed and would otherwise be \
+                 dropped. Declare {column:?} in the output (or source) `schema:` so every \
+                 record carries it, or route to a self-describing format (JSON / NDJSON / XML) \
+                 that needs no shared column set."
             ),
         }
     }
@@ -259,5 +297,42 @@ impl From<std::io::Error> for FormatError {
 impl From<csv::Error> for FormatError {
     fn from(e: csv::Error) -> Self {
         Self::Csv(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_drift_display_names_format_column_and_remedies() {
+        let e = FormatError::SchemaDrift {
+            format: "fixed-width",
+            column: "region".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("fixed-width"), "names the format: {msg}");
+        assert!(msg.contains("\"region\""), "names the column: {msg}");
+        assert!(
+            msg.contains("schema:"),
+            "points to the declare-the-column remedy: {msg}"
+        );
+        assert!(
+            msg.contains("JSON"),
+            "suggests a self-describing format: {msg}"
+        );
+    }
+
+    #[test]
+    fn schema_drift_disposes_through_the_write_error_path_not_the_document_dlq() {
+        // SchemaDrift must NOT be reclassified to the document-level DLQ: it
+        // is a per-record write failure that disposes through
+        // `push_write_error` under the configured error strategy.
+        let e = FormatError::SchemaDrift {
+            format: "CSV",
+            column: "x".to_string(),
+        };
+        assert!(!e.is_document_structural());
+        assert!(!e.is_structural_count());
     }
 }

@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
 
-use clinker_record::{GroupByKey, Record};
+use clinker_record::{GroupByKey, Record, Schema, Value};
+use indexmap::IndexSet;
 use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
@@ -340,7 +341,26 @@ pub(crate) fn dispatch_output(
         return Ok(());
     }
 
-    let output_schema = {
+    // CSV under `include_unmapped` is the one writer whose column header can
+    // widen record-to-record: `auto_widen` surfaces a `$widened` sidecar
+    // column on a later record that the first record lacked. Pinning the
+    // header to the first record's projection would silently drop that column
+    // (issue #805). This buffered records-only arm has the whole batch
+    // materialized in RAM, so it can pre-scan for the UNION of every record's
+    // projected columns in first-seen order and write a lossless widened
+    // header. Every other CSV path lacks that materialization — the streaming
+    // fused arm (Merge / Transform → Output) and the envelope arm both write
+    // record-at-a-time under a bounded-memory budget — so a union is
+    // impossible there and drift surfaces loudly as `FormatError::SchemaDrift`
+    // at the writer (the CSV writer's `error_on_undeclared_columns` guard,
+    // and the fixed-width writer's unconditional guard). JSON / XML need
+    // neither: they self-describe each record.
+    let output_schema = if matches!(out_cfg.format, clinker_plan::config::OutputFormat::Csv(_))
+        && out_cfg.include_unmapped
+    {
+        let _guard = ctx.projection_timer.guard();
+        build_csv_union_schema(&unbuffered, out_cfg, cxl_emit_names_opt)
+    } else {
         let projected = {
             let _guard = ctx.projection_timer.guard();
             project_output_from_record(&unbuffered[0].0, out_cfg, cxl_emit_names_opt)
@@ -380,6 +400,53 @@ pub(crate) fn dispatch_output(
     }
 
     Ok(())
+}
+
+/// Whether `record` carries auto-widened extra columns in its `$widened`
+/// sidecar — a non-empty `Value::Map`. Absent / `Null` / empty means the
+/// record contributes only the shared declared columns (E315 guarantees one
+/// declared schema across a batch), so the CSV union pre-scan can skip
+/// re-projecting it.
+fn record_has_widened_extras(record: &Record) -> bool {
+    matches!(
+        record.get(clinker_plan::config::pipeline_node::WIDENED_SIDECAR_COLUMN),
+        Some(Value::Map(map)) if !map.is_empty()
+    )
+}
+
+/// Build the CSV writer's column header as the UNION of every record's
+/// projected columns, in first-seen order, so a column that `auto_widen`
+/// surfaces only on a later record still gets a header slot (records that
+/// lack it emit an empty cell there) rather than being silently dropped.
+///
+/// Seeds the order from the first record's projection — the shared declared
+/// columns plus whatever `auto_widen` already surfaced on it — then merges in
+/// the extra columns of every LATER record that carries a non-empty
+/// `$widened` sidecar. Records without widened extras contribute only the
+/// shared declared columns, already in the set, so the second projection pass
+/// touches only the drifters: 1x record memory (records are already
+/// materialized at this arm), and a second projection only on the drifting
+/// minority.
+fn build_csv_union_schema(
+    unbuffered: &[(Record, u64)],
+    out_cfg: &clinker_plan::config::OutputConfig,
+    cxl_emit_names_opt: Option<&[String]>,
+) -> Arc<Schema> {
+    let mut union: IndexSet<Box<str>> = IndexSet::new();
+    let first = project_output_from_record(&unbuffered[0].0, out_cfg, cxl_emit_names_opt);
+    for col in first.schema().columns() {
+        union.insert(col.clone());
+    }
+    for (record, _) in &unbuffered[1..] {
+        if !record_has_widened_extras(record) {
+            continue;
+        }
+        let projected = project_output_from_record(record, out_cfg, cxl_emit_names_opt);
+        for col in projected.schema().columns() {
+            union.insert(col.clone());
+        }
+    }
+    Arc::new(Schema::new(union.into_iter().collect()))
 }
 
 /// Execute the `Output` arm under document-level DLQ. Drains this Output's

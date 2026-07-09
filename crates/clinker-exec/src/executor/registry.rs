@@ -250,11 +250,20 @@ fn build_writer_factory(
     field_defs: Option<Vec<clinker_format::Column>>,
     include_engine_stamped: bool,
     reconstruct_envelope: bool,
+    include_unmapped: bool,
 ) -> Result<WriterFactory, PipelineError> {
     match format {
         OutputFormat::Csv(opts) => {
             let mut csv_config = build_csv_writer_config(opts.as_ref(), include_header)?;
             csv_config.include_engine_stamped = include_engine_stamped;
+            // Lossless mode: when the Output carries every column through
+            // (`include_unmapped: true`), a record column the pinned header
+            // lacks must fail loudly rather than be silently dropped. The
+            // buffered Output arm pre-widens the header to the batch union so
+            // this never trips there; it is the drift backstop on the
+            // bounded-memory paths (streaming fusion, envelope framing) that
+            // pin the header to the first record (issue #805).
+            csv_config.error_on_undeclared_columns = include_unmapped;
             csv_config.envelope = resolve_envelope_spec(
                 reconstruct_envelope,
                 opts.as_ref().and_then(|o| o.envelope.as_ref()),
@@ -418,6 +427,7 @@ pub(crate) fn build_format_writer(
         field_defs,
         output.include_correlation_keys,
         output.reconstruct_envelope,
+        output.include_unmapped,
     )?;
 
     if let Some(ref split) = output.split {
@@ -478,7 +488,6 @@ fn build_split_policy(split: &clinker_plan::config::SplitConfig) -> SplitPolicy 
         max_records: split.max_records,
         max_bytes: split.max_bytes,
         group_key: split.group_key.clone(),
-        repeat_header: split.repeat_header,
         oversize_group: match split.oversize_group {
             clinker_plan::config::SplitOversizeGroupPolicy::Warn => OversizeGroupPolicy::Warn,
             clinker_plan::config::SplitOversizeGroupPolicy::Error => OversizeGroupPolicy::Error,

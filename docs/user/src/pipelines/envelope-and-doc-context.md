@@ -148,10 +148,11 @@ Each section declares how the reader locates its payload:
 | Multi-record CSV / fixed-width | `record_type` | A header record-type tag, e.g. `H` |
 
 Declaring an `xml_path` section against a JSON source (or vice versa),
-a `segment` extract against XML/JSON, or a `record_type` extract against
-any format other than multi-record CSV / fixed-width is a configuration
-error and fails fast when the source opens, rather than silently
-producing empty sections.
+a `segment` extract against XML/JSON, a `record_type` extract against
+any format other than multi-record CSV / fixed-width, or any `envelope:`
+block at all on a plain (single-schema) CSV or fixed-width source is a
+configuration error that fails fast rather than silently producing empty
+sections.
 
 A `json_pointer` must be a valid RFC 6901 pointer: either empty (`""`,
 naming the whole document) or a `/`-introduced path such as `/Head` or
@@ -160,10 +161,15 @@ decode to zero segments and silently match the root document — so it is
 **rejected at validation** rather than resolving to the wrong metadata.
 
 A **plain** (single-schema) CSV or fixed-width source carries no envelope
-— there is no header/trailer structure to extract, so declaring envelope
-sections on one is a no-op. The `record_type` extract applies only to a
+— there is no header/trailer structure to extract. Declaring `envelope:`
+sections on one is a configuration error (`E356`): the sections would
+never be populated and every `$doc.<section>.<field>` against the source
+would resolve to `null`, so the compiler **rejects** it rather than
+accepting an inert declaration. Envelope extraction on a flat file — the
+`record_type` extract — applies only to a
 [multi-record](../formats/csv.md#multi-record-files-header--trailer--body)
-source, one declaring a `discriminator:` + `records:` block.
+source, one declaring a `discriminator:` + `records:` block; declare that
+schema if the file genuinely carries header/trailer records.
 
 ### Network (REST) sources carry no `$doc` context
 
@@ -420,8 +426,31 @@ contains optional **batches** (`BHS`/`BTS`), each containing one or more
 onto the same nested levels — the `FHS` file header is a declared
 `segment: "FHS"` section, while the `BHS` batch and the `MSH` message
 surface automatically as the reader-supplied sections `batch` and
-`transaction_set`. Every tier is optional, so a bare `MSH`-led file simply
-opens one message level. See [HL7 v2 Format](../formats/hl7.md) for the full reference.
+`transaction_set`. Every tier is optional, and a level's section exists
+only when its header segment is present in the input — the reader
+synthesizes a `batch` section only where it reads a `BHS`, and the message
+level only where it reads an `MSH`.
+
+A bare `MSH`-led stream — messages with no `BHS` batch and no `FHS` file
+wrapper — therefore opens only the message level. `$doc.transaction_set.*`
+resolves against each message, but **`$doc.batch.*` resolves to `null`**:
+no `BHS` was read, so no `batch` section was synthesized. Whether a file
+carries a `BHS` batch wrapper is a property of the input bytes, not the
+config, so a `$doc.batch.*` path is never a compile error — it follows the
+same missing-value convention an absent `$doc` section follows (resolve
+`null`, never error), and populates as soon as a `BHS` wrapper is present:
+
+```yaml
+# Bare MSH stream (no BHS/FHS) — only the message level opens:
+- msg_type: $doc.transaction_set.f08   # MSH-9 message type — populated
+- batch_id: $doc.batch.f01             # null — no BHS, so no batch tier
+
+# BHS-wrapped stream — the BHS opens a batch level, so both populate:
+- msg_type: $doc.transaction_set.f08   # MSH-9 message type — populated
+- batch_id: $doc.batch.f01             # BHS field — now populated
+```
+
+See [HL7 v2 Format](../formats/hl7.md) for the full reference.
 
 A reader for such a format opens and closes each nested level as it
 crosses the corresponding envelope boundary mid-file. Each level

@@ -170,8 +170,7 @@ fn build_multi_file_reader(
     let owned_config = input.clone();
     let owned_schema = schema.clone();
     let factory: Box<FactoryFn> = Box::new(
-        move |source: ReopenableSource,
-              _idx: usize|
+        move |source: ReopenableSource|
               -> Result<Box<dyn FormatReader>, clinker_format::FormatError> {
             build_format_reader(&owned_config, &owned_schema, source).map_err(|e| {
                 clinker_format::FormatError::SchemaInference(format!(

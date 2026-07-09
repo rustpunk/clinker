@@ -32,6 +32,8 @@ When `true` (the default), every field on an input record that the upstream tran
 
 When `false`, only fields named by an `emit` statement in the upstream transform appear in the output. The `$widened` sidecar slot is stripped and undeclared input fields are dropped.
 
+When `true`, how a carried-along column reaches the writer depends on the output format. Self-describing formats (JSON / NDJSON / XML) write each record's own keys. A CSV output widens its header to the union of every record's columns when it can materialize the batch, and otherwise — on a bounded-memory streaming path (a `Merge`, a fused `Transform`, a single-branch `Route`, a streaming-strategy `Aggregate`, or the probe side of a hash-build-probe `Combine` feeding the output), or an envelope-reconstructing path — fails loudly with a `SchemaDrift` error rather than dropping a column it cannot fit under its already-committed header. A fixed-width output has no room for an undeclared column and likewise raises `SchemaDrift`. See [Auto-Widen & Schema Drift → Schema drift across records](../formats/auto-widen.md#schema-drift-across-records-tabular-formats).
+
 #### Migration notice
 
 The default flipped from `false` to `true` in a recent release (see [issue #90](https://github.com/rustpunk/clinker/issues/90)). Pipelines that relied on the previous behavior -- where output records contained only the fields explicitly emitted upstream -- must now set `include_unmapped: false` explicitly to restore that shape.

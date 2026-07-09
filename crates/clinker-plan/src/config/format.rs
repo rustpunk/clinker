@@ -33,14 +33,6 @@ impl InputFormat {
             InputFormat::Swift(_) => "swift",
         }
     }
-
-    /// Whether this format has a header row concept (CSV only).
-    pub fn has_header(&self) -> Option<bool> {
-        match self {
-            InputFormat::Csv(Some(opts)) => opts.has_header,
-            _ => None,
-        }
-    }
 }
 
 impl OutputFormat {
@@ -93,17 +85,6 @@ pub enum OutputFormat {
     X12(Option<X12OutputOptions>),
     Hl7(Option<Hl7OutputOptions>),
     Swift(Option<SwiftOutputOptions>),
-}
-
-/// Supported format types.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum FormatKind {
-    Csv,
-    Json,
-    Xml,
-    #[serde(rename = "fixed_width")]
-    FixedWidth,
 }
 
 /// Merge ordering discipline across declared inputs.
