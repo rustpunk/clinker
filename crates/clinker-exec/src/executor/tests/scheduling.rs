@@ -134,8 +134,12 @@ fn no_estimates_reproduces_topo_order_exactly() {
         "premise broken: a non-existent path seeded a non-zero peak"
     );
 
-    let arbitrator =
-        MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, MemoryArbitrator::default_policy());
+    let arbitrator = MemoryArbitrator::with_policy(
+        512 * 1024 * 1024,
+        0.80,
+        0.70,
+        MemoryArbitrator::default_policy(),
+    );
     let all: HashSet<NodeIndex> = dag.topo_order.iter().copied().collect();
 
     let order = scheduled_pass_order(dag, &arbitrator, &all, &std::collections::HashMap::new());
@@ -203,8 +207,12 @@ fn immediate_freed_outranks_larger_subtree_reclaim_of_a_fresh_source() {
     );
     let topo_pos = |idx: NodeIndex| dag.topo_order.iter().position(|&n| n == idx).unwrap();
 
-    let arbitrator =
-        MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, MemoryArbitrator::default_policy());
+    let arbitrator = MemoryArbitrator::with_policy(
+        512 * 1024 * 1024,
+        0.80,
+        0.70,
+        MemoryArbitrator::default_policy(),
+    );
 
     // Frontier as the dispatch loop sees it once src_small is done and
     // agg_small has become runnable while src_large is still waiting.
@@ -384,7 +392,7 @@ fn headroom_fit_prefers_fitting_node_over_lower_index() {
     // `with_policy` takes the hard limit and a soft fraction; pick a hard
     // limit whose soft floor equals `soft`.
     let arbitrator =
-        MemoryArbitrator::with_policy(soft * 2, 0.50, MemoryArbitrator::default_policy());
+        MemoryArbitrator::with_policy(soft * 2, 0.50, 0.40, MemoryArbitrator::default_policy());
     assert_eq!(arbitrator.soft_limit(), soft);
     assert!(small_peak <= soft && large_peak > soft);
 
@@ -420,6 +428,7 @@ fn huge_budget_arbitrator() -> std::sync::Arc<MemoryArbitrator> {
     std::sync::Arc::new(MemoryArbitrator::with_policy(
         HUGE_HARD_LIMIT_BYTES,
         0.80,
+        0.70,
         MemoryArbitrator::default_policy(),
     ))
 }

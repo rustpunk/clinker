@@ -958,7 +958,7 @@ mod tests {
         };
         // A 1-byte hard limit: the growing re-materialized vector crosses it
         // at the first 1024-record poll.
-        let arb = MemoryArbitrator::with_policy(1, 0.80, Box::new(NoOpPolicy));
+        let arb = MemoryArbitrator::with_policy(1, 0.80, 0.70, Box::new(NoOpPolicy));
         match nb.drain_split_metered(&arb, "spilled_stage") {
             Err(PipelineError::MemoryBudgetExceeded { node, source, .. }) => {
                 assert_eq!(node, "spilled_stage", "the error names the draining stage");
@@ -984,8 +984,12 @@ mod tests {
             chunks: vec![spill_chunk(rows.clone())],
             pending_puncts: vec![Punctuation::document_close(Arc::clone(&ctx))],
         };
-        let arb =
-            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let arb = MemoryArbitrator::with_policy(
+            100 * 1024 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        );
         let (metered_recs, metered_puncts) = make()
             .drain_split_metered(&arb, "stage")
             .expect("ample-budget metered drain");
@@ -1048,7 +1052,7 @@ mod tests {
         // but their sum (two footprints) breaches it — the joint-overshoot the
         // sum-aware gate exists to catch, invisible to a bytes-only test.
         let hard = poll_footprint + poll_footprint / 2;
-        let arb = MemoryArbitrator::with_policy(hard, 0.80, Box::new(NoOpPolicy));
+        let arb = MemoryArbitrator::with_policy(hard, 0.80, 0.70, Box::new(NoOpPolicy));
         arb.register_consumer(Arc::new(FixedUsageConsumer(poll_footprint)));
 
         match nb.drain_split_metered(&arb, "joint_stage") {
@@ -1100,7 +1104,7 @@ mod tests {
         // under AND their sum under → the drain completes and yields every
         // record. Guards against the gate over-firing on a legitimate drain.
         let hard = poll_footprint * 3;
-        let arb = MemoryArbitrator::with_policy(hard, 0.80, Box::new(NoOpPolicy));
+        let arb = MemoryArbitrator::with_policy(hard, 0.80, 0.70, Box::new(NoOpPolicy));
         arb.register_consumer(Arc::new(FixedUsageConsumer(poll_footprint)));
 
         let (recs, _puncts) = nb

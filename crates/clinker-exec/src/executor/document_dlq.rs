@@ -1040,6 +1040,7 @@ mod tests {
         let arbitrator = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
             64,
             0.5,
+            0.4,
             Box::new(crate::pipeline::memory::NoOpPolicy),
         ));
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -1120,6 +1121,7 @@ mod tests {
         let arbitrator = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
             64,
             0.5,
+            0.4,
             Box::new(crate::pipeline::memory::NoOpPolicy),
         ));
         // A one-byte disk quota: the mem-tail flush overflows it on the first
@@ -1171,6 +1173,7 @@ mod tests {
         let arbitrator = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
             64,
             0.5,
+            0.4,
             Box::new(crate::pipeline::memory::NoOpPolicy),
         ));
         let tmp = tempfile::tempdir().expect("tempdir");

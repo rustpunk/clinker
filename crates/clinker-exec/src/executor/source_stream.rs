@@ -215,6 +215,14 @@ impl crate::pipeline::memory::MemoryConsumer for SourceConsumer {
     fn resume(&self) {
         self.handle.resume();
     }
+
+    fn is_paused(&self) -> bool {
+        self.handle.is_paused()
+    }
+
+    fn is_active(&self) -> bool {
+        self.handle.is_active()
+    }
 }
 
 #[cfg(test)]

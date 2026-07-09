@@ -397,6 +397,7 @@ mod tests {
         let budget = crate::pipeline::memory::MemoryArbitrator::with_policy(
             u64::MAX,
             0.80,
+            0.70,
             Box::new(crate::pipeline::memory::NoOpPolicy),
         );
         Arena::build(

@@ -417,7 +417,7 @@ mod tests {
         use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
 
         let schema = schema();
-        let budget = MemoryArbitrator::with_policy(64 * 1024, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(64 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
         budget.set_max_spill_bytes(1);
         let spill_root = tempfile::tempdir().unwrap();
         // threshold=1 → every push spills, so the first run already crosses the

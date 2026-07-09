@@ -352,9 +352,17 @@ pub(crate) fn build_arbitrator_from_config(
     // builder total rather than re-surfacing an already-rejected error.
     let limit = clinker_plan::config::utils::parse_memory_limit_bytes(mem.limit.as_deref())
         .unwrap_or(clinker_plan::config::utils::DEFAULT_MEMORY_LIMIT_BYTES);
+    // `resume_threshold` is validated at plan time (E324) to sit inside
+    // `(0, DEFAULT_SPILL_THRESHOLD)`; omitted → the 0.70 default. The soft
+    // fraction is the shared `DEFAULT_SPILL_THRESHOLD` constant rather than
+    // a bare literal so plan-side validation and this builder agree.
+    let resume_threshold = mem
+        .resume_threshold
+        .unwrap_or(clinker_plan::config::utils::DEFAULT_RESUME_THRESHOLD);
     crate::pipeline::memory::MemoryArbitrator::with_policy(
         limit,
-        0.80,
+        clinker_plan::config::utils::DEFAULT_SPILL_THRESHOLD,
+        resume_threshold,
         crate::pipeline::memory::build_policy(mem.backpressure),
     )
 }
@@ -389,6 +397,33 @@ nodes:
         let yaml = MINIMAL_PIPELINE.replace("__LIMIT__", limit);
         let config = clinker_plan::config::parse_config(&yaml).expect("minimal pipeline parses");
         parse_memory_limit(&config)
+    }
+
+    /// Build a pipeline-scoped arbitrator from a `memory:` inline block,
+    /// exercising the same `build_arbitrator_from_config` path production uses.
+    fn arbitrator_for_memory(memory_inline: &str) -> crate::pipeline::memory::MemoryArbitrator {
+        let yaml = MINIMAL_PIPELINE.replace(r#"memory: { limit: "__LIMIT__" }"#, memory_inline);
+        let config = clinker_plan::config::parse_config(&yaml).expect("pipeline parses");
+        super::build_arbitrator_from_config(&config)
+    }
+
+    #[test]
+    fn build_arbitrator_applies_default_resume_threshold_when_omitted() {
+        // An omitted `resume_threshold` resolves to the 0.70 default, so
+        // resume_limit = 0.70 * hard; the soft threshold stays 0.80 * hard.
+        let arb = arbitrator_for_memory(r#"memory: { limit: "512M" }"#);
+        let hard = 512 * 1024 * 1024u64;
+        assert_eq!(arb.hard_limit(), hard);
+        assert_eq!(arb.resume_limit(), (hard as f64 * 0.70) as u64);
+        assert_eq!(arb.spill_threshold_bytes(), (hard as f64 * 0.80) as u64);
+    }
+
+    #[test]
+    fn build_arbitrator_honors_custom_resume_threshold() {
+        // A set `resume_threshold` threads through to resume_limit unchanged.
+        let arb = arbitrator_for_memory(r#"memory: { limit: "512M", resume_threshold: 0.5 }"#);
+        let hard = 512 * 1024 * 1024u64;
+        assert_eq!(arb.resume_limit(), (hard as f64 * 0.5) as u64);
     }
 
     #[test]

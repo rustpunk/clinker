@@ -1863,11 +1863,12 @@ mod tests {
         let source_file: Arc<str> = Arc::from("");
         let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
         let mut budget = match rk.budget_bytes {
-            Some(b) => MemoryArbitrator::with_policy(b, 0.80, Box::new(NoOpPolicy)),
+            Some(b) => MemoryArbitrator::with_policy(b, 0.80, 0.70, Box::new(NoOpPolicy)),
             None => MemoryArbitrator::with_policy(
                 clinker_plan::config::utils::parse_memory_limit_bytes(None)
                     .unwrap_or(clinker_plan::config::utils::DEFAULT_MEMORY_LIMIT_BYTES),
                 0.80,
+                0.70,
                 Box::new(NoOpPolicy),
             ),
         };
@@ -2244,7 +2245,7 @@ mod tests {
     #[test]
     fn phase_a_driver_spill_past_disk_cap_fails_with_spill_cap_exceeded() {
         let mut pairs = phase_a_driver_pairs(64);
-        let budget = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(1024, 0.80, 0.70, Box::new(NoOpPolicy));
         budget.set_max_spill_bytes(1);
         let dir = tempfile::tempdir().unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
@@ -2290,7 +2291,7 @@ mod tests {
                 (r, Value::Integer(i))
             })
             .collect();
-        let budget = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(1024, 0.80, 0.70, Box::new(NoOpPolicy));
         budget.set_max_spill_bytes(1);
         let dir = tempfile::tempdir().unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
@@ -2324,7 +2325,7 @@ mod tests {
     #[test]
     fn phase_a_spills_into_configured_root_not_env_temp() {
         let mut pairs = phase_a_driver_pairs(64);
-        let budget = MemoryArbitrator::with_policy(1024, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(1024, 0.80, 0.70, Box::new(NoOpPolicy));
         let scratch = tempfile::tempdir().unwrap();
         let spill_root = scratch.path().join("configured-root");
         std::fs::create_dir(&spill_root).unwrap();

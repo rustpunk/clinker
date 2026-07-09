@@ -50,6 +50,7 @@ fn tight_no_op_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
     Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
         TIGHT_LIMIT,
         SPILL_FRAC,
+        0.70,
         Box::new(crate::pipeline::memory::NoOpPolicy),
     ))
 }

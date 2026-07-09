@@ -383,6 +383,14 @@ pub struct ConsumerHandle {
     bytes: AtomicU64,
     spill_requested: AtomicBool,
     pause_signal: PauseSignal,
+    /// Set while the walk thread is actively draining this consumer's
+    /// channel. A Source the walk is draining is exempt from the resume
+    /// controller's pause step: pausing the producer feeding the `recv()`
+    /// the walk is blocked on would starve that `recv()` and deadlock the
+    /// single-threaded walk. Written only by the walk thread (drain-arm
+    /// entry / exit); read only by the walk thread (`reconcile_backpressure`),
+    /// so `Acquire`/`Release` is ample and no stronger ordering is needed.
+    active: AtomicBool,
 }
 
 impl ConsumerHandle {
@@ -393,6 +401,7 @@ impl ConsumerHandle {
             bytes: AtomicU64::new(0),
             spill_requested: AtomicBool::new(false),
             pause_signal: PauseSignal::new(),
+            active: AtomicBool::new(false),
         })
     }
 
@@ -468,6 +477,24 @@ impl ConsumerHandle {
     pub fn wait_while_paused(&self) {
         self.pause_signal.wait_while_paused();
     }
+
+    /// Mark this consumer as actively drained by the walk. The resume
+    /// controller's pause step skips an active consumer, so the Source the
+    /// walk is currently blocked on is never paused out from under its own
+    /// `recv()`. Set at drain-arm entry by the walk thread.
+    pub fn set_active(&self) {
+        self.active.store(true, Ordering::Release);
+    }
+
+    /// Clear the active-drain exemption once the walk leaves the drain arm.
+    pub fn clear_active(&self) {
+        self.active.store(false, Ordering::Release);
+    }
+
+    /// Whether the walk is currently draining this consumer.
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
 }
 
 /// Memory-consuming operator that the arbitrator can interrogate and,
@@ -528,6 +555,23 @@ pub trait MemoryConsumer: Send + Sync {
     /// Resume a previously paused consumer. Default body is a no-op,
     /// mirroring `pause`.
     fn resume(&self) {}
+
+    /// Whether the consumer is currently paused. Default `false`:
+    /// consumers that return `false` from `can_back_pressure` are never
+    /// pause victims, so they inherit the default. Back-pressureable
+    /// consumers (Sources) override to route to their handle's pause flag
+    /// so the resume controller resumes only actually-paused victims.
+    fn is_paused(&self) -> bool {
+        false
+    }
+
+    /// Whether the walk thread is currently draining this consumer.
+    /// Default `false`; back-pressureable consumers override to route to
+    /// their handle's active flag so the resume controller's pause step
+    /// skips a consumer the walk is blocked on (active-exemption).
+    fn is_active(&self) -> bool {
+        false
+    }
 }
 
 /// Policy that selects which `MemoryConsumer` gives up memory when
@@ -549,6 +593,17 @@ pub trait ArbitrationPolicy: Send + Sync {
     /// Composing wrappers (`BackPressurePreferred`) recurse to spell
     /// out their inner policy, e.g. `BackPressurePreferred -> Priority`.
     fn policy_name(&self) -> Cow<'static, str>;
+
+    /// Whether this policy pauses back-pressureable producers under
+    /// pressure. The resume controller (`reconcile_backpressure`) only
+    /// pauses/resumes producers when this is true, so the `spill` knob
+    /// (bare `Priority`) keeps its documented react-only, never-pause
+    /// semantics — pressure sheds reclaimable state via spill, never by
+    /// parking a producer. Default `false`; only `BackPressurePreferred`
+    /// overrides to `true` (it is what the `pause` / `both` knobs install).
+    fn prefers_backpressure(&self) -> bool {
+        false
+    }
 }
 
 /// Policy that selects no victim under any pressure.
@@ -678,6 +733,10 @@ impl ArbitrationPolicy for BackPressurePreferred {
             self.fallback.policy_name()
         ))
     }
+
+    fn prefers_backpressure(&self) -> bool {
+        true
+    }
 }
 
 /// Build the boxed [`ArbitrationPolicy`] a `pipeline.memory.backpressure`
@@ -742,6 +801,12 @@ pub struct MemoryArbitrator {
     /// Plain `f64`: constructor-set, never reconfigured at runtime;
     /// `std` has no atomic for it and a `Mutex` would be overkill.
     spill_threshold_pct: f64,
+    /// Fraction of limit at which a producer paused under memory pressure
+    /// resumes — the low watermark of the pause/resume hysteresis band
+    /// (default 0.70). Sits strictly below `spill_threshold_pct` so the
+    /// dead zone between the two damps thrash. Same treatment as
+    /// `spill_threshold_pct`: constructor-set, never mutated at runtime.
+    resume_threshold_pct: f64,
     /// Peak RSS observed across all `observe()` / `should_spill()`
     /// calls. Sentinel `0` = never observed; the `peak_rss()` getter
     /// maps `0` back to `None` to preserve the pre-117c "platform
@@ -803,11 +868,23 @@ impl MemoryArbitrator {
     pub fn with_policy(
         limit: u64,
         spill_threshold_pct: f64,
+        resume_threshold_pct: f64,
         policy: Box<dyn ArbitrationPolicy>,
     ) -> Self {
+        // The resume watermark must sit inside `(0, spill_threshold_pct)` so
+        // it forms a hysteresis band below the pause threshold. Production
+        // values are range-checked at plan time (E324), so this documents
+        // the invariant for test callers without a runtime branch on the
+        // release path.
+        debug_assert!(
+            resume_threshold_pct > 0.0 && resume_threshold_pct < spill_threshold_pct,
+            "resume_threshold_pct ({resume_threshold_pct}) must sit in \
+             (0, spill_threshold_pct={spill_threshold_pct})"
+        );
         Self {
             limit: AtomicU64::new(limit),
             spill_threshold_pct,
+            resume_threshold_pct,
             peak_rss: AtomicU64::new(0),
             max_spill_bytes: AtomicU64::new(u64::MAX),
             cumulative_spill_bytes: AtomicU64::new(0),
@@ -865,13 +942,17 @@ impl MemoryArbitrator {
         let tripped =
             self.peak_rss.load(Ordering::Relaxed) > soft || self.sum_consumer_usage() > soft;
         if tripped {
-            // Drive the round-trip: the elected victim is paused
-            // (back-pressureable) or asked to spill (everything else).
-            // `try_spill` flips the consumer's `spill_requested` flag,
-            // which the operator's hot loop reads via
-            // `take_spill_request` and reacts to in-thread. `pause`
-            // flips the consumer's `PauseSignal`, which the
-            // producer's `wait_while_paused` blocks on.
+            // Two cooperating drivers, split by which pressure signal is
+            // sound for each. `reconcile_backpressure` pauses/resumes
+            // back-pressureable producers against CURRENT pressure with a
+            // hysteresis band — reading current (not the monotonic
+            // `peak_rss`) is what lets a paused producer ever resume.
+            // `poll_arbitration` then drives the spill arm for
+            // non-back-pressureable victims, keeping its monotone-safe
+            // peak-based trip; `try_spill` flips the victim's
+            // `spill_requested` flag, which the operator's hot loop reads
+            // via `take_spill_request` and reacts to in-thread.
+            self.reconcile_backpressure();
             self.poll_arbitration();
         }
         tripped
@@ -933,6 +1014,34 @@ impl MemoryArbitrator {
     /// Soft-limit fraction (constructor-set; default 0.80).
     pub fn spill_threshold_pct(&self) -> f64 {
         self.spill_threshold_pct
+    }
+
+    /// Resume watermark in absolute bytes: the low edge of the
+    /// pause/resume hysteresis band. A producer paused under memory
+    /// pressure resumes once `current_pressure()` recedes below this.
+    /// Equals `limit * resume_threshold_pct` (default 0.70·limit).
+    pub fn resume_limit(&self) -> u64 {
+        (self.limit.load(Ordering::Relaxed) as f64 * self.resume_threshold_pct) as u64
+    }
+
+    /// Resume-watermark fraction (constructor-set; default 0.70).
+    pub fn resume_threshold_pct(&self) -> f64 {
+        self.resume_threshold_pct
+    }
+
+    /// Current memory pressure in bytes: the fresh, non-monotonic RSS
+    /// reading maxed with the pull-mode charged-byte sum.
+    ///
+    /// Unlike `peak_rss` (monotonic — `observe()`'s `fetch_max` only ever
+    /// raises it, so a `free()` never lowers it), `rss_bytes()` falls when
+    /// memory is released — the property a resume decision needs, since a
+    /// resume keyed on the monotonic peak could never fire.
+    /// `.max(sum_consumer_usage())` keeps the RSS-independent backstop the
+    /// arbitrator already relies on: the signal still works on targets
+    /// where `rss_bytes()` is `None`, and tests can drive it
+    /// deterministically through registered-consumer bytes.
+    pub fn current_pressure(&self) -> u64 {
+        rss_bytes().unwrap_or(0).max(self.sum_consumer_usage())
     }
 
     /// Spike allowance between soft and hard limits (default 20%).
@@ -1269,20 +1378,75 @@ impl MemoryArbitrator {
             );
         }
         let victim = self.policy.select_victim(&snapshot, pressure);
-        // Round-trip: invoke the corresponding action on the elected
-        // victim through the shared `&` the snapshot provides. No
-        // exclusive access is needed — every consumer routes its
-        // mutation through atomics behind a shared handle.
+        // Spill arm only. Pausing a back-pressureable producer is owned by
+        // `reconcile_backpressure` (current pressure + hysteresis), so here
+        // the elected victim is asked to spill only when it is
+        // non-back-pressureable. The policy may still elect a
+        // back-pressureable consumer (`BackPressurePreferred` prefers one) —
+        // in that case no one spills, preserving the pause-over-spill
+        // posture the `pause`/`both` knobs mean, exactly as before this
+        // split (the pause it used to issue here now happens in
+        // `reconcile_backpressure` on the sound current-pressure signal).
+        // The action routes through the shared `&` the snapshot provides;
+        // every consumer mutates through atomics behind a shared handle, so
+        // no exclusive access is needed.
         if let Some(id) = victim
             && let Some((_, consumer)) = consumers.iter().find(|(cid, _)| *cid == id)
+            && !consumer.can_back_pressure()
         {
-            if consumer.can_back_pressure() {
-                consumer.pause();
-            } else {
-                let _ = consumer.try_spill(pressure);
-            }
+            let _ = consumer.try_spill(pressure);
         }
         victim
+    }
+
+    /// Pause/resume back-pressureable producers against CURRENT pressure
+    /// with a hysteresis band — the resume controller. Runs on the walk
+    /// thread inside `should_spill`'s tripped branch.
+    ///
+    /// - Above the soft limit: pause the first back-pressureable consumer
+    ///   the walk is NOT currently draining. Skipping an `is_active`
+    ///   consumer is load-bearing: pausing the Source feeding the `recv()`
+    ///   the single-threaded walk is blocked on would starve that `recv()`
+    ///   and deadlock. First-registered order matches the single-victim
+    ///   pause `BackPressurePreferred` has always applied.
+    /// - Below the resume watermark: resume every paused back-pressureable
+    ///   consumer (Fluent Bit / NiFi resume once downstream drains below the
+    ///   low watermark).
+    /// - In the dead zone `[resume_limit, soft_limit]`: no state change, so
+    ///   a single admit/discharge swing cannot cross both thresholds and
+    ///   thrash pause/resume every poll.
+    ///
+    /// Reads CURRENT pressure, never the monotonic `peak_rss`: `peak_rss`
+    /// only rises, so a resume keyed on it could never fire. The spill arm
+    /// (`poll_arbitration`) keeps its peak-based trip — spilling is
+    /// monotone-safe and never deadlocks. Iterates the small lock-free
+    /// consumer snapshot and mutates only shared atomics, so it stays cheap
+    /// inside the already-guarded tripped branch.
+    ///
+    /// A no-op under a non-pausing policy (`spill` / bare `Priority`), so a
+    /// `spill`-knob run never parks a producer — its pressure is shed
+    /// entirely through `poll_arbitration`'s spill arm.
+    fn reconcile_backpressure(&self) {
+        if !self.policy.prefers_backpressure() {
+            return;
+        }
+        let cur = self.current_pressure();
+        let soft = self.soft_limit();
+        let consumers = self.consumers.load();
+        if cur > soft {
+            for (_, consumer) in consumers.iter() {
+                if consumer.can_back_pressure() && !consumer.is_active() {
+                    consumer.pause();
+                    break;
+                }
+            }
+        } else if cur < self.resume_limit() {
+            for (_, consumer) in consumers.iter() {
+                if consumer.can_back_pressure() && consumer.is_paused() {
+                    consumer.resume();
+                }
+            }
+        }
     }
 }
 
@@ -1753,8 +1917,12 @@ mod tests {
         // permanently below-threshold, just for a different reason). A
         // registered consumer holding more than the soft limit must trip
         // the gate through that arm alone.
-        let arbitrator =
-            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(
+            100 * 1024 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        );
         let soft = arbitrator.soft_limit();
         assert!(!arbitrator.should_spill(), "empty registry must not trip");
         // Whatever RSS `observe()` just sampled is below the soft limit, so
@@ -1775,8 +1943,12 @@ mod tests {
         // Same RSS-independent backstop for the hard-abort gate; the 100
         // GiB hard limit keeps the RSS arm inert (see the sibling
         // should_spill test for why this isolates the charged-byte arm).
-        let arbitrator =
-            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(
+            100 * 1024 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        );
         let hard = arbitrator.hard_limit();
         assert!(!arbitrator.should_abort(), "empty registry must not abort");
         assert!(
@@ -1798,8 +1970,12 @@ mod tests {
         // empty here (the build's handle is zero-seeded until build
         // completes) and the 100 GiB limit keeps the RSS arm inert, so only
         // the `local_bytes` arm can fire.
-        let arbitrator =
-            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(
+            100 * 1024 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        );
         let hard = arbitrator.hard_limit();
         assert_eq!(arbitrator.sum_consumer_usage(), 0);
         assert!(
@@ -1817,8 +1993,12 @@ mod tests {
         // The streaming-stage variant carries the same backstop so a
         // streaming batch still spills itself when RSS is unavailable. The
         // 100 GiB limit keeps the RSS arm inert.
-        let arbitrator =
-            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(
+            100 * 1024 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        );
         let soft = arbitrator.soft_limit();
         assert!(!arbitrator.should_spill_self());
         assert!(
@@ -1838,7 +2018,7 @@ mod tests {
     #[test]
     fn test_memory_arbitrator_below_threshold() {
         let arbitrator =
-            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
         assert!(!arbitrator.should_spill());
     }
 
@@ -1849,7 +2029,8 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_memory_arbitrator_above_threshold() {
-        let arbitrator = MemoryArbitrator::with_policy(1024 * 1024, 0.80, Box::new(NoOpPolicy));
+        let arbitrator =
+            MemoryArbitrator::with_policy(1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
         assert!(arbitrator.should_spill());
     }
 
@@ -1861,7 +2042,7 @@ mod tests {
     #[test]
     fn test_memory_arbitrator_peak_rss_tracked() {
         let arbitrator =
-            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
         arbitrator.observe();
         assert!(
             arbitrator.peak_rss().is_some(),
@@ -1877,7 +2058,7 @@ mod tests {
     fn test_parse_memory_limit_default_512mb() {
         let limit = clinker_plan::config::utils::parse_memory_limit_bytes(None)
             .unwrap_or(clinker_plan::config::utils::DEFAULT_MEMORY_LIMIT_BYTES);
-        let arbitrator = MemoryArbitrator::with_policy(limit, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(limit, 0.80, 0.70, Box::new(NoOpPolicy));
         assert_eq!(arbitrator.limit(), 512 * 1024 * 1024);
         assert!((arbitrator.spill_threshold_pct() - 0.80).abs() < f64::EPSILON);
     }
@@ -1885,7 +2066,7 @@ mod tests {
     #[test]
     fn test_disk_quota_default_unlimited() {
         let arbitrator =
-            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
         assert_eq!(arbitrator.disk_quota(), u64::MAX);
         assert_eq!(arbitrator.cumulative_spill_bytes(), 0);
     }
@@ -1893,7 +2074,7 @@ mod tests {
     #[test]
     fn test_record_spill_bytes_under_quota() {
         let arbitrator =
-            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
         arbitrator.set_max_spill_bytes(1024);
         assert!(!arbitrator.record_spill_bytes("sort", 256));
         assert_eq!(arbitrator.cumulative_spill_bytes(), 256);
@@ -1904,7 +2085,7 @@ mod tests {
     #[test]
     fn test_record_spill_bytes_overflows_quota() {
         let arbitrator =
-            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
         arbitrator.set_max_spill_bytes(1024);
         assert!(!arbitrator.record_spill_bytes("sort", 1024));
         assert!(arbitrator.record_spill_bytes("sort", 1));
@@ -1917,7 +2098,7 @@ mod tests {
         // accumulation cannot wrap below the configured quota and
         // silently disable the gate.
         let arbitrator =
-            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
         arbitrator.set_max_spill_bytes(1024);
         arbitrator
             .cumulative_spill_bytes
@@ -1931,7 +2112,7 @@ mod tests {
         // Two stages spill; the per-stage breakdown keeps their totals
         // distinct and the cumulative total equals their sum.
         let arbitrator =
-            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
         arbitrator.record_spill_bytes("sort_by_amount", 256);
         arbitrator.record_spill_bytes("dept_totals", 512);
         arbitrator.record_spill_bytes("sort_by_amount", 128);
@@ -2010,6 +2191,45 @@ mod tests {
         }
     }
 
+    /// Reclaimable, non-back-pressureable consumer that records whether the
+    /// arbitrator's spill arm reached it. Mirrors a grace-hash / aggregate
+    /// slot: it spills on demand and can never be paused, so it is the shape
+    /// `poll_arbitration` acts on.
+    struct ReclaimableMock {
+        usage: u64,
+        priority: i32,
+        spilled: AtomicBool,
+    }
+
+    impl ReclaimableMock {
+        fn new(usage: u64, priority: i32) -> Self {
+            Self {
+                usage,
+                priority,
+                spilled: AtomicBool::new(false),
+            }
+        }
+        fn was_spilled(&self) -> bool {
+            self.spilled.load(Ordering::Acquire)
+        }
+    }
+
+    impl MemoryConsumer for ReclaimableMock {
+        fn current_usage(&self) -> u64 {
+            self.usage
+        }
+        fn spill_priority(&self) -> i32 {
+            self.priority
+        }
+        fn try_spill(&self, target_bytes: u64) -> Result<u64, ConsumerSpillError> {
+            self.spilled.store(true, Ordering::Release);
+            Ok(target_bytes)
+        }
+        fn can_back_pressure(&self) -> bool {
+            false
+        }
+    }
+
     #[test]
     fn test_noop_policy_select_victim_returns_none_empty() {
         let policy = NoOpPolicy;
@@ -2045,7 +2265,7 @@ mod tests {
 
     #[test]
     fn test_with_policy_installs_chosen_policy() {
-        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
         // poll_arbitration is private — exercise it through the
         // public `should_spill` path with a deliberately tiny
         // limit so the soft-threshold gate trips.
@@ -2060,7 +2280,7 @@ mod tests {
 
     #[test]
     fn test_register_consumer_assigns_monotonic_ids() {
-        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
         let id_a = arbitrator.register_consumer(Arc::new(MockConsumer::new(10, 0, 0)));
         let id_b = arbitrator.register_consumer(Arc::new(MockConsumer::new(20, 0, 0)));
         let id_c = arbitrator.register_consumer(Arc::new(MockConsumer::new(30, 0, 0)));
@@ -2072,7 +2292,7 @@ mod tests {
 
     #[test]
     fn test_unregister_consumer_returns_removed() {
-        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
         let id = arbitrator.register_consumer(Arc::new(MockConsumer::new(100, 0, 0)));
         assert_eq!(arbitrator.consumer_count(), 1);
         let removed = arbitrator.unregister_consumer(id);
@@ -2085,7 +2305,7 @@ mod tests {
 
     #[test]
     fn test_sum_consumer_usage_aggregates_registered() {
-        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
         assert_eq!(arbitrator.sum_consumer_usage(), 0);
         arbitrator.register_consumer(Arc::new(MockConsumer::new(1024, 0, 0)));
         arbitrator.register_consumer(Arc::new(MockConsumer::new(4096, 0, 0)));
@@ -2102,8 +2322,12 @@ mod tests {
         const ARENA_BYTES: u64 = 8 * 1024 * 1024;
         // 100 GiB hard limit so real-process RSS cannot push peak_rss
         // above the test-seeded value via `observe()`'s `fetch_max`.
-        let arbitrator =
-            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.50, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(
+            100 * 1024 * 1024 * 1024,
+            0.50,
+            0.40,
+            Box::new(NoOpPolicy),
+        );
         arbitrator.set_peak_rss_for_test(ARENA_BYTES);
 
         // Before registration the arena contributes nothing, so the
@@ -2153,32 +2377,33 @@ mod tests {
         // preferred over a spillable consumer. Under `Priority`, lower
         // spill_priority wins; the arena's `i32::MAX - 1` sits behind a
         // grace-hash-shaped consumer at priority 10, so the policy elects
-        // the spillable. `should_spill` drives the round and acts on the
-        // victim — a back-pressureable MockConsumer gets paused, which is
-        // the observable proof it (not the arena) was elected.
+        // the spillable. `should_spill` drives the round and `poll_arbitration`
+        // asks the elected (non-back-pressureable) victim to spill — the
+        // observable proof it (not the arena) was elected. `Priority` never
+        // pauses, so `reconcile_backpressure` is a no-op here.
         // 100 GiB hard limit so real-process RSS cannot push peak_rss
         // above the test-seeded value via `observe()`'s `fetch_max`.
         let arbitrator =
-            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.50, Box::new(Priority));
+            MemoryArbitrator::with_policy(100 * 1024 * 1024 * 1024, 0.50, 0.40, Box::new(Priority));
         let arena_handle = ConsumerHandle::new();
         arena_handle.set_bytes(512 * 1024 * 1024);
         // The arena is far larger than the spillable; only the priority
         // ordering keeps it from being elected, which is the point.
         arbitrator.register_consumer(Arc::new(ArenaConsumer::new(arena_handle)));
-        let spillable = Arc::new(MockConsumer::new(1024, 10, 0));
+        let spillable = Arc::new(ReclaimableMock::new(1024, 10));
         arbitrator.register_consumer(spillable.clone());
 
         arbitrator.set_peak_rss_for_test(75 * 1024 * 1024 * 1024);
         assert!(arbitrator.should_spill());
         assert!(
-            spillable.is_paused(),
+            spillable.was_spilled(),
             "Priority must elect the spillable consumer, never the non-actionable arena"
         );
     }
 
     #[test]
     fn test_consumer_ids_are_never_reused_after_unregister() {
-        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
         let id_a = arbitrator.register_consumer(Arc::new(MockConsumer::new(1, 0, 0)));
         arbitrator.unregister_consumer(id_a);
         let id_b = arbitrator.register_consumer(Arc::new(MockConsumer::new(1, 0, 0)));
@@ -2190,7 +2415,7 @@ mod tests {
 
     #[test]
     fn test_register_then_unregister_leaves_empty_snapshot() {
-        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
         let id = arbitrator.register_consumer(Arc::new(MockConsumer::new(512, 0, 0)));
         assert_eq!(arbitrator.consumer_count(), 1);
         assert_eq!(arbitrator.sum_consumer_usage(), 512);
@@ -2219,6 +2444,7 @@ mod tests {
         let arbitrator = Arc::new(MemoryArbitrator::with_policy(
             u64::MAX,
             0.80,
+            0.70,
             Box::new(NoOpPolicy),
         ));
         let start = Arc::new(Barrier::new(2));
@@ -2542,7 +2768,7 @@ mod tests {
     fn arbitrator_with_headroom(soft: u64, used: u64) -> MemoryArbitrator {
         // soft_limit() = limit * 0.80, so set limit = soft / 0.80.
         let limit = (soft as f64 / 0.80) as u64;
-        let arb = MemoryArbitrator::with_policy(limit, 0.80, Box::new(NoOpPolicy));
+        let arb = MemoryArbitrator::with_policy(limit, 0.80, 0.70, Box::new(NoOpPolicy));
         assert_eq!(arb.soft_limit(), soft, "soft limit setup");
         if used > 0 {
             arb.register_consumer(Arc::new(MockConsumer::new(used, 0, 0)));
@@ -2686,5 +2912,121 @@ mod tests {
         );
         let chosen_again = arb.next_runnable(&[c, a, b], &hint);
         assert_eq!(chosen_again, a, "selection is independent of slice order");
+    }
+
+    #[test]
+    fn reconcile_backpressure_hysteresis_band_bounds_transitions() {
+        use crate::executor::source_stream::SourceConsumer;
+        // hard 100 GiB, spill 0.50 (soft = 50 GiB), resume 0.40
+        // (resume_limit = 40 GiB). A single registered Source drives current
+        // pressure through the `sum_consumer_usage` arm of
+        // `current_pressure()`; real RSS stays far below 40 GiB, so the band
+        // is exercised deterministically. `reconcile_backpressure` is driven
+        // directly so the dead-zone branch (called, no state change) is
+        // reached even though `should_spill` would not trip inside the band.
+        let gib = 1024u64 * 1024 * 1024;
+        let arb = MemoryArbitrator::with_policy(
+            100 * gib,
+            0.50,
+            0.40,
+            Box::new(BackPressurePreferred::wrapping(Priority)),
+        );
+        let handle = ConsumerHandle::new();
+        arb.register_consumer(Arc::new(SourceConsumer::new(handle.clone())));
+
+        // Above soft: pause. Repeated polls stay paused (single victim,
+        // idempotent) — no per-poll thrash.
+        handle.set_bytes(60 * gib);
+        for _ in 0..8 {
+            arb.reconcile_backpressure();
+            assert!(
+                handle.is_paused(),
+                "current > soft must pause and stay paused"
+            );
+        }
+        // Dead zone [resume_limit, soft] = [40, 50] GiB: reconcile is a no-op,
+        // so the pause state is unchanged.
+        handle.set_bytes(45 * gib);
+        for _ in 0..8 {
+            arb.reconcile_backpressure();
+            assert!(handle.is_paused(), "dead zone must not resume");
+        }
+        // Below resume_limit: resume. Repeated polls stay resumed.
+        handle.set_bytes(30 * gib);
+        for _ in 0..8 {
+            arb.reconcile_backpressure();
+            assert!(!handle.is_paused(), "current < resume_limit must resume");
+        }
+        // Dead zone approached from below: no re-pause.
+        handle.set_bytes(45 * gib);
+        for _ in 0..8 {
+            arb.reconcile_backpressure();
+            assert!(!handle.is_paused(), "dead zone must not re-pause");
+        }
+        // Re-crossing soft: re-pause. The pause/resume state only ever
+        // changes at a threshold crossing, never per poll within a band.
+        handle.set_bytes(60 * gib);
+        arb.reconcile_backpressure();
+        assert!(handle.is_paused(), "re-crossing soft must re-pause");
+    }
+
+    #[test]
+    fn reconcile_backpressure_exempts_the_actively_drained_source() {
+        use crate::executor::source_stream::SourceConsumer;
+        // A Source the walk is currently draining (active) is never paused,
+        // even above the soft limit: pausing the producer feeding the
+        // `recv()` the single-threaded walk is blocked on would deadlock.
+        let gib = 1024u64 * 1024 * 1024;
+        let arb = MemoryArbitrator::with_policy(
+            100 * gib,
+            0.50,
+            0.40,
+            Box::new(BackPressurePreferred::wrapping(Priority)),
+        );
+        let handle = ConsumerHandle::new();
+        arb.register_consumer(Arc::new(SourceConsumer::new(handle.clone())));
+
+        handle.set_active();
+        handle.set_bytes(60 * gib); // above soft
+        arb.reconcile_backpressure();
+        assert!(
+            !handle.is_paused(),
+            "an active source is exempt from the pause step"
+        );
+        // Once the drain arm clears the exemption, the same pressure pauses it.
+        handle.clear_active();
+        arb.reconcile_backpressure();
+        assert!(
+            handle.is_paused(),
+            "a non-active source above soft is paused"
+        );
+    }
+
+    #[test]
+    fn poll_arbitration_spills_reclaimable_but_never_pauses() {
+        use crate::executor::source_stream::SourceConsumer;
+        // After the pause/spill split, `poll_arbitration` drives spill only:
+        // it asks a non-back-pressureable victim to spill and never pauses a
+        // producer (pausing is `reconcile_backpressure`'s job on current
+        // pressure). Under bare `Priority` the reclaimable (priority 0) is
+        // elected over the Source (priority i32::MAX), so the Source is never
+        // touched.
+        let gib = 1024u64 * 1024 * 1024;
+        let arb = MemoryArbitrator::with_policy(100 * gib, 0.50, 0.40, Box::new(Priority));
+        let source_handle = ConsumerHandle::new();
+        arb.register_consumer(Arc::new(SourceConsumer::new(source_handle.clone())));
+        let reclaimable = Arc::new(ReclaimableMock::new(60 * gib, 0));
+        arb.register_consumer(reclaimable.clone());
+
+        arb.set_peak_rss_for_test(60 * gib); // trip the peak-based spill arm
+        arb.poll_arbitration();
+        assert!(
+            reclaimable.was_spilled(),
+            "poll_arbitration must spill the elected non-back-pressureable victim"
+        );
+        assert!(
+            !source_handle.is_paused(),
+            "poll_arbitration must never pause a back-pressureable producer"
+        );
     }
 }

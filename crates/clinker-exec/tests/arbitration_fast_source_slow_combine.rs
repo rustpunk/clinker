@@ -50,6 +50,7 @@ fn back_pressure_preferred_pauses_source_under_pressure() {
     let arbitrator = MemoryArbitrator::with_policy(
         100 * 1024 * 1024 * 1024,
         0.50,
+        0.40,
         Box::new(BackPressurePreferred::wrapping(Priority)),
     );
 

@@ -1138,7 +1138,7 @@ mod tests {
     fn arbitrator(soft_bytes: u64) -> MemoryArbitrator {
         // soft = limit * 0.80, so limit = soft / 0.80.
         let limit = (soft_bytes as f64 / 0.80) as u64;
-        let arb = MemoryArbitrator::with_policy(limit, 0.80, Box::new(NoOpPolicy));
+        let arb = MemoryArbitrator::with_policy(limit, 0.80, 0.70, Box::new(NoOpPolicy));
         // Keep the RSS arm quiet: a tiny seeded peak never trips the soft
         // limit, so the buffer's own resident-byte total governs spilling.
         arb.set_peak_rss_for_test(1);

@@ -52,7 +52,7 @@ fn register(arb: &MemoryArbitrator, handle: &Arc<ConsumerHandle>) -> ConsumerId 
 
 #[test]
 fn flagged_resident_memory_slot_spills_and_discharges_via_sweep() {
-    let arb = MemoryArbitrator::with_policy(64 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+    let arb = MemoryArbitrator::with_policy(64 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
     let spill_dir = tempfile::tempdir().expect("temp dir");
     let s = schema();
 
@@ -151,7 +151,7 @@ fn flagged_resident_memory_slot_spills_and_discharges_via_sweep() {
 
 #[test]
 fn flagged_non_spillable_slot_is_skipped_by_sweep() {
-    let arb = MemoryArbitrator::with_policy(64 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+    let arb = MemoryArbitrator::with_policy(64 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
     let spill_dir = tempfile::tempdir().expect("temp dir");
     let s = schema();
     let idx = NodeIndex::new(0);

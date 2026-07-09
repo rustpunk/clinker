@@ -300,6 +300,7 @@ nodes:
     let arbitrator = std::sync::Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
         HARD_LIMIT,
         0.80,
+        0.70,
         Box::new(crate::pipeline::memory::Priority),
     ));
     arbitrator.set_peak_rss_for_test(HARD_LIMIT + 4096);

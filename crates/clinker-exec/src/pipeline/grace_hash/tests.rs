@@ -86,7 +86,12 @@ fn compile_key(
 /// `spill_threshold_pct` is set so soft limit = 1 KiB, well below
 /// any host's resident set.
 fn tiny_budget() -> MemoryArbitrator {
-    MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.000_001, Box::new(NoOpPolicy))
+    MemoryArbitrator::with_policy(
+        10 * 1024 * 1024 * 1024,
+        0.000_001,
+        0.000_000_5,
+        Box::new(NoOpPolicy),
+    )
 }
 
 #[test]
@@ -148,7 +153,7 @@ fn pipeline_temp_dir_owns_spill_files_on_drop() {
     let schema = schema_with(&["k"]);
     // Deposit a record and force a spill so a file actually exists.
     let rec = record_for(&schema, vec![Value::Integer(7)]);
-    let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+    let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
     exec.add_build_record(rec, 0, &budget).unwrap();
     exec.spill_partition(0, &budget).unwrap();
     let spilled_inside = std::fs::read_dir(&pipeline_path).unwrap().count();
@@ -187,7 +192,7 @@ fn pipeline_temp_dir_cleans_on_panic_unwind() {
         .unwrap();
         let schema = schema_with(&["k"]);
         let rec = record_for(&schema, vec![Value::Integer(99)]);
-        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+        let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
         exec.add_build_record(rec, 0, &budget).unwrap();
         exec.spill_partition(0, &budget).unwrap();
         panic!("simulated mid-spill panic");
@@ -262,7 +267,8 @@ fn spill_activates_on_charged_bytes_without_rss() {
     // 1 GiB hard limit → 800 MiB soft limit, above any host's test RSS,
     // so the RSS arm of `should_spill` cannot trip. Register the handle so
     // its charged bytes flow into `sum_consumer_usage`.
-    let budget = MemoryArbitrator::with_policy(1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+    let budget =
+        MemoryArbitrator::with_policy(1024 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
     budget.register_consumer(Arc::new(GraceHashConsumer::new(consumer_handle.clone())));
     let soft = budget.soft_limit();
     assert!(
@@ -479,7 +485,7 @@ fn execute_grace_hash_partition_pair_correct() {
     let stable = StableEvalContext::test_default();
     let source_file: Arc<str> = Arc::from("test.csv");
     let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
-    let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+    let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
 
     // Drive everything through grace hash. body_program=None so
     // the synthetic-step concatenation path is exercised; that's
@@ -738,8 +744,12 @@ fn execute_grace_hash_spill_then_reload_correct() {
     // threshold so should_spill fires immediately (process RSS
     // far exceeds 1 KiB on any host). This decouples spill
     // activation from build abort.
-    let budget =
-        MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.000_001, Box::new(NoOpPolicy));
+    let budget = MemoryArbitrator::with_policy(
+        10 * 1024 * 1024 * 1024,
+        0.000_001,
+        0.000_000_5,
+        Box::new(NoOpPolicy),
+    );
 
     let mut combined_schema_builder = clinker_record::SchemaBuilder::new();
     combined_schema_builder = combined_schema_builder.with_field("dk");
@@ -923,8 +933,12 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
     // Memory hard limit huge so should_abort never fires; spill
     // threshold tiny so spills happen; disk quota tight so the
     // first partition flush trips it.
-    let budget =
-        MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.000_001, Box::new(NoOpPolicy));
+    let budget = MemoryArbitrator::with_policy(
+        10 * 1024 * 1024 * 1024,
+        0.000_001,
+        0.000_000_5,
+        Box::new(NoOpPolicy),
+    );
     budget.set_max_spill_bytes(64);
 
     let combined_schema = clinker_record::SchemaBuilder::new()
@@ -1122,7 +1136,8 @@ fn build_ondisk_immediate_write_commit_trips_disk_cap() {
     // A budget that does NOT auto-spill (soft limit ~8 GiB) so the test
     // controls exactly when a commit happens; the cap starts unlimited so
     // the manual pre-spill lands without tripping.
-    let budget = MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+    let budget =
+        MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
 
     // Top 4 bits select the partition under 4 hash-bits; 0x0…1 -> 0.
     let hash_p0 = 0x0000_0000_0000_0001u64;
@@ -1232,7 +1247,8 @@ fn probe_finalize_spill_commit_trips_disk_cap_per_partition() {
         "join_probe",
     )
     .unwrap();
-    let budget = MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.80, Box::new(NoOpPolicy));
+    let budget =
+        MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
 
     // Top 4 bits select the partition: 0x0…1 -> 0, 0x1000… -> 1.
     let hash_p0 = 0x0000_0000_0000_0001u64;
@@ -1372,7 +1388,7 @@ fn build_spill_reload_records_match() {
         "grace_test",
     )
     .unwrap();
-    let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy)); // never spills via budget
+    let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy)); // never spills via budget
     let originals: Vec<Record> = (0..16i64)
         .map(|i| {
             record_for(
@@ -1726,7 +1742,7 @@ fn test_skew_detection_triggers_bnl() {
     // Now drive BNL directly and confirm it produces the expected
     // 5 driver × 200 build = 1000 join rows.
     let mut output: Vec<(Record, RecordOrder)> = Vec::new();
-    let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+    let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
     let mut stats = BnlStats::default();
     let mut body_eval: Option<ProgramEvaluator> = None;
     with_reload_context(&h, |rc| {
@@ -1783,7 +1799,7 @@ fn test_bnl_fallback_correct_output() {
 
     // Force a small chunk budget so the chunked path actually
     // splits the build into pieces (not a single chunk).
-    let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+    let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
     let mut output: Vec<(Record, RecordOrder)> = Vec::new();
     let mut stats = BnlStats::default();
     let mut body_eval: Option<ProgramEvaluator> = None;
@@ -1869,6 +1885,7 @@ fn test_bnl_bounded_memory() {
     let budget = MemoryArbitrator::with_policy(
         u64::MAX,
         target_soft / (u64::MAX as f64),
+        target_soft / (u64::MAX as f64) / 2.0,
         Box::new(NoOpPolicy),
     );
     let mut output: Vec<(Record, RecordOrder)> = Vec::new();
@@ -1915,6 +1932,7 @@ fn test_bnl_bounded_memory() {
     let big_budget = MemoryArbitrator::with_policy(
         u64::MAX,
         (big_soft as f64) / (u64::MAX as f64),
+        (big_soft as f64) / (u64::MAX as f64) / 2.0,
         Box::new(NoOpPolicy),
     );
     let sp2 = spill_for_bnl(
@@ -2003,7 +2021,7 @@ fn test_bnl_result_batching() {
         .collect();
     let sp = spill_for_bnl(&h, &builds, &probes, 0, 2);
 
-    let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, Box::new(NoOpPolicy));
+    let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
     let mut output: Vec<(Record, RecordOrder)> = Vec::new();
     let mut stats = BnlStats::default();
     let mut body_eval: Option<ProgramEvaluator> = None;
@@ -2068,7 +2086,7 @@ fn test_e310_hard_limit_abort() {
     let sp = spill_for_bnl(&h, &builds, &probes, 7, 2);
 
     // 1-byte hard limit → should_abort fires immediately.
-    let budget = MemoryArbitrator::with_policy(1, 1.0, Box::new(NoOpPolicy));
+    let budget = MemoryArbitrator::with_policy(1, 1.0, 0.70, Box::new(NoOpPolicy));
     let mut output: Vec<(Record, RecordOrder)> = Vec::new();
     let mut stats = BnlStats::default();
     let mut body_eval: Option<ProgramEvaluator> = None;
