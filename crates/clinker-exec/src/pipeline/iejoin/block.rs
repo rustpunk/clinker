@@ -282,16 +282,25 @@ struct DrainCtx<'a> {
     spill_dir: &'a Path,
     spill_compress: bool,
     block_target: usize,
+    /// Sort-buffer spill threshold. A tiny value forces the drain-spill →
+    /// k-way-merge path even under a budget above process RSS, so a test can
+    /// exercise it while the run still completes.
+    sort_threshold: usize,
 }
 
 /// Test-only overrides for the block-band path. Not user-facing config: the
-/// production dispatch always constructs the default and derives the block
-/// target from the arbitrator.
+/// production dispatch always constructs the default and derives both
+/// thresholds from the arbitrator soft limit.
 #[derive(Default)]
 pub(super) struct BlockBandOptions {
     /// Forces the per-block byte target, so a proptest can drive the
     /// multi-block path on tiny inputs. `None` derives it from the soft limit.
     pub(super) block_target_override: Option<usize>,
+    /// Forces the sort-buffer spill threshold, so a test can drive the
+    /// drain-spill → k-way-merge → block-reload path under a budget above RSS
+    /// (which the pre-output gate needs to complete). `None` derives it from
+    /// the soft limit.
+    pub(super) sort_spill_override: Option<usize>,
 }
 
 /// Inputs to [`execute_block_band`]. Grouped into a struct so the entry point
@@ -357,6 +366,9 @@ pub(super) fn execute_block_band(
     let block_target = options
         .block_target_override
         .unwrap_or_else(|| block_target_bytes(budget));
+    let sort_threshold = options
+        .sort_spill_override
+        .unwrap_or_else(|| sort_spill_threshold_bytes(budget));
     let drain_ctx = DrainCtx {
         name,
         budget,
@@ -364,6 +376,7 @@ pub(super) fn execute_block_band(
         spill_dir,
         spill_compress,
         block_target,
+        sort_threshold,
     };
 
     // Phase 1 + 2: drain each matched side into a payload-ordered sort buffer
@@ -527,7 +540,7 @@ fn drain_driver_side(
     };
     let schema = Arc::clone(first.schema());
     let mut buf: SortBuffer<(i64, i64, RecordOrder)> = SortBuffer::new_payload_ordered(
-        sort_spill_threshold_bytes(ctx.budget),
+        ctx.sort_threshold,
         Some(ctx.spill_dir.to_path_buf()),
         ctx.spill_compress,
         Arc::clone(&schema),
@@ -558,7 +571,7 @@ fn drain_build_side(
     };
     let schema = Arc::clone(first.schema());
     let mut buf: SortBuffer<(i64, i64)> = SortBuffer::new_payload_ordered(
-        sort_spill_threshold_bytes(ctx.budget),
+        ctx.sort_threshold,
         Some(ctx.spill_dir.to_path_buf()),
         ctx.spill_compress,
         Arc::clone(&schema),
@@ -928,6 +941,10 @@ mod tests {
         block_target: usize,
         hard_limit: u64,
         max_spill_bytes: Option<u64>,
+        /// Test-only sort-buffer spill threshold override. `None` derives it
+        /// from the budget (16 KiB floor); a tiny value forces the drain-spill
+        /// → merge path under a roomy budget.
+        sort_spill: Option<usize>,
     }
 
     /// Drive the block-band path over synthetic inputs, returning the emitted
@@ -1012,6 +1029,7 @@ mod tests {
             strategy: ErrorStrategy::FailFast,
             options: BlockBandOptions {
                 block_target_override: Some(cfg.block_target),
+                sort_spill_override: cfg.sort_spill,
             },
         })?;
         assert!(
@@ -1209,6 +1227,7 @@ mod tests {
             block_target: 1,
             hard_limit: 1 << 30,
             max_spill_bytes: None,
+            sort_spill: None,
         };
         let records = run_block(driver, build, &cfg).expect("block-band run");
         let actual = all_pairs(&records);
@@ -1295,6 +1314,7 @@ mod tests {
                     block_target: 1 << 20,
                     hard_limit: 1 << 30,
                     max_spill_bytes: None,
+                    sort_spill: None,
                 };
                 let single = all_pairs(&run_block(&driver, &build, &resident).unwrap());
                 resident.block_target = 1;
@@ -1331,6 +1351,7 @@ mod tests {
             block_target: 256,
             hard_limit: 32 * 1024,
             max_spill_bytes: None,
+            sort_spill: None,
         };
         let budget = arbitrator(cfg.hard_limit);
         let records = run_block_on(&driver, &build, &cfg, &budget).expect("drain-spill run");
@@ -1341,6 +1362,56 @@ mod tests {
         assert!(
             budget.cumulative_spill_bytes() > 0,
             "the 400-row sides and per-block writes must have spilled to disk"
+        );
+    }
+
+    /// Force the sort buffer itself to spill (tiny `sort_spill` override) under
+    /// a budget above process RSS, so the full `SortBuffer spill → k-way merge
+    /// → slice → per-block spill → reload → kernel → emit` path runs with
+    /// SURVIVING pairs and the emitted result matches the oracle. The tiny sort
+    /// threshold decouples spilling from the budget, so the pre-output gate is
+    /// never reached.
+    #[test]
+    fn sort_buffer_spill_merge_reload_and_emit_matches_oracle() {
+        // 300 drivers over 30 overlapping bands: each driver falls in one band,
+        // so the output (~300 rows) stays under the 10K poll while the sides are
+        // large enough that a 256-byte sort threshold forces multiple runs.
+        let span = 30_000i64;
+        let n_bands = 30i64;
+        let step = span / n_bands;
+        let build: Side = (0..n_bands)
+            .map(|b| (Some((b * step, b * step + step)), b))
+            .collect();
+        let driver: Side = (0..300i64)
+            .map(|i| {
+                let income = (i.wrapping_mul(101)).rem_euclid(span);
+                (Some((income, income)), i)
+            })
+            .collect();
+        // driver.income >= band.lo AND driver.income < band.hi → axis-1 Ge (lo),
+        // axis-2 Lt (hi); build tuple is (lo, hi).
+        let cfg = RunCfg {
+            op1: RangeOp::Ge,
+            op2: Some(RangeOp::Lt),
+            match_mode: MatchMode::All,
+            on_miss: OnMiss::Skip,
+            block_target: 256,
+            hard_limit: 1 << 30,
+            max_spill_bytes: None,
+            sort_spill: Some(256),
+        };
+        let budget = arbitrator(cfg.hard_limit);
+        let records = run_block_on(&driver, &build, &cfg, &budget).expect("sort-spill run");
+        let actual = all_pairs(&records);
+        let expected = oracle_pairs(&driver, &build, TOp::Ge, Some(TOp::Lt));
+        assert_eq!(
+            actual, expected,
+            "sort-buffer spill → merge → reload → emit diverged from the oracle"
+        );
+        assert!(!expected.is_empty(), "the fixture must produce matches");
+        assert!(
+            budget.cumulative_spill_bytes() > 0,
+            "the tiny sort threshold must have spilled sort runs and blocks"
         );
     }
 
@@ -1370,6 +1441,7 @@ mod tests {
                 block_target: 1,
                 hard_limit: 1 << 30,
                 max_spill_bytes: None,
+                sort_spill: None,
             };
             let actual = all_pairs(&run_block(&driver, &build, &cfg).unwrap());
             let expected = oracle_pairs(&driver, &build, op, None);
@@ -1402,6 +1474,7 @@ mod tests {
             block_target: 1,
             hard_limit: 1 << 30,
             max_spill_bytes: None,
+            sort_spill: None,
         };
         let actual = all_pairs(&run_block(driver, build, &cfg).unwrap());
         let expected = oracle_pairs(driver, build, op, None);
@@ -1457,6 +1530,7 @@ mod tests {
             block_target: target,
             hard_limit: 1 << 30,
             max_spill_bytes: None,
+            sort_spill: None,
         };
         run_block(driver, build, &cfg).expect("mode run")
     }
@@ -1611,6 +1685,7 @@ mod tests {
                 block_target: target,
                 hard_limit: 1 << 30,
                 max_spill_bytes: None,
+                sort_spill: None,
             };
             let err = run_block(&miss_driver, &build, &cfg).unwrap_err();
             assert!(
@@ -1633,6 +1708,7 @@ mod tests {
                     block_target: 1 << 20,
                     hard_limit: 1 << 30,
                     max_spill_bytes: None,
+                    sort_spill: None,
                 },
             )
             .unwrap(),
@@ -1649,6 +1725,7 @@ mod tests {
                     block_target: 1,
                     hard_limit: 1 << 30,
                     max_spill_bytes: None,
+                    sort_spill: None,
                 },
             )
             .unwrap(),
@@ -1675,6 +1752,7 @@ mod tests {
             // target both bind; the cap forbids any spilled byte.
             hard_limit: 32 * 1024,
             max_spill_bytes: Some(1),
+            sort_spill: None,
         };
         let err = run_block(&driver, &build, &cfg).expect_err("tiny spill cap must abort");
         assert!(

@@ -453,12 +453,14 @@ pub(crate) struct IEJoinExec<'a> {
     pub ctx: &'a EvalContext<'a>,
     pub budget: &'a MemoryArbitrator,
     /// Shared handle for the IEJoin's registered `MemoryConsumer` wrapper.
-    /// The kernel mirrors its estimated pre-output working-set bytes into
-    /// this handle at partition-build completion and per equality group, so
-    /// the arbitrator's pull-mode `current_usage` reads the live footprint
-    /// while the join runs. IEJoin has no spill path, so the handle's
-    /// spill / pause flags are never consulted — it carries the byte
-    /// estimate only.
+    /// Both dispatch shapes mirror their live working-set bytes into this
+    /// handle (the block-band path its drain buffers and resident blocks; the
+    /// equi+range path its partition state and per-group sort arrays), so the
+    /// arbitrator's pull-mode `current_usage` reads the footprint while the
+    /// join runs. Neither shape reads the handle's spill / pause flags — the
+    /// block-band path spills on its own byte threshold and the equi+range
+    /// path holds its inputs resident — so the handle carries the byte
+    /// estimate for attribution and the `should_abort_local` gate only.
     pub consumer: &'a Arc<ConsumerHandle>,
     /// Pipeline-scoped spill directory borrowed from
     /// `ExecutorContext::spill_root_path`. The pure-range (`partition_bits:
@@ -1564,10 +1566,13 @@ fn iejoin_numeric_state_bytes(n_left: usize, n_right: usize) -> usize {
     sort_arrays.saturating_add(perm).saturating_add(bit)
 }
 
-/// Build the typed pre-output budget-abort error. IEJoin has no spill
-/// path, so an over-budget pre-output working set surfaces this
-/// `MemoryBudgetExceeded` with `BudgetCategory::Arena` — the same shape the
-/// output-buffer poll and every other budget-checked operator surface use.
+/// Build the typed pre-output budget-abort error, shared by both dispatch
+/// shapes. On the equi+range path it fires when the resident partition and
+/// per-group sort arrays exceed the budget; on the block-band path it is the
+/// genuine last resort — a single loaded block-pair plus kernel aux that still
+/// cannot fit after spilling. Either way it surfaces `MemoryBudgetExceeded`
+/// with `BudgetCategory::Arena`, the same shape the output-buffer poll and
+/// every other budget-checked operator surface use.
 fn pre_output_budget_error(name: &str, used: u64, limit: u64) -> PipelineError {
     PipelineError::MemoryBudgetExceeded {
         node: name.to_string(),
