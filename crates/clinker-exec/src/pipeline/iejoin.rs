@@ -30,26 +30,36 @@
 //! for NULL comparisons, and the pre-filter avoids the entire DuckDB
 //! `#10122` ValidityMask corruption class.
 //!
-//! **Memory model:** the IEJoin scan materializes both partition sides,
-//! the L1/L2 vectors (`signed_idx, op1_key, op2_key` triples), the
-//! permutation P, and the bit array. IEJoin has NO spill path, so this
-//! pre-output working set is what the budget has to bound. Its byte
-//! footprint is estimated from the routed index / range-key / sort-array
-//! counts and gated through [`MemoryArbitrator::should_abort_local`] at
-//! partition-build completion and again per equality group before the
-//! range walk — an RSS-independent check that aborts a doomed join before
-//! the sort arrays are even built, on hosts where `rss_bytes()` is
-//! unavailable. The estimate is also mirrored into a registered
-//! [`ConsumerHandle`] so the arbitrator's pull-mode `current_usage` sees
-//! the live footprint. The accumulated output buffer is polled separately
-//! every 10K emitted matched pairs. Every abort returns a typed
-//! `PipelineError::MemoryBudgetExceeded` carrying the combine node's name
-//! and `BudgetCategory::Arena` — the same shape every other budget-checked
-//! operator surface uses. Because there is no spill path, the arbitrator's
-//! spill / pause signals are never engaged here; the only response to
-//! pressure is a clean abort.
+//! **Memory model.** Two dispatch shapes with different input-axis bounds:
+//!
+//! - **Pure-range (`partition_bits: None`)** runs the bounded block-band path
+//!   in the [`block`] child module. Each side is external-sorted on the
+//!   primary inequality key (spilling its overflow to disk), the merged stream
+//!   is sliced into contiguous min/max-tagged blocks, non-overlapping
+//!   block-pairs are pruned, and the numeric kernel runs per surviving pair. At
+//!   most one driver block and one matching build block plus that pair's L1/L2
+//!   sort arrays are resident at once, so the INPUT axis is bounded by the
+//!   budget rather than the input size.
+//! - **Equi+range (`partition_bits: Some(bits)`)** hash-partitions on the
+//!   equality keys and holds each partition's records, range-key arrays, and
+//!   the per-group L1/L2 / permutation / bit-array state resident. This side
+//!   has no spill path yet (a follow-up bounds it); its pre-output working set
+//!   is estimated and gated through [`MemoryArbitrator::should_abort_local`] at
+//!   partition-build completion and again per equality group before the range
+//!   walk — an RSS-independent check that aborts a doomed join before the sort
+//!   arrays are built, on hosts where `rss_bytes()` is unavailable.
+//!
+//! Both shapes mirror their live footprint into a registered
+//! [`ConsumerHandle`] so the arbitrator's pull-mode `current_usage` sees it,
+//! and both poll the accumulated OUTPUT buffer every 10K emitted matched pairs.
+//! The output axis (`output_records`, O(N·M) worst case) still accumulates in
+//! memory — a later phase streams it. The pre-output abort returns a typed
+//! `PipelineError::MemoryBudgetExceeded` carrying the combine node's name and
+//! `BudgetCategory::Arena`; on the block-band path it is the genuine last
+//! resort — a single block-pair plus kernel aux that still cannot fit.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use ahash::RandomState;
@@ -71,6 +81,8 @@ use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::{DecomposedPredicate, RangeOp};
+
+mod block;
 
 /// Cap on matches collected per driver under [`MatchMode::Collect`].
 /// Mirrors `pipeline::combine::COLLECT_PER_GROUP_CAP` so both code paths
@@ -448,6 +460,17 @@ pub(crate) struct IEJoinExec<'a> {
     /// spill / pause flags are never consulted — it carries the byte
     /// estimate only.
     pub consumer: &'a Arc<ConsumerHandle>,
+    /// Pipeline-scoped spill directory borrowed from
+    /// `ExecutorContext::spill_root_path`. The pure-range (`partition_bits:
+    /// None`) block-band path external-sorts each side and writes its
+    /// min/max-tagged blocks here; the equi+range (`Some`) path holds its
+    /// inputs resident and never touches it.
+    pub spill_dir: &'a Path,
+    /// Whether the block-band path's spill runs and block files are
+    /// LZ4-compressed. Resolved by the dispatcher from the workspace
+    /// `[storage.spill] compress` knob against the combine's schema width and
+    /// batch size, so the on-disk format matches what `--explain` reports.
+    pub spill_compress: bool,
     /// Error strategy governing output-stage eval failures. Under
     /// `FailFast` a residual / body eval error propagates immediately;
     /// under `Continue` / `BestEffort` the failing row is deferred to the
@@ -474,6 +497,8 @@ pub(crate) fn execute_combine_iejoin(
         ctx,
         budget,
         consumer,
+        spill_dir,
+        spill_compress,
         strategy,
     } = args;
     // Recoverable output-stage eval failures deferred to the dispatcher.
@@ -597,7 +622,7 @@ pub(crate) fn execute_combine_iejoin(
     // residual). The residual lives over the merged row, so it needs
     // the full CombineResolver.
     let n_ranges = range_ops.len();
-    let mut residual_eval: Option<ProgramEvaluator> = if n_ranges > 2 {
+    let residual_eval: Option<ProgramEvaluator> = if n_ranges > 2 {
         decomposed
             .residual
             .as_ref()
@@ -605,25 +630,19 @@ pub(crate) fn execute_combine_iejoin(
     } else {
         None
     };
-    let mut body_eval = body_program.map(|p| ProgramEvaluator::new(Arc::clone(p), false));
+    let body_eval = body_program.map(|p| ProgramEvaluator::new(Arc::clone(p), false));
 
-    // Pre-scan: extract eq keys + range keys for every record. Records
-    // with NULL in any eq key (3VL) or any range key are routed to the
-    // unmatched bucket — the IEJoin scan never sees them. Pure-range
-    // case: no eq key, n_buckets=1.
+    // Pre-scan: extract eq keys + range keys for every record in parallel.
+    // A record with a NULL in any eq key (3VL) or any range key can never
+    // match and is handled off the range walk. Pure-range case
+    // (`partition_bits: None`): no eq key, n_buckets=1, and the block-band
+    // path drains the scan outcomes into external-sort buffers instead of
+    // hash buckets.
     let n_buckets: usize = match partition_bits {
         Some(bits) => 1usize << bits.min(16),
         None => 1,
     };
-
     let hash_state = RandomState::new();
-    let mut driver_partitions: Vec<Vec<usize>> = vec![Vec::new(); n_buckets];
-    let mut build_partitions: Vec<Vec<usize>> = vec![Vec::new(); n_buckets];
-    let mut driver_eq_keys: Vec<Option<Vec<Value>>> = vec![None; driver_records.len()];
-    let mut build_eq_keys: Vec<Option<Vec<Value>>> = vec![None; build_records.len()];
-    let mut driver_range_keys: Vec<Option<(i64, i64)>> = vec![None; driver_records.len()];
-    let mut build_range_keys: Vec<Option<(i64, i64)>> = vec![None; build_records.len()];
-    let mut unmatched_drivers: Vec<usize> = Vec::new();
 
     // Per-record key extraction is the expensive part of the pre-scan:
     // every record runs the compiled CXL eq-key and range-key closures.
@@ -654,21 +673,6 @@ pub(crate) fn execute_combine_iejoin(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    for (i, scan) in driver_scans.into_iter().enumerate() {
-        match scan {
-            RecordScan::Unmatched => unmatched_drivers.push(i),
-            RecordScan::Matched {
-                eq_keys,
-                range_key,
-                bucket,
-            } => {
-                driver_partitions[bucket].push(i);
-                driver_eq_keys[i] = Some(eq_keys);
-                driver_range_keys[i] = Some(range_key);
-            }
-        }
-    }
-
     let build_scans: Vec<RecordScan> = build_records
         .par_iter()
         .map(|rec| {
@@ -684,6 +688,85 @@ pub(crate) fn execute_combine_iejoin(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    let op1 = range_ops[0];
+    let op2 = if n_ranges >= 2 {
+        Some(range_ops[1])
+    } else {
+        None
+    };
+
+    // Pure-range predicates (`partition_bits: None`) run the bounded
+    // block-band path: external-sort each side on the primary inequality
+    // key, slice the merged stream into min/max-tagged blocks, prune the
+    // non-overlapping block-pairs, and run the kernel per surviving pair.
+    // The equi+range (`Some(bits)`) path below hash-partitions and holds its
+    // inputs resident. Both share `emit_pairs`, so they agree row-for-row.
+    if partition_bits.is_none() {
+        // `IEJoin(None)` is selected only for pure-range predicates, which
+        // carry no equality conjuncts. A non-empty eq extractor here means
+        // the planner routed an equi+range combine to the pure-range
+        // strategy — a planner-shape violation the block path cannot honor.
+        if !driver_extractor.is_empty() {
+            return Err(PipelineError::Internal {
+                op: "combine",
+                node: name.to_string(),
+                detail: "iejoin block-band path invoked with equality conjuncts; \
+                         the pure-range strategy requires none"
+                    .to_string(),
+            });
+        }
+        return block::execute_block_band(block::BlockBandExec {
+            name,
+            build_qualifier,
+            driver_records,
+            driver_scans,
+            build_records,
+            build_scans,
+            op1,
+            op2,
+            residual_eval,
+            body_eval,
+            resolver_mapping,
+            output_schema,
+            match_mode,
+            on_miss,
+            propagate_ck,
+            ctx,
+            budget,
+            consumer,
+            spill_dir,
+            spill_compress,
+            strategy,
+            options: block::BlockBandOptions::default(),
+        });
+    }
+
+    // ── Equi+range path (`partition_bits: Some(bits)`) ───────────────────
+    let mut driver_partitions: Vec<Vec<usize>> = vec![Vec::new(); n_buckets];
+    let mut build_partitions: Vec<Vec<usize>> = vec![Vec::new(); n_buckets];
+    let mut driver_eq_keys: Vec<Option<Vec<Value>>> = vec![None; driver_records.len()];
+    let mut build_eq_keys: Vec<Option<Vec<Value>>> = vec![None; build_records.len()];
+    let mut driver_range_keys: Vec<Option<(i64, i64)>> = vec![None; driver_records.len()];
+    let mut build_range_keys: Vec<Option<(i64, i64)>> = vec![None; build_records.len()];
+    let mut unmatched_drivers: Vec<usize> = Vec::new();
+
+    // Replay the parallel scan outcomes in strict ascending index order, so
+    // the partition vectors and `unmatched_drivers` end up byte-identical to
+    // a sequential scan.
+    for (i, scan) in driver_scans.into_iter().enumerate() {
+        match scan {
+            RecordScan::Unmatched => unmatched_drivers.push(i),
+            RecordScan::Matched {
+                eq_keys,
+                range_key,
+                bucket,
+            } => {
+                driver_partitions[bucket].push(i);
+                driver_eq_keys[i] = Some(eq_keys);
+                driver_range_keys[i] = Some(range_key);
+            }
+        }
+    }
     for (j, scan) in build_scans.into_iter().enumerate() {
         // NULL build eq keys (3VL) and NULL / non-integer range keys can
         // never match, so the build side drops them — there is no
@@ -704,11 +787,11 @@ pub(crate) fn execute_combine_iejoin(
     // partition index vectors and the per-record range-key slots are the
     // state now held on the heap before any range walk starts. Estimate
     // their bytes, mirror them into the registered consumer handle, and
-    // abort before the first group if they already exceed budget. IEJoin
-    // has no spill path, so an over-budget pre-scan can only be resolved by
-    // a clean abort — `should_abort_local` short-circuits on the local
-    // estimate, so the gate still fires on a host where `rss_bytes()`
-    // returns `None`.
+    // abort before the first group if they already exceed budget. The
+    // equi+range path holds its inputs resident with no spill, so an
+    // over-budget pre-scan can only be resolved by a clean abort —
+    // `should_abort_local` short-circuits on the local estimate, so the gate
+    // still fires on a host where `rss_bytes()` returns `None`.
     let routed_index_count = driver_partitions.iter().map(Vec::len).sum::<usize>()
         + build_partitions.iter().map(Vec::len).sum::<usize>();
     let partition_state_bytes = routed_index_count
@@ -728,26 +811,28 @@ pub(crate) fn execute_combine_iejoin(
         ));
     }
 
-    let mut matched_driver: Vec<bool> = vec![false; driver_records.len()];
     let mut output_records: Vec<(Record, RecordOrder)> = Vec::new();
     let mut emitted_since_check: usize = 0;
 
-    let mut collect_accum: HashMap<usize, Vec<Value>> = HashMap::new();
-    let mut collect_truncated: HashMap<usize, ()> = HashMap::new();
-    // First matched build record per driver index, captured so the
-    // collect-mode flush can propagate build-side `$ck.<field>`
-    // values onto the synthesized output row. Single-valued slot;
-    // every per-build payload still rides inside the array via
-    // `Value::Map`, so no lineage is lost.
-    let mut first_collected_builds: HashMap<usize, Record> = HashMap::new();
-
-    let op1 = range_ops[0];
-    let op2 = if n_ranges >= 2 {
-        Some(range_ops[1])
-    } else {
-        None
+    // Match state is global on this path: each driver lands in exactly one
+    // bucket and, within it, one eq-key group, so a per-driver flag /
+    // accumulator keyed by global index is correct across the whole join.
+    // Shared with the emit loop and the collect / on_miss finalizers below.
+    let mut state = MatchState::new(driver_records.len());
+    let emit_cfg = EmitConfig {
+        name,
+        ctx,
+        resolver_mapping,
+        output_schema,
+        match_mode,
+        propagate_ck,
+        budget,
+        strategy,
     };
-    let pure_range = driver_extractor.is_empty();
+    let mut evals = Evaluators {
+        residual: residual_eval,
+        body: body_eval,
+    };
 
     for bucket in 0..n_buckets {
         let drivers = &driver_partitions[bucket];
@@ -757,15 +842,12 @@ pub(crate) fn execute_combine_iejoin(
         }
 
         // Group records by their full equality-key tuple. With
-        // partition_bits=8 hash collisions can land distinct eq tuples
-        // in the same bucket; the eq verification per group filters
-        // them. Pure-range case: a single group containing every record
-        // in this (sole) bucket.
-        let groups: Vec<(Vec<usize>, Vec<usize>)> = if pure_range {
-            vec![(drivers.clone(), builds.clone())]
-        } else {
-            group_by_eq_keys(drivers, builds, &driver_eq_keys, &build_eq_keys)
-        };
+        // partition_bits=8 hash collisions can land distinct eq tuples in the
+        // same bucket; the eq verification per group filters them. This path
+        // is reached only for equi+range predicates (pure-range runs the
+        // block-band path), so every record carries an eq key.
+        let groups: Vec<(Vec<usize>, Vec<usize>)> =
+            group_by_eq_keys(drivers, builds, &driver_eq_keys, &build_eq_keys);
 
         for (group_drivers, group_builds) in groups {
             if group_drivers.is_empty() || group_builds.is_empty() {
@@ -832,221 +914,33 @@ pub(crate) fn execute_combine_iejoin(
                 ));
             }
 
-            for (di_local, bi_local) in pairs {
-                let driver_idx = group_drivers[di_local];
-                let build_idx = group_builds[bi_local];
-                let (driver_record, driver_order) =
-                    (&driver_records[driver_idx].0, driver_records[driver_idx].1);
-                let build_record = &build_records[build_idx];
-
-                // 3+ range conjuncts: residual filter applies. The
-                // residual covers the full original predicate (every
-                // range was folded in), but we've already verified the
-                // first two ranges via the kernel; the residual run
-                // here re-checks them too. That's a small cost in
-                // exchange for not having to materialize a separate
-                // "tail-only" residual at planning time.
-                if let Some(ref mut residual) = residual_eval {
-                    let resolver =
-                        CombineResolver::new(resolver_mapping, driver_record, Some(build_record));
-                    match residual.eval_record::<NullStorage>(ctx, &resolver, None) {
-                        Ok(EvalResult::Skip(_)) => continue,
-                        Ok(EvalResult::Emit { .. }) => {}
-                        Ok(EvalResult::EmitMany { .. }) => {
-                            return Err(PipelineError::Internal {
-                                op: "iejoin residual",
-                                node: name.to_string(),
-                                detail: "emit_each fan-out is not supported in a combine residual filter".into(),
-                            });
-                        }
-                        Err(e) => {
-                            if strategy == clinker_plan::config::ErrorStrategy::FailFast {
-                                return Err(PipelineError::from(e));
-                            }
-                            output_eval_failures.push(CombineOutputEvalFailure {
-                                probe_record: driver_record.clone(),
-                                row: driver_order,
-                                matched_build: Some(build_record.clone()),
-                                error: e,
-                            });
-                            continue;
-                        }
-                    }
-                }
-
-                if matches!(match_mode, MatchMode::First) && matched_driver[driver_idx] {
-                    continue;
-                }
-
-                match match_mode {
-                    MatchMode::Collect => {
-                        if collect_truncated.contains_key(&driver_idx) {
-                            continue;
-                        }
-                        let arr = collect_accum.entry(driver_idx).or_default();
-                        if arr.len() >= COLLECT_PER_GROUP_CAP {
-                            collect_truncated.insert(driver_idx, ());
-                            continue;
-                        }
-                        first_collected_builds
-                            .entry(driver_idx)
-                            .or_insert_with(|| build_record.clone());
-                        // Build-side records contribute only their
-                        // user-declared field values to the collect
-                        // array. `iter_user_fields` filters every
-                        // engine-stamped column — both `$ck.*`
-                        // (correlation lineage; not meaningful nested
-                        // inside a collect-array entry) and `$widened`
-                        // (the auto_widen sidecar absorber; build-side
-                        // sidecars drop at the join boundary by
-                        // design, mirroring `propagate_ck: Driver`).
-                        // Without this filter, a build record's
-                        // `$widened` `Value::Map` payload nests inside
-                        // the collect-mode `Value::Map` and survives
-                        // projection (it's a regular column slot, not
-                        // engine-stamped) all the way to the writer,
-                        // where the nested Map triggers
-                        // `FormatError::UnserializableMapValue`.
-                        let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
-                        for (fname, val) in build_record.iter_user_fields() {
-                            m.insert(fname.into(), val.clone());
-                        }
-                        arr.push(Value::Map(Box::new(m)));
-                        matched_driver[driver_idx] = true;
-                    }
-                    MatchMode::First | MatchMode::All => {
-                        if let Some(evaluator) = body_eval.as_mut() {
-                            let resolver = CombineResolver::new(
-                                resolver_mapping,
-                                driver_record,
-                                Some(build_record),
-                            );
-                            match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                                Ok(EvalResult::Emit {
-                                    fields,
-                                    record_vars,
-                                    ..
-                                }) => {
-                                    let mut rec = match output_schema {
-                                        Some(s) => widen_record_to_schema(driver_record, s),
-                                        None => driver_record.clone(),
-                                    };
-                                    for (n, v) in fields {
-                                        rec.set(&n, v);
-                                    }
-                                    for (k, v) in *record_vars {
-                                        let _ = rec.set_record_var(&k, v);
-                                    }
-                                    crate::executor::copy_build_ck_columns(
-                                        &mut rec,
-                                        build_record,
-                                        propagate_ck,
-                                    );
-                                    output_records.push((rec, driver_order));
-                                    matched_driver[driver_idx] = true;
-                                    emitted_since_check += 1;
-                                    if emitted_since_check >= MEMORY_CHECK_INTERVAL {
-                                        let used =
-                                            crate::pipeline::combine::combine_output_buffer_bytes(
-                                                &output_records,
-                                            ) as u64;
-                                        if budget.should_abort_local(used) {
-                                            return Err(PipelineError::MemoryBudgetExceeded {
-                                                node: name.to_string(),
-                                                used,
-                                                limit: budget.hard_limit(),
-                                                source: BudgetCategory::Arena,
-                                                detail: Some(
-                                                    "iejoin output buffer exceeded budget"
-                                                        .to_string(),
-                                                ),
-                                            });
-                                        }
-                                        emitted_since_check = 0;
-                                    }
-                                }
-                                Ok(EvalResult::Skip(_)) => {}
-                                Ok(EvalResult::EmitMany { .. }) => {
-                                    return Err(PipelineError::Internal {
-                                        op: "iejoin body",
-                                        node: name.to_string(),
-                                        detail:
-                                            "emit_each fan-out is not supported in a combine body"
-                                                .into(),
-                                    });
-                                }
-                                Err(e) => {
-                                    if strategy == clinker_plan::config::ErrorStrategy::FailFast {
-                                        return Err(PipelineError::from(e));
-                                    }
-                                    output_eval_failures.push(CombineOutputEvalFailure {
-                                        probe_record: driver_record.clone(),
-                                        row: driver_order,
-                                        matched_build: Some(build_record.clone()),
-                                        error: e,
-                                    });
-                                    continue;
-                                }
-                            }
-                        } else {
-                            // Body-less synthetic intermediate step
-                            // from N-ary decomposition: emit one
-                            // record per matched pair by concatenating
-                            // driver values then build values onto the
-                            // step's encoded `Arc<Schema>`. Mirrors
-                            // the HashBuildProbe arm's passthrough
-                            // path; downstream chain step's resolver
-                            // mapping reads the encoded columns at
-                            // their declared positions.
-                            let target_schema =
-                                output_schema.ok_or_else(|| PipelineError::Internal {
-                                    op: "combine",
-                                    node: name.to_string(),
-                                    detail: "synthetic combine step has no output schema; \
-                                             decomposition pass did not run"
-                                        .to_string(),
-                                })?;
-                            let mut values: Vec<Value> =
-                                Vec::with_capacity(target_schema.column_count());
-                            values.extend(driver_record.values().iter().cloned());
-                            values.extend(build_record.values().iter().cloned());
-                            if values.len() != target_schema.column_count() {
-                                return Err(PipelineError::Internal {
-                                    op: "combine",
-                                    node: name.to_string(),
-                                    detail: format!(
-                                        "synthetic combine step produced {} concatenated \
-                                         values; encoded schema has {} columns",
-                                        values.len(),
-                                        target_schema.column_count()
-                                    ),
-                                });
-                            }
-                            let rec = Record::new(Arc::clone(target_schema), values);
-                            output_records.push((rec, driver_order));
-                            matched_driver[driver_idx] = true;
-                            emitted_since_check += 1;
-                            if emitted_since_check >= MEMORY_CHECK_INTERVAL {
-                                let used = crate::pipeline::combine::combine_output_buffer_bytes(
-                                    &output_records,
-                                ) as u64;
-                                if budget.should_abort_local(used) {
-                                    return Err(PipelineError::MemoryBudgetExceeded {
-                                        node: name.to_string(),
-                                        used,
-                                        limit: budget.hard_limit(),
-                                        source: BudgetCategory::Arena,
-                                        detail: Some(
-                                            "iejoin output buffer exceeded budget".to_string(),
-                                        ),
-                                    });
-                                }
-                                emitted_since_check = 0;
-                            }
-                        }
-                    }
-                }
-            }
+            // The kernel returns local pair indices into the group's driver
+            // and build slices; present them to the shared emit loop keyed by
+            // global driver index so match state spans the whole join.
+            let driver_slice: Vec<DriverRef<'_>> = group_drivers
+                .iter()
+                .map(|&gi| DriverRef {
+                    record: &driver_records[gi].0,
+                    order: driver_records[gi].1,
+                    key: gi,
+                })
+                .collect();
+            let build_slice: Vec<&Record> =
+                group_builds.iter().map(|&gj| &build_records[gj]).collect();
+            let mut sink = EmitSink {
+                output_records: &mut output_records,
+                emitted_since_check: &mut emitted_since_check,
+                output_eval_failures: &mut output_eval_failures,
+            };
+            emit_pairs(
+                &emit_cfg,
+                &mut evals,
+                &pairs,
+                &driver_slice,
+                &build_slice,
+                &mut state,
+                &mut sink,
+            )?;
         }
     }
 
@@ -1055,22 +949,21 @@ pub(crate) fn execute_combine_iejoin(
     // HashBuildProbe collect-path shape).
     if matches!(match_mode, MatchMode::Collect) {
         for (i, (driver_record, driver_order)) in driver_records.iter().enumerate() {
-            let arr = collect_accum.remove(&i).unwrap_or_default();
-            if collect_truncated.contains_key(&i) {
-                eprintln!(
-                    "W: combine {name:?} match: collect truncated at \
-                     {COLLECT_PER_GROUP_CAP} matches for driver row {driver_order}"
-                );
-            }
-            let mut rec = match output_schema {
-                Some(s) => widen_record_to_schema(driver_record, s),
-                None => driver_record.clone(),
-            };
-            if let Some(first_build) = first_collected_builds.remove(&i) {
-                crate::executor::copy_build_ck_columns(&mut rec, &first_build, propagate_ck);
-            }
-            rec.set(build_qualifier, Value::Array(arr));
-            output_records.push((rec, *driver_order));
+            let arr = state.collect_accum.remove(&i).unwrap_or_default();
+            let truncated = state.collect_truncated.contains_key(&i);
+            let first_build = state.first_collected_builds.remove(&i);
+            flush_collect_row(
+                &emit_cfg,
+                driver_record,
+                *driver_order,
+                build_qualifier,
+                CollectFlush {
+                    arr,
+                    truncated,
+                    first_build,
+                },
+                &mut output_records,
+            );
         }
         // Collect mode never runs the body eval, so no recoverable
         // output-stage failure can accrue on this path.
@@ -1081,10 +974,10 @@ pub(crate) fn execute_combine_iejoin(
     }
 
     // First/All on_miss dispatch — every driver that saw zero matches
-    // (NULL-eq, NULL-range, and the unmatched pile from the IEJoin
-    // scan) gets the configured handling.
+    // (NULL-eq, NULL-range, and the unmatched pile from the range walk)
+    // gets the configured handling.
     let mut all_unmatched: Vec<usize> = unmatched_drivers;
-    for (i, hit) in matched_driver.iter().enumerate() {
+    for (i, hit) in state.matched.iter().enumerate() {
         if !*hit && !all_unmatched.contains(&i) {
             all_unmatched.push(i);
         }
@@ -1092,89 +985,422 @@ pub(crate) fn execute_combine_iejoin(
     all_unmatched.sort_unstable();
     all_unmatched.dedup();
 
+    let mut sink = EmitSink {
+        output_records: &mut output_records,
+        emitted_since_check: &mut emitted_since_check,
+        output_eval_failures: &mut output_eval_failures,
+    };
     for i in all_unmatched {
         let (driver_record, driver_order) = (&driver_records[i].0, driver_records[i].1);
-        match on_miss {
-            OnMiss::Skip => continue,
-            OnMiss::Error => {
-                return Err(PipelineError::CombineMissingMatch {
-                    combine: name.to_string(),
-                    driver_row: driver_order,
-                });
-            }
-            OnMiss::NullFields => {
-                let resolver = CombineResolver::new(resolver_mapping, driver_record, None);
-                let evaluator = body_eval.as_mut().ok_or_else(|| PipelineError::Internal {
-                    op: "combine",
-                    node: name.to_string(),
-                    detail: "combine body typed program missing for on_miss: null_fields"
-                        .to_string(),
-                })?;
-                match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
-                    Ok(EvalResult::Emit {
-                        fields,
-                        record_vars,
-                        ..
-                    }) => {
-                        let mut rec = match output_schema {
-                            Some(s) => widen_record_to_schema(driver_record, s),
-                            None => driver_record.clone(),
-                        };
-                        for (n, v) in fields {
-                            rec.set(&n, v);
-                        }
-                        for (k, v) in *record_vars {
-                            let _ = rec.set_record_var(&k, v);
-                        }
-                        output_records.push((rec, driver_order));
-                        emitted_since_check += 1;
-                        if emitted_since_check >= MEMORY_CHECK_INTERVAL {
-                            let used = crate::pipeline::combine::combine_output_buffer_bytes(
-                                &output_records,
-                            ) as u64;
-                            if budget.should_abort_local(used) {
-                                return Err(PipelineError::MemoryBudgetExceeded {
-                                    node: name.to_string(),
-                                    used,
-                                    limit: budget.hard_limit(),
-                                    source: BudgetCategory::Arena,
-                                    detail: Some(
-                                        "iejoin output buffer exceeded budget".to_string(),
-                                    ),
-                                });
-                            }
-                            emitted_since_check = 0;
-                        }
-                    }
-                    Ok(EvalResult::Skip(_)) => {}
-                    Ok(EvalResult::EmitMany { .. }) => {
-                        return Err(PipelineError::Internal {
-                            op: "iejoin on_miss body",
-                            node: name.to_string(),
-                            detail: "emit_each fan-out is not supported in a combine body".into(),
-                        });
-                    }
-                    Err(e) => {
-                        if strategy == clinker_plan::config::ErrorStrategy::FailFast {
-                            return Err(PipelineError::from(e));
-                        }
-                        output_eval_failures.push(CombineOutputEvalFailure {
-                            probe_record: driver_record.clone(),
-                            row: driver_order,
-                            matched_build: None,
-                            error: e,
-                        });
-                        continue;
-                    }
-                }
-            }
-        }
+        dispatch_on_miss(
+            &emit_cfg,
+            &mut evals,
+            driver_record,
+            driver_order,
+            on_miss,
+            &mut sink,
+        )?;
     }
 
     Ok(CombineKernelOutput {
         records: output_records,
         output_eval_failures,
     })
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Shared emit path (equi+range groups and pure-range blocks)
+// ──────────────────────────────────────────────────────────────────────────
+
+/// Immutable per-combine configuration threaded through the shared emit
+/// path. Both the equi+range group loop and the pure-range block scheduler
+/// build one and reuse it across every emit call, so the two strategies
+/// synthesize output rows identically. Private to this module and its
+/// `block` child.
+struct EmitConfig<'a> {
+    name: &'a str,
+    ctx: &'a EvalContext<'a>,
+    resolver_mapping: &'a CombineResolverMapping,
+    output_schema: Option<&'a Arc<Schema>>,
+    match_mode: MatchMode,
+    propagate_ck: &'a clinker_plan::config::pipeline_node::PropagateCkSpec,
+    budget: &'a MemoryArbitrator,
+    strategy: clinker_plan::config::ErrorStrategy,
+}
+
+/// The residual (3+ range conjuncts) and body evaluators. Both are stateful
+/// (`eval_record` takes `&mut self`), so they are owned here and borrowed
+/// mutably by the emit path.
+struct Evaluators {
+    residual: Option<ProgramEvaluator>,
+    body: Option<ProgramEvaluator>,
+}
+
+/// One driver row presented to [`emit_pairs`]: its record, its order tag,
+/// and the key under which its match state is tracked in [`MatchState`].
+///
+/// The equi+range path keys by global driver index (each driver lands in
+/// exactly one bucket-and-eq-group); the block path keys by the driver's
+/// local index within its driver block (each driver lands in exactly one
+/// block). Either way a driver's match state lives under one stable key.
+struct DriverRef<'a> {
+    record: &'a Record,
+    order: RecordOrder,
+    key: usize,
+}
+
+/// Per-driver match tracking shared by the pair-emit loop and the collect /
+/// on_miss finalizers, keyed by [`DriverRef::key`].
+struct MatchState {
+    /// `matched[key]` is set once a driver has emitted at least one match.
+    /// Drives the `First`-mode dedup and, for the equi+range path, the
+    /// end-of-join unmatched sweep.
+    matched: Vec<bool>,
+    collect_accum: HashMap<usize, Vec<Value>>,
+    collect_truncated: HashMap<usize, ()>,
+    first_collected_builds: HashMap<usize, Record>,
+}
+
+impl MatchState {
+    fn new(driver_count: usize) -> Self {
+        Self {
+            matched: vec![false; driver_count],
+            collect_accum: HashMap::new(),
+            collect_truncated: HashMap::new(),
+            first_collected_builds: HashMap::new(),
+        }
+    }
+}
+
+/// Mutable output sink for the shared emit path: the accumulating output
+/// buffer, the every-10K poll counter, and the deferred output-eval
+/// failures.
+struct EmitSink<'a> {
+    output_records: &'a mut Vec<(Record, RecordOrder)>,
+    emitted_since_check: &'a mut usize,
+    output_eval_failures: &'a mut Vec<CombineOutputEvalFailure>,
+}
+
+/// Inputs to [`flush_collect_row`] for one driver's collect-mode row.
+struct CollectFlush {
+    arr: Vec<Value>,
+    truncated: bool,
+    first_build: Option<Record>,
+}
+
+/// Emit every qualifying `(driver, build)` pair in `pairs` under the
+/// combine's match mode, applying the residual filter (3+ range conjuncts),
+/// the `First`-mode dedup, and the every-10K output-buffer poll. `pairs`
+/// carries local indices into `driver_slice` / `build_slice`; per-driver
+/// state is tracked in `state` under [`DriverRef::key`].
+///
+/// Shared verbatim by the equi+range group loop and the pure-range block
+/// scheduler so both agree row-for-row; the only difference is the keying
+/// scope of `state`. Streaming into `sink.output_records`; the output axis
+/// is bounded only by the every-10K poll (see [`poll_output_buffer`]).
+fn emit_pairs(
+    cfg: &EmitConfig<'_>,
+    evals: &mut Evaluators,
+    pairs: &[(usize, usize)],
+    driver_slice: &[DriverRef<'_>],
+    build_slice: &[&Record],
+    state: &mut MatchState,
+    sink: &mut EmitSink<'_>,
+) -> Result<(), PipelineError> {
+    for &(di_local, bi_local) in pairs {
+        let dref = &driver_slice[di_local];
+        let driver_record = dref.record;
+        let driver_order = dref.order;
+        let key = dref.key;
+        let build_record = build_slice[bi_local];
+
+        // 3+ range conjuncts: the residual re-checks the full predicate over
+        // the merged row (the kernel verified only the first two axes). See
+        // the module doc.
+        if let Some(residual) = evals.residual.as_mut() {
+            let resolver =
+                CombineResolver::new(cfg.resolver_mapping, driver_record, Some(build_record));
+            match residual.eval_record::<NullStorage>(cfg.ctx, &resolver, None) {
+                Ok(EvalResult::Skip(_)) => continue,
+                Ok(EvalResult::Emit { .. }) => {}
+                Ok(EvalResult::EmitMany { .. }) => {
+                    return Err(PipelineError::Internal {
+                        op: "iejoin residual",
+                        node: cfg.name.to_string(),
+                        detail: "emit_each fan-out is not supported in a combine residual filter"
+                            .into(),
+                    });
+                }
+                Err(e) => {
+                    if cfg.strategy == clinker_plan::config::ErrorStrategy::FailFast {
+                        return Err(PipelineError::from(e));
+                    }
+                    sink.output_eval_failures.push(CombineOutputEvalFailure {
+                        probe_record: driver_record.clone(),
+                        row: driver_order,
+                        matched_build: Some(build_record.clone()),
+                        error: e,
+                    });
+                    continue;
+                }
+            }
+        }
+
+        if matches!(cfg.match_mode, MatchMode::First) && state.matched[key] {
+            continue;
+        }
+
+        match cfg.match_mode {
+            MatchMode::Collect => {
+                if state.collect_truncated.contains_key(&key) {
+                    continue;
+                }
+                // Peek the current length without holding a borrow across the
+                // truncation insert below.
+                let cur_len = state.collect_accum.get(&key).map_or(0, Vec::len);
+                if cur_len >= COLLECT_PER_GROUP_CAP {
+                    state.collect_truncated.insert(key, ());
+                    continue;
+                }
+                state
+                    .first_collected_builds
+                    .entry(key)
+                    .or_insert_with(|| build_record.clone());
+                // Build-side records contribute only their user-declared
+                // field values: `iter_user_fields` filters every
+                // engine-stamped column (`$ck.*` correlation lineage and the
+                // `$widened` auto-widen sidecar) so neither nests inside a
+                // collect-array entry and trips the writer's
+                // `UnserializableMapValue` guard.
+                let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
+                for (fname, val) in build_record.iter_user_fields() {
+                    m.insert(fname.into(), val.clone());
+                }
+                state
+                    .collect_accum
+                    .entry(key)
+                    .or_default()
+                    .push(Value::Map(Box::new(m)));
+                state.matched[key] = true;
+            }
+            MatchMode::First | MatchMode::All => {
+                if let Some(evaluator) = evals.body.as_mut() {
+                    let resolver = CombineResolver::new(
+                        cfg.resolver_mapping,
+                        driver_record,
+                        Some(build_record),
+                    );
+                    match evaluator.eval_record::<NullStorage>(cfg.ctx, &resolver, None) {
+                        Ok(EvalResult::Emit {
+                            fields,
+                            record_vars,
+                            ..
+                        }) => {
+                            let mut rec = match cfg.output_schema {
+                                Some(s) => widen_record_to_schema(driver_record, s),
+                                None => driver_record.clone(),
+                            };
+                            for (n, v) in fields {
+                                rec.set(&n, v);
+                            }
+                            for (k, v) in *record_vars {
+                                let _ = rec.set_record_var(&k, v);
+                            }
+                            crate::executor::copy_build_ck_columns(
+                                &mut rec,
+                                build_record,
+                                cfg.propagate_ck,
+                            );
+                            sink.output_records.push((rec, driver_order));
+                            state.matched[key] = true;
+                            poll_output_buffer(cfg, sink)?;
+                        }
+                        Ok(EvalResult::Skip(_)) => {}
+                        Ok(EvalResult::EmitMany { .. }) => {
+                            return Err(PipelineError::Internal {
+                                op: "iejoin body",
+                                node: cfg.name.to_string(),
+                                detail: "emit_each fan-out is not supported in a combine body"
+                                    .into(),
+                            });
+                        }
+                        Err(e) => {
+                            if cfg.strategy == clinker_plan::config::ErrorStrategy::FailFast {
+                                return Err(PipelineError::from(e));
+                            }
+                            sink.output_eval_failures.push(CombineOutputEvalFailure {
+                                probe_record: driver_record.clone(),
+                                row: driver_order,
+                                matched_build: Some(build_record.clone()),
+                                error: e,
+                            });
+                            continue;
+                        }
+                    }
+                } else {
+                    // Body-less synthetic intermediate step from N-ary
+                    // decomposition: concatenate driver then build values onto
+                    // the step's encoded schema. Mirrors the HashBuildProbe
+                    // passthrough; the downstream chain step reads the encoded
+                    // columns at their declared positions.
+                    let target_schema =
+                        cfg.output_schema.ok_or_else(|| PipelineError::Internal {
+                            op: "combine",
+                            node: cfg.name.to_string(),
+                            detail: "synthetic combine step has no output schema; \
+                                     decomposition pass did not run"
+                                .to_string(),
+                        })?;
+                    let mut values: Vec<Value> = Vec::with_capacity(target_schema.column_count());
+                    values.extend(driver_record.values().iter().cloned());
+                    values.extend(build_record.values().iter().cloned());
+                    if values.len() != target_schema.column_count() {
+                        return Err(PipelineError::Internal {
+                            op: "combine",
+                            node: cfg.name.to_string(),
+                            detail: format!(
+                                "synthetic combine step produced {} concatenated \
+                                 values; encoded schema has {} columns",
+                                values.len(),
+                                target_schema.column_count()
+                            ),
+                        });
+                    }
+                    let rec = Record::new(Arc::clone(target_schema), values);
+                    sink.output_records.push((rec, driver_order));
+                    state.matched[key] = true;
+                    poll_output_buffer(cfg, sink)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Poll the accumulated output buffer every [`MEMORY_CHECK_INTERVAL`] emitted
+/// rows and abort if it has grown past the hard limit. The output axis is
+/// unbounded (O(N·M) worst case) until a later phase streams it, so this
+/// cadence is the backstop that keeps a high-fan-out band join from blowing
+/// the ceiling between charges.
+fn poll_output_buffer(cfg: &EmitConfig<'_>, sink: &mut EmitSink<'_>) -> Result<(), PipelineError> {
+    *sink.emitted_since_check += 1;
+    if *sink.emitted_since_check >= MEMORY_CHECK_INTERVAL {
+        let used =
+            crate::pipeline::combine::combine_output_buffer_bytes(sink.output_records) as u64;
+        if cfg.budget.should_abort_local(used) {
+            return Err(PipelineError::MemoryBudgetExceeded {
+                node: cfg.name.to_string(),
+                used,
+                limit: cfg.budget.hard_limit(),
+                source: BudgetCategory::Arena,
+                detail: Some("iejoin output buffer exceeded budget".to_string()),
+            });
+        }
+        *sink.emitted_since_check = 0;
+    }
+    Ok(())
+}
+
+/// Flush one driver's collect-mode row: even a zero-match driver emits, with
+/// an empty array. Propagates the first matched build's `$ck.<field>` values
+/// onto the synthesized row, then sets the collect array under the build
+/// qualifier.
+fn flush_collect_row(
+    cfg: &EmitConfig<'_>,
+    driver_record: &Record,
+    driver_order: RecordOrder,
+    build_qualifier: &str,
+    flush: CollectFlush,
+    output_records: &mut Vec<(Record, RecordOrder)>,
+) {
+    let CollectFlush {
+        arr,
+        truncated,
+        first_build,
+    } = flush;
+    if truncated {
+        eprintln!(
+            "W: combine {:?} match: collect truncated at \
+             {COLLECT_PER_GROUP_CAP} matches for driver row {driver_order}",
+            cfg.name
+        );
+    }
+    let mut rec = match cfg.output_schema {
+        Some(s) => widen_record_to_schema(driver_record, s),
+        None => driver_record.clone(),
+    };
+    if let Some(first_build) = first_build {
+        crate::executor::copy_build_ck_columns(&mut rec, &first_build, cfg.propagate_ck);
+    }
+    rec.set(build_qualifier, Value::Array(arr));
+    output_records.push((rec, driver_order));
+}
+
+/// Dispatch one zero-match driver through its `on_miss` policy: `Skip` drops
+/// it, `Error` surfaces the missing-match error, `NullFields` runs the body
+/// over the driver alone and emits the widened row (recoverable eval failures
+/// route to `sink.output_eval_failures`).
+fn dispatch_on_miss(
+    cfg: &EmitConfig<'_>,
+    evals: &mut Evaluators,
+    driver_record: &Record,
+    driver_order: RecordOrder,
+    on_miss: OnMiss,
+    sink: &mut EmitSink<'_>,
+) -> Result<(), PipelineError> {
+    match on_miss {
+        OnMiss::Skip => Ok(()),
+        OnMiss::Error => Err(PipelineError::CombineMissingMatch {
+            combine: cfg.name.to_string(),
+            driver_row: driver_order,
+        }),
+        OnMiss::NullFields => {
+            let resolver = CombineResolver::new(cfg.resolver_mapping, driver_record, None);
+            let evaluator = evals.body.as_mut().ok_or_else(|| PipelineError::Internal {
+                op: "combine",
+                node: cfg.name.to_string(),
+                detail: "combine body typed program missing for on_miss: null_fields".to_string(),
+            })?;
+            match evaluator.eval_record::<NullStorage>(cfg.ctx, &resolver, None) {
+                Ok(EvalResult::Emit {
+                    fields,
+                    record_vars,
+                    ..
+                }) => {
+                    let mut rec = match cfg.output_schema {
+                        Some(s) => widen_record_to_schema(driver_record, s),
+                        None => driver_record.clone(),
+                    };
+                    for (n, v) in fields {
+                        rec.set(&n, v);
+                    }
+                    for (k, v) in *record_vars {
+                        let _ = rec.set_record_var(&k, v);
+                    }
+                    sink.output_records.push((rec, driver_order));
+                    poll_output_buffer(cfg, sink)
+                }
+                Ok(EvalResult::Skip(_)) => Ok(()),
+                Ok(EvalResult::EmitMany { .. }) => Err(PipelineError::Internal {
+                    op: "iejoin on_miss body",
+                    node: cfg.name.to_string(),
+                    detail: "emit_each fan-out is not supported in a combine body".into(),
+                }),
+                Err(e) => {
+                    if cfg.strategy == clinker_plan::config::ErrorStrategy::FailFast {
+                        return Err(PipelineError::from(e));
+                    }
+                    sink.output_eval_failures.push(CombineOutputEvalFailure {
+                        probe_record: driver_record.clone(),
+                        row: driver_order,
+                        matched_build: None,
+                        error: e,
+                    });
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1451,6 +1677,25 @@ mod tests {
             budget.should_abort_local(est),
             "a {est}-byte working-set estimate must trip a 1-byte budget on the \
              local arm regardless of RSS availability"
+        );
+
+        // Per-pair charge cadence (block-band path). The block scheduler
+        // charges this estimator with BLOCK-sized arguments once per surviving
+        // block-pair, not with the whole-input counts, and pruning drops most
+        // pairs before they are charged at all. So the estimate paid per pair is
+        // bounded by the block size and is a small fraction of the whole-input
+        // estimate — the property that keeps the input axis bounded. Two
+        // block-sized pairs (64 records each) must together stay well under the
+        // whole-input estimate for a 4000×4000 join.
+        let whole_input = iejoin_numeric_state_bytes(4_000, 4_000);
+        let per_pair = iejoin_numeric_state_bytes(64, 64);
+        assert!(
+            per_pair.saturating_mul(2) < whole_input / 20,
+            "two block-sized per-pair charges ({} bytes) must stay far below the \
+             whole-input estimate ({whole_input} bytes); the scheduler pays the \
+             estimator per surviving pair with block-sized counts, so it never \
+             materializes the whole-input working set at once",
+            per_pair.saturating_mul(2)
         );
     }
 
