@@ -83,6 +83,22 @@ impl<T: Ord> LoserTree<T> {
         self.update_loser_tree();
     }
 
+    /// Like [`replace_winner`](Self::replace_winner), but returns the outgoing
+    /// winner entry by value instead of dropping it. Lets a merge move the
+    /// winning `(record, payload)` out of the tree rather than cloning it —
+    /// the tree exposes only `&T` through [`winner`](Self::winner), so a
+    /// caller that needs the owned entry would otherwise pay a clone.
+    /// Returns `None` when all streams are already exhausted.
+    pub fn take_winner(&mut self, entry: Option<T>) -> Option<T> {
+        if self.cursors.is_empty() {
+            return None;
+        }
+        let winner_idx = self.tree[0];
+        let old = std::mem::replace(&mut self.cursors[winner_idx], entry);
+        self.update_loser_tree();
+        old
+    }
+
     fn init_loser_tree(&mut self) {
         if self.cursors.is_empty() {
             return;
@@ -244,6 +260,47 @@ mod tests {
         assert_eq!(lt.winner().unwrap().key, vec![43]);
         lt.replace_winner(None);
         assert!(lt.winner().is_none());
+    }
+
+    #[test]
+    fn test_loser_tree_take_winner_moves_entry_out() {
+        // take_winner returns the outgoing winner by value and advances the
+        // tree identically to replace_winner.
+        let mut lt = LoserTree::new(vec![entry(1), entry(2), entry(3)]);
+        let out = lt.take_winner(entry(4)).expect("winner present");
+        assert_eq!(out.key, vec![1]); // moved-out old winner
+        assert_eq!(
+            out.record.get("v"),
+            Some(&clinker_record::Value::Integer(1))
+        );
+        // Stream 0 now holds 4; the new winner is stream 1 (key 2).
+        assert_eq!(lt.winner().unwrap().key, vec![2]);
+        assert_eq!(lt.winner_index(), 1);
+    }
+
+    #[test]
+    fn test_loser_tree_take_winner_full_drain() {
+        // Draining via take_winner yields every entry in merge order.
+        let mut lt = LoserTree::new(vec![entry(1), entry(2), entry(3)]);
+        let streams: Vec<Vec<u8>> = vec![vec![4, 7], vec![5, 8], vec![6, 9]];
+        let mut iters: Vec<std::vec::IntoIter<u8>> =
+            streams.into_iter().map(|s| s.into_iter()).collect();
+        let mut result = Vec::new();
+        while lt.winner().is_some() {
+            let idx = lt.winner_index();
+            let next = iters[idx].next().map(|k| MergeEntry {
+                key: vec![k],
+                record: {
+                    use clinker_record::{Record, Schema, Value};
+                    use std::sync::Arc;
+                    let s = Arc::new(Schema::new(vec!["v".into()]));
+                    Record::new(s, vec![Value::Integer(k as i64)])
+                },
+            });
+            let winner = lt.take_winner(next).expect("winner present under guard");
+            result.push(winner.key[0]);
+        }
+        assert_eq!(result, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     #[test]

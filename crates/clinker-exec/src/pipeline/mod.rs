@@ -14,6 +14,7 @@ mod sort_integration;
 pub mod sort_key;
 pub mod sort_merge_join;
 pub mod spill;
+pub mod spill_merge;
 pub mod streaming_merge;
 pub mod sysstats;
 pub mod take;
