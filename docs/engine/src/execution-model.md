@@ -54,7 +54,7 @@ A stage blocks when its result depends on records it has not seen yet:
 - **`sort`** — the full input must be present before the first sorted record is known.
 - **Hash `Aggregate`** — a group's final value depends on every member, so the group table accumulates the whole input. (A `streaming`-strategy Aggregate over a pre-sorted input is the exception: the planner certifies it can emit a group as soon as the sort key advances.)
 - **`Combine` build side** — the build relation is fully indexed before any probe record is matched. The probe side streams against the built index, but the build side materializes.
-- **`IEJoin` / sort-merge `Combine`** — both inputs are sorted and buffered before the band/merge step runs.
+- **`IEJoin` / sort-merge `Combine`** — both inputs are sorted before the band/merge step runs. The pure-range IEJoin and the sort-merge Combine are **block-spilled**: each side is external-sorted to disk and sliced into min/max-tagged blocks, so the input axis stays inside the budget. The equi+range IEJoin (hash-partitioned range join) is **buffered resident**: it holds each partition's sorted arrays in memory (a follow-up bounds it).
 - **`CorrelationCommit`** — a correlation group is held until its commit decision (flush or dead-letter) is known.
 
 A blocking stage keeps its full-stage accumulation inside `pipeline.memory.limit` and spills to disk past the soft threshold; it does not stream batches.
