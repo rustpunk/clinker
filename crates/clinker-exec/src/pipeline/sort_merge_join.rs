@@ -55,7 +55,7 @@ use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
-use crate::pipeline::spill_merge::merge_sorted_runs;
+use crate::pipeline::spill_merge::SortedRunMerger;
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
@@ -939,20 +939,31 @@ fn sort_driver_pairs_externally(
         }
         SortedOutput::Spilled(files) => {
             // `buf.finish()` spilled every record we last charged into
-            // `local_charged`; those bytes are now off-process. The
-            // records flow back from disk through the k-way merge below
-            // and re-charge per-record.
+            // `local_charged`; those bytes are now off-process. Stream the
+            // records back through the k-way merge below and re-charge each as
+            // it lands, so the arbitrator tracks this side's residence as it
+            // grows rather than in one late jump.
             consumer_handle.sub_bytes(local_charged);
             // Fold the individually-sorted runs into one globally-ordered
-            // stream via the shared LoserTree k-way merge. `SortBuffer`
-            // already sorted each run on `field`, so the merge preserves
-            // that order across runs (a single run is an identity pass).
+            // stream via the shared LoserTree k-way merge, draining it record
+            // by record. `SortBuffer` already sorted each run on `field`, so the
+            // merge preserves that order across runs (a single run is an
+            // identity pass). Phase B walks `driver_pairs` as a fully-resident
+            // slice, so the merged side lands entirely in memory here; the
+            // per-record charge keeps the arbitrator's accounting accurate as
+            // it does.
             let merge_field = clinker_plan::config::SortField {
                 field: field.clone(),
                 order: clinker_plan::config::SortOrder::Asc,
                 null_order: None,
             };
-            for (record, order) in merge_sorted_runs(files, std::slice::from_ref(&merge_field))? {
+            let merger = SortedRunMerger::new(
+                files,
+                std::slice::from_ref(&merge_field),
+                "sort-merge driver phase A",
+            )?;
+            for entry in merger {
+                let (record, order) = entry?;
                 let key = record.get(field).cloned().unwrap_or(Value::Null);
                 let bytes = std::mem::size_of::<Record>()
                     + record.estimated_heap_size()
@@ -1056,14 +1067,23 @@ fn sort_build_pairs_externally(
         SortedOutput::Spilled(files) => {
             consumer_handle.sub_bytes(local_charged);
             // Fold the individually-sorted runs into one globally-ordered
-            // stream via the shared LoserTree k-way merge (single-run input
-            // is an identity pass). The build side carries a unit payload.
+            // stream via the shared LoserTree k-way merge, draining it record
+            // by record (single-run input is an identity pass). The build side
+            // carries a unit payload. As on the driver side, Phase B walks the
+            // full `build_pairs` slice, so the merged side is held resident and
+            // charged per record as it lands.
             let merge_field = clinker_plan::config::SortField {
                 field: field.clone(),
                 order: clinker_plan::config::SortOrder::Asc,
                 null_order: None,
             };
-            for (record, _) in merge_sorted_runs(files, std::slice::from_ref(&merge_field))? {
+            let merger = SortedRunMerger::new(
+                files,
+                std::slice::from_ref(&merge_field),
+                "sort-merge build phase A",
+            )?;
+            for entry in merger {
+                let (record, _) = entry?;
                 let key = record.get(field).cloned().unwrap_or(Value::Null);
                 let bytes = std::mem::size_of::<Record>() + record.estimated_heap_size();
                 consumer_handle.add_bytes(bytes as u64);

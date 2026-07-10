@@ -67,10 +67,12 @@ impl<P> Ord for Run<P> {
 }
 
 /// Pull the next `(record, payload)` from one spilled run, wrapping it as a
-/// [`Run`] merge entry, or `None` at end of stream.
+/// [`Run`] merge entry, or `None` at end of stream. `context` names the
+/// calling operator/phase so a decode failure localizes to the right node.
 fn next_run<P: DeserializeOwned>(
     reader: &mut SpillReader<P>,
     sort_by: &Arc<[SortField]>,
+    context: &'static str,
 ) -> Result<Option<Run<P>>, PipelineError> {
     match reader.next() {
         None => Ok(None),
@@ -80,7 +82,7 @@ fn next_run<P: DeserializeOwned>(
             payload,
         })),
         Some(Err(e)) => Err(PipelineError::Io(std::io::Error::other(format!(
-            "spill run decode failed during k-way merge: {e}"
+            "{context}: spill run decode failed during k-way merge: {e}"
         )))),
     }
 }
@@ -97,17 +99,18 @@ fn next_run<P: DeserializeOwned>(
 /// stable per-run sort, and the loser tree breaks ties by lower stream index,
 /// so equal keys emit in input order.
 ///
-/// Module-private: the only current consumer is [`merge_sorted_runs`], which
-/// materializes the stream. The lazy form exists so a later caller can
-/// re-slice the merged run into bounded blocks; that caller widens the
-/// visibility when it lands.
-struct SortedRunMerger<P> {
+/// Callers that need the whole run at once use [`merge_sorted_runs`]; callers
+/// that can consume incrementally (draining straight into their own buffer, or
+/// re-slicing the merged run into bounded blocks) drive this iterator directly.
+pub(crate) struct SortedRunMerger<P> {
     /// Held only to keep the backing temp files alive across iteration; the
     /// readers below own independent file handles, not borrows of these.
     _files: Vec<SpillFile<P>>,
     readers: Vec<SpillReader<P>>,
     tree: LoserTree<Run<P>>,
     sort_by: Arc<[SortField]>,
+    /// Names the calling operator/phase for decode-error messages.
+    context: &'static str,
     /// Latches once a decode error has been surfaced so `next` stops rather
     /// than re-polling an already-failed reader.
     done: bool,
@@ -115,9 +118,14 @@ struct SortedRunMerger<P> {
 
 impl<P: DeserializeOwned> SortedRunMerger<P> {
     /// Open a reader over every run and seed the loser tree with one record
-    /// per run. Returns an I/O error if any run fails to open or its first
-    /// record fails to decode.
-    fn new(files: Vec<SpillFile<P>>, sort_by: &[SortField]) -> Result<Self, PipelineError> {
+    /// per run. `context` names the calling operator/phase so a spill open or
+    /// decode failure localizes to the right node. Returns an I/O error if any
+    /// run fails to open or its first record fails to decode.
+    pub(crate) fn new(
+        files: Vec<SpillFile<P>>,
+        sort_by: &[SortField],
+        context: &'static str,
+    ) -> Result<Self, PipelineError> {
         let sort_by: Arc<[SortField]> = Arc::from(sort_by.to_vec());
         let mut readers: Vec<SpillReader<P>> = files
             .iter()
@@ -125,13 +133,13 @@ impl<P: DeserializeOwned> SortedRunMerger<P> {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| {
                 PipelineError::Io(std::io::Error::other(format!(
-                    "spill run open failed during k-way merge: {e}"
+                    "{context}: spill run open failed during k-way merge: {e}"
                 )))
             })?;
 
         let mut initial: Vec<Option<Run<P>>> = Vec::with_capacity(readers.len());
         for reader in &mut readers {
-            initial.push(next_run(reader, &sort_by)?);
+            initial.push(next_run(reader, &sort_by, context)?);
         }
         let tree = LoserTree::new(initial);
 
@@ -140,6 +148,7 @@ impl<P: DeserializeOwned> SortedRunMerger<P> {
             readers,
             tree,
             sort_by,
+            context,
             done: false,
         })
     }
@@ -160,7 +169,7 @@ impl<P: DeserializeOwned> Iterator for SortedRunMerger<P> {
         // winner's successor. A decode error aborts the whole merge — the
         // partial output the caller has collected is discarded when it
         // propagates the `Err`.
-        let refill = match next_run(&mut self.readers[idx], &self.sort_by) {
+        let refill = match next_run(&mut self.readers[idx], &self.sort_by, self.context) {
             Ok(next) => next,
             Err(e) => {
                 self.done = true;
@@ -177,15 +186,17 @@ impl<P: DeserializeOwned> Iterator for SortedRunMerger<P> {
 
 /// K-way merge the individually-sorted spill runs into one globally-ordered
 /// `Vec`, preserving each record's payload. Convenience wrapper over
-/// [`SortedRunMerger`] for callers that need the full run materialized.
+/// [`SortedRunMerger`] for callers that need the full run materialized;
+/// `context` names the calling operator for spill-error messages.
 ///
 /// Memory model: holds one resident record per open run plus the fully
 /// materialized output.
 pub(crate) fn merge_sorted_runs<P: DeserializeOwned>(
     files: Vec<SpillFile<P>>,
     sort_by: &[SortField],
+    context: &'static str,
 ) -> Result<Vec<(Record, P)>, PipelineError> {
-    SortedRunMerger::new(files, sort_by)?.collect()
+    SortedRunMerger::new(files, sort_by, context)?.collect()
 }
 
 #[cfg(test)]
@@ -258,7 +269,7 @@ mod tests {
             SortedOutput::InMemory(_) => panic!("expected Spilled after three flushes"),
         };
 
-        let merged = merge_sorted_runs(files, &sort_by).unwrap();
+        let merged = merge_sorted_runs(files, &sort_by, "test").unwrap();
 
         // Every input record survives the merge exactly once.
         assert_eq!(merged.len(), 7);
@@ -319,7 +330,7 @@ mod tests {
             SortedOutput::InMemory(_) => panic!("expected Spilled"),
         };
         assert!(files.len() > 1, "expected multiple runs");
-        let merged = merge_sorted_runs(files, &sort_by).unwrap();
+        let merged = merge_sorted_runs(files, &sort_by, "test").unwrap();
         let keys: Vec<Decimal> = merged
             .iter()
             .map(|(r, _)| match r.get("k") {
@@ -356,7 +367,7 @@ mod tests {
             SortedOutput::InMemory(_) => panic!("expected Spilled"),
         };
         assert_eq!(files.len(), 1);
-        let merged = merge_sorted_runs(files, &sort_by).unwrap();
+        let merged = merge_sorted_runs(files, &sort_by, "test").unwrap();
         assert_eq!(merged.len(), 2);
         assert_eq!(
             merged[0].0.get("k"),
@@ -384,7 +395,7 @@ mod tests {
             SortedOutput::Spilled(files) => files,
             SortedOutput::InMemory(_) => panic!("expected Spilled"),
         };
-        let merger = SortedRunMerger::new(files, &sort_by).unwrap();
+        let merger = SortedRunMerger::new(files, &sort_by, "test").unwrap();
         let collected: Vec<(Record, u64)> = merger.map(|r| r.unwrap()).collect();
         let keys: Vec<Decimal> = collected
             .iter()

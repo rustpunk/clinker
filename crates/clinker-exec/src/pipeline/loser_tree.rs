@@ -41,7 +41,8 @@ impl Ord for MergeEntry {
 /// After initialization, `winner()` returns the smallest element.
 /// Call `replace_winner(next)` to advance: supply the next element
 /// from the winning stream (or `None` if exhausted), and the tree
-/// replays to find the new winner.
+/// replays to find the new winner. `take_winner(next)` advances the
+/// same way but returns the outgoing winner by value.
 pub struct LoserTree<T: Ord> {
     /// Internal nodes. `tree[0]` holds the overall winner index.
     /// `tree[1..k]` hold loser indices at each internal node.

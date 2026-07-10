@@ -113,7 +113,7 @@ pub(crate) fn dispatch_sort(
     // merge.
     let out: Vec<(Record, u64)> = match sorted {
         SortedOutput::InMemory(pairs) => pairs,
-        SortedOutput::Spilled(files) => merge_sorted_runs(files, sort_fields)?,
+        SortedOutput::Spilled(files) => merge_sorted_runs(files, sort_fields, "sort enforcer")?,
     };
     ctx.collector
         .record(sort_timer.finish(sort_count, sort_count));
