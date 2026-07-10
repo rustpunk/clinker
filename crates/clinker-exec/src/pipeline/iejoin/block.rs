@@ -25,11 +25,17 @@
 //!
 //! Memory model: bounded on the input axis — at most one driver block and one
 //! matching build block are resident at once, plus the kernel's O(n) sort
-//! arrays for that pair. The OUTPUT axis (`output_records`) still accumulates
-//! in memory and is bounded only by the every-10K poll; a later phase streams
-//! it. The pre-output abort (`should_abort_local` →
-//! [`pre_output_budget_error`](super::pre_output_budget_error)) is the genuine
-//! last resort: a single block-pair plus kernel aux that still cannot fit.
+//! arrays for that pair. The scan/sort and slice phases respond to memory
+//! pressure by SPILLING (own byte threshold + disk-quota E320), never by
+//! consulting global process pressure. The per-pair pre-output abort
+//! ([`pre_output_budget_error`](super::pre_output_budget_error)) is a strictly
+//! LOCAL last resort — the one block-pair's resident bytes plus kernel aux
+//! exceed the hard limit even alone — so a bounded-residency run stays
+//! host-independent and never aborts because the process floor sits above a
+//! tight budget. The OUTPUT axis (`output_records`, O(N·M) worst case) is
+//! un-spillable until a later phase streams it, so it keeps the every-10K
+//! poll on the arbitrator's global-aware `should_abort_local`: reacting to
+//! global pressure is the arbitrator's job, on that axis only.
 
 use std::io;
 use std::path::Path;
@@ -439,15 +445,22 @@ pub(super) fn execute_block_band(
             let bkeys: Vec<(i64, i64)> = build_loaded.iter().map(|(_, p)| *p).collect();
 
             // Pre-output charge: the two resident blocks plus the kernel's
-            // O(n) sort arrays for this pair. This is the genuine last-resort
-            // abort — a single block-pair plus aux that cannot fit.
+            // O(n) sort arrays for this pair. The abort here is a STRICTLY
+            // LOCAL last resort — a single block-pair plus aux that cannot fit
+            // the hard limit even alone. It deliberately does NOT consult the
+            // arbitrator's global pressure (process RSS or the consumer-usage
+            // sum): this path's response to global pressure is spilling, so a
+            // bounded-residency run must not abort merely because the process
+            // floor sits above a tight budget. Responding to global pressure is
+            // the arbitrator's job on the un-spillable output axis, polled
+            // separately below.
             let aux = iejoin_numeric_state_bytes(dkeys.len(), bkeys.len()) as u64;
             let peak = driver_block
                 .resident_bytes
                 .saturating_add(build_block.resident_bytes)
                 .saturating_add(aux);
             consumer.set_bytes(peak);
-            if budget.should_abort_local(peak) {
+            if peak > budget.hard_limit() {
                 return Err(pre_output_budget_error(name, peak, budget.hard_limit()));
             }
 

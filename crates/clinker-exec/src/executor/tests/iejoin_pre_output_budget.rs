@@ -6,27 +6,25 @@
 //! block-pairs, and run the kernel per surviving pair. These tests drive that
 //! path end-to-end through the public executor entry point.
 //!
-//! Three guarantees are pinned:
+//! The load-bearing guarantee: an input that USED to abort (no spill path) now
+//! COMPLETES with correct NON-EMPTY results while spilling, under a budget far
+//! below process RSS. That is only possible because the per-pair pre-output
+//! abort is a strictly LOCAL check — the one block-pair's resident bytes plus
+//! kernel aux against the hard limit — and never consults global process
+//! pressure (RSS or the consumer-usage sum). The scan/sort/slice phases answer
+//! pressure by spilling. The un-spillable output axis keeps the every-10K
+//! global-aware poll, so these fixtures hold their match sets under 10K.
 //!
-//!   1. A pure-range join over a budget that fits the block-pair working set
-//!      COMPLETES with correct results (it used to abort with no spill path),
-//!      and its consumer is unregistered on the clean exit.
-//!   2. The same shape over a fully-pruned (disjoint-range) dataset COMPLETES
-//!      under a tight budget while spilling — `per_stage_spill_bytes` for the
-//!      node is non-zero — because every block-pair is pruned before the
-//!      pre-output charge, so the RSS-sensitive abort is never reached.
-//!   3. A non-empty join whose single block-pair plus kernel aux cannot fit
-//!      the budget aborts with a typed `MemoryBudgetExceeded { source: Arena,
-//!      detail: "iejoin pre-output ..." }` — the genuine last resort — and
-//!      still unregisters its consumer on the error path.
-//!
-//! A tight budget over a non-empty pure-range join necessarily trips the
-//! pre-output gate on an RSS-present host (the budget small enough to force
-//! spill sits below process RSS), so the "completes while spilling" guarantee
-//! is pinned with the fully-pruned dataset in case 2; per-block spill during a
-//! completing NON-empty join is exercised directly by the block-module tests,
-//! which force it with a test-only block-target override and a budget above
-//! RSS.
+//! Cases:
+//!   1. Tight budget, non-empty, wide input forcing multi-run sort spill and
+//!      multiple blocks per side → COMPLETES with correct rows, non-zero
+//!      per-stage spill, consumer released. (Host-independent: passes on an
+//!      RSS-present host precisely because the gate is local.)
+//!   2. Roomy budget, non-empty → completes (the resident/degenerate path).
+//!   3. Tight budget, fully pruned (disjoint ranges) → completes empty while
+//!      spilling — the pipeline-level prune observation.
+//!   4. Budget below a single block-pair's local footprint → aborts with the
+//!      typed pre-output error via the LOCAL arm, consumer released.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -35,19 +33,21 @@ use clinker_plan::plan::execution::PlanNode;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// A tight hard limit far below process RSS. Over a non-empty join it trips the
-/// pre-output gate; over a fully-pruned dataset the gate is never reached, so
-/// the run completes while the drain and block slicing spill to disk.
-const TIGHT_LIMIT: u64 = 32 * 1024;
-/// A hard limit comfortably above process RSS, so a small non-empty join
-/// completes without tripping the RSS-sensitive abort.
+/// A tight hard limit far below process RSS, but above the local footprint of a
+/// single block-pair (two 16 KiB-floored blocks plus kernel aux). A non-empty
+/// join completes under it because the pre-output gate is strictly local.
+const TIGHT_LIMIT: u64 = 128 * 1024;
+/// Below a single block-pair's local footprint (two 16 KiB block floors plus
+/// aux), so the first surviving pair trips the local pre-output abort.
+const ABORT_LIMIT: u64 = 8 * 1024;
+/// Comfortably above process RSS, for the resident/degenerate completion path.
 const ROOMY_LIMIT: u64 = 512 * 1024 * 1024;
 const SPILL_FRAC: f64 = 0.80;
 
 /// Arbitrator with the given hard limit and `NoOpPolicy` so no victim is ever
 /// paused or asked to spill — the block-band path spills on its own byte
-/// threshold. `peak_rss` is left unseeded; the real reading governs the
-/// pre-output gate.
+/// threshold. `peak_rss` is left unseeded; the real reading would only matter
+/// on the output poll, which these fixtures keep under its 10K cadence.
 fn no_op_arbitrator(limit: u64) -> Arc<crate::pipeline::memory::MemoryArbitrator> {
     Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
         limit,
@@ -59,6 +59,9 @@ fn no_op_arbitrator(limit: u64) -> Arc<crate::pipeline::memory::MemoryArbitrator
 
 /// Pure-range predicate (two range conjuncts, no equality) so the planner
 /// selects `CombineStrategy::IEJoin` and the runtime runs the block-band path.
+/// The `pad` column widens each input record without appearing in the output,
+/// so a side can exceed the sort-spill threshold while the emitted rows stay
+/// small (keeping the match set under the 10K output poll).
 const PIPELINE_YAML: &str = r#"
 pipeline:
   name: iejoin_block_band
@@ -72,6 +75,7 @@ nodes:
     schema:
       - { name: order_id, type: string }
       - { name: amount, type: int }
+      - { name: pad, type: string }
 - type: source
   name: bands
   config:
@@ -82,6 +86,7 @@ nodes:
       - { name: band_id, type: string }
       - { name: lo, type: int }
       - { name: hi, type: int }
+      - { name: pad, type: string }
 - type: combine
   name: banded
   input:
@@ -124,23 +129,26 @@ fn banded_strategy() -> CombineStrategy {
     panic!("combine node \"banded\" not present in compiled plan");
 }
 
-/// CSV for `n` orders whose amounts are `2*i`.
-fn orders_csv(n: usize) -> String {
-    let mut s = String::from("order_id,amount\n");
+/// CSV for `n` orders whose amounts are `2*i`, each padded with `pad_len` bytes.
+fn orders_csv(n: usize, pad_len: usize) -> String {
+    let pad = "x".repeat(pad_len);
+    let mut s = String::from("order_id,amount,pad\n");
     for i in 0..n {
-        s.push_str(&format!("o{i},{}\n", i * 2));
+        s.push_str(&format!("o{i},{},{pad}\n", i * 2));
     }
     s
 }
 
-/// CSV for `n` bands. `offset` shifts the band ranges: `0` makes band `i` cover
-/// `[2*i, 2*i+2)` so order `i` falls in it; a large offset makes every band
-/// disjoint from every order amount so the whole join prunes away.
-fn bands_csv(n: usize, offset: i64) -> String {
-    let mut s = String::from("band_id,lo,hi\n");
+/// CSV for `n` bands, each padded with `pad_len` bytes. `offset` shifts the band
+/// ranges: `0` makes band `i` cover `[2*i, 2*i+2)` so order `i` falls in it; a
+/// large offset makes every band disjoint from every order so the join prunes
+/// away entirely.
+fn bands_csv(n: usize, offset: i64, pad_len: usize) -> String {
+    let pad = "x".repeat(pad_len);
+    let mut s = String::from("band_id,lo,hi,pad\n");
     for i in 0..n {
         let lo = offset + (i as i64) * 2;
-        s.push_str(&format!("b{i},{},{}\n", lo, lo + 2));
+        s.push_str(&format!("b{i},{},{},{pad}\n", lo, lo + 2));
     }
     s
 }
@@ -193,6 +201,13 @@ fn run_pipeline(
     (result.map(|_report| ()), out.as_string())
 }
 
+fn spilled_bytes(arb: &Arc<crate::pipeline::memory::MemoryArbitrator>) -> u64 {
+    arb.per_stage_spill_bytes()
+        .get("banded")
+        .copied()
+        .unwrap_or(0)
+}
+
 #[test]
 fn pure_range_selects_block_band_strategy() {
     assert!(
@@ -202,31 +217,40 @@ fn pure_range_selects_block_band_strategy() {
 }
 
 #[test]
-fn block_band_completes_non_empty_join_and_releases_consumer() {
-    // 500 orders × 500 overlapping bands: order i (amount 2*i) falls exactly in
-    // band i. A budget above process RSS fits the block-pair working set, so
-    // the join that used to have no spill path now completes.
-    let arb = no_op_arbitrator(ROOMY_LIMIT);
-    let (result, output) = run_pipeline(orders_csv(500), bands_csv(500, 0), &arb);
-    result.expect("the pure-range block-band join must complete under a roomy budget");
+fn block_band_completes_non_empty_with_spill_under_tight_budget() {
+    // 400 orders × 400 overlapping bands: order i (amount 2*i) falls exactly in
+    // band i, so there are 400 matches — well under the 10K output poll. Each
+    // input record carries a 200-byte pad column (not emitted), so each side is
+    // ~140 KB: it exceeds the ~51 KB sort-spill threshold (multi-run sort spill)
+    // and slices into many 16 KB blocks. Under the 128 KB budget a single
+    // block-pair's local footprint (~two 16 KB blocks + kernel aux) fits, so the
+    // run COMPLETES — the input that previously had no spill path now finishes,
+    // and does so on this RSS-present host precisely because the per-pair gate
+    // is local, not global.
+    let arb = no_op_arbitrator(TIGHT_LIMIT);
+    let (result, output) = run_pipeline(orders_csv(400, 200), bands_csv(400, 0, 200), &arb);
+    result.expect("the wide-input pure-range join must complete under the tight local budget");
 
     let data_lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).skip(1).collect();
     assert_eq!(
         data_lines.len(),
-        500,
+        400,
         "every order falls in exactly one band, so first-match emits one row each"
     );
-    // Spot-check the banding: order o0 → band b0, order o499 → band b499.
     assert!(
         data_lines.iter().any(|l| l.starts_with("o0,0,b0")),
-        "order o0 (amount 0) must band to b0; got rows like {:?}",
-        &data_lines[..data_lines.len().min(3)]
+        "order o0 (amount 0) must band to b0"
     );
     assert!(
-        data_lines.iter().any(|l| l.starts_with("o499,998,b499")),
-        "order o499 (amount 998) must band to b499"
+        data_lines.iter().any(|l| l.starts_with("o399,798,b399")),
+        "order o399 (amount 798) must band to b399"
     );
-
+    assert!(
+        spilled_bytes(&arb) > 0,
+        "the ~140 KB sides must spill sort runs and blocks under the 128 KB budget; \
+         per_stage_spill_bytes[banded] was {}",
+        spilled_bytes(&arb)
+    );
     assert_eq!(
         arb.consumer_count(),
         0,
@@ -235,14 +259,36 @@ fn block_band_completes_non_empty_join_and_releases_consumer() {
 }
 
 #[test]
-fn block_band_completes_while_spilling_when_fully_pruned() {
-    // 500 orders × 500 bands, but every band is shifted far above every order
-    // amount, so `possible(Gt/Ge, ...)` prunes every block-pair before the
-    // pre-output charge. Under a tight budget the drain and block slicing spill
-    // to disk, yet the run completes (empty result) because the RSS-sensitive
-    // gate is never reached.
+fn block_band_completes_non_empty_under_roomy_budget() {
+    // The resident / degenerate path: a roomy budget keeps each small side in a
+    // single resident block (no spill), and the non-empty join completes with
+    // correct results.
+    let arb = no_op_arbitrator(ROOMY_LIMIT);
+    let (result, output) = run_pipeline(orders_csv(500, 0), bands_csv(500, 0, 0), &arb);
+    result.expect("the pure-range block-band join must complete under a roomy budget");
+
+    let data_lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).skip(1).collect();
+    assert_eq!(data_lines.len(), 500, "one first-match row per order");
+    assert!(
+        data_lines.iter().any(|l| l.starts_with("o499,998,b499")),
+        "order o499 (amount 998) must band to b499"
+    );
+    assert_eq!(
+        arb.consumer_count(),
+        0,
+        "the block-band consumer must be unregistered on the clean exit"
+    );
+}
+
+#[test]
+fn block_band_completes_while_fully_pruned_and_spilling() {
+    // 500 orders × 500 bands shifted far above every order amount, so every
+    // block-pair is pruned before the pre-output charge. Under a tight budget
+    // the drain and block slicing spill to disk, yet the run completes (empty
+    // result) — the pipeline-level observation that pruning happens before any
+    // per-pair work.
     let arb = no_op_arbitrator(TIGHT_LIMIT);
-    let (result, output) = run_pipeline(orders_csv(500), bands_csv(500, 1_000_000), &arb);
+    let (result, output) = run_pipeline(orders_csv(500, 0), bands_csv(500, 1_000_000, 200), &arb);
     result.expect("a fully-pruned pure-range join must complete even under a tight budget");
 
     let data_lines = output.lines().filter(|l| !l.is_empty()).skip(1).count();
@@ -250,16 +296,10 @@ fn block_band_completes_while_spilling_when_fully_pruned() {
         data_lines, 0,
         "disjoint bands match nothing, so first-match + on_miss:skip emit no rows"
     );
-
-    let spilled = arb
-        .per_stage_spill_bytes()
-        .get("banded")
-        .copied()
-        .unwrap_or(0);
     assert!(
-        spilled > 0,
-        "the 500-row sides must spill their sort runs and blocks under the tight budget; \
-         per_stage_spill_bytes[banded] was {spilled}"
+        spilled_bytes(&arb) > 0,
+        "the wide build side must spill under the tight budget; got {}",
+        spilled_bytes(&arb)
     );
     assert_eq!(
         arb.consumer_count(),
@@ -269,15 +309,16 @@ fn block_band_completes_while_spilling_when_fully_pruned() {
 }
 
 #[test]
-fn block_band_pre_output_state_aborts_under_tight_budget() {
-    // 500 orders × 500 overlapping bands under the tight budget: every order
-    // matches its band, so a block-pair survives the prune and reaches the
-    // pre-output charge. That charge (two resident blocks plus the kernel's
-    // sort arrays) cannot fit the budget, so the run aborts with the typed
-    // pre-output error rather than blowing the ceiling.
-    let arb = no_op_arbitrator(TIGHT_LIMIT);
-    let (result, output) = run_pipeline(orders_csv(500), bands_csv(500, 0), &arb);
-    let err = result.expect_err("the block-pair working set over the tight budget must abort");
+fn block_band_pre_output_local_abort_under_undersized_budget() {
+    // 500 orders × 500 overlapping bands under a budget below a single
+    // block-pair's local footprint: every order matches its band, so a pair
+    // survives the prune and reaches the pre-output charge. Two 16 KB-floored
+    // blocks plus the kernel's sort arrays exceed the 8 KB budget, so the LOCAL
+    // gate trips — proving the demoted abort still fires when a lone block-pair
+    // genuinely cannot fit, independent of process RSS.
+    let arb = no_op_arbitrator(ABORT_LIMIT);
+    let (result, output) = run_pipeline(orders_csv(500, 0), bands_csv(500, 0, 0), &arb);
+    let err = result.expect_err("a block-pair over the undersized budget must abort");
 
     match err {
         PipelineError::MemoryBudgetExceeded {
@@ -294,12 +335,12 @@ fn block_band_pre_output_state_aborts_under_tight_budget() {
                 "block-band pre-output state is arena-class memory"
             );
             assert_eq!(
-                limit, TIGHT_LIMIT,
+                limit, ABORT_LIMIT,
                 "the reported limit must be the hard budget"
             );
             assert!(
-                used > TIGHT_LIMIT,
-                "the reported estimate ({used}) must exceed the budget ({TIGHT_LIMIT})"
+                used > ABORT_LIMIT,
+                "the reported footprint ({used}) must exceed the budget ({ABORT_LIMIT})"
             );
             let detail = detail.expect("the pre-output abort must carry a detail string");
             assert!(
@@ -315,7 +356,6 @@ fn block_band_pre_output_state_aborts_under_tight_budget() {
         "the run aborted before emitting any matched row, so the sink holds at most a header; \
          got: {output:?}"
     );
-
     assert_eq!(
         arb.consumer_count(),
         0,

@@ -51,12 +51,18 @@
 //!
 //! Both shapes mirror their live footprint into a registered
 //! [`ConsumerHandle`] so the arbitrator's pull-mode `current_usage` sees it,
-//! and both poll the accumulated OUTPUT buffer every 10K emitted matched pairs.
-//! The output axis (`output_records`, O(N·M) worst case) still accumulates in
-//! memory — a later phase streams it. The pre-output abort returns a typed
-//! `PipelineError::MemoryBudgetExceeded` carrying the combine node's name and
-//! `BudgetCategory::Arena`; on the block-band path it is the genuine last
-//! resort — a single block-pair plus kernel aux that still cannot fit.
+//! and both poll the accumulated OUTPUT buffer every 10K emitted matched pairs
+//! through the arbitrator's global-aware `should_abort_local` — the output
+//! axis (`output_records`, O(N·M) worst case) is un-spillable until a later
+//! phase streams it, so reacting to global pressure there is correct. The
+//! pre-output abort returns a typed `PipelineError::MemoryBudgetExceeded`
+//! carrying the combine node's name and `BudgetCategory::Arena`. On the
+//! equi+range path it fires when the resident partition and per-group sort
+//! arrays exceed the budget; on the block-band path it is a strictly LOCAL
+//! last resort — a single block-pair plus kernel aux exceeding the hard limit
+//! even alone — so a spilling, bounded-residency run never aborts merely
+//! because process RSS sits above a tight budget. Global pressure on the input
+//! axis is answered by spilling, not by aborting.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -1568,11 +1574,15 @@ fn iejoin_numeric_state_bytes(n_left: usize, n_right: usize) -> usize {
 
 /// Build the typed pre-output budget-abort error, shared by both dispatch
 /// shapes. On the equi+range path it fires when the resident partition and
-/// per-group sort arrays exceed the budget; on the block-band path it is the
-/// genuine last resort — a single loaded block-pair plus kernel aux that still
-/// cannot fit after spilling. Either way it surfaces `MemoryBudgetExceeded`
-/// with `BudgetCategory::Arena`, the same shape the output-buffer poll and
-/// every other budget-checked operator surface use.
+/// per-group sort arrays exceed the budget (gated through the arbitrator's
+/// `should_abort_local`, since that path holds its inputs resident with no
+/// spill). On the block-band path it is a strictly LOCAL last resort — the one
+/// loaded block-pair's resident bytes plus kernel aux exceed the hard limit
+/// even alone — gated by a direct `peak > hard_limit` comparison, never by
+/// global process pressure, because that path answers pressure by spilling.
+/// Either way it surfaces `MemoryBudgetExceeded` with `BudgetCategory::Arena`,
+/// the same shape the output-buffer poll and every other budget-checked
+/// operator surface use.
 fn pre_output_budget_error(name: &str, used: u64, limit: u64) -> PipelineError {
     PipelineError::MemoryBudgetExceeded {
         node: name.to_string(),
