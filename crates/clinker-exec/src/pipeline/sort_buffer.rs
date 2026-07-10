@@ -6,12 +6,20 @@
 //! postcard temp files — optionally LZ4-framed per the workspace
 //! `[storage.spill] compress` knob — when the budget is exceeded.
 //!
-//! Generic over per-record payload `P`. Source/output sort uses
-//! `SortBuffer<()>`; the DAG executor's `PlanNode::Sort` dispatch arm uses
-//! `SortBuffer<(u64, IndexMap<String,Value>, IndexMap<String,Value>)>` to
-//! carry row number and metadata maps through the sort permutation. Payload
-//! travels inside the spill envelope (bundled-tuple sort), not on a parallel
-//! array, to avoid permutation-reindex bugs.
+//! Two ordering modes, chosen at construction:
+//!   - Field-ordered ([`SortBuffer::new`]): the sort key is read from the
+//!     record via [`compare_records_by_fields`] and the payload rides along
+//!     inert. Every source/output/DAG/join sort uses this.
+//!   - Payload-ordered ([`SortBuffer::new_payload_ordered`]): pairs order by the
+//!     payload `P: Ord` directly, with no record field consulted. This serves a
+//!     sort whose key is a value computed off the record — e.g. a range join
+//!     keying on evaluated inequality expressions that back no single column —
+//!     so the key need not be stamped onto the record as a synthetic field.
+//!
+//! Generic over per-record payload `P`. Source/output sort uses `SortBuffer<()>`;
+//! the DAG enforcer-sort and the sort-merge join carry a `u64` row-order tag as
+//! the payload. Payload travels inside the spill envelope (bundled-tuple sort),
+//! not on a parallel array, to avoid permutation-reindex bugs.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -35,12 +43,24 @@ pub enum SortedOutput<P> {
     Spilled(Vec<SpillFile<P>>),
 }
 
+/// How a [`SortBuffer`] orders its accumulated pairs.
+enum SortOrdering {
+    /// Order by [`compare_records_by_fields`] over these fields; the record
+    /// carries the sort key and the payload rides along inert.
+    Fields(Vec<SortField>),
+    /// Order by the carried payload `P: Ord` directly, with no record field
+    /// consulted. For a sort key computed off the record rather than stored in
+    /// a column.
+    Payload,
+}
+
 /// Accumulates `(record, payload)` pairs, sorts in-memory or spills to disk
-/// when the byte budget is exceeded. Sort key is extracted from the record
-/// only — the payload rides along.
+/// when the byte budget is exceeded. Orders either by a record-field comparator
+/// (payload inert) or by the payload `P: Ord` directly, per the constructor
+/// chosen.
 pub struct SortBuffer<P> {
     pairs: Vec<(Record, P)>,
-    sort_by: Vec<SortField>,
+    ordering: SortOrdering,
     bytes_used: usize,
     spill_threshold: usize,
     spill_dir: Option<PathBuf>,
@@ -53,7 +73,14 @@ pub struct SortBuffer<P> {
     schema: Arc<Schema>,
 }
 
-impl<P: Serialize + DeserializeOwned + Send> SortBuffer<P> {
+// `P: Ord` spans the whole impl, not just the payload-ordered constructor, so
+// the shared `sort_and_spill` / `finish` path can compare payloads in the
+// payload-ordered mode without splitting the buffer across two impl blocks.
+// Every payload type in use is already `Ord`, so this constrains no caller.
+impl<P: Serialize + DeserializeOwned + Send + Ord> SortBuffer<P> {
+    /// Field-ordered buffer: pairs sort by `sort_by` over each record's fields
+    /// and the payload rides along inert. The historical mode; used by every
+    /// source/output/DAG/join sort.
     pub fn new(
         sort_by: Vec<SortField>,
         spill_threshold: usize,
@@ -63,7 +90,30 @@ impl<P: Serialize + DeserializeOwned + Send> SortBuffer<P> {
     ) -> Self {
         Self {
             pairs: Vec::new(),
-            sort_by,
+            ordering: SortOrdering::Fields(sort_by),
+            bytes_used: 0,
+            spill_threshold,
+            spill_dir,
+            spill_compress,
+            spill_files: Vec::new(),
+            schema,
+        }
+    }
+
+    /// Payload-ordered buffer: pairs sort by the payload `P: Ord` directly, with
+    /// no record field consulted. For a sort key computed off the record (e.g. a
+    /// range join's evaluated inequality keys) that backs no single column, so
+    /// no synthetic sort column need be stamped onto the records. Spill,
+    /// merge, and charging behave exactly as in the field-ordered mode.
+    pub fn new_payload_ordered(
+        spill_threshold: usize,
+        spill_dir: Option<PathBuf>,
+        spill_compress: bool,
+        schema: Arc<Schema>,
+    ) -> Self {
+        Self {
+            pairs: Vec::new(),
+            ordering: SortOrdering::Payload,
             bytes_used: 0,
             spill_threshold,
             spill_dir,
@@ -90,17 +140,32 @@ impl<P: Serialize + DeserializeOwned + Send> SortBuffer<P> {
     /// Clears the buffer and resets the byte counter. Returns the spilled
     /// file's on-disk byte length so the caller can charge it against the
     /// pipeline disk-spill quota; an empty buffer writes nothing and returns 0.
+    /// Stable-sort the in-memory pairs by the buffer's ordering mode. Parallel
+    /// stable sort on the shared kernel pool: `par_sort_by` preserves the
+    /// tie-break order of the sequential `slice::sort_by`, so a spilled run is
+    /// byte-identical to the sequential sort and equal keys keep input order.
+    fn sort_pairs(&mut self) {
+        // Split the borrow so the comparator can read `ordering` while
+        // `par_sort_by` holds `pairs` mutably.
+        let Self {
+            pairs, ordering, ..
+        } = self;
+        match ordering {
+            SortOrdering::Fields(sort_by) => {
+                pairs.par_sort_by(|(a, _), (b, _)| compare_records_by_fields(a, b, sort_by));
+            }
+            SortOrdering::Payload => {
+                pairs.par_sort_by(|(_, a), (_, b)| a.cmp(b));
+            }
+        }
+    }
+
     pub fn sort_and_spill(&mut self) -> Result<u64, SpillError> {
         if self.pairs.is_empty() {
             return Ok(0);
         }
 
-        let sort_by = &self.sort_by;
-        // Parallel stable sort on the shared kernel pool. `par_sort_by`
-        // preserves the tie-break order of `slice::sort_by` (both stable),
-        // so the spilled run is byte-identical to the sequential sort.
-        self.pairs
-            .par_sort_by(|(a, _), (b, _)| compare_records_by_fields(a, b, sort_by));
+        self.sort_pairs();
 
         let mut writer: SpillWriter<P> = SpillWriter::new(
             self.schema.clone(),
@@ -130,12 +195,7 @@ impl<P: Serialize + DeserializeOwned + Send> SortBuffer<P> {
     /// the caller can charge that final run against the disk-spill quota.
     pub fn finish(mut self) -> Result<(SortedOutput<P>, u64), SpillError> {
         if self.spill_files.is_empty() {
-            let sort_by = &self.sort_by;
-            // Parallel stable sort on the shared kernel pool; tie-break
-            // order matches the sequential `slice::sort_by` exactly, so
-            // the in-memory result is byte-identical.
-            self.pairs
-                .par_sort_by(|(a, _), (b, _)| compare_records_by_fields(a, b, sort_by));
+            self.sort_pairs();
             Ok((SortedOutput::InMemory(self.pairs), 0))
         } else {
             let residue = if !self.pairs.is_empty() {
@@ -382,6 +442,49 @@ mod tests {
                 assert_eq!(pairs[2].1, 100);
             }
             _ => panic!("expected Spilled"),
+        }
+    }
+
+    #[test]
+    fn test_sort_buffer_payload_ordered_in_memory_sorts_by_payload() {
+        // Payload-ordered mode sorts by the (i64, i64, u64) payload — the shape
+        // a range join carries — and never consults a record field. Records
+        // carry an unrelated `value`; ordering must ignore it. Negative primary
+        // keys must order correctly.
+        let schema = test_schema();
+        let mut buf: SortBuffer<(i64, i64, u64)> =
+            SortBuffer::new_payload_ordered(1_000_000, None, true, schema.clone());
+        buf.push(make_record(&schema, "a", 999), (5, 0, 0));
+        buf.push(make_record(&schema, "b", 111), (-3, 2, 1));
+        buf.push(make_record(&schema, "c", 555), (-3, 1, 2));
+        buf.push(make_record(&schema, "d", 222), (5, 0, 3));
+        match buf.finish().unwrap().0 {
+            SortedOutput::InMemory(pairs) => {
+                let payloads: Vec<(i64, i64, u64)> = pairs.iter().map(|(_, p)| *p).collect();
+                assert_eq!(payloads, vec![(-3, 1, 2), (-3, 2, 1), (5, 0, 0), (5, 0, 3)]);
+            }
+            SortedOutput::Spilled(_) => panic!("expected InMemory"),
+        }
+    }
+
+    #[test]
+    fn test_sort_buffer_payload_ordered_forced_spill_multiple_runs() {
+        // A tiny threshold plus explicit flushes forces several
+        // individually-sorted runs to disk; finish() flushes the residue as one
+        // more. Payload-ordered spill uses the same envelope as field-ordered.
+        let schema = test_schema();
+        let mut buf: SortBuffer<(i64, i64, u64)> =
+            SortBuffer::new_payload_ordered(1, None, true, schema.clone());
+        for i in 0..3i64 {
+            buf.push(make_record(&schema, "r", i), (i, 0, i as u64));
+            assert!(buf.should_spill());
+            buf.sort_and_spill().unwrap();
+        }
+        // One more pair left resident for finish() to flush.
+        buf.push(make_record(&schema, "r", 9), (9, 0, 9));
+        match buf.finish().unwrap().0 {
+            SortedOutput::Spilled(files) => assert_eq!(files.len(), 4, "3 flushes + 1 residue"),
+            SortedOutput::InMemory(_) => panic!("expected Spilled"),
         }
     }
 
