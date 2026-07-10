@@ -55,6 +55,7 @@ use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
+use crate::pipeline::spill_merge::SortedRunMerger;
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
@@ -937,45 +938,38 @@ fn sort_driver_pairs_externally(
             }
         }
         SortedOutput::Spilled(files) => {
-            // `buf.finish()` may have spilled the in-memory residue
-            // we last charged into `local_charged`. Those bytes are
-            // now off-process; the records flow back from disk into
-            // `pairs` below and re-charge per-record.
+            // `buf.finish()` spilled every record we last charged into
+            // `local_charged`; those bytes are now off-process. Stream the
+            // records back through the k-way merge below and re-charge each as
+            // it lands, so the arbitrator tracks this side's residence as it
+            // grows rather than in one late jump.
             consumer_handle.sub_bytes(local_charged);
-            // Single-file path is exact (the buffer sort is stable).
-            // Multi-file would need a k-way merge via `LoserTree`; the
-            // matching-run spill is independent and handled in Phase B,
-            // so a true k-way merge over Phase A spill files is the
-            // next-iteration improvement. Today we surface the limit
-            // explicitly so a future enlargement of the soft limit (or
-            // a user `memory.limit:` increase) lets the workload run.
-            if files.len() > 1 {
-                return Err(PipelineError::Io(std::io::Error::other(format!(
-                    "sort-merge driver phase A produced {} spill files; multi-file \
-                     k-way merge is wired but not yet enabled — increase the \
-                     pipeline `memory.limit:` so the sort fits in a single chunk",
-                    files.len()
-                ))));
-            }
-            for file in files {
-                let reader = file.reader().map_err(|e| {
-                    PipelineError::Io(std::io::Error::other(format!(
-                        "sort-merge driver phase A spill read failed: {e}"
-                    )))
-                })?;
-                for entry in reader {
-                    let (record, order) = entry.map_err(|e| {
-                        PipelineError::Io(std::io::Error::other(format!(
-                            "sort-merge driver phase A spill decode failed: {e}"
-                        )))
-                    })?;
-                    let key = record.get(field).cloned().unwrap_or(Value::Null);
-                    let bytes = std::mem::size_of::<Record>()
-                        + record.estimated_heap_size()
-                        + std::mem::size_of::<RecordOrder>();
-                    consumer_handle.add_bytes(bytes as u64);
-                    pairs.push((record, order, key));
-                }
+            // Fold the individually-sorted runs into one globally-ordered
+            // stream via the shared LoserTree k-way merge, draining it record
+            // by record. `SortBuffer` already sorted each run on `field`, so the
+            // merge preserves that order across runs (a single run is an
+            // identity pass). Phase B walks `driver_pairs` as a fully-resident
+            // slice, so the merged side lands entirely in memory here; the
+            // per-record charge keeps the arbitrator's accounting accurate as
+            // it does.
+            let merge_field = clinker_plan::config::SortField {
+                field: field.clone(),
+                order: clinker_plan::config::SortOrder::Asc,
+                null_order: None,
+            };
+            let merger = SortedRunMerger::new(
+                files,
+                std::slice::from_ref(&merge_field),
+                "sort-merge driver phase A",
+            )?;
+            for entry in merger {
+                let (record, order) = entry?;
+                let key = record.get(field).cloned().unwrap_or(Value::Null);
+                let bytes = std::mem::size_of::<Record>()
+                    + record.estimated_heap_size()
+                    + std::mem::size_of::<RecordOrder>();
+                consumer_handle.add_bytes(bytes as u64);
+                pairs.push((record, order, key));
             }
         }
     }
@@ -1072,31 +1066,28 @@ fn sort_build_pairs_externally(
         }
         SortedOutput::Spilled(files) => {
             consumer_handle.sub_bytes(local_charged);
-            if files.len() > 1 {
-                return Err(PipelineError::Io(std::io::Error::other(format!(
-                    "sort-merge build phase A produced {} spill files; multi-file \
-                     k-way merge is wired but not yet enabled — increase the \
-                     pipeline `memory.limit:` so the sort fits in a single chunk",
-                    files.len()
-                ))));
-            }
-            for file in files {
-                let reader = file.reader().map_err(|e| {
-                    PipelineError::Io(std::io::Error::other(format!(
-                        "sort-merge build phase A spill read failed: {e}"
-                    )))
-                })?;
-                for entry in reader {
-                    let (record, _) = entry.map_err(|e| {
-                        PipelineError::Io(std::io::Error::other(format!(
-                            "sort-merge build phase A spill decode failed: {e}"
-                        )))
-                    })?;
-                    let key = record.get(field).cloned().unwrap_or(Value::Null);
-                    let bytes = std::mem::size_of::<Record>() + record.estimated_heap_size();
-                    consumer_handle.add_bytes(bytes as u64);
-                    pairs.push((record, key));
-                }
+            // Fold the individually-sorted runs into one globally-ordered
+            // stream via the shared LoserTree k-way merge, draining it record
+            // by record (single-run input is an identity pass). The build side
+            // carries a unit payload. As on the driver side, Phase B walks the
+            // full `build_pairs` slice, so the merged side is held resident and
+            // charged per record as it lands.
+            let merge_field = clinker_plan::config::SortField {
+                field: field.clone(),
+                order: clinker_plan::config::SortOrder::Asc,
+                null_order: None,
+            };
+            let merger = SortedRunMerger::new(
+                files,
+                std::slice::from_ref(&merge_field),
+                "sort-merge build phase A",
+            )?;
+            for entry in merger {
+                let (record, _) = entry?;
+                let key = record.get(field).cloned().unwrap_or(Value::Null);
+                let bytes = std::mem::size_of::<Record>() + record.estimated_heap_size();
+                consumer_handle.add_bytes(bytes as u64);
+                pairs.push((record, key));
             }
         }
     }
@@ -2104,6 +2095,132 @@ mod tests {
             small_stats.matching_run_spills, 0,
             "small-build run must not spill"
         );
+    }
+
+    /// Phase A external sort spilling to MULTIPLE runs per side must k-way
+    /// merge them into one globally-ordered stream — the join result is
+    /// identical to the same inputs sorted entirely in memory, and matches a
+    /// brute-force oracle. Before the multi-file merge was wired, a >1-run
+    /// Phase A spill returned a hard error ("multi-file k-way merge is wired
+    /// but not yet enabled"); this drives the completed merge end-to-end.
+    #[test]
+    fn test_sort_merge_phase_a_multi_file_spill() {
+        let drivers_schema = schema_with(&["k", "pad"]);
+        let builds_schema = schema_with(&["k", "pad"]);
+        // ~1.2 KiB pad per row inflates each side well past the Phase A spill
+        // threshold at the 128 KiB budget (soft_limit / 2 ≈ 51 KiB), forcing
+        // several sorted runs per side and thus the k-way merge. The match set
+        // is kept tiny (only the low-key drivers beat the high-key builds) so
+        // the O(N·M) output stays under the same budget's output guard — this
+        // test targets the input axis, not the output axis.
+        let pad = "x".repeat(1200);
+        let n = 100i64;
+        // First `matching_lo` drivers have a low key that beats the builds;
+        // the rest have a key no build can exceed. Symmetrically only the first
+        // `matching_hi` builds carry a key the low drivers beat.
+        let matching_lo = 4i64;
+        let matching_hi = 4i64;
+        let driver_keys: Vec<i64> = (0..n)
+            .map(|i| if i < matching_lo { 0 } else { 1_000_000 })
+            .collect();
+        let build_keys: Vec<i64> = (0..n)
+            .map(|j| if j < matching_hi { 10 } else { -1_000_000 })
+            .collect();
+
+        let make_inputs = || {
+            let driver: Vec<(Record, RecordOrder)> = driver_keys
+                .iter()
+                .enumerate()
+                .map(|(i, &k)| {
+                    (
+                        rec(
+                            &drivers_schema,
+                            vec![Value::Integer(k), Value::String(pad.clone().into())],
+                        ),
+                        i as RecordOrder,
+                    )
+                })
+                .collect();
+            let build: Vec<Record> = build_keys
+                .iter()
+                .map(|&k| {
+                    rec(
+                        &builds_schema,
+                        vec![Value::Integer(k), Value::String(pad.clone().into())],
+                    )
+                })
+                .collect();
+            (driver, build)
+        };
+
+        // Brute-force oracle for `drivers.k < builds.k`: each satisfying build
+        // emits one row tagged with the driver's original order.
+        let mut oracle_orders: Vec<RecordOrder> = Vec::new();
+        for (i, &dk) in driver_keys.iter().enumerate() {
+            let matches = build_keys.iter().filter(|&&bk| dk < bk).count();
+            oracle_orders.extend(std::iter::repeat_n(i as RecordOrder, matches));
+        }
+        oracle_orders.sort_unstable();
+        assert_eq!(
+            oracle_orders.len(),
+            (matching_lo * matching_hi) as usize,
+            "oracle match count is the low-driver × high-build product"
+        );
+
+        let compile = || {
+            let typed = compile_pure_range(
+                "filter drivers.k < builds.k",
+                &[
+                    ("drivers", "k", cxl::typecheck::Type::Int),
+                    ("builds", "k", cxl::typecheck::Type::Int),
+                ],
+            );
+            let rc = extract_range_conjunct(&typed, "drivers", "builds");
+            decomposed_pure_range(rc, Arc::clone(&typed))
+        };
+
+        let run = |budget_bytes: Option<u64>| {
+            let (driver, build) = make_inputs();
+            run_kernel(RunKernel {
+                driver_records: driver,
+                build_records: build,
+                decomposed: compile(),
+                driver_qual: "drivers",
+                build_qual: "builds",
+                driver_schema: &drivers_schema,
+                build_schema: &builds_schema,
+                match_mode: MatchMode::All,
+                on_miss: OnMiss::Skip,
+                presorted: false,
+                body_program: None,
+                budget_bytes,
+            })
+        };
+
+        // Constrained budget → Phase A spills several runs per side and k-way
+        // merges them; the small match set keeps the output under the guard.
+        let (spilled_records, spilled_stats) = run(Some(128 * 1024));
+        // Default (large) budget → Phase A sorts entirely in memory.
+        let (in_mem_records, in_mem_stats) = run(None);
+
+        // Phase A external sort ran on both (not the presorted skip).
+        assert_eq!(spilled_stats.phase_a_sort_invocations, 2);
+        assert_eq!(in_mem_stats.phase_a_sort_invocations, 2);
+
+        // Same match count as the oracle, both ways.
+        assert_eq!(spilled_records.len(), oracle_orders.len());
+        assert_eq!(in_mem_records.len(), oracle_orders.len());
+
+        // The multiset of emitted driver-order tags matches the oracle exactly,
+        // so the multi-run merge admitted precisely the same pairs the
+        // in-memory sort did.
+        let mut spilled_orders: Vec<RecordOrder> =
+            spilled_records.iter().map(|(_, o)| *o).collect();
+        spilled_orders.sort_unstable();
+        let mut in_mem_orders: Vec<RecordOrder> = in_mem_records.iter().map(|(_, o)| *o).collect();
+        in_mem_orders.sort_unstable();
+        assert_eq!(spilled_orders, oracle_orders);
+        assert_eq!(in_mem_orders, oracle_orders);
     }
 
     /// Pre-sorted inputs skip Phase A external sort. Verified by
