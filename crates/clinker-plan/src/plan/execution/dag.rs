@@ -194,13 +194,16 @@ impl ExecutionPlanDag {
     /// state.
     ///
     /// A spill-writing operator (external sort, hash Aggregate, grace-hash /
-    /// sort-merge Combine — see [`super::writes_spill_files`]) holds its whole
-    /// accumulated input before it can emit, and writes that state to a spill
-    /// file when the memory budget trips. In-memory join strategies (inline
-    /// hash build/probe, IEJoin) carry an arbitration `spill_priority` but run
-    /// their kernel entirely in RAM, so they contribute nothing to disk
-    /// volume and are excluded — counting them would over-state the free-space
-    /// a run needs. Summing rather than taking the max is the conservative
+    /// sort-merge Combine, pure-range block-band `IEJoin` — see
+    /// [`super::writes_spill_files`]) holds its whole accumulated input before
+    /// it can emit, and writes that state to a spill file when the memory budget
+    /// trips; the block-band path writes it about twice (sort runs plus block
+    /// files), reflected by [`super::spill_volume_multiplier`]. In-memory join
+    /// strategies (inline hash build/probe, `HashPartitionIEJoin`) carry an
+    /// arbitration `spill_priority` but run their kernel entirely in RAM, so
+    /// they contribute nothing to disk volume and are excluded — counting them
+    /// would over-state the free-space a run needs. Summing rather than taking
+    /// the max is the conservative
     /// choice for a free-space preflight: two blocking operators can be live
     /// and spilled simultaneously, so their footprints add. The figure derives
     /// from the same `predicted_peak_bytes` estimates `--explain` surfaces, so
@@ -211,22 +214,30 @@ impl ExecutionPlanDag {
         self.topo_order
             .iter()
             .filter(|&&idx| super::writes_spill_files(&self.graph[idx]))
-            .filter_map(|idx| self.node_properties.get(idx))
-            .fold(0u64, |acc, props| {
-                acc.saturating_add(props.predicted_peak_bytes)
+            .filter_map(|&idx| {
+                self.node_properties
+                    .get(&idx)
+                    .map(|props| (idx, props.predicted_peak_bytes))
+            })
+            .fold(0u64, |acc, (idx, peak)| {
+                acc.saturating_add(
+                    peak.saturating_mul(super::spill_volume_multiplier(&self.graph[idx])),
+                )
             })
     }
 
     /// Per-blocking-stage spill-volume estimate, one entry per spill-writing
-    /// operator (external sort, hash Aggregate, grace-hash / sort-merge
-    /// Combine — see [`super::writes_spill_files`]) in topological order.
+    /// operator (external sort, hash Aggregate, grace-hash / sort-merge Combine,
+    /// pure-range block-band `IEJoin` — see [`super::writes_spill_files`]) in
+    /// topological order.
     ///
-    /// In-memory join strategies (inline hash build/probe, IEJoin) carry an
-    /// arbitration `spill_priority` but never write a spill file, so they do
-    /// not appear here — the per-stage estimate describes what reaches disk.
-    /// Each [`StageSpillEstimate`] carries the operator's node name, its
-    /// `--explain` display name, and its `predicted_peak_bytes` — the coarse
-    /// plan-time estimate of the live state it could spill. `estimate_bytes`
+    /// In-memory join strategies (inline hash build/probe, `HashPartitionIEJoin`)
+    /// carry an arbitration `spill_priority` but never write a spill file, so
+    /// they do not appear here — the per-stage estimate describes what reaches
+    /// disk. Each [`StageSpillEstimate`] carries the operator's node name, its
+    /// `--explain` display name, and its `predicted_peak_bytes` scaled by
+    /// [`super::spill_volume_multiplier`] (about 2× for the block-band path,
+    /// which writes sort runs then block files). `estimate_bytes`
     /// is `0` (rendered "unknown") when no on-disk file-size seed reached the
     /// node: a multi-file source matcher (glob/regex/paths) whose discovered
     /// sizes were not summed at plan time, a missing/unreadable input, or a
@@ -246,7 +257,8 @@ impl ExecutionPlanDag {
                     estimate_bytes: self
                         .node_properties
                         .get(&idx)
-                        .map_or(0, |p| p.predicted_peak_bytes),
+                        .map_or(0, |p| p.predicted_peak_bytes)
+                        .saturating_mul(super::spill_volume_multiplier(node)),
                 }
             })
             .collect()

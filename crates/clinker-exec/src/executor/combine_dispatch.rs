@@ -410,16 +410,18 @@ pub(crate) fn dispatch_combine(
             // Register an IEJoin consumer with the pipeline-
             // scoped arbitrator under `SortConsumer` (priority
             // 20), sharing a `ConsumerHandle` with the kernel. The
-            // kernel mirrors its estimated pre-output working-set
-            // bytes (routed partition indices, range-key arrays,
-            // and per-group L1/L2 / permutation / bit state) into
-            // this handle, so the arbitrator's pull-mode
-            // `current_usage` reads the live footprint while the
-            // join runs. IEJoin has no spill path, so the
-            // `SortConsumer`'s spill-request flag is never read by
-            // the kernel — the handle carries the byte estimate for
-            // attribution and drives the kernel's own
-            // `should_abort_local` gate.
+            // kernel mirrors its live working-set bytes (the
+            // block-band path's external-sort buffers and resident
+            // blocks; the equi+range path's routed indices and
+            // per-group L1/L2 / permutation / bit state) into this
+            // handle, so the arbitrator's pull-mode `current_usage`
+            // reads the live footprint while the join runs. The
+            // pure-range block-band path is threshold-driven: it
+            // spills its sorted runs and min/max-tagged blocks when
+            // the buffer exceeds the soft limit, so the handle also
+            // drives the kernel's `should_abort_local` gate, now a
+            // genuine last resort for a single block-pair plus kernel
+            // aux that still cannot fit.
             let ie_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
             let ie_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
                 crate::pipeline::sort_buffer::SortConsumer::new(ie_consumer_handle.clone()),
@@ -461,6 +463,19 @@ pub(crate) fn dispatch_combine(
                     });
                 let body_typed = body_typed_on_node.as_ref();
                 let combine_output_schema_arc = combine_output_schema.clone();
+                // Resolve the spill compression mode against the combine's output
+                // schema width and the run's batch size, so the block-band path's
+                // spill runs and block files match what `--explain` projects.
+                // `auto` skips LZ4 on narrow combines where the per-frame fixed
+                // cost outweighs the savings. The equi+range (`Some`) path never
+                // spills, so this is inert there.
+                let ie_column_count = combine_output_schema_arc
+                    .as_ref()
+                    .map(|s| s.column_count())
+                    .unwrap_or(0);
+                let ie_spill_compress = ctx
+                    .spill_compress
+                    .resolve_for_schema(ie_column_count, ctx.batch_size as u64);
                 let iejoin_ctx = ctx.merged_eval_ctx();
                 // CPU-bound IEJoin kernel — partition + range-walk +
                 // materialize. The kernel owns its inputs
@@ -486,6 +501,8 @@ pub(crate) fn dispatch_combine(
                         ctx: &iejoin_ctx,
                         budget: &ctx.memory_budget,
                         consumer: &ie_consumer_handle,
+                        spill_dir: ctx.spill_root_path.as_ref(),
+                        spill_compress: ie_spill_compress,
                         strategy: ctx.strategy,
                     })
                 })?;

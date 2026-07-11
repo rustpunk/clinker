@@ -8,9 +8,14 @@
 //! runs — the `Sort` DAG node and the sort-merge combine's Phase A external
 //! sort.
 //!
-//! Ordering is by [`compare_records_by_fields`] — the exact field comparator
-//! `SortBuffer` formed each run with — so the merged order is byte-identical to
-//! the single in-memory sort the buffer would have produced without spilling.
+//! Ordering mirrors the [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer)
+//! mode the runs were spilled under, so the merged order is byte-identical to
+//! the single in-memory sort the buffer would have produced without spilling:
+//!   - Field-ordered ([`SortedRunMerger::new`]): by [`compare_records_by_fields`]
+//!     — the exact field comparator each run was formed with.
+//!   - Payload-ordered ([`SortedRunMerger::new_payload_ordered`]): by the
+//!     carried payload `P: Ord` directly, matching a payload-ordered buffer.
+//!
 //! The memcomparable byte key on
 //! [`crate::pipeline::loser_tree::MergeEntry`] is deliberately not used here:
 //! it is not provably equal to the field comparator across Integer/Decimal or
@@ -36,48 +41,65 @@ use crate::pipeline::spill::{SpillFile, SpillReader};
 use clinker_plan::config::SortField;
 use clinker_plan::error::PipelineError;
 
+/// How [`SortedRunMerger`] orders runs against each other, mirroring the
+/// [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer) mode each run was
+/// spilled under. Cheap to clone: the field variant shares one `Arc`.
+#[derive(Clone)]
+enum RunOrdering {
+    /// Order by [`compare_records_by_fields`] over the shared fields — the
+    /// record carries the sort key.
+    Fields(Arc<[SortField]>),
+    /// Order by the carried payload `P: Ord` directly — no record field.
+    Payload,
+}
+
 /// One entry in the k-way merge: a spilled record and the payload `P` carried
-/// through the sort permutation. `Ord` delegates to
-/// [`compare_records_by_fields`] against the shared `sort_by`, so the merged
-/// order matches every run's internal sort exactly.
+/// through the sort permutation. `Ord` delegates to the run's [`RunOrdering`],
+/// so the merged order matches every run's internal sort exactly.
 struct Run<P> {
-    sort_by: Arc<[SortField]>,
+    ordering: RunOrdering,
     record: Record,
     payload: P,
 }
 
-impl<P> PartialEq for Run<P> {
+impl<P: Ord> PartialEq for Run<P> {
     fn eq(&self, other: &Self) -> bool {
         self.cmp(other) == Ordering::Equal
     }
 }
 
-impl<P> Eq for Run<P> {}
+impl<P: Ord> Eq for Run<P> {}
 
-impl<P> PartialOrd for Run<P> {
+impl<P: Ord> PartialOrd for Run<P> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<P> Ord for Run<P> {
+impl<P: Ord> Ord for Run<P> {
     fn cmp(&self, other: &Self) -> Ordering {
-        compare_records_by_fields(&self.record, &other.record, &self.sort_by)
+        match &self.ordering {
+            RunOrdering::Fields(sort_by) => {
+                compare_records_by_fields(&self.record, &other.record, sort_by)
+            }
+            RunOrdering::Payload => self.payload.cmp(&other.payload),
+        }
     }
 }
 
 /// Pull the next `(record, payload)` from one spilled run, wrapping it as a
-/// [`Run`] merge entry, or `None` at end of stream. `context` names the
-/// calling operator/phase so a decode failure localizes to the right node.
+/// [`Run`] merge entry under `ordering`, or `None` at end of stream. `context`
+/// names the calling operator/phase so a decode failure localizes to the right
+/// node.
 fn next_run<P: DeserializeOwned>(
     reader: &mut SpillReader<P>,
-    sort_by: &Arc<[SortField]>,
+    ordering: &RunOrdering,
     context: &'static str,
 ) -> Result<Option<Run<P>>, PipelineError> {
     match reader.next() {
         None => Ok(None),
         Some(Ok((record, payload))) => Ok(Some(Run {
-            sort_by: Arc::clone(sort_by),
+            ordering: ordering.clone(),
             record,
             payload,
         })),
@@ -97,18 +119,22 @@ fn next_run<P: DeserializeOwned>(
 ///
 /// Stable: `SortBuffer` spills runs in input order (run 0 earliest) with a
 /// stable per-run sort, and the loser tree breaks ties by lower stream index,
-/// so equal keys emit in input order.
+/// so records with an equal ordering key emit run-0-first, then in input order
+/// within a run. In the payload-ordered mode an "equal key" is an equal
+/// payload; a caller wanting a total order gives the payload a unique
+/// tie-break component (the merge order is otherwise deterministic but carries
+/// no stability guarantee beyond that (run-index, within-run) rule).
 ///
 /// Callers that need the whole run at once use [`merge_sorted_runs`]; callers
 /// that can consume incrementally (draining straight into their own buffer, or
 /// re-slicing the merged run into bounded blocks) drive this iterator directly.
-pub(crate) struct SortedRunMerger<P> {
+pub(crate) struct SortedRunMerger<P: Ord> {
     /// Held only to keep the backing temp files alive across iteration; the
     /// readers below own independent file handles, not borrows of these.
     _files: Vec<SpillFile<P>>,
     readers: Vec<SpillReader<P>>,
     tree: LoserTree<Run<P>>,
-    sort_by: Arc<[SortField]>,
+    ordering: RunOrdering,
     /// Names the calling operator/phase for decode-error messages.
     context: &'static str,
     /// Latches once a decode error has been surfaced so `next` stops rather
@@ -116,17 +142,45 @@ pub(crate) struct SortedRunMerger<P> {
     done: bool,
 }
 
-impl<P: DeserializeOwned> SortedRunMerger<P> {
-    /// Open a reader over every run and seed the loser tree with one record
-    /// per run. `context` names the calling operator/phase so a spill open or
-    /// decode failure localizes to the right node. Returns an I/O error if any
-    /// run fails to open or its first record fails to decode.
+impl<P: DeserializeOwned + Ord> SortedRunMerger<P> {
+    /// Field-ordered merge: runs are ordered by [`compare_records_by_fields`]
+    /// over `sort_by`, matching a field-ordered
+    /// [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer). `context` names
+    /// the calling operator/phase so a spill open or decode failure localizes
+    /// to the right node.
     pub(crate) fn new(
         files: Vec<SpillFile<P>>,
         sort_by: &[SortField],
         context: &'static str,
     ) -> Result<Self, PipelineError> {
-        let sort_by: Arc<[SortField]> = Arc::from(sort_by.to_vec());
+        Self::open(
+            files,
+            RunOrdering::Fields(Arc::from(sort_by.to_vec())),
+            context,
+        )
+    }
+
+    /// Payload-ordered merge: runs are ordered by the carried payload `P: Ord`
+    /// directly, matching a payload-ordered
+    /// [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer). Folds
+    /// payload-sorted runs back into one globally payload-sorted stream. See the
+    /// type-level doc for tie behavior on equal payloads.
+    pub(crate) fn new_payload_ordered(
+        files: Vec<SpillFile<P>>,
+        context: &'static str,
+    ) -> Result<Self, PipelineError> {
+        Self::open(files, RunOrdering::Payload, context)
+    }
+
+    /// Open a reader over every run and seed the loser tree with one record per
+    /// run under `ordering`. Returns an I/O error if any run fails to open or
+    /// its first record fails to decode; `context` localizes such a failure to
+    /// the calling operator/phase.
+    fn open(
+        files: Vec<SpillFile<P>>,
+        ordering: RunOrdering,
+        context: &'static str,
+    ) -> Result<Self, PipelineError> {
         let mut readers: Vec<SpillReader<P>> = files
             .iter()
             .map(|f| f.reader())
@@ -139,7 +193,7 @@ impl<P: DeserializeOwned> SortedRunMerger<P> {
 
         let mut initial: Vec<Option<Run<P>>> = Vec::with_capacity(readers.len());
         for reader in &mut readers {
-            initial.push(next_run(reader, &sort_by, context)?);
+            initial.push(next_run(reader, &ordering, context)?);
         }
         let tree = LoserTree::new(initial);
 
@@ -147,14 +201,14 @@ impl<P: DeserializeOwned> SortedRunMerger<P> {
             _files: files,
             readers,
             tree,
-            sort_by,
+            ordering,
             context,
             done: false,
         })
     }
 }
 
-impl<P: DeserializeOwned> Iterator for SortedRunMerger<P> {
+impl<P: DeserializeOwned + Ord> Iterator for SortedRunMerger<P> {
     type Item = Result<(Record, P), PipelineError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -169,7 +223,7 @@ impl<P: DeserializeOwned> Iterator for SortedRunMerger<P> {
         // winner's successor. A decode error aborts the whole merge — the
         // partial output the caller has collected is discarded when it
         // propagates the `Err`.
-        let refill = match next_run(&mut self.readers[idx], &self.sort_by, self.context) {
+        let refill = match next_run(&mut self.readers[idx], &self.ordering, self.context) {
             Ok(next) => next,
             Err(e) => {
                 self.done = true;
@@ -191,7 +245,7 @@ impl<P: DeserializeOwned> Iterator for SortedRunMerger<P> {
 ///
 /// Memory model: holds one resident record per open run plus the fully
 /// materialized output.
-pub(crate) fn merge_sorted_runs<P: DeserializeOwned>(
+pub(crate) fn merge_sorted_runs<P: DeserializeOwned + Ord>(
     files: Vec<SpillFile<P>>,
     sort_by: &[SortField],
     context: &'static str,
@@ -377,6 +431,101 @@ mod tests {
             merged[1].0.get("k"),
             Some(&Value::Decimal(Decimal::new(30, 1)))
         );
+    }
+
+    /// Payload-ordered runs merged by the payload-ordered merger must yield the
+    /// exact globally sorted sequence a single std sort of the same tuples
+    /// produces. Tuple shape `(i64, i64, u64)` mirrors the range-join driver
+    /// payload; the run includes negative primary keys, and the `u64` third
+    /// component is a unique `RecordOrder` tag making the payload a total order.
+    /// The `id` column carries that tag too, so the check also proves each
+    /// record kept its own payload across the spill envelope and the merge.
+    #[test]
+    fn payload_ordered_merge_matches_std_sorted_oracle() {
+        let schema = schema();
+        let tuples: Vec<(i64, i64, u64)> = vec![
+            (5, -2, 0),
+            (-7, 3, 1),
+            (5, -2, 2),
+            (0, 0, 3),
+            (-7, -9, 4),
+            (12, 1, 5),
+            (-7, 3, 6),
+            (3, 8, 7),
+            (5, -2, 8),
+            (-100, 4, 9),
+        ];
+        // budget=1 with explicit flushes: three runs carrying several unsorted
+        // tuples each, the last flushed by finish() as the residue.
+        let mut buf: SortBuffer<(i64, i64, u64)> =
+            SortBuffer::new_payload_ordered(1, None, true, schema.clone());
+        let push_chunk = |buf: &mut SortBuffer<(i64, i64, u64)>, chunk: &[(i64, i64, u64)]| {
+            for &t in chunk {
+                // id column mirrors the payload's RecordOrder tag for readback.
+                buf.push(rec(&schema, t.0, t.2 as i64), t);
+            }
+        };
+        push_chunk(&mut buf, &tuples[0..4]);
+        buf.sort_and_spill().unwrap();
+        push_chunk(&mut buf, &tuples[4..7]);
+        buf.sort_and_spill().unwrap();
+        push_chunk(&mut buf, &tuples[7..10]);
+
+        let files = match buf.finish().unwrap().0 {
+            SortedOutput::Spilled(files) => files,
+            SortedOutput::InMemory(_) => panic!("expected Spilled after explicit flushes"),
+        };
+        assert!(files.len() >= 2, "forced spill must produce multiple runs");
+
+        let merged: Vec<(Record, (i64, i64, u64))> =
+            SortedRunMerger::new_payload_ordered(files, "test")
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+
+        let mut oracle = tuples.clone();
+        oracle.sort();
+        let merged_payloads: Vec<(i64, i64, u64)> = merged.iter().map(|(_, p)| *p).collect();
+        assert_eq!(merged_payloads, oracle, "merged order must equal std sort");
+
+        // Every record kept its own payload: id column == payload's third field.
+        for (record, payload) in &merged {
+            assert_eq!(record.get("id"), Some(&Value::Integer(payload.2 as i64)));
+        }
+    }
+
+    /// Equal payloads across different runs emit run-0-first, then in input
+    /// order within a run — the deterministic tie rule the loser tree provides.
+    /// The `id` column tags each record's origin so the emitted order is
+    /// observable.
+    #[test]
+    fn payload_ordered_merge_breaks_ties_by_run_then_input_order() {
+        let schema = schema();
+        let mut buf: SortBuffer<(i64, i64, u64)> =
+            SortBuffer::new_payload_ordered(1, None, true, schema.clone());
+        // Run A: two records with the same payload, ids 0 then 1 (input order).
+        buf.push(rec(&schema, 0, 0), (7, 7, 7));
+        buf.push(rec(&schema, 0, 1), (7, 7, 7));
+        buf.sort_and_spill().unwrap();
+        // Run B (spilled later): same payload, id 2.
+        buf.push(rec(&schema, 0, 2), (7, 7, 7));
+        buf.sort_and_spill().unwrap();
+
+        let files = match buf.finish().unwrap().0 {
+            SortedOutput::Spilled(files) => files,
+            SortedOutput::InMemory(_) => panic!("expected Spilled"),
+        };
+        assert_eq!(files.len(), 2);
+
+        let ids: Vec<i64> = SortedRunMerger::new_payload_ordered(files, "test")
+            .unwrap()
+            .map(|r| match r.unwrap().0.get("id") {
+                Some(Value::Integer(n)) => *n,
+                other => panic!("expected Integer id, got {other:?}"),
+            })
+            .collect();
+        // Run A (ids 0, 1 in input order) precedes run B (id 2).
+        assert_eq!(ids, vec![0, 1, 2]);
     }
 
     /// The streaming iterator yields the same global order as the

@@ -96,11 +96,13 @@ Spill compression: Auto [storage.spill.compress]
 ```
 
 Only operators that actually write spill files appear here: the external sort,
-the hash Aggregate, and the grace-hash / sort-merge Combine. In-memory join
-strategies (the inline hash build/probe and the IEJoin range join) run their
-kernel entirely in RAM and never open a spill file, so spill compression does
-not apply to them and they are omitted from this list — even though they carry
-a spill priority for memory arbitration.
+the hash Aggregate, the grace-hash / sort-merge Combine, and the pure-range
+(block-band) IEJoin Combine, which external-sorts each side and writes its
+min/max-tagged blocks to disk. The remaining in-memory join strategies — the
+inline hash build/probe and the equi+range IEJoin (hash-partitioned range
+join) — run their kernel entirely in RAM and never open a spill file, so spill
+compression does not apply to them and they are omitted from this list, even
+though they carry a spill priority for memory arbitration.
 
 ## `storage.spill.disk_cap_bytes` — cap cumulative spill
 
@@ -194,10 +196,11 @@ are comparing the same unit the actuals report.
 ### Estimated spill volume per stage
 
 The `=== Estimated Spill Volume ===` section lists one line per spill-writing
-stage (hash Aggregate, external sort, grace-hash / sort-merge Combine) with its
-plan-time spill-volume estimate, followed by a total. In-memory join strategies
-(inline hash build/probe, IEJoin) never write spill files, so they do not
-appear here and do not inflate the total:
+stage (hash Aggregate, external sort, grace-hash / sort-merge Combine, and the
+pure-range block-band IEJoin Combine) with its plan-time spill-volume estimate,
+followed by a total. The remaining in-memory join strategies (inline hash
+build/probe, equi+range IEJoin) never write spill files, so they do not appear
+here and do not inflate the total:
 
 ```text
 === Estimated Spill Volume ===
