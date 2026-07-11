@@ -2046,16 +2046,21 @@ mod tests {
         assert!(arbitrator.should_spill_self());
     }
 
-    /// Below-threshold behavior: a 512 MiB budget (410 MiB soft) is far
-    /// above the test harness's own footprint on every first-class target,
-    /// so `should_spill` must stay false with no consumers registered.
+    /// Below-threshold behavior: `should_spill` must stay false with no
+    /// consumers registered when the budget sits above the process footprint.
+    /// The RSS arm reads the REAL process RSS, so the fixture budget must
+    /// exceed the whole parallel test harness's peak — a 512 MiB budget's
+    /// 410 MiB soft threshold proved reachable by the workspace test binary
+    /// on CI runners. 8 GiB keeps the premise true on every first-class
+    /// runner; pinning the comparison independent of ambient RSS needs an
+    /// injectable RSS source instead of a bigger constant.
     /// Gated to the supported targets so the assertion runs unconditionally
     /// on each runner.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_memory_arbitrator_below_threshold() {
         let arbitrator =
-            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
+            MemoryArbitrator::with_policy(8 * 1024 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
         assert!(!arbitrator.should_spill());
     }
 
