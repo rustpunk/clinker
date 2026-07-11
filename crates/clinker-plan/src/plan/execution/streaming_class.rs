@@ -269,12 +269,13 @@ pub fn classify_stream_nodes(
                 // feeding a streaming consumer (Output writer, Aggregate
                 // ingest, or Combine probe) — fused Transform, non-fused
                 // Merge, single-branch Route, streaming Aggregate, inline
-                // Combine probe — streams its output over the bounded
-                // channel and admits no `node_buffers` slot, so it renders
-                // `streaming`. The predicate already excluded blocking
-                // strategies (hash Aggregate, range/sort-merge/grace
-                // Combine) and window roots, so this branch only fires for
-                // genuinely streaming producers.
+                // Combine probe, pure-range block-band Combine output drain
+                // — streams its output over the bounded channel and admits
+                // no `node_buffers` slot, so it renders `streaming`. The
+                // predicate already excluded blocking strategies (hash
+                // Aggregate; equi+range / sort-merge / grace-hash Combine)
+                // and window roots, so this branch only fires for genuinely
+                // streaming producers.
                 PlanNode::Transform { .. }
                 | PlanNode::Merge { .. }
                 | PlanNode::Route { .. }
@@ -436,6 +437,11 @@ pub fn compute_streaming_combine_probe_edges(
 /// - hash build-probe `Combine`
 ///   ([`CombineStrategy::HashBuildProbe`]): only the probe-side emit
 ///   streams; the build side stays materialized inside the arm.
+/// - pure-range block-band `Combine` ([`CombineStrategy::IEJoin`]):
+///   blocking on its input (both sides drained and sorted), but its
+///   bounded payload-sorted output drain streams to the consumer. The
+///   equi+range `HashPartitionIEJoin`, sort-merge, and grace-hash joins
+///   keep their output materialized and stay blocking.
 ///
 /// Correlation buffering disables streaming pipeline-wide — the
 /// `CorrelationCommit` terminal owns the writes — so the caller short-
@@ -569,8 +575,9 @@ fn single_incoming_producer(
 /// producer index, return `Some(producer_idx)` when the producer is a
 /// linear streaming source (fused `Merge.interleave`, non-fused `Merge`,
 /// fused `Source → Transform`, single-branch `Route`, streaming-strategy
-/// `Aggregate`, or hash build-probe `Combine`) feeding only the consumer
-/// and rooting no node-anchored window arena, or `None` otherwise.
+/// `Aggregate`, hash build-probe `Combine`, or pure-range block-band
+/// `Combine`) feeding only the consumer and rooting no node-anchored window
+/// arena, or `None` otherwise.
 ///
 /// Shared by every consumer arm of [`certify_streaming_edge`] so the
 /// producer eligibility rules are derived once. A window rooted at the
@@ -655,10 +662,26 @@ fn certify_linear_producer(
             Some(producer_idx)
         }
         PlanNode::Combine { strategy, .. } => {
-            // Only the inline hash build-probe streams its probe-side
-            // emit; the build side stays fully materialized inside the
-            // arm. Range / sort-merge / grace-hash joins are blocking.
-            if !matches!(strategy, CombineStrategy::HashBuildProbe) {
+            // Two combine shapes stream their output over the sink, for
+            // different reasons:
+            //
+            // - `HashBuildProbe`: the probe-side emit streams row-by-row
+            //   while the build side stays materialized in the hash table.
+            // - `IEJoin` (pure-range block-band): fully blocking on its
+            //   INPUT — both sides are drained, sorted, and the output
+            //   buffer filled before anything emits — but the bounded,
+            //   payload-sorted output DRAIN streams straight to the sink
+            //   instead of admitting a node-buffer. From this predicate's
+            //   view it is a linear producer with one output edge, same as
+            //   the others.
+            //
+            // The equi+range `HashPartitionIEJoin`, sort-merge, and
+            // grace-hash joins keep their output materialized (their output
+            // axis is a separate task), so they stay blocking here.
+            if !matches!(
+                strategy,
+                CombineStrategy::HashBuildProbe | CombineStrategy::IEJoin
+            ) {
                 return None;
             }
             if !has_single_outgoing(plan, producer_idx) || roots_window(producer_idx) {
@@ -667,5 +690,297 @@ fn certify_linear_producer(
             Some(producer_idx)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{CompileContext, parse_config};
+    use crate::plan::combine::CombineStrategy;
+
+    /// A pure-range combine (`amount >= lo and amount < hi`, no equality
+    /// conjunct) whose sole downstream is a single `Output`. The planner
+    /// selects `CombineStrategy::IEJoin` (the block-band path), and the
+    /// combine has exactly one out-edge into the Output.
+    const PURE_RANGE_TO_OUTPUT: &str = r#"
+pipeline:
+  name: cert_pure_range
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: amount, type: int }
+- type: source
+  name: bands
+  config:
+    name: bands
+    type: csv
+    path: bands.csv
+    schema:
+      - { name: band_id, type: string }
+      - { name: lo, type: int }
+      - { name: hi, type: int }
+- type: combine
+  name: banded
+  input:
+    orders: orders
+    bands: bands
+  config:
+    where: "orders.amount >= bands.lo and orders.amount < bands.hi"
+    match: all
+    on_miss: skip
+    cxl: |
+      emit order_id = orders.order_id
+      emit band_id = bands.band_id
+    propagate_ck: driver
+- type: output
+  name: out
+  input: banded
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+
+    /// The same pure-range combine, but its output fans out to two
+    /// `Output` sinks — two out-edges, so the single-outgoing constraint
+    /// must reject streaming.
+    const PURE_RANGE_FAN_OUT: &str = r#"
+pipeline:
+  name: cert_pure_range_fanout
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: amount, type: int }
+- type: source
+  name: bands
+  config:
+    name: bands
+    type: csv
+    path: bands.csv
+    schema:
+      - { name: band_id, type: string }
+      - { name: lo, type: int }
+      - { name: hi, type: int }
+- type: combine
+  name: banded
+  input:
+    orders: orders
+    bands: bands
+  config:
+    where: "orders.amount >= bands.lo and orders.amount < bands.hi"
+    match: all
+    on_miss: skip
+    cxl: |
+      emit order_id = orders.order_id
+      emit band_id = bands.band_id
+    propagate_ck: driver
+- type: output
+  name: out_a
+  input: banded
+  config:
+    name: out_a
+    type: csv
+    path: out_a.csv
+- type: output
+  name: out_b
+  input: banded
+  config:
+    name: out_b
+    type: csv
+    path: out_b.csv
+"#;
+
+    /// An equi+range combine (`region == region and amount >= lo`) whose
+    /// sole downstream is a single `Output`. The planner selects
+    /// `CombineStrategy::HashPartitionIEJoin`; its output axis is a separate
+    /// task, so the producer arm must decline it.
+    const EQUI_RANGE_TO_OUTPUT: &str = r#"
+pipeline:
+  name: cert_equi_range
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: region, type: string }
+      - { name: amount, type: int }
+- type: source
+  name: bands
+  config:
+    name: bands
+    type: csv
+    path: bands.csv
+    schema:
+      - { name: region, type: string }
+      - { name: lo, type: int }
+- type: combine
+  name: banded
+  input:
+    orders: orders
+    bands: bands
+  config:
+    where: "orders.region == bands.region and orders.amount >= bands.lo"
+    match: all
+    on_miss: skip
+    cxl: |
+      emit region = orders.region
+      emit amount = orders.amount
+      emit lo = bands.lo
+    propagate_ck: driver
+- type: output
+  name: out
+  input: banded
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+
+    /// Compile `yaml`, then run the exact fused-set + init-phase setup that
+    /// [`classify_stream_nodes`] uses at runtime, invoking the closure with
+    /// the compiled DAG plus the two derived sets so a test can assert
+    /// [`certify_streaming_edge`] verdicts against live plan indices.
+    fn with_certification_inputs<R>(
+        yaml: &str,
+        f: impl FnOnce(
+            &ExecutionPlanDag,
+            &HashSet<petgraph::graph::NodeIndex>,
+            &HashSet<petgraph::graph::NodeIndex>,
+        ) -> R,
+    ) -> R {
+        let config = parse_config(yaml).expect("parse pipeline YAML");
+        let validated = config
+            .compile(&CompileContext::default())
+            .expect("compile pipeline");
+        let dag = validated.dag();
+        let init_phase = compute_init_phase_node_set(dag);
+        let merge_fused = compute_merge_interleave_fused_sources(dag, &config);
+        let (_extra_sources, fused_transforms) =
+            compute_transform_fused_sources(dag, &merge_fused, &init_phase);
+        f(dag, &fused_transforms, &init_phase)
+    }
+
+    /// The `NodeIndex` of the first node matching `pred`, panicking with
+    /// `label` when absent.
+    fn find_node(
+        dag: &ExecutionPlanDag,
+        label: &str,
+        pred: impl Fn(&PlanNode) -> bool,
+    ) -> petgraph::graph::NodeIndex {
+        dag.graph
+            .node_indices()
+            .find(|idx| pred(&dag.graph[*idx]))
+            .unwrap_or_else(|| panic!("plan is missing a {label} node"))
+    }
+
+    fn combine_strategy(dag: &ExecutionPlanDag) -> CombineStrategy {
+        let idx = find_node(dag, "combine", |n| matches!(n, PlanNode::Combine { .. }));
+        match &dag.graph[idx] {
+            PlanNode::Combine { strategy, .. } => strategy.clone(),
+            _ => unreachable!("find_node matched a Combine"),
+        }
+    }
+
+    #[test]
+    fn pure_range_block_band_combine_certifies_streaming_output_edge() {
+        with_certification_inputs(PURE_RANGE_TO_OUTPUT, |dag, fused, init| {
+            // Honest fixture: the predicate is pure-range, so the block-band
+            // strategy is selected — the exact producer this task admits.
+            assert!(
+                matches!(combine_strategy(dag), CombineStrategy::IEJoin),
+                "the pure-range predicate must select the block-band IEJoin strategy, got {:?}",
+                combine_strategy(dag)
+            );
+            let combine = find_node(dag, "combine", |n| matches!(n, PlanNode::Combine { .. }));
+            let output = find_node(dag, "output", |n| matches!(n, PlanNode::Output { .. }));
+            // The combine→Output edge certifies as a streaming output edge,
+            // resolving the block-band combine as the producer.
+            assert_eq!(
+                certify_streaming_edge(dag, output, fused, init),
+                Some(combine),
+                "combine(IEJoin) -> single Output must certify the combine as the streaming producer"
+            );
+            // The runtime-facing classification agrees: the combine renders
+            // `Streaming` (no node-buffers slot), so the dispatcher installs
+            // a sender for it.
+            let classes = classify_stream_nodes(
+                dag,
+                &parse_config(PURE_RANGE_TO_OUTPUT).expect("re-parse for config"),
+            );
+            assert_eq!(classes[&combine], StreamClass::Streaming);
+        });
+    }
+
+    #[test]
+    fn pure_range_block_band_combine_with_fan_out_is_not_certified() {
+        with_certification_inputs(PURE_RANGE_FAN_OUT, |dag, fused, init| {
+            assert!(
+                matches!(combine_strategy(dag), CombineStrategy::IEJoin),
+                "the fan-out fixture must still select the block-band strategy"
+            );
+            let combine = find_node(dag, "combine", |n| matches!(n, PlanNode::Combine { .. }));
+            // Two out-edges: every Output's incoming edge fails the
+            // single-outgoing constraint, so none certifies.
+            for output in dag
+                .graph
+                .node_indices()
+                .filter(|idx| matches!(&dag.graph[*idx], PlanNode::Output { .. }))
+            {
+                assert_eq!(
+                    certify_streaming_edge(dag, output, fused, init),
+                    None,
+                    "a combine with >1 outgoing edge must not certify a streaming output edge"
+                );
+            }
+            let classes = classify_stream_nodes(
+                dag,
+                &parse_config(PURE_RANGE_FAN_OUT).expect("re-parse for config"),
+            );
+            assert_eq!(
+                classes[&combine],
+                StreamClass::Materialized,
+                "a fan-out combine must materialize its output"
+            );
+        });
+    }
+
+    #[test]
+    fn equi_range_hash_partition_combine_is_not_certified() {
+        with_certification_inputs(EQUI_RANGE_TO_OUTPUT, |dag, fused, init| {
+            // Scope guard: only the pure-range block-band variant is
+            // admitted. The equi+range HashPartitionIEJoin path keeps its
+            // output materialized, so its combine→Output edge must NOT
+            // certify even though it too has a single downstream Output.
+            assert!(
+                matches!(
+                    combine_strategy(dag),
+                    CombineStrategy::HashPartitionIEJoin { .. }
+                ),
+                "the equi+range predicate must select the hash-partitioned IEJoin strategy, got {:?}",
+                combine_strategy(dag)
+            );
+            let output = find_node(dag, "output", |n| matches!(n, PlanNode::Output { .. }));
+            assert_eq!(
+                certify_streaming_edge(dag, output, fused, init),
+                None,
+                "equi+range HashPartitionIEJoin output axis is out of scope; it must not certify"
+            );
+        });
     }
 }
