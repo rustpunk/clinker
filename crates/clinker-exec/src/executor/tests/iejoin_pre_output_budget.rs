@@ -61,6 +61,43 @@ fn no_op_arbitrator(limit: u64) -> Arc<crate::pipeline::memory::MemoryArbitrator
     ))
 }
 
+/// Assert `err` is the typed pre-output budget abort: the `banded` combine node,
+/// arena-class memory, the reported limit equal to `expected_limit`, a footprint
+/// above it, and a pre-output detail string. Shared by the block-band and
+/// equi+range abort tests, whose pre-output gates surface the same shape.
+fn assert_pre_output_abort(err: PipelineError, expected_limit: u64) {
+    match err {
+        PipelineError::MemoryBudgetExceeded {
+            node,
+            used,
+            limit,
+            source,
+            detail,
+        } => {
+            assert_eq!(node, "banded", "the abort must name the combine node");
+            assert_eq!(
+                source,
+                clinker_plan::BudgetCategory::Arena,
+                "pre-output state is arena-class memory"
+            );
+            assert_eq!(
+                limit, expected_limit,
+                "the reported limit must be the hard budget"
+            );
+            assert!(
+                used > expected_limit,
+                "the reported footprint ({used}) must exceed the budget ({expected_limit})"
+            );
+            let detail = detail.expect("the pre-output abort must carry a detail string");
+            assert!(
+                detail.contains("iejoin pre-output"),
+                "the abort must come from the pre-output gate; got: {detail:?}"
+            );
+        }
+        other => panic!("expected MemoryBudgetExceeded from the pre-output gate; got: {other:?}"),
+    }
+}
+
 /// Pure-range predicate (two range conjuncts, no equality) so the planner
 /// selects `CombineStrategy::IEJoin` and the runtime runs the block-band path.
 /// The `pad` column widens each input record without appearing in the output,
@@ -371,37 +408,7 @@ fn block_band_pre_output_local_abort_under_undersized_budget() {
     let arb = no_op_arbitrator(ABORT_LIMIT);
     let (result, output) = run_pipeline(orders_csv(500, 0), bands_csv(500, 0, 0), &arb);
     let err = result.expect_err("a block-pair over the undersized budget must abort");
-
-    match err {
-        PipelineError::MemoryBudgetExceeded {
-            node,
-            used,
-            limit,
-            source,
-            detail,
-        } => {
-            assert_eq!(node, "banded", "the abort must name the combine node");
-            assert_eq!(
-                source,
-                clinker_plan::BudgetCategory::Arena,
-                "block-band pre-output state is arena-class memory"
-            );
-            assert_eq!(
-                limit, ABORT_LIMIT,
-                "the reported limit must be the hard budget"
-            );
-            assert!(
-                used > ABORT_LIMIT,
-                "the reported footprint ({used}) must exceed the budget ({ABORT_LIMIT})"
-            );
-            let detail = detail.expect("the pre-output abort must carry a detail string");
-            assert!(
-                detail.contains("iejoin pre-output"),
-                "the abort must come from the block-band pre-output gate; got: {detail:?}"
-            );
-        }
-        other => panic!("expected MemoryBudgetExceeded from the pre-output gate; got: {other:?}"),
-    }
+    assert_pre_output_abort(err, ABORT_LIMIT);
 
     assert!(
         output.lines().filter(|l| !l.is_empty()).count() <= 1,
@@ -534,37 +541,7 @@ fn equi_range_pre_output_state_aborts_under_tight_budget_without_rss() {
         &arb,
     );
     let err = result.expect_err("the equi+range pre-scan state must abort under the tight budget");
-
-    match err {
-        PipelineError::MemoryBudgetExceeded {
-            node,
-            used,
-            limit,
-            source,
-            detail,
-        } => {
-            assert_eq!(node, "banded", "the abort must name the combine node");
-            assert_eq!(
-                source,
-                clinker_plan::BudgetCategory::Arena,
-                "equi+range pre-output state is arena-class memory"
-            );
-            assert_eq!(
-                limit, ABORT_LIMIT,
-                "the reported limit must be the hard budget"
-            );
-            assert!(
-                used > ABORT_LIMIT,
-                "the reported footprint ({used}) must exceed the budget ({ABORT_LIMIT})"
-            );
-            let detail = detail.expect("the pre-output abort must carry a detail string");
-            assert!(
-                detail.contains("iejoin pre-output"),
-                "the abort must come from the equi+range pre-output gate; got: {detail:?}"
-            );
-        }
-        other => panic!("expected MemoryBudgetExceeded from the pre-output gate; got: {other:?}"),
-    }
+    assert_pre_output_abort(err, ABORT_LIMIT);
 
     assert_eq!(
         arb.consumer_count(),
@@ -708,14 +685,17 @@ fn block_band_dlq_order_is_identical_across_memory_limits() {
     // limits — mirroring the guarantee the emitted rows already hold.
     let dlq_source_rows = |limit: u64| -> Vec<u64> {
         let arb = no_op_arbitrator(limit);
-        let report = run_pipeline_report(DLQ_YAML, dlq_orders_csv(60, 1024), dlq_bands_csv(40, 1024), &arb)
-            .expect("the continue-strategy run completes, routing failures to the DLQ");
+        let report = run_pipeline_report(
+            DLQ_YAML,
+            dlq_orders_csv(60, 1024),
+            dlq_bands_csv(40, 1024),
+            &arb,
+        )
+        .expect("the continue-strategy run completes, routing failures to the DLQ");
         report
             .dlq_entries
             .iter()
-            .filter(|e| {
-                e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow
-            })
+            .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow)
             .map(|e| e.source_row)
             .collect()
     };

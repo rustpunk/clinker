@@ -971,7 +971,14 @@ pub(crate) fn execute_combine_iejoin(
         };
         for (i, (driver_record, driver_order)) in driver_records.iter().enumerate() {
             let flush = state.take_collect(i);
-            flush_collect_row(&emit_cfg, driver_record, *driver_order, i as u64, flush, &mut sink);
+            flush_collect_row(
+                &emit_cfg,
+                driver_record,
+                *driver_order,
+                i as u64,
+                flush,
+                &mut sink,
+            );
         }
         // Collect mode never runs the body eval, so no recoverable
         // output-stage failure can accrue on this path.
@@ -1451,31 +1458,13 @@ fn emit_pairs(
                     if state.matched[key] {
                         continue;
                     }
-                    if emit_match_row(
-                        cfg,
-                        evals,
-                        driver_record,
-                        driver_order,
-                        dref.driver_idx,
-                        build_record,
-                        0,
-                        sink,
-                    )? {
+                    if emit_match_row(cfg, evals, dref, build_record, 0, sink)? {
                         state.matched[key] = true;
                     }
                 }
             },
             MatchMode::All => {
-                if emit_match_row(
-                    cfg,
-                    evals,
-                    driver_record,
-                    driver_order,
-                    dref.driver_idx,
-                    build_record,
-                    bidx.unwrap_or(0),
-                    sink,
-                )? {
+                if emit_match_row(cfg, evals, dref, build_record, bidx.unwrap_or(0), sink)? {
                     state.matched[key] = true;
                 }
             }
@@ -1494,13 +1483,14 @@ fn emit_pairs(
 fn emit_match_row(
     cfg: &EmitConfig<'_>,
     evals: &mut Evaluators,
-    driver_record: &Record,
-    driver_order: RecordOrder,
-    driver_idx: u64,
+    driver: &DriverRef<'_>,
     build_record: &Record,
     build_idx: u64,
     sink: &mut EmitSink<'_>,
 ) -> Result<bool, PipelineError> {
+    let driver_record = driver.record;
+    let driver_order = driver.order;
+    let driver_idx = driver.driver_idx;
     if let Some(evaluator) = evals.body.as_mut() {
         let resolver =
             CombineResolver::new(cfg.resolver_mapping, driver_record, Some(build_record));

@@ -137,11 +137,12 @@ fn resident_budget_total(budget: &MemoryArbitrator) -> u64 {
 }
 
 /// Tracks the resident bytes both sides' kept-in-RAM blocks hold against the
-/// shared [`resident_budget_total`]. A completed block is admitted resident
-/// only while the running total stays within budget; otherwise it spills.
-/// Because blocks complete in slice order and the scheduler visits the earliest
-/// blocks first, admitting a resident prefix and spilling the rest serves the
-/// most reloads for a fixed budget.
+/// shared [`resident_budget_total`]. Admission is per-block and fit-based: a
+/// completed block stays resident whenever it still fits the remaining budget
+/// and spills otherwise, so a later, smaller block can still be admitted after
+/// an earlier, larger one spilled — it is not a strict resident prefix. The
+/// build side (reloaded once per driver block) drains first, so the budget
+/// favors the side whose residency saves the most reloads.
 struct ResidentBudget {
     total: u64,
     used: u64,
@@ -169,6 +170,17 @@ impl ResidentBudget {
 /// charges, so block sizing and the pre-output charge track its accounting.
 fn pair_bytes<P>(record: &Record) -> usize {
     std::mem::size_of::<Record>() + record.estimated_heap_size() + std::mem::size_of::<P>()
+}
+
+/// The kernel dispatch for one driver block. `Dual` runs the two-conjunct
+/// IEJoin over both key axes; `Single` runs the single-inequality PWMJ over the
+/// primary axis and carries the driver's primary-key column, hoisted out of the
+/// build loop since it depends only on the driver block. Bundling the mode this
+/// way lets one value stand for "op2 present" vs "single-axis keys hoisted",
+/// which the two are never both.
+enum RangeMode {
+    Dual(RangeOp),
+    Single(Vec<i64>),
 }
 
 /// Per-axis key bounds accumulated while a block fills.
@@ -453,9 +465,9 @@ pub(super) fn execute_block_band(
         block_target,
         sort_threshold,
     };
-    // Shared across both sides so their resident blocks compete for one budget
-    // (B1): a side, or both together, whose sliced blocks fit `soft / 2` stays
-    // entirely in RAM. `Some(0)` forces every block to spill for the test path.
+    // Shared across both sides so their resident blocks compete for one budget:
+    // a side, or both together, whose sliced blocks fit `soft / 2` stays entirely
+    // in RAM. `Some(0)` forces every block to spill for the test path.
     let resident_total = options
         .resident_budget_override
         .unwrap_or_else(|| resident_budget_total(budget));
@@ -469,9 +481,14 @@ pub(super) fn execute_block_band(
     // it stays charged through the other side's drain and all of the pruning
     // and range walk, so the arbitrator's pull-mode view never under-reads this
     // operator's live footprint.
+    //
+    // Drain the build side first so it claims the shared resident budget: each
+    // build block is reloaded once per driver block (the inner loop), while a
+    // driver block loads once, so keeping the build side in RAM saves the most
+    // reloads for a fixed budget.
+    let build_blocks = drain_build_side(build_records, build_scans, &drain_ctx, &mut resident)?;
     let (driver_blocks, unmatched_driver_records) =
         drain_driver_side(driver_records, driver_scans, &drain_ctx, &mut resident)?;
-    let build_blocks = drain_build_side(build_records, build_scans, &drain_ctx, &mut resident)?;
 
     // Baseline resident footprint the consumer holds through the schedule/emit
     // stage: the sum of both sides' kept-in-RAM blocks. Spilled blocks hold no
@@ -539,7 +556,11 @@ pub(super) fn execute_block_band(
         let driver_peak = baseline_resident.saturating_add(driver_held);
         if driver_peak > budget.hard_limit() {
             consumer.set_bytes(0);
-            return Err(pre_output_budget_error(name, driver_peak, budget.hard_limit()));
+            return Err(pre_output_budget_error(
+                name,
+                driver_peak,
+                budget.hard_limit(),
+            ));
         }
 
         let driver_loaded = driver_block.load("iejoin block-band driver block")?;
@@ -562,12 +583,14 @@ pub(super) fn execute_block_band(
             })
             .collect();
         let dkeys: Vec<(i64, i64)> = driver_loaded.iter().map(|(_, p)| (p.0, p.1)).collect();
-        // Single-inequality (PWMJ) uses only the primary driver key column; it
-        // is fixed for the whole inner loop, so build it once here instead of
-        // per surviving build pair.
-        let driver_pwmj_keys: Option<Vec<i64>> = match op2 {
-            None => Some(dkeys.iter().map(|(a, _)| *a).collect()),
-            Some(_) => None,
+        // Fix the kernel dispatch for this driver block. The single-inequality
+        // (PWMJ) mode reads only the primary driver key column, which depends on
+        // the driver block alone, so hoist it here instead of rebuilding it per
+        // surviving build pair. Modeling the two modes as one value keeps the
+        // hoisted column and the two-conjunct operator from ever coexisting.
+        let range_mode = match op2 {
+            Some(op2v) => RangeMode::Dual(op2v),
+            None => RangeMode::Single(dkeys.iter().map(|(a, _)| *a).collect()),
         };
         consumer.set_bytes(baseline_resident.saturating_add(driver_held));
 
@@ -599,7 +622,11 @@ pub(super) fn execute_block_band(
                 .saturating_add(state.held_bytes());
             if pair_peak > budget.hard_limit() {
                 consumer.set_bytes(0);
-                return Err(pre_output_budget_error(name, pair_peak, budget.hard_limit()));
+                return Err(pre_output_budget_error(
+                    name,
+                    pair_peak,
+                    budget.hard_limit(),
+                ));
             }
 
             let build_loaded = build_block.load("iejoin block-band build block")?;
@@ -615,13 +642,12 @@ pub(super) fn execute_block_band(
                     .saturating_add(state.held_bytes()),
             );
 
-            let pairs: Vec<(usize, usize)> = match (op2, &driver_pwmj_keys) {
-                (Some(op2v), _) => iejoin_numeric(&dkeys, &bkeys, op1, op2v),
-                (None, Some(dl)) => {
+            let pairs: Vec<(usize, usize)> = match &range_mode {
+                RangeMode::Dual(op2v) => iejoin_numeric(&dkeys, &bkeys, op1, *op2v),
+                RangeMode::Single(dl) => {
                     let bl: Vec<i64> = bkeys.iter().map(|(a, _)| *a).collect();
                     pwmj_numeric(dl, &bl, op1)
                 }
-                (None, None) => unreachable!("driver_pwmj_keys is Some whenever op2 is None"),
             };
 
             // Fold the materialized pair-index vector into the peak: it is the
@@ -635,7 +661,11 @@ pub(super) fn execute_block_band(
             let pair_peak = pair_peak.saturating_add(pairs_bytes);
             if pair_peak > budget.hard_limit() {
                 consumer.set_bytes(0);
-                return Err(pre_output_budget_error(name, pair_peak, budget.hard_limit()));
+                return Err(pre_output_budget_error(
+                    name,
+                    pair_peak,
+                    budget.hard_limit(),
+                ));
             }
             consumer.set_bytes(
                 baseline_resident
@@ -721,8 +751,7 @@ pub(super) fn execute_block_band(
     let mut rows: Vec<((Record, RecordOrder), (u64, u64))> =
         output_records.into_iter().zip(row_tags).collect();
     rows.sort_by_key(|((_, order), (driver_idx, build_idx))| (*order, *driver_idx, *build_idx));
-    let output_records: Vec<(Record, RecordOrder)> =
-        rows.into_iter().map(|(row, _)| row).collect();
+    let output_records: Vec<(Record, RecordOrder)> = rows.into_iter().map(|(row, _)| row).collect();
 
     // Re-order the deferred output-eval failures into the same
     // layout-independent order, so the dead-letter output is a pure function of
@@ -852,6 +881,21 @@ fn drain_build_side(
     })
 }
 
+/// Charge `written` on-disk bytes against the run's spill quota, returning the
+/// typed E320 error if this write pushed cumulative spill past the cap. Shared
+/// by the drain-spill, finish-residue, and per-block spill sites.
+fn charge_block_spill(ctx: &DrainCtx<'_>, written: u64) -> Result<(), PipelineError> {
+    if written > 0 && ctx.budget.record_spill_bytes(ctx.name, written) {
+        return Err(PipelineError::spill_cap_exceeded(
+            ctx.name,
+            ctx.budget.disk_quota(),
+            written,
+            ctx.budget.cumulative_spill_bytes(),
+        ));
+    }
+    Ok(())
+}
+
 /// Push one matched pair into the sort buffer, mirror the byte delta into the
 /// consumer handle, and spill (charging the run against the disk quota, E320)
 /// when the buffer crosses its threshold.
@@ -873,14 +917,7 @@ fn push_charge_spill<P: Serialize + DeserializeOwned + Send + Ord>(
             )))
         })?;
         ctx.consumer.sub_bytes(pre_spill);
-        if written > 0 && ctx.budget.record_spill_bytes(ctx.name, written) {
-            return Err(PipelineError::spill_cap_exceeded(
-                ctx.name,
-                ctx.budget.disk_quota(),
-                written,
-                ctx.budget.cumulative_spill_bytes(),
-            ));
-        }
+        charge_block_spill(ctx, written)?;
     }
     Ok(())
 }
@@ -906,14 +943,7 @@ fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord>(
             "iejoin block-band drain finish failed: {e}"
         )))
     })?;
-    if residue > 0 && ctx.budget.record_spill_bytes(ctx.name, residue) {
-        return Err(PipelineError::spill_cap_exceeded(
-            ctx.name,
-            ctx.budget.disk_quota(),
-            residue,
-            ctx.budget.cumulative_spill_bytes(),
-        ));
-    }
+    charge_block_spill(ctx, residue)?;
 
     // `defer_release` keeps the buffer charge live across slicing for the
     // in-memory case, where the sorted vec is still resident and each admitted
@@ -970,6 +1000,7 @@ fn slice_side<P: Serialize + DeserializeOwned + Send + Ord>(
             blocks.push(make_block(
                 std::mem::take(&mut cur),
                 bounds,
+                cur_bytes as u64,
                 schema,
                 ctx,
                 resident,
@@ -979,7 +1010,14 @@ fn slice_side<P: Serialize + DeserializeOwned + Send + Ord>(
         }
     }
     if !cur.is_empty() {
-        blocks.push(make_block(cur, bounds, schema, ctx, resident)?);
+        blocks.push(make_block(
+            cur,
+            bounds,
+            cur_bytes as u64,
+            schema,
+            ctx,
+            resident,
+        )?);
     }
     Ok(blocks)
 }
@@ -987,15 +1025,17 @@ fn slice_side<P: Serialize + DeserializeOwned + Send + Ord>(
 /// Build one completed block, keeping it resident if the shared budget still
 /// admits its bytes (charged into the consumer, since it holds that RAM through
 /// the rest of the join) or spilling it to its own file otherwise.
+/// `resident_bytes` is the block's estimated footprint, already accumulated by
+/// the slicer as it filled the block, so it is not re-summed here.
 fn make_block<P: Serialize + DeserializeOwned + Send + Ord>(
     pairs: Vec<(Record, P)>,
     bounds: Bounds,
+    resident_bytes: u64,
     schema: &Arc<Schema>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
 ) -> Result<Block<P>, PipelineError> {
     let len = pairs.len();
-    let resident_bytes = pairs.iter().map(|(r, _)| pair_bytes::<P>(r)).sum::<usize>() as u64;
     if resident.admit(resident_bytes) {
         ctx.consumer.add_bytes(resident_bytes);
         Ok(Block {
@@ -1013,7 +1053,7 @@ fn make_block<P: Serialize + DeserializeOwned + Send + Ord>(
 /// [`Block`], charging the exact bytes written against the disk quota (E320 on
 /// cap). The writer reports its own on-disk byte total, so a block that reaches
 /// disk is always charged — no post-hoc `stat` that could transiently fail and
-/// silently under-charge the cap (A5).
+/// silently under-charge the cap.
 fn spill_block<P: Serialize>(
     pairs: Vec<(Record, P)>,
     bounds: Bounds,
@@ -1091,9 +1131,13 @@ fn finalize_driver_block(
                     // skips it leaves the driver a miss (no other candidate is
                     // held), routed to the deferred on_miss dispatch.
                     Some((bidx, build)) => {
-                        if !emit_match_row(
-                            cfg, evals, record, payload.3, payload.2, &build, bidx, sink,
-                        )? {
+                        let dref = DriverRef {
+                            record,
+                            order: payload.3,
+                            key: di,
+                            driver_idx: payload.2,
+                        };
+                        if !emit_match_row(cfg, evals, &dref, &build, bidx, sink)? {
                             note_unmatched(on_miss, record, payload.3, payload.2, unmatched);
                         }
                     }
@@ -1411,7 +1455,7 @@ mod tests {
         out
     }
 
-    // ── T6: possible() prune truth table ─────────────────────────────────
+    // ── possible() prune truth table ─────────────────────────────────────
 
     #[test]
     fn possible_truth_table_over_four_range_configs() {
@@ -1547,7 +1591,7 @@ mod tests {
         ));
     }
 
-    // ── T2: two-conjunct equivalence to the nested-loop oracle ───────────
+    // ── two-conjunct equivalence to the nested-loop oracle ───────────────
 
     /// Every prunable/keeper block-pair decision plus the kernel must
     /// reproduce the nested-loop oracle, under a block target of 1 byte that
@@ -1754,7 +1798,7 @@ mod tests {
         );
     }
 
-    // ── T3: single-conjunct (PWMJ) equivalence ───────────────────────────
+    // ── single-conjunct (PWMJ) equivalence ───────────────────────────────
 
     #[test]
     fn pwmj_single_conjunct_matches_oracle() {
@@ -1822,7 +1866,7 @@ mod tests {
         assert_eq!(actual, expected, "PWMJ diverged for {op:?}");
     }
 
-    // ── T4: match-mode × on_miss, multi-block vs single-block ────────────
+    // ── match-mode × on_miss, multi-block vs single-block ────────────────
 
     /// Set of driver ids that emitted at least one row (`First`-mode readback:
     /// the driver id is column 2 of the concat row).
@@ -2078,7 +2122,7 @@ mod tests {
         assert_eq!(single, multi);
     }
 
-    // ── T5: E320 spill-cap enforcement ───────────────────────────────────
+    // ── E320 spill-cap enforcement ─────────────────────────────────────────
 
     #[test]
     fn block_spill_over_tiny_cap_raises_e320() {
@@ -2108,12 +2152,12 @@ mod tests {
         );
     }
 
-    // ── B2: mid-size sides stay resident (no spill) ──────────────────────
+    // ── mid-size sides stay resident (no spill) ──────────────────────────
 
     #[test]
     fn mid_size_multi_block_sides_stay_resident_without_spill() {
         // Each side is multi-block (many records past a tiny block target) yet
-        // both together fit a generous resident budget, so under B1 nothing
+        // both together fit a generous resident budget, so nothing
         // spills — the in-RAM path the previous spill-everything-when-multi-block
         // policy lost for mid-size inputs. A roomy hard limit keeps the sort
         // threshold high so no sort run spills either; the only possible spill is
@@ -2150,7 +2194,7 @@ mod tests {
         );
     }
 
-    // ── F3: dense block-pair typed abort (A1) ────────────────────────────
+    // ── dense block-pair typed abort ────────────────────────────────────
 
     #[test]
     fn dense_block_pair_aborts_with_typed_error_not_oom() {
@@ -2190,12 +2234,12 @@ mod tests {
                 );
             }
             other => {
-                panic!("expected MemoryBudgetExceeded from the A1 pairs charge; got {other:?}")
+                panic!("expected MemoryBudgetExceeded from the pairs-vector charge; got {other:?}")
             }
         }
     }
 
-    // ── F2: output determinism across block layouts ──────────────────────
+    // ── output determinism across block layouts ──────────────────────────
 
     /// Ordered `(driver_id, build_id)` sequence from `All`/`First` concat rows.
     fn ordered_pairs(records: &[Record]) -> Vec<(i64, i64)> {
@@ -2471,7 +2515,11 @@ mod tests {
             "output order changed with block layout despite duplicate RecordOrder"
         );
         // Every one of the four drivers matches every one of the four builds.
-        assert_eq!(resident_layout.len(), 16, "the 4x4 match set must be complete");
+        assert_eq!(
+            resident_layout.len(),
+            16,
+            "the 4x4 match set must be complete"
+        );
     }
 
     // ── G1: held First candidates over budget abort with the typed error ──
@@ -2583,7 +2631,10 @@ mod tests {
             PipelineError::MemoryBudgetExceeded { detail, source, .. } => {
                 assert_eq!(source, clinker_plan::BudgetCategory::Arena);
                 assert!(
-                    detail.as_deref().unwrap_or("").contains("iejoin pre-output"),
+                    detail
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("iejoin pre-output"),
                     "abort must come from the pre-output gate; got {detail:?}"
                 );
             }
@@ -2604,7 +2655,9 @@ mod tests {
         // complete (everything pruned). The metadata gate must abort at the
         // driver load instead.
         let driver: Side = (0..500i64).map(|i| (Some((i % 100, 0)), i)).collect();
-        let build: Side = (0..10i64).map(|i| (Some((10_000 + i, 0)), i + 1_000)).collect();
+        let build: Side = (0..10i64)
+            .map(|i| (Some((10_000 + i, 0)), i + 1_000))
+            .collect();
         let cfg = RunCfg {
             op1: RangeOp::Gt,
             op2: None,
@@ -2625,7 +2678,10 @@ mod tests {
             PipelineError::MemoryBudgetExceeded { detail, source, .. } => {
                 assert_eq!(source, clinker_plan::BudgetCategory::Arena);
                 assert!(
-                    detail.as_deref().unwrap_or("").contains("iejoin pre-output"),
+                    detail
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("iejoin pre-output"),
                     "abort must come from the driver-load gate; got {detail:?}"
                 );
             }
