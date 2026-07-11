@@ -572,3 +572,170 @@ fn equi_range_pre_output_state_aborts_under_tight_budget_without_rss() {
         "the equi+range IEJoin consumer must be unregistered even when the branch aborts"
     );
 }
+
+/// Pure-range pipeline whose matched body divides by a band column that is zero
+/// for every band, so every matched (order, band) pair defers a recoverable
+/// output-eval failure under `strategy: continue`. `match: all` fans each order
+/// across every overlapping band, and the padded orders and bands slice into
+/// several blocks under a tight budget — so the failures accrue in a
+/// block-layout-dependent order that the final dead-letter sort must normalize.
+const DLQ_YAML: &str = r#"
+pipeline:
+  name: iejoin_block_band_dlq
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: amount, type: int }
+      - { name: pad, type: string }
+- type: source
+  name: bands
+  config:
+    name: bands
+    type: csv
+    path: bands.csv
+    schema:
+      - { name: band_id, type: string }
+      - { name: lo, type: int }
+      - { name: hi, type: int }
+      - { name: divisor, type: int }
+      - { name: pad, type: string }
+- type: combine
+  name: banded
+  input:
+    orders: orders
+    bands: bands
+  config:
+    where: "orders.amount >= bands.lo and orders.amount < bands.hi"
+    match: all
+    on_miss: skip
+    cxl: |
+      emit order_id = orders.order_id
+      emit q = orders.amount / bands.divisor
+    propagate_ck: driver
+- type: output
+  name: out
+  input: banded
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+
+/// `n` orders with `amount == i`, each padded so the order side slices into
+/// several driver blocks under a tight budget.
+fn dlq_orders_csv(n: usize, pad_len: usize) -> String {
+    let pad = "x".repeat(pad_len);
+    let mut s = String::from("order_id,amount,pad\n");
+    for i in 0..n {
+        s.push_str(&format!("o{i},{i},{pad}\n"));
+    }
+    s
+}
+
+/// `b` bands, all covering `[0, 10000)` so every order matches all of them, each
+/// with divisor 0 (every matched body divides by zero) and a wide pad so the
+/// band side slices into several build blocks under a tight budget.
+fn dlq_bands_csv(b: usize, pad_len: usize) -> String {
+    let pad = "x".repeat(pad_len);
+    let mut s = String::from("band_id,lo,hi,divisor,pad\n");
+    for i in 0..b {
+        s.push_str(&format!("b{i},0,10000,0,{pad}\n"));
+    }
+    s
+}
+
+/// Run `yaml` over the given CSV inputs against `arb`, returning the full
+/// execution report (so a test can inspect its dead-letter entries).
+fn run_pipeline_report(
+    yaml: &str,
+    orders: String,
+    bands: String,
+    arb: &Arc<crate::pipeline::memory::MemoryArbitrator>,
+) -> Result<crate::executor::ExecutionReport, PipelineError> {
+    let readers: crate::executor::SourceReaders = HashMap::from([
+        (
+            "orders".to_string(),
+            crate::executor::single_file_reader(
+                "orders.csv",
+                Box::new(std::io::Cursor::new(orders.into_bytes())),
+            ),
+        ),
+        (
+            "bands".to_string(),
+            crate::executor::single_file_reader(
+                "bands.csv",
+                Box::new(std::io::Cursor::new(bands.into_bytes())),
+            ),
+        ),
+    ]);
+    let out = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(out.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let config = clinker_plan::config::parse_config(yaml).expect("parse pipeline YAML");
+    let params = PipelineRunParams {
+        execution_id: "iejoin-block-band-dlq".to_string(),
+        batch_id: "batch-0".to_string(),
+        ..Default::default()
+    };
+    PipelineExecutor::run_with_readers_writers_with_arbitrator(
+        &config,
+        readers,
+        writers.into(),
+        &params,
+        clinker_plan::config::CompileContext::default(),
+        Arc::clone(arb),
+    )
+}
+
+#[test]
+fn block_band_dlq_order_is_identical_across_memory_limits() {
+    // The determinism invariant for the dead-letter output: a pure-range combine
+    // whose body eval fails on every matched pair (divide by zero) under
+    // `strategy: continue`. At a tight budget both sides slice into several
+    // blocks, so the failures accrue in a block-interleaved order; at a roomy
+    // budget each side is one block. The final failure sort must make the
+    // dead-letter row order a pure function of the data — identical at both
+    // limits — mirroring the guarantee the emitted rows already hold.
+    let dlq_source_rows = |limit: u64| -> Vec<u64> {
+        let arb = no_op_arbitrator(limit);
+        let report = run_pipeline_report(DLQ_YAML, dlq_orders_csv(60, 1024), dlq_bands_csv(40, 1024), &arb)
+            .expect("the continue-strategy run completes, routing failures to the DLQ");
+        report
+            .dlq_entries
+            .iter()
+            .filter(|e| {
+                e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow
+            })
+            .map(|e| e.source_row)
+            .collect()
+    };
+
+    let tight = dlq_source_rows(TIGHT_LIMIT);
+    let roomy = dlq_source_rows(ROOMY_LIMIT);
+    assert!(
+        !tight.is_empty(),
+        "every matched pair divides by zero, so the dead-letter output must be non-empty"
+    );
+    assert_eq!(
+        tight, roomy,
+        "block-band dead-letter order must be a pure function of the data, not of pipeline.memory.limit"
+    );
+    // The normalized order groups every failure of a given order together in
+    // ascending source-row order — the layout-independent shape the sort gives.
+    let mut expected = tight.clone();
+    expected.sort_unstable();
+    assert_eq!(
+        tight, expected,
+        "the dead-letter rows must land in ascending source-row order after the sort"
+    );
+}

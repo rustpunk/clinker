@@ -9,8 +9,9 @@
 //!
 //!   1. **Drain** each side into a payload-ordered
 //!      [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer) keyed on the
-//!      primary inequality key (payload `(k1, k2, order)` for the driver,
-//!      `(k1, k2)` for the build). The buffer spills its overflow to disk.
+//!      primary inequality key (payload `(k1, k2, driver_idx, order)` for the
+//!      driver, `(k1, k2, build_idx)` for the build). The buffer spills its
+//!      overflow to disk.
 //!   2. **Slice** the sorted stream (in-memory vec or the k-way merge over the
 //!      spilled runs — never collected) into contiguous blocks of at most
 //!      `block_target_bytes`, tagging each with its per-axis key bounds. Blocks
@@ -24,30 +25,39 @@
 //!      spilled block read into scratch), runs the numeric kernel, and emits
 //!      through the shared [`emit_pairs`](super::emit_pairs) loop.
 //!
-//! Determinism: the emitted rows are a pure function of the input data and the
-//! pipeline config, never of `pipeline.memory.limit`. Build payloads carry the
-//! build record's original input index, so `match: first` selects the minimum
-//! such index, `collect` orders and truncates by it, and the whole output is
-//! stable-sorted by (driver input order, build input index) before return — all
-//! independent of the memory-derived block layout. `on_miss: error` is
-//! dispatched after the full pass and names the lowest-input-index unmatched
-//! driver.
+//! Determinism: the emitted rows — and the deferred output-eval (dead-letter)
+//! rows — are a pure function of the input data and the pipeline config, never
+//! of `pipeline.memory.limit`. Build payloads carry the build record's original
+//! input index, so `match: first` selects the minimum such index and `collect`
+//! orders and truncates by it. Driver payloads carry the driver's unique global
+//! input index, so the whole output is sorted by
+//! `(driver order, driver_idx, build_idx)` before return — a total key even when
+//! a chained upstream stamps duplicate driver orders — and the dead-letter rows
+//! are sorted the same way, both independent of the memory-derived block layout.
+//! `on_miss: error` is dispatched after the full pass and names the
+//! lowest-input-index unmatched driver. The one documented exception is the
+//! FailFast eval-error identity: FailFast surfaces the first eval error in
+//! visitation order and returns immediately, since determinizing an error path
+//! would defeat fail-fast.
 //!
 //! Memory model: bounded on the input axis — the resident-block budget plus at
-//! most one loaded spilled block per side and the kernel's O(n) sort arrays for
-//! the current pair. The scan/sort and slice phases respond to memory pressure
-//! by SPILLING (own byte threshold + disk-quota E320), never by consulting
-//! global process pressure. The per-pair pre-output abort
+//! most one loaded spilled block per side, the kernel's O(n) sort arrays, and
+//! the held `First` / `collect` candidates for the current driver block. The
+//! scan/sort and slice phases respond to memory pressure by SPILLING (own byte
+//! threshold + disk-quota E320), never by consulting global process pressure.
+//! The per-pair pre-output abort
 //! ([`pre_output_budget_error`](super::pre_output_budget_error)) is a strictly
-//! LOCAL last resort — the one block-pair's resident bytes plus the kernel aux
-//! and pair-index vector exceed the hard limit even alone — so a
-//! bounded-residency run stays host-independent and never aborts because the
-//! process floor sits above a tight budget, or because the resident baseline
-//! plus one pair momentarily does (the budget constants keep that sum under
-//! `hard`). The OUTPUT axis (`output_records`, O(N·M) worst case) is
-//! un-spillable until a later phase streams it, so it keeps the every-10K
-//! poll on the arbitrator's global-aware `should_abort_local`: reacting to
-//! global pressure is the arbitrator's job, on that axis only.
+//! LOCAL last resort: it measures this pair's exact live footprint — the
+//! resident baseline, the scratch for any spilled block loaded here, the
+//! range-key and kernel-aux arrays, the materialized pair-index vector, and the
+//! held candidates accumulated so far — directly against the hard limit, never
+//! against the arbitrator's global process pressure. So a bounded-residency run
+//! stays host-independent and aborts only when one pair's own footprint cannot
+//! fit `hard`, not because the process floor sits above a tight budget. The
+//! OUTPUT axis (`output_records`, O(N·M) worst case) is un-spillable until a
+//! later phase streams it, so it keeps the every-10K poll on the arbitrator's
+//! global-aware `should_abort_local`: reacting to global pressure is the
+//! arbitrator's job, on that axis only.
 
 use std::io;
 use std::path::Path;
@@ -159,25 +169,6 @@ impl ResidentBudget {
 /// charges, so block sizing and the pre-output charge track its accounting.
 fn pair_bytes<P>(record: &Record) -> usize {
     std::mem::size_of::<Record>() + record.estimated_heap_size() + std::mem::size_of::<P>()
-}
-
-/// The primary and secondary inequality keys carried in a block payload, read
-/// for slicing (block bounds) and pruning. Both the driver payload
-/// `(k1, k2, order)` and the build payload `(k1, k2, build_idx)` are
-/// `(i64, i64, u64)`, so one impl serves both; the third element differs in
-/// meaning (driver input order vs. build input index) but is never read here.
-trait BlockKey {
-    fn k1(&self) -> i64;
-    fn k2(&self) -> i64;
-}
-
-impl BlockKey for (i64, i64, u64) {
-    fn k1(&self) -> i64 {
-        self.0
-    }
-    fn k2(&self) -> i64 {
-        self.1
-    }
 }
 
 /// Per-axis key bounds accumulated while a block fills.
@@ -487,20 +478,25 @@ pub(super) fn execute_block_band(
     // RAM until their per-pair load, charged transiently below.
     let baseline_resident = resident_bytes_of(&driver_blocks) + resident_bytes_of(&build_blocks);
 
-    // Schedule + emit: prune block pairs, run the kernel per surviving pair,
-    // and emit through the shared loop. `row_tags` records each emitted row's build
-    // input index (`u64::MAX` for collect / on_miss rows) so the output can be
-    // stable-sorted into a deterministic order at the end — a pure function of
-    // the data, independent of the memory-derived block layout.
+    // Schedule + emit: prune block pairs, run the kernel per surviving pair, and
+    // emit through the shared loop. `row_tags` records each emitted row's
+    // `(driver input index, build input index)` — `(driver_idx, u64::MAX)` for
+    // collect / on_miss rows — so the output can be sorted into a deterministic
+    // order at the end, a pure function of the data and independent of the
+    // memory-derived block layout even when a chained upstream repeats orders.
     let mut output_records: Vec<(Record, RecordOrder)> = Vec::new();
-    let mut row_tags: Vec<u64> = Vec::new();
+    let mut row_tags: Vec<(u64, u64)> = Vec::new();
     let mut emitted_since_check: usize = 0;
     let mut output_eval_failures = Vec::new();
+    // Parallel `(order, driver_idx, build_idx)` sort key per deferred output-eval
+    // failure, so the dead-letter rows re-order into the same layout-independent
+    // order as the emitted rows.
+    let mut failure_tags: Vec<(RecordOrder, u64, u64)> = Vec::new();
     // Zero-match drivers whose on_miss handling is deferred to after the full
-    // pass, so on_miss:error names the lowest-input-index unmatched driver (not
-    // whichever range-key-ordered block finalized first). Empty under
-    // on_miss:skip (nothing to do) and Collect (every driver emits a row).
-    let mut unmatched: Vec<(Record, RecordOrder)> = Vec::new();
+    // pass — record, order, and global input index — so on_miss:error names the
+    // lowest-input-index unmatched driver (not whichever range-key-ordered block
+    // finalized first). Empty under on_miss:skip and Collect (every driver emits).
+    let mut unmatched: Vec<(Record, RecordOrder, u64)> = Vec::new();
     let emit_cfg = EmitConfig {
         name,
         build_qualifier,
@@ -516,8 +512,36 @@ pub(super) fn execute_block_band(
         residual: residual_eval,
         body: body_eval,
     };
+    // One sink threads the whole emit phase (driver loop, driver-block finalize,
+    // scan-unmatched sweep, on_miss dispatch); its borrows of the output and tag
+    // buffers end at its last use, before the final deterministic sort consumes
+    // them.
+    let mut sink = EmitSink {
+        output_records: &mut output_records,
+        emitted_since_check: &mut emitted_since_check,
+        output_eval_failures: &mut output_eval_failures,
+        row_tags: Some(&mut row_tags),
+        failure_tags: Some(&mut failure_tags),
+    };
 
     for driver_block in &driver_blocks {
+        // Transient bytes this driver block holds for its whole inner loop: the
+        // scratch copy of a spilled block (a resident block is already in the
+        // baseline and only borrowed) plus its range-key array.
+        let dkeys_bytes = (driver_block.len * std::mem::size_of::<(i64, i64)>()) as u64;
+        let driver_scratch = spilled_scratch_bytes(driver_block);
+        let driver_held = driver_scratch.saturating_add(dkeys_bytes);
+        // Gate the driver block's own load from metadata, symmetric with the
+        // per-pair build gate below: a spilled driver block whose scratch plus
+        // the resident baseline cannot fit the hard limit aborts before it is
+        // materialized rather than after. A resident (borrowed) block adds zero
+        // scratch and never trips this.
+        let driver_peak = baseline_resident.saturating_add(driver_held);
+        if driver_peak > budget.hard_limit() {
+            consumer.set_bytes(0);
+            return Err(pre_output_budget_error(name, driver_peak, budget.hard_limit()));
+        }
+
         let driver_loaded = driver_block.load("iejoin block-band driver block")?;
         if driver_loaded.is_empty() {
             continue;
@@ -532,51 +556,50 @@ pub(super) fn execute_block_band(
             .enumerate()
             .map(|(di, (record, payload))| DriverRef {
                 record,
-                order: payload.2,
+                order: payload.3,
                 key: di,
+                driver_idx: payload.2,
             })
             .collect();
         let dkeys: Vec<(i64, i64)> = driver_loaded.iter().map(|(_, p)| (p.0, p.1)).collect();
-        // Transient bytes this driver block holds for its whole inner loop: the
-        // scratch copy of a spilled block (a resident block is already in the
-        // baseline and only borrowed) plus its range-key array.
-        let dkeys_bytes = (driver_block.len * std::mem::size_of::<(i64, i64)>()) as u64;
-        let driver_scratch = spilled_scratch_bytes(driver_block);
-        let driver_held = driver_scratch + dkeys_bytes;
-        consumer.set_bytes(baseline_resident + driver_held);
+        // Single-inequality (PWMJ) uses only the primary driver key column; it
+        // is fixed for the whole inner loop, so build it once here instead of
+        // per surviving build pair.
+        let driver_pwmj_keys: Option<Vec<i64>> = match op2 {
+            None => Some(dkeys.iter().map(|(a, _)| *a).collect()),
+            Some(_) => None,
+        };
+        consumer.set_bytes(baseline_resident.saturating_add(driver_held));
 
         for build_block in &build_blocks {
             if !block_pair_possible(op1, op2, driver_block, build_block) {
                 continue;
             }
 
-            // Pre-output charge, computed from block metadata BEFORE either
-            // side is loaded (A3): the two blocks' resident bytes, the kernel's
-            // O(n) L1/L2 sort arrays, and the two range-key arrays. The abort
-            // here is a STRICTLY LOCAL last resort — a single block-pair whose
-            // own footprint cannot fit the hard limit even alone. It
-            // deliberately does NOT consult the arbitrator's global pressure
-            // (process RSS or the consumer-usage sum): this path answers global
-            // pressure by spilling, so a bounded-residency run must not abort
-            // merely because the process floor sits above a tight budget, or
-            // because the resident baseline plus this pair momentarily exceeds
-            // it (the budget constants guarantee that sum stays under `hard`).
-            // Global pressure is the arbitrator's job, on the un-spillable
-            // output axis polled inside the emit loop.
+            // Pre-output charge, from block metadata BEFORE the build side is
+            // loaded: the exact live footprint this pair charges the consumer —
+            // the resident baseline (kept-in-RAM blocks, counted once), this
+            // pair's scratch for any spilled block loaded here (zero for a
+            // borrowed resident block, already in the baseline), the two
+            // range-key arrays, the kernel's O(n) sort state, and the First /
+            // collect candidates held so far in this driver block. The abort is
+            // a strictly LOCAL last resort: it compares that sum directly to the
+            // hard limit and never consults the arbitrator's global pressure,
+            // because this path answers pressure by spilling. Global pressure is
+            // the arbitrator's job, on the un-spillable output axis polled inside
+            // the emit loop.
             let bkeys_bytes = (build_block.len * std::mem::size_of::<(i64, i64)>()) as u64;
             let aux_kernel = iejoin_numeric_state_bytes(driver_block.len, build_block.len) as u64;
-            let local_peak = driver_block
-                .resident_bytes
-                .saturating_add(build_block.resident_bytes)
-                .saturating_add(aux_kernel)
-                .saturating_add(dkeys_bytes)
-                .saturating_add(bkeys_bytes);
-            if local_peak > budget.hard_limit() {
-                return Err(pre_output_budget_error(
-                    name,
-                    local_peak,
-                    budget.hard_limit(),
-                ));
+            let build_held = spilled_scratch_bytes(build_block)
+                .saturating_add(bkeys_bytes)
+                .saturating_add(aux_kernel);
+            let pair_peak = baseline_resident
+                .saturating_add(driver_held)
+                .saturating_add(build_held)
+                .saturating_add(state.held_bytes());
+            if pair_peak > budget.hard_limit() {
+                consumer.set_bytes(0);
+                return Err(pre_output_budget_error(name, pair_peak, budget.hard_limit()));
             }
 
             let build_loaded = build_block.load("iejoin block-band build block")?;
@@ -585,42 +608,44 @@ pub(super) fn execute_block_band(
             }
             let bkeys: Vec<(i64, i64)> = build_loaded.iter().map(|(_, p)| (p.0, p.1)).collect();
             let build_idx: Vec<u64> = build_loaded.iter().map(|(_, p)| p.2).collect();
-            let build_held = spilled_scratch_bytes(build_block) + bkeys_bytes + aux_kernel;
-            consumer.set_bytes(baseline_resident + driver_held + build_held);
+            consumer.set_bytes(
+                baseline_resident
+                    .saturating_add(driver_held)
+                    .saturating_add(build_held)
+                    .saturating_add(state.held_bytes()),
+            );
 
-            let pairs: Vec<(usize, usize)> = match op2 {
-                Some(op2v) => iejoin_numeric(&dkeys, &bkeys, op1, op2v),
-                None => {
-                    // Single-inequality: PWMJ on the sole (primary) axis.
-                    let dl: Vec<i64> = dkeys.iter().map(|(a, _)| *a).collect();
+            let pairs: Vec<(usize, usize)> = match (op2, &driver_pwmj_keys) {
+                (Some(op2v), _) => iejoin_numeric(&dkeys, &bkeys, op1, op2v),
+                (None, Some(dl)) => {
                     let bl: Vec<i64> = bkeys.iter().map(|(a, _)| *a).collect();
-                    pwmj_numeric(&dl, &bl, op1)
+                    pwmj_numeric(dl, &bl, op1)
                 }
+                (None, None) => unreachable!("driver_pwmj_keys is Some whenever op2 is None"),
             };
 
-            // Fold the materialized pair-index vector into the local peak (A1):
-            // it is the last pre-output allocation before per-pair emit, so a
-            // dense block-pair (near cross-product under duplicate keys) aborts
-            // here with the typed error instead of OOM-ing the process, the
-            // same allocation the equi+range path gates.
+            // Fold the materialized pair-index vector into the peak: it is the
+            // last pre-output allocation before per-pair emit. This is a
+            // check-AFTER-allocation — the vector is already built — so it is a
+            // typed abort for an over-budget-but-allocatable pair, not a
+            // guarantee against an allocation larger than free RAM (that is the
+            // block-nested-loop follow-up). It mirrors the equi+range path's
+            // post-kernel pairs gate.
             let pairs_bytes = (pairs.len() * std::mem::size_of::<(usize, usize)>()) as u64;
-            let local_peak = local_peak.saturating_add(pairs_bytes);
-            if local_peak > budget.hard_limit() {
-                return Err(pre_output_budget_error(
-                    name,
-                    local_peak,
-                    budget.hard_limit(),
-                ));
+            let pair_peak = pair_peak.saturating_add(pairs_bytes);
+            if pair_peak > budget.hard_limit() {
+                consumer.set_bytes(0);
+                return Err(pre_output_budget_error(name, pair_peak, budget.hard_limit()));
             }
-            consumer.set_bytes(baseline_resident + driver_held + build_held + pairs_bytes);
+            consumer.set_bytes(
+                baseline_resident
+                    .saturating_add(driver_held)
+                    .saturating_add(build_held)
+                    .saturating_add(state.held_bytes())
+                    .saturating_add(pairs_bytes),
+            );
 
             let build_slice: Vec<&Record> = build_loaded.iter().map(|(r, _)| r).collect();
-            let mut sink = EmitSink {
-                output_records: &mut output_records,
-                emitted_since_check: &mut emitted_since_check,
-                output_eval_failures: &mut output_eval_failures,
-                row_tags: Some(&mut row_tags),
-            };
             let batch = EmitBatch {
                 pairs: &pairs,
                 driver_slice: &driver_slice,
@@ -629,20 +654,19 @@ pub(super) fn execute_block_band(
             };
             emit_pairs(&emit_cfg, &mut evals, &batch, &mut state, &mut sink)?;
 
-            // The build scratch, key/pair arrays for this pair are dropped;
-            // fall back to the driver block's held state for the next pair.
-            consumer.set_bytes(baseline_resident + driver_held);
+            // The build scratch and key/pair arrays for this pair are dropped;
+            // fall back to the driver block's held state plus the First / collect
+            // candidates accumulated so far.
+            consumer.set_bytes(
+                baseline_resident
+                    .saturating_add(driver_held)
+                    .saturating_add(state.held_bytes()),
+            );
         }
 
         // This driver block's inner loop is complete: flush collect
         // accumulators / emit deferred First candidates, and gather its
         // zero-match drivers for the end-of-join on_miss dispatch.
-        let mut sink = EmitSink {
-            output_records: &mut output_records,
-            emitted_since_check: &mut emitted_since_check,
-            output_eval_failures: &mut output_eval_failures,
-            row_tags: Some(&mut row_tags),
-        };
         finalize_driver_block(
             &emit_cfg,
             &mut evals,
@@ -653,20 +677,14 @@ pub(super) fn execute_block_band(
             &mut sink,
         )?;
 
-        // The driver block's scratch and key array are dropped at end of
-        // iteration; leave only the resident baseline charged.
+        // The driver block's scratch, key array, and now-drained held state are
+        // released; leave only the resident baseline charged.
         consumer.set_bytes(baseline_resident);
     }
 
     // Scan-phase unmatched drivers (NULL / non-orderable range key) never
     // entered a block. Under Collect each emits an empty-array row; under
     // First / All each joins the deferred on_miss pile.
-    let mut sink = EmitSink {
-        output_records: &mut output_records,
-        emitted_since_check: &mut emitted_since_check,
-        output_eval_failures: &mut output_eval_failures,
-        row_tags: Some(&mut row_tags),
-    };
     finalize_scan_unmatched(
         &emit_cfg,
         &unmatched_driver_records,
@@ -676,35 +694,50 @@ pub(super) fn execute_block_band(
     );
 
     // End-of-join on_miss dispatch over every zero-match driver, in ascending
-    // input order (C3): on_miss:error names the lowest-input-index driver, and
-    // on_miss:null_fields emits its rows in input order. Skip / Collect leave
-    // `unmatched` empty.
-    unmatched.sort_by_key(|(_, order)| *order);
-    let mut sink = EmitSink {
-        output_records: &mut output_records,
-        emitted_since_check: &mut emitted_since_check,
-        output_eval_failures: &mut output_eval_failures,
-        row_tags: Some(&mut row_tags),
-    };
-    for (record, order) in &unmatched {
-        dispatch_on_miss(&emit_cfg, &mut evals, record, *order, on_miss, &mut sink)?;
+    // input order: on_miss:error names the lowest-input-index driver, and
+    // on_miss:null_fields emits its rows in input order. `driver_idx` breaks
+    // ties when a chained upstream repeats orders, so the dispatched-driver
+    // identity is deterministic. Skip / Collect leave `unmatched` empty.
+    unmatched.sort_by_key(|(_, order, driver_idx)| (*order, *driver_idx));
+    for (record, order, driver_idx) in &unmatched {
+        dispatch_on_miss(
+            &emit_cfg,
+            &mut evals,
+            record,
+            *order,
+            *driver_idx,
+            on_miss,
+            &mut sink,
+        )?;
     }
 
-    // Final deterministic order: sort emitted rows by (driver input order,
-    // build input index). Collect / on_miss rows carry `build_idx == u64::MAX`,
-    // so they sort after a driver's match rows (a collect/miss driver has none)
-    // and, having distinct driver orders, hold input order among themselves.
-    // Keys are unique — a (driver, build) pair is emitted at most once — so the
-    // sort is deterministic.
+    // Final deterministic order: sort emitted rows by
+    // `(driver order, driver input index, build input index)`. `driver_idx` is
+    // unique per driver, so the key is total even when a chained upstream stamps
+    // duplicate orders; collect / on_miss rows carry `build_idx == u64::MAX`, so
+    // they sort after that driver's match rows (a collect / miss driver has
+    // none). The `sink` borrow of these buffers ends at its last use above.
     debug_assert_eq!(output_records.len(), row_tags.len());
-    let mut ordered: Vec<((RecordOrder, u64), (Record, RecordOrder))> = output_records
-        .into_iter()
-        .zip(row_tags)
-        .map(|((rec, order), tag)| ((order, tag), (rec, order)))
-        .collect();
-    ordered.sort_by_key(|(key, _)| *key);
+    let mut rows: Vec<((Record, RecordOrder), (u64, u64))> =
+        output_records.into_iter().zip(row_tags).collect();
+    rows.sort_by_key(|((_, order), (driver_idx, build_idx))| (*order, *driver_idx, *build_idx));
     let output_records: Vec<(Record, RecordOrder)> =
-        ordered.into_iter().map(|(_, row)| row).collect();
+        rows.into_iter().map(|(row, _)| row).collect();
+
+    // Re-order the deferred output-eval failures into the same
+    // layout-independent order, so the dead-letter output is a pure function of
+    // the data too. FailFast surfaces the first-encountered eval error and
+    // returns before reaching here; that identity stays visitation-ordered by
+    // design — determinizing an error path would defeat fail-fast.
+    debug_assert_eq!(output_eval_failures.len(), failure_tags.len());
+    let mut failures: Vec<_> = output_eval_failures.into_iter().zip(failure_tags).collect();
+    failures.sort_by_key(|(_, key)| *key);
+    let output_eval_failures = failures.into_iter().map(|(f, _)| f).collect();
+
+    // The resident blocks are freed as this function returns; discharge the
+    // consumer now so the node-buffer admission that follows never sums a stale
+    // baseline that no longer holds any RAM.
+    consumer.set_bytes(0);
 
     Ok(CombineKernelOutput {
         records: output_records,
@@ -737,12 +770,16 @@ fn spilled_scratch_bytes<P>(block: &Block<P>) -> u64 {
 /// Build-side blocks, keyed on `(k1, k2, build_idx)`.
 type BuildBlocks = Vec<Block<(i64, i64, u64)>>;
 
+/// Driver payload: primary/secondary range keys, the driver's unique global
+/// input index, and its `RecordOrder` tag. `driver_idx` is the sort tiebreak
+/// after the keys (`order` may repeat when a chained upstream fans one input
+/// row into several) and disambiguates the final output sort.
+type DriverPayload = (i64, i64, u64, RecordOrder);
+
 /// Driver-side drain result: the sliced driver blocks and the retained
-/// scan-phase unmatched drivers (held for end-of-join on_miss dispatch).
-type DriverSide = (
-    Vec<Block<(i64, i64, RecordOrder)>>,
-    Vec<(Record, RecordOrder)>,
-);
+/// scan-phase unmatched drivers (record, order, and global input index), held
+/// for end-of-join on_miss dispatch.
+type DriverSide = (Vec<Block<DriverPayload>>, Vec<(Record, RecordOrder, u64)>);
 
 /// Drain the driver side: matched records go into a payload-ordered sort
 /// buffer keyed on `(k1, k2, order)`; unmatched drivers are retained for
@@ -758,23 +795,26 @@ fn drain_driver_side(
         return Ok((Vec::new(), Vec::new()));
     };
     let schema = Arc::clone(first.schema());
-    let mut buf: SortBuffer<(i64, i64, RecordOrder)> = SortBuffer::new_payload_ordered(
+    let mut buf: SortBuffer<DriverPayload> = SortBuffer::new_payload_ordered(
         ctx.sort_threshold,
         Some(ctx.spill_dir.to_path_buf()),
         ctx.spill_compress,
         Arc::clone(&schema),
     );
-    let mut unmatched: Vec<(Record, RecordOrder)> = Vec::new();
-    for ((record, order), scan) in driver_records.into_iter().zip(driver_scans) {
+    let mut unmatched: Vec<(Record, RecordOrder, u64)> = Vec::new();
+    for (driver_idx, ((record, order), scan)) in
+        driver_records.into_iter().zip(driver_scans).enumerate()
+    {
+        let driver_idx = driver_idx as u64;
         match scan {
-            RecordScan::Unmatched => unmatched.push((record, order)),
+            RecordScan::Unmatched => unmatched.push((record, order, driver_idx)),
             RecordScan::Matched {
                 range_key: (k1, k2),
                 ..
-            } => push_charge_spill(&mut buf, record, (k1, k2, order), ctx)?,
+            } => push_charge_spill(&mut buf, record, (k1, k2, driver_idx, order), ctx)?,
         }
     }
-    let blocks = finish_and_slice(buf, &schema, ctx, resident)?;
+    let blocks = finish_and_slice(buf, &schema, ctx, resident, &|p: &DriverPayload| (p.0, p.1))?;
     Ok((blocks, unmatched))
 }
 
@@ -807,7 +847,9 @@ fn drain_build_side(
             push_charge_spill(&mut buf, record, (k1, k2, build_idx as u64), ctx)?;
         }
     }
-    finish_and_slice(buf, &schema, ctx, resident)
+    finish_and_slice(buf, &schema, ctx, resident, &|p: &(i64, i64, u64)| {
+        (p.0, p.1)
+    })
 }
 
 /// Push one matched pair into the sort buffer, mirror the byte delta into the
@@ -845,15 +887,18 @@ fn push_charge_spill<P: Serialize + DeserializeOwned + Send + Ord>(
 
 /// Finish the sort buffer and slice its sorted output into blocks. Every block
 /// is admitted resident while the shared budget allows and spilled to its own
-/// file otherwise (B1), so a side (or both sides together) that fits the
-/// resident budget stays entirely in RAM. Removing the buffer's charge here and
-/// re-charging resident blocks as they form keeps the consumer accurate through
-/// the rest of the join (A4).
-fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord + BlockKey>(
+/// file otherwise, so a side (or both sides together) that fits the resident
+/// budget stays entirely in RAM. The buffer's charge is released so the
+/// consumer reflects the resident blocks that replace it — but for the
+/// in-memory case that release is deferred until the sorted vec is actually
+/// consumed into blocks, so the still-resident vec is never charged out from
+/// under the consumer mid-slice.
+fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord>(
     buf: SortBuffer<P>,
     schema: &Arc<Schema>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
+    key_of: &impl Fn(&P) -> (i64, i64),
 ) -> Result<Vec<Block<P>>, PipelineError> {
     let pre_finish = buf.bytes_used() as u64;
     let (sorted, residue) = buf.finish().map_err(|e| {
@@ -869,35 +914,45 @@ fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord + BlockKey>(
             ctx.budget.cumulative_spill_bytes(),
         ));
     }
-    // The buffer's in-memory residue has left RAM: spilled runs are on disk, and
-    // an in-memory vec is about to be re-partitioned into blocks. Drop its
-    // charge; each admitted resident block re-charges its own bytes.
-    ctx.consumer.sub_bytes(pre_finish);
 
-    let stream = match sorted {
+    // `defer_release` keeps the buffer charge live across slicing for the
+    // in-memory case, where the sorted vec is still resident and each admitted
+    // block re-charges its own bytes (a transient over-count that never
+    // under-reports). The spilled case has already written its runs to disk, so
+    // its charge is dropped now — the k-way merge holds only one record per run.
+    let (stream, defer_release) = match sorted {
         SortedOutput::InMemory(pairs) => {
             if pairs.is_empty() {
+                ctx.consumer.sub_bytes(pre_finish);
                 return Ok(Vec::new());
             }
-            SortedStream::InMemory(pairs.into_iter())
+            (SortedStream::InMemory(pairs.into_iter()), true)
         }
         SortedOutput::Spilled(files) => {
+            ctx.consumer.sub_bytes(pre_finish);
             let merger = SortedRunMerger::new_payload_ordered(files, "iejoin block-band merge")?;
-            SortedStream::Spilled(merger)
+            (SortedStream::Spilled(merger), false)
         }
     };
-    slice_side(stream, schema, ctx, resident)
+    let blocks = slice_side(stream, schema, ctx, resident, key_of)?;
+    if defer_release {
+        // The in-memory sorted vec is now fully consumed into blocks; release
+        // its buffer charge, leaving only the admitted resident blocks charged.
+        ctx.consumer.sub_bytes(pre_finish);
+    }
+    Ok(blocks)
 }
 
 /// Slice a sorted stream into contiguous `block_target`-sized blocks, admitting
 /// each into RAM under the shared resident budget or spilling it otherwise.
 /// Streaming over the input: at most one forming block is resident beyond the
 /// admitted set, so the spilled-run merge is never collected.
-fn slice_side<P: Serialize + DeserializeOwned + Send + Ord + BlockKey>(
+fn slice_side<P: Serialize + DeserializeOwned + Send + Ord>(
     stream: SortedStream<P>,
     schema: &Arc<Schema>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
+    key_of: &impl Fn(&P) -> (i64, i64),
 ) -> Result<Vec<Block<P>>, PipelineError> {
     let mut blocks: Vec<Block<P>> = Vec::new();
     let mut cur: Vec<(Record, P)> = Vec::new();
@@ -905,7 +960,8 @@ fn slice_side<P: Serialize + DeserializeOwned + Send + Ord + BlockKey>(
     let mut bounds = Bounds::empty();
     for item in stream {
         let (record, payload) = item?;
-        bounds.update(payload.k1(), payload.k2());
+        let (k1, k2) = key_of(&payload);
+        bounds.update(k1, k2);
         cur_bytes += pair_bytes::<P>(&record);
         cur.push((record, payload));
         // A single record larger than the target still forms a block of one —
@@ -931,7 +987,7 @@ fn slice_side<P: Serialize + DeserializeOwned + Send + Ord + BlockKey>(
 /// Build one completed block, keeping it resident if the shared budget still
 /// admits its bytes (charged into the consumer, since it holds that RAM through
 /// the rest of the join) or spilling it to its own file otherwise.
-fn make_block<P: Serialize + DeserializeOwned + Send + Ord + BlockKey>(
+fn make_block<P: Serialize + DeserializeOwned + Send + Ord>(
     pairs: Vec<(Record, P)>,
     bounds: Bounds,
     schema: &Arc<Schema>,
@@ -1005,47 +1061,50 @@ fn spill_block<P: Serialize>(
 /// Finalize one driver block after its inner loop over build blocks. Under
 /// `Collect`, flush one row per driver (even zero-match drivers, with an empty
 /// array). Under `First`, emit each driver's held minimum-build-index candidate
-/// (C1) — the selection is now a pure function of the data, not of the block
-/// layout — and gather any driver with no emitting candidate. Under `All`,
-/// gather every zero-match driver. Gathered drivers are appended to `unmatched`
-/// for the deferred end-of-join on_miss dispatch (C3), so on_miss:error names
-/// the lowest-input-index unmatched driver rather than whichever block finalized
-/// first.
+/// — the selection is a pure function of the data, not of the block layout —
+/// and gather any driver with no emitting candidate. Under `All`, gather every
+/// zero-match driver. Gathered drivers are appended to `unmatched` for the
+/// deferred end-of-join on_miss dispatch, so on_miss:error names the
+/// lowest-input-index unmatched driver rather than whichever block finalized
+/// first. Each driver's global input index (`payload.2`) is carried through so
+/// its rows tag deterministically.
 fn finalize_driver_block(
     cfg: &EmitConfig<'_>,
     evals: &mut Evaluators,
-    driver_loaded: &[(Record, (i64, i64, RecordOrder))],
+    driver_loaded: &[(Record, DriverPayload)],
     on_miss: OnMiss,
     state: &mut MatchState,
-    unmatched: &mut Vec<(Record, RecordOrder)>,
+    unmatched: &mut Vec<(Record, RecordOrder, u64)>,
     sink: &mut EmitSink<'_>,
 ) -> Result<(), PipelineError> {
     match cfg.match_mode {
         MatchMode::Collect => {
             for (di, (record, payload)) in driver_loaded.iter().enumerate() {
                 let flush = state.take_collect(di);
-                flush_collect_row(cfg, record, payload.2, flush, sink);
+                flush_collect_row(cfg, record, payload.3, payload.2, flush, sink);
             }
         }
         MatchMode::First => {
             for (di, (record, payload)) in driver_loaded.iter().enumerate() {
-                match state.first_match.remove(&di) {
+                match state.take_first_candidate(di) {
                     // Emit the minimum-build-index candidate. A body eval that
                     // skips it leaves the driver a miss (no other candidate is
                     // held), routed to the deferred on_miss dispatch.
                     Some((bidx, build)) => {
-                        if !emit_match_row(cfg, evals, record, payload.2, &build, bidx, sink)? {
-                            note_unmatched(on_miss, record, payload.2, unmatched);
+                        if !emit_match_row(
+                            cfg, evals, record, payload.3, payload.2, &build, bidx, sink,
+                        )? {
+                            note_unmatched(on_miss, record, payload.3, payload.2, unmatched);
                         }
                     }
-                    None => note_unmatched(on_miss, record, payload.2, unmatched),
+                    None => note_unmatched(on_miss, record, payload.3, payload.2, unmatched),
                 }
             }
         }
         MatchMode::All => {
             for (di, (record, payload)) in driver_loaded.iter().enumerate() {
                 if !state.matched[di] {
-                    note_unmatched(on_miss, record, payload.2, unmatched);
+                    note_unmatched(on_miss, record, payload.3, payload.2, unmatched);
                 }
             }
         }
@@ -1058,18 +1117,19 @@ fn finalize_driver_block(
 /// joins the deferred on_miss pile.
 fn finalize_scan_unmatched(
     cfg: &EmitConfig<'_>,
-    scan_unmatched: &[(Record, RecordOrder)],
+    scan_unmatched: &[(Record, RecordOrder, u64)],
     on_miss: OnMiss,
-    unmatched: &mut Vec<(Record, RecordOrder)>,
+    unmatched: &mut Vec<(Record, RecordOrder, u64)>,
     sink: &mut EmitSink<'_>,
 ) {
     match cfg.match_mode {
         MatchMode::Collect => {
-            for (record, order) in scan_unmatched {
+            for (record, order, driver_idx) in scan_unmatched {
                 flush_collect_row(
                     cfg,
                     record,
                     *order,
+                    *driver_idx,
                     CollectFlush {
                         arr: Vec::new(),
                         truncated: false,
@@ -1080,8 +1140,8 @@ fn finalize_scan_unmatched(
             }
         }
         MatchMode::First | MatchMode::All => {
-            for (record, order) in scan_unmatched {
-                note_unmatched(on_miss, record, *order, unmatched);
+            for (record, order, driver_idx) in scan_unmatched {
+                note_unmatched(on_miss, record, *order, *driver_idx, unmatched);
             }
         }
     }
@@ -1090,15 +1150,17 @@ fn finalize_scan_unmatched(
 /// Record one zero-match driver for the deferred end-of-join on_miss dispatch.
 /// `Skip` needs nothing (the driver emits no row); `Error` and `NullFields`
 /// need the driver held until the full pass completes, so the error names the
-/// lowest input index and the null-field rows emit in input order.
+/// lowest input index and the null-field rows emit in input order. The driver's
+/// global input index is retained for the deterministic row tag.
 fn note_unmatched(
     on_miss: OnMiss,
     record: &Record,
     order: RecordOrder,
-    unmatched: &mut Vec<(Record, RecordOrder)>,
+    driver_idx: u64,
+    unmatched: &mut Vec<(Record, RecordOrder, u64)>,
 ) {
     if !matches!(on_miss, OnMiss::Skip) {
-        unmatched.push((record.clone(), order));
+        unmatched.push((record.clone(), order, driver_idx));
     }
 }
 
@@ -2315,6 +2377,260 @@ mod tests {
                     );
                 }
                 other => panic!("expected CombineMissingMatch; got {other:?}"),
+            }
+        }
+    }
+
+    // ── G4: duplicate driver RecordOrder stays deterministic ─────────────
+
+    #[test]
+    fn duplicate_record_order_output_is_deterministic_across_layouts() {
+        // A chained upstream can stamp several driver rows with the same
+        // RecordOrder (one input row fanned into many). When two such rows match
+        // the same builds, the (order, build_idx) key collides; the driver's
+        // unique global input index breaks the tie, so the emitted order is a
+        // pure function of the data — identical across block layouts.
+        let d_schema = driver_schema();
+        let b_schema = build_schema();
+        let out_schema = Arc::new(Schema::new(vec![
+            "d_k1".into(),
+            "d_k2".into(),
+            "d_id".into(),
+            "b_k1".into(),
+            "b_k2".into(),
+            "b_id".into(),
+        ]));
+        // Four drivers, all key (5, 5); ids 1 and 2 share the duplicate order 7.
+        let driver_keyed: [(i64, i64, i64, RecordOrder); 4] =
+            [(5, 5, 0, 0), (5, 5, 1, 7), (5, 5, 2, 7), (5, 5, 3, 9)];
+        let build: Side = (0..4).map(|i| (Some((5, 5)), 100 + i)).collect();
+
+        let run = |block_target: usize, resident: Option<u64>| -> Vec<(i64, i64)> {
+            let driver_records: Vec<(Record, RecordOrder)> = driver_keyed
+                .iter()
+                .map(|(k1, k2, id, order)| (make_rec(&d_schema, *k1, *k2, *id), *order))
+                .collect();
+            let driver_scans: Vec<RecordScan> = driver_keyed
+                .iter()
+                .map(|(k1, k2, _, _)| RecordScan::Matched {
+                    eq_keys: Vec::new(),
+                    range_key: (*k1, *k2),
+                    bucket: 0,
+                })
+                .collect();
+            let (build_records, build_scans) = to_records_scans(&build, &b_schema);
+            let budget = arbitrator(1 << 30);
+            let stable = StableEvalContext::test_default();
+            let ctx = EvalContext::test_default_borrowed(&stable);
+            let resolver = empty_resolver();
+            let consumer = ConsumerHandle::new();
+            let tmp = tempfile::Builder::new()
+                .prefix("iejoin-dup-order-")
+                .tempdir()
+                .expect("temp dir");
+            let propagate = PropagateCkSpec::Driver;
+            let out = execute_block_band(BlockBandExec {
+                name: "dup_order",
+                build_qualifier: "b",
+                driver_records,
+                driver_scans,
+                build_records,
+                build_scans,
+                op1: RangeOp::Le,
+                op2: Some(RangeOp::Ge),
+                residual_eval: None,
+                body_eval: None,
+                resolver_mapping: &resolver,
+                output_schema: Some(&out_schema),
+                match_mode: MatchMode::All,
+                on_miss: OnMiss::Skip,
+                propagate_ck: &propagate,
+                ctx: &ctx,
+                budget: &budget,
+                consumer: &consumer,
+                spill_dir: tmp.path(),
+                spill_compress: false,
+                strategy: ErrorStrategy::FailFast,
+                options: BlockBandOptions {
+                    block_target_override: Some(block_target),
+                    sort_spill_override: None,
+                    resident_budget_override: resident,
+                },
+            })
+            .expect("dup-order run");
+            out.records
+                .iter()
+                .map(|(r, _)| (int(r.get("d_id")), int(r.get("b_id"))))
+                .collect()
+        };
+
+        let resident_layout = run(1 << 20, None);
+        let spilled_layout = run(1, Some(0));
+        assert_eq!(
+            resident_layout, spilled_layout,
+            "output order changed with block layout despite duplicate RecordOrder"
+        );
+        // Every one of the four drivers matches every one of the four builds.
+        assert_eq!(resident_layout.len(), 16, "the 4x4 match set must be complete");
+    }
+
+    // ── G1: held First candidates over budget abort with the typed error ──
+
+    #[test]
+    fn held_first_candidates_over_budget_abort_typed() {
+        // match:first holds one build record per matched driver until the driver
+        // block finalizes. With wide build records and many small drivers in a
+        // single driver block, that held residency grows across build blocks; the
+        // per-pair pre-output gate must fold it in and abort with the typed
+        // budget error rather than let it grow unbounded.
+        let d_schema = driver_schema();
+        let b_schema = Arc::new(Schema::new(vec![
+            "k1".into(),
+            "k2".into(),
+            "id".into(),
+            "pad".into(),
+        ]));
+        let out_schema = Arc::new(Schema::new(vec![
+            "d_k1".into(),
+            "d_k2".into(),
+            "d_id".into(),
+            "b_k1".into(),
+            "b_k2".into(),
+            "b_id".into(),
+            "b_pad".into(),
+        ]));
+        let n = 300i64;
+        let pad = "w".repeat(2048);
+        // Driver i has key (i, i); build i has key (i, i) plus a wide pad. Under
+        // `Le AND Ge` driver i matches only build i, so match:first holds build
+        // i's wide record — one held candidate per driver across the block.
+        let driver_records: Vec<(Record, RecordOrder)> = (0..n)
+            .map(|i| (make_rec(&d_schema, i, i, i), i as RecordOrder))
+            .collect();
+        let driver_scans: Vec<RecordScan> = (0..n)
+            .map(|i| RecordScan::Matched {
+                eq_keys: Vec::new(),
+                range_key: (i, i),
+                bucket: 0,
+            })
+            .collect();
+        let build_records: Vec<Record> = (0..n)
+            .map(|i| {
+                Record::new(
+                    Arc::clone(&b_schema),
+                    vec![
+                        Value::Integer(i),
+                        Value::Integer(i),
+                        Value::Integer(i + 10_000),
+                        Value::string_unique(&pad),
+                    ],
+                )
+            })
+            .collect();
+        let build_scans: Vec<RecordScan> = (0..n)
+            .map(|i| RecordScan::Matched {
+                eq_keys: Vec::new(),
+                range_key: (i, i),
+                bucket: 0,
+            })
+            .collect();
+
+        let budget = arbitrator(256 * 1024);
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let resolver = empty_resolver();
+        let consumer = ConsumerHandle::new();
+        let tmp = tempfile::Builder::new()
+            .prefix("iejoin-held-")
+            .tempdir()
+            .expect("temp dir");
+        let propagate = PropagateCkSpec::Driver;
+        let err = execute_block_band(BlockBandExec {
+            name: "held_test",
+            build_qualifier: "b",
+            driver_records,
+            driver_scans,
+            build_records,
+            build_scans,
+            op1: RangeOp::Le,
+            op2: Some(RangeOp::Ge),
+            residual_eval: None,
+            body_eval: None,
+            resolver_mapping: &resolver,
+            output_schema: Some(&out_schema),
+            match_mode: MatchMode::First,
+            on_miss: OnMiss::Skip,
+            propagate_ck: &propagate,
+            ctx: &ctx,
+            budget: &budget,
+            consumer: &consumer,
+            spill_dir: tmp.path(),
+            spill_compress: false,
+            strategy: ErrorStrategy::FailFast,
+            options: BlockBandOptions {
+                // All 300 narrow drivers fit one block; each build block holds
+                // only a few wide builds, so the driver block iterates many build
+                // blocks and the held candidates accumulate across them.
+                block_target_override: Some(64 * 1024),
+                sort_spill_override: Some(1 << 30),
+                // Spill every block so the resident baseline stays ~zero and the
+                // growing held candidates are the term that crosses the budget.
+                resident_budget_override: Some(0),
+            },
+        })
+        .expect_err("accumulated held candidates over the budget must abort");
+        match err {
+            PipelineError::MemoryBudgetExceeded { detail, source, .. } => {
+                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+                assert!(
+                    detail.as_deref().unwrap_or("").contains("iejoin pre-output"),
+                    "abort must come from the pre-output gate; got {detail:?}"
+                );
+            }
+            other => {
+                panic!("expected MemoryBudgetExceeded from the held-state gate; got {other:?}")
+            }
+        }
+    }
+
+    // ── G2: spilled driver block gated before its load ───────────────────
+
+    #[test]
+    fn spilled_driver_block_over_hard_limit_aborts_before_load() {
+        // Driver keys strictly below build keys under Gt → every block-pair is
+        // pruned, so no per-pair build gate ever runs. The driver side is one
+        // spilled block whose scratch alone exceeds the hard limit; without a
+        // driver-load gate the run would materialize it over budget and then
+        // complete (everything pruned). The metadata gate must abort at the
+        // driver load instead.
+        let driver: Side = (0..500i64).map(|i| (Some((i % 100, 0)), i)).collect();
+        let build: Side = (0..10i64).map(|i| (Some((10_000 + i, 0)), i + 1_000)).collect();
+        let cfg = RunCfg {
+            op1: RangeOp::Gt,
+            op2: None,
+            match_mode: MatchMode::All,
+            on_miss: OnMiss::Skip,
+            // One block holds all 500 drivers (~80 KB); a zero resident budget
+            // spills it, so its load would allocate over-hard scratch.
+            block_target: 1 << 30,
+            hard_limit: 16 * 1024,
+            max_spill_bytes: None,
+            // Keep the sort buffer in memory so the whole side forms one block.
+            sort_spill: Some(1 << 30),
+            resident_budget: Some(0),
+        };
+        let err = run_block(&driver, &build, &cfg)
+            .expect_err("an over-hard spilled driver block must abort at its load");
+        match err {
+            PipelineError::MemoryBudgetExceeded { detail, source, .. } => {
+                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+                assert!(
+                    detail.as_deref().unwrap_or("").contains("iejoin pre-output"),
+                    "abort must come from the driver-load gate; got {detail:?}"
+                );
+            }
+            other => {
+                panic!("expected MemoryBudgetExceeded from the driver-load gate; got {other:?}")
             }
         }
     }
