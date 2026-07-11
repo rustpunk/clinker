@@ -49,8 +49,10 @@
 //! ([`pre_output_budget_error`](super::pre_output_budget_error)) is a strictly
 //! LOCAL last resort: it measures this pair's exact live footprint — the
 //! resident baseline, the scratch for any spilled block loaded here, the
-//! range-key and kernel-aux arrays, the materialized pair-index vector, and the
-//! held candidates accumulated so far — directly against the hard limit, never
+//! per-mode range-key columns, the emit-side driver/build slice and build-index
+//! vectors, the per-mode kernel-aux arrays (two-conjunct IEJoin or the leaner
+//! single-inequality PWMJ), the materialized pair-index vector, and the held
+//! candidates accumulated so far — directly against the hard limit, never
 //! against the arbitrator's global process pressure. So a bounded-residency run
 //! stays host-independent and aborts only when one pair's own footprint cannot
 //! fit `hard`, not because the process floor sits above a tight budget. The
@@ -85,7 +87,7 @@ use crate::pipeline::spill_merge::SortedRunMerger;
 use super::{
     CollectFlush, DriverRef, EmitBatch, EmitConfig, EmitSink, Evaluators, MatchState, RecordOrder,
     RecordScan, dispatch_on_miss, emit_match_row, emit_pairs, flush_collect_row, iejoin_numeric,
-    iejoin_numeric_state_bytes, pre_output_budget_error, pwmj_numeric,
+    iejoin_numeric_state_bytes, pre_output_budget_error, pwmj_numeric, pwmj_numeric_state_bytes,
 };
 
 /// Soft-limit divisor for the per-block byte target. Targeting `soft / 8` per
@@ -172,15 +174,47 @@ fn pair_bytes<P>(record: &Record) -> usize {
     std::mem::size_of::<Record>() + record.estimated_heap_size() + std::mem::size_of::<P>()
 }
 
-/// The kernel dispatch for one driver block. `Dual` runs the two-conjunct
-/// IEJoin over both key axes; `Single` runs the single-inequality PWMJ over the
-/// primary axis and carries the driver's primary-key column, hoisted out of the
-/// build loop since it depends only on the driver block. Bundling the mode this
-/// way lets one value stand for "op2 present" vs "single-axis keys hoisted",
-/// which the two are never both.
+/// Per-record byte width of a hoisted range-key column: the `(k1, k2)` tuple a
+/// two-conjunct band feeds to `iejoin_numeric`, or the bare `k1` a
+/// single-inequality PWMJ reads. The pre-output gate charges both sides' key
+/// columns at this width, so `Single`'s dead second axis is never counted.
+fn range_key_width(op2: Option<RangeOp>) -> usize {
+    match op2 {
+        Some(_) => std::mem::size_of::<(i64, i64)>(),
+        None => std::mem::size_of::<i64>(),
+    }
+}
+
+/// Zero the consumer handle and build the typed strictly-local pre-output
+/// abort for a gate whose measured `peak` exceeds `hard`. Every block-path
+/// gate (driver load, pre-load pair, post-kernel pairs) returns through here,
+/// so "no stale charge survives an abort" is a property of one function rather
+/// than of copy discipline repeated at each gate.
+fn abort_over_budget(
+    consumer: &Arc<ConsumerHandle>,
+    name: &str,
+    peak: u64,
+    hard: u64,
+) -> PipelineError {
+    consumer.set_bytes(0);
+    pre_output_budget_error(name, peak, hard)
+}
+
+/// The kernel dispatch for one driver block, carrying the driver-side key
+/// column hoisted out of the build loop (it depends only on the driver block).
+/// `Dual` runs the two-conjunct IEJoin over both key axes and holds the
+/// `(k1, k2)` column; `Single` runs the single-inequality PWMJ over the primary
+/// axis and holds the bare `k1` column — no dead `k2` slot. Bundling the mode
+/// with its column lets one value stand for "op2 present" vs "single-axis keys
+/// hoisted", which the two are never both.
 enum RangeMode {
-    Dual(RangeOp),
-    Single(Vec<i64>),
+    Dual {
+        op2: RangeOp,
+        driver_keys: Vec<(i64, i64)>,
+    },
+    Single {
+        driver_keys: Vec<i64>,
+    },
 }
 
 /// Per-axis key bounds accumulated while a block fills.
@@ -542,12 +576,16 @@ pub(super) fn execute_block_band(
     };
 
     for driver_block in &driver_blocks {
-        // Transient bytes this driver block holds for its whole inner loop: the
-        // scratch copy of a spilled block (a resident block is already in the
-        // baseline and only borrowed) plus its range-key array.
-        let dkeys_bytes = (driver_block.len * std::mem::size_of::<(i64, i64)>()) as u64;
+        // Bytes this driver block holds for its whole inner loop: the scratch
+        // copy of a spilled block (a resident block is already in the baseline
+        // and only borrowed), the hoisted range-key column — `(k1, k2)` for a
+        // two-conjunct band, the bare `k1` for the single-inequality PWMJ, with
+        // no dead second axis — and the `DriverRef` slice the emit consumes.
+        let driver_key_bytes = range_key_width(op2);
+        let driver_vecs_bytes =
+            (driver_block.len * (driver_key_bytes + std::mem::size_of::<DriverRef<'_>>())) as u64;
         let driver_scratch = spilled_scratch_bytes(driver_block);
-        let driver_held = driver_scratch.saturating_add(dkeys_bytes);
+        let driver_held = driver_scratch.saturating_add(driver_vecs_bytes);
         // Gate the driver block's own load from metadata, symmetric with the
         // per-pair build gate below: a spilled driver block whose scratch plus
         // the resident baseline cannot fit the hard limit aborts before it is
@@ -555,8 +593,8 @@ pub(super) fn execute_block_band(
         // scratch and never trips this.
         let driver_peak = baseline_resident.saturating_add(driver_held);
         if driver_peak > budget.hard_limit() {
-            consumer.set_bytes(0);
-            return Err(pre_output_budget_error(
+            return Err(abort_over_budget(
+                consumer,
                 name,
                 driver_peak,
                 budget.hard_limit(),
@@ -582,15 +620,19 @@ pub(super) fn execute_block_band(
                 driver_idx: payload.2,
             })
             .collect();
-        let dkeys: Vec<(i64, i64)> = driver_loaded.iter().map(|(_, p)| (p.0, p.1)).collect();
-        // Fix the kernel dispatch for this driver block. The single-inequality
-        // (PWMJ) mode reads only the primary driver key column, which depends on
-        // the driver block alone, so hoist it here instead of rebuilding it per
-        // surviving build pair. Modeling the two modes as one value keeps the
-        // hoisted column and the two-conjunct operator from ever coexisting.
+        // Fix the kernel dispatch for this driver block, hoisting the driver key
+        // column (which depends only on this block) out of the build loop. The
+        // single-inequality (PWMJ) mode carries the bare `k1` column directly —
+        // no `(k1, k2)` tuple with a dead second axis — so it allocates and the
+        // gate charges only what PWMJ reads.
         let range_mode = match op2 {
-            Some(op2v) => RangeMode::Dual(op2v),
-            None => RangeMode::Single(dkeys.iter().map(|(a, _)| *a).collect()),
+            Some(op2v) => RangeMode::Dual {
+                op2: op2v,
+                driver_keys: driver_loaded.iter().map(|(_, p)| (p.0, p.1)).collect(),
+            },
+            None => RangeMode::Single {
+                driver_keys: driver_loaded.iter().map(|(_, p)| p.0).collect(),
+            },
         };
         consumer.set_bytes(baseline_resident.saturating_add(driver_held));
 
@@ -603,26 +645,34 @@ pub(super) fn execute_block_band(
             // loaded: the exact live footprint this pair charges the consumer —
             // the resident baseline (kept-in-RAM blocks, counted once), this
             // pair's scratch for any spilled block loaded here (zero for a
-            // borrowed resident block, already in the baseline), the two
-            // range-key arrays, the kernel's O(n) sort state, and the First /
-            // collect candidates held so far in this driver block. The abort is
-            // a strictly LOCAL last resort: it compares that sum directly to the
-            // hard limit and never consults the arbitrator's global pressure,
-            // because this path answers pressure by spilling. Global pressure is
-            // the arbitrator's job, on the un-spillable output axis polled inside
-            // the emit loop.
-            let bkeys_bytes = (build_block.len * std::mem::size_of::<(i64, i64)>()) as u64;
-            let aux_kernel = iejoin_numeric_state_bytes(driver_block.len, build_block.len) as u64;
+            // borrowed resident block, already in the baseline), the build-side
+            // vectors held across the kernel and emit (its range-key column
+            // sized per mode, the `build_idx` and `build_slice` vecs), the
+            // kernel's O(n) sort state (the two-conjunct IEJoin arrays or the
+            // leaner PWMJ index vecs), and the First / collect candidates held
+            // so far in this driver block. The abort is a strictly LOCAL last
+            // resort: it compares that sum directly to the hard limit and never
+            // consults the arbitrator's global pressure, because this path
+            // answers pressure by spilling. Global pressure is the arbitrator's
+            // job, on the un-spillable output axis polled inside the emit loop.
+            let build_vecs_bytes = (build_block.len
+                * (range_key_width(op2)
+                    + std::mem::size_of::<u64>()
+                    + std::mem::size_of::<&Record>())) as u64;
+            let aux_kernel = match op2 {
+                Some(_) => iejoin_numeric_state_bytes(driver_block.len, build_block.len),
+                None => pwmj_numeric_state_bytes(driver_block.len, build_block.len),
+            } as u64;
             let build_held = spilled_scratch_bytes(build_block)
-                .saturating_add(bkeys_bytes)
+                .saturating_add(build_vecs_bytes)
                 .saturating_add(aux_kernel);
             let pair_peak = baseline_resident
                 .saturating_add(driver_held)
                 .saturating_add(build_held)
                 .saturating_add(state.held_bytes());
             if pair_peak > budget.hard_limit() {
-                consumer.set_bytes(0);
-                return Err(pre_output_budget_error(
+                return Err(abort_over_budget(
+                    consumer,
                     name,
                     pair_peak,
                     budget.hard_limit(),
@@ -633,7 +683,6 @@ pub(super) fn execute_block_band(
             if build_loaded.is_empty() {
                 continue;
             }
-            let bkeys: Vec<(i64, i64)> = build_loaded.iter().map(|(_, p)| (p.0, p.1)).collect();
             let build_idx: Vec<u64> = build_loaded.iter().map(|(_, p)| p.2).collect();
             consumer.set_bytes(
                 baseline_resident
@@ -642,11 +691,18 @@ pub(super) fn execute_block_band(
                     .saturating_add(state.held_bytes()),
             );
 
+            // Build the build-side key column at the width the chosen kernel
+            // reads: the `(k1, k2)` pairs for the two-conjunct IEJoin, or the
+            // bare `k1` column for PWMJ (one pass, no dead second axis).
             let pairs: Vec<(usize, usize)> = match &range_mode {
-                RangeMode::Dual(op2v) => iejoin_numeric(&dkeys, &bkeys, op1, *op2v),
-                RangeMode::Single(dl) => {
-                    let bl: Vec<i64> = bkeys.iter().map(|(a, _)| *a).collect();
-                    pwmj_numeric(dl, &bl, op1)
+                RangeMode::Dual { op2, driver_keys } => {
+                    let bkeys: Vec<(i64, i64)> =
+                        build_loaded.iter().map(|(_, p)| (p.0, p.1)).collect();
+                    iejoin_numeric(driver_keys, &bkeys, op1, *op2)
+                }
+                RangeMode::Single { driver_keys } => {
+                    let bl: Vec<i64> = build_loaded.iter().map(|(_, p)| p.0).collect();
+                    pwmj_numeric(driver_keys, &bl, op1)
                 }
             };
 
@@ -660,8 +716,8 @@ pub(super) fn execute_block_band(
             let pairs_bytes = (pairs.len() * std::mem::size_of::<(usize, usize)>()) as u64;
             let pair_peak = pair_peak.saturating_add(pairs_bytes);
             if pair_peak > budget.hard_limit() {
-                consumer.set_bytes(0);
-                return Err(pre_output_budget_error(
+                return Err(abort_over_budget(
+                    consumer,
                     name,
                     pair_peak,
                     budget.hard_limit(),
@@ -724,11 +780,15 @@ pub(super) fn execute_block_band(
     );
 
     // End-of-join on_miss dispatch over every zero-match driver, in ascending
-    // input order: on_miss:error names the lowest-input-index driver, and
-    // on_miss:null_fields emits its rows in input order. `driver_idx` breaks
-    // ties when a chained upstream repeats orders, so the dispatched-driver
-    // identity is deterministic. Skip / Collect leave `unmatched` empty.
-    unmatched.sort_by_key(|(_, order, driver_idx)| (*order, *driver_idx));
+    // global-input-index order — the same key the equi+range arm sorts by
+    // (`all_unmatched.sort_unstable()` over driver indices). `driver_idx` is
+    // unique per driver, so on_miss:error names the lowest-input-index driver
+    // and on_miss:null_fields emits its rows in input order, both a pure
+    // function of the data even when a chained upstream repeats `order`. Sorting
+    // by `order` first would instead name the lowest-order driver, diverging
+    // from that sibling path and the documented contract. Skip / Collect leave
+    // `unmatched` empty.
+    unmatched.sort_by_key(|(_, _order, driver_idx)| *driver_idx);
     for (record, order, driver_idx) in &unmatched {
         dispatch_on_miss(
             &emit_cfg,
@@ -811,9 +871,10 @@ type DriverPayload = (i64, i64, u64, RecordOrder);
 type DriverSide = (Vec<Block<DriverPayload>>, Vec<(Record, RecordOrder, u64)>);
 
 /// Drain the driver side: matched records go into a payload-ordered sort
-/// buffer keyed on `(k1, k2, order)`; unmatched drivers are retained for
-/// on_miss dispatch. Returns the sliced blocks and the retained unmatched
-/// records.
+/// buffer keyed on `(k1, k2, driver_idx, order)` — `driver_idx` (the driver's
+/// unique global input index) breaks key ties ahead of the possibly-repeated
+/// `order`; unmatched drivers are retained for on_miss dispatch. Returns the
+/// sliced blocks and the retained unmatched records.
 fn drain_driver_side(
     driver_records: Vec<(Record, RecordOrder)>,
     driver_scans: Vec<RecordScan>,
@@ -1082,14 +1143,7 @@ fn spill_block<P: Serialize>(
             "iejoin block-band block spill finish failed: {e}"
         )))
     })?;
-    if written > 0 && ctx.budget.record_spill_bytes(ctx.name, written) {
-        return Err(PipelineError::spill_cap_exceeded(
-            ctx.name,
-            ctx.budget.disk_quota(),
-            written,
-            ctx.budget.cumulative_spill_bytes(),
-        ));
-    }
+    charge_block_spill(ctx, written)?;
     Ok(Block {
         storage: BlockStorage::Spilled(file),
         bounds,
@@ -2418,6 +2472,105 @@ mod tests {
                     assert_eq!(
                         *driver_row, 3,
                         "on_miss:error must name the lowest input index"
+                    );
+                }
+                other => panic!("expected CombineMissingMatch; got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn on_miss_error_names_lowest_input_index_when_order_differs_from_index() {
+        // A chained upstream can stamp RecordOrder out of step with input
+        // position. Two zero-match drivers: input index 1 carries order 30,
+        // input index 2 carries the SMALLER order 10. on_miss:error must name
+        // the lowest INPUT INDEX miss (index 1, whose order is 30) — the identity
+        // the equi+range arm enforces by sorting unmatched drivers on index
+        // alone — not the lowest-order miss (index 2, order 10) that an
+        // (order, driver_idx) sort would surface. `run_block` stamps order ==
+        // index, so it cannot tell the two apart; this fixture sets them apart.
+        let d_schema = driver_schema();
+        let b_schema = build_schema();
+        let out_schema = Arc::new(Schema::new(vec![
+            "d_k1".into(),
+            "d_k2".into(),
+            "d_id".into(),
+            "b_k1".into(),
+            "b_k2".into(),
+            "b_id".into(),
+        ]));
+        // (k1, k2, id, order). The two matches (key 5,5) keep the miss set from
+        // being the whole input; the two misses use an unreachable key.
+        let driver_keyed: [(i64, i64, i64, RecordOrder); 4] = [
+            (5, 5, 0, 50),
+            (100_000, 100_000, 1, 30),
+            (100_000, 100_000, 2, 10),
+            (5, 5, 3, 40),
+        ];
+        let build: Side = (0..3).map(|i| (Some((5, 5)), 100 + i)).collect();
+
+        let run = |block_target: usize, resident: Option<u64>| -> PipelineError {
+            let driver_records: Vec<(Record, RecordOrder)> = driver_keyed
+                .iter()
+                .map(|(k1, k2, id, order)| (make_rec(&d_schema, *k1, *k2, *id), *order))
+                .collect();
+            let driver_scans: Vec<RecordScan> = driver_keyed
+                .iter()
+                .map(|(k1, k2, _, _)| RecordScan::Matched {
+                    eq_keys: Vec::new(),
+                    range_key: (*k1, *k2),
+                    bucket: 0,
+                })
+                .collect();
+            let (build_records, build_scans) = to_records_scans(&build, &b_schema);
+            let budget = arbitrator(1 << 30);
+            let stable = StableEvalContext::test_default();
+            let ctx = EvalContext::test_default_borrowed(&stable);
+            let resolver = empty_resolver();
+            let consumer = ConsumerHandle::new();
+            let tmp = tempfile::Builder::new()
+                .prefix("iejoin-miss-order-")
+                .tempdir()
+                .expect("temp dir");
+            let propagate = PropagateCkSpec::Driver;
+            execute_block_band(BlockBandExec {
+                name: "miss_order",
+                build_qualifier: "b",
+                driver_records,
+                driver_scans,
+                build_records,
+                build_scans,
+                op1: RangeOp::Le,
+                op2: Some(RangeOp::Ge),
+                residual_eval: None,
+                body_eval: None,
+                resolver_mapping: &resolver,
+                output_schema: Some(&out_schema),
+                match_mode: MatchMode::All,
+                on_miss: OnMiss::Error,
+                propagate_ck: &propagate,
+                ctx: &ctx,
+                budget: &budget,
+                consumer: &consumer,
+                spill_dir: tmp.path(),
+                spill_compress: false,
+                strategy: ErrorStrategy::FailFast,
+                options: BlockBandOptions {
+                    block_target_override: Some(block_target),
+                    sort_spill_override: None,
+                    resident_budget_override: resident,
+                },
+            })
+            .expect_err("a zero-match driver must error under on_miss: error")
+        };
+
+        for err in [run(1 << 20, None), run(1, Some(0))] {
+            match err {
+                PipelineError::CombineMissingMatch { driver_row, .. } => {
+                    assert_eq!(
+                        driver_row, 30,
+                        "on_miss:error must name the lowest INPUT INDEX miss \
+                         (index 1, order 30), not the lowest-order miss (index 2, order 10)"
                     );
                 }
                 other => panic!("expected CombineMissingMatch; got {other:?}"),

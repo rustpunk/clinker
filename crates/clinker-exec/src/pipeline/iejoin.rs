@@ -1186,9 +1186,11 @@ struct MatchState {
     /// above (`first_match`, `first_collected_builds`, and the `collect_accum`
     /// heaps). The block path folds it into its per-pair pre-output gate so a
     /// `match: first` / `collect` join over wide build records aborts with the
-    /// typed budget error instead of growing this residency unbounded. Zero on
-    /// the equi+range path, which emits matches immediately and holds no build
-    /// records across pairs.
+    /// typed budget error instead of growing this residency unbounded. On the
+    /// equi+range path this accrues for `collect` too (its per-group heaps and
+    /// min-order `$ck` build run through the same code, draining only at the
+    /// group flush); it stays zero only for that path's `first` / `all` modes,
+    /// which emit each match immediately and hold no build records across pairs.
     held_bytes: u64,
 }
 
@@ -1869,6 +1871,20 @@ fn iejoin_numeric_state_bytes(n_left: usize, n_right: usize) -> usize {
         .saturating_add(n_total.div_ceil(1024).div_ceil(64))
         .saturating_mul(std::mem::size_of::<u64>());
     sort_arrays.saturating_add(perm).saturating_add(bit)
+}
+
+/// Estimated bytes of the single-inequality PWMJ working set for a group of
+/// `n_left` driver and `n_right` build keys: the two `Vec<usize>` sorted-index
+/// arrays [`pwmj_numeric`] builds (one per side) before it enumerates any
+/// output pair. Far smaller than [`iejoin_numeric_state_bytes`] — no L1/L2
+/// key-triple arrays, permutation vector, or visited bit array — so the
+/// block-band gate charges the PWMJ kernel its real footprint instead of the
+/// dual-conjunct estimate. Saturating arithmetic keeps a pathological count
+/// from wrapping the estimate back under the budget.
+fn pwmj_numeric_state_bytes(n_left: usize, n_right: usize) -> usize {
+    n_left
+        .saturating_add(n_right)
+        .saturating_mul(std::mem::size_of::<usize>())
 }
 
 /// Build the typed pre-output budget-abort error, shared by both dispatch

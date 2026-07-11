@@ -212,6 +212,26 @@ fn run_pipeline_yaml(
     bands: String,
     arb: &Arc<crate::pipeline::memory::MemoryArbitrator>,
 ) -> (Result<(), PipelineError>, String) {
+    let (result, output) = run_pipeline_capture(yaml, orders, bands, "iejoin-block-band", arb);
+    (result.map(|_report| ()), output)
+}
+
+/// Shared execution harness for the two-source (`orders` / `bands`) pipelines:
+/// wire the CSV readers and the captured output writer, run under `arb` with the
+/// given `execution_id`, and return the full execution result alongside the
+/// captured output CSV. Both the `(Result<()>, String)` entry point above and
+/// the report-returning [`run_pipeline_report`] project from this one body, so
+/// their reader / writer / params setup never drifts apart.
+fn run_pipeline_capture(
+    yaml: &str,
+    orders: String,
+    bands: String,
+    execution_id: &str,
+    arb: &Arc<crate::pipeline::memory::MemoryArbitrator>,
+) -> (
+    Result<crate::executor::ExecutionReport, PipelineError>,
+    String,
+) {
     let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),
@@ -237,7 +257,7 @@ fn run_pipeline_yaml(
 
     let config = clinker_plan::config::parse_config(yaml).expect("parse pipeline YAML");
     let params = PipelineRunParams {
-        execution_id: "iejoin-block-band".to_string(),
+        execution_id: execution_id.to_string(),
         batch_id: "batch-0".to_string(),
         ..Default::default()
     };
@@ -250,7 +270,7 @@ fn run_pipeline_yaml(
         clinker_plan::config::CompileContext::default(),
         Arc::clone(arb),
     );
-    (result.map(|_report| ()), out.as_string())
+    (result, out.as_string())
 }
 
 fn spilled_bytes(arb: &Arc<crate::pipeline::memory::MemoryArbitrator>) -> u64 {
@@ -617,61 +637,41 @@ fn dlq_orders_csv(n: usize, pad_len: usize) -> String {
     s
 }
 
-/// `b` bands, all covering `[0, 10000)` so every order matches all of them, each
-/// with divisor 0 (every matched body divides by zero) and a wide pad so the
-/// band side slices into several build blocks under a tight budget.
+/// `b` bands, each covering `[lo_i, 10000)` with a non-positive `lo_i` and a
+/// high `hi` so every order still matches all of them, each with divisor 0
+/// (every matched body divides by zero) and a wide pad so the band side slices
+/// into several build blocks under a tight budget.
+///
+/// `lo_i = -((i * 13) % b)` makes the primary range key a permutation of the
+/// band input order (coprime stride, so distinct and non-monotonic). The kernel
+/// emits a driver's matched builds in `lo`-key order, which the block slicing
+/// preserves across layouts — so the emitted build sequence is layout-invariant
+/// but is NOT the band input order. Only the `(order, driver_idx, build_idx)`
+/// output sort restores input order; a regressed build tag would leave the
+/// dead-letter builds in this `lo`-key permutation instead, which the ordering
+/// assertion in the DLQ determinism test detects.
 fn dlq_bands_csv(b: usize, pad_len: usize) -> String {
     let pad = "x".repeat(pad_len);
     let mut s = String::from("band_id,lo,hi,divisor,pad\n");
     for i in 0..b {
-        s.push_str(&format!("b{i},0,10000,0,{pad}\n"));
+        let lo = -(((i * 13) % b) as i64);
+        s.push_str(&format!("b{i},{lo},10000,0,{pad}\n"));
     }
     s
 }
 
 /// Run `yaml` over the given CSV inputs against `arb`, returning the full
-/// execution report (so a test can inspect its dead-letter entries).
+/// execution report (so a test can inspect its dead-letter entries). Shares the
+/// reader / writer / params setup with [`run_pipeline_yaml`] through
+/// [`run_pipeline_capture`]; the captured output CSV is produced there too, but
+/// this entry point's callers only need the report.
 fn run_pipeline_report(
     yaml: &str,
     orders: String,
     bands: String,
     arb: &Arc<crate::pipeline::memory::MemoryArbitrator>,
 ) -> Result<crate::executor::ExecutionReport, PipelineError> {
-    let readers: crate::executor::SourceReaders = HashMap::from([
-        (
-            "orders".to_string(),
-            crate::executor::single_file_reader(
-                "orders.csv",
-                Box::new(std::io::Cursor::new(orders.into_bytes())),
-            ),
-        ),
-        (
-            "bands".to_string(),
-            crate::executor::single_file_reader(
-                "bands.csv",
-                Box::new(std::io::Cursor::new(bands.into_bytes())),
-            ),
-        ),
-    ]);
-    let out = SharedBuffer::new();
-    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
-        "out".to_string(),
-        Box::new(out.clone()) as Box<dyn std::io::Write + Send>,
-    )]);
-    let config = clinker_plan::config::parse_config(yaml).expect("parse pipeline YAML");
-    let params = PipelineRunParams {
-        execution_id: "iejoin-block-band-dlq".to_string(),
-        batch_id: "batch-0".to_string(),
-        ..Default::default()
-    };
-    PipelineExecutor::run_with_readers_writers_with_arbitrator(
-        &config,
-        readers,
-        writers.into(),
-        &params,
-        clinker_plan::config::CompileContext::default(),
-        Arc::clone(arb),
-    )
+    run_pipeline_capture(yaml, orders, bands, "iejoin-block-band-dlq", arb).0
 }
 
 #[test]
@@ -680,42 +680,85 @@ fn block_band_dlq_order_is_identical_across_memory_limits() {
     // whose body eval fails on every matched pair (divide by zero) under
     // `strategy: continue`. At a tight budget both sides slice into several
     // blocks, so the failures accrue in a block-interleaved order; at a roomy
-    // budget each side is one block. The final failure sort must make the
-    // dead-letter row order a pure function of the data — identical at both
-    // limits — mirroring the guarantee the emitted rows already hold.
-    let dlq_source_rows = |limit: u64| -> Vec<u64> {
+    // budget each side is one block. The final failure sort — keyed on
+    // (driver order, driver_idx, BUILD input index) — must make the dead-letter
+    // row order a pure function of the data, identical at both limits.
+    //
+    // A driver's failures all share its source_row, so a source_row-only
+    // projection is blind to the third (build input index) sort component.
+    // Capture each build-side entry's band INPUT INDEX instead — the band side's
+    // `lo` key is a non-monotonic permutation of that index (see
+    // `dlq_bands_csv`), so the kernel emits a driver's builds in `lo`-key order,
+    // which the block slicing keeps layout-invariant but which is NOT the input
+    // order. Only the `(order, driver_idx, build_idx)` sort restores input order,
+    // so asserting each driver's builds ascend by input index pins that third
+    // component: a regressed build tag (e.g. u64::MAX) would leave them in the
+    // `lo`-key permutation and fail the assertion.
+    const N_BANDS: usize = 40;
+    let dlq_build_indices = |limit: u64| -> Vec<(u64, u64)> {
         let arb = no_op_arbitrator(limit);
         let report = run_pipeline_report(
             DLQ_YAML,
             dlq_orders_csv(60, 1024),
-            dlq_bands_csv(40, 1024),
+            dlq_bands_csv(N_BANDS, 1024),
             &arb,
         )
         .expect("the continue-strategy run completes, routing failures to the DLQ");
         report
             .dlq_entries
             .iter()
-            .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow)
-            .map(|e| e.source_row)
+            .filter(|e| {
+                e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow
+                    && !e.trigger
+            })
+            .map(|e| {
+                let band = match e.original_record.get("band_id") {
+                    Some(clinker_record::Value::String(s)) => s.to_string(),
+                    other => panic!("a build-side DLQ entry must carry band_id; got {other:?}"),
+                };
+                let idx = band
+                    .strip_prefix('b')
+                    .and_then(|d| d.parse::<u64>().ok())
+                    .unwrap_or_else(|| panic!("band_id must be b<input-index>; got {band:?}"));
+                (e.source_row, idx)
+            })
             .collect()
     };
 
-    let tight = dlq_source_rows(TIGHT_LIMIT);
-    let roomy = dlq_source_rows(ROOMY_LIMIT);
+    let tight = dlq_build_indices(TIGHT_LIMIT);
+    let roomy = dlq_build_indices(ROOMY_LIMIT);
     assert!(
         !tight.is_empty(),
-        "every matched pair divides by zero, so the dead-letter output must be non-empty"
+        "every matched pair divides by zero and attributes its build, so the build-side \
+         dead-letter output must be non-empty"
     );
     assert_eq!(
         tight, roomy,
-        "block-band dead-letter order must be a pure function of the data, not of pipeline.memory.limit"
+        "block-band dead-letter order (including the build identity the third sort key fixes) \
+         must be a pure function of the data, not of pipeline.memory.limit"
     );
-    // The normalized order groups every failure of a given order together in
-    // ascending source-row order — the layout-independent shape the sort gives.
-    let mut expected = tight.clone();
-    expected.sort_unstable();
+    // Each driver's builds must land in ascending INPUT index at both limits —
+    // the order the `build_idx` sort component fixes, distinct from the kernel's
+    // `lo`-key emission order this fixture forces them out in.
+    use std::collections::BTreeMap;
+    let mut by_driver: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (source_row, build_idx) in &tight {
+        by_driver.entry(*source_row).or_default().push(*build_idx);
+    }
+    for (source_row, builds) in &by_driver {
+        let expected: Vec<u64> = (0..builds.len() as u64).collect();
+        assert_eq!(
+            *builds, expected,
+            "driver source_row {source_row} must dead-letter its builds in ascending input \
+             index (all {N_BANDS} bands match), not the kernel's lo-key emission order"
+        );
+    }
+    // The outer sort's source-row grouping holds too: ascending driver source row.
+    let by_source: Vec<u64> = tight.iter().map(|(rn, _)| *rn).collect();
+    let mut expected_sources = by_source.clone();
+    expected_sources.sort_unstable();
     assert_eq!(
-        tight, expected,
+        by_source, expected_sources,
         "the dead-letter rows must land in ascending source-row order after the sort"
     );
 }
