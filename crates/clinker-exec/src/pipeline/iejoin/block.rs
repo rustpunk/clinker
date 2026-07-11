@@ -470,7 +470,7 @@ pub(super) fn execute_block_band(
         .unwrap_or_else(|| resident_budget_total(budget));
     let mut resident = ResidentBudget::new(resident_total);
 
-    // Phase 1 + 2: drain each matched side into a payload-ordered sort buffer
+    // Drain + slice: pull each matched side into a payload-ordered sort buffer
     // and slice the sorted stream into min/max-tagged blocks. Scan-phase
     // unmatched drivers are retained for on_miss dispatch; unmatched builds
     // are dropped (they can never match). The drain/slice mirror each resident
@@ -482,13 +482,13 @@ pub(super) fn execute_block_band(
         drain_driver_side(driver_records, driver_scans, &drain_ctx, &mut resident)?;
     let build_blocks = drain_build_side(build_records, build_scans, &drain_ctx, &mut resident)?;
 
-    // Baseline resident footprint the consumer holds through Phase 3: the sum
-    // of both sides' kept-in-RAM blocks. Spilled blocks hold no RAM until their
-    // per-pair load, charged transiently below.
+    // Baseline resident footprint the consumer holds through the schedule/emit
+    // stage: the sum of both sides' kept-in-RAM blocks. Spilled blocks hold no
+    // RAM until their per-pair load, charged transiently below.
     let baseline_resident = resident_bytes_of(&driver_blocks) + resident_bytes_of(&build_blocks);
 
-    // Phase 3: schedule blocks, prune, run the kernel per surviving pair, and
-    // emit through the shared loop. `row_tags` records each emitted row's build
+    // Schedule + emit: prune block pairs, run the kernel per surviving pair,
+    // and emit through the shared loop. `row_tags` records each emitted row's build
     // input index (`u64::MAX` for collect / on_miss rows) so the output can be
     // stable-sorted into a deterministic order at the end — a pure function of
     // the data, independent of the memory-derived block layout.
