@@ -56,10 +56,16 @@
 //! against the arbitrator's global process pressure. So a bounded-residency run
 //! stays host-independent and aborts only when one pair's own footprint cannot
 //! fit `hard`, not because the process floor sits above a tight budget. The
-//! OUTPUT axis (`output_records`, O(N·M) worst case) is un-spillable until a
-//! later phase streams it, so it keeps the every-10K poll on the arbitrator's
-//! global-aware `should_abort_local`: reacting to global pressure is the
-//! arbitrator's job, on that axis only.
+//! OUTPUT axis is bounded too: emitted rows accumulate in a payload-ordered
+//! [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer) keyed on
+//! `(driver order, driver_idx, build_idx)` that spills on its own byte threshold
+//! (disk-quota E320) instead of holding the O(N·M) result in RAM, and the
+//! dispatcher drains that sorted handle incrementally. The buffer's resident
+//! bytes are deliberately NOT mirrored into the consumer handle — it self-bounds
+//! on its threshold, and adding it to the handle (already near `hard` from a
+//! spilling drain plus the resident blocks) would abort a completing run. A
+//! coarse every-10K `should_abort_local` poll stays as a global-pressure
+//! backstop on that axis until a later task removes it.
 
 use std::io;
 use std::path::Path;
@@ -78,16 +84,16 @@ use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::RangeOp;
 
 use crate::executor::combine::CombineResolverMapping;
-use crate::pipeline::combine::CombineKernelOutput;
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use crate::pipeline::spill_merge::SortedRunMerger;
 
 use super::{
-    CollectFlush, DriverRef, EmitBatch, EmitConfig, EmitSink, Evaluators, MatchState, RecordOrder,
-    RecordScan, dispatch_on_miss, emit_match_row, emit_pairs, flush_collect_row, iejoin_numeric,
-    iejoin_numeric_state_bytes, pre_output_budget_error, pwmj_numeric, pwmj_numeric_state_bytes,
+    BlockBandOutput, CollectFlush, DriverRef, EmitBatch, EmitConfig, EmitSink, Evaluators,
+    MatchState, RecordOrder, RecordScan, RowSink, dispatch_on_miss, emit_match_row, emit_pairs,
+    flush_collect_row, iejoin_numeric, iejoin_numeric_state_bytes, pre_output_budget_error,
+    pwmj_numeric, pwmj_numeric_state_bytes,
 };
 
 /// Soft-limit divisor for the per-block byte target. Targeting `soft / 8` per
@@ -454,11 +460,13 @@ pub(super) struct BlockBandExec<'a> {
 
 /// Execute a pure-range combine via the block-band path. Blocking on both
 /// sides (each is drained and sliced before the range walk); bounded on the
-/// input axis. Returns the combined rows and any deferred output-eval failures
-/// for the dispatcher to route through the DLQ.
+/// input axis AND, now, the output axis: emitted rows accumulate in a
+/// payload-ordered, spillable sort buffer rather than an in-RAM vec. Returns a
+/// bounded [`BlockBandOutput`] — a sorted output handle the dispatcher drains
+/// incrementally — plus any deferred output-eval failures for the DLQ.
 pub(super) fn execute_block_band(
     exec: BlockBandExec<'_>,
-) -> Result<CombineKernelOutput, PipelineError> {
+) -> Result<BlockBandOutput, PipelineError> {
     let BlockBandExec {
         name,
         build_qualifier,
@@ -507,6 +515,20 @@ pub(super) fn execute_block_band(
         .unwrap_or_else(|| resident_budget_total(budget));
     let mut resident = ResidentBudget::new(resident_total);
 
+    // Schema the emitted output records carry, resolved before the drains
+    // consume `driver_records`: the combine's output schema when present, else
+    // the driver schema (the shape the body-less / no-output-schema synthetic
+    // step re-emits). Spilling output rows only happens on high-fan-out combines,
+    // which always carry an output schema, so the fallback backs only the
+    // never-spilling small cases and the header always matches the rows written.
+    let output_row_schema: Arc<Schema> = match output_schema {
+        Some(s) => Arc::clone(s),
+        None => match driver_records.first() {
+            Some((record, _)) => Arc::clone(record.schema()),
+            None => Arc::new(Schema::new(Vec::new())),
+        },
+    };
+
     // Drain + slice: pull each matched side into a payload-ordered sort buffer
     // and slice the sorted stream into min/max-tagged blocks. Scan-phase
     // unmatched drivers are retained for on_miss dispatch; unmatched builds
@@ -530,13 +552,20 @@ pub(super) fn execute_block_band(
     let baseline_resident = resident_bytes_of(&driver_blocks) + resident_bytes_of(&build_blocks);
 
     // Schedule + emit: prune block pairs, run the kernel per surviving pair, and
-    // emit through the shared loop. `row_tags` records each emitted row's
-    // `(driver input index, build input index)` — `(driver_idx, u64::MAX)` for
-    // collect / on_miss rows — so the output can be sorted into a deterministic
-    // order at the end, a pure function of the data and independent of the
-    // memory-derived block layout even when a chained upstream repeats orders.
-    let mut output_records: Vec<(Record, RecordOrder)> = Vec::new();
-    let mut row_tags: Vec<(u64, u64)> = Vec::new();
+    // emit through the shared loop. Each emitted row folds its
+    // `(driver order, driver input index, build input index)` sort key in as the
+    // payload of a payload-ordered sort buffer — `(order, driver_idx, u64::MAX)`
+    // for collect / on_miss rows — so the deterministic output order is realized
+    // by the (possibly external) sort, a pure function of the data and
+    // independent of the memory-derived block layout even when a chained upstream
+    // repeats orders. The buffer spills on its own byte threshold, so the output
+    // axis is bounded rather than holding every matched row in RAM.
+    let mut output_buf: SortBuffer<(RecordOrder, u64, u64)> = SortBuffer::new_payload_ordered(
+        sort_threshold,
+        Some(spill_dir.to_path_buf()),
+        spill_compress,
+        output_row_schema,
+    );
     let mut emitted_since_check: usize = 0;
     let mut output_eval_failures = Vec::new();
     // Parallel `(order, driver_idx, build_idx)` sort key per deferred output-eval
@@ -564,14 +593,17 @@ pub(super) fn execute_block_band(
         body: body_eval,
     };
     // One sink threads the whole emit phase (driver loop, driver-block finalize,
-    // scan-unmatched sweep, on_miss dispatch); its borrows of the output and tag
-    // buffers end at its last use, before the final deterministic sort consumes
-    // them.
+    // scan-unmatched sweep, on_miss dispatch); its borrows of the output buffer
+    // and failure-tag vec end at its last use, before the output buffer is
+    // finished and the failures re-sorted.
     let mut sink = EmitSink {
-        output_records: &mut output_records,
+        rows: RowSink::Sorted {
+            buf: &mut output_buf,
+            budget,
+            name,
+        },
         emitted_since_check: &mut emitted_since_check,
         output_eval_failures: &mut output_eval_failures,
-        row_tags: Some(&mut row_tags),
         failure_tags: Some(&mut failure_tags),
     };
 
@@ -777,7 +809,7 @@ pub(super) fn execute_block_band(
         on_miss,
         &mut unmatched,
         &mut sink,
-    );
+    )?;
 
     // End-of-join on_miss dispatch over every zero-match driver, in ascending
     // global-input-index order — the same key the equi+range arm sorts by
@@ -801,17 +833,28 @@ pub(super) fn execute_block_band(
         )?;
     }
 
-    // Final deterministic order: sort emitted rows by
-    // `(driver order, driver input index, build input index)`. `driver_idx` is
+    // Final deterministic order: the payload-ordered output buffer sorts by
+    // `(driver order, driver input index, build input index)` — resident when it
+    // fit its byte threshold, spilled to sorted runs otherwise. `driver_idx` is
     // unique per driver, so the key is total even when a chained upstream stamps
     // duplicate orders; collect / on_miss rows carry `build_idx == u64::MAX`, so
     // they sort after that driver's match rows (a collect / miss driver has
-    // none). The `sink` borrow of these buffers ends at its last use above.
-    debug_assert_eq!(output_records.len(), row_tags.len());
-    let mut rows: Vec<((Record, RecordOrder), (u64, u64))> =
-        output_records.into_iter().zip(row_tags).collect();
-    rows.sort_by_key(|((_, order), (driver_idx, build_idx))| (*order, *driver_idx, *build_idx));
-    let output_records: Vec<(Record, RecordOrder)> = rows.into_iter().map(|(row, _)| row).collect();
+    // none). The `sink` borrow of the buffer ends at its last use above, so it
+    // can be finished here. A final spill of the residue run is charged against
+    // the disk quota (E320).
+    let (sorted, residue) = output_buf.finish().map_err(|e| {
+        PipelineError::Io(io::Error::other(format!(
+            "iejoin block-band output finish failed: {e}"
+        )))
+    })?;
+    if residue > 0 && budget.record_spill_bytes(name, residue) {
+        return Err(PipelineError::spill_cap_exceeded(
+            name,
+            budget.disk_quota(),
+            residue,
+            budget.cumulative_spill_bytes(),
+        ));
+    }
 
     // Re-order the deferred output-eval failures into the same
     // layout-independent order, so the dead-letter output is a pure function of
@@ -825,11 +868,15 @@ pub(super) fn execute_block_band(
 
     // The resident blocks are freed as this function returns; discharge the
     // consumer now so the node-buffer admission that follows never sums a stale
-    // baseline that no longer holds any RAM.
+    // baseline that no longer holds any RAM. The output buffer's resident bytes
+    // were never mirrored into this handle — the buffer self-bounds on its own
+    // byte threshold, and charging it would push the handle past the hard limit
+    // (a spilling drain plus the resident blocks already sum near it) and abort a
+    // completing run.
     consumer.set_bytes(0);
 
-    Ok(CombineKernelOutput {
-        records: output_records,
+    Ok(BlockBandOutput {
+        sorted,
         output_eval_failures,
     })
 }
@@ -1175,7 +1222,7 @@ fn finalize_driver_block(
         MatchMode::Collect => {
             for (di, (record, payload)) in driver_loaded.iter().enumerate() {
                 let flush = state.take_collect(di);
-                flush_collect_row(cfg, record, payload.3, payload.2, flush, sink);
+                flush_collect_row(cfg, record, payload.3, payload.2, flush, sink)?;
             }
         }
         MatchMode::First => {
@@ -1219,7 +1266,7 @@ fn finalize_scan_unmatched(
     on_miss: OnMiss,
     unmatched: &mut Vec<(Record, RecordOrder, u64)>,
     sink: &mut EmitSink<'_>,
-) {
+) -> Result<(), PipelineError> {
     match cfg.match_mode {
         MatchMode::Collect => {
             for (record, order, driver_idx) in scan_unmatched {
@@ -1234,7 +1281,7 @@ fn finalize_scan_unmatched(
                         first_build: None,
                     },
                     sink,
-                );
+                )?;
             }
         }
         MatchMode::First | MatchMode::All => {
@@ -1243,6 +1290,7 @@ fn finalize_scan_unmatched(
             }
         }
     }
+    Ok(())
 }
 
 /// Record one zero-match driver for the deferred end-of-join on_miss dispatch.
@@ -1360,6 +1408,31 @@ mod tests {
         (records, scans)
     }
 
+    /// Materialize a `BlockBandOutput`'s payload-ordered sorted handle back into
+    /// the flat `(record, order)` sequence the pre-spill kernel returned, so the
+    /// assertions can read emitted rows in their final deterministic order. In
+    /// memory the buffer's sorted vec is already ordered; a spilled buffer folds
+    /// its runs through the k-way merger.
+    fn drain_sorted(
+        sorted: SortedOutput<(RecordOrder, u64, u64)>,
+    ) -> Result<Vec<(Record, RecordOrder)>, PipelineError> {
+        match sorted {
+            SortedOutput::InMemory(pairs) => Ok(pairs
+                .into_iter()
+                .map(|(record, (order, _, _))| (record, order))
+                .collect()),
+            SortedOutput::Spilled(files) => {
+                let merger = SortedRunMerger::new_payload_ordered(files, "block-band test drain")?;
+                let mut rows = Vec::new();
+                for item in merger {
+                    let (record, (order, _, _)) = item?;
+                    rows.push((record, order));
+                }
+                Ok(rows)
+            }
+        }
+    }
+
     struct RunCfg {
         op1: RangeOp,
         op2: Option<RangeOp>,
@@ -1468,7 +1541,10 @@ mod tests {
             out.output_eval_failures.is_empty(),
             "the synthetic emit path never defers an eval failure"
         );
-        Ok(out.records.into_iter().map(|(r, _)| r).collect())
+        Ok(drain_sorted(out.sorted)?
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect())
     }
 
     fn int(v: Option<&Value>) -> i64 {
@@ -2655,7 +2731,8 @@ mod tests {
                 },
             })
             .expect("dup-order run");
-            out.records
+            drain_sorted(out.sorted)
+                .expect("drain dup-order output")
                 .iter()
                 .map(|(r, _)| (int(r.get("d_id")), int(r.get("b_id"))))
                 .collect()

@@ -442,6 +442,148 @@ fn block_band_pre_output_local_abort_under_undersized_budget() {
     );
 }
 
+/// A pure-range pipeline whose `match: all` result is far larger than its inputs:
+/// every order matches every band (each band spans the whole amount range), so a
+/// small `n x m` input fans into `n * m` output rows. The block-band path
+/// accumulates those in a payload-ordered sort buffer that spills on its own
+/// threshold, so the output axis stays bounded even though the result dwarfs the
+/// inputs. The match set is kept under the 10K output poll so completion is the
+/// output buffer's spill doing the bounding, not the poll aborting.
+const EXPLODE_YAML: &str = r#"
+pipeline:
+  name: iejoin_block_band_explode
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: amount, type: int }
+- type: source
+  name: bands
+  config:
+    name: bands
+    type: csv
+    path: bands.csv
+    schema:
+      - { name: band_id, type: string }
+      - { name: lo, type: int }
+      - { name: hi, type: int }
+- type: combine
+  name: banded
+  input:
+    orders: orders
+    bands: bands
+  config:
+    where: "orders.amount >= bands.lo and orders.amount < bands.hi"
+    match: all
+    on_miss: skip
+    cxl: |
+      emit order_id = orders.order_id
+      emit band_id = bands.band_id
+    propagate_ck: driver
+- type: output
+  name: out
+  input: banded
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+
+/// `n` orders with tiny amounts `i` (no pad, so the order side stays resident).
+fn explode_orders_csv(n: usize) -> String {
+    let mut s = String::from("order_id,amount\n");
+    for i in 0..n {
+        s.push_str(&format!("o{i},{i}\n"));
+    }
+    s
+}
+
+/// `m` all-covering bands `[-1, 1_000_000)`, so every order falls in every band
+/// and `match: all` emits the full `n x m` cross product.
+fn explode_bands_csv(m: usize) -> String {
+    let mut s = String::from("band_id,lo,hi\n");
+    for j in 0..m {
+        s.push_str(&format!("b{j},-1,1000000\n"));
+    }
+    s
+}
+
+#[test]
+fn block_band_output_explosion_spills_and_completes_under_tight_budget() {
+    // The output-axis bound, end-to-end: a 60 x 60 input (120 tiny records that
+    // stay resident) fans into 3600 output rows under `match: all` — a result far
+    // larger than the inputs. Under a tight budget the emitted rows overflow the
+    // output sort buffer's byte threshold and spill to disk; the dispatcher then
+    // streams the sorted runs into a spillable node-buffer that a blocking CSV
+    // Output drains. So the run COMPLETES (bounded peak — spills rather than
+    // aborts), and its result equals the nested-loop oracle (every order-band
+    // pair, since every band covers every amount).
+    const N: usize = 60;
+    const M: usize = 60;
+    let arb = no_op_arbitrator(TIGHT_LIMIT);
+    let (result, output) = run_pipeline_yaml(
+        EXPLODE_YAML,
+        explode_orders_csv(N),
+        explode_bands_csv(M),
+        &arb,
+    );
+    result.expect("the output-explosion join must complete under the tight budget by spilling");
+
+    let data_lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).skip(1).collect();
+    assert_eq!(
+        data_lines.len(),
+        N * M,
+        "match: all over all-covering bands emits the full {N}x{M} cross product"
+    );
+
+    // The result equals the nested-loop oracle: every (order, band) pair appears
+    // exactly once. Header is `order_id,band_id` (the two emitted columns).
+    use std::collections::HashSet;
+    let emitted: HashSet<(String, String)> = data_lines
+        .iter()
+        .map(|l| {
+            let mut cols = l.split(',');
+            let order = cols.next().expect("order_id column").to_string();
+            let band = cols.next().expect("band_id column").to_string();
+            (order, band)
+        })
+        .collect();
+    assert_eq!(
+        emitted.len(),
+        N * M,
+        "every emitted (order, band) pair must be distinct — no duplicates or drops"
+    );
+    for i in 0..N {
+        for j in 0..M {
+            assert!(
+                emitted.contains(&(format!("o{i}"), format!("b{j}"))),
+                "the nested-loop oracle expects order o{i} banded to b{j}"
+            );
+        }
+    }
+
+    // The inputs are tiny and stay resident, so any spilled bytes come from the
+    // output axis: the buffer overflowed its threshold and spilled rather than
+    // holding all 3600 rows in RAM.
+    assert!(
+        spilled_bytes(&arb) > 0,
+        "the {}-row output must overflow the output sort buffer and spill; \
+         per_stage_spill_bytes[banded] was {}",
+        N * M,
+        spilled_bytes(&arb)
+    );
+    assert_eq!(
+        arb.consumer_count(),
+        0,
+        "the block-band consumer must be unregistered on the clean exit"
+    );
+}
+
 /// An equi+range predicate (one equality conjunct plus one range conjunct) so
 /// the planner selects `CombineStrategy::HashPartitionIEJoin`, which holds its
 /// hash partitions and per-group sort arrays resident with no spill path. Its

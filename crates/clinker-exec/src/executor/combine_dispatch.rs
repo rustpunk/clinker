@@ -25,6 +25,7 @@ use crate::executor::dispatch::{
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, NullStorage, stage_metrics, widen_record_to_schema};
+use crate::pipeline::iejoin::RecordOrder;
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
@@ -77,7 +78,7 @@ pub(crate) fn dispatch_combine(
     use crate::executor::combine::CombineResolverMapping;
     use crate::pipeline::combine::{CombineHashTable, KeyExtractor};
     use crate::pipeline::grace_hash::{GraceHashExec, execute_combine_grace_hash};
-    use crate::pipeline::iejoin::{IEJoinExec, execute_combine_iejoin};
+    use crate::pipeline::iejoin::{IEJoinExec, IEJoinKernelOutput, execute_combine_iejoin};
     use crate::pipeline::sort_merge_join::{SortMergeExec, execute_combine_sort_merge};
     use clinker_plan::plan::combine::CombineStrategy;
 
@@ -506,40 +507,67 @@ pub(crate) fn dispatch_combine(
                         strategy: ctx.strategy,
                     })
                 })?;
-                let crate::pipeline::combine::CombineKernelOutput {
-                    records: output_records,
-                    output_eval_failures,
-                } = kernel_out;
-                // Route each deferred output-stage eval failure through
-                // the same `combine_output_row` path the inline arm
-                // uses. This MUST run before the snapshot is dropped
-                // below — `dispatch_combine_output_error` reads the
-                // installed pre-fold snapshot to rewind each
-                // contributing source's rollback cursor.
-                for f in output_eval_failures {
-                    dispatch_combine_output_error(
-                        ctx,
-                        node_idx,
-                        &f.probe_record,
-                        f.row,
-                        f.matched_build.as_ref(),
-                        name,
-                        f.error,
-                    )?;
-                }
-                let probe_records_out = output_records.len() as u64;
-                ctx.collector
-                    .record(probe_timer.finish(probe_records_in, probe_records_out));
-                finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
-                tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-                let nb = admit_node_buffer(
-                    ctx,
-                    name,
-                    node_idx,
-                    output_records,
-                    combined_puncts,
-                    node_buffer_spill_allowed(current_dag, node_idx),
-                )?;
+                // Route each deferred output-stage eval failure through the same
+                // `combine_output_row` path the inline arm uses. This MUST run
+                // before the snapshot is dropped below —
+                // `dispatch_combine_output_error` reads the installed pre-fold
+                // snapshot to rewind each contributing source's rollback cursor.
+                // Both dispatch shapes carry the same failure vector, so it is
+                // routed first, before the shape-specific row handling.
+                let nb = match kernel_out {
+                    IEJoinKernelOutput::Materialized(kernel) => {
+                        // Equi+range: rows are already materialized in
+                        // kernel/bucket visitation order; admit the whole vec.
+                        dispatch_combine_output_errors(
+                            ctx,
+                            node_idx,
+                            name,
+                            kernel.output_eval_failures,
+                        )?;
+                        let output_records = kernel.records;
+                        let probe_records_out = output_records.len() as u64;
+                        ctx.collector
+                            .record(probe_timer.finish(probe_records_in, probe_records_out));
+                        finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
+                        tee_emit_to_region_input_buffers(
+                            ctx,
+                            current_dag,
+                            node_idx,
+                            &output_records,
+                        )?;
+                        admit_node_buffer(
+                            ctx,
+                            name,
+                            node_idx,
+                            output_records,
+                            combined_puncts,
+                            node_buffer_spill_allowed(current_dag, node_idx),
+                        )?
+                    }
+                    IEJoinKernelOutput::BlockBand(kernel) => {
+                        // Pure-range: drain the bounded, payload-sorted output
+                        // handle incrementally into a spillable node-buffer so a
+                        // blocking downstream stays bounded.
+                        dispatch_combine_output_errors(
+                            ctx,
+                            node_idx,
+                            name,
+                            kernel.output_eval_failures,
+                        )?;
+                        let nb = drain_block_band_output(
+                            ctx,
+                            current_dag,
+                            node_idx,
+                            name,
+                            kernel.sorted,
+                            combined_puncts,
+                        )?;
+                        let probe_records_out = nb.len_hint() as u64;
+                        ctx.collector
+                            .record(probe_timer.finish(probe_records_in, probe_records_out));
+                        nb
+                    }
+                };
                 ctx.node_buffers.insert(node_idx, nb);
                 // Combine arm clean-exit: drop the per-fold cursor
                 // snapshot. Every emitted record has cleared into
@@ -1822,6 +1850,222 @@ impl CombineProbeKernel<'_> {
             }
         }
     }
+}
+
+/// Route every deferred output-stage eval failure through the shared
+/// `combine_output_row` dead-letter path, in visitation order. Both IEJoin
+/// dispatch shapes hand back the same failure vector, so this runs once per
+/// combine before the shape-specific row handling — and, like the singular
+/// helper, MUST run while the pre-fold input snapshot is still installed so each
+/// contributing source's rollback cursor rewinds to the right floor.
+fn dispatch_combine_output_errors(
+    ctx: &mut ExecutorContext<'_>,
+    node_idx: NodeIndex,
+    combine_name: &str,
+    failures: Vec<crate::pipeline::combine::CombineOutputEvalFailure>,
+) -> Result<(), PipelineError> {
+    for f in failures {
+        dispatch_combine_output_error(
+            ctx,
+            node_idx,
+            &f.probe_record,
+            f.row,
+            f.matched_build.as_ref(),
+            combine_name,
+            f.error,
+        )?;
+    }
+    Ok(())
+}
+
+/// Drain a pure-range block-band combine's bounded, payload-sorted output into a
+/// `node_buffers` slot, preserving the deterministic
+/// `(driver order, driver_idx, build_idx)` order the sort realized.
+///
+/// This is the single drain seam for the block-band output axis: a later task
+/// adds a second drain target — a streaming sender to a downstream `Output`
+/// thread — right here, choosing per the downstream edge's streaming
+/// eligibility. Everything that seam needs is already in hand: `ctx`, the DAG,
+/// the node, and the sorted handle.
+///
+/// Resident output (the whole result fit the sort buffer's byte threshold) is
+/// admitted through the shared `admit_node_buffer` path, which itself spills the
+/// slot if RSS pressure warrants. Spilled output streams straight from the k-way
+/// run merge into a single node-buffer spill chunk, never re-materializing the
+/// full result — so a blocking downstream stays bounded. When a downstream
+/// window is rooted on this node, a deferred region abuts one of its out-edges,
+/// or the slot cannot spill (multi-consumer fan-out / composition input port),
+/// the spilled result is materialized once — those surfaces hold the whole set
+/// regardless — and admitted in memory.
+fn drain_block_band_output(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+    combine_name: &str,
+    sorted: crate::pipeline::sort_buffer::SortedOutput<(RecordOrder, u64, u64)>,
+    puncts: Vec<crate::executor::stream_event::Punctuation>,
+) -> Result<crate::executor::node_buffer::NodeBuffer, PipelineError> {
+    use crate::pipeline::sort_buffer::SortedOutput;
+    let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
+    match sorted {
+        SortedOutput::InMemory(pairs) => {
+            // The result fit the buffer's byte threshold, so it is already
+            // bounded. Strip the sort payload back to `(record, order)` and admit
+            // as the equi+range path does, running the window-root and
+            // cross-region tee side effects (no-ops when neither applies).
+            let rows: Vec<(Record, u64)> = pairs
+                .into_iter()
+                .map(|(record, (order, _, _))| (record, order))
+                .collect();
+            finalize_node_rooted_windows(ctx, current_dag, node_idx, &rows)?;
+            tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &rows)?;
+            admit_node_buffer(ctx, combine_name, node_idx, rows, puncts, spill_allowed)
+        }
+        SortedOutput::Spilled(files) => {
+            let merger = crate::pipeline::spill_merge::SortedRunMerger::new_payload_ordered(
+                files,
+                "iejoin block-band output merge",
+            )?;
+            if spill_allowed && !block_band_output_needs_materialization(current_dag, node_idx) {
+                // Bounded path: fold the sorted runs straight into a node-buffer
+                // spill chunk, one resident record per open run.
+                drain_merger_to_spilled_node_buffer(ctx, combine_name, node_idx, merger, puncts)
+            } else {
+                // A window root, a cross-region tee, or a non-spillable slot needs
+                // the whole slice; those surfaces are O(N) regardless, so
+                // re-materialize the sorted stream once and admit it in memory.
+                let mut rows: Vec<(Record, u64)> = Vec::new();
+                for item in merger {
+                    let (record, (order, _, _)) = item?;
+                    rows.push((record, order));
+                }
+                finalize_node_rooted_windows(ctx, current_dag, node_idx, &rows)?;
+                tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &rows)?;
+                admit_node_buffer(ctx, combine_name, node_idx, rows, puncts, spill_allowed)
+            }
+        }
+    }
+}
+
+/// Whether the block-band output must be fully materialized before admission: a
+/// downstream window is rooted on this node, or a deferred region abuts one of
+/// its out-edges. Both side effects (node-rooted arena build, cross-region
+/// tee) consume the whole emitted slice, so the streamed-spill path cannot serve
+/// them. Kept in sync with the surfaces `finalize_node_rooted_windows` and
+/// `tee_emit_to_region_input_buffers` act on.
+fn block_band_output_needs_materialization(
+    current_dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+) -> bool {
+    node_roots_window(current_dag, node_idx) || node_tees_to_deferred_region(current_dag, node_idx)
+}
+
+/// Whether any node-rooted window index is anchored on `node_idx` — the exact
+/// condition under which `finalize_node_rooted_windows` builds an arena from the
+/// node's full output.
+fn node_roots_window(current_dag: &ExecutionPlanDag, node_idx: NodeIndex) -> bool {
+    use clinker_plan::plan::index::PlanIndexRoot;
+    current_dag.indices_to_build.iter().any(
+        |spec| matches!(&spec.root, PlanIndexRoot::Node { upstream, .. } if *upstream == node_idx),
+    )
+}
+
+/// Whether any out-edge of `node_idx` crosses into a deferred region — the exact
+/// condition under which `tee_emit_to_region_input_buffers` parks the node's full
+/// output into a region input buffer. Mirrors that function's crossing test, so
+/// the two agree on which edges cross.
+fn node_tees_to_deferred_region(current_dag: &ExecutionPlanDag, node_idx: NodeIndex) -> bool {
+    use petgraph::visit::EdgeRef;
+    let producer_region_producer = current_dag.deferred_region_at(node_idx).map(|r| r.producer);
+    current_dag
+        .graph
+        .edges_directed(node_idx, Direction::Outgoing)
+        .any(|edge_ref| {
+            let target_region_producer = current_dag
+                .deferred_region_at(edge_ref.target())
+                .map(|r| r.producer);
+            match (producer_region_producer, target_region_producer) {
+                (None, Some(_)) => true,
+                (Some(p), Some(t)) => p != t,
+                _ => false,
+            }
+        })
+}
+
+/// Stream a payload-sorted run merge straight into a single spilled node-buffer
+/// chunk, dropping the sort payload back to the `(record, order)` shape the slot
+/// stores. Bounded: at most one resident record per open run plus the writer's
+/// buffer, never the whole result. Charges the chunk's on-disk bytes against the
+/// disk quota (E320) and registers a node-buffer consumer at zero resident bytes
+/// — the records live on disk — mirroring `admit_node_buffer`'s spilled tail so
+/// the slot's later drain unregisters through the same path.
+fn drain_merger_to_spilled_node_buffer(
+    ctx: &mut ExecutorContext<'_>,
+    combine_name: &str,
+    node_idx: NodeIndex,
+    merger: crate::pipeline::spill_merge::SortedRunMerger<(RecordOrder, u64, u64)>,
+    puncts: Vec<crate::executor::stream_event::Punctuation>,
+) -> Result<crate::executor::node_buffer::NodeBuffer, PipelineError> {
+    use crate::executor::node_buffer::{NodeBuffer, NodeBufferConsumer};
+    let mut iter = merger;
+    // Pull the first row to resolve the schema and compression mode; an empty
+    // merge yields a punctuation-only memory slot.
+    let (first_record, first_order) = match iter.next() {
+        None => {
+            return Ok(NodeBuffer::memory_from_records_and_puncts(
+                Vec::new(),
+                puncts,
+            ));
+        }
+        Some(Ok((record, (order, _, _)))) => (record, order),
+        Some(Err(e)) => return Err(e),
+    };
+    let schema = Arc::clone(first_record.schema());
+    let column_count = schema.column_count();
+    let compress = ctx
+        .spill_compress
+        .resolve_for_schema(column_count, ctx.batch_size as u64);
+    let mut writer: crate::pipeline::spill::SpillWriter<u64> =
+        crate::pipeline::spill::SpillWriter::new(
+            schema,
+            Some(ctx.spill_root_path.as_ref()),
+            compress,
+        )?;
+    writer.write_pair(&first_record, &first_order)?;
+    let mut count: u64 = 1;
+    for item in iter {
+        let (record, (order, _, _)) = item?;
+        writer.write_pair(&record, &order)?;
+        count += 1;
+    }
+    let (file, written) = writer.finish_with_bytes()?;
+    // Record the committed spill bytes against the run's disk quota (E320).
+    if ctx.memory_budget.record_spill_bytes(combine_name, written) {
+        return Err(PipelineError::spill_cap_exceeded(
+            combine_name,
+            ctx.memory_budget.max_spill_bytes(),
+            written,
+            ctx.memory_budget.cumulative_spill_bytes(),
+        ));
+    }
+    // Register the slot's node-buffer consumer at zero resident bytes so its
+    // later drain unregisters through the same path `admit_node_buffer` sets up.
+    // A prior registration at this slot is replaced first.
+    if let Some((prev_id, _)) = ctx.node_buffer_consumer_ids.remove(&node_idx) {
+        ctx.memory_budget.unregister_consumer(prev_id);
+    }
+    let handle = crate::pipeline::memory::ConsumerHandle::new();
+    handle.set_bytes(0);
+    let consumer_id = ctx
+        .memory_budget
+        .register_consumer(Arc::new(NodeBufferConsumer::new(handle.clone())));
+    ctx.node_buffer_consumer_ids
+        .insert(node_idx, (consumer_id, handle));
+    ctx.memory_budget.sample_peak_consumer_usage();
+    Ok(NodeBuffer::Spilled {
+        chunks: vec![(file, count)],
+        pending_puncts: puncts,
+    })
 }
 
 fn dispatch_combine_output_error(
