@@ -1955,9 +1955,7 @@ fn drain_block_band_output(
     // cross-region tee — those consume the whole slice) AND a sender is
     // present: taking it without draining would strand the writer thread on
     // records that never arrive.
-    if !needs_materialization
-        && let Some(sender) = ctx.take_streaming_sender(node_idx)
-    {
+    if !needs_materialization && let Some(sender) = ctx.take_streaming_sender(node_idx) {
         let batch_size = ctx.batch_size;
         let charge = ctx
             .streaming_charge_handle(node_idx, combine_name, spill_allowed)
