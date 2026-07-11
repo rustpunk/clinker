@@ -2425,7 +2425,7 @@ mod tests {
         }
     }
 
-    // ── G4: duplicate driver RecordOrder stays deterministic ─────────────
+    // ── duplicate driver RecordOrder stays deterministic ──────────────────
 
     #[test]
     fn duplicate_record_order_output_is_deterministic_across_layouts() {
@@ -2522,7 +2522,7 @@ mod tests {
         );
     }
 
-    // ── G1: held First candidates over budget abort with the typed error ──
+    // ── held First candidates over budget abort with the typed error ─────
 
     #[test]
     fn held_first_candidates_over_budget_abort_typed() {
@@ -2644,7 +2644,7 @@ mod tests {
         }
     }
 
-    // ── G2: spilled driver block gated before its load ───────────────────
+    // ── spilled driver block gated before its load ────────────────────────
 
     #[test]
     fn spilled_driver_block_over_hard_limit_aborts_before_load() {

@@ -531,8 +531,8 @@ fn equi_range_pre_output_state_aborts_under_tight_budget_without_rss() {
     // far below the partition/group footprint of 300×300 records, the
     // RSS-independent `should_abort_local` gate must trip with the typed
     // MemoryBudgetExceeded, and the IEJoin consumer must still be unregistered.
-    // This is the coverage the deleted block-band rewrite removed; no block-band
-    // test drives it, since that path spills instead of aborting.
+    // Only the equi+range path drives this gate: the pure-range block-band
+    // path answers pressure by spilling instead of aborting.
     let arb = no_op_arbitrator(ABORT_LIMIT);
     let (result, _output) = run_pipeline_yaml(
         EQUI_RANGE_YAML,
