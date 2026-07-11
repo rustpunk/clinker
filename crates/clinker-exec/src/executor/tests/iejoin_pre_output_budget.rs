@@ -213,7 +213,7 @@ fn run_pipeline_yaml(
     arb: &Arc<crate::pipeline::memory::MemoryArbitrator>,
 ) -> (Result<(), PipelineError>, String) {
     let (result, output) = run_pipeline_capture(yaml, orders, bands, "iejoin-block-band", arb);
-    (result.map(|_report| ()), output)
+    (result.map(|_report| ()), output.as_string())
 }
 
 /// Shared execution harness for the two-source (`orders` / `bands`) pipelines:
@@ -230,7 +230,7 @@ fn run_pipeline_capture(
     arb: &Arc<crate::pipeline::memory::MemoryArbitrator>,
 ) -> (
     Result<crate::executor::ExecutionReport, PipelineError>,
-    String,
+    SharedBuffer,
 ) {
     let readers: crate::executor::SourceReaders = HashMap::from([
         (
@@ -270,7 +270,7 @@ fn run_pipeline_capture(
         clinker_plan::config::CompileContext::default(),
         Arc::clone(arb),
     );
-    (result, out.as_string())
+    (result, out)
 }
 
 fn spilled_bytes(arb: &Arc<crate::pipeline::memory::MemoryArbitrator>) -> u64 {
@@ -695,7 +695,15 @@ fn block_band_dlq_order_is_identical_across_memory_limits() {
     // component: a regressed build tag (e.g. u64::MAX) would leave them in the
     // `lo`-key permutation and fail the assertion.
     const N_BANDS: usize = 40;
-    let dlq_build_indices = |limit: u64| -> Vec<(u64, u64)> {
+    // One run yields two projections: the FULL CombineOutputRow sequence
+    // (trigger and collateral entries alike, as (source_row, trigger)) so a
+    // layout-dependent difference in trigger routing cannot hide behind a
+    // collateral-only view, and the collateral (build-side) entries' band
+    // input indices, which pin the third sort component.
+    // (source_row, trigger) for every CombineOutputRow entry; (source_row,
+    // band input index) for the collateral subset.
+    type DlqSequences = (Vec<(u64, bool)>, Vec<(u64, u64)>);
+    let dlq_sequences = |limit: u64| -> DlqSequences {
         let arb = no_op_arbitrator(limit);
         let report = run_pipeline_report(
             DLQ_YAML,
@@ -704,13 +712,15 @@ fn block_band_dlq_order_is_identical_across_memory_limits() {
             &arb,
         )
         .expect("the continue-strategy run completes, routing failures to the DLQ");
-        report
+        let rows: Vec<_> = report
             .dlq_entries
             .iter()
-            .filter(|e| {
-                e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow
-                    && !e.trigger
-            })
+            .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow)
+            .collect();
+        let full: Vec<(u64, bool)> = rows.iter().map(|e| (e.source_row, e.trigger)).collect();
+        let builds: Vec<(u64, u64)> = rows
+            .iter()
+            .filter(|e| !e.trigger)
             .map(|e| {
                 let band = match e.original_record.get("band_id") {
                     Some(clinker_record::Value::String(s)) => s.to_string(),
@@ -722,15 +732,21 @@ fn block_band_dlq_order_is_identical_across_memory_limits() {
                     .unwrap_or_else(|| panic!("band_id must be b<input-index>; got {band:?}"));
                 (e.source_row, idx)
             })
-            .collect()
+            .collect();
+        (full, builds)
     };
 
-    let tight = dlq_build_indices(TIGHT_LIMIT);
-    let roomy = dlq_build_indices(ROOMY_LIMIT);
+    let (tight_full, tight) = dlq_sequences(TIGHT_LIMIT);
+    let (roomy_full, roomy) = dlq_sequences(ROOMY_LIMIT);
     assert!(
         !tight.is_empty(),
         "every matched pair divides by zero and attributes its build, so the build-side \
          dead-letter output must be non-empty"
+    );
+    assert_eq!(
+        tight_full, roomy_full,
+        "the complete dead-letter sequence — trigger entries included — must be a pure \
+         function of the data, not of pipeline.memory.limit"
     );
     assert_eq!(
         tight, roomy,

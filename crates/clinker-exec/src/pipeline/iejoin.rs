@@ -882,11 +882,24 @@ pub(crate) fn execute_combine_iejoin(
             // partition state plus this one group's kernel state (prior
             // groups' state is already dropped), so mirror that sum into the
             // handle for the arbitrator's pull-mode view.
+            let kernel_aux = match op2 {
+                Some(_) => iejoin_numeric_state_bytes(dkeys.len(), bkeys.len()),
+                // Single-inequality groups run `pwmj_numeric`: charge its
+                // index arrays + sort scratch plus the two bare `Vec<i64>`
+                // key columns the call site extracts, not the far larger
+                // dual-conjunct arrays it never allocates.
+                None => pwmj_numeric_state_bytes(dkeys.len(), bkeys.len()).saturating_add(
+                    dkeys
+                        .len()
+                        .saturating_add(bkeys.len())
+                        .saturating_mul(std::mem::size_of::<i64>()),
+                ),
+            };
             let group_state_bytes = dkeys
                 .len()
                 .saturating_add(bkeys.len())
                 .saturating_mul(std::mem::size_of::<(i64, i64)>())
-                .saturating_add(iejoin_numeric_state_bytes(dkeys.len(), bkeys.len()));
+                .saturating_add(kernel_aux);
             let group_peak_bytes = partition_state_bytes.saturating_add(group_state_bytes);
             consumer.set_bytes(group_peak_bytes as u64);
             if budget.should_abort_local(group_peak_bytes as u64) {
@@ -1187,10 +1200,11 @@ struct MatchState {
     /// heaps). The block path folds it into its per-pair pre-output gate so a
     /// `match: first` / `collect` join over wide build records aborts with the
     /// typed budget error instead of growing this residency unbounded. On the
-    /// equi+range path this accrues for `collect` too (its per-group heaps and
-    /// min-order `$ck` build run through the same code, draining only at the
-    /// group flush); it stays zero only for that path's `first` / `all` modes,
-    /// which emit each match immediately and hold no build records across pairs.
+    /// equi+range path this accrues for `collect` too (its per-driver heaps and
+    /// min-order `$ck` build run through the same code, draining only in the
+    /// single end-of-join flush loop, after every bucket and group completes);
+    /// it stays zero only for that path's `first` / `all` modes, which emit
+    /// each match immediately and hold no build records across pairs.
     held_bytes: u64,
 }
 
@@ -1875,16 +1889,22 @@ fn iejoin_numeric_state_bytes(n_left: usize, n_right: usize) -> usize {
 
 /// Estimated bytes of the single-inequality PWMJ working set for a group of
 /// `n_left` driver and `n_right` build keys: the two `Vec<usize>` sorted-index
-/// arrays [`pwmj_numeric`] builds (one per side) before it enumerates any
-/// output pair. Far smaller than [`iejoin_numeric_state_bytes`] — no L1/L2
-/// key-triple arrays, permutation vector, or visited bit array — so the
-/// block-band gate charges the PWMJ kernel its real footprint instead of the
-/// dual-conjunct estimate. Saturating arithmetic keeps a pathological count
-/// from wrapping the estimate back under the budget.
+/// arrays [`pwmj_numeric`] builds (one per side), plus the merge scratch the
+/// stable `slice::sort_by` transiently allocates while sorting each of them —
+/// the sides sort sequentially, so the larger side bounds that transient peak.
+/// Far smaller than [`iejoin_numeric_state_bytes`] — no L1/L2 key-triple
+/// arrays, permutation vector, or visited bit array — so the block-band gate
+/// charges the PWMJ kernel its real footprint instead of the dual-conjunct
+/// estimate. Saturating arithmetic keeps a pathological count from wrapping
+/// the estimate back under the budget.
 fn pwmj_numeric_state_bytes(n_left: usize, n_right: usize) -> usize {
-    n_left
+    let index_arrays = n_left
         .saturating_add(n_right)
-        .saturating_mul(std::mem::size_of::<usize>())
+        .saturating_mul(std::mem::size_of::<usize>());
+    let sort_scratch = n_left
+        .max(n_right)
+        .saturating_mul(std::mem::size_of::<usize>());
+    index_arrays.saturating_add(sort_scratch)
 }
 
 /// Build the typed pre-output budget-abort error, shared by both dispatch
