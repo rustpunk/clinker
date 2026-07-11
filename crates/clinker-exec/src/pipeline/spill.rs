@@ -54,6 +54,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use lz4_flex::frame::{FrameDecoder, FrameEncoder};
 use serde::{Serialize, de::DeserializeOwned};
@@ -87,16 +88,43 @@ const FRAME_CONTEXT_INTERN: u8 = 0x01;
 /// shares this cap for parity.
 pub(crate) const SPILL_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
+/// Wraps the innermost temp file and counts every byte written through to it,
+/// so a spill file's true on-disk length is known from the writer itself — no
+/// post-hoc `stat`, which can transiently fail (network / overlay FS, fd
+/// pressure) and silently record `0`, under-charging the disk-spill quota. The
+/// counter sits at the file layer, below the LZ4 frame encoder, so it counts
+/// the compressed on-disk bytes every other spill op charges. Shared with the
+/// owning [`SpillWriter`] via the atomic, read after the buffered and framed
+/// tails have flushed.
+struct CountingWriter<W> {
+    inner: W,
+    written: Arc<AtomicU64>,
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 /// Record-stream sink for a spill file: either a raw buffered writer
 /// (uncompressed) or an LZ4 frame encoder wrapping one. Both expose
 /// `io::Write` for the schema header and per-record bodies; the variant is
 /// chosen at construction from the resolved compression decision and recorded
-/// in the file's leading format tag.
+/// in the file's leading format tag. The buffered writer sits over a
+/// [`CountingWriter`], so the file's on-disk byte total is available without a
+/// `stat`.
 enum SpillSink {
     /// Uncompressed: postcard records written straight to the buffered file.
-    Uncompressed(BufWriter<NamedTempFile>),
+    Uncompressed(BufWriter<CountingWriter<NamedTempFile>>),
     /// LZ4-frame-compressed: the historical default for large spills.
-    Lz4(FrameEncoder<BufWriter<NamedTempFile>>),
+    Lz4(FrameEncoder<BufWriter<CountingWriter<NamedTempFile>>>),
 }
 
 impl Write for SpillSink {
@@ -132,9 +160,10 @@ impl SpillSink {
                 .finish()
                 .map_err(|e| SpillError::from_spill_dir_io(spill_dir, std::io::Error::from(e)))?,
         };
-        buf_writer
+        let counting = buf_writer
             .into_inner()
-            .map_err(|e| SpillError::from_spill_dir_io(spill_dir, e.into_error()))
+            .map_err(|e| SpillError::from_spill_dir_io(spill_dir, e.into_error()))?;
+        Ok(counting.inner)
     }
 }
 
@@ -167,6 +196,11 @@ pub struct SpillWriter<P> {
     /// generic `Io` variant. Holds the OS temp dir when no explicit spill
     /// dir was configured, so the diagnostic still names a real path.
     spill_dir: PathBuf,
+    /// Running count of bytes written to the underlying file, shared with the
+    /// sink's [`CountingWriter`]. Read at `finish` (after the buffered and LZ4
+    /// tails flush) as the file's exact on-disk length, so a spill charge never
+    /// depends on a `stat` that could fail and under-count.
+    bytes_written: Arc<AtomicU64>,
     _payload: PhantomData<P>,
 }
 
@@ -201,7 +235,11 @@ impl<P: Serialize> SpillWriter<P> {
             NamedTempFile::new().map_err(|e| SpillError::from_spill_dir_io(&resolved_dir, e))?
         };
 
-        let mut buf_writer = BufWriter::new(temp_file);
+        let bytes_written = Arc::new(AtomicU64::new(0));
+        let mut buf_writer = BufWriter::new(CountingWriter {
+            inner: temp_file,
+            written: Arc::clone(&bytes_written),
+        });
 
         // The format tag is the very first on-disk byte and sits outside the
         // LZ4 frame so the reader can dispatch before opening a decoder.
@@ -234,6 +272,7 @@ impl<P: Serialize> SpillWriter<P> {
             schema,
             seen_docs: HashSet::new(),
             spill_dir: resolved_dir,
+            bytes_written,
             _payload: PhantomData,
         })
     }
@@ -290,13 +329,27 @@ impl<P: Serialize> SpillWriter<P> {
     /// Flush, finalize the record stream (LZ4 frame if compressed), and return
     /// a handle to the completed spill file.
     pub fn finish(self) -> Result<SpillFile<P>, SpillError> {
+        self.finish_with_bytes().map(|(file, _)| file)
+    }
+
+    /// Like [`finish`](Self::finish), but also returns the file's exact on-disk
+    /// byte length (leading tag + schema header + every frame, post-compression)
+    /// so a caller can charge it against the disk-spill quota without a `stat`
+    /// that could fail and silently under-count.
+    pub fn finish_with_bytes(self) -> Result<(SpillFile<P>, u64), SpillError> {
         let temp_file = self.sink.into_temp_file(&self.spill_dir)?;
+        // Read the counter after the buffered and LZ4-framed tails have flushed,
+        // so it reflects every byte on disk.
+        let written = self.bytes_written.load(Ordering::Relaxed);
         let path = temp_file.into_temp_path();
-        Ok(SpillFile {
-            path,
-            schema: self.schema,
-            _payload: PhantomData,
-        })
+        Ok((
+            SpillFile {
+                path,
+                schema: self.schema,
+                _payload: PhantomData,
+            },
+            written,
+        ))
     }
 }
 

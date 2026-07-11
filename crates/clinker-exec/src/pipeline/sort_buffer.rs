@@ -136,10 +136,6 @@ impl<P: Serialize + DeserializeOwned + Send + Ord> SortBuffer<P> {
         self.bytes_used > 0 && self.bytes_used >= self.spill_threshold
     }
 
-    /// Sort the current in-memory pairs and write them to a spill file.
-    /// Clears the buffer and resets the byte counter. Returns the spilled
-    /// file's on-disk byte length so the caller can charge it against the
-    /// pipeline disk-spill quota; an empty buffer writes nothing and returns 0.
     /// Stable-sort the in-memory pairs by the buffer's ordering mode. Parallel
     /// stable sort on the shared kernel pool: `par_sort_by` preserves the
     /// tie-break order of the sequential `slice::sort_by`, so a spilled run is
@@ -160,6 +156,10 @@ impl<P: Serialize + DeserializeOwned + Send + Ord> SortBuffer<P> {
         }
     }
 
+    /// Sort the current in-memory pairs and write them to a spill file. Clears
+    /// the buffer and resets the byte counter. Returns the spilled file's exact
+    /// on-disk byte length so the caller can charge it against the pipeline
+    /// disk-spill quota; an empty buffer writes nothing and returns 0.
     pub fn sort_and_spill(&mut self) -> Result<u64, SpillError> {
         if self.pairs.is_empty() {
             return Ok(0);
@@ -175,14 +175,10 @@ impl<P: Serialize + DeserializeOwned + Send + Ord> SortBuffer<P> {
         for (record, payload) in self.pairs.drain(..) {
             writer.write_pair(&record, &payload)?;
         }
-        let spill_file = writer.finish()?;
-        // On-disk length after finalize (the LZ4 frame tail is flushed by
-        // `finish`), matching the byte figure the disk-cap accounting charges
-        // for every other spill op. A stat failure charges 0 rather than
-        // aborting a successful spill.
-        let written = std::fs::metadata(spill_file.path())
-            .map(|m| m.len())
-            .unwrap_or(0);
+        // The writer reports its own on-disk byte total (the same figure the
+        // disk-cap accounting charges for every spill op), so a written run is
+        // always charged — no post-hoc `stat` that could fail and charge 0.
+        let (spill_file, written) = writer.finish_with_bytes()?;
         self.spill_files.push(spill_file);
         self.bytes_used = 0;
         Ok(written)

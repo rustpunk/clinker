@@ -20,11 +20,15 @@
 //!      multiple blocks per side → COMPLETES with correct rows, non-zero
 //!      per-stage spill, consumer released. (Host-independent: passes on an
 //!      RSS-present host precisely because the gate is local.)
-//!   2. Roomy budget, non-empty → completes (the resident/degenerate path).
+//!   2. Roomy budget, non-empty → completes fully resident with zero spill.
 //!   3. Tight budget, fully pruned (disjoint ranges) → completes empty while
 //!      spilling — the pipeline-level prune observation.
 //!   4. Budget below a single block-pair's local footprint → aborts with the
 //!      typed pre-output error via the LOCAL arm, consumer released.
+//!   5. The equi+range (HashPartitionIEJoin) sibling path, whose pre-output gate
+//!      is instead the RSS-independent global-aware check, aborts under a tight
+//!      budget with the consumer released — the coverage the block-band rewrite
+//!      would otherwise have left untested.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -153,9 +157,20 @@ fn bands_csv(n: usize, offset: i64, pad_len: usize) -> String {
     s
 }
 
-/// Run `PIPELINE_YAML` over the given CSV inputs against `arb`, returning the
-/// run result and the captured output CSV.
+/// Run `PIPELINE_YAML` (the pure-range block-band pipeline) over the given CSV
+/// inputs against `arb`, returning the run result and the captured output CSV.
 fn run_pipeline(
+    orders: String,
+    bands: String,
+    arb: &Arc<crate::pipeline::memory::MemoryArbitrator>,
+) -> (Result<(), PipelineError>, String) {
+    run_pipeline_yaml(PIPELINE_YAML, orders, bands, arb)
+}
+
+/// Run an arbitrary two-source (`orders` / `bands`) pipeline `yaml` over the
+/// given CSV inputs against `arb`, returning the run result and captured output.
+fn run_pipeline_yaml(
+    yaml: &str,
     orders: String,
     bands: String,
     arb: &Arc<crate::pipeline::memory::MemoryArbitrator>,
@@ -183,7 +198,7 @@ fn run_pipeline(
         Box::new(out.clone()) as Box<dyn std::io::Write + Send>,
     )]);
 
-    let config = clinker_plan::config::parse_config(PIPELINE_YAML).expect("parse pipeline YAML");
+    let config = clinker_plan::config::parse_config(yaml).expect("parse pipeline YAML");
     let params = PipelineRunParams {
         execution_id: "iejoin-block-band".to_string(),
         batch_id: "batch-0".to_string(),
@@ -213,6 +228,36 @@ fn pure_range_selects_block_band_strategy() {
     assert!(
         matches!(banded_strategy(), CombineStrategy::IEJoin),
         "the pure-range predicate must select the block-band IEJoin strategy"
+    );
+}
+
+#[test]
+fn block_band_output_is_identical_across_memory_limits() {
+    // The determinism invariant, end-to-end: the same data and pipeline run at a
+    // tight budget (multi-run sort spill, many blocks per side) and a roomy
+    // budget (fully resident) must produce byte-identical output. The tight run
+    // spills and re-slices; the roomy run holds everything in RAM; the final
+    // deterministic sort makes the emitted CSV the same regardless.
+    let (tight_result, tight_out) = run_pipeline(
+        orders_csv(400, 200),
+        bands_csv(400, 0, 200),
+        &no_op_arbitrator(TIGHT_LIMIT),
+    );
+    tight_result.expect("tight-budget run must complete");
+    let (roomy_result, roomy_out) = run_pipeline(
+        orders_csv(400, 200),
+        bands_csv(400, 0, 200),
+        &no_op_arbitrator(ROOMY_LIMIT),
+    );
+    roomy_result.expect("roomy-budget run must complete");
+
+    assert_eq!(
+        tight_out, roomy_out,
+        "block-band output must be a pure function of the data, not of pipeline.memory.limit"
+    );
+    assert!(
+        tight_out.lines().filter(|l| !l.is_empty()).count() > 1,
+        "the fixture must emit rows for the comparison to be meaningful"
     );
 }
 
@@ -260,9 +305,8 @@ fn block_band_completes_non_empty_with_spill_under_tight_budget() {
 
 #[test]
 fn block_band_completes_non_empty_under_roomy_budget() {
-    // The resident / degenerate path: a roomy budget keeps each small side in a
-    // single resident block (no spill), and the non-empty join completes with
-    // correct results.
+    // The resident path: a roomy budget keeps each small side entirely in RAM
+    // (no spill), and the non-empty join completes with correct results.
     let arb = no_op_arbitrator(ROOMY_LIMIT);
     let (result, output) = run_pipeline(orders_csv(500, 0), bands_csv(500, 0, 0), &arb);
     result.expect("the pure-range block-band join must complete under a roomy budget");
@@ -272,6 +316,14 @@ fn block_band_completes_non_empty_under_roomy_budget() {
     assert!(
         data_lines.iter().any(|l| l.starts_with("o499,998,b499")),
         "order o499 (amount 998) must band to b499"
+    );
+    // The no-spill property this test exists to cover, pinned: small sides fit
+    // the resident budget, so nothing reaches disk.
+    assert_eq!(
+        spilled_bytes(&arb),
+        0,
+        "small sides must stay resident under a roomy budget; per_stage_spill_bytes[banded] was {}",
+        spilled_bytes(&arb)
     );
     assert_eq!(
         arb.consumer_count(),
@@ -360,5 +412,163 @@ fn block_band_pre_output_local_abort_under_undersized_budget() {
         arb.consumer_count(),
         0,
         "the block-band consumer must be unregistered even when the branch aborts"
+    );
+}
+
+/// An equi+range predicate (one equality conjunct plus one range conjunct) so
+/// the planner selects `CombineStrategy::HashPartitionIEJoin`, which holds its
+/// hash partitions and per-group sort arrays resident with no spill path. Its
+/// pre-output gate is the RSS-independent `should_abort_local` check on the
+/// partition / group state — the coverage the deleted test guarded and that no
+/// block-band test can exercise (the block-band path spills instead of
+/// aborting under input pressure).
+const EQUI_RANGE_YAML: &str = r#"
+pipeline:
+  name: iejoin_equi_range
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: region, type: string }
+      - { name: amount, type: int }
+- type: source
+  name: bands
+  config:
+    name: bands
+    type: csv
+    path: bands.csv
+    schema:
+      - { name: region, type: string }
+      - { name: lo, type: int }
+- type: combine
+  name: banded
+  input:
+    orders: orders
+    bands: bands
+  config:
+    where: "orders.region == bands.region and orders.amount >= bands.lo"
+    match: all
+    on_miss: skip
+    cxl: |
+      emit region = orders.region
+      emit amount = orders.amount
+      emit lo = bands.lo
+    propagate_ck: driver
+- type: output
+  name: out
+  input: banded
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+
+/// The strategy stamped on the `banded` node of `EQUI_RANGE_YAML`.
+fn equi_range_strategy() -> CombineStrategy {
+    let config =
+        clinker_plan::config::parse_config(EQUI_RANGE_YAML).expect("parse equi+range YAML");
+    let validated = config
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("compile equi+range pipeline");
+    let dag = validated.dag();
+    for idx in dag.graph.node_indices() {
+        if let PlanNode::Combine { name, strategy, .. } = &dag.graph[idx]
+            && name == "banded"
+        {
+            return strategy.clone();
+        }
+    }
+    panic!("combine node \"banded\" not present in compiled equi+range plan");
+}
+
+/// CSV for `n` orders across `regions` regions, each amount `2*i`.
+fn equi_orders_csv(n: usize, regions: usize) -> String {
+    let mut s = String::from("region,amount\n");
+    for i in 0..n {
+        s.push_str(&format!("r{},{}\n", i % regions, i * 2));
+    }
+    s
+}
+
+/// CSV for `n` bands across `regions` regions, each lo `2*i` so every order
+/// matches at least the bands in its region with a lower amount.
+fn equi_bands_csv(n: usize, regions: usize) -> String {
+    let mut s = String::from("region,lo\n");
+    for i in 0..n {
+        s.push_str(&format!("r{},{}\n", i % regions, i * 2));
+    }
+    s
+}
+
+#[test]
+fn equi_range_selects_hash_partition_strategy() {
+    assert!(
+        matches!(
+            equi_range_strategy(),
+            CombineStrategy::HashPartitionIEJoin { .. }
+        ),
+        "an equi+range predicate must select the hash-partitioned IEJoin strategy, got {:?}",
+        equi_range_strategy()
+    );
+}
+
+#[test]
+fn equi_range_pre_output_state_aborts_under_tight_budget_without_rss() {
+    // The equi+range (HashPartitionIEJoin) path holds its routed partitions and
+    // per-group sort arrays resident — it has no spill path, so an over-budget
+    // pre-scan state can only be resolved by a clean abort. Under a tight budget
+    // far below the partition/group footprint of 300×300 records, the
+    // RSS-independent `should_abort_local` gate must trip with the typed
+    // MemoryBudgetExceeded, and the IEJoin consumer must still be unregistered.
+    // This is the coverage the deleted block-band rewrite removed; no block-band
+    // test drives it, since that path spills instead of aborting.
+    let arb = no_op_arbitrator(ABORT_LIMIT);
+    let (result, _output) = run_pipeline_yaml(
+        EQUI_RANGE_YAML,
+        equi_orders_csv(300, 4),
+        equi_bands_csv(300, 4),
+        &arb,
+    );
+    let err = result.expect_err("the equi+range pre-scan state must abort under the tight budget");
+
+    match err {
+        PipelineError::MemoryBudgetExceeded {
+            node,
+            used,
+            limit,
+            source,
+            detail,
+        } => {
+            assert_eq!(node, "banded", "the abort must name the combine node");
+            assert_eq!(
+                source,
+                clinker_plan::BudgetCategory::Arena,
+                "equi+range pre-output state is arena-class memory"
+            );
+            assert_eq!(
+                limit, ABORT_LIMIT,
+                "the reported limit must be the hard budget"
+            );
+            assert!(
+                used > ABORT_LIMIT,
+                "the reported footprint ({used}) must exceed the budget ({ABORT_LIMIT})"
+            );
+            let detail = detail.expect("the pre-output abort must carry a detail string");
+            assert!(
+                detail.contains("iejoin pre-output"),
+                "the abort must come from the equi+range pre-output gate; got: {detail:?}"
+            );
+        }
+        other => panic!("expected MemoryBudgetExceeded from the pre-output gate; got: {other:?}"),
+    }
+
+    assert_eq!(
+        arb.consumer_count(),
+        0,
+        "the equi+range IEJoin consumer must be unregistered even when the branch aborts"
     );
 }

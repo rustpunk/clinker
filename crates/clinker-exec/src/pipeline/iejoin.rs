@@ -64,6 +64,8 @@
 //! because process RSS sits above a tight budget. Global pressure on the input
 //! axis is answered by spilling, not by aborting.
 
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -829,6 +831,7 @@ pub(crate) fn execute_combine_iejoin(
     let mut state = MatchState::new(driver_records.len());
     let emit_cfg = EmitConfig {
         name,
+        build_qualifier,
         ctx,
         resolver_mapping,
         output_schema,
@@ -939,16 +942,17 @@ pub(crate) fn execute_combine_iejoin(
                 output_records: &mut output_records,
                 emitted_since_check: &mut emitted_since_check,
                 output_eval_failures: &mut output_eval_failures,
+                // Equi+range keeps kernel/bucket visitation order; no final
+                // deterministic re-sort, so no per-row tags.
+                row_tags: None,
             };
-            emit_pairs(
-                &emit_cfg,
-                &mut evals,
-                &pairs,
-                &driver_slice,
-                &build_slice,
-                &mut state,
-                &mut sink,
-            )?;
+            let batch = EmitBatch {
+                pairs: &pairs,
+                driver_slice: &driver_slice,
+                build_slice: &build_slice,
+                build_idx: None,
+            };
+            emit_pairs(&emit_cfg, &mut evals, &batch, &mut state, &mut sink)?;
         }
     }
 
@@ -956,22 +960,15 @@ pub(crate) fn execute_combine_iejoin(
     // zero matches emit, with an empty array (matches the
     // HashBuildProbe collect-path shape).
     if matches!(match_mode, MatchMode::Collect) {
+        let mut sink = EmitSink {
+            output_records: &mut output_records,
+            emitted_since_check: &mut emitted_since_check,
+            output_eval_failures: &mut output_eval_failures,
+            row_tags: None,
+        };
         for (i, (driver_record, driver_order)) in driver_records.iter().enumerate() {
-            let arr = state.collect_accum.remove(&i).unwrap_or_default();
-            let truncated = state.collect_truncated.contains_key(&i);
-            let first_build = state.first_collected_builds.remove(&i);
-            flush_collect_row(
-                &emit_cfg,
-                driver_record,
-                *driver_order,
-                build_qualifier,
-                CollectFlush {
-                    arr,
-                    truncated,
-                    first_build,
-                },
-                &mut output_records,
-            );
+            let flush = state.take_collect(i);
+            flush_collect_row(&emit_cfg, driver_record, *driver_order, flush, &mut sink);
         }
         // Collect mode never runs the body eval, so no recoverable
         // output-stage failure can accrue on this path.
@@ -997,6 +994,7 @@ pub(crate) fn execute_combine_iejoin(
         output_records: &mut output_records,
         emitted_since_check: &mut emitted_since_check,
         output_eval_failures: &mut output_eval_failures,
+        row_tags: None,
     };
     for i in all_unmatched {
         let (driver_record, driver_order) = (&driver_records[i].0, driver_records[i].1);
@@ -1027,6 +1025,10 @@ pub(crate) fn execute_combine_iejoin(
 /// `block` child.
 struct EmitConfig<'a> {
     name: &'a str,
+    /// Build-side qualifier (the combine input name the build rows carry), under
+    /// which a collect row nests its build array. Combine-wide, so it rides on
+    /// the config rather than threading through each finalize call.
+    build_qualifier: &'a str,
     ctx: &'a EvalContext<'a>,
     resolver_mapping: &'a CombineResolverMapping,
     output_schema: Option<&'a Arc<Schema>>,
@@ -1057,16 +1059,70 @@ struct DriverRef<'a> {
     key: usize,
 }
 
+/// The per-call inputs to [`emit_pairs`]: the kernel's local pair indices, the
+/// driver and build slices they index, and — on the block path only — each
+/// local build's original input index for deterministic selection and ordering.
+struct EmitBatch<'a> {
+    pairs: &'a [(usize, usize)],
+    driver_slice: &'a [DriverRef<'a>],
+    build_slice: &'a [&'a Record],
+    build_idx: Option<&'a [u64]>,
+}
+
+/// One accumulated collect-array element, ordered by a build-order key so a
+/// bounded max-heap can retain the smallest-key [`COLLECT_PER_GROUP_CAP`]
+/// matches deterministically. `order_key` is the build's original input index
+/// on the pure-range block path (making the kept set and its order a pure
+/// function of the data) and a per-driver insertion counter on the equi+range
+/// path (which preserves visitation order and the first-`CAP` truncation the
+/// path had before). Ordering ignores `value`, which is not `Ord`.
+struct CollectEntry {
+    order_key: u64,
+    value: Value,
+}
+
+impl PartialEq for CollectEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.order_key == other.order_key
+    }
+}
+impl Eq for CollectEntry {}
+impl PartialOrd for CollectEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for CollectEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.order_key.cmp(&other.order_key)
+    }
+}
+
 /// Per-driver match tracking shared by the pair-emit loop and the collect /
 /// on_miss finalizers, keyed by [`DriverRef::key`].
 struct MatchState {
     /// `matched[key]` is set once a driver has emitted at least one match.
-    /// Drives the `First`-mode dedup and, for the equi+range path, the
-    /// end-of-join unmatched sweep.
+    /// Drives the `First`-mode dedup (equi+range path) and, for the `All`
+    /// mode, the end-of-join unmatched sweep. The block path's `First`
+    /// selection uses `first_match` instead, so it never reads this for
+    /// `First`.
     matched: Vec<bool>,
-    collect_accum: HashMap<usize, Vec<Value>>,
+    /// Bounded max-heap per driver of the smallest-`order_key`
+    /// [`COLLECT_PER_GROUP_CAP`] collect matches. Draining it sorted yields
+    /// the deterministic collect array.
+    collect_accum: HashMap<usize, BinaryHeap<CollectEntry>>,
     collect_truncated: HashMap<usize, ()>,
-    first_collected_builds: HashMap<usize, Record>,
+    /// The matched build with the smallest `order_key`, kept for `$ck`
+    /// propagation onto the collect row. Min-keyed so the propagated build is
+    /// a pure function of the data on the block path (min build input index),
+    /// and the first-visited build on the equi+range path (min insertion
+    /// counter) — matching that path's prior behavior.
+    first_collected_builds: HashMap<usize, (u64, Record)>,
+    /// The block path's `First`-mode candidate per driver: the residual-passing
+    /// match with the smallest build input index, held until the driver block
+    /// finalizes and emits it. Empty on the equi+range path, which emits the
+    /// first-visited match immediately. Bounded by one build record per driver.
+    first_match: HashMap<usize, (u64, Record)>,
 }
 
 impl MatchState {
@@ -1076,17 +1132,113 @@ impl MatchState {
             collect_accum: HashMap::new(),
             collect_truncated: HashMap::new(),
             first_collected_builds: HashMap::new(),
+            first_match: HashMap::new(),
+        }
+    }
+
+    /// Record one residual-passing collect match for `key`: extract the build's
+    /// user fields, keep the bounded smallest-`order_key` set, and track the
+    /// min-`order_key` build for `$ck`. Marking a driver truncated once its
+    /// heap is full and a further match cannot displace a kept element.
+    fn record_collect_match(&mut self, key: usize, order_key: u64, build_record: &Record) {
+        match self.first_collected_builds.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) if order_key < e.get().0 => {
+                e.insert((order_key, build_record.clone()));
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((order_key, build_record.clone()));
+            }
+        }
+        // Build-side records contribute only their user-declared field values:
+        // `iter_user_fields` filters every engine-stamped column (`$ck.*`
+        // correlation lineage and the `$widened` auto-widen sidecar) so neither
+        // nests inside a collect-array entry and trips the writer's
+        // `UnserializableMapValue` guard.
+        let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
+        for (fname, val) in build_record.iter_user_fields() {
+            m.insert(fname.into(), val.clone());
+        }
+        let entry = CollectEntry {
+            order_key,
+            value: Value::Map(Box::new(m)),
+        };
+        let heap = self.collect_accum.entry(key).or_default();
+        if heap.len() < COLLECT_PER_GROUP_CAP {
+            heap.push(entry);
+        } else {
+            // Heap is full: keep the smallest-`order_key` CAP entries. Displace
+            // the current largest only when this match is smaller.
+            self.collect_truncated.insert(key, ());
+            if entry.order_key < heap.peek().expect("full heap is non-empty").order_key {
+                heap.pop();
+                heap.push(entry);
+            }
+        }
+    }
+
+    /// Drain the collect state for `key` into the deterministic flush inputs:
+    /// the array sorted ascending by `order_key`, the truncation flag, and the
+    /// min-`order_key` build for `$ck`.
+    fn take_collect(&mut self, key: usize) -> CollectFlush {
+        let arr = self
+            .collect_accum
+            .remove(&key)
+            .map(|heap| {
+                heap.into_sorted_vec()
+                    .into_iter()
+                    .map(|e| e.value)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let truncated = self.collect_truncated.remove(&key).is_some();
+        let first_build = self.first_collected_builds.remove(&key).map(|(_, r)| r);
+        CollectFlush {
+            arr,
+            truncated,
+            first_build,
+        }
+    }
+
+    /// Record one residual-passing `First`-mode candidate for the block path:
+    /// keep the match with the smallest build input index, held until the
+    /// driver block finalizes.
+    fn note_first_candidate(&mut self, key: usize, build_idx: u64, build_record: &Record) {
+        match self.first_match.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut e) if build_idx < e.get().0 => {
+                e.insert((build_idx, build_record.clone()));
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {}
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert((build_idx, build_record.clone()));
+            }
         }
     }
 }
 
 /// Mutable output sink for the shared emit path: the accumulating output
-/// buffer, the every-10K poll counter, and the deferred output-eval
-/// failures.
+/// buffer, the every-10K poll counter, and the deferred output-eval failures.
 struct EmitSink<'a> {
     output_records: &'a mut Vec<(Record, RecordOrder)>,
     emitted_since_check: &'a mut usize,
     output_eval_failures: &'a mut Vec<CombineOutputEvalFailure>,
+    /// Block-path only: parallel build-index tag per pushed row, `u64::MAX` for
+    /// collect / on_miss rows. Zipped with `output_records` and stable-sorted
+    /// by `(driver order, build_idx)` after the pass so block output order is a
+    /// pure function of the data, not the memory-derived block layout. `None`
+    /// on the equi+range path, which keeps kernel/bucket visitation order.
+    row_tags: Option<&'a mut Vec<u64>>,
+}
+
+impl EmitSink<'_> {
+    /// Push one emitted row, recording its build-index tag when the block path
+    /// asked for deterministic ordering.
+    fn push_row(&mut self, record: Record, order: RecordOrder, build_idx: u64) {
+        self.output_records.push((record, order));
+        if let Some(tags) = self.row_tags.as_deref_mut() {
+            tags.push(build_idx);
+        }
+    }
 }
 
 /// Inputs to [`flush_collect_row`] for one driver's collect-mode row.
@@ -1098,29 +1250,39 @@ struct CollectFlush {
 
 /// Emit every qualifying `(driver, build)` pair in `pairs` under the
 /// combine's match mode, applying the residual filter (3+ range conjuncts),
-/// the `First`-mode dedup, and the every-10K output-buffer poll. `pairs`
+/// the `First`-mode selection, and the every-10K output-buffer poll. `pairs`
 /// carries local indices into `driver_slice` / `build_slice`; per-driver
 /// state is tracked in `state` under [`DriverRef::key`].
 ///
-/// Shared verbatim by the equi+range group loop and the pure-range block
-/// scheduler so both agree row-for-row; the only difference is the keying
-/// scope of `state`. Streaming into `sink.output_records`; the output axis
-/// is bounded only by the every-10K poll (see [`poll_output_buffer`]).
+/// Shared by the equi+range group loop and the pure-range block scheduler so
+/// both synthesize rows identically. `build_idx` distinguishes the two: `None`
+/// on the equi+range path keeps that path's kernel/bucket visitation order and
+/// its immediate first-visited `First`-mode emit; `Some(idx)` on the block path
+/// supplies each local build's original input index, so `First` selects the
+/// minimum-index match (deferred to the driver block's finalize), `Collect`
+/// orders and truncates by that index, and every emitted row is tagged for the
+/// block path's final deterministic sort. Both make block output a pure
+/// function of the data rather than of the memory-derived block layout.
+///
+/// Streaming into `sink.output_records`; the output axis is bounded only by the
+/// every-10K poll (see [`poll_output_buffer`]).
 fn emit_pairs(
     cfg: &EmitConfig<'_>,
     evals: &mut Evaluators,
-    pairs: &[(usize, usize)],
-    driver_slice: &[DriverRef<'_>],
-    build_slice: &[&Record],
+    batch: &EmitBatch<'_>,
     state: &mut MatchState,
     sink: &mut EmitSink<'_>,
 ) -> Result<(), PipelineError> {
-    for &(di_local, bi_local) in pairs {
-        let dref = &driver_slice[di_local];
+    for &(di_local, bi_local) in batch.pairs {
+        let dref = &batch.driver_slice[di_local];
         let driver_record = dref.record;
         let driver_order = dref.order;
         let key = dref.key;
-        let build_record = build_slice[bi_local];
+        let build_record = batch.build_slice[bi_local];
+        // Original build input index on the block path; a per-driver insertion
+        // counter stand-in (the next collect-array position) on the equi+range
+        // path, which preserves its visitation order.
+        let bidx = batch.build_idx.map(|idx| idx[bi_local]);
 
         // 3+ range conjuncts: the residual re-checks the full predicate over
         // the merged row (the kernel verified only the first two axes). See
@@ -1154,135 +1316,151 @@ fn emit_pairs(
             }
         }
 
-        if matches!(cfg.match_mode, MatchMode::First) && state.matched[key] {
-            continue;
-        }
-
         match cfg.match_mode {
             MatchMode::Collect => {
-                if state.collect_truncated.contains_key(&key) {
-                    continue;
-                }
-                // Peek the current length without holding a borrow across the
-                // truncation insert below.
-                let cur_len = state.collect_accum.get(&key).map_or(0, Vec::len);
-                if cur_len >= COLLECT_PER_GROUP_CAP {
-                    state.collect_truncated.insert(key, ());
-                    continue;
-                }
-                state
-                    .first_collected_builds
-                    .entry(key)
-                    .or_insert_with(|| build_record.clone());
-                // Build-side records contribute only their user-declared
-                // field values: `iter_user_fields` filters every
-                // engine-stamped column (`$ck.*` correlation lineage and the
-                // `$widened` auto-widen sidecar) so neither nests inside a
-                // collect-array entry and trips the writer's
-                // `UnserializableMapValue` guard.
-                let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
-                for (fname, val) in build_record.iter_user_fields() {
-                    m.insert(fname.into(), val.clone());
-                }
-                state
-                    .collect_accum
-                    .entry(key)
-                    .or_default()
-                    .push(Value::Map(Box::new(m)));
-                state.matched[key] = true;
+                // Order key: the build input index on the block path (kept set
+                // and array order become deterministic); an insertion counter
+                // on the equi+range path (preserves visitation order and the
+                // first-`CAP` truncation). The counter is the driver's current
+                // collect-array length, which strictly increases per push.
+                let order_key = bidx.unwrap_or_else(|| {
+                    state.collect_accum.get(&key).map_or(0, BinaryHeap::len) as u64
+                });
+                state.record_collect_match(key, order_key, build_record);
             }
-            MatchMode::First | MatchMode::All => {
-                if let Some(evaluator) = evals.body.as_mut() {
-                    let resolver = CombineResolver::new(
-                        cfg.resolver_mapping,
+            MatchMode::First => match bidx {
+                // Block path: hold the minimum-build-index candidate; emit at
+                // the driver block's finalize.
+                Some(idx) => state.note_first_candidate(key, idx, build_record),
+                // Equi+range path: first-visited wins. Emit immediately and
+                // dedup; a body eval that skips leaves the driver open to the
+                // next pair.
+                None => {
+                    if state.matched[key] {
+                        continue;
+                    }
+                    if emit_match_row(
+                        cfg,
+                        evals,
                         driver_record,
-                        Some(build_record),
-                    );
-                    match evaluator.eval_record::<NullStorage>(cfg.ctx, &resolver, None) {
-                        Ok(EvalResult::Emit {
-                            fields,
-                            record_vars,
-                            ..
-                        }) => {
-                            let mut rec = match cfg.output_schema {
-                                Some(s) => widen_record_to_schema(driver_record, s),
-                                None => driver_record.clone(),
-                            };
-                            for (n, v) in fields {
-                                rec.set(&n, v);
-                            }
-                            for (k, v) in *record_vars {
-                                let _ = rec.set_record_var(&k, v);
-                            }
-                            crate::executor::copy_build_ck_columns(
-                                &mut rec,
-                                build_record,
-                                cfg.propagate_ck,
-                            );
-                            sink.output_records.push((rec, driver_order));
-                            state.matched[key] = true;
-                            poll_output_buffer(cfg, sink)?;
-                        }
-                        Ok(EvalResult::Skip(_)) => {}
-                        Ok(EvalResult::EmitMany { .. }) => {
-                            return Err(PipelineError::Internal {
-                                op: "iejoin body",
-                                node: cfg.name.to_string(),
-                                detail: "emit_each fan-out is not supported in a combine body"
-                                    .into(),
-                            });
-                        }
-                        Err(e) => {
-                            if cfg.strategy == clinker_plan::config::ErrorStrategy::FailFast {
-                                return Err(PipelineError::from(e));
-                            }
-                            sink.output_eval_failures.push(CombineOutputEvalFailure {
-                                probe_record: driver_record.clone(),
-                                row: driver_order,
-                                matched_build: Some(build_record.clone()),
-                                error: e,
-                            });
-                            continue;
-                        }
+                        driver_order,
+                        build_record,
+                        0,
+                        sink,
+                    )? {
+                        state.matched[key] = true;
                     }
-                } else {
-                    // Body-less synthetic intermediate step from N-ary
-                    // decomposition: concatenate driver then build values onto
-                    // the step's encoded schema. Mirrors the HashBuildProbe
-                    // passthrough; the downstream chain step reads the encoded
-                    // columns at their declared positions.
-                    let target_schema =
-                        cfg.output_schema.ok_or_else(|| PipelineError::Internal {
-                            op: "combine",
-                            node: cfg.name.to_string(),
-                            detail: "synthetic combine step has no output schema; \
-                                     decomposition pass did not run"
-                                .to_string(),
-                        })?;
-                    let mut values: Vec<Value> = Vec::with_capacity(target_schema.column_count());
-                    values.extend(driver_record.values().iter().cloned());
-                    values.extend(build_record.values().iter().cloned());
-                    if values.len() != target_schema.column_count() {
-                        return Err(PipelineError::Internal {
-                            op: "combine",
-                            node: cfg.name.to_string(),
-                            detail: format!(
-                                "synthetic combine step produced {} concatenated \
-                                 values; encoded schema has {} columns",
-                                values.len(),
-                                target_schema.column_count()
-                            ),
-                        });
-                    }
-                    let rec = Record::new(Arc::clone(target_schema), values);
-                    sink.output_records.push((rec, driver_order));
+                }
+            },
+            MatchMode::All => {
+                if emit_match_row(
+                    cfg,
+                    evals,
+                    driver_record,
+                    driver_order,
+                    build_record,
+                    bidx.unwrap_or(0),
+                    sink,
+                )? {
                     state.matched[key] = true;
-                    poll_output_buffer(cfg, sink)?;
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Materialize and push one `(driver, build)` output row for `First` / `All`:
+/// the body eval (or, for a body-less synthetic decomposition step, the
+/// driver-then-build value concat), `$ck` propagation, and the every-10K poll.
+/// The row is tagged with `build_idx` for the block path's final deterministic
+/// sort (ignored on the equi+range path, whose sink records no tags). Returns
+/// `true` if a row was pushed, `false` if the body eval skipped it or a
+/// recoverable eval failure was deferred.
+fn emit_match_row(
+    cfg: &EmitConfig<'_>,
+    evals: &mut Evaluators,
+    driver_record: &Record,
+    driver_order: RecordOrder,
+    build_record: &Record,
+    build_idx: u64,
+    sink: &mut EmitSink<'_>,
+) -> Result<bool, PipelineError> {
+    if let Some(evaluator) = evals.body.as_mut() {
+        let resolver =
+            CombineResolver::new(cfg.resolver_mapping, driver_record, Some(build_record));
+        match evaluator.eval_record::<NullStorage>(cfg.ctx, &resolver, None) {
+            Ok(EvalResult::Emit {
+                fields,
+                record_vars,
+                ..
+            }) => {
+                let mut rec = match cfg.output_schema {
+                    Some(s) => widen_record_to_schema(driver_record, s),
+                    None => driver_record.clone(),
+                };
+                for (n, v) in fields {
+                    rec.set(&n, v);
+                }
+                for (k, v) in *record_vars {
+                    let _ = rec.set_record_var(&k, v);
+                }
+                crate::executor::copy_build_ck_columns(&mut rec, build_record, cfg.propagate_ck);
+                sink.push_row(rec, driver_order, build_idx);
+                poll_output_buffer(cfg, sink)?;
+                Ok(true)
+            }
+            Ok(EvalResult::Skip(_)) => Ok(false),
+            Ok(EvalResult::EmitMany { .. }) => Err(PipelineError::Internal {
+                op: "iejoin body",
+                node: cfg.name.to_string(),
+                detail: "emit_each fan-out is not supported in a combine body".into(),
+            }),
+            Err(e) => {
+                if cfg.strategy == clinker_plan::config::ErrorStrategy::FailFast {
+                    return Err(PipelineError::from(e));
+                }
+                sink.output_eval_failures.push(CombineOutputEvalFailure {
+                    probe_record: driver_record.clone(),
+                    row: driver_order,
+                    matched_build: Some(build_record.clone()),
+                    error: e,
+                });
+                Ok(false)
+            }
+        }
+    } else {
+        // Body-less synthetic intermediate step from N-ary decomposition:
+        // concatenate driver then build values onto the step's encoded schema.
+        // Mirrors the HashBuildProbe passthrough; the downstream chain step
+        // reads the encoded columns at their declared positions.
+        let target_schema = cfg.output_schema.ok_or_else(|| PipelineError::Internal {
+            op: "combine",
+            node: cfg.name.to_string(),
+            detail: "synthetic combine step has no output schema; \
+                     decomposition pass did not run"
+                .to_string(),
+        })?;
+        let mut values: Vec<Value> = Vec::with_capacity(target_schema.column_count());
+        values.extend(driver_record.values().iter().cloned());
+        values.extend(build_record.values().iter().cloned());
+        if values.len() != target_schema.column_count() {
+            return Err(PipelineError::Internal {
+                op: "combine",
+                node: cfg.name.to_string(),
+                detail: format!(
+                    "synthetic combine step produced {} concatenated \
+                     values; encoded schema has {} columns",
+                    values.len(),
+                    target_schema.column_count()
+                ),
+            });
+        }
+        let rec = Record::new(Arc::clone(target_schema), values);
+        sink.push_row(rec, driver_order, build_idx);
+        poll_output_buffer(cfg, sink)?;
+        Ok(true)
+    }
 }
 
 /// Poll the accumulated output buffer every [`MEMORY_CHECK_INTERVAL`] emitted
@@ -1317,9 +1495,8 @@ fn flush_collect_row(
     cfg: &EmitConfig<'_>,
     driver_record: &Record,
     driver_order: RecordOrder,
-    build_qualifier: &str,
     flush: CollectFlush,
-    output_records: &mut Vec<(Record, RecordOrder)>,
+    sink: &mut EmitSink<'_>,
 ) {
     let CollectFlush {
         arr,
@@ -1340,8 +1517,11 @@ fn flush_collect_row(
     if let Some(first_build) = first_build {
         crate::executor::copy_build_ck_columns(&mut rec, &first_build, cfg.propagate_ck);
     }
-    rec.set(build_qualifier, Value::Array(arr));
-    output_records.push((rec, driver_order));
+    rec.set(cfg.build_qualifier, Value::Array(arr));
+    // A collect row carries no single build index; tag it `MAX` so the block
+    // path's final sort places it after that driver's match rows (of which a
+    // collect driver has none) and orders collect rows by driver input order.
+    sink.push_row(rec, driver_order, u64::MAX);
 }
 
 /// Dispatch one zero-match driver through its `on_miss` policy: `Skip` drops
@@ -1385,7 +1565,9 @@ fn dispatch_on_miss(
                     for (k, v) in *record_vars {
                         let _ = rec.set_record_var(&k, v);
                     }
-                    sink.output_records.push((rec, driver_order));
+                    // An on_miss row has no matched build; tag it `MAX` so the
+                    // block path's final sort keeps it in driver input order.
+                    sink.push_row(rec, driver_order, u64::MAX);
                     poll_output_buffer(cfg, sink)
                 }
                 Ok(EvalResult::Skip(_)) => Ok(()),
