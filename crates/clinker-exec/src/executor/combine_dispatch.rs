@@ -1944,6 +1944,10 @@ fn drain_block_band_output(
 ) -> Result<BlockBandDrain, PipelineError> {
     use crate::pipeline::sort_buffer::SortedOutput;
     let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
+    // A window root, a cross-region tee, or a non-spillable slot needs the whole
+    // slice materialized; the traversal that decides this is walked once and
+    // reused by both the streaming guard and the spilled-buffer branch.
+    let needs_materialization = block_band_output_needs_materialization(current_dag, node_idx);
 
     // Streaming graft: drain the SAME payload-sorted handle through the
     // back-pressure sink instead of admitting a node-buffer. Take the sender
@@ -1951,7 +1955,7 @@ fn drain_block_band_output(
     // cross-region tee — those consume the whole slice) AND a sender is
     // present: taking it without draining would strand the writer thread on
     // records that never arrive.
-    if !block_band_output_needs_materialization(current_dag, node_idx)
+    if !needs_materialization
         && let Some(sender) = ctx.take_streaming_sender(node_idx)
     {
         let batch_size = ctx.batch_size;
@@ -2013,10 +2017,10 @@ fn drain_block_band_output(
                 files,
                 "iejoin block-band output merge",
             )?;
-            if spill_allowed && !block_band_output_needs_materialization(current_dag, node_idx) {
+            if spill_allowed && !needs_materialization {
                 // Bounded path: fold the sorted runs straight into a node-buffer
                 // spill chunk, one resident record per open run.
-                drain_merger_to_spilled_node_buffer(ctx, combine_name, node_idx, merger, puncts)?
+                drain_merger_to_spilled_node_buffer(ctx, node_idx, merger, puncts)?
             } else {
                 // A window root, a cross-region tee, or a non-spillable slot needs
                 // the whole slice; those surfaces are O(N) regardless, so
@@ -2141,7 +2145,6 @@ fn node_tees_to_deferred_region(current_dag: &ExecutionPlanDag, node_idx: NodeIn
 /// the slot's later drain unregisters through the same path.
 fn drain_merger_to_spilled_node_buffer(
     ctx: &mut ExecutorContext<'_>,
-    combine_name: &str,
     node_idx: NodeIndex,
     merger: crate::pipeline::spill_merge::SortedRunMerger<(RecordOrder, u64, u64)>,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
@@ -2178,16 +2181,13 @@ fn drain_merger_to_spilled_node_buffer(
         writer.write_pair(&record, &order)?;
         count += 1;
     }
-    let (file, written) = writer.finish_with_bytes()?;
-    // Record the committed spill bytes against the run's disk quota (E320).
-    if ctx.memory_budget.record_spill_bytes(combine_name, written) {
-        return Err(PipelineError::spill_cap_exceeded(
-            combine_name,
-            ctx.memory_budget.max_spill_bytes(),
-            written,
-            ctx.memory_budget.cumulative_spill_bytes(),
-        ));
-    }
+    let (file, _written) = writer.finish_with_bytes()?;
+    // The emit-phase output sort already charged this result against the disk
+    // quota when it spilled its runs. This drain only re-serializes that same,
+    // already-charged output into the node-buffer's single sorted chunk and then
+    // frees the source runs, so charging the rewrite again would double-count one
+    // logical result — making the disk-cap outcome depend on whether the
+    // downstream buffers or streams (the streaming drain charges it only once).
     // Register the slot's node-buffer consumer at zero resident bytes so its
     // later drain unregisters through the same path `admit_node_buffer` sets up.
     // A prior registration at this slot is replaced first.

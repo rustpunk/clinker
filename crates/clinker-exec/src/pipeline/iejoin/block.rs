@@ -693,11 +693,13 @@ pub(super) fn execute_block_band(
             // sized per mode, the `build_idx` and `build_slice` vecs), the
             // kernel's O(n) sort state (the two-conjunct IEJoin arrays or the
             // leaner PWMJ index vecs), and the First / collect candidates held
-            // so far in this driver block. The abort is a strictly LOCAL last
-            // resort: it compares that sum directly to the hard limit and never
-            // consults the arbitrator's global pressure, because this path
-            // answers pressure by spilling. Global pressure is the arbitrator's
-            // job, on the un-spillable output axis polled inside the emit loop.
+            // so far in this driver block. The output sort buffer is bounded
+            // independently by its own spill threshold, so it is deliberately not
+            // summed here — folding it in would abort a pair whose input and
+            // output both legitimately spill. The abort is a strictly LOCAL last
+            // resort: it compares the input working set directly to the hard limit
+            // and never consults the arbitrator's global pressure, because both
+            // the input and output axes answer memory pressure by spilling.
             let build_vecs_bytes = (build_block.len
                 * (range_key_width(op2)
                     + std::mem::size_of::<u64>()
