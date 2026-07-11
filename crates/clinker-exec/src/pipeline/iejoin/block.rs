@@ -56,16 +56,19 @@
 //! against the arbitrator's global process pressure. So a bounded-residency run
 //! stays host-independent and aborts only when one pair's own footprint cannot
 //! fit `hard`, not because the process floor sits above a tight budget. The
-//! OUTPUT axis is bounded too: emitted rows accumulate in a payload-ordered
+//! OUTPUT axis is spill-bounded on the same strictly-local terms: emitted rows
+//! accumulate in a payload-ordered
 //! [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer) keyed on
 //! `(driver order, driver_idx, build_idx)` that spills on its own byte threshold
 //! (disk-quota E320) instead of holding the O(N·M) result in RAM, and the
 //! dispatcher drains that sorted handle incrementally. The buffer's resident
-//! bytes are deliberately NOT mirrored into the consumer handle — it self-bounds
-//! on its threshold, and adding it to the handle (already near `hard` from a
-//! spilling drain plus the resident blocks) would abort a completing run. A
-//! coarse every-10K `should_abort_local` poll stays as a global-pressure
-//! backstop on that axis until a later task removes it.
+//! bytes ARE charged through the consumer handle — mirrored per row exactly as
+//! the input drains charge, so the arbitrator's pull-mode view reflects both
+//! axes — while spilling on the buffer's own threshold, not global pressure, is
+//! what bounds it. With both axes spill-bounded the operator keeps no
+//! global-pressure abort: the emit path polls no `should_abort`, so a handle
+//! transiently summing the input footprint plus the output sort's resident bytes
+//! is only ever an attribution reading, never an abort trigger.
 
 use std::io;
 use std::path::Path;
@@ -601,6 +604,7 @@ pub(super) fn execute_block_band(
             buf: &mut output_buf,
             budget,
             name,
+            consumer,
         },
         emitted_since_check: &mut emitted_since_check,
         output_eval_failures: &mut output_eval_failures,
@@ -666,7 +670,14 @@ pub(super) fn execute_block_band(
                 driver_keys: driver_loaded.iter().map(|(_, p)| p.0).collect(),
             },
         };
-        consumer.set_bytes(baseline_resident.saturating_add(driver_held));
+        // Each absolute set includes the output sort's current resident bytes,
+        // so the per-row `add_bytes` charge the emit path applies is not clobbered
+        // back to an input-only figure — the handle reflects BOTH axes throughout.
+        consumer.set_bytes(
+            baseline_resident
+                .saturating_add(driver_held)
+                .saturating_add(sink.output_buffer_bytes()),
+        );
 
         for build_block in &build_blocks {
             if !block_pair_possible(op1, op2, driver_block, build_block) {
@@ -720,7 +731,8 @@ pub(super) fn execute_block_band(
                 baseline_resident
                     .saturating_add(driver_held)
                     .saturating_add(build_held)
-                    .saturating_add(state.held_bytes()),
+                    .saturating_add(state.held_bytes())
+                    .saturating_add(sink.output_buffer_bytes()),
             );
 
             // Build the build-side key column at the width the chosen kernel
@@ -760,7 +772,8 @@ pub(super) fn execute_block_band(
                     .saturating_add(driver_held)
                     .saturating_add(build_held)
                     .saturating_add(state.held_bytes())
-                    .saturating_add(pairs_bytes),
+                    .saturating_add(pairs_bytes)
+                    .saturating_add(sink.output_buffer_bytes()),
             );
 
             let build_slice: Vec<&Record> = build_loaded.iter().map(|(r, _)| r).collect();
@@ -774,11 +787,13 @@ pub(super) fn execute_block_band(
 
             // The build scratch and key/pair arrays for this pair are dropped;
             // fall back to the driver block's held state plus the First / collect
-            // candidates accumulated so far.
+            // candidates accumulated so far, still carrying the output sort's
+            // resident bytes so the emit-side charge persists.
             consumer.set_bytes(
                 baseline_resident
                     .saturating_add(driver_held)
-                    .saturating_add(state.held_bytes()),
+                    .saturating_add(state.held_bytes())
+                    .saturating_add(sink.output_buffer_bytes()),
             );
         }
 
@@ -796,8 +811,9 @@ pub(super) fn execute_block_band(
         )?;
 
         // The driver block's scratch, key array, and now-drained held state are
-        // released; leave only the resident baseline charged.
-        consumer.set_bytes(baseline_resident);
+        // released; leave the resident baseline plus the output sort's resident
+        // bytes charged.
+        consumer.set_bytes(baseline_resident.saturating_add(sink.output_buffer_bytes()));
     }
 
     // Scan-phase unmatched drivers (NULL / non-orderable range key) never
@@ -866,13 +882,14 @@ pub(super) fn execute_block_band(
     failures.sort_by_key(|(_, key)| *key);
     let output_eval_failures = failures.into_iter().map(|(f, _)| f).collect();
 
-    // The resident blocks are freed as this function returns; discharge the
-    // consumer now so the node-buffer admission that follows never sums a stale
-    // baseline that no longer holds any RAM. The output buffer's resident bytes
-    // were never mirrored into this handle — the buffer self-bounds on its own
-    // byte threshold, and charging it would push the handle past the hard limit
-    // (a spilling drain plus the resident blocks already sum near it) and abort a
-    // completing run.
+    // The resident blocks are freed as this function returns and the finished
+    // output sort is handed to the dispatcher, so discharge the whole handle now
+    // — releasing the output sort's mirrored bytes along with the input baseline
+    // — and the node-buffer admission that follows never sums a stale footprint.
+    // Charging the output sort through this handle during emit never aborted a
+    // completing run: the buffer self-bounds by spilling on its own threshold and
+    // the emit path polls no global-pressure gate, so a handle transiently above
+    // the hard limit is only ever an attribution reading, never an abort trigger.
     consumer.set_bytes(0);
 
     Ok(BlockBandOutput {

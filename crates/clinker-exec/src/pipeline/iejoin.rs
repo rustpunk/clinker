@@ -50,11 +50,15 @@
 //!   arrays are built, on hosts where `rss_bytes()` is unavailable.
 //!
 //! Both shapes mirror their live footprint into a registered
-//! [`ConsumerHandle`] so the arbitrator's pull-mode `current_usage` sees it,
-//! and both poll the accumulated OUTPUT buffer every 10K emitted matched pairs
-//! through the arbitrator's global-aware `should_abort_local` — the output
-//! axis (`output_records`, O(N·M) worst case) is un-spillable until a later
-//! phase streams it, so reacting to global pressure there is correct. The
+//! [`ConsumerHandle`] so the arbitrator's pull-mode `current_usage` sees it —
+//! the block-band path mirrors its input drain buffers, resident blocks, AND its
+//! output sort buffer, so both of its axes are visible. The two paths bound the
+//! OUTPUT axis differently: the equi+range in-RAM output vec has no spill path
+//! (O(N·M) worst case), so it polls every 10K emitted matched pairs through the
+//! arbitrator's global-aware `should_abort_local` — reacting to global pressure
+//! is its only ceiling. The block-band output sort instead spills on its own
+//! byte threshold and charges the resident bytes through the handle, so it is
+//! spill-bounded and strictly-local, with no global-pressure abort. The
 //! pre-output abort returns a typed `PipelineError::MemoryBudgetExceeded`
 //! carrying the combine node's name and `BudgetCategory::Arena`. On the
 //! equi+range path it fires when the resident partition and per-group sort
@@ -503,13 +507,17 @@ pub(crate) struct IEJoinExec<'a> {
     pub budget: &'a MemoryArbitrator,
     /// Shared handle for the IEJoin's registered `MemoryConsumer` wrapper.
     /// Both dispatch shapes mirror their live working-set bytes into this
-    /// handle (the block-band path its drain buffers and resident blocks; the
-    /// equi+range path its partition state and per-group sort arrays), so the
-    /// arbitrator's pull-mode `current_usage` reads the footprint while the
-    /// join runs. Neither shape reads the handle's spill / pause flags — the
-    /// block-band path spills on its own byte threshold and the equi+range
-    /// path holds its inputs resident — so the handle carries the byte
-    /// estimate for attribution and the `should_abort_local` gate only.
+    /// handle (the block-band path its drain buffers, resident blocks, and
+    /// output sort buffer — so both its axes are visible; the equi+range path
+    /// its partition state and per-group sort arrays), so the arbitrator's
+    /// pull-mode `current_usage` reads the footprint while the join runs.
+    /// Neither shape reads the handle's spill / pause flags — the block-band
+    /// path spills both its input drains and its output sort on their own byte
+    /// thresholds, and the equi+range path holds its inputs resident. So the
+    /// handle carries the byte estimate for attribution; only the equi+range
+    /// path reads process pressure back (its unspillable output vec's every-10K
+    /// `should_abort_local` poll), while the block-band path answers pressure by
+    /// spilling on every axis, never by a global-pressure abort.
     pub consumer: &'a Arc<ConsumerHandle>,
     /// Pipeline-scoped spill directory borrowed from
     /// `ExecutorContext::spill_root_path`. The pure-range (`partition_bits:
@@ -1377,11 +1385,16 @@ enum RowSink<'a> {
     /// Equi+range: append preserving visitation order.
     Unsorted(&'a mut Vec<(Record, RecordOrder)>),
     /// Block-band: fold each row into the payload-ordered output sort buffer.
-    /// `budget` / `name` charge each spilled run against the disk quota (E320).
+    /// `budget` / `name` charge each spilled run against the disk quota (E320);
+    /// `consumer` mirrors the buffer's resident bytes into the IEJoin handle, so
+    /// the output sort self-bounds by spilling on its own threshold while its
+    /// live footprint stays visible to the arbitrator — the same charge+spill
+    /// contract the input-side drain honors.
     Sorted {
         buf: &'a mut SortBuffer<(RecordOrder, u64, u64)>,
         budget: &'a MemoryArbitrator,
         name: &'a str,
+        consumer: &'a Arc<ConsumerHandle>,
     },
 }
 
@@ -1417,14 +1430,29 @@ impl EmitSink<'_> {
                 records.push((record, order));
                 Ok(())
             }
-            RowSink::Sorted { buf, budget, name } => {
+            RowSink::Sorted {
+                buf,
+                budget,
+                name,
+                consumer,
+            } => {
+                // Mirror the byte delta into the consumer handle the moment the
+                // row lands — the same charge the input-side drain applies — so
+                // the arbitrator's pull-mode view reflects the output sort's live
+                // footprint. Spilling on the buffer's own threshold, not global
+                // pressure, is what bounds this axis; the charge releases the
+                // bytes it moves to disk.
+                let pre = buf.bytes_used();
                 buf.push(record, (order, driver_idx, build_idx));
+                consumer.add_bytes(buf.bytes_used().saturating_sub(pre) as u64);
                 if buf.should_spill() {
+                    let pre_spill = buf.bytes_used() as u64;
                     let written = buf.sort_and_spill().map_err(|e| {
                         PipelineError::Io(std::io::Error::other(format!(
                             "iejoin block-band output spill failed: {e}"
                         )))
                     })?;
+                    consumer.sub_bytes(pre_spill);
                     if written > 0 && budget.record_spill_bytes(name, written) {
                         return Err(PipelineError::spill_cap_exceeded(
                             *name,
@@ -1491,8 +1519,10 @@ struct CollectFlush {
 /// block path's final deterministic sort. Both make block output a pure
 /// function of the data rather than of the memory-derived block layout.
 ///
-/// Streaming into `sink.output_records`; the output axis is bounded only by the
-/// every-10K poll (see [`poll_output_buffer`]).
+/// Streaming into the sink's output target. The equi+range path's in-RAM vec is
+/// bounded by the every-10K poll (see [`poll_output_buffer`]); the block-band
+/// path's output sort spills on its own byte threshold and charges through the
+/// consumer handle, so it is spill-bounded and strictly-local.
 fn emit_pairs(
     cfg: &EmitConfig<'_>,
     evals: &mut Evaluators,
@@ -1687,11 +1717,17 @@ fn emit_match_row(
 }
 
 /// Poll the accumulated output buffer every [`MEMORY_CHECK_INTERVAL`] emitted
-/// rows and abort if it has grown past the hard limit. The output axis is
-/// unbounded (O(N·M) worst case) until a later phase streams it, so this
-/// cadence is the backstop that keeps a high-fan-out band join from blowing
-/// the ceiling between charges.
+/// rows and abort if it has grown past the hard limit. This backstop guards
+/// only the equi+range ([`RowSink::Unsorted`]) path, whose in-RAM output vec has
+/// no spill path (O(N·M) worst case), so global pressure is the sole ceiling on
+/// its growth. The block-band ([`RowSink::Sorted`]) path spills its output sort
+/// on the buffer's own byte threshold and charges the resident bytes through the
+/// consumer handle, so it is spill-bounded and strictly-local — it never
+/// consults global process pressure and is skipped here.
 fn poll_output_buffer(cfg: &EmitConfig<'_>, sink: &mut EmitSink<'_>) -> Result<(), PipelineError> {
+    if !matches!(sink.rows, RowSink::Unsorted(_)) {
+        return Ok(());
+    }
     *sink.emitted_since_check += 1;
     if *sink.emitted_since_check >= MEMORY_CHECK_INTERVAL {
         let used = sink.output_buffer_bytes();
