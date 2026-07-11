@@ -1226,9 +1226,9 @@ pub(super) fn arbitration_class(node: &PlanNode) -> ArbitrationClass {
 /// - inline hash Combine (`HashBuildProbe`) builds its hash table in RAM;
 ///   its consumer's `try_spill` requests a rebuild, it does not write a
 ///   spill file.
-/// - `IEJoin` / `HashPartitionIEJoin` register under the sort-buffer
-///   consumer for arbitration accounting but their range-join kernel
-///   partitions and walks in memory — no spill writer is wired.
+/// - `HashPartitionIEJoin` (equi+range) registers under the sort-buffer
+///   consumer for arbitration accounting but holds its hash partitions and
+///   walks them in memory — no spill writer is wired.
 ///
 /// The operators that DO write spill files (`SpillWriter` /
 /// `AggSpillWriter` / `GraceSpillWriter`):
@@ -1237,6 +1237,8 @@ pub(super) fn arbitration_class(node: &PlanNode) -> ArbitrationClass {
 /// - hash Aggregate (`PlanNode::Aggregation` with the hash strategy;
 ///   streaming aggregate holds one group and never spills),
 /// - grace-hash and sort-merge Combine,
+/// - pure-range `IEJoin`, whose block-band path external-sorts each side and
+///   re-slices the merged stream into per-block spill files,
 /// - Reshape (`PlanNode::Reshape`), which spills its raw per-group input
 ///   records and re-runs synthesis on reload.
 ///
@@ -1257,9 +1259,17 @@ pub(super) fn writes_spill_files(node: &PlanNode) -> bool {
             strategy: AggregateStrategy::Streaming,
             ..
         } => false,
+        // Pure-range IEJoin (`CombineStrategy::IEJoin`) runs the bounded
+        // block-band path: it external-sorts each side into runs and re-slices
+        // the merged stream into per-block spill files, so it writes real spill
+        // files and must appear in the disk-spill projection surfaces. The
+        // equi+range `HashPartitionIEJoin` still holds its partitions resident
+        // (no spill writer), so it stays excluded.
         PlanNode::Combine { strategy, .. } => matches!(
             strategy,
-            CombineStrategy::GraceHash { .. } | CombineStrategy::SortMerge
+            CombineStrategy::GraceHash { .. }
+                | CombineStrategy::SortMerge
+                | CombineStrategy::IEJoin
         ),
         // Reshape spills its raw input records per group when the buffer trips
         // the budget and re-runs synthesis on reload, so it writes real spill
@@ -1279,6 +1289,24 @@ pub(super) fn writes_spill_files(node: &PlanNode) -> bool {
         | PlanNode::Output { .. }
         | PlanNode::Composition { .. }
         | PlanNode::CorrelationCommit { .. } => false,
+    }
+}
+
+/// How many times a spill-writing operator rewrites its input to disk, so the
+/// spill-volume estimate reflects the bytes that actually land there.
+///
+/// Most spilling operators write their accumulated input once. The pure-range
+/// `IEJoin` block-band path writes it about twice: it external-sorts each side
+/// into runs (pass one), then re-slices the merged stream into per-block spill
+/// files (pass two). Returns `1` for a node that does not write spill files.
+pub(super) fn spill_volume_multiplier(node: &PlanNode) -> u64 {
+    use crate::plan::combine::CombineStrategy;
+    match node {
+        PlanNode::Combine {
+            strategy: CombineStrategy::IEJoin,
+            ..
+        } => 2,
+        _ => 1,
     }
 }
 

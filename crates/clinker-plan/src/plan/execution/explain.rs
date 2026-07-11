@@ -2270,11 +2270,11 @@ mod spill_projection_tests {
     }
 
     /// The `--explain` spill-compression projection lists only operators
-    /// backed by a real spill writer. In-memory join strategies
-    /// (`HashBuildProbe`, `IEJoin`, `HashPartitionIEJoin`) carry a
-    /// `spill_priority` for memory arbitration but never open a spill file,
-    /// so they must not appear; the genuinely-spilling external sort and
-    /// grace-hash / sort-merge Combine must.
+    /// backed by a real spill writer. The in-memory join strategies
+    /// (`HashBuildProbe`, `HashPartitionIEJoin`) carry a `spill_priority` for
+    /// memory arbitration but never open a spill file, so they must not appear;
+    /// the genuinely-spilling external sort, grace-hash / sort-merge Combine,
+    /// and pure-range block-band `IEJoin` must.
     #[test]
     fn spill_compression_lists_only_real_spill_writers() {
         let mut dag = empty_dag();
@@ -2321,15 +2321,16 @@ mod spill_projection_tests {
             "HashBuildProbe must not appear in the spill-compression projection:\n{out}"
         );
         assert!(
-            !out.contains("range_join"),
-            "IEJoin must not appear in the spill-compression projection:\n{out}"
-        );
-        assert!(
             !out.contains("hashpart_join"),
             "HashPartitionIEJoin must not appear in the spill-compression projection:\n{out}"
         );
 
-        // Genuine spill writers are included.
+        // Genuine spill writers are included, including the pure-range
+        // block-band IEJoin.
+        assert!(
+            out.contains("range_join"),
+            "block-band IEJoin must appear in the spill-compression projection:\n{out}"
+        );
         assert!(
             out.contains("grace_join"),
             "grace-hash Combine must appear in the spill-compression projection:\n{out}"
@@ -2342,6 +2343,41 @@ mod spill_projection_tests {
             out.contains("external_sort"),
             "external sort must appear in the spill-compression projection:\n{out}"
         );
+    }
+
+    /// The pure-range block-band `IEJoin` writes each side to disk about twice
+    /// (sort runs, then per-block files), so its spill-volume estimate is 2×
+    /// its `predicted_peak_bytes`, while `HashPartitionIEJoin` — which holds its
+    /// partitions resident — contributes nothing.
+    #[test]
+    fn block_band_iejoin_spill_estimate_doubles_and_hash_partition_excluded() {
+        let mut dag = empty_dag();
+        add_node(
+            &mut dag,
+            combine_node("range_join", 0, CombineStrategy::IEJoin),
+            3_000,
+        );
+        add_node(
+            &mut dag,
+            combine_node(
+                "hashpart_join",
+                1,
+                CombineStrategy::HashPartitionIEJoin { partition_bits: 4 },
+            ),
+            9_000,
+        );
+
+        let estimates = dag.per_stage_spill_estimates();
+        let entries: Vec<(&str, u64)> = estimates
+            .iter()
+            .map(|e| (e.node_name.as_str(), e.estimate_bytes))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![("range_join", 6_000)],
+            "only the block-band IEJoin spills, at 2x its peak; HashPartitionIEJoin is excluded"
+        );
+        assert_eq!(dag.estimated_spill_bytes(), 6_000);
     }
 
     /// The per-stage estimated-spill-volume projection applies the same
