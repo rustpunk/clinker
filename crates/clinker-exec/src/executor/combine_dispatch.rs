@@ -2144,14 +2144,11 @@ fn node_tees_to_deferred_region(current_dag: &ExecutionPlanDag, node_idx: NodeIn
 /// lazily when the slot drains — one resident record per open run, never the
 /// whole result — so a blocking downstream stays bounded.
 ///
-/// This performs NO disk write. The emit-phase output sort already serialized
+/// This performs NO disk write: the emit-phase output sort already serialized
 /// these runs and charged their bytes against the disk quota (E320) when it
-/// spilled them. The prior implementation re-serialized the merged stream into
-/// one fresh chunk — a second physical write of the same logical result, and one
-/// that made the disk-cap outcome depend on whether the downstream buffers or
-/// streams. Adopting the runs whole eliminates that write and charges nothing
-/// further, so both drain shapes charge the result exactly once. Registers a
-/// node-buffer consumer at zero resident bytes — the records live on disk —
+/// spilled them, so adopting them whole charges nothing further and both the
+/// buffered and streaming drain shapes charge the result exactly once. Registers
+/// a node-buffer consumer at zero resident bytes — the records live on disk —
 /// mirroring `admit_node_buffer`'s spilled tail so the slot's later drain
 /// unregisters through the same path.
 fn adopt_spilled_runs_into_node_buffer(
