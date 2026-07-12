@@ -1278,7 +1278,7 @@ mod tests {
     /// each payload back to the `(record, order)` shape the slot yields — with NO
     /// second disk write. The arbitrator here exists only so the test can read
     /// `cumulative_spill_bytes` on either side of the drain; the drain takes no
-    /// arbitrator, so it structurally cannot charge. Pins: (a) the LOCKED
+    /// arbitrator, so it structurally cannot charge. Pins: (a) the
     /// no-double-charge invariant, (b) the exact emitted count, (c) the
     /// deterministic `(order, driver_idx, build_idx)` order against a std-sort
     /// oracle and the payload→order projection, (d) the trailing punctuation.
@@ -1337,7 +1337,7 @@ mod tests {
         };
         assert!(files.len() >= 2, "forced spill must produce multiple runs");
 
-        // (a) LOCKED no-double-charge: adopting + draining the runs adds not a
+        // (a) no-double-charge: adopting + draining the runs adds not a
         // single byte to the cumulative spill total.
         let before = arb.cumulative_spill_bytes();
         let nb =
