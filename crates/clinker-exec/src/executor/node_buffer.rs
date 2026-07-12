@@ -25,6 +25,7 @@ use clinker_record::{Record, Value};
 
 use crate::executor::stream_event::{Punctuation, StreamEvent};
 use crate::pipeline::spill::{SpillFile, SpillReader};
+use crate::pipeline::spill_merge::SortedRunMerger;
 use clinker_plan::error::PipelineError;
 
 /// Body records paired with the punctuations preserved from a buffer
@@ -87,6 +88,17 @@ pub(crate) enum NodeBuffer {
         spills: Vec<(SpillFile<u64>, u64)>,
         pending_puncts: Vec<Punctuation>,
     },
+    /// Emit-phase payload-ordered output-sort runs adopted whole — never
+    /// re-serialized. Drains by lazily k-way-merging the runs on
+    /// `(order, driver_idx, build_idx)` and projecting each row to
+    /// `(record, order)`. `row_count` is the exact emitted count (O(1)
+    /// `len_hint`); `pending_puncts` drain after the merged records. The block-
+    /// band IEJoin buffered-spilled path is the sole producer.
+    MergeSpilled {
+        runs: Vec<SpillFile<(u64, u64, u64)>>,
+        row_count: u64,
+        pending_puncts: Vec<Punctuation>,
+    },
 }
 
 impl NodeBuffer {
@@ -101,6 +113,27 @@ impl NodeBuffer {
                 .map(|(r, rn)| StreamEvent::record(r, rn))
                 .collect(),
         )
+    }
+
+    /// Adopt the block-band output sort's already-spilled payload-ordered runs
+    /// whole into a slot that k-way-merges them lazily at drain — never
+    /// re-serializing them to a fresh chunk. `row_count` is the exact emitted
+    /// count (the drain's O(1) `len_hint`); `pending_puncts` drain after the
+    /// merged records. An empty run set or a zero count carries only the
+    /// punctuations, so the drain never opens a merge over nothing.
+    pub(crate) fn merge_spilled(
+        runs: Vec<SpillFile<(u64, u64, u64)>>,
+        row_count: u64,
+        pending_puncts: Vec<Punctuation>,
+    ) -> Self {
+        if runs.is_empty() || row_count == 0 {
+            return Self::memory_from_records_and_puncts(Vec::new(), pending_puncts);
+        }
+        Self::MergeSpilled {
+            runs,
+            row_count,
+            pending_puncts,
+        }
     }
 
     /// Total record count across memory and recorded spill chunks.
@@ -119,6 +152,7 @@ impl NodeBuffer {
                 mem.iter().filter(|e| e.is_record()).count()
                     + spills.iter().map(|(_, c)| *c as usize).sum::<usize>()
             }
+            Self::MergeSpilled { row_count, .. } => *row_count as usize,
         }
     }
 
@@ -158,6 +192,11 @@ impl NodeBuffer {
                     pending_puncts: puncts,
                 };
             }
+            Self::MergeSpilled { .. } => panic!(
+                "push_event on a MergeSpilled node buffer: block-band output slots \
+                 are never push_event-ed, and the (u64, u64, u64) runs are format-\
+                 incompatible with Mixed's SpillFile<u64>, so promotion is impossible"
+            ),
         }
     }
 
@@ -175,7 +214,7 @@ impl NodeBuffer {
         let mem_slice = match self {
             Self::Memory(v) => v.as_slice(),
             Self::Mixed { mem, .. } => mem.as_slice(),
-            Self::Spilled { .. } => &[],
+            Self::Spilled { .. } | Self::MergeSpilled { .. } => &[],
         };
         mem_slice
             .iter()
@@ -203,7 +242,7 @@ impl NodeBuffer {
     pub(crate) fn clone_memory_only(&self) -> Vec<StreamEvent> {
         match self {
             Self::Memory(v) => v.clone(),
-            Self::Spilled { .. } | Self::Mixed { .. } => {
+            Self::Spilled { .. } | Self::Mixed { .. } | Self::MergeSpilled { .. } => {
                 panic!(
                     "NodeBuffer::clone_memory_only called on a spill-backed \
                      variant; spilled rows cannot be cloned for multi-consumer \
@@ -223,6 +262,11 @@ impl NodeBuffer {
             Self::Memory(v) => v.as_slice(),
             Self::Mixed { mem, .. } => mem.as_slice(),
             Self::Spilled { .. } => &[],
+            // Records live on disk; read the width off the adopted run's schema
+            // without opening it.
+            Self::MergeSpilled { runs, .. } => {
+                return runs.first().map(|f| f.schema().column_count()).unwrap_or(0);
+            }
         };
         mem_slice
             .iter()
@@ -473,8 +517,24 @@ impl NodeBuffer {
                 spills,
                 pending_puncts,
             } => (mem, spills, pending_puncts),
+            // Adopted runs open their k-way merge lazily on the first record
+            // poll (deferring the fallible open into `next`, so `drain` stays
+            // infallible), then project each `(order, driver_idx, build_idx)`
+            // payload back to the `(record, order)` shape the slot yields.
+            Self::MergeSpilled {
+                runs,
+                row_count: _,
+                pending_puncts,
+            } => {
+                return NodeBufferDrain::Merged {
+                    runs: Some(runs),
+                    merger: None,
+                    pending_puncts: pending_puncts.into_iter(),
+                    done: false,
+                };
+            }
         };
-        NodeBufferDrain {
+        NodeBufferDrain::Chunked {
             mem: mem.into_iter(),
             remaining_spills: spills.into_iter(),
             current: None,
@@ -483,20 +543,45 @@ impl NodeBuffer {
     }
 }
 
-/// Iterator returned by [`NodeBuffer::drain`].
+/// Iterator returned by [`NodeBuffer::drain`]. One variant per drainable buffer
+/// family; both dispatch statically and are infallible to construct.
 ///
-/// Owns the spill chunks so each chunk's `TempPath` stays alive until
-/// the iterator advances past it, even if the producer dropped its
-/// handle. Fields drop in declaration order: the active reader closes
-/// its file handle before the chunk it was opened from is unlinked.
-pub(crate) struct NodeBufferDrain {
-    mem: VecIntoIter<StreamEvent>,
-    remaining_spills: VecIntoIter<(SpillFile<u64>, u64)>,
-    current: Option<ActiveSpill>,
-    pending_puncts: VecIntoIter<Punctuation>,
+/// - `Chunked` streams a `Memory` / `Spilled` / `Mixed` slot: its in-memory
+///   events first, then each spill chunk's records via `SpillReader<u64>`,
+///   finally the trailing punctuations. It owns the spill chunks so each
+///   chunk's `TempPath` stays alive until the iterator advances past it, even
+///   if the producer dropped its handle. Fields drop in declaration order: the
+///   active reader closes its file handle before the chunk it was opened from
+///   is unlinked.
+/// - `Merged` streams a `MergeSpilled` slot by lazily k-way-merging the adopted
+///   `(u64, u64, u64)` runs and projecting each row to `(record, order)`, then
+///   the trailing punctuations. The merge opens on the first record poll, so a
+///   run-open failure surfaces as an `Err` item rather than at construction —
+///   mirroring the chunked arm's lazy `file.reader()` open.
+pub(crate) enum NodeBufferDrain {
+    Chunked {
+        mem: VecIntoIter<StreamEvent>,
+        remaining_spills: VecIntoIter<(SpillFile<u64>, u64)>,
+        // Boxed so the `Chunked` variant's size does not dwarf `Merged`'s: the
+        // active `SpillReader` is bulky and only one is live at a time, and the
+        // chunked path already does per-chunk file I/O, so the heap indirection
+        // is free here.
+        current: Option<Box<ActiveSpill>>,
+        pending_puncts: VecIntoIter<Punctuation>,
+    },
+    Merged {
+        /// Taken on the first record poll to open the merge; `None` afterward.
+        runs: Option<Vec<SpillFile<(u64, u64, u64)>>>,
+        merger: Option<SortedRunMerger<(u64, u64, u64)>>,
+        pending_puncts: VecIntoIter<Punctuation>,
+        /// Latches once a run-open or decode error has surfaced, so the drain
+        /// stops rather than falling through to the trailing punctuations over a
+        /// broken merge.
+        done: bool,
+    },
 }
 
-struct ActiveSpill {
+pub(crate) struct ActiveSpill {
     reader: SpillReader<u64>,
     // Holds the file alive while `reader` streams it.
     _file: SpillFile<u64>,
@@ -506,33 +591,84 @@ impl Iterator for NodeBufferDrain {
     type Item = Result<StreamEvent, PipelineError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(event) = self.mem.next() {
-            return Some(Ok(event));
-        }
-        loop {
-            if let Some(curr) = self.current.as_mut() {
-                match curr.reader.next() {
-                    Some(Ok((rec, rn))) => return Some(Ok(StreamEvent::record(rec, rn))),
-                    Some(Err(e)) => return Some(Err(PipelineError::from(e))),
-                    None => self.current = None,
+        match self {
+            Self::Chunked {
+                mem,
+                remaining_spills,
+                current,
+                pending_puncts,
+            } => {
+                if let Some(event) = mem.next() {
+                    return Some(Ok(event));
+                }
+                loop {
+                    if let Some(curr) = current.as_mut() {
+                        match curr.reader.next() {
+                            Some(Ok((rec, rn))) => return Some(Ok(StreamEvent::record(rec, rn))),
+                            Some(Err(e)) => return Some(Err(PipelineError::from(e))),
+                            None => *current = None,
+                        }
+                    }
+                    if let Some((file, _count)) = remaining_spills.next() {
+                        let reader = match file.reader() {
+                            Ok(r) => r,
+                            Err(e) => return Some(Err(PipelineError::from(e))),
+                        };
+                        *current = Some(Box::new(ActiveSpill {
+                            reader,
+                            _file: file,
+                        }));
+                        continue;
+                    }
+                    // Spill chunks exhausted — emit any trailing puncts.
+                    return pending_puncts
+                        .next()
+                        .map(|p| Ok(StreamEvent::punctuation(p)));
                 }
             }
-            if let Some((file, _count)) = self.remaining_spills.next() {
-                let reader = match file.reader() {
-                    Ok(r) => r,
-                    Err(e) => return Some(Err(PipelineError::from(e))),
-                };
-                self.current = Some(ActiveSpill {
-                    reader,
-                    _file: file,
-                });
-                continue;
+            Self::Merged {
+                runs,
+                merger,
+                pending_puncts,
+                done,
+            } => {
+                if *done {
+                    return None;
+                }
+                // Open the k-way merge on the first record poll; a failed open
+                // is deferred here (keeping `drain` infallible) and latches
+                // `done` so the trailing puncts never drain over a broken merge.
+                if merger.is_none()
+                    && let Some(files) = runs.take()
+                {
+                    match SortedRunMerger::new_payload_ordered(
+                        files,
+                        "iejoin block-band output merge",
+                    ) {
+                        Ok(m) => *merger = Some(m),
+                        Err(e) => {
+                            *done = true;
+                            return Some(Err(e));
+                        }
+                    }
+                }
+                if let Some(m) = merger.as_mut() {
+                    match m.next() {
+                        Some(Ok((record, (order, _, _)))) => {
+                            return Some(Ok(StreamEvent::record(record, order)));
+                        }
+                        Some(Err(e)) => {
+                            *done = true;
+                            return Some(Err(e));
+                        }
+                        // Runs exhausted — fall through to the trailing puncts.
+                        None => {}
+                    }
+                }
+                pending_puncts
+                    .next()
+                    .map(|p| Ok(StreamEvent::punctuation(p)))
             }
-            // Spill chunks exhausted — emit any trailing puncts.
-            return self
-                .pending_puncts
-                .next()
-                .map(|p| Ok(StreamEvent::punctuation(p)));
         }
     }
 }
@@ -1134,5 +1270,116 @@ mod tests {
         // Above-target: 4096 ≥ 1024 → Ok.
         handle.set_bytes(8192);
         assert_eq!(consumer.try_spill(4096).unwrap(), 8192);
+    }
+
+    /// The block-band buffered-spilled drain adopts the emit-phase sorted runs
+    /// whole: [`NodeBuffer::merge_spilled`] holds the `(order, driver_idx,
+    /// build_idx)` runs on disk and k-way-merges them lazily at drain, projecting
+    /// each payload back to the `(record, order)` shape the slot yields — with NO
+    /// second disk write. The arbitrator here exists only so the test can read
+    /// `cumulative_spill_bytes` on either side of the drain; the drain takes no
+    /// arbitrator, so it structurally cannot charge. Pins: (a) the LOCKED
+    /// no-double-charge invariant, (b) the exact emitted count, (c) the
+    /// deterministic `(order, driver_idx, build_idx)` order against a std-sort
+    /// oracle and the payload→order projection, (d) the trailing punctuation.
+    #[test]
+    fn merge_spilled_adopts_runs_without_recharging_disk() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
+
+        let s = schema();
+        let ctx = synthetic_document_context();
+        let arb =
+            MemoryArbitrator::with_policy(1024 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
+
+        // (order, driver_idx, build_idx) payloads. `order` repeats (5 and 2
+        // thrice) so ties exist; `driver_idx` is unique across every row, so the
+        // (order, driver_idx, build_idx) key is a total order with an unambiguous
+        // oracle. The record's `id` column mirrors `driver_idx`, making the
+        // drained sequence observable.
+        let payloads: Vec<(u64, u64, u64)> = vec![
+            (5, 0, 0),
+            (2, 1, 0),
+            (5, 2, 0),
+            (2, 3, 0),
+            (9, 4, 0),
+            (0, 5, 0),
+            (2, 6, 0),
+            (5, 7, 0),
+        ];
+        let row_count = payloads.len() as u64;
+
+        // budget=1 is the spill-everything threshold; explicit flushes between
+        // chunks force several individually-sorted runs. Each returned byte count
+        // is charged exactly once, as the emit phase charges its runs.
+        let mut buf: SortBuffer<(u64, u64, u64)> =
+            SortBuffer::new_payload_ordered(1, None, true, s.clone());
+        let push_chunk = |buf: &mut SortBuffer<(u64, u64, u64)>, chunk: &[(u64, u64, u64)]| {
+            for &(order, driver_idx, build_idx) in chunk {
+                buf.push(
+                    rec(&s, driver_idx as i64, "x"),
+                    (order, driver_idx, build_idx),
+                );
+            }
+        };
+        push_chunk(&mut buf, &payloads[0..3]);
+        let written = buf.sort_and_spill().unwrap();
+        arb.record_spill_bytes("banded", written);
+        push_chunk(&mut buf, &payloads[3..6]);
+        let written = buf.sort_and_spill().unwrap();
+        arb.record_spill_bytes("banded", written);
+        // The remaining pair stays resident for finish() to flush as the residue.
+        push_chunk(&mut buf, &payloads[6..]);
+        let (out, residue) = buf.finish().unwrap();
+        arb.record_spill_bytes("banded", residue);
+        let SortedOutput::Spilled(files) = out else {
+            panic!("expected Spilled after explicit flushes");
+        };
+        assert!(files.len() >= 2, "forced spill must produce multiple runs");
+
+        // (a) LOCKED no-double-charge: adopting + draining the runs adds not a
+        // single byte to the cumulative spill total.
+        let before = arb.cumulative_spill_bytes();
+        let nb =
+            NodeBuffer::merge_spilled(files, row_count, vec![Punctuation::document_close(ctx)]);
+        let (drained, puncts) = nb.drain_split().unwrap();
+        assert_eq!(
+            arb.cumulative_spill_bytes(),
+            before,
+            "the merge-on-drain adopt path re-serializes nothing, so it charges no disk"
+        );
+
+        // (b) Every emitted row survives exactly once.
+        assert_eq!(drained.len() as u64, row_count);
+
+        // (c) Deterministic order: a std sort of the payloads is the oracle. The
+        // drained `id` column == driver_idx and the projected order ==
+        // payload.order.
+        let mut oracle = payloads.clone();
+        oracle.sort();
+        let expected_ids: Vec<i64> = oracle
+            .iter()
+            .map(|(_, driver_idx, _)| *driver_idx as i64)
+            .collect();
+        let expected_orders: Vec<u64> = oracle.iter().map(|(order, _, _)| *order).collect();
+        let drained_ids: Vec<i64> = drained
+            .iter()
+            .map(|(r, _)| match r.get("id") {
+                Some(Value::Integer(n)) => *n,
+                other => panic!("expected Integer id, got {other:?}"),
+            })
+            .collect();
+        let drained_orders: Vec<u64> = drained.iter().map(|(_, order)| *order).collect();
+        assert_eq!(
+            drained_ids, expected_ids,
+            "drained records order by (order, driver_idx, build_idx)"
+        );
+        assert_eq!(
+            drained_orders, expected_orders,
+            "each drained row projects the payload's order back as its (record, order) tag"
+        );
+
+        // (d) The trailing punctuation drains after the merged records.
+        assert_eq!(puncts.len(), 1);
     }
 }

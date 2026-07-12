@@ -895,6 +895,11 @@ pub(super) fn execute_block_band(
     // none). The `sink` borrow of the buffer ends at its last use above, so it
     // can be finished here. A final spill of the residue run is charged against
     // the disk quota (E320).
+    // Exact emitted-row count, captured before `finish` consumes the buffer.
+    // Equals the total rows the output sort will emit across every run, so a
+    // downstream that adopts the spilled runs whole can report `len_hint` in
+    // O(1) without scanning them off disk.
+    let row_count = output_buf.total_rows() as u64;
     let (sorted, residue) = output_buf.finish().map_err(|e| {
         PipelineError::Io(io::Error::other(format!(
             "iejoin block-band output finish failed: {e}"
@@ -931,6 +936,7 @@ pub(super) fn execute_block_band(
 
     Ok(BlockBandOutput {
         sorted,
+        row_count,
         output_eval_failures,
     })
 }

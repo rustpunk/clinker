@@ -62,6 +62,12 @@ pub struct SortBuffer<P> {
     pairs: Vec<(Record, P)>,
     ordering: SortOrdering,
     bytes_used: usize,
+    /// Total pairs ever pushed, across every spilled run and the resident
+    /// tail. Never decremented on spill — `sort_and_spill` and `finish` move
+    /// pairs out but drop none, so this equals the exact count the finished
+    /// output emits. Lets a spilled consumer size its drain in O(1) without a
+    /// disk scan.
+    total_rows: usize,
     spill_threshold: usize,
     spill_dir: Option<PathBuf>,
     /// Whether spilled sorted runs are LZ4-compressed. Resolved by the caller
@@ -92,6 +98,7 @@ impl<P: Serialize + DeserializeOwned + Send + Ord> SortBuffer<P> {
             pairs: Vec::new(),
             ordering: SortOrdering::Fields(sort_by),
             bytes_used: 0,
+            total_rows: 0,
             spill_threshold,
             spill_dir,
             spill_compress,
@@ -115,6 +122,7 @@ impl<P: Serialize + DeserializeOwned + Send + Ord> SortBuffer<P> {
             pairs: Vec::new(),
             ordering: SortOrdering::Payload,
             bytes_used: 0,
+            total_rows: 0,
             spill_threshold,
             spill_dir,
             spill_compress,
@@ -128,6 +136,7 @@ impl<P: Serialize + DeserializeOwned + Send + Ord> SortBuffer<P> {
         let size =
             std::mem::size_of::<Record>() + record.estimated_heap_size() + std::mem::size_of::<P>();
         self.bytes_used += size;
+        self.total_rows += 1;
         self.pairs.push((record, payload));
     }
 
@@ -206,6 +215,13 @@ impl<P: Serialize + DeserializeOwned + Send + Ord> SortBuffer<P> {
     /// Current estimated memory usage in bytes.
     pub fn bytes_used(&self) -> usize {
         self.bytes_used
+    }
+
+    /// Total pairs pushed over this buffer's life, across every spilled run and
+    /// the resident tail. Equals the exact row count the finished output emits,
+    /// so a spilled-run consumer can size its drain without a disk scan.
+    pub(crate) fn total_rows(&self) -> usize {
+        self.total_rows
     }
 }
 

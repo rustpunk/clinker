@@ -122,6 +122,11 @@ pub(crate) type RecordOrder = u64;
 /// separate resident sorted pass).
 pub(crate) struct BlockBandOutput {
     pub sorted: SortedOutput<(RecordOrder, u64, u64)>,
+    /// Exact count of emitted rows across every sorted run (== the output sort
+    /// buffer's total pushes). Lets the dispatcher size a spilled drain in O(1),
+    /// and — when the runs are adopted whole into a merge-on-drain node buffer —
+    /// serves as that slot's `len_hint` without a disk scan.
+    pub row_count: u64,
     pub output_eval_failures: Vec<CombineOutputEvalFailure>,
 }
 
@@ -136,6 +141,7 @@ impl std::fmt::Debug for BlockBandOutput {
         };
         f.debug_struct("BlockBandOutput")
             .field("sorted", &sorted)
+            .field("row_count", &self.row_count)
             .field("output_eval_failures", &self.output_eval_failures.len())
             .finish()
     }

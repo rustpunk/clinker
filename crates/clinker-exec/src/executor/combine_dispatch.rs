@@ -564,6 +564,7 @@ pub(crate) fn dispatch_combine(
                             node_idx,
                             name,
                             kernel.sorted,
+                            kernel.row_count,
                             combined_puncts,
                         )? {
                             BlockBandDrain::Streamed(count) => {
@@ -1940,6 +1941,7 @@ fn drain_block_band_output(
     node_idx: NodeIndex,
     combine_name: &str,
     sorted: crate::pipeline::sort_buffer::SortedOutput<(RecordOrder, u64, u64)>,
+    row_count: u64,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
 ) -> Result<BlockBandDrain, PipelineError> {
     use crate::pipeline::sort_buffer::SortedOutput;
@@ -2011,18 +2013,21 @@ fn drain_block_band_output(
             admit_node_buffer(ctx, combine_name, node_idx, rows, puncts, spill_allowed)?
         }
         SortedOutput::Spilled(files) => {
-            let merger = crate::pipeline::spill_merge::SortedRunMerger::new_payload_ordered(
-                files,
-                "iejoin block-band output merge",
-            )?;
             if spill_allowed && !needs_materialization {
-                // Bounded path: fold the sorted runs straight into a node-buffer
-                // spill chunk, one resident record per open run.
-                drain_merger_to_spilled_node_buffer(ctx, node_idx, merger, puncts)?
+                // Bounded path: adopt the already-spilled sorted runs whole into a
+                // merge-on-drain node buffer. The runs stay on disk and k-way-merge
+                // lazily when the downstream drains — one resident record per open
+                // run — so a blocking consumer stays bounded and the result is
+                // never re-serialized to a second chunk.
+                adopt_spilled_runs_into_node_buffer(ctx, node_idx, files, row_count, puncts)?
             } else {
                 // A window root, a cross-region tee, or a non-spillable slot needs
                 // the whole slice; those surfaces are O(N) regardless, so
                 // re-materialize the sorted stream once and admit it in memory.
+                let merger = crate::pipeline::spill_merge::SortedRunMerger::new_payload_ordered(
+                    files,
+                    "iejoin block-band output merge",
+                )?;
                 let mut rows: Vec<(Record, u64)> = Vec::new();
                 for item in merger {
                     let (record, (order, _, _)) = item?;
@@ -2134,58 +2139,29 @@ fn node_tees_to_deferred_region(current_dag: &ExecutionPlanDag, node_idx: NodeIn
         })
 }
 
-/// Stream a payload-sorted run merge straight into a single spilled node-buffer
-/// chunk, dropping the sort payload back to the `(record, order)` shape the slot
-/// stores. Bounded: at most one resident record per open run plus the writer's
-/// buffer, never the whole result. Charges the chunk's on-disk bytes against the
-/// disk quota (E320) and registers a node-buffer consumer at zero resident bytes
-/// — the records live on disk — mirroring `admit_node_buffer`'s spilled tail so
-/// the slot's later drain unregisters through the same path.
-fn drain_merger_to_spilled_node_buffer(
+/// Adopt the block-band output sort's already-spilled payload-ordered runs whole
+/// into a merge-on-drain node buffer. The runs stay on disk and k-way-merge
+/// lazily when the slot drains — one resident record per open run, never the
+/// whole result — so a blocking downstream stays bounded.
+///
+/// This performs NO disk write. The emit-phase output sort already serialized
+/// these runs and charged their bytes against the disk quota (E320) when it
+/// spilled them. The prior implementation re-serialized the merged stream into
+/// one fresh chunk — a second physical write of the same logical result, and one
+/// that made the disk-cap outcome depend on whether the downstream buffers or
+/// streams. Adopting the runs whole eliminates that write and charges nothing
+/// further, so both drain shapes charge the result exactly once. Registers a
+/// node-buffer consumer at zero resident bytes — the records live on disk —
+/// mirroring `admit_node_buffer`'s spilled tail so the slot's later drain
+/// unregisters through the same path.
+fn adopt_spilled_runs_into_node_buffer(
     ctx: &mut ExecutorContext<'_>,
     node_idx: NodeIndex,
-    merger: crate::pipeline::spill_merge::SortedRunMerger<(RecordOrder, u64, u64)>,
+    files: Vec<crate::pipeline::spill::SpillFile<(RecordOrder, u64, u64)>>,
+    row_count: u64,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
 ) -> Result<crate::executor::node_buffer::NodeBuffer, PipelineError> {
     use crate::executor::node_buffer::{NodeBuffer, NodeBufferConsumer};
-    let mut iter = merger;
-    // Pull the first row to resolve the schema and compression mode; an empty
-    // merge yields a punctuation-only memory slot.
-    let (first_record, first_order) = match iter.next() {
-        None => {
-            return Ok(NodeBuffer::memory_from_records_and_puncts(
-                Vec::new(),
-                puncts,
-            ));
-        }
-        Some(Ok((record, (order, _, _)))) => (record, order),
-        Some(Err(e)) => return Err(e),
-    };
-    let schema = Arc::clone(first_record.schema());
-    let column_count = schema.column_count();
-    let compress = ctx
-        .spill_compress
-        .resolve_for_schema(column_count, ctx.batch_size as u64);
-    let mut writer: crate::pipeline::spill::SpillWriter<u64> =
-        crate::pipeline::spill::SpillWriter::new(
-            schema,
-            Some(ctx.spill_root_path.as_ref()),
-            compress,
-        )?;
-    writer.write_pair(&first_record, &first_order)?;
-    let mut count: u64 = 1;
-    for item in iter {
-        let (record, (order, _, _)) = item?;
-        writer.write_pair(&record, &order)?;
-        count += 1;
-    }
-    let (file, _written) = writer.finish_with_bytes()?;
-    // The emit-phase output sort already charged this result against the disk
-    // quota when it spilled its runs. This drain only re-serializes that same,
-    // already-charged output into the node-buffer's single sorted chunk and then
-    // frees the source runs, so charging the rewrite again would double-count one
-    // logical result — making the disk-cap outcome depend on whether the
-    // downstream buffers or streams (the streaming drain charges it only once).
     // Register the slot's node-buffer consumer at zero resident bytes so its
     // later drain unregisters through the same path `admit_node_buffer` sets up.
     // A prior registration at this slot is replaced first.
@@ -2200,10 +2176,7 @@ fn drain_merger_to_spilled_node_buffer(
     ctx.node_buffer_consumer_ids
         .insert(node_idx, (consumer_id, handle));
     ctx.memory_budget.sample_peak_consumer_usage();
-    Ok(NodeBuffer::Spilled {
-        chunks: vec![(file, count)],
-        pending_puncts: puncts,
-    })
+    Ok(NodeBuffer::merge_spilled(files, row_count, puncts))
 }
 
 fn dispatch_combine_output_error(

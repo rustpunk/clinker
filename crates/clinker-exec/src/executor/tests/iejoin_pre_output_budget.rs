@@ -515,9 +515,10 @@ fn explode_bands_csv(m: usize) -> String {
 
 /// The output-explosion pipeline with a BLOCKING downstream: a passthrough
 /// `Transform` sits between the combine and the Output, so the combine's sole
-/// consumer is not a streaming consumer kind. The combine admits a spillable
-/// node-buffer (`drain_merger_to_spilled_node_buffer`) that the materialized
-/// chain drains — the drain target the streaming graft does NOT take.
+/// consumer is not a streaming consumer kind. The combine adopts its spilled
+/// output runs whole into a merge-on-drain node-buffer
+/// (`adopt_spilled_runs_into_node_buffer`) that the materialized chain drains —
+/// the drain target the streaming graft does NOT take.
 const EXPLODE_BLOCKING_YAML: &str = r#"
 pipeline:
   name: iejoin_block_band_explode_blocking
