@@ -946,6 +946,18 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         clinker_plan::config::load_config_with_vars_and_patches(&args.config, &[], source_patches)
             .map_err(PipelineError::Config)?;
 
+    // A `--memory-limit` flag overrides the pipeline's `memory.limit`, matching
+    // the documented CLI-wins precedence. Applied before compile so the value is
+    // baked into the plan the executor recompiles and reads when it builds the
+    // arbitrator ceiling and spill budgets. When the flag is absent the YAML
+    // value stands untouched (and the arbitrator's own 512 MiB default applies
+    // when the YAML is also silent), so an omitted flag never clobbers a
+    // configured budget. The raw suffix string flows through the same
+    // `memory.limit` grammar a YAML value uses, so both paths parse identically.
+    if let Some(limit) = &args.mem_limit {
+        pipeline_config.pipeline.memory.limit = Some(limit.clone());
+    }
+
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;

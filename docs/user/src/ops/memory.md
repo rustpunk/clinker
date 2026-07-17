@@ -48,7 +48,7 @@ pipeline:
     limit: "512M"
 ```
 
-The CLI flag overrides the YAML value. Suffixes are **binary (1024-based)**: `K` = 1024 bytes, `M` = 1024², `G` = 1024³; a bare integer is bytes. (This differs from the **decimal** `KB`/`MB`/`GB` used by `min_size`/`max_size`, which are 1000-based.)
+When `--memory-limit` is passed it overrides `pipeline.memory.limit` for that run; omit the flag and the YAML value applies unchanged, falling back to the 512 MB default only when neither is set. Suffixes are **binary (1024-based)**: `K` = 1024 bytes, `M` = 1024², `G` = 1024³; a bare integer is bytes. (This differs from the **decimal** `KB`/`MB`/`GB` used by `min_size`/`max_size`, which are 1000-based.)
 
 **Default:** 512 MB.
 

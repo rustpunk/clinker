@@ -98,3 +98,52 @@ fn valid_memory_limit_passes_the_startup_gate() {
         "a valid memory.limit must not trip the overflow gate; got:\n{stderr}"
     );
 }
+
+#[test]
+fn cli_memory_limit_overrides_pipeline_yaml() {
+    // The `--memory-limit` flag is documented as CLI-wins over `memory.limit`.
+    // A pipeline whose YAML sets a generous 2 GiB budget runs cleanly on its
+    // own; passing `--memory-limit 1` on the same pipeline must force a
+    // sub-baseline budget the arbitrator rejects at startup (E312), proving the
+    // flag reaches the executor rather than being silently ignored.
+    let tmp = pipeline_with_limit("2G");
+
+    // Baseline: the YAML 2 GiB budget alone clears startup and the run
+    // completes, so any failure below is attributable to the CLI override, not
+    // the pipeline itself.
+    let without_flag = Command::new(clinker_bin())
+        .arg("run")
+        .arg("pipeline.yaml")
+        .current_dir(tmp.path())
+        .output()
+        .expect("spawn clinker");
+    assert!(
+        without_flag.status.success(),
+        "the 2G YAML budget alone must let the run pass; stderr:\n{}",
+        String::from_utf8_lossy(&without_flag.stderr),
+    );
+
+    // Override: `--memory-limit 1` sets a 1-byte ceiling, below the process's
+    // baseline resident memory, so the pause-policy startup gate aborts with
+    // E312 before any data loads. If the flag were ignored, the 2G YAML value
+    // would let this pass exactly as the baseline run above did.
+    let with_flag = Command::new(clinker_bin())
+        .arg("run")
+        .arg("pipeline.yaml")
+        .arg("--memory-limit")
+        .arg("1")
+        .current_dir(tmp.path())
+        .output()
+        .expect("spawn clinker");
+    let stderr = String::from_utf8_lossy(&with_flag.stderr);
+    assert!(
+        !with_flag.status.success(),
+        "`--memory-limit 1` must override the 2G YAML budget and abort the run; \
+         stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("E312"),
+        "the CLI-forced sub-baseline budget must surface the E312 startup abort; \
+         got:\n{stderr}"
+    );
+}
