@@ -409,9 +409,259 @@ fn bench_combine_iejoin(c: &mut Criterion) {
     group.finish();
 }
 
+// ─── Pure-range block-band workload (no equality key) ───────────────
+//
+// A half-open range join with NO equality conjunct routes to the
+// bounded pure-range block-band path
+// (`crates/clinker-exec/src/pipeline/iejoin/block.rs`), not the
+// equi+range hash-partitioned path the bench above measures. A small
+// `memory.limit` under `backpressure: spill` forces the block-band drain
+// to overflow its external-sort threshold into multiple blocks and
+// spilled runs, so this bench keeps the merge / reload / prune cost of
+// the spilled layout under regression watch — the path that carries the
+// bounded-driver-residency change.
+const COMBINE_IEJOIN_PURE_RANGE_YAML: &str = r#"
+pipeline:
+  name: bench_combine_iejoin_pure_range
+  memory: { limit: 8M, backpressure: spill }
+nodes:
+- type: source
+  name: readings
+  config:
+    name: readings
+    type: csv
+    path: readings.csv
+    options:
+      has_header: true
+    schema:
+      - { name: reading_id, type: int }
+      - { name: amount, type: int }
+- type: source
+  name: bands
+  config:
+    name: bands
+    type: csv
+    path: bands.csv
+    options:
+      has_header: true
+    schema:
+      - { name: band_id, type: int }
+      - { name: lo, type: int }
+      - { name: hi, type: int }
+- type: combine
+  name: banded
+  input:
+    readings: readings
+    bands: bands
+  config:
+    where: "readings.amount >= bands.lo and readings.amount < bands.hi"
+    match: all
+    on_miss: skip
+    cxl: |
+      emit reading_id = readings.reading_id
+      emit band_id = bands.band_id
+    propagate_ck: driver
+- type: output
+  name: out
+  input: banded
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+
+/// Half-open pure-range workload: `band_count` non-overlapping bands tile
+/// `[0, SPAN)`, and `reading_count` readings tile the same range so each
+/// falls in exactly one band (selectivity ≈ 1/band_count). Returns the
+/// readings for the nested-loop gate plus CSV bytes for both sides.
+struct PureRangeWorkload {
+    readings: Vec<Record>,
+    bands: Vec<Record>,
+    readings_csv: Vec<u8>,
+    bands_csv: Vec<u8>,
+}
+
+fn generate_pure_range_workload(
+    band_count: usize,
+    reading_count: usize,
+    seed: u64,
+) -> PureRangeWorkload {
+    const SPAN: i64 = 1_000_000;
+    let band_step: i64 = SPAN / band_count as i64;
+    let readings_schema = SchemaBuilder::with_capacity(2)
+        .with_field("reading_id")
+        .with_field("amount")
+        .build();
+    let bands_schema = SchemaBuilder::with_capacity(3)
+        .with_field("band_id")
+        .with_field("lo")
+        .with_field("hi")
+        .build();
+
+    let mut bands = Vec::with_capacity(band_count);
+    let mut bands_csv = Vec::with_capacity(band_count * 24);
+    bands_csv.extend_from_slice(b"band_id,lo,hi\n");
+    for b in 0..band_count {
+        let lo = b as i64 * band_step;
+        let hi = lo + band_step;
+        bands.push(Record::new(
+            Arc::clone(&bands_schema),
+            vec![
+                Value::Integer(b as i64),
+                Value::Integer(lo),
+                Value::Integer(hi),
+            ],
+        ));
+        writeln!(bands_csv, "{b},{lo},{hi}").unwrap();
+    }
+
+    let mut readings = Vec::with_capacity(reading_count);
+    let mut readings_csv = Vec::with_capacity(reading_count * 20);
+    readings_csv.extend_from_slice(b"reading_id,amount\n");
+    for r in 0..reading_count {
+        let mix = seed
+            .wrapping_add(r as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            & 0xFFFF_FFFF;
+        let amount = (mix as i64) % SPAN;
+        readings.push(Record::new(
+            Arc::clone(&readings_schema),
+            vec![Value::Integer(r as i64), Value::Integer(amount)],
+        ));
+        writeln!(readings_csv, "{r},{amount}").unwrap();
+    }
+
+    PureRangeWorkload {
+        readings,
+        bands,
+        readings_csv,
+        bands_csv,
+    }
+}
+
+/// Brute-force `O(N*M)` half-open band join count — the correctness gate
+/// denominator for the pure-range path.
+fn nested_loop_pure_range(readings: &[Record], bands: &[Record]) -> usize {
+    let mut count = 0usize;
+    for reading in readings {
+        let Some(Value::Integer(amount)) = reading.get("amount") else {
+            continue;
+        };
+        for band in bands {
+            let Some(Value::Integer(lo)) = band.get("lo") else {
+                continue;
+            };
+            let Some(Value::Integer(hi)) = band.get("hi") else {
+                continue;
+            };
+            if *amount >= *lo && *amount < *hi {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Run the pure-range block-band pipeline end-to-end on cached CSV bytes;
+/// return the number of data rows in the output.
+fn run_pure_range_executor(
+    plan: &clinker_plan::plan::CompiledPlan,
+    readings_csv: &[u8],
+    bands_csv: &[u8],
+    params: &PipelineRunParams,
+) -> usize {
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([
+        (
+            "readings".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "test.csv",
+                Box::new(Cursor::new(readings_csv.to_vec())),
+            ),
+        ),
+        (
+            "bands".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "test.csv",
+                Box::new(Cursor::new(bands_csv.to_vec())),
+            ),
+        ),
+    ]);
+    let out_buf = BenchBuffer::new();
+    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(out_buf.clone()) as Box<dyn Write + Send>,
+    )]);
+    PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, params)
+        .expect("pure-range pipeline must execute");
+    let bytes = out_buf.0.lock().unwrap().clone();
+    let text = std::str::from_utf8(&bytes).expect("output is utf8");
+    text.lines()
+        .filter(|l| !l.is_empty())
+        .count()
+        .saturating_sub(1)
+}
+
+fn bench_combine_iejoin_pure_range(c: &mut Criterion) {
+    // Correctness gate: at a small scale, the block-band path and the
+    // nested-loop baseline must agree on row counts before measurement.
+    let small = generate_pure_range_workload(20, 2_000, 0xA11CE);
+    let nlj_count = nested_loop_pure_range(&small.readings, &small.bands);
+    let small_config =
+        parse_config(COMBINE_IEJOIN_PURE_RANGE_YAML).expect("pure-range bench yaml must parse");
+    let small_plan = clinker_plan::config::PipelineConfig::compile(
+        &small_config,
+        &clinker_plan::config::CompileContext::default(),
+    )
+    .expect("pure-range bench yaml must compile");
+    let small_params = bench_params();
+    let block_count = run_pure_range_executor(
+        &small_plan,
+        &small.readings_csv,
+        &small.bands_csv,
+        &small_params,
+    );
+    assert_eq!(
+        block_count, nlj_count,
+        "pure-range block-band and nested-loop disagreed on the small workload row count \
+         (block_band={block_count}, nested_loop={nlj_count})"
+    );
+
+    // Full bench: 200K readings × 100 bands over a 1M span, ~1% range
+    // selectivity. The 8 MiB spill-policy budget forces the block-band
+    // drain to spill multiple blocks and sorted runs, so the timed loop
+    // pays the merge / reload / prune cost of the spilled layout.
+    let workload = generate_pure_range_workload(100, 200_000, 0xF00D);
+    let config =
+        parse_config(COMBINE_IEJOIN_PURE_RANGE_YAML).expect("pure-range bench yaml must parse");
+    let plan = clinker_plan::config::PipelineConfig::compile(
+        &config,
+        &clinker_plan::config::CompileContext::default(),
+    )
+    .expect("pure-range bench yaml must compile");
+    let params = bench_params();
+
+    let mut group = c.benchmark_group("combine_iejoin_pure_range");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(20));
+    group.throughput(Throughput::Elements(workload.readings.len() as u64));
+    group.bench_function("200k_x_100_spilled", |b| {
+        b.iter(|| {
+            let count = run_pure_range_executor(
+                &plan,
+                &workload.readings_csv,
+                &workload.bands_csv,
+                &params,
+            );
+            black_box(count);
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     iejoin_benches,
     bench_combine_iejoin_nested_loop,
     bench_combine_iejoin,
+    bench_combine_iejoin_pure_range,
 );
 criterion_main!(iejoin_benches);
