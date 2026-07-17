@@ -50,11 +50,15 @@
 //!   arrays are built, on hosts where `rss_bytes()` is unavailable.
 //!
 //! Both shapes mirror their live footprint into a registered
-//! [`ConsumerHandle`] so the arbitrator's pull-mode `current_usage` sees it,
-//! and both poll the accumulated OUTPUT buffer every 10K emitted matched pairs
-//! through the arbitrator's global-aware `should_abort_local` — the output
-//! axis (`output_records`, O(N·M) worst case) is un-spillable until a later
-//! phase streams it, so reacting to global pressure there is correct. The
+//! [`ConsumerHandle`] so the arbitrator's pull-mode `current_usage` sees it —
+//! the block-band path mirrors its input drain buffers, resident blocks, AND its
+//! output sort buffer, so both of its axes are visible. The two paths bound the
+//! OUTPUT axis differently: the equi+range in-RAM output vec has no spill path
+//! (O(N·M) worst case), so it polls every 10K emitted matched pairs through the
+//! arbitrator's global-aware `should_abort_local` — reacting to global pressure
+//! is its only ceiling. The block-band output sort instead spills on its own
+//! byte threshold and charges the resident bytes through the handle, so it is
+//! spill-bounded and strictly-local, with no global-pressure abort. The
 //! pre-output abort returns a typed `PipelineError::MemoryBudgetExceeded`
 //! carrying the combine node's name and `BudgetCategory::Arena`. On the
 //! equi+range path it fires when the resident partition and per-group sort
@@ -85,6 +89,7 @@ use crate::pipeline::combine::{
     keys_equal_canonicalized,
 };
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
+use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
@@ -105,6 +110,52 @@ const MEMORY_CHECK_INTERVAL: usize = 10_000;
 /// executor's `node_buffers`. Spelled out here so the IEJoin entry
 /// point's signature stays self-documenting.
 pub(crate) type RecordOrder = u64;
+
+/// The block-band combine's bounded output: a payload-ordered sorted handle over
+/// the emitted rows — resident when the whole result fit the output sort
+/// buffer's byte threshold, spilled to sorted runs otherwise — keyed on
+/// `(driver order, driver_idx, build_idx)`, the exact key the pre-spill kernel
+/// globally sorted its in-RAM output vec by. The dispatcher drains this handle
+/// incrementally, so the output axis spills instead of holding every matched row
+/// in RAM. `output_eval_failures` carries the deferred output-stage eval failures
+/// the dispatcher routes through the DLQ (bounded by driver count, so it stays a
+/// separate resident sorted pass).
+pub(crate) struct BlockBandOutput {
+    pub sorted: SortedOutput<(RecordOrder, u64, u64)>,
+    /// Exact count of emitted rows across every sorted run (== the output sort
+    /// buffer's total pushes). Lets the dispatcher size a spilled drain in O(1),
+    /// and — when the runs are adopted whole into a merge-on-drain node buffer —
+    /// serves as that slot's `len_hint` without a disk scan.
+    pub row_count: u64,
+    pub output_eval_failures: Vec<CombineOutputEvalFailure>,
+}
+
+// Summarizes shape and counts without recursing into records or spill files, so
+// a test's `expect_err` panic renders the handle without requiring `Debug` on
+// `SortedOutput` / `SpillFile`.
+impl std::fmt::Debug for BlockBandOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sorted = match &self.sorted {
+            SortedOutput::InMemory(rows) => format!("InMemory({} rows)", rows.len()),
+            SortedOutput::Spilled(files) => format!("Spilled({} runs)", files.len()),
+        };
+        f.debug_struct("BlockBandOutput")
+            .field("sorted", &sorted)
+            .field("row_count", &self.row_count)
+            .field("output_eval_failures", &self.output_eval_failures.len())
+            .finish()
+    }
+}
+
+/// What [`execute_combine_iejoin`] hands the dispatcher, one variant per dispatch
+/// shape. The equi+range (`partition_bits: Some`) path materializes its rows in
+/// kernel/bucket visitation order and is admitted as one buffer; the pure-range
+/// (`partition_bits: None`) block-band path returns a bounded, payload-sorted
+/// handle the dispatcher drains incrementally into a spillable node-buffer.
+pub(crate) enum IEJoinKernelOutput {
+    Materialized(CombineKernelOutput),
+    BlockBand(BlockBandOutput),
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // Bit array with coarse 1:1024 Bloom filter
@@ -462,13 +513,17 @@ pub(crate) struct IEJoinExec<'a> {
     pub budget: &'a MemoryArbitrator,
     /// Shared handle for the IEJoin's registered `MemoryConsumer` wrapper.
     /// Both dispatch shapes mirror their live working-set bytes into this
-    /// handle (the block-band path its drain buffers and resident blocks; the
-    /// equi+range path its partition state and per-group sort arrays), so the
-    /// arbitrator's pull-mode `current_usage` reads the footprint while the
-    /// join runs. Neither shape reads the handle's spill / pause flags — the
-    /// block-band path spills on its own byte threshold and the equi+range
-    /// path holds its inputs resident — so the handle carries the byte
-    /// estimate for attribution and the `should_abort_local` gate only.
+    /// handle (the block-band path its drain buffers, resident blocks, and
+    /// output sort buffer — so both its axes are visible; the equi+range path
+    /// its partition state and per-group sort arrays), so the arbitrator's
+    /// pull-mode `current_usage` reads the footprint while the join runs.
+    /// Neither shape reads the handle's spill / pause flags — the block-band
+    /// path spills both its input drains and its output sort on their own byte
+    /// thresholds, and the equi+range path holds its inputs resident. So the
+    /// handle carries the byte estimate for attribution; only the equi+range
+    /// path reads process pressure back (its unspillable output vec's every-10K
+    /// `should_abort_local` poll), while the block-band path answers pressure by
+    /// spilling on every axis, never by a global-pressure abort.
     pub consumer: &'a Arc<ConsumerHandle>,
     /// Pipeline-scoped spill directory borrowed from
     /// `ExecutorContext::spill_root_path`. The pure-range (`partition_bits:
@@ -490,7 +545,7 @@ pub(crate) struct IEJoinExec<'a> {
 
 pub(crate) fn execute_combine_iejoin(
     args: IEJoinExec<'_>,
-) -> Result<CombineKernelOutput, PipelineError> {
+) -> Result<IEJoinKernelOutput, PipelineError> {
     let IEJoinExec {
         name,
         build_qualifier,
@@ -725,30 +780,32 @@ pub(crate) fn execute_combine_iejoin(
                     .to_string(),
             });
         }
-        return block::execute_block_band(block::BlockBandExec {
-            name,
-            build_qualifier,
-            driver_records,
-            driver_scans,
-            build_records,
-            build_scans,
-            op1,
-            op2,
-            residual_eval,
-            body_eval,
-            resolver_mapping,
-            output_schema,
-            match_mode,
-            on_miss,
-            propagate_ck,
-            ctx,
-            budget,
-            consumer,
-            spill_dir,
-            spill_compress,
-            strategy,
-            options: block::BlockBandOptions::default(),
-        });
+        return Ok(IEJoinKernelOutput::BlockBand(block::execute_block_band(
+            block::BlockBandExec {
+                name,
+                build_qualifier,
+                driver_records,
+                driver_scans,
+                build_records,
+                build_scans,
+                op1,
+                op2,
+                residual_eval,
+                body_eval,
+                resolver_mapping,
+                output_schema,
+                match_mode,
+                on_miss,
+                propagate_ck,
+                ctx,
+                budget,
+                consumer,
+                spill_dir,
+                spill_compress,
+                strategy,
+                options: block::BlockBandOptions::default(),
+            },
+        )?));
     }
 
     // ── Equi+range path (`partition_bits: Some(bits)`) ───────────────────
@@ -953,12 +1010,11 @@ pub(crate) fn execute_combine_iejoin(
             let build_slice: Vec<&Record> =
                 group_builds.iter().map(|&gj| &build_records[gj]).collect();
             let mut sink = EmitSink {
-                output_records: &mut output_records,
+                // Equi+range keeps kernel/bucket visitation order; no final
+                // deterministic re-sort, so no failure sort keys either.
+                rows: RowSink::Unsorted(&mut output_records),
                 emitted_since_check: &mut emitted_since_check,
                 output_eval_failures: &mut output_eval_failures,
-                // Equi+range keeps kernel/bucket visitation order; no final
-                // deterministic re-sort, so no per-row tags or failure keys.
-                row_tags: None,
                 failure_tags: None,
             };
             let batch = EmitBatch {
@@ -976,10 +1032,9 @@ pub(crate) fn execute_combine_iejoin(
     // HashBuildProbe collect-path shape).
     if matches!(match_mode, MatchMode::Collect) {
         let mut sink = EmitSink {
-            output_records: &mut output_records,
+            rows: RowSink::Unsorted(&mut output_records),
             emitted_since_check: &mut emitted_since_check,
             output_eval_failures: &mut output_eval_failures,
-            row_tags: None,
             failure_tags: None,
         };
         for (i, (driver_record, driver_order)) in driver_records.iter().enumerate() {
@@ -991,14 +1046,14 @@ pub(crate) fn execute_combine_iejoin(
                 i as u64,
                 flush,
                 &mut sink,
-            );
+            )?;
         }
         // Collect mode never runs the body eval, so no recoverable
         // output-stage failure can accrue on this path.
-        return Ok(CombineKernelOutput {
+        return Ok(IEJoinKernelOutput::Materialized(CombineKernelOutput {
             records: output_records,
             output_eval_failures,
-        });
+        }));
     }
 
     // First/All on_miss dispatch — every driver that saw zero matches
@@ -1014,10 +1069,9 @@ pub(crate) fn execute_combine_iejoin(
     all_unmatched.dedup();
 
     let mut sink = EmitSink {
-        output_records: &mut output_records,
+        rows: RowSink::Unsorted(&mut output_records),
         emitted_since_check: &mut emitted_since_check,
         output_eval_failures: &mut output_eval_failures,
-        row_tags: None,
         failure_tags: None,
     };
     for i in all_unmatched {
@@ -1033,10 +1087,10 @@ pub(crate) fn execute_combine_iejoin(
         )?;
     }
 
-    Ok(CombineKernelOutput {
+    Ok(IEJoinKernelOutput::Materialized(CombineKernelOutput {
         records: output_records,
         output_eval_failures,
-    })
+    }))
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -1324,19 +1378,38 @@ impl MatchState {
     }
 }
 
-/// Mutable output sink for the shared emit path: the accumulating output
-/// buffer, the every-10K poll counter, and the deferred output-eval failures.
+/// Where the shared emit path lands each output row.
+///
+/// The equi+range path keeps kernel/bucket visitation order in a plain vec (no
+/// final re-sort). The block path folds each row's
+/// `(driver order, driver_idx, build_idx)` tiebreak in as the payload of a
+/// payload-ordered, spillable sort buffer — so the deterministic output order is
+/// realized by the (possibly external) sort rather than by a trailing global
+/// sort of an in-RAM vec, and the output axis spills on its own byte threshold
+/// instead of holding every matched row.
+enum RowSink<'a> {
+    /// Equi+range: append preserving visitation order.
+    Unsorted(&'a mut Vec<(Record, RecordOrder)>),
+    /// Block-band: fold each row into the payload-ordered output sort buffer.
+    /// `budget` / `name` charge each spilled run against the disk quota (E320);
+    /// `consumer` mirrors the buffer's resident bytes into the IEJoin handle, so
+    /// the output sort self-bounds by spilling on its own threshold while its
+    /// live footprint stays visible to the arbitrator — the same charge+spill
+    /// contract the input-side drain honors.
+    Sorted {
+        buf: &'a mut SortBuffer<(RecordOrder, u64, u64)>,
+        budget: &'a MemoryArbitrator,
+        name: &'a str,
+        consumer: &'a Arc<ConsumerHandle>,
+    },
+}
+
+/// Mutable output sink for the shared emit path: the row target, the every-10K
+/// poll counter, and the deferred output-eval failures.
 struct EmitSink<'a> {
-    output_records: &'a mut Vec<(Record, RecordOrder)>,
+    rows: RowSink<'a>,
     emitted_since_check: &'a mut usize,
     output_eval_failures: &'a mut Vec<CombineOutputEvalFailure>,
-    /// Block-path only: parallel `(driver input index, build input index)` tag
-    /// per pushed row — `(driver_idx, u64::MAX)` for collect / on_miss rows.
-    /// Zipped with `output_records` and stable-sorted by `(driver order,
-    /// driver_idx, build_idx)` after the pass, so block output order is a pure
-    /// function of the data even when a chained upstream stamps duplicate driver
-    /// orders. `None` on the equi+range path, which keeps kernel/bucket order.
-    row_tags: Option<&'a mut Vec<(u64, u64)>>,
     /// Block-path only: parallel `(driver order, driver_idx, build_idx)` sort key
     /// per deferred output-eval failure, so dead-letter rows are re-ordered into
     /// the same layout-independent order as the emitted rows. `None` on the
@@ -1345,12 +1418,70 @@ struct EmitSink<'a> {
 }
 
 impl EmitSink<'_> {
-    /// Push one emitted row, recording its `(driver_idx, build_idx)` tag when the
-    /// block path asked for deterministic ordering.
-    fn push_row(&mut self, record: Record, order: RecordOrder, driver_idx: u64, build_idx: u64) {
-        self.output_records.push((record, order));
-        if let Some(tags) = self.row_tags.as_deref_mut() {
-            tags.push((driver_idx, build_idx));
+    /// Push one emitted row. Equi+range appends it in visitation order; the block
+    /// path folds `(order, driver_idx, build_idx)` in as the sort payload and
+    /// spills a run once the buffer crosses its byte threshold (charging the run
+    /// against the disk quota, E320) — so this is fallible on the block path.
+    /// `build_idx` is `u64::MAX` for collect / on_miss rows, which sort after a
+    /// driver's match rows in driver input order.
+    fn push_row(
+        &mut self,
+        record: Record,
+        order: RecordOrder,
+        driver_idx: u64,
+        build_idx: u64,
+    ) -> Result<(), PipelineError> {
+        match &mut self.rows {
+            RowSink::Unsorted(records) => {
+                records.push((record, order));
+                Ok(())
+            }
+            RowSink::Sorted {
+                buf,
+                budget,
+                name,
+                consumer,
+            } => {
+                // Mirror the byte delta into the consumer handle the moment the
+                // row lands — the same charge the input-side drain applies — so
+                // the arbitrator's pull-mode view reflects the output sort's live
+                // footprint. Spilling on the buffer's own threshold, not global
+                // pressure, is what bounds this axis; the charge releases the
+                // bytes it moves to disk.
+                let pre = buf.bytes_used();
+                buf.push(record, (order, driver_idx, build_idx));
+                consumer.add_bytes(buf.bytes_used().saturating_sub(pre) as u64);
+                if buf.should_spill() {
+                    let pre_spill = buf.bytes_used() as u64;
+                    let written = buf.sort_and_spill().map_err(|e| {
+                        PipelineError::Io(std::io::Error::other(format!(
+                            "iejoin block-band output spill failed: {e}"
+                        )))
+                    })?;
+                    consumer.sub_bytes(pre_spill);
+                    if written > 0 && budget.record_spill_bytes(name, written) {
+                        return Err(PipelineError::spill_cap_exceeded(
+                            *name,
+                            budget.disk_quota(),
+                            written,
+                            budget.cumulative_spill_bytes(),
+                        ));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Estimated resident bytes of the accumulated output, read by the every-10K
+    /// poll: the emitted vec's heap footprint on the equi+range path, or the sort
+    /// buffer's in-RAM bytes (bounded by its spill threshold) on the block path.
+    fn output_buffer_bytes(&self) -> u64 {
+        match &self.rows {
+            RowSink::Unsorted(records) => {
+                crate::pipeline::combine::combine_output_buffer_bytes(records) as u64
+            }
+            RowSink::Sorted { buf, .. } => buf.bytes_used() as u64,
         }
     }
 
@@ -1394,8 +1525,10 @@ struct CollectFlush {
 /// block path's final deterministic sort. Both make block output a pure
 /// function of the data rather than of the memory-derived block layout.
 ///
-/// Streaming into `sink.output_records`; the output axis is bounded only by the
-/// every-10K poll (see [`poll_output_buffer`]).
+/// Streaming into the sink's output target. The equi+range path's in-RAM vec is
+/// bounded by the every-10K poll (see [`poll_output_buffer`]); the block-band
+/// path's output sort spills on its own byte threshold and charges through the
+/// consumer handle, so it is spill-bounded and strictly-local.
 fn emit_pairs(
     cfg: &EmitConfig<'_>,
     evals: &mut Evaluators,
@@ -1527,7 +1660,7 @@ fn emit_match_row(
                     let _ = rec.set_record_var(&k, v);
                 }
                 crate::executor::copy_build_ck_columns(&mut rec, build_record, cfg.propagate_ck);
-                sink.push_row(rec, driver_order, driver_idx, build_idx);
+                sink.push_row(rec, driver_order, driver_idx, build_idx)?;
                 poll_output_buffer(cfg, sink)?;
                 Ok(true)
             }
@@ -1583,22 +1716,27 @@ fn emit_match_row(
             });
         }
         let rec = Record::new(Arc::clone(target_schema), values);
-        sink.push_row(rec, driver_order, driver_idx, build_idx);
+        sink.push_row(rec, driver_order, driver_idx, build_idx)?;
         poll_output_buffer(cfg, sink)?;
         Ok(true)
     }
 }
 
 /// Poll the accumulated output buffer every [`MEMORY_CHECK_INTERVAL`] emitted
-/// rows and abort if it has grown past the hard limit. The output axis is
-/// unbounded (O(N·M) worst case) until a later phase streams it, so this
-/// cadence is the backstop that keeps a high-fan-out band join from blowing
-/// the ceiling between charges.
+/// rows and abort if it has grown past the hard limit. This backstop guards
+/// only the equi+range ([`RowSink::Unsorted`]) path, whose in-RAM output vec has
+/// no spill path (O(N·M) worst case), so global pressure is the sole ceiling on
+/// its growth. The block-band ([`RowSink::Sorted`]) path spills its output sort
+/// on the buffer's own byte threshold and charges the resident bytes through the
+/// consumer handle, so it is spill-bounded and strictly-local — it never
+/// consults global process pressure and is skipped here.
 fn poll_output_buffer(cfg: &EmitConfig<'_>, sink: &mut EmitSink<'_>) -> Result<(), PipelineError> {
+    if !matches!(sink.rows, RowSink::Unsorted(_)) {
+        return Ok(());
+    }
     *sink.emitted_since_check += 1;
     if *sink.emitted_since_check >= MEMORY_CHECK_INTERVAL {
-        let used =
-            crate::pipeline::combine::combine_output_buffer_bytes(sink.output_records) as u64;
+        let used = sink.output_buffer_bytes();
         if cfg.budget.should_abort_local(used) {
             return Err(PipelineError::MemoryBudgetExceeded {
                 node: cfg.name.to_string(),
@@ -1624,7 +1762,7 @@ fn flush_collect_row(
     driver_idx: u64,
     flush: CollectFlush,
     sink: &mut EmitSink<'_>,
-) {
+) -> Result<(), PipelineError> {
     let CollectFlush {
         arr,
         truncated,
@@ -1648,7 +1786,7 @@ fn flush_collect_row(
     // A collect row carries no single build index; tag it `MAX` so the block
     // path's final sort places it after that driver's match rows (of which a
     // collect driver has none) and orders collect rows by driver input order.
-    sink.push_row(rec, driver_order, driver_idx, u64::MAX);
+    sink.push_row(rec, driver_order, driver_idx, u64::MAX)
 }
 
 /// Dispatch one zero-match driver through its `on_miss` policy: `Skip` drops
@@ -1695,7 +1833,7 @@ fn dispatch_on_miss(
                     }
                     // An on_miss row has no matched build; tag it `MAX` so the
                     // block path's final sort keeps it in driver input order.
-                    sink.push_row(rec, driver_order, driver_idx, u64::MAX);
+                    sink.push_row(rec, driver_order, driver_idx, u64::MAX)?;
                     poll_output_buffer(cfg, sink)
                 }
                 Ok(EvalResult::Skip(_)) => Ok(()),

@@ -159,8 +159,8 @@ and **degrade gracefully** under pressure rather than OOM:
 - **Combine** picks among in-memory hash join, grace hash join (spilled), and
   IEJoin / sort-merge depending on predicates and memory pressure. A pure-range
   Combine (band join with no equality key) runs the block-band IEJoin, which
-  external-sorts each side and spills its blocks to disk so its input stays
-  inside the budget.
+  external-sorts each side and spills a matched-output sort to disk so both its
+  input and its result stay inside the budget.
 
 The memory ceiling is a first-class promise. Clinker is designed to share a
 server with JVM applications, databases, and other services without competing

@@ -442,6 +442,321 @@ fn block_band_pre_output_local_abort_under_undersized_budget() {
     );
 }
 
+/// A pure-range pipeline whose `match: all` result is far larger than its inputs:
+/// every order matches every band (each band spans the whole amount range), so a
+/// small `n x m` input fans into `n * m` output rows. The block-band path
+/// accumulates those in a payload-ordered sort buffer that spills on its own
+/// threshold, so the output axis stays bounded even though the result dwarfs the
+/// inputs. The match set is kept under the 10K output poll so completion is the
+/// output buffer's spill doing the bounding, not the poll aborting.
+const EXPLODE_YAML: &str = r#"
+pipeline:
+  name: iejoin_block_band_explode
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: amount, type: int }
+- type: source
+  name: bands
+  config:
+    name: bands
+    type: csv
+    path: bands.csv
+    schema:
+      - { name: band_id, type: string }
+      - { name: lo, type: int }
+      - { name: hi, type: int }
+- type: combine
+  name: banded
+  input:
+    orders: orders
+    bands: bands
+  config:
+    where: "orders.amount >= bands.lo and orders.amount < bands.hi"
+    match: all
+    on_miss: skip
+    cxl: |
+      emit order_id = orders.order_id
+      emit band_id = bands.band_id
+    propagate_ck: driver
+- type: output
+  name: out
+  input: banded
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+
+/// `n` orders with tiny amounts `i` (no pad, so the order side stays resident).
+fn explode_orders_csv(n: usize) -> String {
+    let mut s = String::from("order_id,amount\n");
+    for i in 0..n {
+        s.push_str(&format!("o{i},{i}\n"));
+    }
+    s
+}
+
+/// `m` all-covering bands `[-1, 1_000_000)`, so every order falls in every band
+/// and `match: all` emits the full `n x m` cross product.
+fn explode_bands_csv(m: usize) -> String {
+    let mut s = String::from("band_id,lo,hi\n");
+    for j in 0..m {
+        s.push_str(&format!("b{j},-1,1000000\n"));
+    }
+    s
+}
+
+/// The output-explosion pipeline with a BLOCKING downstream: a passthrough
+/// `Transform` sits between the combine and the Output, so the combine's sole
+/// consumer is not a streaming consumer kind. The combine adopts its spilled
+/// output runs whole into a merge-on-drain node-buffer
+/// (`adopt_spilled_runs_into_node_buffer`) that the materialized chain drains —
+/// the drain target the streaming graft does NOT take.
+const EXPLODE_BLOCKING_YAML: &str = r#"
+pipeline:
+  name: iejoin_block_band_explode_blocking
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: orders.csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: amount, type: int }
+- type: source
+  name: bands
+  config:
+    name: bands
+    type: csv
+    path: bands.csv
+    schema:
+      - { name: band_id, type: string }
+      - { name: lo, type: int }
+      - { name: hi, type: int }
+- type: combine
+  name: banded
+  input:
+    orders: orders
+    bands: bands
+  config:
+    where: "orders.amount >= bands.lo and orders.amount < bands.hi"
+    match: all
+    on_miss: skip
+    cxl: |
+      emit order_id = orders.order_id
+      emit band_id = bands.band_id
+    propagate_ck: driver
+- type: transform
+  name: passthrough
+  input: banded
+  config:
+    cxl: |
+      emit order_id = order_id
+      emit band_id = band_id
+- type: output
+  name: out
+  input: passthrough
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+
+/// Compile `yaml` and return the [`StreamClass`] the streaming-fusion analysis
+/// assigns the `banded` combine node — `Streaming` when the dispatcher will
+/// graft the block-band output drain onto the sink, `Materialized` when it
+/// admits a node-buffer. This is the exact plan-derived predicate the runtime
+/// sender-install consults, so it proves which drain branch the run takes.
+fn banded_stream_class(yaml: &str) -> clinker_plan::plan::execution::StreamClass {
+    let config = clinker_plan::config::parse_config(yaml).expect("parse pipeline YAML");
+    let validated = config
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("compile pipeline");
+    let dag = validated.dag();
+    let classes = clinker_plan::plan::execution::classify_stream_nodes(dag, &config);
+    let banded = dag
+        .graph
+        .node_indices()
+        .find(|idx| matches!(&dag.graph[*idx], PlanNode::Combine { name, .. } if name == "banded"))
+        .expect("banded combine present in compiled plan");
+    classes[&banded]
+}
+
+#[test]
+fn block_band_output_buffers_under_blocking_downstream() {
+    // The block-band output NODE-BUFFER path (the drain target the streaming
+    // graft does NOT take): a passthrough Transform sits between the combine and
+    // the Output, so the combine's sole consumer is not a streaming consumer
+    // kind. The combine admits a node-buffer through the buffered branch of
+    // `drain_block_band_output` rather than streaming, and the materialized
+    // chain carries the rows to the sink. A 30 x 30 result that stays resident
+    // under a roomy budget exercises the buffered `admit_node_buffer` branch
+    // (the streamed alternative is pinned by the sibling streaming test); the
+    // run COMPLETES and equals the nested-loop oracle.
+
+    // Proof the node-buffer (not the streaming) path is exercised: the combine
+    // classifies `Materialized`, so no streaming sender is installed for it and
+    // `drain_block_band_output` falls through to the buffered branch.
+    assert_eq!(
+        banded_stream_class(EXPLODE_BLOCKING_YAML),
+        clinker_plan::plan::execution::StreamClass::Materialized,
+        "a combine whose consumer is a non-streaming Transform must materialize its output"
+    );
+
+    const N: usize = 30;
+    const M: usize = 30;
+    let arb = no_op_arbitrator(ROOMY_LIMIT);
+    let (result, output) = run_pipeline_yaml(
+        EXPLODE_BLOCKING_YAML,
+        explode_orders_csv(N),
+        explode_bands_csv(M),
+        &arb,
+    );
+    result.expect("the buffered blocking-downstream join must complete under the roomy budget");
+
+    let data_lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).skip(1).collect();
+    assert_eq!(
+        data_lines.len(),
+        N * M,
+        "match: all over all-covering bands emits the full {N}x{M} cross product"
+    );
+
+    // The result equals the nested-loop oracle: every (order, band) pair appears
+    // exactly once. Header is `order_id,band_id` (the two emitted columns).
+    use std::collections::HashSet;
+    let emitted: HashSet<(String, String)> = data_lines
+        .iter()
+        .map(|l| {
+            let mut cols = l.split(',');
+            let order = cols.next().expect("order_id column").to_string();
+            let band = cols.next().expect("band_id column").to_string();
+            (order, band)
+        })
+        .collect();
+    assert_eq!(
+        emitted.len(),
+        N * M,
+        "every emitted (order, band) pair must be distinct — no duplicates or drops"
+    );
+    for i in 0..N {
+        for j in 0..M {
+            assert!(
+                emitted.contains(&(format!("o{i}"), format!("b{j}"))),
+                "the nested-loop oracle expects order o{i} banded to b{j}"
+            );
+        }
+    }
+
+    // A roomy budget keeps the small result resident, so the buffered branch
+    // admits an in-memory node-buffer with nothing reaching disk.
+    assert_eq!(
+        spilled_bytes(&arb),
+        0,
+        "the {N}x{M} result must stay resident under the roomy budget; \
+         per_stage_spill_bytes[banded] was {}",
+        spilled_bytes(&arb)
+    );
+    assert_eq!(
+        arb.consumer_count(),
+        0,
+        "the block-band consumer must be unregistered on the clean exit"
+    );
+}
+
+#[test]
+fn block_band_output_explosion_streams_and_completes_under_tight_budget() {
+    // The output-axis bound with a STREAMING downstream, end-to-end: the same
+    // 60 x 60 explosion (3600 output rows from 120 tiny resident inputs), but
+    // the combine's sole consumer is a single streaming-eligible Output. The
+    // dispatcher grafts the payload-sorted output DRAIN straight onto the
+    // back-pressure sink instead of admitting a node-buffer, so the output axis
+    // is bounded at the edge as well as the operator: one batch in flight, spilt
+    // under the tight budget, never the whole 3600-row result held at once. The
+    // run COMPLETES and its result equals the nested-loop oracle.
+
+    // Proof the streaming path (not the node-buffer path) is exercised: the same
+    // plan-derived predicate the runtime sender-install consults classifies the
+    // `banded` combine as `Streaming`, so a sender IS installed for it and
+    // `drain_block_band_output` takes the streaming branch.
+    assert_eq!(
+        banded_stream_class(EXPLODE_YAML),
+        clinker_plan::plan::execution::StreamClass::Streaming,
+        "combine(IEJoin) -> single Output must classify Streaming so the drain streams"
+    );
+
+    const N: usize = 60;
+    const M: usize = 60;
+    let arb = no_op_arbitrator(TIGHT_LIMIT);
+    let (result, output) = run_pipeline_yaml(
+        EXPLODE_YAML,
+        explode_orders_csv(N),
+        explode_bands_csv(M),
+        &arb,
+    );
+    result.expect("the streaming output-explosion join must complete under the tight budget");
+
+    let data_lines: Vec<&str> = output.lines().filter(|l| !l.is_empty()).skip(1).collect();
+    assert_eq!(
+        data_lines.len(),
+        N * M,
+        "match: all over all-covering bands emits the full {N}x{M} cross product"
+    );
+
+    // The result equals the nested-loop oracle: every (order, band) pair appears
+    // exactly once, streamed in the deterministic sort order.
+    use std::collections::HashSet;
+    let emitted: HashSet<(String, String)> = data_lines
+        .iter()
+        .map(|l| {
+            let mut cols = l.split(',');
+            let order = cols.next().expect("order_id column").to_string();
+            let band = cols.next().expect("band_id column").to_string();
+            (order, band)
+        })
+        .collect();
+    assert_eq!(
+        emitted.len(),
+        N * M,
+        "every emitted (order, band) pair must be distinct — no duplicates or drops"
+    );
+    for i in 0..N {
+        for j in 0..M {
+            assert!(
+                emitted.contains(&(format!("o{i}"), format!("b{j}"))),
+                "the nested-loop oracle expects order o{i} banded to b{j}"
+            );
+        }
+    }
+
+    // The tiny inputs stay resident, so the spill bytes come from the output
+    // axis overflowing under the tight budget (the kernel's output sort buffer,
+    // then the streaming batch spill) — the bound holding rather than the run
+    // aborting.
+    assert!(
+        spilled_bytes(&arb) > 0,
+        "the {}-row streamed output must overflow and spill under the tight budget; \
+         per_stage_spill_bytes[banded] was {}",
+        N * M,
+        spilled_bytes(&arb)
+    );
+    // Both the block-band kernel consumer and the streaming charge consumer must
+    // be unregistered by the time the run returns.
+    assert_eq!(
+        arb.consumer_count(),
+        0,
+        "every consumer must be unregistered on the clean exit"
+    );
+}
+
 /// An equi+range predicate (one equality conjunct plus one range conjunct) so
 /// the planner selects `CombineStrategy::HashPartitionIEJoin`, which holds its
 /// hash partitions and per-group sort arrays resident with no spill path. Its
