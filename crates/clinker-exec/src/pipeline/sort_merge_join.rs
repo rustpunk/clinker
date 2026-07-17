@@ -856,6 +856,7 @@ fn execute_combine_sort_merge_with_stats(
                 Vec::new(),
                 None,
                 &mut output_records,
+                &mut emitted_since_check,
             )?;
         } else {
             dispatch_driver_miss(
@@ -1319,8 +1320,10 @@ fn poll_output_buffer(
 
 /// Build and push one collect-mode row for `driver_order`: even a zero-match
 /// driver emits, with an empty array. Propagates the first matched build's
-/// `$ck.<field>` values onto the widened row and sets the collect array under
-/// the build qualifier.
+/// `$ck.<field>` values onto the widened row, sets the collect array under the
+/// build qualifier, then polls the output buffer — so a high-cardinality
+/// driver with a permissive predicate aborts cleanly over budget instead of
+/// growing collect-mode output unbounded.
 fn emit_collect_row(
     ectx: &EmitCtx<'_>,
     driver_record: &Record,
@@ -1328,6 +1331,7 @@ fn emit_collect_row(
     arr: Vec<Value>,
     first_build: Option<&Record>,
     output: &mut Vec<(Record, RecordOrder)>,
+    emitted_since_check: &mut usize,
 ) -> Result<(), PipelineError> {
     let mut rec = match ectx.output_schema {
         Some(s) => widen_record_to_schema(driver_record, s),
@@ -1338,7 +1342,7 @@ fn emit_collect_row(
     }
     rec.set(ectx.build_qualifier, Value::Array(arr));
     output.push((rec, driver_order));
-    Ok(())
+    poll_output_buffer(ectx, output, emitted_since_check)
 }
 
 /// Dispatch one zero-match driver through its `on_miss` policy: `Skip` drops
@@ -1544,6 +1548,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                 arr,
                 first_build.as_ref(),
                 output,
+                emitted_since_check,
             )?;
         }
 
@@ -2602,6 +2607,77 @@ mod tests {
         let mut tight_orders: Vec<RecordOrder> = tight_records.iter().map(|(_, o)| *o).collect();
         tight_orders.sort_unstable();
         assert_eq!(tight_orders, oracle_orders);
+    }
+
+    /// `match: collect` must poll the output buffer and abort cleanly over a
+    /// tight budget instead of growing unbounded. A high-cardinality driver
+    /// side with a permissive predicate accumulates one collect row per driver;
+    /// past the every-10K poll the output-buffer byte count trips the hard
+    /// limit and the kernel returns `MemoryBudgetExceeded`.
+    #[test]
+    fn test_sort_merge_collect_aborts_over_tight_budget() {
+        // The driver schema carries the build-qualifier column ("builds"),
+        // standing in for the plan-time-widened output schema the collect flush
+        // writes its array into (run_kernel passes no separate output schema).
+        let drivers_schema = schema_with(&["k", "builds"]);
+        let builds_schema = schema_with(&["k", "b"]);
+        // Every driver (key 0) matches every build (key 1000): a permissive
+        // predicate making each collect array non-empty. More than one poll
+        // interval of drivers so the every-10K output poll fires.
+        let n_drivers = 12_000usize;
+        let driver: Vec<(Record, RecordOrder)> = (0..n_drivers)
+            .map(|i| {
+                (
+                    rec(&drivers_schema, vec![Value::Integer(0), Value::Null]),
+                    i as RecordOrder,
+                )
+            })
+            .collect();
+        let build: Vec<Record> = (0..4)
+            .map(|j| {
+                rec(
+                    &builds_schema,
+                    vec![Value::Integer(1000), Value::Integer(j)],
+                )
+            })
+            .collect();
+
+        let typed = compile_pure_range(
+            "filter drivers.k < builds.k",
+            &[
+                ("drivers", "k", cxl::typecheck::Type::Int),
+                ("builds", "k", cxl::typecheck::Type::Int),
+            ],
+        );
+        let rc = extract_range_conjunct(&typed, "drivers", "builds");
+        let decomposed = decomposed_pure_range(rc, Arc::clone(&typed));
+
+        // 64 KiB hard limit: one poll interval of accumulated collect rows
+        // dwarfs it, so the poll at the first interval boundary aborts.
+        let result = run_kernel_result(RunKernel {
+            driver_records: driver,
+            build_records: build,
+            decomposed,
+            driver_qual: "drivers",
+            build_qual: "builds",
+            driver_schema: &drivers_schema,
+            build_schema: &builds_schema,
+            match_mode: MatchMode::Collect,
+            on_miss: OnMiss::Skip,
+            presorted: true,
+            body_program: None,
+            budget_bytes: Some(64 * 1024),
+        });
+        let err = match result {
+            Ok(_) => panic!("collect over a tight budget must abort, not grow unbounded"),
+            Err(e) => e,
+        };
+        match err {
+            PipelineError::MemoryBudgetExceeded { node, .. } => assert_eq!(node, "sm_test"),
+            other => {
+                panic!("expected MemoryBudgetExceeded from the collect output poll; got {other:?}")
+            }
+        }
     }
 
     /// Build `n` phase A driver pairs whose sort key `k` is an Integer and

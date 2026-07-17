@@ -1786,7 +1786,13 @@ fn flush_collect_row(
     // A collect row carries no single build index; tag it `MAX` so the block
     // path's final sort places it after that driver's match rows (of which a
     // collect driver has none) and orders collect rows by driver input order.
-    sink.push_row(rec, driver_order, driver_idx, u64::MAX)
+    sink.push_row(rec, driver_order, driver_idx, u64::MAX)?;
+    // Poll the output buffer as the first / all and on-miss paths do: a
+    // high-cardinality driver with a permissive predicate emits one collect
+    // row apiece and would otherwise grow the equi+range in-RAM output vector
+    // unbounded between the operator's other memory checks. The block-band
+    // Sorted sink is already spill-bounded, so this is a no-op there.
+    poll_output_buffer(cfg, sink)
 }
 
 /// Dispatch one zero-match driver through its `on_miss` policy: `Skip` drops
