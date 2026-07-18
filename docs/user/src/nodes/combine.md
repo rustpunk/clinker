@@ -96,6 +96,8 @@ Emit one output row per driver record, using the first matching build-side recor
       emit product_name = products.product_name
 ```
 
+The `where:` predicate selects the match; the `cxl:` body is a **post-match projection** that runs once on the chosen build record. Selection and projection are separate steps: if the body filters the row out (a `filter` that fails, or a body that emits nothing), that one output row is dropped. The combine does **not** fall back to a later matching build, and the driver is **not** treated as unmatched — it matched the predicate, the body just produced no row. `on_miss` (below) never fires for such a driver; it fires only when the predicate matched nothing at all. This holds identically for every join strategy the planner may pick.
+
 ### `match: all`
 
 Emit one output row for every matching build-side record. 1:N fan-out -- if a driver record matches three build records, three rows are emitted.
@@ -126,7 +128,7 @@ Use `collect` when you need the set of matches as a single structured value; use
 
 ## Unmatched records (`on_miss`)
 
-`on_miss` controls what happens to driver records with zero matches:
+`on_miss` controls what happens to driver records with **zero predicate matches** — drivers for which no build-side record satisfied `where:`. A driver that matched the predicate but whose `cxl:` body skipped the row (see [`match: first`](#match-first)) is **not** a miss and never reaches `on_miss`; it simply produces no output row.
 
 | Value | Semantics |
 |-------|-----------|

@@ -14,6 +14,15 @@ The `where:` expression is a CXL boolean evaluated for every candidate record pa
 
 At least one cross-input equality is required for every Combine, except for pure-range predicates, which IEJoin handles without an equi conjunct.
 
+## Match selection versus the projection body
+
+Every strategy separates two steps: **match selection** (the `where:` predicate, including any residual re-check) chooses which build records pair with a driver, and the **`cxl:` body** projects each selected pair into an output row. Under `match: first` this distinction is load-bearing and is contractually uniform across all five physical paths — in-memory hash build-probe, grace-hash, sort-merge, hash-partitioned IEJoin (equi+range), and block-band IEJoin (pure-range):
+
+- **Selection is deterministic and budget-stable.** `first` picks a single predicate-matching build in a fixed order — the block-band path holds the minimum build-input-index candidate, sort-merge takes the lowest range-key match, and the hash paths take the first probe hit — so the chosen build is a function of the data, not of the memory-derived block/spill layout.
+- **The body runs once, as a post-match projection.** A body that skips the chosen build (a `filter` that fails, an `EvalResult::Skip`) or defers on a recoverable error drops **only that output row**. The engine does not retry a later matching build, and it does not route the driver to `on_miss`: the driver matched the predicate, so it is not a zero-match driver. `on_miss` dispatch is gated purely on whether *selection* found anything — the hash and grace paths test `matched.is_empty()`, the block path routes only drivers that held no candidate, and sort-merge / equi+range mark the driver satisfied the moment a predicate-matching build is selected, before the body runs.
+
+The earlier divergence — where the IEJoin and sort-merge paths retried later builds or routed an all-body-skip driver to `on_miss` while the hash paths did not — is retired; all strategies now match the hash paths and the User Guide.
+
 ## Strategy hint
 
 The `strategy` config field carries a hint; the planner has final say.
