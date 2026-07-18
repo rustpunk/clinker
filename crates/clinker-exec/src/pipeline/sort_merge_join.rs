@@ -55,7 +55,7 @@ use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
-use crate::pipeline::spill_merge::SortedRunMerger;
+use crate::pipeline::spill_merge::{MergeBudget, SortedRunMerger};
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
@@ -961,6 +961,11 @@ fn sort_driver_pairs_externally(
                 files,
                 std::slice::from_ref(&merge_field),
                 "sort-merge driver phase A",
+                MergeBudget {
+                    budget,
+                    node: name,
+                    compress: spill_compress,
+                },
             )?;
             for entry in merger {
                 let (record, order) = entry?;
@@ -1081,6 +1086,11 @@ fn sort_build_pairs_externally(
                 files,
                 std::slice::from_ref(&merge_field),
                 "sort-merge build phase A",
+                MergeBudget {
+                    budget,
+                    node: name,
+                    compress: spill_compress,
+                },
             )?;
             for entry in merger {
                 let (record, _) = entry?;

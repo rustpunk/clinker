@@ -25,7 +25,7 @@ use clinker_record::{Record, Value};
 
 use crate::executor::stream_event::{Punctuation, StreamEvent};
 use crate::pipeline::spill::{SpillFile, SpillReader};
-use crate::pipeline::spill_merge::SortedRunMerger;
+use crate::pipeline::spill_merge::{OwnedMergeBudget, SortedRunMerger};
 use clinker_plan::error::PipelineError;
 
 /// Body records paired with the punctuations preserved from a buffer
@@ -98,6 +98,10 @@ pub(crate) enum NodeBuffer {
         runs: Vec<SpillFile<(u64, u64, u64)>>,
         row_count: u64,
         pending_puncts: Vec<Punctuation>,
+        /// Charging context for the lazy fold-down: if the adopted runs are too
+        /// fragmented, the drain's k-way merge cascades them, and the
+        /// intermediate runs charge this node's disk quota through here.
+        merge_budget: OwnedMergeBudget,
     },
 }
 
@@ -125,6 +129,7 @@ impl NodeBuffer {
         runs: Vec<SpillFile<(u64, u64, u64)>>,
         row_count: u64,
         pending_puncts: Vec<Punctuation>,
+        merge_budget: OwnedMergeBudget,
     ) -> Self {
         if runs.is_empty() || row_count == 0 {
             return Self::memory_from_records_and_puncts(Vec::new(), pending_puncts);
@@ -133,6 +138,7 @@ impl NodeBuffer {
             runs,
             row_count,
             pending_puncts,
+            merge_budget,
         }
     }
 
@@ -525,12 +531,14 @@ impl NodeBuffer {
                 runs,
                 row_count: _,
                 pending_puncts,
+                merge_budget,
             } => {
                 return NodeBufferDrain::Merged {
                     runs: Some(runs),
                     merger: None,
                     pending_puncts: pending_puncts.into_iter(),
                     done: false,
+                    merge_budget,
                 };
             }
         };
@@ -578,6 +586,9 @@ pub(crate) enum NodeBufferDrain {
         /// stops rather than falling through to the trailing punctuations over a
         /// broken merge.
         done: bool,
+        /// Charging context lent to the merge open so a fragmented adopted-run
+        /// set folds down under the disk quota (E320) at drain.
+        merge_budget: OwnedMergeBudget,
     },
 }
 
@@ -631,6 +642,7 @@ impl Iterator for NodeBufferDrain {
                 merger,
                 pending_puncts,
                 done,
+                merge_budget,
             } => {
                 if *done {
                     return None;
@@ -638,12 +650,15 @@ impl Iterator for NodeBufferDrain {
                 // Open the k-way merge on the first record poll; a failed open
                 // is deferred here (keeping `drain` infallible) and latches
                 // `done` so the trailing puncts never drain over a broken merge.
+                // The merge folds an over-fragmented run set down under the disk
+                // quota, charging intermediate runs through the parked budget.
                 if merger.is_none()
                     && let Some(files) = runs.take()
                 {
                     match SortedRunMerger::new_payload_ordered(
                         files,
                         "iejoin block-band output merge",
+                        merge_budget.as_borrowed(),
                     ) {
                         Ok(m) => *merger = Some(m),
                         Err(e) => {
@@ -1289,8 +1304,12 @@ mod tests {
 
         let s = schema();
         let ctx = synthetic_document_context();
-        let arb =
-            MemoryArbitrator::with_policy(1024 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
+        let arb = std::sync::Arc::new(MemoryArbitrator::with_policy(
+            1024 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        ));
 
         // (order, driver_idx, build_idx) payloads. `order` repeats (5 and 2
         // thrice) so ties exist; `driver_idx` is unique across every row, so the
@@ -1340,8 +1359,18 @@ mod tests {
         // (a) no-double-charge: adopting + draining the runs adds not a
         // single byte to the cumulative spill total.
         let before = arb.cumulative_spill_bytes();
-        let nb =
-            NodeBuffer::merge_spilled(files, row_count, vec![Punctuation::document_close(ctx)]);
+        // Few runs (< the merge fan-in) so the drain's k-way merge is a single
+        // pass: it writes no intermediate runs and charges nothing further.
+        let nb = NodeBuffer::merge_spilled(
+            files,
+            row_count,
+            vec![Punctuation::document_close(ctx)],
+            crate::pipeline::spill_merge::OwnedMergeBudget::new(
+                std::sync::Arc::clone(&arb),
+                std::sync::Arc::from("banded"),
+                true,
+            ),
+        );
         let (drained, puncts) = nb.drain_split().unwrap();
         assert_eq!(
             arb.cumulative_spill_bytes(),

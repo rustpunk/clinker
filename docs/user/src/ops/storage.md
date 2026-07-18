@@ -105,13 +105,17 @@ join) — run their kernel entirely in RAM and never open a spill file, so spill
 compression does not apply to them and they are omitted from this list, even
 though they carry a spill priority for memory arbitration.
 
-## `storage.spill.disk_cap_bytes` — cap cumulative spill
+## `storage.spill.disk_cap_bytes` — cap concurrent spill
 
 By default a run will spill as much as it needs, limited only by the physical
-space on the spill volume. `disk_cap_bytes` sets a **cumulative budget**: the
-total on-disk size of every spill file a run writes. When that running total
-would cross the cap, the run aborts with a dedicated diagnostic instead of
-continuing to fill the volume.
+space on the spill volume. `disk_cap_bytes` sets a **budget on the spill the run
+holds at once**: the on-disk size of the spill files live at any moment. When
+that footprint would cross the cap, the run aborts with a dedicated diagnostic
+instead of continuing to fill the volume. Because the cap tracks what is
+concurrently on disk, an operator that deletes intermediate spill files as it
+consumes them (such as the merge that folds a heavily fragmented external sort
+back together) does not count those transient files twice — only the disk a run
+actually occupies at once is charged against the cap.
 
 ```toml
 [storage.spill]

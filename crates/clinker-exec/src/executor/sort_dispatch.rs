@@ -113,7 +113,19 @@ pub(crate) fn dispatch_sort(
     // merge.
     let out: Vec<(Record, u64)> = match sorted {
         SortedOutput::InMemory(pairs) => pairs,
-        SortedOutput::Spilled(files) => merge_sorted_runs(files, sort_fields, "sort enforcer")?,
+        // A high-fragmentation spill folds down through a bounded-fan-in cascade
+        // before the final merge; intermediate runs charge this node's disk
+        // quota exactly like the runs above.
+        SortedOutput::Spilled(files) => merge_sorted_runs(
+            files,
+            sort_fields,
+            "sort enforcer",
+            crate::pipeline::spill_merge::MergeBudget {
+                budget: &ctx.memory_budget,
+                node: name,
+                compress: spill_compress,
+            },
+        )?,
     };
     ctx.collector
         .record(sort_timer.finish(sort_count, sort_count));

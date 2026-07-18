@@ -95,7 +95,7 @@ use crate::executor::combine::CombineResolverMapping;
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use crate::pipeline::spill::{SpillFile, SpillWriter};
-use crate::pipeline::spill_merge::SortedRunMerger;
+use crate::pipeline::spill_merge::{MergeBudget, SortedRunMerger};
 
 use super::{
     BlockBandOutput, CollectFlush, DriverRef, EmitBatch, EmitConfig, EmitSink, Evaluators,
@@ -1128,7 +1128,15 @@ fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord>(
         }
         SortedOutput::Spilled(files) => {
             ctx.consumer.sub_bytes(pre_finish);
-            let merger = SortedRunMerger::new_payload_ordered(files, "iejoin block-band merge")?;
+            let merger = SortedRunMerger::new_payload_ordered(
+                files,
+                "iejoin block-band merge",
+                MergeBudget {
+                    budget: ctx.budget,
+                    node: ctx.name,
+                    compress: ctx.spill_compress,
+                },
+            )?;
             (SortedStream::Spilled(merger), false)
         }
     };
@@ -1482,7 +1490,19 @@ mod tests {
                 .map(|(record, (order, _, _))| (record, order))
                 .collect()),
             SortedOutput::Spilled(files) => {
-                let merger = SortedRunMerger::new_payload_ordered(files, "block-band test drain")?;
+                // The cascade only charges intermediate runs, which this small
+                // fixture never produces; a roomy unlimited-quota arbitrator
+                // keeps the test's focus on emitted order.
+                let arb = arbitrator(u64::MAX);
+                let merger = SortedRunMerger::new_payload_ordered(
+                    files,
+                    "block-band test drain",
+                    MergeBudget {
+                        budget: &arb,
+                        node: "block-band test drain",
+                        compress: true,
+                    },
+                )?;
                 let mut rows = Vec::new();
                 for item in merger {
                     let (record, (order, _, _)) = item?;

@@ -1135,9 +1135,12 @@ impl MemoryArbitrator {
         self.max_spill_bytes.store(n, Ordering::Relaxed);
     }
 
-    /// Cumulative spill bytes recorded so far across every spill
-    /// operator polling this arbitrator. Equals the sum of every entry
-    /// in [`Self::per_stage_spill_bytes`].
+    /// Bytes currently on disk across every spill operator polling this
+    /// arbitrator: the sum of every [`Self::record_spill_bytes`] charge minus
+    /// every [`Self::release_spill_bytes`] release. Equals the sum of every
+    /// entry in [`Self::per_stage_spill_bytes`]. For spill paths that never
+    /// unlink a run before the run ends (all but the cascaded k-way merge) no
+    /// release fires, so this is exactly the monotonic total those paths wrote.
     pub fn cumulative_spill_bytes(&self) -> u64 {
         self.cumulative_spill_bytes.load(Ordering::Relaxed)
     }
@@ -1165,6 +1168,14 @@ impl MemoryArbitrator {
     /// breakdown attributes the bytes to the exact stage that wrote them.
     /// Saturating-add via `fetch_update` keeps an overflowing pipeline
     /// from wrapping back below the quota silently.
+    ///
+    /// The disk cap bounds *concurrent* on-disk spill (how much a run holds at
+    /// once), so a caller that later unlinks a run it charged here releases the
+    /// bytes with [`Self::release_spill_bytes`]; the counter then tracks current
+    /// on-disk usage. A spill site that never deletes a run before the run ends
+    /// (every existing spill path except the cascaded k-way merge) never
+    /// releases, so for it current stays equal to the monotonic total — the
+    /// historical behavior, unchanged.
     pub fn record_spill_bytes(&self, node: &str, n: u64) -> bool {
         let _ =
             self.cumulative_spill_bytes
@@ -1181,6 +1192,38 @@ impl MemoryArbitrator {
         }
         self.cumulative_spill_bytes.load(Ordering::Relaxed)
             > self.max_spill_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Release `n` bytes previously charged via [`Self::record_spill_bytes`] for
+    /// `node`, because a run that held those bytes was unlinked from disk. The
+    /// pipeline-wide cumulative total and the stage's entry both drop by `n`, so
+    /// the disk-cap counter reflects the bytes still on disk rather than every
+    /// byte ever written.
+    ///
+    /// Only the cascaded k-way spill merge calls this: when it folds a group of
+    /// runs into one intermediate run it unlinks the consumed runs, and their
+    /// bytes were charged (by this same merge for a prior-pass intermediate, or
+    /// by the operator that spilled the originals) against `node`. No cap check
+    /// here — releasing bytes can only move the total further under the cap.
+    /// Saturating-sub floors at zero, so an over-release (a run whose bytes were
+    /// never charged to this node) cannot wrap the counter below other stages'
+    /// live charges.
+    pub fn release_spill_bytes(&self, node: &str, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let _ =
+            self.cumulative_spill_bytes
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                    Some(cur.saturating_sub(n))
+                });
+        let mut per_stage = self
+            .per_stage_spill_bytes
+            .lock()
+            .expect("per_stage_spill_bytes mutex poisoned");
+        if let Some(entry) = per_stage.get_mut(node) {
+            *entry = entry.saturating_sub(n);
+        }
     }
 
     /// Register a consumer with the arbitrator. Returns a fresh
@@ -2281,6 +2324,45 @@ mod tests {
             arbitrator.cumulative_spill_bytes(),
             "the per-stage totals must sum to the pipeline-wide cumulative total"
         );
+    }
+
+    #[test]
+    fn test_release_spill_bytes_tracks_current_on_disk() {
+        // Charge two runs, then release one (as the cascade does when it unlinks
+        // a consumed run): the cumulative total and the stage entry both drop by
+        // the released bytes, so the counter reflects what is still on disk.
+        let arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
+        arbitrator.record_spill_bytes("merge", 1000);
+        arbitrator.record_spill_bytes("merge", 400);
+        assert_eq!(arbitrator.cumulative_spill_bytes(), 1400);
+        arbitrator.release_spill_bytes("merge", 1000);
+        assert_eq!(arbitrator.cumulative_spill_bytes(), 400);
+        assert_eq!(
+            arbitrator.per_stage_spill_bytes().get("merge"),
+            Some(&400),
+            "the stage entry drops with the pipeline-wide total"
+        );
+    }
+
+    #[test]
+    fn test_release_spill_bytes_saturates_at_zero() {
+        // Releasing more than was charged (a run whose bytes were not charged to
+        // this node) floors at zero rather than wrapping the counter under other
+        // stages' live charges.
+        let arbitrator =
+            MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
+        arbitrator.record_spill_bytes("a", 200);
+        arbitrator.record_spill_bytes("b", 300);
+        arbitrator.release_spill_bytes("a", 10_000);
+        assert_eq!(
+            arbitrator.per_stage_spill_bytes().get("a"),
+            Some(&0),
+            "an over-release floors the stage entry at zero"
+        );
+        // The pipeline-wide counter also floors at zero on the over-release; the
+        // guard is the floor, not per-stage bookkeeping of other nodes.
+        assert_eq!(arbitrator.cumulative_spill_bytes(), 0);
     }
 
     #[test]
