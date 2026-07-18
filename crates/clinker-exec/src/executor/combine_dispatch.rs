@@ -1981,9 +1981,21 @@ fn drain_block_band_output(
                 // The k-way run merge is lazy — one resident record per open
                 // run — so streaming its rows through the batcher keeps the
                 // spilled result bounded, never re-materializing the slice.
+                let merge_compress = ctx.spill_compress.resolve_for_schema(
+                    files
+                        .first()
+                        .map(|f| f.schema().column_count())
+                        .unwrap_or(0),
+                    batch_size as u64,
+                );
                 let merger = crate::pipeline::spill_merge::SortedRunMerger::new_payload_ordered(
                     files,
                     "iejoin block-band output merge",
+                    crate::pipeline::spill_merge::MergeBudget {
+                        budget: &ctx.memory_budget,
+                        node: combine_name,
+                        compress: merge_compress,
+                    },
                 )?;
                 stream_block_band_rows(
                     &sender,
@@ -2019,14 +2031,33 @@ fn drain_block_band_output(
                 // lazily when the downstream drains — one resident record per open
                 // run — so a blocking consumer stays bounded and the result is
                 // never re-serialized to a second chunk.
-                adopt_spilled_runs_into_node_buffer(ctx, node_idx, files, row_count, puncts)?
+                adopt_spilled_runs_into_node_buffer(
+                    ctx,
+                    node_idx,
+                    combine_name,
+                    files,
+                    row_count,
+                    puncts,
+                )?
             } else {
                 // A window root, a cross-region tee, or a non-spillable slot needs
                 // the whole slice; those surfaces are O(N) regardless, so
                 // re-materialize the sorted stream once and admit it in memory.
+                let merge_compress = ctx.spill_compress.resolve_for_schema(
+                    files
+                        .first()
+                        .map(|f| f.schema().column_count())
+                        .unwrap_or(0),
+                    ctx.batch_size as u64,
+                );
                 let merger = crate::pipeline::spill_merge::SortedRunMerger::new_payload_ordered(
                     files,
                     "iejoin block-band output merge",
+                    crate::pipeline::spill_merge::MergeBudget {
+                        budget: &ctx.memory_budget,
+                        node: combine_name,
+                        compress: merge_compress,
+                    },
                 )?;
                 let mut rows: Vec<(Record, u64)> = Vec::new();
                 for item in merger {
@@ -2154,6 +2185,7 @@ fn node_tees_to_deferred_region(current_dag: &ExecutionPlanDag, node_idx: NodeIn
 fn adopt_spilled_runs_into_node_buffer(
     ctx: &mut ExecutorContext<'_>,
     node_idx: NodeIndex,
+    combine_name: &str,
     files: Vec<crate::pipeline::spill::SpillFile<(RecordOrder, u64, u64)>>,
     row_count: u64,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
@@ -2173,7 +2205,28 @@ fn adopt_spilled_runs_into_node_buffer(
     ctx.node_buffer_consumer_ids
         .insert(node_idx, (consumer_id, handle));
     ctx.memory_budget.sample_peak_consumer_usage();
-    Ok(NodeBuffer::merge_spilled(files, row_count, puncts))
+    // Park a charging context on the slot so that if this adopted run set is too
+    // fragmented, the drain's k-way merge folds it down under the disk quota
+    // (E320), charging the intermediate runs to this combine node — matching the
+    // compression of the runs it adopts.
+    let merge_compress = ctx.spill_compress.resolve_for_schema(
+        files
+            .first()
+            .map(|f| f.schema().column_count())
+            .unwrap_or(0),
+        ctx.batch_size as u64,
+    );
+    let merge_budget = crate::pipeline::spill_merge::OwnedMergeBudget::new(
+        Arc::clone(&ctx.memory_budget),
+        Arc::from(combine_name),
+        merge_compress,
+    );
+    Ok(NodeBuffer::merge_spilled(
+        files,
+        row_count,
+        puncts,
+        merge_budget,
+    ))
 }
 
 fn dispatch_combine_output_error(
