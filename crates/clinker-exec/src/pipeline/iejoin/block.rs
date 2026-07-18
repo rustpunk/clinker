@@ -41,12 +41,15 @@
 //! would defeat fail-fast.
 //!
 //! Memory model: bounded on the input axis — the resident-block budget plus at
-//! most one loaded spilled block per side, the kernel's O(n) sort arrays, the
-//! held `First` / `collect` candidates for the current driver block, and the
-//! scan-phase unmatched-driver pile (NULL / non-orderable range key), which
-//! drains into its own spillable, driver-index-ordered sort buffer rather than a
-//! resident vec and streams back through the on-miss handler at finalize — so an
-//! input dominated by unmatched drivers stays bounded on the driver side too.
+//! most one loaded spilled block per side, the kernel's O(n) sort arrays, and
+//! the held `First` / `collect` candidates for the current driver block. Both
+//! deferred on-miss piles are bounded the same way: the scan-phase pile (drivers
+//! with a NULL / non-orderable range key, routed out before any block) AND the
+//! in-block zero-match pile (drivers that entered a block but matched nothing)
+//! each drain into their own spillable, driver-index-ordered sort buffer rather
+//! than a resident vec, and stream back through a two-way merge at finalize — so
+//! an input dominated by unmatched drivers, whether NULL-keyed or
+//! orderable-but-out-of-range, stays bounded on the driver side too.
 //! The scan/sort and slice phases respond to memory pressure by SPILLING (own
 //! byte threshold + disk-quota E320), never by consulting global process
 //! pressure.
@@ -68,14 +71,16 @@
 //! (disk-quota E320) instead of holding the O(N·M) result in RAM, and the
 //! dispatcher drains that sorted handle incrementally. The buffer's resident
 //! bytes ARE charged through the consumer handle — mirrored per row exactly as
-//! the input drains charge, so the arbitrator's pull-mode view reflects both
-//! axes — while spilling on the buffer's own threshold, not global pressure, is
-//! what bounds it. The per-pair gate additionally RESERVES this output sort's
-//! spill threshold — the constant cap, not the live output bytes — so each gate
-//! proves `working_set + reservation ≤ hard`; because the output buffer spills
-//! at that same cap, the simultaneous input-plus-output peak stays within
-//! `hard`, a provable bound rather than the earlier ~1.4×hard worst case. With
-//! both axes spill-bounded the operator keeps no
+//! the input drains charge, so the arbitrator's pull-mode view reflects every
+//! axis — while spilling on the buffer's own threshold, not global pressure, is
+//! what bounds it. The per-pair gate additionally RESERVES the constant spill cap
+//! of each deferred sort buffer that can hold live bytes — the output-row buffer
+//! always, plus the in-block zero-match pile under a First / All run with a
+//! non-skip on_miss — not their live bytes, so each gate proves
+//! `working_set + reservation ≤ hard`; because every reserved buffer spills at
+//! that same cap, the simultaneous input-plus-deferred peak stays within `hard`,
+//! a provable bound rather than the earlier ~1.4×hard worst case. With
+//! every axis spill-bounded the operator keeps no
 //! global-pressure abort: the emit path polls no `should_abort`, so a handle
 //! transiently summing the input footprint plus the output sort's resident bytes
 //! is only ever an attribution reading, never an abort trigger.
@@ -520,14 +525,20 @@ pub(super) fn execute_block_band(
     let sort_threshold = options
         .sort_spill_override
         .unwrap_or_else(|| sort_spill_threshold_bytes(budget));
-    // Statically reserve the output sort's spill cap in the per-pair gate so the
-    // input working set is bounded to `hard - reservation`; the output buffer
-    // spills at this same cap, so simultaneous peak stays within `hard`. This
-    // reserves the CONSTANT cap, not the live output bytes (folding live bytes
-    // false-aborts runs where input and output both legitimately spill). Derived
-    // from the budget, NOT `sort_threshold`, which honors the test-only
-    // `sort_spill_override`.
-    let output_reservation = sort_spill_threshold_bytes(budget) as u64;
+    // Each deferred sort buffer self-bounds by spilling at this per-buffer cap,
+    // so the per-pair gate reserves one cap PER buffer that can hold live bytes:
+    // the output-row buffer always, plus the in-block zero-match pile whenever a
+    // First / All run with a non-skip on_miss can populate it. Reserving the
+    // CONSTANT caps — not the live bytes, which would false-abort a run where a
+    // buffer legitimately spills — bounds the input working set to
+    // `hard - reservation`, so even with every reserved buffer simultaneously at
+    // its cap the peak still fits `hard`. Derived from the budget, NOT
+    // `sort_threshold`, which honors the test-only `sort_spill_override`.
+    let deferred_cap = sort_spill_threshold_bytes(budget) as u64;
+    let inblock_can_fill =
+        matches!(match_mode, MatchMode::First | MatchMode::All) && !matches!(on_miss, OnMiss::Skip);
+    let deferred_reservation =
+        deferred_cap.saturating_add(if inblock_can_fill { deferred_cap } else { 0 });
     let drain_ctx = DrainCtx {
         name,
         budget,
@@ -557,6 +568,14 @@ pub(super) fn execute_block_band(
             Some((record, _)) => Arc::clone(record.schema()),
             None => Arc::new(Schema::new(Vec::new())),
         },
+    };
+
+    // Driver record schema, captured before the drain consumes `driver_records`:
+    // the in-block zero-match buffer holds driver records and must decode them on
+    // reload exactly as the scan-phase buffer does.
+    let driver_row_schema: Arc<Schema> = match driver_records.first() {
+        Some((record, _)) => Arc::clone(record.schema()),
+        None => Arc::new(Schema::new(Vec::new())),
     };
 
     // Scan-phase unmatched drivers (NULL / non-orderable range key) are retained
@@ -625,13 +644,22 @@ pub(super) fn execute_block_band(
     // order as the emitted rows.
     let mut failure_tags: Vec<(RecordOrder, u64, u64)> = Vec::new();
     // In-block zero-match drivers (a driver that entered a block but matched no
-    // build) whose on_miss handling is deferred to after the full pass — record,
-    // order, and global input index. At finalize this pile merges with the
-    // streamed scan-phase pile in driver-index order, so on_miss:error names the
-    // globally lowest-input-index unmatched driver (not whichever range-key-
-    // ordered block finalized first). Empty under on_miss:skip and Collect
-    // (every driver emits).
-    let mut unmatched: Vec<(Record, RecordOrder, u64)> = Vec::new();
+    // build) drain into their own payload-ordered, spillable buffer keyed on
+    // `(driver_idx, order)`, on the same spill substrate and disk-quota accounting
+    // (E320) as the scan-phase pile — so an input dominated by
+    // orderable-but-out-of-range drivers stays bounded on the driver side too,
+    // streamed back through the deferred on-miss merge rather than held resident
+    // until dispatch. At finalize this pile merges with the streamed scan-phase
+    // pile in driver-index order, so on_miss:error names the globally
+    // lowest-input-index unmatched driver (not whichever range-key-ordered block
+    // finalized first). Empty under on_miss:skip and Collect (nothing routes
+    // here).
+    let mut inblock_buf: SortBuffer<ScanUnmatchedPayload> = SortBuffer::new_payload_ordered(
+        sort_threshold,
+        Some(spill_dir.to_path_buf()),
+        spill_compress,
+        driver_row_schema,
+    );
     let emit_cfg = EmitConfig {
         name,
         build_qualifier,
@@ -676,13 +704,16 @@ pub(super) fn execute_block_band(
         let driver_held = driver_scratch.saturating_add(driver_vecs_bytes);
         // Gate the driver block's own load from metadata, symmetric with the
         // per-pair build gate below: a spilled driver block whose scratch plus
-        // the resident baseline and the reserved output cap cannot fit the hard
+        // the resident baseline and the reserved deferred caps cannot fit the hard
         // limit aborts before it is materialized rather than after. A resident
         // (borrowed) block adds zero scratch, so it trips only if the resident
-        // baseline plus the reserved output cap already exceeds `hard`.
+        // baseline plus the reserved deferred caps already exceeds `hard`. This
+        // gate also covers the block's finalize peak: the in-block pile grows
+        // there (after this loop's per-pair gates), but only up to its reserved
+        // cap, and by then the per-pair input working set has been released.
         let driver_peak = baseline_resident
             .saturating_add(driver_held)
-            .saturating_add(output_reservation);
+            .saturating_add(deferred_reservation);
         if driver_peak > budget.hard_limit() {
             return Err(abort_over_budget(
                 consumer,
@@ -725,13 +756,16 @@ pub(super) fn execute_block_band(
                 driver_keys: driver_loaded.iter().map(|(_, p)| p.0).collect(),
             },
         };
-        // Each absolute set includes the output sort's current resident bytes,
-        // so the per-row `add_bytes` charge the emit path applies is not clobbered
-        // back to an input-only figure — the handle reflects BOTH axes throughout.
+        // Each absolute set includes the output sort's and the in-block pile's
+        // current resident bytes, so the per-row `add_bytes` charges the emit and
+        // finalize paths apply are not clobbered back to an input-only figure —
+        // the handle reflects the input, output, and deferred in-block footprints
+        // throughout.
         consumer.set_bytes(
             baseline_resident
                 .saturating_add(driver_held)
-                .saturating_add(sink.output_buffer_bytes()),
+                .saturating_add(sink.output_buffer_bytes())
+                .saturating_add(inblock_buf.bytes_used() as u64),
         );
 
         for build_block in &build_blocks {
@@ -775,10 +809,10 @@ pub(super) fn execute_block_band(
                 .saturating_add(driver_held)
                 .saturating_add(build_held)
                 .saturating_add(state.held_bytes());
-            // Reserve the constant output cap on top of the pure input working
+            // Reserve the constant deferred caps on top of the pure input working
             // set (`pair_peak` stays pure so the post-kernel gate below can add
             // `pairs_bytes` and reserve exactly once, never double-counting).
-            let pair_peak_reserved = pair_peak.saturating_add(output_reservation);
+            let pair_peak_reserved = pair_peak.saturating_add(deferred_reservation);
             if pair_peak_reserved > budget.hard_limit() {
                 return Err(abort_over_budget(
                     consumer,
@@ -798,7 +832,8 @@ pub(super) fn execute_block_band(
                     .saturating_add(driver_held)
                     .saturating_add(build_held)
                     .saturating_add(state.held_bytes())
-                    .saturating_add(sink.output_buffer_bytes()),
+                    .saturating_add(sink.output_buffer_bytes())
+                    .saturating_add(inblock_buf.bytes_used() as u64),
             );
 
             // Build the build-side key column at the width the chosen kernel
@@ -825,7 +860,7 @@ pub(super) fn execute_block_band(
             // post-kernel pairs gate.
             let pairs_bytes = (pairs.len() * std::mem::size_of::<(usize, usize)>()) as u64;
             let pair_peak = pair_peak.saturating_add(pairs_bytes);
-            let pair_peak_reserved = pair_peak.saturating_add(output_reservation);
+            let pair_peak_reserved = pair_peak.saturating_add(deferred_reservation);
             if pair_peak_reserved > budget.hard_limit() {
                 return Err(abort_over_budget(
                     consumer,
@@ -840,7 +875,8 @@ pub(super) fn execute_block_band(
                     .saturating_add(build_held)
                     .saturating_add(state.held_bytes())
                     .saturating_add(pairs_bytes)
-                    .saturating_add(sink.output_buffer_bytes()),
+                    .saturating_add(sink.output_buffer_bytes())
+                    .saturating_add(inblock_buf.bytes_used() as u64),
             );
 
             let build_slice: Vec<&Record> = build_loaded.iter().map(|(r, _)| r).collect();
@@ -854,70 +890,80 @@ pub(super) fn execute_block_band(
 
             // The build scratch and key/pair arrays for this pair are dropped;
             // fall back to the driver block's held state plus the First / collect
-            // candidates accumulated so far, still carrying the output sort's
-            // resident bytes so the emit-side charge persists.
+            // candidates accumulated so far, still carrying the output sort's and
+            // the in-block pile's resident bytes so those charges persist.
             consumer.set_bytes(
                 baseline_resident
                     .saturating_add(driver_held)
                     .saturating_add(state.held_bytes())
-                    .saturating_add(sink.output_buffer_bytes()),
+                    .saturating_add(sink.output_buffer_bytes())
+                    .saturating_add(inblock_buf.bytes_used() as u64),
             );
         }
 
         // This driver block's inner loop is complete: flush collect
-        // accumulators / emit deferred First candidates, and gather its
-        // zero-match drivers for the end-of-join on_miss dispatch.
+        // accumulators / emit deferred First candidates, and drain its zero-match
+        // drivers into the spillable in-block pile for the end-of-join on_miss
+        // dispatch. The temporary pile borrows `inblock_buf` only for this call,
+        // so the set_bytes below can read its resident bytes.
         finalize_driver_block(
             &emit_cfg,
             &mut evals,
             &driver_loaded,
-            on_miss,
             &mut state,
-            &mut unmatched,
+            &mut InblockPile {
+                buf: &mut inblock_buf,
+                ctx: &drain_ctx,
+                on_miss,
+            },
             &mut sink,
         )?;
 
         // The driver block's scratch, key array, and now-drained held state are
-        // released; leave the resident baseline plus the output sort's resident
-        // bytes charged.
-        consumer.set_bytes(baseline_resident.saturating_add(sink.output_buffer_bytes()));
+        // released; leave the resident baseline plus the output sort's and the
+        // in-block pile's resident bytes charged.
+        consumer.set_bytes(
+            baseline_resident
+                .saturating_add(sink.output_buffer_bytes())
+                .saturating_add(inblock_buf.bytes_used() as u64),
+        );
     }
 
-    // Deferred zero-match handling. Scan-phase unmatched drivers (NULL /
-    // non-orderable range key) never entered a block; they are streamed back
-    // from their spillable buffer in driver-input-index order — one record
-    // resident at a time, never the whole pile. Under Collect each emits one
+    // Deferred zero-match handling. Both on-miss piles finish to their own
+    // driver-input-index-ordered streams — the scan-phase pile (NULL /
+    // non-orderable range key, never entered a block) and the in-block pile
+    // (entered a block, matched nothing) — each streamed one record resident at a
+    // time, never the whole pile. Under Collect each scan-phase driver emits one
     // empty-array row (the output buffer re-sorts, so the stream order is
-    // immaterial to the result). Under First / All the streamed pile merges with
-    // the in-block zero-match pile and dispatches through on_miss in ascending
-    // driver-input-index order — the same total order the prior single sorted
-    // vec produced — so on_miss:error names the globally lowest-input-index miss
-    // and on_miss:null_fields visits misses in input order (its rows re-sort
-    // through the output buffer, so that order only fixes the FailFast eval-error
-    // identity). The residue run this finish spills is charged against the disk
+    // immaterial to the result). Under First / All the two streams two-way merge
+    // by ascending driver-input-index and dispatch through on_miss in that order
+    // — the same total order the prior single sorted vec produced — so
+    // on_miss:error names the globally lowest-input-index miss and
+    // on_miss:null_fields visits misses in input order (its rows re-sort through
+    // the output buffer, so that order only fixes the FailFast eval-error
+    // identity). The residue run each finish spills is charged against the disk
     // quota (E320).
-    let scan_stream = finish_scan_unmatched_stream(scan_unmatched_buf, &drain_ctx)?;
+    let scan_stream = finish_unmatched_stream(scan_unmatched_buf, &drain_ctx)?;
     match match_mode {
         MatchMode::Collect => {
-            debug_assert!(
-                unmatched.is_empty(),
-                "Collect emits a row for every driver, so none joins the on_miss pile"
+            debug_assert_eq!(
+                inblock_buf.total_rows(),
+                0,
+                "Collect emits a row for every driver, so none routes to the in-block on_miss pile"
             );
             emit_scan_unmatched_collect(&emit_cfg, scan_stream, &mut sink)?;
         }
         MatchMode::First | MatchMode::All => {
-            // In-block misses in ascending driver-input-index order, so the merge
-            // with the already-index-ordered scan-phase stream is a total order.
-            // `driver_idx` is unique per driver, so the key is total even when a
-            // chained upstream repeats `order`; sorting by `order` first would
-            // instead name the lowest-order driver, diverging from the equi+range
-            // sibling and the documented contract.
-            unmatched.sort_by_key(|(_, _order, driver_idx)| *driver_idx);
+            // Each buffer is payload-ordered on `(driver_idx, order)`, so both
+            // streams arrive in ascending driver-input-index order and the merge
+            // is a total order. `driver_idx` is unique per driver, so the key is
+            // total even when a chained upstream repeats `order`.
+            let inblock_stream = finish_unmatched_stream(inblock_buf, &drain_ctx)?;
             dispatch_deferred_misses(
                 &emit_cfg,
                 &mut evals,
                 scan_stream,
-                unmatched,
+                inblock_stream,
                 on_miss,
                 &mut sink,
             )?;
@@ -1333,23 +1379,33 @@ fn spill_block<P: Serialize>(
     })
 }
 
+/// The deferred in-block-miss drain target handed to the driver-block finalizer:
+/// the spillable pile, the spill/charge context it drains through, and the
+/// `on_miss` policy that decides whether a miss is recorded at all. Bundled so
+/// the finalizer stays within the argument budget.
+struct InblockPile<'a, 'ctx> {
+    buf: &'a mut SortBuffer<ScanUnmatchedPayload>,
+    ctx: &'a DrainCtx<'ctx>,
+    on_miss: OnMiss,
+}
+
 /// Finalize one driver block after its inner loop over build blocks. Under
 /// `Collect`, flush one row per driver (even zero-match drivers, with an empty
 /// array). Under `First`, emit each driver's held minimum-build-index candidate
 /// — the selection is a pure function of the data, not of the block layout —
 /// and gather any driver with no emitting candidate. Under `All`, gather every
-/// zero-match driver. Gathered drivers are appended to `unmatched` for the
+/// zero-match driver. Gathered drivers drain into the spillable in-block pile
+/// (keyed on `(driver_idx, order)`, charged against the disk quota, E320) for the
 /// deferred end-of-join on_miss dispatch, so on_miss:error names the
 /// lowest-input-index unmatched driver rather than whichever block finalized
-/// first. Each driver's global input index (`payload.2`) is carried through so
-/// its rows tag deterministically.
+/// first and the pile stays bounded rather than resident. Each driver's global
+/// input index (`payload.2`) is carried through so its rows tag deterministically.
 fn finalize_driver_block(
     cfg: &EmitConfig<'_>,
     evals: &mut Evaluators,
     driver_loaded: &[(Record, DriverPayload)],
-    on_miss: OnMiss,
     state: &mut MatchState,
-    unmatched: &mut Vec<(Record, RecordOrder, u64)>,
+    pile: &mut InblockPile<'_, '_>,
     sink: &mut EmitSink<'_>,
 ) -> Result<(), PipelineError> {
     match cfg.match_mode {
@@ -1373,17 +1429,17 @@ fn finalize_driver_block(
                             driver_idx: payload.2,
                         };
                         if !emit_match_row(cfg, evals, &dref, &build, bidx, sink)? {
-                            note_unmatched(on_miss, record, payload.3, payload.2, unmatched);
+                            note_unmatched(pile, record, payload.3, payload.2)?;
                         }
                     }
-                    None => note_unmatched(on_miss, record, payload.3, payload.2, unmatched),
+                    None => note_unmatched(pile, record, payload.3, payload.2)?,
                 }
             }
         }
         MatchMode::All => {
             for (di, (record, payload)) in driver_loaded.iter().enumerate() {
                 if !state.matched[di] {
-                    note_unmatched(on_miss, record, payload.3, payload.2, unmatched);
+                    note_unmatched(pile, record, payload.3, payload.2)?;
                 }
             }
         }
@@ -1391,26 +1447,26 @@ fn finalize_driver_block(
     Ok(())
 }
 
-/// Finish the scan-phase unmatched buffer into a driver-input-index-ordered
-/// stream, charging any residue run this call spills against the disk quota
-/// (E320). Mirrors the matched-side finish: an in-memory buffer yields its
-/// sorted vec; a spilled one folds its runs through the k-way merger, one
-/// resident record per open run — so the stream is bounded regardless of how
-/// many drivers were unmatched.
-fn finish_scan_unmatched_stream(
+/// Finish an unmatched-driver buffer (scan-phase or in-block) into a
+/// driver-input-index-ordered stream, charging any residue run this call spills
+/// against the disk quota (E320). Mirrors the matched-side finish: an in-memory
+/// buffer yields its sorted vec; a spilled one folds its runs through the k-way
+/// merger, one resident record per open run — so the stream is bounded
+/// regardless of how many drivers were unmatched.
+fn finish_unmatched_stream(
     buf: SortBuffer<ScanUnmatchedPayload>,
     ctx: &DrainCtx<'_>,
 ) -> Result<SortedStream<ScanUnmatchedPayload>, PipelineError> {
     let (sorted, residue) = buf.finish().map_err(|e| {
         PipelineError::Io(io::Error::other(format!(
-            "iejoin block-band scan-unmatched finish failed: {e}"
+            "iejoin block-band unmatched finish failed: {e}"
         )))
     })?;
     charge_block_spill(ctx, residue)?;
     Ok(match sorted {
         SortedOutput::InMemory(pairs) => SortedStream::InMemory(pairs.into_iter()),
         SortedOutput::Spilled(files) => SortedStream::Spilled(
-            SortedRunMerger::new_payload_ordered(files, "iejoin block-band scan-unmatched merge")?,
+            SortedRunMerger::new_payload_ordered(files, "iejoin block-band unmatched merge")?,
         ),
     })
 }
@@ -1443,32 +1499,32 @@ fn emit_scan_unmatched_collect(
 }
 
 /// Dispatch every zero-match driver through its `on_miss` policy in ascending
-/// driver-input-index order, merging the streamed scan-phase pile (NULL /
-/// non-orderable range key, spillable and bounded) with the in-block zero-match
-/// pile (already index-sorted by the caller). A driver is in exactly one pile,
-/// so their driver indices are disjoint and the merge is a total order:
-/// on_miss:error names the globally lowest-input-index miss regardless of which
-/// pile it came from, and on_miss:null_fields visits misses in that same order
-/// (its emitted / dead-letter rows re-sort through the output buffer, so the
-/// order only fixes the FailFast eval-error identity). Bounded on the scan-phase
-/// side — one streamed record resident at a time.
+/// driver-input-index order, two-way merging the streamed scan-phase pile (NULL /
+/// non-orderable range key) with the streamed in-block zero-match pile (entered a
+/// block, matched nothing). Both streams are payload-ordered on
+/// `(driver_idx, order)`. A driver is in exactly one pile, so their driver
+/// indices are disjoint and the merge is a total order: on_miss:error names the
+/// globally lowest-input-index miss regardless of which pile it came from, and
+/// on_miss:null_fields visits misses in that same order (its emitted / dead-letter
+/// rows re-sort through the output buffer, so the order only fixes the FailFast
+/// eval-error identity). Bounded on both sides — one streamed record resident per
+/// open run.
 fn dispatch_deferred_misses(
     cfg: &EmitConfig<'_>,
     evals: &mut Evaluators,
     mut scan_stream: SortedStream<ScanUnmatchedPayload>,
-    inblock: Vec<(Record, RecordOrder, u64)>,
+    mut inblock_stream: SortedStream<ScanUnmatchedPayload>,
     on_miss: OnMiss,
     sink: &mut EmitSink<'_>,
 ) -> Result<(), PipelineError> {
-    let mut inblock = inblock.into_iter();
     let mut scan_cur = scan_stream.next().transpose()?;
-    let mut inblock_cur = inblock.next();
+    let mut inblock_cur = inblock_stream.next().transpose()?;
     loop {
         // Advance the front with the smaller driver index. Disjoint indices, so
         // the `<=` tie branch never actually ties an in-block index; consuming
-        // the chosen front by move (not take/expect) keeps the merge panic-free.
+        // the chosen front by move keeps the merge panic-free.
         let take_scan = match (&scan_cur, &inblock_cur) {
-            (Some((_, (scan_idx, _))), Some((_, _, inblock_idx))) => scan_idx <= inblock_idx,
+            (Some((_, (scan_idx, _))), Some((_, (inblock_idx, _)))) => scan_idx <= inblock_idx,
             (Some(_), None) => true,
             (None, Some(_)) => false,
             (None, None) => break,
@@ -1479,30 +1535,33 @@ fn dispatch_deferred_misses(
             }
             scan_cur = scan_stream.next().transpose()?;
         } else {
-            if let Some((record, order, driver_idx)) = inblock_cur {
+            if let Some((record, (driver_idx, order))) = inblock_cur {
                 dispatch_on_miss(cfg, evals, &record, order, driver_idx, on_miss, sink)?;
             }
-            inblock_cur = inblock.next();
+            inblock_cur = inblock_stream.next().transpose()?;
         }
     }
     Ok(())
 }
 
-/// Record one zero-match driver for the deferred end-of-join on_miss dispatch.
-/// `Skip` needs nothing (the driver emits no row); `Error` and `NullFields`
-/// need the driver held until the full pass completes, so the error names the
-/// lowest input index and the null-field rows emit in input order. The driver's
-/// global input index is retained for the deterministic row tag.
+/// Drain one zero-match driver into the spillable in-block pile for the deferred
+/// end-of-join on_miss dispatch. `Skip` needs nothing (the driver emits no row);
+/// `Error` and `NullFields` need the driver held until the full pass completes,
+/// so the error names the lowest input index and the null-field rows emit in
+/// input order. The buffer spills on its own byte threshold (charging each run
+/// against the disk quota, E320), so the pile stays bounded even when most
+/// drivers miss. The payload `(driver_idx, order)` keys the buffer on the unique
+/// global input index, so the finished stream is already in dispatch order.
 fn note_unmatched(
-    on_miss: OnMiss,
+    pile: &mut InblockPile<'_, '_>,
     record: &Record,
     order: RecordOrder,
     driver_idx: u64,
-    unmatched: &mut Vec<(Record, RecordOrder, u64)>,
-) {
-    if !matches!(on_miss, OnMiss::Skip) {
-        unmatched.push((record.clone(), order, driver_idx));
+) -> Result<(), PipelineError> {
+    if !matches!(pile.on_miss, OnMiss::Skip) {
+        push_charge_spill(pile.buf, record.clone(), (driver_idx, order), pile.ctx)?;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3253,5 +3312,56 @@ mod tests {
                 other => panic!("expected CombineMissingMatch; got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn all_inblock_miss_driver_heavy_spills_under_tight_budget() {
+        // The pathological all-in-block-miss shape: every driver carries an
+        // orderable range key that falls outside every build range, so each enters
+        // a block (it is not scan-phase unmatched) but matches nothing and routes
+        // to the DEFERRED in-block on-miss pile. Under on_miss:error that whole
+        // pile drains into its spillable buffer, spills its runs, then streams back
+        // through the two-way merge and errors on the lowest input index. The old
+        // code held this pile in a resident O(N) Vec until dispatch; the buffer
+        // bounds it to disk instead. Here the scan-phase pile and the output buffer
+        // are both empty, so the in-block pile IS the entire deferred-miss
+        // residency — the structure that must not stay resident. (The valid-key
+        // drivers also form spilled driver blocks under this budget, so the
+        // cumulative spill is not attributed to the in-block buffer alone; the
+        // isolating facts are that the run reaches the merge and errors on index 0,
+        // and that a 900-driver deferred pile completes under a sub-100 KiB working
+        // budget without a resident Vec.)
+        let driver: Side = (0..900i64)
+            .map(|i| (Some((1_000 + i, 1_000 + i)), i))
+            .collect();
+        let build: Side = vec![(Some((5, 5)), 100), (Some((6, 4)), 101)];
+        let cfg = RunCfg {
+            op1: RangeOp::Le,
+            op2: Some(RangeOp::Ge),
+            match_mode: MatchMode::All,
+            on_miss: OnMiss::Error,
+            // Small blocks, all spilled, so the driver-load gate stays well under
+            // the hard limit while the in-block buffer overflows its 16 KiB-floored
+            // threshold and spills its runs.
+            block_target: 256,
+            hard_limit: 128 * 1024,
+            max_spill_bytes: None,
+            sort_spill: None,
+            resident_budget: Some(0),
+        };
+        let budget = arbitrator(cfg.hard_limit);
+        let err = run_block_on(&driver, &build, &cfg, &budget)
+            .expect_err("an all-in-block-miss input under on_miss:error must error");
+        match err {
+            PipelineError::CombineMissingMatch { driver_row, .. } => assert_eq!(
+                driver_row, 0,
+                "on_miss:error must name the lowest-input-index in-block miss"
+            ),
+            other => panic!("expected CombineMissingMatch; got {other:?}"),
+        }
+        assert!(
+            budget.cumulative_spill_bytes() > 0,
+            "the 900-driver deferred pile must have reached disk, not stayed resident"
+        );
     }
 }
