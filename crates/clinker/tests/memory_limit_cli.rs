@@ -98,3 +98,134 @@ fn valid_memory_limit_passes_the_startup_gate() {
         "a valid memory.limit must not trip the overflow gate; got:\n{stderr}"
     );
 }
+
+#[test]
+fn cli_memory_limit_overrides_pipeline_yaml() {
+    // The `--memory-limit` flag is documented as CLI-wins over `memory.limit`.
+    // A pipeline whose YAML sets a generous 2 GiB budget runs cleanly on its
+    // own; passing `--memory-limit 1` on the same pipeline must force a
+    // sub-baseline budget the arbitrator rejects at startup (E312), proving the
+    // flag reaches the executor rather than being silently ignored.
+    let tmp = pipeline_with_limit("2G");
+
+    // Baseline: the YAML 2 GiB budget alone clears startup and the run
+    // completes, so any failure below is attributable to the CLI override, not
+    // the pipeline itself.
+    let without_flag = Command::new(clinker_bin())
+        .arg("run")
+        .arg("pipeline.yaml")
+        .current_dir(tmp.path())
+        .output()
+        .expect("spawn clinker");
+    assert!(
+        without_flag.status.success(),
+        "the 2G YAML budget alone must let the run pass; stderr:\n{}",
+        String::from_utf8_lossy(&without_flag.stderr),
+    );
+
+    // Override: `--memory-limit 1` sets a 1-byte ceiling, below the process's
+    // baseline resident memory, so the run aborts before any data loads. The
+    // load-bearing signal is the differential itself — the same pipeline that
+    // passed on its 2G YAML budget now fails — which proves the flag reached the
+    // executor and won over the YAML value regardless of the abort mechanism.
+    let with_flag = Command::new(clinker_bin())
+        .arg("run")
+        .arg("pipeline.yaml")
+        .arg("--memory-limit")
+        .arg("1")
+        .current_dir(tmp.path())
+        .output()
+        .expect("spawn clinker");
+    let stderr = String::from_utf8_lossy(&with_flag.stderr);
+    assert!(
+        !with_flag.status.success(),
+        "`--memory-limit 1` must override the 2G YAML budget and abort the run; \
+         stderr:\n{stderr}"
+    );
+    // On the supported CI targets (Linux, macOS, Windows) `rss_bytes()` is
+    // available and the default backpressure policy pauses producers, so a
+    // sub-baseline budget is rejected up front as E312 whose message echoes the
+    // exact 1-byte ceiling — confirming the flag's specific value, not merely
+    // some failure, propagated into the arbitrator sizing. (The E312 gate is
+    // skipped only where `rss_bytes()` returns `None` or under a non-pausing
+    // policy, neither of which applies on those targets.)
+    assert!(
+        stderr.contains("E312") && stderr.contains("of 1 bytes"),
+        "the CLI-forced 1-byte budget must surface the E312 startup abort naming \
+         that ceiling; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn malformed_memory_limit_flag_fails_at_the_boundary_without_clobbering_yaml() {
+    // Regression guard for the wiring's original hazard: before boundary
+    // validation, a malformed `--memory-limit` value (the decimal `4GB` where
+    // the binary `4G` is meant, or plain garbage) parsed to the 512 MiB default
+    // downstream, silently overriding a larger YAML budget with no diagnostic.
+    // The flag must now be rejected at the CLI boundary — naming the flag and
+    // echoing the bad value — before it can touch the plan, so the generous YAML
+    // budget below is never clobbered.
+    let tmp = pipeline_with_limit("8G");
+
+    for bad in ["4GB", "notanumber"] {
+        let output = Command::new(clinker_bin())
+            .arg("run")
+            .arg("pipeline.yaml")
+            .arg("--memory-limit")
+            .arg(bad)
+            .current_dir(tmp.path())
+            .output()
+            .expect("spawn clinker");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "a malformed --memory-limit {bad:?} must fail the run; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("--memory-limit"),
+            "the diagnostic must name the flag the operator passed, not the YAML \
+             `memory.limit` key; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(bad),
+            "the diagnostic must echo the offending value {bad:?}; got:\n{stderr}"
+        );
+        // The run-failed guard above is the load-bearing check that no silent
+        // clobber happened: had a malformed flag collapsed to the 512 MiB
+        // default and overridden the 8G YAML budget, this one-row pipeline would
+        // have run to completion, so the non-zero exit proves the value was
+        // rejected at the boundary rather than coerced into a budget.
+    }
+}
+
+#[test]
+fn empty_memory_limit_flag_is_treated_as_unset() {
+    // An ops wrapper such as `clinker run --memory-limit "$CLINKER_MEM" pipeline.yaml`
+    // expands an unset variable to `--memory-limit ""`. An empty (or
+    // whitespace-only) flag value must be treated as absent — the run falls back
+    // to the YAML budget and completes — never rejected as an invalid budget the
+    // way a non-empty malformed value is.
+    let tmp = pipeline_with_limit("256M");
+
+    for empty in ["", "   "] {
+        let output = Command::new(clinker_bin())
+            .arg("run")
+            .arg("pipeline.yaml")
+            .arg("--memory-limit")
+            .arg(empty)
+            .current_dir(tmp.path())
+            .output()
+            .expect("spawn clinker");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "an empty --memory-limit {empty:?} must fall back to the YAML budget and \
+             succeed, not abort; stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("--memory-limit"),
+            "an empty flag value must not surface the invalid-budget abort that names \
+             the flag; got:\n{stderr}"
+        );
+    }
+}

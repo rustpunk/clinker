@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use clinker_exec::executor::PipelineExecutor;
 use clinker_exec::metrics::{self, ExecutionMetrics};
-use clinker_plan::config::utils::parse_memory_limit_bytes;
+use clinker_plan::config::utils::parse_memory_limit_bytes_strict;
 use clinker_plan::error::PipelineError;
 
 mod refactor;
@@ -425,13 +425,38 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
-    /// Resolve memory limit from CLI flag or default (512MB).
+    /// Validate the `--memory-limit` flag and resolve the string to inject into
+    /// `pipeline.memory.limit`.
     ///
-    /// Returns a config error when the flag value's binary-suffix scaling
-    /// overflows `u64`, so the caller surfaces a clear diagnostic to the
-    /// operator instead of panicking or silently wrapping to a tiny budget.
-    pub fn memory_limit_bytes(&self) -> Result<u64, clinker_plan::config::ConfigError> {
-        parse_memory_limit_bytes(self.mem_limit.as_deref().or(Some("512M")))
+    /// `Ok(None)` when the flag is absent or its value is empty or
+    /// whitespace-only — an ops wrapper that forwards an unset variable expands
+    /// to `--memory-limit ""`, and that must fall through to the YAML budget
+    /// exactly as an omitted flag would, not abort. `Ok(Some(_))` for a valid
+    /// budget the caller injects; the value is the trimmed flag string, which the
+    /// executor re-parses through the lenient `memory.limit` grammar. A strictly
+    /// accepted value scales identically on that lenient path (held by the
+    /// strict/lenient agreement test), so the byte budget is preserved. `Err` —
+    /// naming the flag and echoing the value — only for a non-empty but malformed
+    /// value (e.g. the decimal `4GB` where the binary `4G` was meant), which must
+    /// fail loudly rather than silently collapse to the default and shrink a
+    /// larger configured budget.
+    pub fn resolved_memory_limit(
+        &self,
+    ) -> Result<Option<String>, clinker_plan::config::ConfigError> {
+        let Some(raw) = self.mem_limit.as_deref() else {
+            return Ok(None);
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        parse_memory_limit_bytes_strict(trimmed)
+            .map(|_| Some(trimmed.to_string()))
+            .map_err(|reason| {
+                clinker_plan::config::ConfigError::Validation(format!(
+                    "--memory-limit {raw:?} is not a valid memory budget: {reason}"
+                ))
+            })
     }
 
     /// Resolve batch_id from CLI flag or generate UUID v7.
@@ -945,6 +970,24 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let mut pipeline_config =
         clinker_plan::config::load_config_with_vars_and_patches(&args.config, &[], source_patches)
             .map_err(PipelineError::Config)?;
+
+    // A `--memory-limit` flag overrides the pipeline's `memory.limit`, matching
+    // the documented CLI-wins precedence. The flag is validated at the boundary,
+    // before it can reach the plan: only a valid budget is injected, so a
+    // malformed value fails loudly (naming the flag) instead of parsing to the
+    // default downstream and silently shrinking a larger configured budget. An
+    // absent flag — or an empty/whitespace-only value, as an ops wrapper produces
+    // when it forwards an unset variable — resolves to `None`, leaving the YAML
+    // value untouched (the arbitrator's own 512 MiB default still applies when
+    // the YAML is silent too), so it never clobbers a configured budget. The
+    // executor recomputes the byte budget from the injected string through the
+    // identical grammar, so the validated verdict, not the byte count, matters here.
+    if let Some(limit) = args
+        .resolved_memory_limit()
+        .map_err(PipelineError::Config)?
+    {
+        pipeline_config.pipeline.memory.limit = Some(limit);
+    }
 
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
@@ -3688,7 +3731,12 @@ mod tests {
         let cli =
             Cli::try_parse_from(["clinker", "run", "--memory-limit", "512K", "p.yaml"]).unwrap();
         match cli.command {
-            Commands::Run(args) => assert_eq!(args.memory_limit_bytes().ok(), Some(524288)),
+            Commands::Run(args) => {
+                assert_eq!(
+                    args.resolved_memory_limit().unwrap(),
+                    Some("512K".to_string())
+                )
+            }
             _ => panic!("expected Run command"),
         }
     }
@@ -3698,7 +3746,12 @@ mod tests {
         let cli =
             Cli::try_parse_from(["clinker", "run", "--memory-limit", "256M", "p.yaml"]).unwrap();
         match cli.command {
-            Commands::Run(args) => assert_eq!(args.memory_limit_bytes().ok(), Some(268435456)),
+            Commands::Run(args) => {
+                assert_eq!(
+                    args.resolved_memory_limit().unwrap(),
+                    Some("256M".to_string())
+                )
+            }
             _ => panic!("expected Run command"),
         }
     }
@@ -3708,7 +3761,12 @@ mod tests {
         let cli =
             Cli::try_parse_from(["clinker", "run", "--memory-limit", "2G", "p.yaml"]).unwrap();
         match cli.command {
-            Commands::Run(args) => assert_eq!(args.memory_limit_bytes().ok(), Some(2147483648)),
+            Commands::Run(args) => {
+                assert_eq!(
+                    args.resolved_memory_limit().unwrap(),
+                    Some("2G".to_string())
+                )
+            }
             _ => panic!("expected Run command"),
         }
     }
@@ -3718,18 +3776,89 @@ mod tests {
         let cli =
             Cli::try_parse_from(["clinker", "run", "--memory-limit", "1000000", "p.yaml"]).unwrap();
         match cli.command {
-            Commands::Run(args) => assert_eq!(args.memory_limit_bytes().ok(), Some(1000000)),
+            Commands::Run(args) => {
+                assert_eq!(
+                    args.resolved_memory_limit().unwrap(),
+                    Some("1000000".to_string())
+                )
+            }
             _ => panic!("expected Run command"),
         }
     }
 
     #[test]
-    fn test_cli_run_default_memory_limit() {
+    fn test_cli_run_memory_limit_absent_resolves_to_none() {
+        // An omitted flag resolves to `None`, so the caller leaves the YAML
+        // budget (and the arbitrator's own default) untouched.
         let cli = Cli::try_parse_from(["clinker", "run", "p.yaml"]).unwrap();
         match cli.command {
-            Commands::Run(args) => {
-                assert_eq!(args.memory_limit_bytes().ok(), Some(512 * 1024 * 1024))
+            Commands::Run(args) => assert_eq!(args.resolved_memory_limit().unwrap(), None),
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_run_memory_limit_empty_treated_as_absent() {
+        // An ops wrapper like `clinker run --memory-limit "$CLINKER_MEM" ...`
+        // expands an unset variable to `--memory-limit ""`. An empty or
+        // whitespace-only value must resolve to `None` — falling back to the YAML
+        // budget exactly as an omitted flag would — never a hard abort.
+        for empty in ["", "   "] {
+            let cli =
+                Cli::try_parse_from(["clinker", "run", "--memory-limit", empty, "p.yaml"]).unwrap();
+            match cli.command {
+                Commands::Run(args) => assert_eq!(
+                    args.resolved_memory_limit().unwrap(),
+                    None,
+                    "empty flag value {empty:?} must resolve to None"
+                ),
+                _ => panic!("expected Run command"),
             }
+        }
+    }
+
+    #[test]
+    fn test_cli_run_memory_limit_malformed_fails_naming_flag() {
+        // A malformed value (the decimal `4GB` where the binary `4G` is meant,
+        // or plain garbage) must be rejected at the boundary — naming the flag
+        // and echoing the value — never coerced to the default, which would
+        // silently shrink a larger configured budget.
+        for bad in ["4GB", "notanumber"] {
+            let cli =
+                Cli::try_parse_from(["clinker", "run", "--memory-limit", bad, "p.yaml"]).unwrap();
+            match cli.command {
+                Commands::Run(args) => match args.resolved_memory_limit() {
+                    Err(clinker_plan::config::ConfigError::Validation(msg)) => {
+                        assert!(
+                            msg.contains("--memory-limit") && msg.contains(bad),
+                            "diagnostic must name the flag and echo {bad:?}; got: {msg}"
+                        );
+                    }
+                    other => panic!("expected a validation error for {bad:?}, got: {other:?}"),
+                },
+                _ => panic!("expected Run command"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_cli_run_memory_limit_overflow_fails_naming_flag() {
+        // A well-formed but oversized value (numeric part fits, suffix multiply
+        // overflows `u64`) must also fail naming the flag the operator passed,
+        // not the YAML `memory.limit` key.
+        let cli =
+            Cli::try_parse_from(["clinker", "run", "--memory-limit", "17179869184G", "p.yaml"])
+                .unwrap();
+        match cli.command {
+            Commands::Run(args) => match args.resolved_memory_limit() {
+                Err(clinker_plan::config::ConfigError::Validation(msg)) => {
+                    assert!(
+                        msg.contains("--memory-limit") && msg.contains("overflow"),
+                        "diagnostic must name the flag and the overflow; got: {msg}"
+                    );
+                }
+                other => panic!("expected a validation error, got: {other:?}"),
+            },
             _ => panic!("expected Run command"),
         }
     }
