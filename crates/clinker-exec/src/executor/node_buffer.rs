@@ -657,7 +657,7 @@ impl Iterator for NodeBufferDrain {
                 {
                     match SortedRunMerger::new_payload_ordered(
                         files,
-                        "iejoin block-band output merge",
+                        "combine payload-sorted output merge",
                         merge_budget.as_borrowed(),
                     ) {
                         Ok(m) => *merger = Some(m),

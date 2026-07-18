@@ -2008,7 +2008,7 @@ fn drain_block_band_output(
                 let merge_compress = merge_compress_for(ctx, &files, batch_size);
                 let merger = crate::pipeline::spill_merge::SortedRunMerger::new_payload_ordered(
                     files,
-                    "iejoin block-band output merge",
+                    "combine payload-sorted output merge",
                     crate::pipeline::spill_merge::MergeBudget {
                         budget: &ctx.memory_budget,
                         node: combine_name,
@@ -2064,7 +2064,7 @@ fn drain_block_band_output(
                 let merge_compress = merge_compress_for(ctx, &files, ctx.batch_size);
                 let merger = crate::pipeline::spill_merge::SortedRunMerger::new_payload_ordered(
                     files,
-                    "iejoin block-band output merge",
+                    "combine payload-sorted output merge",
                     crate::pipeline::spill_merge::MergeBudget {
                         budget: &ctx.memory_budget,
                         node: combine_name,
