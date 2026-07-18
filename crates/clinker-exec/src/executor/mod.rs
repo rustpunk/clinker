@@ -393,11 +393,12 @@ impl PipelineExecutor {
     ) -> Result<ExecutionReport, PipelineError> {
         // Reject an unsatisfiable memory budget before building the run.
         // A `memory.limit` below the process's live baseline RSS can never
-        // be met (the empty pipeline already exceeds it), and under the
-        // default producer-pausing policy it deadlocks rather than failing
-        // fast — so surface a clear E312 startup error here, alongside the
-        // storage-config validation the CLI run path performs, instead of
-        // letting the run park. Scoped to the pausing policies; `spill`
+        // be met (the empty pipeline already exceeds it), and under a
+        // producer-pausing policy the run only churns against the impossible
+        // ceiling rather than failing fast — so surface a clear E312 startup
+        // error here, alongside the storage-config validation the CLI run
+        // path performs, instead of letting the run thrash. Scoped to the
+        // pausing policies; `spill`
         // makes forward progress under a tiny budget and is left alone.
         // The run boundary is where a bad `memory.limit` becomes a user-facing
         // error: an unparseable value falls back to the default budget, but a
