@@ -1816,6 +1816,9 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
 
         MatchMode::First | MatchMode::All => {
             let mut emitted_any = false;
+            // Loop-invariant: First commits to one build and treats the body as a
+            // post-match projection; All scans every window entry.
+            let select_first = matches!(match_mode, MatchMode::First);
             for entry in window.replay(mspill) {
                 let (inner, _build_key, build_idx) = entry?;
                 let out_key = (driver_order, driver_idx, build_idx);
@@ -1856,7 +1859,6 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                     // match up front so a body skip drops only this row instead
                     // of falling through to on_miss, then stop after this one
                     // build rather than retrying a later match.
-                    let select_first = matches!(match_mode, MatchMode::First);
                     if select_first {
                         emitted_any = true;
                     }
@@ -1907,12 +1909,10 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                                 error: e,
                             });
                             failure_tags.push(out_key);
-                            // First already committed to this build; the
-                            // deferred dead-letter above is its only output. All
-                            // keeps scanning the remaining window entries.
-                            if !select_first {
-                                continue;
-                            }
+                            // First already committed to this build; the deferred
+                            // dead-letter above is its only output and the trailing
+                            // break stops the scan. All falls through to the next
+                            // window entry.
                         }
                     }
                     if select_first {
@@ -1941,7 +1941,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                     let rec = Record::new(Arc::clone(target_schema), values);
                     push_output_row(output, rec, out_key, mspill)?;
                     emitted_any = true;
-                    if matches!(match_mode, MatchMode::First) {
+                    if select_first {
                         break;
                     }
                 } else {
@@ -1950,7 +1950,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                     // verbatim.
                     push_output_row(output, driver_record.clone(), out_key, mspill)?;
                     emitted_any = true;
-                    if matches!(match_mode, MatchMode::First) {
+                    if select_first {
                         break;
                     }
                 }

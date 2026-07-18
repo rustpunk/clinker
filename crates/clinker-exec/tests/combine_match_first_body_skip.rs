@@ -536,6 +536,80 @@ fn body_skip_does_not_trip_on_miss_error_across_strategies() {
     }
 }
 
+// ── no retry to a later matching build ────────────────────────────────────────
+
+// The differential scenarios above give each driver exactly one matching build,
+// so they cannot see the "no retry" half of the contract: a regression that
+// reopened a body-skipping driver to its next match would still match one build
+// and emit nothing extra. These tests give one driver TWO matching builds where
+// the first-selected build's body SKIPS (`keep = 0`) and a later matching build
+// WOULD emit (`keep = 1`). Behavior A commits to the first selection, so the
+// driver produces NO row. The retired retry reading would fall through to the
+// `keep = 1` build and emit it — the exact regression these tests must catch.
+//
+// Each strategy defines "first" differently, so each fixture places the
+// `keep = 0` build where that strategy looks first:
+//   * sort-merge and equi+range visit a driver's matches in ascending range-key
+//     (`hi`) order, so the lower-`hi` build is `keep = 0`;
+//   * the block-band path selects the minimum build input index, so the
+//     first-listed (overlapping) build is `keep = 0`.
+// `on_miss: error` would abort if either fixture's matched driver were mistaken
+// for a miss, so a success with zero output rows also proves the driver is not
+// routed to on_miss.
+
+/// No output rows once the header line is dropped.
+fn assert_no_rows(outcome: &RunOutcome, tag: &str) {
+    let rows = sorted_rows(&outcome.output);
+    assert!(
+        rows.is_empty(),
+        "[{tag}] a body-skipping first selection must not retry a later matching \
+         build; got rows: {rows:?}"
+    );
+}
+
+/// sort-merge: `drivers.v < builds.hi`. The driver `v = 10` matches both builds;
+/// the lower-`hi` (=50) build is visited first and skips (`keep = 0`), while the
+/// `hi = 100` build would emit. No retry ⇒ no row.
+#[test]
+fn sort_merge_first_skip_does_not_retry_later_build() {
+    let yaml = sort_merge_yaml("error");
+    assert_strategy(&yaml, "sort_merge");
+    let drivers = String::from("did,v\n10,10\n");
+    let builds = String::from("bid,hi,keep\n100,50,0\n200,100,1\n");
+    let inputs = [("drivers", drivers), ("builds", builds)];
+    let out = try_run(&yaml, &inputs).expect("sort-merge no-retry run");
+    assert_no_rows(&out, "sort_merge");
+}
+
+/// equi+range IEJoin: `drivers.mk == builds.mk and drivers.v < builds.hi`. Within
+/// the `mk = 1` group the driver `v = 10` matches both builds; the lower-`hi`
+/// (=50) build is visited first and skips, the `hi = 100` build would emit.
+#[test]
+fn equi_range_first_skip_does_not_retry_later_build() {
+    let yaml = equi_range_yaml("error");
+    assert_strategy(&yaml, "hash_partition_iejoin");
+    let drivers = String::from("did,mk,v\n10,1,10\n");
+    let builds = String::from("bid,mk,hi,keep\n100,1,50,0\n200,1,100,1\n");
+    let inputs = [("drivers", drivers), ("builds", builds)];
+    let out = try_run(&yaml, &inputs).expect("equi+range no-retry run");
+    assert_no_rows(&out, "hash_partition_iejoin");
+}
+
+/// block-band IEJoin: `drivers.v >= builds.lo and drivers.v < builds.hi`. Two
+/// overlapping bands both contain `v = 10`; the minimum-input-index band
+/// (`bid = 100`) is `keep = 0` and skips, the higher-index band (`bid = 200`)
+/// would emit. Minimum-index selection ⇒ no retry ⇒ no row.
+#[test]
+fn block_band_first_skip_does_not_retry_higher_index_build() {
+    let yaml = block_yaml("error");
+    assert_strategy(&yaml, "iejoin");
+    let drivers = String::from("did,v\n10,10\n");
+    let builds = String::from("bid,lo,hi,keep\n100,0,100,0\n200,0,100,1\n");
+    let inputs = [("drivers", drivers), ("builds", builds)];
+    let out = try_run(&yaml, &inputs).expect("block-band no-retry run");
+    assert_no_rows(&out, "iejoin");
+}
+
 // ── block path: byte-identical across memory budgets ──────────────────────────
 
 /// Tight budget: the block-band external-sort threshold (`soft / 4`) binds and

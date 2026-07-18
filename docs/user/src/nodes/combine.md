@@ -50,7 +50,7 @@ Iteration order in the `input:` map is preserved and used as the default driver-
 |-------|----------|---------|-------------|
 | `where` | Yes | -- | CXL boolean expression matching records across inputs. Must contain at least one cross-input equality. |
 | `match` | No | `first` | Match cardinality: `first`, `all`, or `collect`. |
-| `on_miss` | No | `null_fields` | Driver-record handling on zero matches: `null_fields`, `skip`, or `error`. |
+| `on_miss` | No | `null_fields` | Driver-record handling on zero predicate matches: `null_fields`, `skip`, or `error`. |
 | `cxl` | Yes (except under `match: collect`) | -- | Emit statements defining the output row. Empty under `match: collect`. |
 | `drive` | No | first input | Explicit driver-input qualifier. Overrides the iteration-order default. |
 | `strategy` | No | `auto` | Execution strategy hint: `auto` or `grace_hash`. |
@@ -97,6 +97,8 @@ Emit one output row per driver record, using the first matching build-side recor
 ```
 
 The `where:` predicate selects the match; the `cxl:` body is a **post-match projection** that runs once on the chosen build record. Selection and projection are separate steps: if the body filters the row out (a `filter` that fails, or a body that emits nothing), that one output row is dropped. The combine does **not** fall back to a later matching build, and the driver is **not** treated as unmatched — it matched the predicate, the body just produced no row. `on_miss` (below) never fires for such a driver; it fires only when the predicate matched nothing at all. This holds identically for every join strategy the planner may pick.
+
+> **Behavior change.** This is a change in observable output for existing pipelines that use a range or equi+range `where:` predicate. On the strategies the planner picks for those predicates (sort-merge and hash-partitioned range joins), a driver that matched the predicate but whose body skipped every candidate was previously routed to `on_miss` — firing `null_fields`, `skip`, or `error`. It now silently produces no row, matching the equality-join strategies. A pipeline that relied on the old routing (for example, `on_miss: error` tripping on a body-skipped driver) no longer sees it.
 
 ### `match: all`
 
