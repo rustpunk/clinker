@@ -1,43 +1,52 @@
 //! Sort-merge join executor for combine nodes with pure-range predicates.
 //!
-//! Two-phase execution:
+//! Bounded on all three axes — driver input, build input, and output — so a
+//! join whose sides or result exceed the memory budget completes by spilling
+//! rather than materializing in RAM. Two-phase execution:
 //!
-//!   Phase A — external sort each side on the range key(s) via the
-//!             existing [`SortBuffer`] + [`SpillWriter`] / [`LoserTree`]
-//!             infrastructure (postcard+LZ4 spills). Skipped when the
-//!             upstream `NodeProperties::ordering` already covers the
-//!             range keys.
+//!   Phase A — bound each side into a single-pass ascending cursor over the
+//!             range key, via the shared [`SortBuffer`] + [`SortedRunMerger`]
+//!             external sort (postcard+LZ4 spills). A pre-sorted side that fits
+//!             budget is streamed in place (no redundant stable sort); an
+//!             over-budget side spills regardless.
 //!
-//!   Phase B — two-cursor merge walk. For each outer-side run with a
-//!             common range key, buffer the matching inner-side run in
-//!             [`MatchingRunBuffer`] and emit the cross-product. When the
-//!             buffered run exceeds `soft_limit / 4` it spills to a
-//!             [`GraceSpillWriter`] file and replays for each matching
-//!             outer row, bounding peak memory at one inner record on
-//!             the spill path.
+//!   Phase B — streaming windowed merge. Drivers are pulled one at a time from
+//!             the sorted driver stream. The matching build rows for one driver
+//!             form a contiguous prefix (`>=` / `>`) or suffix (`<=` / `<`) of
+//!             the sorted build side; the walk advances a monotonic build cursor
+//!             into a spillable [`MatchWindow`], appending newly-matching builds
+//!             and front-dropping ones that fall below the current driver. Each
+//!             build is decoded from its sorted input exactly once, never once
+//!             per driver — the difference between a merge and a nested loop.
+//!             The window spills past `soft_limit / 4` (the SPARK-13450 spill
+//!             fallback for a single high-duplication run).
 //!
-//! The matching-run spill prevents an unbounded-buffer OOM on
-//! high-duplication inner sides — the SPARK-13450 failure mode.
-//! DataFusion and CockroachDB use the same pattern.
+//! Output order and axis: emitted rows route through a payload-ordered,
+//! spillable [`SortBuffer`] keyed on `(driver order, driver input index, build
+//! input index)` — the engine-canonical order the IEJoin block-band path also
+//! realizes. So the emitted order is a pure function of the data, byte-identical
+//! across memory limits and independent of the merge's internal emit sequence,
+//! and the output axis spills instead of holding every matched row in RAM. The
+//! dispatcher drains the resulting sorted handle through the shared payload-
+//! sorted drain (streaming to a downstream Output, adopting spilled runs whole,
+//! or admitting resident).
 //!
-//! NULL handling matches the IEJoin path: any record with a NULL in any
-//! range key participates in `on_miss` dispatch instead of the merge
-//! walk, since CXL ternary semantics return false for NULL comparisons.
-//! Pre-filtering keeps the sorted runs free of NULLs so the cursor walk
-//! never has to special-case them.
+//! NULL handling matches the IEJoin path: any record with a NULL in any range
+//! key matches nothing (CXL ternary semantics return false for NULL
+//! comparisons) and routes through `on_miss` / collect-empty. `on_miss: error`
+//! cites the globally lowest `RecordOrder` miss, tracked as a single running
+//! minimum so a sparse left join stays bounded.
 //!
-//! The current planner selects `SortMerge` only when both inputs already
-//! arrive sorted on the range key prefix; in that case Phase A is a
-//! no-op and the executor walks the inputs in place. Phase A is wired
-//! end-to-end so a future planner relaxation (or an explicit user knob)
-//! can route unsorted inputs through this path without a second
-//! implementation pass.
+//! The current planner selects `SortMerge` only when both inputs already arrive
+//! sorted on the range key prefix; the non-pre-sorted branch is wired end-to-end
+//! so a future planner relaxation (or an explicit user knob) can route unsorted
+//! inputs here without a second implementation pass.
 
 use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::Arc;
 
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
 use clinker_record::{Record, Schema, Value};
 use cxl::ast::Expr;
@@ -47,16 +56,13 @@ use indexmap::IndexMap;
 
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
-use crate::pipeline::combine::{CombineKernelOutput, CombineOutputEvalFailure, KeyExtractor};
-use crate::pipeline::grace_spill::{
-    GraceSpillError, GraceSpillReader, GraceSpillWriter, SpillFilePath, grace_spill_error,
-};
+use crate::pipeline::combine::{CombineOutputEvalFailure, KeyExtractor};
 use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
+use crate::pipeline::spill::{SpillFile, SpillWriter};
 use crate::pipeline::spill_merge::{MergeBudget, SortedRunMerger};
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::{DecomposedPredicate, RangeOp};
@@ -66,10 +72,6 @@ use clinker_plan::plan::combine::{DecomposedPredicate, RangeOp};
 /// `pipeline::grace_hash` so every code path truncates at the same
 /// threshold.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
-
-/// Period (matched pairs emitted) between [`MemoryArbitrator::should_abort`]
-/// polls during the merge walk.
-const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
 /// Per-side external-sort spill threshold in bytes: half the soft RSS limit,
 /// floored at 16 KiB so tests with tiny budgets still exercise the spill path.
@@ -85,209 +87,363 @@ fn spill_threshold_bytes(budget: &MemoryArbitrator) -> usize {
 pub(crate) type RecordOrder = u64;
 
 // ──────────────────────────────────────────────────────────────────────
-// Matching-run buffer
+// Match window
 // ──────────────────────────────────────────────────────────────────────
 
-/// Buffered inner-side records that share a single range-key value.
-///
-/// Capped at `soft_limit / 4` bytes in the in-memory variant; on
-/// overflow the buffer transitions to the spilled variant, where most
-/// records live on disk (in one or more spill segments) and a small
-/// in-memory tail accumulates until it itself overflows and gets
-/// flushed to a new segment. Replay streams every segment in order and
-/// then the tail.
-enum MatchingRunBuffer {
-    InMemory {
-        records: Vec<Record>,
-        bytes: usize,
-    },
-    Spilled {
-        /// Spill file segments, written in append order. Each is a
-        /// self-contained postcard+LZ4 frame from `GraceSpillWriter`.
-        segments: Vec<SpillFilePath>,
-        schema: Arc<Schema>,
-        /// Total records written to disk across `segments`.
-        spilled_count: u64,
-        /// In-memory tail of records that have not yet been spilled.
-        tail: Vec<Record>,
-        /// Bytes accumulated in `tail` since the last spill flush.
-        tail_bytes: usize,
-    },
+/// One build row buffered in the [`MatchWindow`]: the record, its range key,
+/// and its unique global input index.
+type WindowEntry = (Record, Value, u64);
+
+/// Shared spill / charge context for a [`MatchWindow`] mutation. Bundled so the
+/// window methods stay under clippy's argument cap and every spill charges disk
+/// and memory identically.
+struct MergeSpill<'a> {
+    name: &'a str,
+    spill_dir: &'a Path,
+    spill_compress: bool,
+    budget: &'a MemoryArbitrator,
+    consumer: &'a Arc<crate::pipeline::memory::ConsumerHandle>,
 }
 
-impl MatchingRunBuffer {
-    fn new() -> Self {
-        Self::InMemory {
-            records: Vec::new(),
-            bytes: 0,
-        }
-    }
+/// A sealed [`MatchWindow`] segment: resident entries, or a spilled
+/// postcard+LZ4 run re-decoded on replay. The spill carries each entry's
+/// `(key, build_idx)` as the payload so both survive off-process without a
+/// synthetic sort column — the key need not be re-derivable from a record field
+/// (an expression range axis has none).
+enum WindowSegment {
+    Resident(Vec<WindowEntry>),
+    Spilled(SpillFile<(Value, u64)>),
 }
 
-/// Push one inner record into the buffer, spilling either the whole
-/// in-memory run (on the first overflow) or the accumulated tail (on
-/// subsequent overflows) when the byte count would exceed `byte_limit`.
+/// Spillable, front-droppable, replayable buffer holding the *current matching
+/// run* of the streaming range merge — the contiguous prefix (for `>=` / `>`)
+/// or suffix (for `<=` / `<`) of the sorted build side that satisfies the range
+/// predicate against the current driver.
 ///
-/// Returns the byte length committed to disk during this call (zero
-/// when the record stayed in memory). Caller folds the result into
-/// [`crate::pipeline::memory::MemoryArbitrator::record_spill_bytes`] so
-/// the disk-quota gate can fire on overflow.
-fn push_to_buffer(
-    buf: &mut MatchingRunBuffer,
-    record: Record,
+/// Streaming/blocking + memory model: the merge walk back-appends builds as
+/// they enter the run from the sorted cursor ([`push_back`]), front-drops builds
+/// that permanently stop matching as drivers advance ([`drop_front_while`]), and
+/// replays the run front-to-back (build-index ascending) once per driver
+/// ([`replay`]). Resident content is held to roughly `byte_limit`; when it would
+/// exceed that, the most-recently-sealed resident segment spills to disk —
+/// keeping the front resident so front-drop stays a cheap pop, and the newest
+/// (least-soon-dropped) segment on disk so a shrinking suffix does not
+/// spill-then-immediately-drop. Spilled segments re-decode on each replay (the
+/// SPARK-13450 fallback, reached only when one matching run itself exceeds
+/// budget), and a fully-dropped front segment is released so an over-budget
+/// build is never re-decoded past the run's lower bound. The live in-memory
+/// footprint mirrors into the shared consumer handle for the walk's duration
+/// and is discharged when the window drops.
+///
+/// [`push_back`]: MatchWindow::push_back
+/// [`drop_front_while`]: MatchWindow::drop_front_while
+/// [`replay`]: MatchWindow::replay
+struct MatchWindow {
+    /// Sealed segments, front-to-back. A partially front-dropped head is always
+    /// `Resident` (a spilled head is decoded to resident before it is dropped
+    /// into), so `head_off` indexes a resident vec.
+    segments: std::collections::VecDeque<WindowSegment>,
+    /// Records already dropped from the front of `segments.front()`.
+    head_off: usize,
+    /// Open resident tail receiving appends; sealed into a segment past
+    /// `seg_target`.
+    tail: Vec<WindowEntry>,
+    tail_bytes: usize,
+    /// Live in-memory bytes charged into the consumer handle: the resident
+    /// segments' undropped entries plus the tail.
+    charged: u64,
+    schema: Option<Arc<Schema>>,
+    /// Seal the tail into a segment once it reaches this many bytes.
+    seg_target: usize,
+    /// Spill sealed segments once resident content would exceed this.
     byte_limit: usize,
-    spill_dir: &std::path::Path,
-    spill_compress: bool,
-    spill_seq: &mut u32,
-    consumer_handle: &Arc<crate::pipeline::memory::ConsumerHandle>,
-) -> Result<u64, GraceSpillError> {
-    let incoming = std::mem::size_of::<Record>() + record.estimated_heap_size();
-    match buf {
-        MatchingRunBuffer::InMemory { records, bytes } => {
-            if bytes.saturating_add(incoming) > byte_limit && !records.is_empty() {
-                // Promote to Spilled: drain all records to a fresh
-                // segment, then start a tail with the incoming record.
-                // Every in-memory byte previously charged into the
-                // consumer handle is now off-process; subtract before
-                // the variant flip so the handle stays aligned with
-                // the operator's live state (Velox's "reclaimable ≠
-                // held" point).
-                let prev_in_memory = *bytes as u64;
-                let mut drained = std::mem::take(records);
-                let schema = Arc::clone(drained[0].schema());
-                drained.push(record);
-                let (segment_path, written) =
-                    write_spill_segment(spill_dir, spill_compress, spill_seq, &drained)?;
-                let count = drained.len() as u64;
-                *buf = MatchingRunBuffer::Spilled {
-                    segments: vec![segment_path],
-                    schema,
-                    spilled_count: count,
-                    tail: Vec::new(),
-                    tail_bytes: 0,
+    /// Set once any segment spilled — surfaces the `matching_run_spills` stat.
+    spilled: bool,
+}
+
+impl MatchWindow {
+    fn new(byte_limit: usize) -> Self {
+        // Seal at half the resident cap so ~two sealed segments plus the open
+        // tail span the budget; a smaller segment also bounds the re-decode
+        // wasted skipping a spilled head's dropped prefix.
+        let seg_target = std::cmp::max(4 * 1024, byte_limit / 2);
+        Self {
+            segments: std::collections::VecDeque::new(),
+            head_off: 0,
+            tail: Vec::new(),
+            tail_bytes: 0,
+            charged: 0,
+            schema: None,
+            seg_target,
+            byte_limit,
+            spilled: false,
+        }
+    }
+
+    fn entry_bytes(entry: &WindowEntry) -> usize {
+        std::mem::size_of::<Record>()
+            + entry.0.estimated_heap_size()
+            + std::mem::size_of::<Value>()
+            + std::mem::size_of::<u64>()
+    }
+
+    /// Append one matching build row, charging its in-memory growth into the
+    /// consumer handle. Seals the tail past `seg_target`; when resident content
+    /// would exceed `byte_limit`, spills the most-recently-sealed resident
+    /// segment to disk and charges the written bytes against the disk quota,
+    /// aborting with `SpillCapExceeded` on overflow.
+    fn push_back(
+        &mut self,
+        entry: WindowEntry,
+        ctx: &MergeSpill<'_>,
+        spill_seq: &mut u32,
+    ) -> Result<(), PipelineError> {
+        if self.schema.is_none() {
+            self.schema = Some(Arc::clone(entry.0.schema()));
+        }
+        let bytes = Self::entry_bytes(&entry) as u64;
+        self.tail.push(entry);
+        self.tail_bytes += bytes as usize;
+        self.charged += bytes;
+        ctx.consumer.add_bytes(bytes);
+
+        if self.tail_bytes >= self.seg_target {
+            let sealed = std::mem::take(&mut self.tail);
+            self.tail_bytes = 0;
+            self.segments.push_back(WindowSegment::Resident(sealed));
+        }
+        while self.charged > self.byte_limit as u64 {
+            if !self.spill_one_resident(ctx, spill_seq)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Spill the most-recently-sealed resident segment to disk, returning false
+    /// when no resident segment remains. Writes only the segment's undropped
+    /// entries (past `head_off` for a resident head) and rewinds `head_off`,
+    /// since the spilled run holds only live entries.
+    fn spill_one_resident(
+        &mut self,
+        ctx: &MergeSpill<'_>,
+        _spill_seq: &mut u32,
+    ) -> Result<bool, PipelineError> {
+        let Some(idx) = self
+            .segments
+            .iter()
+            .rposition(|s| matches!(s, WindowSegment::Resident(_)))
+        else {
+            return Ok(false);
+        };
+        let is_head = idx == 0;
+        let live: Vec<WindowEntry> = {
+            let WindowSegment::Resident(v) = &self.segments[idx] else {
+                unreachable!("rposition selected a Resident segment")
+            };
+            let start = if is_head { self.head_off } else { 0 };
+            v[start..].to_vec()
+        };
+        if live.is_empty() {
+            self.segments.remove(idx);
+            if is_head {
+                self.head_off = 0;
+            }
+            return Ok(true);
+        }
+        let schema = self
+            .schema
+            .clone()
+            .expect("a non-empty window recorded its schema on first push");
+        let mut writer: SpillWriter<(Value, u64)> =
+            SpillWriter::new(schema, Some(ctx.spill_dir), ctx.spill_compress)
+                .map_err(|e| spill_io_error(ctx.name, "match-window spill open failed", e))?;
+        for (record, key, build_idx) in &live {
+            writer
+                .write_pair(record, &(key.clone(), *build_idx))
+                .map_err(|e| spill_io_error(ctx.name, "match-window spill write failed", e))?;
+        }
+        let (file, written) = writer
+            .finish_with_bytes()
+            .map_err(|e| spill_io_error(ctx.name, "match-window spill finish failed", e))?;
+        let live_bytes: u64 = live.iter().map(|e| Self::entry_bytes(e) as u64).sum();
+        self.segments[idx] = WindowSegment::Spilled(file);
+        if is_head {
+            self.head_off = 0;
+        }
+        self.charged -= live_bytes;
+        ctx.consumer.sub_bytes(live_bytes);
+        self.spilled = true;
+        if written > 0 && ctx.budget.record_spill_bytes(ctx.name, written) {
+            return Err(PipelineError::spill_cap_exceeded(
+                ctx.name,
+                ctx.budget.disk_quota(),
+                written,
+                ctx.budget.cumulative_spill_bytes(),
+            ));
+        }
+        Ok(true)
+    }
+
+    /// Decode the spilled front segment to resident so it can be peeked and
+    /// front-dropped by index. A no-op when the front is already resident.
+    fn decode_head_to_resident(&mut self, ctx: &MergeSpill<'_>) -> Result<(), PipelineError> {
+        if !matches!(self.segments.front(), Some(WindowSegment::Spilled(_))) {
+            return Ok(());
+        }
+        let WindowSegment::Spilled(file) = self.segments.pop_front().unwrap() else {
+            unreachable!("matched Spilled above")
+        };
+        let reader = file
+            .reader()
+            .map_err(|e| spill_io_error(ctx.name, "match-window replay open failed", e))?;
+        let mut v: Vec<WindowEntry> = Vec::new();
+        let mut bytes: u64 = 0;
+        for item in reader {
+            let (record, (key, build_idx)) =
+                item.map_err(|e| spill_io_error(ctx.name, "match-window replay decode failed", e))?;
+            let entry = (record, key, build_idx);
+            bytes += Self::entry_bytes(&entry) as u64;
+            v.push(entry);
+        }
+        self.charged += bytes;
+        ctx.consumer.add_bytes(bytes);
+        self.segments.push_front(WindowSegment::Resident(v));
+        self.head_off = 0;
+        Ok(())
+    }
+
+    /// Front-drop every leading build whose key satisfies `should_drop` — the
+    /// builds that no longer match the current driver and, because both sides
+    /// ascend, never match a later one. Releases fully-dropped segments so an
+    /// over-budget build is not re-decoded past the run's lower bound.
+    fn drop_front_while(
+        &mut self,
+        should_drop: impl Fn(&Value) -> bool,
+        ctx: &MergeSpill<'_>,
+    ) -> Result<(), PipelineError> {
+        loop {
+            if self.segments.is_empty() {
+                if self.tail.is_empty() {
+                    return Ok(());
+                }
+                // Fold the open tail into a segment so the drop walks one path.
+                let sealed = std::mem::take(&mut self.tail);
+                self.tail_bytes = 0;
+                self.segments.push_back(WindowSegment::Resident(sealed));
+                self.head_off = 0;
+            }
+            self.decode_head_to_resident(ctx)?;
+            let mut head_off = self.head_off;
+            let mut dropped_bytes: u64 = 0;
+            let seg_len;
+            {
+                let WindowSegment::Resident(v) = self.segments.front().unwrap() else {
+                    unreachable!("decode_head_to_resident left a resident head")
                 };
-                consumer_handle.sub_bytes(prev_in_memory);
-                Ok(written)
-            } else {
-                *bytes = bytes.saturating_add(incoming);
-                records.push(record);
-                consumer_handle.add_bytes(incoming as u64);
-                Ok(0)
+                seg_len = v.len();
+                while head_off < v.len() && should_drop(&v[head_off].1) {
+                    dropped_bytes += Self::entry_bytes(&v[head_off]) as u64;
+                    head_off += 1;
+                }
             }
-        }
-        MatchingRunBuffer::Spilled {
-            segments,
-            schema: _,
-            spilled_count,
-            tail,
-            tail_bytes,
-        } => {
-            if tail_bytes.saturating_add(incoming) > byte_limit && !tail.is_empty() {
-                // Tail itself overflowed; flush it as a new segment
-                // and start a fresh tail with the incoming record.
-                let prev_tail = *tail_bytes as u64;
-                let mut drained = std::mem::take(tail);
-                drained.push(record);
-                let (segment_path, written) =
-                    write_spill_segment(spill_dir, spill_compress, spill_seq, &drained)?;
-                *spilled_count = spilled_count.saturating_add(drained.len() as u64);
-                *tail_bytes = 0;
-                segments.push(segment_path);
-                consumer_handle.sub_bytes(prev_tail);
-                Ok(written)
-            } else {
-                *tail_bytes = tail_bytes.saturating_add(incoming);
-                tail.push(record);
-                consumer_handle.add_bytes(incoming as u64);
-                Ok(0)
+            self.head_off = head_off;
+            self.charged -= dropped_bytes;
+            ctx.consumer.sub_bytes(dropped_bytes);
+            if head_off >= seg_len {
+                self.segments.pop_front();
+                self.head_off = 0;
+                // Advance to the next segment; the run may keep dropping.
+                continue;
             }
+            return Ok(());
         }
+    }
+
+    /// Replay the current run front-to-back (build-index ascending) as
+    /// `(record, key, build_idx)`. Resident segments clone; a spilled segment
+    /// opens its reader lazily as the walk reaches it, so at most one spill
+    /// reader is live and the run is never re-materialized whole.
+    fn replay<'a>(
+        &'a self,
+        ctx: &'a MergeSpill<'a>,
+    ) -> impl Iterator<Item = Result<WindowEntry, PipelineError>> + 'a {
+        let head_off = self.head_off;
+        let name = ctx.name;
+        let seg_iter = (0..self.segments.len()).flat_map(
+            move |i| -> Box<dyn Iterator<Item = Result<WindowEntry, PipelineError>> + 'a> {
+                let start = if i == 0 { head_off } else { 0 };
+                match &self.segments[i] {
+                    WindowSegment::Resident(v) => Box::new(v[start..].iter().cloned().map(Ok)),
+                    WindowSegment::Spilled(file) => match file.reader() {
+                        Ok(reader) => Box::new(reader.map(move |item| {
+                            item.map(|(record, (key, build_idx))| (record, key, build_idx))
+                                .map_err(|e| {
+                                    spill_io_error(name, "match-window replay decode failed", e)
+                                })
+                        })),
+                        Err(e) => Box::new(std::iter::once(Err(spill_io_error(
+                            name,
+                            "match-window replay open failed",
+                            e,
+                        )))),
+                    },
+                }
+            },
+        );
+        let tail_iter = self.tail.iter().cloned().map(Ok);
+        seg_iter.chain(tail_iter)
+    }
+
+    /// Live in-memory bytes this window has charged into the consumer handle, so
+    /// the caller discharges exactly once the walk finishes.
+    fn charged_bytes(&self) -> u64 {
+        self.charged
     }
 }
 
-/// Write a slice of records as a single fresh spill segment via
-/// [`GraceSpillWriter`]. The returned path lives inside `spill_dir`;
-/// the caller's `TempDir` owns its lifetime. The byte length is
-/// returned alongside the path so the caller can fold it into
-/// [`crate::pipeline::memory::MemoryArbitrator::record_spill_bytes`].
-fn write_spill_segment(
-    spill_dir: &std::path::Path,
-    spill_compress: bool,
-    spill_seq: &mut u32,
-    records: &[Record],
-) -> Result<(SpillFilePath, u64), GraceSpillError> {
-    let seq = *spill_seq;
-    *spill_seq = spill_seq.wrapping_add(1);
-    let mut writer = GraceSpillWriter::new(spill_dir, 0, (seq & 0xFFFF) as u16, spill_compress)?;
-    for r in records {
-        writer.write_record(r)?;
-    }
-    writer.finish()
-}
-
-/// Replay-side iteration over a matching-run buffer. Yields each inner
-/// record once. The spilled variant streams from each segment in order
-/// then yields the in-memory tail; the in-memory variant clones from
-/// the backing Vec so the buffer can be re-iterated per outer row in
-/// the matching run.
-fn iter_run(
-    buf: &MatchingRunBuffer,
-) -> Result<Box<dyn Iterator<Item = std::io::Result<Record>> + '_>, std::io::Error> {
-    match buf {
-        MatchingRunBuffer::InMemory { records, .. } => {
-            Ok(Box::new(records.iter().map(|r| Ok(r.clone()))))
-        }
-        MatchingRunBuffer::Spilled {
-            segments,
-            schema,
-            tail,
-            ..
-        } => {
-            // Open every segment up front so iteration is straight-line
-            // (the chained iterator below is a single `flatten`); a
-            // failure to open any segment surfaces immediately rather
-            // than mid-walk.
-            let mut readers: Vec<GraceSpillReader> = Vec::with_capacity(segments.len());
-            for path in segments {
-                readers.push(GraceSpillReader::open(path, Arc::clone(schema))?);
-            }
-            let from_disk = readers.into_iter().flatten();
-            let from_tail = tail.iter().map(|r| Ok(r.clone()));
-            Ok(Box::new(from_disk.chain(from_tail)))
-        }
-    }
+/// Lift a spill error into a `PipelineError::Io` localized to the combine node —
+/// the same shape the external-sort spill errors take. Generic over the error
+/// type so it accepts both the sort-buffer and spill-writer error enums.
+fn spill_io_error<E: std::fmt::Display>(name: &str, detail: &str, err: E) -> PipelineError {
+    PipelineError::Io(std::io::Error::other(format!(
+        "sort-merge {name}: {detail}: {err}"
+    )))
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Streamed driver cursor / replayable build side
+// Streamed driver / build cursors
 // ──────────────────────────────────────────────────────────────────────
 
-/// Single-pass ascending stream of driver `(record, order, key)` tuples.
+/// Single-pass ascending stream of driver `(record, order, driver_idx, key)`
+/// tuples. `driver_idx` is the driver's unique global input index — the
+/// deterministic tie-break under a repeated `RecordOrder` (a chained upstream
+/// can fan one input row into several sharing one order).
 ///
-/// Memory model: streaming. The spilled variant holds one resident record
-/// per open run inside the [`SortedRunMerger`]; the in-memory variant owns
-/// the sorted vector and yields it by value. Either way Phase B never holds
-/// a second full copy of the driver side — the merge walk pulls one driver
-/// at a time. The range key rides on the record's sort column, re-read here
-/// for the spilled variant so no per-record key vector is materialized.
+/// Memory model: streaming. The spilled variant holds one resident record per
+/// open run inside the [`SortedRunMerger`]; the in-memory variant owns the
+/// sorted vector and yields it by value. Either way Phase B never holds a
+/// second full copy of the driver side — the merge walk pulls one driver at a
+/// time. The range key rides on the record's sort column, re-read here for the
+/// spilled variant so no per-record key vector is materialized.
 enum DriverStream {
-    InMemory(std::vec::IntoIter<(Record, RecordOrder, Value)>),
+    InMemory(std::vec::IntoIter<(Record, RecordOrder, u64, Value)>),
     Spilled {
-        merger: SortedRunMerger<RecordOrder>,
+        merger: SortedRunMerger<(RecordOrder, u64)>,
         field: String,
     },
 }
 
 impl Iterator for DriverStream {
-    type Item = Result<(Record, RecordOrder, Value), PipelineError>;
+    type Item = Result<(Record, RecordOrder, u64, Value), PipelineError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
             DriverStream::InMemory(it) => it.next().map(Ok),
             DriverStream::Spilled { merger, field } => match merger.next()? {
-                Ok((record, order)) => {
+                Ok((record, (order, driver_idx))) => {
                     let key = record.get(field).cloned().unwrap_or(Value::Null);
-                    Some(Ok((record, order, key)))
+                    Some(Ok((record, order, driver_idx, key)))
                 }
                 Err(e) => Some(Err(e)),
             },
@@ -295,60 +451,39 @@ impl Iterator for DriverStream {
     }
 }
 
-/// Replayable, spillable build side for the Phase B merge walk.
+/// Single-pass ascending stream of build `(record, key, build_idx)` tuples.
+/// `build_idx` is the build's unique global input index, carried so the output
+/// sort breaks ties among one driver's matches deterministically. Consumed
+/// exactly once by the merge walk (each build is pulled into the match window a
+/// single time), so — unlike the replay-per-driver predecessor — each build
+/// decodes from its sorted input O(1) times regardless of driver count.
 ///
-/// The build side is scanned once per driver, so it must support repeated
-/// replay — unlike the single-pass driver stream. `Buffered` reuses the
-/// spilling [`MatchingRunBuffer`]: when the sorted build exceeds
-/// `soft_limit / 4` it spills to disk, bounding the resident footprint to
-/// one in-memory tail plus on-disk segments regardless of build size. The
-/// range key is re-read from the record's sort column `field` on each
-/// replay, so no parallel key vector is held. `Resident` keeps pre-extracted
-/// keys in memory and is used only when the range axis is not a simple field
-/// reference (an expression axis, reachable only on the pre-sorted skip path)
-/// so the key cannot be recovered from a record column.
-enum BuildSide {
-    Resident(Vec<(Record, Value)>),
-    Buffered {
-        buf: MatchingRunBuffer,
+/// Memory model: streaming. `Spilled` holds one resident record per open run in
+/// the [`SortedRunMerger`] and re-reads the key from the sort column `field`;
+/// `InMemory` owns the sorted vector with pre-extracted keys (also the carrier
+/// for an expression range axis, whose key rides in no record column — reachable
+/// only on the pre-sorted skip path, where the axis never spills).
+enum BuildCursor {
+    InMemory(std::vec::IntoIter<(Record, Value, u64)>),
+    Spilled {
+        merger: SortedRunMerger<u64>,
         field: String,
     },
 }
 
-/// A single replay pass over a [`BuildSide`]: `(record, range key)` in sorted
-/// order, each item fallible because the spilled variant decodes from disk.
-type BuildReplayIter<'a> = Box<dyn Iterator<Item = std::io::Result<(Record, Value)>> + 'a>;
+impl Iterator for BuildCursor {
+    type Item = Result<(Record, Value, u64), PipelineError>;
 
-impl BuildSide {
-    /// Replay every build record in sorted order, pairing each with its
-    /// range key. Cloning the resident records / decoding the spilled ones
-    /// keeps the buffer intact for the next driver's replay.
-    fn replay(&self) -> Result<BuildReplayIter<'_>, std::io::Error> {
+    fn next(&mut self) -> Option<Self::Item> {
         match self {
-            BuildSide::Resident(pairs) => Ok(Box::new(
-                pairs.iter().map(|(r, k)| Ok((r.clone(), k.clone()))),
-            )),
-            BuildSide::Buffered { buf, field } => {
-                let field = field.clone();
-                let it = iter_run(buf)?.map(move |r| {
-                    r.map(|record| {
-                        let key = record.get(&field).cloned().unwrap_or(Value::Null);
-                        (record, key)
-                    })
-                });
-                Ok(Box::new(it))
-            }
-        }
-    }
-
-    /// In-memory bytes this build side has charged into the shared consumer
-    /// handle. `Resident` is uncharged (it holds no handle bytes); `Buffered`
-    /// reports its live in-memory portion so the caller can discharge it once
-    /// the walk finishes. On-disk segments are off-process and excluded.
-    fn charged_bytes(&self) -> u64 {
-        match self {
-            BuildSide::Resident(_) => 0,
-            BuildSide::Buffered { buf, .. } => matching_run_in_memory_bytes(buf),
+            BuildCursor::InMemory(it) => it.next().map(Ok),
+            BuildCursor::Spilled { merger, field } => match merger.next()? {
+                Ok((record, build_idx)) => {
+                    let key = record.get(field).cloned().unwrap_or(Value::Null);
+                    Some(Ok((record, key, build_idx)))
+                }
+                Err(e) => Some(Err(e)),
+            },
         }
     }
 }
@@ -480,11 +615,15 @@ pub(crate) struct SortMergeExec<'a> {
     /// against the combine's schema width and batch size, so the on-disk
     /// format matches what `--explain` reports.
     pub spill_compress: bool,
-    /// Shared with the registered `SortMergeConsumer` wrapper.
-    /// Phase A per-side `SortBuffer.bytes_used` plus Phase B
-    /// matching-run accumulator size mirror into `handle.bytes`
-    /// so the arbitrator's pull-mode `current_usage` reads the
-    /// operator's live in-memory state.
+    /// Shared with the registered `SortMergeConsumer` wrapper. The operator
+    /// mirrors its live in-memory footprint into `handle.bytes` so the
+    /// arbitrator's pull-mode `current_usage` reads it: a resident (in-memory)
+    /// sorted driver stays charged for the whole walk, the [`MatchWindow`]'s
+    /// resident matching run is charged as it fills and discharged when the walk
+    /// ends, and the payload-ordered output sort's resident bytes are charged as
+    /// rows accumulate and released as they spill. Each side's transient Phase A
+    /// sort-buffer charge nets to zero once that side lands (spilled records are
+    /// off-process; a resident driver's charge is retained, not double-counted).
     pub consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
     /// Error strategy governing output-stage eval failures. Under
     /// `FailFast` a residual / body eval error propagates immediately;
@@ -511,6 +650,22 @@ struct SortMergeStats {
     /// holding it resident; 0 when the sorted driver fit in memory. Proves the
     /// driver axis is bounded on both the sorted and (bounded) pre-sorted paths.
     driver_stream_spilled: u32,
+    /// Set to 1 when the build side exceeded its sort-buffer spill threshold and
+    /// Phase B streamed the build cursor from disk through the k-way merger
+    /// instead of holding it resident; 0 when the sorted build fit in memory.
+    /// Proves the build input axis is bounded independently of the window spill.
+    build_stream_spilled: u32,
+    /// Count of build records pulled once from the sorted build cursor into the
+    /// monotonically-advancing match window. Equals the number of orderable
+    /// build rows regardless of driver count — the structural proof that the
+    /// merge walk decodes each build from its sorted input O(1) times, never
+    /// once per driver (the nested-loop failure mode).
+    build_pulls: u64,
+    /// Set to 1 when the payload-ordered output sort exceeded its byte threshold
+    /// and spilled to disk instead of holding every emitted row resident. Proves
+    /// the output axis is bounded — including the collect and on_miss paths,
+    /// which route through the same sort.
+    output_spilled: u32,
 }
 
 /// Execute a combine via sort-merge. Caller provides full driver and
@@ -530,19 +685,36 @@ struct SortMergeStats {
 /// (e.g. invocation with no range conjuncts) and on spill I/O failures.
 pub(crate) fn execute_combine_sort_merge(
     args: SortMergeExec<'_>,
-) -> Result<CombineKernelOutput, PipelineError> {
+) -> Result<SortMergeOutput, PipelineError> {
     let (output, _stats) = execute_combine_sort_merge_with_stats(args)?;
     Ok(output)
 }
 
+/// A sort-merge combine's bounded output: a payload-ordered sorted handle over
+/// the emitted rows — resident when the whole result fit the output sort
+/// buffer's byte threshold, spilled to sorted runs otherwise — keyed on
+/// `(driver order, driver_idx, build_idx)`, the engine-canonical, memory-limit
+/// -independent order. The dispatcher drains it incrementally through the shared
+/// payload-sorted drain, so the output axis spills instead of holding every
+/// matched row in RAM. Mirrors the block-band IEJoin's `BlockBandOutput` so both
+/// pure-range paths realize the same output order through the same sink.
+pub(crate) struct SortMergeOutput {
+    pub sorted: SortedOutput<(RecordOrder, u64, u64)>,
+    /// Exact emitted-row count across every sorted run (== the output sort
+    /// buffer's total pushes). Lets the dispatcher size a spilled drain in O(1)
+    /// and serve a merge-on-drain node buffer's `len_hint` without a disk scan.
+    pub row_count: u64,
+    pub output_eval_failures: Vec<CombineOutputEvalFailure>,
+}
+
 /// Variant of [`execute_combine_sort_merge`] that also returns
 /// [`SortMergeStats`]. Module-private — exposed to the in-module
-/// `#[cfg(test)]` block so tests can verify Phase A skip and
-/// matching-run spill counts. Production callers go through
-/// [`execute_combine_sort_merge`].
+/// `#[cfg(test)]` block so tests can verify Phase A skip, the windowed build
+/// pulls, and the matching-run / output spill counts. Production callers go
+/// through [`execute_combine_sort_merge`].
 fn execute_combine_sort_merge_with_stats(
     args: SortMergeExec<'_>,
-) -> Result<(CombineKernelOutput, SortMergeStats), PipelineError> {
+) -> Result<(SortMergeOutput, SortMergeStats), PipelineError> {
     let SortMergeExec {
         name,
         build_qualifier,
@@ -671,20 +843,24 @@ fn execute_combine_sort_merge_with_stats(
     let driver_field = field_name_of_range_expr(&driver_expr);
     let build_field = field_name_of_range_expr(&build_expr);
 
-    let mut driver_pairs: Vec<(Record, RecordOrder, Value)> = Vec::new();
-    let mut driver_unmatched_records: Vec<(Record, RecordOrder)> = Vec::new();
+    // Output rows carry the combine's output schema when present, else the
+    // driver schema (the shape the body-less synthetic step and the
+    // no-output-schema test path re-emit). Captured before the drains consume
+    // `driver_records`; it backs the output sort's spill header. Spilling output
+    // only happens on high-fan-out combines, which always carry an output
+    // schema, so the fallback backs only the never-spilling small cases.
+    let driver_schema_hint: Option<Arc<Schema>> =
+        driver_records.first().map(|(r, _)| Arc::clone(r.schema()));
 
-    // Range-key extraction runs the compiled CXL range closures per
-    // record — the costly part of Phase A. `extract_range_key` is
-    // stateless (`&self` extractor, a per-call key buffer) and
-    // `EvalContext` is read-only, so the extraction parallelizes across
-    // the shared kernel pool. The routing loop replays the owned
-    // `(record, order, key)` outcomes in declared order, so `driver_pairs`
-    // and the unmatched vector stay byte-identical to a sequential
-    // extraction.
-    let driver_keyed: Vec<(Record, RecordOrder, Option<Value>)> = driver_records
+    // Range-key extraction runs the compiled CXL range closures per record — the
+    // costly part of Phase A — in parallel across the shared kernel pool. Each
+    // driver keeps its unique global input index (`driver_idx`) as the
+    // deterministic output-order tie-break under a repeated `RecordOrder` (a
+    // chained upstream can fan one input row into several sharing one order).
+    let driver_keyed: Vec<(Record, RecordOrder, u64, Option<Value>)> = driver_records
         .into_par_iter()
-        .map(|(record, order)| {
+        .enumerate()
+        .map(|(driver_idx, (record, order))| {
             let mut range_buf: Vec<Value> = Vec::new();
             let key = extract_range_key(
                 &driver_extractor,
@@ -695,23 +871,24 @@ fn execute_combine_sort_merge_with_stats(
                 &mut range_buf,
             )
             .map_err(|e| key_eval_error(name, "driving", e))?;
-            Ok::<_, PipelineError>((record, order, key))
+            Ok::<_, PipelineError>((record, order, driver_idx as u64, key))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for (record, order, key) in driver_keyed {
+    let mut driver_pairs: Vec<(Record, RecordOrder, u64, Value)> = Vec::new();
+    // NULL / non-orderable-key drivers never satisfy a CXL ternary comparison,
+    // so they match nothing and route through the miss dispatch after the walk.
+    let mut driver_unmatched: Vec<(Record, RecordOrder, u64)> = Vec::new();
+    for (record, order, driver_idx, key) in driver_keyed {
         match key {
-            Some(k) => driver_pairs.push((record, order, k)),
-            // A NULL / non-orderable range key never satisfies a CXL
-            // ternary comparison, so the driver matches nothing and is
-            // dispatched through `on_miss` / collect-empty after the walk.
-            None => driver_unmatched_records.push((record, order)),
+            Some(k) => driver_pairs.push((record, order, driver_idx, k)),
+            None => driver_unmatched.push((record, order, driver_idx)),
         }
     }
 
-    let mut build_pairs: Vec<(Record, Value)> = Vec::new();
-    let build_keyed: Vec<(Record, Option<Value>)> = build_records
+    let build_keyed: Vec<(Record, u64, Option<Value>)> = build_records
         .into_par_iter()
-        .map(|record| {
+        .enumerate()
+        .map(|(build_idx, record)| {
             let mut range_buf: Vec<Value> = Vec::new();
             let key = extract_range_key(
                 &build_extractor,
@@ -722,32 +899,29 @@ fn execute_combine_sort_merge_with_stats(
                 &mut range_buf,
             )
             .map_err(|e| key_eval_error(name, "build", e))?;
-            Ok::<_, PipelineError>((record, key))
+            Ok::<_, PipelineError>((record, build_idx as u64, key))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for (record, key) in build_keyed {
+    let mut build_pairs: Vec<(Record, Value, u64)> = Vec::new();
+    for (record, build_idx, key) in build_keyed {
         if let Some(k) = key {
-            build_pairs.push((record, k));
+            build_pairs.push((record, k, build_idx));
         }
     }
 
-    // Build-side byte threshold: soft_limit / 4 (SPARK-13450 / DataFusion
-    // convention). Floor at 16 KiB so tests with tiny budgets still
-    // exercise the spill path. Spill segments land in the caller-owned
-    // pipeline-scoped TempDir; each cleans itself on Drop.
+    // Match-window byte threshold: soft_limit / 4 (SPARK-13450 / DataFusion
+    // convention), floored at 16 KiB so tiny-budget tests still exercise spill.
     let byte_limit: usize = std::cmp::max(16 * 1024, (budget.soft_limit() / 4) as usize);
     let mut spill_seq: u32 = 0;
 
-    // ── Phase A: bound each side for the streaming merge walk. The driver
-    //    becomes a single-pass ascending stream and the build a replayable,
-    //    spillable buffer. Neither holds a second full copy of an over-budget
-    //    side during Phase B: the driver merges lazily one record per open run,
-    //    the build spills past `byte_limit`. The pre-sorted path only avoids the
-    //    sort *work* — an already-sorted driver still funnels through the same
-    //    spillable stream (a stable sort of sorted input is an order-preserving
-    //    no-op), matching the build side, so a pre-sorted-but-over-budget driver
-    //    no longer materializes whole in RAM either.
-    let driver_stream = sort_driver_stream(DriverStreamBuild {
+    // ── Phase A: bound each side for the streaming windowed merge. The driver
+    //    becomes a single-pass ascending stream and the build a single-pass
+    //    ascending cursor pulled once into the match window. Neither holds a
+    //    second full copy of an over-budget side during Phase B: driver and
+    //    build merge lazily one record per open run, the window spills past
+    //    `byte_limit`, and the output spills past its own threshold. The
+    //    pre-sorted path only avoids the sort *work*.
+    let (driver_stream, driver_charge) = sort_driver_stream(DriverStreamBuild {
         pairs: driver_pairs,
         name,
         range_field: &driver_field,
@@ -757,7 +931,7 @@ fn execute_combine_sort_merge_with_stats(
         spill_dir,
         presorted,
     })?;
-    let build_side = build_side_from_pairs(BuildSideBuild {
+    let build_cursor = build_cursor_from_pairs(BuildCursorBuild {
         pairs: build_pairs,
         name,
         range_field: &build_field,
@@ -765,10 +939,7 @@ fn execute_combine_sort_merge_with_stats(
         spill_compress,
         consumer_handle: &consumer_handle,
         spill_dir,
-        byte_limit,
         presorted,
-        spill_seq: &mut spill_seq,
-        stats: &mut stats,
     })?;
     if !presorted {
         stats.phase_a_sort_invocations = 2;
@@ -776,12 +947,34 @@ fn execute_combine_sort_merge_with_stats(
     if matches!(driver_stream, DriverStream::Spilled { .. }) {
         stats.driver_stream_spilled = 1;
     }
+    if matches!(build_cursor, BuildCursor::Spilled { .. }) {
+        stats.build_stream_spilled = 1;
+    }
 
-    // ── Phase B: streaming merge walk ────────────────────────────────
-    let mut output_records: Vec<(Record, RecordOrder)> = Vec::new();
+    // ── Phase B: streaming windowed merge ────────────────────────────
+    //
+    // Emitted rows accumulate in a payload-ordered, spillable sort keyed on
+    // `(driver order, driver_idx, build_idx)` — `(order, driver_idx, u64::MAX)`
+    // for collect / on_miss rows — so the emitted order is the engine-canonical,
+    // memory-limit-independent order regardless of the merge's emit sequence, and
+    // the output axis spills rather than holding every matched row in RAM.
+    let output_row_schema: Arc<Schema> = match output_schema {
+        Some(s) => Arc::clone(s),
+        None => driver_schema_hint.unwrap_or_else(|| Arc::new(Schema::new(Vec::new()))),
+    };
+    let sort_threshold = spill_threshold_bytes(budget);
+    let mut output_buf: SortBuffer<(RecordOrder, u64, u64)> = SortBuffer::new_payload_ordered(
+        sort_threshold,
+        Some(spill_dir.to_path_buf()),
+        spill_compress,
+        output_row_schema,
+    );
+    // Parallel `(order, driver_idx, build_idx)` sort key per deferred output-eval
+    // failure, so the dead-letter rows re-order into the same layout-independent
+    // order as the emitted rows.
+    let mut failure_tags: Vec<(RecordOrder, u64, u64)> = Vec::new();
+
     let mut body_eval = body_program.map(|p| ProgramEvaluator::new(Arc::clone(p), false));
-    let mut emitted_since_check = 0usize;
-
     let ectx = EmitCtx {
         name,
         output_schema,
@@ -789,71 +982,166 @@ fn execute_combine_sort_merge_with_stats(
         propagate_ck,
         resolver_mapping,
         ctx,
-        budget,
         strategy,
     };
+    let mspill = MergeSpill {
+        name,
+        spill_dir,
+        spill_compress,
+        budget,
+        consumer: &consumer_handle,
+    };
 
-    // Pull one driver at a time from the sorted stream, replay the build
-    // side against it, and emit its matches. `on_miss` and collect-mode
-    // are dispatched inline per driver so the walk never retains the set
-    // of drivers to revisit after the fact — that would reintroduce a
-    // full-driver-side residency for a sparse join.
+    // The matching set for one driver is a contiguous prefix (`>=` / `>`: build
+    // keys at/below the driver) or suffix (`<=` / `<`: build keys at/above the
+    // driver) of the ascending build side, whose boundary advances monotonically
+    // as drivers ascend. Prefix ops only pull new builds into the window; suffix
+    // ops also front-drop builds that fall below the current driver.
+    let is_suffix = matches!(op, RangeOp::Lt | RangeOp::Le);
+    let mut window = MatchWindow::new(byte_limit);
+    let mut build_iter = build_cursor;
+    // One-record lookahead: a build that does not yet match the current driver
+    // (prefix ops) waits here for a later, larger-key driver rather than dropping.
+    let mut pending_build: Option<(Record, Value, u64)> = None;
+    // Lowest `RecordOrder` among zero-match drivers, for `on_miss: error`. A
+    // single value, so a sparse left join records misses in O(1) resident state
+    // (never a resident vector of every unmatched driver).
+    let mut min_miss: Option<RecordOrder> = None;
+
     for driver in driver_stream {
-        let (driver_record, driver_order, driver_key) = driver?;
+        let (driver_record, driver_order, driver_idx, driver_key) = driver?;
+
+        // Front-drop builds that no longer match this driver (suffix ops only;
+        // a prefix build, once matched, matches every later driver).
+        if is_suffix {
+            window.drop_front_while(|bk| !apply_op(&driver_key, op, bk), &mspill)?;
+        }
+        // Pull newly-matching builds from the cursor into the window. Each build
+        // is read from the cursor exactly once (`build_pulls`), so a build is
+        // decoded from its sorted input O(1) times regardless of driver count.
+        loop {
+            if pending_build.is_none() {
+                match build_iter.next() {
+                    Some(Ok(b)) => {
+                        pending_build = Some(b);
+                        stats.build_pulls += 1;
+                    }
+                    Some(Err(e)) => return Err(e),
+                    None => break,
+                }
+            }
+            let matches = {
+                let (_, bk, _) = pending_build.as_ref().unwrap();
+                apply_op(&driver_key, op, bk)
+            };
+            if matches {
+                window.push_back(pending_build.take().unwrap(), &mspill, &mut spill_seq)?;
+            } else if is_suffix {
+                // Below the suffix: never matches this or any later driver — skip.
+                pending_build = None;
+            } else {
+                // Above the prefix: may match a later, larger-key driver — hold.
+                break;
+            }
+        }
+
         emit_for_driver(EmitDriverArgs {
             ectx: &ectx,
+            mspill: &mspill,
             driver_record: &driver_record,
             driver_order,
-            driver_key: &driver_key,
-            op,
-            build_side: &build_side,
-            decomposed,
+            driver_idx,
+            window: &window,
             body_eval: body_eval.as_mut(),
+            decomposed,
             match_mode,
             on_miss,
-            output: &mut output_records,
-            emitted_since_check: &mut emitted_since_check,
+            output: &mut output_buf,
             failures: &mut output_eval_failures,
+            failure_tags: &mut failure_tags,
+            min_miss: &mut min_miss,
         })?;
     }
 
-    // The build side's in-memory residency was charged into the shared
-    // consumer handle as it filled; discharge it now the walk is done so
-    // the arbitrator's pull-mode usage falls back to zero for this
-    // operator.
-    consumer_handle.sub_bytes(build_side.charged_bytes());
-
-    // ── NULL-range drivers ───────────────────────────────────────────
-    // They never entered the merge (no orderable key), so each matches
-    // nothing: one collect row (empty array) or the on_miss policy,
-    // preserving original row order.
-    for (driver_record, driver_order) in driver_unmatched_records {
-        if matches!(match_mode, MatchMode::Collect) {
-            emit_collect_row(
-                &ectx,
-                &driver_record,
-                driver_order,
-                Vec::new(),
-                None,
-                &mut output_records,
-                &mut emitted_since_check,
-            )?;
-        } else {
-            dispatch_driver_miss(
-                &ectx,
-                &driver_record,
-                driver_order,
-                on_miss,
-                body_eval.as_mut(),
-                &mut output_records,
-                &mut output_eval_failures,
-            )?;
-        }
+    // The window's in-memory residency and any resident-driver charge were
+    // mirrored into the shared consumer handle for the walk's duration;
+    // discharge both now the walk is done.
+    consumer_handle.sub_bytes(window.charged_bytes());
+    consumer_handle.sub_bytes(driver_charge);
+    if window.spilled {
+        stats.matching_run_spills = 1;
     }
 
+    // ── Zero-key (NULL-range) drivers ────────────────────────────────
+    // They never entered the merge, so each matches nothing: one collect row
+    // (empty array) or the on_miss policy, routed through the same output sort so
+    // their canonical order is realized alongside the walk's matched rows.
+    for (driver_record, driver_order, driver_idx) in driver_unmatched {
+        dispatch_driver_miss(DispatchMiss {
+            ectx: &ectx,
+            mspill: &mspill,
+            driver_record: &driver_record,
+            driver_order,
+            driver_idx,
+            match_mode,
+            on_miss,
+            body_eval: body_eval.as_mut(),
+            output: &mut output_buf,
+            failures: &mut output_eval_failures,
+            failure_tags: &mut failure_tags,
+            min_miss: &mut min_miss,
+        })?;
+    }
+
+    // `on_miss: error` cites the globally lowest-RecordOrder miss, independent of
+    // the walk order and the memory limit — identical to the pre-streaming flush.
+    if matches!(on_miss, OnMiss::Error)
+        && !matches!(match_mode, MatchMode::Collect)
+        && let Some(row) = min_miss
+    {
+        return Err(PipelineError::CombineMissingMatch {
+            combine: name.to_string(),
+            driver_row: row,
+        });
+    }
+
+    let row_count = output_buf.total_rows() as u64;
+    // The output sort's mirrored bytes are freed as the finished handle passes to
+    // the dispatcher; discharge them so the node-buffer admission never sums a
+    // stale footprint. Charging the output sort during emit never aborts a
+    // completing run — it self-bounds by spilling.
+    let output_sort_charged = output_buf.bytes_used() as u64;
+    let (sorted, residue) = output_buf.finish().map_err(|e| {
+        PipelineError::Io(std::io::Error::other(format!(
+            "sort-merge output finish failed: {e}"
+        )))
+    })?;
+    consumer_handle.sub_bytes(output_sort_charged);
+    if matches!(sorted, SortedOutput::Spilled(_)) {
+        stats.output_spilled = 1;
+    }
+    if residue > 0 && budget.record_spill_bytes(name, residue) {
+        return Err(PipelineError::spill_cap_exceeded(
+            name,
+            budget.disk_quota(),
+            residue,
+            budget.cumulative_spill_bytes(),
+        ));
+    }
+
+    // Re-order the deferred output-eval failures into the same
+    // layout-independent order, so the dead-letter output is a pure function of
+    // the data too. FailFast surfaces the first eval error and returns before
+    // reaching here.
+    debug_assert_eq!(output_eval_failures.len(), failure_tags.len());
+    let mut failures: Vec<_> = output_eval_failures.into_iter().zip(failure_tags).collect();
+    failures.sort_by_key(|(_, key)| *key);
+    let output_eval_failures = failures.into_iter().map(|(f, _)| f).collect();
+
     Ok((
-        CombineKernelOutput {
-            records: output_records,
+        SortMergeOutput {
+            sorted,
+            row_count,
             output_eval_failures,
         },
         stats,
@@ -864,32 +1152,10 @@ fn execute_combine_sort_merge_with_stats(
 // Phase A helpers — external sort each side on the range key
 // ──────────────────────────────────────────────────────────────────────
 
-/// Sort the driver-side `(record, order, key)` tuples on the range key field
-/// (skipped when pre-sorted) and hand back a single-pass ascending
-/// [`DriverStream`]. Uses [`SortBuffer<RecordOrder>`] under the hood; the sort
-/// key rides on the record so the spill envelope preserves the order tag
-/// verbatim.
-///
-/// Memory model: streaming. The driver side is consumed once and never holds a
-/// second full copy resident during Phase B — the spilled variant streams one
-/// record per open run through the [`SortedRunMerger`], and the in-memory
-/// variant is bounded by the sort buffer's `soft_limit / 2` spill threshold.
-/// The transient sort-buffer charge is netted to zero here (an already-consumed
-/// single-pass stream offers the arbitrator nothing to reclaim), matching the
-/// build side's discharge after the walk.
-///
-/// A pre-sorted simple-field driver still funnels through the same spillable
-/// sort buffer rather than staying resident: a stable sort of already-ascending
-/// input is an order-preserving no-op, so the emitted stream is byte-identical
-/// while an over-budget driver spills instead of materializing whole. An
-/// expression range axis (no simple field, reachable only pre-sorted) keeps its
-/// pre-extracted keys resident, the driver analog of [`BuildSide::Resident`],
-/// because a spilled key cannot be re-read from a record column.
-///
-/// Inputs bundled into [`DriverStreamBuild`] so the signature stays under
-/// clippy's `too_many_arguments` cap, matching [`BuildSideBuild`].
+/// Inputs to [`sort_driver_stream`], bundled so the signature stays under
+/// clippy's `too_many_arguments` cap.
 struct DriverStreamBuild<'a> {
-    pairs: Vec<(Record, RecordOrder, Value)>,
+    pairs: Vec<(Record, RecordOrder, u64, Value)>,
     name: &'a str,
     range_field: &'a Option<String>,
     budget: &'a MemoryArbitrator,
@@ -897,13 +1163,31 @@ struct DriverStreamBuild<'a> {
     consumer_handle: &'a Arc<crate::pipeline::memory::ConsumerHandle>,
     spill_dir: &'a Path,
     /// True when the caller certified the input already ascends on the range
-    /// key: the external sort is still applied (a stable no-op that keeps the
-    /// stream byte-identical while bounding residency), but an expression range
-    /// axis is kept resident rather than rejected.
+    /// key. A pre-sorted driver that fits budget is walked in place; only an
+    /// over-budget pre-sorted driver funnels through the spillable sort.
     presorted: bool,
 }
 
-fn sort_driver_stream(args: DriverStreamBuild<'_>) -> Result<DriverStream, PipelineError> {
+/// Sort the driver-side `(record, order, driver_idx, key)` tuples on the range
+/// key field (skipped when pre-sorted) and hand back a single-pass ascending
+/// [`DriverStream`] plus the in-memory bytes it charged into the consumer handle.
+///
+/// Memory model: streaming. A spilled driver streams one record per open run
+/// through the [`SortedRunMerger`] and returns a zero charge — its transient
+/// sort-buffer charge is netted here, and the records are off-process. A
+/// resident (in-memory) driver — sorted-but-fits, pre-sorted-and-fits, or an
+/// expression range axis — stays charged through the walk and returns that
+/// charge for the caller to discharge afterward, so a byte-counting arbitrator
+/// (RSS unavailable, concurrent consumers) sees the resident driver.
+///
+/// A pre-sorted simple-field driver that fits budget is walked in place, with no
+/// redundant stable sort and Vec rebuild; only an over-budget pre-sorted driver
+/// funnels through the spillable sort (a stable sort of already-ascending input
+/// is an order-preserving no-op, so the stream stays byte-identical while
+/// spilling). An expression range axis (no simple field, reachable only
+/// pre-sorted) keeps its pre-extracted keys resident, because a spilled key
+/// cannot be re-read from a record column.
+fn sort_driver_stream(args: DriverStreamBuild<'_>) -> Result<(DriverStream, u64), PipelineError> {
     let DriverStreamBuild {
         pairs,
         name,
@@ -915,16 +1199,23 @@ fn sort_driver_stream(args: DriverStreamBuild<'_>) -> Result<DriverStream, Pipel
         presorted,
     } = args;
     if pairs.is_empty() {
-        return Ok(DriverStream::InMemory(Vec::new().into_iter()));
+        return Ok((DriverStream::InMemory(Vec::new().into_iter()), 0));
     }
+    let entry_bytes = |record: &Record| -> u64 {
+        (std::mem::size_of::<Record>()
+            + record.estimated_heap_size()
+            + std::mem::size_of::<RecordOrder>()
+            + std::mem::size_of::<u64>()
+            + std::mem::size_of::<Value>()) as u64
+    };
+    let spill_threshold = spill_threshold_bytes(budget);
+
     let Some(field) = range_field else {
         // Expression range axis (e.g. `a.x + 1`): the key rides in no record
         // column, so it can neither drive `SortBuffer`'s field comparator nor be
-        // recovered on a spilled replay. It is reachable only on the pre-sorted
-        // skip path — the external sort requires a simple field — where the pairs
-        // already ascend and carry their extracted keys, so keep them resident.
-        // A non-presorted expression axis has no sort path at all: a
-        // planner-shape violation the kernel never sees today.
+        // recovered on a spilled replay. Reachable only pre-sorted (the sort
+        // requires a simple field); keep resident with pre-extracted keys,
+        // charged so the arbitrator sees it.
         if !presorted {
             return Err(PipelineError::Internal {
                 op: "combine",
@@ -938,19 +1229,40 @@ fn sort_driver_stream(args: DriverStreamBuild<'_>) -> Result<DriverStream, Pipel
         debug_assert!(
             pairs
                 .windows(2)
-                .all(|w| cmp_range_keys(&w[0].2, &w[1].2) != Ordering::Greater),
+                .all(|w| cmp_range_keys(&w[0].3, &w[1].3) != Ordering::Greater),
             "presorted driver pairs are not in ascending range-key order"
         );
-        return Ok(DriverStream::InMemory(pairs.into_iter()));
+        let charged: u64 = pairs.iter().map(|(r, _, _, _)| entry_bytes(r)).sum();
+        consumer_handle.add_bytes(charged);
+        return Ok((DriverStream::InMemory(pairs.into_iter()), charged));
     };
+
+    if presorted {
+        debug_assert!(
+            pairs
+                .windows(2)
+                .all(|w| cmp_range_keys(&w[0].3, &w[1].3) != Ordering::Greater),
+            "presorted driver pairs are not in ascending range-key order"
+        );
+        let total: u64 = pairs.iter().map(|(r, _, _, _)| entry_bytes(r)).sum();
+        if total <= spill_threshold as u64 {
+            // Fits budget: walk in place — no redundant stable sort + rebuild.
+            consumer_handle.add_bytes(total);
+            return Ok((DriverStream::InMemory(pairs.into_iter()), total));
+        }
+        // Over budget: fall through to the spillable sort (stable no-op on
+        // already-ascending input) so the driver spills instead of holding whole.
+    }
+
     let schema = Arc::clone(pairs[0].0.schema());
-    let spill_threshold = spill_threshold_bytes(budget);
     let sort_field = clinker_plan::config::SortField {
         field: field.clone(),
         order: clinker_plan::config::SortOrder::Asc,
         null_order: None,
     };
-    let mut buf: SortBuffer<RecordOrder> = SortBuffer::new(
+    // Payload carries `(order, driver_idx)` so both survive the spill envelope
+    // verbatim; the range key rides on the record's sort column.
+    let mut buf: SortBuffer<(RecordOrder, u64)> = SortBuffer::new(
         vec![sort_field],
         spill_threshold,
         Some(spill_dir.to_path_buf()),
@@ -958,23 +1270,18 @@ fn sort_driver_stream(args: DriverStreamBuild<'_>) -> Result<DriverStream, Pipel
         schema,
     );
 
-    // Transient sort-buffer charge, rewound in full below so the driver side
-    // contributes nothing to the consumer handle once sorting completes.
     let mut local_charged: u64 = 0;
-
-    for (record, order, _key) in pairs {
+    for (record, order, driver_idx, _key) in pairs {
         let pre = buf.bytes_used();
-        buf.push(record, order);
+        buf.push(record, (order, driver_idx));
         let delta = (buf.bytes_used().saturating_sub(pre)) as u64;
         consumer_handle.add_bytes(delta);
         local_charged = local_charged.saturating_add(delta);
         if buf.should_spill() {
             let pre_spill = buf.bytes_used() as u64;
-            let written = buf.sort_and_spill().map_err(|e| {
-                PipelineError::Io(std::io::Error::other(format!(
-                    "sort-merge driver phase A spill failed: {e}"
-                )))
-            })?;
+            let written = buf
+                .sort_and_spill()
+                .map_err(|e| spill_io_error(name, "driver phase A spill failed", e))?;
             consumer_handle.sub_bytes(pre_spill);
             local_charged = local_charged.saturating_sub(pre_spill);
             if written > 0 && budget.record_spill_bytes(name, written) {
@@ -988,11 +1295,9 @@ fn sort_driver_stream(args: DriverStreamBuild<'_>) -> Result<DriverStream, Pipel
         }
     }
 
-    let (sorted, residue) = buf.finish().map_err(|e| {
-        PipelineError::Io(std::io::Error::other(format!(
-            "sort-merge driver phase A finish failed: {e}"
-        )))
-    })?;
+    let (sorted, residue) = buf
+        .finish()
+        .map_err(|e| spill_io_error(name, "driver phase A finish failed", e))?;
     if residue > 0 && budget.record_spill_bytes(name, residue) {
         return Err(PipelineError::spill_cap_exceeded(
             name,
@@ -1002,26 +1307,24 @@ fn sort_driver_stream(args: DriverStreamBuild<'_>) -> Result<DriverStream, Pipel
         ));
     }
 
-    // Discharge the whole transient sort charge: whichever way the sort
-    // landed, the driver stream carries the records from here on and is not
-    // charged against the handle.
-    consumer_handle.sub_bytes(local_charged);
-
     match sorted {
         SortedOutput::InMemory(out) => {
-            let mut v: Vec<(Record, RecordOrder, Value)> = Vec::with_capacity(out.len());
-            for (record, order) in out {
+            // Records stay resident in `out`; the walk consumes them. Keep them
+            // charged (a byte-counting arbitrator must see a resident driver);
+            // return the charge so the caller discharges it after the walk.
+            let mut v: Vec<(Record, RecordOrder, u64, Value)> = Vec::with_capacity(out.len());
+            for (record, (order, driver_idx)) in out {
                 let key = record.get(field).cloned().unwrap_or(Value::Null);
-                v.push((record, order, key));
+                v.push((record, order, driver_idx, key));
             }
-            Ok(DriverStream::InMemory(v.into_iter()))
+            Ok((DriverStream::InMemory(v.into_iter()), local_charged))
         }
         SortedOutput::Spilled(files) => {
-            // Fold the individually-sorted runs into one globally-ordered
-            // stream via the shared LoserTree k-way merge. `SortBuffer` already
-            // sorted each run on `field`, so the merge preserves that order
-            // across runs (a single run is an identity pass); the walk pulls
-            // one record per open run.
+            // Records are off-process; discharge the transient sort charge. The
+            // merger holds one record per open run and the walk pulls one at a
+            // time, so `SortBuffer` sorted each run and the merge preserves that
+            // order across runs (a single run is an identity pass).
+            consumer_handle.sub_bytes(local_charged);
             let merge_field = clinker_plan::config::SortField {
                 field: field.clone(),
                 order: clinker_plan::config::SortOrder::Asc,
@@ -1037,90 +1340,48 @@ fn sort_driver_stream(args: DriverStreamBuild<'_>) -> Result<DriverStream, Pipel
                     compress: spill_compress,
                 },
             )?;
-            Ok(DriverStream::Spilled {
-                merger,
-                field: field.clone(),
-            })
+            Ok((
+                DriverStream::Spilled {
+                    merger,
+                    field: field.clone(),
+                },
+                0,
+            ))
         }
     }
 }
 
-/// Fixed context for pushing one build record into the replay buffer:
-/// spill threshold, spill directory, disk-quota budget, and the shared
-/// consumer handle. Bundled so [`BuildPush::push`] stays under clippy's
-/// argument cap and every call site charges memory and disk identically.
-struct BuildPush<'a> {
-    byte_limit: usize,
-    spill_dir: &'a Path,
-    spill_compress: bool,
-    consumer_handle: &'a Arc<crate::pipeline::memory::ConsumerHandle>,
-    budget: &'a MemoryArbitrator,
-    name: &'a str,
-}
-
-impl BuildPush<'_> {
-    /// Append one sorted build record to the replay buffer, spilling past
-    /// `byte_limit`. Charges in-memory growth into the consumer handle
-    /// (via [`push_to_buffer`]) and any freshly written spill bytes against
-    /// the disk quota, aborting with `SpillCapExceeded` on overflow.
-    fn push(
-        &self,
-        buf: &mut MatchingRunBuffer,
-        record: Record,
-        spill_seq: &mut u32,
-    ) -> Result<(), PipelineError> {
-        let written = push_to_buffer(
-            buf,
-            record,
-            self.byte_limit,
-            self.spill_dir,
-            self.spill_compress,
-            spill_seq,
-            self.consumer_handle,
-        )
-        .map_err(|e| grace_spill_error(e, self.name, "sort-merge build buffer spill failed"))?;
-        if written > 0 && self.budget.record_spill_bytes(self.name, written) {
-            return Err(PipelineError::spill_cap_exceeded(
-                self.name,
-                self.budget.disk_quota(),
-                written,
-                self.budget.cumulative_spill_bytes(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Inputs to [`build_side_from_pairs`]. Bundled so the function signature
+/// Inputs to [`build_cursor_from_pairs`]. Bundled so the function signature
 /// stays under clippy's `too_many_arguments` cap.
-struct BuildSideBuild<'a> {
-    pairs: Vec<(Record, Value)>,
+struct BuildCursorBuild<'a> {
+    pairs: Vec<(Record, Value, u64)>,
     name: &'a str,
     range_field: &'a Option<String>,
     budget: &'a MemoryArbitrator,
     spill_compress: bool,
     consumer_handle: &'a Arc<crate::pipeline::memory::ConsumerHandle>,
     spill_dir: &'a Path,
-    byte_limit: usize,
     /// True when the caller certified the input already ascends on the range
-    /// key (upstream ordering), so the external sort is skipped.
+    /// key. A pre-sorted build that fits budget is streamed in place; only an
+    /// over-budget pre-sorted build funnels through the spillable sort.
     presorted: bool,
-    spill_seq: &'a mut u32,
-    stats: &'a mut SortMergeStats,
 }
 
-/// Sort the build-side `(record, key)` tuples on the range key (skipped when
-/// pre-sorted) and fold them into a replayable [`BuildSide`].
+/// Sort the build-side `(record, key, build_idx)` tuples on the range key
+/// (skipped when pre-sorted) into a single-pass ascending [`BuildCursor`] the
+/// merge walk pulls once into the match window.
 ///
-/// Memory model: the sorted records land in a spillable [`MatchingRunBuffer`]
-/// that overflows to disk past `byte_limit`, so an over-budget build side no
-/// longer materializes whole in RAM. The buffer's in-memory residency is
-/// charged into the shared consumer handle for the walk's duration and
-/// discharged by the caller once the walk finishes. Expression range axes
-/// (no simple field) keep their pre-extracted keys resident because the key
-/// cannot be re-read from a record column on replay.
-fn build_side_from_pairs(args: BuildSideBuild<'_>) -> Result<BuildSide, PipelineError> {
-    let BuildSideBuild {
+/// Memory model: streaming. A spilled build streams one record per open run
+/// through the [`SortedRunMerger`]; an in-memory build stays resident until
+/// pulled (bounded by the sort buffer's `soft_limit / 2` threshold, or the
+/// caller's own input for a pre-sorted-and-fits build). The transient
+/// sort-buffer charge is netted here; the match window charges the resident
+/// matching set as builds are pulled into it, so the build side is charged
+/// exactly once. An expression range axis (no simple field, pre-sorted only)
+/// keeps its pre-extracted keys resident because the key cannot be re-read from
+/// a record column.
+fn build_cursor_from_pairs(args: BuildCursorBuild<'_>) -> Result<BuildCursor, PipelineError> {
+    let BuildCursorBuild {
         pairs,
         name,
         range_field,
@@ -1128,24 +1389,27 @@ fn build_side_from_pairs(args: BuildSideBuild<'_>) -> Result<BuildSide, Pipeline
         spill_compress,
         consumer_handle,
         spill_dir,
-        byte_limit,
         presorted,
-        spill_seq,
-        stats,
     } = args;
 
     if pairs.is_empty() {
-        return Ok(BuildSide::Resident(Vec::new()));
+        return Ok(BuildCursor::InMemory(Vec::new().into_iter()));
     }
+    let entry_bytes = |record: &Record| -> u64 {
+        (std::mem::size_of::<Record>()
+            + record.estimated_heap_size()
+            + std::mem::size_of::<Value>()
+            + std::mem::size_of::<u64>()) as u64
+    };
+    let spill_threshold = spill_threshold_bytes(budget);
+
     let Some(field) = range_field else {
         // Expression range axis: the key rides in no record column, so it cannot
         // be re-read on a spilled replay — keep the already-sorted pairs resident
-        // with their pre-extracted keys. Reachable only on the pre-sorted skip
-        // path; the external sort requires a simple field. A non-presorted
-        // expression axis has no sort path at all: a planner-shape violation the
-        // kernel never sees today, surfaced as a typed invariant error rather
-        // than a debug-only panic that would silently hold the full build side
-        // resident in release.
+        // with their pre-extracted keys. Reachable only pre-sorted (the sort
+        // requires a simple field). A non-presorted expression axis has no sort
+        // path at all: a planner-shape violation the kernel never sees today,
+        // surfaced as a typed invariant error rather than a release panic.
         if !presorted {
             return Err(PipelineError::Internal {
                 op: "combine",
@@ -1156,132 +1420,114 @@ fn build_side_from_pairs(args: BuildSideBuild<'_>) -> Result<BuildSide, Pipeline
                     .to_string(),
             });
         }
-        return Ok(BuildSide::Resident(pairs));
-    };
-
-    let pusher = BuildPush {
-        byte_limit,
-        spill_dir,
-        spill_compress,
-        consumer_handle,
-        budget,
-        name,
-    };
-    let mut buf = MatchingRunBuffer::new();
-
-    if presorted {
-        // Upstream ordering already ascends on the range key, so the buffer is
-        // filled in place — no sort, just the spill-bounded FIFO append.
         debug_assert!(
             pairs
                 .windows(2)
                 .all(|w| cmp_range_keys(&w[0].1, &w[1].1) != Ordering::Greater),
             "presorted build pairs are not in ascending range-key order"
         );
-        for (record, _key) in pairs {
-            pusher.push(&mut buf, record, spill_seq)?;
-        }
-    } else {
-        // External sort into globally-ordered runs, then fold into the replay
-        // buffer. The transient sort-buffer charge is netted to zero before
-        // the replay buffer re-charges its residency, so the build side is
-        // charged exactly once.
-        let schema = Arc::clone(pairs[0].0.schema());
-        let spill_threshold = spill_threshold_bytes(budget);
-        let sort_field = clinker_plan::config::SortField {
-            field: field.clone(),
-            order: clinker_plan::config::SortOrder::Asc,
-            null_order: None,
-        };
-        let mut sbuf: SortBuffer<()> = SortBuffer::new(
-            vec![sort_field],
-            spill_threshold,
-            Some(spill_dir.to_path_buf()),
-            spill_compress,
-            schema,
+        return Ok(BuildCursor::InMemory(pairs.into_iter()));
+    };
+
+    if presorted {
+        debug_assert!(
+            pairs
+                .windows(2)
+                .all(|w| cmp_range_keys(&w[0].1, &w[1].1) != Ordering::Greater),
+            "presorted build pairs are not in ascending range-key order"
         );
-        let mut local_charged: u64 = 0;
-        for (record, _key) in pairs {
-            let pre = sbuf.bytes_used();
-            sbuf.push(record, ());
-            let delta = (sbuf.bytes_used().saturating_sub(pre)) as u64;
-            consumer_handle.add_bytes(delta);
-            local_charged = local_charged.saturating_add(delta);
-            if sbuf.should_spill() {
-                let pre_spill = sbuf.bytes_used() as u64;
-                let written = sbuf.sort_and_spill().map_err(|e| {
-                    PipelineError::Io(std::io::Error::other(format!(
-                        "sort-merge build phase A spill failed: {e}"
-                    )))
-                })?;
-                consumer_handle.sub_bytes(pre_spill);
-                local_charged = local_charged.saturating_sub(pre_spill);
-                if written > 0 && budget.record_spill_bytes(name, written) {
-                    return Err(PipelineError::spill_cap_exceeded(
-                        name,
-                        budget.disk_quota(),
-                        written,
-                        budget.cumulative_spill_bytes(),
-                    ));
-                }
-            }
+        let total: u64 = pairs.iter().map(|(r, _, _)| entry_bytes(r)).sum();
+        if total <= spill_threshold as u64 {
+            // Fits budget: stream in place — no redundant stable sort.
+            return Ok(BuildCursor::InMemory(pairs.into_iter()));
         }
-        let (sorted, residue) = sbuf.finish().map_err(|e| {
-            PipelineError::Io(std::io::Error::other(format!(
-                "sort-merge build phase A finish failed: {e}"
-            )))
-        })?;
-        if residue > 0 && budget.record_spill_bytes(name, residue) {
-            return Err(PipelineError::spill_cap_exceeded(
-                name,
-                budget.disk_quota(),
-                residue,
-                budget.cumulative_spill_bytes(),
-            ));
-        }
-        // Net the transient sort charge; the replay buffer re-charges below.
-        consumer_handle.sub_bytes(local_charged);
-        match sorted {
-            SortedOutput::InMemory(out) => {
-                for (record, ()) in out {
-                    pusher.push(&mut buf, record, spill_seq)?;
-                }
-            }
-            SortedOutput::Spilled(files) => {
-                let merge_field = clinker_plan::config::SortField {
-                    field: field.clone(),
-                    order: clinker_plan::config::SortOrder::Asc,
-                    null_order: None,
-                };
-                let merger = SortedRunMerger::new(
-                    files,
-                    std::slice::from_ref(&merge_field),
-                    "sort-merge build phase A",
-                    MergeBudget {
-                        budget,
-                        node: name,
-                        compress: spill_compress,
-                    },
-                )?;
-                for entry in merger {
-                    let (record, ()) = entry?;
-                    pusher.push(&mut buf, record, spill_seq)?;
-                }
-            }
-        }
+        // Over budget: fall through to the spillable sort (stable no-op on
+        // already-ascending input) so the build spills instead of holding whole.
     }
 
-    if matches!(buf, MatchingRunBuffer::Spilled { .. }) {
-        // The build buffer overflowed `byte_limit` and now lives mostly on
-        // disk. Counted once per build side; drives the module tests'
-        // spill-path assertions.
-        stats.matching_run_spills = stats.matching_run_spills.saturating_add(1);
-    }
-
-    Ok(BuildSide::Buffered {
-        buf,
+    // External sort into globally-ordered runs carrying `build_idx` as payload.
+    let schema = Arc::clone(pairs[0].0.schema());
+    let sort_field = clinker_plan::config::SortField {
         field: field.clone(),
-    })
+        order: clinker_plan::config::SortOrder::Asc,
+        null_order: None,
+    };
+    let mut buf: SortBuffer<u64> = SortBuffer::new(
+        vec![sort_field],
+        spill_threshold,
+        Some(spill_dir.to_path_buf()),
+        spill_compress,
+        schema,
+    );
+    let mut local_charged: u64 = 0;
+    for (record, _key, build_idx) in pairs {
+        let pre = buf.bytes_used();
+        buf.push(record, build_idx);
+        let delta = (buf.bytes_used().saturating_sub(pre)) as u64;
+        consumer_handle.add_bytes(delta);
+        local_charged = local_charged.saturating_add(delta);
+        if buf.should_spill() {
+            let pre_spill = buf.bytes_used() as u64;
+            let written = buf
+                .sort_and_spill()
+                .map_err(|e| spill_io_error(name, "build phase A spill failed", e))?;
+            consumer_handle.sub_bytes(pre_spill);
+            local_charged = local_charged.saturating_sub(pre_spill);
+            if written > 0 && budget.record_spill_bytes(name, written) {
+                return Err(PipelineError::spill_cap_exceeded(
+                    name,
+                    budget.disk_quota(),
+                    written,
+                    budget.cumulative_spill_bytes(),
+                ));
+            }
+        }
+    }
+    let (sorted, residue) = buf
+        .finish()
+        .map_err(|e| spill_io_error(name, "build phase A finish failed", e))?;
+    if residue > 0 && budget.record_spill_bytes(name, residue) {
+        return Err(PipelineError::spill_cap_exceeded(
+            name,
+            budget.disk_quota(),
+            residue,
+            budget.cumulative_spill_bytes(),
+        ));
+    }
+    // The window re-charges the resident matching set as it pulls, so net the
+    // transient sort charge to zero to avoid double-counting.
+    consumer_handle.sub_bytes(local_charged);
+    match sorted {
+        SortedOutput::InMemory(out) => {
+            let mut v: Vec<(Record, Value, u64)> = Vec::with_capacity(out.len());
+            for (record, build_idx) in out {
+                let key = record.get(field).cloned().unwrap_or(Value::Null);
+                v.push((record, key, build_idx));
+            }
+            Ok(BuildCursor::InMemory(v.into_iter()))
+        }
+        SortedOutput::Spilled(files) => {
+            let merge_field = clinker_plan::config::SortField {
+                field: field.clone(),
+                order: clinker_plan::config::SortOrder::Asc,
+                null_order: None,
+            };
+            let merger = SortedRunMerger::new(
+                files,
+                std::slice::from_ref(&merge_field),
+                "sort-merge build phase A",
+                MergeBudget {
+                    budget,
+                    node: name,
+                    compress: spill_compress,
+                },
+            )?;
+            Ok(BuildCursor::Spilled {
+                merger,
+                field: field.clone(),
+            })
+        }
+    }
 }
 
 /// Extract the bare field name from a range-side expression iff the
@@ -1301,22 +1547,10 @@ fn field_name_of_range_expr(expr: &Expr) -> Option<String> {
 // Phase B helpers — streaming merge walk
 // ──────────────────────────────────────────────────────────────────────
 
-/// In-memory byte count for a matching-run buffer. `InMemory` carries
-/// its accumulated bytes directly; `Spilled` reports only the tail
-/// (on-disk segments are off-process and don't count against the
-/// pull-mode `current_usage` surface — same convention as the grace-
-/// hash partition Building → OnDisk transition).
-fn matching_run_in_memory_bytes(buf: &MatchingRunBuffer) -> u64 {
-    match buf {
-        MatchingRunBuffer::InMemory { bytes, .. } => *bytes as u64,
-        MatchingRunBuffer::Spilled { tail_bytes, .. } => *tail_bytes as u64,
-    }
-}
-
 /// Fixed per-combine emit context: everything the per-driver emit and the
 /// zero-match dispatch read but never mutate. Bundled so the emit helpers
-/// stay under clippy's argument cap and every emit site widens, propagates
-/// `$ck`, and polls the budget identically.
+/// stay under clippy's argument cap and every emit site widens and propagates
+/// `$ck` identically.
 struct EmitCtx<'a> {
     name: &'a str,
     output_schema: Option<&'a Arc<Schema>>,
@@ -1324,89 +1558,120 @@ struct EmitCtx<'a> {
     propagate_ck: &'a clinker_plan::config::pipeline_node::PropagateCkSpec,
     resolver_mapping: &'a CombineResolverMapping,
     ctx: &'a EvalContext<'a>,
-    budget: &'a MemoryArbitrator,
     strategy: clinker_plan::config::ErrorStrategy,
 }
 
-/// Poll the accumulated output buffer every [`MEMORY_CHECK_INTERVAL`] emitted
-/// rows and abort if its own byte count has grown past the hard limit. The
-/// sort-merge output vector has no spill path, so — as on the IEJoin
-/// equi+range path — global pressure is the sole ceiling on its growth; the
-/// byte-counted [`MemoryArbitrator::should_abort_local`] gate fires even where
-/// process RSS is unavailable. Applies uniformly across `first` / `all` and
-/// `collect`, so a high-cardinality driver with a permissive predicate aborts
-/// cleanly instead of growing the output unbounded.
-fn poll_output_buffer(
-    ectx: &EmitCtx<'_>,
-    output: &[(Record, RecordOrder)],
-    emitted_since_check: &mut usize,
+/// Build slot of a collect / on_miss row's `(order, driver_idx, build)` sort
+/// key. Such a row carries no build, so `u64::MAX` fixes the slot
+/// deterministically — a driver emits either matched rows or a single
+/// miss/collect row, never both, so it never collides with a real build index.
+const MISS_BUILD_TAG: u64 = u64::MAX;
+
+/// Push one emitted row into the payload-ordered output sort, charging its
+/// in-memory growth into the consumer handle and spilling (charging the run
+/// against the disk quota) when the buffer crosses its threshold. Every emit
+/// path — matched, on_miss null_fields, and collect — routes through here, so
+/// the output axis is bounded uniformly rather than growing an in-RAM vec.
+fn push_output_row(
+    output: &mut SortBuffer<(RecordOrder, u64, u64)>,
+    record: Record,
+    key: (RecordOrder, u64, u64),
+    mspill: &MergeSpill<'_>,
 ) -> Result<(), PipelineError> {
-    *emitted_since_check += 1;
-    if *emitted_since_check >= MEMORY_CHECK_INTERVAL {
-        let used = crate::pipeline::combine::combine_output_buffer_bytes(output) as u64;
-        if ectx.budget.should_abort_local(used) {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: ectx.name.to_string(),
-                used,
-                limit: ectx.budget.hard_limit(),
-                source: BudgetCategory::Arena,
-                detail: Some("sort-merge output buffer exceeded budget".to_string()),
-            });
+    let pre = output.bytes_used();
+    output.push(record, key);
+    mspill
+        .consumer
+        .add_bytes(output.bytes_used().saturating_sub(pre) as u64);
+    if output.should_spill() {
+        let pre_spill = output.bytes_used() as u64;
+        let written = output
+            .sort_and_spill()
+            .map_err(|e| spill_io_error(mspill.name, "output sort spill failed", e))?;
+        mspill.consumer.sub_bytes(pre_spill);
+        if written > 0 && mspill.budget.record_spill_bytes(mspill.name, written) {
+            return Err(PipelineError::spill_cap_exceeded(
+                mspill.name,
+                mspill.budget.disk_quota(),
+                written,
+                mspill.budget.cumulative_spill_bytes(),
+            ));
         }
-        *emitted_since_check = 0;
     }
     Ok(())
 }
 
-/// Build and push one collect-mode row for `driver_order`: even a zero-match
-/// driver emits, with an empty array. Propagates the first matched build's
-/// `$ck.<field>` values onto the widened row, sets the collect array under the
-/// build qualifier, then polls the output buffer — so a high-cardinality
-/// driver with a permissive predicate aborts cleanly over budget instead of
-/// growing collect-mode output unbounded.
+/// One driver row's identity for the emit helpers: record, order tag, and
+/// unique global input index. Bundled so the emit helpers stay under clippy's
+/// argument cap.
+struct DriverRow<'a> {
+    record: &'a Record,
+    order: RecordOrder,
+    idx: u64,
+}
+
+/// Deferred-failure and miss trackers threaded through the emit helpers: the
+/// dead-letter rows, their parallel canonical sort tags, and the running lowest
+/// `RecordOrder` miss for `on_miss: error`. Bundled to stay under the argument
+/// cap.
+struct FailSink<'a> {
+    failures: &'a mut Vec<CombineOutputEvalFailure>,
+    failure_tags: &'a mut Vec<(RecordOrder, u64, u64)>,
+    min_miss: &'a mut Option<RecordOrder>,
+}
+
+/// Build and push one collect-mode row for `driver` into the output sort: even a
+/// zero-match driver emits, with an empty array. Propagates the first matched
+/// build's `$ck.<field>` values onto the widened row and sets the collect array
+/// under the build qualifier.
 fn emit_collect_row(
     ectx: &EmitCtx<'_>,
-    driver_record: &Record,
-    driver_order: RecordOrder,
+    mspill: &MergeSpill<'_>,
+    driver: DriverRow<'_>,
     arr: Vec<Value>,
     first_build: Option<&Record>,
-    output: &mut Vec<(Record, RecordOrder)>,
-    emitted_since_check: &mut usize,
+    output: &mut SortBuffer<(RecordOrder, u64, u64)>,
 ) -> Result<(), PipelineError> {
     let mut rec = match ectx.output_schema {
-        Some(s) => widen_record_to_schema(driver_record, s),
-        None => driver_record.clone(),
+        Some(s) => widen_record_to_schema(driver.record, s),
+        None => driver.record.clone(),
     };
     if let Some(b) = first_build {
         crate::executor::copy_build_ck_columns(&mut rec, b, ectx.propagate_ck);
     }
     rec.set(ectx.build_qualifier, Value::Array(arr));
-    output.push((rec, driver_order));
-    poll_output_buffer(ectx, output, emitted_since_check)
+    push_output_row(
+        output,
+        rec,
+        (driver.order, driver.idx, MISS_BUILD_TAG),
+        mspill,
+    )
 }
 
-/// Dispatch one zero-match driver through its `on_miss` policy: `Skip` drops
-/// it, `Error` surfaces the missing-match error, `NullFields` runs the body
-/// over the driver alone and emits the widened row (a recoverable eval failure
-/// routes to `failures`, or fails fast). Used inline for both keyed drivers
-/// that matched nothing and NULL-range drivers.
-fn dispatch_driver_miss(
+/// Handle one zero-match driver under `first` / `all`: `Skip` drops it, `Error`
+/// records it so the walk can cite the globally lowest-`RecordOrder` miss
+/// afterward (a single running minimum, not a resident vector of every
+/// unmatched driver), and `NullFields` runs the body over the driver alone and
+/// routes the widened row through the output sort — a recoverable eval failure
+/// defers to `fail.failures` with its canonical sort tag, or fails fast.
+fn handle_on_miss(
     ectx: &EmitCtx<'_>,
-    driver_record: &Record,
-    driver_order: RecordOrder,
+    mspill: &MergeSpill<'_>,
+    driver: DriverRow<'_>,
     on_miss: OnMiss,
     body_eval: Option<&mut ProgramEvaluator>,
-    output: &mut Vec<(Record, RecordOrder)>,
-    failures: &mut Vec<CombineOutputEvalFailure>,
+    output: &mut SortBuffer<(RecordOrder, u64, u64)>,
+    fail: &mut FailSink<'_>,
 ) -> Result<(), PipelineError> {
     match on_miss {
         OnMiss::Skip => Ok(()),
-        OnMiss::Error => Err(PipelineError::CombineMissingMatch {
-            combine: ectx.name.to_string(),
-            driver_row: driver_order,
-        }),
+        OnMiss::Error => {
+            let m = (*fail.min_miss).map_or(driver.order, |cur| cur.min(driver.order));
+            *fail.min_miss = Some(m);
+            Ok(())
+        }
         OnMiss::NullFields => {
-            let resolver = CombineResolver::new(ectx.resolver_mapping, driver_record, None);
+            let resolver = CombineResolver::new(ectx.resolver_mapping, driver.record, None);
             let evaluator = body_eval.ok_or_else(|| PipelineError::Internal {
                 op: "combine",
                 node: ectx.name.to_string(),
@@ -1419,8 +1684,8 @@ fn dispatch_driver_miss(
                     ..
                 }) => {
                     let mut rec = match ectx.output_schema {
-                        Some(s) => widen_record_to_schema(driver_record, s),
-                        None => driver_record.clone(),
+                        Some(s) => widen_record_to_schema(driver.record, s),
+                        None => driver.record.clone(),
                     };
                     for (n, v) in fields {
                         rec.set(&n, v);
@@ -1428,8 +1693,12 @@ fn dispatch_driver_miss(
                     for (k, v) in *record_vars {
                         let _ = rec.set_record_var(&k, v);
                     }
-                    output.push((rec, driver_order));
-                    Ok(())
+                    push_output_row(
+                        output,
+                        rec,
+                        (driver.order, driver.idx, MISS_BUILD_TAG),
+                        mspill,
+                    )
                 }
                 Ok(EvalResult::Skip(_)) => Ok(()),
                 Ok(EvalResult::EmitMany { .. }) => Err(PipelineError::Internal {
@@ -1441,12 +1710,14 @@ fn dispatch_driver_miss(
                     if ectx.strategy == clinker_plan::config::ErrorStrategy::FailFast {
                         return Err(PipelineError::from(e));
                     }
-                    failures.push(CombineOutputEvalFailure {
-                        probe_record: driver_record.clone(),
-                        row: driver_order,
+                    fail.failures.push(CombineOutputEvalFailure {
+                        probe_record: driver.record.clone(),
+                        row: driver.order,
                         matched_build: None,
                         error: e,
                     });
+                    fail.failure_tags
+                        .push((driver.order, driver.idx, MISS_BUILD_TAG));
                     Ok(())
                 }
             }
@@ -1454,76 +1725,113 @@ fn dispatch_driver_miss(
     }
 }
 
-/// Inputs to [`emit_for_driver`]: one driver row plus everything the merge
-/// walk needs to replay the build side against it. Bundled so the function
-/// stays under clippy's argument cap. Consumed by value — each call owns the
-/// mutable output / counter / failures borrows for its duration.
-struct EmitDriverArgs<'a, 'b> {
+/// Inputs to [`dispatch_driver_miss`], for a driver that matched nothing.
+struct DispatchMiss<'a, 'b> {
     ectx: &'b EmitCtx<'a>,
+    mspill: &'b MergeSpill<'b>,
     driver_record: &'b Record,
     driver_order: RecordOrder,
-    driver_key: &'b Value,
-    op: RangeOp,
-    build_side: &'b BuildSide,
-    decomposed: &'a DecomposedPredicate,
-    body_eval: Option<&'b mut ProgramEvaluator>,
+    driver_idx: u64,
     match_mode: MatchMode,
     on_miss: OnMiss,
-    output: &'b mut Vec<(Record, RecordOrder)>,
-    emitted_since_check: &'b mut usize,
+    body_eval: Option<&'b mut ProgramEvaluator>,
+    output: &'b mut SortBuffer<(RecordOrder, u64, u64)>,
     failures: &'b mut Vec<CombineOutputEvalFailure>,
+    failure_tags: &'b mut Vec<(RecordOrder, u64, u64)>,
+    min_miss: &'b mut Option<RecordOrder>,
 }
 
-/// Emit the join output for one driver row, replaying the build side and
-/// applying the range predicate inline. The predicate filter is fused into
-/// the replay so no per-driver matching run is materialized: the only
-/// buffered build state is the shared, spillable [`BuildSide`], keeping peak
-/// residency at one matching set plus the k open runs of each side's cursor.
-///
-/// Honors `match: collect | first | all`, the residual filter, and the body
-/// evaluator; `on_miss` is dispatched inline when the driver emits nothing.
+/// Dispatch a driver that matched nothing (a NULL-range driver): under collect
+/// it emits one empty-array row, otherwise it routes through `on_miss`.
+fn dispatch_driver_miss(args: DispatchMiss<'_, '_>) -> Result<(), PipelineError> {
+    let DispatchMiss {
+        ectx,
+        mspill,
+        driver_record,
+        driver_order,
+        driver_idx,
+        match_mode,
+        on_miss,
+        body_eval,
+        output,
+        failures,
+        failure_tags,
+        min_miss,
+    } = args;
+    let driver = DriverRow {
+        record: driver_record,
+        order: driver_order,
+        idx: driver_idx,
+    };
+    if matches!(match_mode, MatchMode::Collect) {
+        emit_collect_row(ectx, mspill, driver, Vec::new(), None, output)
+    } else {
+        let mut fail = FailSink {
+            failures,
+            failure_tags,
+            min_miss,
+        };
+        handle_on_miss(ectx, mspill, driver, on_miss, body_eval, output, &mut fail)
+    }
+}
+
+/// Inputs to [`emit_for_driver`]: one driver row plus its match window and the
+/// output sort. Bundled so the function stays under clippy's argument cap.
+struct EmitDriverArgs<'a, 'b> {
+    ectx: &'b EmitCtx<'a>,
+    mspill: &'b MergeSpill<'b>,
+    driver_record: &'b Record,
+    driver_order: RecordOrder,
+    driver_idx: u64,
+    window: &'b MatchWindow,
+    body_eval: Option<&'b mut ProgramEvaluator>,
+    decomposed: &'a DecomposedPredicate,
+    match_mode: MatchMode,
+    on_miss: OnMiss,
+    output: &'b mut SortBuffer<(RecordOrder, u64, u64)>,
+    failures: &'b mut Vec<CombineOutputEvalFailure>,
+    failure_tags: &'b mut Vec<(RecordOrder, u64, u64)>,
+    min_miss: &'b mut Option<RecordOrder>,
+}
+
+/// Emit the join output for one driver row from its match window. Every window
+/// entry already satisfies the range predicate — window membership *is* the
+/// merge walk's pull / front-drop invariant — so the residual filter and body
+/// run directly, with no per-pair `apply_op`. Rows route through the
+/// payload-ordered output sort, so the emit order is free: the canonical
+/// `(order, driver_idx, build_idx)` order is realized by the sort regardless of
+/// this walk's emit sequence. Honors `match: collect | first | all` and the
+/// residual filter / body evaluator; a zero-match driver falls through to the
+/// on_miss dispatch.
 fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
     let EmitDriverArgs {
         ectx,
+        mspill,
         driver_record,
         driver_order,
-        driver_key,
-        op,
-        build_side,
-        decomposed,
+        driver_idx,
+        window,
         mut body_eval,
+        decomposed,
         match_mode,
         on_miss,
         output,
-        emitted_since_check,
         failures,
+        failure_tags,
+        min_miss,
     } = args;
 
     let name = ectx.name;
     let resolver_mapping = ectx.resolver_mapping;
     let ctx = ectx.ctx;
 
-    let replay_err = |e: std::io::Error| PipelineError::Internal {
-        op: "combine",
-        node: name.to_string(),
-        detail: format!("sort-merge build replay failed: {e}"),
-    };
-    let decode_err = |e: std::io::Error| PipelineError::Internal {
-        op: "combine",
-        node: name.to_string(),
-        detail: format!("sort-merge build replay decode failed: {e}"),
-    };
-
     match match_mode {
         MatchMode::Collect => {
             let mut arr: Vec<Value> = Vec::new();
             let mut first_build: Option<Record> = None;
             let mut truncated = false;
-            for entry in build_side.replay().map_err(replay_err)? {
-                let (inner, build_key) = entry.map_err(decode_err)?;
-                if !apply_op(driver_key, op, &build_key) {
-                    continue;
-                }
+            for entry in window.replay(mspill) {
+                let (inner, _build_key, build_idx) = entry?;
                 if let Some(residual) = decomposed.residual.as_ref() {
                     let resolver =
                         CombineResolver::new(resolver_mapping, driver_record, Some(&inner));
@@ -1548,6 +1856,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                                 matched_build: Some(inner.clone()),
                                 error: e,
                             });
+                            failure_tags.push((driver_order, driver_idx, build_idx));
                             continue;
                         }
                     }
@@ -1583,22 +1892,23 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
             }
             emit_collect_row(
                 ectx,
-                driver_record,
-                driver_order,
+                mspill,
+                DriverRow {
+                    record: driver_record,
+                    order: driver_order,
+                    idx: driver_idx,
+                },
                 arr,
                 first_build.as_ref(),
                 output,
-                emitted_since_check,
-            )?;
+            )
         }
 
         MatchMode::First | MatchMode::All => {
             let mut emitted_any = false;
-            for entry in build_side.replay().map_err(replay_err)? {
-                let (inner, build_key) = entry.map_err(decode_err)?;
-                if !apply_op(driver_key, op, &build_key) {
-                    continue;
-                }
+            for entry in window.replay(mspill) {
+                let (inner, _build_key, build_idx) = entry?;
+                let out_key = (driver_order, driver_idx, build_idx);
 
                 if let Some(residual) = decomposed.residual.as_ref() {
                     let resolver =
@@ -1624,6 +1934,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                                 matched_build: Some(inner.clone()),
                                 error: e,
                             });
+                            failure_tags.push(out_key);
                             continue;
                         }
                     }
@@ -1653,9 +1964,8 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                                 &inner,
                                 ectx.propagate_ck,
                             );
-                            output.push((rec, driver_order));
+                            push_output_row(output, rec, out_key, mspill)?;
                             emitted_any = true;
-                            poll_output_buffer(ectx, output, emitted_since_check)?;
                             if matches!(match_mode, MatchMode::First) {
                                 break;
                             }
@@ -1680,6 +1990,7 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                                 matched_build: Some(inner.clone()),
                                 error: e,
                             });
+                            failure_tags.push(out_key);
                             continue;
                         }
                     }
@@ -1704,21 +2015,17 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                         });
                     }
                     let rec = Record::new(Arc::clone(target_schema), values);
-                    output.push((rec, driver_order));
+                    push_output_row(output, rec, out_key, mspill)?;
                     emitted_any = true;
-                    poll_output_buffer(ectx, output, emitted_since_check)?;
                     if matches!(match_mode, MatchMode::First) {
                         break;
                     }
                 } else {
                     // No body and no output schema (test-mode pass-through):
                     // emit one record per match carrying the driver record
-                    // verbatim. The output buffer is the kernel's record count
-                    // gauge — without a body the combine still signals "this
-                    // driver matched at least once".
-                    output.push((driver_record.clone(), driver_order));
+                    // verbatim.
+                    push_output_row(output, driver_record.clone(), out_key, mspill)?;
                     emitted_any = true;
-                    poll_output_buffer(ectx, output, emitted_since_check)?;
                     if matches!(match_mode, MatchMode::First) {
                         break;
                     }
@@ -1726,19 +2033,28 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
             }
 
             if !emitted_any {
-                dispatch_driver_miss(
+                let mut fail = FailSink {
+                    failures,
+                    failure_tags,
+                    min_miss,
+                };
+                handle_on_miss(
                     ectx,
-                    driver_record,
-                    driver_order,
+                    mspill,
+                    DriverRow {
+                        record: driver_record,
+                        order: driver_order,
+                        idx: driver_idx,
+                    },
                     on_miss,
                     body_eval,
                     output,
-                    failures,
+                    &mut fail,
                 )?;
             }
+            Ok(())
         }
     }
-    Ok(())
 }
 
 fn key_eval_error(name: &str, side: &'static str, err: EvalError) -> PipelineError {
@@ -2018,20 +2334,54 @@ mod tests {
         budget_bytes: Option<u64>,
     }
 
-    /// Drive the SortMerge kernel on hand-built inputs and return the
-    /// emitted (record, order) pairs alongside the stats. Panics if the
-    /// kernel returns an error; over-budget-abort tests use
-    /// [`run_kernel_result`] instead.
-    fn run_kernel(rk: RunKernel<'_>) -> (Vec<(Record, RecordOrder)>, SortMergeStats) {
-        let (output, stats) = run_kernel_result(rk).expect("sort-merge kernel execution failed");
-        (output.records, stats)
+    /// Drain a finished output handle into `(record, order)` pairs in the
+    /// canonical `(order, driver_idx, build_idx)` order — the same projection
+    /// the dispatcher's drain applies — so a test observes the emitted order
+    /// identically whether the output stayed resident or spilled.
+    fn drain_sorted(
+        sorted: SortedOutput<(RecordOrder, u64, u64)>,
+    ) -> Result<Vec<(Record, RecordOrder)>, PipelineError> {
+        match sorted {
+            SortedOutput::InMemory(pairs) => {
+                Ok(pairs.into_iter().map(|(r, (o, _, _))| (r, o)).collect())
+            }
+            SortedOutput::Spilled(files) => {
+                // Order-only drain: an unbounded-quota arbitrator suffices because
+                // the test asserts the merged order, not disk accounting.
+                let arbitrator =
+                    MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
+                let merger = SortedRunMerger::new_payload_ordered(
+                    files,
+                    "sort-merge test drain",
+                    MergeBudget {
+                        budget: &arbitrator,
+                        node: "sort-merge test drain",
+                        compress: true,
+                    },
+                )?;
+                let mut v = Vec::new();
+                for item in merger {
+                    let (record, (order, _, _)) = item?;
+                    v.push((record, order));
+                }
+                Ok(v)
+            }
+        }
     }
 
-    /// Drive the SortMerge kernel and return the raw `Result`, so tests can
-    /// assert a clean over-budget abort rather than unwrapping.
+    /// Drive the SortMerge kernel on hand-built inputs and return the emitted
+    /// (record, order) pairs alongside the stats. Panics if the kernel returns
+    /// an error; over-budget-abort tests use [`run_kernel_result`] instead.
+    fn run_kernel(rk: RunKernel<'_>) -> (Vec<(Record, RecordOrder)>, SortMergeStats) {
+        run_kernel_result(rk).expect("sort-merge kernel execution failed")
+    }
+
+    /// Drive the SortMerge kernel, drain its bounded output handle into the
+    /// emitted pairs, and return the raw `Result` so tests can assert a clean
+    /// over-budget abort rather than unwrapping.
     fn run_kernel_result(
         rk: RunKernel<'_>,
-    ) -> Result<(CombineKernelOutput, SortMergeStats), PipelineError> {
+    ) -> Result<(Vec<(Record, RecordOrder)>, SortMergeStats), PipelineError> {
         let resolver_mapping = make_test_resolver_mapping(
             rk.driver_qual,
             rk.driver_schema,
@@ -2075,12 +2425,14 @@ mod tests {
             consumer_handle: crate::pipeline::memory::ConsumerHandle::new(),
             strategy: clinker_plan::config::ErrorStrategy::FailFast,
         };
-        let result = execute_combine_sort_merge_with_stats(args);
-        // Hold the TempDir until the kernel has consumed every spill
-        // segment; segments carry `Arc<Path>` references back into
-        // this directory.
+        // Drain the output handle while the TempDir is still alive: a spilled
+        // handle's sorted runs live inside it, so the drain must precede the drop.
+        let out = match execute_combine_sort_merge_with_stats(args) {
+            Ok((output, stats)) => drain_sorted(output.sorted).map(|records| (records, stats)),
+            Err(e) => Err(e),
+        };
         drop(dir);
-        result
+        out
     }
 
     /// Pure-range correctness gate: products vs tax brackets.
@@ -2632,17 +2984,25 @@ mod tests {
         let (tight_records, tight_stats) = run(Some(128 * 1024));
         let (large_records, _large_stats) = run(None);
 
-        // The tight run ran Phase A external sort on both sides and spilled the
-        // replayable build buffer — the streamed path, not the resident one.
+        // The tight run ran Phase A external sort on both sides and streamed
+        // both from disk — the bounded path, not the resident one. Each build is
+        // pulled from the sorted cursor exactly once across the whole walk (the
+        // structural no-O(N*M) proof), regardless of driver count.
         assert_eq!(tight_stats.phase_a_sort_invocations, 2);
-        assert!(
-            tight_stats.matching_run_spills >= 1,
-            "the build side must spill under the tight budget; stats={tight_stats:?}"
-        );
         assert_eq!(
             tight_stats.driver_stream_spilled, 1,
             "the driver side must stream from disk under the tight budget \
              (not stay resident); stats={tight_stats:?}"
+        );
+        assert_eq!(
+            tight_stats.build_stream_spilled, 1,
+            "the build side must stream from disk under the tight budget \
+             (not stay resident); stats={tight_stats:?}"
+        );
+        assert_eq!(
+            tight_stats.build_pulls, n as u64,
+            "each orderable build is pulled from the sorted cursor exactly once, \
+             not once per driver; stats={tight_stats:?}"
         );
 
         // Same match count as the oracle, both ways.
@@ -2773,6 +3133,262 @@ mod tests {
         );
     }
 
+    /// Determinism across budgets for every non-body match mode: the emitted
+    /// `(order, values)` sequence must be byte-identical between a tight
+    /// (spilling) budget and a roomy (resident) one, for `first`, `all`, and
+    /// `collect`. Matching drivers share range key 0 — a tie — but carry a
+    /// distinct `tag` equal to their input index, and matching builds a distinct
+    /// `b`, so a tie permutation or a value↔order mis-pairing across budgets would
+    /// change the projected sequence and fail the assertion. The payload-ordered
+    /// output sort is the single sink for all three modes, so this pins that its
+    /// canonical `(order, driver_idx, build_idx)` order is realized regardless of
+    /// which axis spilled. (`on_miss: null_fields` routes through the identical
+    /// `push_output_row` sink, so its cross-budget determinism follows by
+    /// construction; the `error` path is pinned separately below.)
+    #[test]
+    fn test_sort_merge_determinism_across_budgets_all_modes() {
+        let drivers_schema = schema_with(&["k", "pad", "tag", "builds"]);
+        let builds_schema = schema_with(&["k", "pad", "b"]);
+        let pad = "z".repeat(1024);
+        let n = 30i64;
+        let m = 30i64;
+        let make_inputs = || {
+            let driver: Vec<(Record, RecordOrder)> = (0..n)
+                .map(|i| {
+                    (
+                        rec(
+                            &drivers_schema,
+                            vec![
+                                Value::Integer(0),
+                                Value::String(pad.clone().into()),
+                                Value::Integer(i),
+                                Value::Null,
+                            ],
+                        ),
+                        i as RecordOrder,
+                    )
+                })
+                .collect();
+            let build: Vec<Record> = (0..m)
+                .map(|j| {
+                    rec(
+                        &builds_schema,
+                        vec![
+                            Value::Integer(10),
+                            Value::String(pad.clone().into()),
+                            Value::Integer(j),
+                        ],
+                    )
+                })
+                .collect();
+            (driver, build)
+        };
+        let compile = || {
+            let typed = compile_pure_range(
+                "filter drivers.k < builds.k",
+                &[
+                    ("drivers", "k", cxl::typecheck::Type::Int),
+                    ("builds", "k", cxl::typecheck::Type::Int),
+                ],
+            );
+            let rc = extract_range_conjunct(&typed, "drivers", "builds");
+            decomposed_pure_range(rc, Arc::clone(&typed))
+        };
+        let run = |mode: MatchMode, budget_bytes: Option<u64>| {
+            let (driver, build) = make_inputs();
+            run_kernel(RunKernel {
+                driver_records: driver,
+                build_records: build,
+                decomposed: compile(),
+                driver_qual: "drivers",
+                build_qual: "builds",
+                driver_schema: &drivers_schema,
+                build_schema: &builds_schema,
+                match_mode: mode,
+                on_miss: OnMiss::Skip,
+                presorted: false,
+                body_program: None,
+                budget_bytes,
+            })
+        };
+        let project = |rs: &[(Record, RecordOrder)]| {
+            rs.iter()
+                .map(|(r, o)| (*o, r.values().to_vec()))
+                .collect::<Vec<_>>()
+        };
+        for mode in [MatchMode::First, MatchMode::All, MatchMode::Collect] {
+            let (tight, tight_stats) = run(mode, Some(48 * 1024));
+            let (roomy, _) = run(mode, None);
+            assert!(
+                tight_stats.driver_stream_spilled == 1 || tight_stats.output_spilled == 1,
+                "the tight budget must exercise a spill path for {mode:?}; \
+                 stats={tight_stats:?}"
+            );
+            assert_eq!(
+                project(&tight),
+                project(&roomy),
+                "{mode:?}: tight (spilling) and roomy (resident) output must be \
+                 byte-identical"
+            );
+        }
+    }
+
+    /// `on_miss: error` must cite the globally lowest `RecordOrder` miss,
+    /// identical across budgets and independent of the walk order — the
+    /// pre-streaming flush semantics. A chained upstream stamps `RecordOrder` out
+    /// of step with range-key order, and the lowest-order miss is not the
+    /// first-encountered one, so an inline in-stream-order dispatch would cite the
+    /// wrong row.
+    #[test]
+    fn test_sort_merge_on_miss_error_cites_lowest_record_order() {
+        let drivers_schema = schema_with(&["k", "pad"]);
+        let builds_schema = schema_with(&["k"]);
+        let pad = "q".repeat(1024);
+        // Drivers with range keys 100, 50, 10, 30 and RecordOrders 7, 3, 9, 2.
+        // The single build has key 20, so only the key-10 driver matches
+        // (10 < 20). The three misses carry orders 7, 3, 2 — lowest is 2, the
+        // key-30 driver, which the range-sorted walk visits last.
+        let driver_spec: [(i64, RecordOrder); 4] = [(100, 7), (50, 3), (10, 9), (30, 2)];
+        let make_driver = || {
+            driver_spec
+                .iter()
+                .map(|&(k, order)| {
+                    (
+                        rec(
+                            &drivers_schema,
+                            vec![Value::Integer(k), Value::String(pad.clone().into())],
+                        ),
+                        order,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let build = vec![rec(&builds_schema, vec![Value::Integer(20)])];
+        let compile = || {
+            let typed = compile_pure_range(
+                "filter drivers.k < builds.k",
+                &[
+                    ("drivers", "k", cxl::typecheck::Type::Int),
+                    ("builds", "k", cxl::typecheck::Type::Int),
+                ],
+            );
+            let rc = extract_range_conjunct(&typed, "drivers", "builds");
+            decomposed_pure_range(rc, Arc::clone(&typed))
+        };
+        let run = |budget_bytes: Option<u64>| {
+            run_kernel_result(RunKernel {
+                driver_records: make_driver(),
+                build_records: build.clone(),
+                decomposed: compile(),
+                driver_qual: "drivers",
+                build_qual: "builds",
+                driver_schema: &drivers_schema,
+                build_schema: &builds_schema,
+                match_mode: MatchMode::All,
+                on_miss: OnMiss::Error,
+                presorted: false,
+                body_program: None,
+                budget_bytes,
+            })
+        };
+        for budget in [Some(20 * 1024), None] {
+            match run(budget) {
+                Err(PipelineError::CombineMissingMatch { driver_row, .. }) => {
+                    assert_eq!(
+                        driver_row, 2,
+                        "on_miss: error must cite the lowest-RecordOrder miss (2), \
+                         not the first visited; budget={budget:?}"
+                    );
+                }
+                other => panic!("expected CombineMissingMatch citing row 2; got {other:?}"),
+            }
+        }
+    }
+
+    /// No O(N*M): a spilled build with many drivers must decode each build from
+    /// its sorted input O(1) times — `build_pulls` equals the build row count,
+    /// never `build_count * driver_count`. This is the structural line between a
+    /// windowed merge and the per-driver full-build replay it replaces.
+    #[test]
+    fn test_sort_merge_no_nested_loop_pulls_each_build_once() {
+        let drivers_schema = schema_with(&["k"]);
+        let builds_schema = schema_with(&["k", "pad"]);
+        let pad = "w".repeat(256);
+        let n_driver = 400i64;
+        let n_build = 200i64;
+        // Interleaved keys keep the result neither empty nor a full cross-product.
+        let driver: Vec<(Record, RecordOrder)> = (0..n_driver)
+            .map(|i| {
+                (
+                    rec(&drivers_schema, vec![Value::Integer(i)]),
+                    i as RecordOrder,
+                )
+            })
+            .collect();
+        let build: Vec<Record> = (0..n_build)
+            .map(|j| {
+                rec(
+                    &builds_schema,
+                    vec![Value::Integer(j), Value::String(pad.clone().into())],
+                )
+            })
+            .collect();
+        // Brute-force oracle: driver i (key i) matches build j (key j) iff i < j.
+        let mut oracle: Vec<RecordOrder> = Vec::new();
+        for i in 0..n_driver {
+            for j in 0..n_build {
+                if i < j {
+                    oracle.push(i as RecordOrder);
+                }
+            }
+        }
+        oracle.sort_unstable();
+
+        let typed = compile_pure_range(
+            "filter drivers.k < builds.k",
+            &[
+                ("drivers", "k", cxl::typecheck::Type::Int),
+                ("builds", "k", cxl::typecheck::Type::Int),
+            ],
+        );
+        let rc = extract_range_conjunct(&typed, "drivers", "builds");
+        let decomposed = decomposed_pure_range(rc, Arc::clone(&typed));
+        // Tight budget so the build cursor spills — the case where the old
+        // per-driver replay re-decoded the whole build from disk every driver.
+        let (records, stats) = run_kernel(RunKernel {
+            driver_records: driver,
+            build_records: build,
+            decomposed,
+            driver_qual: "drivers",
+            build_qual: "builds",
+            driver_schema: &drivers_schema,
+            build_schema: &builds_schema,
+            match_mode: MatchMode::All,
+            on_miss: OnMiss::Skip,
+            presorted: false,
+            body_program: None,
+            budget_bytes: Some(32 * 1024),
+        });
+        assert_eq!(
+            stats.build_stream_spilled, 1,
+            "the build must spill so the assertion exercises the on-disk path; \
+             stats={stats:?}"
+        );
+        assert_eq!(
+            stats.build_pulls,
+            n_build as u64,
+            "each build is pulled from the sorted cursor exactly once ({n_build}), \
+             not once per driver ({}); stats={stats:?}",
+            n_build * n_driver
+        );
+        let mut orders: Vec<RecordOrder> = records.iter().map(|(_, o)| *o).collect();
+        orders.sort_unstable();
+        assert_eq!(
+            orders, oracle,
+            "windowed merge must match the brute-force oracle"
+        );
+    }
+
     /// Body-less range combines (no CXL body, encoded output schema present —
     /// the plain 2-input join shape, distinct from the N-ary synthetic chain
     /// whose intermediate steps always use `match: all`) must honor the match
@@ -2832,13 +3448,13 @@ mod tests {
         );
     }
 
-    /// `match: collect` must poll the output buffer and abort cleanly over a
-    /// tight budget instead of growing unbounded. A high-cardinality driver
-    /// side with a permissive predicate accumulates one collect row per driver;
-    /// past the every-10K poll the output-buffer byte count trips the hard
-    /// limit and the kernel returns `MemoryBudgetExceeded`.
+    /// `match: collect` over a tight budget must stay bounded by *spilling* the
+    /// output — not by aborting, and not by growing unbounded. A high-cardinality
+    /// driver side with a permissive predicate accumulates one collect row per
+    /// driver; the payload-ordered output sort spills past its byte threshold, so
+    /// the join completes within budget and emits exactly one row per driver.
     #[test]
-    fn test_sort_merge_collect_aborts_over_tight_budget() {
+    fn test_sort_merge_collect_stays_bounded_by_spilling() {
         // The driver schema carries the build-qualifier column ("builds"),
         // standing in for the plan-time-widened output schema the collect flush
         // writes its array into (run_kernel passes no separate output schema).
@@ -2875,9 +3491,9 @@ mod tests {
         let rc = extract_range_conjunct(&typed, "drivers", "builds");
         let decomposed = decomposed_pure_range(rc, Arc::clone(&typed));
 
-        // 64 KiB hard limit: one poll interval of accumulated collect rows
-        // dwarfs it, so the poll at the first interval boundary aborts.
-        let result = run_kernel_result(RunKernel {
+        // 64 KiB budget: the accumulated collect output dwarfs it, so the output
+        // sort spills and the join completes bounded instead of aborting.
+        let (records, stats) = run_kernel_result(RunKernel {
             driver_records: driver,
             build_records: build,
             decomposed,
@@ -2890,15 +3506,25 @@ mod tests {
             presorted: true,
             body_program: None,
             budget_bytes: Some(64 * 1024),
-        });
-        let err = match result {
-            Ok(_) => panic!("collect over a tight budget must abort, not grow unbounded"),
-            Err(e) => e,
-        };
-        match err {
-            PipelineError::MemoryBudgetExceeded { node, .. } => assert_eq!(node, "sm_test"),
-            other => {
-                panic!("expected MemoryBudgetExceeded from the collect output poll; got {other:?}")
+        })
+        .expect("collect over a tight budget must complete by spilling, not abort");
+        assert_eq!(
+            records.len(),
+            n_drivers,
+            "collect emits exactly one row per driver"
+        );
+        assert_eq!(
+            stats.output_spilled, 1,
+            "the collect output must spill under the tight budget rather than \
+             growing unbounded in RAM; stats={stats:?}"
+        );
+        // Every collect array holds all four matching builds (0 < 1000).
+        for (rec, _order) in &records {
+            match rec.get("builds") {
+                Some(Value::Array(a)) => {
+                    assert_eq!(a.len(), 4, "each driver collects all 4 builds")
+                }
+                other => panic!("collect row must carry a 4-element array; got {other:?}"),
             }
         }
     }
@@ -2906,7 +3532,7 @@ mod tests {
     /// Build `n` phase A driver pairs whose sort key `k` is an Integer and
     /// whose wide `pad` column pushes the accumulated buffer past the phase A
     /// 16 KiB spill-threshold floor after a handful of records.
-    fn phase_a_driver_pairs(n: usize) -> Vec<(Record, RecordOrder, Value)> {
+    fn phase_a_driver_pairs(n: usize) -> Vec<(Record, RecordOrder, u64, Value)> {
         let schema = schema_with(&["k", "pad"]);
         let pad = "x".repeat(1024);
         (0..n)
@@ -2915,7 +3541,7 @@ mod tests {
                     &schema,
                     vec![Value::Integer(i as i64), Value::String(pad.as_str().into())],
                 );
-                (r, i as RecordOrder, Value::Integer(i as i64))
+                (r, i as RecordOrder, i as u64, Value::Integer(i as i64))
             })
             .collect()
     }
@@ -2966,22 +3592,20 @@ mod tests {
     fn phase_a_build_spill_past_disk_cap_fails_with_spill_cap_exceeded() {
         let schema = schema_with(&["k", "pad"]);
         let pad = "x".repeat(1024);
-        let pairs: Vec<(Record, Value)> = (0..64i64)
+        let pairs: Vec<(Record, Value, u64)> = (0..64i64)
             .map(|i| {
                 let r = rec(
                     &schema,
                     vec![Value::Integer(i), Value::String(pad.as_str().into())],
                 );
-                (r, Value::Integer(i))
+                (r, Value::Integer(i), i as u64)
             })
             .collect();
         let budget = MemoryArbitrator::with_policy(1024, 0.80, 0.70, Box::new(NoOpPolicy));
         budget.set_max_spill_bytes(1);
         let dir = tempfile::tempdir().unwrap();
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let mut spill_seq: u32 = 0;
-        let mut stats = SortMergeStats::default();
-        let err = build_side_from_pairs(BuildSideBuild {
+        let err = build_cursor_from_pairs(BuildCursorBuild {
             pairs,
             name: "sm",
             range_field: &Some("k".to_string()),
@@ -2989,10 +3613,7 @@ mod tests {
             spill_compress: true,
             consumer_handle: &handle,
             spill_dir: dir.path(),
-            byte_limit: 16 * 1024,
             presorted: false,
-            spill_seq: &mut spill_seq,
-            stats: &mut stats,
         })
         .err()
         .expect("a one-byte disk cap must abort the build phase A spill");
