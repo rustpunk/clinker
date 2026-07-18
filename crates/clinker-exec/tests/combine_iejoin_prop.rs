@@ -1,25 +1,32 @@
 //! Oracle-equivalence coverage for the pure-range block-band IEJoin.
 //!
-//! The proptest harness here generates arbitrary numeric record pairs and an
-//! operator-pair, checked against a brute-force nested-loop oracle — the
-//! load-bearing reference for every equivalence assertion below.
+//! Every equivalence assertion in this file checks the engine against one shared
+//! brute-force `nested_loop_oracle`, so a tie- or NULL-handling fix to the
+//! reference propagates everywhere. The proptest harness generates arbitrary
+//! numeric record pairs and an operator-pair; the `pure_range` tests drive whole
+//! combine pipelines.
 //!
 //! The `pure_range` module drives whole pure-range combine pipelines through the
 //! public executor at BOTH a tight (spilling) and a roomy (resident) memory
-//! budget, asserting the emitted rows equal the nested-loop oracle at each. The
-//! tight budget runs under `backpressure: spill` so it forces the block-band
-//! external-sort / k-way-merge / block-reload path regardless of the host's
-//! baseline RSS, and `cumulative_spill_bytes` confirms the spill actually
-//! happened. These cover branches the unit tests cannot reach through the
-//! body-less synthetic harness: a three-conjunct residual re-check, on_miss
-//! null-fields under a spilled layout (real body evaluator), recoverable
-//! output-eval deferral to the dead-letter queue under `strategy: continue`, and
-//! LZ4-compressed block spill (the dispatcher's `auto` compression resolves to
-//! LZ4 at the default batch size). The null-fields case additionally routes
-//! NULL-range-key drivers through the spilled scan-phase unmatched path.
+//! budget, asserting the emitted rows equal the oracle at each. The tight budget
+//! runs under `backpressure: spill` so it forces the block-band external-sort /
+//! k-way-merge / block-reload path regardless of the host's baseline RSS, and
+//! `cumulative_spill_bytes` confirms the spill actually happened. These cover
+//! branches the unit tests cannot reach through the body-less synthetic harness:
+//! a three-conjunct residual re-check, on_miss null-fields under a spilled layout
+//! (real body evaluator), recoverable output-eval deferral to the dead-letter
+//! queue under `strategy: continue`, and LZ4-compressed block spill (the
+//! dispatcher's `auto` compression resolves to LZ4 at the default batch size).
+//! The null-fields cases additionally route NULL-range-key drivers through the
+//! spilled scan-phase pile and orderable-but-out-of-range drivers through the
+//! spilled in-block pile — both bounded to disk.
 //!
-//! The fixture-existence test exercises the IEJoin YAML fixtures end-to-end
-//! through the YAML parser.
+//! The `iejoin_three_conjunct_residual` and `iejoin_pure_range_null_fields`
+//! fixtures are the single source of truth for their pipeline shapes: the
+//! `pure_range` module executes each one both over its own documented CSV data
+//! (asserting the fixture's documented matches against the oracle) and over a
+//! generated spilling workload. The other IEJoin fixtures are parse-checked by
+//! `test_iejoin_fixtures_exist`.
 use std::collections::HashSet;
 
 use clinker_plan::config::PipelineConfig;
@@ -78,28 +85,49 @@ fn arb_iejoin_inputs() -> impl Strategy<Value = IEJoinInputs> {
     )
 }
 
-/// Brute-force nested-loop join — the IEJoin correctness oracle.
+/// Shared brute-force nested-loop oracle — the single trusted reference behind
+/// every IEJoin equivalence assertion in this file.
 ///
-/// Returns the set of `(left_index, right_index)` pairs `(li, ri)` where
-/// `op1.apply(left[li].0, right[ri].0) && op2.apply(left[li].1, right[ri].1)`
-/// holds. The set form is order-independent so it can be compared
-/// directly against IEJoin's output (which is permitted to emit pairs in
-/// any internal order).
+/// For each `(driver, build)` pair the `matched` predicate accepts, it collects
+/// `entry(di, driver, bi, build)`. Callers encode NULL / out-of-range skips in
+/// `matched` and choose the comparison key in `entry`, so the index-pair proptest
+/// oracle and the id-pair pipeline oracles share one loop — a tie- or
+/// NULL-handling fix lives in exactly one place. The set form is
+/// order-independent, so it compares directly against IEJoin's output (which may
+/// emit in any internal order).
+fn nested_loop_oracle<D, B, K: Eq + std::hash::Hash>(
+    drivers: &[D],
+    builds: &[B],
+    matched: impl Fn(&D, &B) -> bool,
+    entry: impl Fn(usize, &D, usize, &B) -> K,
+) -> HashSet<K> {
+    let mut out = HashSet::new();
+    for (di, d) in drivers.iter().enumerate() {
+        for (bi, b) in builds.iter().enumerate() {
+            if matched(d, b) {
+                out.insert(entry(di, d, bi, b));
+            }
+        }
+    }
+    out
+}
+
+/// Two-operator index-pair oracle over numeric rows — the proptest reference,
+/// expressed over the shared [`nested_loop_oracle`]. Returns the set of
+/// `(left_index, right_index)` pairs where
+/// `op1.apply(left.0, right.0) && op2.apply(left.1, right.1)` holds.
 fn nested_loop_join(
     left: &[(i64, i64)],
     right: &[(i64, i64)],
     op1: TestOp,
     op2: TestOp,
 ) -> HashSet<(usize, usize)> {
-    let mut out = HashSet::new();
-    for (li, l) in left.iter().enumerate() {
-        for (ri, r) in right.iter().enumerate() {
-            if op1.apply(l.0, r.0) && op2.apply(l.1, r.1) {
-                out.insert((li, ri));
-            }
-        }
-    }
-    out
+    nested_loop_oracle(
+        left,
+        right,
+        |l, r| op1.apply(l.0, r.0) && op2.apply(l.1, r.1),
+        |li, _, ri, _| (li, ri),
+    )
 }
 
 /// The oracle is correct on a hand-crafted 3x3 matrix.
@@ -149,11 +177,15 @@ fn test_iejoin_scaffold_compiles() {
     );
 }
 
-/// All seven IEJoin fixture YAMLs parse cleanly via the workspace's
+/// The seven parse-only IEJoin fixture YAMLs parse cleanly via the workspace's
 /// canonical YAML chokepoint.
 ///
-/// Parse-time validation pins the schema shape and catches typos; the
-/// `pure_range` module below covers the runtime block-band path end-to-end.
+/// Parse-time validation pins the schema shape and catches typos. The two
+/// pure-range fixtures (`iejoin_three_conjunct_residual`,
+/// `iejoin_pure_range_null_fields`) are not listed here because the `pure_range`
+/// module below executes them end-to-end against the nested-loop oracle — both
+/// over their own documented data and over a generated spilling workload — which
+/// subsumes a parse check.
 #[test]
 fn test_iejoin_fixtures_exist() {
     let fixture_dir =
@@ -166,8 +198,6 @@ fn test_iejoin_fixtures_exist() {
         "iejoin_empty_build",
         "iejoin_single_row",
         "iejoin_all_null_ranges",
-        "iejoin_three_conjunct_residual",
-        "iejoin_pure_range_null_fields",
     ];
     for stem in stems {
         let path = fixture_dir.join(format!("{stem}.yaml"));
@@ -188,7 +218,9 @@ mod pure_range {
     use clinker_bench_support::io::SharedBuffer;
     use clinker_core_types::dlq::DlqErrorCategory;
     use clinker_exec::executor::{PipelineExecutor, PipelineRunParams, SourceReaders};
-    use clinker_plan::config::{CompileContext, PipelineConfig};
+    use clinker_plan::config::{BackpressureKnob, CompileContext, PipelineConfig};
+
+    use super::nested_loop_oracle;
 
     /// Tight budget: small enough that the block-band external-sort threshold
     /// (`soft / 4`) binds and the sides spill. Run under `backpressure: spill`
@@ -209,9 +241,8 @@ mod pure_range {
         combine_dlq: usize,
     }
 
-    /// Compile and run a pipeline over in-memory CSV inputs, capturing the named
-    /// output. `yaml` carries `__LIMIT__` / `__POLICY__` placeholders the caller
-    /// fills per budget.
+    /// Fill an inline template's `__LIMIT__` / `__POLICY__` placeholders per
+    /// budget, then compile and run it over in-memory CSV inputs.
     fn run(
         yaml_template: &str,
         limit: &str,
@@ -224,6 +255,53 @@ mod pure_range {
             .replace("__POLICY__", policy);
         let config: PipelineConfig =
             clinker_plan::yaml::from_str(&yaml).expect("pure-range yaml must parse");
+        run_config(config, inputs, output_name)
+    }
+
+    /// Map a `backpressure` YAML string to its knob.
+    fn backpressure_of(policy: &str) -> BackpressureKnob {
+        match policy {
+            "spill" => BackpressureKnob::Spill,
+            "pause" => BackpressureKnob::Pause,
+            "both" => BackpressureKnob::Both,
+            other => panic!("unknown backpressure policy: {other}"),
+        }
+    }
+
+    /// Load a combine fixture from disk and inject the memory config for this
+    /// budget, so the on-disk fixture is the single pipeline definition executed
+    /// at both the documented small scale (its own CSVs) and the generated spill
+    /// scale. The fixtures carry no `memory:` block, so this is the one place the
+    /// budget is set; source readers are injected by name, so the fixture's own
+    /// `path:` values are never opened.
+    fn fixture_config(stem: &str, limit: &str, policy: &str) -> PipelineConfig {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/combine")
+            .join(format!("{stem}.yaml"));
+        let yaml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read fixture {}: {e}", path.display()));
+        let mut config: PipelineConfig = clinker_plan::yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("fixture {stem} must parse: {e}"));
+        config.pipeline.memory.limit = Some(limit.to_string());
+        config.pipeline.memory.backpressure = backpressure_of(policy);
+        config
+    }
+
+    /// Execute a fixture pipeline at the given budget over in-memory CSV inputs.
+    fn fixture_run(
+        stem: &str,
+        limit: &str,
+        policy: &str,
+        inputs: &[(&str, &str)],
+        output_name: &str,
+    ) -> RunResult {
+        run_config(fixture_config(stem, limit, policy), inputs, output_name)
+    }
+
+    /// Compile a config and run it over in-memory CSV inputs, capturing the named
+    /// output. Source readers are keyed by source-node name; the writer by output
+    /// name.
+    fn run_config(config: PipelineConfig, inputs: &[(&str, &str)], output_name: &str) -> RunResult {
         let plan = config
             .compile(&CompileContext::default())
             .expect("pure-range yaml must compile");
@@ -290,20 +368,17 @@ mod pure_range {
     /// Nested-loop oracle for a two-conjunct half-open band
     /// (`driver.k1 >= build.lo AND driver.k1 < build.hi`), returning the set of
     /// matched `(driver_id, build_id)` pairs. NULL-keyed rows never match.
+    /// Expressed over the shared [`nested_loop_oracle`].
     fn oracle_band(drivers: &[Row], builds: &[Row]) -> HashSet<(i64, i64)> {
-        let mut out = HashSet::new();
-        for (did, dk, _) in drivers {
-            let Some(amount) = dk else { continue };
-            for (bid, lo, hi) in builds {
-                let (Some(lo), Some(hi)) = (lo, hi) else {
-                    continue;
-                };
-                if amount >= lo && amount < hi {
-                    out.insert((*did, *bid));
-                }
-            }
-        }
-        out
+        nested_loop_oracle(
+            drivers,
+            builds,
+            |(_, dk, _), (_, lo, hi)| match (dk, lo, hi) {
+                (Some(amount), Some(lo), Some(hi)) => amount >= lo && amount < hi,
+                _ => false,
+            },
+            |_, (did, _, _), _, (bid, _, _)| (*did, *bid),
+        )
     }
 
     /// Expected `[did, bid]` output rows (sorted) for a match:all band join,
@@ -432,105 +507,73 @@ nodes:
         );
     }
 
-    const THREE_CONJUNCT_YAML: &str = r#"
-pipeline:
-  name: pure_range_three_conjunct
-  memory: { limit: "__LIMIT__", backpressure: __POLICY__ }
-nodes:
-  - type: source
-    name: drivers
-    config:
-      name: drivers
-      type: csv
-      path: drivers.csv
-      schema:
-        - { name: did, type: int }
-        - { name: k1, type: int }
-        - { name: k2, type: int }
-  - type: source
-    name: builds
-    config:
-      name: builds
-      type: csv
-      path: builds.csv
-      schema:
-        - { name: bid, type: int }
-        - { name: lo, type: int }
-        - { name: hi, type: int }
-        - { name: base, type: int }
-  - type: combine
-    name: banded
-    input:
-      drivers: drivers
-      builds: builds
-    config:
-      where: "drivers.k1 >= builds.lo and drivers.k1 < builds.hi and drivers.k2 > builds.base"
-      match: all
-      on_miss: skip
-      cxl: |
-        emit did = drivers.did
-        emit bid = builds.bid
-      propagate_ck: driver
-  - type: output
-    name: out
-    input: banded
-    config:
-      name: out
-      type: csv
-      path: out.csv
-"#;
-
     /// A three-conjunct residual predicate (two-axis band plus a third
     /// cross-input `>` conjunct) emits exactly the oracle's matched rows across
     /// both budgets. The block-band kernel proves the two band axes; the third
     /// conjunct rides the residual re-check filter, so this exercises that filter
-    /// through the spilled and resident block layouts alike.
+    /// through the spilled and resident block layouts alike. Driven through the
+    /// `iejoin_three_conjunct_residual` fixture — the single source of truth for
+    /// this pipeline shape — with a generated workload large enough to spill.
     #[test]
     fn three_conjunct_residual_matches_oracle_across_budgets() {
-        // drivers: k1 tiles [0, span), k2 cycles 0..100. builds: 40 half-open
-        // bands over [0, span) with base = 50, so the third conjunct (k2 > 50)
-        // drops roughly half of every band's otherwise-matching drivers — the
-        // residual filter has to fire for the output to match the oracle.
+        // applicants: income tiles [0, span), score cycles 0..100. tiers: 40
+        // half-open bands over [0, span) with min_score = 50, so the third
+        // conjunct (score > 50) drops roughly half of every band's
+        // otherwise-matching applicants — the residual filter has to fire for the
+        // output to match the oracle.
         let span = 1_000i64;
         let n_builds = 40i64;
         let bstep = span / n_builds;
-        let mut drivers: Vec<(i64, i64, i64)> = Vec::new();
-        let mut driver_csv = String::from("did,k1,k2\n");
+        // (did, income, score)
+        let mut applicants: Vec<(i64, i64, i64)> = Vec::new();
+        let mut applicant_csv = String::from("did,income,score\n");
         for i in 0..8_000i64 {
-            let k1 = (i.wrapping_mul(2_617)).rem_euclid(span);
-            let k2 = i.rem_euclid(100);
-            drivers.push((i, k1, k2));
-            driver_csv.push_str(&format!("{i},{k1},{k2}\n"));
+            let income = (i.wrapping_mul(2_617)).rem_euclid(span);
+            let score = i.rem_euclid(100);
+            applicants.push((i, income, score));
+            applicant_csv.push_str(&format!("{i},{income},{score}\n"));
         }
-        let mut builds: Vec<(i64, i64, i64, i64)> = Vec::new();
-        let mut build_csv = String::from("bid,lo,hi,base\n");
+        // (bid, lo, hi, min_score)
+        let mut tiers: Vec<(i64, i64, i64, i64)> = Vec::new();
+        let mut tier_csv = String::from("bid,lo,hi,min_score\n");
         for b in 0..n_builds {
             let lo = b * bstep;
             let hi = lo + bstep;
-            let base = 50;
-            builds.push((b, lo, hi, base));
-            build_csv.push_str(&format!("{b},{lo},{hi},{base}\n"));
+            let min_score = 50;
+            tiers.push((b, lo, hi, min_score));
+            tier_csv.push_str(&format!("{b},{lo},{hi},{min_score}\n"));
         }
-        let mut expected_pairs: HashSet<(i64, i64)> = HashSet::new();
-        for (did, k1, k2) in &drivers {
-            for (bid, lo, hi, base) in &builds {
-                if k1 >= lo && k1 < hi && k2 > base {
-                    expected_pairs.insert((*did, *bid));
-                }
-            }
-        }
-        let expected = expected_band_rows(&expected_pairs);
+        let expected = expected_band_rows(&nested_loop_oracle(
+            &applicants,
+            &tiers,
+            |(_, income, score), (_, lo, hi, min_score)| {
+                income >= lo && income < hi && score > min_score
+            },
+            |_, (did, _, _), _, (bid, _, _, _)| (*did, *bid),
+        ));
         assert!(
             !expected.is_empty(),
             "the three-conjunct workload must produce matches"
         );
 
         let inputs = [
-            ("drivers", driver_csv.as_str()),
-            ("builds", build_csv.as_str()),
+            ("applicants", applicant_csv.as_str()),
+            ("tiers", tier_csv.as_str()),
         ];
-        let tight = run(THREE_CONJUNCT_YAML, TIGHT_LIMIT, "spill", &inputs, "out");
-        let roomy = run(THREE_CONJUNCT_YAML, ROOMY_LIMIT, "spill", &inputs, "out");
+        let tight = fixture_run(
+            "iejoin_three_conjunct_residual",
+            TIGHT_LIMIT,
+            "spill",
+            &inputs,
+            "tiered_out",
+        );
+        let roomy = fixture_run(
+            "iejoin_three_conjunct_residual",
+            ROOMY_LIMIT,
+            "spill",
+            &inputs,
+            "tiered_out",
+        );
         assert_eq!(
             rows(&tight.output),
             expected,
@@ -547,9 +590,238 @@ nodes:
         );
     }
 
-    const NULL_FIELDS_YAML: &str = r#"
+    /// on_miss:null_fields under a spilled layout, driven by a real body
+    /// evaluator (the unit harness is body-less). Every driver emits exactly one
+    /// row: a matched driver carries its first (only, since the bands are
+    /// disjoint) build id; a zero-match driver — whether its range key is out of
+    /// range or NULL — carries a null build id. A third of the drivers carry a
+    /// NULL range key (routed to the deferred scan-phase pile), and the
+    /// in-range-format tail past `span` matches no band (routed to the deferred
+    /// in-block pile), so the null-fields dispatch reunites BOTH spilled deferred
+    /// piles in input order — the residency both spills bound. The per-driver
+    /// output must match the oracle identically at the spilled and resident
+    /// budgets. Driven through the `iejoin_pure_range_null_fields` fixture — the
+    /// single source of truth for this pipeline shape.
+    #[test]
+    fn null_fields_over_spilled_scan_phase_matches_oracle_across_budgets() {
+        let span = 1_000i64;
+        let n_builds = 40i64;
+        let bstep = span / n_builds;
+        // readings: (did, Option<amount>); None models a NULL range key.
+        let mut readings: Vec<(i64, Option<i64>)> = Vec::new();
+        let mut reading_csv = String::from("did,amount\n");
+        for i in 0..6_000i64 {
+            if i.rem_euclid(3) == 0 {
+                // NULL range key → scan-phase unmatched → null-fields row.
+                reading_csv.push_str(&format!("{i},\n"));
+                readings.push((i, None));
+            } else {
+                // amount spans [0, span + 200): the tail past `span` matches no
+                // band, so it is an in-range-format but zero-match (in-block miss).
+                let amount = (i.wrapping_mul(2_617)).rem_euclid(span + 200);
+                reading_csv.push_str(&format!("{i},{amount}\n"));
+                readings.push((i, Some(amount)));
+            }
+        }
+        // bands: (bid, lo, hi)
+        let mut bands: Vec<(i64, i64, i64)> = Vec::new();
+        let mut band_csv = String::from("bid,lo,hi\n");
+        for b in 0..n_builds {
+            let lo = b * bstep;
+            let hi = lo + bstep;
+            bands.push((b, lo, hi));
+            band_csv.push_str(&format!("{b},{lo},{hi}\n"));
+        }
+        // match: first over disjoint bands → at most one build per reading; the
+        // shared oracle's match set gives that bid, and every unmatched reading
+        // (NULL or out-of-range) carries a null bid.
+        let expected = expected_null_fields_rows(
+            &readings,
+            &nested_loop_oracle(
+                &readings,
+                &bands,
+                |(_, amount), (_, lo, hi)| matches!(amount, Some(a) if a >= lo && a < hi),
+                |_, (did, _), _, (bid, _, _)| (*did, *bid),
+            ),
+        );
+
+        let inputs = [
+            ("readings", reading_csv.as_str()),
+            ("bands", band_csv.as_str()),
+        ];
+        let tight = fixture_run(
+            "iejoin_pure_range_null_fields",
+            TIGHT_LIMIT,
+            "spill",
+            &inputs,
+            "banded_out",
+        );
+        let roomy = fixture_run(
+            "iejoin_pure_range_null_fields",
+            ROOMY_LIMIT,
+            "spill",
+            &inputs,
+            "banded_out",
+        );
+        assert_eq!(
+            rows(&tight.output),
+            expected,
+            "spilled null-fields output (incl. both spilled deferred piles) diverged from the oracle"
+        );
+        assert_eq!(
+            rows(&roomy.output),
+            expected,
+            "resident null-fields output diverged from the oracle"
+        );
+        assert!(
+            tight.spill_bytes > 0,
+            "the tight budget must have spilled the sides and both deferred piles"
+        );
+    }
+
+    /// Expected sorted `[did, bid]` output rows for a `match: first` +
+    /// on_miss:null_fields band join: every reading emits one row carrying its
+    /// matched bid (from the oracle set) or an empty bid when it matched nothing.
+    fn expected_null_fields_rows(
+        readings: &[(i64, Option<i64>)],
+        matched: &HashSet<(i64, i64)>,
+    ) -> Vec<Vec<String>> {
+        let by_did: HashMap<i64, i64> = matched.iter().copied().collect();
+        let mut rows: Vec<Vec<String>> = readings
+            .iter()
+            .map(|(did, _)| {
+                let bid = by_did.get(did).map(i64::to_string).unwrap_or_default();
+                vec![did.to_string(), bid]
+            })
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// Read a fixture data CSV (under `tests/fixtures/combine/data`) and return
+    /// its raw bytes plus its numeric body parsed into rows of optional `i64`
+    /// cells — an empty field is `None`, modelling a NULL range key. The raw bytes
+    /// feed the pipeline and the parsed rows feed the oracle, so the on-disk CSV is
+    /// the single source both check against.
+    fn read_fixture_data(name: &str) -> (String, Vec<Vec<Option<i64>>>) {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/combine/data")
+            .join(name);
+        let csv = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read fixture data {}: {e}", path.display()));
+        let parsed = csv::ReaderBuilder::new()
+            .has_headers(true)
+            .from_reader(csv.as_bytes())
+            .records()
+            .map(|r| {
+                r.expect("fixture data row parses")
+                    .iter()
+                    .map(|cell| {
+                        if cell.is_empty() {
+                            None
+                        } else {
+                            Some(cell.parse::<i64>().expect("integer fixture cell"))
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        (csv, parsed)
+    }
+
+    /// Both new pure-range fixtures, executed end-to-end over their OWN documented
+    /// CSV data, match the shared nested-loop oracle — so the "Expected matches"
+    /// each fixture documents are asserted against the real pipeline, not left to
+    /// drift. Runs at the roomy budget: the data is tiny, so correctness (not
+    /// spill) is the point here.
+    #[test]
+    fn fixtures_match_oracle_over_documented_data() {
+        // Three-conjunct residual: applicants (did, income, score) ⋈ tiers
+        // (bid, lo, hi, min_score) on income ∈ [lo, hi) AND score > min_score,
+        // match: all. The fixture's own data has no NULLs, so every cell is Some.
+        let (applicant_csv, applicants) = read_fixture_data("iejoin_3c_drivers.csv");
+        let (tier_csv, tiers) = read_fixture_data("iejoin_3c_builds.csv");
+        let expected = expected_band_rows(&nested_loop_oracle(
+            &applicants,
+            &tiers,
+            |a, t| {
+                a[1].unwrap() >= t[1].unwrap()
+                    && a[1].unwrap() < t[2].unwrap()
+                    && a[2].unwrap() > t[3].unwrap()
+            },
+            |_, a, _, t| (a[0].unwrap(), t[0].unwrap()),
+        ));
+        assert_eq!(
+            expected,
+            vec![
+                vec!["2".to_string(), "10".to_string()],
+                vec!["4".to_string(), "11".to_string()]
+            ],
+            "the three-conjunct fixture's documented matches changed; update the fixture comment"
+        );
+        let out = fixture_run(
+            "iejoin_three_conjunct_residual",
+            ROOMY_LIMIT,
+            "spill",
+            &[("applicants", &applicant_csv), ("tiers", &tier_csv)],
+            "tiered_out",
+        );
+        assert_eq!(
+            rows(&out.output),
+            expected,
+            "three-conjunct fixture output diverged from the oracle over its documented data"
+        );
+
+        // Null-fields: readings (did, amount) ⋈ bands (bid, lo, hi) on
+        // amount ∈ [lo, hi), match: first, on_miss: null_fields — every reading
+        // emits a row (matched bid or null). The fixture's reading 2 has a NULL
+        // amount and reading 4 (amount 999) is out of range, so both emit null.
+        let (reading_csv, reading_rows) = read_fixture_data("iejoin_prnf_drivers.csv");
+        let (band_csv, band_rows) = read_fixture_data("iejoin_prnf_builds.csv");
+        let readings: Vec<(i64, Option<i64>)> =
+            reading_rows.iter().map(|r| (r[0].unwrap(), r[1])).collect();
+        let bands: Vec<(i64, i64, i64)> = band_rows
+            .iter()
+            .map(|r| (r[0].unwrap(), r[1].unwrap(), r[2].unwrap()))
+            .collect();
+        let expected = expected_null_fields_rows(
+            &readings,
+            &nested_loop_oracle(
+                &readings,
+                &bands,
+                |(_, amount), (_, lo, hi)| matches!(amount, Some(a) if a >= lo && a < hi),
+                |_, (did, _), _, (bid, _, _)| (*did, *bid),
+            ),
+        );
+        // Reading 1 matches band 10, reading 3 matches band 11; reading 2 (NULL
+        // amount) and reading 4 (out of range) carry a null bid.
+        assert_eq!(
+            expected,
+            vec![
+                vec!["1".to_string(), "10".to_string()],
+                vec!["2".to_string(), String::new()],
+                vec!["3".to_string(), "11".to_string()],
+                vec!["4".to_string(), String::new()],
+            ],
+            "the null-fields fixture's documented result changed; update the fixture comment"
+        );
+        let out = fixture_run(
+            "iejoin_pure_range_null_fields",
+            ROOMY_LIMIT,
+            "spill",
+            &[("readings", &reading_csv), ("bands", &band_csv)],
+            "banded_out",
+        );
+        assert_eq!(
+            rows(&out.output),
+            expected,
+            "null-fields fixture output diverged from the oracle over its documented data"
+        );
+    }
+
+    const ALL_OUT_OF_RANGE_NULL_FIELDS_YAML: &str = r#"
 pipeline:
-  name: pure_range_null_fields
+  name: pure_range_all_out_of_range_null_fields
   memory: { limit: "__LIMIT__", backpressure: __POLICY__ }
 nodes:
   - type: source
@@ -578,7 +850,7 @@ nodes:
       builds: builds
     config:
       where: "drivers.k1 >= builds.lo and drivers.k1 < builds.hi"
-      match: first
+      match: all
       on_miss: null_fields
       cxl: |
         emit did = drivers.did
@@ -593,72 +865,72 @@ nodes:
       path: out.csv
 "#;
 
-    /// on_miss:null_fields under a spilled layout, driven by a real body
-    /// evaluator (the unit harness is body-less). Every driver emits exactly one
-    /// row: a matched driver carries its first (only, since the bands are
-    /// disjoint) build id; a zero-match driver — whether its range key is out of
-    /// range or NULL — carries a null build id. A third of the drivers carry a
-    /// NULL range key, so the deferred null-fields dispatch drains the spilled
-    /// scan-phase unmatched pile (a residency the scan-phase spill bounds) and
-    /// reunites it with the in-block misses in input order. The per-driver output
-    /// must match the oracle identically at the spilled and resident budgets.
+    /// The pathological in-block-pile shape: every driver carries an
+    /// orderable range key that falls OUTSIDE every build range, so each enters a
+    /// block but matches nothing and routes to the deferred in-block on-miss pile
+    /// — under match: all + on_miss: null_fields the maximal case, holding one
+    /// deferred record per driver. The pile drains into its spillable buffer and
+    /// streams back through the two-way merge, so the per-driver null-fields output
+    /// is byte-identical across a spilling (tight) and a resident (roomy) budget,
+    /// and the tight run bounds the whole pile to disk rather than holding an O(N)
+    /// resident vec.
     #[test]
-    fn null_fields_over_spilled_scan_phase_matches_oracle_across_budgets() {
+    fn all_out_of_range_inblock_pile_null_fields_matches_across_budgets() {
         let span = 1_000i64;
         let n_builds = 40i64;
         let bstep = span / n_builds;
-        // Per-driver expected build id ("" == null). Keyed by did.
-        let mut expected_by_did: Vec<(i64, String)> = Vec::new();
+        // Every driver's k1 is >= span, so it falls outside every band and is an
+        // in-block miss that emits a null build id.
         let mut driver_csv = String::from("did,k1\n");
+        let mut expected: Vec<Vec<String>> = Vec::new();
         for i in 0..6_000i64 {
-            if i.rem_euclid(3) == 0 {
-                // NULL range key → scan-phase unmatched → null-fields row.
-                driver_csv.push_str(&format!("{i},\n"));
-                expected_by_did.push((i, String::new()));
-            } else {
-                // k1 spans [0, span + 200): the tail past `span` matches no band,
-                // so it is an in-range-format but zero-match (null-fields) driver.
-                let k1 = (i.wrapping_mul(2_617)).rem_euclid(span + 200);
-                driver_csv.push_str(&format!("{i},{k1}\n"));
-                let bid = if k1 < span {
-                    (k1 / bstep).to_string()
-                } else {
-                    String::new()
-                };
-                expected_by_did.push((i, bid));
-            }
+            let k1 = span + i.rem_euclid(500);
+            driver_csv.push_str(&format!("{i},{k1}\n"));
+            expected.push(vec![i.to_string(), String::new()]);
         }
+        expected.sort();
         let mut build_csv = String::from("bid,lo,hi\n");
         for b in 0..n_builds {
             let lo = b * bstep;
             let hi = lo + bstep;
             build_csv.push_str(&format!("{b},{lo},{hi}\n"));
         }
-        let mut expected: Vec<Vec<String>> = expected_by_did
-            .iter()
-            .map(|(did, bid)| vec![did.to_string(), bid.clone()])
-            .collect();
-        expected.sort();
-
         let inputs = [
             ("drivers", driver_csv.as_str()),
             ("builds", build_csv.as_str()),
         ];
-        let tight = run(NULL_FIELDS_YAML, TIGHT_LIMIT, "spill", &inputs, "out");
-        let roomy = run(NULL_FIELDS_YAML, ROOMY_LIMIT, "spill", &inputs, "out");
+        let tight = run(
+            ALL_OUT_OF_RANGE_NULL_FIELDS_YAML,
+            TIGHT_LIMIT,
+            "spill",
+            &inputs,
+            "out",
+        );
+        let roomy = run(
+            ALL_OUT_OF_RANGE_NULL_FIELDS_YAML,
+            ROOMY_LIMIT,
+            "spill",
+            &inputs,
+            "out",
+        );
         assert_eq!(
             rows(&tight.output),
             expected,
-            "spilled null-fields output (incl. spilled scan-phase misses) diverged from the oracle"
+            "spilled all-out-of-range in-block pile diverged from the resident run"
         );
         assert_eq!(
             rows(&roomy.output),
             expected,
-            "resident null-fields output diverged from the oracle"
+            "resident all-out-of-range null-fields output unexpected"
+        );
+        assert_eq!(
+            rows(&tight.output).len(),
+            6_000,
+            "every driver emits exactly one null-fields row"
         );
         assert!(
             tight.spill_bytes > 0,
-            "the tight budget must have spilled the sides and the scan-phase pile"
+            "the tight budget must bound the 6000-driver in-block pile to disk"
         );
     }
 
