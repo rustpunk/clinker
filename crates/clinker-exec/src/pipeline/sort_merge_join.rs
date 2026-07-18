@@ -1851,6 +1851,15 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                 }
 
                 if let Some(evaluator) = body_eval.as_deref_mut() {
+                    // First selects this residual-passing build and treats the
+                    // body as a post-match projection: record the predicate
+                    // match up front so a body skip drops only this row instead
+                    // of falling through to on_miss, then stop after this one
+                    // build rather than retrying a later match.
+                    let select_first = matches!(match_mode, MatchMode::First);
+                    if select_first {
+                        emitted_any = true;
+                    }
                     let resolver =
                         CombineResolver::new(resolver_mapping, driver_record, Some(&inner));
                     match evaluator.eval_record::<NullStorage>(ctx, &resolver, None) {
@@ -1876,9 +1885,6 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                             );
                             push_output_row(output, rec, out_key, mspill)?;
                             emitted_any = true;
-                            if matches!(match_mode, MatchMode::First) {
-                                break;
-                            }
                         }
                         Ok(EvalResult::Skip(SkipReason::Filtered)) => {}
                         Ok(EvalResult::Skip(SkipReason::Duplicate)) => {}
@@ -1901,8 +1907,16 @@ fn emit_for_driver(args: EmitDriverArgs<'_, '_>) -> Result<(), PipelineError> {
                                 error: e,
                             });
                             failure_tags.push(out_key);
-                            continue;
+                            // First already committed to this build; the
+                            // deferred dead-letter above is its only output. All
+                            // keeps scanning the remaining window entries.
+                            if !select_first {
+                                continue;
+                            }
                         }
+                    }
+                    if select_first {
+                        break;
                     }
                 } else if let Some(target_schema) = ectx.output_schema {
                     // Body-less synthetic chain step: concatenate driver and

@@ -1508,9 +1508,11 @@ fn finalize_driver_block(
         MatchMode::First => {
             for (di, (record, payload)) in driver_loaded.iter().enumerate() {
                 match state.take_first_candidate(di) {
-                    // Emit the minimum-build-index candidate. A body eval that
-                    // skips it leaves the driver a miss (no other candidate is
-                    // held), routed to the deferred on_miss dispatch.
+                    // A held candidate means this driver matched the predicate:
+                    // its minimum-build-index match is the selection and the
+                    // body is a post-match projection. Run it once and discard
+                    // the emit/skip result — a body skip drops only this output
+                    // row, it does not turn a matched driver into a miss.
                     Some((bidx, build)) => {
                         let dref = DriverRef {
                             record,
@@ -1518,10 +1520,11 @@ fn finalize_driver_block(
                             key: di,
                             driver_idx: payload.2,
                         };
-                        if !emit_match_row(cfg, evals, &dref, &build, bidx, sink)? {
-                            note_unmatched(pile, record, payload.3, payload.2)?;
-                        }
+                        emit_match_row(cfg, evals, &dref, &build, bidx, sink)?;
                     }
+                    // No candidate held: the driver matched no build predicate,
+                    // a genuine zero-match routed to the deferred on_miss
+                    // dispatch.
                     None => note_unmatched(pile, record, payload.3, payload.2)?,
                 }
             }

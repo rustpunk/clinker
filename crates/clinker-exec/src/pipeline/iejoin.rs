@@ -1617,16 +1617,18 @@ fn emit_pairs(
                 // Block path: hold the minimum-build-index candidate; emit at
                 // the driver block's finalize.
                 Some(idx) => state.note_first_candidate(key, idx, build_record),
-                // Equi+range path: first-visited wins. Emit immediately and
-                // dedup; a body eval that skips leaves the driver open to the
-                // next pair.
+                // Equi+range path: the first predicate-matching build is the
+                // selection and the body is a post-match projection. Mark the
+                // driver matched before the body runs, so a body skip drops
+                // only this row without reopening the driver to a later build
+                // or routing it to on_miss; the already-matched guard then
+                // skips every remaining pair for this driver.
                 None => {
                     if state.matched[key] {
                         continue;
                     }
-                    if emit_match_row(cfg, evals, dref, build_record, 0, sink)? {
-                        state.matched[key] = true;
-                    }
+                    state.matched[key] = true;
+                    emit_match_row(cfg, evals, dref, build_record, 0, sink)?;
                 }
             },
             MatchMode::All => {
