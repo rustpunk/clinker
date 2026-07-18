@@ -80,8 +80,13 @@
 //! pushes during a driver block's inner loop (its misses drain only in that
 //! block's finalize, after the loop), so the per-pair gates fold in its CURRENT
 //! live bytes — zero for a fully-matching run, which therefore reserves one cap,
-//! not two — while the driver-load gate reserves its full cap to cover that later
-//! growth against the released per-pair working set. At end-of-join the piles
+//! not two — while the driver-load gate covers that later finalize growth with a
+//! bounded term: the pile's current live bytes plus at most the driver block's own
+//! record footprint (the misses it can clone), capped at the pile's spill cap. A
+//! fully-matching block routes nothing to the pile, so that term collapses to the
+//! block footprint (≤ `block_target`) rather than a full second cap, which is what
+//! lets a run whose true finalize peak is one cap plus a block complete instead of
+//! aborting for a cap it never uses. At end-of-join the piles
 //! convert to k-way mergers and stack with the output sort and the still-resident
 //! blocks; that finalize footprint is bounded by construction (the mergers are the
 //! same one-record-per-open-run primitive the drain phase already opens un-gated,
@@ -435,6 +440,30 @@ impl<P: Ord + DeserializeOwned> Iterator for SortedStream<P> {
     }
 }
 
+/// Wrap a finished sort buffer's [`SortedOutput`] in a [`SortedStream`]: an
+/// in-memory buffer yields its already-sorted vec, a spilled one folds its runs
+/// through the k-way [`SortedRunMerger`] (one resident record per open run).
+/// `context` localizes a merge-open failure. `budget` charges any intermediate
+/// runs the bounded-k cascade spills when a pile fragments past the merge fan-in;
+/// callers pass the same node / arbitrator / compression they charge their own
+/// spills under, so the cascade's re-writes attribute to this stage and balance
+/// against the input runs' charges. The matched-side slice, the deferred-pile
+/// finish, and the test drain all stream a `SortedOutput` the same way, so the
+/// `InMemory` / `Spilled` dispatch lives here once. Residue charging is the
+/// caller's concern — it happens on the `finish` that produced `sorted`.
+fn sorted_output_stream<P: Serialize + Ord + DeserializeOwned>(
+    sorted: SortedOutput<P>,
+    context: &'static str,
+    budget: MergeBudget<'_>,
+) -> Result<SortedStream<P>, PipelineError> {
+    Ok(match sorted {
+        SortedOutput::InMemory(pairs) => SortedStream::InMemory(pairs.into_iter()),
+        SortedOutput::Spilled(files) => SortedStream::Spilled(
+            SortedRunMerger::new_payload_ordered(files, context, budget)?,
+        ),
+    })
+}
+
 /// Shared spill / charge context for the drain and slice helpers. Bundled so
 /// each helper stays under clippy's argument cap.
 struct DrainCtx<'a> {
@@ -541,25 +570,11 @@ pub(super) fn execute_block_band(
     // `sort_threshold`, which honors the test-only `sort_spill_override`.
     let deferred_cap = sort_spill_threshold_bytes(budget) as u64;
     // The in-block zero-match pile can hold live bytes only under a First / All
-    // run with a non-skip on_miss; Collect and Skip never route to it.
+    // run with a non-skip on_miss; Collect and Skip never route to it. The
+    // driver-load gate below folds a bounded finalize term for it (computed per
+    // driver block); the per-pair gates fold its constant live bytes.
     let inblock_can_fill =
         matches!(match_mode, MatchMode::First | MatchMode::All) && !matches!(on_miss, OnMiss::Skip);
-    // Reservation the DRIVER-LOAD gate applies, phase-distinct from the per-pair
-    // gates below. The output sort grows across the whole emit phase, so its
-    // constant cap is always reserved. The in-block pile is different: it takes
-    // no pushes during a driver block's inner build loop — its misses are drained
-    // only in that block's finalize, AFTER the loop, once the per-pair input
-    // working set is released. So the per-pair gates fold in the pile's CURRENT
-    // live bytes (constant across the loop they gate), while THIS driver-load gate
-    // — which also has to cover that later finalize, where the pile grows up to
-    // its cap against only the driver-block working set — reserves the pile's full
-    // constant cap. Reserving constant caps, not live output bytes (which would
-    // false-abort a run whose output legitimately spills), bounds each phase to
-    // `hard - reservation`. Folding the pile's live bytes rather than its cap into
-    // the per-pair gate is what lets a fully-matching workload — whose pile stays
-    // empty — keep its per-pair reservation at one cap instead of two.
-    let driver_load_reservation =
-        deferred_cap.saturating_add(if inblock_can_fill { deferred_cap } else { 0 });
     let drain_ctx = DrainCtx {
         name,
         budget,
@@ -728,18 +743,37 @@ pub(super) fn execute_block_band(
         let driver_held = driver_scratch.saturating_add(driver_vecs_bytes);
         // Gate the driver block's own load from metadata, symmetric with the
         // per-pair build gate below: a spilled driver block whose scratch plus
-        // the resident baseline and the reserved deferred caps cannot fit the hard
-        // limit aborts before it is materialized rather than after. A resident
-        // (borrowed) block adds zero scratch, so it trips only if the resident
-        // baseline plus the reserved deferred caps already exceeds `hard`. This
-        // gate uses `driver_load_reservation` — the output cap PLUS the in-block
-        // pile's full cap — because it also covers the block's finalize peak: the
-        // in-block pile grows there (after this loop's per-pair gates) up to its
-        // cap, and by then the per-pair input working set has been released, so
-        // the pile's full cap is the co-resident term to reserve.
+        // the resident baseline and the reserved deferred terms cannot fit the
+        // hard limit aborts before it is materialized rather than after. A
+        // resident (borrowed) block adds zero scratch, so it trips only if the
+        // resident baseline plus those terms already exceeds `hard`.
+        //
+        // The output sort grows across the whole emit phase, so its constant cap
+        // is always reserved. The in-block miss pile is phase-distinct: it takes
+        // no pushes during the inner build loop (the per-pair gates below fold its
+        // constant live bytes), and grows only in THIS block's finalize, where it
+        // clones this block's own zero-match drivers. So its finalize residency is
+        // bounded by its current live bytes plus at most this block's record
+        // footprint (`resident_bytes`, the most those clones can add), and it
+        // never exceeds its spill cap (it spills at that cap regardless). Reserving
+        // that bounded term rather than a second full cap is the tightening: a
+        // fully-matching block routes nothing to the pile, so its live bytes are
+        // zero and the term collapses to the block footprint (≤ `block_target`)
+        // instead of a whole cap — so a run whose true finalize peak is one cap
+        // plus a block completes instead of aborting for a cap it never uses. A
+        // miss-heavy run whose pile has already accumulated toward its cap folds
+        // that live figure in, so the bound stays sound: it degrades to the full
+        // cap exactly when the pile is genuinely near it.
+        let inblock_finalize_term = if inblock_can_fill {
+            deferred_cap
+                .min((inblock_buf.bytes_used() as u64).saturating_add(driver_block.resident_bytes))
+        } else {
+            0
+        };
         let driver_peak = baseline_resident
             .saturating_add(driver_held)
-            .saturating_add(driver_load_reservation);
+            .saturating_add(deferred_cap)
+            .saturating_add(inblock_finalize_term);
         if driver_peak > budget.hard_limit() {
             return Err(abort_over_budget(
                 consumer,
@@ -1275,28 +1309,29 @@ fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord>(
     // block re-charges its own bytes (a transient over-count that never
     // under-reports). The spilled case has already written its runs to disk, so
     // its charge is dropped now — the k-way merge holds only one record per run.
-    let (stream, defer_release) = match sorted {
+    // An empty in-memory buffer forms no blocks, so release and return early.
+    let defer_release = match &sorted {
         SortedOutput::InMemory(pairs) => {
             if pairs.is_empty() {
                 ctx.consumer.sub_bytes(pre_finish);
                 return Ok(Vec::new());
             }
-            (SortedStream::InMemory(pairs.into_iter()), true)
+            true
         }
-        SortedOutput::Spilled(files) => {
+        SortedOutput::Spilled(_) => {
             ctx.consumer.sub_bytes(pre_finish);
-            let merger = SortedRunMerger::new_payload_ordered(
-                files,
-                "iejoin block-band merge",
-                MergeBudget {
-                    budget: ctx.budget,
-                    node: ctx.name,
-                    compress: ctx.spill_compress,
-                },
-            )?;
-            (SortedStream::Spilled(merger), false)
+            false
         }
     };
+    let stream = sorted_output_stream(
+        sorted,
+        "iejoin block-band merge",
+        MergeBudget {
+            budget: ctx.budget,
+            node: ctx.name,
+            compress: ctx.spill_compress,
+        },
+    )?;
     let blocks = slice_side(stream, schema, ctx, resident, key_of)?;
     if defer_release {
         // The in-memory sorted vec is now fully consumed into blocks; release
@@ -1508,12 +1543,15 @@ fn finish_unmatched_stream(
         )))
     })?;
     charge_block_spill(ctx, residue)?;
-    Ok(match sorted {
-        SortedOutput::InMemory(pairs) => SortedStream::InMemory(pairs.into_iter()),
-        SortedOutput::Spilled(files) => SortedStream::Spilled(
-            SortedRunMerger::new_payload_ordered(files, "iejoin block-band unmatched merge")?,
-        ),
-    })
+    sorted_output_stream(
+        sorted,
+        "iejoin block-band unmatched merge",
+        MergeBudget {
+            budget: ctx.budget,
+            node: ctx.name,
+            compress: ctx.spill_compress,
+        },
+    )
 }
 
 /// Stream the scan-phase unmatched drivers back and emit one empty-array
@@ -1715,33 +1753,24 @@ mod tests {
     fn drain_sorted(
         sorted: SortedOutput<(RecordOrder, u64, u64)>,
     ) -> Result<Vec<(Record, RecordOrder)>, PipelineError> {
-        match sorted {
-            SortedOutput::InMemory(pairs) => Ok(pairs
-                .into_iter()
-                .map(|(record, (order, _, _))| (record, order))
-                .collect()),
-            SortedOutput::Spilled(files) => {
-                // The cascade only charges intermediate runs, which this small
-                // fixture never produces; a roomy unlimited-quota arbitrator
-                // keeps the test's focus on emitted order.
-                let arb = arbitrator(u64::MAX);
-                let merger = SortedRunMerger::new_payload_ordered(
-                    files,
-                    "block-band test drain",
-                    MergeBudget {
-                        budget: &arb,
-                        node: "block-band test drain",
-                        compress: true,
-                    },
-                )?;
-                let mut rows = Vec::new();
-                for item in merger {
-                    let (record, (order, _, _)) = item?;
-                    rows.push((record, order));
-                }
-                Ok(rows)
-            }
+        // The cascade only charges intermediate runs, which this small fixture
+        // never produces; a roomy unlimited-quota arbitrator keeps the test's
+        // focus on emitted order.
+        let arb = arbitrator(u64::MAX);
+        let mut rows = Vec::new();
+        for item in sorted_output_stream(
+            sorted,
+            "block-band test drain",
+            MergeBudget {
+                budget: &arb,
+                node: "block-band test drain",
+                compress: true,
+            },
+        )? {
+            let (record, (order, _, _)) = item?;
+            rows.push((record, order));
         }
+        Ok(rows)
     }
 
     struct RunCfg {
@@ -3499,6 +3528,127 @@ mod tests {
                 "a fully-matching Error run must not be aborted by the in-block reservation",
             ));
         assert_eq!(error, oracle_pairs(&driver, &build, TOp::Ge, Some(TOp::Lt)));
+        assert_eq!(
+            skip, error,
+            "a fully-matching run's output must not depend on on_miss"
+        );
+        assert!(!error.is_empty(), "the fixture must produce matches");
+    }
+
+    #[test]
+    fn fully_matching_spilled_driver_block_reserves_bounded_finalize_term_not_two_caps() {
+        // The DRIVER-LOAD gate's over-reservation: it reserved the output cap PLUS
+        // the in-block pile's FULL cap for every First / All + non-skip on_miss
+        // run, even one that never routes a driver to that pile. This fixture is
+        // exactly that shape — every driver matches, so the pile stays empty the
+        // whole run — AND the driver blocks SPILL (a large resident build claims
+        // the entire resident budget), so `driver_held` carries each block's
+        // scratch and the gate's driver-side term is substantial. The budget sits
+        // in the band where the resident baseline plus a spilled driver block plus
+        // ONE output cap fits under hard, but a SECOND full cap for the empty pile
+        // does not. The pile takes no pushes during the inner loop and, at
+        // finalize, clones only this block's own drivers, so the correct finalize
+        // term is bounded by the block footprint — not a whole cap — and a
+        // fully-matching block's term collapses toward zero. The old two-cap
+        // reservation aborted this run at the driver-load gate; the bounded term
+        // admits it.
+        let d_schema = driver_schema();
+        let b_schema = build_schema();
+        // Every driver clears the single matching build on the primary axis
+        // (`Ge`, single-conjunct PWMJ): driver k1 = 0 ≥ build k1 = 0. The build is
+        // dominated by high-key fillers whose block-pairs prune away (0 ≥ 1e9 is
+        // false), so they inflate the resident baseline without adding surviving
+        // pairs — which keeps the per-pair working set small so the DRIVER-LOAD
+        // gate, not a per-pair gate, is the binding reservation.
+        let driver: Side = (0..200i64).map(|i| (Some((0, 0)), i)).collect();
+        let mut build: Side = vec![(Some((0, 0)), 900_000)];
+        build.extend((0..800i64).map(|j| (Some((1_000_000_000, 0)), j)));
+        let op2: Option<RangeOp> = None;
+
+        let (driver_records, _) = to_records_scans(&driver, &d_schema);
+        let (build_records, _) = to_records_scans(&build, &b_schema);
+
+        // The whole resident build side is the baseline: the resident budget is
+        // set to exactly its bytes, so every build block stays resident and every
+        // driver block spills (the build drains first and claims the budget).
+        let baseline: u64 = build_records
+            .iter()
+            .map(|r| pair_bytes::<(i64, i64, u64)>(r) as u64)
+            .sum();
+
+        // One full spilled driver block's footprint at the gate: its record
+        // scratch (`resident_bytes`, charged into `driver_held` on load) plus its
+        // hoisted key column and `DriverRef` slice. `block_target` is set so a full
+        // block holds exactly `RECORDS_PER_BLOCK` records, matching the slicer's
+        // fill rule (emit once cumulative bytes reach the target).
+        const RECORDS_PER_BLOCK: u64 = 12;
+        let r_d = pair_bytes::<DriverPayload>(&driver_records[0]) as u64;
+        let block_target = (RECORDS_PER_BLOCK * r_d) as usize;
+        let block_bytes = RECORDS_PER_BLOCK * r_d;
+        let driver_vecs = RECORDS_PER_BLOCK
+            * (range_key_width(op2) as u64 + std::mem::size_of::<DriverRef<'_>>() as u64);
+        let driver_held = block_bytes + driver_vecs;
+        // `s` is the co-resident input footprint the gate measures for a full,
+        // spilled driver block: the resident baseline plus that block's held bytes.
+        let s = baseline + driver_held;
+
+        // Land hard in the band where `s + one output cap + the bounded finalize
+        // term (≈ one block)` fits but `s + two caps` does not. hard = s·10/7
+        // (~1.43·s) puts s at ~0.70·hard and cap = soft/4 = 0.2·hard, so the second
+        // cap overshoots while one cap plus a block-sized term fits.
+        let hard = s * 10 / 7;
+        let budget = arbitrator(hard);
+        let cap = sort_spill_threshold_bytes(&budget) as u64;
+        // The tightened finalize term for a fully-matching (empty-pile) block: its
+        // pile is empty, so it collapses to the block footprint, capped at the
+        // pile's spill cap.
+        let inblock_term = cap.min(block_bytes);
+        assert!(
+            block_bytes < cap,
+            "the block footprint must sit below the pile cap so the finalize term \
+             is a fraction of a cap: block_bytes={block_bytes} cap={cap}"
+        );
+        assert!(
+            s + cap + inblock_term <= budget.hard_limit(),
+            "the tightened driver-load reservation (one output cap + bounded \
+             finalize term) must fit: s={s} cap={cap} term={inblock_term} hard={}",
+            budget.hard_limit()
+        );
+        assert!(
+            budget.hard_limit() < s + 2 * cap,
+            "the old two-cap driver-load reservation must NOT fit — this is the \
+             over-reservation the fix removes: s={s} cap={cap} hard={}",
+            budget.hard_limit()
+        );
+
+        let cfg = |on_miss| RunCfg {
+            op1: RangeOp::Ge,
+            op2,
+            match_mode: MatchMode::All,
+            on_miss,
+            block_target,
+            hard_limit: hard,
+            max_spill_bytes: None,
+            // Keep the drain buffers in memory so each side slices cleanly into
+            // blocks; the driver blocks then spill because the resident budget is
+            // fully claimed by the build side.
+            sort_spill: Some(1 << 30),
+            resident_budget: Some(baseline),
+        };
+
+        // Skip never routes a driver to the in-block pile, so it reserves no pile
+        // term at the driver-load gate under either the old or the new code — it
+        // completes and fixes the expected fully-matching output.
+        let skip = all_pairs(&run_block(&driver, &build, &cfg(OnMiss::Skip)).expect("skip run"));
+        // Error CAN route to the in-block pile, so the old gate reserved a second
+        // full cap for it up front and aborted this run at the driver-load gate.
+        // With the bounded finalize term it completes — the pile stays empty
+        // because every driver matches.
+        let error = all_pairs(&run_block(&driver, &build, &cfg(OnMiss::Error)).expect(
+            "a fully-matching Error run over a spilled driver block must not be \
+                 aborted by an over-reserved in-block pile cap",
+        ));
+        assert_eq!(error, oracle_pairs(&driver, &build, TOp::Ge, None));
         assert_eq!(
             skip, error,
             "a fully-matching run's output must not depend on on_miss"
