@@ -1957,10 +1957,10 @@ mod tests {
         );
     }
 
-    /// Regression guard for the hard-limit-only startup gate: budgets inside
-    /// the `[baseline_rss, baseline_rss / spill_threshold_pct)` band — above
-    /// the process baseline yet low enough that the run opens above the
-    /// soft-pressure threshold — are ACCEPTED under every policy, the
+    /// Regression guard for the hard-limit-only startup gate: a budget inside
+    /// the `[baseline_rss, baseline_rss / DEFAULT_SPILL_THRESHOLD)` band —
+    /// above the process baseline yet low enough that the run opens above the
+    /// soft-pressure threshold — is ACCEPTED under every policy, the
     /// producer-pausing ones included. The gate rejects only on
     /// `limit < baseline_rss` and deliberately does not extend up into the
     /// soft band: a band budget is satisfiable (it sits above the
@@ -1970,25 +1970,30 @@ mod tests {
     /// Such a budget spills from the first pressure crossing or aborts fast
     /// through the hard-limit path rather than hanging. Pinning this keeps a
     /// future edit from re-introducing soft-band rejection under any policy —
-    /// a soft-limit comparison would reject the whole band, so any in-band
+    /// a soft-limit comparison would reject the whole band, so a mid-band
     /// budget catches that regression.
     ///
     /// Runs in a child process via [`run_isolated`] so no sibling test thread
-    /// churns process-global RSS between the reads. Two mechanics keep the
-    /// probes robustly inside the band the gate itself compares against:
+    /// churns process-global RSS between the reads. The gate re-samples
+    /// `rss_bytes()` internally as its baseline, so the probe is built to
+    /// survive that re-read rather than assume it equals an earlier sample:
     ///
-    /// - The band is anchored on a settled RSS plateau, not an early sample. A
-    ///   fresh process's RSS climbs steeply over its first reads as code and
-    ///   data pages fault in, so an early sample reads well below the value the
-    ///   gate later compares against. Reading until the figure stops rising
-    ///   (RSS only rises here — freeing small heap does not return pages)
-    ///   sidesteps that startup ramp, and the gate's per-call re-read then
-    ///   never exceeds the plateau.
-    /// - The probes sit a quarter and a half into the band, not on its lower
-    ///   edge, so any residual page-level drift cannot flip a probe onto the
-    ///   reject side of the strict `<`. (The exact `limit == baseline_rss`
-    ///   edge is not deterministically testable: the gate always re-samples a
-    ///   possibly-higher RSS after the limit is fixed.)
+    /// - The budget is derived from a baseline sampled immediately before each
+    ///   gate call, holding the sample-to-re-sample window to a single
+    ///   function call so live RSS cannot creep past the probe within it.
+    /// - The probe sits at the MIDDLE of the band — the
+    ///   `baseline / DEFAULT_SPILL_THRESHOLD` ceiling folded halfway back to
+    ///   baseline (~12.5% above baseline at the 0.80 default). That symmetric
+    ///   headroom absorbs page-level drift in both directions: it stays above
+    ///   baseline for the accept side and below the ceiling for the in-band
+    ///   requirement, so residual drift cannot flip the probe onto the reject
+    ///   side of the strict `<`.
+    /// - A bounded retry re-samples a fresh baseline and re-probes on the rare
+    ///   read where RSS pages in between the sample and the gate's re-read.
+    ///   Every attempt re-derives the probe from its own baseline, so a
+    ///   genuine soft-band rejection (which rejects a mid-band budget against
+    ///   any baseline) still fails all of them — the retry tolerates timing
+    ///   jitter without weakening the guard.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn reject_unsatisfiable_budget_accepts_soft_pressure_band() {
@@ -1996,67 +2001,66 @@ mod tests {
             "pipeline::memory::tests::reject_unsatisfiable_budget_accepts_soft_pressure_band",
             || {
                 use clinker_plan::config::BackpressureKnob;
+                use clinker_plan::config::utils::DEFAULT_SPILL_THRESHOLD;
 
-                // Drive RSS to a plateau before anchoring the band: read until the
-                // figure holds at or below its running max for many reads in a row
-                // (RSS is monotonic non-decreasing here), warming the probe path so
-                // the gate's later re-read cannot exceed `plateau`. `None` → the
-                // gate is skipped on this platform; there is no band to pin.
-                let mut plateau = match rss_bytes() {
-                    Some(x) => x,
-                    None => return,
-                };
-                let mut steady = 0u32;
-                for _ in 0..10_000 {
-                    let cur = match rss_bytes() {
-                        Some(x) => x,
-                        None => return,
-                    };
-                    if cur > plateau {
-                        plateau = cur;
-                        steady = 0;
-                    } else {
-                        steady += 1;
-                        if steady >= 32 {
-                            break;
-                        }
+                // Warm the RSS-read path before probing: `rss_bytes()` reads
+                // `/proc/self/statm` into a fresh String, and the first such
+                // reads can fault in allocator pages that nudge process RSS
+                // upward. Exercising the path up front pages that machinery in,
+                // so the gate's internal re-read faults nothing new relative to
+                // the sample each probe is built from. `None` → the gate is
+                // skipped on this platform; there is no band to pin.
+                for _ in 0..256 {
+                    if rss_bytes().is_none() {
+                        return;
                     }
                 }
 
-                // Proactive pressure begins at `limit * spill_threshold_pct`
-                // (default 0.80), so the process opens above the soft threshold
-                // whenever `plateau > limit * 0.80`, i.e. `limit < plateau / 0.80`.
-                // The half-open band `[plateau, ceil(plateau / 0.80))` is exactly
-                // the set of budgets that clear the hard gate yet start under soft
-                // pressure — the band the startup validation keeps accepting. Both
-                // probes clear `plateau` (so the gate, reading at most `plateau`,
-                // accepts them) yet stay below the ceiling (so a soft-limit
-                // comparison — the rejected direction this guards against — would
-                // reject them).
-                let spill_threshold_pct = 0.80_f64;
-                let band_ceiling = (plateau as f64 / spill_threshold_pct).ceil() as u64;
-                let band_width = band_ceiling - plateau;
-                let low_band = plateau + band_width / 4;
-                let mid_band = plateau + band_width / 2;
-                assert!(
-                    plateau < low_band && low_band < mid_band && mid_band < band_ceiling,
-                    "probes must sit strictly inside [{plateau}, {band_ceiling}): \
-                     low={low_band} mid={mid_band}"
-                );
-
-                for limit in [low_band, mid_band] {
-                    for knob in [
-                        BackpressureKnob::Pause,
-                        BackpressureKnob::Both,
-                        BackpressureKnob::Spill,
-                    ] {
+                // Proactive pressure begins at `limit * DEFAULT_SPILL_THRESHOLD`,
+                // so a process whose baseline RSS is `b` opens above the soft
+                // threshold for any budget in the half-open band
+                // `[b, ceil(b / DEFAULT_SPILL_THRESHOLD))`: at or above baseline
+                // (so the hard gate accepts it) yet under the ceiling (so a
+                // soft-limit comparison — the rejected direction this guards
+                // against — would reject it). Because the gate re-samples RSS
+                // itself, the budget is derived from a baseline read immediately
+                // before each call and placed at the middle of the band, with a
+                // bounded retry to re-sample if RSS still crept past it. Every
+                // attempt re-derives the probe, so a real soft-band rejection
+                // fails all of them and the guard holds.
+                for knob in [
+                    BackpressureKnob::Pause,
+                    BackpressureKnob::Both,
+                    BackpressureKnob::Spill,
+                ] {
+                    let mut accepted = false;
+                    let mut last = String::new();
+                    for _ in 0..8 {
+                        let baseline = match rss_bytes() {
+                            Some(x) => x,
+                            None => return,
+                        };
+                        let band_ceiling =
+                            (baseline as f64 / DEFAULT_SPILL_THRESHOLD).ceil() as u64;
+                        let mid_band = baseline + (band_ceiling - baseline) / 2;
                         assert!(
-                            reject_unsatisfiable_budget(limit, knob).is_ok(),
-                            "a soft-pressure-band budget (limit={limit}, plateau={plateau}, \
-                             band_ceiling={band_ceiling}) must be accepted under {knob:?}: the \
-                             startup gate is hard-limit-only and must not reject the soft band"
+                            baseline < mid_band && mid_band < band_ceiling,
+                            "mid-band probe must sit strictly inside \
+                             [{baseline}, {band_ceiling}): mid={mid_band}"
+                        );
+                        if reject_unsatisfiable_budget(mid_band, knob).is_ok() {
+                            accepted = true;
+                            break;
+                        }
+                        last = format!(
+                            "limit={mid_band}, baseline={baseline}, band_ceiling={band_ceiling}"
                         );
                     }
+                    assert!(
+                        accepted,
+                        "a soft-pressure-band budget ({last}) must be accepted under {knob:?}: \
+                         the startup gate is hard-limit-only and must not reject the soft band"
+                    );
                 }
             },
         );
