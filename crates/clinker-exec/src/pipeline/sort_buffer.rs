@@ -34,6 +34,26 @@ use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_plan::SpillError;
 use clinker_plan::config::SortField;
 
+/// The heap bytes a sort payload owns beyond its inline `size_of<P>`. Folded
+/// into the buffer's per-pair byte estimate so a payload carrying a
+/// variable-length key — the block-band IEJoin's canonical equality bytes — is
+/// charged for the RAM it actually holds. Without it the spill threshold, and
+/// (through the same per-pair figure) block sizing, resident admission, and the
+/// pre-output abort gate, would all read under the true residency for a wide or
+/// data-expanding equality key. A payload with no heap key uses the default `0`,
+/// so pure-range and every other sort stay byte-for-byte unchanged.
+pub trait HeapBytes {
+    fn heap_bytes(&self) -> usize {
+        0
+    }
+}
+
+impl HeapBytes for () {}
+impl HeapBytes for u64 {}
+impl HeapBytes for (u64, u64) {}
+impl HeapBytes for (u64, u64, u64) {}
+impl HeapBytes for (i64, i64, u64) {}
+
 /// Result of finishing a sort buffer: either all (record, payload) pairs
 /// fit in memory, or some were spilled to disk.
 pub enum SortedOutput<P> {
@@ -83,7 +103,7 @@ pub struct SortBuffer<P> {
 // the shared `sort_and_spill` / `finish` path can compare payloads in the
 // payload-ordered mode without splitting the buffer across two impl blocks.
 // Every payload type in use is already `Ord`, so this constrains no caller.
-impl<P: Serialize + DeserializeOwned + Send + Ord> SortBuffer<P> {
+impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
     /// Field-ordered buffer: pairs sort by `sort_by` over each record's fields
     /// and the payload rides along inert. The historical mode; used by every
     /// source/output/DAG/join sort.
@@ -131,10 +151,14 @@ impl<P: Serialize + DeserializeOwned + Send + Ord> SortBuffer<P> {
         }
     }
 
-    /// Push a `(record, payload)` pair into the buffer.
+    /// Push a `(record, payload)` pair into the buffer. The payload's own heap
+    /// (its `HeapBytes`, e.g. a variable-length key) is charged alongside the
+    /// record so a wide-key payload is not undercounted.
     pub fn push(&mut self, record: Record, payload: P) {
-        let size =
-            std::mem::size_of::<Record>() + record.estimated_heap_size() + std::mem::size_of::<P>();
+        let size = std::mem::size_of::<Record>()
+            + record.estimated_heap_size()
+            + std::mem::size_of::<P>()
+            + payload.heap_bytes();
         self.bytes_used += size;
         self.total_rows += 1;
         self.pairs.push((record, payload));

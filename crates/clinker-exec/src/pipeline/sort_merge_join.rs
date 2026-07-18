@@ -1261,7 +1261,7 @@ fn checked_presorted_charge<P>(
 /// across budgets.
 fn sort_side_stream<P>(args: SideStreamBuild<'_, P>) -> Result<(SideStream<P>, u64), PipelineError>
 where
-    P: Serialize + DeserializeOwned + Send + Ord,
+    P: Serialize + DeserializeOwned + Send + Ord + crate::pipeline::sort_buffer::HeapBytes,
 {
     let SideStreamBuild {
         pairs,
