@@ -86,20 +86,28 @@
 //! fully-matching block routes nothing to the pile, so that term collapses to the
 //! block footprint (≤ `block_target`) rather than a full second cap, which is what
 //! lets a run whose true finalize peak is one cap plus a block complete instead of
-//! aborting for a cap it never uses. At end-of-join the piles
-//! convert to k-way mergers and stack with the output sort and the still-resident
-//! blocks; that finalize footprint is bounded by construction (the mergers are the
-//! same one-record-per-open-run primitive the drain phase already opens un-gated,
-//! and the resident sides plus three caps sum to ≤ `soft < hard` for the derived
-//! caps), not by a reservation. Each per-pair gate thus proves
-//! `phase_working_set + reservation ≤
+//! aborting for a cap it never uses. At end-of-join the piles convert to k-way
+//! mergers and stack with the output sort and the still-resident blocks; that
+//! finalize footprint is bounded by construction. Each pile's merger first folds
+//! its spilled runs down to a fixed merge fan-in before streaming (the bounded-k
+//! cascaded multi-pass merge, #868), so its open-run residency — loser-tree
+//! records and open readers — is capped by that fan-in no matter how many runs a
+//! pathologically fragmented pile produced, rather than scaling with the run
+//! count. The two finalize mergers plus the output sort (≤ its cap) and the
+//! resident sides (≤ the shared block budget) thus sum to a bounded stack under the
+//! derived caps. Each per-pair gate proves `phase_working_set + reservation ≤
 //! hard`; because every reserved buffer spills at its cap, the true phase-peak
 //! stays within `hard`, a provable bound rather than the earlier ~1.4×hard worst
-//! case. With
-//! every axis spill-bounded the operator keeps no global-pressure abort: the emit
-//! path polls no `should_abort`, so a handle transiently summing the input
-//! footprint plus the output sort's resident bytes is only ever an attribution
-//! reading, never an abort trigger.
+//! case. The per-pair EMIT loop keeps no global-pressure abort: it polls no
+//! `should_abort`, so a handle transiently summing the input footprint plus the
+//! output sort's resident bytes is only ever an attribution reading, never an abort
+//! trigger. The deferred-miss dispatch does run one `should_abort` backstop
+//! ([`poll_finalize_backstop`]) every
+//! [`MEMORY_CHECK_INTERVAL`](super::MEMORY_CHECK_INTERVAL) dispatched rows, but as
+//! defense-in-depth against a cross-consumer or host-RSS overrun surfacing during
+//! finalize — consistent with the global-pressure polls the engine's other spill
+//! operators run — NOT as the guard for the mergers' open-run residency, which the
+//! bounded-k fold-down already caps.
 
 use std::io;
 use std::path::Path;
@@ -112,6 +120,7 @@ use clinker_record::{Record, Schema};
 
 use cxl::eval::{EvalContext, ProgramEvaluator};
 
+use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss, PropagateCkSpec};
 use clinker_plan::error::PipelineError;
@@ -592,20 +601,6 @@ pub(super) fn execute_block_band(
         .unwrap_or_else(|| resident_budget_total(budget));
     let mut resident = ResidentBudget::new(resident_total);
 
-    // Schema the emitted output records carry, resolved before the drains
-    // consume `driver_records`: the combine's output schema when present, else
-    // the driver schema (the shape the body-less / no-output-schema synthetic
-    // step re-emits). Spilling output rows only happens on high-fan-out combines,
-    // which always carry an output schema, so the fallback backs only the
-    // never-spilling small cases and the header always matches the rows written.
-    let output_row_schema: Arc<Schema> = match output_schema {
-        Some(s) => Arc::clone(s),
-        None => match driver_records.first() {
-            Some((record, _)) => Arc::clone(record.schema()),
-            None => Arc::new(Schema::new(Vec::new())),
-        },
-    };
-
     // Driver record schema, captured before the drain consumes `driver_records`
     // and shared with it: the scan-phase and in-block zero-match buffers both hold
     // driver records and must decode them on reload exactly as the matched driver
@@ -615,6 +610,18 @@ pub(super) fn execute_block_band(
         Some((record, _)) => Arc::clone(record.schema()),
         None => Arc::new(Schema::new(Vec::new())),
     };
+
+    // Schema the emitted output records carry, resolved before the drains
+    // consume `driver_records`: the combine's output schema when present, else
+    // the driver schema (the shape the body-less / no-output-schema synthetic
+    // step re-emits). The empty / first-driver fallback reuses `driver_row_schema`
+    // so the derivation lives in one place and the two cannot silently diverge.
+    // Spilling output rows only happens on high-fan-out combines, which always
+    // carry an output schema, so the fallback backs only the never-spilling small
+    // cases and the header always matches the rows written.
+    let output_row_schema: Arc<Schema> = output_schema
+        .map(Arc::clone)
+        .unwrap_or_else(|| Arc::clone(&driver_row_schema));
 
     // Scan-phase unmatched drivers (NULL / non-orderable range key) are retained
     // — spilled to their own buffer during the drain — only when the run will
@@ -1022,11 +1029,14 @@ pub(super) fn execute_block_band(
     // finish_and_slice's single drain merger does, on top of the still-resident
     // sides and the output sort (≤ its cap). With the resident sides bounded by
     // the shared block budget and each cap derived at `soft / 4` (16 KiB floored),
-    // that stack fits under `soft < hard`. It is not gated because a static cap
-    // reservation over-states a merger holding only a few open runs (it would
-    // false-abort a tight-budget run whose actual finalize residency is a fraction
-    // of a cap), and the residual open-run cost of a pathologically fragmented
-    // pile is the shared merge primitive's, not specific to this path.
+    // that stack fits under `soft < hard`. It is not gated by a reservation because
+    // the bounded-k cascade (#868) already caps each merger's open-run residency at
+    // a fixed fan-in, folding a pathologically fragmented pile's runs down to that
+    // many before streaming: a static cap reservation would over-state a merger
+    // holding at most that many open runs and false-abort a tight-budget run whose
+    // actual finalize residency is a fraction of a cap. The deferred-miss dispatch
+    // still polls a global backstop (see `poll_finalize_backstop`) as
+    // defense-in-depth against pressure this operator does not itself own.
     let scan_stream = finish_unmatched_stream(scan_unmatched_buf, &drain_ctx)?;
     match match_mode {
         MatchMode::Collect => {
@@ -1602,6 +1612,7 @@ fn dispatch_deferred_misses(
 ) -> Result<(), PipelineError> {
     let mut scan_cur = scan_stream.next().transpose()?;
     let mut inblock_cur = inblock_stream.next().transpose()?;
+    let mut emitted_since_check = 0usize;
     loop {
         // Advance the front with the smaller driver index. Disjoint indices, so
         // the `<=` tie branch never actually ties an in-block index; consuming
@@ -1623,6 +1634,47 @@ fn dispatch_deferred_misses(
             }
             inblock_cur = inblock_stream.next().transpose()?;
         }
+        poll_finalize_backstop(cfg, &mut emitted_since_check)?;
+    }
+    Ok(())
+}
+
+/// Backstop the deferred-miss finalize against a global-pressure overshoot.
+///
+/// This finalize opens per-pile k-way mergers — two at once under First / All. The
+/// bounded-k cascade (#868) folds each pile's spilled runs down to a fixed fan-in
+/// before streaming, so a merger's own open-run residency (its loser-tree records
+/// and open readers) is capped by construction regardless of how fragmented the
+/// pile is; the local per-pair gates plus that fold-down already bound the
+/// operator's finalize footprint. This poll is not that bound — it is
+/// defense-in-depth. The rest of the block-band path answers pressure by spilling on
+/// its own byte thresholds and runs no global poll, but finalize dispatch can still
+/// meet memory pressure the operator does not itself own — a co-resident consumer's
+/// residency, or host RSS the byte-counted view does not fully capture — so poll the
+/// global ceiling here every [`MEMORY_CHECK_INTERVAL`](super::MEMORY_CHECK_INTERVAL)
+/// dispatched rows, matching the cadence the engine's other spill operators poll at.
+/// An overshoot then aborts cleanly with the typed diagnostic instead of allocating
+/// past the hard limit in silence. [`should_abort`](MemoryArbitrator::should_abort)
+/// trips on RSS OR the byte-counted consumer sum, so the guard still fires on a host
+/// where RSS cannot be measured.
+fn poll_finalize_backstop(
+    cfg: &EmitConfig<'_>,
+    emitted_since_check: &mut usize,
+) -> Result<(), PipelineError> {
+    *emitted_since_check += 1;
+    if *emitted_since_check >= super::MEMORY_CHECK_INTERVAL {
+        if cfg.budget.should_abort() {
+            return Err(PipelineError::MemoryBudgetExceeded {
+                node: cfg.name.to_string(),
+                used: cfg.budget.current_pressure(),
+                limit: cfg.budget.hard_limit(),
+                source: BudgetCategory::Arena,
+                detail: Some(
+                    "iejoin block-band deferred-miss finalize exceeded budget".to_string(),
+                ),
+            });
+        }
+        *emitted_since_check = 0;
     }
     Ok(())
 }
@@ -3304,6 +3356,165 @@ mod tests {
         );
     }
 
+    /// Fixed-usage consumer: reports `bytes` every arbitration round and never
+    /// spills, so a test can pin `sum_consumer_usage` above the hard limit
+    /// deterministically — the byte-counted abort arm, independent of host RSS.
+    struct PinnedConsumer {
+        bytes: u64,
+    }
+
+    impl crate::pipeline::memory::MemoryConsumer for PinnedConsumer {
+        fn current_usage(&self) -> u64 {
+            self.bytes
+        }
+        fn spill_priority(&self) -> i32 {
+            0
+        }
+        fn try_spill(
+            &self,
+            _target: u64,
+        ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+            Ok(0)
+        }
+        fn can_back_pressure(&self) -> bool {
+            false
+        }
+    }
+
+    /// Compile a constant-emit combine body into a `ProgramEvaluator`, so an
+    /// on_miss:null_fields dispatch emits a row (advancing the finalize poll
+    /// counter) without consulting the resolver.
+    fn constant_body() -> ProgramEvaluator {
+        use cxl::lexer::Span;
+        use cxl::parser::Parser;
+        use cxl::resolve::pass::resolve_program;
+        use cxl::typecheck::pass::type_check;
+        use cxl::typecheck::row::Row;
+        let parsed = Parser::parse("emit d_id = 0");
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        let resolved = resolve_program(parsed.ast, &["k1", "k2", "id"], parsed.node_count)
+            .unwrap_or_else(|d| panic!("resolve errors: {d:?}"));
+        let row = Row::closed(IndexMap::new(), Span::new(0, 0));
+        let typed = type_check(resolved, &row).unwrap_or_else(|d| panic!("type errors: {d:?}"));
+        ProgramEvaluator::new(Arc::new(typed), false)
+    }
+
+    #[test]
+    fn deferred_miss_finalize_backstop_aborts_cleanly_on_budget_breach() {
+        // The deferred-miss finalize opens a k-way merger per on-miss pile — two
+        // at once under First/All — whose open-run residency the strictly-local
+        // per-pair gates never reserve, so a fragmented pile can lift it toward the
+        // hard limit. This drives the exact driver-heavy-unmatched shape (every
+        // driver unmatched, so all route through the finalize dispatch) with the
+        // byte-counted abort arm already breached by a co-resident pinned consumer,
+        // and asserts the finalize backstop surfaces a clean typed
+        // MemoryBudgetExceeded rather than allocating past the ceiling in silence.
+        // The pinned charge drives `sum_consumer_usage` past `hard` with no real
+        // allocation, so the trigger is host-independent: it does not rely on the
+        // process RSS the other arm reads.
+
+        // 1 GiB hard limit sits above any host's test RSS, so the RSS arm of
+        // should_abort cannot trip; the registered pinned consumer alone pushes
+        // sum_consumer_usage past the ceiling.
+        let hard = 1u64 << 30;
+        let budget = arbitrator(hard);
+        budget.register_consumer(Arc::new(PinnedConsumer { bytes: hard + 1 }));
+        assert!(
+            budget.sum_consumer_usage() > budget.hard_limit(),
+            "test invariant: the pinned consumer must arm the byte-counted abort arm"
+        );
+        assert!(
+            budget.peak_rss().is_none_or(|rss| rss < hard),
+            "test invariant: host RSS must stay under the 1 GiB ceiling so only the \
+             byte-counted arm can trip the finalize backstop"
+        );
+
+        // Every driver is scan-phase unmatched (NULL range key); one more than a
+        // full MEMORY_CHECK_INTERVAL of them, so the finalize dispatch reaches its
+        // first poll. The build is immaterial — no driver enters a block.
+        let interval = crate::pipeline::iejoin::MEMORY_CHECK_INTERVAL;
+        let d_schema = driver_schema();
+        let b_schema = build_schema();
+        let out_schema = Arc::new(Schema::new(vec![
+            "d_k1".into(),
+            "d_k2".into(),
+            "d_id".into(),
+            "b_k1".into(),
+            "b_k2".into(),
+            "b_id".into(),
+        ]));
+        let driver: Side = (0..(interval as i64 + 1)).map(|i| (None, i)).collect();
+        let build: Side = vec![(Some((5, 5)), 100)];
+        let (driver_bare, driver_scans) = to_records_scans(&driver, &d_schema);
+        let driver_records: Vec<(Record, RecordOrder)> = driver_bare
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| (r, i as RecordOrder))
+            .collect();
+        let (build_records, build_scans) = to_records_scans(&build, &b_schema);
+
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let resolver = empty_resolver();
+        // The operator's own handle is unregistered, so only the pinned consumer
+        // feeds `sum_consumer_usage`; the trigger stays deterministic.
+        let consumer = ConsumerHandle::new();
+        let tmp = tempfile::Builder::new()
+            .prefix("iejoin-finalize-backstop-")
+            .tempdir()
+            .expect("temp dir");
+        let propagate = PropagateCkSpec::Driver;
+
+        let err = execute_block_band(BlockBandExec {
+            name: "finalize_backstop",
+            build_qualifier: "b",
+            driver_records,
+            driver_scans,
+            build_records,
+            build_scans,
+            op1: RangeOp::Le,
+            op2: Some(RangeOp::Ge),
+            residual_eval: None,
+            body_eval: Some(constant_body()),
+            resolver_mapping: &resolver,
+            output_schema: Some(&out_schema),
+            match_mode: MatchMode::All,
+            on_miss: OnMiss::NullFields,
+            propagate_ck: &propagate,
+            ctx: &ctx,
+            budget: &budget,
+            consumer: &consumer,
+            spill_dir: tmp.path(),
+            spill_compress: false,
+            strategy: ErrorStrategy::FailFast,
+            options: BlockBandOptions::default(),
+        })
+        .expect_err("the finalize backstop must abort when the ceiling is already breached");
+
+        match err {
+            PipelineError::MemoryBudgetExceeded {
+                detail,
+                source,
+                limit,
+                ..
+            } => {
+                assert_eq!(source, clinker_plan::BudgetCategory::Arena);
+                assert_eq!(limit, hard);
+                assert!(
+                    detail.as_deref().unwrap_or("").contains("finalize"),
+                    "abort must come from the deferred-miss finalize backstop; got {detail:?}"
+                );
+            }
+            other => {
+                panic!("expected MemoryBudgetExceeded from the finalize backstop; got {other:?}")
+            }
+        }
+    }
+
     #[test]
     fn all_unmatched_collect_streams_scan_phase_identically_across_budgets() {
         // Every driver is scan-phase unmatched; under Collect each emits one
@@ -3436,6 +3647,193 @@ mod tests {
         assert!(
             budget.cumulative_spill_bytes() > 0,
             "the 900-driver deferred pile must have reached disk, not stayed resident"
+        );
+    }
+
+    /// Compile a constant-marker combine body (`emit m = 1`) so an
+    /// on_miss:null_fields dispatch emits one row per unmatched driver while the
+    /// driver's own columns pass through `widen_record_to_schema` — letting a
+    /// test read each miss row's driver `id` back in emitted order.
+    fn marker_body() -> ProgramEvaluator {
+        use cxl::lexer::Span;
+        use cxl::parser::Parser;
+        use cxl::resolve::pass::resolve_program;
+        use cxl::typecheck::pass::type_check;
+        use cxl::typecheck::row::Row;
+        let parsed = Parser::parse("emit m = 1");
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        let resolved = resolve_program(parsed.ast, &["k1", "k2", "id"], parsed.node_count)
+            .unwrap_or_else(|d| panic!("resolve errors: {d:?}"));
+        let row = Row::closed(IndexMap::new(), Span::new(0, 0));
+        let typed = type_check(resolved, &row).unwrap_or_else(|d| panic!("type errors: {d:?}"));
+        ProgramEvaluator::new(Arc::new(typed), false)
+    }
+
+    /// Drive an all-unmatched null_fields shape and return the emitted rows plus
+    /// the arbitrator's cumulative spill. `sort_spill` fragments every sort buffer
+    /// (both on-miss piles and the output) into runs; a tiny value fans each pile
+    /// past the merge fan-in so the finalize mergers must fold down.
+    fn run_null_fields_frag(
+        driver: &Side,
+        build: &Side,
+        out_schema: &Arc<Schema>,
+        sort_spill: Option<usize>,
+        hard_limit: u64,
+    ) -> (Vec<Record>, u64) {
+        let d_schema = driver_schema();
+        let b_schema = build_schema();
+        let (driver_bare, driver_scans) = to_records_scans(driver, &d_schema);
+        let driver_records: Vec<(Record, RecordOrder)> = driver_bare
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| (r, i as RecordOrder))
+            .collect();
+        let (build_records, build_scans) = to_records_scans(build, &b_schema);
+
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let resolver = empty_resolver();
+        let consumer = ConsumerHandle::new();
+        let tmp = tempfile::Builder::new()
+            .prefix("iejoin-cascade-frag-")
+            .tempdir()
+            .expect("temp dir");
+        let propagate = PropagateCkSpec::Driver;
+        let budget = arbitrator(hard_limit);
+
+        let out = execute_block_band(BlockBandExec {
+            name: "cascade_frag",
+            build_qualifier: "b",
+            driver_records,
+            driver_scans,
+            build_records,
+            build_scans,
+            op1: RangeOp::Le,
+            op2: Some(RangeOp::Ge),
+            residual_eval: None,
+            body_eval: Some(marker_body()),
+            resolver_mapping: &resolver,
+            output_schema: Some(out_schema),
+            match_mode: MatchMode::All,
+            on_miss: OnMiss::NullFields,
+            propagate_ck: &propagate,
+            ctx: &ctx,
+            budget: &budget,
+            consumer: &consumer,
+            spill_dir: tmp.path(),
+            spill_compress: false,
+            strategy: ErrorStrategy::FailFast,
+            options: BlockBandOptions {
+                block_target_override: Some(256),
+                sort_spill_override: sort_spill,
+                resident_budget_override: None,
+            },
+        })
+        .expect("an all-unmatched null_fields shape must complete within budget");
+        assert!(
+            out.output_eval_failures.is_empty(),
+            "the constant-marker body never defers an eval failure"
+        );
+        let rows: Vec<Record> = drain_sorted(out.sorted)
+            .expect("drain the completed output")
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect();
+        (rows, budget.cumulative_spill_bytes())
+    }
+
+    #[test]
+    fn driver_heavy_both_piles_fragment_and_complete_via_cascade() {
+        // The driver-heavy-unmatched payoff for the bounded-k finalize merge
+        // (#868). Even-index drivers carry a NULL range key (the scan-phase pile);
+        // odd-index drivers carry an orderable key outside every build range (the
+        // in-block pile). Under match:all + on_miss:null_fields BOTH piles fill,
+        // and at finalize the two convert to k-way mergers streamed in one
+        // interleaved driver-index order. A 64-byte sort threshold fans each pile
+        // into hundreds of spilled runs — far past the merge fan-in
+        // (`MERGE_FAN_IN` = 64) — so opening every run at once (the pre-cascade
+        // behavior) would exhaust file descriptors or overshoot memory. The cascade
+        // folds each pile down to the fan-in before streaming, so the run
+        // COMPLETES; its output must be byte-identical to the same run under a
+        // roomy, non-spilling budget — the determinism-across-budgets contract,
+        // here across the fold-down.
+        const N: i64 = 600;
+        let driver: Side = (0..N)
+            .map(|i| {
+                if i % 2 == 0 {
+                    (None, i) // scan-phase pile: NULL range key, never enters a block
+                } else {
+                    // in-block pile: orderable, but out of every build range
+                    (Some((1_000_000 + i, 1_000_000 + i)), i)
+                }
+            })
+            .collect();
+        // Build ranges every orderable driver misses on the primary axis (Le:
+        // driver k1 ≤ 5 is false for the million-scale keys). No driver matches, so
+        // all N route through the deferred on-miss finalize.
+        let build: Side = vec![(Some((5, 5)), 100), (Some((6, 4)), 101)];
+        assert!(
+            oracle_pairs(&driver, &build, TOp::Le, Some(TOp::Ge)).is_empty(),
+            "the fixture must be all-unmatched so every driver reaches the finalize dispatch"
+        );
+        // Driver columns pass through `widen_record_to_schema`, so keep `id` in the
+        // output schema to read each miss row's driver identity back; `m` carries
+        // the constant marker the null_fields body stamps.
+        let out_schema = Arc::new(Schema::new(vec![
+            "k1".into(),
+            "k2".into(),
+            "id".into(),
+            "m".into(),
+        ]));
+
+        // Reference: a roomy budget with no spill override keeps every pile
+        // resident.
+        let (resident_rows, resident_spill) =
+            run_null_fields_frag(&driver, &build, &out_schema, None, 1 << 30);
+        // Fragmented: the tiny threshold spills each pile into hundreds of runs
+        // under the same roomy hard limit, so completion is the cascade fold-down's
+        // doing, not a looser budget.
+        let (frag_rows, frag_spill) =
+            run_null_fields_frag(&driver, &build, &out_schema, Some(64), 1 << 30);
+
+        assert_eq!(resident_spill, 0, "the roomy reference must not spill");
+        assert!(
+            frag_spill > 0,
+            "the fragmented run must spill both piles and the output to disk"
+        );
+
+        let ids = |rows: &[Record]| -> Vec<i64> {
+            rows.iter()
+                .map(|r| {
+                    assert_eq!(
+                        int(r.get("m")),
+                        1,
+                        "every emitted row must be a null_fields miss row"
+                    );
+                    int(r.get("id"))
+                })
+                .collect()
+        };
+        let resident_ids = ids(&resident_rows);
+        let frag_ids = ids(&frag_rows);
+        assert_eq!(
+            resident_ids.len(),
+            N as usize,
+            "match:all null_fields emits exactly one row per unmatched driver"
+        );
+        assert_eq!(
+            resident_ids,
+            (0..N).collect::<Vec<_>>(),
+            "misses must emit in ascending driver-input-index order"
+        );
+        assert_eq!(
+            resident_ids, frag_ids,
+            "the fold-down through the bounded-k cascade must not change the emitted \
+             order or drop / duplicate any miss row"
         );
     }
 
