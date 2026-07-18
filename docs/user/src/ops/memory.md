@@ -48,17 +48,19 @@ pipeline:
     limit: "512M"
 ```
 
-When `--memory-limit` is passed it overrides `pipeline.memory.limit` for that run; omit the flag and the YAML value applies unchanged, falling back to the 512 MB default only when neither is set. Suffixes are **binary (1024-based)**: `K` = 1024 bytes, `M` = 1024², `G` = 1024³; a bare integer is bytes. (This differs from the **decimal** `KB`/`MB`/`GB` used by `min_size`/`max_size`, which are 1000-based.)
+When `--memory-limit` is passed it overrides `pipeline.memory.limit` for that run; omit the flag and the YAML value applies unchanged, falling back to the 512 MB default only when neither is set. An empty or whitespace-only flag value — as an ops wrapper produces when it forwards an unset variable, so `--memory-limit "$CLINKER_MEM"` expands to `--memory-limit ""` — is treated exactly like omitting the flag: the YAML value (or default) applies, rather than the run aborting. Suffixes are **binary (1024-based)**: `K` = 1024 bytes, `M` = 1024², `G` = 1024³; a bare integer is bytes. (This differs from the **decimal** `KB`/`MB`/`GB` used by `min_size`/`max_size`, which are 1000-based.)
 
 **Default:** 512 MB.
 
 **Invalid values:** the two entry points treat a malformed limit differently.
 An empty or unparseable `memory.limit` *in the YAML* (for example a stray
-non-numeric value) falls back to the 512 MB default. A malformed
+non-numeric value) falls back to the 512 MB default. A *non-empty* malformed
 `--memory-limit` *flag*, by contrast, is rejected up front with a config error
 that names `--memory-limit` and echoes the value you passed — so a typo such as
 the decimal `4GB` (the binary suffix is `4G`) fails loudly instead of silently
-collapsing to the default and shrinking a larger budget set in your YAML.
+collapsing to the default and shrinking a larger budget set in your YAML. (An
+empty or whitespace-only flag value is not malformed: it is treated as if the
+flag were omitted, as noted above.)
 Either way, a value whose size is well-formed but too large to represent — its
 scaled byte count exceeds the maximum a 64-bit counter can hold — is rejected
 rather than wrapping to a small budget (the YAML overflow error names

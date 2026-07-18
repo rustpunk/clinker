@@ -197,3 +197,35 @@ fn malformed_memory_limit_flag_fails_at_the_boundary_without_clobbering_yaml() {
         // rejected at the boundary rather than coerced into a budget.
     }
 }
+
+#[test]
+fn empty_memory_limit_flag_is_treated_as_unset() {
+    // An ops wrapper such as `clinker run --memory-limit "$CLINKER_MEM" pipeline.yaml`
+    // expands an unset variable to `--memory-limit ""`. An empty (or
+    // whitespace-only) flag value must be treated as absent — the run falls back
+    // to the YAML budget and completes — never rejected as an invalid budget the
+    // way a non-empty malformed value is.
+    let tmp = pipeline_with_limit("256M");
+
+    for empty in ["", "   "] {
+        let output = Command::new(clinker_bin())
+            .arg("run")
+            .arg("pipeline.yaml")
+            .arg("--memory-limit")
+            .arg(empty)
+            .current_dir(tmp.path())
+            .output()
+            .expect("spawn clinker");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "an empty --memory-limit {empty:?} must fall back to the YAML budget and \
+             succeed, not abort; stderr:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("--memory-limit"),
+            "an empty flag value must not surface the invalid-budget abort that names \
+             the flag; got:\n{stderr}"
+        );
+    }
+}
