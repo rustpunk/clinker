@@ -63,6 +63,7 @@ use crate::pipeline::memory::NoOpPolicy;
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use crate::pipeline::spill_merge::{MergeBudget, SortedRunMerger};
+use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::combine::{DecomposedPredicate, RangeOp};
@@ -72,6 +73,15 @@ use clinker_plan::plan::combine::{DecomposedPredicate, RangeOp};
 /// `pipeline::grace_hash` so every code path truncates at the same
 /// threshold.
 const COLLECT_PER_GROUP_CAP: usize = 10_000;
+
+/// Emitted-row period between global [`MemoryArbitrator::should_abort`] polls
+/// during the merge walk. The self-spilling output sort is the primary bound on
+/// this operator's own residency; this poll is the last-resort defense that
+/// catches cross-consumer or under-counted global pressure the output sort
+/// cannot see — the same cadence `pipeline::grace_hash` and `pipeline::combine`
+/// use. `should_abort` trips on either RSS or the byte-counted consumer sum, so
+/// the backstop still fires on targets where RSS is unmeasurable.
+const MEMORY_CHECK_INTERVAL: usize = 10_000;
 
 /// Per-side external-sort spill threshold in bytes: half the soft RSS limit,
 /// floored at 16 KiB so tests with tiny budgets still exercise the spill path.
@@ -94,15 +104,19 @@ pub(crate) type RecordOrder = u64;
 /// and its unique global input index.
 type WindowEntry = (Record, Value, u64);
 
-/// Shared spill / charge context for a [`MatchWindow`] mutation. Bundled so the
-/// window methods stay under clippy's argument cap and every spill charges disk
-/// and memory identically.
+/// Shared spill / charge context for a [`MatchWindow`] mutation and the output
+/// sink. Bundled so the window methods stay under clippy's argument cap and
+/// every spill charges disk and memory identically.
 struct MergeSpill<'a> {
     name: &'a str,
     spill_dir: &'a Path,
     spill_compress: bool,
     budget: &'a MemoryArbitrator,
     consumer: &'a Arc<crate::pipeline::memory::ConsumerHandle>,
+    /// Emitted rows since the last global memory backstop poll. Interior
+    /// mutability because the sink borrows `MergeSpill` shared; the walk is
+    /// single-threaded so a `Cell` suffices.
+    emitted_since_check: std::cell::Cell<usize>,
 }
 
 /// A sealed [`MatchWindow`] segment: resident entries, or a spilled
@@ -192,12 +206,7 @@ impl MatchWindow {
     /// would exceed `byte_limit`, spills the most-recently-sealed resident
     /// segment to disk and charges the written bytes against the disk quota,
     /// aborting with `SpillCapExceeded` on overflow.
-    fn push_back(
-        &mut self,
-        entry: WindowEntry,
-        ctx: &MergeSpill<'_>,
-        spill_seq: &mut u32,
-    ) -> Result<(), PipelineError> {
+    fn push_back(&mut self, entry: WindowEntry, ctx: &MergeSpill<'_>) -> Result<(), PipelineError> {
         if self.schema.is_none() {
             self.schema = Some(Arc::clone(entry.0.schema()));
         }
@@ -213,7 +222,7 @@ impl MatchWindow {
             self.segments.push_back(WindowSegment::Resident(sealed));
         }
         while self.charged > self.byte_limit as u64 {
-            if !self.spill_one_resident(ctx, spill_seq)? {
+            if !self.spill_one_resident(ctx)? {
                 break;
             }
         }
@@ -224,11 +233,7 @@ impl MatchWindow {
     /// when no resident segment remains. Writes only the segment's undropped
     /// entries (past `head_off` for a resident head) and rewinds `head_off`,
     /// since the spilled run holds only live entries.
-    fn spill_one_resident(
-        &mut self,
-        ctx: &MergeSpill<'_>,
-        _spill_seq: &mut u32,
-    ) -> Result<bool, PipelineError> {
+    fn spill_one_resident(&mut self, ctx: &MergeSpill<'_>) -> Result<bool, PipelineError> {
         let Some(idx) = self
             .segments
             .iter()
@@ -912,7 +917,6 @@ fn execute_combine_sort_merge_with_stats(
     // Match-window byte threshold: soft_limit / 4 (SPARK-13450 / DataFusion
     // convention), floored at 16 KiB so tiny-budget tests still exercise spill.
     let byte_limit: usize = std::cmp::max(16 * 1024, (budget.soft_limit() / 4) as usize);
-    let mut spill_seq: u32 = 0;
 
     // ── Phase A: bound each side for the streaming windowed merge. The driver
     //    becomes a single-pass ascending stream and the build a single-pass
@@ -931,7 +935,7 @@ fn execute_combine_sort_merge_with_stats(
         spill_dir,
         presorted,
     })?;
-    let build_cursor = build_cursor_from_pairs(BuildCursorBuild {
+    let (build_cursor, build_resident_charge) = build_cursor_from_pairs(BuildCursorBuild {
         pairs: build_pairs,
         name,
         range_field: &build_field,
@@ -990,6 +994,7 @@ fn execute_combine_sort_merge_with_stats(
         spill_compress,
         budget,
         consumer: &consumer_handle,
+        emitted_since_check: std::cell::Cell::new(0),
     };
 
     // The matching set for one driver is a contiguous prefix (`>=` / `>`: build
@@ -999,6 +1004,16 @@ fn execute_combine_sort_merge_with_stats(
     // ops also front-drop builds that fall below the current driver.
     let is_suffix = matches!(op, RangeOp::Lt | RangeOp::Le);
     let mut window = MatchWindow::new(byte_limit);
+    // A resident (`InMemory`) build cursor holds every build row in RAM upfront,
+    // charged as `build_resident_charge`; a spilled cursor streams one record per
+    // open run and is not pre-charged. For the resident case the charge is handed
+    // off row by row: each pull discharges the pulled build here and the window
+    // re-charges it in `push_back`, so a byte-counting arbitrator always sees the
+    // build exactly once — in the cursor before the pull, in the window after —
+    // never twice and never zero. `build_charge` tracks the still-resident,
+    // not-yet-pulled remainder, discharged once the walk ends.
+    let build_charge_tracked = matches!(build_cursor, BuildCursor::InMemory(_));
+    let mut build_charge = build_resident_charge;
     let mut build_iter = build_cursor;
     // One-record lookahead: a build that does not yet match the current driver
     // (prefix ops) waits here for a later, larger-key driver rather than dropping.
@@ -1023,6 +1038,14 @@ fn execute_combine_sort_merge_with_stats(
             if pending_build.is_none() {
                 match build_iter.next() {
                     Some(Ok(b)) => {
+                        if build_charge_tracked {
+                            // Ownership of this build's bytes moves from the
+                            // resident cursor to the window (or is freed on a
+                            // non-match); discharge the cursor's share here.
+                            let b_bytes = MatchWindow::entry_bytes(&b) as u64;
+                            consumer_handle.sub_bytes(b_bytes);
+                            build_charge = build_charge.saturating_sub(b_bytes);
+                        }
                         pending_build = Some(b);
                         stats.build_pulls += 1;
                     }
@@ -1035,7 +1058,7 @@ fn execute_combine_sort_merge_with_stats(
                 apply_op(&driver_key, op, bk)
             };
             if matches {
-                window.push_back(pending_build.take().unwrap(), &mspill, &mut spill_seq)?;
+                window.push_back(pending_build.take().unwrap(), &mspill)?;
             } else if is_suffix {
                 // Below the suffix: never matches this or any later driver — skip.
                 pending_build = None;
@@ -1063,11 +1086,14 @@ fn execute_combine_sort_merge_with_stats(
         })?;
     }
 
-    // The window's in-memory residency and any resident-driver charge were
-    // mirrored into the shared consumer handle for the walk's duration;
-    // discharge both now the walk is done.
+    // The window's in-memory residency, any resident-driver charge, and the
+    // still-resident (never-pulled) tail of a resident build cursor were mirrored
+    // into the shared consumer handle for the walk's duration; discharge them all
+    // now the walk is done. `build_charge` is zero for a spilled or exhausted
+    // cursor.
     consumer_handle.sub_bytes(window.charged_bytes());
     consumer_handle.sub_bytes(driver_charge);
+    consumer_handle.sub_bytes(build_charge);
     if window.spilled {
         stats.matching_run_spills = 1;
     }
@@ -1380,7 +1406,16 @@ struct BuildCursorBuild<'a> {
 /// exactly once. An expression range axis (no simple field, pre-sorted only)
 /// keeps its pre-extracted keys resident because the key cannot be re-read from
 /// a record column.
-fn build_cursor_from_pairs(args: BuildCursorBuild<'_>) -> Result<BuildCursor, PipelineError> {
+///
+/// Returns the resident-byte charge mirrored into the consumer handle alongside
+/// the cursor: nonzero only for an `InMemory` cursor that holds every build row
+/// in RAM (so a byte-counting arbitrator sees the resident build, symmetric with
+/// the driver stream), zero for a spilled cursor that streams from disk. The
+/// caller hands this charge off row by row as it pulls and discharges the
+/// remainder when the walk ends.
+fn build_cursor_from_pairs(
+    args: BuildCursorBuild<'_>,
+) -> Result<(BuildCursor, u64), PipelineError> {
     let BuildCursorBuild {
         pairs,
         name,
@@ -1393,7 +1428,7 @@ fn build_cursor_from_pairs(args: BuildCursorBuild<'_>) -> Result<BuildCursor, Pi
     } = args;
 
     if pairs.is_empty() {
-        return Ok(BuildCursor::InMemory(Vec::new().into_iter()));
+        return Ok((BuildCursor::InMemory(Vec::new().into_iter()), 0));
     }
     let entry_bytes = |record: &Record| -> u64 {
         (std::mem::size_of::<Record>()
@@ -1426,7 +1461,9 @@ fn build_cursor_from_pairs(args: BuildCursorBuild<'_>) -> Result<BuildCursor, Pi
                 .all(|w| cmp_range_keys(&w[0].1, &w[1].1) != Ordering::Greater),
             "presorted build pairs are not in ascending range-key order"
         );
-        return Ok(BuildCursor::InMemory(pairs.into_iter()));
+        let charged: u64 = pairs.iter().map(|(r, _, _)| entry_bytes(r)).sum();
+        consumer_handle.add_bytes(charged);
+        return Ok((BuildCursor::InMemory(pairs.into_iter()), charged));
     };
 
     if presorted {
@@ -1438,8 +1475,10 @@ fn build_cursor_from_pairs(args: BuildCursorBuild<'_>) -> Result<BuildCursor, Pi
         );
         let total: u64 = pairs.iter().map(|(r, _, _)| entry_bytes(r)).sum();
         if total <= spill_threshold as u64 {
-            // Fits budget: stream in place — no redundant stable sort.
-            return Ok(BuildCursor::InMemory(pairs.into_iter()));
+            // Fits budget: stream in place — no redundant stable sort. Keep it
+            // charged so the resident build stays visible to the arbitrator.
+            consumer_handle.add_bytes(total);
+            return Ok((BuildCursor::InMemory(pairs.into_iter()), total));
         }
         // Over budget: fall through to the spillable sort (stable no-op on
         // already-ascending input) so the build spills instead of holding whole.
@@ -1494,8 +1533,9 @@ fn build_cursor_from_pairs(args: BuildCursorBuild<'_>) -> Result<BuildCursor, Pi
             budget.cumulative_spill_bytes(),
         ));
     }
-    // The window re-charges the resident matching set as it pulls, so net the
-    // transient sort charge to zero to avoid double-counting.
+    // Net the transient sort-buffer charge to zero; each terminal branch below
+    // then charges only what it actually holds resident (nothing, for a spilled
+    // cursor whose records live on disk).
     consumer_handle.sub_bytes(local_charged);
     match sorted {
         SortedOutput::InMemory(out) => {
@@ -1504,7 +1544,12 @@ fn build_cursor_from_pairs(args: BuildCursorBuild<'_>) -> Result<BuildCursor, Pi
                 let key = record.get(field).cloned().unwrap_or(Value::Null);
                 v.push((record, key, build_idx));
             }
-            Ok(BuildCursor::InMemory(v.into_iter()))
+            // Records stay resident in `v` until the walk pulls them; charge them
+            // with the window's per-entry metric so each pull discharges exactly
+            // what was charged and the not-yet-pulled remainder nets clean.
+            let charged: u64 = v.iter().map(|(r, _, _)| entry_bytes(r)).sum();
+            consumer_handle.add_bytes(charged);
+            Ok((BuildCursor::InMemory(v.into_iter()), charged))
         }
         SortedOutput::Spilled(files) => {
             let merge_field = clinker_plan::config::SortField {
@@ -1522,10 +1567,13 @@ fn build_cursor_from_pairs(args: BuildCursorBuild<'_>) -> Result<BuildCursor, Pi
                     compress: spill_compress,
                 },
             )?;
-            Ok(BuildCursor::Spilled {
-                merger,
-                field: field.clone(),
-            })
+            Ok((
+                BuildCursor::Spilled {
+                    merger,
+                    field: field.clone(),
+                },
+                0,
+            ))
         }
     }
 }
@@ -1597,6 +1645,27 @@ fn push_output_row(
                 mspill.budget.cumulative_spill_bytes(),
             ));
         }
+    }
+
+    // Global memory backstop. The self-spilling output sort above bounds this
+    // operator's own residency, but it cannot see memory other consumers hold
+    // nor a Record heap the estimator under-counts. Every `MEMORY_CHECK_INTERVAL`
+    // emitted rows, poll the arbitrator's global hard-limit gate so a genuine
+    // over-budget condition surfaces as a typed abort rather than an OS OOM.
+    let emitted = mspill.emitted_since_check.get() + 1;
+    if emitted >= MEMORY_CHECK_INTERVAL {
+        mspill.emitted_since_check.set(0);
+        if mspill.budget.should_abort() {
+            return Err(PipelineError::MemoryBudgetExceeded {
+                node: mspill.name.to_string(),
+                used: mspill.budget.current_pressure(),
+                limit: mspill.budget.hard_limit(),
+                source: BudgetCategory::Arena,
+                detail: Some("sort-merge output-axis global memory backstop".to_string()),
+            });
+        }
+    } else {
+        mspill.emitted_since_check.set(emitted);
     }
     Ok(())
 }
@@ -2382,6 +2451,17 @@ mod tests {
     fn run_kernel_result(
         rk: RunKernel<'_>,
     ) -> Result<(Vec<(Record, RecordOrder)>, SortMergeStats), PipelineError> {
+        run_kernel_result_pinned(rk, None)
+    }
+
+    /// [`run_kernel_result`] with an optional co-resident consumer pinned to a
+    /// fixed byte count and registered with the arbitrator, so the global memory
+    /// backstop can be driven through the host-independent byte-counted arm of
+    /// `should_abort` rather than the test process's real RSS.
+    fn run_kernel_result_pinned(
+        rk: RunKernel<'_>,
+        pinned_consumer_bytes: Option<u64>,
+    ) -> Result<(Vec<(Record, RecordOrder)>, SortMergeStats), PipelineError> {
         let resolver_mapping = make_test_resolver_mapping(
             rk.driver_qual,
             rk.driver_schema,
@@ -2401,6 +2481,14 @@ mod tests {
                 Box::new(NoOpPolicy),
             ),
         };
+        // A co-resident consumer pinned to a fixed byte count, registered so its
+        // usage sums into `should_abort`'s byte-counted arm. The arbitrator keeps
+        // the `Arc` alive in its consumer list for the run's duration.
+        if let Some(bytes) = pinned_consumer_bytes {
+            let pinned = crate::pipeline::memory::ConsumerHandle::new();
+            pinned.add_bytes(bytes);
+            budget.register_consumer(Arc::new(SortMergeConsumer::new(pinned)));
+        }
         let dir = tempfile::Builder::new()
             .prefix("sm-test-")
             .tempdir()
@@ -3314,8 +3402,14 @@ mod tests {
         let drivers_schema = schema_with(&["k"]);
         let builds_schema = schema_with(&["k", "pad"]);
         let pad = "w".repeat(256);
+        // Many drivers relative to builds is the point — `build_pulls` must equal
+        // `n_build`, not `n_build * n_driver`. `n_build` stays high enough (wide
+        // `pad`) to overflow the phase A spill threshold, yet the `i < j` match
+        // count `(n_build-1)*n_build/2` = 7140 sits under the `MEMORY_CHECK_INTERVAL`
+        // emitted-row backstop, so the tight budget exercises the spilled merge
+        // without tripping the global abort on the test process's baseline RSS.
         let n_driver = 400i64;
-        let n_build = 200i64;
+        let n_build = 120i64;
         // Interleaved keys keep the result neither empty nor a full cross-product.
         let driver: Vec<(Record, RecordOrder)> = (0..n_driver)
             .map(|i| {
@@ -3461,9 +3555,12 @@ mod tests {
         let drivers_schema = schema_with(&["k", "builds"]);
         let builds_schema = schema_with(&["k", "b"]);
         // Every driver (key 0) matches every build (key 1000): a permissive
-        // predicate making each collect array non-empty. More than one poll
-        // interval of drivers so the every-10K output poll fires.
-        let n_drivers = 12_000usize;
+        // predicate making each collect array non-empty. Kept under the
+        // `MEMORY_CHECK_INTERVAL` emitted-row backstop so this tight-budget run
+        // demonstrates the output self-spill in isolation — the global abort
+        // backstop (which trips on the test process's own baseline RSS at a
+        // sub-baseline budget) is exercised separately by the backstop test.
+        let n_drivers = 8_000usize;
         let driver: Vec<(Record, RecordOrder)> = (0..n_drivers)
             .map(|i| {
                 (
@@ -3525,6 +3622,101 @@ mod tests {
                     assert_eq!(a.len(), 4, "each driver collects all 4 builds")
                 }
                 other => panic!("collect row must carry a 4-element array; got {other:?}"),
+            }
+        }
+    }
+
+    /// The self-spilling output sort bounds this operator's own residency, but a
+    /// global over-budget condition driven by *another* consumer's memory (or a
+    /// Record heap the estimator under-counts) is invisible to it. The merge walk
+    /// polls the arbitrator's global hard-limit gate every `MEMORY_CHECK_INTERVAL`
+    /// emitted rows so such a breach surfaces as a clean typed
+    /// `MemoryBudgetExceeded`, never an OS OOM. A co-resident consumer pinned
+    /// above the hard limit trips the byte-counted arm of `should_abort` — host
+    /// independent, with no reliance on the test process's real RSS — while an
+    /// otherwise-identical run without it completes, proving the poll neither
+    /// spuriously aborts nor misses the breach.
+    #[test]
+    fn test_sort_merge_output_backstop_aborts_on_global_pressure() {
+        let drivers_schema = schema_with(&["k"]);
+        let builds_schema = schema_with(&["k"]);
+        // One build above every driver key: under `drivers.k < builds.k` every
+        // driver matches the single build, so `match: all` emits one row per
+        // driver. More than `MEMORY_CHECK_INTERVAL` drivers so the walk polls the
+        // backstop at least once.
+        let n_drivers = MEMORY_CHECK_INTERVAL + 1_000;
+        let build = vec![rec(&builds_schema, vec![Value::Integer(5_000_000)])];
+        let make_drivers = || {
+            (0..n_drivers)
+                .map(|i| {
+                    (
+                        rec(&drivers_schema, vec![Value::Integer(i as i64)]),
+                        i as RecordOrder,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let compile = || {
+            let typed = compile_pure_range(
+                "filter drivers.k < builds.k",
+                &[
+                    ("drivers", "k", cxl::typecheck::Type::Int),
+                    ("builds", "k", cxl::typecheck::Type::Int),
+                ],
+            );
+            let rc = extract_range_conjunct(&typed, "drivers", "builds");
+            decomposed_pure_range(rc, Arc::clone(&typed))
+        };
+        // A hard limit far above any plausible test-process RSS, so `should_abort`
+        // can only trip through the byte-counted consumer sum, never real RSS.
+        let hard = 8u64 * 1024 * 1024 * 1024;
+        let run = |pinned: Option<u64>| {
+            run_kernel_result_pinned(
+                RunKernel {
+                    driver_records: make_drivers(),
+                    build_records: build.clone(),
+                    decomposed: compile(),
+                    driver_qual: "drivers",
+                    build_qual: "builds",
+                    driver_schema: &drivers_schema,
+                    build_schema: &builds_schema,
+                    match_mode: MatchMode::All,
+                    on_miss: OnMiss::Skip,
+                    presorted: true,
+                    body_program: None,
+                    budget_bytes: Some(hard),
+                },
+                pinned,
+            )
+        };
+
+        // Control: no external pressure — the walk polls the backstop but the
+        // arbitrator is under budget, so it completes and emits one row per driver.
+        let (records, _stats) =
+            run(None).expect("without external pressure the backstop must not abort");
+        assert_eq!(
+            records.len(),
+            n_drivers,
+            "the unpressured walk emits one row per driver"
+        );
+
+        // Pin a consumer above the hard limit: the byte-counted arm of
+        // `should_abort` trips at the first poll and the walk aborts cleanly.
+        let err = run(Some(hard + 64 * 1024))
+            .expect_err("a co-resident consumer over the hard limit must abort the walk");
+        match err {
+            PipelineError::MemoryBudgetExceeded {
+                node,
+                limit,
+                source,
+                ..
+            } => {
+                assert_eq!(node, "sm_test");
+                assert_eq!(limit, hard);
+                assert_eq!(source, BudgetCategory::Arena);
+            }
+            other => {
+                panic!("the global backstop must surface MemoryBudgetExceeded; got {other:?}")
             }
         }
     }
