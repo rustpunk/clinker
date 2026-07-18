@@ -84,7 +84,12 @@ pub(crate) struct MergeBudget<'a> {
     /// Disk-spill accountant. Every intermediate run is charged against this
     /// exactly like the caller's own spills, so a cascade that writes past
     /// `storage.spill.disk_cap_bytes` aborts with the same `SpillCapExceeded`
-    /// (E320) surface rather than silently writing over quota.
+    /// (E320) surface rather than silently writing over quota. As each group's
+    /// input runs unlink, their charge is released, so the accountant tracks the
+    /// bytes concurrently on disk — the cascade's transient re-writes do not
+    /// inflate the quota counter. The cascade's inputs must have been charged
+    /// against `node` (the operator's own spills are; a prior-pass intermediate
+    /// is charged here), so releasing them balances the charge exactly.
     pub(crate) budget: &'a MemoryArbitrator,
     /// The spilling node's name, so an intermediate run's bytes attribute to
     /// the right stage in the per-stage breakdown and name the E320 diagnostic.
@@ -339,6 +344,17 @@ impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
 ///
 /// Termination: each pass with `len > fan_in` replaces the list with
 /// `ceil(len / fan_in)` runs, which is strictly smaller for `fan_in >= 2`.
+///
+/// Peak spill disk: a pass writes each group's output run while that group's own
+/// input runs are still on disk (they unlink only once the group is fully
+/// consumed), so the cascade's peak on-disk footprint is the original spill plus
+/// roughly one fan-in group of intermediates — an increase inherent to any
+/// multi-pass merge and the price of bounding open descriptors and residency to
+/// `O(fan_in)` regardless of run count. It is kept to ~one group by unlinking
+/// each group's inputs the moment they are consumed rather than at pass end;
+/// [`merge_group`] releases their disk-cap charge on the same boundary, so the
+/// concurrent footprint is what `storage.spill.disk_cap_bytes` bounds (E320) and
+/// the physical volume backstops (E321 on `ENOSPC`).
 fn reduce_to_fan_in<P: Serialize + DeserializeOwned + Ord>(
     files: Vec<SpillFile<P>>,
     ordering: &RunOrdering,
@@ -369,12 +385,18 @@ fn reduce_to_fan_in<P: Serialize + DeserializeOwned + Ord>(
 }
 
 /// Merge one contiguous group of `2..=fan_in` sorted runs into a single new
-/// spilled run and charge its on-disk bytes against the disk-spill quota exactly
-/// as the caller's own spills are charged — surfacing `SpillCapExceeded` (E320)
-/// when this write pushes the cumulative total past the cap. Streams straight
-/// from the loser tree into the writer, so it holds one resident record per open
-/// run — `O(group.len())`. The group's input `SpillFile`s drop at return,
-/// unlinking their temp files, so a cascade never leaks its consumed runs.
+/// spilled run, streaming through the shared [`SortedRunMerger`] rather than a
+/// second hand-rolled loser-tree drain, so a cascaded intermediate run and the
+/// final pass order records through the one merge implementation — the tie-break
+/// cannot drift between them.
+///
+/// Disk accounting bounds *concurrent* on-disk spill: the new run's on-disk
+/// bytes are charged exactly as the caller's own spills are (surfacing
+/// `SpillCapExceeded` (E320) when this write pushes the total, with the consumed
+/// inputs still counted, past the cap), and the consumed inputs — unlinked as
+/// the merger drops — have their charge released, so a cascade's transient
+/// re-writes net to zero instead of piling a monotonic sum onto the quota
+/// counter. Holds one resident record per open run — `O(group.len())`.
 fn merge_group<P: Serialize + DeserializeOwned + Ord>(
     group: Vec<SpillFile<P>>,
     ordering: &RunOrdering,
@@ -386,42 +408,33 @@ fn merge_group<P: Serialize + DeserializeOwned + Ord>(
     // caller's runs already live on, so a cascade never crosses onto a different
     // device or escapes the run's spill root.
     let spill_dir = group[0].path().parent().map(Path::to_path_buf);
-
-    let mut readers: Vec<SpillReader<P>> = group
-        .iter()
-        .map(|f| f.reader())
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| {
-            PipelineError::Io(std::io::Error::other(format!(
-                "{context}: spill run open failed during k-way merge: {e}"
-            )))
-        })?;
-
-    let mut initial: Vec<Option<Run<P>>> = Vec::with_capacity(readers.len());
-    for reader in &mut readers {
-        initial.push(next_run(reader, ordering, context)?);
-    }
-    let mut tree = LoserTree::new(initial);
+    // Sum the inputs' charged on-disk bytes while the group is still in hand;
+    // released below once they unlink so the disk-cap counter drops back to what
+    // remains on disk.
+    let input_bytes: u64 = group.iter().map(SpillFile::bytes).sum();
+    // `group.len() <= fan_in` (they are equal here), so `open` performs no
+    // further reduction and writes no runs of its own — it just streams this
+    // group through the loser tree. No unbounded recursion: the inner
+    // `reduce_to_fan_in` returns immediately.
+    let fan_in = group.len();
 
     // Intermediate-run write faults keep their structured `SpillError`, so an
     // `ENOSPC` mid-cascade still surfaces as `DiskFull` (E321) and a vanished
     // spill dir as `DirUnavailable`, rather than flattening into a generic `Io`.
     let mut writer = SpillWriter::<P>::new(schema, spill_dir.as_deref(), budget.compress)
         .map_err(PipelineError::from)?;
-    while tree.winner().is_some() {
-        let idx = tree.winner_index();
-        // Refill before extracting, exactly as the streaming iterator does: the
-        // reader position is independent of the tree cursor, so this reads the
-        // winner's successor.
-        let refill = next_run(&mut readers[idx], ordering, context)?;
-        let winner = tree
-            .take_winner(refill)
-            .expect("winner present under the winner() guard");
+    let merger = SortedRunMerger::open(group, ordering.clone(), context, *budget, fan_in)?;
+    for item in merger {
+        let (record, payload) = item?;
         writer
-            .write_pair(&winner.record, &winner.payload)
+            .write_pair(&record, &payload)
             .map_err(PipelineError::from)?;
     }
     let (file, written) = writer.finish_with_bytes().map_err(PipelineError::from)?;
+    // The consumed inputs are still charged at this point (the merger dropped at
+    // the end of the drain loop, but nothing has released their bytes yet), so
+    // the cap check sees inputs + this output — the cascade's true concurrent
+    // peak. On overflow the inputs stay counted in the E320 figure.
     if written > 0 && budget.budget.record_spill_bytes(budget.node, written) {
         return Err(PipelineError::spill_cap_exceeded(
             budget.node,
@@ -430,6 +443,7 @@ fn merge_group<P: Serialize + DeserializeOwned + Ord>(
             budget.budget.cumulative_spill_bytes(),
         ));
     }
+    budget.budget.release_spill_bytes(budget.node, input_bytes);
     Ok(file)
 }
 
@@ -1084,6 +1098,64 @@ mod tests {
             }
             other => panic!("expected SpillCapExceeded (E320), got {other:?}"),
         }
+    }
+
+    /// A merge fragmented into well more than [`MERGE_FAN_IN`] runs, whose real
+    /// data sits just under the disk cap, must COMPLETE rather than false-abort
+    /// with E320. The cascade re-writes its runs pass after pass, but it releases
+    /// each consumed run's charge as it unlinks it, so the disk-cap counter
+    /// tracks the bytes concurrently on disk (~one copy of the data plus one
+    /// fan-in group) rather than the sum of every transient re-write. A
+    /// `fan_in = 2` cascade over 200 runs folds through seven passes, re-writing
+    /// several times the data; a monotonic counter would blow a 2x-data cap and
+    /// abort even though concurrent usage never approaches it.
+    #[test]
+    fn cascade_does_not_false_trip_e320_on_transient_rewrites() {
+        let arb = unlimited_arbitrator();
+        let (files, sort_by, oracle) = build_dup_key_runs(200, 1);
+        assert_eq!(files.len(), 200);
+        // The originals' total on-disk bytes: the amount a caller (the sort
+        // enforcer or the block-band emit sort) charges as it spills them.
+        let data_bytes: u64 = files.iter().map(|f| f.bytes()).sum();
+        assert!(data_bytes > 0, "the spilled runs must have on-disk bytes");
+        // Cap the run at twice the data and simulate the caller's charge.
+        // Concurrent on-disk usage peaks at ~data + one fan-in group, under 2x;
+        // the sum of transient re-writes across the seven passes is several times
+        // the data, so a monotonic counter would trip this cap.
+        arb.set_max_spill_bytes(2 * data_bytes);
+        arb.record_spill_bytes("sort", data_bytes);
+
+        let budget = MergeBudget {
+            budget: &arb,
+            node: "sort",
+            compress: true,
+        };
+        let merged: Vec<(Decimal, u64)> =
+            SortedRunMerger::new_with_fan_in(files, &sort_by, "sort", budget, 2)
+                .expect(
+                    "a fragmented cascade whose concurrent on-disk usage stays under \
+                     the cap must not abort with E320",
+                )
+                .map(|r| {
+                    let (rec, p) = r.unwrap();
+                    (key_decimal(&rec), p)
+                })
+                .collect();
+        // Correctness survives the cascade: the output still equals the canonical
+        // (key, input-order) oracle.
+        assert_eq!(merged.len(), 200);
+        assert_eq!(merged, oracle);
+
+        // The accounted spill reflects current on-disk bytes, not the sum of the
+        // transient re-writes: after the drain the counter is back at one copy of
+        // the data at most (the two surviving runs re-serialize it with far less
+        // framing than the 200 originals), well under the 2x cap it never crossed.
+        let after = arb.cumulative_spill_bytes();
+        assert!(
+            after <= data_bytes,
+            "current-on-disk accounting must collapse the cascade's transient \
+             re-writes: cumulative {after} vs one data copy {data_bytes}"
+        );
     }
 
     /// After a full multi-pass drain and drop, no spill file — original run or

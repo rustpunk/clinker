@@ -346,6 +346,7 @@ impl<P: Serialize> SpillWriter<P> {
             SpillFile {
                 path,
                 schema: self.schema,
+                bytes: written,
                 _payload: PhantomData,
             },
             written,
@@ -357,6 +358,14 @@ impl<P: Serialize> SpillWriter<P> {
 pub struct SpillFile<P> {
     path: tempfile::TempPath,
     schema: Arc<Schema>,
+    /// Exact on-disk byte length of this run — the same figure
+    /// [`SpillWriter::finish_with_bytes`] returned for it (leading tag + schema
+    /// header + every frame, post-compression). Carried so a consumer that
+    /// unlinks the run (the cascaded k-way merge folding it into an intermediate
+    /// run) can release exactly the bytes the writer charged against the
+    /// disk-spill quota, keeping the quota counter on current on-disk usage
+    /// rather than a monotonic sum.
+    bytes: u64,
     _payload: PhantomData<P>,
 }
 
@@ -417,6 +426,13 @@ impl<P> SpillFile<P> {
     /// Path to the spill file on disk (for diagnostics).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Exact on-disk byte length of this run, as charged against the disk-spill
+    /// quota when it was written. A consumer that unlinks the run releases this
+    /// many bytes so the quota counter tracks current on-disk usage.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
     }
 }
 

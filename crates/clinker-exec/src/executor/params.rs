@@ -143,11 +143,12 @@ pub struct ExecutionReport {
     /// `counters.dlq_count` minus any entries the executor failed to
     /// attribute to a declared source.
     pub per_source_dlq_counts: BTreeMap<String, u64>,
-    /// Saturating sum of bytes committed to spill files across every
-    /// spill site (`node_buffers` admission, grace-hash partition
-    /// flush, sort-merge external sort). Sourced from
-    /// `MemoryArbitrator`'s running total at dispatch close; an aborted
-    /// run still surfaces the last committed value.
+    /// Bytes committed to spill files across every spill site
+    /// (`node_buffers` admission, grace-hash partition flush, sort-merge
+    /// external sort), net of any released as a run was unlinked — so a
+    /// cascaded k-way merge's transient intermediate runs do not inflate it.
+    /// Sourced from `MemoryArbitrator`'s running total at dispatch close; an
+    /// aborted run still surfaces the last committed value.
     pub cumulative_spill_bytes: u64,
     /// Per-stage on-disk spill totals, keyed by the spilling node's name.
     /// The sum of the values equals [`Self::cumulative_spill_bytes`]; this

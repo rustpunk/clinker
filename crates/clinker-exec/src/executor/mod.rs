@@ -133,11 +133,12 @@ pub(crate) struct DispatchOutcome {
     /// landed"). The synthetic `MERGED_SOURCE_NAME` slot is filtered
     /// out on the way through.
     pub(crate) per_source_dlq_counts: BTreeMap<String, u64>,
-    /// Saturating sum of bytes the run committed to spill files across
-    /// every spill site (node_buffer admission, grace-hash partition
-    /// flush, sort-merge external sort). Read from `MemoryArbitrator`'s
-    /// running total at dispatch close so an aborted run still
-    /// reports the last committed value.
+    /// Bytes the run committed to spill files across every spill site
+    /// (node_buffer admission, grace-hash partition flush, sort-merge external
+    /// sort), net of any released when a run was unlinked — so a cascaded k-way
+    /// merge's transient intermediate runs do not inflate it. Read from
+    /// `MemoryArbitrator`'s running total at dispatch close so an aborted run
+    /// still reports the last committed value.
     pub(crate) cumulative_spill_bytes: u64,
     /// Per-stage on-disk spill totals, keyed by the spilling node's name.
     /// The sum equals `cumulative_spill_bytes`; this breakdown is what an
