@@ -287,29 +287,31 @@ fn bench_params() -> PipelineRunParams {
     }
 }
 
-/// Run the IEJoin executor end-to-end on the workload's cached CSV
-/// bytes; return the number of data rows in the output. The compiled
-/// plan is reused across iterations to keep planner overhead out of
-/// the timed loop.
-fn run_iejoin_executor(
+/// Run a two-source combine pipeline end-to-end on cached CSV bytes; return the
+/// number of data rows in the output. `left` / `right` each pair a source-node
+/// name with its CSV bytes, so both the equi+range (`employees` / `brackets`) and
+/// the pure-range (`readings` / `bands`) benches share one runner. The compiled
+/// plan is reused across iterations to keep planner overhead out of the timed
+/// loop.
+fn run_two_source_executor(
     plan: &clinker_plan::plan::CompiledPlan,
-    employees_csv: &[u8],
-    brackets_csv: &[u8],
+    left: (&str, &[u8]),
+    right: (&str, &[u8]),
     params: &PipelineRunParams,
 ) -> usize {
     let readers: clinker_exec::executor::SourceReaders = HashMap::from([
         (
-            "employees".to_string(),
+            left.0.to_string(),
             clinker_exec::executor::single_file_reader(
                 "test.csv",
-                Box::new(Cursor::new(employees_csv.to_vec())),
+                Box::new(Cursor::new(left.1.to_vec())),
             ),
         ),
         (
-            "brackets".to_string(),
+            right.0.to_string(),
             clinker_exec::executor::single_file_reader(
                 "test.csv",
-                Box::new(Cursor::new(brackets_csv.to_vec())),
+                Box::new(Cursor::new(right.1.to_vec())),
             ),
         ),
     ]);
@@ -319,7 +321,7 @@ fn run_iejoin_executor(
         Box::new(out_buf.clone()) as Box<dyn Write + Send>,
     )]);
     PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, params)
-        .expect("iejoin pipeline must execute");
+        .expect("bench pipeline must execute");
     let bytes = out_buf.0.lock().unwrap().clone();
     let text = std::str::from_utf8(&bytes).expect("output is utf8");
     text.lines()
@@ -364,10 +366,10 @@ fn bench_combine_iejoin(c: &mut Criterion) {
     )
     .expect("bench yaml must compile");
     let small_params = bench_params();
-    let iejoin_count = run_iejoin_executor(
+    let iejoin_count = run_two_source_executor(
         &small_plan,
-        &small.employees_csv,
-        &small.brackets_csv,
+        ("employees", &small.employees_csv),
+        ("brackets", &small.brackets_csv),
         &small_params,
     );
     assert_eq!(
@@ -397,10 +399,10 @@ fn bench_combine_iejoin(c: &mut Criterion) {
     group.throughput(Throughput::Elements(workload.employees.len() as u64));
     group.bench_function("1m_x_50k", |b| {
         b.iter(|| {
-            let count = run_iejoin_executor(
+            let count = run_two_source_executor(
                 &plan,
-                &workload.employees_csv,
-                &workload.brackets_csv,
+                ("employees", &workload.employees_csv),
+                ("brackets", &workload.brackets_csv),
                 &params,
             );
             black_box(count);
@@ -562,45 +564,6 @@ fn nested_loop_pure_range(readings: &[Record], bands: &[Record]) -> usize {
     count
 }
 
-/// Run the pure-range block-band pipeline end-to-end on cached CSV bytes;
-/// return the number of data rows in the output.
-fn run_pure_range_executor(
-    plan: &clinker_plan::plan::CompiledPlan,
-    readings_csv: &[u8],
-    bands_csv: &[u8],
-    params: &PipelineRunParams,
-) -> usize {
-    let readers: clinker_exec::executor::SourceReaders = HashMap::from([
-        (
-            "readings".to_string(),
-            clinker_exec::executor::single_file_reader(
-                "test.csv",
-                Box::new(Cursor::new(readings_csv.to_vec())),
-            ),
-        ),
-        (
-            "bands".to_string(),
-            clinker_exec::executor::single_file_reader(
-                "test.csv",
-                Box::new(Cursor::new(bands_csv.to_vec())),
-            ),
-        ),
-    ]);
-    let out_buf = BenchBuffer::new();
-    let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
-        "out".to_string(),
-        Box::new(out_buf.clone()) as Box<dyn Write + Send>,
-    )]);
-    PipelineExecutor::run_plan_with_readers_writers(plan, readers, writers, params)
-        .expect("pure-range pipeline must execute");
-    let bytes = out_buf.0.lock().unwrap().clone();
-    let text = std::str::from_utf8(&bytes).expect("output is utf8");
-    text.lines()
-        .filter(|l| !l.is_empty())
-        .count()
-        .saturating_sub(1)
-}
-
 fn bench_combine_iejoin_pure_range(c: &mut Criterion) {
     // Correctness gate: at a small scale, the block-band path and the
     // nested-loop baseline must agree on row counts before measurement.
@@ -614,10 +577,10 @@ fn bench_combine_iejoin_pure_range(c: &mut Criterion) {
     )
     .expect("pure-range bench yaml must compile");
     let small_params = bench_params();
-    let block_count = run_pure_range_executor(
+    let block_count = run_two_source_executor(
         &small_plan,
-        &small.readings_csv,
-        &small.bands_csv,
+        ("readings", &small.readings_csv),
+        ("bands", &small.bands_csv),
         &small_params,
     );
     assert_eq!(
@@ -646,10 +609,10 @@ fn bench_combine_iejoin_pure_range(c: &mut Criterion) {
     group.throughput(Throughput::Elements(workload.readings.len() as u64));
     group.bench_function("200k_x_100_spilled", |b| {
         b.iter(|| {
-            let count = run_pure_range_executor(
+            let count = run_two_source_executor(
                 &plan,
-                &workload.readings_csv,
-                &workload.bands_csv,
+                ("readings", &workload.readings_csv),
+                ("bands", &workload.bands_csv),
                 &params,
             );
             black_box(count);

@@ -392,7 +392,27 @@ mod pure_range {
         rows
     }
 
-    /// Half-open band workload: driver `i` carries `k1 = (i * step) % span`, so
+    /// The block-band driver key for driver `i` over `[0, span)`: a fixed prime
+    /// stride so the keys tile the covered range rather than cluster, which makes
+    /// the sort buffer overflow the tight `soft / 4` threshold into multiple
+    /// blocks and spilled runs. Centralized so every band workload tiles the same
+    /// way and a tiling change lives in one place.
+    fn tiled_key(i: i64, span: i64) -> i64 {
+        i.wrapping_mul(2_617).rem_euclid(span)
+    }
+
+    /// The `n_builds` contiguous half-open bands `[b*bstep, b*bstep + bstep)` that
+    /// tile `[0, span)` (`bstep = span / n_builds`), as `(bid, lo, hi)`.
+    /// Centralized so every band workload lays out the same bands; callers that
+    /// carry an extra build column (a min-score, a divisor) append it per band.
+    fn half_open_bands(n_builds: i64, span: i64) -> Vec<(i64, i64, i64)> {
+        let bstep = span / n_builds;
+        (0..n_builds)
+            .map(|b| (b, b * bstep, b * bstep + bstep))
+            .collect()
+    }
+
+    /// Half-open band workload: driver `i` carries `k1 = tiled_key(i, span)`, so
     /// incomes tile the covered range; build `b` is the half-open interval
     /// `[b*bstep, b*bstep + bstep)`. Sized so the block-band drain overflows the
     /// tight `soft / 4` sort threshold into multiple blocks and spilled runs.
@@ -402,20 +422,18 @@ mod pure_range {
         n_builds: i64,
         span: i64,
     ) -> (Vec<Row>, Vec<Row>, String, String) {
-        let bstep = span / n_builds;
         let mut drivers = Vec::with_capacity(n_drivers as usize);
         let mut driver_csv = String::from("did,k1\n");
         for i in 0..n_drivers {
-            let k1 = (i.wrapping_mul(2_617)).rem_euclid(span);
+            let k1 = tiled_key(i, span);
             drivers.push((i, Some(k1), None));
             driver_csv.push_str(&format!("{i},{k1}\n"));
         }
+        let bands = half_open_bands(n_builds, span);
         let mut builds = Vec::with_capacity(n_builds as usize);
         let mut build_csv = String::from("bid,lo,hi\n");
-        for b in 0..n_builds {
-            let lo = b * bstep;
-            let hi = lo + bstep;
-            builds.push((b, Some(lo), Some(hi)));
+        for (b, lo, hi) in &bands {
+            builds.push((*b, Some(*lo), Some(*hi)));
             build_csv.push_str(&format!("{b},{lo},{hi}\n"));
         }
         (drivers, builds, driver_csv, build_csv)
@@ -523,23 +541,22 @@ nodes:
         // output to match the oracle.
         let span = 1_000i64;
         let n_builds = 40i64;
-        let bstep = span / n_builds;
-        // (did, income, score)
+        // (did, income, score): income tiles the covered range as in every band
+        // workload; score cycles 0..100 for the third conjunct.
         let mut applicants: Vec<(i64, i64, i64)> = Vec::new();
         let mut applicant_csv = String::from("did,income,score\n");
         for i in 0..8_000i64 {
-            let income = (i.wrapping_mul(2_617)).rem_euclid(span);
+            let income = tiled_key(i, span);
             let score = i.rem_euclid(100);
             applicants.push((i, income, score));
             applicant_csv.push_str(&format!("{i},{income},{score}\n"));
         }
-        // (bid, lo, hi, min_score)
+        // (bid, lo, hi, min_score): the shared half-open bands, each carrying a
+        // constant min-score the residual conjunct filters on.
+        let min_score = 50;
         let mut tiers: Vec<(i64, i64, i64, i64)> = Vec::new();
         let mut tier_csv = String::from("bid,lo,hi,min_score\n");
-        for b in 0..n_builds {
-            let lo = b * bstep;
-            let hi = lo + bstep;
-            let min_score = 50;
+        for (b, lo, hi) in half_open_bands(n_builds, span) {
             tiers.push((b, lo, hi, min_score));
             tier_csv.push_str(&format!("{b},{lo},{hi},{min_score}\n"));
         }
@@ -606,7 +623,6 @@ nodes:
     fn null_fields_over_spilled_scan_phase_matches_oracle_across_budgets() {
         let span = 1_000i64;
         let n_builds = 40i64;
-        let bstep = span / n_builds;
         // readings: (did, Option<amount>); None models a NULL range key.
         let mut readings: Vec<(i64, Option<i64>)> = Vec::new();
         let mut reading_csv = String::from("did,amount\n");
@@ -616,20 +632,17 @@ nodes:
                 reading_csv.push_str(&format!("{i},\n"));
                 readings.push((i, None));
             } else {
-                // amount spans [0, span + 200): the tail past `span` matches no
+                // amount tiles [0, span + 200): the tail past `span` matches no
                 // band, so it is an in-range-format but zero-match (in-block miss).
-                let amount = (i.wrapping_mul(2_617)).rem_euclid(span + 200);
+                let amount = tiled_key(i, span + 200);
                 reading_csv.push_str(&format!("{i},{amount}\n"));
                 readings.push((i, Some(amount)));
             }
         }
-        // bands: (bid, lo, hi)
-        let mut bands: Vec<(i64, i64, i64)> = Vec::new();
+        // bands: the shared half-open tiling of [0, span).
+        let bands = half_open_bands(n_builds, span);
         let mut band_csv = String::from("bid,lo,hi\n");
-        for b in 0..n_builds {
-            let lo = b * bstep;
-            let hi = lo + bstep;
-            bands.push((b, lo, hi));
+        for (b, lo, hi) in &bands {
             band_csv.push_str(&format!("{b},{lo},{hi}\n"));
         }
         // match: first over disjoint bands → at most one build per reading; the
@@ -934,6 +947,100 @@ nodes:
         );
     }
 
+    /// The adversarial finalize shape: a match: all + on_miss: null_fields input
+    /// dominated by zero-match drivers split across BOTH deferred piles — NULL /
+    /// non-orderable range keys route to the scan-phase pile, orderable-but-out-of-
+    /// range keys to the in-block pile — with only a minority actually matching.
+    /// Under a tight budget both piles spill heavily, so at end-of-join the deferred
+    /// dispatch holds the scan-phase AND the in-block k-way mergers open at once,
+    /// alongside the still-resident sides and the output sort. That finalize phase
+    /// is the one the per-pair gates do not cover; the finalize gate bounds it. This
+    /// asserts the run completes within the tight budget rather than OOMing, and
+    /// that its per-driver output is byte-identical to the roomy resident run — the
+    /// determinism-across-budgets contract, now over the two-merger finalize.
+    #[test]
+    fn all_both_deferred_piles_dominant_null_fields_matches_across_budgets() {
+        let span = 1_000i64;
+        let n_builds = 40i64;
+        // 40% NULL range key (scan-phase pile), 40% orderable-out-of-range
+        // (in-block pile), 20% in-range (matched): the run is dominated by misses,
+        // and both piles are large enough to overflow the tight sort threshold.
+        let mut driver_csv = String::from("did,k1\n");
+        let mut readings: Vec<(i64, Option<i64>)> = Vec::new();
+        for i in 0..6_000i64 {
+            match i.rem_euclid(10) {
+                0..=3 => {
+                    driver_csv.push_str(&format!("{i},\n"));
+                    readings.push((i, None));
+                }
+                4..=7 => {
+                    let k1 = span + i.rem_euclid(500);
+                    driver_csv.push_str(&format!("{i},{k1}\n"));
+                    readings.push((i, Some(k1)));
+                }
+                _ => {
+                    let k1 = tiled_key(i, span);
+                    driver_csv.push_str(&format!("{i},{k1}\n"));
+                    readings.push((i, Some(k1)));
+                }
+            }
+        }
+        let bands = half_open_bands(n_builds, span);
+        let mut build_csv = String::from("bid,lo,hi\n");
+        for (b, lo, hi) in &bands {
+            build_csv.push_str(&format!("{b},{lo},{hi}\n"));
+        }
+        // Disjoint half-open bands → each in-range driver matches exactly one build,
+        // so match: all still emits one row per driver; every miss (NULL or
+        // out-of-range) carries a null build id.
+        let expected = expected_null_fields_rows(
+            &readings,
+            &nested_loop_oracle(
+                &readings,
+                &bands,
+                |(_, amount), (_, lo, hi)| matches!(amount, Some(a) if a >= lo && a < hi),
+                |_, (did, _), _, (bid, _, _)| (*did, *bid),
+            ),
+        );
+        let inputs = [
+            ("drivers", driver_csv.as_str()),
+            ("builds", build_csv.as_str()),
+        ];
+        let tight = run(
+            ALL_OUT_OF_RANGE_NULL_FIELDS_YAML,
+            TIGHT_LIMIT,
+            "spill",
+            &inputs,
+            "out",
+        );
+        let roomy = run(
+            ALL_OUT_OF_RANGE_NULL_FIELDS_YAML,
+            ROOMY_LIMIT,
+            "spill",
+            &inputs,
+            "out",
+        );
+        assert_eq!(
+            rows(&tight.output),
+            expected,
+            "spilled two-pile finalize output diverged from the oracle"
+        );
+        assert_eq!(
+            rows(&tight.output),
+            rows(&roomy.output),
+            "two-pile finalize output changed between the tight and roomy budgets"
+        );
+        assert_eq!(
+            rows(&tight.output).len(),
+            6_000,
+            "every driver emits exactly one row under match: all + null_fields over disjoint bands"
+        );
+        assert!(
+            tight.spill_bytes > 0,
+            "the tight budget must spill both deferred piles and the sides to disk"
+        );
+    }
+
     const CONTINUE_DEFER_YAML: &str = r#"
 pipeline:
   name: pure_range_continue_defer
@@ -1006,7 +1113,7 @@ nodes:
         for i in 0..8_000i64 {
             // Keep every driver inside [0, span) so it matches exactly one band;
             // whether it emits or defers depends only on that band's factor.
-            let k1 = (i.wrapping_mul(2_617)).rem_euclid(span);
+            let k1 = tiled_key(i, span);
             driver_csv.push_str(&format!("{i},{k1}\n"));
             let band = k1 / bstep;
             let factor = factor_of(band);
@@ -1016,10 +1123,9 @@ nodes:
             }
         }
         expected.sort();
+        // The shared half-open bands, each carrying the divisor the body reads.
         let mut build_csv = String::from("bid,lo,hi,factor\n");
-        for b in 0..n_builds {
-            let lo = b * bstep;
-            let hi = lo + bstep;
+        for (b, lo, hi) in half_open_bands(n_builds, span) {
             build_csv.push_str(&format!("{b},{lo},{hi},{}\n", factor_of(b)));
         }
 

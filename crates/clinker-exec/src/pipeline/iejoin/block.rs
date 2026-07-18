@@ -73,17 +73,28 @@
 //! bytes ARE charged through the consumer handle — mirrored per row exactly as
 //! the input drains charge, so the arbitrator's pull-mode view reflects every
 //! axis — while spilling on the buffer's own threshold, not global pressure, is
-//! what bounds it. The per-pair gate additionally RESERVES the constant spill cap
-//! of each deferred sort buffer that can hold live bytes — the output-row buffer
-//! always, plus the in-block zero-match pile under a First / All run with a
-//! non-skip on_miss — not their live bytes, so each gate proves
-//! `working_set + reservation ≤ hard`; because every reserved buffer spills at
-//! that same cap, the simultaneous input-plus-deferred peak stays within `hard`,
-//! a provable bound rather than the earlier ~1.4×hard worst case. With
-//! every axis spill-bounded the operator keeps no
-//! global-pressure abort: the emit path polls no `should_abort`, so a handle
-//! transiently summing the input footprint plus the output sort's resident bytes
-//! is only ever an attribution reading, never an abort trigger.
+//! what bounds it. The gates additionally reserve the deferred sort buffers'
+//! spill caps, but PER PHASE, since the buffers are not all co-resident at their
+//! caps at once. The output sort grows across the whole emit phase, so every gate
+//! reserves its constant cap. The in-block pile is phase-distinct: it takes no
+//! pushes during a driver block's inner loop (its misses drain only in that
+//! block's finalize, after the loop), so the per-pair gates fold in its CURRENT
+//! live bytes — zero for a fully-matching run, which therefore reserves one cap,
+//! not two — while the driver-load gate reserves its full cap to cover that later
+//! growth against the released per-pair working set. At end-of-join the piles
+//! convert to k-way mergers and stack with the output sort and the still-resident
+//! blocks; that finalize footprint is bounded by construction (the mergers are the
+//! same one-record-per-open-run primitive the drain phase already opens un-gated,
+//! and the resident sides plus three caps sum to ≤ `soft < hard` for the derived
+//! caps), not by a reservation. Each per-pair gate thus proves
+//! `phase_working_set + reservation ≤
+//! hard`; because every reserved buffer spills at its cap, the true phase-peak
+//! stays within `hard`, a provable bound rather than the earlier ~1.4×hard worst
+//! case. With
+//! every axis spill-bounded the operator keeps no global-pressure abort: the emit
+//! path polls no `should_abort`, so a handle transiently summing the input
+//! footprint plus the output sort's resident bytes is only ever an attribution
+//! reading, never an abort trigger.
 
 use std::io;
 use std::path::Path;
@@ -525,19 +536,29 @@ pub(super) fn execute_block_band(
     let sort_threshold = options
         .sort_spill_override
         .unwrap_or_else(|| sort_spill_threshold_bytes(budget));
-    // Each deferred sort buffer self-bounds by spilling at this per-buffer cap,
-    // so the per-pair gate reserves one cap PER buffer that can hold live bytes:
-    // the output-row buffer always, plus the in-block zero-match pile whenever a
-    // First / All run with a non-skip on_miss can populate it. Reserving the
-    // CONSTANT caps — not the live bytes, which would false-abort a run where a
-    // buffer legitimately spills — bounds the input working set to
-    // `hard - reservation`, so even with every reserved buffer simultaneously at
-    // its cap the peak still fits `hard`. Derived from the budget, NOT
+    // Constant per-buffer spill cap: each deferred sort buffer self-bounds by
+    // spilling once its resident bytes reach this. Derived from the budget, NOT
     // `sort_threshold`, which honors the test-only `sort_spill_override`.
     let deferred_cap = sort_spill_threshold_bytes(budget) as u64;
+    // The in-block zero-match pile can hold live bytes only under a First / All
+    // run with a non-skip on_miss; Collect and Skip never route to it.
     let inblock_can_fill =
         matches!(match_mode, MatchMode::First | MatchMode::All) && !matches!(on_miss, OnMiss::Skip);
-    let deferred_reservation =
+    // Reservation the DRIVER-LOAD gate applies, phase-distinct from the per-pair
+    // gates below. The output sort grows across the whole emit phase, so its
+    // constant cap is always reserved. The in-block pile is different: it takes
+    // no pushes during a driver block's inner build loop — its misses are drained
+    // only in that block's finalize, AFTER the loop, once the per-pair input
+    // working set is released. So the per-pair gates fold in the pile's CURRENT
+    // live bytes (constant across the loop they gate), while THIS driver-load gate
+    // — which also has to cover that later finalize, where the pile grows up to
+    // its cap against only the driver-block working set — reserves the pile's full
+    // constant cap. Reserving constant caps, not live output bytes (which would
+    // false-abort a run whose output legitimately spills), bounds each phase to
+    // `hard - reservation`. Folding the pile's live bytes rather than its cap into
+    // the per-pair gate is what lets a fully-matching workload — whose pile stays
+    // empty — keep its per-pair reservation at one cap instead of two.
+    let driver_load_reservation =
         deferred_cap.saturating_add(if inblock_can_fill { deferred_cap } else { 0 });
     let drain_ctx = DrainCtx {
         name,
@@ -570,9 +591,11 @@ pub(super) fn execute_block_band(
         },
     };
 
-    // Driver record schema, captured before the drain consumes `driver_records`:
-    // the in-block zero-match buffer holds driver records and must decode them on
-    // reload exactly as the scan-phase buffer does.
+    // Driver record schema, captured before the drain consumes `driver_records`
+    // and shared with it: the scan-phase and in-block zero-match buffers both hold
+    // driver records and must decode them on reload exactly as the matched driver
+    // buffer does. An empty driver side yields an empty schema — it holds nothing,
+    // so no reload occurs.
     let driver_row_schema: Arc<Schema> = match driver_records.first() {
         Some((record, _)) => Arc::clone(record.schema()),
         None => Arc::new(Schema::new(Vec::new())),
@@ -606,6 +629,7 @@ pub(super) fn execute_block_band(
         driver_records,
         driver_scans,
         retain_unmatched,
+        &driver_row_schema,
         &drain_ctx,
         &mut resident,
     )?;
@@ -708,12 +732,14 @@ pub(super) fn execute_block_band(
         // limit aborts before it is materialized rather than after. A resident
         // (borrowed) block adds zero scratch, so it trips only if the resident
         // baseline plus the reserved deferred caps already exceeds `hard`. This
-        // gate also covers the block's finalize peak: the in-block pile grows
-        // there (after this loop's per-pair gates), but only up to its reserved
-        // cap, and by then the per-pair input working set has been released.
+        // gate uses `driver_load_reservation` — the output cap PLUS the in-block
+        // pile's full cap — because it also covers the block's finalize peak: the
+        // in-block pile grows there (after this loop's per-pair gates) up to its
+        // cap, and by then the per-pair input working set has been released, so
+        // the pile's full cap is the co-resident term to reserve.
         let driver_peak = baseline_resident
             .saturating_add(driver_held)
-            .saturating_add(deferred_reservation);
+            .saturating_add(driver_load_reservation);
         if driver_peak > budget.hard_limit() {
             return Err(abort_over_budget(
                 consumer,
@@ -781,19 +807,25 @@ pub(super) fn execute_block_band(
             // vectors held across the kernel and emit (its range-key column
             // sized per mode, the `build_idx` and `build_slice` vecs), the
             // kernel's O(n) sort state (the two-conjunct IEJoin arrays or the
-            // leaner PWMJ index vecs), and the First / collect candidates held
-            // so far in this driver block. The output sort buffer's LIVE bytes
-            // are bounded independently by its own spill threshold, so they are
-            // deliberately not summed here — folding the live output bytes in
-            // would abort a pair whose input and output both legitimately spill.
-            // What the gate DOES fold in is the output sort's CONSTANT spill cap
-            // (`output_reservation`): reserving that fixed cap up front bounds the
-            // input working set to `hard - reservation`, so once the output buffer
-            // reaches the same cap the simultaneous peak still fits `hard`. The
-            // abort is a strictly LOCAL last resort: it compares the input working
-            // set plus that reserved cap directly to the hard limit and never
-            // consults the arbitrator's global pressure, because both the input
-            // and output axes answer memory pressure by spilling.
+            // leaner PWMJ index vecs), the First / collect candidates held so far
+            // in this driver block, and the in-block miss pile's CURRENT resident
+            // bytes. The pile is folded in at its live size rather than its cap
+            // because it takes no pushes during this inner loop — its misses are
+            // drained only in the driver-block finalize below, after the loop — so
+            // its residency is exactly constant across every pair this gate
+            // guards; the driver-load gate reserves its full cap to cover that
+            // later growth. The output sort buffer's LIVE bytes are bounded
+            // independently by its own spill threshold, so they are deliberately
+            // not summed here — folding the live output bytes in would abort a pair
+            // whose input and output both legitimately spill. What the gate DOES
+            // reserve is the output sort's CONSTANT spill cap (`deferred_cap`):
+            // reserving that fixed cap up front bounds the working set to
+            // `hard - reservation`, so once the output buffer reaches the same cap
+            // the simultaneous peak still fits `hard`. The abort is a strictly
+            // LOCAL last resort: it compares the working set plus that reserved cap
+            // directly to the hard limit and never consults the arbitrator's global
+            // pressure, because both the input and output axes answer memory
+            // pressure by spilling.
             let build_vecs_bytes = (build_block.len
                 * (range_key_width(op2)
                     + std::mem::size_of::<u64>()
@@ -808,11 +840,13 @@ pub(super) fn execute_block_band(
             let pair_peak = baseline_resident
                 .saturating_add(driver_held)
                 .saturating_add(build_held)
-                .saturating_add(state.held_bytes());
-            // Reserve the constant deferred caps on top of the pure input working
-            // set (`pair_peak` stays pure so the post-kernel gate below can add
-            // `pairs_bytes` and reserve exactly once, never double-counting).
-            let pair_peak_reserved = pair_peak.saturating_add(deferred_reservation);
+                .saturating_add(state.held_bytes())
+                .saturating_add(inblock_buf.bytes_used() as u64);
+            // Reserve only the output sort's constant cap on top of the measured
+            // working set (`pair_peak` already carries the in-block pile's live
+            // bytes and stays otherwise stable, so the post-kernel gate below can
+            // add `pairs_bytes` and reserve exactly once, never double-counting).
+            let pair_peak_reserved = pair_peak.saturating_add(deferred_cap);
             if pair_peak_reserved > budget.hard_limit() {
                 return Err(abort_over_budget(
                     consumer,
@@ -860,7 +894,7 @@ pub(super) fn execute_block_band(
             // post-kernel pairs gate.
             let pairs_bytes = (pairs.len() * std::mem::size_of::<(usize, usize)>()) as u64;
             let pair_peak = pair_peak.saturating_add(pairs_bytes);
-            let pair_peak_reserved = pair_peak.saturating_add(deferred_reservation);
+            let pair_peak_reserved = pair_peak.saturating_add(deferred_cap);
             if pair_peak_reserved > budget.hard_limit() {
                 return Err(abort_over_budget(
                     consumer,
@@ -943,6 +977,22 @@ pub(super) fn execute_block_band(
     // the output buffer, so that order only fixes the FailFast eval-error
     // identity). The residue run each finish spills is charged against the disk
     // quota (E320).
+    //
+    // Finalize is its own memory phase, distinct from the emit loop the per-pair
+    // gates bound, and it is bounded here by construction rather than by a gate.
+    // The per-pair input working set is released, and each pile converts from a
+    // resident buffer (≤ one spill cap) to a k-way merger over its spilled runs.
+    // That merger is the same accepted external-merge primitive the drain phase
+    // and the downstream output drain already open un-gated — one resident record
+    // per open run — so the two deferred mergers stack the same order of residency
+    // finish_and_slice's single drain merger does, on top of the still-resident
+    // sides and the output sort (≤ its cap). With the resident sides bounded by
+    // the shared block budget and each cap derived at `soft / 4` (16 KiB floored),
+    // that stack fits under `soft < hard`. It is not gated because a static cap
+    // reservation over-states a merger holding only a few open runs (it would
+    // false-abort a tight-budget run whose actual finalize residency is a fraction
+    // of a cap), and the residual open-run cost of a pathologically fragmented
+    // pile is the shared merge primitive's, not specific to this path.
     let scan_stream = finish_unmatched_stream(scan_unmatched_buf, &drain_ctx)?;
     match match_mode {
         MatchMode::Collect => {
@@ -1081,22 +1131,17 @@ fn drain_driver_side(
     driver_records: Vec<(Record, RecordOrder)>,
     driver_scans: Vec<RecordScan>,
     retain_unmatched: bool,
+    schema: &Arc<Schema>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
 ) -> Result<DriverSide, PipelineError> {
-    // The scan-phase records carry the driver schema, so the buffer decodes them
-    // on reload exactly as the matched driver buffer does. An empty driver side
-    // backs the buffer with an empty schema — it holds nothing, so no reload
-    // occurs.
-    let schema = match driver_records.first() {
-        Some((first, _)) => Arc::clone(first.schema()),
-        None => Arc::new(Schema::new(Vec::new())),
-    };
+    // The matched, scan-phase, and in-block buffers all carry the driver schema
+    // (`schema`, derived once by the caller), so every reload decodes identically.
     let mut scan_buf: SortBuffer<ScanUnmatchedPayload> = SortBuffer::new_payload_ordered(
         ctx.sort_threshold,
         Some(ctx.spill_dir.to_path_buf()),
         ctx.spill_compress,
-        Arc::clone(&schema),
+        Arc::clone(schema),
     );
     if driver_records.is_empty() {
         return Ok((Vec::new(), scan_buf));
@@ -1105,7 +1150,7 @@ fn drain_driver_side(
         ctx.sort_threshold,
         Some(ctx.spill_dir.to_path_buf()),
         ctx.spill_compress,
-        Arc::clone(&schema),
+        Arc::clone(schema),
     );
     for (driver_idx, ((record, order), scan)) in
         driver_records.into_iter().zip(driver_scans).enumerate()
@@ -1123,7 +1168,7 @@ fn drain_driver_side(
             } => push_charge_spill(&mut buf, record, (k1, k2, driver_idx, order), ctx)?,
         }
     }
-    let blocks = finish_and_slice(buf, &schema, ctx, resident, &|p: &DriverPayload| (p.0, p.1))?;
+    let blocks = finish_and_slice(buf, schema, ctx, resident, &|p: &DriverPayload| (p.0, p.1))?;
     Ok((blocks, scan_buf))
 }
 
@@ -3363,5 +3408,101 @@ mod tests {
             budget.cumulative_spill_bytes() > 0,
             "the 900-driver deferred pile must have reached disk, not stayed resident"
         );
+    }
+
+    // ── deferred reservation is phase-split, not a naive per-buffer sum ───────
+
+    #[test]
+    fn fully_matching_run_reserves_one_cap_not_two_for_the_empty_inblock_pile() {
+        // Every driver matches, so the in-block zero-match pile stays empty for the
+        // whole run. Under a First / All run with a non-skip on_miss the pile COULD
+        // fill, but this workload never routes to it, so the per-pair gate must
+        // reserve only the output sort's cap — the pile's live bytes are zero — not
+        // a second cap for a pile that never grows. The budget is sized into the
+        // band where one reserved cap fits and two do not, so the earlier
+        // unconditional two-cap reservation would abort a run that genuinely fits:
+        // the regression this guards.
+        let d_schema = driver_schema();
+        let b_schema = build_schema();
+        // A small build side every driver clears on both axes: build k1 = 0 (Ge
+        // passes for any non-negative driver k1) and k2 huge (Lt passes for any
+        // in-range driver k2). A large driver side makes the resident block and the
+        // two-conjunct kernel aux the dominant working-set terms.
+        let driver: Side = (0..600i64).map(|i| (Some((i + 1, i + 1)), i)).collect();
+        let build: Side = (0..3i64)
+            .map(|j| (Some((0, 1_000_000_000)), 100 + j))
+            .collect();
+        let op2 = Some(RangeOp::Lt);
+
+        // The exact per-pair working set the single-block layout presents at its
+        // binding (post-kernel) gate: both sides in one resident block, the
+        // hoisted driver key column and `DriverRef` slice, the build-side vectors,
+        // the two-conjunct kernel aux, and the materialized pair-index vector for
+        // the one surviving pair (every driver-build combination matches). A
+        // resident block is borrowed (no scratch) and All holds no candidates, so
+        // these are the whole measured working set the gate sees.
+        let (driver_records, _) = to_records_scans(&driver, &d_schema);
+        let (build_records, _) = to_records_scans(&build, &b_schema);
+        let baseline_blocks: u64 = driver_records
+            .iter()
+            .map(|r| pair_bytes::<DriverPayload>(r) as u64)
+            .sum::<u64>()
+            + build_records
+                .iter()
+                .map(|r| pair_bytes::<(i64, i64, u64)>(r) as u64)
+                .sum::<u64>();
+        let driver_vecs =
+            (driver.len() * (range_key_width(op2) + std::mem::size_of::<DriverRef<'_>>())) as u64;
+        let build_vecs = (build.len()
+            * (range_key_width(op2) + std::mem::size_of::<u64>() + std::mem::size_of::<&Record>()))
+            as u64;
+        let aux = iejoin_numeric_state_bytes(driver.len(), build.len()) as u64;
+        let pairs_bytes =
+            (driver.len() * build.len() * std::mem::size_of::<(usize, usize)>()) as u64;
+        let peak = baseline_blocks + driver_vecs + build_vecs + aux + pairs_bytes;
+
+        // Land the budget in the (hard - 2cap, hard - cap] band: hard = 1.4 * peak
+        // puts peak at ~0.71 * hard, and cap = soft / 4 = 0.2 * hard, so peak fits
+        // with one reserved cap but not two.
+        let hard = peak * 14 / 10;
+        let budget = arbitrator(hard);
+        let cap = sort_spill_threshold_bytes(&budget) as u64;
+        assert!(
+            peak + cap <= budget.hard_limit() && budget.hard_limit() < peak + 2 * cap,
+            "test must sit in the one-cap-fits / two-caps-abort band: \
+             peak={peak} cap={cap} hard={}",
+            budget.hard_limit()
+        );
+
+        let cfg = |on_miss| RunCfg {
+            op1: RangeOp::Ge,
+            op2,
+            match_mode: MatchMode::All,
+            on_miss,
+            // One block per side (the layout the peak was computed for); the sort
+            // buffers spill on the real threshold, so the output axis stays bounded
+            // while the resident blocks anchor the working set.
+            block_target: 1 << 30,
+            hard_limit: hard,
+            max_spill_bytes: None,
+            sort_spill: None,
+            resident_budget: Some(1 << 30),
+        };
+
+        // Skip reserves one cap before and after the phase split, so it completes
+        // and fixes the expected matched output.
+        let skip = all_pairs(&run_block(&driver, &build, &cfg(OnMiss::Skip)).expect("skip run"));
+        // Error over a fully-matching input dispatches no miss, so it must also
+        // complete — but only when the per-pair gate reserves one cap, not two.
+        let error =
+            all_pairs(&run_block(&driver, &build, &cfg(OnMiss::Error)).expect(
+                "a fully-matching Error run must not be aborted by the in-block reservation",
+            ));
+        assert_eq!(error, oracle_pairs(&driver, &build, TOp::Ge, Some(TOp::Lt)));
+        assert_eq!(
+            skip, error,
+            "a fully-matching run's output must not depend on on_miss"
+        );
+        assert!(!error.is_empty(), "the fixture must produce matches");
     }
 }
