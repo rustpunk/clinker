@@ -957,7 +957,15 @@ pub(crate) fn execute_combine_iejoin(
                 .saturating_add(bkeys.len())
                 .saturating_mul(std::mem::size_of::<(i64, i64)>())
                 .saturating_add(kernel_aux);
-            let group_peak_bytes = partition_state_bytes.saturating_add(group_state_bytes);
+            // The per-driver collect accumulators (and `match: first` / `$ck`
+            // candidates) are retained across every group until the end-of-join
+            // flush, so they are part of this group's live peak — fold them in.
+            // Without this a high-cardinality `collect` join grows them uncharged
+            // and ungated between groups, peaking before the flush poll fires.
+            let accum_bytes = state.held_bytes() as usize;
+            let group_peak_bytes = partition_state_bytes
+                .saturating_add(group_state_bytes)
+                .saturating_add(accum_bytes);
             consumer.set_bytes(group_peak_bytes as u64);
             if budget.should_abort_local(group_peak_bytes as u64) {
                 return Err(pre_output_budget_error(
@@ -1251,14 +1259,15 @@ struct MatchState {
     first_match: HashMap<usize, (u64, Record)>,
     /// Running byte total of every cloned build record and collect entry held
     /// above (`first_match`, `first_collected_builds`, and the `collect_accum`
-    /// heaps). The block path folds it into its per-pair pre-output gate so a
+    /// heaps). Both paths fold it into their pre-output budget gates so a
     /// `match: first` / `collect` join over wide build records aborts with the
-    /// typed budget error instead of growing this residency unbounded. On the
-    /// equi+range path this accrues for `collect` too (its per-driver heaps and
-    /// min-order `$ck` build run through the same code, draining only in the
-    /// single end-of-join flush loop, after every bucket and group completes);
-    /// it stays zero only for that path's `first` / `all` modes, which emit
-    /// each match immediately and hold no build records across pairs.
+    /// typed budget error instead of growing this residency unbounded: the block
+    /// path via its per-pair pre-output gate (and it drains collect per driver
+    /// block), the equi+range path via each group's pre-output peak plus the
+    /// every-10K accumulation poll — its per-driver heaps and min-order `$ck`
+    /// build drain only in the single end-of-join flush loop, after every bucket
+    /// and group completes. It stays zero for both paths' `first` / `all` modes,
+    /// which emit each match immediately and hold no build records across pairs.
     held_bytes: u64,
 }
 
@@ -1274,8 +1283,9 @@ impl MatchState {
         }
     }
 
-    /// The bytes of held `First` / collect candidates accumulated so far in
-    /// this driver block, for the block path's pre-output gate.
+    /// The live bytes of held `First` / collect candidates, folded into the
+    /// pre-output budget gates on both the block path (per-pair) and the
+    /// equi+range path (per-group peak plus the every-10K accumulation poll).
     fn held_bytes(&self) -> u64 {
         self.held_bytes
     }
@@ -1595,6 +1605,13 @@ fn emit_pairs(
                     state.collect_accum.get(&key).map_or(0, BinaryHeap::len) as u64
                 });
                 state.record_collect_match(key, order_key, build_record);
+                // Abort-gate the growing per-driver accumulators on the same
+                // every-10K cadence the emit paths use. On the equi+range path
+                // they drain only in the single end-of-join flush, so this is the
+                // gate that catches a permissive high-cardinality collect join
+                // during accumulation instead of after it has peaked. No-op on
+                // the block path's spill-bounded sink (drains per driver block).
+                poll_collect_accum(cfg, sink, state.held_bytes())?;
             }
             MatchMode::First => match bidx {
                 // Block path: hold the minimum-build-index candidate; emit at
@@ -1751,6 +1768,39 @@ fn poll_output_buffer(cfg: &EmitConfig<'_>, sink: &mut EmitSink<'_>) -> Result<(
     Ok(())
 }
 
+/// Poll the growing collect accumulators every [`MEMORY_CHECK_INTERVAL`]
+/// recorded matches and abort if their resident bytes — plus any already-emitted
+/// output — exceed the hard limit. Equi+range only: its per-driver heaps hold
+/// every driver's collect set until the single end-of-join flush, so they, not
+/// the output vec, are the axis that grows during the walk. `accum_bytes` is the
+/// [`MatchState`]'s live held-byte total. The block-band ([`RowSink::Sorted`])
+/// path drains collect per driver block and spills its output sort, so it is
+/// already bounded and skipped here, mirroring [`poll_output_buffer`].
+fn poll_collect_accum(
+    cfg: &EmitConfig<'_>,
+    sink: &mut EmitSink<'_>,
+    accum_bytes: u64,
+) -> Result<(), PipelineError> {
+    if !matches!(sink.rows, RowSink::Unsorted(_)) {
+        return Ok(());
+    }
+    *sink.emitted_since_check += 1;
+    if *sink.emitted_since_check >= MEMORY_CHECK_INTERVAL {
+        let used = sink.output_buffer_bytes().saturating_add(accum_bytes);
+        if cfg.budget.should_abort_local(used) {
+            return Err(PipelineError::MemoryBudgetExceeded {
+                node: cfg.name.to_string(),
+                used,
+                limit: cfg.budget.hard_limit(),
+                source: BudgetCategory::Arena,
+                detail: Some("iejoin collect accumulator exceeded budget".to_string()),
+            });
+        }
+        *sink.emitted_since_check = 0;
+    }
+    Ok(())
+}
+
 /// Flush one driver's collect-mode row: even a zero-match driver emits, with
 /// an empty array. Propagates the first matched build's `$ck.<field>` values
 /// onto the synthesized row, then sets the collect array under the build
@@ -1786,7 +1836,13 @@ fn flush_collect_row(
     // A collect row carries no single build index; tag it `MAX` so the block
     // path's final sort places it after that driver's match rows (of which a
     // collect driver has none) and orders collect rows by driver input order.
-    sink.push_row(rec, driver_order, driver_idx, u64::MAX)
+    sink.push_row(rec, driver_order, driver_idx, u64::MAX)?;
+    // Poll the output buffer as the first / all and on-miss paths do: a
+    // high-cardinality driver with a permissive predicate emits one collect
+    // row apiece and would otherwise grow the equi+range in-RAM output vector
+    // unbounded between the operator's other memory checks. The block-band
+    // Sorted sink is already spill-bounded, so this is a no-op there.
+    poll_output_buffer(cfg, sink)
 }
 
 /// Dispatch one zero-match driver through its `on_miss` policy: `Skip` drops
@@ -2185,6 +2241,96 @@ mod tests {
              materializes the whole-input working set at once",
             per_pair.saturating_mul(2)
         );
+    }
+
+    /// The equi+range collect accumulator is charged into the every-10K budget
+    /// poll: past the cadence, an accumulator larger than the hard limit aborts
+    /// cleanly with `MemoryBudgetExceeded`, so a high-cardinality collect join
+    /// cannot grow the per-driver heaps unbounded before the single end-of-join
+    /// flush. Regression guard for the previously uncharged, ungated equi+range
+    /// `collect_accum`.
+    ///
+    /// The 100 GiB limit keeps `should_abort`'s RSS arm inert (any real
+    /// test-process RSS is far smaller), so only the local accumulator-byte arm
+    /// can fire; the accumulator size is a synthetic byte count, so the gate is
+    /// driven deterministically without a multi-GiB allocation.
+    #[test]
+    fn poll_collect_accum_aborts_over_budget_at_cadence() {
+        use crate::executor::combine::CombineResolverMapping;
+        use clinker_plan::plan::combine::CombineInput;
+        use clinker_plan::plan::execution::ResolvedColumnMap;
+        use indexmap::IndexMap;
+        use std::collections::HashMap;
+
+        let budget = MemoryArbitrator::with_policy(
+            100 * 1024 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        );
+        // The poll never reads the resolver mapping / eval context, so an empty
+        // mapping and a bare context are sufficient to construct the config.
+        let resolved: ResolvedColumnMap = Arc::new(HashMap::new());
+        let combine_inputs: IndexMap<String, CombineInput> = IndexMap::new();
+        let resolver_mapping =
+            CombineResolverMapping::from_pre_resolved(&resolved, &combine_inputs);
+        let stable = cxl::eval::StableEvalContext::test_default();
+        let source_file: Arc<str> = Arc::from("");
+        let ctx = EvalContext::test_with_file(&stable, &source_file, 0);
+        let cfg = EmitConfig {
+            name: "ie_test",
+            build_qualifier: "b",
+            ctx: &ctx,
+            resolver_mapping: &resolver_mapping,
+            output_schema: None,
+            match_mode: MatchMode::Collect,
+            propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
+            budget: &budget,
+            strategy: clinker_plan::config::ErrorStrategy::FailFast,
+        };
+
+        // An accumulator well past the hard limit. Below the cadence the poll
+        // only counts; at the interval boundary it charges the accumulator and
+        // aborts.
+        let over = 200u64 * 1024 * 1024 * 1024; // 200 GiB > 100 GiB limit
+        let mut output: Vec<(Record, RecordOrder)> = Vec::new();
+        let mut emitted_since_check = 0usize;
+        let mut failures: Vec<CombineOutputEvalFailure> = Vec::new();
+        let mut sink = EmitSink {
+            rows: RowSink::Unsorted(&mut output),
+            emitted_since_check: &mut emitted_since_check,
+            output_eval_failures: &mut failures,
+            failure_tags: None,
+        };
+        for _ in 0..(MEMORY_CHECK_INTERVAL - 1) {
+            poll_collect_accum(&cfg, &mut sink, over)
+                .expect("below the cadence the poll only counts");
+        }
+        let err = poll_collect_accum(&cfg, &mut sink, over)
+            .expect_err("at the cadence an over-limit accumulator must abort");
+        match err {
+            PipelineError::MemoryBudgetExceeded { node, .. } => assert_eq!(node, "ie_test"),
+            other => {
+                panic!("expected MemoryBudgetExceeded from the accumulator poll; got {other:?}")
+            }
+        }
+
+        // Control: the same cadence with a zero accumulator (and the RSS arm
+        // inert) never aborts — proving the abort is driven by the charged
+        // accumulator bytes, not by the cadence alone.
+        let mut output2: Vec<(Record, RecordOrder)> = Vec::new();
+        let mut esc2 = 0usize;
+        let mut failures2: Vec<CombineOutputEvalFailure> = Vec::new();
+        let mut sink2 = EmitSink {
+            rows: RowSink::Unsorted(&mut output2),
+            emitted_since_check: &mut esc2,
+            output_eval_failures: &mut failures2,
+            failure_tags: None,
+        };
+        for _ in 0..(MEMORY_CHECK_INTERVAL * 2) {
+            poll_collect_accum(&cfg, &mut sink2, 0)
+                .expect("a zero accumulator under an inert RSS arm never aborts");
+        }
     }
 
     #[derive(Clone, Copy, Debug)]

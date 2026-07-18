@@ -833,41 +833,45 @@ pub(crate) fn dispatch_combine(
                         strategy: ctx.strategy,
                     })
                 })?;
-                let crate::pipeline::combine::CombineKernelOutput {
-                    records: output_records,
+                let crate::pipeline::sort_merge_join::SortMergeOutput {
+                    sorted,
+                    row_count,
                     output_eval_failures,
                 } = kernel_out;
-                // Route each deferred output-stage eval failure through
-                // the `combine_output_row` path while the pre-fold
-                // snapshot is still installed (the rewind reads it).
-                for f in output_eval_failures {
-                    dispatch_combine_output_error(
-                        ctx,
-                        node_idx,
-                        &f.probe_record,
-                        f.row,
-                        f.matched_build.as_ref(),
-                        name,
-                        f.error,
-                    )?;
-                }
-                let probe_records_out = output_records.len() as u64;
-                ctx.collector
-                    .record(probe_timer.finish(probe_records_in, probe_records_out));
-                finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
-                tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-                let nb = admit_node_buffer(
+                // Route each deferred output-stage eval failure through the same
+                // `combine_output_row` path the inline arm uses, before the
+                // pre-fold snapshot is dropped (the rewind reads it).
+                dispatch_combine_output_errors(ctx, node_idx, name, output_eval_failures)?;
+                // Drain the bounded, payload-sorted output handle through the
+                // same seam the block-band IEJoin uses, so the canonical
+                // (driver order, driver_idx, build_idx) order is realized and the
+                // output axis stays bounded: streamed straight to a downstream
+                // streaming Output, spilled runs adopted whole into a
+                // merge-on-drain node buffer, or admitted resident.
+                match drain_block_band_output(
                     ctx,
-                    name,
+                    current_dag,
                     node_idx,
-                    output_records,
+                    name,
+                    sorted,
+                    row_count,
                     combined_puncts,
-                    node_buffer_spill_allowed(current_dag, node_idx),
-                )?;
-                ctx.node_buffers.insert(node_idx, nb);
-                // Combine arm clean-exit: drop the per-fold cursor
-                // snapshot. Mirrors the inline arm's post-emit
-                // clear.
+                )? {
+                    BlockBandDrain::Streamed(count) => {
+                        ctx.collector
+                            .record(probe_timer.finish(probe_records_in, count));
+                        ctx.combine_input_snapshots.remove(&node_idx);
+                        return Ok(());
+                    }
+                    BlockBandDrain::Buffered(nb) => {
+                        let probe_records_out = nb.len_hint() as u64;
+                        ctx.collector
+                            .record(probe_timer.finish(probe_records_in, probe_records_out));
+                        ctx.node_buffers.insert(node_idx, nb);
+                    }
+                }
+                // Combine arm clean-exit: drop the per-fold cursor snapshot.
+                // Mirrors the inline arm's post-emit clear.
                 ctx.combine_input_snapshots.remove(&node_idx);
                 Ok(())
             })();
@@ -2004,7 +2008,7 @@ fn drain_block_band_output(
                 let merge_compress = merge_compress_for(ctx, &files, batch_size);
                 let merger = crate::pipeline::spill_merge::SortedRunMerger::new_payload_ordered(
                     files,
-                    "iejoin block-band output merge",
+                    "combine payload-sorted output merge",
                     crate::pipeline::spill_merge::MergeBudget {
                         budget: &ctx.memory_budget,
                         node: combine_name,
@@ -2060,7 +2064,7 @@ fn drain_block_band_output(
                 let merge_compress = merge_compress_for(ctx, &files, ctx.batch_size);
                 let merger = crate::pipeline::spill_merge::SortedRunMerger::new_payload_ordered(
                     files,
-                    "iejoin block-band output merge",
+                    "combine payload-sorted output merge",
                     crate::pipeline::spill_merge::MergeBudget {
                         budget: &ctx.memory_budget,
                         node: combine_name,
