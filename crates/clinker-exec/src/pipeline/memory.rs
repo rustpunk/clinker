@@ -378,8 +378,8 @@ impl Default for PauseSignal {
 /// from the same thread that holds the operator's live state.
 ///
 /// `pause_signal` mirrors the `MemoryConsumer::pause` / `resume` signal
-/// for back-pressureable consumers (Sources, `node_buffers` slots that
-/// chain to a pauseable Source). Producer hot loops call
+/// for back-pressureable consumers — Sources, the only class the
+/// arbitrator pauses instead of spilling. Producer hot loops call
 /// `wait_while_paused()` at batch boundaries; the call blocks on a
 /// `Condvar` until the arbitrator's `resume` notifies. The fast path
 /// (not paused) is lock-free.
@@ -541,19 +541,22 @@ pub trait MemoryConsumer: Send + Sync {
     /// from a lock-free snapshot read rather than a mutable registry.
     fn try_spill(&self, target_bytes: u64) -> Result<u64, ConsumerSpillError>;
 
-    /// Whether the consumer can be paused at its inbound channel
-    /// instead of forced to spill. True for Sources and inter-stage
-    /// buffers fronted by a bounded channel; false for blocking
-    /// operators that have no upstream to gate.
+    /// Whether the arbitrator can pause the consumer's producer at its
+    /// inbound channel instead of forcing a spill. True for Sources,
+    /// whose ingest thread parks on the pause signal. A materialized
+    /// `node_buffers` slot returns false: it is filled synchronously by
+    /// the walk thread with no separate producer to park, so its only
+    /// relief is spill. The streaming handoff (a separate writer thread
+    /// behind a bounded channel) also returns false — that channel, not
+    /// an arbitrator pause, paces its producer at the transport layer.
     fn can_back_pressure(&self) -> bool;
 
     /// Pause the consumer's inbound channel. Default body is a no-op:
-    /// blocking operators that return `false` from `can_back_pressure`
-    /// inherit the default and do not need to override. Back-pressureable
-    /// consumers (Sources, `node_buffers` slots whose producer chains to
-    /// a pauseable Source) override with a real `PauseSignal::pause()`
-    /// call. Takes `&self` because the pause flag lives behind a shared
-    /// handle's atomic.
+    /// consumers that return `false` from `can_back_pressure` (blocking
+    /// operators and every materialized `node_buffers` slot) inherit the
+    /// default and do not need to override. Only Sources override with a
+    /// real `PauseSignal::pause()` call. Takes `&self` because the pause
+    /// flag lives behind a shared handle's atomic.
     fn pause(&self) {}
 
     /// Resume a previously paused consumer. Default body is a no-op,

@@ -541,9 +541,10 @@ impl ExecutionPlanDag {
             // here is that index — stable and identical to the slot the
             // executor admits into. Every slot registers a
             // `NodeBufferConsumer` (priority 0, the cheapest spill victim);
-            // its `can_back_pressure` is the slot's own flag, today always
-            // false at the admit site, so the producer-variant suffix is
-            // informational context only — it does not flip the flag.
+            // its `can_back_pressure` is a constant `false` — a
+            // materialized node buffer has no pauseable producer — so the
+            // producer-variant suffix is informational context only; it
+            // does not flip the flag.
             let materialized_edges: Vec<(NodeIndex, NodeIndex)> = self
                 .topo_order
                 .iter()

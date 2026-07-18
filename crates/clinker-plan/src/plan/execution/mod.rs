@@ -1108,8 +1108,8 @@ pub(super) struct ArbitrationClass {
 /// to query. Keep the two in lock-step:
 ///
 /// - `node_buffers` slot — `executor::node_buffer::NodeBufferConsumer`
-///   (priority `0`; `can_back_pressure` is the slot's own flag, today
-///   always `false` at the admit site).
+///   (priority `0`; `can_back_pressure` is a constant `false` — a
+///   materialized node buffer has no pauseable producer).
 /// - Source ingest — `executor::source_stream::SourceConsumer`
 ///   (priority `i32::MAX`, back-pressureable; rendered `N/A` here).
 /// - hash Aggregate — `aggregation::AggregateConsumer` (priority `30`).
