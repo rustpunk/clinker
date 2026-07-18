@@ -62,20 +62,20 @@ fn transform_cxl_sources(config: &PipelineConfig) -> Vec<(String, String)> {
 }
 
 /// Human-readable strategy label for the multi-line `--explain` block.
-/// `HashPartitionIEJoin` and `GraceHash` append their `1 << partition_bits`
-/// partition count so the planner's bucket choice surfaces without making
-/// the reader compute it. The bare-tag form is used elsewhere (header
-/// line, JSON tag), the spelled-out form here.
+/// `GraceHash` appends its `1 << partition_bits` partition count, since it
+/// really does hash-partition its build side into that many on-disk buckets.
+/// `HashPartitionIEJoin` (equi+range) instead runs the bounded block-band path —
+/// equality is a prune axis derived from the sort, not a fixed bucket count — so
+/// it renders the mechanism rather than a `partition_bits`-derived number the
+/// block-band runtime does not act on. The bare-tag form is used elsewhere
+/// (header line, JSON tag), the spelled-out form here.
 fn combine_strategy_display(s: &crate::plan::combine::CombineStrategy) -> String {
     use crate::plan::combine::CombineStrategy;
     match s {
         CombineStrategy::HashBuildProbe => "HashBuildProbe".to_string(),
         CombineStrategy::InMemoryHash => "InMemoryHash".to_string(),
-        CombineStrategy::HashPartitionIEJoin { partition_bits } => {
-            format!(
-                "HashPartitionIEJoin ({} partitions)",
-                1u32 << *partition_bits
-            )
+        CombineStrategy::HashPartitionIEJoin { .. } => {
+            "HashPartitionIEJoin (equi+range, block-band)".to_string()
         }
         CombineStrategy::IEJoin => "IEJoin".to_string(),
         CombineStrategy::SortMerge => "SortMerge".to_string(),
