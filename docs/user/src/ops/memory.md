@@ -68,11 +68,15 @@ rather than wrapping to a small budget (the YAML overflow error names
 that fits your host's real memory.
 
 A well-formed but *undersized* value is a different case: it is not a malformed
-flag, so it clears the boundary check and is instead rejected at startup by the
-budget gate as `E312` when it falls below the process's baseline resident
-memory. Because `--memory-limit` simply populates `pipeline.memory.limit`, that
-`E312` — which names the limit and echoes the offending byte value — refers to
-the same limit you passed via the flag.
+flag, so it clears the boundary check, and whether it aborts the run depends on
+the `backpressure` policy. Under a producer-pausing policy (`pause`, the
+default, or `both`) a value below the process's baseline resident memory is
+rejected at startup by the budget gate as `E312`. Under the non-pausing `spill`
+policy that startup gate does not fire: the run proceeds and relies on spilling
+to stay within the budget rather than aborting. Because `--memory-limit` simply
+populates `pipeline.memory.limit`, that `E312` — which names the limit and
+echoes the offending byte value — refers to the same limit you passed via the
+flag.
 
 ## Choosing a backpressure policy
 
