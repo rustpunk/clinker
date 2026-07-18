@@ -437,11 +437,12 @@ pub fn compute_streaming_combine_probe_edges(
 /// - hash build-probe `Combine`
 ///   ([`CombineStrategy::HashBuildProbe`]): only the probe-side emit
 ///   streams; the build side stays materialized inside the arm.
-/// - pure-range block-band `Combine` ([`CombineStrategy::IEJoin`]):
-///   blocking on its input (both sides drained and sorted), but its
-///   bounded payload-sorted output drain streams to the consumer. The
-///   equi+range `HashPartitionIEJoin`, sort-merge, and grace-hash joins
-///   keep their output materialized and stay blocking.
+/// - block-band `Combine` ([`CombineStrategy::IEJoin`] pure-range and
+///   [`CombineStrategy::HashPartitionIEJoin`] equi+range, which share the
+///   one path): blocking on its input (both sides drained and sorted), but
+///   its bounded payload-sorted output drain streams to the consumer. The
+///   sort-merge and grace-hash joins keep their output materialized and
+///   stay blocking.
 ///
 /// Correlation buffering disables streaming pipeline-wide — the
 /// `CorrelationCommit` terminal owns the writes — so the caller short-
@@ -667,20 +668,23 @@ fn certify_linear_producer(
             //
             // - `HashBuildProbe`: the probe-side emit streams row-by-row
             //   while the build side stays materialized in the hash table.
-            // - `IEJoin` (pure-range block-band): fully blocking on its
-            //   INPUT — both sides are drained, sorted, and the output
-            //   buffer filled before anything emits — but the bounded,
+            // - `IEJoin` / `HashPartitionIEJoin` (the one block-band path,
+            //   pure-range and equi+range): fully blocking on its INPUT —
+            //   both sides are drained, sorted, and the output buffer
+            //   filled before anything emits — but the bounded,
             //   payload-sorted output DRAIN streams straight to the sink
             //   instead of admitting a node-buffer. From this predicate's
             //   view it is a linear producer with one output edge, same as
             //   the others.
             //
-            // The equi+range `HashPartitionIEJoin`, sort-merge, and
-            // grace-hash joins keep their output materialized (their output
-            // axis is a separate task), so they stay blocking here.
+            // The sort-merge and grace-hash joins keep their output
+            // materialized (their output axis is a separate task), so they
+            // stay blocking here.
             if !matches!(
                 strategy,
-                CombineStrategy::HashBuildProbe | CombineStrategy::IEJoin
+                CombineStrategy::HashBuildProbe
+                    | CombineStrategy::IEJoin
+                    | CombineStrategy::HashPartitionIEJoin { .. }
             ) {
                 return None;
             }
@@ -805,8 +809,9 @@ nodes:
 
     /// An equi+range combine (`region == region and amount >= lo`) whose
     /// sole downstream is a single `Output`. The planner selects
-    /// `CombineStrategy::HashPartitionIEJoin`; its output axis is a separate
-    /// task, so the producer arm must decline it.
+    /// `CombineStrategy::HashPartitionIEJoin`, which now runs the same bounded
+    /// block-band path as pure-range `IEJoin`, so its payload-sorted output
+    /// drain streams to the sink and the producer arm certifies it.
     const EQUI_RANGE_TO_OUTPUT: &str = r#"
 pipeline:
   name: cert_equi_range
@@ -961,12 +966,11 @@ nodes:
     }
 
     #[test]
-    fn equi_range_hash_partition_combine_is_not_certified() {
+    fn equi_range_hash_partition_combine_certifies_streaming_output_edge() {
         with_certification_inputs(EQUI_RANGE_TO_OUTPUT, |dag, fused, init| {
-            // Scope guard: only the pure-range block-band variant is
-            // admitted. The equi+range HashPartitionIEJoin path keeps its
-            // output materialized, so its combine→Output edge must NOT
-            // certify even though it too has a single downstream Output.
+            // The equi+range HashPartitionIEJoin path now runs the same bounded
+            // block-band machinery as pure-range IEJoin, so its payload-sorted
+            // output drain streams to the sink exactly like the pure-range case.
             assert!(
                 matches!(
                     combine_strategy(dag),
@@ -975,12 +979,22 @@ nodes:
                 "the equi+range predicate must select the hash-partitioned IEJoin strategy, got {:?}",
                 combine_strategy(dag)
             );
+            let combine = find_node(dag, "combine", |n| matches!(n, PlanNode::Combine { .. }));
             let output = find_node(dag, "output", |n| matches!(n, PlanNode::Output { .. }));
+            // The combine→Output edge certifies, resolving the equi+range
+            // block-band combine as the streaming producer, and the runtime
+            // classification agrees.
             assert_eq!(
                 certify_streaming_edge(dag, output, fused, init),
-                None,
-                "equi+range HashPartitionIEJoin output axis is out of scope; it must not certify"
+                Some(combine),
+                "equi+range block-band combine -> single Output must certify the combine as the \
+                 streaming producer"
             );
+            let classes = classify_stream_nodes(
+                dag,
+                &parse_config(EQUI_RANGE_TO_OUTPUT).expect("re-parse for config"),
+            );
+            assert_eq!(classes[&combine], StreamClass::Streaming);
         });
     }
 }

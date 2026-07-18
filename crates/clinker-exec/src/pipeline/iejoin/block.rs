@@ -1,29 +1,47 @@
-//! Block-band execution for pure-range IEJoin combines (`CombineStrategy::IEJoin`,
-//! dispatched as `IEJoin(None)`).
+//! Block-band execution for every IEJoin combine — pure-range
+//! (`CombineStrategy::IEJoin`) and equi+range (`CombineStrategy::
+//! HashPartitionIEJoin`) alike.
 //!
 //! The whole-input IEJoin kernel materializes both sides plus its L1/L2 sort
-//! arrays, so a pure-range band join over inputs larger than the memory budget
-//! has nowhere to spill. This module bounds the INPUT axis by partitioning
-//! each side into contiguous, key-sorted, min/max-tagged blocks that live on
-//! disk, then running the unchanged kernel per surviving block-pair:
+//! arrays, so a band join over inputs larger than the memory budget has nowhere
+//! to spill. This module bounds the INPUT axis by partitioning each side into
+//! contiguous, key-sorted, min/max-tagged blocks that live on disk, then running
+//! the unchanged kernel per surviving block-pair:
 //!
 //!   1. **Drain** each side into a payload-ordered
-//!      [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer) keyed on the
-//!      primary inequality key (payload `(k1, k2, driver_idx, order)` for the
-//!      driver, `(k1, k2, build_idx)` for the build). The buffer spills its
-//!      overflow to disk.
+//!      [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer) keyed on
+//!      `(equality-hash, k1, k2, …)` — the equality hash LEADS so equal-keyed
+//!      records cluster (payload `(eq_hash, k1, k2, driver_idx, order, eq)` for
+//!      the driver, `(eq_hash, k1, k2, build_idx, eq)` for the build; a
+//!      pure-range combine hashes every record to one constant value, so the
+//!      lead key is inert and this is exactly the prior range-only sort). The
+//!      buffer spills its overflow to disk.
 //!   2. **Slice** the sorted stream (in-memory vec or the k-way merge over the
 //!      spilled runs — never collected) into contiguous blocks of at most
-//!      `block_target_bytes`, tagging each with its per-axis key bounds. Blocks
-//!      stay resident under a shared `soft / 2` budget across both sides, so a
-//!      side (or both sides together) that fits it never touches disk;
-//!      remaining blocks are written to their own spill files.
-//!   3. **Schedule** driver blocks as the outer loop and build blocks as the
-//!      inner loop, strictly sequentially. A block-pair whose key bounds prove
-//!      the predicate empty (see [`possible`]) is pruned before any load. Each
-//!      surviving pair loads its two blocks (a resident block is borrowed, a
-//!      spilled block read into scratch), runs the numeric kernel, and emits
+//!      `block_target_bytes`, cutting a new block at every equality-hash boundary
+//!      so a block never straddles two hashes, and tagging each with its single
+//!      equality hash plus its per-axis range bounds. Blocks stay resident under
+//!      a shared `soft / 2` budget across both sides, so a side (or both sides
+//!      together) that fits it never touches disk; remaining blocks are written
+//!      to their own spill files.
+//!   3. **Schedule** driver blocks as the outer loop and, for each, only the
+//!      build blocks that share its equality hash (a contiguous slice found by
+//!      binary search, since blocks are hash-sorted) as the inner loop —
+//!      equality is a prune axis on TOP of the range-bounds prune (see
+//!      [`possible`]). A pure-range combine's single hash makes the inner loop
+//!      the whole build side, i.e. the prior nested loop. Each surviving pair
+//!      loads its two blocks (a resident block is borrowed, a spilled block read
+//!      into scratch), runs the numeric kernel, RE-VERIFIES canonical equality
+//!      per candidate pair (the payloads carry the actual equality-key bytes;
+//!      the hash is only a prune filter and hashes collide, so this recheck is
+//!      what a hash join does after a bucket hit), and emits the survivors
 //!      through the shared [`emit_pairs`](super::emit_pairs) loop.
+//!
+//! A single hot equality value produces many same-hash, range-ordered blocks
+//! the scheduler pairs and scans one bounded pair at a time, so it degrades to a
+//! pure-range band join over its own blocks with no separate skew path — the
+//! irreducible single-value block-nested-loop fallback is tracked separately
+//! (see #863).
 //!
 //! Determinism: the emitted rows — and the deferred output-eval (dead-letter)
 //! rows — are a pure function of the input data and the pipeline config, never
@@ -113,8 +131,8 @@ use std::io;
 use std::path::Path;
 use std::sync::Arc;
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
 use clinker_record::{Record, Schema};
 
@@ -128,13 +146,13 @@ use clinker_plan::plan::combine::RangeOp;
 
 use crate::executor::combine::CombineResolverMapping;
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
-use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
+use crate::pipeline::sort_buffer::{HeapBytes, SortBuffer, SortedOutput};
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use crate::pipeline::spill_merge::{MergeBudget, SortedRunMerger};
 
 use super::{
     BlockBandOutput, CollectFlush, DriverRef, EmitBatch, EmitConfig, EmitSink, Evaluators,
-    MatchState, RecordOrder, RecordScan, RowSink, dispatch_on_miss, emit_match_row, emit_pairs,
+    MatchState, RecordOrder, RecordScan, dispatch_on_miss, emit_match_row, emit_pairs,
     flush_collect_row, iejoin_numeric, iejoin_numeric_state_bytes, pre_output_budget_error,
     pwmj_numeric, pwmj_numeric_state_bytes,
 };
@@ -227,9 +245,17 @@ impl ResidentBudget {
 
 /// Estimated resident byte cost of one `(record, payload)` pair — the same
 /// formula the [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer)
-/// charges, so block sizing and the pre-output charge track its accounting.
-fn pair_bytes<P>(record: &Record) -> usize {
-    std::mem::size_of::<Record>() + record.estimated_heap_size() + std::mem::size_of::<P>()
+/// charges, so block sizing, resident admission, and the pre-output abort gate
+/// track its accounting. `size_of::<P>()` covers the payload's inline fields;
+/// [`HeapBytes::heap_bytes`] adds the bytes its keys point at on the heap — the
+/// block-band payload's canonical equality bytes — so a wide or data-expanding
+/// equality key is counted, not undercounted. Empty for a pure-range combine, so
+/// its block layout and spill decisions stay byte-for-byte unchanged.
+fn pair_bytes<P: HeapBytes>(record: &Record, payload: &P) -> usize {
+    std::mem::size_of::<Record>()
+        + record.estimated_heap_size()
+        + std::mem::size_of::<P>()
+        + payload.heap_bytes()
 }
 
 /// Per-record byte width of a hoisted range-key column: the `(k1, k2)` tuple a
@@ -310,6 +336,13 @@ impl Bounds {
 /// file.
 struct Block<P> {
     storage: BlockStorage<P>,
+    /// The single equality hash every record in this block shares. The slicer
+    /// cuts a block at every equality-hash boundary, so a block never straddles
+    /// two hashes; the scheduler pairs only same-hash driver/build blocks (the
+    /// equality prune on top of the range-bounds prune). A pure-range combine
+    /// hashes every record to one constant value, so this collapses to a single
+    /// group and the block-band behaves exactly as the prior pure-range path.
+    eq_hash: u64,
     bounds: Bounds,
     /// Estimated resident byte cost when loaded: the figure charged against the
     /// budget and, for a resident block, the RAM it actually holds. Known at
@@ -683,7 +716,6 @@ pub(super) fn execute_block_band(
         spill_compress,
         output_row_schema,
     );
-    let mut emitted_since_check: usize = 0;
     let mut output_eval_failures = Vec::new();
     // Parallel `(order, driver_idx, build_idx)` sort key per deferred output-eval
     // failure, so the dead-letter rows re-order into the same layout-independent
@@ -726,13 +758,10 @@ pub(super) fn execute_block_band(
     // and failure-tag vec end at its last use, before the output buffer is
     // finished and the failures re-sorted.
     let mut sink = EmitSink {
-        rows: RowSink::Sorted {
-            buf: &mut output_buf,
-            budget,
-            name,
-            consumer,
-        },
-        emitted_since_check: &mut emitted_since_check,
+        buf: &mut output_buf,
+        budget,
+        name,
+        consumer,
         output_eval_failures: &mut output_eval_failures,
         failure_tags: Some(&mut failure_tags),
     };
@@ -804,9 +833,9 @@ pub(super) fn execute_block_band(
             .enumerate()
             .map(|(di, (record, payload))| DriverRef {
                 record,
-                order: payload.3,
+                order: payload.order,
                 key: di,
-                driver_idx: payload.2,
+                driver_idx: payload.driver_idx,
             })
             .collect();
         // Fix the kernel dispatch for this driver block, hoisting the driver key
@@ -817,10 +846,10 @@ pub(super) fn execute_block_band(
         let range_mode = match op2 {
             Some(op2v) => RangeMode::Dual {
                 op2: op2v,
-                driver_keys: driver_loaded.iter().map(|(_, p)| (p.0, p.1)).collect(),
+                driver_keys: driver_loaded.iter().map(|(_, p)| (p.k1, p.k2)).collect(),
             },
             None => RangeMode::Single {
-                driver_keys: driver_loaded.iter().map(|(_, p)| p.0).collect(),
+                driver_keys: driver_loaded.iter().map(|(_, p)| p.k1).collect(),
             },
         };
         // Each absolute set includes the output sort's and the in-block pile's
@@ -835,7 +864,25 @@ pub(super) fn execute_block_band(
                 .saturating_add(inblock_buf.bytes_used() as u64),
         );
 
-        for build_block in &build_blocks {
+        // Equality prune: pair this driver block only with build blocks that
+        // share its equality hash. `build_blocks` is sorted by `eq_hash`
+        // (ascending), so the same-hash run is a contiguous slice found by
+        // binary search — O(log B) per driver block, and O(D + B) block pairs
+        // overall for a high-cardinality equi join rather than the O(D·B) a full
+        // nested loop would cost. A pure-range combine hashes every record to
+        // one constant value, so this slice is the whole build side and the
+        // schedule is exactly the prior pure-range nested loop.
+        let h = driver_block.eq_hash;
+        let lo = build_blocks.partition_point(|b| b.eq_hash < h);
+        let hi = build_blocks.partition_point(|b| b.eq_hash <= h);
+        for build_block in &build_blocks[lo..hi] {
+            debug_assert_eq!(
+                build_block.eq_hash, h,
+                "the same-hash slice must hold only equality-hash-matched build blocks"
+            );
+            // Within the same hash, prune on the range bounds; a surviving pair
+            // still re-verifies canonical equality per candidate row below,
+            // because distinct equality values can share a hash.
             if !block_pair_possible(op1, op2, driver_block, build_block) {
                 continue;
             }
@@ -901,7 +948,7 @@ pub(super) fn execute_block_band(
             if build_loaded.is_empty() {
                 continue;
             }
-            let build_idx: Vec<u64> = build_loaded.iter().map(|(_, p)| p.2).collect();
+            let build_idx: Vec<u64> = build_loaded.iter().map(|(_, p)| p.build_idx).collect();
             consumer.set_bytes(
                 baseline_resident
                     .saturating_add(driver_held)
@@ -914,17 +961,28 @@ pub(super) fn execute_block_band(
             // Build the build-side key column at the width the chosen kernel
             // reads: the `(k1, k2)` pairs for the two-conjunct IEJoin, or the
             // bare `k1` column for PWMJ (one pass, no dead second axis).
-            let pairs: Vec<(usize, usize)> = match &range_mode {
+            let mut pairs: Vec<(usize, usize)> = match &range_mode {
                 RangeMode::Dual { op2, driver_keys } => {
                     let bkeys: Vec<(i64, i64)> =
-                        build_loaded.iter().map(|(_, p)| (p.0, p.1)).collect();
+                        build_loaded.iter().map(|(_, p)| (p.k1, p.k2)).collect();
                     iejoin_numeric(driver_keys, &bkeys, op1, *op2)
                 }
                 RangeMode::Single { driver_keys } => {
-                    let bl: Vec<i64> = build_loaded.iter().map(|(_, p)| p.0).collect();
+                    let bl: Vec<i64> = build_loaded.iter().map(|(_, p)| p.k1).collect();
                     pwmj_numeric(driver_keys, &bl, op1)
                 }
             };
+
+            // Canonical equality re-verify. The block-pair prune keyed on the
+            // equality HASH, and hashes collide, so within a same-hash pair the
+            // range kernel can pair a driver and build whose actual equality
+            // values differ. Drop those: compare the canonical equality bytes
+            // the payloads carry (the exact value, not the hash), the way a hash
+            // join rechecks the key after a bucket hit. For a pure-range combine
+            // every `eq` is empty, so this retains every pair — a no-op that
+            // leaves the pure-range result and order unchanged. Done before the
+            // pairs-vector gate so the gate sees the post-verify count.
+            pairs.retain(|&(di, bi)| driver_loaded[di].1.eq == build_loaded[bi].1.eq);
 
             // Fold the materialized pair-index vector into the peak: it is the
             // last pre-output allocation before per-pair emit. This is a
@@ -959,7 +1017,7 @@ pub(super) fn execute_block_band(
                 pairs: &pairs,
                 driver_slice: &driver_slice,
                 build_slice: &build_slice,
-                build_idx: Some(&build_idx),
+                build_idx: &build_idx,
             };
             emit_pairs(&emit_cfg, &mut evals, &batch, &mut state, &mut sink)?;
 
@@ -1141,14 +1199,59 @@ fn spilled_scratch_bytes<P>(block: &Block<P>) -> u64 {
     }
 }
 
-/// Build-side blocks, keyed on `(k1, k2, build_idx)`.
-type BuildBlocks = Vec<Block<(i64, i64, u64)>>;
+/// Build-side sort payload. The derived `Ord` compares fields in declaration
+/// order — `(eq_hash, k1, k2, build_idx, eq)` — so the equality hash LEADS:
+/// equal-keyed builds cluster and the slicer can cut a block at every hash
+/// boundary. The range keys order within a hash, then `build_idx` (the build's
+/// unique original input index) fully breaks ties, so the trailing `eq`
+/// (canonical equality bytes, carried only for the per-pair re-verify) never
+/// participates in the order — keeping the `Ord`/`Eq` contract intact even
+/// though two distinct keys can share `eq_hash`.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+struct BuildPayload {
+    eq_hash: u64,
+    k1: i64,
+    k2: i64,
+    build_idx: u64,
+    eq: Vec<u8>,
+}
 
-/// Driver payload: primary/secondary range keys, the driver's unique global
-/// input index, and its `RecordOrder` tag. `driver_idx` is the sort tiebreak
-/// after the keys (`order` may repeat when a chained upstream fans one input
-/// row into several) and disambiguates the final output sort.
-type DriverPayload = (i64, i64, u64, RecordOrder);
+/// Driver-side sort payload. The derived `Ord` compares
+/// `(eq_hash, k1, k2, driver_idx, order, eq)`: equality hash leads (block
+/// clustering + prune), then the range keys, then `driver_idx` (the driver's
+/// unique global input index — the tiebreak ahead of the possibly-repeated
+/// `order` a chained upstream can stamp), then `order`, then the canonical
+/// equality bytes for re-verify. `driver_idx` is unique, so `eq` never breaks a
+/// tie.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+struct DriverPayload {
+    eq_hash: u64,
+    k1: i64,
+    k2: i64,
+    driver_idx: u64,
+    order: RecordOrder,
+    eq: Vec<u8>,
+}
+
+// Charge the canonical equality-key bytes each payload carries, so a wide or
+// data-expanding equality key is counted in the sort buffer's byte estimate,
+// block sizing, resident admission, and the pre-output abort gate. Empty for a
+// pure-range combine (no equality keys), so its accounting is unchanged.
+impl HeapBytes for BuildPayload {
+    fn heap_bytes(&self) -> usize {
+        self.eq.len()
+    }
+}
+
+impl HeapBytes for DriverPayload {
+    fn heap_bytes(&self) -> usize {
+        self.eq.len()
+    }
+}
+
+/// Build-side blocks, each single-equality-hash (the slicer never straddles a
+/// hash boundary), sorted `(eq_hash, k1, k2, build_idx)` within.
+type BuildBlocks = Vec<Block<BuildPayload>>;
 
 /// Scan-phase unmatched-driver payload: the driver's unique global input index
 /// and its `RecordOrder` tag. Sorting by `driver_idx` (unique) yields the
@@ -1162,15 +1265,16 @@ type ScanUnmatchedPayload = (u64, RecordOrder);
 type DriverSide = (Vec<Block<DriverPayload>>, SortBuffer<ScanUnmatchedPayload>);
 
 /// Drain the driver side: matched records go into a payload-ordered sort
-/// buffer keyed on `(k1, k2, driver_idx, order)` — `driver_idx` (the driver's
-/// unique global input index) breaks key ties ahead of the possibly-repeated
-/// `order`. Scan-phase unmatched drivers (NULL / non-orderable range key) drain
-/// into a second payload-ordered buffer keyed on `(driver_idx, order)` — spilled
-/// on the same substrate and quota (E320) as the matched sides, so an input
-/// dominated by unmatched drivers stays bounded rather than resident — unless
-/// `retain_unmatched` is false (First / All + Skip), where they produce no
-/// output and are dropped outright. Returns the sliced blocks and the scan-phase
-/// buffer.
+/// buffer keyed on `(eq_hash, k1, k2, driver_idx, order)` — the equality hash
+/// leads so equal-keyed drivers cluster into contiguous single-hash blocks, and
+/// `driver_idx` (the driver's unique global input index) breaks key ties ahead
+/// of the possibly-repeated `order`. Scan-phase unmatched drivers (NULL equality
+/// or non-orderable range key) drain into a second payload-ordered buffer keyed
+/// on `(driver_idx, order)` — spilled on the same substrate and quota (E320) as
+/// the matched sides, so an input dominated by unmatched drivers stays bounded
+/// rather than resident — unless `retain_unmatched` is false (First / All +
+/// Skip), where they produce no output and are dropped outright. Returns the
+/// sliced blocks and the scan-phase buffer.
 fn drain_driver_side(
     driver_records: Vec<(Record, RecordOrder)>,
     driver_scans: Vec<RecordScan>,
@@ -1207,19 +1311,35 @@ fn drain_driver_side(
                 }
             }
             RecordScan::Matched {
+                eq_hash,
+                eq,
                 range_key: (k1, k2),
-                ..
-            } => push_charge_spill(&mut buf, record, (k1, k2, driver_idx, order), ctx)?,
+            } => push_charge_spill(
+                &mut buf,
+                record,
+                DriverPayload {
+                    eq_hash,
+                    k1,
+                    k2,
+                    driver_idx,
+                    order,
+                    eq,
+                },
+                ctx,
+            )?,
         }
     }
-    let blocks = finish_and_slice(buf, schema, ctx, resident, &|p: &DriverPayload| (p.0, p.1))?;
+    let blocks = finish_and_slice(buf, schema, ctx, resident, &|p: &DriverPayload| {
+        (p.eq_hash, p.k1, p.k2)
+    })?;
     Ok((blocks, scan_buf))
 }
 
 /// Drain the build side: matched records go into a payload-ordered sort buffer
-/// keyed on `(k1, k2, build_idx)` — the build's original input index, so the
-/// downstream First / Collect selection and the output ordering are a pure
-/// function of the data. Unmatched builds are dropped (no build-side on_miss).
+/// keyed on `(eq_hash, k1, k2, build_idx)` — the equality hash leads (single-
+/// hash blocks) and `build_idx`, the build's original input index, keeps the
+/// downstream First / Collect selection and the output ordering a pure function
+/// of the data. Unmatched builds are dropped (no build-side on_miss).
 fn drain_build_side(
     build_records: Vec<Record>,
     build_scans: Vec<RecordScan>,
@@ -1230,7 +1350,7 @@ fn drain_build_side(
         return Ok(Vec::new());
     };
     let schema = Arc::clone(first.schema());
-    let mut buf: SortBuffer<(i64, i64, u64)> = SortBuffer::new_payload_ordered(
+    let mut buf: SortBuffer<BuildPayload> = SortBuffer::new_payload_ordered(
         ctx.sort_threshold,
         Some(ctx.spill_dir.to_path_buf()),
         ctx.spill_compress,
@@ -1238,15 +1358,27 @@ fn drain_build_side(
     );
     for (build_idx, (record, scan)) in build_records.into_iter().zip(build_scans).enumerate() {
         if let RecordScan::Matched {
+            eq_hash,
+            eq,
             range_key: (k1, k2),
-            ..
         } = scan
         {
-            push_charge_spill(&mut buf, record, (k1, k2, build_idx as u64), ctx)?;
+            push_charge_spill(
+                &mut buf,
+                record,
+                BuildPayload {
+                    eq_hash,
+                    k1,
+                    k2,
+                    build_idx: build_idx as u64,
+                    eq,
+                },
+                ctx,
+            )?;
         }
     }
-    finish_and_slice(buf, &schema, ctx, resident, &|p: &(i64, i64, u64)| {
-        (p.0, p.1)
+    finish_and_slice(buf, &schema, ctx, resident, &|p: &BuildPayload| {
+        (p.eq_hash, p.k1, p.k2)
     })
 }
 
@@ -1268,7 +1400,7 @@ fn charge_block_spill(ctx: &DrainCtx<'_>, written: u64) -> Result<(), PipelineEr
 /// Push one matched pair into the sort buffer, mirror the byte delta into the
 /// consumer handle, and spill (charging the run against the disk quota, E320)
 /// when the buffer crosses its threshold.
-fn push_charge_spill<P: Serialize + DeserializeOwned + Send + Ord>(
+fn push_charge_spill<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
     buf: &mut SortBuffer<P>,
     record: Record,
     payload: P,
@@ -1299,12 +1431,12 @@ fn push_charge_spill<P: Serialize + DeserializeOwned + Send + Ord>(
 /// in-memory case that release is deferred until the sorted vec is actually
 /// consumed into blocks, so the still-resident vec is never charged out from
 /// under the consumer mid-slice.
-fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord>(
+fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
     buf: SortBuffer<P>,
     schema: &Arc<Schema>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
-    key_of: &impl Fn(&P) -> (i64, i64),
+    key_of: &impl Fn(&P) -> (u64, i64, i64),
 ) -> Result<Vec<Block<P>>, PipelineError> {
     let pre_finish = buf.bytes_used() as u64;
     let (sorted, residue) = buf.finish().map_err(|e| {
@@ -1351,32 +1483,59 @@ fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord>(
     Ok(blocks)
 }
 
-/// Slice a sorted stream into contiguous `block_target`-sized blocks, admitting
-/// each into RAM under the shared resident budget or spilling it otherwise.
-/// Streaming over the input: at most one forming block is resident beyond the
-/// admitted set, so the spilled-run merge is never collected.
-fn slice_side<P: Serialize + DeserializeOwned + Send + Ord>(
+/// Slice a sorted stream into contiguous `block_target`-sized blocks, cutting a
+/// new block at every equality-hash boundary so no block straddles two hashes
+/// (the scheduler's equality prune then keys on a block's single hash). Each
+/// completed block is admitted into RAM under the shared resident budget or
+/// spilled otherwise. Streaming over the input: at most one forming block is
+/// resident beyond the admitted set, so the spilled-run merge is never
+/// collected. The stream is sorted `(eq_hash, k1, k2, …)`, so records of one
+/// hash are contiguous and a hot equality value spreads across several
+/// budget-sized blocks the scheduler pairs one at a time.
+fn slice_side<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
     stream: SortedStream<P>,
     schema: &Arc<Schema>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
-    key_of: &impl Fn(&P) -> (i64, i64),
+    key_of: &impl Fn(&P) -> (u64, i64, i64),
 ) -> Result<Vec<Block<P>>, PipelineError> {
     let mut blocks: Vec<Block<P>> = Vec::new();
     let mut cur: Vec<(Record, P)> = Vec::new();
     let mut cur_bytes: usize = 0;
     let mut bounds = Bounds::empty();
+    // The equality hash of the block currently filling; meaningful only while
+    // `cur` is non-empty. Set when the first record of a block lands.
+    let mut cur_hash: u64 = 0;
     for item in stream {
         let (record, payload) = item?;
-        let (k1, k2) = key_of(&payload);
+        let (eq_hash, k1, k2) = key_of(&payload);
+        // Flush at an equality-hash boundary before adding this record, so the
+        // just-finished block carries a single hash. The stream is hash-sorted,
+        // so this fires exactly at each transition.
+        if !cur.is_empty() && eq_hash != cur_hash {
+            blocks.push(make_block(
+                std::mem::take(&mut cur),
+                cur_hash,
+                bounds,
+                cur_bytes as u64,
+                schema,
+                ctx,
+                resident,
+            )?);
+            cur_bytes = 0;
+            bounds = Bounds::empty();
+        }
+        cur_hash = eq_hash;
         bounds.update(k1, k2);
-        cur_bytes += pair_bytes::<P>(&record);
+        cur_bytes += pair_bytes::<P>(&record, &payload);
         cur.push((record, payload));
         // A single record larger than the target still forms a block of one —
-        // the target is soft.
+        // the target is soft. A hot equality value is thus spread across
+        // multiple same-hash blocks rather than one oversized resident block.
         if cur_bytes >= ctx.block_target {
             blocks.push(make_block(
                 std::mem::take(&mut cur),
+                cur_hash,
                 bounds,
                 cur_bytes as u64,
                 schema,
@@ -1390,6 +1549,7 @@ fn slice_side<P: Serialize + DeserializeOwned + Send + Ord>(
     if !cur.is_empty() {
         blocks.push(make_block(
             cur,
+            cur_hash,
             bounds,
             cur_bytes as u64,
             schema,
@@ -1400,13 +1560,15 @@ fn slice_side<P: Serialize + DeserializeOwned + Send + Ord>(
     Ok(blocks)
 }
 
-/// Build one completed block, keeping it resident if the shared budget still
-/// admits its bytes (charged into the consumer, since it holds that RAM through
-/// the rest of the join) or spilling it to its own file otherwise.
-/// `resident_bytes` is the block's estimated footprint, already accumulated by
-/// the slicer as it filled the block, so it is not re-summed here.
+/// Build one completed block (all records sharing `eq_hash`), keeping it
+/// resident if the shared budget still admits its bytes (charged into the
+/// consumer, since it holds that RAM through the rest of the join) or spilling
+/// it to its own file otherwise. `resident_bytes` is the block's estimated
+/// footprint, already accumulated by the slicer as it filled the block, so it
+/// is not re-summed here.
 fn make_block<P: Serialize + DeserializeOwned + Send + Ord>(
     pairs: Vec<(Record, P)>,
+    eq_hash: u64,
     bounds: Bounds,
     resident_bytes: u64,
     schema: &Arc<Schema>,
@@ -1418,12 +1580,13 @@ fn make_block<P: Serialize + DeserializeOwned + Send + Ord>(
         ctx.consumer.add_bytes(resident_bytes);
         Ok(Block {
             storage: BlockStorage::Resident(pairs),
+            eq_hash,
             bounds,
             resident_bytes,
             len,
         })
     } else {
-        spill_block(pairs, bounds, len, resident_bytes, schema, ctx)
+        spill_block(pairs, eq_hash, bounds, len, resident_bytes, schema, ctx)
     }
 }
 
@@ -1434,6 +1597,7 @@ fn make_block<P: Serialize + DeserializeOwned + Send + Ord>(
 /// silently under-charge the cap.
 fn spill_block<P: Serialize>(
     pairs: Vec<(Record, P)>,
+    eq_hash: u64,
     bounds: Bounds,
     len: usize,
     resident_bytes: u64,
@@ -1463,6 +1627,7 @@ fn spill_block<P: Serialize>(
     charge_block_spill(ctx, written)?;
     Ok(Block {
         storage: BlockStorage::Spilled(file),
+        eq_hash,
         bounds,
         resident_bytes,
         len,
@@ -1489,7 +1654,8 @@ struct InblockPile<'a, 'ctx> {
 /// deferred end-of-join on_miss dispatch, so on_miss:error names the
 /// lowest-input-index unmatched driver rather than whichever block finalized
 /// first and the pile stays bounded rather than resident. Each driver's global
-/// input index (`payload.2`) is carried through so its rows tag deterministically.
+/// input index (`payload.driver_idx`) is carried through so its rows tag
+/// deterministically.
 fn finalize_driver_block(
     cfg: &EmitConfig<'_>,
     evals: &mut Evaluators,
@@ -1502,7 +1668,7 @@ fn finalize_driver_block(
         MatchMode::Collect => {
             for (di, (record, payload)) in driver_loaded.iter().enumerate() {
                 let flush = state.take_collect(di);
-                flush_collect_row(cfg, record, payload.3, payload.2, flush, sink)?;
+                flush_collect_row(cfg, record, payload.order, payload.driver_idx, flush, sink)?;
             }
         }
         MatchMode::First => {
@@ -1516,23 +1682,23 @@ fn finalize_driver_block(
                     Some((bidx, build)) => {
                         let dref = DriverRef {
                             record,
-                            order: payload.3,
+                            order: payload.order,
                             key: di,
-                            driver_idx: payload.2,
+                            driver_idx: payload.driver_idx,
                         };
                         emit_match_row(cfg, evals, &dref, &build, bidx, sink)?;
                     }
                     // No candidate held: the driver matched no build predicate,
                     // a genuine zero-match routed to the deferred on_miss
                     // dispatch.
-                    None => note_unmatched(pile, record, payload.3, payload.2)?,
+                    None => note_unmatched(pile, record, payload.order, payload.driver_idx)?,
                 }
             }
         }
         MatchMode::All => {
             for (di, (record, payload)) in driver_loaded.iter().enumerate() {
                 if !state.matched[di] {
-                    note_unmatched(pile, record, payload.3, payload.2)?;
+                    note_unmatched(pile, record, payload.order, payload.driver_idx)?;
                 }
             }
         }
@@ -1766,6 +1932,30 @@ mod tests {
         )
     }
 
+    /// Empty-equality-key payload probes for the byte-accounting fixtures: the
+    /// exact payload types the drains build for a pure-range side, so
+    /// `pair_bytes` returns the real per-pair estimate (empty `eq` → zero heap).
+    fn driver_payload_probe() -> DriverPayload {
+        DriverPayload {
+            eq_hash: 0,
+            k1: 0,
+            k2: 0,
+            driver_idx: 0,
+            order: 0,
+            eq: Vec::new(),
+        }
+    }
+
+    fn build_payload_probe() -> BuildPayload {
+        BuildPayload {
+            eq_hash: 0,
+            k1: 0,
+            k2: 0,
+            build_idx: 0,
+            eq: Vec::new(),
+        }
+    }
+
     /// Empty resolver mapping. The body-less synthetic emit path never
     /// consults it (no residual, no body), so an empty map suffices.
     fn empty_resolver() -> CombineResolverMapping {
@@ -1790,9 +1980,9 @@ mod tests {
             .iter()
             .map(|(key, _)| match key {
                 Some((k1, k2)) => RecordScan::Matched {
-                    eq_keys: Vec::new(),
+                    eq_hash: 0,
                     range_key: (*k1, *k2),
-                    bucket: 0,
+                    eq: Vec::new(),
                 },
                 None => RecordScan::Unmatched,
             })
@@ -2988,9 +3178,9 @@ mod tests {
             let driver_scans: Vec<RecordScan> = driver_keyed
                 .iter()
                 .map(|(k1, k2, _, _)| RecordScan::Matched {
-                    eq_keys: Vec::new(),
+                    eq_hash: 0,
                     range_key: (*k1, *k2),
-                    bucket: 0,
+                    eq: Vec::new(),
                 })
                 .collect();
             let (build_records, build_scans) = to_records_scans(&build, &b_schema);
@@ -3081,9 +3271,9 @@ mod tests {
             let driver_scans: Vec<RecordScan> = driver_keyed
                 .iter()
                 .map(|(k1, k2, _, _)| RecordScan::Matched {
-                    eq_keys: Vec::new(),
+                    eq_hash: 0,
                     range_key: (*k1, *k2),
-                    bucket: 0,
+                    eq: Vec::new(),
                 })
                 .collect();
             let (build_records, build_scans) = to_records_scans(&build, &b_schema);
@@ -3182,9 +3372,9 @@ mod tests {
             .collect();
         let driver_scans: Vec<RecordScan> = (0..n)
             .map(|i| RecordScan::Matched {
-                eq_keys: Vec::new(),
+                eq_hash: 0,
                 range_key: (i, i),
-                bucket: 0,
+                eq: Vec::new(),
             })
             .collect();
         let build_records: Vec<Record> = (0..n)
@@ -3202,9 +3392,9 @@ mod tests {
             .collect();
         let build_scans: Vec<RecordScan> = (0..n)
             .map(|i| RecordScan::Matched {
-                eq_keys: Vec::new(),
+                eq_hash: 0,
                 range_key: (i, i),
-                bucket: 0,
+                eq: Vec::new(),
             })
             .collect();
 
@@ -3875,11 +4065,11 @@ mod tests {
         let (build_records, _) = to_records_scans(&build, &b_schema);
         let baseline_blocks: u64 = driver_records
             .iter()
-            .map(|r| pair_bytes::<DriverPayload>(r) as u64)
+            .map(|r| pair_bytes(r, &driver_payload_probe()) as u64)
             .sum::<u64>()
             + build_records
                 .iter()
-                .map(|r| pair_bytes::<(i64, i64, u64)>(r) as u64)
+                .map(|r| pair_bytes(r, &build_payload_probe()) as u64)
                 .sum::<u64>();
         let driver_vecs =
             (driver.len() * (range_key_width(op2) + std::mem::size_of::<DriverRef<'_>>())) as u64;
@@ -3974,7 +4164,7 @@ mod tests {
         // driver block spills (the build drains first and claims the budget).
         let baseline: u64 = build_records
             .iter()
-            .map(|r| pair_bytes::<(i64, i64, u64)>(r) as u64)
+            .map(|r| pair_bytes(r, &build_payload_probe()) as u64)
             .sum();
 
         // One full spilled driver block's footprint at the gate: its record
@@ -3983,7 +4173,7 @@ mod tests {
         // block holds exactly `RECORDS_PER_BLOCK` records, matching the slicer's
         // fill rule (emit once cumulative bytes reach the target).
         const RECORDS_PER_BLOCK: u64 = 12;
-        let r_d = pair_bytes::<DriverPayload>(&driver_records[0]) as u64;
+        let r_d = pair_bytes(&driver_records[0], &driver_payload_probe()) as u64;
         let block_target = (RECORDS_PER_BLOCK * r_d) as usize;
         let block_bytes = RECORDS_PER_BLOCK * r_d;
         let driver_vecs = RECORDS_PER_BLOCK
@@ -4055,5 +4245,632 @@ mod tests {
             "a fully-matching run's output must not depend on on_miss"
         );
         assert!(!error.is_empty(), "the fixture must produce matches");
+    }
+
+    // ── Equi+range block-band coverage ──────────────────────────────────────
+    //
+    // Equality is an additional prune axis on the same block-band path. These
+    // tests construct scans with an explicit equality group per record: matched
+    // records carry `eq = group.to_le_bytes()` (the canonical re-verify token)
+    // and `eq_hash = hash_of(group)` (the block-pair prune key), so a test can
+    // force two distinct groups into one hash to exercise the collision recheck.
+
+    /// One equi-side record: the range key (`None` models a NULL / non-orderable
+    /// key routed to on_miss), the readback id, and the equality group.
+    #[derive(Clone)]
+    struct EqRec {
+        key: Option<(i64, i64)>,
+        id: i64,
+        group: i64,
+    }
+
+    fn eqrec(k1: i64, k2: i64, id: i64, group: i64) -> EqRec {
+        EqRec {
+            key: Some((k1, k2)),
+            id,
+            group,
+        }
+    }
+
+    /// Canonical equality bytes for a group: distinct groups map to distinct
+    /// bytes, so equal groups re-verify equal. The production-faithful default.
+    fn group_eq_bytes(group: i64) -> Vec<u8> {
+        group.to_le_bytes().to_vec()
+    }
+
+    /// Build `(records, scans)` for one equi side. Matched records carry
+    /// `eq_hash = hash_of(group)` (the block-pair prune key) and `eq =
+    /// eq_of(group)` (the canonical re-verify bytes) — separate closures so a
+    /// test can force distinct groups into one hash (collision) or make the
+    /// re-verify bytes wide (accounting) independently.
+    fn to_records_scans_equi(
+        side: &[EqRec],
+        schema: &Arc<Schema>,
+        hash_of: &impl Fn(i64) -> u64,
+        eq_of: &impl Fn(i64) -> Vec<u8>,
+    ) -> (Vec<Record>, Vec<RecordScan>) {
+        let records = side
+            .iter()
+            .map(|r| {
+                let (k1, k2) = r.key.unwrap_or((0, 0));
+                make_rec(schema, k1, k2, r.id)
+            })
+            .collect();
+        let scans = side
+            .iter()
+            .map(|r| match r.key {
+                Some((k1, k2)) => RecordScan::Matched {
+                    eq_hash: hash_of(r.group),
+                    eq: eq_of(r.group),
+                    range_key: (k1, k2),
+                },
+                None => RecordScan::Unmatched,
+            })
+            .collect();
+        (records, scans)
+    }
+
+    /// Drive the block-band path over equi-keyed inputs against a caller-owned
+    /// arbitrator, so a test can inspect its spill accounting. Mirrors
+    /// [`run_block_on`] but constructs equality-carrying scans.
+    fn run_block_equi_on(
+        driver: &[EqRec],
+        build: &[EqRec],
+        cfg: &RunCfg,
+        hash_of: &impl Fn(i64) -> u64,
+        eq_of: &impl Fn(i64) -> Vec<u8>,
+        budget: &MemoryArbitrator,
+    ) -> Result<Vec<Record>, PipelineError> {
+        let d_schema = driver_schema();
+        let b_schema = build_schema();
+        let out_schema = match cfg.match_mode {
+            MatchMode::Collect => Arc::new(Schema::new(vec![
+                "k1".into(),
+                "k2".into(),
+                "id".into(),
+                "b".into(),
+            ])),
+            MatchMode::First | MatchMode::All => Arc::new(Schema::new(vec![
+                "d_k1".into(),
+                "d_k2".into(),
+                "d_id".into(),
+                "b_k1".into(),
+                "b_k2".into(),
+                "b_id".into(),
+            ])),
+        };
+        let (driver_records_bare, driver_scans) =
+            to_records_scans_equi(driver, &d_schema, hash_of, eq_of);
+        let driver_records: Vec<(Record, RecordOrder)> = driver_records_bare
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| (r, i as RecordOrder))
+            .collect();
+        let (build_records, build_scans) = to_records_scans_equi(build, &b_schema, hash_of, eq_of);
+
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let resolver = empty_resolver();
+        let consumer = ConsumerHandle::new();
+        let tmp = tempfile::Builder::new()
+            .prefix("iejoin-equi-test-")
+            .tempdir()
+            .expect("temp dir");
+        let propagate = PropagateCkSpec::Driver;
+
+        let out = execute_block_band(BlockBandExec {
+            name: "equi_test",
+            build_qualifier: "b",
+            driver_records,
+            driver_scans,
+            build_records,
+            build_scans,
+            op1: cfg.op1,
+            op2: cfg.op2,
+            residual_eval: None,
+            body_eval: None,
+            resolver_mapping: &resolver,
+            output_schema: Some(&out_schema),
+            match_mode: cfg.match_mode,
+            on_miss: cfg.on_miss,
+            propagate_ck: &propagate,
+            ctx: &ctx,
+            budget,
+            consumer: &consumer,
+            spill_dir: tmp.path(),
+            spill_compress: false,
+            strategy: ErrorStrategy::FailFast,
+            options: BlockBandOptions {
+                block_target_override: Some(cfg.block_target),
+                sort_spill_override: cfg.sort_spill,
+                resident_budget_override: cfg.resident_budget,
+            },
+        })?;
+        assert!(
+            out.output_eval_failures.is_empty(),
+            "the synthetic emit path never defers an eval failure"
+        );
+        Ok(drain_sorted(out.sorted)?
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect())
+    }
+
+    /// Drive the block-band path over equi-keyed inputs, building the arbitrator
+    /// from `cfg`.
+    fn run_block_equi(
+        driver: &[EqRec],
+        build: &[EqRec],
+        cfg: &RunCfg,
+        hash_of: &impl Fn(i64) -> u64,
+        eq_of: &impl Fn(i64) -> Vec<u8>,
+    ) -> Result<Vec<Record>, PipelineError> {
+        let budget = arbitrator(cfg.hard_limit);
+        if let Some(cap) = cfg.max_spill_bytes {
+            budget.set_max_spill_bytes(cap);
+        }
+        run_block_equi_on(driver, build, cfg, hash_of, eq_of, &budget)
+    }
+
+    /// Nested-loop oracle over equi-keyed sides: `(driver_id, build_id)` for
+    /// every pair with the SAME group AND the range predicate holding. Same-group
+    /// is the canonical equality the block-band re-verifies after the hash prune.
+    fn equi_oracle_pairs(
+        driver: &[EqRec],
+        build: &[EqRec],
+        op1: TOp,
+        op2: Option<TOp>,
+    ) -> HashSet<(i64, i64)> {
+        let mut out = HashSet::new();
+        for d in driver {
+            let Some((dk1, dk2)) = d.key else { continue };
+            for b in build {
+                let Some((bk1, bk2)) = b.key else { continue };
+                let m1 = op1.apply(dk1, bk1);
+                let m2 = op2.is_none_or(|o2| o2.apply(dk2, bk2));
+                if d.group == b.group && m1 && m2 {
+                    out.insert((d.id, b.id));
+                }
+            }
+        }
+        out
+    }
+
+    fn equi_cfg(op1: TOp, op2: Option<TOp>, block_target: usize, spilling: bool) -> RunCfg {
+        RunCfg {
+            op1: op1.to_range(),
+            op2: op2.map(TOp::to_range),
+            match_mode: MatchMode::All,
+            on_miss: OnMiss::Skip,
+            block_target,
+            hard_limit: 1 << 30,
+            max_spill_bytes: None,
+            // A tiny sort threshold forces the drain-spill → k-way-merge path and
+            // `Some(0)` spills every completed block, so the spilling variant
+            // exercises disk round-trips under a roomy hard limit.
+            sort_spill: if spilling { Some(64) } else { None },
+            resident_budget: if spilling { Some(0) } else { None },
+        }
+    }
+
+    #[test]
+    fn equi_range_multigroup_matches_oracle_across_operators_and_budgets() {
+        // Multi-group inputs whose ranges overlap ACROSS groups, so a join that
+        // ignored equality would over-match. The block-band must emit only
+        // within-group pairs that also satisfy the range, for every op1/op2
+        // combination and with NULL and duplicate rows present. Each op-pair runs
+        // resident (roomy) and spilling (tiny blocks + forced spill); both must
+        // equal the nested-loop oracle, and the ordered output must be identical
+        // across the two budgets (determinism independent of block layout).
+        let driver: Vec<EqRec> = vec![
+            eqrec(1, 5, 10, 0),
+            eqrec(3, 2, 11, 1),
+            eqrec(3, 8, 12, 0),
+            eqrec(7, 1, 13, 1),
+            eqrec(4, 4, 14, 2),
+            EqRec {
+                key: None,
+                id: 15,
+                group: 0,
+            },
+            eqrec(3, 2, 16, 1),
+            eqrec(6, 6, 17, 2),
+        ];
+        let build: Vec<EqRec> = vec![
+            eqrec(2, 6, 20, 0),
+            eqrec(3, 2, 21, 1),
+            eqrec(5, 9, 22, 0),
+            eqrec(3, 8, 23, 2),
+            eqrec(4, 4, 24, 2),
+            eqrec(1, 1, 25, 1),
+            EqRec {
+                key: None,
+                id: 26,
+                group: 2,
+            },
+            eqrec(3, 8, 27, 1),
+        ];
+        // Distinct groups get distinct hashes: the production no-collision case.
+        let identity = |g: i64| g as u64;
+        for &op1 in &OPS {
+            for op2 in [
+                None,
+                Some(TOp::Lt),
+                Some(TOp::Le),
+                Some(TOp::Gt),
+                Some(TOp::Ge),
+            ] {
+                let oracle = equi_oracle_pairs(&driver, &build, op1, op2);
+                let roomy = run_block_equi(
+                    &driver,
+                    &build,
+                    &equi_cfg(op1, op2, 1 << 20, false),
+                    &identity,
+                    &group_eq_bytes,
+                )
+                .expect("roomy equi run");
+                assert_eq!(
+                    all_pairs(&roomy),
+                    oracle,
+                    "op1={op1:?} op2={op2:?}: roomy result must equal the within-group oracle"
+                );
+                let tight = run_block_equi(
+                    &driver,
+                    &build,
+                    &equi_cfg(op1, op2, 48, true),
+                    &identity,
+                    &group_eq_bytes,
+                )
+                .expect("spilling equi run");
+                assert_eq!(
+                    all_pairs(&tight),
+                    oracle,
+                    "op1={op1:?} op2={op2:?}: spilling result must equal the within-group oracle"
+                );
+                assert_eq!(
+                    ordered_pairs(&tight),
+                    ordered_pairs(&roomy),
+                    "op1={op1:?} op2={op2:?}: output must be byte-identical across budgets"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn equi_range_hot_key_completes_spilling_within_budget() {
+        // A single hot equality value whose group far exceeds a tight budget must
+        // COMPLETE by spilling through the block-band — the headline skew
+        // guarantee — instead of aborting the way the old resident hash-partition
+        // path would. The hot group is sliced into many same-hash blocks the
+        // scheduler pairs one bounded pair at a time (degrading to a pure-range
+        // band join over its own blocks), plus a couple of cold groups to prove
+        // grouping still holds.
+        let mut driver: Vec<EqRec> = Vec::new();
+        let mut build: Vec<EqRec> = Vec::new();
+        // Hot group 0: 80 records per side, a band on the primary axis.
+        for i in 0..80i64 {
+            driver.push(eqrec(i, 0, 1000 + i, 0));
+            build.push(eqrec(i, 0, 2000 + i, 0));
+        }
+        // Cold groups 1 and 2: a few records each, ranges overlapping the hot
+        // group's so equality (not range) is what keeps them apart.
+        for i in 0..3i64 {
+            driver.push(eqrec(i, 0, 3000 + i, 1));
+            build.push(eqrec(i, 0, 4000 + i, 1));
+            driver.push(eqrec(i, 0, 5000 + i, 2));
+            build.push(eqrec(i, 0, 6000 + i, 2));
+        }
+        let identity = |g: i64| g as u64;
+        let oracle = equi_oracle_pairs(&driver, &build, TOp::Ge, None);
+
+        // A hard limit far below the hot group's resident footprint (80 records
+        // per side), with tiny blocks and forced spill, so holding the group
+        // resident would abort. The bound holds: the run completes and spills.
+        let budget = arbitrator(96 * 1024);
+        let cfg = RunCfg {
+            op1: RangeOp::Ge,
+            op2: None,
+            match_mode: MatchMode::All,
+            on_miss: OnMiss::Skip,
+            block_target: 512,
+            hard_limit: 96 * 1024,
+            max_spill_bytes: None,
+            sort_spill: Some(2 * 1024),
+            resident_budget: Some(0),
+        };
+        let out = run_block_equi_on(&driver, &build, &cfg, &identity, &group_eq_bytes, &budget)
+            .expect("the hot-key equi join must complete (spilling) within the tight budget");
+        assert_eq!(
+            all_pairs(&out),
+            oracle,
+            "the hot-key result must equal the within-group nested-loop oracle"
+        );
+        assert!(
+            budget.cumulative_spill_bytes() > 0,
+            "the hot group must spill through the block-band rather than stay resident"
+        );
+    }
+
+    #[test]
+    fn equi_range_hash_collision_reverify_prevents_false_matches() {
+        // Two DISTINCT equality values forced into the SAME hash bucket. The
+        // block-pair prune keys on the hash, so the range kernel pairs records
+        // across the two values (their ranges overlap); only the per-pair
+        // canonical re-verify (comparing the actual equality bytes) keeps the
+        // cross-value pairs out. Without it, this fixture would emit phantom
+        // matches — the exact hash-join collision hazard.
+        let driver: Vec<EqRec> = vec![
+            eqrec(5, 0, 10, 1),
+            eqrec(5, 0, 11, 2),
+            eqrec(9, 0, 12, 1),
+            eqrec(9, 0, 13, 2),
+        ];
+        let build: Vec<EqRec> = vec![
+            eqrec(1, 0, 20, 1),
+            eqrec(1, 0, 21, 2),
+            eqrec(4, 0, 22, 1),
+            eqrec(4, 0, 23, 2),
+        ];
+        // Collapse every group to ONE hash: all records land in a single
+        // hash-group, so the range kernel considers every cross-group pair and
+        // the re-verify is the only thing separating the two values.
+        let collide = |_g: i64| 42u64;
+        // The identity mapping (distinct hashes, no collision) is the reference:
+        // the result must be the same either way, proving the hash is only a
+        // prune filter and equality is decided by the canonical recheck.
+        let identity = |g: i64| g as u64;
+        let oracle = equi_oracle_pairs(&driver, &build, TOp::Ge, None);
+        assert!(
+            !oracle.is_empty(),
+            "the fixture must produce within-group matches (driver k1 >= build k1)"
+        );
+        // Prove the fixture is a real collision hazard: if equality were ignored
+        // (every same-hash pair kept), far more pairs would match.
+        assert!(
+            oracle.len() < driver.len() * build.len(),
+            "the fixture must have cross-group pairs that only re-verify excludes"
+        );
+
+        let collided = run_block_equi(
+            &driver,
+            &build,
+            &equi_cfg(TOp::Ge, None, 1 << 20, false),
+            &collide,
+            &group_eq_bytes,
+        )
+        .expect("collided equi run");
+        assert_eq!(
+            all_pairs(&collided),
+            oracle,
+            "forced hash collisions must not produce cross-value matches — the re-verify \
+             rejects every pair whose canonical equality bytes differ"
+        );
+        let distinct = run_block_equi(
+            &driver,
+            &build,
+            &equi_cfg(TOp::Ge, None, 1 << 20, false),
+            &identity,
+            &group_eq_bytes,
+        )
+        .expect("distinct-hash equi run");
+        assert_eq!(
+            all_pairs(&distinct),
+            oracle,
+            "distinct hashes must give the same result: the hash is a prune filter, \
+             equality is decided by the recheck"
+        );
+    }
+
+    #[test]
+    fn equi_range_wide_key_residency_is_accounted_and_bounded() {
+        // A WIDE equality key (2 KiB per record) whose canonical re-verify bytes
+        // dominate residency: the records carry only tiny int columns, so those
+        // bytes are residency the record heap does not already cover — the
+        // data-expanding-key hazard. Before the payload-heap accounting fix the
+        // drain byte counter omitted them, so the input-sort buffer never reached
+        // its spill threshold and held the whole side resident (nothing spilled);
+        // after the fix the same input crosses the threshold and spills. The run
+        // must COMPLETE and SPILL (proving the bytes are charged), and be
+        // byte-identical resident-vs-spilling.
+        //
+        // `match: first` keeps the OUTPUT tiny (one row per driver) so the ONLY
+        // buffer that can cross the spill threshold is an eq-carrying input drain,
+        // and a large resident-block budget keeps block spill (which is
+        // eq-independent) out of the signal — so the spill is caused by the eq
+        // accounting alone, the fail-before / pass-after signal.
+        const WIDE: usize = 2 * 1024;
+        let wide_eq = |group: i64| {
+            let mut v = group.to_le_bytes().to_vec();
+            v.resize(WIDE, (group & 0xff) as u8);
+            v
+        };
+        // 30 driver / 30 build records across 3 groups; every driver matches at
+        // least the lowest-key build in its group, so `first` emits 30 rows.
+        let mut driver: Vec<EqRec> = Vec::new();
+        let mut build: Vec<EqRec> = Vec::new();
+        for i in 0..30i64 {
+            driver.push(eqrec(i, 0, 1000 + i, i % 3));
+            build.push(eqrec(i, 0, 2000 + i, i % 3));
+        }
+        let identity = |g: i64| g as u64;
+
+        // sort_spill = 24 KiB: 30 records * ~2 KiB of eq crosses it once the eq
+        // bytes are charged, but the tiny records alone (~a few KiB) do not.
+        // resident_budget is large so completed blocks stay resident (no
+        // eq-independent block spill).
+        let spilling_cfg = RunCfg {
+            op1: RangeOp::Ge,
+            op2: None,
+            match_mode: MatchMode::First,
+            on_miss: OnMiss::Skip,
+            block_target: 4 * 1024,
+            hard_limit: 1 << 30,
+            max_spill_bytes: None,
+            sort_spill: Some(24 * 1024),
+            resident_budget: Some(1 << 30),
+        };
+        let tight_budget = arbitrator(1 << 30);
+        let spilling = run_block_equi_on(
+            &driver,
+            &build,
+            &spilling_cfg,
+            &identity,
+            &wide_eq,
+            &tight_budget,
+        )
+        .expect("the wide-key equi join must complete");
+        assert_eq!(
+            spilling.len(),
+            driver.len(),
+            "match:first must emit one row per (matched) driver"
+        );
+        assert!(
+            tight_budget.cumulative_spill_bytes() > 0,
+            "the wide equality key's bytes must be charged into the input drain so it spills; \
+             an undercount would hold the side resident and spill nothing"
+        );
+
+        // Determinism: a fully-resident run (no forced input-sort spill) emits the
+        // same rows in the same order as the spilling run.
+        let resident = run_block_equi(
+            &driver,
+            &build,
+            &RunCfg {
+                sort_spill: None,
+                ..spilling_cfg
+            },
+            &identity,
+            &wide_eq,
+        )
+        .expect("the wide-key resident run must complete");
+        assert_eq!(
+            ordered_pairs(&resident),
+            ordered_pairs(&spilling),
+            "wide-key output must be byte-identical across the resident and spilling layouts"
+        );
+    }
+
+    #[test]
+    fn equi_range_first_selects_min_build_index_across_budgets() {
+        // match:first over equi groups selects the minimum build-input-index
+        // match within the driver's group (deterministic, layout-independent), not
+        // whichever block the winning build landed in. Assert the emitted build id
+        // per driver equals the oracle's minimum, byte-identical resident vs
+        // spilling.
+        let driver: Vec<EqRec> = vec![eqrec(9, 0, 10, 0), eqrec(9, 0, 11, 1), eqrec(3, 0, 12, 0)];
+        // Group 0 builds with k1 <= 9 in ascending input index; the minimum-index
+        // qualifying build must win regardless of block layout. Build id encodes
+        // input index order (20, 21, 22, ...).
+        let build: Vec<EqRec> = vec![
+            eqrec(1, 0, 20, 0),
+            eqrec(2, 0, 21, 0),
+            eqrec(5, 0, 22, 1),
+            eqrec(8, 0, 23, 0),
+            eqrec(2, 0, 24, 1),
+        ];
+        let identity = |g: i64| g as u64;
+        // Oracle: per driver, the minimum build_idx (input order) whose group
+        // matches and k1 <= driver.k1. Build input index == position in `build`.
+        let expect_first = |dk1: i64, dgroup: i64| -> i64 {
+            build
+                .iter()
+                .find(|b| b.group == dgroup && b.key.unwrap().0 <= dk1)
+                .map(|b| b.id)
+                .expect("each driver has at least one match")
+        };
+        let cfg = |spilling| RunCfg {
+            op1: RangeOp::Ge,
+            op2: None,
+            match_mode: MatchMode::First,
+            on_miss: OnMiss::Skip,
+            block_target: if spilling { 40 } else { 1 << 20 },
+            hard_limit: 1 << 30,
+            max_spill_bytes: None,
+            sort_spill: if spilling { Some(40) } else { None },
+            resident_budget: if spilling { Some(0) } else { None },
+        };
+        let roomy = run_block_equi(&driver, &build, &cfg(false), &identity, &group_eq_bytes)
+            .expect("roomy first run");
+        let tight = run_block_equi(&driver, &build, &cfg(true), &identity, &group_eq_bytes)
+            .expect("spilling first run");
+        // Each driver emits exactly one row (First), carrying the min-index build.
+        let first_map: HashMap<i64, i64> = roomy
+            .iter()
+            .map(|r| (int(r.get("d_id")), int(r.get("b_id"))))
+            .collect();
+        for d in &driver {
+            let (dk1, _) = d.key.unwrap();
+            assert_eq!(
+                first_map.get(&d.id).copied(),
+                Some(expect_first(dk1, d.group)),
+                "driver {} must select its minimum-build-index within-group match",
+                d.id
+            );
+        }
+        assert_eq!(
+            ordered_pairs(&tight),
+            ordered_pairs(&roomy),
+            "match:first equi output must be byte-identical across budgets"
+        );
+    }
+
+    #[test]
+    fn equi_range_collect_orders_by_build_index_across_budgets() {
+        // match:collect over equi groups: each driver's collected build set equals
+        // the within-group oracle, ordered by build input index, and the whole
+        // output is byte-identical resident vs spilling.
+        let driver: Vec<EqRec> = vec![eqrec(9, 0, 10, 0), eqrec(4, 0, 11, 1), eqrec(9, 0, 12, 1)];
+        let build: Vec<EqRec> = vec![
+            eqrec(1, 0, 20, 0),
+            eqrec(8, 0, 21, 0),
+            eqrec(3, 0, 22, 1),
+            eqrec(5, 0, 23, 1),
+            eqrec(2, 0, 24, 0),
+        ];
+        let identity = |g: i64| g as u64;
+        // Oracle per driver: build ids (in input-index order) whose group matches
+        // and k1 <= driver.k1.
+        let expect_collect = |dk1: i64, dgroup: i64| -> Vec<i64> {
+            build
+                .iter()
+                .filter(|b| b.group == dgroup && b.key.unwrap().0 <= dk1)
+                .map(|b| b.id)
+                .collect()
+        };
+        let cfg = |spilling| RunCfg {
+            op1: RangeOp::Ge,
+            op2: None,
+            match_mode: MatchMode::Collect,
+            on_miss: OnMiss::Skip,
+            block_target: if spilling { 40 } else { 1 << 20 },
+            hard_limit: 1 << 30,
+            max_spill_bytes: None,
+            sort_spill: if spilling { Some(40) } else { None },
+            resident_budget: if spilling { Some(0) } else { None },
+        };
+        let roomy = run_block_equi(&driver, &build, &cfg(false), &identity, &group_eq_bytes)
+            .expect("roomy collect run");
+        let tight = run_block_equi(&driver, &build, &cfg(true), &identity, &group_eq_bytes)
+            .expect("spilling collect run");
+        let collected = ordered_collect(&roomy);
+        for d in &driver {
+            let (dk1, _) = d.key.unwrap();
+            let got = collected
+                .iter()
+                .find(|(id, _)| *id == d.id)
+                .map(|(_, arr)| arr.clone())
+                .unwrap_or_default();
+            assert_eq!(
+                got,
+                expect_collect(dk1, d.group),
+                "driver {} collect array must equal its within-group matches in build-index order",
+                d.id
+            );
+        }
+        assert_eq!(
+            ordered_collect(&tight),
+            ordered_collect(&roomy),
+            "match:collect equi output must be byte-identical across budgets"
+        );
     }
 }

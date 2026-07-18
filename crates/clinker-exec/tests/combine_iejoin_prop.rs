@@ -525,6 +525,140 @@ nodes:
         );
     }
 
+    const EQUI_BAND_YAML: &str = r#"
+pipeline:
+  name: equi_range_band
+  memory: { limit: "__LIMIT__", backpressure: __POLICY__ }
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: drivers.csv
+      schema:
+        - { name: did, type: int }
+        - { name: region, type: string }
+        - { name: k1, type: int }
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: builds.csv
+      schema:
+        - { name: bid, type: int }
+        - { name: region, type: string }
+        - { name: lo, type: int }
+        - { name: hi, type: int }
+  - type: combine
+    name: banded
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.region == builds.region and drivers.k1 >= builds.lo and drivers.k1 < builds.hi"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit did = drivers.did
+        emit bid = builds.bid
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+    /// A multi-region equi+range workload: each region carries a full tiling of
+    /// `bands_per_region` half-open bands over `[0, span)`, and every driver in a
+    /// region falls in exactly one band of ITS region. Returns the driver and
+    /// build CSVs plus the sorted `(did, bid)` oracle rows, computed by an
+    /// independent nested loop over region equality AND `lo <= k1 < hi`.
+    fn equi_band_workload(
+        n_drivers: i64,
+        regions: i64,
+        bands_per_region: i64,
+        span: i64,
+    ) -> (String, String, Vec<Vec<String>>) {
+        // drivers: (did, region_index, k1)
+        let mut driver_csv = String::from("did,region,k1\n");
+        let mut drivers: Vec<(i64, i64, i64)> = Vec::with_capacity(n_drivers as usize);
+        for i in 0..n_drivers {
+            let region = i % regions;
+            let k1 = tiled_key(i, span);
+            drivers.push((i, region, k1));
+            driver_csv.push_str(&format!("{i},r{region},{k1}\n"));
+        }
+        // builds: a full band tiling per region; (bid, region_index, lo, hi)
+        let mut build_csv = String::from("bid,region,lo,hi\n");
+        let mut builds: Vec<(i64, i64, i64, i64)> = Vec::new();
+        for region in 0..regions {
+            for (b, lo, hi) in half_open_bands(bands_per_region, span) {
+                let bid = region * bands_per_region + b;
+                builds.push((bid, region, lo, hi));
+                build_csv.push_str(&format!("{bid},r{region},{lo},{hi}\n"));
+            }
+        }
+        let mut expected: Vec<Vec<String>> = Vec::new();
+        for (did, dregion, k1) in &drivers {
+            for (bid, bregion, lo, hi) in &builds {
+                if dregion == bregion && k1 >= lo && k1 < hi {
+                    expected.push(vec![did.to_string(), bid.to_string()]);
+                }
+            }
+        }
+        expected.sort();
+        (driver_csv, build_csv, expected)
+    }
+
+    /// The equi+range generalization end-to-end: an equality conjunct
+    /// (`region == region`) plus a two-axis band, driven through the real planner
+    /// and executor. The planner selects `HashPartitionIEJoin`, which now runs
+    /// the block-band path with equality as an added prune axis, so a tight
+    /// budget spills the sides and the result still equals the nested-loop oracle
+    /// (region equality AND `lo <= k1 < hi`) — byte-identical to the resident
+    /// roomy run. Region-only matches (same k1 band, different region) must NOT
+    /// appear, proving the per-pair canonical equality re-verify holds through
+    /// the spilled block layout.
+    #[test]
+    fn equi_range_band_matches_oracle_across_budgets() {
+        let (driver_csv, build_csv, expected) = equi_band_workload(6_000, 4, 40, 1_000);
+        let inputs = [
+            ("drivers", driver_csv.as_str()),
+            ("builds", build_csv.as_str()),
+        ];
+
+        let tight = run(EQUI_BAND_YAML, TIGHT_LIMIT, "spill", &inputs, "out");
+        let roomy = run(EQUI_BAND_YAML, ROOMY_LIMIT, "spill", &inputs, "out");
+
+        assert!(
+            !expected.is_empty(),
+            "the equi+range workload must produce matches"
+        );
+        assert_eq!(
+            rows(&tight.output),
+            expected,
+            "spilled equi+range block-band output diverged from the region-eq + band oracle"
+        );
+        assert_eq!(
+            rows(&roomy.output),
+            expected,
+            "resident equi+range block-band output diverged from the region-eq + band oracle"
+        );
+        assert_eq!(
+            tight.output, roomy.output,
+            "equi+range output must be byte-identical across budgets"
+        );
+        assert!(
+            tight.spill_bytes > 0,
+            "the tight budget must have spilled the equi+range block-band sides to disk"
+        );
+    }
+
     /// A three-conjunct residual predicate (two-axis band plus a third
     /// cross-input `>` conjunct) emits exactly the oracle's matched rows across
     /// both budgets. The block-band kernel proves the two band axes; the third

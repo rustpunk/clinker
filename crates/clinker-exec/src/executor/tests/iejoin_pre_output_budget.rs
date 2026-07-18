@@ -1,9 +1,11 @@
-//! Pipeline-level coverage for the pure-range IEJoin block-band path.
+//! Pipeline-level coverage for the IEJoin block-band path.
 //!
-//! `CombineStrategy::IEJoin` (dispatched as `IEJoin(None)`) runs the bounded
-//! block-band path: external-sort each side on the primary inequality key,
-//! slice the merged stream into min/max-tagged blocks, prune non-overlapping
-//! block-pairs, and run the kernel per surviving pair. These tests drive that
+//! Both `CombineStrategy::IEJoin` (pure-range) and
+//! `CombineStrategy::HashPartitionIEJoin` (equi+range) run the one bounded
+//! block-band path: external-sort each side on `(equality-hash, primary-range-
+//! key, …)`, slice the merged stream into min/max-tagged single-hash blocks,
+//! prune non-overlapping same-hash block-pairs, re-verify canonical equality per
+//! candidate pair, and run the kernel per surviving pair. These tests drive that
 //! path end-to-end through the public executor entry point.
 //!
 //! The load-bearing guarantee: an input that USED to abort (no spill path) now
@@ -25,10 +27,12 @@
 //!      spilling — the pipeline-level prune observation.
 //!   4. Budget below a single block-pair's local footprint → aborts with the
 //!      typed pre-output error via the LOCAL arm, consumer released.
-//!   5. The equi+range (HashPartitionIEJoin) sibling path, whose pre-output gate
-//!      is instead the RSS-independent global-aware check, aborts under a tight
-//!      budget with the consumer released — the coverage the block-band rewrite
-//!      would otherwise have left untested.
+//!   5. The equi+range (HashPartitionIEJoin) path, now generalized onto the same
+//!      block-band machinery (equality is an added prune axis): an input that
+//!      used to hold its hash partitions resident and abort now COMPLETES with
+//!      correct non-empty results while spilling under a tight budget, and its
+//!      output is byte-identical across memory limits — the equi+range
+//!      input-axis bound, proven end-to-end.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -858,30 +862,142 @@ fn equi_range_selects_hash_partition_strategy() {
     );
 }
 
-#[test]
-fn equi_range_pre_output_state_aborts_under_tight_budget_without_rss() {
-    // The equi+range (HashPartitionIEJoin) path holds its routed partitions and
-    // per-group sort arrays resident — it has no spill path, so an over-budget
-    // pre-scan state can only be resolved by a clean abort. Under a tight budget
-    // far below the partition/group footprint of 300×300 records, the
-    // RSS-independent `should_abort_local` gate must trip with the typed
-    // MemoryBudgetExceeded, and the IEJoin consumer must still be unregistered.
-    // Only the equi+range path drives this gate: the pure-range block-band
-    // path answers pressure by spilling instead of aborting.
-    let arb = no_op_arbitrator(ABORT_LIMIT);
-    let (result, _output) = run_pipeline_yaml(
-        EQUI_RANGE_YAML,
-        equi_orders_csv(300, 4),
-        equi_bands_csv(300, 4),
-        &arb,
-    );
-    let err = result.expect_err("the equi+range pre-scan state must abort under the tight budget");
-    assert_pre_output_abort(err, ABORT_LIMIT);
+/// Parse a two-column `region,int` CSV (orders' `amount` or bands' `lo`) into
+/// `(region, int)` rows, skipping the header. Independent of the executor, so
+/// the oracle below is a pure function of the fixture data.
+fn parse_region_int_csv(csv: &str) -> Vec<(String, i64)> {
+    csv.lines()
+        .skip(1)
+        .filter(|l| !l.is_empty())
+        .map(|l| {
+            let mut c = l.split(',');
+            let region = c.next().expect("region column").to_string();
+            let value = c.next().expect("int column").parse().expect("int value");
+            (region, value)
+        })
+        .collect()
+}
 
+/// Nested-loop oracle over the equi+range fixture: the `(region, amount, lo)`
+/// triple for every `(order, band)` with matching region AND `amount >= lo`.
+/// Each surviving pair yields a distinct triple (an order's amount is unique in
+/// its region), so the set doubles as the exact emitted-row set.
+fn equi_range_oracle(orders: &str, bands: &str) -> std::collections::HashSet<(String, i64, i64)> {
+    let ords = parse_region_int_csv(orders);
+    let bnds = parse_region_int_csv(bands);
+    let mut out = std::collections::HashSet::new();
+    for (oregion, amount) in &ords {
+        for (bregion, lo) in &bnds {
+            if oregion == bregion && amount >= lo {
+                out.insert((oregion.clone(), *amount, *lo));
+            }
+        }
+    }
+    out
+}
+
+/// Parse the `banded` output CSV (`region,amount,lo`) into the same triple set,
+/// keyed by header name so a column-order change surfaces as a parse error
+/// rather than silent misalignment.
+fn equi_range_output_triples(output: &str) -> std::collections::HashSet<(String, i64, i64)> {
+    let mut lines = output.lines().filter(|l| !l.is_empty());
+    let header: Vec<&str> = lines.next().expect("output header").split(',').collect();
+    let col = |name: &str| {
+        header
+            .iter()
+            .position(|h| *h == name)
+            .unwrap_or_else(|| panic!("output missing {name} column; header was {header:?}"))
+    };
+    let (ri, ai, li) = (col("region"), col("amount"), col("lo"));
+    lines
+        .map(|l| {
+            let cells: Vec<&str> = l.split(',').collect();
+            (
+                cells[ri].to_string(),
+                cells[ai].parse().expect("amount int"),
+                cells[li].parse().expect("lo int"),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn equi_range_completes_with_spill_under_tight_budget() {
+    // The headline guarantee, end-to-end: an equi+range join that used to hold its
+    // hash partitions and per-group sort arrays resident (fit-or-abort) now runs
+    // the bounded block-band path — equality is an added prune axis — so under a
+    // tight budget far below process RSS it COMPLETES with correct non-empty
+    // results while SPILLING, instead of aborting. The result equals the
+    // nested-loop oracle exactly.
+    let arb = no_op_arbitrator(TIGHT_LIMIT);
+    let orders = equi_orders_csv(300, 4);
+    let bands = equi_bands_csv(300, 4);
+    let (result, output) = run_pipeline_yaml(EQUI_RANGE_YAML, orders.clone(), bands.clone(), &arb);
+    result.expect("the equi+range join must complete (spilling) under the tight budget");
+
+    let oracle = equi_range_oracle(&orders, &bands);
+    let emitted = equi_range_output_triples(&output);
+    assert!(
+        !oracle.is_empty(),
+        "the fixture must produce matches for the comparison to be meaningful"
+    );
+    let emitted_rows = output.lines().filter(|l| !l.is_empty()).count() - 1;
+    assert_eq!(
+        emitted_rows,
+        oracle.len(),
+        "every (order, band) match must emit exactly one row — no duplicates or drops"
+    );
+    assert_eq!(
+        emitted, oracle,
+        "the equi+range result must equal the nested-loop oracle (region-eq AND amount >= lo)"
+    );
+
+    // The input and/or output axes spilled under the tight budget: the bound
+    // holding rather than the run holding everything resident.
+    assert!(
+        spilled_bytes(&arb) > 0,
+        "the equi+range join must spill under the tight budget; \
+         per_stage_spill_bytes[banded] was {}",
+        spilled_bytes(&arb)
+    );
     assert_eq!(
         arb.consumer_count(),
         0,
-        "the equi+range IEJoin consumer must be unregistered even when the branch aborts"
+        "the equi+range IEJoin consumer must be unregistered on the clean exit"
+    );
+}
+
+#[test]
+fn equi_range_output_is_identical_across_memory_limits() {
+    // Determinism across budgets for equi+range, mirroring the pure-range
+    // invariant: the tight run spills and re-slices, the roomy run stays
+    // resident, and the final deterministic `(driver order, driver_idx,
+    // build_idx)` output sort makes the emitted CSV byte-identical regardless of
+    // `pipeline.memory.limit`.
+    let orders = equi_orders_csv(300, 4);
+    let bands = equi_bands_csv(300, 4);
+    let (tight_result, tight_out) = run_pipeline_yaml(
+        EQUI_RANGE_YAML,
+        orders.clone(),
+        bands.clone(),
+        &no_op_arbitrator(TIGHT_LIMIT),
+    );
+    tight_result.expect("tight-budget equi+range run must complete");
+    let (roomy_result, roomy_out) = run_pipeline_yaml(
+        EQUI_RANGE_YAML,
+        orders,
+        bands,
+        &no_op_arbitrator(ROOMY_LIMIT),
+    );
+    roomy_result.expect("roomy-budget equi+range run must complete");
+
+    assert_eq!(
+        tight_out, roomy_out,
+        "equi+range output must be a pure function of the data, not of pipeline.memory.limit"
+    );
+    assert!(
+        tight_out.lines().filter(|l| !l.is_empty()).count() > 1,
+        "the fixture must emit rows for the comparison to be meaningful"
     );
 }
 
