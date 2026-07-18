@@ -404,8 +404,12 @@ impl fmt::Display for PipelineError {
                  measured before any data loads — a figure that, when clinker runs \
                  embedded in a larger host, includes the host's own memory, which \
                  clinker cannot spill. Raise memory.limit above the baseline \
-                 (realistic budgets are hundreds of MiB), or set \
-                 memory.backpressure: spill to opt out of the producer-pausing path. \
+                 (realistic budgets are hundreds of MiB), or partition the input \
+                 across smaller invocations when a single host cannot hold the \
+                 working set under a satisfiable budget. Setting \
+                 memory.backpressure: spill only opts out of this producer-pausing \
+                 startup check; it does not let an undersized budget hold a \
+                 working set that does not fit. \
                  See: clinker explain --code E312"
             ),
             Self::CombineMissingMatch {

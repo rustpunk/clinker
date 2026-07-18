@@ -1957,21 +1957,17 @@ mod tests {
         );
     }
 
-    /// Regression guard for the hard-limit-only startup gate: a budget inside
-    /// the `[baseline_rss, baseline_rss / DEFAULT_SPILL_THRESHOLD)` band —
-    /// above the process baseline yet low enough that the run opens above the
-    /// soft-pressure threshold — is ACCEPTED under every policy, the
-    /// producer-pausing ones included. The gate rejects only on
-    /// `limit < baseline_rss` and deliberately does not extend up into the
-    /// soft band: a band budget is satisfiable (it sits above the
-    /// empty-process floor), and `activate_source_for_drain` resumes and
-    /// active-exempts each source as the walk reaches its drain turn, so a
-    /// source the arbitrator paused under soft pressure never stalls the walk.
-    /// Such a budget spills from the first pressure crossing or aborts fast
-    /// through the hard-limit path rather than hanging. Pinning this keeps a
-    /// future edit from re-introducing soft-band rejection under any policy —
-    /// a soft-limit comparison would reject the whole band, so a mid-band
-    /// budget catches that regression.
+    /// Pins that the startup gate accepts a budget in the soft-pressure band
+    /// `[baseline_rss, baseline_rss / DEFAULT_SPILL_THRESHOLD)` — above the
+    /// process baseline yet low enough to open past the soft threshold — under
+    /// the producer-pausing policies (`pause` and `both`). Guards against a
+    /// future edit re-introducing soft-band rejection: a soft-limit comparison
+    /// would reject the whole band, so a mid-band probe catches that. See
+    /// [`reject_unsatisfiable_budget`] for why a band budget is satisfiable and
+    /// deliberately admitted. `spill` short-circuits before the band comparison
+    /// (non-pausing policies never reach it), so its non-rejection is pinned by
+    /// the sibling `reject_unsatisfiable_budget_pins_both_policies` test rather
+    /// than looped here.
     ///
     /// Runs in a child process via [`run_isolated`] so no sibling test thread
     /// churns process-global RSS between the reads. The gate re-samples
@@ -2028,11 +2024,7 @@ mod tests {
                 // bounded retry to re-sample if RSS still crept past it. Every
                 // attempt re-derives the probe, so a real soft-band rejection
                 // fails all of them and the guard holds.
-                for knob in [
-                    BackpressureKnob::Pause,
-                    BackpressureKnob::Both,
-                    BackpressureKnob::Spill,
-                ] {
+                for knob in [BackpressureKnob::Pause, BackpressureKnob::Both] {
                     let mut accepted = false;
                     let mut last = String::new();
                     for _ in 0..8 {
