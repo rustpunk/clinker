@@ -490,6 +490,10 @@ pub(crate) struct IEJoinExec<'a> {
     pub output_schema: Option<&'a Arc<Schema>>,
     pub match_mode: MatchMode,
     pub on_miss: OnMiss,
+    /// Opt-in runtime cap on the combine's emitted-row count (E325 on breach);
+    /// `None` is unlimited. Enforced at the shared output-emit chokepoint, so it
+    /// covers every match mode and both the materialized and nested-loop paths.
+    pub max_output_rows: Option<u64>,
     /// Build-side `$ck.<field>` propagation policy. Mirrors the
     /// HashBuildProbe arm — every strategy threads the same spec to
     /// the shared `copy_build_ck_columns` helper at every emit site.
@@ -536,6 +540,7 @@ pub(crate) fn execute_combine_iejoin(
         output_schema,
         match_mode,
         on_miss,
+        max_output_rows,
         propagate_ck,
         ctx,
         budget,
@@ -746,6 +751,7 @@ pub(crate) fn execute_combine_iejoin(
         output_schema,
         match_mode,
         on_miss,
+        max_output_rows,
         propagate_ck,
         ctx,
         budget,
@@ -1063,6 +1069,13 @@ struct EmitSink<'a> {
     budget: &'a MemoryArbitrator,
     name: &'a str,
     consumer: &'a Arc<ConsumerHandle>,
+    /// Opt-in cap on the combine's total emitted rows; `None` is unlimited.
+    /// Checked against `rows_emitted` before each push so the run fails loud
+    /// (E325) rather than truncating once the output would exceed it.
+    max_output_rows: Option<u64>,
+    /// Running count of rows this combine has emitted, owned by the caller so it
+    /// persists across every phase that reconstructs no sink but reuses this one.
+    rows_emitted: &'a mut u64,
     output_eval_failures: &'a mut Vec<CombineOutputEvalFailure>,
     /// Parallel `(driver order, driver_idx, build_idx)` sort key per deferred
     /// output-eval failure, so dead-letter rows re-order into the same
@@ -1084,6 +1097,20 @@ impl EmitSink<'_> {
         driver_idx: u64,
         build_idx: u64,
     ) -> Result<(), PipelineError> {
+        // Opt-in output-size runaway guard: refuse to push the row that would
+        // carry the emitted count past the configured cap, failing loud (E325)
+        // rather than truncating to a partial result. Checked before the push so
+        // exactly `cap` rows land and the first over-cap row aborts. Independent
+        // of the memory budget — this is a result-size ceiling, not memory
+        // pressure (the output sort spills to stay within memory).
+        if let Some(cap) = self.max_output_rows
+            && *self.rows_emitted >= cap
+        {
+            return Err(PipelineError::CombineOutputCapExceeded {
+                combine: self.name.to_string(),
+                cap,
+            });
+        }
         // Mirror the byte delta into the consumer handle the moment the row
         // lands — the same charge the input-side drain applies — so the
         // arbitrator's pull-mode view reflects the output sort's live footprint.
@@ -1110,6 +1137,7 @@ impl EmitSink<'_> {
                 ));
             }
         }
+        *self.rows_emitted += 1;
         Ok(())
     }
 

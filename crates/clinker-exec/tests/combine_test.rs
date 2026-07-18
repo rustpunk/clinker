@@ -4646,6 +4646,7 @@ nodes:
             predicate_summary: CombinePredicateSummary::default(),
             match_mode: clinker_plan::config::pipeline_node::MatchMode::First,
             on_miss: clinker_plan::config::pipeline_node::OnMiss::NullFields,
+            max_output_rows: None,
             propagate_ck: clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),

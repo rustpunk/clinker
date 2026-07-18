@@ -48,13 +48,14 @@ Iteration order in the `input:` map is preserved and used as the default driver-
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `where` | Yes | -- | CXL boolean expression matching records across inputs. Must contain at least one cross-input equality. |
+| `where` | Yes | -- | CXL boolean expression matching records across inputs. Must contain at least one cross-input equality **or** range conjunct (a predicate with neither is rejected at plan time — see [Predicate requirements](#the-where-predicate)). |
 | `match` | No | `first` | Match cardinality: `first`, `all`, or `collect`. |
 | `on_miss` | No | `null_fields` | Driver-record handling on zero predicate matches: `null_fields`, `skip`, or `error`. |
 | `cxl` | Yes (except under `match: collect`) | -- | Emit statements defining the output row. Empty under `match: collect`. |
 | `drive` | No | first input | Explicit driver-input qualifier. Overrides the iteration-order default. |
 | `strategy` | No | `auto` | Execution strategy hint: `auto` or `grace_hash`. |
 | `propagate_ck` | Yes | -- | Selects which correlation-key columns ride onto the output. `driver` keeps the driver's CK only; `all` unions every input's CK columns; `{ named: [<field>, ...] }` carries an explicit subset. See [Correlation-key propagation](#correlation-key-propagation) below. |
+| `max_output_rows` | No | unlimited | Opt-in cap on the number of rows this combine may emit. When set, the run **fails loud** (diagnostic `E325`) the moment the output would exceed the cap — it never truncates to a partial result. See [Output-size cap](#output-size-cap-max_output_rows). |
 
 ## The `where:` predicate
 
@@ -79,7 +80,16 @@ Compound predicates combine multiple conjuncts with `and`. Each conjunct is clas
 
 Above: the equi conjunct drives the join; `orders.amount >= 100` and `products.region == "us-east"` are applied as residuals.
 
-At least one cross-input equality is required for every combine. Pure-range predicates without an equi conjunct are also supported via IEJoin.
+Every combine predicate must carry at least one cross-input **equality or range** conjunct. A predicate with neither — a pure residual with no decomposable cross-input comparison — is rejected at plan time with diagnostic `E313`; there is no supported execution strategy for it. Pure-range predicates without an equi conjunct are fully supported via IEJoin.
+
+### Non-orderable range keys
+
+A range conjunct compares values that must be **orderable at runtime** — integers, decimals, finite floats, dates, and datetimes. When a record's range key evaluates to a non-orderable value — SQL `NULL`, a non-finite float (`NaN`/infinity), or a non-numeric/non-temporal type — that record can never satisfy the range comparison, so it is routed **out** of the range match rather than joined:
+
+- A **driver** record with a non-orderable range key is treated as a zero-match driver and handled by [`on_miss`](#unmatched-records-on_miss) (`null_fields` / `skip` / `error`).
+- A **build** record with a non-orderable range key is dropped (it can match nothing).
+
+This is a runtime routing decision on the data, distinct from the plan-time `E313` rejection above (which is about the predicate *shape*, not the values).
 
 ## Match modes
 
@@ -253,9 +263,34 @@ Driver wins on a name collision: if both the driver and a build input declare th
 
 `propagate_ck` is required on every combine; pipelines without an explicit value fail to compile. Existing pipelines migrate by adding `propagate_ck: driver`, which is bit-for-bit equivalent to today's behavior.
 
+## Output-size cap (`max_output_rows`)
+
+`max_output_rows` is an **opt-in** ceiling on how many rows a combine may emit. It defaults to unlimited; set it to guard against a permissive or mis-specified predicate that would explode a small pair of inputs into a huge result (for example, a range join over an unexpectedly hot key producing a near cross product):
+
+```yaml
+  config:
+    where: "orders.ts >= prices.effective_from"
+    cxl: |
+      emit order_id = orders.order_id
+      emit price = prices.amount
+    propagate_ck: driver
+    match: all
+    max_output_rows: 1000000
+```
+
+Semantics:
+
+- **Fail-loud, never truncate.** The moment the combine would emit more than the cap, the run stops with diagnostic `E325` naming the node and the cap. It does **not** produce a capped or partial result — a silently truncated join would corrupt downstream data.
+- **Independent of the memory budget.** This is a result-*size* guard, not memory pressure. A runaway join can be perfectly bounded in memory (its output spills to disk) yet still produce far more rows than intended; `max_output_rows` caps the row count regardless of bytes.
+- **Covers the whole output.** The cap counts every emitted row across all match modes (`all`, `first`, `collect`) and any `on_miss` rows.
+
+If the large result is expected, raise the cap (or omit the field). If it is not, tighten the `where:` predicate. Run `clinker explain --code E325` for the full remediation guide.
+
 ## Memory considerations
 
 Each non-driving (build-side) input is held in memory while the join runs, so plan for roughly 1.5–2× its file size — a 50 MB lookup table needs about 75–100 MB. If a build side is larger than the memory budget, the join spills to disk automatically rather than failing. Set the budget with `pipeline.memory.limit`; see [Memory Tuning](../ops/memory.md).
+
+Range and equi+range predicates (the IEJoin block-band strategy) are bounded on **both input axes and the output**: each side is drained into disk-backed, key-sorted blocks, and the emitted rows accumulate in a spillable sort buffer rather than a resident vector. So a range join whose inputs — or whose result — exceed the memory budget spills automatically and completes, rather than failing. Even a single hot key whose block-pair is a near cross product streams through a bounded nested loop instead of materializing the whole candidate set. Use [`max_output_rows`](#output-size-cap-max_output_rows) if you want such a runaway result to *stop* rather than spill.
 
 ## Document boundaries
 

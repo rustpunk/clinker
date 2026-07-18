@@ -192,6 +192,18 @@ pub enum PipelineError {
         combine: String,
         driver_row: u64,
     },
+    /// E325 — a combine's emitted-row count would exceed the opt-in
+    /// `max_output_rows` cap configured on the node. A result-size runaway guard,
+    /// deliberately distinct from E310 (`MemoryBudgetExceeded`): a permissive
+    /// high-fan-out join can produce a correct but explosively large result while
+    /// sitting well inside its memory envelope (the output sort spills), so the
+    /// cap fires on row COUNT, not bytes. Fails loud rather than truncating — a
+    /// capped/partial result would silently corrupt downstream data — so it always
+    /// aborts the run. `combine` names the node; `cap` is the configured ceiling.
+    CombineOutputCapExceeded {
+        combine: String,
+        cap: u64,
+    },
     /// E350 — an Envelope node with the `concat` strategy collapsed a
     /// multi-document body into one framed document, but the body carried
     /// two or more distinct non-empty envelope headers. One consolidated
@@ -419,6 +431,15 @@ impl fmt::Display for PipelineError {
                 f,
                 "E319 combine '{combine}': on_miss: error — no matching build row \
                  for driver row {driver_row}"
+            ),
+            Self::CombineOutputCapExceeded { combine, cap } => write!(
+                f,
+                "E325 combine '{combine}': output exceeded max_output_rows of {cap} \
+                 rows. This is a result-size runaway guard, not an out-of-memory \
+                 condition: the combine would emit more than the configured cap, so \
+                 the run stops rather than truncating to a partial result. Raise \
+                 max_output_rows if the large result is expected, or tighten the \
+                 combine predicate."
             ),
             Self::EnvelopeMultiHeaderConflict {
                 envelope,

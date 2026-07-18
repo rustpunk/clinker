@@ -2223,6 +2223,7 @@ mod spill_projection_tests {
             predicate_summary: CombinePredicateSummary::default(),
             match_mode: crate::config::pipeline_node::MatchMode::First,
             on_miss: crate::config::pipeline_node::OnMiss::NullFields,
+            max_output_rows: None,
             propagate_ck: crate::config::pipeline_node::PropagateCkSpec::Driver,
             decomposed_from: None,
             output_schema: Arc::new(clinker_record::Schema::new(Vec::new())),

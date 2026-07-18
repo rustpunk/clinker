@@ -54,6 +54,7 @@ pub(crate) fn dispatch_combine(
         ref driving_input,
         ref match_mode,
         ref on_miss,
+        max_output_rows,
         ref resolved_column_map,
         ref propagate_ck,
         // Typed `cxl:` body program carried on the node (like
@@ -499,6 +500,7 @@ pub(crate) fn dispatch_combine(
                         output_schema: combine_output_schema_arc.as_ref(),
                         match_mode: *match_mode,
                         on_miss: *on_miss,
+                        max_output_rows,
                         propagate_ck,
                         ctx: &iejoin_ctx,
                         budget: &ctx.memory_budget,

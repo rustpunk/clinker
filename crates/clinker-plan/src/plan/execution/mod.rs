@@ -500,6 +500,12 @@ pub enum PlanNode {
         predicate_summary: crate::plan::combine::CombinePredicateSummary,
         match_mode: crate::config::pipeline_node::MatchMode,
         on_miss: crate::config::pipeline_node::OnMiss,
+        /// Mirrors `CombineBody.max_output_rows`. Opt-in runtime cap on this
+        /// combine's emitted-row count, enforced at the output-emit chokepoint
+        /// (E325 on breach); `None` is unlimited. Carried only on the final
+        /// user-visible combine step — synthetic N-ary decomposition steps mint
+        /// `None`, so the cap counts the user-facing output, not intermediates.
+        max_output_rows: Option<u64>,
         /// Mirrors `CombineBody.propagate_ck`. Selects which correlation-key
         /// fields the combine's output rows carry — driver-only, union of
         /// all inputs, or an explicit named subset. Read by the per-node

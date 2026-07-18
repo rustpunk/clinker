@@ -593,6 +593,9 @@ pub(super) struct BlockBandExec<'a> {
     pub(super) output_schema: Option<&'a Arc<Schema>>,
     pub(super) match_mode: MatchMode,
     pub(super) on_miss: OnMiss,
+    /// Opt-in runtime cap on the combine's emitted-row count (E325 on breach);
+    /// `None` is unlimited. Enforced at the output-emit chokepoint.
+    pub(super) max_output_rows: Option<u64>,
     pub(super) propagate_ck: &'a PropagateCkSpec,
     pub(super) ctx: &'a EvalContext<'a>,
     pub(super) budget: &'a MemoryArbitrator,
@@ -627,6 +630,7 @@ pub(super) fn execute_block_band(
         output_schema,
         match_mode,
         on_miss,
+        max_output_rows,
         propagate_ck,
         ctx,
         budget,
@@ -789,6 +793,11 @@ pub(super) fn execute_block_band(
         residual: residual_eval,
         body: body_eval,
     };
+    // Total rows this combine has emitted, threaded through the single sink so
+    // the opt-in `max_output_rows` cap counts the whole output — every match
+    // mode, the materialized and nested-loop paths, and the deferred on-miss
+    // dispatch alike, since all of them push through `EmitSink::push_row`.
+    let mut rows_emitted: u64 = 0;
     // One sink threads the whole emit phase (driver loop, driver-block finalize,
     // scan-unmatched sweep, on_miss dispatch); its borrows of the output buffer
     // and failure-tag vec end at its last use, before the output buffer is
@@ -798,6 +807,8 @@ pub(super) fn execute_block_band(
         budget,
         name,
         consumer,
+        max_output_rows,
+        rows_emitted: &mut rows_emitted,
         output_eval_failures: &mut output_eval_failures,
         failure_tags: Some(&mut failure_tags),
     };
@@ -2238,6 +2249,7 @@ mod tests {
             output_schema: Some(&out_schema),
             match_mode: cfg.match_mode,
             on_miss: cfg.on_miss,
+            max_output_rows: None,
             propagate_ck: &propagate,
             ctx: &ctx,
             budget,
@@ -3144,6 +3156,121 @@ mod tests {
         );
     }
 
+    // ── max_output_rows runaway cap (opt-in, fail-loud) ──────────────────
+
+    /// Drive the block-band with an explicit `max_output_rows`, so the cap tests
+    /// can exercise the runaway guard `run_block` (which always passes `None`)
+    /// cannot. Mirrors `run_block_on`'s body-less concat emit.
+    fn run_block_capped(
+        driver: &Side,
+        build: &Side,
+        cfg: &RunCfg,
+        max_output_rows: Option<u64>,
+    ) -> Result<Vec<Record>, PipelineError> {
+        let d_schema = driver_schema();
+        let b_schema = build_schema();
+        let out_schema = Arc::new(Schema::new(vec![
+            "d_k1".into(),
+            "d_k2".into(),
+            "d_id".into(),
+            "b_k1".into(),
+            "b_k2".into(),
+            "b_id".into(),
+        ]));
+        let (driver_records_bare, driver_scans) = to_records_scans(driver, &d_schema);
+        let driver_records: Vec<(Record, RecordOrder)> = driver_records_bare
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| (r, i as RecordOrder))
+            .collect();
+        let (build_records, build_scans) = to_records_scans(build, &b_schema);
+        let budget = arbitrator(cfg.hard_limit);
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let resolver = empty_resolver();
+        let consumer = ConsumerHandle::new();
+        let tmp = tempfile::Builder::new()
+            .prefix("iejoin-cap-")
+            .tempdir()
+            .expect("temp dir");
+        let propagate = PropagateCkSpec::Driver;
+        let out = execute_block_band(BlockBandExec {
+            name: "cap_test",
+            build_qualifier: "b",
+            driver_records,
+            driver_scans,
+            build_records,
+            build_scans,
+            op1: cfg.op1,
+            op2: cfg.op2,
+            residual_eval: None,
+            body_eval: None,
+            resolver_mapping: &resolver,
+            output_schema: Some(&out_schema),
+            match_mode: cfg.match_mode,
+            on_miss: cfg.on_miss,
+            max_output_rows,
+            propagate_ck: &propagate,
+            ctx: &ctx,
+            budget: &budget,
+            consumer: &consumer,
+            spill_dir: tmp.path(),
+            spill_compress: false,
+            strategy: ErrorStrategy::FailFast,
+            options: BlockBandOptions {
+                block_target_override: Some(cfg.block_target),
+                sort_spill_override: cfg.sort_spill,
+                resident_budget_override: cfg.resident_budget,
+            },
+        })?;
+        Ok(drain_sorted(out.sorted)?
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect())
+    }
+
+    #[test]
+    fn max_output_rows_cap_fails_loud_and_never_truncates() {
+        // 5 drivers × 4 builds, all key (5,5) under `Le AND Ge` → 20 output rows.
+        let driver: Side = (0..5).map(|i| (Some((5, 5)), i)).collect();
+        let build: Side = (0..4).map(|i| (Some((5, 5)), i + 100)).collect();
+        let cfg = RunCfg {
+            op1: RangeOp::Le,
+            op2: Some(RangeOp::Ge),
+            match_mode: MatchMode::All,
+            on_miss: OnMiss::Skip,
+            block_target: 1 << 20,
+            hard_limit: 1 << 30,
+            max_spill_bytes: None,
+            sort_spill: None,
+            resident_budget: None,
+        };
+
+        // A cap below the true output size fails loud with the typed E325 error
+        // naming the cap — never a truncated / partial result.
+        let err = run_block_capped(&driver, &build, &cfg, Some(10))
+            .expect_err("output over the cap must fail loud, not truncate");
+        match err {
+            PipelineError::CombineOutputCapExceeded { cap, .. } => {
+                assert_eq!(cap, 10, "the error must name the configured cap");
+            }
+            other => panic!("expected CombineOutputCapExceeded; got {other:?}"),
+        }
+
+        // A cap exactly at the output size completes, emitting every row.
+        let at_cap = run_block_capped(&driver, &build, &cfg, Some(20))
+            .expect("a run at the cap must complete");
+        assert_eq!(at_cap.len(), 20, "a run at the cap emits every row");
+        let roomy_cap = run_block_capped(&driver, &build, &cfg, Some(1_000))
+            .expect("a generous cap must complete");
+        assert_eq!(roomy_cap.len(), 20);
+
+        // The default (None) is unlimited and matches the capped-OK run.
+        let uncapped =
+            run_block_capped(&driver, &build, &cfg, None).expect("unlimited default completes");
+        assert_eq!(uncapped.len(), 20, "None is unlimited");
+    }
+
     // ── output determinism across block layouts ──────────────────────────
 
     /// Ordered `(driver_id, build_id)` sequence from `All`/`First` concat rows.
@@ -3399,6 +3526,7 @@ mod tests {
                 output_schema: Some(&out_schema),
                 match_mode: MatchMode::All,
                 on_miss: OnMiss::Error,
+                max_output_rows: None,
                 propagate_ck: &propagate,
                 ctx: &ctx,
                 budget: &budget,
@@ -3492,6 +3620,7 @@ mod tests {
                 output_schema: Some(&out_schema),
                 match_mode: MatchMode::All,
                 on_miss: OnMiss::Skip,
+                max_output_rows: None,
                 propagate_ck: &propagate,
                 ctx: &ctx,
                 budget: &budget,
@@ -3613,6 +3742,7 @@ mod tests {
             output_schema: Some(&out_schema),
             match_mode: MatchMode::First,
             on_miss: OnMiss::Skip,
+            max_output_rows: None,
             propagate_ck: &propagate,
             ctx: &ctx,
             budget: &budget,
@@ -3867,6 +3997,7 @@ mod tests {
             output_schema: Some(&out_schema),
             match_mode: MatchMode::All,
             on_miss: OnMiss::NullFields,
+            max_output_rows: None,
             propagate_ck: &propagate,
             ctx: &ctx,
             budget: &budget,
@@ -4103,6 +4234,7 @@ mod tests {
             output_schema: Some(out_schema),
             match_mode: MatchMode::All,
             on_miss: OnMiss::NullFields,
+            max_output_rows: None,
             propagate_ck: &propagate,
             ctx: &ctx,
             budget: &budget,
@@ -4563,6 +4695,7 @@ mod tests {
             output_schema: Some(&out_schema),
             match_mode: cfg.match_mode,
             on_miss: cfg.on_miss,
+            max_output_rows: None,
             propagate_ck: &propagate,
             ctx: &ctx,
             budget,

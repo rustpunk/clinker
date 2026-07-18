@@ -66,6 +66,7 @@
 //! | `E313`      | error    | Combine has no equality conjuncts (HashBuildProbe needs ≥1) |
 //! | `E314`      | error    | Schema mismatch at operator entry (column list divergence) |
 //! | `E319`      | error    | Combine `on_miss: error` had no matching build row   |
+//! | `E325`      | error    | Combine output exceeded the opt-in `max_output_rows` cap |
 //! | `W302`      | warning  | Pure-equi combine with all small inputs — consider InMemoryHash |
 //! | `W305`      | warning  | Combine where-clause has no equality conjuncts       |
 //! | `W306`      | warning  | Combine planner cannot determine optimal driving input |
@@ -329,7 +330,7 @@ mod diagnostic_tests {
         // explicit entry both here and in the registry table above.
         for code in [
             "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308", "E309", "E310", "E311",
-            "E313", "E314", "E315", "E316", "E317", "E318", "E319", "E322",
+            "E313", "E314", "E315", "E316", "E317", "E318", "E319", "E322", "E325",
         ] {
             let pattern = format!("`{code}`");
             assert!(
