@@ -124,9 +124,10 @@ fn cli_memory_limit_overrides_pipeline_yaml() {
     );
 
     // Override: `--memory-limit 1` sets a 1-byte ceiling, below the process's
-    // baseline resident memory, so the pause-policy startup gate aborts with
-    // E312 before any data loads. If the flag were ignored, the 2G YAML value
-    // would let this pass exactly as the baseline run above did.
+    // baseline resident memory, so the run aborts before any data loads. The
+    // load-bearing signal is the differential itself — the same pipeline that
+    // passed on its 2G YAML budget now fails — which proves the flag reached the
+    // executor and won over the YAML value regardless of the abort mechanism.
     let with_flag = Command::new(clinker_bin())
         .arg("run")
         .arg("pipeline.yaml")
@@ -141,9 +142,62 @@ fn cli_memory_limit_overrides_pipeline_yaml() {
         "`--memory-limit 1` must override the 2G YAML budget and abort the run; \
          stderr:\n{stderr}"
     );
+    // On the supported CI targets (Linux, macOS, Windows) `rss_bytes()` is
+    // available and the default backpressure policy pauses producers, so a
+    // sub-baseline budget is rejected up front as E312 whose message echoes the
+    // exact 1-byte ceiling — confirming the flag's specific value, not merely
+    // some failure, propagated into the arbitrator sizing. (The E312 gate is
+    // skipped only where `rss_bytes()` returns `None` or under a non-pausing
+    // policy, neither of which applies on those targets.)
     assert!(
-        stderr.contains("E312"),
-        "the CLI-forced sub-baseline budget must surface the E312 startup abort; \
-         got:\n{stderr}"
+        stderr.contains("E312") && stderr.contains("of 1 bytes"),
+        "the CLI-forced 1-byte budget must surface the E312 startup abort naming \
+         that ceiling; got:\n{stderr}"
     );
+}
+
+#[test]
+fn malformed_memory_limit_flag_fails_at_the_boundary_without_clobbering_yaml() {
+    // Regression guard for the wiring's original hazard: before boundary
+    // validation, a malformed `--memory-limit` value (the decimal `4GB` where
+    // the binary `4G` is meant, or plain garbage) parsed to the 512 MiB default
+    // downstream, silently overriding a larger YAML budget with no diagnostic.
+    // The flag must now be rejected at the CLI boundary — naming the flag and
+    // echoing the bad value — before it can touch the plan, so the generous YAML
+    // budget below is never clobbered.
+    let tmp = pipeline_with_limit("8G");
+
+    for bad in ["4GB", "notanumber"] {
+        let output = Command::new(clinker_bin())
+            .arg("run")
+            .arg("pipeline.yaml")
+            .arg("--memory-limit")
+            .arg(bad)
+            .current_dir(tmp.path())
+            .output()
+            .expect("spawn clinker");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "a malformed --memory-limit {bad:?} must fail the run; stderr:\n{stderr}"
+        );
+        assert!(
+            stderr.contains("--memory-limit"),
+            "the diagnostic must name the flag the operator passed, not the YAML \
+             `memory.limit` key; got:\n{stderr}"
+        );
+        assert!(
+            stderr.contains(bad),
+            "the diagnostic must echo the offending value {bad:?}; got:\n{stderr}"
+        );
+        // The failure must be the boundary rejection, not a downstream abort from
+        // a silently-defaulted budget: had `4GB` collapsed to 512 MiB and
+        // clobbered the 8G YAML value, this 1-row pipeline would still have run
+        // to completion, so any E312 here would signal the exact regression.
+        assert!(
+            !stderr.contains("E312"),
+            "a malformed flag must be rejected at the boundary, never coerced to a \
+             budget the executor then judges; got:\n{stderr}"
+        );
+    }
 }

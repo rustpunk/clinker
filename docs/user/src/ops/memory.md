@@ -52,11 +52,17 @@ When `--memory-limit` is passed it overrides `pipeline.memory.limit` for that ru
 
 **Default:** 512 MB.
 
-**Invalid values:** an empty or unparseable limit (for example a stray
-non-numeric value) falls back to the 512 MB default. A value whose size is
-well-formed but too large to represent — its scaled byte count exceeds the
-maximum a 64-bit counter can hold — is rejected at startup with a config error
-that names `memory.limit`, rather than wrapping to a small budget. Pick a limit
+**Invalid values:** the two entry points treat a malformed limit differently.
+An empty or unparseable `memory.limit` *in the YAML* (for example a stray
+non-numeric value) falls back to the 512 MB default. A malformed
+`--memory-limit` *flag*, by contrast, is rejected up front with a config error
+that names `--memory-limit` and echoes the value you passed — so a typo such as
+the decimal `4GB` (the binary suffix is `4G`) fails loudly instead of silently
+collapsing to the default and shrinking a larger budget set in your YAML.
+Either way, a value whose size is well-formed but too large to represent — its
+scaled byte count exceeds the maximum a 64-bit counter can hold — is rejected
+rather than wrapping to a small budget (the YAML overflow error names
+`memory.limit`; the flag overflow error names `--memory-limit`). Pick a limit
 that fits your host's real memory.
 
 ## Choosing a backpressure policy

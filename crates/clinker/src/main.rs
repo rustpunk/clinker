@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use clinker_exec::executor::PipelineExecutor;
 use clinker_exec::metrics::{self, ExecutionMetrics};
-use clinker_plan::config::utils::parse_memory_limit_bytes;
+use clinker_plan::config::utils::{DEFAULT_MEMORY_LIMIT_BYTES, parse_memory_limit_bytes_strict};
 use clinker_plan::error::PipelineError;
 
 mod refactor;
@@ -425,13 +425,26 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
-    /// Resolve memory limit from CLI flag or default (512MB).
+    /// Validate the `--memory-limit` flag and resolve it to a byte budget.
     ///
-    /// Returns a config error when the flag value's binary-suffix scaling
-    /// overflows `u64`, so the caller surfaces a clear diagnostic to the
-    /// operator instead of panicking or silently wrapping to a tiny budget.
+    /// A present flag is parsed strictly: a malformed or overflowing value is a
+    /// hard error that names the flag and echoes the offending value, so an
+    /// operator typo (e.g. the decimal `4GB` where the binary `4G` was meant)
+    /// fails loudly instead of silently collapsing to the default and clobbering
+    /// a larger configured `memory.limit`. An absent flag resolves to the shared
+    /// [`DEFAULT_MEMORY_LIMIT_BYTES`], so the 512 MiB default lives in exactly
+    /// one place. Production calls this at the boundary (in `run`) before the
+    /// flag value is injected into the plan; the unit tests exercise the same
+    /// path.
     pub fn memory_limit_bytes(&self) -> Result<u64, clinker_plan::config::ConfigError> {
-        parse_memory_limit_bytes(self.mem_limit.as_deref().or(Some("512M")))
+        match self.mem_limit.as_deref() {
+            Some(raw) => parse_memory_limit_bytes_strict(raw).map_err(|reason| {
+                clinker_plan::config::ConfigError::Validation(format!(
+                    "--memory-limit {raw:?} is not a valid memory budget: {reason}"
+                ))
+            }),
+            None => Ok(DEFAULT_MEMORY_LIMIT_BYTES),
+        }
     }
 
     /// Resolve batch_id from CLI flag or generate UUID v7.
@@ -947,14 +960,18 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             .map_err(PipelineError::Config)?;
 
     // A `--memory-limit` flag overrides the pipeline's `memory.limit`, matching
-    // the documented CLI-wins precedence. Applied before compile so the value is
-    // baked into the plan the executor recompiles and reads when it builds the
-    // arbitrator ceiling and spill budgets. When the flag is absent the YAML
-    // value stands untouched (and the arbitrator's own 512 MiB default applies
-    // when the YAML is also silent), so an omitted flag never clobbers a
-    // configured budget. The raw suffix string flows through the same
-    // `memory.limit` grammar a YAML value uses, so both paths parse identically.
+    // the documented CLI-wins precedence. The value is validated strictly here at
+    // the boundary — before it can reach the plan — so a malformed flag fails
+    // loudly, naming the flag and echoing the bad value, instead of parsing to
+    // the default downstream and silently shrinking a larger configured budget.
+    // Only a value that validates is injected; the executor recomputes the budget
+    // from this same string through the identical grammar, so the validated
+    // verdict (not the byte count) is what matters here. When the flag is absent
+    // the YAML value stands untouched (and the arbitrator's own 512 MiB default
+    // applies when the YAML is also silent), so an omitted flag never clobbers a
+    // configured budget.
     if let Some(limit) = &args.mem_limit {
+        args.memory_limit_bytes().map_err(PipelineError::Config)?;
         pipeline_config.pipeline.memory.limit = Some(limit.clone());
     }
 
@@ -3742,6 +3759,52 @@ mod tests {
             Commands::Run(args) => {
                 assert_eq!(args.memory_limit_bytes().ok(), Some(512 * 1024 * 1024))
             }
+            _ => panic!("expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_run_memory_limit_malformed_fails_naming_flag() {
+        // A malformed value (the decimal `4GB` where the binary `4G` is meant,
+        // or plain garbage) must be rejected at the boundary — naming the flag
+        // and echoing the value — never coerced to the default, which would
+        // silently shrink a larger configured budget.
+        for bad in ["4GB", "notanumber"] {
+            let cli =
+                Cli::try_parse_from(["clinker", "run", "--memory-limit", bad, "p.yaml"]).unwrap();
+            match cli.command {
+                Commands::Run(args) => match args.memory_limit_bytes() {
+                    Err(clinker_plan::config::ConfigError::Validation(msg)) => {
+                        assert!(
+                            msg.contains("--memory-limit") && msg.contains(bad),
+                            "diagnostic must name the flag and echo {bad:?}; got: {msg}"
+                        );
+                    }
+                    other => panic!("expected a validation error for {bad:?}, got: {other:?}"),
+                },
+                _ => panic!("expected Run command"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_cli_run_memory_limit_overflow_fails_naming_flag() {
+        // A well-formed but oversized value (numeric part fits, suffix multiply
+        // overflows `u64`) must also fail naming the flag the operator passed,
+        // not the YAML `memory.limit` key.
+        let cli =
+            Cli::try_parse_from(["clinker", "run", "--memory-limit", "17179869184G", "p.yaml"])
+                .unwrap();
+        match cli.command {
+            Commands::Run(args) => match args.memory_limit_bytes() {
+                Err(clinker_plan::config::ConfigError::Validation(msg)) => {
+                    assert!(
+                        msg.contains("--memory-limit") && msg.contains("overflow"),
+                        "diagnostic must name the flag and the overflow; got: {msg}"
+                    );
+                }
+                other => panic!("expected a validation error, got: {other:?}"),
+            },
             _ => panic!("expected Run command"),
         }
     }
