@@ -1248,6 +1248,14 @@ mod tests {
         let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
         m.insert("k".into(), Value::Null);
         assert_eq!(canonical_key_bytes(&[Value::Map(Box::new(m))]), None);
+        // Cross-type nesting: a null buried under a Map -> Array still poisons the
+        // key, matching `value_equal_canonicalized` recursing to false.
+        let mut nested: IndexMap<Box<str>, Value> = IndexMap::new();
+        nested.insert(
+            "arr".into(),
+            Value::Array(vec![Value::Integer(1), Value::Null]),
+        );
+        assert_eq!(canonical_key_bytes(&[Value::Map(Box::new(nested))]), None);
     }
 
     #[test]
@@ -1265,6 +1273,23 @@ mod tests {
         m_ba.insert("b".into(), Value::Integer(2));
         m_ba.insert("a".into(), Value::Integer(1));
 
+        // A leap second (23:59:60, encoded as :59 with a nanosecond ≥ 1e9) must
+        // encode distinctly from an ordinary sub-second instant at the same
+        // wall-clock second — the `and_utc().nanosecond()` term differs — so the
+        // canonical bytes track `NaiveDateTime` equality across the leap boundary.
+        let dt_normal = Value::DateTime(
+            NaiveDate::from_ymd_opt(2016, 12, 31)
+                .unwrap()
+                .and_hms_nano_opt(23, 59, 59, 123_456_789)
+                .unwrap(),
+        );
+        let dt_leap = Value::DateTime(
+            NaiveDate::from_ymd_opt(2016, 12, 31)
+                .unwrap()
+                .and_hms_nano_opt(23, 59, 59, 1_000_000_000)
+                .unwrap(),
+        );
+
         let tuples: Vec<Vec<Value>> = vec![
             vec![Value::Integer(1)],
             vec![Value::Integer(2)],
@@ -1277,6 +1302,10 @@ mod tests {
             vec![Value::String("a".into()), Value::String("bc".into())],
             vec![Value::Decimal("2.5".parse().unwrap())],
             vec![Value::Decimal("2.50".parse().unwrap())],
+            vec![Value::Date(NaiveDate::from_ymd_opt(2026, 4, 18).unwrap())],
+            vec![Value::Date(NaiveDate::from_ymd_opt(2026, 4, 19).unwrap())],
+            vec![dt_normal],
+            vec![dt_leap],
             vec![Value::Integer(1), Value::Integer(2)],
             vec![Value::Array(vec![Value::Integer(1), Value::Integer(2)])],
             vec![Value::Map(Box::new(m_ab))],
@@ -1301,6 +1330,53 @@ mod tests {
                         "equal canonical bytes must imply equal composite hash for {a:?} vs {b:?}"
                     );
                 }
+            }
+        }
+    }
+
+    /// A pool of representative key Values for the property test, including
+    /// nulls (top-level and nested) so the `None` / 3VL branch is exercised.
+    fn value_pool() -> impl proptest::strategy::Strategy<Value = Value> {
+        proptest::sample::select(vec![
+            Value::Null,
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Integer(1),
+            Value::Integer(2),
+            Value::Float(0.0),
+            Value::Float(-0.0),
+            Value::Float(f64::NAN),
+            Value::String("a".into()),
+            Value::String("ab".into()),
+            Value::Decimal("2.5".parse().unwrap()),
+            Value::Decimal("2.50".parse().unwrap()),
+            Value::Array(vec![Value::Integer(1), Value::Integer(2)]),
+            Value::Array(vec![Value::Integer(1), Value::Null]),
+        ])
+    }
+
+    proptest::proptest! {
+        /// Over arbitrary tuples drawn from the pool: canonical byte equality
+        /// tracks `keys_equal_canonicalized` exactly, and equal keys hash equally.
+        /// A tuple whose canonical bytes are `None` (a null anywhere, recursively)
+        /// is never equal to anything under SQL 3VL.
+        #[test]
+        fn canonical_key_bytes_matches_equality_over_value_pool(
+            a in proptest::collection::vec(value_pool(), 1..4),
+            b in proptest::collection::vec(value_pool(), 1..4),
+        ) {
+            let state = deterministic_state();
+            match (canonical_key_bytes(&a), canonical_key_bytes(&b)) {
+                (Some(ca), Some(cb)) => {
+                    proptest::prop_assert_eq!(ca == cb, keys_equal_canonicalized(&a, &b));
+                    if ca == cb {
+                        proptest::prop_assert_eq!(
+                            hash_composite_key(&a, &state),
+                            hash_composite_key(&b, &state)
+                        );
+                    }
+                }
+                _ => proptest::prop_assert!(!keys_equal_canonicalized(&a, &b)),
             }
         }
     }
