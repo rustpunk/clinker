@@ -64,6 +64,7 @@ mod tests {
                 &[
                     "fn bench_combine_iejoin",
                     "fn bench_combine_iejoin_nested_loop",
+                    "fn bench_combine_iejoin_pure_range",
                 ],
             ),
             ("combine_nary_3input.rs", &["fn bench_combine_nary_3input"]),

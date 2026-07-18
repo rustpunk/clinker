@@ -1,0 +1,55 @@
+# Pure-range block-band combine with THREE range conjuncts. The band
+# (income within [lo, hi)) is proved by the block-band kernel's two axes;
+# the third conjunct (score > min_score) is a cross-input range that rides
+# the residual re-check filter. No equality conjunct, so this routes to the
+# pure-range IEJoin block-band path (not the equi+range hash partition).
+#
+# Expected matches (match: all): driver 2 (income 250, score 90) falls in
+# band 10 [0,300) and clears its min_score 60; driver 4 (income 450, score
+# 75) falls in band 11 [300,600) and clears min_score 20. Drivers 1 and 3
+# fall in a band but fail the score residual, so the residual filter drops
+# them.
+pipeline:
+  name: iejoin_three_conjunct_residual
+nodes:
+  - type: source
+    name: applicants
+    config:
+      name: applicants
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_3c_drivers.csv
+      schema:
+        - { name: did, type: int }
+        - { name: income, type: int }
+        - { name: score, type: int }
+  - type: source
+    name: tiers
+    config:
+      name: tiers
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_3c_builds.csv
+      schema:
+        - { name: bid, type: int }
+        - { name: lo, type: int }
+        - { name: hi, type: int }
+        - { name: min_score, type: int }
+  - type: combine
+    name: tiered
+    input:
+      applicants: applicants
+      tiers: tiers
+    config:
+      where: "applicants.income >= tiers.lo and applicants.income < tiers.hi and applicants.score > tiers.min_score"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit did = applicants.did
+        emit bid = tiers.bid
+      propagate_ck: driver
+  - type: output
+    name: tiered_out
+    input: tiered
+    config:
+      name: tiered_out
+      type: csv
+      path: iejoin_three_conjunct_residual.csv

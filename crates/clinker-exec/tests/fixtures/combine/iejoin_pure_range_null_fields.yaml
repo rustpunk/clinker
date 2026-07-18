@@ -1,0 +1,52 @@
+# Pure-range block-band combine with on_miss: null_fields. No equality
+# conjunct, so this routes to the pure-range IEJoin block-band path. Every
+# driver emits exactly one row: a matched driver carries its band's build
+# id; a zero-match driver carries a null build id.
+#
+# Driver 2 has a NULL amount (empty CSV field): its range key is
+# non-orderable, so the scan routes it to the deferred scan-phase unmatched
+# pile and it emits a null-fields row. Driver 4 (amount 999) falls outside
+# every band, so it is an in-block zero match and also emits a null-fields
+# row. Drivers 1 and 3 match bands 10 and 11.
+pipeline:
+  name: iejoin_pure_range_null_fields
+nodes:
+  - type: source
+    name: readings
+    config:
+      name: readings
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_prnf_drivers.csv
+      schema:
+        - { name: did, type: int }
+        - { name: amount, type: int }
+  - type: source
+    name: bands
+    config:
+      name: bands
+      type: csv
+      path: tests/fixtures/combine/data/iejoin_prnf_builds.csv
+      schema:
+        - { name: bid, type: int }
+        - { name: lo, type: int }
+        - { name: hi, type: int }
+  - type: combine
+    name: banded
+    input:
+      readings: readings
+      bands: bands
+    config:
+      where: "readings.amount >= bands.lo and readings.amount < bands.hi"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit did = readings.did
+        emit bid = bands.bid
+      propagate_ck: driver
+  - type: output
+    name: banded_out
+    input: banded
+    config:
+      name: banded_out
+      type: csv
+      path: iejoin_pure_range_null_fields.csv
