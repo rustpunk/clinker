@@ -86,9 +86,7 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::executor::combine::{CombineResolver, CombineResolverMapping};
 use crate::executor::widen_record_to_schema;
-use crate::pipeline::combine::{
-    CombineOutputEvalFailure, KeyExtractor, canonical_key_bytes, hash_composite_key,
-};
+use crate::pipeline::combine::{CombineOutputEvalFailure, KeyExtractor, canonical_key_bytes};
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
 use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use clinker_plan::BudgetCategory;
@@ -674,15 +672,15 @@ pub(crate) fn execute_combine_iejoin(
     };
     let body_eval = body_program.map(|p| ProgramEvaluator::new(Arc::clone(p), false));
 
-    // Pre-scan: extract each record's equality-key hash + canonical bytes and
-    // its range keys in parallel. A record with a NULL in any equality key
-    // (3VL) or an unrepresentable range key can never match and is routed off
-    // the range walk. A pure-range combine carries no equality extractor, so
-    // every record hashes to one constant group and the path is byte-for-byte
-    // the prior pure-range behavior; an equi+range combine hashes on its
-    // equality keys so the block-band sort clusters equal-keyed records and
-    // prunes block-pairs on the equality hash before the range walk.
-    let hash_state = RandomState::new();
+    // Pre-scan: extract each record's canonical equality-key bytes and its range
+    // keys in parallel, deriving the equality hash from those bytes so the prune
+    // hash and the re-verify bytes agree by construction. A record with a NULL in
+    // any equality key (3VL) or an unrepresentable range key can never match and
+    // is routed off the range walk. A pure-range combine carries no equality
+    // extractor, so every record hashes to one constant group and the path is
+    // byte-for-byte the prior pure-range behavior; an equi+range combine hashes
+    // on its equality keys so the block-band sort clusters equal-keyed records
+    // and prunes block-pairs on the equality hash before the range walk.
 
     // Per-record key extraction is the expensive part of the pre-scan: every
     // record runs the compiled CXL eq-key and range-key closures. The
@@ -704,7 +702,6 @@ pub(crate) fn execute_combine_iejoin(
                 &driver_range_extractor,
                 ctx,
                 &driver_resolver,
-                &hash_state,
             )
             .map_err(|e| key_eval_error(name, "driving", e))
         })
@@ -713,14 +710,8 @@ pub(crate) fn execute_combine_iejoin(
     let build_scans: Vec<RecordScan> = build_records
         .par_iter()
         .map(|rec| {
-            scan_record(
-                &build_extractor,
-                &build_range_extractor,
-                ctx,
-                rec,
-                &hash_state,
-            )
-            .map_err(|e| key_eval_error(name, "build", e))
+            scan_record(&build_extractor, &build_range_extractor, ctx, rec)
+                .map_err(|e| key_eval_error(name, "build", e))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1493,7 +1484,6 @@ fn scan_record(
     range_extractor: &KeyExtractor,
     ctx: &EvalContext<'_>,
     resolver: &dyn cxl::resolve::traits::FieldResolver,
-    hash_state: &RandomState,
 ) -> Result<RecordScan, EvalError> {
     let mut eq_buf: Vec<Value> = Vec::new();
     if !eq_extractor.is_empty() {
@@ -1509,16 +1499,40 @@ fn scan_record(
     let Some(range_key) = range_keys_to_i64_pair(&range_buf) else {
         return Ok(RecordScan::Unmatched);
     };
-    // Equal equality keys always hash identically (the hash and the canonical
-    // bytes mirror the same canonicalization), so equal-keyed records cluster
-    // under the block-band sort; distinct keys may collide, which the per-pair
-    // canonical re-verify catches.
-    let eq_hash = hash_composite_key(&eq_buf, hash_state);
+    // Derive the prune hash from the canonical bytes: equal equality keys have
+    // equal bytes and so hash identically (they cluster under the block-band
+    // sort), and this agrees with the per-pair re-verify by construction while
+    // avoiding a second walk of the key Values. Distinct keys may collide, which
+    // the re-verify catches.
+    let eq_hash = eq_hash_of_bytes(&eq);
     Ok(RecordScan::Matched {
         eq_hash,
         eq,
         range_key,
     })
+}
+
+/// Hash the canonical equality-key bytes with a FIXED seed. Block-band-local (it
+/// does not touch the shared [`hash_composite_key`] the equi-hash join and other
+/// strategies depend on): the hash only groups and prunes and never reaches
+/// output, so any stable, well-distributed hash of the canonical bytes suffices.
+/// A fixed seed makes the sliced block layout identical run to run rather than
+/// varying with a process-random seed.
+fn eq_hash_of_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::OnceLock;
+    static STATE: OnceLock<RandomState> = OnceLock::new();
+    let state = STATE.get_or_init(|| {
+        RandomState::with_seeds(
+            0x9e37_79b9_7f4a_7c15,
+            0xc2b2_ae3d_27d4_eb4f,
+            0x1656_67b1_9e37_79f9,
+            0x2545_f491_4f6c_dd1d,
+        )
+    });
+    let mut hasher = state.build_hasher();
+    hasher.write(bytes);
+    hasher.finish()
 }
 
 /// Convert a 1-or-2-element vector of range key Values to an
