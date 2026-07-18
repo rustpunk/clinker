@@ -50,7 +50,7 @@ Iteration order in the `input:` map is preserved and used as the default driver-
 |-------|----------|---------|-------------|
 | `where` | Yes | -- | CXL boolean expression matching records across inputs. Must contain at least one cross-input equality. |
 | `match` | No | `first` | Match cardinality: `first`, `all`, or `collect`. |
-| `on_miss` | No | `null_fields` | Driver-record handling on zero matches: `null_fields`, `skip`, or `error`. |
+| `on_miss` | No | `null_fields` | Driver-record handling on zero predicate matches: `null_fields`, `skip`, or `error`. |
 | `cxl` | Yes (except under `match: collect`) | -- | Emit statements defining the output row. Empty under `match: collect`. |
 | `drive` | No | first input | Explicit driver-input qualifier. Overrides the iteration-order default. |
 | `strategy` | No | `auto` | Execution strategy hint: `auto` or `grace_hash`. |
@@ -96,6 +96,10 @@ Emit one output row per driver record, using the first matching build-side recor
       emit product_name = products.product_name
 ```
 
+The `where:` predicate selects the match; the `cxl:` body is a **post-match projection** that runs once on the chosen build record. Selection and projection are separate steps: if the body filters the row out (a `filter` that fails, or a body that emits nothing), that one output row is dropped. The combine does **not** fall back to a later matching build, and the driver is **not** treated as unmatched — it matched the predicate, the body just produced no row. `on_miss` (below) never fires for such a driver; it fires only when the predicate matched nothing at all. This holds identically for every join strategy the planner may pick.
+
+> **Behavior change.** This is a change in observable output for existing pipelines whose `where:` predicate carries a range, equi+range, or single-inequality comparison — the shapes the planner runs as a sort-merge join or an IEJoin (both the pure-range block-band path and the equi+range hash-partitioned path). On any of those three strategies, a driver that matched the predicate but whose body skipped every candidate was previously routed to `on_miss` — firing `null_fields`, `skip`, or `error`. It now silently produces no row, matching the pure-equality strategies (in-memory hash and grace hash), which already behaved this way and are unchanged. A pipeline that relied on the old routing (for example, `on_miss: error` tripping on a body-skipped driver) no longer sees it.
+
 ### `match: all`
 
 Emit one output row for every matching build-side record. 1:N fan-out -- if a driver record matches three build records, three rows are emitted.
@@ -126,7 +130,7 @@ Use `collect` when you need the set of matches as a single structured value; use
 
 ## Unmatched records (`on_miss`)
 
-`on_miss` controls what happens to driver records with zero matches:
+`on_miss` controls what happens to driver records with **zero predicate matches** — drivers for which no build-side record satisfied `where:`. A driver that matched the predicate but whose `cxl:` body skipped the row (see [`match: first`](#match-first)) is **not** a miss and never reaches `on_miss`; it simply produces no output row. On sort-merge and IEJoin strategies this is a recent change — see the behavior-change note under [`match: first`](#match-first).
 
 | Value | Semantics |
 |-------|-----------|
