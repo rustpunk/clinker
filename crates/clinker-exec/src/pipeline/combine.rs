@@ -213,6 +213,109 @@ fn hash_value_into<H: Hasher>(v: &Value, h: &mut H) {
     }
 }
 
+/// Canonical byte encoding of a composite equality key.
+///
+/// Two key tuples encode to identical bytes iff they are equal under
+/// [`keys_equal_canonicalized`], and equal keys therefore also hash identically
+/// under [`hash_composite_key`]. This makes the byte form a faithful,
+/// spill-safe stand-in for the value tuple: the block-band IEJoin carries it in
+/// each record's sort payload and compares two records' bytes directly to
+/// re-verify equality after a hash-partition prune, without needing `Value:
+/// Ord` (which is only partial). The hash is the partition/prune filter; this
+/// byte compare is the exact recheck at the join, the way a hash join rechecks
+/// the key after a bucket hit.
+///
+/// Returns `None` when any key element is `Null` — recursively, including a
+/// `Null` nested inside an `Array` or `Map` value. SQL 3VL makes a null key
+/// never-equal to anything (even another null), so such a record can never
+/// join; the caller routes it out through `on_miss`, the same observable
+/// outcome [`keys_equal_canonicalized`] produces (it returns `false` for every
+/// comparison touching a null). The encoding mirrors [`hash_value_into`]
+/// arm-for-arm — type tags, length prefixes, `canonical_f64` float bits,
+/// normalized decimal, sorted map keys — so the byte and hash forms cannot
+/// silently diverge in what they treat as equal.
+pub(crate) fn canonical_key_bytes(values: &[Value]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    for v in values {
+        if !encode_canonical(v, &mut out) {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// Append `v`'s canonical bytes to `out`, returning `false` if `v` is or
+/// contains a `Null` (leaving `out` in a partial state the caller discards).
+/// Recursive over `Array` / `Map`, mirroring [`hash_value_into`] so byte
+/// equality tracks [`value_equal_canonicalized`].
+fn encode_canonical(v: &Value, out: &mut Vec<u8>) -> bool {
+    match v {
+        Value::Null => return false,
+        Value::Bool(b) => {
+            out.push(TAG_BOOL);
+            out.push(u8::from(*b));
+        }
+        Value::Integer(i) => {
+            out.push(TAG_INTEGER);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        Value::Float(f) => {
+            out.push(TAG_FLOAT);
+            out.extend_from_slice(&canonical_f64(*f).to_bits().to_le_bytes());
+        }
+        Value::Decimal(d) => {
+            out.push(TAG_DECIMAL);
+            // Normalized 16-byte form so equal values of differing scale
+            // (2.50 vs 2.5) encode identically — matching the normalized
+            // Decimal hash and `value_equal_canonicalized`.
+            out.extend_from_slice(&d.normalize().serialize());
+        }
+        Value::String(s) => {
+            out.push(TAG_STRING);
+            // Length prefix prevents concatenation collisions, exactly as the
+            // hash writes `write_usize(s.len())` before the bytes.
+            out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        Value::Date(d) => {
+            out.push(TAG_DATE);
+            out.extend_from_slice(&d.num_days_from_ce().to_le_bytes());
+        }
+        Value::DateTime(dt) => {
+            let utc = dt.and_utc();
+            out.push(TAG_DATETIME);
+            out.extend_from_slice(&utc.timestamp().to_le_bytes());
+            out.extend_from_slice(&utc.nanosecond().to_le_bytes());
+        }
+        Value::Array(arr) => {
+            out.push(TAG_ARRAY);
+            out.extend_from_slice(&(arr.len() as u64).to_le_bytes());
+            for x in arr {
+                if !encode_canonical(x, out) {
+                    return false;
+                }
+            }
+        }
+        Value::Map(m) => {
+            out.push(TAG_MAP);
+            out.extend_from_slice(&(m.len() as u64).to_le_bytes());
+            // Sorted-key order so two Maps with the same entries encode
+            // identically regardless of insertion order — the order-independent
+            // Map equality `value_equal_canonicalized` gives.
+            let mut keys: Vec<&Box<str>> = m.keys().collect();
+            keys.sort_unstable();
+            for k in keys {
+                out.extend_from_slice(&(k.len() as u64).to_le_bytes());
+                out.extend_from_slice(k.as_bytes());
+                if !encode_canonical(m.get(k.as_ref()).expect("key from iteration"), out) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Canonicalized element-wise key equality. Applied AFTER hash match in the
 /// probe path to filter out hash collisions (DataFusion #843 — emitting
 /// no-match rows before exhausting the collision chain causes phantom
@@ -818,21 +921,6 @@ fn partial_memory_bytes(
             .sum::<usize>()
 }
 
-/// Estimated owned-memory footprint of an accumulated combine output buffer
-/// (`(Record, RecordOrder)` pairs). The IEJoin and sort-merge probe kernels
-/// gate this buffer's growth on its own byte count via `should_abort_local`,
-/// so the memory budget still fires on a platform where process RSS is
-/// unavailable — without it those two kernels would grow unbounded toward an
-/// OOM on the wasm build, unsupported targets, or a transient platform-API
-/// failure. Mirrors the equi-join build-side `partial_memory_bytes` gate.
-pub(crate) fn combine_output_buffer_bytes(records: &[(Record, u64)]) -> usize {
-    std::mem::size_of_val(records)
-        + records
-            .iter()
-            .map(|(r, _)| r.estimated_heap_size())
-            .sum::<usize>()
-}
-
 // ──────────────────────────────────────────────────────────────────────────
 // MemoryConsumer wrapper for the inline-combine `CombineHashTable`
 // ──────────────────────────────────────────────────────────────────────────
@@ -1146,6 +1234,77 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn canonical_key_bytes_null_returns_none() {
+        // Top-level null and null nested inside an array/map value all make the
+        // whole key never-joinable — the caller routes it to on_miss, matching
+        // `keys_equal_canonicalized` returning false for anything touching null.
+        assert_eq!(canonical_key_bytes(&[Value::Null]), None);
+        assert_eq!(canonical_key_bytes(&[Value::Integer(1), Value::Null]), None);
+        assert_eq!(
+            canonical_key_bytes(&[Value::Array(vec![Value::Integer(1), Value::Null])]),
+            None
+        );
+        let mut m: IndexMap<Box<str>, Value> = IndexMap::new();
+        m.insert("k".into(), Value::Null);
+        assert_eq!(canonical_key_bytes(&[Value::Map(Box::new(m))]), None);
+    }
+
+    #[test]
+    fn canonical_key_bytes_tracks_keys_equal_canonicalized() {
+        // Byte equality of the canonical encoding must match
+        // `keys_equal_canonicalized` exactly, and equal bytes must imply equal
+        // `hash_composite_key` — the two invariants the block-band re-verify and
+        // hash-partition prune rely on. Cover the canonicalization corners:
+        // ±0.0 / NaN floats, Decimal scale, cross-type disjointness, string
+        // length-prefixing, map key-order independence, and nesting.
+        let mut m_ab: IndexMap<Box<str>, Value> = IndexMap::new();
+        m_ab.insert("a".into(), Value::Integer(1));
+        m_ab.insert("b".into(), Value::Integer(2));
+        let mut m_ba: IndexMap<Box<str>, Value> = IndexMap::new();
+        m_ba.insert("b".into(), Value::Integer(2));
+        m_ba.insert("a".into(), Value::Integer(1));
+
+        let tuples: Vec<Vec<Value>> = vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Float(0.0)],
+            vec![Value::Float(-0.0)],
+            vec![Value::Float(f64::NAN)],
+            vec![Value::Float(f64::from_bits(0x7ff8_0000_0000_00ff))],
+            vec![Value::Bool(true)],
+            vec![Value::String("ab".into()), Value::String("c".into())],
+            vec![Value::String("a".into()), Value::String("bc".into())],
+            vec![Value::Decimal("2.5".parse().unwrap())],
+            vec![Value::Decimal("2.50".parse().unwrap())],
+            vec![Value::Integer(1), Value::Integer(2)],
+            vec![Value::Array(vec![Value::Integer(1), Value::Integer(2)])],
+            vec![Value::Map(Box::new(m_ab))],
+            vec![Value::Map(Box::new(m_ba))],
+        ];
+
+        let state = deterministic_state();
+        for a in &tuples {
+            for b in &tuples {
+                let ca = canonical_key_bytes(a).expect("null-free tuple encodes");
+                let cb = canonical_key_bytes(b).expect("null-free tuple encodes");
+                let bytes_equal = ca == cb;
+                assert_eq!(
+                    bytes_equal,
+                    keys_equal_canonicalized(a, b),
+                    "canonical byte equality must match keys_equal_canonicalized for {a:?} vs {b:?}"
+                );
+                if bytes_equal {
+                    assert_eq!(
+                        hash_composite_key(a, &state),
+                        hash_composite_key(b, &state),
+                        "equal canonical bytes must imply equal composite hash for {a:?} vs {b:?}"
+                    );
+                }
+            }
+        }
+    }
+
     // ──────────────────────────────────────────────────────────────────
     // KeyExtractor tests
     // ──────────────────────────────────────────────────────────────────
@@ -1371,34 +1530,6 @@ mod tests {
 
     fn mk_record(schema: &Arc<Schema>, values: Vec<Value>) -> Record {
         Record::new(Arc::clone(schema), values)
-    }
-
-    #[test]
-    fn combine_output_buffer_bytes_is_nonzero_and_grows() {
-        // The IEJoin and sort-merge probe kernels gate their output buffer's
-        // growth on this figure when process RSS is unavailable, so it must be
-        // non-zero for a populated buffer and increase as records accrue.
-        let schema = test_schema(&["id", "name"]);
-        let rec = |id: i64, name: &str| {
-            (
-                mk_record(
-                    &schema,
-                    vec![Value::Integer(id), Value::String(name.into())],
-                ),
-                0u64,
-            )
-        };
-        let empty: Vec<(Record, u64)> = Vec::new();
-        assert_eq!(combine_output_buffer_bytes(&empty), 0);
-
-        let one = vec![rec(1, "alice")];
-        let three = vec![rec(1, "alice"), rec(2, "bob"), rec(3, "carol")];
-        let one_bytes = combine_output_buffer_bytes(&one);
-        assert!(one_bytes > 0, "populated buffer must report non-zero bytes");
-        assert!(
-            combine_output_buffer_bytes(&three) > one_bytes,
-            "byte estimate must grow with the buffer"
-        );
     }
 
     fn test_budget(limit_bytes: u64) -> MemoryArbitrator {

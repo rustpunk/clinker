@@ -194,16 +194,15 @@ impl ExecutionPlanDag {
     /// state.
     ///
     /// A spill-writing operator (external sort, hash Aggregate, grace-hash /
-    /// sort-merge Combine, pure-range block-band `IEJoin` — see
+    /// sort-merge Combine, block-band `IEJoin` / `HashPartitionIEJoin` — see
     /// [`super::writes_spill_files`]) holds its whole accumulated input before
     /// it can emit, and writes that state to a spill file when the memory budget
     /// trips; the block-band path writes it about twice (sort runs plus block
-    /// files), reflected by [`super::spill_volume_multiplier`]. In-memory join
-    /// strategies (inline hash build/probe, `HashPartitionIEJoin`) carry an
-    /// arbitration `spill_priority` but run their kernel entirely in RAM, so
-    /// they contribute nothing to disk volume and are excluded — counting them
-    /// would over-state the free-space a run needs. Summing rather than taking
-    /// the max is the conservative
+    /// files), reflected by [`super::spill_volume_multiplier`]. The in-memory
+    /// inline hash build/probe join carries an arbitration `spill_priority` but
+    /// runs its kernel entirely in RAM, so it contributes nothing to disk volume
+    /// and is excluded — counting it would over-state the free-space a run
+    /// needs. Summing rather than taking the max is the conservative
     /// choice for a free-space preflight: two blocking operators can be live
     /// and spilled simultaneously, so their footprints add. The figure derives
     /// from the same `predicted_peak_bytes` estimates `--explain` surfaces, so
@@ -228,14 +227,14 @@ impl ExecutionPlanDag {
 
     /// Per-blocking-stage spill-volume estimate, one entry per spill-writing
     /// operator (external sort, hash Aggregate, grace-hash / sort-merge Combine,
-    /// pure-range block-band `IEJoin` — see [`super::writes_spill_files`]) in
-    /// topological order.
+    /// block-band `IEJoin` / `HashPartitionIEJoin` — see
+    /// [`super::writes_spill_files`]) in topological order.
     ///
-    /// In-memory join strategies (inline hash build/probe, `HashPartitionIEJoin`)
-    /// carry an arbitration `spill_priority` but never write a spill file, so
-    /// they do not appear here — the per-stage estimate describes what reaches
-    /// disk. Each [`StageSpillEstimate`] carries the operator's node name, its
-    /// `--explain` display name, and its `predicted_peak_bytes` scaled by
+    /// The in-memory inline hash build/probe join carries an arbitration
+    /// `spill_priority` but never writes a spill file, so it does not appear
+    /// here — the per-stage estimate describes what reaches disk. Each
+    /// [`StageSpillEstimate`] carries the operator's node name, its `--explain`
+    /// display name, and its `predicted_peak_bytes` scaled by
     /// [`super::spill_volume_multiplier`] (about 2× for the block-band path,
     /// which writes sort runs then block files). `estimate_bytes`
     /// is `0` (rendered "unknown") when no on-disk file-size seed reached the

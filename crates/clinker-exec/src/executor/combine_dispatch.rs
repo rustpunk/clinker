@@ -78,29 +78,32 @@ pub(crate) fn dispatch_combine(
     use crate::executor::combine::CombineResolverMapping;
     use crate::pipeline::combine::{CombineHashTable, KeyExtractor};
     use crate::pipeline::grace_hash::{GraceHashExec, execute_combine_grace_hash};
-    use crate::pipeline::iejoin::{IEJoinExec, IEJoinKernelOutput, execute_combine_iejoin};
+    use crate::pipeline::iejoin::{IEJoinExec, execute_combine_iejoin};
     use crate::pipeline::sort_merge_join::{SortMergeExec, execute_combine_sort_merge};
     use clinker_plan::plan::combine::CombineStrategy;
 
     // Strategy dispatch up front. HashBuildProbe stays
-    // inline below (the long-standing path);
-    // HashPartitionIEJoin and pure-range IEJoin route
-    // to the IEJoin executor; GraceHash routes to the
-    // grace-hash executor; SortMerge routes to the
-    // sort-merge executor; in-memory hash and the BNL
-    // fallback are not yet wired.
+    // inline below (the long-standing path); both
+    // HashPartitionIEJoin (equi+range) and pure-range
+    // IEJoin route to the one bounded block-band IEJoin
+    // executor — `partition_bits` is retained on the plan
+    // variant for explain/compat but is vestigial at
+    // runtime, since the block-band path derives equality
+    // grouping from its sort rather than a fixed bucket
+    // count; GraceHash routes to the grace-hash executor;
+    // SortMerge routes to the sort-merge executor;
+    // in-memory hash and the BNL fallback are not yet
+    // wired.
     enum Dispatch {
         Inline,
-        IEJoin(Option<u8>),
+        IEJoin,
         Grace(u8),
         SortMerge,
     }
     let dispatch = match strategy {
         CombineStrategy::HashBuildProbe => Dispatch::Inline,
-        CombineStrategy::HashPartitionIEJoin { partition_bits } => {
-            Dispatch::IEJoin(Some(*partition_bits))
-        }
-        CombineStrategy::IEJoin => Dispatch::IEJoin(None),
+        CombineStrategy::HashPartitionIEJoin { .. } => Dispatch::IEJoin,
+        CombineStrategy::IEJoin => Dispatch::IEJoin,
         CombineStrategy::GraceHash { partition_bits } => Dispatch::Grace(*partition_bits),
         CombineStrategy::SortMerge => Dispatch::SortMerge,
         CombineStrategy::InMemoryHash | CombineStrategy::BlockNestedLoop => {
@@ -407,22 +410,21 @@ pub(crate) fn dispatch_combine(
     // resolver mapping), but the matching kernel is
     // strategy-specific.
     match dispatch {
-        Dispatch::IEJoin(partition_bits) => {
+        Dispatch::IEJoin => {
             // Register an IEJoin consumer with the pipeline-
             // scoped arbitrator under `SortConsumer` (priority
             // 20), sharing a `ConsumerHandle` with the kernel. The
-            // kernel mirrors its live working-set bytes (the
-            // block-band path's external-sort buffers and resident
-            // blocks; the equi+range path's routed indices and
-            // per-group L1/L2 / permutation / bit state) into this
-            // handle, so the arbitrator's pull-mode `current_usage`
-            // reads the live footprint while the join runs. The
-            // pure-range block-band path is threshold-driven: it
-            // spills its sorted runs and min/max-tagged blocks when
-            // the buffer exceeds the soft limit, so the handle also
-            // drives the kernel's `should_abort_local` gate, now a
-            // genuine last resort for a single block-pair plus kernel
-            // aux that still cannot fit.
+            // block-band kernel mirrors its live working-set bytes
+            // (its external-sort drain buffers, resident blocks, and
+            // output sort buffer) into this handle, so the
+            // arbitrator's pull-mode `current_usage` reads the live
+            // footprint while the join runs — for both pure-range and
+            // equi+range combines, which now share the one path. The
+            // path is threshold-driven: it spills its sorted runs,
+            // min/max-tagged blocks, and output sort when a buffer
+            // exceeds its own threshold, so the handle's
+            // `should_abort_local` gate is a genuine last resort for a
+            // single block-pair plus kernel aux that still cannot fit.
             let ie_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
             let ie_consumer_id = ctx.memory_budget.register_consumer(Arc::new(
                 crate::pipeline::sort_buffer::SortConsumer::new(ie_consumer_handle.clone()),
@@ -468,8 +470,8 @@ pub(crate) fn dispatch_combine(
                 // schema width and the run's batch size, so the block-band path's
                 // spill runs and block files match what `--explain` projects.
                 // `auto` skips LZ4 on narrow combines where the per-frame fixed
-                // cost outweighs the savings. The equi+range (`Some`) path never
-                // spills, so this is inert there.
+                // cost outweighs the savings. Both pure-range and equi+range
+                // combines run the block-band path, so this applies to either.
                 let ie_column_count = combine_output_schema_arc
                     .as_ref()
                     .map(|s| s.column_count())
@@ -478,14 +480,14 @@ pub(crate) fn dispatch_combine(
                     .spill_compress
                     .resolve_for_schema(ie_column_count, ctx.batch_size as u64);
                 let iejoin_ctx = ctx.merged_eval_ctx();
-                // CPU-bound IEJoin kernel — partition + range-walk +
-                // materialize. The kernel owns its inputs
-                // (`driver_buf`, `build_records`) and borrows only
-                // `&ctx.memory_budget` + the local `iejoin_ctx`, so
-                // it runs on the shared Rayon pool. Row order is
-                // determined by the kernel's deterministic
-                // partition-then-merge, not by pool scheduling.
-                let kernel_out = ctx.kernel_pool.install(|| {
+                // CPU-bound block-band IEJoin kernel — external-sort +
+                // block-band range walk over a bounded working set. The
+                // kernel owns its inputs (`driver_buf`, `build_records`)
+                // and borrows only `&ctx.memory_budget` + the local
+                // `iejoin_ctx`, so it runs on the shared Rayon pool. Row
+                // order is the deterministic `(driver order, driver_idx,
+                // build_idx)` the output sort returns, not pool scheduling.
+                let kernel = ctx.kernel_pool.install(|| {
                     execute_combine_iejoin(IEJoinExec {
                         name,
                         build_qualifier: &build_qualifier,
@@ -497,7 +499,6 @@ pub(crate) fn dispatch_combine(
                         output_schema: combine_output_schema_arc.as_ref(),
                         match_mode: *match_mode,
                         on_miss: *on_miss,
-                        partition_bits,
                         propagate_ck,
                         ctx: &iejoin_ctx,
                         budget: &ctx.memory_budget,
@@ -512,80 +513,40 @@ pub(crate) fn dispatch_combine(
                 // before the snapshot is dropped below —
                 // `dispatch_combine_output_error` reads the installed pre-fold
                 // snapshot to rewind each contributing source's rollback cursor.
-                // Both dispatch shapes carry the same failure vector, so it is
-                // routed first, before the shape-specific row handling.
-                let nb = match kernel_out {
-                    IEJoinKernelOutput::Materialized(kernel) => {
-                        // Equi+range: rows are already materialized in
-                        // kernel/bucket visitation order; admit the whole vec.
-                        dispatch_combine_output_errors(
-                            ctx,
-                            node_idx,
-                            name,
-                            kernel.output_eval_failures,
-                        )?;
-                        let output_records = kernel.records;
-                        let probe_records_out = output_records.len() as u64;
+                dispatch_combine_output_errors(ctx, node_idx, name, kernel.output_eval_failures)?;
+                // Drain the bounded, payload-sorted output handle incrementally.
+                // When a downstream streaming Output certified this combine as
+                // its producer, the drain streams straight through the
+                // back-pressure sink so the output axis stays bounded end-to-end;
+                // otherwise it folds into a spillable node-buffer a blocking
+                // downstream drains. Both pure-range and equi+range combines
+                // return the same block-band handle, so the output axis is
+                // bounded either way.
+                let nb = match drain_block_band_output(
+                    ctx,
+                    current_dag,
+                    node_idx,
+                    name,
+                    kernel.sorted,
+                    kernel.row_count,
+                    combined_puncts,
+                )? {
+                    BlockBandDrain::Streamed(count) => {
+                        // The rows already streamed to the writer thread, so
+                        // there is no node-buffer to admit. Record the probe
+                        // timer, drop the per-fold snapshot as every clean exit
+                        // does, and return before the shared `node_buffers.insert`
+                        // tail.
+                        ctx.collector
+                            .record(probe_timer.finish(probe_records_in, count));
+                        ctx.combine_input_snapshots.remove(&node_idx);
+                        return Ok(());
+                    }
+                    BlockBandDrain::Buffered(nb) => {
+                        let probe_records_out = nb.len_hint() as u64;
                         ctx.collector
                             .record(probe_timer.finish(probe_records_in, probe_records_out));
-                        finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
-                        tee_emit_to_region_input_buffers(
-                            ctx,
-                            current_dag,
-                            node_idx,
-                            &output_records,
-                        )?;
-                        admit_node_buffer(
-                            ctx,
-                            name,
-                            node_idx,
-                            output_records,
-                            combined_puncts,
-                            node_buffer_spill_allowed(current_dag, node_idx),
-                        )?
-                    }
-                    IEJoinKernelOutput::BlockBand(kernel) => {
-                        // Pure-range: drain the bounded, payload-sorted output
-                        // handle incrementally. When a downstream streaming
-                        // Output certified this combine as its producer, the
-                        // drain streams straight through the back-pressure sink
-                        // so the output axis stays bounded end-to-end;
-                        // otherwise it folds into a spillable node-buffer a
-                        // blocking downstream drains.
-                        dispatch_combine_output_errors(
-                            ctx,
-                            node_idx,
-                            name,
-                            kernel.output_eval_failures,
-                        )?;
-                        match drain_block_band_output(
-                            ctx,
-                            current_dag,
-                            node_idx,
-                            name,
-                            kernel.sorted,
-                            kernel.row_count,
-                            combined_puncts,
-                        )? {
-                            BlockBandDrain::Streamed(count) => {
-                                // The rows already streamed to the writer
-                                // thread, so there is no node-buffer to admit.
-                                // Record the probe timer, drop the per-fold
-                                // snapshot as every clean exit does, and return
-                                // before the shared `node_buffers.insert` tail.
-                                ctx.collector
-                                    .record(probe_timer.finish(probe_records_in, count));
-                                ctx.combine_input_snapshots.remove(&node_idx);
-                                return Ok(());
-                            }
-                            BlockBandDrain::Buffered(nb) => {
-                                let probe_records_out = nb.len_hint() as u64;
-                                ctx.collector.record(
-                                    probe_timer.finish(probe_records_in, probe_records_out),
-                                );
-                                nb
-                            }
-                        }
+                        nb
                     }
                 };
                 ctx.node_buffers.insert(node_idx, nb);
