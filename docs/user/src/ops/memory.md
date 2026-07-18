@@ -65,6 +65,13 @@ rather than wrapping to a small budget (the YAML overflow error names
 `memory.limit`; the flag overflow error names `--memory-limit`). Pick a limit
 that fits your host's real memory.
 
+A well-formed but *undersized* value is a different case: it is not a malformed
+flag, so it clears the boundary check and is instead rejected at startup by the
+budget gate as `E312` when it falls below the process's baseline resident
+memory. Because `--memory-limit` simply populates `pipeline.memory.limit`, that
+`E312` — which names the limit and echoes the offending byte value — refers to
+the same limit you passed via the flag.
+
 ## Choosing a backpressure policy
 
 When memory use approaches the limit (the soft threshold is 80 % of `limit`), something has to give up memory. The `backpressure` knob chooses what:

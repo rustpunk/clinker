@@ -138,9 +138,9 @@ pub const DEFAULT_RESUME_THRESHOLD: f64 = 0.70;
 ///
 /// A trailing `G`/`g`, `M`/`m`, or `K`/`k` scales by 1024^3 / 1024^2 /
 /// 1024; anything else is a bare byte count (multiplier 1). The numeric
-/// text is returned unparsed so callers apply their own lenient or strict
-/// handling of a non-numeric part — both share this one grammar, so a
-/// value can never scale differently depending on which parser saw it.
+/// text is returned unparsed; [`scale_memory_limit`] parses and scales it so
+/// the lenient and strict parsers share one grammar and a value can never
+/// scale differently depending on which parser saw it.
 fn split_memory_limit_suffix(trimmed: &str) -> (&str, u64) {
     if let Some(num) = trimmed
         .strip_suffix('G')
@@ -162,6 +162,33 @@ fn split_memory_limit_suffix(trimmed: &str) -> (&str, u64) {
     }
 }
 
+/// Why scaling a trimmed `memory.limit` body to a byte count failed. The
+/// lenient and strict parsers share the scaling core and diverge only in how
+/// they render each variant.
+enum MemoryLimitScaleError {
+    /// The numeric body was not a bare `u64` — empty, non-numeric, or wider
+    /// than `u64` before any suffix scaling.
+    ParseFailed,
+    /// The body parsed but scaling it by the binary suffix exceeded `u64::MAX`.
+    Overflow,
+}
+
+/// Parse a trimmed `memory.limit` body and scale it by the binary multiplier
+/// its suffix selects. This is the single numeric-parse-and-overflow core both
+/// [`parse_memory_limit_bytes`] and [`parse_memory_limit_bytes_strict`] run, so
+/// a value can never scale differently depending on which parser saw it; the
+/// two paths differ only in how they render a [`MemoryLimitScaleError`]. Expects
+/// already-trimmed input, matching [`split_memory_limit_suffix`].
+fn scale_memory_limit(trimmed: &str) -> Result<u64, MemoryLimitScaleError> {
+    let (num_part, multiplier) = split_memory_limit_suffix(trimmed);
+    let value = num_part
+        .parse::<u64>()
+        .map_err(|_| MemoryLimitScaleError::ParseFailed)?;
+    value
+        .checked_mul(multiplier)
+        .ok_or(MemoryLimitScaleError::Overflow)
+}
+
 /// Parse the `memory.limit` knob into a byte count, leniently.
 ///
 /// Binary units follow [`split_memory_limit_suffix`]. `None`, an empty
@@ -180,19 +207,20 @@ pub fn parse_memory_limit_bytes(s: Option<&str>) -> Result<u64, crate::config::C
         return Ok(DEFAULT_MEMORY_LIMIT_BYTES);
     };
     let trimmed = raw.trim();
-    let (num_part, multiplier) = split_memory_limit_suffix(trimmed);
-    // An unparseable numeric part keeps the lenient fallback contract: the
-    // caller gets the default budget, matching the historical handling of
-    // `None`/empty/garbage input. Only a value that parses cleanly yet
-    // overflows the byte range when scaled by its binary suffix is an error.
-    let Ok(value) = num_part.parse::<u64>() else {
-        return Ok(DEFAULT_MEMORY_LIMIT_BYTES);
-    };
-    value.checked_mul(multiplier).ok_or_else(|| {
-        crate::config::ConfigError::Validation(format!(
-            "memory.limit {trimmed:?} overflows the maximum addressable byte count (u64::MAX)"
-        ))
-    })
+    match scale_memory_limit(trimmed) {
+        Ok(bytes) => Ok(bytes),
+        // An unparseable numeric part keeps the lenient fallback contract: the
+        // caller gets the default budget, matching the historical handling of
+        // `None`/empty/garbage input.
+        Err(MemoryLimitScaleError::ParseFailed) => Ok(DEFAULT_MEMORY_LIMIT_BYTES),
+        // Only a value that parses cleanly yet overflows the byte range when
+        // scaled by its binary suffix is an error.
+        Err(MemoryLimitScaleError::Overflow) => {
+            Err(crate::config::ConfigError::Validation(format!(
+                "memory.limit {trimmed:?} overflows the maximum addressable byte count (u64::MAX)"
+            )))
+        }
+    }
 }
 
 /// Parse a `memory.limit` value strictly, for input boundaries where a
@@ -200,24 +228,25 @@ pub fn parse_memory_limit_bytes(s: Option<&str>) -> Result<u64, crate::config::C
 /// default budget — a fallback that would quietly shrink a larger configured
 /// limit and hide the operator's typo.
 ///
-/// Shares the exact suffix grammar of the lenient [`parse_memory_limit_bytes`]
-/// via [`split_memory_limit_suffix`], so any value this accepts scales
-/// identically on the lenient path the executor re-reads. Returns the byte
-/// budget, or a human-readable reason the value is not a valid limit. The
-/// reason is a bare fragment with no leading subject, so each caller prefixes
-/// the surface it owns — a CLI flag, a config key — and echoes the raw value
-/// once.
+/// Runs the same [`scale_memory_limit`] core as the lenient
+/// [`parse_memory_limit_bytes`], so any value this accepts scales identically on
+/// the lenient path the executor re-reads; only the failure handling differs.
+/// Returns the byte budget, or a human-readable reason the value is not a valid
+/// limit. The reason is a bare fragment with no leading subject, so each caller
+/// prefixes the surface it owns — a CLI flag, a config key — and echoes the raw
+/// value once.
 pub fn parse_memory_limit_bytes_strict(raw: &str) -> Result<u64, String> {
-    let (num_part, multiplier) = split_memory_limit_suffix(raw.trim());
-    let value = num_part.parse::<u64>().map_err(|_| {
-        "expected a non-negative byte count, optionally suffixed with a binary \
-         K, M, or G unit (for example \"512M\" or \"4G\")"
-            .to_string()
-    })?;
-    value.checked_mul(multiplier).ok_or_else(|| {
-        "the value scaled by its binary suffix overflows the maximum addressable \
-         byte count (u64::MAX)"
-            .to_string()
+    scale_memory_limit(raw.trim()).map_err(|err| match err {
+        MemoryLimitScaleError::ParseFailed => {
+            "expected a non-negative byte count, optionally suffixed with a binary \
+             K, M, or G unit (for example \"512M\" or \"4G\")"
+                .to_string()
+        }
+        MemoryLimitScaleError::Overflow => {
+            "the value scaled by its binary suffix overflows the maximum addressable \
+             byte count (u64::MAX)"
+                .to_string()
+        }
     })
 }
 
