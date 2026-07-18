@@ -1179,11 +1179,13 @@ impl PipelineExecutor {
             // producer arm `add_bytes` each flushed batch into this
             // handle; the writer thread holds a clone and `sub_bytes` each
             // consumed record, so the live count is "batches in flight,"
-            // never the whole stage. `can_back_pressure` is conservatively
-            // false: the bounded channel already paces the producer, and
-            // the static pause-reachability analysis that would let the
-            // arbitrator prefer pausing this slot over spilling has not
-            // landed — matching `admit_node_buffer`'s posture.
+            // never the whole stage. `can_back_pressure` is false here
+            // because the bounded channel already paces the producer at
+            // the transport layer, so an arbitrator pause of this slot
+            // would be redundant; relief is spilling the in-flight batches
+            // one at a time. Any pause-based inter-stage back-pressure
+            // would arrive with the streaming generalization tracked in
+            // #301. Matches `admit_node_buffer`'s posture.
             let charge_handle = crate::pipeline::memory::ConsumerHandle::new();
             let charge_consumer_id = memory_budget.register_consumer(Arc::new(
                 crate::executor::node_buffer::NodeBufferConsumer::new(charge_handle.clone()),

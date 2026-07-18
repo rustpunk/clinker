@@ -1539,9 +1539,14 @@ pub(crate) fn admit_node_buffer(
     // arbitrator for every slot admission. The handle's `bytes`
     // counter seeds to the admitted byte estimate so the consumer's
     // current_usage immediately reflects the slot's footprint at
-    // policy-poll time. `can_back_pressure` is conservatively false
-    // until the static DAG analysis that classifies upstream pause
-    // reachability lands; the Priority policy then ranks node_buffer
+    // policy-poll time. `can_back_pressure` is a by-design constant
+    // false: the slot is materialized synchronously on this walk
+    // thread, so there is no separate producer thread to park, and
+    // spill is the only lever that relieves its memory — see
+    // `NodeBufferConsumer` for the full rationale. Streaming the
+    // inter-stage edges that stay materialized today (#301) is where a
+    // producer thread — and any pause-based back-pressure — would
+    // eventually come from. The Priority policy ranks node_buffer
     // consumers first among spill candidates (priority 0).
     //
     // A prior registration at the same slot (re-admit after partial
