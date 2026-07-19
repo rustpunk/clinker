@@ -1602,7 +1602,7 @@ enum RecordScan {
 /// is a decimal range value the fixed-point axis cannot represent exactly
 /// (overflow or truncation) — a fail-loud data error, never a silent drop.
 #[derive(Debug)]
-enum ScanKeyError {
+pub(crate) enum ScanKeyError {
     Eval(EvalError),
     RangeOutOfRange { value: String },
 }
@@ -1719,9 +1719,10 @@ fn range_keys_to_i128_pair(
 /// otherwise means a NULL / off-type value routed to the unmatched pile; `Err`
 /// only when a decimal value cannot be placed on the fixed-point grid exactly.
 #[inline]
-fn value_to_i128(kind: RangeKeyType, v: &Value) -> Result<Option<i128>, ScanKeyError> {
+pub(crate) fn value_to_i128(kind: RangeKeyType, v: &Value) -> Result<Option<i128>, ScanKeyError> {
     use crate::pipeline::sort_key::{
-        decimal_to_orderable_i128, float_to_orderable_i128, integer_on_decimal_grid,
+        datetime_to_orderable_i128, decimal_to_orderable_i128, float_to_orderable_i128,
+        integer_on_decimal_grid,
     };
     use chrono::Datelike;
     let out = match kind {
@@ -1762,7 +1763,10 @@ fn value_to_i128(kind: RangeKeyType, v: &Value) -> Result<Option<i128>, ScanKeyE
             _ => None,
         },
         RangeKeyType::DateTime => match v {
-            Value::DateTime(dt) => Some(dt.and_utc().timestamp_micros() as i128),
+            // Canonical nanosecond key: exact and injective for any datetime, so
+            // the block-band sweep enumerates the right candidate set instead of
+            // dropping sub-microsecond matches a truncated key would collide.
+            Value::DateTime(dt) => Some(datetime_to_orderable_i128(*dt)),
             _ => None,
         },
         // Plan-rejected (E327) before runtime; defensively route out.

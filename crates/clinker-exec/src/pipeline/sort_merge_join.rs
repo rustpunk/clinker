@@ -512,7 +512,7 @@ fn extract_range_key(
 }
 
 /// Whether a Value participates in range comparisons. Matches the
-/// IEJoin's `value_to_i64` set: integers, finite floats, dates,
+/// IEJoin's `value_to_i128` set: integers, finite floats, dates,
 /// datetimes. Strings, booleans, arrays, and maps are rejected
 /// upstream as residual.
 fn is_orderable(v: &Value) -> bool {
@@ -523,33 +523,36 @@ fn is_orderable(v: &Value) -> bool {
     }
 }
 
-/// Compare two range key values by mapping each to a monotone `i64`
-/// *within its own type*: integers as-is, floats through the
-/// order-preserving `float_to_orderable_i64` encoding, dates/datetimes as
-/// their epoch counts. NULLs and non-orderables are filtered before this
-/// is called.
+/// Compare two range-key values by reducing each to a monotone `i128`
+/// *within its own type*: integers widened as-is, floats through the
+/// order-preserving `float_to_orderable_i64` transform, dates as their
+/// epoch-day count, and datetimes through the canonical
+/// [`datetime_to_orderable_i128`](crate::pipeline::sort_key::datetime_to_orderable_i128)
+/// nanosecond key. NULLs and non-orderables are filtered before this is called.
 ///
 /// There is no cross-type coercion here: an integer and a float are NOT
-/// brought onto a common numeric scale, so this assumes both keys of an
-/// axis share a type. A mixed int/float range axis is not currently
-/// guarded at plan time and would compare in disjoint encoding spaces.
-fn cmp_range_keys(a: &Value, b: &Value) -> Ordering {
+/// brought onto a common numeric scale, so both keys of an axis must share a
+/// type. The plan-time `sort_merge_key_ok` gate (see `clinker_plan`'s combine
+/// planner) guarantees exactly that — only single-type `int` / `float` / `date`
+/// / `datetime` axes route to SortMerge, while `decimal` and mixed int/float
+/// axes go to IEJoin's shared i128 space instead. Reducing datetime through the
+/// same nanosecond key the memcomparable sort bytes and the IEJoin axis use
+/// keeps all three strategies inducing one identical total order, so a
+/// presorted (SortMerge) and an unsorted (IEJoin) run agree row for row.
+pub(crate) fn cmp_range_keys(a: &Value, b: &Value) -> Ordering {
     use chrono::Datelike;
-    let ai = match a {
-        Value::Integer(i) => *i,
-        Value::Float(f) => crate::pipeline::sort_key::float_to_orderable_i64(*f),
-        Value::Date(d) => d.num_days_from_ce() as i64,
-        Value::DateTime(dt) => dt.and_utc().timestamp_micros(),
-        _ => 0,
+    // One reducer for both operands so the two sides can never diverge — the
+    // whole point of routing every strategy through a single monotone key.
+    let key = |v: &Value| -> i128 {
+        match v {
+            Value::Integer(i) => *i as i128,
+            Value::Float(f) => crate::pipeline::sort_key::float_to_orderable_i64(*f) as i128,
+            Value::Date(d) => d.num_days_from_ce() as i128,
+            Value::DateTime(dt) => crate::pipeline::sort_key::datetime_to_orderable_i128(*dt),
+            _ => 0,
+        }
     };
-    let bi = match b {
-        Value::Integer(i) => *i,
-        Value::Float(f) => crate::pipeline::sort_key::float_to_orderable_i64(*f),
-        Value::Date(d) => d.num_days_from_ce() as i64,
-        Value::DateTime(dt) => dt.and_utc().timestamp_micros(),
-        _ => 0,
-    };
-    ai.cmp(&bi)
+    key(a).cmp(&key(b))
 }
 
 /// Apply a range operator to two pre-extracted, non-NULL range keys.
