@@ -14,12 +14,12 @@
 //! - String: UTF-8 bytes + 0x00 terminator
 //! - Bool: 0x00 (false) or 0x01 (true)
 //! - Date: sign-flipped big-endian i32 days since Unix epoch (4 bytes)
-//! - DateTime: sign-flipped big-endian i64 microseconds since Unix epoch (8 bytes)
+//! - DateTime: sign-flipped big-endian i128 nanoseconds since Unix epoch (16 bytes)
 //! - Descending: XOR all segment bytes with 0xFF
 
 use std::cmp::Ordering;
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, NaiveDateTime};
 use clinker_record::{Record, Value};
 
 use clinker_plan::config::{NullOrder, SortField, SortOrder};
@@ -79,8 +79,12 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&bytes);
         }
         Value::DateTime(dt) => {
-            let micros = dt.and_utc().timestamp_micros();
-            let mut bytes = micros.to_be_bytes();
+            // Canonical nanosecond key (16 bytes), sign-flipped so the signed
+            // i128 orders as unsigned big-endian — the same reduction the
+            // IEJoin axis and the sort-merge comparator use, so a datetime
+            // sorts identically everywhere and sub-microsecond group keys stay
+            // distinct through a spilled aggregation's byte-wise k-way merge.
+            let mut bytes = datetime_to_orderable_i128(*dt).to_be_bytes();
             bytes[0] ^= 0x80;
             buf.extend_from_slice(&bytes);
         }
@@ -253,6 +257,49 @@ pub(crate) fn integer_on_decimal_grid(i: i64) -> Option<i128> {
     (i as i128).checked_mul(10i128.pow(DECIMAL_RANGE_SCALE))
 }
 
+/// Order-preserving, injective `NaiveDateTime` → `i128`: the UTC instant as a
+/// nanosecond count since the Unix epoch, assembled as
+/// `timestamp_seconds · 10^9 + subsecond_nanos`.
+///
+/// This is the SINGLE canonical datetime range / sort / join key. `Value::DateTime`
+/// (a `chrono::NaiveDateTime`), [`compare_values`](crate::pipeline::sort::compare_values),
+/// and the windowing path all carry nanosecond resolution, so every
+/// order-bearing datetime encoder — the inequality-join i128 axis, the
+/// memcomparable sort key, and the sort-merge range comparator — reduces
+/// through THIS function to induce one identical total order. The microsecond
+/// key it supersedes was monotone but NOT injective, so it both dropped
+/// sub-microsecond join matches (a lossy sole-arbiter key enumerates the wrong
+/// candidate set) and, because the spilled-aggregation k-way merge decides
+/// group identity by sort-key bytes, silently merged two distinct
+/// sub-microsecond groups once aggregation spilled.
+///
+/// Exact and injective for every non-leap-second `NaiveDateTime`, so no
+/// fail-loud arm is needed: chrono caps the year at ±262 143, bounding
+/// `|timestamp| < 8.3e12` seconds, so the nanosecond result stays under
+/// `8.3e12 · 10^9 ≈ 8.3e21` in magnitude — more than sixteen orders below
+/// `i128::MAX ≈ 1.7e38`, so the multiply cannot overflow. Assembling the value
+/// directly (rather than via `timestamp_nanos_opt`, whose `i64` result
+/// saturates outside 1677–2262) keeps pre-1677 and post-2262 datetimes exact.
+/// `timestamp()` floors toward negative infinity and `timestamp_subsec_nanos()`
+/// is the non-negative offset within that floored second, so the sum is the
+/// correct signed nanosecond count for pre-epoch instants too. Pure arithmetic
+/// on an owned value: no allocation, no I/O, streaming-safe.
+///
+/// Leap seconds are the lone exception: chrono stores them as second `:59` with
+/// a sub-second field in `[10^9, 2·10^9)`, which Unix `timestamp()` does not
+/// count, so this key places a leap instant onto the following second. That
+/// matches Unix-time convention and the `i64`-nanosecond `Value::DateTime` spill
+/// serialization (which collapses leap seconds identically), but not
+/// `NaiveDateTime::cmp`. All three encoders reduce through this function, so they
+/// still agree with EACH OTHER on leap seconds — cross-strategy join/sort/group
+/// results stay identical; only the axis-vs-`compare_values` order can differ at
+/// a leap instant, which no linear nanosecond key can represent distinctly.
+#[inline]
+pub(crate) fn datetime_to_orderable_i128(dt: NaiveDateTime) -> i128 {
+    let utc = dt.and_utc();
+    (utc.timestamp() as i128) * 1_000_000_000 + utc.timestamp_subsec_nanos() as i128
+}
+
 /// Append the order-preserving 8-byte memcomparable encoding of an `f64`.
 fn encode_f64_order(f: f64, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&f64_to_orderable_u64(f).to_be_bytes());
@@ -383,6 +430,7 @@ mod tests {
     use super::*;
     use chrono::NaiveDate;
     use clinker_record::Schema;
+    use proptest::prelude::*;
     use rust_decimal::Decimal;
     use std::sync::Arc;
 
@@ -593,6 +641,196 @@ mod tests {
         // A value with genuine (nonzero) digits past 18 places still truncates.
         let genuine = Decimal::from_str("1.0000000000000000001").unwrap();
         assert_eq!(decimal_to_orderable_i128(genuine), None);
+    }
+
+    /// Build a `NaiveDateTime` at nanosecond resolution.
+    fn ndt(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32, nano: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, mo, d)
+            .unwrap()
+            .and_hms_nano_opt(h, mi, s, nano)
+            .unwrap()
+    }
+
+    /// The canonical datetime key is injective at nanosecond resolution — the
+    /// exact property the microsecond encoder lacked. Two datetimes that share a
+    /// microsecond but differ by a nanosecond MUST map to distinct keys, or a
+    /// spilled aggregation would merge them into one group and a range sweep
+    /// would drop the boundary match.
+    #[test]
+    fn datetime_to_orderable_i128_is_injective_at_nanos() {
+        let a = ndt(2024, 1, 1, 0, 0, 0, 1_000); // …000001000  (micros = 1)
+        let b = ndt(2024, 1, 1, 0, 0, 0, 1_500); // …000001500  (micros = 1)
+        assert_ne!(
+            datetime_to_orderable_i128(a),
+            datetime_to_orderable_i128(b),
+            "sub-microsecond datetimes must not collide onto one key"
+        );
+        // The key is exactly the signed nanosecond count.
+        assert_eq!(datetime_to_orderable_i128(a), 1_704_067_200_000_001_000);
+        assert_eq!(
+            datetime_to_orderable_i128(b) - datetime_to_orderable_i128(a),
+            500
+        );
+    }
+
+    /// Order preservation across the full representable range, including dates
+    /// OUTSIDE the `i64`-nanosecond window (1677–2262) that `timestamp_nanos_opt`
+    /// saturates: a year-1400 instant is negative and a year-3000 instant is a
+    /// large positive, and their key order matches chronological order exactly.
+    #[test]
+    fn datetime_to_orderable_i128_is_order_preserving_full_range() {
+        // Strictly ascending in time, spanning pre-epoch, sub-microsecond ties,
+        // and both ends of the out-of-`i64`-nanos range.
+        let ascending = [
+            ndt(1400, 1, 1, 0, 0, 0, 0), // deep pre-epoch → negative key
+            ndt(1677, 1, 1, 0, 0, 0, 0), // just outside the i64-nanos floor
+            ndt(1969, 12, 31, 23, 59, 59, 999_999_999), // one nanosecond before epoch
+            ndt(1970, 1, 1, 0, 0, 0, 0), // the epoch → key 0
+            ndt(2024, 1, 1, 0, 0, 0, 1_000), // micros = 1, nanos 1000
+            ndt(2024, 1, 1, 0, 0, 0, 1_001), // sub-µs successor
+            ndt(2024, 6, 15, 10, 30, 0, 0),
+            ndt(2262, 6, 1, 0, 0, 0, 0), // just outside the i64-nanos ceiling
+            ndt(3000, 6, 15, 12, 0, 0, 123_456_789),
+        ];
+        assert_eq!(datetime_to_orderable_i128(ndt(1970, 1, 1, 0, 0, 0, 0)), 0);
+        assert!(
+            datetime_to_orderable_i128(ascending[0]) < 0,
+            "pre-epoch is negative"
+        );
+        for w in ascending.windows(2) {
+            assert!(
+                datetime_to_orderable_i128(w[0]) < datetime_to_orderable_i128(w[1]),
+                "key order must match chronological order: {} then {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    /// The single differential guard: over an adversarial datetime corpus, the
+    /// four order-bearing datetime encoders — the IEJoin i128 axis
+    /// (`value_to_i128`), the memcomparable sort-key bytes (`encode_sort_key`),
+    /// the sort-merge comparator (`cmp_range_keys`), and the reducer
+    /// (`datetime_to_orderable_i128`) — MUST induce the identical total order as
+    /// the evaluator's own `compare_values`. Before unification the microsecond
+    /// encoders disagreed with the nanosecond `compare_values` on sub-µs ties;
+    /// this pins that they no longer can.
+    #[test]
+    fn datetime_encoders_induce_one_total_order() {
+        use crate::pipeline::iejoin::value_to_i128;
+        use crate::pipeline::sort::compare_values;
+        use crate::pipeline::sort_merge_join::cmp_range_keys;
+        use clinker_plan::plan::combine::RangeKeyType;
+
+        // Adversarial corpus: sub-microsecond near-ties (differ only in nanos),
+        // whole-second pre-1677 and post-2262 dates, the epoch and its immediate
+        // neighbours, and ordinary timestamps.
+        let corpus = [
+            ndt(1400, 7, 4, 12, 0, 0, 0),
+            ndt(1400, 7, 4, 12, 0, 0, 1),
+            ndt(1676, 12, 31, 23, 59, 59, 999_999_999),
+            ndt(1969, 12, 31, 23, 59, 59, 999_999_000),
+            ndt(1969, 12, 31, 23, 59, 59, 999_999_999),
+            ndt(1970, 1, 1, 0, 0, 0, 0),
+            ndt(1970, 1, 1, 0, 0, 0, 1),
+            ndt(2024, 1, 1, 0, 0, 0, 1_000),
+            ndt(2024, 1, 1, 0, 0, 0, 1_001),
+            ndt(2024, 1, 1, 0, 0, 0, 1_999),
+            ndt(2024, 1, 1, 0, 0, 0, 2_000),
+            ndt(2024, 6, 15, 10, 30, 0, 0),
+            ndt(2262, 4, 11, 23, 47, 16, 854_775_807),
+            ndt(3000, 6, 15, 12, 0, 0, 123_456_789),
+        ];
+
+        let sort_field = [sf("ts", SortOrder::Asc)];
+        let sort_key = |dt: NaiveDateTime| -> Vec<u8> {
+            encode_sort_key(&make_record(&[("ts", Value::DateTime(dt))]), &sort_field)
+        };
+        let axis_key = |dt: NaiveDateTime| -> i128 {
+            value_to_i128(RangeKeyType::DateTime, &Value::DateTime(dt))
+                .ok()
+                .flatten()
+                .expect("datetime always reduces to an axis key")
+        };
+
+        for &a in &corpus {
+            for &b in &corpus {
+                let va = Value::DateTime(a);
+                let vb = Value::DateTime(b);
+                let oracle = compare_values(&va, &vb);
+                assert_eq!(
+                    axis_key(a).cmp(&axis_key(b)),
+                    oracle,
+                    "IEJoin axis order disagrees with compare_values for {a} vs {b}"
+                );
+                assert_eq!(
+                    sort_key(a).cmp(&sort_key(b)),
+                    oracle,
+                    "memcomparable sort-key order disagrees with compare_values for {a} vs {b}"
+                );
+                assert_eq!(
+                    cmp_range_keys(&va, &vb),
+                    oracle,
+                    "sort-merge comparator disagrees with compare_values for {a} vs {b}"
+                );
+                assert_eq!(
+                    datetime_to_orderable_i128(a).cmp(&datetime_to_orderable_i128(b)),
+                    oracle,
+                    "reducer order disagrees with compare_values for {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    proptest! {
+        /// The same one-total-order invariant under randomized datetimes,
+        /// including seconds outside the `i64`-nanosecond window. Independent
+        /// second draws essentially never collide, so half the cases pin `b` to
+        /// `a`'s second with an independent nanosecond — that is what actually
+        /// stresses the sub-microsecond tie ordering the key exists for (and hits
+        /// exact ties when the nanos also match); the other half draws `b`'s
+        /// second freely to cover cross-era monotonicity. No random pair may make
+        /// any encoder disagree with `compare_values`.
+        #[test]
+        fn prop_datetime_encoders_agree_with_compare_values(
+            // Bounded to `chrono::DateTime::from_timestamp`'s valid second range
+            // (± ~8.3e12 s ≈ year ±262 000). Still ~870× past the i64-nanosecond
+            // window (± ~9.2e9 s), so it richly covers the out-of-`i64`-nanos era.
+            a_s in -8_000_000_000_000i64..=8_000_000_000_000i64,
+            a_n in 0u32..1_000_000_000,
+            share_second in proptest::bool::ANY,
+            b_s in -8_000_000_000_000i64..=8_000_000_000_000i64,
+            b_n in 0u32..1_000_000_000,
+        ) {
+            use crate::pipeline::iejoin::value_to_i128;
+            use crate::pipeline::sort::compare_values;
+            use crate::pipeline::sort_merge_join::cmp_range_keys;
+            use clinker_plan::plan::combine::RangeKeyType;
+
+            let a = chrono::DateTime::from_timestamp(a_s, a_n).unwrap().naive_utc();
+            let b_sec = if share_second { a_s } else { b_s };
+            let b = chrono::DateTime::from_timestamp(b_sec, b_n).unwrap().naive_utc();
+            let (va, vb) = (Value::DateTime(a), Value::DateTime(b));
+            let oracle = compare_values(&va, &vb);
+
+            let sort_field = [sf("ts", SortOrder::Asc)];
+            let ka = encode_sort_key(&make_record(&[("ts", va.clone())]), &sort_field);
+            let kb = encode_sort_key(&make_record(&[("ts", vb.clone())]), &sort_field);
+            prop_assert_eq!(ka.cmp(&kb), oracle);
+
+            let axis = |v: &Value| {
+                value_to_i128(RangeKeyType::DateTime, v)
+                    .ok()
+                    .flatten()
+                    .unwrap()
+            };
+            prop_assert_eq!(axis(&va).cmp(&axis(&vb)), oracle);
+            prop_assert_eq!(cmp_range_keys(&va, &vb), oracle);
+            prop_assert_eq!(
+                datetime_to_orderable_i128(a).cmp(&datetime_to_orderable_i128(b)),
+                oracle
+            );
+        }
     }
 
     fn make_record(fields: &[(&str, Value)]) -> Record {
