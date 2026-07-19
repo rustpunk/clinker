@@ -84,7 +84,9 @@ Every combine predicate must carry at least one cross-input **equality or range*
 
 ### Non-orderable range keys
 
-A range conjunct compares values that must be **orderable at runtime** — integers, decimals, finite floats, dates, and datetimes. When a record's range key evaluates to a non-orderable value — SQL `NULL`, a non-finite float (`NaN`/infinity), or a non-numeric/non-temporal type — that record can never satisfy the range comparison, so it is routed **out** of the range match rather than joined:
+A range conjunct compares values that must be **orderable at runtime**: integers, finite floats, dates, and datetimes. When a record's range key evaluates to a non-orderable value — SQL `NULL`, a non-finite float (`NaN`/infinity), or any other type — that record can never satisfy the range comparison, so it is routed **out** of the range match rather than joined:
+
+> **Known gap: decimal range keys.** The exact fixed-point `decimal` type is **not** currently ordered as a range key — a decimal-valued range key is treated as non-orderable at runtime and routed out exactly like a `NULL`. Use an integer or float range key until decimal range ordering lands. (Decimals are fine as equality keys and as ordinary output columns; only the range-comparison axis is affected.)
 
 - A **driver** record with a non-orderable range key is treated as a zero-match driver and handled by [`on_miss`](#unmatched-records-on_miss) (`null_fields` / `skip` / `error`).
 - A **build** record with a non-orderable range key is dropped (it can match nothing).
@@ -282,7 +284,10 @@ Semantics:
 
 - **Fail-loud, never truncate.** The moment the combine would emit more than the cap, the run stops with diagnostic `E325` naming the node and the cap. It does **not** produce a capped or partial result — a silently truncated join would corrupt downstream data.
 - **Independent of the memory budget.** This is a result-*size* guard, not memory pressure. A runaway join can be perfectly bounded in memory (its output spills to disk) yet still produce far more rows than intended; `max_output_rows` caps the row count regardless of bytes.
-- **Covers the whole output.** The cap counts every emitted row across all match modes (`all`, `first`, `collect`) and any `on_miss` rows.
+- **Covers the whole output, on every strategy.** The cap counts every emitted **output row** across all match modes and any `on_miss` rows, and is enforced identically whichever join strategy the planner picks (hash build-probe, grace-hash, sort-merge, or the IEJoin block-band).
+- **`collect` counts driver rows.** Under `match: collect` a combine emits **one output row per driver row** (each carrying an array of up to 10 000 collected matches), so `max_output_rows` bounds the driver-row count, not the number of collected array elements.
+- **Dead-lettered rows are not counted.** A driver whose `cxl:` body or residual raises a *recoverable* eval failure is routed to the DLQ, not the output, so it does not count toward the cap.
+- **N-ary combines cap the final output.** A combine whose `where:` spans three or more inputs is decomposed into a chain of binary steps; `max_output_rows` guards the **final** combined output, not the intermediate chain steps.
 
 If the large result is expected, raise the cap (or omit the field). If it is not, tighten the `where:` predicate. Run `clinker explain --code E325` for the full remediation guide.
 

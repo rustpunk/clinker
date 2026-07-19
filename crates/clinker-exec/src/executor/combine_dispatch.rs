@@ -644,6 +644,7 @@ pub(crate) fn dispatch_combine(
                         output_schema: combine_output_schema_arc.as_ref(),
                         match_mode: *match_mode,
                         on_miss: *on_miss,
+                        max_output_rows,
                         partition_bits,
                         propagate_ck,
                         ctx: &grace_ctx,
@@ -786,6 +787,7 @@ pub(crate) fn dispatch_combine(
                         output_schema: combine_output_schema_arc.as_ref(),
                         match_mode: *match_mode,
                         on_miss: *on_miss,
+                        max_output_rows,
                         presorted: true,
                         propagate_ck,
                         ctx: &sm_ctx,
@@ -940,6 +942,7 @@ pub(crate) fn dispatch_combine(
             build_qualifier: &build_qualifier,
             match_mode: *match_mode,
             on_miss: *on_miss,
+            max_output_rows,
             propagate_ck,
             fail_fast: ctx.strategy == ErrorStrategy::FailFast,
         };
@@ -1028,6 +1031,19 @@ pub(crate) fn dispatch_combine(
                         continue;
                     }
                     emitted_since_check += output_records.len() - before;
+
+                    // Opt-in output-size runaway guard (E325), checked per driver
+                    // against the cumulative output count. Fails loud rather than
+                    // truncating; independent of the memory backstop below (a count
+                    // ceiling, not a byte one).
+                    if let Some(cap) = kernel.max_output_rows
+                        && output_records.len() as u64 > cap
+                    {
+                        return Err(PipelineError::CombineOutputCapExceeded {
+                            combine: name.clone(),
+                            cap,
+                        });
+                    }
 
                     // Budget check every 10K emitted records to bound memory under
                     // fan-out. The build phase polls `should_abort` every 10K
@@ -1324,6 +1340,21 @@ fn run_streaming_combine_probe(
                     continue;
                 }
 
+                // Opt-in output-size runaway guard (E325), per driver against the
+                // cumulative output count — the same check the materialized loop
+                // makes, so the cap covers the streaming-probe path too. Drain the
+                // channel first so the producer thread cannot deadlock on a full
+                // channel while this consumer returns.
+                if let Some(cap) = kernel.max_output_rows
+                    && output_records.len() as u64 > cap
+                {
+                    while rx.recv().is_ok() {}
+                    return Err(PipelineError::CombineOutputCapExceeded {
+                        combine: name.to_string(),
+                        cap,
+                    });
+                }
+
                 // Budget check every 10K emitted records, the same cadence
                 // and abort the materialized loop uses.
                 budget_cadence += output_records.len() - before;
@@ -1488,6 +1519,10 @@ struct CombineProbeKernel<'k> {
     build_qualifier: &'k str,
     match_mode: clinker_plan::config::pipeline_node::MatchMode,
     on_miss: clinker_plan::config::pipeline_node::OnMiss,
+    /// Opt-in per-combine output-row cap (E325); `None` is unlimited. Enforced
+    /// per driver against the shared output vec's cumulative length in both the
+    /// materialized and streaming probe loops that drive this kernel.
+    max_output_rows: Option<u64>,
     propagate_ck: &'k clinker_plan::config::pipeline_node::PropagateCkSpec,
     /// Whether `ErrorStrategy::FailFast` is active: surface a recoverable
     /// per-row eval failure as `Err` rather than deferring it to the DLQ.

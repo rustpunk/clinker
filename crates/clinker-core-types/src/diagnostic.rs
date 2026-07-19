@@ -63,7 +63,7 @@
 //! | `E309`      | error    | Combine output schema is empty                       |
 //! | `E310`      | error    | Memory-budget surface exceeded the configured hard limit |
 //! | `E311`      | error    | Combine `match: collect` has a non-empty `cxl:` body |
-//! | `E313`      | error    | Combine has no equality conjuncts (HashBuildProbe needs ≥1) |
+//! | `E313`      | error    | Combine `where:` has neither an equality nor a range conjunct |
 //! | `E314`      | error    | Schema mismatch at operator entry (column list divergence) |
 //! | `E319`      | error    | Combine `on_miss: error` had no matching build row   |
 //! | `E325`      | error    | Combine output exceeded the opt-in `max_output_rows` cap |

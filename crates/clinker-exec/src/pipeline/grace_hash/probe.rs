@@ -38,6 +38,35 @@ pub(crate) enum ProbeOutcome<'a> {
 pub(super) struct GraceEmitSink<'a> {
     pub(super) records: &'a mut Vec<(Record, RecordOrder)>,
     pub(super) failures: &'a mut Vec<CombineOutputEvalFailure>,
+    /// Combine node name, for the E325 runaway-cap diagnostic.
+    pub(super) name: &'a str,
+    /// Opt-in per-combine output-row cap (E325); `None` is unlimited. `records`
+    /// is the single output vec threaded across every phase (in-memory probe,
+    /// spilled reload, BNL), so its length is the combine's cumulative row count.
+    pub(super) max_output_rows: Option<u64>,
+}
+
+impl GraceEmitSink<'_> {
+    /// Push one emitted output row, failing loud (E325) the moment it would carry
+    /// the cumulative count past `max_output_rows` rather than truncating.
+    /// Checked before the push, so exactly `cap` rows land and the first over-cap
+    /// row aborts — a result-size ceiling independent of the memory budget.
+    pub(super) fn push_row(
+        &mut self,
+        record: Record,
+        rn: RecordOrder,
+    ) -> Result<(), PipelineError> {
+        if let Some(cap) = self.max_output_rows
+            && self.records.len() as u64 >= cap
+        {
+            return Err(PipelineError::CombineOutputCapExceeded {
+                combine: self.name.to_string(),
+                cap,
+            });
+        }
+        self.records.push((record, rn));
+        Ok(())
+    }
 }
 
 /// Shape-stable bundle for [`emit_for_probe`]. Bundling the per-call
@@ -154,7 +183,7 @@ pub(super) fn emit_for_probe<'a>(
                 crate::executor::copy_build_ck_columns(&mut rec, b, propagate_ck);
             }
             rec.set(build_qualifier, Value::Array(arr));
-            sink.records.push((rec, rn));
+            sink.push_row(rec, rn)?;
         }
         MatchMode::First | MatchMode::All => {
             let matched: Vec<Record> = {
@@ -228,7 +257,7 @@ pub(super) fn emit_for_probe<'a>(
                                 for (k, v) in *record_vars {
                                     let _ = rec.set_record_var(&k, v);
                                 }
-                                sink.records.push((rec, rn));
+                                sink.push_row(rec, rn)?;
                             }
                             Ok(EvalResult::Skip(SkipReason::Filtered)) => {}
                             Ok(EvalResult::Skip(SkipReason::Duplicate)) => {}
@@ -274,7 +303,7 @@ pub(super) fn emit_for_probe<'a>(
                                 let _ = rec.set_record_var(&k, v);
                             }
                             crate::executor::copy_build_ck_columns(&mut rec, m, propagate_ck);
-                            sink.records.push((rec, rn));
+                            sink.push_row(rec, rn)?;
                         }
                         Ok(EvalResult::Skip(_)) => {}
                         Ok(EvalResult::EmitMany { .. }) => {
@@ -325,7 +354,7 @@ pub(super) fn emit_for_probe<'a>(
                         });
                     }
                     let rec = Record::new(Arc::clone(target_schema), values);
-                    sink.records.push((rec, rn));
+                    sink.push_row(rec, rn)?;
                 }
             }
         }

@@ -522,6 +522,7 @@ fn execute_grace_hash_partition_pair_correct() {
         output_schema: Some(&combined_schema),
         match_mode: clinker_plan::config::pipeline_node::MatchMode::All,
         on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
+        max_output_rows: None,
         partition_bits: 4,
         propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
         ctx: &ctx,
@@ -774,6 +775,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
         output_schema: Some(&combined_schema),
         match_mode: clinker_plan::config::pipeline_node::MatchMode::All,
         on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
+        max_output_rows: None,
         partition_bits: 4,
         propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
         ctx: &ctx,
@@ -964,6 +966,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         output_schema: Some(&combined_schema),
         match_mode: clinker_plan::config::pipeline_node::MatchMode::All,
         on_miss: clinker_plan::config::pipeline_node::OnMiss::Skip,
+        max_output_rows: None,
         partition_bits: 4,
         propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
         ctx: &ctx,
@@ -1755,6 +1758,8 @@ fn test_skew_detection_triggers_bnl() {
             &mut GraceEmitSink {
                 records: &mut output,
                 failures: &mut Vec::new(),
+                name: "grace_test",
+                max_output_rows: None,
             },
             &mut stats,
         )
@@ -1813,6 +1818,8 @@ fn test_bnl_fallback_correct_output() {
             &mut GraceEmitSink {
                 records: &mut output,
                 failures: &mut Vec::new(),
+                name: "grace_test",
+                max_output_rows: None,
             },
             &mut stats,
         )
@@ -1902,6 +1909,8 @@ fn test_bnl_bounded_memory() {
             &mut GraceEmitSink {
                 records: &mut output,
                 failures: &mut Vec::new(),
+                name: "grace_test",
+                max_output_rows: None,
             },
             &mut stats,
         )
@@ -1970,6 +1979,8 @@ fn test_bnl_bounded_memory() {
             &mut GraceEmitSink {
                 records: &mut output2,
                 failures: &mut Vec::new(),
+                name: "grace_test",
+                max_output_rows: None,
             },
             &mut stats2,
         )
@@ -2035,6 +2046,8 @@ fn test_bnl_result_batching() {
             &mut GraceEmitSink {
                 records: &mut output,
                 failures: &mut Vec::new(),
+                name: "grace_test",
+                max_output_rows: None,
             },
             &mut stats,
         )
@@ -2100,6 +2113,8 @@ fn test_e310_hard_limit_abort() {
             &mut GraceEmitSink {
                 records: &mut output,
                 failures: &mut Vec::new(),
+                name: "grace_test",
+                max_output_rows: None,
             },
             &mut stats,
         )
