@@ -1708,15 +1708,16 @@ fn range_keys_to_i128_pair(
 }
 
 /// Reduce one range-axis Value to the order-preserving `i128` its axis kind
-/// dictates, so both cross-input sides land in one comparable space. The kind
-/// is the typechecker's unified operand type (`int <=> float` compares as float,
-/// `int <=> decimal` as decimal), so an integer on a float axis coerces through
-/// `f64` — matching the runtime `compare_values` semantics — and an integer on a
-/// decimal axis widens exactly onto the same fixed-point grid.
+/// dictates, so both cross-input sides land in one comparable space. The kind is
+/// fixed at plan time from the concrete operand types, matching the runtime
+/// `compare_values` semantics: an integer on a mixed int/float axis coerces
+/// through `f64`, and an integer on a decimal axis widens exactly onto the same
+/// fixed-point grid.
 ///
-/// `Ok(None)` for a NULL / unrepresentable-but-skippable value (routed to the
-/// unmatched pile, preserving the prior behavior for those); `Err` only when a
-/// decimal value cannot be placed on the fixed-point grid exactly.
+/// Only the reducible kinds reach here — `Numeric` and `Unsupported` are
+/// rejected at plan time (E327), so their arms are defensively `None`. `Ok(None)`
+/// otherwise means a NULL / off-type value routed to the unmatched pile; `Err`
+/// only when a decimal value cannot be placed on the fixed-point grid exactly.
 #[inline]
 fn value_to_i128(kind: RangeKeyType, v: &Value) -> Result<Option<i128>, ScanKeyError> {
     use crate::pipeline::sort_key::{
@@ -1728,10 +1729,11 @@ fn value_to_i128(kind: RangeKeyType, v: &Value) -> Result<Option<i128>, ScanKeyE
             Value::Integer(i) => Some(*i as i128),
             _ => None,
         },
-        RangeKeyType::Float => match v {
+        // A pure-float axis sees only floats; a mixed int/float axis coerces the
+        // integer side through `f64`, the same widening `compare_values` applies
+        // to `int <=> float`. Both reduce through the orderable-float transform.
+        RangeKeyType::Float | RangeKeyType::MixedNumeric => match v {
             Value::Float(f) if f.is_finite() => Some(float_to_orderable_i128(*f)),
-            // Integer operand on a promoted float axis: coerce through f64, the
-            // same widening `compare_values` applies to `int <=> float`.
             Value::Integer(i) => Some(float_to_orderable_i128(*i as f64)),
             _ => None,
         },
@@ -1763,7 +1765,8 @@ fn value_to_i128(kind: RangeKeyType, v: &Value) -> Result<Option<i128>, ScanKeyE
             Value::DateTime(dt) => Some(dt.and_utc().timestamp_micros() as i128),
             _ => None,
         },
-        RangeKeyType::Unsupported => None,
+        // Plan-rejected (E327) before runtime; defensively route out.
+        RangeKeyType::Numeric | RangeKeyType::Unsupported => None,
     };
     Ok(out)
 }
@@ -2140,11 +2143,25 @@ mod tests {
         assert!(pwmj_numeric(&empty, &empty, RangeOp::Lt).is_empty());
     }
 
+    /// A range-key value skewed toward small clustered integers (so duplicate
+    /// keys and boundary equality get exercised) but also drawing values that
+    /// straddle the `i64` limits and span the full `i128` range — the widened
+    /// axis must compare those correctly, which a `-50..50` generator alone
+    /// (all within `i64`) could never catch.
+    fn arb_i128_key() -> impl Strategy<Value = i128> {
+        prop_oneof![
+            4 => -50i128..50,
+            1 => (i64::MAX as i128 - 5)..(i64::MAX as i128 + 5),
+            1 => (i64::MIN as i128 - 5)..(i64::MIN as i128 + 5),
+            1 => any::<i128>(),
+        ]
+    }
+
     fn arb_inputs() -> impl Strategy<Value = JoinCase> {
         let op = prop_oneof![Just(TOp::Lt), Just(TOp::Le), Just(TOp::Gt), Just(TOp::Ge)];
         (
-            prop::collection::vec((-50i128..50, -50i128..50), 0..50),
-            prop::collection::vec((-50i128..50, -50i128..50), 0..50),
+            prop::collection::vec((arb_i128_key(), arb_i128_key()), 0..50),
+            prop::collection::vec((arb_i128_key(), arb_i128_key()), 0..50),
             op.clone(),
             op,
         )
@@ -2192,8 +2209,8 @@ mod tests {
         /// Same contract for the single-inequality PWMJ kernel.
         #[test]
         fn proptest_pwmj_capped_equals_uncapped_or_overflows(
-            left in prop::collection::vec(-50i128..50, 0..40),
-            right in prop::collection::vec(-50i128..50, 0..40),
+            left in prop::collection::vec(arb_i128_key(), 0..40),
+            right in prop::collection::vec(arb_i128_key(), 0..40),
             op_idx in 0usize..4,
             cap in 0usize..400,
         ) {

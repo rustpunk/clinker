@@ -222,9 +222,20 @@ pub(crate) const DECIMAL_RANGE_SCALE: u32 = 18;
 /// typed error rather than dropping the row.
 #[inline]
 pub(crate) fn decimal_to_orderable_i128(d: rust_decimal::Decimal) -> Option<i128> {
+    // `rust_decimal` does not auto-strip trailing fractional zeros, so a value
+    // like `1.5` stored at scale 20 (`1.50000000000000000000`) carries scale 20
+    // even though it is exactly representable at scale 1. Normalize away those
+    // trailing zeros before the truncation check so an exactly-representable
+    // value is never a false out-of-range. Only pay the normalize cost when the
+    // scale actually exceeds the grid — the common path is untouched.
+    let d = if d.scale() > DECIMAL_RANGE_SCALE {
+        d.normalize()
+    } else {
+        d
+    };
     let scale = d.scale();
     if scale > DECIMAL_RANGE_SCALE {
-        return None; // more fractional digits than the grid holds → truncation
+        return None; // more significant fractional digits than the grid holds → truncation
     }
     // `mantissa` is a 96-bit integer, so it always fits `i128`; the scaling
     // multiply is the only step that can overflow.
@@ -560,6 +571,28 @@ mod tests {
         // A realistic monetary value (~1e9 at 2 dp: 999,999,999.99) stays
         // representable.
         assert!(decimal_to_orderable_i128(Decimal::new(99_999_999_999, 2)).is_some());
+    }
+
+    #[test]
+    fn decimal_to_orderable_i128_normalizes_trailing_zeros() {
+        use std::str::FromStr;
+        // `rust_decimal` keeps trailing fractional zeros, so this value carries
+        // scale 22 even though it is exactly `1.5`. It must NOT be a false
+        // out-of-range: normalize strips the zeros before the scale-18 check, and
+        // it reduces to the same key as the scale-1 form.
+        let padded = Decimal::from_str("1.5000000000000000000000").unwrap();
+        assert!(
+            padded.scale() > DECIMAL_RANGE_SCALE,
+            "value must be padded past 18 dp"
+        );
+        assert_eq!(
+            decimal_to_orderable_i128(padded),
+            decimal_to_orderable_i128(Decimal::new(15, 1))
+        );
+        assert!(decimal_to_orderable_i128(padded).is_some());
+        // A value with genuine (nonzero) digits past 18 places still truncates.
+        let genuine = Decimal::from_str("1.0000000000000000001").unwrap();
+        assert_eq!(decimal_to_orderable_i128(genuine), None);
     }
 
     fn make_record(fields: &[(&str, Value)]) -> Record {

@@ -64,6 +64,7 @@
 //! | `E310`      | error    | Memory-budget surface exceeded the configured hard limit |
 //! | `E311`      | error    | Combine `match: collect` has a non-empty `cxl:` body |
 //! | `E313`      | error    | Combine `where:` has neither an equality nor a range conjunct |
+//! | `E327`      | error    | Combine range conjunct operands don't reduce to a supported range axis (ambiguous `numeric`, or non-orderable) |
 //! | `E314`      | error    | Schema mismatch at operator entry (column list divergence) |
 //! | `E319`      | error    | Combine `on_miss: error` had no matching build row   |
 //! | `E325`      | error    | Combine output exceeded the opt-in `max_output_rows` cap |
@@ -330,7 +331,7 @@ mod diagnostic_tests {
         // explicit entry both here and in the registry table above.
         for code in [
             "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308", "E309", "E310", "E311",
-            "E313", "E314", "E315", "E316", "E317", "E318", "E319", "E322", "E325",
+            "E313", "E314", "E315", "E316", "E317", "E318", "E319", "E322", "E325", "E327",
         ] {
             let pattern = format!("`{code}`");
             assert!(

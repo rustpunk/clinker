@@ -73,7 +73,6 @@ mod tests {
                 | PipelineError::UnsatisfiableMemoryBudget { .. }
                 | PipelineError::CombineMissingMatch { .. }
                 | PipelineError::CombineOutputCapExceeded { .. }
-                | PipelineError::CombineRangeKeyOutOfRange { .. }
                 | PipelineError::EnvelopeMultiHeaderConflict { .. }
                 | PipelineError::EnvelopeHeaderGrainUnmatched { .. }
                 | PipelineError::EnvelopeHeaderMultipleForGrain { .. },
@@ -81,6 +80,7 @@ mod tests {
             Err(
                 PipelineError::Eval(_)
                 | PipelineError::Accumulator { .. }
+                | PipelineError::CombineRangeKeyOutOfRange { .. }
                 | PipelineError::DlqRateExceeded { .. },
             ) => 3,
             Err(

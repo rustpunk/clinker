@@ -227,31 +227,61 @@ pub struct RangeConjunct {
     pub right_expr: Expr,
     pub right_input: Arc<str>,
     /// The order-preserving reduction the IEJoin numeric axis uses for this
-    /// conjunct, fixed here from the typechecker's unified operand type so both
-    /// cross-input sides land in one comparable space (`int <=> float` → float,
-    /// `int <=> decimal` → decimal). See [`RangeKeyType`].
+    /// conjunct, fixed here from the concrete types of the two operands. See
+    /// [`RangeKeyType`].
     pub key_type: RangeKeyType,
 }
 
 /// How the IEJoin/block-band numeric axis reduces a range conjunct's two
 /// cross-input operands to the single order-preserving `i128` its kernels
-/// compare.
+/// compare — and, for [`SortMerge`](CombineStrategy::SortMerge)-eligible
+/// combines, whether that strategy's per-type key encoding handles the pair
+/// consistently.
 ///
-/// Chosen once, at plan time, from the CXL typechecker's unified type of the
-/// two operands so the driver and build sides share one encoding: the
-/// typechecker promotes `int <=> float` to `float` and widens `int <=> decimal`
-/// to `decimal` (and rejects `decimal <=> float` outright), and the axis honors
-/// exactly that. [`Unsupported`](RangeKeyType::Unsupported) marks a range
-/// comparison whose type is not reducible to the numeric axis (e.g. a string
-/// comparison); the runtime routes such records out of the range match.
+/// Fixed once, at plan time, from the CONCRETE types of the two operands (not
+/// merely their unified type), so a mixed integer/float axis is distinguished
+/// from a pure-float axis: both reduce through the float transform in IEJoin,
+/// but the SortMerge kernel's per-type key encoding is only consistent for a
+/// same-type pair. Chosen to match the runtime `compare_values` coercion
+/// exactly: `int <=> float` compares as float, `int <=> decimal` widens the
+/// integer into the decimal domain.
+///
+/// [`Numeric`](RangeKeyType::Numeric) and [`Unsupported`](RangeKeyType::Unsupported)
+/// are the two flavors the numeric axis cannot reduce without risking a silent
+/// disagreement with `compare_values` — an ambiguous `Numeric` operand
+/// (`abs`/`min`/`max`/`clamp`, whose runtime value may be an integer compared
+/// exactly OR a float) or a non-orderable type. Both are rejected at plan time
+/// (E327) rather than routed to the axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RangeKeyType {
+    /// Both operands are `int`. Reduced exactly (`i as i128`); SortMerge-safe.
     Integer,
+    /// Both operands are `float`. Reduced through the orderable-float transform;
+    /// SortMerge-safe.
     Float,
+    /// One operand is `int`, the other `float`. IEJoin reduces both through the
+    /// float transform (matching `int <=> float` comparison); the SortMerge
+    /// kernel would compare them in disjoint per-type encodings, so a combine on
+    /// this axis is routed to IEJoin.
+    MixedNumeric,
+    /// At least one operand is `decimal` (the other `decimal` or `int`). Placed
+    /// on the shared fixed-point grid; routed to IEJoin (SortMerge maps decimals
+    /// to a constant).
     Decimal,
+    /// Both operands are `date`. SortMerge-safe.
     Date,
+    /// Both operands are `datetime`. SortMerge-safe.
     DateTime,
+    /// At least one operand is the ambiguous `Numeric` supertype
+    /// (`abs`/`min`/`max`/`clamp` over a numeric): its runtime value may be an
+    /// integer (compared exactly by the residual) or a float, so no single axis
+    /// reduction agrees with `compare_values` for every value. Rejected at plan
+    /// time (E327).
+    Numeric,
+    /// The operands do not reduce to any orderable numeric axis (e.g. a string
+    /// or boolean comparison, or a type that does not unify). Rejected at plan
+    /// time (E327).
     Unsupported,
 }
 
@@ -518,30 +548,44 @@ fn classify_conjunct(conjunct: &Expr, typed: &Arc<TypedProgram>) -> ConjunctClas
     }
 }
 
-/// The IEJoin numeric-axis reduction for a range conjunct, derived from the
-/// typechecker's unified type of its two operands. The where clause is already
-/// typechecked when this runs, so the operand `NodeId`s index valid entries in
-/// `typed.types`; the unify mirrors the runtime comparison coercion
-/// (`int <=> float` compares as float, `int <=> decimal` as decimal). A missing
-/// or non-orderable-in-`i128` type yields [`RangeKeyType::Unsupported`].
+/// The range-axis flavor for a conjunct, derived from the CONCRETE types of its
+/// two operands. The where clause is already typechecked when this runs, so the
+/// operand `NodeId`s index valid entries in `typed.types`.
+///
+/// The pairing is classified directly rather than through the typechecker's
+/// `unify` for two reasons: `unify` collapses `(int, float)` and `(float, float)`
+/// to the same `Float`, but the two need different treatment on the SortMerge
+/// path (a mixed pair compares in disjoint per-type encodings there); and
+/// `unify` optimistically resolves a `Numeric` operand to a concrete type
+/// (`unify(Numeric, Int) = Int`), hiding that the operand's runtime value may be
+/// a float — which would silently disagree with the exact-integer residual. An
+/// ambiguous `Numeric` operand, or any non-orderable pairing, yields a flavor
+/// the axis rejects at plan time rather than reduces.
 fn range_key_type(typed: &TypedProgram, lhs: &Expr, rhs: &Expr) -> RangeKeyType {
     let type_of =
         |e: &Expr| -> Option<Type> { typed.types.get(e.node_id().0 as usize).cloned().flatten() };
     let (Some(lt), Some(rt)) = (type_of(lhs), type_of(rhs)) else {
         return RangeKeyType::Unsupported;
     };
-    match lt.unwrap_nullable().unify(rt.unwrap_nullable()) {
-        Some(unified) => match unified.unwrap_nullable() {
-            Type::Int => RangeKeyType::Integer,
-            // `Numeric` (union of int/float) can be either at runtime; the float
-            // grid is the common superset, matching the runtime int→f64 coercion.
-            Type::Float | Type::Numeric => RangeKeyType::Float,
-            Type::Decimal => RangeKeyType::Decimal,
-            Type::Date => RangeKeyType::Date,
-            Type::DateTime => RangeKeyType::DateTime,
-            _ => RangeKeyType::Unsupported,
-        },
-        None => RangeKeyType::Unsupported,
+    // Any `Numeric` operand is ambiguous (its runtime value may be an integer
+    // compared exactly by the residual, or a float): no single axis reduction
+    // agrees with `compare_values` for every value, so mark it for plan-time
+    // rejection ahead of the concrete pairings below.
+    if matches!(lt.unwrap_nullable(), Type::Numeric)
+        || matches!(rt.unwrap_nullable(), Type::Numeric)
+    {
+        return RangeKeyType::Numeric;
+    }
+    match (lt.unwrap_nullable(), rt.unwrap_nullable()) {
+        (Type::Int, Type::Int) => RangeKeyType::Integer,
+        (Type::Float, Type::Float) => RangeKeyType::Float,
+        (Type::Int, Type::Float) | (Type::Float, Type::Int) => RangeKeyType::MixedNumeric,
+        (Type::Decimal, Type::Decimal)
+        | (Type::Decimal, Type::Int)
+        | (Type::Int, Type::Decimal) => RangeKeyType::Decimal,
+        (Type::Date, Type::Date) => RangeKeyType::Date,
+        (Type::DateTime, Type::DateTime) => RangeKeyType::DateTime,
+        _ => RangeKeyType::Unsupported,
     }
 }
 
@@ -892,6 +936,20 @@ pub(crate) fn select_combine_strategies_in_graph(
             diags.push(combine_e313_no_equi(&name, span));
             continue;
         }
+        // A range conjunct whose operands do not reduce to a supported numeric
+        // axis flavor — an ambiguous `Numeric` operand, or a non-orderable pair —
+        // cannot be a prune/kernel axis without risking a silent disagreement
+        // with the exact `compare_values` semantics (a dropped row or a wrong
+        // match). Reject it at plan time rather than route it to the axis.
+        if let Some(bad) = decomposed.ranges.iter().find(|r| {
+            matches!(
+                r.key_type,
+                RangeKeyType::Numeric | RangeKeyType::Unsupported
+            )
+        }) {
+            diags.push(combine_e327_unsupported_range_axis(&name, span, bad));
+            continue;
+        }
         if decomposed.ranges.is_empty()
             && inputs.values().all(|ci| {
                 matches!(
@@ -933,7 +991,25 @@ pub(crate) fn select_combine_strategies_in_graph(
             // for large pre-sorted workloads. SortMerge today only
             // covers the single-inequality case; mixed-axis (`a.x <=
             // b.y AND a.z >= b.w`) keeps routing to IEJoin.
+            //
+            // SortMerge's kernel compares range keys by mapping each Value to a
+            // monotone i64 WITHIN its own type (int as-is, float through the
+            // orderable transform, date/datetime as epoch counts); it has no
+            // shared numeric space, so it is only correct when both operands
+            // share one of those directly-encoded types. A `decimal` axis (which
+            // it maps to a constant) and a mixed int/float axis (disjoint per-type
+            // encodings) must route to IEJoin, which reduces both sides to one
+            // i128 space. `Numeric`/`Unsupported` never reach here — E327 rejected
+            // them above.
+            let sort_merge_key_ok = matches!(
+                decomposed.ranges[0].key_type,
+                RangeKeyType::Integer
+                    | RangeKeyType::Float
+                    | RangeKeyType::Date
+                    | RangeKeyType::DateTime
+            );
             let sort_merge_eligible = decomposed.ranges.len() == 1
+                && sort_merge_key_ok
                 && node_properties.is_some_and(|props| {
                     pure_range_inputs_presorted(graph, props, &name, &decomposed.ranges[0])
                 });
@@ -1220,6 +1296,47 @@ fn combine_e313_no_equi(combine_name: &str, span: Span) -> Diagnostic {
     .with_help(
         "add a cross-input comparison (e.g. `a.id == b.id` or `a.t < b.t`); \
          predicates with neither shape have no supported execution strategy yet",
+    )
+}
+
+/// E327 — a combine range conjunct compares operands that do not reduce to a
+/// supported numeric range axis. Either an operand has the ambiguous `Numeric`
+/// type (`abs`/`min`/`max`/`clamp` over a numeric, whose runtime value may be an
+/// integer compared exactly or a float), or the pair is not orderable on the
+/// axis (a string/boolean comparison, or a `decimal`/`float` mix). Routing it to
+/// the prune/kernel axis would risk a silent disagreement with the exact
+/// `compare_values` semantics — a dropped row or a wrong match — so the planner
+/// rejects it here instead.
+fn combine_e327_unsupported_range_axis(
+    combine_name: &str,
+    span: Span,
+    conjunct: &RangeConjunct,
+) -> Diagnostic {
+    let rendered = format!(
+        "{} {} {}",
+        format_conjunct_operand(&conjunct.left_expr),
+        range_op_symbol(conjunct.op),
+        format_conjunct_operand(&conjunct.right_expr),
+    );
+    let reason = if matches!(conjunct.key_type, RangeKeyType::Numeric) {
+        "an operand has the ambiguous `numeric` type (e.g. from abs/min/max/clamp): its \
+         runtime value may be an integer compared exactly or a float, so no single range-axis \
+         reduction agrees with the comparison for every value"
+    } else {
+        "the operands are not an orderable int, float, decimal, date, or datetime pair (a \
+         `decimal` and a `float` cannot be mixed on the range axis)"
+    };
+    Diagnostic::error(
+        "E327",
+        format!(
+            "combine {combine_name:?} range conjunct `{rendered}` cannot use the range axis: \
+             {reason}"
+        ),
+        LabeledSpan::primary(span, String::new()),
+    )
+    .with_help(
+        "compare a supported range key instead — matching concrete int, float, or decimal \
+         operands on both sides — or move this comparison out of the join predicate",
     )
 }
 
