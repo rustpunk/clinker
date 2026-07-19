@@ -406,4 +406,55 @@ mod tests {
         .expect("no cap means no rejection");
         assert!(idx.retained_bytes() >= 100_000);
     }
+
+    #[test]
+    fn cap_gates_on_a_scalar_map_structural_backing() {
+        // A many-field map of small scalars owns almost no key/value heap, so
+        // its retention cost is dominated by the IndexMap structural backing.
+        // Setting the cap in the gap between the key/value bytes and the full
+        // charge pins that the backing term itself decides the cap — a future
+        // change to per-entry backing can't move that boundary unnoticed.
+        let section = "Summary";
+        let build = || {
+            map(&[
+                ("a", Value::Integer(1)),
+                ("b", Value::Integer(2)),
+                ("c", Value::Integer(3)),
+                ("d", Value::Bool(true)),
+                ("e", Value::Integer(5)),
+                ("f", Value::Integer(6)),
+                ("g", Value::Bool(false)),
+                ("h", Value::Integer(8)),
+            ])
+        };
+        // `build()` is deterministic, so every instance has identical capacity
+        // and heap_size; derive the caps from one measured instance.
+        let payload = build();
+        let inner = payload.as_map().unwrap();
+        let keys_and_values: usize = inner.iter().map(|(k, v)| k.len() + v.heap_size()).sum();
+        let full_value_heap = payload.heap_size();
+        assert!(
+            full_value_heap > keys_and_values,
+            "a scalar map must carry structural backing beyond its key/value bytes"
+        );
+        let bytes_only_charge = section.len() + keys_and_values;
+        let full_charge = section.len() + full_value_heap;
+
+        // A cap above the key/value bytes but below the full charge rejects the
+        // insert: the structural backing is what tips it over.
+        let mut tight = DocArenaIndex::new(&[path(section, "a")], Some(bytes_only_charge + 1));
+        let err = tight
+            .insert(&path(section, "a"), build())
+            .expect_err("structural backing must push the charge over the cap");
+        assert!(matches!(err, FormatError::Json(msg) if msg.contains("max_index_bytes")));
+        assert!(tight.into_sections().is_empty());
+
+        // A cap equal to the full charge clears, confirming the rejection above
+        // came from the backing term rather than the bytes.
+        let mut roomy = DocArenaIndex::new(&[path(section, "a")], Some(full_charge));
+        roomy
+            .insert(&path(section, "a"), build())
+            .expect("full charge fits under a cap equal to it");
+        assert_eq!(roomy.retained_bytes(), full_charge);
+    }
 }

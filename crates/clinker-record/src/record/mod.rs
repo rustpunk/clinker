@@ -319,16 +319,12 @@ impl Record {
     pub fn estimated_heap_size(&self) -> usize {
         let values_backing = self.values.capacity() * std::mem::size_of::<Value>();
         let values_heap: usize = self.values.iter().map(Value::heap_size).sum();
-        let indexmap_heap = |m: &IndexMap<Box<str>, Value>| {
-            let entry_size = std::mem::size_of::<Box<str>>()
-                + std::mem::size_of::<Value>()
-                + std::mem::size_of::<u64>();
-            let map_backing = m.capacity() * entry_size;
-            let keys_heap: usize = m.keys().map(|k| k.len()).sum();
-            let values_heap: usize = m.values().map(Value::heap_size).sum();
-            map_backing + keys_heap + values_heap
-        };
-        let record_vars_size = self.record_vars.as_ref().map_or(0, |m| indexmap_heap(m));
+        // The `$record.<key>` vars map and any `Value::Map` field share one
+        // IndexMap-backing estimator so the two accounting paths cannot drift.
+        let record_vars_size = self
+            .record_vars
+            .as_ref()
+            .map_or(0, |m| crate::value::indexmap_heap_size(m));
         values_backing + values_heap + record_vars_size
     }
 }
