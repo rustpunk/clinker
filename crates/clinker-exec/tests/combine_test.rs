@@ -4712,15 +4712,17 @@ nodes:
         }
     }
 
-    /// A range conjunct over an ambiguous `numeric` operand (`abs` result, whose
-    /// runtime value may be an integer compared exactly or a float) is rejected at
-    /// plan time with E327 rather than routed to the axis, where a large integer
-    /// would silently lose precision against the exact residual.
+    /// A range conjunct over `abs()` of same-concrete-type operands
+    /// (`a.x.abs() >= b.y.abs()`, both `int`) resolves to a concrete `int` axis
+    /// and runs: `abs` returns the `numeric` supertype, but its recovered leaf
+    /// type is `int` on both sides, so the axis is exactly as safe as a plain
+    /// `int`/`int` pairing. Negative inputs make `abs` load-bearing — a raw
+    /// (non-`abs`) `a.x >= b.y` would match a different, disjoint set of pairs.
     #[test]
-    fn combine_numeric_range_operand_rejected_e327() {
+    fn combine_abs_int_pair_range_matches() {
         let yaml = r#"
 pipeline:
-  name: e327_numeric
+  name: abs_int_pair
 nodes:
   - type: source
     name: a
@@ -4759,7 +4761,119 @@ nodes:
       type: csv
       path: out.csv
 "#;
-        assert_compile_e327(yaml, "an abs()/numeric range operand must be rejected E327");
+        // Driver a.x ∈ {-5, 3, -10} (|x| = 5, 3, 10); build b.y ∈ {-4, 8}
+        // (|y| = 4, 8). Match iff |a.x| >= |b.y| (match: all, so every matching
+        // build row surfaces):
+        //   a=-5 (5): b=-4 (4) 5>=4 ✓ → (-5,-4);  b=8 (8) 5>=8 ✗
+        //   a= 3 (3): b=-4 (4) 3>=4 ✗;  b=8 (8) 3>=8 ✗ → no match (skipped)
+        //   a=-10(10): b=-4 (4) ✓ → (-10,-4);  b=8 (8) 10>=8 ✓ → (-10,8)
+        // Exactly 3 matched pairs. A raw `a.x >= b.y` (no abs) would instead
+        // match only (3,-4), so this oracle proves abs is applied on the axis.
+        let a_csv = "x\n-5\n3\n-10\n";
+        let b_csv = "y\n-4\n8\n";
+        let result = run_combine_fixture(yaml, &[("a", a_csv), ("b", b_csv)], Some("a"))
+            .expect("abs(int) >= abs(int) range join must compile and run");
+        let canon = canonicalize_csv(result.primary_output());
+        let data_rows: Vec<&str> = canon.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            data_rows.len(),
+            3,
+            "expected exactly 3 matched (a,b) pairs; got: {canon}"
+        );
+        assert!(
+            canon.contains("-5,-4"),
+            "(-5,-4): |−5|=5 >= |−4|=4 must match (needs abs on lhs); got: {canon}"
+        );
+        assert!(
+            canon.contains("-10,-4"),
+            "(-10,-4): |−10|=10 >= |−4|=4 must match; got: {canon}"
+        );
+        assert!(
+            canon.contains("-10,8"),
+            "(-10,8): |−10|=10 >= |8|=8 must match (needs abs on both); got: {canon}"
+        );
+        assert!(
+            !data_rows.contains(&"3,-4"),
+            "(3,-4) is a raw-compare-only match; abs must exclude it (3 >= 4 is false); got: {canon}"
+        );
+    }
+
+    /// The Float sibling of `combine_abs_int_pair_range_matches`: `abs()` of
+    /// same-`float` operands resolves to the concrete `Float` axis and runs, so
+    /// this exercises `abs` end-to-end on the float axis (the int test only
+    /// covers the integer axis). Fractional negatives make `abs` load-bearing.
+    #[test]
+    fn combine_abs_float_pair_range_matches() {
+        let yaml = r#"
+pipeline:
+  name: abs_float_pair
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: x, type: float }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: y, type: float }
+  - type: combine
+    name: banded
+    input:
+      a: a
+      b: b
+    config:
+      where: "a.x.abs() >= b.y.abs()"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit ax = a.x
+        emit bx = b.y
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+        // Driver a.x ∈ {-2.5, 0.5} (|x| = 2.5, 0.5); build b.y ∈ {-1.5, 3.5}
+        // (|y| = 1.5, 3.5). Match iff |a.x| >= |b.y|:
+        //   a=-2.5(2.5): b=-1.5(1.5) 2.5>=1.5 ✓ → (-2.5,-1.5);  b=3.5 2.5>=3.5 ✗
+        //   a= 0.5(0.5): b=-1.5(1.5) ✗;  b=3.5 ✗ → no match (skipped)
+        // Exactly 1 matched pair (-2.5,-1.5). A raw `a.x >= b.y` (no abs) would
+        // instead match only (0.5,-1.5) — disjoint — so this proves abs runs on
+        // the Float axis end to end.
+        let a_csv = "x\n-2.5\n0.5\n";
+        let b_csv = "y\n-1.5\n3.5\n";
+        let result = run_combine_fixture(yaml, &[("a", a_csv), ("b", b_csv)], Some("a"))
+            .expect("abs(float) >= abs(float) range join must compile and run");
+        let canon = canonicalize_csv(result.primary_output());
+        let data_rows: Vec<&str> = canon.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            data_rows.len(),
+            1,
+            "expected exactly 1 matched (a,b) pair; got: {canon}"
+        );
+        // Parse the row's two floats numerically so the assertion does not depend
+        // on the writer's float formatting.
+        let cols: Vec<f64> = data_rows[0]
+            .split(',')
+            .map(|c| c.parse::<f64>().expect("float columns ax,bx"))
+            .collect();
+        assert_eq!(cols.len(), 2, "row must be ax,bx; got: {canon}");
+        assert!(
+            (cols[0] - (-2.5)).abs() < 1e-9 && (cols[1] - (-1.5)).abs() < 1e-9,
+            "matched pair must be (-2.5,-1.5) — the abs-only match, not the raw-compare-only (0.5,-1.5); got: {canon}"
+        );
     }
 
     /// A `decimal` range operand compared against an ambiguous `numeric`
@@ -4863,6 +4977,109 @@ nodes:
       path: out.csv
 "#;
         assert_compile_e327(yaml, "a string range operand must be rejected E327");
+    }
+
+    /// A range conjunct whose operand is `abs()` of a genuinely-mixed pair —
+    /// `abs(int) >= abs(float)` — stays rejected at plan time with E327. Each
+    /// side recovers a concrete leaf type (int on the left, float on the right),
+    /// but they disagree, so the axis cannot reduce without risking a silent
+    /// disagreement with `compare_values`; it is NOT widened to MixedNumeric.
+    #[test]
+    fn combine_abs_mixed_int_float_range_rejected_e327() {
+        let yaml = r#"
+pipeline:
+  name: e327_abs_mixed
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: x, type: int }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: y, type: float }
+  - type: combine
+    name: banded
+    input:
+      a: a
+      b: b
+    config:
+      where: "a.x.abs() >= b.y.abs()"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit ax = a.x
+        emit bx = b.y
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+        assert_compile_e327(yaml, "abs(int) >= abs(float) is genuinely mixed → E327");
+    }
+
+    /// A range conjunct whose operand is `min()` over a mixed pair —
+    /// `a.i.min(a.f)` (int receiver, float argument) — stays rejected at plan
+    /// time with E327. `min` may return the int receiver OR the float argument,
+    /// so the operand's concrete type is per-row-ambiguous and no single axis
+    /// reduction agrees with `compare_values` for every value.
+    #[test]
+    fn combine_min_mixed_args_range_rejected_e327() {
+        let yaml = r#"
+pipeline:
+  name: e327_min_mixed
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: i, type: int }
+        - { name: f, type: float }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: y, type: int }
+  - type: combine
+    name: banded
+    input:
+      a: a
+      b: b
+    config:
+      where: "a.i.min(a.f) >= b.y"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit ai = a.i
+        emit bx = b.y
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+        assert_compile_e327(yaml, "min(int, float) is per-row-ambiguous → E327");
     }
 
     /// max_output_rows on a pure-EQUI combine (HashBuildProbe, the default
