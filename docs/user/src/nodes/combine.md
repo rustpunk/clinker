@@ -84,9 +84,11 @@ Every combine predicate must carry at least one cross-input **equality or range*
 
 ### Non-orderable range keys
 
-A range conjunct compares values that must be **orderable at runtime**: integers, finite floats, dates, and datetimes. When a record's range key evaluates to a non-orderable value — SQL `NULL`, a non-finite float (`NaN`/infinity), or any other type — that record can never satisfy the range comparison, so it is routed **out** of the range match rather than joined:
+A range conjunct compares values that must be **orderable at runtime**: integers, finite floats, exact `decimal`s, dates, and datetimes. When a record's range key evaluates to a non-orderable value — SQL `NULL`, a non-finite float (`NaN`/infinity), or any other type — that record can never satisfy the range comparison, so it is routed **out** of the range match rather than joined:
 
-> **Known gap: decimal range keys.** The exact fixed-point `decimal` type is **not** currently ordered as a range key — a decimal-valued range key is treated as non-orderable at runtime and routed out exactly like a `NULL`. Use an integer or float range key until decimal range ordering lands. (Decimals are fine as equality keys and as ordinary output columns; only the range-comparison axis is affected.)
+> **Decimal and mixed-numeric range keys.** Exact fixed-point `decimal` range keys are fully supported — a monetary band join (`amount >= tier.floor and amount < tier.ceiling`) matches correctly. A range conjunct that mixes an `integer` and a `float` operand across the two inputs is also supported: the integer is compared as a float, exactly as the `>=`/`<` operators compare it elsewhere. (A `decimal`-vs-`float` comparison is rejected at plan time — mix them with an explicit cast.)
+>
+> Decimal range keys are placed on a shared fixed-point grid with up to **18 fractional digits** and an integer magnitude up to roughly **1.7 × 10²⁰** — well beyond any realistic monetary value. A decimal range value outside that grid (more than 18 fractional digits, which would truncate, or a magnitude that would overflow the grid) is **not** silently dropped: the run stops with diagnostic `E326` naming the combine, so a wrong or empty result is never emitted. Rescale or narrow the compared values if you hit it.
 
 - A **driver** record with a non-orderable range key is treated as a zero-match driver and handled by [`on_miss`](#unmatched-records-on_miss) (`null_fields` / `skip` / `error`).
 - A **build** record with a non-orderable range key is dropped (it can match nothing).

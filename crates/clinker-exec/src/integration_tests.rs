@@ -73,6 +73,7 @@ mod tests {
                 | PipelineError::UnsatisfiableMemoryBudget { .. }
                 | PipelineError::CombineMissingMatch { .. }
                 | PipelineError::CombineOutputCapExceeded { .. }
+                | PipelineError::CombineRangeKeyOutOfRange { .. }
                 | PipelineError::EnvelopeMultiHeaderConflict { .. }
                 | PipelineError::EnvelopeHeaderGrainUnmatched { .. }
                 | PipelineError::EnvelopeHeaderMultipleForGrain { .. },

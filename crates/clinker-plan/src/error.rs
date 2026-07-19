@@ -192,6 +192,19 @@ pub enum PipelineError {
         combine: String,
         driver_row: u64,
     },
+    /// E326 — a combine range/inequality predicate on a `decimal` axis met a
+    /// range key that the numeric join axis cannot represent exactly. The axis
+    /// places every decimal on a shared 10^18 fixed-point grid as an `i128`; a
+    /// value whose magnitude overflows that grid (integer part beyond ~1.7e20)
+    /// or whose scale exceeds 18 fractional digits (which would truncate) cannot
+    /// be placed there without dropping or corrupting the comparison. Rather
+    /// than silently emit an empty or wrong result, the run aborts. `combine`
+    /// names the node; `value` is the offending decimal rendered for the
+    /// diagnostic. Always aborts the run.
+    CombineRangeKeyOutOfRange {
+        combine: String,
+        value: String,
+    },
     /// E325 — a combine's emitted-row count would exceed the opt-in
     /// `max_output_rows` cap configured on the node. A result-size runaway guard,
     /// deliberately distinct from E310 (`MemoryBudgetExceeded`): a permissive
@@ -431,6 +444,16 @@ impl fmt::Display for PipelineError {
                 f,
                 "E319 combine '{combine}': on_miss: error — no matching build row \
                  for driver row {driver_row}"
+            ),
+            Self::CombineRangeKeyOutOfRange { combine, value } => write!(
+                f,
+                "E326 combine '{combine}': range key {value} is outside the exact \
+                 fixed-point range the decimal inequality-join axis supports — its \
+                 magnitude exceeds ~1.7e20 or it carries more than 18 fractional \
+                 digits, so it cannot be placed on the join's fixed-point grid \
+                 without corrupting the comparison. The run stops rather than \
+                 dropping the row or emitting a wrong match. Rescale or narrow the \
+                 compared values. See: clinker explain --code E326"
             ),
             Self::CombineOutputCapExceeded { combine, cap } => write!(
                 f,

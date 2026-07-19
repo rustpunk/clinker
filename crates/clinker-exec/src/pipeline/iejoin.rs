@@ -92,7 +92,7 @@ use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
-use clinker_plan::plan::combine::{DecomposedPredicate, RangeOp};
+use clinker_plan::plan::combine::{DecomposedPredicate, RangeKeyType, RangeOp};
 
 mod block;
 
@@ -279,9 +279,11 @@ fn both_inclusive(op1: RangeOp, op2: RangeOp) -> bool {
     matches!(op1, RangeOp::Le | RangeOp::Ge) && matches!(op2, RangeOp::Le | RangeOp::Ge)
 }
 
-/// Compare two `i64` keys under a sort direction.
+/// Compare two order-preserving keys under a sort direction. Generic so the
+/// range axis (widened to `i128` to carry the decimal fixed-point grid) and the
+/// `i64` signed record index share one comparator.
 #[inline]
-fn cmp_dir(a: i64, b: i64, dir: SortDir) -> std::cmp::Ordering {
+fn cmp_dir<T: Ord>(a: T, b: T, dir: SortDir) -> std::cmp::Ordering {
     match dir {
         SortDir::Asc => a.cmp(&b),
         SortDir::Desc => b.cmp(&a),
@@ -299,8 +301,8 @@ fn cmp_dir(a: i64, b: i64, dir: SortDir) -> std::cmp::Ordering {
 /// budget-derived cap.
 #[cfg(test)]
 fn iejoin_numeric(
-    left_keys: &[(i64, i64)],
-    right_keys: &[(i64, i64)],
+    left_keys: &[(i128, i128)],
+    right_keys: &[(i128, i128)],
     op1: RangeOp,
     op2: RangeOp,
 ) -> Vec<(usize, usize)> {
@@ -316,8 +318,8 @@ fn iejoin_numeric(
 /// result whenever `pairs.len() <= max_pairs`. `max_pairs == usize::MAX` is
 /// effectively uncapped (a `usize` length can never exceed it).
 fn iejoin_numeric_capped(
-    left_keys: &[(i64, i64)],
-    right_keys: &[(i64, i64)],
+    left_keys: &[(i128, i128)],
+    right_keys: &[(i128, i128)],
     op1: RangeOp,
     op2: RangeOp,
     max_pairs: usize,
@@ -329,9 +331,9 @@ fn iejoin_numeric_capped(
         return Some(Vec::new());
     }
 
-    // Encode left record `i` as +(i+1), right record `j` as -(j+1).
-    // i64 fits both signs without `-0` ambiguity.
-    let mut l1: Vec<(i64, i64, i64)> = Vec::with_capacity(n_total);
+    // Encode left record `i` as +(i+1), right record `j` as -(j+1) in the
+    // signed-index slot (i64); the two order-preserving range keys ride as i128.
+    let mut l1: Vec<(i64, i128, i128)> = Vec::with_capacity(n_total);
     for (i, (k1, k2)) in left_keys.iter().enumerate() {
         l1.push(((i + 1) as i64, *k1, *k2));
     }
@@ -449,7 +451,7 @@ fn iejoin_numeric_capped(
 /// Uncapped convenience wrapper, used only by the kernel's own equivalence
 /// tests; production always goes through [`pwmj_numeric_capped`].
 #[cfg(test)]
-fn pwmj_numeric(left_keys: &[i64], right_keys: &[i64], op: RangeOp) -> Vec<(usize, usize)> {
+fn pwmj_numeric(left_keys: &[i128], right_keys: &[i128], op: RangeOp) -> Vec<(usize, usize)> {
     pwmj_numeric_capped(left_keys, right_keys, op, usize::MAX)
         .expect("an uncapped pwmj_numeric (max_pairs == usize::MAX) never overflows")
 }
@@ -459,8 +461,8 @@ fn pwmj_numeric(left_keys: &[i64], right_keys: &[i64], op: RangeOp) -> Vec<(usiz
 /// materializing an over-budget vector, else `Some(pairs)` with
 /// `pairs.len() <= max_pairs`. `max_pairs == usize::MAX` is uncapped.
 fn pwmj_numeric_capped(
-    left_keys: &[i64],
-    right_keys: &[i64],
+    left_keys: &[i128],
+    right_keys: &[i128],
     op: RangeOp,
     max_pairs: usize,
 ) -> Option<Vec<(usize, usize)>> {
@@ -475,7 +477,7 @@ fn pwmj_numeric_capped(
     left_idx.sort_by(|&a, &b| cmp_dir(left_keys[a], left_keys[b], dir).then(a.cmp(&b)));
     right_idx.sort_by(|&a, &b| cmp_dir(right_keys[a], right_keys[b], dir).then(a.cmp(&b)));
 
-    let apply = |a: i64, b: i64| -> bool {
+    let apply = |a: i128, b: i128| -> bool {
         match op {
             RangeOp::Lt => a < b,
             RangeOp::Le => a <= b,
@@ -679,6 +681,10 @@ pub(crate) fn execute_combine_iejoin(
     let mut driver_range_progs: Vec<(Arc<TypedProgram>, Expr)> = Vec::new();
     let mut build_range_progs: Vec<(Arc<TypedProgram>, Expr)> = Vec::new();
     let mut range_ops: Vec<RangeOp> = Vec::new();
+    // The per-axis numeric flavor (fixed at plan time from the unified operand
+    // type) tells the scan how to reduce each side to one comparable i128. It is
+    // symmetric under the driver/build flip, so it rides `r` directly.
+    let mut range_kinds: Vec<RangeKeyType> = Vec::new();
     for r in &decomposed.ranges {
         let (driver_expr, build_expr, op) = if r.right_input.as_ref() == build_qualifier {
             (r.left_expr.clone(), r.right_expr.clone(), r.op)
@@ -706,6 +712,7 @@ pub(crate) fn execute_combine_iejoin(
         driver_range_progs.push((Arc::clone(&range_program), driver_expr));
         build_range_progs.push((Arc::clone(&range_program), build_expr));
         range_ops.push(op);
+        range_kinds.push(r.key_type);
     }
     let driver_range_extractor = KeyExtractor::new(driver_range_progs);
     let build_range_extractor = KeyExtractor::new(build_range_progs);
@@ -753,18 +760,25 @@ pub(crate) fn execute_combine_iejoin(
             scan_record(
                 &driver_extractor,
                 &driver_range_extractor,
+                &range_kinds,
                 ctx,
                 &driver_resolver,
             )
-            .map_err(|e| key_eval_error(name, "driving", e))
+            .map_err(|e| scan_key_error(name, "driving", e))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     let build_scans: Vec<RecordScan> = build_records
         .par_iter()
         .map(|rec| {
-            scan_record(&build_extractor, &build_range_extractor, ctx, rec)
-                .map_err(|e| key_eval_error(name, "build", e))
+            scan_record(
+                &build_extractor,
+                &build_range_extractor,
+                &range_kinds,
+                ctx,
+                rec,
+            )
+            .map_err(|e| scan_key_error(name, "build", e))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1579,8 +1593,24 @@ enum RecordScan {
     Matched {
         eq_hash: u64,
         eq: Vec<u8>,
-        range_key: (i64, i64),
+        range_key: (i128, i128),
     },
+}
+
+/// Why [`scan_record`] could not reduce a record's keys. `Eval` is a CXL
+/// key-expression failure (routed like any other eval error); `RangeOutOfRange`
+/// is a decimal range value the fixed-point axis cannot represent exactly
+/// (overflow or truncation) — a fail-loud data error, never a silent drop.
+#[derive(Debug)]
+enum ScanKeyError {
+    Eval(EvalError),
+    RangeOutOfRange { value: String },
+}
+
+impl From<EvalError> for ScanKeyError {
+    fn from(e: EvalError) -> Self {
+        ScanKeyError::Eval(e)
+    }
 }
 
 /// Extract one record's equality + range keys into a [`RecordScan`]. Pure over
@@ -1594,9 +1624,10 @@ enum RecordScan {
 fn scan_record(
     eq_extractor: &KeyExtractor,
     range_extractor: &KeyExtractor,
+    range_kinds: &[RangeKeyType],
     ctx: &EvalContext<'_>,
     resolver: &dyn cxl::resolve::traits::FieldResolver,
-) -> Result<RecordScan, EvalError> {
+) -> Result<RecordScan, ScanKeyError> {
     let mut eq_buf: Vec<Value> = Vec::new();
     if !eq_extractor.is_empty() {
         eq_extractor.extract_into(ctx, resolver, &mut eq_buf)?;
@@ -1608,7 +1639,7 @@ fn scan_record(
     };
     let mut range_buf: Vec<Value> = Vec::new();
     range_extractor.extract_into(ctx, resolver, &mut range_buf)?;
-    let Some(range_key) = range_keys_to_i64_pair(&range_buf) else {
+    let Some(range_key) = range_keys_to_i128_pair(&range_buf, range_kinds)? else {
         return Ok(RecordScan::Unmatched);
     };
     // Derive the prune hash from the canonical bytes: equal equality keys have
@@ -1647,39 +1678,94 @@ fn eq_hash_of_bytes(bytes: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// Convert a 1-or-2-element vector of range key Values to an
-/// `(i64, i64)` pair, returning `None` if any element is NULL or
-/// non-orderable. Single-axis callers (PWMJ) ignore the second slot;
-/// the placeholder zero keeps the layout uniform across kernels.
-fn range_keys_to_i64_pair(values: &[Value]) -> Option<(i64, i64)> {
+/// Convert a 1-or-2-element vector of range key Values to an order-preserving
+/// `(i128, i128)` pair, one axis kind per element (the axis's static numeric
+/// flavor from the typechecker). Returns `Ok(None)` when any element is NULL or
+/// not reducible to the numeric axis (routed to the unmatched pile as before),
+/// and `Err` when a decimal element is outside the exact fixed-point range —
+/// fail-loud rather than a silent drop. Single-axis callers (PWMJ) ignore the
+/// second slot; the placeholder zero keeps the layout uniform across kernels.
+fn range_keys_to_i128_pair(
+    values: &[Value],
+    kinds: &[RangeKeyType],
+) -> Result<Option<(i128, i128)>, ScanKeyError> {
     let n = values.len();
     if n == 0 {
-        return None;
+        return Ok(None);
     }
-    let v1 = value_to_i64(&values[0])?;
+    let kind0 = kinds.first().copied().unwrap_or(RangeKeyType::Unsupported);
+    let Some(v1) = value_to_i128(kind0, &values[0])? else {
+        return Ok(None);
+    };
     if n == 1 {
-        return Some((v1, 0));
+        return Ok(Some((v1, 0)));
     }
-    let v2 = value_to_i64(&values[1])?;
-    Some((v1, v2))
+    let kind1 = kinds.get(1).copied().unwrap_or(RangeKeyType::Unsupported);
+    let Some(v2) = value_to_i128(kind1, &values[1])? else {
+        return Ok(None);
+    };
+    Ok(Some((v1, v2)))
 }
 
+/// Reduce one range-axis Value to the order-preserving `i128` its axis kind
+/// dictates, so both cross-input sides land in one comparable space. The kind
+/// is the typechecker's unified operand type (`int <=> float` compares as float,
+/// `int <=> decimal` as decimal), so an integer on a float axis coerces through
+/// `f64` — matching the runtime `compare_values` semantics — and an integer on a
+/// decimal axis widens exactly onto the same fixed-point grid.
+///
+/// `Ok(None)` for a NULL / unrepresentable-but-skippable value (routed to the
+/// unmatched pile, preserving the prior behavior for those); `Err` only when a
+/// decimal value cannot be placed on the fixed-point grid exactly.
 #[inline]
-fn value_to_i64(v: &Value) -> Option<i64> {
+fn value_to_i128(kind: RangeKeyType, v: &Value) -> Result<Option<i128>, ScanKeyError> {
+    use crate::pipeline::sort_key::{
+        decimal_to_orderable_i128, float_to_orderable_i128, integer_on_decimal_grid,
+    };
     use chrono::Datelike;
-    match v {
-        Value::Integer(i) => Some(*i),
-        Value::Float(f) => {
-            if f.is_finite() {
-                Some(crate::pipeline::sort_key::float_to_orderable_i64(*f))
-            } else {
-                None
-            }
-        }
-        Value::Date(d) => Some(d.num_days_from_ce() as i64),
-        Value::DateTime(dt) => Some(dt.and_utc().timestamp_micros()),
-        _ => None,
-    }
+    let out = match kind {
+        RangeKeyType::Integer => match v {
+            Value::Integer(i) => Some(*i as i128),
+            _ => None,
+        },
+        RangeKeyType::Float => match v {
+            Value::Float(f) if f.is_finite() => Some(float_to_orderable_i128(*f)),
+            // Integer operand on a promoted float axis: coerce through f64, the
+            // same widening `compare_values` applies to `int <=> float`.
+            Value::Integer(i) => Some(float_to_orderable_i128(*i as f64)),
+            _ => None,
+        },
+        RangeKeyType::Decimal => match v {
+            Value::Decimal(d) => match decimal_to_orderable_i128(*d) {
+                Some(k) => Some(k),
+                None => {
+                    return Err(ScanKeyError::RangeOutOfRange {
+                        value: v.to_string(),
+                    });
+                }
+            },
+            // Integer operand widened exactly into the decimal context.
+            Value::Integer(i) => match integer_on_decimal_grid(*i) {
+                Some(k) => Some(k),
+                None => {
+                    return Err(ScanKeyError::RangeOutOfRange {
+                        value: v.to_string(),
+                    });
+                }
+            },
+            _ => None,
+        },
+        RangeKeyType::Date => match v {
+            Value::Date(d) => Some(d.num_days_from_ce() as i128),
+            _ => None,
+        },
+        RangeKeyType::DateTime => match v {
+            Value::DateTime(dt) => Some(dt.and_utc().timestamp_micros() as i128),
+            _ => None,
+        },
+        RangeKeyType::Unsupported => None,
+    };
+    Ok(out)
 }
 
 /// Estimated bytes of the numeric-IEJoin internal working set for a group
@@ -1695,9 +1781,10 @@ fn value_to_i64(v: &Value) -> Option<i64> {
 /// estimate back under the budget.
 fn iejoin_numeric_state_bytes(n_left: usize, n_right: usize) -> usize {
     let n_total = n_left.saturating_add(n_right);
-    // L1 + L2: two `Vec<(i64, i64, i64)>` of length n_total.
+    // L1 + L2: two `Vec<(i64, i128, i128)>` of length n_total (signed index +
+    // the two i128 range keys).
     let sort_arrays = n_total
-        .saturating_mul(std::mem::size_of::<(i64, i64, i64)>())
+        .saturating_mul(std::mem::size_of::<(i64, i128, i128)>())
         .saturating_mul(2);
     // l1_pos_of_dense + p: two `Vec<usize>` of length n_total.
     let perm = n_total
@@ -1757,6 +1844,20 @@ fn key_eval_error(name: &str, side: &'static str, err: EvalError) -> PipelineErr
     PipelineError::Compilation {
         transform_name: name.to_string(),
         messages: vec![format!("combine {side}-side range/key eval error: {err}")],
+    }
+}
+
+/// Map a [`ScanKeyError`] to the typed pipeline error for its class: a CXL
+/// key-expression failure through [`key_eval_error`], and a decimal range value
+/// beyond the fixed-point axis to the fail-loud E326 abort (never a silent
+/// drop). `side` names the combine input for the diagnostic.
+fn scan_key_error(name: &str, side: &'static str, err: ScanKeyError) -> PipelineError {
+    match err {
+        ScanKeyError::Eval(e) => key_eval_error(name, side, e),
+        ScanKeyError::RangeOutOfRange { value } => PipelineError::CombineRangeKeyOutOfRange {
+            combine: name.to_string(),
+            value,
+        },
     }
 }
 
@@ -1825,7 +1926,7 @@ mod tests {
         // sum the kernel allocates so it tracks real footprint, not a fudge
         // factor. n_total = 300.
         let n_total = 300usize;
-        let expected = n_total * std::mem::size_of::<(i64, i64, i64)>() * 2 // L1 + L2
+        let expected = n_total * std::mem::size_of::<(i64, i128, i128)>() * 2 // L1 + L2
             + n_total * std::mem::size_of::<usize>() * 2 // l1_pos_of_dense + p
             + (n_total.div_ceil(64) + n_total.div_ceil(1024).div_ceil(64))
                 * std::mem::size_of::<u64>(); // bit array
@@ -1883,7 +1984,7 @@ mod tests {
     }
 
     impl TOp {
-        fn apply(self, a: i64, b: i64) -> bool {
+        fn apply(self, a: i128, b: i128) -> bool {
             match self {
                 TOp::Lt => a < b,
                 TOp::Le => a <= b,
@@ -1911,11 +2012,11 @@ mod tests {
 
     /// One proptest case: left rows, right rows, and the two range
     /// operators forming the band predicate.
-    type JoinCase = (Vec<(i64, i64)>, Vec<(i64, i64)>, TOp, TOp);
+    type JoinCase = (Vec<(i128, i128)>, Vec<(i128, i128)>, TOp, TOp);
 
     fn nested_loop(
-        left: &[(i64, i64)],
-        right: &[(i64, i64)],
+        left: &[(i128, i128)],
+        right: &[(i128, i128)],
         op1: TOp,
         op2: TOp,
     ) -> HashSet<(usize, usize)> {
@@ -1934,8 +2035,8 @@ mod tests {
     fn test_iejoin_numeric_basic() {
         // Tax-bracket-shaped 3 left × 3 right.
         // Predicate: left.0 <= right.0 AND left.1 >= right.1.
-        let left = vec![(10_i64, 100_i64), (20, 50), (5, 200)];
-        let right = vec![(15_i64, 80_i64), (25, 150), (8, 60)];
+        let left = vec![(10_i128, 100_i128), (20, 50), (5, 200)];
+        let right = vec![(15_i128, 80_i128), (25, 150), (8, 60)];
         let actual: HashSet<(usize, usize)> =
             iejoin_numeric(&left, &right, RangeOp::Le, RangeOp::Ge)
                 .into_iter()
@@ -1963,8 +2064,8 @@ mod tests {
 
     #[test]
     fn test_iejoin_numeric_empty_inputs() {
-        let empty: Vec<(i64, i64)> = Vec::new();
-        let some = vec![(1_i64, 2_i64)];
+        let empty: Vec<(i128, i128)> = Vec::new();
+        let some = vec![(1_i128, 2_i128)];
         assert!(iejoin_numeric(&empty, &some, RangeOp::Lt, RangeOp::Lt).is_empty());
         assert!(iejoin_numeric(&some, &empty, RangeOp::Lt, RangeOp::Lt).is_empty());
         assert!(iejoin_numeric(&empty, &empty, RangeOp::Lt, RangeOp::Lt).is_empty());
@@ -1972,8 +2073,8 @@ mod tests {
 
     #[test]
     fn test_iejoin_numeric_single_row() {
-        let left = vec![(5_i64, 10_i64)];
-        let right = vec![(3_i64, 8_i64)];
+        let left = vec![(5_i128, 10_i128)];
+        let right = vec![(3_i128, 8_i128)];
         // 5 > 3 AND 10 > 8 → match
         let m: HashSet<_> = iejoin_numeric(&left, &right, RangeOp::Gt, RangeOp::Gt)
             .into_iter()
@@ -1988,8 +2089,8 @@ mod tests {
 
     #[test]
     fn test_iejoin_numeric_all_duplicates() {
-        let left: Vec<(i64, i64)> = (0..10).map(|_| (5_i64, 5_i64)).collect();
-        let right: Vec<(i64, i64)> = (0..10).map(|_| (5_i64, 5_i64)).collect();
+        let left: Vec<(i128, i128)> = (0..10).map(|_| (5_i128, 5_i128)).collect();
+        let right: Vec<(i128, i128)> = (0..10).map(|_| (5_i128, 5_i128)).collect();
         // Both ops inclusive — full Cartesian = 100 pairs.
         let actual: HashSet<(usize, usize)> =
             iejoin_numeric(&left, &right, RangeOp::Le, RangeOp::Ge)
@@ -2007,8 +2108,8 @@ mod tests {
 
     #[test]
     fn test_pwmj_numeric_basic() {
-        let left = vec![1_i64, 3, 5, 7];
-        let right = vec![2_i64, 4, 6, 8];
+        let left = vec![1_i128, 3, 5, 7];
+        let right = vec![2_i128, 4, 6, 8];
         for op in [RangeOp::Lt, RangeOp::Le, RangeOp::Gt, RangeOp::Ge] {
             let actual: HashSet<(usize, usize)> =
                 pwmj_numeric(&left, &right, op).into_iter().collect();
@@ -2032,8 +2133,8 @@ mod tests {
 
     #[test]
     fn test_pwmj_numeric_empty() {
-        let empty: Vec<i64> = Vec::new();
-        let some = vec![1_i64];
+        let empty: Vec<i128> = Vec::new();
+        let some = vec![1_i128];
         assert!(pwmj_numeric(&empty, &some, RangeOp::Lt).is_empty());
         assert!(pwmj_numeric(&some, &empty, RangeOp::Lt).is_empty());
         assert!(pwmj_numeric(&empty, &empty, RangeOp::Lt).is_empty());
@@ -2042,8 +2143,8 @@ mod tests {
     fn arb_inputs() -> impl Strategy<Value = JoinCase> {
         let op = prop_oneof![Just(TOp::Lt), Just(TOp::Le), Just(TOp::Gt), Just(TOp::Ge)];
         (
-            prop::collection::vec((-50i64..50, -50i64..50), 0..50),
-            prop::collection::vec((-50i64..50, -50i64..50), 0..50),
+            prop::collection::vec((-50i128..50, -50i128..50), 0..50),
+            prop::collection::vec((-50i128..50, -50i128..50), 0..50),
             op.clone(),
             op,
         )
@@ -2091,8 +2192,8 @@ mod tests {
         /// Same contract for the single-inequality PWMJ kernel.
         #[test]
         fn proptest_pwmj_capped_equals_uncapped_or_overflows(
-            left in prop::collection::vec(-50i64..50, 0..40),
-            right in prop::collection::vec(-50i64..50, 0..40),
+            left in prop::collection::vec(-50i128..50, 0..40),
+            right in prop::collection::vec(-50i128..50, 0..40),
             op_idx in 0usize..4,
             cap in 0usize..400,
         ) {
@@ -2171,13 +2272,18 @@ mod tests {
         fn proptest_iejoin_float_keys_match_nested_loop(
             (left, right, op1, op2) in arb_float_inputs()
         ) {
-            // Every generated value is finite, so `value_to_i64` is `Some`.
-            let enc = |rows: &[(f64, f64)]| -> Vec<(i64, i64)> {
+            // Every generated value is finite, so the float axis reduction is
+            // `Ok(Some(..))`.
+            let enc = |rows: &[(f64, f64)]| -> Vec<(i128, i128)> {
                 rows.iter()
                     .map(|&(a, b)| {
                         (
-                            value_to_i64(&Value::Float(a)).unwrap(),
-                            value_to_i64(&Value::Float(b)).unwrap(),
+                            value_to_i128(RangeKeyType::Float, &Value::Float(a))
+                                .unwrap()
+                                .unwrap(),
+                            value_to_i128(RangeKeyType::Float, &Value::Float(b))
+                                .unwrap()
+                                .unwrap(),
                         )
                     })
                     .collect()
@@ -2217,8 +2323,8 @@ mod tests {
         let n_employees_per_tile = 500usize;
         let step = SPAN / n_brackets_per_tile as i64;
 
-        let mut left: Vec<(i64, i64)> = Vec::with_capacity(2 * n_employees_per_tile);
-        let mut right: Vec<(i64, i64)> = Vec::with_capacity(2 * n_brackets_per_tile);
+        let mut left: Vec<(i128, i128)> = Vec::with_capacity(2 * n_employees_per_tile);
+        let mut right: Vec<(i128, i128)> = Vec::with_capacity(2 * n_brackets_per_tile);
         for tile in 0usize..2 {
             let base = tile as i64 * SPAN;
             for b in 0..n_brackets_per_tile {
@@ -2230,7 +2336,7 @@ mod tests {
                 // (Gt when flipped). The kernel sees the predicate as
                 // `left OP right` so the build is on the right; we pass
                 // (bracket_lo, bracket_hi) as the right tuple.
-                right.push((lo, hi));
+                right.push((lo as i128, hi as i128));
             }
             for e in 0..n_employees_per_tile {
                 // Mix per-row so income lands on different bracket
@@ -2238,7 +2344,7 @@ mod tests {
                 let mix =
                     ((tile * n_employees_per_tile + e) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 let income = base + (mix as i64).rem_euclid(SPAN);
-                left.push((income, income));
+                left.push((income as i128, income as i128));
             }
         }
 
@@ -2252,7 +2358,7 @@ mod tests {
                 .collect();
 
         // Oracle: same predicate via direct nested loop on the same
-        // (i64, i64) keys.
+        // (i128, i128) keys.
         let mut expected: HashSet<(usize, usize)> = HashSet::new();
         for (li, l) in left.iter().enumerate() {
             for (ri, r) in right.iter().enumerate() {

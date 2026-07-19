@@ -226,6 +226,33 @@ pub struct RangeConjunct {
     pub op: RangeOp,
     pub right_expr: Expr,
     pub right_input: Arc<str>,
+    /// The order-preserving reduction the IEJoin numeric axis uses for this
+    /// conjunct, fixed here from the typechecker's unified operand type so both
+    /// cross-input sides land in one comparable space (`int <=> float` → float,
+    /// `int <=> decimal` → decimal). See [`RangeKeyType`].
+    pub key_type: RangeKeyType,
+}
+
+/// How the IEJoin/block-band numeric axis reduces a range conjunct's two
+/// cross-input operands to the single order-preserving `i128` its kernels
+/// compare.
+///
+/// Chosen once, at plan time, from the CXL typechecker's unified type of the
+/// two operands so the driver and build sides share one encoding: the
+/// typechecker promotes `int <=> float` to `float` and widens `int <=> decimal`
+/// to `decimal` (and rejects `decimal <=> float` outright), and the axis honors
+/// exactly that. [`Unsupported`](RangeKeyType::Unsupported) marks a range
+/// comparison whose type is not reducible to the numeric axis (e.g. a string
+/// comparison); the runtime routes such records out of the range match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RangeKeyType {
+    Integer,
+    Float,
+    Decimal,
+    Date,
+    DateTime,
+    Unsupported,
 }
 
 /// Range operator for [`RangeConjunct`].
@@ -477,13 +504,44 @@ fn classify_conjunct(conjunct: &Expr, typed: &Arc<TypedProgram>) -> ConjunctClas
             right_input,
             right_program: Arc::clone(typed),
         }),
-        Some(op) => ConjunctClass::Range(RangeConjunct {
-            left_expr,
-            left_input,
-            op,
-            right_expr,
-            right_input,
-        }),
+        Some(op) => {
+            let key_type = range_key_type(typed, &left_expr, &right_expr);
+            ConjunctClass::Range(RangeConjunct {
+                left_expr,
+                left_input,
+                op,
+                right_expr,
+                right_input,
+                key_type,
+            })
+        }
+    }
+}
+
+/// The IEJoin numeric-axis reduction for a range conjunct, derived from the
+/// typechecker's unified type of its two operands. The where clause is already
+/// typechecked when this runs, so the operand `NodeId`s index valid entries in
+/// `typed.types`; the unify mirrors the runtime comparison coercion
+/// (`int <=> float` compares as float, `int <=> decimal` as decimal). A missing
+/// or non-orderable-in-`i128` type yields [`RangeKeyType::Unsupported`].
+fn range_key_type(typed: &TypedProgram, lhs: &Expr, rhs: &Expr) -> RangeKeyType {
+    let type_of =
+        |e: &Expr| -> Option<Type> { typed.types.get(e.node_id().0 as usize).cloned().flatten() };
+    let (Some(lt), Some(rt)) = (type_of(lhs), type_of(rhs)) else {
+        return RangeKeyType::Unsupported;
+    };
+    match lt.unwrap_nullable().unify(rt.unwrap_nullable()) {
+        Some(unified) => match unified.unwrap_nullable() {
+            Type::Int => RangeKeyType::Integer,
+            // `Numeric` (union of int/float) can be either at runtime; the float
+            // grid is the common superset, matching the runtime int→f64 coercion.
+            Type::Float | Type::Numeric => RangeKeyType::Float,
+            Type::Decimal => RangeKeyType::Decimal,
+            Type::Date => RangeKeyType::Date,
+            Type::DateTime => RangeKeyType::DateTime,
+            _ => RangeKeyType::Unsupported,
+        },
+        None => RangeKeyType::Unsupported,
     }
 }
 
@@ -2448,6 +2506,7 @@ mod tests {
             op: RangeOp::Lt,
             right_expr: dummy_lit(),
             right_input: Arc::from(inputs.get(1).map(|(q, _)| *q).unwrap_or(inputs[0].0)),
+            key_type: RangeKeyType::Integer,
         };
         let decomposed = DecomposedPredicate {
             equalities: (0..equalities).map(|_| mk_eq()).collect(),

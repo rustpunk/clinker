@@ -188,6 +188,60 @@ pub(crate) fn float_to_orderable_i64(f: f64) -> i64 {
     (f64_to_orderable_u64(f) ^ (1 << 63)) as i64
 }
 
+/// Order-preserving `f64` → `i128`: the sign-extended widening of
+/// [`float_to_orderable_i64`].
+///
+/// The inequality-join range axis carries keys as `i128` so it can also hold
+/// the fixed-point decimal grid (see [`decimal_to_orderable_i128`]). Sign
+/// extension preserves the signed ordering exactly, so a float range key
+/// compares identically to the earlier `i64` axis — the widening is
+/// behavior-preserving for float and integer axes.
+#[inline]
+pub(crate) fn float_to_orderable_i128(f: f64) -> i128 {
+    float_to_orderable_i64(f) as i128
+}
+
+/// Canonical scale of the inequality-join decimal range axis: every decimal on
+/// a decimal axis is placed on a common `10^18` fixed-point grid. 18 fractional
+/// digits are preserved exactly, and the integer magnitude reaches
+/// `i128::MAX / 10^18 ≈ 1.7e20` — far beyond any realistic monetary value.
+/// Chosen so a full `i64` operand widened onto the same grid always fits
+/// (`i64::MAX · 10^18 < i128::MAX`), keeping a mixed decimal/integer axis exact.
+pub(crate) const DECIMAL_RANGE_SCALE: u32 = 18;
+
+/// Order-preserving, value-canonical `Decimal` → `i128` for the inequality-join
+/// range axis: the decimal placed on the fixed `10^18` grid as the integer
+/// `mantissa × 10^(18 − scale)`.
+///
+/// Exact and injective for the representable range: `2.5` and `2.50` map to the
+/// same `i128` (scale-invariant), distinct values never collide, and signed
+/// ordering matches numeric ordering because `mantissa` already carries the
+/// sign. Returns `None` — never a wrong key — when the value cannot be placed
+/// exactly: a scale beyond 18 fractional digits would truncate, or the scaled
+/// magnitude would overflow `i128`. The caller turns `None` into a fail-loud
+/// typed error rather than dropping the row.
+#[inline]
+pub(crate) fn decimal_to_orderable_i128(d: rust_decimal::Decimal) -> Option<i128> {
+    let scale = d.scale();
+    if scale > DECIMAL_RANGE_SCALE {
+        return None; // more fractional digits than the grid holds → truncation
+    }
+    // `mantissa` is a 96-bit integer, so it always fits `i128`; the scaling
+    // multiply is the only step that can overflow.
+    let pow = 10i128.pow(DECIMAL_RANGE_SCALE - scale);
+    d.mantissa().checked_mul(pow)
+}
+
+/// Place an integer operand of a decimal range axis on the same `10^18` grid as
+/// [`decimal_to_orderable_i128`], so a mixed `decimal`/`integer` comparison
+/// (the CXL typechecker widens the integer exactly into the decimal context)
+/// stays exact on one axis. Always `Some` for an `i64`: `i64::MAX · 10^18`
+/// stays within `i128`.
+#[inline]
+pub(crate) fn integer_on_decimal_grid(i: i64) -> Option<i128> {
+    (i as i128).checked_mul(10i128.pow(DECIMAL_RANGE_SCALE))
+}
+
 /// Append the order-preserving 8-byte memcomparable encoding of an `f64`.
 fn encode_f64_order(f: f64, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&f64_to_orderable_u64(f).to_be_bytes());
@@ -423,6 +477,89 @@ mod tests {
                 w[1]
             );
         }
+    }
+
+    #[test]
+    fn float_to_orderable_i128_is_sign_extension() {
+        // The i128 axis form must be the exact sign-extension of the i64 form,
+        // so a float range key compares identically under either width.
+        for f in [
+            f64::MIN,
+            -1.0e300,
+            -1.0,
+            -0.0,
+            0.0,
+            1.0,
+            2.5,
+            1.0e300,
+            f64::MAX,
+        ] {
+            assert_eq!(
+                float_to_orderable_i128(f),
+                float_to_orderable_i64(f) as i128,
+                "i128 float encoding must sign-extend the i64 form for {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_to_orderable_i128_is_canonical_and_order_preserving() {
+        use rust_decimal::Decimal;
+        // Scale-invariant: equal values of differing scale share one key.
+        assert_eq!(
+            decimal_to_orderable_i128(Decimal::new(250, 2)), // 2.50
+            decimal_to_orderable_i128(Decimal::new(25, 1))   // 2.5
+        );
+        assert_eq!(
+            decimal_to_orderable_i128(Decimal::new(0, 0)),
+            decimal_to_orderable_i128(Decimal::new(0, 5))
+        );
+        // An integer widened onto the grid equals the same-valued decimal.
+        assert_eq!(
+            integer_on_decimal_grid(42),
+            decimal_to_orderable_i128(Decimal::new(42, 0))
+        );
+        // Distinct values never collide.
+        assert_ne!(
+            decimal_to_orderable_i128(Decimal::new(250, 2)),
+            decimal_to_orderable_i128(Decimal::new(251, 2))
+        );
+        // Order-preserving across a spread of magnitudes and signs.
+        let mut vals = vec![
+            Decimal::new(-99999, 2),
+            Decimal::new(-1, 0),
+            Decimal::new(-1, 2),
+            Decimal::new(0, 0),
+            Decimal::new(1, 2),
+            Decimal::new(1, 0),
+            Decimal::new(250, 2),
+            Decimal::new(251, 2),
+            Decimal::new(99999, 2),
+        ];
+        vals.sort();
+        for w in vals.windows(2) {
+            let a = decimal_to_orderable_i128(w[0]).expect("in range");
+            let b = decimal_to_orderable_i128(w[1]).expect("in range");
+            assert!(
+                a <= b,
+                "i128 order must match numeric order: {} vs {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+
+    #[test]
+    fn decimal_to_orderable_i128_rejects_out_of_range() {
+        use rust_decimal::Decimal;
+        // Truncation: more than 18 fractional digits cannot be placed exactly.
+        assert_eq!(decimal_to_orderable_i128(Decimal::new(1, 19)), None);
+        assert_eq!(decimal_to_orderable_i128(Decimal::new(123, 28)), None);
+        // Overflow: a large magnitude at a small scale exceeds i128 once scaled.
+        assert_eq!(decimal_to_orderable_i128(Decimal::MAX), None);
+        // A realistic monetary value (~1e9 at 2 dp: 999,999,999.99) stays
+        // representable.
+        assert!(decimal_to_orderable_i128(Decimal::new(99_999_999_999, 2)).is_some());
     }
 
     fn make_record(fields: &[(&str, Value)]) -> Record {
