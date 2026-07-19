@@ -4793,7 +4793,7 @@ nodes:
             "(-10,8): |−10|=10 >= |8|=8 must match (needs abs on both); got: {canon}"
         );
         assert!(
-            !data_rows.iter().any(|r| *r == "3,-4"),
+            !data_rows.contains(&"3,-4"),
             "(3,-4) is a raw-compare-only match; abs must exclude it (3 >= 4 is false); got: {canon}"
         );
     }
