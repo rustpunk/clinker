@@ -273,17 +273,27 @@ pub(crate) fn integer_on_decimal_grid(i: i64) -> Option<i128> {
 /// group identity by sort-key bytes, silently merged two distinct
 /// sub-microsecond groups once aggregation spilled.
 ///
-/// Exact and total for ANY `NaiveDateTime`, so no fail-loud arm is needed:
-/// chrono caps the year at ±262 143, bounding `|timestamp| < 8.4e15` seconds,
-/// so the nanosecond result stays under `8.4e15 · 10^9 ≈ 8.3e24` in magnitude —
-/// about fourteen orders below `i128::MAX ≈ 1.7e38`, so the multiply cannot
-/// overflow. Assembling the value directly (rather than via
-/// `timestamp_nanos_opt`, whose `i64` result saturates outside 1677–2262) keeps
-/// pre-1677 and post-2262 datetimes exact. `timestamp()` floors toward negative
-/// infinity and `timestamp_subsec_nanos()` is the non-negative offset within
-/// that floored second, so the sum is the correct signed nanosecond count for
-/// pre-epoch instants too. Pure arithmetic on an owned value: no allocation, no
-/// I/O, streaming-safe.
+/// Exact and injective for every non-leap-second `NaiveDateTime`, so no
+/// fail-loud arm is needed: chrono caps the year at ±262 143, bounding
+/// `|timestamp| < 8.3e12` seconds, so the nanosecond result stays under
+/// `8.3e12 · 10^9 ≈ 8.3e21` in magnitude — more than sixteen orders below
+/// `i128::MAX ≈ 1.7e38`, so the multiply cannot overflow. Assembling the value
+/// directly (rather than via `timestamp_nanos_opt`, whose `i64` result
+/// saturates outside 1677–2262) keeps pre-1677 and post-2262 datetimes exact.
+/// `timestamp()` floors toward negative infinity and `timestamp_subsec_nanos()`
+/// is the non-negative offset within that floored second, so the sum is the
+/// correct signed nanosecond count for pre-epoch instants too. Pure arithmetic
+/// on an owned value: no allocation, no I/O, streaming-safe.
+///
+/// Leap seconds are the lone exception: chrono stores them as second `:59` with
+/// a sub-second field in `[10^9, 2·10^9)`, which Unix `timestamp()` does not
+/// count, so this key places a leap instant onto the following second. That
+/// matches Unix-time convention and the `i64`-nanosecond `Value::DateTime` spill
+/// serialization (which collapses leap seconds identically), but not
+/// `NaiveDateTime::cmp`. All three encoders reduce through this function, so they
+/// still agree with EACH OTHER on leap seconds — cross-strategy join/sort/group
+/// results stay identical; only the axis-vs-`compare_values` order can differ at
+/// a leap instant, which no linear nanosecond key can represent distinctly.
 #[inline]
 pub(crate) fn datetime_to_orderable_i128(dt: NaiveDateTime) -> i128 {
     let utc = dt.and_utc();
@@ -774,9 +784,13 @@ mod tests {
 
     proptest! {
         /// The same one-total-order invariant under randomized datetimes,
-        /// including seconds outside the `i64`-nanosecond window and the full
-        /// nanosecond spread that stresses sub-microsecond ties. No random pair
-        /// may make any encoder disagree with `compare_values`.
+        /// including seconds outside the `i64`-nanosecond window. Independent
+        /// second draws essentially never collide, so half the cases pin `b` to
+        /// `a`'s second with an independent nanosecond — that is what actually
+        /// stresses the sub-microsecond tie ordering the key exists for (and hits
+        /// exact ties when the nanos also match); the other half draws `b`'s
+        /// second freely to cover cross-era monotonicity. No random pair may make
+        /// any encoder disagree with `compare_values`.
         #[test]
         fn prop_datetime_encoders_agree_with_compare_values(
             // Bounded to `chrono::DateTime::from_timestamp`'s valid second range
@@ -784,6 +798,7 @@ mod tests {
             // window (± ~9.2e9 s), so it richly covers the out-of-`i64`-nanos era.
             a_s in -8_000_000_000_000i64..=8_000_000_000_000i64,
             a_n in 0u32..1_000_000_000,
+            share_second in proptest::bool::ANY,
             b_s in -8_000_000_000_000i64..=8_000_000_000_000i64,
             b_n in 0u32..1_000_000_000,
         ) {
@@ -793,7 +808,8 @@ mod tests {
             use clinker_plan::plan::combine::RangeKeyType;
 
             let a = chrono::DateTime::from_timestamp(a_s, a_n).unwrap().naive_utc();
-            let b = chrono::DateTime::from_timestamp(b_s, b_n).unwrap().naive_utc();
+            let b_sec = if share_second { a_s } else { b_s };
+            let b = chrono::DateTime::from_timestamp(b_sec, b_n).unwrap().naive_utc();
             let (va, vb) = (Value::DateTime(a), Value::DateTime(b));
             let oracle = compare_values(&va, &vb);
 

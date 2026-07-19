@@ -2234,7 +2234,7 @@ mod tests {
     type FloatJoinCase = (Vec<(f64, f64)>, Vec<(f64, f64)>, TOp, TOp);
 
     /// Brute-force nested-loop join over the ORIGINAL float values. The
-    /// kernel compares `value_to_i64`-encoded keys, so agreement with this
+    /// kernel compares `value_to_i128`-encoded keys, so agreement with this
     /// oracle is exactly the order-preservation property under test.
     fn nested_loop_f64(
         left: &[(f64, f64)],
@@ -2282,7 +2282,7 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
-        /// The kernel result over `value_to_i64`-encoded float keys must
+        /// The kernel result over `value_to_i128`-encoded float keys must
         /// equal the float nested-loop oracle for every operator pair,
         /// including negatives and signed zeros. Under the old
         /// `f.to_bits() as i64` arm this diverged: among negative floats a
