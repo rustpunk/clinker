@@ -1057,14 +1057,23 @@ pub(super) fn execute_block_band(
 
             // Materialize-vs-fallback decision keyed on the kernel's ACTUAL output,
             // not the theoretical worst case. Ask the kernel for at most `max_pairs`
-            // — the count that fits beside the reserved output cap — and it stops,
-            // signaling overflow, the moment the real match count would exceed that,
-            // WITHOUT materializing an over-budget vector. A selective band / as-of
-            // join (matches ≪ driver×build) produces its small vector and takes the
-            // fast plane-sweep materialized path with no regression; only a
-            // genuinely dense pair overflows to the bounded nested loop.
+            // — and it stops, signaling overflow, the moment the real match count
+            // would exceed that, WITHOUT materializing an over-budget vector. A
+            // selective band / as-of join (matches ≪ driver×build) produces its
+            // small vector and takes the fast plane-sweep materialized path with no
+            // regression; only a genuinely dense pair overflows to the fallback.
+            //
+            // The kernel grows `out` from empty, so its backing allocation follows
+            // Vec's doubling — up to ~2× the logical length, and ~3× transiently
+            // while the final realloc holds both the old and new buffers. That
+            // transient is invisible to the arbitrator (the consumer charge is set
+            // before the call, un-polled mid-kernel), so bound the LOGICAL cap so
+            // even the ~3× peak stays within the free headroom: divide by
+            // `3 * pair_size`. Selective pairs emit far fewer than `max_pairs`, so a
+            // lower cap does not push them off the fast path; only denser pairs fall
+            // back a little earlier.
             let max_pairs =
-                (budget.hard_limit().saturating_sub(pair_peak_reserved) / pair_size) as usize;
+                (budget.hard_limit().saturating_sub(pair_peak_reserved) / (3 * pair_size)) as usize;
             let materialized = match &range_mode {
                 RangeMode::Dual { op2, driver_keys } => {
                     let bkeys: Vec<(i64, i64)> =
@@ -1084,12 +1093,18 @@ pub(super) fn execute_block_band(
                     pairs.retain(|&(di, bi)| {
                         eq_match(&driver_loaded[di].1.eq, &build_loaded[bi].1.eq)
                     });
+                    // The kernel has returned, so its O(n) `aux_kernel` sort state is
+                    // freed; the emit's live build-side footprint is
+                    // `build_held_no_aux` plus the materialized pair vector — exactly
+                    // as the fallback arm accounts. Charging or gating against
+                    // `build_held` (with aux) here would over-count the freed state
+                    // and could spuriously abort a completable `match: collect`.
                     let pairs_bytes = (pairs.len() as u64).saturating_mul(pair_size);
                     charge_working_set(
                         consumer,
                         baseline_resident,
                         driver_held
-                            .saturating_add(build_held)
+                            .saturating_add(build_held_no_aux)
                             .saturating_add(state.held_bytes())
                             .saturating_add(pairs_bytes),
                         sink.output_buffer_bytes(),
@@ -1107,7 +1122,7 @@ pub(super) fn execute_block_band(
                     let pair_budget = PairBudget {
                         floor: baseline_resident
                             .saturating_add(driver_held)
-                            .saturating_add(build_held)
+                            .saturating_add(build_held_no_aux)
                             .saturating_add(pairs_bytes)
                             .saturating_add(inblock_buf.bytes_used() as u64)
                             .saturating_add(deferred_cap),

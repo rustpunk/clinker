@@ -4703,6 +4703,106 @@ nodes:
         );
     }
 
+    /// max_output_rows on a grace-hash combine (forced via `strategy: grace_hash`)
+    /// must fail loud with E325 over the cap and complete uncapped — proving the
+    /// cap reaches the grace-hash emit chokepoint, not only the block-band and
+    /// hash/sort-merge paths. Many-to-many key: 3 probe × 4 build on the same key
+    /// = 12 output rows; a cap of 5 aborts.
+    #[test]
+    fn max_output_rows_caps_grace_hash_combine() {
+        let yaml = r#"
+pipeline:
+  name: cap_grace
+nodes:
+  - type: source
+    name: build
+    config:
+      name: build
+      type: csv
+      path: build.csv
+      schema:
+        - { name: key, type: string }
+        - { name: b, type: string }
+  - type: source
+    name: probe
+    config:
+      name: probe
+      type: csv
+      path: probe.csv
+      schema:
+        - { name: key, type: string }
+        - { name: p, type: string }
+  - type: combine
+    name: joined
+    input:
+      probe: probe
+      build: build
+    config:
+      where: "probe.key == build.key"
+      match: all
+      on_miss: skip
+      strategy: grace_hash
+      max_output_rows: 5
+      cxl: |
+        emit key = probe.key
+        emit p = probe.p
+        emit b = build.b
+      propagate_ck: driver
+  - type: output
+    name: result
+    input: joined
+    config:
+      name: result
+      type: csv
+      path: cap_grace.csv
+"#;
+        let probe = "key,p\nK,p1\nK,p2\nK,p3\n";
+        let build = "key,b\nK,b1\nK,b2\nK,b3\nK,b4\n";
+        let inputs = [("probe", probe), ("build", build)];
+        let err = run_combine_fixture(yaml, &inputs, Some("probe"))
+            .expect_err("12 output rows over a cap of 5 must fail loud on grace-hash");
+        match err {
+            CombineFixtureError::Run(PipelineError::CombineOutputCapExceeded { cap, combine }) => {
+                assert_eq!(cap, 5, "the error must name the configured cap");
+                assert_eq!(combine, "joined", "the error must name the combine node");
+            }
+            other => panic!("expected E325 on the grace-hash combine; got {other}"),
+        }
+
+        // Confirm the strategy hint actually selected grace-hash, so this really
+        // exercises the grace emit chokepoint (not a HashBuildProbe fallback).
+        let cfg = clinker_plan::yaml::from_str::<PipelineConfig>(yaml).expect("YAML must parse");
+        let plan = cfg
+            .compile(&clinker_plan::config::CompileContext::default())
+            .expect("YAML must compile");
+        let combine_node = plan
+            .dag()
+            .graph
+            .node_indices()
+            .find(|i| matches!(plan.dag().graph[*i], PlanNode::Combine { .. }))
+            .expect("combine node must exist");
+        if let PlanNode::Combine { strategy, .. } = &plan.dag().graph[combine_node] {
+            assert!(
+                matches!(
+                    strategy,
+                    clinker_plan::plan::combine::CombineStrategy::GraceHash { .. }
+                ),
+                "the cap test must run on grace-hash; got {strategy:?}",
+            );
+        }
+
+        // Drop the cap → the grace-hash combine completes with all 12 rows.
+        let uncapped = yaml.replace("      max_output_rows: 5\n", "");
+        let ok = run_combine_fixture(&uncapped, &inputs, Some("probe"))
+            .expect("an uncapped grace-hash combine completes");
+        let canon = canonicalize_csv(ok.primary_output());
+        let rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            rows, 12,
+            "3×4 many-to-many grace-hash join emits 12 rows uncapped"
+        );
+    }
+
     /// Strategy-selection: an estimated build cardinality whose product
     /// with the per-record byte estimate clears the default soft-limit
     /// must yield `CombineStrategy::GraceHash` instead of

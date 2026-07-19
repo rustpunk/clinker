@@ -1032,18 +1032,9 @@ pub(crate) fn dispatch_combine(
                     }
                     emitted_since_check += output_records.len() - before;
 
-                    // Opt-in output-size runaway guard (E325), checked per driver
-                    // against the cumulative output count. Fails loud rather than
-                    // truncating; independent of the memory backstop below (a count
-                    // ceiling, not a byte one).
-                    if let Some(cap) = kernel.max_output_rows
-                        && output_records.len() as u64 > cap
-                    {
-                        return Err(PipelineError::CombineOutputCapExceeded {
-                            combine: name.clone(),
-                            cap,
-                        });
-                    }
+                    // The opt-in `max_output_rows` cap (E325) is enforced per-row
+                    // inside `kernel.probe_row` (before each push), so it needs no
+                    // check here — this loop only bounds memory.
 
                     // Budget check every 10K emitted records to bound memory under
                     // fan-out. The build phase polls `should_abort` every 10K
@@ -1340,20 +1331,10 @@ fn run_streaming_combine_probe(
                     continue;
                 }
 
-                // Opt-in output-size runaway guard (E325), per driver against the
-                // cumulative output count — the same check the materialized loop
-                // makes, so the cap covers the streaming-probe path too. Drain the
-                // channel first so the producer thread cannot deadlock on a full
-                // channel while this consumer returns.
-                if let Some(cap) = kernel.max_output_rows
-                    && output_records.len() as u64 > cap
-                {
-                    while rx.recv().is_ok() {}
-                    return Err(PipelineError::CombineOutputCapExceeded {
-                        combine: name.to_string(),
-                        cap,
-                    });
-                }
+                // The opt-in `max_output_rows` cap (E325) is enforced per-row inside
+                // `kernel.probe_row`; when it trips, `probe_row` returns `Err`, which
+                // the match above already surfaces after draining the channel — so
+                // the streaming path is covered without a separate check here.
 
                 // Budget check every 10K emitted records, the same cadence
                 // and abort the materialized loop uses.
@@ -1532,6 +1513,23 @@ struct CombineProbeKernel<'k> {
 }
 
 impl CombineProbeKernel<'_> {
+    /// Fail loud with E325 if the combine's cumulative output has already reached
+    /// the opt-in `max_output_rows` cap. Called before each output push, so the
+    /// cap is enforced per-row (exactly `cap` rows land, the first over-cap row
+    /// aborts) — the same granularity the spill-backed strategies use, so every
+    /// combine strategy matches the documented behavior.
+    fn check_output_cap(&self, current_len: usize) -> Result<(), PipelineError> {
+        if let Some(cap) = self.max_output_rows
+            && current_len as u64 >= cap
+        {
+            return Err(PipelineError::CombineOutputCapExceeded {
+                combine: self.name.to_string(),
+                cap,
+            });
+        }
+        Ok(())
+    }
+
     /// Probe one driver record against the materialized hash table, pushing
     /// every emitted `(Record, row_num)` into `out` and accumulating
     /// `distinct` / `filtered` skips into `counters`. Returns
@@ -1653,6 +1651,7 @@ impl CombineProbeKernel<'_> {
                     );
                 }
                 rec.set(self.build_qualifier, Value::Array(arr));
+                self.check_output_cap(out.len())?;
                 out.push((rec, rn));
                 Ok(ProbeRowStep::Continue)
             }
@@ -1743,6 +1742,7 @@ impl CombineProbeKernel<'_> {
                                     for (k, v) in *record_vars {
                                         let _ = rec.set_record_var(&k, v);
                                     }
+                                    self.check_output_cap(out.len())?;
                                     out.push((rec, rn));
                                     Ok(ProbeRowStep::Continue)
                                 }
@@ -1805,6 +1805,7 @@ impl CombineProbeKernel<'_> {
                                     matched,
                                     self.propagate_ck,
                                 );
+                                self.check_output_cap(out.len())?;
                                 out.push((rec, rn));
                             }
                             Ok(EvalResult::Skip(SkipReason::Filtered)) => counters.filtered += 1,
@@ -1865,6 +1866,7 @@ impl CombineProbeKernel<'_> {
                             });
                         }
                         let rec = Record::new(Arc::clone(target_schema), values);
+                        self.check_output_cap(out.len())?;
                         out.push((rec, rn));
                     }
                     Ok(ProbeRowStep::Continue)
