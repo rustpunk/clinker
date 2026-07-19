@@ -4798,6 +4798,84 @@ nodes:
         );
     }
 
+    /// The Float sibling of `combine_abs_int_pair_range_matches`: `abs()` of
+    /// same-`float` operands resolves to the concrete `Float` axis and runs, so
+    /// this exercises `abs` end-to-end on the float axis (the int test only
+    /// covers the integer axis). Fractional negatives make `abs` load-bearing.
+    #[test]
+    fn combine_abs_float_pair_range_matches() {
+        let yaml = r#"
+pipeline:
+  name: abs_float_pair
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: x, type: float }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: y, type: float }
+  - type: combine
+    name: banded
+    input:
+      a: a
+      b: b
+    config:
+      where: "a.x.abs() >= b.y.abs()"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit ax = a.x
+        emit bx = b.y
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+        // Driver a.x ∈ {-2.5, 0.5} (|x| = 2.5, 0.5); build b.y ∈ {-1.5, 3.5}
+        // (|y| = 1.5, 3.5). Match iff |a.x| >= |b.y|:
+        //   a=-2.5(2.5): b=-1.5(1.5) 2.5>=1.5 ✓ → (-2.5,-1.5);  b=3.5 2.5>=3.5 ✗
+        //   a= 0.5(0.5): b=-1.5(1.5) ✗;  b=3.5 ✗ → no match (skipped)
+        // Exactly 1 matched pair (-2.5,-1.5). A raw `a.x >= b.y` (no abs) would
+        // instead match only (0.5,-1.5) — disjoint — so this proves abs runs on
+        // the Float axis end to end.
+        let a_csv = "x\n-2.5\n0.5\n";
+        let b_csv = "y\n-1.5\n3.5\n";
+        let result = run_combine_fixture(yaml, &[("a", a_csv), ("b", b_csv)], Some("a"))
+            .expect("abs(float) >= abs(float) range join must compile and run");
+        let canon = canonicalize_csv(result.primary_output());
+        let data_rows: Vec<&str> = canon.lines().skip(1).filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            data_rows.len(),
+            1,
+            "expected exactly 1 matched (a,b) pair; got: {canon}"
+        );
+        // Parse the row's two floats numerically so the assertion does not depend
+        // on the writer's float formatting.
+        let cols: Vec<f64> = data_rows[0]
+            .split(',')
+            .map(|c| c.parse::<f64>().expect("float columns ax,bx"))
+            .collect();
+        assert_eq!(cols.len(), 2, "row must be ax,bx; got: {canon}");
+        assert!(
+            (cols[0] - (-2.5)).abs() < 1e-9 && (cols[1] - (-1.5)).abs() < 1e-9,
+            "matched pair must be (-2.5,-1.5) — the abs-only match, not the raw-compare-only (0.5,-1.5); got: {canon}"
+        );
+    }
+
     /// A `decimal` range operand compared against an ambiguous `numeric`
     /// (`abs(int)`) is rejected at plan time with E327: the numeric side's runtime
     /// value may be an integer widened exactly into the decimal domain OR a float,

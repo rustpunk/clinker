@@ -2525,7 +2525,20 @@ mod tests {
         /// A `receiver.method(args...)` call typed as the `Numeric` supertype —
         /// how the typechecker types `abs`/`min`/`max`/`clamp`.
         fn numeric_call(&mut self, method: &str, receiver: Expr, args: Vec<Expr>) -> Expr {
-            let node_id = self.alloc(Type::Numeric);
+            self.numeric_call_typed(Type::Numeric, method, receiver, args)
+        }
+
+        /// A `receiver.method(args...)` call carrying an explicit result type —
+        /// used to model a nullable-receiver call, which the typechecker types
+        /// as `Nullable(Numeric)`.
+        fn numeric_call_typed(
+            &mut self,
+            ty: Type,
+            method: &str,
+            receiver: Expr,
+            args: Vec<Expr>,
+        ) -> Expr {
+            let node_id = self.alloc(ty);
             Expr::MethodCall {
                 node_id,
                 receiver: Box::new(receiver),
@@ -2677,6 +2690,55 @@ mod tests {
         assert_eq!(
             range_key_type(&s.typed(), &lhs, &rhs),
             RangeKeyType::Numeric
+        );
+    }
+
+    #[test]
+    fn range_key_type_max_int_pair_reduces_to_integer() {
+        // a.i.max(b.i) can only return an int — covers `max` in the enumerated
+        // method set (it shares min's arm, but the set is pinned explicitly).
+        let mut s = RangeOperandScaffold::new();
+        let recv = s.field("a", "i", Type::Int);
+        let arg = s.field("b", "i", Type::Int);
+        let lhs = s.numeric_call("max", recv, vec![arg]);
+        let rhs = s.field("c", "i", Type::Int);
+        assert_eq!(
+            range_key_type(&s.typed(), &lhs, &rhs),
+            RangeKeyType::Integer
+        );
+    }
+
+    #[test]
+    fn range_key_type_clamp_diverging_later_arg_stays_numeric() {
+        // a.f.clamp(b.f, c.i): the receiver and first bound are float but the
+        // SECOND bound is int, so a value clamped up to it could be an int. Every
+        // argument must be checked, not just the first: a first-arg-only reducer
+        // would route this onto the Float axis and silently disagree with
+        // `compare_values`, so it must stay `Numeric` (E327).
+        let mut s = RangeOperandScaffold::new();
+        let recv = s.field("a", "f", Type::Float);
+        let lo = s.field("b", "f", Type::Float);
+        let hi = s.field("c", "i", Type::Int);
+        let lhs = s.numeric_call("clamp", recv, vec![lo, hi]);
+        let rhs = s.field("d", "f", Type::Float);
+        assert_eq!(
+            range_key_type(&s.typed(), &lhs, &rhs),
+            RangeKeyType::Numeric
+        );
+    }
+
+    #[test]
+    fn range_key_type_nullable_abs_int_reduces_to_integer() {
+        // abs() over a nullable-int receiver types as Nullable(Numeric); leaf
+        // recovery must unwrap the nullable on both the call and the receiver to
+        // reach the concrete int and reduce to the Integer axis.
+        let mut s = RangeOperandScaffold::new();
+        let recv = s.field("a", "x", Type::nullable(Type::Int));
+        let lhs = s.numeric_call_typed(Type::nullable(Type::Numeric), "abs", recv, vec![]);
+        let rhs = s.field("b", "y", Type::Int);
+        assert_eq!(
+            range_key_type(&s.typed(), &lhs, &rhs),
+            RangeKeyType::Integer
         );
     }
 
