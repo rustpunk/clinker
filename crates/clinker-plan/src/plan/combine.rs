@@ -248,10 +248,13 @@ pub struct RangeConjunct {
 ///
 /// [`Numeric`](RangeKeyType::Numeric) and [`Unsupported`](RangeKeyType::Unsupported)
 /// are the two flavors the numeric axis cannot reduce without risking a silent
-/// disagreement with `compare_values` — an ambiguous `Numeric` operand
-/// (`abs`/`min`/`max`/`clamp`, whose runtime value may be an integer compared
-/// exactly OR a float) or a non-orderable type. Both are rejected at plan time
-/// (E327) rather than routed to the axis.
+/// disagreement with `compare_values` — an irreducibly-ambiguous `Numeric`
+/// operand or a non-orderable type. Both are rejected at plan time (E327) rather
+/// than routed to the axis. An `abs`/`min`/`max`/`clamp` operand types as the
+/// `Numeric` supertype but is not automatically ambiguous: when its concrete leaf
+/// type is recoverable and both operands share it (see `resolve_concrete_numeric`)
+/// the axis reduces to `Integer`/`Float`; only the genuinely-mixed or
+/// non-numeric-partner residue stays `Numeric`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RangeKeyType {
@@ -273,11 +276,12 @@ pub enum RangeKeyType {
     Date,
     /// Both operands are `datetime`. SortMerge-safe.
     DateTime,
-    /// At least one operand is the ambiguous `Numeric` supertype
-    /// (`abs`/`min`/`max`/`clamp` over a numeric): its runtime value may be an
-    /// integer (compared exactly by the residual) or a float, so no single axis
-    /// reduction agrees with `compare_values` for every value. Rejected at plan
-    /// time (E327).
+    /// An operand is the ambiguous `Numeric` supertype whose concrete leaf type
+    /// cannot be recovered to match its partner — a genuinely-mixed pair like
+    /// `abs(int) >= abs(float)`, a per-row-ambiguous `min(int, float)`, or a
+    /// decimal/non-numeric partner. Its runtime value may be an integer (compared
+    /// exactly by the residual) or a float, so no single axis reduction agrees
+    /// with `compare_values` for every value. Rejected at plan time (E327).
     Numeric,
     /// The operands do not reduce to any orderable numeric axis (e.g. a string
     /// or boolean comparison, or a type that does not unify). Rejected at plan
@@ -567,14 +571,27 @@ fn range_key_type(typed: &TypedProgram, lhs: &Expr, rhs: &Expr) -> RangeKeyType 
     let (Some(lt), Some(rt)) = (type_of(lhs), type_of(rhs)) else {
         return RangeKeyType::Unsupported;
     };
-    // Any `Numeric` operand is ambiguous (its runtime value may be an integer
-    // compared exactly by the residual, or a float): no single axis reduction
-    // agrees with `compare_values` for every value, so mark it for plan-time
-    // rejection ahead of the concrete pairings below.
+    // A top-level `Numeric` operand (an `abs`/`min`/`max`/`clamp` call, which the
+    // typechecker types as the `Int | Float` supertype) is only ambiguous when its
+    // concrete leaf type cannot be recovered. Recurse the call tree: when every
+    // value the call can return — its receiver and, for `min`/`max`/`clamp`, each
+    // argument — agrees on ONE concrete type, and BOTH operands resolve to the
+    // SAME concrete type, the axis is exactly as safe as a plain field pairing.
+    // Anything else (a genuinely mixed pair like `abs(int) >= abs(float)`, a
+    // per-row-ambiguous `min(int, float)`, or a decimal/non-numeric partner) stays
+    // `Numeric` and is rejected at plan time (E327) — no single axis reduction
+    // agrees with `compare_values` for every runtime value.
     if matches!(lt.unwrap_nullable(), Type::Numeric)
         || matches!(rt.unwrap_nullable(), Type::Numeric)
     {
-        return RangeKeyType::Numeric;
+        return match (
+            resolve_concrete_numeric(typed, lhs),
+            resolve_concrete_numeric(typed, rhs),
+        ) {
+            (Some(Concrete::Int), Some(Concrete::Int)) => RangeKeyType::Integer,
+            (Some(Concrete::Float), Some(Concrete::Float)) => RangeKeyType::Float,
+            _ => RangeKeyType::Numeric,
+        };
     }
     match (lt.unwrap_nullable(), rt.unwrap_nullable()) {
         (Type::Int, Type::Int) => RangeKeyType::Integer,
@@ -586,6 +603,53 @@ fn range_key_type(typed: &TypedProgram, lhs: &Expr, rhs: &Expr) -> RangeKeyType 
         (Type::Date, Type::Date) => RangeKeyType::Date,
         (Type::DateTime, Type::DateTime) => RangeKeyType::DateTime,
         _ => RangeKeyType::Unsupported,
+    }
+}
+
+/// The concrete numeric leaf type recovered for a range operand that the
+/// typechecker types as the `Numeric` (`Int | Float`) supertype.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Concrete {
+    Int,
+    Float,
+}
+
+/// Recover the concrete numeric type of a range operand whose top-level type is
+/// the ambiguous `Numeric` supertype produced by `abs`/`min`/`max`/`clamp`.
+///
+/// A concrete `Int`/`Float` operand resolves to itself. A `Numeric`-typed
+/// `abs`/`min`/`max`/`clamp` call resolves only when every value it can return
+/// agrees on one concrete type: `abs`'s result is its receiver's, while
+/// `min`/`max`/`clamp` may return the receiver OR any argument, so the receiver
+/// and all arguments must unify to the same concrete type. Returns `None` for
+/// a mixed (`min(int, float)`), non-numeric, or otherwise unrecoverable operand,
+/// which keeps the axis `Numeric` and rejected at plan time (E327). Recursion
+/// mirrors `collect_qualifiers_inner`'s `MethodCall` descent, so nested calls
+/// (`abs(min(a.i, b.i))`) and calls over arithmetic (`abs(a.i + 1)`, whose
+/// receiver is a `Binary` node already typed concretely) reduce correctly.
+fn resolve_concrete_numeric(typed: &TypedProgram, expr: &Expr) -> Option<Concrete> {
+    let ty = typed.types.get(expr.node_id().0 as usize)?.as_ref()?;
+    match ty.unwrap_nullable() {
+        Type::Int => Some(Concrete::Int),
+        Type::Float => Some(Concrete::Float),
+        Type::Numeric => match expr {
+            Expr::MethodCall {
+                receiver,
+                method,
+                args,
+                ..
+            } if matches!(&**method, "abs" | "min" | "max" | "clamp") => {
+                let resolved = resolve_concrete_numeric(typed, receiver)?;
+                for arg in args {
+                    if resolve_concrete_numeric(typed, arg)? != resolved {
+                        return None;
+                    }
+                }
+                Some(resolved)
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -2423,6 +2487,197 @@ mod tests {
                 .unwrap();
         assert!(json.contains("hash_partition_iejoin"));
         assert!(json.contains("\"partition_bits\":8"));
+    }
+
+    // ── range_key_type: concrete-leaf recovery through abs/min/max/clamp ──
+    //
+    // `range_key_type` reads only `typed.types[node_id]` plus the `MethodCall`
+    // shape, so these build operand `Expr`s and a matching `types` vector by
+    // hand and exercise the classifier in isolation, without a full CXL compile.
+
+    /// Accumulates operand `Expr`s and their node types so both sides of a
+    /// range comparison share one contiguous `types` vector (node id == index).
+    struct RangeOperandScaffold {
+        types: Vec<Option<Type>>,
+    }
+
+    impl RangeOperandScaffold {
+        fn new() -> Self {
+            Self { types: Vec::new() }
+        }
+
+        fn alloc(&mut self, ty: Type) -> NodeId {
+            let id = NodeId(self.types.len() as u32);
+            self.types.push(Some(ty));
+            id
+        }
+
+        /// A concrete-typed leaf field `qual.name`.
+        fn field(&mut self, qual: &str, name: &str, ty: Type) -> Expr {
+            let node_id = self.alloc(ty);
+            Expr::QualifiedFieldRef {
+                node_id,
+                parts: vec![Box::<str>::from(qual), Box::<str>::from(name)].into_boxed_slice(),
+                span: cxl::lexer::Span::new(0, 0),
+            }
+        }
+
+        /// A `receiver.method(args...)` call typed as the `Numeric` supertype —
+        /// how the typechecker types `abs`/`min`/`max`/`clamp`.
+        fn numeric_call(&mut self, method: &str, receiver: Expr, args: Vec<Expr>) -> Expr {
+            let node_id = self.alloc(Type::Numeric);
+            Expr::MethodCall {
+                node_id,
+                receiver: Box::new(receiver),
+                method: Box::<str>::from(method),
+                args,
+                span: cxl::lexer::Span::new(0, 0),
+            }
+        }
+
+        fn typed(&self) -> TypedProgram {
+            TypedProgram {
+                program: cxl::ast::Program {
+                    statements: Vec::new(),
+                    span: cxl::lexer::Span::new(0, 0),
+                },
+                types: self.types.clone(),
+                bindings: Vec::new(),
+                field_types: IndexMap::new(),
+                regexes: Vec::new(),
+                node_count: self.types.len() as u32,
+                output_row: cxl::typecheck::row::Row::closed(
+                    IndexMap::new(),
+                    cxl::lexer::Span::new(0, 0),
+                ),
+                source: None,
+            }
+        }
+    }
+
+    #[test]
+    fn range_key_type_abs_int_pair_reduces_to_integer() {
+        // a.x.abs() >= b.y.abs() over int columns: both leaves are int, so the
+        // axis is exactly as safe as a plain int/int field pairing.
+        let mut s = RangeOperandScaffold::new();
+        let lx = s.field("a", "x", Type::Int);
+        let lhs = s.numeric_call("abs", lx, vec![]);
+        let ry = s.field("b", "y", Type::Int);
+        let rhs = s.numeric_call("abs", ry, vec![]);
+        assert_eq!(
+            range_key_type(&s.typed(), &lhs, &rhs),
+            RangeKeyType::Integer
+        );
+    }
+
+    #[test]
+    fn range_key_type_abs_float_pair_reduces_to_float() {
+        let mut s = RangeOperandScaffold::new();
+        let lx = s.field("a", "x", Type::Float);
+        let lhs = s.numeric_call("abs", lx, vec![]);
+        let ry = s.field("b", "y", Type::Float);
+        let rhs = s.numeric_call("abs", ry, vec![]);
+        assert_eq!(range_key_type(&s.typed(), &lhs, &rhs), RangeKeyType::Float);
+    }
+
+    #[test]
+    fn range_key_type_abs_mixed_pair_stays_numeric() {
+        // abs(int) >= abs(float): the two axes disagree with `compare_values`,
+        // so the pair stays `Numeric` (E327) rather than becoming MixedNumeric.
+        let mut s = RangeOperandScaffold::new();
+        let lx = s.field("a", "x", Type::Int);
+        let lhs = s.numeric_call("abs", lx, vec![]);
+        let ry = s.field("b", "y", Type::Float);
+        let rhs = s.numeric_call("abs", ry, vec![]);
+        assert_eq!(
+            range_key_type(&s.typed(), &lhs, &rhs),
+            RangeKeyType::Numeric
+        );
+    }
+
+    #[test]
+    fn range_key_type_min_same_int_args_reduces_to_integer() {
+        // a.i.min(b.i) can only return an int, so min(int, int) >= int reduces.
+        let mut s = RangeOperandScaffold::new();
+        let recv = s.field("a", "i", Type::Int);
+        let arg = s.field("b", "i", Type::Int);
+        let lhs = s.numeric_call("min", recv, vec![arg]);
+        let rhs = s.field("c", "i", Type::Int);
+        assert_eq!(
+            range_key_type(&s.typed(), &lhs, &rhs),
+            RangeKeyType::Integer
+        );
+    }
+
+    #[test]
+    fn range_key_type_min_mixed_args_stays_numeric() {
+        // a.i.min(b.f) may return the int receiver OR the float argument, so its
+        // concrete type is per-row-ambiguous: the pair stays `Numeric` (E327).
+        let mut s = RangeOperandScaffold::new();
+        let recv = s.field("a", "i", Type::Int);
+        let arg = s.field("b", "f", Type::Float);
+        let lhs = s.numeric_call("min", recv, vec![arg]);
+        let rhs = s.field("c", "i", Type::Int);
+        assert_eq!(
+            range_key_type(&s.typed(), &lhs, &rhs),
+            RangeKeyType::Numeric
+        );
+    }
+
+    #[test]
+    fn range_key_type_clamp_same_float_reduces_to_float() {
+        // a.f.clamp(b.f, c.f): receiver and both bounds are float, so every value
+        // the call can return is a float.
+        let mut s = RangeOperandScaffold::new();
+        let recv = s.field("a", "f", Type::Float);
+        let lo = s.field("b", "f", Type::Float);
+        let hi = s.field("c", "f", Type::Float);
+        let lhs = s.numeric_call("clamp", recv, vec![lo, hi]);
+        let rhs = s.field("d", "f", Type::Float);
+        assert_eq!(range_key_type(&s.typed(), &lhs, &rhs), RangeKeyType::Float);
+    }
+
+    #[test]
+    fn range_key_type_nested_call_reduces_to_integer() {
+        // abs(min(a.i, b.i)): nested calls bottom out at concrete int leaves.
+        let mut s = RangeOperandScaffold::new();
+        let recv = s.field("a", "i", Type::Int);
+        let arg = s.field("b", "i", Type::Int);
+        let inner = s.numeric_call("min", recv, vec![arg]);
+        let lhs = s.numeric_call("abs", inner, vec![]);
+        let rhs = s.field("c", "i", Type::Int);
+        assert_eq!(
+            range_key_type(&s.typed(), &lhs, &rhs),
+            RangeKeyType::Integer
+        );
+    }
+
+    #[test]
+    fn range_key_type_abs_int_vs_decimal_stays_numeric() {
+        // abs(int) >= decimal: a decimal partner is not recoverable to int, so
+        // the pair stays `Numeric` (E327) — decimal-vs-numeric is unchanged.
+        let mut s = RangeOperandScaffold::new();
+        let lx = s.field("a", "i", Type::Int);
+        let lhs = s.numeric_call("abs", lx, vec![]);
+        let rhs = s.field("b", "d", Type::Decimal);
+        assert_eq!(
+            range_key_type(&s.typed(), &lhs, &rhs),
+            RangeKeyType::Numeric
+        );
+    }
+
+    #[test]
+    fn range_key_type_unlisted_numeric_method_stays_numeric() {
+        // A Numeric-typed call whose method is outside {abs, min, max, clamp}
+        // is not reduced — the leaf-recovery guard rejects it.
+        let mut s = RangeOperandScaffold::new();
+        let recv = s.field("a", "i", Type::Int);
+        let lhs = s.numeric_call("some_other_fn", recv, vec![]);
+        let rhs = s.field("b", "i", Type::Int);
+        assert_eq!(
+            range_key_type(&s.typed(), &lhs, &rhs),
+            RangeKeyType::Numeric
+        );
     }
 
     /// Build a single combine input plus, when a row count is supplied,
