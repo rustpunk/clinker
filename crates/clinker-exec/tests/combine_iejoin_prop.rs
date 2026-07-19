@@ -1292,4 +1292,384 @@ nodes:
             "the tight budget must have spilled the block-band sides"
         );
     }
+
+    // ── decimal + mixed-numeric range axes ───────────────────────────────
+    //
+    // The block-band numeric axis carries range keys as i128 so a decimal band
+    // join (monetary bracket/tier lookups) and a mixed integer/float range join
+    // land in one order-preserving space instead of silently dropping every row.
+    // These oracles compare the engine to a brute-force reference over the REAL
+    // typed values, across the tight (spilling) and roomy (resident) budgets, so
+    // the decimal keys flowing through the block-band drain/sort/spill are proven
+    // deterministic and byte-identical regardless of memory pressure.
+
+    use rust_decimal::Decimal;
+
+    /// One decimal-band driver row (`id`, `amount`) and build row
+    /// (`id`, `lo`, `hi`); a mixed-band build row carries float bounds. Named so
+    /// the workload return types stay readable (mirrors the `Row` alias above).
+    type DecDriver = (i64, Decimal);
+    type DecBuild = (i64, Decimal, Decimal);
+    type MixBuild = (i64, f64, f64);
+
+    const DEC_BAND_YAML: &str = r#"
+pipeline:
+  name: pure_range_decimal_band
+  memory: { limit: "__LIMIT__", backpressure: __POLICY__ }
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: drivers.csv
+      schema:
+        - { name: did, type: int }
+        - { name: amount, type: decimal, scale: 4 }
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: builds.csv
+      schema:
+        - { name: bid, type: int }
+        - { name: lo, type: decimal, scale: 2 }
+        - { name: hi, type: decimal, scale: 2 }
+  - type: combine
+    name: banded
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.amount >= builds.lo and drivers.amount < builds.hi"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit did = drivers.did
+        emit bid = builds.bid
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+    /// Half-open decimal band workload: driver `i` carries a scale-4 amount
+    /// tiling `[0, span)` ten-thousandths, band `b` is the half-open dollar
+    /// interval `[b.00, (b+1).00)` at scale 2. The two sides deliberately carry
+    /// DIFFERENT scales so the amounts that land exactly on a whole-dollar floor
+    /// (e.g. `5.0000` vs `5.00`) exercise the fixed-point grid's scale-invariance
+    /// (`2.5` and `2.50` compare equal). Sized to overflow the tight sort
+    /// threshold into spilled runs.
+    fn decimal_band_workload() -> (Vec<DecDriver>, Vec<DecBuild>, String, String) {
+        let n_builds = 40i64;
+        let span_e4 = n_builds * 10_000; // [0.0000, 40.0000) as ten-thousandths
+        let n_drivers = 8_000i64;
+        let mut drivers = Vec::with_capacity(n_drivers as usize);
+        let mut driver_csv = String::from("did,amount\n");
+        for i in 0..n_drivers {
+            let amount = Decimal::new(tiled_key(i, span_e4), 4);
+            drivers.push((i, amount));
+            driver_csv.push_str(&format!("{i},{amount}\n"));
+        }
+        // Explicit cross-scale equality boundaries: a scale-4 amount exactly
+        // equal to a scale-2 band floor must match that band (inclusive `>=`),
+        // proving `b.0000 == b.00` on the grid.
+        for (k, b) in [(0i64, 7i64), (1, 13), (2, 25), (3, 39)] {
+            let did = n_drivers + k;
+            let amount = Decimal::new(b * 10_000, 4); // b.0000
+            drivers.push((did, amount));
+            driver_csv.push_str(&format!("{did},{amount}\n"));
+        }
+        let mut builds = Vec::with_capacity(n_builds as usize);
+        let mut build_csv = String::from("bid,lo,hi\n");
+        for b in 0..n_builds {
+            let lo = Decimal::new(b * 100, 2); // b.00
+            let hi = Decimal::new((b + 1) * 100, 2); // (b+1).00
+            builds.push((b, lo, hi));
+            build_csv.push_str(&format!("{b},{lo},{hi}\n"));
+        }
+        (drivers, builds, driver_csv, build_csv)
+    }
+
+    /// Nested-loop oracle for a decimal half-open band (`amount >= lo AND
+    /// amount < hi`) over exact `Decimal` values, as `(driver_id, build_id)`.
+    fn decimal_oracle_band(drivers: &[DecDriver], builds: &[DecBuild]) -> HashSet<(i64, i64)> {
+        let mut out = HashSet::new();
+        for (did, amount) in drivers {
+            for (bid, lo, hi) in builds {
+                if amount >= lo && amount < hi {
+                    out.insert((*did, *bid));
+                }
+            }
+        }
+        out
+    }
+
+    /// A decimal band join emits exactly the `Decimal`-oracle match set and does
+    /// so identically at a spilling and a resident budget — the decimal keys ride
+    /// the same i128 block-band drain/sort/spill, so the result is budget-
+    /// independent. Cross-scale floors (`5.0000` vs `5.00`) match, proving the
+    /// fixed-point grid is scale-invariant end to end.
+    #[test]
+    fn decimal_band_matches_oracle_across_budgets() {
+        let (drivers, builds, driver_csv, build_csv) = decimal_band_workload();
+        let inputs = [
+            ("drivers", driver_csv.as_str()),
+            ("builds", build_csv.as_str()),
+        ];
+        let expected = expected_band_rows(&decimal_oracle_band(&drivers, &builds));
+        assert!(
+            !expected.is_empty(),
+            "the decimal band workload must produce matches"
+        );
+
+        let tight = run(DEC_BAND_YAML, TIGHT_LIMIT, "spill", &inputs, "out");
+        let roomy = run(DEC_BAND_YAML, ROOMY_LIMIT, "spill", &inputs, "out");
+        assert_eq!(
+            rows(&tight.output),
+            expected,
+            "spilled decimal band output diverged from the Decimal oracle"
+        );
+        assert_eq!(
+            rows(&roomy.output),
+            expected,
+            "resident decimal band output diverged from the Decimal oracle"
+        );
+        assert_eq!(
+            rows(&tight.output),
+            rows(&roomy.output),
+            "the decimal band result must be byte-identical across budgets"
+        );
+        assert!(
+            tight.spill_bytes > 0,
+            "the tight budget must have spilled the decimal band sides to disk"
+        );
+    }
+
+    const MIXED_BAND_YAML: &str = r#"
+pipeline:
+  name: pure_range_mixed_band
+  memory: { limit: "__LIMIT__", backpressure: __POLICY__ }
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: drivers.csv
+      schema:
+        - { name: did, type: int }
+        - { name: amount, type: int }
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: builds.csv
+      schema:
+        - { name: bid, type: int }
+        - { name: lo, type: float }
+        - { name: hi, type: float }
+  - type: combine
+    name: banded
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.amount >= builds.lo and drivers.amount < builds.hi"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit did = drivers.did
+        emit bid = builds.bid
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+    /// Mixed integer/float band workload: driver `i` carries an INTEGER amount
+    /// tiling `[0, span)`; band `b` is the FLOAT half-open interval
+    /// `[b·bstep + 0.5, (b+1)·bstep + 0.5)`. The `.5` offsets keep every integer
+    /// amount strictly off a band boundary, so the match is unambiguous. The
+    /// integer and float sides must reduce to one comparable axis (the engine
+    /// coerces the integer through `f64`, mirroring `int <=> float` comparison).
+    fn mixed_band_workload() -> (Vec<(i64, i64)>, Vec<MixBuild>, String, String) {
+        let span = 1_000i64;
+        let n_builds = 40i64;
+        let bstep = span / n_builds;
+        let n_drivers = 8_000i64;
+        let mut drivers = Vec::with_capacity(n_drivers as usize);
+        let mut driver_csv = String::from("did,amount\n");
+        for i in 0..n_drivers {
+            let amount = tiled_key(i, span);
+            drivers.push((i, amount));
+            driver_csv.push_str(&format!("{i},{amount}\n"));
+        }
+        let mut builds = Vec::with_capacity(n_builds as usize);
+        let mut build_csv = String::from("bid,lo,hi\n");
+        for b in 0..n_builds {
+            let lo = (b * bstep) as f64 + 0.5;
+            let hi = ((b + 1) * bstep) as f64 + 0.5;
+            builds.push((b, lo, hi));
+            build_csv.push_str(&format!("{b},{lo},{hi}\n"));
+        }
+        (drivers, builds, driver_csv, build_csv)
+    }
+
+    /// A mixed int/float range join emits exactly the reference match set —
+    /// computed by coercing the integer amount through `f64`, the same widening
+    /// the runtime comparison applies — identically across budgets.
+    #[test]
+    fn mixed_int_float_band_matches_oracle_across_budgets() {
+        let (drivers, builds, driver_csv, build_csv) = mixed_band_workload();
+        let inputs = [
+            ("drivers", driver_csv.as_str()),
+            ("builds", build_csv.as_str()),
+        ];
+        let expected = expected_band_rows(&nested_loop_oracle(
+            &drivers,
+            &builds,
+            |(_, amount), (_, lo, hi)| (*amount as f64) >= *lo && (*amount as f64) < *hi,
+            |_, (did, _), _, (bid, _, _)| (*did, *bid),
+        ));
+        assert!(
+            !expected.is_empty(),
+            "the mixed int/float band workload must produce matches"
+        );
+
+        let tight = run(MIXED_BAND_YAML, TIGHT_LIMIT, "spill", &inputs, "out");
+        let roomy = run(MIXED_BAND_YAML, ROOMY_LIMIT, "spill", &inputs, "out");
+        assert_eq!(
+            rows(&tight.output),
+            expected,
+            "spilled mixed int/float band diverged from the f64-coerced oracle"
+        );
+        assert_eq!(
+            rows(&roomy.output),
+            expected,
+            "resident mixed int/float band diverged from the f64-coerced oracle"
+        );
+        assert_eq!(
+            rows(&tight.output),
+            rows(&roomy.output),
+            "the mixed band result must be byte-identical across budgets"
+        );
+        assert!(
+            tight.spill_bytes > 0,
+            "the tight budget must have spilled the mixed band sides to disk"
+        );
+    }
+
+    const OVERFLOW_YAML: &str = r#"
+pipeline:
+  name: decimal_range_overflow
+  memory: { limit: "512M", backpressure: spill }
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: drivers.csv
+      schema:
+        - { name: did, type: int }
+        - { name: amount, type: decimal, scale: 0 }
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: builds.csv
+      schema:
+        - { name: bid, type: int }
+        - { name: threshold, type: decimal, scale: 0 }
+  - type: combine
+    name: banded
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.amount >= builds.threshold"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit did = drivers.did
+        emit bid = builds.bid
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+    /// Compile and run a pipeline over in-memory CSVs, returning the raw
+    /// execution result so a test can assert a fail-loud runtime error rather
+    /// than unwrapping it. Mirrors [`run_config`] minus the success assertion.
+    fn run_config_result(
+        config: PipelineConfig,
+        inputs: &[(&str, &str)],
+        output_name: &str,
+    ) -> Result<(), clinker_plan::PipelineError> {
+        let plan = config
+            .compile(&CompileContext::default())
+            .expect("overflow yaml must compile");
+        let readers: SourceReaders = inputs
+            .iter()
+            .map(|(name, data)| {
+                (
+                    (*name).to_string(),
+                    clinker_exec::executor::single_file_reader(
+                        "test.csv",
+                        Box::new(Cursor::new(data.as_bytes().to_vec())),
+                    ),
+                )
+            })
+            .collect();
+        let buf = SharedBuffer::new();
+        let writers: HashMap<String, Box<dyn Write + Send>> = HashMap::from([(
+            output_name.to_string(),
+            Box::new(buf.clone()) as Box<dyn Write + Send>,
+        )]);
+        let params = PipelineRunParams {
+            execution_id: "iejoin-prop".to_string(),
+            batch_id: "iejoin-prop-batch".to_string(),
+            ..Default::default()
+        };
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+            .map(|_| ())
+    }
+
+    /// A decimal range value whose scaled magnitude overflows the fixed-point
+    /// axis fails LOUD with E326 rather than dropping the row or emitting a wrong
+    /// match. `Decimal::MAX` scaled onto the 10^18 grid exceeds `i128`, so the
+    /// scan raises `CombineRangeKeyOutOfRange` naming the combine.
+    #[test]
+    fn decimal_range_value_beyond_fixed_point_fails_loud() {
+        // Decimal::MAX ≈ 7.9e28; on the 10^18 grid that is ~7.9e46, far past i128.
+        let d_csv = "did,amount\n1,79228162514264337593543950335\n";
+        let b_csv = "bid,threshold\n1,1\n";
+        let config: PipelineConfig =
+            clinker_plan::yaml::from_str(OVERFLOW_YAML).expect("overflow yaml must parse");
+        let err = run_config_result(config, &[("drivers", d_csv), ("builds", b_csv)], "out")
+            .expect_err("a decimal range value beyond the fixed-point axis must fail loud");
+        match err {
+            clinker_plan::PipelineError::CombineRangeKeyOutOfRange { combine, .. } => {
+                assert_eq!(combine, "banded", "E326 must name the offending combine");
+            }
+            other => panic!("expected E326 CombineRangeKeyOutOfRange, got {other:?}"),
+        }
+    }
 }

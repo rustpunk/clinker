@@ -296,8 +296,8 @@ fn pair_bytes<P: HeapBytes>(record: &Record, payload: &P) -> usize {
 /// columns at this width, so `Single`'s dead second axis is never counted.
 fn range_key_width(op2: Option<RangeOp>) -> usize {
     match op2 {
-        Some(_) => std::mem::size_of::<(i64, i64)>(),
-        None => std::mem::size_of::<i64>(),
+        Some(_) => std::mem::size_of::<(i128, i128)>(),
+        None => std::mem::size_of::<i128>(),
     }
 }
 
@@ -358,20 +358,20 @@ fn eq_match(driver_eq: &[u8], build_eq: &[u8]) -> bool {
 enum RangeMode {
     Dual {
         op2: RangeOp,
-        driver_keys: Vec<(i64, i64)>,
+        driver_keys: Vec<(i128, i128)>,
     },
     Single {
-        driver_keys: Vec<i64>,
+        driver_keys: Vec<i128>,
     },
 }
 
 /// Per-axis key bounds accumulated while a block fills.
 #[derive(Clone, Copy)]
 struct Bounds {
-    k1_min: i64,
-    k1_max: i64,
-    k2_min: i64,
-    k2_max: i64,
+    k1_min: i128,
+    k1_max: i128,
+    k2_min: i128,
+    k2_max: i128,
 }
 
 impl Bounds {
@@ -379,14 +379,14 @@ impl Bounds {
     /// an unfilled block (never updated) prunes against every operator.
     fn empty() -> Self {
         Self {
-            k1_min: i64::MAX,
-            k1_max: i64::MIN,
-            k2_min: i64::MAX,
-            k2_max: i64::MIN,
+            k1_min: i128::MAX,
+            k1_max: i128::MIN,
+            k2_min: i128::MAX,
+            k2_max: i128::MIN,
         }
     }
 
-    fn update(&mut self, k1: i64, k2: i64) {
+    fn update(&mut self, k1: i128, k2: i128) {
         self.k1_min = self.k1_min.min(k1);
         self.k1_max = self.k1_max.max(k1);
         self.k2_min = self.k2_min.min(k2);
@@ -483,7 +483,7 @@ impl<P: DeserializeOwned> Block<P> {
 /// `op` is already driver-vs-build oriented (the executor flips the raw
 /// predicate before the kernel), matching `iejoin_numeric`'s `left OP right`
 /// convention.
-fn possible(op: RangeOp, dmin: i64, dmax: i64, bmin: i64, bmax: i64) -> bool {
+fn possible(op: RangeOp, dmin: i128, dmax: i128, bmin: i128, bmax: i128) -> bool {
     match op {
         // ∃ d,b: d < b  ⇔  min d < max b
         RangeOp::Lt => dmin < bmax,
@@ -500,7 +500,7 @@ fn possible(op: RangeOp, dmin: i64, dmax: i64, bmin: i64, bmax: i64) -> bool {
 /// `pwmj_numeric` would return for the same keys — so the two paths emit the
 /// identical match set for a block-pair.
 #[inline]
-fn apply_range(op: RangeOp, a: i64, b: i64) -> bool {
+fn apply_range(op: RangeOp, a: i128, b: i128) -> bool {
     match op {
         RangeOp::Lt => a < b,
         RangeOp::Le => a <= b,
@@ -1076,12 +1076,12 @@ pub(super) fn execute_block_band(
                 (budget.hard_limit().saturating_sub(pair_peak_reserved) / (3 * pair_size)) as usize;
             let materialized = match &range_mode {
                 RangeMode::Dual { op2, driver_keys } => {
-                    let bkeys: Vec<(i64, i64)> =
+                    let bkeys: Vec<(i128, i128)> =
                         build_loaded.iter().map(|(_, p)| (p.k1, p.k2)).collect();
                     iejoin_numeric_capped(driver_keys, &bkeys, op1, *op2, max_pairs)
                 }
                 RangeMode::Single { driver_keys } => {
-                    let bl: Vec<i64> = build_loaded.iter().map(|(_, p)| p.k1).collect();
+                    let bl: Vec<i128> = build_loaded.iter().map(|(_, p)| p.k1).collect();
                     pwmj_numeric_capped(driver_keys, &bl, op1, max_pairs)
                 }
             };
@@ -1438,8 +1438,8 @@ fn spilled_scratch_bytes<P>(block: &Block<P>) -> u64 {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 struct BuildPayload {
     eq_hash: u64,
-    k1: i64,
-    k2: i64,
+    k1: i128,
+    k2: i128,
     build_idx: u64,
     eq: Vec<u8>,
 }
@@ -1454,8 +1454,8 @@ struct BuildPayload {
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 struct DriverPayload {
     eq_hash: u64,
-    k1: i64,
-    k2: i64,
+    k1: i128,
+    k2: i128,
     driver_idx: u64,
     order: RecordOrder,
     eq: Vec<u8>,
@@ -1664,7 +1664,7 @@ fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
     schema: &Arc<Schema>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
-    key_of: &impl Fn(&P) -> (u64, i64, i64),
+    key_of: &impl Fn(&P) -> (u64, i128, i128),
 ) -> Result<Vec<Block<P>>, PipelineError> {
     let pre_finish = buf.bytes_used() as u64;
     let (sorted, residue) = buf.finish().map_err(|e| {
@@ -1725,7 +1725,7 @@ fn slice_side<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
     schema: &Arc<Schema>,
     ctx: &DrainCtx<'_>,
     resident: &mut ResidentBudget,
-    key_of: &impl Fn(&P) -> (u64, i64, i64),
+    key_of: &impl Fn(&P) -> (u64, i128, i128),
 ) -> Result<Vec<Block<P>>, PipelineError> {
     let mut blocks: Vec<Block<P>> = Vec::new();
     let mut cur: Vec<(Record, P)> = Vec::new();
@@ -2230,7 +2230,7 @@ mod tests {
             .map(|(key, _)| match key {
                 Some((k1, k2)) => RecordScan::Matched {
                     eq_hash: 0,
-                    range_key: (*k1, *k2),
+                    range_key: (*k1 as i128, *k2 as i128),
                     eq: Vec::new(),
                 },
                 None => RecordScan::Unmatched,
@@ -2427,12 +2427,12 @@ mod tests {
         // Driver bounds fixed at [10, 20]; build bounds chosen so each axis
         // configuration is disjoint-below, touching-equal, overlapping, or
         // disjoint-above relative to the driver.
-        let (dmin, dmax) = (10i64, 20i64);
+        let (dmin, dmax) = (10i128, 20i128);
         // (bmin, bmax, label) fixtures.
-        let disjoint_below = (0i64, 5i64); // build strictly below driver
-        let touching_equal = (20i64, 30i64); // build min == driver max
-        let overlapping = (15i64, 25i64); // ranges overlap
-        let disjoint_above = (25i64, 40i64); // build strictly above driver
+        let disjoint_below = (0i128, 5i128); // build strictly below driver
+        let touching_equal = (20i128, 30i128); // build min == driver max
+        let overlapping = (15i128, 25i128); // ranges overlap
+        let disjoint_above = (25i128, 40i128); // build strictly above driver
 
         // Lt: possible ⇔ dmin < bmax.
         assert!(!possible(
@@ -3830,7 +3830,7 @@ mod tests {
                 .iter()
                 .map(|(k1, k2, _, _)| RecordScan::Matched {
                     eq_hash: 0,
-                    range_key: (*k1, *k2),
+                    range_key: (*k1 as i128, *k2 as i128),
                     eq: Vec::new(),
                 })
                 .collect();
@@ -3924,7 +3924,7 @@ mod tests {
                 .iter()
                 .map(|(k1, k2, _, _)| RecordScan::Matched {
                     eq_hash: 0,
-                    range_key: (*k1, *k2),
+                    range_key: (*k1 as i128, *k2 as i128),
                     eq: Vec::new(),
                 })
                 .collect();
@@ -4026,7 +4026,7 @@ mod tests {
         let driver_scans: Vec<RecordScan> = (0..n)
             .map(|i| RecordScan::Matched {
                 eq_hash: 0,
-                range_key: (i, i),
+                range_key: (i as i128, i as i128),
                 eq: Vec::new(),
             })
             .collect();
@@ -4046,7 +4046,7 @@ mod tests {
         let build_scans: Vec<RecordScan> = (0..n)
             .map(|i| RecordScan::Matched {
                 eq_hash: 0,
-                range_key: (i, i),
+                range_key: (i as i128, i as i128),
                 eq: Vec::new(),
             })
             .collect();
@@ -4958,7 +4958,7 @@ mod tests {
                 Some((k1, k2)) => RecordScan::Matched {
                     eq_hash: hash_of(r.group),
                     eq: eq_of(r.group),
-                    range_key: (k1, k2),
+                    range_key: (k1 as i128, k2 as i128),
                 },
                 None => RecordScan::Unmatched,
             })

@@ -2092,7 +2092,7 @@ impl crate::pipeline::memory::MemoryConsumer for SortMergeConsumer {
 mod tests {
     use super::*;
     use crate::executor::combine::CombineResolverMapping;
-    use clinker_plan::plan::combine::{CombineInput, RangeConjunct};
+    use clinker_plan::plan::combine::{CombineInput, RangeConjunct, RangeKeyType};
     use clinker_plan::plan::types::JoinSide;
     use clinker_record::SchemaBuilder;
     use cxl::ast::Statement;
@@ -2169,6 +2169,7 @@ mod tests {
             op: range_op,
             right_expr: (**rhs).clone(),
             right_input: Arc::from(right_input),
+            key_type: RangeKeyType::Integer,
         }
     }
 

@@ -4539,6 +4539,332 @@ nodes:
         );
     }
 
+    /// A presorted single-inequality range combine on the given decimal/int/float
+    /// column pair. Both sources declare `sort_order` on their range field, so the
+    /// combine reaches the SortMerge eligibility path (single conjunct +
+    /// presorted). `did`/`tid`-keyed output. Placeholders `__DTY__`/`__TTY__` set
+    /// the driver/build range column types.
+    fn presorted_range_yaml(driver_ty: &str, build_ty: &str) -> String {
+        format!(
+            r#"
+pipeline:
+  name: sm_route
+nodes:
+  - type: source
+    name: drivers
+    config:
+      name: drivers
+      type: csv
+      path: drivers.csv
+      sort_order:
+        - field: val
+      schema:
+        - {{ name: did, type: int }}
+        - {{ name: val, type: {driver_ty} }}
+  - type: source
+    name: builds
+    config:
+      name: builds
+      type: csv
+      path: builds.csv
+      sort_order:
+        - field: threshold
+      schema:
+        - {{ name: tid, type: int }}
+        - {{ name: threshold, type: {build_ty} }}
+  - type: combine
+    name: banded
+    input:
+      drivers: drivers
+      builds: builds
+    config:
+      where: "drivers.val < builds.threshold"
+      match: first
+      on_miss: skip
+      cxl: |
+        emit did = drivers.did
+        emit tid = builds.tid
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+        )
+    }
+
+    /// The strategy the planner selects for the single combine in `yaml`,
+    /// rendered as its `Debug` discriminant (`"IEJoin"`, `"SortMerge"`, …).
+    fn selected_combine_strategy(yaml: &str) -> String {
+        let config: PipelineConfig =
+            clinker_plan::yaml::from_str(yaml).expect("routing yaml must parse");
+        let plan = config
+            .compile(&CompileContext::default())
+            .expect("routing yaml must compile");
+        plan.dag()
+            .graph
+            .node_weights()
+            .find_map(|n| match n {
+                PlanNode::Combine { strategy, .. } => Some(format!("{strategy:?}")),
+                _ => None,
+            })
+            .expect("plan contains a combine node")
+    }
+
+    /// The two `[did, tid]` rows a `match: first` `val < threshold` join emits for
+    /// the shared presorted workload, sorted for a set comparison.
+    fn expected_route_rows(result: &CombineFixtureResult) -> Vec<Vec<String>> {
+        let canon = canonicalize_csv(result.primary_output());
+        let mut rows: Vec<Vec<String>> = canon
+            .lines()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split(',').map(str::to_string).collect())
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// A presorted DECIMAL single-inequality range join reaches the SortMerge
+    /// eligibility path but must route to IEJoin — SortMerge's kernel maps
+    /// decimals to a constant, which would silently drop every row. The result
+    /// must still be correct.
+    #[test]
+    fn presorted_decimal_range_routes_to_iejoin_and_is_correct() {
+        let yaml = presorted_range_yaml("decimal", "decimal");
+        assert_eq!(
+            selected_combine_strategy(&yaml),
+            "IEJoin",
+            "a presorted decimal range join must route to IEJoin, not SortMerge"
+        );
+        let drivers = "did,val\n1,2.50\n2,5.00\n";
+        let builds = "tid,threshold\n10,3.00\n20,6.00\n";
+        let result = run_combine_fixture(&yaml, &[("drivers", drivers), ("builds", builds)], None)
+            .expect("decimal range join runs");
+        assert_eq!(
+            expected_route_rows(&result),
+            vec![vec!["1", "10"], vec!["2", "20"]],
+            "decimal band match:first output diverged"
+        );
+    }
+
+    /// A presorted MIXED int/float single-inequality range join reaches the
+    /// SortMerge eligibility path but must route to IEJoin — SortMerge would
+    /// compare the int and float sides in disjoint per-type encodings.
+    #[test]
+    fn presorted_mixed_int_float_range_routes_to_iejoin_and_is_correct() {
+        let yaml = presorted_range_yaml("int", "float");
+        assert_eq!(
+            selected_combine_strategy(&yaml),
+            "IEJoin",
+            "a presorted mixed int/float range join must route to IEJoin"
+        );
+        let drivers = "did,val\n1,2\n2,5\n";
+        let builds = "tid,threshold\n10,3.5\n20,6.5\n";
+        let result = run_combine_fixture(&yaml, &[("drivers", drivers), ("builds", builds)], None)
+            .expect("mixed range join runs");
+        assert_eq!(
+            expected_route_rows(&result),
+            vec![vec!["1", "10"], vec!["2", "20"]],
+            "mixed int/float band match:first output diverged"
+        );
+    }
+
+    /// A presorted pure-INT single-inequality range join still uses SortMerge (its
+    /// per-type encoding is correct for a same-type integer pair) and is correct.
+    #[test]
+    fn presorted_int_range_keeps_sort_merge_and_is_correct() {
+        let yaml = presorted_range_yaml("int", "int");
+        assert_eq!(
+            selected_combine_strategy(&yaml),
+            "SortMerge",
+            "a presorted same-type int range join must keep SortMerge"
+        );
+        let drivers = "did,val\n1,2\n2,5\n";
+        let builds = "tid,threshold\n10,3\n20,6\n";
+        let result = run_combine_fixture(&yaml, &[("drivers", drivers), ("builds", builds)], None)
+            .expect("int range join runs");
+        assert_eq!(
+            expected_route_rows(&result),
+            vec![vec!["1", "10"], vec!["2", "20"]],
+            "int band match:first output diverged"
+        );
+    }
+
+    /// Assert compiling `yaml` fails with an E327 diagnostic naming the range-axis
+    /// rejection.
+    fn assert_compile_e327(yaml: &str, context: &str) {
+        let err =
+            run_combine_fixture(yaml, &[("a", "x\n"), ("b", "y\n")], None).expect_err(context);
+        match err {
+            CombineFixtureError::Compile(diags) => assert!(
+                diags.iter().any(|d| d.code == "E327"),
+                "{context}: expected E327; got {:?}",
+                diags
+                    .iter()
+                    .map(|d| format!("{}: {}", d.code, d.message))
+                    .collect::<Vec<_>>()
+            ),
+            other => panic!("{context}: expected a compile diagnostic, got {other}"),
+        }
+    }
+
+    /// A range conjunct over an ambiguous `numeric` operand (`abs` result, whose
+    /// runtime value may be an integer compared exactly or a float) is rejected at
+    /// plan time with E327 rather than routed to the axis, where a large integer
+    /// would silently lose precision against the exact residual.
+    #[test]
+    fn combine_numeric_range_operand_rejected_e327() {
+        let yaml = r#"
+pipeline:
+  name: e327_numeric
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: x, type: int }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: y, type: int }
+  - type: combine
+    name: banded
+    input:
+      a: a
+      b: b
+    config:
+      where: "a.x.abs() >= b.y.abs()"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit ax = a.x
+        emit bx = b.y
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+        assert_compile_e327(yaml, "an abs()/numeric range operand must be rejected E327");
+    }
+
+    /// A `decimal` range operand compared against an ambiguous `numeric`
+    /// (`abs(int)`) is rejected at plan time with E327: the numeric side's runtime
+    /// value may be an integer widened exactly into the decimal domain OR a float,
+    /// so no single axis reduction is safe. (A plain `decimal` vs `float` is caught
+    /// even earlier by the typechecker's exactness guard.)
+    #[test]
+    fn combine_decimal_vs_numeric_range_rejected_e327() {
+        let yaml = r#"
+pipeline:
+  name: e327_dec_numeric
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: x, type: decimal, scale: 2 }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: y, type: int }
+  - type: combine
+    name: banded
+    input:
+      a: a
+      b: b
+    config:
+      where: "a.x >= b.y.abs()"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit ax = a.x
+        emit bx = b.y
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+        assert_compile_e327(
+            yaml,
+            "a decimal-vs-numeric range operand must be rejected E327",
+        );
+    }
+
+    /// A range conjunct over non-orderable-on-the-axis operands (a string
+    /// comparison) is rejected at plan time with E327 rather than silently routed
+    /// out at runtime — the earlier behavior dropped every such row.
+    #[test]
+    fn combine_string_range_operand_rejected_e327() {
+        let yaml = r#"
+pipeline:
+  name: e327_string
+nodes:
+  - type: source
+    name: a
+    config:
+      name: a
+      type: csv
+      path: a.csv
+      schema:
+        - { name: x, type: string }
+  - type: source
+    name: b
+    config:
+      name: b
+      type: csv
+      path: b.csv
+      schema:
+        - { name: y, type: string }
+  - type: combine
+    name: banded
+    input:
+      a: a
+      b: b
+    config:
+      where: "a.x < b.y"
+      match: all
+      on_miss: skip
+      cxl: |
+        emit ax = a.x
+        emit bx = b.y
+      propagate_ck: driver
+  - type: output
+    name: out
+    input: banded
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+        assert_compile_e327(yaml, "a string range operand must be rejected E327");
+    }
+
     /// max_output_rows on a pure-EQUI combine (HashBuildProbe, the default
     /// strategy) must fail loud with E325 the moment the output exceeds the cap,
     /// and complete uncapped — proving the cap is strategy-agnostic, not

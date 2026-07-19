@@ -80,6 +80,7 @@ mod tests {
             Err(
                 PipelineError::Eval(_)
                 | PipelineError::Accumulator { .. }
+                | PipelineError::CombineRangeKeyOutOfRange { .. }
                 | PipelineError::DlqRateExceeded { .. },
             ) => 3,
             Err(
