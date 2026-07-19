@@ -351,6 +351,27 @@ impl From<smol_str::SmolStr> for Value {
 /// `Value` has no backing storage to borrow from.
 pub static NULL: Value = Value::Null;
 
+/// Estimated heap bytes backing an `IndexMap<Box<str>, Value>`: the structural
+/// bucket array plus every key string and recursively-owned value.
+///
+/// Shared verbatim by [`Value::heap_size`] (for `Value::Map`) and
+/// `Record::estimated_heap_size` (for the `$record.<key>` vars map) so both
+/// accounting paths estimate the same IndexMap backing identically and cannot
+/// drift apart. The bucket array dominates residency for small maps: a bare
+/// `Value` is 32 bytes, but each occupied slot also carries a `Box<str>` fat
+/// pointer and a hash/index word, so counting only the entries' key/value heap
+/// undercounts a typical few-field map several-fold.
+pub(crate) fn indexmap_heap_size(m: &IndexMap<Box<str>, Value>) -> usize {
+    // Per-entry backing: the (Box<str>, Value) bucket in IndexMap's entry Vec
+    // plus one hash/index word (u64) for the parallel hashbrown index table.
+    let entry_size =
+        std::mem::size_of::<Box<str>>() + std::mem::size_of::<Value>() + std::mem::size_of::<u64>();
+    let map_backing = m.capacity() * entry_size;
+    let keys_heap: usize = m.keys().map(|k| k.len()).sum();
+    let values_heap: usize = m.values().map(Value::heap_size).sum();
+    map_backing + keys_heap + values_heap
+}
+
 impl Value {
     /// Returns the CXL type name as a static string.
     pub fn type_name(&self) -> &'static str {
@@ -381,6 +402,11 @@ impl Value {
     /// Strings store their bytes inline when short (<=23 bytes) and so
     /// contribute zero heap; heap-backed strings (the `Arc`-shared default arm
     /// or the `Box`-unique arm) charge their byte length.
+    /// Container variants charge their own structural backing on top of the
+    /// recursively-owned element heap: an `Array` counts its `Vec` capacity
+    /// (used slots plus spare) and a `Map` counts the `IndexMap` bucket array
+    /// (see `indexmap_heap_size`) — omitting either undercounts real
+    /// residency, which is what memory arbitration bounds are drawn against.
     pub fn heap_size(&self) -> usize {
         match self {
             Value::String(s) => s.heap_size(),
@@ -388,12 +414,7 @@ impl Value {
                 arr.capacity() * std::mem::size_of::<Value>()
                     + arr.iter().map(Value::heap_size).sum::<usize>()
             }
-            Value::Map(m) => {
-                // IndexMap overhead: each entry is (Box<str>, Value) = key heap + value heap
-                m.iter()
-                    .map(|(k, v)| k.len() + v.heap_size())
-                    .sum::<usize>()
-            }
+            Value::Map(m) => indexmap_heap_size(m),
             _ => 0,
         }
     }
@@ -756,6 +777,62 @@ mod tests {
         let arr2 = Value::Array(vec![Value::Integer(1), Value::String(long.into())]);
         let expected2 = 2 * std::mem::size_of::<Value>() + long.len();
         assert_eq!(arr2.heap_size(), expected2);
+    }
+
+    #[test]
+    fn test_value_heap_size_array_counts_spare_capacity() {
+        // The Vec backing charges reserved-but-unused slots, not just len:
+        // eight-slot capacity holding one element still costs eight strides.
+        let mut backing = Vec::with_capacity(8);
+        backing.push(Value::Integer(1));
+        let arr = Value::Array(backing);
+        assert_eq!(arr.heap_size(), 8 * std::mem::size_of::<Value>());
+    }
+
+    #[test]
+    fn test_value_heap_size_map_counts_structural_backing() {
+        use crate::record::Record;
+        use crate::schema::Schema;
+        use std::sync::Arc;
+
+        // Scalar values own no heap, so every reported byte is either a key
+        // string or the IndexMap bucket array — the structural backing this
+        // accounting previously omitted.
+        let map = Value::map([
+            ("alpha", Value::Integer(1)),
+            ("beta", Value::Integer(2)),
+            ("gamma", Value::Integer(3)),
+        ]);
+        let inner = map.as_map().unwrap();
+
+        // The prior undercount summed only key + value heap.
+        let keys_and_values: usize = inner.iter().map(|(k, v)| k.len() + v.heap_size()).sum();
+        // The structural term this fix restores: capacity × (Box<str> + Value +
+        // hash/index word), matching `indexmap_heap_size`.
+        let entry_size = std::mem::size_of::<Box<str>>()
+            + std::mem::size_of::<Value>()
+            + std::mem::size_of::<u64>();
+        let structural_backing = inner.capacity() * entry_size;
+
+        assert_eq!(map.heap_size(), keys_and_values + structural_backing);
+        // At least one bucket per occupied entry is charged on top of the bytes.
+        assert!(structural_backing >= inner.len() * entry_size);
+        assert!(map.heap_size() > keys_and_values);
+
+        // Cross-method agreement: a record whose only field is this map
+        // attributes exactly `map.heap_size()` to it, on top of the one-slot
+        // `Vec<Value>` backing (`vec![_]` has capacity 1).
+        let schema = Arc::new(Schema::new(vec!["m".into()]));
+        let record = Record::new(schema, vec![map.clone()]);
+        assert_eq!(
+            record.estimated_heap_size(),
+            std::mem::size_of::<Value>() + map.heap_size(),
+        );
+
+        // The map's heap equals the shared IndexMap-backing estimator that
+        // `Record::estimated_heap_size` applies to its `$record.<key>` vars map,
+        // so the two accounting paths cannot disagree on the same data.
+        assert_eq!(map.heap_size(), indexmap_heap_size(inner));
     }
 
     #[test]
