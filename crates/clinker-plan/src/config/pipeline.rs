@@ -4063,6 +4063,7 @@ pub(crate) fn lower_node_to_plan_node(
                 predicate_summary,
                 match_mode: config.match_mode,
                 on_miss: config.on_miss,
+                max_output_rows: config.max_output_rows,
                 propagate_ck: config.propagate_ck.clone(),
                 decomposed_from: None,
                 output_schema: schema_from_bound(),

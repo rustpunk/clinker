@@ -294,17 +294,39 @@ fn cmp_dir(a: i64, b: i64, dir: SortDir) -> std::cmp::Ordering {
 /// which `op1.apply(left[li].0, right[ri].0)` AND
 /// `op2.apply(left[li].1, right[ri].1)` hold. Output order is not
 /// specified — callers that care must sort or hash before comparing.
+/// Uncapped convenience wrapper, used only by the kernel's own equivalence
+/// tests; production always goes through [`iejoin_numeric_capped`] with a
+/// budget-derived cap.
+#[cfg(test)]
 fn iejoin_numeric(
     left_keys: &[(i64, i64)],
     right_keys: &[(i64, i64)],
     op1: RangeOp,
     op2: RangeOp,
 ) -> Vec<(usize, usize)> {
+    iejoin_numeric_capped(left_keys, right_keys, op1, op2, usize::MAX)
+        .expect("an uncapped iejoin_numeric (max_pairs == usize::MAX) never overflows")
+}
+
+/// Cap-aware IEJoin. Identical to [`iejoin_numeric`] except it stops and returns
+/// `None` the moment the match count would exceed `max_pairs`, WITHOUT
+/// materializing an over-budget output vector — so a caller under a tight memory
+/// budget can detect a dense pair and fall back to a bounded streaming pass
+/// rather than allocating a huge pair vector. `Some(pairs)` is the complete
+/// result whenever `pairs.len() <= max_pairs`. `max_pairs == usize::MAX` is
+/// effectively uncapped (a `usize` length can never exceed it).
+fn iejoin_numeric_capped(
+    left_keys: &[(i64, i64)],
+    right_keys: &[(i64, i64)],
+    op1: RangeOp,
+    op2: RangeOp,
+    max_pairs: usize,
+) -> Option<Vec<(usize, usize)>> {
     let n_left = left_keys.len();
     let n_right = right_keys.len();
     let n_total = n_left + n_right;
     if n_left == 0 || n_right == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
     // Encode left record `i` as +(i+1), right record `j` as -(j+1).
@@ -406,6 +428,11 @@ fn iejoin_numeric(
                 let li = (entry.0 - 1) as usize;
                 let ri = ((-right_signed) - 1) as usize;
                 out.push((li, ri));
+                // Stop before the vector grows past what the caller's budget
+                // admits; the caller re-runs the pair through a bounded pass.
+                if out.len() > max_pairs {
+                    return None;
+                }
             }
         } else {
             // RIGHT side: mark its L1 position as visited.
@@ -413,17 +440,34 @@ fn iejoin_numeric(
             bit.set(l1_pos);
         }
     }
-    out
+    Some(out)
 }
 
 /// Single-inequality piecewise merge join — universal across DuckDB,
 /// Polars, and DataFusion (drill D34). Sorts both sides by the
 /// condition key, then enumerates pairs that satisfy the predicate.
+/// Uncapped convenience wrapper, used only by the kernel's own equivalence
+/// tests; production always goes through [`pwmj_numeric_capped`].
+#[cfg(test)]
 fn pwmj_numeric(left_keys: &[i64], right_keys: &[i64], op: RangeOp) -> Vec<(usize, usize)> {
+    pwmj_numeric_capped(left_keys, right_keys, op, usize::MAX)
+        .expect("an uncapped pwmj_numeric (max_pairs == usize::MAX) never overflows")
+}
+
+/// Cap-aware single-inequality PWMJ. Mirrors [`iejoin_numeric_capped`]: returns
+/// `None` the moment the match count would exceed `max_pairs`, stopping without
+/// materializing an over-budget vector, else `Some(pairs)` with
+/// `pairs.len() <= max_pairs`. `max_pairs == usize::MAX` is uncapped.
+fn pwmj_numeric_capped(
+    left_keys: &[i64],
+    right_keys: &[i64],
+    op: RangeOp,
+    max_pairs: usize,
+) -> Option<Vec<(usize, usize)>> {
     let n_left = left_keys.len();
     let n_right = right_keys.len();
     if n_left == 0 || n_right == 0 {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let dir = primary_dir(op);
     let mut left_idx: Vec<usize> = (0..n_left).collect();
@@ -452,10 +496,14 @@ fn pwmj_numeric(left_keys: &[i64], right_keys: &[i64], op: RangeOp) -> Vec<(usiz
         for &ri in &right_idx {
             if apply(lv, right_keys[ri]) {
                 out.push((li, ri));
+                // Stop before the vector grows past the caller's budget.
+                if out.len() > max_pairs {
+                    return None;
+                }
             }
         }
     }
-    out
+    Some(out)
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -490,6 +538,10 @@ pub(crate) struct IEJoinExec<'a> {
     pub output_schema: Option<&'a Arc<Schema>>,
     pub match_mode: MatchMode,
     pub on_miss: OnMiss,
+    /// Opt-in runtime cap on the combine's emitted-row count (E325 on breach);
+    /// `None` is unlimited. Enforced at the shared output-emit chokepoint, so it
+    /// covers every match mode and both the materialized and nested-loop paths.
+    pub max_output_rows: Option<u64>,
     /// Build-side `$ck.<field>` propagation policy. Mirrors the
     /// HashBuildProbe arm — every strategy threads the same spec to
     /// the shared `copy_build_ck_columns` helper at every emit site.
@@ -536,6 +588,7 @@ pub(crate) fn execute_combine_iejoin(
         output_schema,
         match_mode,
         on_miss,
+        max_output_rows,
         propagate_ck,
         ctx,
         budget,
@@ -746,6 +799,7 @@ pub(crate) fn execute_combine_iejoin(
         output_schema,
         match_mode,
         on_miss,
+        max_output_rows,
         propagate_ck,
         ctx,
         budget,
@@ -1063,6 +1117,11 @@ struct EmitSink<'a> {
     budget: &'a MemoryArbitrator,
     name: &'a str,
     consumer: &'a Arc<ConsumerHandle>,
+    /// Opt-in cap on the combine's total emitted rows; `None` is unlimited. The
+    /// running count is the output buffer's own `total_rows()` (cumulative pushes
+    /// across every spilled run), checked before each push so the run fails loud
+    /// (E325) rather than truncating once the output would exceed it.
+    max_output_rows: Option<u64>,
     output_eval_failures: &'a mut Vec<CombineOutputEvalFailure>,
     /// Parallel `(driver order, driver_idx, build_idx)` sort key per deferred
     /// output-eval failure, so dead-letter rows re-order into the same
@@ -1084,6 +1143,21 @@ impl EmitSink<'_> {
         driver_idx: u64,
         build_idx: u64,
     ) -> Result<(), PipelineError> {
+        // Opt-in output-size runaway guard: refuse to push the row that would
+        // carry the emitted count past the configured cap, failing loud (E325)
+        // rather than truncating to a partial result. `total_rows()` is the
+        // buffer's cumulative push count, so checking it before the push makes
+        // exactly `cap` rows land and the first over-cap row abort. Independent
+        // of the memory budget — this is a result-size ceiling, not memory
+        // pressure (the output sort spills to stay within memory).
+        if let Some(cap) = self.max_output_rows
+            && self.buf.total_rows() as u64 >= cap
+        {
+            return Err(PipelineError::CombineOutputCapExceeded {
+                combine: self.name.to_string(),
+                cap,
+            });
+        }
         // Mirror the byte delta into the consumer handle the moment the row
         // lands — the same charge the input-side drain applies — so the
         // arbitrator's pull-mode view reflects the output sort's live footprint.
@@ -1144,6 +1218,27 @@ struct CollectFlush {
     first_build: Option<Record>,
 }
 
+/// The strictly-local memory budget for one [`emit_pairs`] call, so a
+/// `match: collect` join's per-driver accumulators cannot grow past the hard
+/// limit while a pair emits.
+///
+/// `floor` is this pair's fixed working set — everything EXCEPT the live
+/// [`MatchState`] held bytes: the resident baseline, the driver/build held
+/// bytes, the materialized pair vector or nested-loop tile, the in-block pile,
+/// and the reserved output-sort cap. After each collect match `emit_pairs` polls
+/// `floor + state.held_bytes()` against `hard` and aborts with the typed
+/// strictly-local error rather than growing collect residency unbounded — the
+/// block-nested-loop fallback (and, for a many-to-one pair, the materialized
+/// path) would otherwise turn a hot `match: collect` value into an OOM instead of
+/// the clean pre-fallback abort. `First` / `All` hold O(1) per-driver state, so
+/// the poll is a cheap no-op for them.
+struct PairBudget<'a> {
+    floor: u64,
+    budget: &'a MemoryArbitrator,
+    name: &'a str,
+    consumer: &'a Arc<ConsumerHandle>,
+}
+
 /// Emit every qualifying `(driver, build)` pair in `pairs` under the
 /// combine's match mode, applying the residual filter (3+ range conjuncts) and
 /// the `First`-mode selection. `pairs` carries local indices into
@@ -1166,6 +1261,7 @@ fn emit_pairs(
     batch: &EmitBatch<'_>,
     state: &mut MatchState,
     sink: &mut EmitSink<'_>,
+    pair_budget: &PairBudget<'_>,
 ) -> Result<(), PipelineError> {
     for &(di_local, bi_local) in batch.pairs {
         let dref = &batch.driver_slice[di_local];
@@ -1221,6 +1317,22 @@ fn emit_pairs(
                 // Order key: the build's input index, so the kept set and array
                 // order are a deterministic function of the data.
                 state.record_collect_match(key, bidx, build_record);
+                // Bound the collect accumulators as they grow: they hold up to
+                // COLLECT_PER_GROUP_CAP cloned build records per driver, are never
+                // spilled, and drain only at the driver-block finalize — so a hot
+                // equality value (the case the block-nested-loop fallback is
+                // entered for) could otherwise grow them past the budget and OOM.
+                // Poll the strictly-local peak after each match and abort typed,
+                // matching the clean pre-fallback behavior for this shape.
+                let peak = pair_budget.floor.saturating_add(state.held_bytes());
+                if peak > pair_budget.budget.hard_limit() {
+                    pair_budget.consumer.set_bytes(0);
+                    return Err(pre_output_budget_error(
+                        pair_budget.name,
+                        peak,
+                        pair_budget.budget.hard_limit(),
+                    ));
+                }
             }
             MatchMode::First => {
                 // Hold the minimum-build-index candidate; emit at the driver
@@ -1949,6 +2061,49 @@ mod tests {
                     .collect();
             let expected = nested_loop(&left, &right, op1, op2);
             prop_assert_eq!(actual, expected);
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(256))]
+        /// The cap-aware kernel returns the identical full result whenever the
+        /// actual match count fits `max_pairs`, and overflows (`None`) exactly
+        /// when it does not — so a caller can trust `None` to mean "dense pair,
+        /// fall back" and `Some` to be the complete, materialization-safe vector.
+        #[test]
+        fn proptest_iejoin_capped_equals_uncapped_or_overflows(
+            (left, right, op1, op2) in arb_inputs(),
+            cap in 0usize..600,
+        ) {
+            let uncapped = iejoin_numeric(&left, &right, op1.to_range(), op2.to_range());
+            let capped =
+                iejoin_numeric_capped(&left, &right, op1.to_range(), op2.to_range(), cap);
+            if uncapped.len() <= cap {
+                // Non-overflowing: byte-identical to the uncapped kernel, order
+                // and all — the capped path shares the exact enumeration.
+                prop_assert_eq!(capped, Some(uncapped));
+            } else {
+                // Overflow fires precisely when the true count exceeds the cap.
+                prop_assert_eq!(capped, None);
+            }
+        }
+
+        /// Same contract for the single-inequality PWMJ kernel.
+        #[test]
+        fn proptest_pwmj_capped_equals_uncapped_or_overflows(
+            left in prop::collection::vec(-50i64..50, 0..40),
+            right in prop::collection::vec(-50i64..50, 0..40),
+            op_idx in 0usize..4,
+            cap in 0usize..400,
+        ) {
+            let op = [RangeOp::Lt, RangeOp::Le, RangeOp::Gt, RangeOp::Ge][op_idx];
+            let uncapped = pwmj_numeric(&left, &right, op);
+            let capped = pwmj_numeric_capped(&left, &right, op, cap);
+            if uncapped.len() <= cap {
+                prop_assert_eq!(capped, Some(uncapped));
+            } else {
+                prop_assert_eq!(capped, None);
+            }
         }
     }
 

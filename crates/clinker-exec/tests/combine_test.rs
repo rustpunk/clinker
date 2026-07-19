@@ -4539,6 +4539,270 @@ nodes:
         );
     }
 
+    /// max_output_rows on a pure-EQUI combine (HashBuildProbe, the default
+    /// strategy) must fail loud with E325 the moment the output exceeds the cap,
+    /// and complete uncapped — proving the cap is strategy-agnostic, not
+    /// block-band-only. A many-to-many key (3 employees × 4 assignments on the
+    /// same id) emits 12 rows; a cap of 5 aborts.
+    #[test]
+    fn max_output_rows_caps_hash_build_probe_combine() {
+        let yaml = r#"
+pipeline:
+  name: cap_equi
+nodes:
+  - type: source
+    name: employees
+    config:
+      name: employees
+      type: csv
+      path: employees.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: department, type: string }
+  - type: source
+    name: assignments
+    config:
+      name: assignments
+      type: csv
+      path: assignments.csv
+      schema:
+        - { name: employee_id, type: string }
+        - { name: project, type: string }
+  - type: combine
+    name: enrich
+    input:
+      employees: employees
+      assignments: assignments
+    config:
+      where: "employees.employee_id == assignments.employee_id"
+      match: all
+      on_miss: skip
+      max_output_rows: 5
+      cxl: |
+        emit employee_id = employees.employee_id
+        emit department = employees.department
+        emit project = assignments.project
+      propagate_ck: driver
+  - type: output
+    name: result
+    input: enrich
+    config:
+      name: result
+      type: csv
+      path: cap_equi.csv
+"#;
+        let employees = "employee_id,department\nE1,A\nE1,B\nE1,C\n";
+        let assignments = "employee_id,project\nE1,P1\nE1,P2\nE1,P3\nE1,P4\n";
+        let inputs = [("employees", employees), ("assignments", assignments)];
+        let err = run_combine_fixture(yaml, &inputs, Some("employees"))
+            .expect_err("12 output rows over a cap of 5 must fail loud on HashBuildProbe");
+        match err {
+            CombineFixtureError::Run(PipelineError::CombineOutputCapExceeded { cap, combine }) => {
+                assert_eq!(cap, 5, "the error must name the configured cap");
+                assert_eq!(combine, "enrich", "the error must name the combine node");
+            }
+            other => panic!("expected E325 on the equi (HashBuildProbe) combine; got {other}"),
+        }
+
+        // Drop the cap → the same equi combine completes and emits all 12 rows.
+        let uncapped = yaml.replace("      max_output_rows: 5\n", "");
+        let ok = run_combine_fixture(&uncapped, &inputs, Some("employees"))
+            .expect("an uncapped equi combine completes");
+        let canon = canonicalize_csv(ok.primary_output());
+        let rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            rows, 12,
+            "3×4 many-to-many equi join emits 12 rows uncapped"
+        );
+    }
+
+    /// max_output_rows on a presorted pure-RANGE combine, which the planner runs
+    /// through SortMerge (both inputs declare `sort_order` on the range axis).
+    /// `products.price < brackets.max`, match:all, emits 8 rows; a cap of 4 must
+    /// abort with E325 — the cap reaches the SortMerge emit chokepoint too.
+    #[test]
+    fn max_output_rows_caps_sort_merge_combine() {
+        let yaml = r#"
+pipeline:
+  name: cap_sort_merge
+nodes:
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      sort_order:
+        - field: price
+      schema:
+        - { name: sku, type: string }
+        - { name: price, type: int }
+  - type: source
+    name: brackets
+    config:
+      name: brackets
+      type: csv
+      path: brackets.csv
+      sort_order:
+        - field: max
+      schema:
+        - { name: bracket_id, type: string }
+        - { name: max, type: int }
+        - { name: rate, type: float }
+  - type: combine
+    name: assign_bracket
+    input:
+      products: products
+      brackets: brackets
+    config:
+      where: "products.price < brackets.max"
+      match: all
+      on_miss: skip
+      max_output_rows: 4
+      cxl: |
+        emit sku = products.sku
+        emit price = products.price
+        emit bracket_id = brackets.bracket_id
+      propagate_ck: driver
+  - type: output
+    name: result
+    input: assign_bracket
+    config:
+      name: result
+      type: csv
+      path: cap_sort_merge.csv
+"#;
+        // P10 → {25,40,100} (3), P20 → {25,40,100} (3), P30 → {40,100} (2) = 8.
+        let products = "sku,price\nP1,10\nP2,20\nP3,30\n";
+        let brackets = "bracket_id,max,rate\nB25,25,0.10\nB40,40,0.20\nB100,100,0.30\n";
+        let inputs = [("products", products), ("brackets", brackets)];
+        let err = run_combine_fixture(yaml, &inputs, Some("products"))
+            .expect_err("8 output rows over a cap of 4 must fail loud on SortMerge");
+        match err {
+            CombineFixtureError::Run(PipelineError::CombineOutputCapExceeded { cap, combine }) => {
+                assert_eq!(cap, 4, "the error must name the configured cap");
+                assert_eq!(
+                    combine, "assign_bracket",
+                    "the error must name the combine node"
+                );
+            }
+            other => {
+                panic!("expected E325 on the presorted-range (SortMerge) combine; got {other}")
+            }
+        }
+
+        // Drop the cap → the presorted-range combine completes with all 8 rows.
+        let uncapped = yaml.replace("      max_output_rows: 4\n", "");
+        let ok = run_combine_fixture(&uncapped, &inputs, Some("products"))
+            .expect("an uncapped presorted-range combine completes");
+        let canon = canonicalize_csv(ok.primary_output());
+        let rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            rows, 8,
+            "the presorted-range match:all join emits 8 rows uncapped"
+        );
+    }
+
+    /// max_output_rows on a grace-hash combine (forced via `strategy: grace_hash`)
+    /// must fail loud with E325 over the cap and complete uncapped — proving the
+    /// cap reaches the grace-hash emit chokepoint, not only the block-band and
+    /// hash/sort-merge paths. Many-to-many key: 3 probe × 4 build on the same key
+    /// = 12 output rows; a cap of 5 aborts.
+    #[test]
+    fn max_output_rows_caps_grace_hash_combine() {
+        let yaml = r#"
+pipeline:
+  name: cap_grace
+nodes:
+  - type: source
+    name: build
+    config:
+      name: build
+      type: csv
+      path: build.csv
+      schema:
+        - { name: key, type: string }
+        - { name: b, type: string }
+  - type: source
+    name: probe
+    config:
+      name: probe
+      type: csv
+      path: probe.csv
+      schema:
+        - { name: key, type: string }
+        - { name: p, type: string }
+  - type: combine
+    name: joined
+    input:
+      probe: probe
+      build: build
+    config:
+      where: "probe.key == build.key"
+      match: all
+      on_miss: skip
+      strategy: grace_hash
+      max_output_rows: 5
+      cxl: |
+        emit key = probe.key
+        emit p = probe.p
+        emit b = build.b
+      propagate_ck: driver
+  - type: output
+    name: result
+    input: joined
+    config:
+      name: result
+      type: csv
+      path: cap_grace.csv
+"#;
+        let probe = "key,p\nK,p1\nK,p2\nK,p3\n";
+        let build = "key,b\nK,b1\nK,b2\nK,b3\nK,b4\n";
+        let inputs = [("probe", probe), ("build", build)];
+        let err = run_combine_fixture(yaml, &inputs, Some("probe"))
+            .expect_err("12 output rows over a cap of 5 must fail loud on grace-hash");
+        match err {
+            CombineFixtureError::Run(PipelineError::CombineOutputCapExceeded { cap, combine }) => {
+                assert_eq!(cap, 5, "the error must name the configured cap");
+                assert_eq!(combine, "joined", "the error must name the combine node");
+            }
+            other => panic!("expected E325 on the grace-hash combine; got {other}"),
+        }
+
+        // Confirm the strategy hint actually selected grace-hash, so this really
+        // exercises the grace emit chokepoint (not a HashBuildProbe fallback).
+        let cfg = clinker_plan::yaml::from_str::<PipelineConfig>(yaml).expect("YAML must parse");
+        let plan = cfg
+            .compile(&clinker_plan::config::CompileContext::default())
+            .expect("YAML must compile");
+        let combine_node = plan
+            .dag()
+            .graph
+            .node_indices()
+            .find(|i| matches!(plan.dag().graph[*i], PlanNode::Combine { .. }))
+            .expect("combine node must exist");
+        if let PlanNode::Combine { strategy, .. } = &plan.dag().graph[combine_node] {
+            assert!(
+                matches!(
+                    strategy,
+                    clinker_plan::plan::combine::CombineStrategy::GraceHash { .. }
+                ),
+                "the cap test must run on grace-hash; got {strategy:?}",
+            );
+        }
+
+        // Drop the cap → the grace-hash combine completes with all 12 rows.
+        let uncapped = yaml.replace("      max_output_rows: 5\n", "");
+        let ok = run_combine_fixture(&uncapped, &inputs, Some("probe"))
+            .expect("an uncapped grace-hash combine completes");
+        let canon = canonicalize_csv(ok.primary_output());
+        let rows = canon.lines().skip(1).filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            rows, 12,
+            "3×4 many-to-many grace-hash join emits 12 rows uncapped"
+        );
+    }
+
     /// Strategy-selection: an estimated build cardinality whose product
     /// with the per-record byte estimate clears the default soft-limit
     /// must yield `CombineStrategy::GraceHash` instead of
@@ -4646,6 +4910,7 @@ nodes:
             predicate_summary: CombinePredicateSummary::default(),
             match_mode: clinker_plan::config::pipeline_node::MatchMode::First,
             on_miss: clinker_plan::config::pipeline_node::OnMiss::NullFields,
+            max_output_rows: None,
             propagate_ck: clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),

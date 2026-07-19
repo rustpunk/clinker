@@ -71,17 +71,29 @@
 //! The scan/sort and slice phases respond to memory pressure by SPILLING (own
 //! byte threshold + disk-quota E320), never by consulting global process
 //! pressure.
+//! A block-pair's match vector is materialized only when its worst case — the
+//! full driver×build cross product — provably fits the hard limit beside the
+//! reserved output cap. An irreducible over-budget pair (a hot single equality
+//! value whose near-full cross product cannot be reduced by finer slicing)
+//! instead streams its candidates through a bounded block-nested-loop that holds
+//! only one small tile of pair indices at a time, testing the same range
+//! predicate and equality re-verify the kernel would and emitting each match
+//! immediately through the shared, spillable, re-sorting output sink. That
+//! fallback is byte-identical to the materialized path across every memory
+//! budget — the output re-sorts by `(order, driver_idx, build_idx)`, so the
+//! order candidates arrive in never shows.
 //! The per-pair pre-output abort
 //! ([`pre_output_budget_error`](super::pre_output_budget_error)) is a strictly
 //! LOCAL last resort: it measures this pair's exact live footprint — the
 //! resident baseline, the scratch for any spilled block loaded here, the
 //! per-mode range-key columns, the emit-side driver/build slice and build-index
 //! vectors, the per-mode kernel-aux arrays (two-conjunct IEJoin or the leaner
-//! single-inequality PWMJ), the materialized pair-index vector, and the held
-//! candidates accumulated so far — directly against the hard limit, never
-//! against the arbitrator's global process pressure. So a bounded-residency run
-//! stays host-independent and aborts only when one pair's own footprint cannot
-//! fit `hard`, not because the process floor sits above a tight budget. The
+//! single-inequality PWMJ), and the held candidates accumulated so far — directly
+//! against the hard limit, never against the arbitrator's global process
+//! pressure. Since the pair vector is materialized only when it provably fits and
+//! streamed otherwise, this abort now fires only for a pair whose own block plus
+//! kernel-aux footprint cannot fit `hard` (leaving no room for even one streamed
+//! index pair) — not because the process floor sits above a tight budget. The
 //! OUTPUT axis is spill-bounded on the same strictly-local terms: emitted rows
 //! accumulate in a payload-ordered
 //! [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer) keyed on
@@ -152,9 +164,9 @@ use crate::pipeline::spill_merge::{MergeBudget, SortedRunMerger};
 
 use super::{
     BlockBandOutput, CollectFlush, DriverRef, EmitBatch, EmitConfig, EmitSink, Evaluators,
-    MatchState, RecordOrder, RecordScan, dispatch_on_miss, emit_match_row, emit_pairs,
-    flush_collect_row, iejoin_numeric, iejoin_numeric_state_bytes, pre_output_budget_error,
-    pwmj_numeric, pwmj_numeric_state_bytes,
+    MatchState, PairBudget, RecordOrder, RecordScan, dispatch_on_miss, emit_match_row, emit_pairs,
+    flush_collect_row, iejoin_numeric_capped, iejoin_numeric_state_bytes, pre_output_budget_error,
+    pwmj_numeric_capped, pwmj_numeric_state_bytes,
 };
 
 /// Soft-limit divisor for the per-block byte target. Targeting `soft / 8` per
@@ -191,6 +203,26 @@ const SORT_SPILL_DIVISOR: u64 = 4;
 /// resident blocks (≤ `soft / 4`), summing to `soft / 2`, which is below the hard
 /// limit (`soft` is a fraction of `hard`).
 const RESIDENT_BUDGET_DIVISOR: u64 = 4;
+
+/// Candidate pairs the bounded block-nested-loop fallback buffers before
+/// flushing them through the shared emit path. A fixed tile keeps the
+/// fallback's extra residency at O(tile) — 16 bytes per buffered pair,
+/// independent of the block cross-product size — which is the whole point of
+/// streaming an irreducible over-budget block-pair instead of materializing it.
+/// The tile is further clamped down to the headroom the per-pair gate proved
+/// free, so under a genuinely tiny budget it shrinks rather than overshooting.
+const BNL_TILE_PAIRS: usize = 4096;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only tally of block-pairs that took the bounded nested-loop fallback
+    /// (the kernel overflowed the budget), so a test can prove a SELECTIVE pair
+    /// stayed on the fast plane-sweep kernel path while a dense hot-value pair
+    /// fell back. Incremented in the fallback arm; reset and read by the harness.
+    /// Thread-local because the block-band runs synchronously on the caller's
+    /// thread, so parallel tests never share this counter.
+    static BNL_FALLBACK_PAIRS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Per-block byte target derived from the arbitrator soft limit, or the
 /// test-only override.
@@ -282,6 +314,38 @@ fn abort_over_budget(
 ) -> PipelineError {
     consumer.set_bytes(0);
     pre_output_budget_error(name, peak, hard)
+}
+
+/// Mirror this block-pair's live working set onto the consumer handle, so the
+/// arbitrator's pull-mode view never drops a term. `middle` is the pair's
+/// variable footprint (held blocks, kernel state, the materialized pair vector
+/// or nested-loop tile, and the current held First/collect candidates); the
+/// resident baseline, the output sort's resident bytes, and the in-block pile's
+/// resident bytes are always folded in around it. Centralized so no charge site
+/// can silently undercharge by forgetting the output or in-block terms.
+fn charge_working_set(
+    consumer: &Arc<ConsumerHandle>,
+    baseline_resident: u64,
+    middle: u64,
+    output_bytes: u64,
+    inblock_bytes: u64,
+) {
+    consumer.set_bytes(
+        baseline_resident
+            .saturating_add(middle)
+            .saturating_add(output_bytes)
+            .saturating_add(inblock_bytes),
+    );
+}
+
+/// Canonical equality re-verify for one candidate `(driver, build)` pair. The
+/// block-pair prune keys on the equality HASH and hashes collide, so a same-hash
+/// pair can still hold distinct equality values; both the materialized `retain`
+/// and the nested-loop fallback drop those through this one check — the way a
+/// hash join rechecks the key after a bucket hit. A pure-range combine carries
+/// empty `eq` on every record, so it always returns `true` (a no-op).
+fn eq_match(driver_eq: &[u8], build_eq: &[u8]) -> bool {
+    driver_eq == build_eq
 }
 
 /// The kernel dispatch for one driver block, carrying the driver-side key
@@ -430,6 +494,21 @@ fn possible(op: RangeOp, dmin: i64, dmax: i64, bmin: i64, bmax: i64) -> bool {
     }
 }
 
+/// Apply a driver-vs-build range operator to one key pair, matching the kernels'
+/// `left OP right` convention. The bounded nested-loop fallback tests candidates
+/// with this directly, reproducing exactly the pair set `iejoin_numeric` /
+/// `pwmj_numeric` would return for the same keys — so the two paths emit the
+/// identical match set for a block-pair.
+#[inline]
+fn apply_range(op: RangeOp, a: i64, b: i64) -> bool {
+    match op {
+        RangeOp::Lt => a < b,
+        RangeOp::Le => a <= b,
+        RangeOp::Gt => a > b,
+        RangeOp::Ge => a >= b,
+    }
+}
+
 /// A block-pair survives the prune iff the primary axis is possible and — for
 /// a two-conjunct band — the secondary axis is possible too. Each axis is an
 /// independent existence check, so a conjunction needs both.
@@ -557,6 +636,9 @@ pub(super) struct BlockBandExec<'a> {
     pub(super) output_schema: Option<&'a Arc<Schema>>,
     pub(super) match_mode: MatchMode,
     pub(super) on_miss: OnMiss,
+    /// Opt-in runtime cap on the combine's emitted-row count (E325 on breach);
+    /// `None` is unlimited. Enforced at the output-emit chokepoint.
+    pub(super) max_output_rows: Option<u64>,
     pub(super) propagate_ck: &'a PropagateCkSpec,
     pub(super) ctx: &'a EvalContext<'a>,
     pub(super) budget: &'a MemoryArbitrator,
@@ -591,6 +673,7 @@ pub(super) fn execute_block_band(
         output_schema,
         match_mode,
         on_miss,
+        max_output_rows,
         propagate_ck,
         ctx,
         budget,
@@ -756,12 +839,17 @@ pub(super) fn execute_block_band(
     // One sink threads the whole emit phase (driver loop, driver-block finalize,
     // scan-unmatched sweep, on_miss dispatch); its borrows of the output buffer
     // and failure-tag vec end at its last use, before the output buffer is
-    // finished and the failures re-sorted.
+    // finished and the failures re-sorted. The opt-in `max_output_rows` cap
+    // counts the whole output — every match mode, the materialized and
+    // nested-loop paths, and the deferred on-miss dispatch alike — via the output
+    // buffer's own cumulative `total_rows()`, since all of them push through
+    // `EmitSink::push_row`.
     let mut sink = EmitSink {
         buf: &mut output_buf,
         budget,
         name,
         consumer,
+        max_output_rows,
         output_eval_failures: &mut output_eval_failures,
         failure_tags: Some(&mut failure_tags),
     };
@@ -922,18 +1010,23 @@ pub(super) fn execute_block_band(
                 Some(_) => iejoin_numeric_state_bytes(driver_block.len, build_block.len),
                 None => pwmj_numeric_state_bytes(driver_block.len, build_block.len),
             } as u64;
-            let build_held = spilled_scratch_bytes(build_block)
-                .saturating_add(build_vecs_bytes)
-                .saturating_add(aux_kernel);
+            // The nested-loop fallback (below) runs no kernel, so it allocates none
+            // of the O(n) sort state `aux_kernel` covers. Keep the two apart: the
+            // pre-load gate and the materialized kernel attempt reserve `build_held`
+            // (with aux); the fallback bounds its tile against `build_held_no_aux`,
+            // so a razor-thin-budget pair the fallback could complete is not
+            // spuriously aborted for state it never allocates.
+            let build_held_no_aux =
+                spilled_scratch_bytes(build_block).saturating_add(build_vecs_bytes);
+            let build_held = build_held_no_aux.saturating_add(aux_kernel);
             let pair_peak = baseline_resident
                 .saturating_add(driver_held)
                 .saturating_add(build_held)
                 .saturating_add(state.held_bytes())
                 .saturating_add(inblock_buf.bytes_used() as u64);
-            // Reserve only the output sort's constant cap on top of the measured
-            // working set (`pair_peak` already carries the in-block pile's live
-            // bytes and stays otherwise stable, so the post-kernel gate below can
-            // add `pairs_bytes` and reserve exactly once, never double-counting).
+            // Genuinely-impossible guard: if this pair's resident blocks, the
+            // kernel's O(n) sort state, the held candidates, and the reserved output
+            // cap together cannot fit `hard`, no path can complete it — abort typed.
             let pair_peak_reserved = pair_peak.saturating_add(deferred_cap);
             if pair_peak_reserved > budget.hard_limit() {
                 return Err(abort_over_budget(
@@ -949,88 +1042,223 @@ pub(super) fn execute_block_band(
                 continue;
             }
             let build_idx: Vec<u64> = build_loaded.iter().map(|(_, p)| p.build_idx).collect();
-            consumer.set_bytes(
-                baseline_resident
-                    .saturating_add(driver_held)
+            charge_working_set(
+                consumer,
+                baseline_resident,
+                driver_held
                     .saturating_add(build_held)
-                    .saturating_add(state.held_bytes())
-                    .saturating_add(sink.output_buffer_bytes())
-                    .saturating_add(inblock_buf.bytes_used() as u64),
-            );
-
-            // Build the build-side key column at the width the chosen kernel
-            // reads: the `(k1, k2)` pairs for the two-conjunct IEJoin, or the
-            // bare `k1` column for PWMJ (one pass, no dead second axis).
-            let mut pairs: Vec<(usize, usize)> = match &range_mode {
-                RangeMode::Dual { op2, driver_keys } => {
-                    let bkeys: Vec<(i64, i64)> =
-                        build_loaded.iter().map(|(_, p)| (p.k1, p.k2)).collect();
-                    iejoin_numeric(driver_keys, &bkeys, op1, *op2)
-                }
-                RangeMode::Single { driver_keys } => {
-                    let bl: Vec<i64> = build_loaded.iter().map(|(_, p)| p.k1).collect();
-                    pwmj_numeric(driver_keys, &bl, op1)
-                }
-            };
-
-            // Canonical equality re-verify. The block-pair prune keyed on the
-            // equality HASH, and hashes collide, so within a same-hash pair the
-            // range kernel can pair a driver and build whose actual equality
-            // values differ. Drop those: compare the canonical equality bytes
-            // the payloads carry (the exact value, not the hash), the way a hash
-            // join rechecks the key after a bucket hit. For a pure-range combine
-            // every `eq` is empty, so this retains every pair — a no-op that
-            // leaves the pure-range result and order unchanged. Done before the
-            // pairs-vector gate so the gate sees the post-verify count.
-            pairs.retain(|&(di, bi)| driver_loaded[di].1.eq == build_loaded[bi].1.eq);
-
-            // Fold the materialized pair-index vector into the peak: it is the
-            // last pre-output allocation before per-pair emit. This is a
-            // check-AFTER-allocation — the vector is already built — so it is a
-            // typed abort for an over-budget-but-allocatable pair, not a
-            // guarantee against an allocation larger than free RAM (that is the
-            // block-nested-loop follow-up). It mirrors the equi+range path's
-            // post-kernel pairs gate.
-            let pairs_bytes = (pairs.len() * std::mem::size_of::<(usize, usize)>()) as u64;
-            let pair_peak = pair_peak.saturating_add(pairs_bytes);
-            let pair_peak_reserved = pair_peak.saturating_add(deferred_cap);
-            if pair_peak_reserved > budget.hard_limit() {
-                return Err(abort_over_budget(
-                    consumer,
-                    name,
-                    pair_peak_reserved,
-                    budget.hard_limit(),
-                ));
-            }
-            consumer.set_bytes(
-                baseline_resident
-                    .saturating_add(driver_held)
-                    .saturating_add(build_held)
-                    .saturating_add(state.held_bytes())
-                    .saturating_add(pairs_bytes)
-                    .saturating_add(sink.output_buffer_bytes())
-                    .saturating_add(inblock_buf.bytes_used() as u64),
+                    .saturating_add(state.held_bytes()),
+                sink.output_buffer_bytes(),
+                inblock_buf.bytes_used() as u64,
             );
 
             let build_slice: Vec<&Record> = build_loaded.iter().map(|(r, _)| r).collect();
-            let batch = EmitBatch {
-                pairs: &pairs,
-                driver_slice: &driver_slice,
-                build_slice: &build_slice,
-                build_idx: &build_idx,
+            let pair_size = std::mem::size_of::<(usize, usize)>() as u64;
+
+            // Materialize-vs-fallback decision keyed on the kernel's ACTUAL output,
+            // not the theoretical worst case. Ask the kernel for at most `max_pairs`
+            // — and it stops, signaling overflow, the moment the real match count
+            // would exceed that, WITHOUT materializing an over-budget vector. A
+            // selective band / as-of join (matches ≪ driver×build) produces its
+            // small vector and takes the fast plane-sweep materialized path with no
+            // regression; only a genuinely dense pair overflows to the fallback.
+            //
+            // The kernel grows `out` from empty, so its backing allocation follows
+            // Vec's doubling — up to ~2× the logical length, and ~3× transiently
+            // while the final realloc holds both the old and new buffers. That
+            // transient is invisible to the arbitrator (the consumer charge is set
+            // before the call, un-polled mid-kernel), so bound the LOGICAL cap so
+            // even the ~3× peak stays within the free headroom: divide by
+            // `3 * pair_size`. Selective pairs emit far fewer than `max_pairs`, so a
+            // lower cap does not push them off the fast path; only denser pairs fall
+            // back a little earlier.
+            let max_pairs =
+                (budget.hard_limit().saturating_sub(pair_peak_reserved) / (3 * pair_size)) as usize;
+            let materialized = match &range_mode {
+                RangeMode::Dual { op2, driver_keys } => {
+                    let bkeys: Vec<(i64, i64)> =
+                        build_loaded.iter().map(|(_, p)| (p.k1, p.k2)).collect();
+                    iejoin_numeric_capped(driver_keys, &bkeys, op1, *op2, max_pairs)
+                }
+                RangeMode::Single { driver_keys } => {
+                    let bl: Vec<i64> = build_loaded.iter().map(|(_, p)| p.k1).collect();
+                    pwmj_numeric_capped(driver_keys, &bl, op1, max_pairs)
+                }
             };
-            emit_pairs(&emit_cfg, &mut evals, &batch, &mut state, &mut sink)?;
+            match materialized {
+                Some(mut pairs) => {
+                    // Fast materialized path: the kernel's output provably fits the
+                    // budget. Canonical equality re-verify (same-hash blocks can pair
+                    // distinct equality values) before the emit.
+                    pairs.retain(|&(di, bi)| {
+                        eq_match(&driver_loaded[di].1.eq, &build_loaded[bi].1.eq)
+                    });
+                    // The kernel has returned, so its O(n) `aux_kernel` sort state is
+                    // freed; the emit's live build-side footprint is
+                    // `build_held_no_aux` plus the materialized pair vector — exactly
+                    // as the fallback arm accounts. Charging or gating against
+                    // `build_held` (with aux) here would over-count the freed state
+                    // and could spuriously abort a completable `match: collect`.
+                    let pairs_bytes = (pairs.len() as u64).saturating_mul(pair_size);
+                    charge_working_set(
+                        consumer,
+                        baseline_resident,
+                        driver_held
+                            .saturating_add(build_held_no_aux)
+                            .saturating_add(state.held_bytes())
+                            .saturating_add(pairs_bytes),
+                        sink.output_buffer_bytes(),
+                        inblock_buf.bytes_used() as u64,
+                    );
+                    let batch = EmitBatch {
+                        pairs: &pairs,
+                        driver_slice: &driver_slice,
+                        build_slice: &build_slice,
+                        build_idx: &build_idx,
+                    };
+                    // Fixed working-set floor (everything but the live held bytes the
+                    // collect poll adds), so a hot `match: collect` pair bounds its
+                    // per-driver accumulators against `hard` instead of OOMing.
+                    let pair_budget = PairBudget {
+                        floor: baseline_resident
+                            .saturating_add(driver_held)
+                            .saturating_add(build_held_no_aux)
+                            .saturating_add(pairs_bytes)
+                            .saturating_add(inblock_buf.bytes_used() as u64)
+                            .saturating_add(deferred_cap),
+                        budget,
+                        name,
+                        consumer,
+                    };
+                    emit_pairs(
+                        &emit_cfg,
+                        &mut evals,
+                        &batch,
+                        &mut state,
+                        &mut sink,
+                        &pair_budget,
+                    )?;
+                }
+                None => {
+                    #[cfg(test)]
+                    BNL_FALLBACK_PAIRS.with(|c| c.set(c.get() + 1));
+                    // Bounded block-nested-loop fallback for an irreducible dense
+                    // pair — the case a hot single equality value produces, whose
+                    // near-full range cross product finer slicing cannot reduce, so
+                    // the kernel overflowed the budget. It walks the driver×build
+                    // cross product, tests the SAME range predicate (`apply_range`)
+                    // and canonical equality re-verify the kernel would, and buffers
+                    // only a fixed-size tile of matching local index pairs before
+                    // flushing them through the shared `emit_pairs`. Extra residency
+                    // is O(tile) — 16 bytes per buffered pair, capped at
+                    // `BNL_TILE_PAIRS` and clamped to the proven-free headroom — so
+                    // the pair completes instead of aborting. Determinism: it emits
+                    // exactly the kernel's `(driver, build)` match set, and every
+                    // match rides the same `(order, driver_idx, build_idx)`-tagged,
+                    // re-sorting output sink, so the completed output is
+                    // byte-identical to the materialized path across every budget.
+                    // `First`, `All`, `Collect`, the residual filter, and `on_miss`
+                    // are all realized by `emit_pairs` unchanged, since none depends
+                    // on the order the candidates arrive in.
+                    //
+                    // The kernel returned, so its O(n) `aux_kernel` state is freed;
+                    // the fallback's live footprint and tile headroom exclude it
+                    // (`build_held_no_aux`).
+                    let bnl_reserved = baseline_resident
+                        .saturating_add(driver_held)
+                        .saturating_add(build_held_no_aux)
+                        .saturating_add(state.held_bytes())
+                        .saturating_add(inblock_buf.bytes_used() as u64)
+                        .saturating_add(deferred_cap);
+                    let headroom = budget.hard_limit().saturating_sub(bnl_reserved);
+                    let tile_cap = (headroom / pair_size).min(BNL_TILE_PAIRS as u64) as usize;
+                    if tile_cap == 0 {
+                        // Not even one output-index pair fits beside this pair's own
+                        // resident state — the one genuinely-impossible case the
+                        // fallback cannot rescue.
+                        return Err(abort_over_budget(
+                            consumer,
+                            name,
+                            bnl_reserved.saturating_add(pair_size),
+                            budget.hard_limit(),
+                        ));
+                    }
+                    let tile_reserve = (tile_cap as u64).saturating_mul(pair_size);
+                    charge_working_set(
+                        consumer,
+                        baseline_resident,
+                        driver_held
+                            .saturating_add(build_held_no_aux)
+                            .saturating_add(state.held_bytes())
+                            .saturating_add(tile_reserve),
+                        sink.output_buffer_bytes(),
+                        inblock_buf.bytes_used() as u64,
+                    );
+                    let pair_budget = PairBudget {
+                        floor: baseline_resident
+                            .saturating_add(driver_held)
+                            .saturating_add(build_held_no_aux)
+                            .saturating_add(tile_reserve)
+                            .saturating_add(inblock_buf.bytes_used() as u64)
+                            .saturating_add(deferred_cap),
+                        budget,
+                        name,
+                        consumer,
+                    };
+                    // One flush routine for both the tile-full and end-of-loop
+                    // drains, so the two paths cannot diverge. It takes the mutable
+                    // state / sink as arguments rather than capturing them, so it
+                    // stays a plain `Fn` over the immutable slices.
+                    let flush = |tile: &[(usize, usize)],
+                                 evals: &mut Evaluators,
+                                 state: &mut MatchState,
+                                 sink: &mut EmitSink<'_>|
+                     -> Result<(), PipelineError> {
+                        let batch = EmitBatch {
+                            pairs: tile,
+                            driver_slice: &driver_slice,
+                            build_slice: &build_slice,
+                            build_idx: &build_idx,
+                        };
+                        emit_pairs(&emit_cfg, evals, &batch, state, sink, &pair_budget)
+                    };
+                    let mut tile: Vec<(usize, usize)> = Vec::with_capacity(tile_cap);
+                    for (di, (_, dp)) in driver_loaded.iter().enumerate() {
+                        for (bi, (_, bp)) in build_loaded.iter().enumerate() {
+                            let range_ok = match &range_mode {
+                                RangeMode::Dual { op2, driver_keys } => {
+                                    let (dk1, dk2) = driver_keys[di];
+                                    apply_range(op1, dk1, bp.k1) && apply_range(*op2, dk2, bp.k2)
+                                }
+                                RangeMode::Single { driver_keys } => {
+                                    apply_range(op1, driver_keys[di], bp.k1)
+                                }
+                            };
+                            if range_ok && eq_match(&dp.eq, &bp.eq) {
+                                tile.push((di, bi));
+                                if tile.len() == tile_cap {
+                                    flush(&tile, &mut evals, &mut state, &mut sink)?;
+                                    tile.clear();
+                                }
+                            }
+                        }
+                    }
+                    if !tile.is_empty() {
+                        flush(&tile, &mut evals, &mut state, &mut sink)?;
+                    }
+                }
+            }
 
             // The build scratch and key/pair arrays for this pair are dropped;
             // fall back to the driver block's held state plus the First / collect
             // candidates accumulated so far, still carrying the output sort's and
             // the in-block pile's resident bytes so those charges persist.
-            consumer.set_bytes(
-                baseline_resident
-                    .saturating_add(driver_held)
-                    .saturating_add(state.held_bytes())
-                    .saturating_add(sink.output_buffer_bytes())
-                    .saturating_add(inblock_buf.bytes_used() as u64),
+            charge_working_set(
+                consumer,
+                baseline_resident,
+                driver_held.saturating_add(state.held_bytes()),
+                sink.output_buffer_bytes(),
+                inblock_buf.bytes_used() as u64,
             );
         }
 
@@ -1968,6 +2196,27 @@ mod tests {
         MemoryArbitrator::with_policy(hard_limit, 0.80, 0.70, Box::new(NoOpPolicy))
     }
 
+    /// Reset the per-thread block-nested-loop fallback tally to zero before a run.
+    fn reset_bnl_fallbacks() {
+        BNL_FALLBACK_PAIRS.with(|c| c.set(0));
+    }
+
+    /// Block-pairs that took the nested-loop fallback since the last reset.
+    fn bnl_fallbacks() -> u64 {
+        BNL_FALLBACK_PAIRS.with(|c| c.get())
+    }
+
+    /// Build a range operator from `(strict, gt)` flags: `Lt`/`Gt` when strict,
+    /// `Le`/`Ge` otherwise. Lets the strict-op determinism tests cover all four.
+    fn pick_op(strict: bool, gt: bool) -> RangeOp {
+        match (gt, strict) {
+            (false, true) => RangeOp::Lt,
+            (false, false) => RangeOp::Le,
+            (true, true) => RangeOp::Gt,
+            (true, false) => RangeOp::Ge,
+        }
+    }
+
     fn to_records_scans(side: &Side, schema: &Arc<Schema>) -> (Vec<Record>, Vec<RecordScan>) {
         let records = side
             .iter()
@@ -2109,6 +2358,7 @@ mod tests {
             output_schema: Some(&out_schema),
             match_mode: cfg.match_mode,
             on_miss: cfg.on_miss,
+            max_output_rows: None,
             propagate_ck: &propagate,
             ctx: &ctx,
             budget,
@@ -2909,19 +3159,25 @@ mod tests {
         );
     }
 
-    // ── dense block-pair typed abort ────────────────────────────────────
+    // ── dense block-pair completes via the bounded nested-loop fallback ──
 
     #[test]
-    fn dense_block_pair_aborts_with_typed_error_not_oom() {
+    fn dense_block_pair_completes_via_nested_loop_not_abort() {
         // Every driver matches every build (all keys equal, `<= AND >=`), so a
-        // single block-pair materializes an N*M pair-index vector. A budget that
-        // admits both blocks and the kernel aux but not the pair vector must
-        // abort with the typed MemoryBudgetExceeded (the same allocation the
-        // equi+range path gates), not OOM the process.
+        // single block-pair's candidate set is the full N*M cross product — the
+        // irreducible hot-value shape that cannot be reduced by finer slicing. A
+        // budget that admits both blocks and the kernel aux but NOT the ~640 KiB
+        // pair-index vector used to abort with a typed pre-output error; the
+        // bounded block-nested-loop fallback must now COMPLETE that pair within
+        // the budget instead, streaming candidates in bounded tiles.
+        //
+        // Fail-before / pass-after: before the fallback this run aborted with
+        // `MemoryBudgetExceeded { detail: "iejoin pre-output …" }`; it must now
+        // return the full pair set and be byte-identical to a roomy run.
         let n = 200i64;
         let driver: Side = (0..n).map(|i| (Some((5, 5)), i)).collect();
         let build: Side = (0..n).map(|i| (Some((5, 5)), i + 10_000)).collect();
-        let cfg = RunCfg {
+        let tight = RunCfg {
             op1: RangeOp::Le,
             op2: Some(RangeOp::Ge),
             match_mode: MatchMode::All,
@@ -2930,13 +3186,179 @@ mod tests {
             // pair is a single near-cross-product.
             block_target: 1 << 20,
             // Both ~small blocks plus the kernel aux fit, but the 200×200 pair
-            // vector (~640 KiB) pushes the local peak over this limit.
+            // vector (~640 KiB) does not — so the pair takes the fallback.
             hard_limit: 256 * 1024,
             max_spill_bytes: None,
             sort_spill: None,
             resident_budget: None,
         };
-        let err = run_block(&driver, &build, &cfg).expect_err("dense pair must abort");
+        reset_bnl_fallbacks();
+        let tight_rows = run_block(&driver, &build, &tight)
+            .expect("the dense hot-value pair must COMPLETE via the nested-loop fallback");
+        assert!(
+            bnl_fallbacks() > 0,
+            "the dense pair's kernel output overflows the tight budget, so it must take the fallback"
+        );
+        // A roomy budget materializes the whole pair vector (the ordinary path).
+        let roomy = RunCfg {
+            hard_limit: 1 << 30,
+            ..tight
+        };
+        reset_bnl_fallbacks();
+        let roomy_rows =
+            run_block(&driver, &build, &roomy).expect("the roomy run materializes the pair vector");
+        assert_eq!(
+            bnl_fallbacks(),
+            0,
+            "a roomy budget admits the full pair vector, so the kernel path is taken"
+        );
+
+        // The whole 200×200 cross product is emitted — matching the nested-loop
+        // oracle — and the tight (fallback) and roomy (materialized) runs are
+        // byte-identical in final order: the determinism-across-budgets contract.
+        let expected = oracle_pairs(&driver, &build, TOp::Le, Some(TOp::Ge));
+        assert_eq!(expected.len(), (n * n) as usize, "every pair matches");
+        assert_eq!(
+            all_pairs(&tight_rows),
+            expected,
+            "the fallback must reproduce the full nested-loop match set"
+        );
+        assert_eq!(
+            ordered_pairs(&tight_rows),
+            ordered_pairs(&roomy_rows),
+            "the fallback output must be byte-identical to the materialized run"
+        );
+    }
+
+    #[test]
+    fn hot_value_fallback_preserves_match_first_selection() {
+        // The fallback must preserve `match: first` exactly — the minimum build
+        // input index per driver, deferred to the driver-block finalize. Every
+        // driver matches every build (hot value), so the winning build is index 0
+        // for all of them. Under a tight budget the ~640 KiB pair vector does not
+        // fit, so the pair streams through the bounded nested loop; the emitted
+        // selection must be byte-identical to the roomy materialized run — the
+        // held-candidate min-selection is order-independent, so tiling cannot
+        // change it.
+        let n = 200i64;
+        let driver: Side = (0..n).map(|i| (Some((5, 5)), i)).collect();
+        let build: Side = (0..n).map(|i| (Some((5, 5)), i + 10_000)).collect();
+        let tight = RunCfg {
+            op1: RangeOp::Le,
+            op2: Some(RangeOp::Ge),
+            match_mode: MatchMode::First,
+            on_miss: OnMiss::Skip,
+            block_target: 1 << 20,
+            hard_limit: 256 * 1024,
+            max_spill_bytes: None,
+            sort_spill: None,
+            resident_budget: None,
+        };
+        let tight_rows = run_block(&driver, &build, &tight)
+            .expect("match:first over the hot pair must complete via the fallback");
+        let roomy = RunCfg {
+            hard_limit: 1 << 30,
+            ..tight
+        };
+        let roomy_rows = run_block(&driver, &build, &roomy).expect("roomy match:first run");
+
+        assert_eq!(
+            ordered_pairs(&tight_rows),
+            ordered_pairs(&roomy_rows),
+            "the fallback must not change match:first selection or order"
+        );
+        // Exactly one row per driver, each selecting build input index 0 (id
+        // 10_000), the minimum among the matches.
+        assert_eq!(tight_rows.len(), n as usize, "one row per matched driver");
+        assert!(
+            tight_rows.iter().all(|r| int(r.get("b_id")) == 10_000),
+            "match:first must select the minimum build input index"
+        );
+    }
+
+    #[test]
+    fn selective_pair_takes_kernel_not_fallback() {
+        // The no-regression check for the actual-output gate: a big block-pair
+        // whose ACTUAL match set is small (a selective single-inequality / as-of
+        // shape) must run the plane-sweep kernel and materialize its small vector,
+        // NOT fall back to the O(n·m) nested loop — even under a budget too tight
+        // to hold the theoretical driver×build cross product. Driver keys 0..300;
+        // build keys 0, 1000, 2000, … so under `Ge` every driver matches only
+        // build 0 (300 matches total), while the worst-case cross product is
+        // 90_000 pairs (~1.4 MiB). The old worst-case gate took the fallback for
+        // this pair; the actual-output gate keeps it on the kernel.
+        let n = 300i64;
+        let driver: Side = (0..n).map(|i| (Some((i, 0)), i)).collect();
+        let build: Side = (0..n).map(|j| (Some((j * 1000, 0)), j + 10_000)).collect();
+        let cfg = RunCfg {
+            op1: RangeOp::Ge,
+            op2: None,
+            match_mode: MatchMode::All,
+            on_miss: OnMiss::Skip,
+            // One block per side, so a single selective pair survives the prune.
+            block_target: 1 << 20,
+            // Admits the 300-pair actual vector, the kernel aux, and both blocks,
+            // but NOT the 90_000-pair (~1.4 MiB) worst-case cross product.
+            hard_limit: 512 * 1024,
+            max_spill_bytes: None,
+            sort_spill: None,
+            resident_budget: None,
+        };
+        reset_bnl_fallbacks();
+        let rows =
+            run_block(&driver, &build, &cfg).expect("a selective pair completes on the kernel");
+        assert_eq!(
+            bnl_fallbacks(),
+            0,
+            "a selective pair's small kernel output fits the budget, so no fallback"
+        );
+        // Correctness: every driver matches build 0 (id 10_000) and only that.
+        let expected = oracle_pairs(&driver, &build, TOp::Ge, None);
+        assert_eq!(
+            all_pairs(&rows),
+            expected,
+            "kernel result must match the oracle"
+        );
+        assert_eq!(
+            rows.len(),
+            n as usize,
+            "each driver matches exactly build 0"
+        );
+        assert!(
+            rows.iter().all(|r| int(r.get("b_id")) == 10_000),
+            "the only in-range build is index 0"
+        );
+    }
+
+    // ── match:collect stays bounded under the fallback ───────────────────
+
+    #[test]
+    fn hot_value_collect_stays_bounded_not_oom() {
+        // A hot equality value under match:collect: every driver collects every
+        // build. The nested-loop fallback bounds only the pair-index tile, NOT the
+        // collect accumulators — up to COLLECT_PER_GROUP_CAP cloned build records
+        // per driver, never spilled. Without the in-emit collect poll a tight
+        // budget would grow them to multi-MiB and OOM; the poll must instead abort
+        // with the typed strictly-local budget error, the same clean bound the
+        // pre-fallback pairs-vector gate gave this shape. It must NOT silently
+        // complete with an unbounded resident accumulator, and must NOT OOM.
+        let n = 200i64;
+        let driver: Side = (0..n).map(|i| (Some((5, 5)), i)).collect();
+        let build: Side = (0..n).map(|i| (Some((5, 5)), i + 10_000)).collect();
+        let cfg = RunCfg {
+            op1: RangeOp::Le,
+            op2: Some(RangeOp::Ge),
+            match_mode: MatchMode::Collect,
+            on_miss: OnMiss::Skip,
+            block_target: 1 << 20,
+            hard_limit: 256 * 1024,
+            max_spill_bytes: None,
+            sort_spill: None,
+            resident_budget: None,
+        };
+        let budget = arbitrator(cfg.hard_limit);
+        let err = run_block_on(&driver, &build, &cfg, &budget)
+            .expect_err("a hot-value collect must stay bounded, aborting rather than OOMing");
         match err {
             PipelineError::MemoryBudgetExceeded { detail, source, .. } => {
                 assert_eq!(source, clinker_plan::BudgetCategory::Arena);
@@ -2945,13 +3367,242 @@ mod tests {
                         .as_deref()
                         .unwrap_or("")
                         .contains("iejoin pre-output"),
-                    "abort must come from the pre-output gate; got {detail:?}"
+                    "the collect bound must abort via the strictly-local pre-output gate; got {detail:?}"
                 );
             }
             other => {
-                panic!("expected MemoryBudgetExceeded from the pairs-vector charge; got {other:?}")
+                panic!(
+                    "expected a typed MemoryBudgetExceeded from the collect bound; got {other:?}"
+                )
             }
         }
+        // The abort discharged the handle (no stale charge survives).
+        assert_eq!(
+            budget.sum_consumer_usage(),
+            0,
+            "a strictly-local abort must zero the operator's charge"
+        );
+    }
+
+    // ── fallback vs kernel agree byte-for-byte under strict ops ──────────
+
+    #[test]
+    fn bnl_strict_ops_byte_identical_to_kernel_all_and_first() {
+        // Discriminating determinism check the symmetric all-equal Le∧Ge fixture
+        // cannot make: asymmetric, partly-colliding keys under the STRICT operators
+        // (Lt/Gt), where the kernel's left/right interleaving and strict-vs-
+        // inclusive tiebreaks are load-bearing. Drive the SAME input through a
+        // TIGHT budget (which forces the dense pair to the nested loop) and a ROOMY
+        // budget (plane-sweep kernel), for match:all and match:first, and assert
+        // the final ordered output is byte-identical — so a fallback orientation or
+        // strict-tiebreak divergence from the kernel would fail here.
+        let n = 120i64;
+        // k1 collides in bands of 20, k2 in bands of 13 → many equal-key pairs the
+        // strict operators must EXCLUDE, and the two axes are asymmetric.
+        let driver: Side = (0..n).map(|i| (Some((i % 20, i % 13)), i)).collect();
+        let build: Side = (0..n)
+            .map(|j| (Some((j % 17, j % 11)), j + 10_000))
+            .collect();
+        for mode in [MatchMode::All, MatchMode::First] {
+            let tight = RunCfg {
+                op1: RangeOp::Lt,
+                op2: Some(RangeOp::Gt),
+                match_mode: mode,
+                on_miss: OnMiss::Skip,
+                // One block per side, so the surviving pair is a single dense
+                // cross-product the tight budget cannot materialize whole.
+                block_target: 1 << 20,
+                hard_limit: 128 * 1024,
+                max_spill_bytes: None,
+                sort_spill: None,
+                resident_budget: None,
+            };
+            reset_bnl_fallbacks();
+            let tight_rows =
+                run_block(&driver, &build, &tight).expect("tight strict-op run completes");
+            assert!(
+                bnl_fallbacks() > 0,
+                "the tight budget must force the dense strict-op pair to the fallback ({mode:?})"
+            );
+            let roomy = RunCfg {
+                hard_limit: 1 << 30,
+                ..tight
+            };
+            reset_bnl_fallbacks();
+            let roomy_rows =
+                run_block(&driver, &build, &roomy).expect("roomy strict-op run completes");
+            assert_eq!(
+                bnl_fallbacks(),
+                0,
+                "the roomy budget must keep the pair on the kernel ({mode:?})"
+            );
+            assert_eq!(
+                ordered_pairs(&tight_rows),
+                ordered_pairs(&roomy_rows),
+                "fallback and kernel output diverged under strict ops for {mode:?}"
+            );
+            assert!(
+                !tight_rows.is_empty(),
+                "the strict-op fixture must produce matches for {mode:?}"
+            );
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(48))]
+        /// Broaden the strict-op agreement check over random asymmetric inputs and
+        /// all four operators on each axis: the SAME input through a tight
+        /// (fallback-forcing) and a roomy (kernel) budget must yield byte-identical
+        /// ordered output for match:all and match:first. Byte-identity must hold
+        /// whether or not a given case actually forces the fallback, so a
+        /// divergence surfaces regardless.
+        #[test]
+        fn proptest_bnl_matches_kernel_byte_for_byte(
+            driver in arb_side(20..55),
+            build in arb_side(20..55),
+            strict1 in prop::bool::ANY,
+            gt1 in prop::bool::ANY,
+            strict2 in prop::bool::ANY,
+            gt2 in prop::bool::ANY,
+        ) {
+            let op1 = pick_op(strict1, gt1);
+            let op2 = pick_op(strict2, gt2);
+            for mode in [MatchMode::All, MatchMode::First] {
+                let tight = RunCfg {
+                    op1,
+                    op2: Some(op2),
+                    match_mode: mode,
+                    on_miss: OnMiss::Skip,
+                    block_target: 1 << 20,
+                    hard_limit: 96 * 1024,
+                    max_spill_bytes: None,
+                    sort_spill: None,
+                    resident_budget: None,
+                };
+                let roomy = RunCfg {
+                    hard_limit: 1 << 30,
+                    ..tight
+                };
+                let tight_rows = run_block(&driver, &build, &tight).expect("tight run");
+                let roomy_rows = run_block(&driver, &build, &roomy).expect("roomy run");
+                prop_assert_eq!(ordered_pairs(&tight_rows), ordered_pairs(&roomy_rows));
+            }
+        }
+    }
+
+    // ── max_output_rows runaway cap (opt-in, fail-loud) ──────────────────
+
+    /// Drive the block-band with an explicit `max_output_rows`, so the cap tests
+    /// can exercise the runaway guard `run_block` (which always passes `None`)
+    /// cannot. Mirrors `run_block_on`'s body-less concat emit.
+    fn run_block_capped(
+        driver: &Side,
+        build: &Side,
+        cfg: &RunCfg,
+        max_output_rows: Option<u64>,
+    ) -> Result<Vec<Record>, PipelineError> {
+        let d_schema = driver_schema();
+        let b_schema = build_schema();
+        let out_schema = Arc::new(Schema::new(vec![
+            "d_k1".into(),
+            "d_k2".into(),
+            "d_id".into(),
+            "b_k1".into(),
+            "b_k2".into(),
+            "b_id".into(),
+        ]));
+        let (driver_records_bare, driver_scans) = to_records_scans(driver, &d_schema);
+        let driver_records: Vec<(Record, RecordOrder)> = driver_records_bare
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| (r, i as RecordOrder))
+            .collect();
+        let (build_records, build_scans) = to_records_scans(build, &b_schema);
+        let budget = arbitrator(cfg.hard_limit);
+        let stable = StableEvalContext::test_default();
+        let ctx = EvalContext::test_default_borrowed(&stable);
+        let resolver = empty_resolver();
+        let consumer = ConsumerHandle::new();
+        let tmp = tempfile::Builder::new()
+            .prefix("iejoin-cap-")
+            .tempdir()
+            .expect("temp dir");
+        let propagate = PropagateCkSpec::Driver;
+        let out = execute_block_band(BlockBandExec {
+            name: "cap_test",
+            build_qualifier: "b",
+            driver_records,
+            driver_scans,
+            build_records,
+            build_scans,
+            op1: cfg.op1,
+            op2: cfg.op2,
+            residual_eval: None,
+            body_eval: None,
+            resolver_mapping: &resolver,
+            output_schema: Some(&out_schema),
+            match_mode: cfg.match_mode,
+            on_miss: cfg.on_miss,
+            max_output_rows,
+            propagate_ck: &propagate,
+            ctx: &ctx,
+            budget: &budget,
+            consumer: &consumer,
+            spill_dir: tmp.path(),
+            spill_compress: false,
+            strategy: ErrorStrategy::FailFast,
+            options: BlockBandOptions {
+                block_target_override: Some(cfg.block_target),
+                sort_spill_override: cfg.sort_spill,
+                resident_budget_override: cfg.resident_budget,
+            },
+        })?;
+        Ok(drain_sorted(out.sorted)?
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect())
+    }
+
+    #[test]
+    fn max_output_rows_cap_fails_loud_and_never_truncates() {
+        // 5 drivers × 4 builds, all key (5,5) under `Le AND Ge` → 20 output rows.
+        let driver: Side = (0..5).map(|i| (Some((5, 5)), i)).collect();
+        let build: Side = (0..4).map(|i| (Some((5, 5)), i + 100)).collect();
+        let cfg = RunCfg {
+            op1: RangeOp::Le,
+            op2: Some(RangeOp::Ge),
+            match_mode: MatchMode::All,
+            on_miss: OnMiss::Skip,
+            block_target: 1 << 20,
+            hard_limit: 1 << 30,
+            max_spill_bytes: None,
+            sort_spill: None,
+            resident_budget: None,
+        };
+
+        // A cap below the true output size fails loud with the typed E325 error
+        // naming the cap — never a truncated / partial result.
+        let err = run_block_capped(&driver, &build, &cfg, Some(10))
+            .expect_err("output over the cap must fail loud, not truncate");
+        match err {
+            PipelineError::CombineOutputCapExceeded { cap, .. } => {
+                assert_eq!(cap, 10, "the error must name the configured cap");
+            }
+            other => panic!("expected CombineOutputCapExceeded; got {other:?}"),
+        }
+
+        // A cap exactly at the output size completes, emitting every row.
+        let at_cap = run_block_capped(&driver, &build, &cfg, Some(20))
+            .expect("a run at the cap must complete");
+        assert_eq!(at_cap.len(), 20, "a run at the cap emits every row");
+        let roomy_cap = run_block_capped(&driver, &build, &cfg, Some(1_000))
+            .expect("a generous cap must complete");
+        assert_eq!(roomy_cap.len(), 20);
+
+        // The default (None) is unlimited and matches the capped-OK run.
+        let uncapped =
+            run_block_capped(&driver, &build, &cfg, None).expect("unlimited default completes");
+        assert_eq!(uncapped.len(), 20, "None is unlimited");
     }
 
     // ── output determinism across block layouts ──────────────────────────
@@ -3209,6 +3860,7 @@ mod tests {
                 output_schema: Some(&out_schema),
                 match_mode: MatchMode::All,
                 on_miss: OnMiss::Error,
+                max_output_rows: None,
                 propagate_ck: &propagate,
                 ctx: &ctx,
                 budget: &budget,
@@ -3302,6 +3954,7 @@ mod tests {
                 output_schema: Some(&out_schema),
                 match_mode: MatchMode::All,
                 on_miss: OnMiss::Skip,
+                max_output_rows: None,
                 propagate_ck: &propagate,
                 ctx: &ctx,
                 budget: &budget,
@@ -3423,6 +4076,7 @@ mod tests {
             output_schema: Some(&out_schema),
             match_mode: MatchMode::First,
             on_miss: OnMiss::Skip,
+            max_output_rows: None,
             propagate_ck: &propagate,
             ctx: &ctx,
             budget: &budget,
@@ -3677,6 +4331,7 @@ mod tests {
             output_schema: Some(&out_schema),
             match_mode: MatchMode::All,
             on_miss: OnMiss::NullFields,
+            max_output_rows: None,
             propagate_ck: &propagate,
             ctx: &ctx,
             budget: &budget,
@@ -3913,6 +4568,7 @@ mod tests {
             output_schema: Some(out_schema),
             match_mode: MatchMode::All,
             on_miss: OnMiss::NullFields,
+            max_output_rows: None,
             propagate_ck: &propagate,
             ctx: &ctx,
             budget: &budget,
@@ -4373,6 +5029,7 @@ mod tests {
             output_schema: Some(&out_schema),
             match_mode: cfg.match_mode,
             on_miss: cfg.on_miss,
+            max_output_rows: None,
             propagate_ck: &propagate,
             ctx: &ctx,
             budget,

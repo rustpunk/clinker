@@ -193,6 +193,10 @@ pub(crate) struct GraceHashExec<'a> {
     pub output_schema: Option<&'a Arc<Schema>>,
     pub match_mode: MatchMode,
     pub on_miss: OnMiss,
+    /// Opt-in per-combine output-row cap (E325); `None` is unlimited. Enforced at
+    /// the shared `GraceEmitSink::push_row` chokepoint against the output vec's
+    /// cumulative length.
+    pub max_output_rows: Option<u64>,
     /// Initial partition bit width supplied by the planner.
     pub partition_bits: u8,
     /// Build-side `$ck.<field>` propagation policy. Threaded uniformly
@@ -699,6 +703,7 @@ pub(crate) fn execute_combine_grace_hash(
         output_schema,
         match_mode,
         on_miss,
+        max_output_rows,
         partition_bits,
         propagate_ck,
         ctx,
@@ -936,6 +941,8 @@ pub(crate) fn execute_combine_grace_hash(
                     &mut GraceEmitSink {
                         records: &mut output_records,
                         failures: &mut output_eval_failures,
+                        name,
+                        max_output_rows,
                     },
                 )?;
             }
@@ -994,6 +1001,8 @@ pub(crate) fn execute_combine_grace_hash(
             &mut GraceEmitSink {
                 records: &mut output_records,
                 failures: &mut output_eval_failures,
+                name,
+                max_output_rows,
             },
         )?;
     }

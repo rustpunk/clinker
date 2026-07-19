@@ -1526,6 +1526,13 @@ pub struct CombineBody {
     /// out across the joined record set" semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correlation_fanout_policy: Option<crate::config::CorrelationFanoutPolicy>,
+    /// Optional opt-in runtime cap on the number of output rows this combine may
+    /// emit. `None` (the default) is unlimited. When set, the runtime fails loud
+    /// with E325 the moment the combine's emitted-row count would exceed the cap,
+    /// rather than truncating — a runaway-output guard for a permissive join
+    /// whose result blows up, independent of the memory budget (which spills).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_rows: Option<u64>,
 }
 
 /// Output variant body. Wraps the existing sink config.
@@ -2122,6 +2129,51 @@ nodes:
         assert_eq!(body.match_mode, MatchMode::First);
         assert_eq!(body.on_miss, OnMiss::NullFields);
         assert_eq!(body.drive, None);
+        assert_eq!(
+            body.max_output_rows, None,
+            "max_output_rows defaults to None"
+        );
+    }
+
+    /// The opt-in `max_output_rows` runaway cap parses onto the combine body.
+    #[test]
+    fn test_combine_yaml_deser_max_output_rows() {
+        let yaml = r#"
+pipeline:
+  name: combine_capped
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: orders.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: source
+    name: products
+    config:
+      name: products
+      type: csv
+      path: products.csv
+      schema:
+        - { name: product_id, type: string }
+  - type: combine
+    name: enrich
+    input:
+      orders: orders
+      products: products
+    config:
+      where: "orders.product_id == products.product_id"
+      cxl: |
+        emit order_id = orders.order_id
+      propagate_ck: driver
+      max_output_rows: 5000
+"#;
+        let doc: PipelineConfig =
+            crate::yaml::from_str(yaml).expect("combine with max_output_rows should parse");
+        let (_, body) = parse_and_find_combine(&doc, "enrich");
+        assert_eq!(body.max_output_rows, Some(5000));
     }
 
     /// 3-input combine; IndexMap preserves insertion order.
@@ -2295,6 +2347,7 @@ nodes:
             strategy: crate::config::CombineStrategyHint::Auto,
             propagate_ck: PropagateCkSpec::Driver,
             correlation_fanout_policy: None,
+            max_output_rows: None,
         };
         let node = PipelineNode::Combine {
             header,

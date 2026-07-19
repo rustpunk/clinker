@@ -54,6 +54,7 @@ pub(crate) fn dispatch_combine(
         ref driving_input,
         ref match_mode,
         ref on_miss,
+        max_output_rows,
         ref resolved_column_map,
         ref propagate_ck,
         // Typed `cxl:` body program carried on the node (like
@@ -499,6 +500,7 @@ pub(crate) fn dispatch_combine(
                         output_schema: combine_output_schema_arc.as_ref(),
                         match_mode: *match_mode,
                         on_miss: *on_miss,
+                        max_output_rows,
                         propagate_ck,
                         ctx: &iejoin_ctx,
                         budget: &ctx.memory_budget,
@@ -642,6 +644,7 @@ pub(crate) fn dispatch_combine(
                         output_schema: combine_output_schema_arc.as_ref(),
                         match_mode: *match_mode,
                         on_miss: *on_miss,
+                        max_output_rows,
                         partition_bits,
                         propagate_ck,
                         ctx: &grace_ctx,
@@ -784,6 +787,7 @@ pub(crate) fn dispatch_combine(
                         output_schema: combine_output_schema_arc.as_ref(),
                         match_mode: *match_mode,
                         on_miss: *on_miss,
+                        max_output_rows,
                         presorted: true,
                         propagate_ck,
                         ctx: &sm_ctx,
@@ -938,6 +942,7 @@ pub(crate) fn dispatch_combine(
             build_qualifier: &build_qualifier,
             match_mode: *match_mode,
             on_miss: *on_miss,
+            max_output_rows,
             propagate_ck,
             fail_fast: ctx.strategy == ErrorStrategy::FailFast,
         };
@@ -1026,6 +1031,10 @@ pub(crate) fn dispatch_combine(
                         continue;
                     }
                     emitted_since_check += output_records.len() - before;
+
+                    // The opt-in `max_output_rows` cap (E325) is enforced per-row
+                    // inside `kernel.probe_row` (before each push), so it needs no
+                    // check here — this loop only bounds memory.
 
                     // Budget check every 10K emitted records to bound memory under
                     // fan-out. The build phase polls `should_abort` every 10K
@@ -1322,6 +1331,11 @@ fn run_streaming_combine_probe(
                     continue;
                 }
 
+                // The opt-in `max_output_rows` cap (E325) is enforced per-row inside
+                // `kernel.probe_row`; when it trips, `probe_row` returns `Err`, which
+                // the match above already surfaces after draining the channel — so
+                // the streaming path is covered without a separate check here.
+
                 // Budget check every 10K emitted records, the same cadence
                 // and abort the materialized loop uses.
                 budget_cadence += output_records.len() - before;
@@ -1486,6 +1500,10 @@ struct CombineProbeKernel<'k> {
     build_qualifier: &'k str,
     match_mode: clinker_plan::config::pipeline_node::MatchMode,
     on_miss: clinker_plan::config::pipeline_node::OnMiss,
+    /// Opt-in per-combine output-row cap (E325); `None` is unlimited. Enforced
+    /// per driver against the shared output vec's cumulative length in both the
+    /// materialized and streaming probe loops that drive this kernel.
+    max_output_rows: Option<u64>,
     propagate_ck: &'k clinker_plan::config::pipeline_node::PropagateCkSpec,
     /// Whether `ErrorStrategy::FailFast` is active: surface a recoverable
     /// per-row eval failure as `Err` rather than deferring it to the DLQ.
@@ -1495,6 +1513,23 @@ struct CombineProbeKernel<'k> {
 }
 
 impl CombineProbeKernel<'_> {
+    /// Fail loud with E325 if the combine's cumulative output has already reached
+    /// the opt-in `max_output_rows` cap. Called before each output push, so the
+    /// cap is enforced per-row (exactly `cap` rows land, the first over-cap row
+    /// aborts) — the same granularity the spill-backed strategies use, so every
+    /// combine strategy matches the documented behavior.
+    fn check_output_cap(&self, current_len: usize) -> Result<(), PipelineError> {
+        if let Some(cap) = self.max_output_rows
+            && current_len as u64 >= cap
+        {
+            return Err(PipelineError::CombineOutputCapExceeded {
+                combine: self.name.to_string(),
+                cap,
+            });
+        }
+        Ok(())
+    }
+
     /// Probe one driver record against the materialized hash table, pushing
     /// every emitted `(Record, row_num)` into `out` and accumulating
     /// `distinct` / `filtered` skips into `counters`. Returns
@@ -1616,6 +1651,7 @@ impl CombineProbeKernel<'_> {
                     );
                 }
                 rec.set(self.build_qualifier, Value::Array(arr));
+                self.check_output_cap(out.len())?;
                 out.push((rec, rn));
                 Ok(ProbeRowStep::Continue)
             }
@@ -1706,6 +1742,7 @@ impl CombineProbeKernel<'_> {
                                     for (k, v) in *record_vars {
                                         let _ = rec.set_record_var(&k, v);
                                     }
+                                    self.check_output_cap(out.len())?;
                                     out.push((rec, rn));
                                     Ok(ProbeRowStep::Continue)
                                 }
@@ -1768,6 +1805,7 @@ impl CombineProbeKernel<'_> {
                                     matched,
                                     self.propagate_ck,
                                 );
+                                self.check_output_cap(out.len())?;
                                 out.push((rec, rn));
                             }
                             Ok(EvalResult::Skip(SkipReason::Filtered)) => counters.filtered += 1,
@@ -1828,6 +1866,7 @@ impl CombineProbeKernel<'_> {
                             });
                         }
                         let rec = Record::new(Arc::clone(target_schema), values);
+                        self.check_output_cap(out.len())?;
                         out.push((rec, rn));
                     }
                     Ok(ProbeRowStep::Continue)

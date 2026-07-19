@@ -118,6 +118,10 @@ struct MergeSpill<'a> {
     /// mutability because the sink borrows `MergeSpill` shared; the walk is
     /// single-threaded so a `Cell` suffices.
     emitted_since_check: std::cell::Cell<usize>,
+    /// Opt-in per-combine output-row cap (E325); `None` is unlimited. Checked
+    /// against the output buffer's cumulative `total_rows()` before each push, so
+    /// the combine fails loud rather than emitting past the configured ceiling.
+    max_output_rows: Option<u64>,
 }
 
 /// A sealed [`MatchWindow`] segment: resident entries, or a spilled
@@ -576,6 +580,10 @@ pub(crate) struct SortMergeExec<'a> {
     pub output_schema: Option<&'a Arc<Schema>>,
     pub match_mode: MatchMode,
     pub on_miss: OnMiss,
+    /// Opt-in per-combine output-row cap (E325); `None` is unlimited. Enforced at
+    /// the shared `push_output_row` chokepoint against the output sort's
+    /// cumulative row count.
+    pub max_output_rows: Option<u64>,
     /// True when the planner has already verified that both inputs
     /// arrive sorted on the range key prefix. Phase A external sort is
     /// skipped in that case and the inputs are walked in place.
@@ -707,6 +715,7 @@ fn execute_combine_sort_merge_with_stats(
         output_schema,
         match_mode,
         on_miss,
+        max_output_rows,
         presorted,
         propagate_ck,
         ctx,
@@ -975,6 +984,7 @@ fn execute_combine_sort_merge_with_stats(
         spill_dir,
         spill_compress,
         budget,
+        max_output_rows,
         consumer: &consumer_handle,
         emitted_since_check: std::cell::Cell::new(0),
     };
@@ -1467,6 +1477,19 @@ fn push_output_row(
     key: (RecordOrder, u64, u64),
     mspill: &MergeSpill<'_>,
 ) -> Result<(), PipelineError> {
+    // Opt-in output-size runaway guard (E325): refuse the row that would carry
+    // the cumulative count past the cap, failing loud rather than truncating.
+    // `total_rows()` counts every prior push across spilled runs, so checking it
+    // before the push makes exactly `cap` rows land and the first over-cap row
+    // abort — a result-size ceiling, orthogonal to the memory backstop below.
+    if let Some(cap) = mspill.max_output_rows
+        && output.total_rows() as u64 >= cap
+    {
+        return Err(PipelineError::CombineOutputCapExceeded {
+            combine: mspill.name.to_string(),
+            cap,
+        });
+    }
     let pre = output.bytes_used();
     output.push(record, key);
     mspill
@@ -2363,6 +2386,7 @@ mod tests {
             output_schema,
             match_mode: rk.match_mode,
             on_miss: rk.on_miss,
+            max_output_rows: None,
             presorted: rk.presorted,
             propagate_ck: &clinker_plan::config::pipeline_node::PropagateCkSpec::Driver,
             ctx: &ctx,

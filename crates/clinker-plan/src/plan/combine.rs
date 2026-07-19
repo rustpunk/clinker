@@ -1988,6 +1988,10 @@ pub(crate) fn decompose_nary_combines(
                         predicate_summary,
                         match_mode: MatchMode::All,
                         on_miss: OnMiss::Skip,
+                        // Synthetic intermediate chain steps carry no output cap;
+                        // the cap rides only the final user-visible step, so it
+                        // counts the combine's actual output, not intermediates.
+                        max_output_rows: None,
                         propagate_ck: original_propagate_ck.clone(),
                         decomposed_from: Some(original_name.clone()),
                         output_schema: Arc::clone(&step_output_schema),
@@ -2470,6 +2474,7 @@ mod tests {
             predicate_summary,
             match_mode: MatchMode::First,
             on_miss: OnMiss::NullFields,
+            max_output_rows: None,
             propagate_ck: crate::config::pipeline_node::PropagateCkSpec::Driver,
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
@@ -2659,6 +2664,7 @@ mod tests {
             predicate_summary: CombinePredicateSummary::default(),
             match_mode: MatchMode::First,
             on_miss: OnMiss::NullFields,
+            max_output_rows: None,
             propagate_ck: PropagateCkSpec::Driver,
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
@@ -2806,6 +2812,7 @@ mod tests {
             ),
             match_mode: MatchMode::First,
             on_miss: OnMiss::NullFields,
+            max_output_rows: None,
             propagate_ck: crate::config::pipeline_node::PropagateCkSpec::Driver,
             decomposed_from: None,
             output_schema: clinker_record::SchemaBuilder::new().build(),
