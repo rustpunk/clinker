@@ -17,8 +17,12 @@ concurrency:
 
 jobs:
   update:
+    # No PR_BRANCH_UPDATE_TOKEN is passed on purpose. Without a PAT the reusable
+    # workflow pushes rebases with the default GITHUB_TOKEN, and pushes made with
+    # GITHUB_TOKEN do not trigger new workflow runs. A squash-merge therefore
+    # still auto-rebases every open PR, but those rebases no longer auto-start the
+    # CI gauntlet — a maintainer runs CI manually when they choose to validate a
+    # rebased PR.
     uses: rustpunk/github-workflows/.github/workflows/pr-auto-update-branches.yml@main
     with:
       base: main
-    secrets:
-      PR_BRANCH_UPDATE_TOKEN: ${{ secrets.PR_BRANCH_UPDATE_TOKEN }}
