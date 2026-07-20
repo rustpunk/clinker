@@ -914,6 +914,185 @@ nodes:
 }
 
 #[test]
+fn test_multi_record_csv_doc_field_typo_aborts_with_e341() {
+    // A multi-record CSV source exposes its `head` (record type `H`) section
+    // with a single declared field, `batch_id`. A `$doc.head.<typo>` against
+    // it names a field the section never serves — the reader coerces only the
+    // section's declared fields from the matched header record, so the typo
+    // resolves null at run time. Before this validation it compiled silently;
+    // now the closed-schema arm rejects it with E341, the same code XML/JSON
+    // typos raise.
+    let yaml = r#"
+pipeline:
+  name: multi_record_csv_doc_field_typo
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: csv
+      path: ./payments.csv
+      schema:
+        discriminator: { field: record_type }
+        records:
+          - { id: header, tag: H, columns: [ { name: record_type, type: string }, { name: batch_id, type: string } ] }
+          - { id: detail, tag: D, columns: [ { name: record_type, type: string }, { name: amount, type: int } ] }
+      envelope:
+        sections:
+          head:
+            extract: { record_type: H }
+            fields:
+              batch_id: string
+  - type: transform
+    name: tag
+    input: payments
+    config:
+      cxl: |
+        emit kind = record_type
+        emit batch = $doc.head.bath_id
+  - type: output
+    name: out
+    input: tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse multi-record csv typo pipeline");
+    let err = config
+        .compile(&CompileContext::default())
+        .expect_err("a `$doc` field typo against a multi-record csv source must fail to compile");
+    let diag = err
+        .iter()
+        .find(|d| d.code == "E341")
+        .unwrap_or_else(|| panic!("expected an E341 diagnostic, got: {err:?}"));
+    assert!(
+        diag.message.contains("bath_id") && diag.message.contains("head"),
+        "E341 message must name the undeclared field and its section: {}",
+        diag.message
+    );
+    assert!(diag.help.is_some(), "E341 must carry help text");
+}
+
+#[test]
+fn test_multi_record_csv_doc_section_typo_aborts_with_e341() {
+    // A `$doc.<typo-section>.<field>` names a section that no `envelope.sections`
+    // key declares. The multi-record source's closed schema rejects the unknown
+    // section with E341 rather than resolving it to null.
+    let yaml = r#"
+pipeline:
+  name: multi_record_csv_doc_section_typo
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: csv
+      path: ./payments.csv
+      schema:
+        discriminator: { field: record_type }
+        records:
+          - { id: header, tag: H, columns: [ { name: record_type, type: string }, { name: batch_id, type: string } ] }
+          - { id: detail, tag: D, columns: [ { name: record_type, type: string }, { name: amount, type: int } ] }
+      envelope:
+        sections:
+          head:
+            extract: { record_type: H }
+            fields:
+              batch_id: string
+  - type: transform
+    name: tag
+    input: payments
+    config:
+      cxl: |
+        emit kind = record_type
+        emit batch = $doc.hed.batch_id
+  - type: output
+    name: out
+    input: tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse multi-record csv section-typo pipeline");
+    let err = config
+        .compile(&CompileContext::default())
+        .expect_err("a `$doc` section typo against a multi-record csv source must fail to compile");
+    let diag = err
+        .iter()
+        .find(|d| d.code == "E341")
+        .unwrap_or_else(|| panic!("expected an E341 diagnostic, got: {err:?}"));
+    assert!(
+        diag.message.contains("hed"),
+        "E341 message must name the undeclared section: {}",
+        diag.message
+    );
+    assert!(diag.help.is_some(), "E341 must carry help text");
+}
+
+#[test]
+fn test_multi_record_fixed_width_doc_field_typo_aborts_with_e341() {
+    // The same closed-schema check applies to a multi-record fixed-width
+    // source: a `$doc.head.<typo>` naming a field the `head` section does not
+    // declare fails the compile with E341.
+    let yaml = r#"
+pipeline:
+  name: multi_record_fixed_width_doc_field_typo
+nodes:
+  - type: source
+    name: payments
+    config:
+      name: payments
+      type: fixed_width
+      path: ./payments.txt
+      schema:
+        discriminator: { start: 0, width: 1 }
+        structure:
+          - { record: trailer, count: count }
+        records:
+          - { id: header,  tag: H, columns: [ { name: batch_id, type: string, start: 1, width: 9 } ] }
+          - { id: detail,  tag: D, columns: [ { name: id, type: int, start: 1, width: 5 }, { name: amount, type: int, start: 6, width: 4 } ] }
+          - { id: trailer, tag: T, columns: [ { name: count, type: int, start: 1, width: 5 } ] }
+      envelope:
+        sections:
+          head:
+            extract: { record_type: H }
+            fields:
+              batch_id: string
+  - type: transform
+    name: tag
+    input: payments
+    config:
+      cxl: |
+        emit kind = record_type
+        emit amount = amount
+        emit batch = $doc.head.batch_di
+  - type: output
+    name: out
+    input: tag
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse multi-record fixed-width typo pipeline");
+    let err = config.compile(&CompileContext::default()).expect_err(
+        "a `$doc` field typo against a multi-record fixed-width source must fail to compile",
+    );
+    let diag = err
+        .iter()
+        .find(|d| d.code == "E341")
+        .unwrap_or_else(|| panic!("expected an E341 diagnostic, got: {err:?}"));
+    assert!(
+        diag.message.contains("batch_di") && diag.message.contains("head"),
+        "E341 message must name the undeclared field and its section: {}",
+        diag.message
+    );
+    assert!(diag.help.is_some(), "E341 must carry help text");
+}
+
+#[test]
 fn test_plain_csv_without_envelope_compiles() {
     // The guard fires only on a declared envelope: a plain CSV source with no
     // `envelope:` block is unaffected.

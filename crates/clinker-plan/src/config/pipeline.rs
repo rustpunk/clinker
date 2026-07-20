@@ -1083,15 +1083,29 @@ impl PipelineConfig {
         //   any user-declared section/field, so a typo or out-of-range
         //   positional element is caught without false-positiving on a
         //   legitimate wire path.
-        // - Unvalidated: CSV, fixed-width, SWIFT (see `doc_schema_for`).
+        // - Closed (E341) for a multi-record CSV/fixed-width source: a
+        //   `discriminator:` + `records:` schema exposes each `record_type`
+        //   envelope section, and the reader serves exactly that section's
+        //   declared `fields:` (coerced from the matched header record), so
+        //   the same closed-schema check applies.
+        // - Unvalidated: plain (single-record) CSV/fixed-width, SWIFT (see
+        //   `doc_schema_for`).
         //
         // `doc_schema_for` is keyed once per source here, not rebuilt on
         // every (path × node × source) iteration of the loop below — a
         // `SegmentPositional` schema allocates its synthesized-section
-        // vector, so recomputing it per reference would be wasteful.
-        let doc_schema_by_source: HashMap<&str, DocSchema> = source_configs
-            .iter()
-            .map(|s| (s.name.as_str(), doc_schema_for(s)))
+        // vector, so recomputing it per reference would be wasteful. Keyed
+        // off `source_bodies()` rather than `source_configs` because the
+        // multi-record classification needs the resolved `SourceSchema`,
+        // which lives on the body, not the format-layer `SourceConfig`.
+        let doc_schema_by_source: HashMap<&str, DocSchema> = self
+            .source_bodies()
+            .map(|body| {
+                (
+                    body.source.name.as_str(),
+                    doc_schema_for(&body.source, &body.schema),
+                )
+            })
             .collect();
         // E349 — a `rest` source that declares an `envelope:` block. The
         // declaration is always inert (a REST pull buffers no document), so
@@ -2709,15 +2723,19 @@ fn resolve_all_input_references(
 ///   user-declared section/field, so a typo (`$doc.functonal_group.e06`)
 ///   or an out-of-range positional element (`$doc.transaction_set.e99`) is
 ///   caught (`E348`) without false-positiving on a legitimate wire path.
-/// - **Unvalidated** (CSV, fixed-width, SWIFT): not statically checked. A
-///   plain flat file synthesizes no `$doc` sections (a `$doc` read against
-///   one is inert but harmless), a multi-record flat file's `record_type`
-///   sections are author-declared but the section vocabulary the reader
-///   serves is not statically reconstructible here without resolving the
-///   `format_schema`, and SWIFT serves declared sections under user-chosen
-///   *or* stable default block labels — none fits the closed or positional
-///   model cleanly, so each is left unchecked rather than risk a false
-///   positive.
+/// - **Multi-record flat file** (CSV / fixed-width with a `discriminator:` +
+///   `records:` schema): each `record_type` envelope section is served as a
+///   **closed** schema — the reader coerces the matched header record's
+///   columns through the section's declared `fields:`, serving exactly those
+///   fields, so a `$doc.<section>.<field>` naming an undeclared section or
+///   field resolves null at run time. Validated by the closed arm (`E341`),
+///   the same one XML/JSON use.
+/// - **Unvalidated** (plain single-record CSV / fixed-width, SWIFT): not
+///   statically checked. A plain flat file synthesizes no `$doc` sections
+///   (declaring an `envelope:` on one is rejected by `E356`), and SWIFT
+///   serves declared sections under user-chosen *or* stable default block
+///   labels — neither fits the closed or positional model cleanly, so each
+///   is left unchecked rather than risk a false positive.
 ///
 /// REST sources are handled before this classification: a `rest` transport
 /// buffers no document, so any `$doc` access against one can never resolve
@@ -2728,7 +2746,7 @@ enum DocSchema {
     /// Validate against the format's synthesized section/positional-element
     /// vocabulary plus any user-declared section/field.
     SegmentPositional(SegmentPositionalSchema),
-    /// Not statically validated (CSV, fixed-width, SWIFT).
+    /// Not statically validated (plain single-record CSV, fixed-width, SWIFT).
     Unvalidated,
 }
 
@@ -3103,16 +3121,23 @@ fn synthesized_section(
     }
 }
 
-/// Classify how a source's `$doc` references are validated, from its
-/// format. The REST transport is checked by the caller before this is
-/// consulted, so this maps purely on `InputFormat`.
+/// Classify how a source's `$doc` references are validated, from its format
+/// and resolved schema shape. The REST transport is checked by the caller
+/// before this is consulted, so this maps on `InputFormat` plus — for the
+/// flat-file formats — the resolved [`SourceSchema`](clinker_format::SourceSchema)
+/// cardinality: a multi-record CSV/fixed-width schema (`discriminator:` +
+/// `records:`) is closed over its declared `record_type` section fields,
+/// while a plain single-record one is unvalidated.
 ///
 /// The positional bound is the reader's body-segment ceiling, not the
 /// header segment's precise arity (see [`SegmentPositionalSchema`]). A
 /// tighter per-segment-arity bound — to catch a mid-range positional typo
 /// on a short header segment — is tracked at
 /// <https://github.com/rustpunk/clinker/issues/558>.
-fn doc_schema_for(source: &crate::config::SourceConfig) -> DocSchema {
+fn doc_schema_for(
+    source: &crate::config::SourceConfig,
+    schema: &clinker_format::SourceSchema,
+) -> DocSchema {
     match &source.format {
         InputFormat::Xml(_) | InputFormat::Json(_) => DocSchema::Closed,
         InputFormat::X12(opts) => {
@@ -3165,6 +3190,26 @@ fn doc_schema_for(source: &crate::config::SourceConfig) -> DocSchema {
                 .and_then(|o| o.max_fields)
                 .unwrap_or(HL7_DEFAULT_MAX_FIELDS),
         }),
+        // A multi-record flat file (`discriminator:` + `records:`) exposes
+        // each declared `record_type` envelope section as a CLOSED schema:
+        // the reader coerces the matched header record's columns through the
+        // section's declared `fields:` and serves exactly those fields (a
+        // field the section does not declare is never served), so a
+        // `$doc.<section>.<field>` naming an undeclared section or field is a
+        // genuine typo that resolves null at run time — validated by the same
+        // closed-schema arm XML/JSON use (`E341`).
+        InputFormat::Csv(_) | InputFormat::FixedWidth(_)
+            if matches!(schema, clinker_format::SourceSchema::MultiRecord { .. }) =>
+        {
+            DocSchema::Closed
+        }
+        // Plain single-record CSV / fixed-width synthesize no `$doc` sections
+        // (declaring an `envelope:` on one is rejected by `E356`), and an
+        // as-yet-unresolved external `File` schema (which may itself be
+        // multi-record) is left unvalidated rather than risk a false positive
+        // — the same resolved-shape gate the `E356` guard applies. SWIFT
+        // serves sections under user-chosen or default block labels and is
+        // likewise unvalidated.
         InputFormat::Csv(_) | InputFormat::FixedWidth(_) | InputFormat::Swift(_) => {
             DocSchema::Unvalidated
         }
