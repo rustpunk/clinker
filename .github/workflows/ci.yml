@@ -45,6 +45,29 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
 
+      # Example pipelines double as runnable documentation and a smoke-test
+      # surface, so every top-level pipeline under examples/pipelines/ must at
+      # least compile through the plan-only `--explain` path. This catches
+      # config-schema and CXL-grammar drift at the boundary instead of leaving a
+      # reader to trip over a stale example. `cargo test` above already exercises
+      # the same gate via crates/clinker/tests/examples_explain.rs; this step is
+      # the fast, explicit signal and keeps the smoke command discoverable.
+      - name: Smoke-check example pipelines (--explain)
+        run: |
+          cargo build --locked -p clinker
+          bin="$PWD/target/debug/clinker"
+          cd examples/pipelines
+          rc=0
+          for f in *.yaml; do
+            if "$bin" run "$f" --explain >/dev/null; then
+              echo "ok: $f"
+            else
+              echo "FAIL: $f did not pass --explain"
+              rc=1
+            fi
+          done
+          exit $rc
+
       # Bench infrastructure CI gate (compile + smoke)
       - run: cargo check --benches --workspace
       - run: cargo check --features bench-alloc -p clinker-benchmarks

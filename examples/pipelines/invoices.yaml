@@ -14,7 +14,7 @@ nodes:
         - { name: invoice_id, type: string }
         - { name: invoice_date, type: string }
         - { name: customer_id, type: string }
-        - { name: amount, type: string }
+        - { name: amount, type: float }
 
   - type: source
     name: customers
@@ -35,18 +35,18 @@ nodes:
     input: invoices
     config:
       cxl: |
-        emit _include = days_since(invoice_date) < 90
+        emit _include = now.diff_days(invoice_date.to_date()) < 90
 
-  # TODO(16c compositions): fiscal_date composition import was stripped during 16b fixture migration.
-
-  - type: transform
+  - type: aggregate
     name: totals
     description: Sum by customer
     input: recent_only
     config:
+      group_by: [customer_id]
       cxl: |
+        emit customer_id = customer_id
         emit total_amount = sum(amount)
-        emit invoice_count = count(invoice_id)
+        emit invoice_count = count(*)
 
   - type: output
     name: rollup
