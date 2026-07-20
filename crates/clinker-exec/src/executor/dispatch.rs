@@ -1600,6 +1600,11 @@ pub(crate) fn drain_or_clone_shared_input(
                 )
         })
         .count();
+    // Single consumer (the overwhelming common case): plain drain, no counting.
+    // This also covers the two paths that count a consumer but skip its drain —
+    // a streaming-probe driver (its producer is certified single-outgoing-edge,
+    // so `total_consumers == 1`) and a fused-Source Merge (streams live channels,
+    // materializes no `(source, None)` slot) — so neither can stall the counter.
     if total_consumers <= 1 {
         return drain_node_buffer_slot(ctx, key);
     }
@@ -1609,6 +1614,10 @@ pub(crate) fn drain_or_clone_shared_input(
         ctx.shared_input_drains.remove(&key);
         drain_node_buffer_slot(ctx, key)
     } else {
+        // The clone is a transient owned buffer drained immediately by this
+        // consumer; the original slot keeps its registered charge until the last
+        // consumer removes it, so the shared data stays accounted once. The
+        // clone is deliberately not admitted (at most one exists at a time).
         ctx.node_buffers
             .get(&key)
             .map(|nb| NodeBuffer::Memory(nb.clone_memory_only()))

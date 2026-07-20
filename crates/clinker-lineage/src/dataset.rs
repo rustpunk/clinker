@@ -317,6 +317,9 @@ mod tests {
             name: name.to_string(),
             id: PlanNodeId::new(0),
             span: Span::SYNTHETIC,
+            mode: clinker_plan::config::MergeMode::Concat,
+            interleave_seed: None,
+            input_order: Vec::new(),
             output_schema: Arc::new(Schema::new(vec![])),
         }
     }
