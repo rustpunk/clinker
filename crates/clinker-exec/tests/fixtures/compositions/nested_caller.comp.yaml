@@ -1,5 +1,3 @@
-# FORWARD-ONLY: baseline captured in Task 16c.2.4
-#
 # Uses another composition internally (tests recursive expansion).
 _compose:
   name: nested_caller

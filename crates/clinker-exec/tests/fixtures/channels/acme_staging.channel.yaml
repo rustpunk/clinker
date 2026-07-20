@@ -1,5 +1,3 @@
-# FORWARD-ONLY: baseline captured in Task 16c.2.4
-#
 # Same pipeline as acme_prod, different bindings for staging.
 channel:
   name: acme_staging

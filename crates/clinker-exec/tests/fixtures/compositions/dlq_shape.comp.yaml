@@ -1,5 +1,3 @@
-# FORWARD-ONLY: baseline captured in Task 16c.2.4
-#
 # 1 input, 1 output, 3 config params. Models DLQ reshaping pattern.
 _compose:
   name: dlq_shape

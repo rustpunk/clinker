@@ -1,5 +1,3 @@
-# FORWARD-ONLY: baseline captured in Task 16c.2.4
-#
 # Second pipeline target, production bindings.
 channel:
   name: beta_prod
