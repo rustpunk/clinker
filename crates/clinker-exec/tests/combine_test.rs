@@ -5396,6 +5396,7 @@ nodes:
                 q.to_string(),
                 CombineInput {
                     upstream_name: Arc::from(q),
+                    producer_port: None,
                     row: Row::closed(row_fields, CxlSpan::new(0, 0)),
                 },
             );

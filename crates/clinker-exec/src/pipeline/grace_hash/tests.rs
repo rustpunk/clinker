@@ -469,6 +469,7 @@ fn execute_grace_hash_partition_pair_correct() {
         "orders".to_string(),
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
+            producer_port: None,
             row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
         },
     );
@@ -476,6 +477,7 @@ fn execute_grace_hash_partition_pair_correct() {
         "products".to_string(),
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
+            producer_port: None,
             row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
         },
     );
@@ -724,6 +726,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
         "orders".to_string(),
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
+            producer_port: None,
             row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
         },
     );
@@ -731,6 +734,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
         "products".to_string(),
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
+            producer_port: None,
             row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
         },
     );
@@ -915,6 +919,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         "orders".to_string(),
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
+            producer_port: None,
             row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
         },
     );
@@ -922,6 +927,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
         "products".to_string(),
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
+            producer_port: None,
             row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
         },
     );
@@ -1555,6 +1561,7 @@ fn build_bnl_harness() -> BnlHarness {
         "orders".to_string(),
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("orders"),
+            producer_port: None,
             row: clinker_plan::plan::row_type::Row::closed(driver_row_cols, CxlSpan::new(0, 0)),
         },
     );
@@ -1562,6 +1569,7 @@ fn build_bnl_harness() -> BnlHarness {
         "products".to_string(),
         clinker_plan::plan::combine::CombineInput {
             upstream_name: Arc::from("products"),
+            producer_port: None,
             row: clinker_plan::plan::row_type::Row::closed(build_row_cols, CxlSpan::new(0, 0)),
         },
     );

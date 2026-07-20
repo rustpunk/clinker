@@ -470,6 +470,152 @@ ENG,500
     );
 }
 
+/// The build side of a Combine that is a deferred-region member is replayed
+/// at commit through the cross-region tee. That replay must deliver each
+/// build row EXACTLY ONCE: the forward pass also left the producer's copy in
+/// its port slot, so the commit re-seed must replace it, not append. Under
+/// `match: all` a doubled build side is observable — every driver row would
+/// fan out to two identical matches instead of one. With a single build row
+/// per key, the correct output is one row per department; a double would
+/// yield two.
+#[test]
+fn combine_match_all_in_deferred_region_replays_build_side_once() {
+    let yaml = r#"
+pipeline:
+  name: combine_deferred_region_match_all
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    path: orders.csv
+    correlation_key: order_id
+    type: csv
+    schema:
+      - { name: order_id, type: string }
+      - { name: department, type: string }
+      - { name: amount, type: int }
+- type: aggregate
+  name: dept_totals
+  input: orders
+  config:
+    group_by: [department]
+    cxl: |
+      emit department = department
+      emit total = sum(amount)
+- type: transform
+  name: probe_xform
+  input: dept_totals
+  config:
+    cxl: |
+      emit department = department
+      emit total = total
+- type: source
+  name: dept_lookup
+  config:
+    name: dept_lookup
+    path: dept_lookup.csv
+    type: csv
+    schema:
+      - { name: department, type: string }
+      - { name: budget, type: int }
+- type: combine
+  name: enriched
+  input:
+    p: probe_xform
+    b: dept_lookup
+  config:
+    where: 'p.department == b.department'
+    match: all
+    on_miss: skip
+    cxl: |
+      emit department = p.department
+      emit total = p.total
+      emit budget = b.budget
+    propagate_ck: driver
+- type: output
+  name: out
+  input: enriched
+  config:
+    name: out
+    path: out.csv
+    type: csv
+    include_unmapped: true
+"#;
+    let orders_csv = "\
+order_id,department,amount
+o1,HR,10
+o2,HR,20
+o3,ENG,100
+o4,ENG,200
+";
+    let lookup_csv = "\
+department,budget
+HR,100
+ENG,500
+";
+    let config = clinker_plan::config::parse_config(yaml).expect("parse");
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([
+        (
+            "orders".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(orders_csv.as_bytes().to_vec())),
+            ),
+        ),
+        (
+            "dept_lookup".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "test.csv",
+                Box::new(std::io::Cursor::new(lookup_csv.as_bytes().to_vec())),
+            ),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "test-exec".to_string(),
+        batch_id: "test-batch".to_string(),
+        pipeline_vars: Default::default(),
+        shutdown_token: None,
+        ..Default::default()
+    };
+    let report = common::run_config(&config, readers, writers, &params)
+        .expect("combine-in-region match:all pipeline must converge");
+
+    let written = buf.as_string();
+    let rows: Vec<&str> = written.lines().skip(1).filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        report.counters.dlq_count, 0,
+        "no errors expected; got {}",
+        report.counters.dlq_count
+    );
+    // One build row per department, so `match: all` yields exactly one output
+    // row per department. A doubled cross-region build replay would produce two
+    // per department (four total).
+    assert_eq!(
+        rows.len(),
+        2,
+        "each department must match its single build row exactly once (no \
+         cross-region build duplication): {written}"
+    );
+    assert_eq!(
+        rows.iter().filter(|r| r.starts_with("HR,")).count(),
+        1,
+        "HR must appear once: {written}"
+    );
+    assert_eq!(
+        rows.iter().filter(|r| r.starts_with("ENG,")).count(),
+        1,
+        "ENG must appear once: {written}"
+    );
+}
+
 /// Two-level nested composition wrapping a relaxed-CK Aggregate at the
 /// inner body's terminal output port, with a parent-side Transform that
 /// mutates the body Aggregate's emit. The commit-pass harvest chain

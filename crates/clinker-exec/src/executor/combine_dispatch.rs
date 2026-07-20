@@ -31,32 +31,6 @@ use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, matches_upstream_name};
 
-/// The producer output port a combine input qualifier draws from, read off the
-/// combine node's `input:` map. `Some(port)` for a `<producer>.<port>`
-/// reference (a Cull `removed_to` / Route branch), `None` for a bare producer
-/// reference. Used to disambiguate a driver/build pair that resolves to the
-/// same predecessor node via two different ports.
-fn combine_input_port(
-    config: &clinker_plan::config::PipelineConfig,
-    combine_name: &str,
-    qualifier: &str,
-) -> Option<String> {
-    use clinker_plan::config::PipelineNode;
-    use clinker_plan::config::node_header::NodeInput;
-    config
-        .nodes
-        .iter()
-        .find_map(|spanned| match &spanned.value {
-            PipelineNode::Combine { header, .. } if header.name == combine_name => {
-                header.input.get(qualifier).and_then(|ni| match &ni.value {
-                    NodeInput::Port { port, .. } => Some(port.clone()),
-                    NodeInput::Single(_) => None,
-                })
-            }
-            _ => None,
-        })
-}
-
 /// Cap on matches collected per driver row under `match: collect` before
 /// truncation. 10K mirrors the module constants in `pipeline/combine.rs`
 /// and aligns with DataFusion's collect-list bound.
@@ -231,8 +205,14 @@ pub(crate) fn dispatch_combine(
     // `producer_port: None` and the passthrough re-materialised the records
     // into its own `(idx, None)` slot.
     use petgraph::visit::EdgeRef;
-    let driver_port_ref = combine_input_port(ctx.config, name, driving_input.as_str());
-    let build_port_ref = combine_input_port(ctx.config, name, build_qualifier.as_str());
+    // The qualifier's declared producer port, read off the node's own
+    // `combine_inputs` so it is scope-correct inside a composition body (a
+    // by-name lookup into `ctx.config.nodes` would miss a body combine, or
+    // resolve to a same-named top-level one).
+    let driver_port_ref = combine_inputs[driving_input.as_str()].producer_port.clone();
+    let build_port_ref = combine_inputs[build_qualifier.as_str()]
+        .producer_port
+        .clone();
     let resolve_side = |upstream: &str,
                         port_ref: Option<&str>,
                         side: &str|

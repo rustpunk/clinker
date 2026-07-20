@@ -326,17 +326,21 @@ fn seed_cross_region_inputs_for(
         let Some(parked) = ctx.region_input_buffers.remove(&key) else {
             continue;
         };
-        // Append onto the source node's buffer, keyed by the crossing edge's
-        // producer output port so a multi-output source (Route branch / Cull
-        // port) lands in the exact slot the consumer's edge-based drain reads.
-        // Per-row attribution flows through the slot's registered
-        // `NodeBufferConsumer` once `admit_node_buffer` re-keys this
-        // slot at the next bulk admission; the arbitrator's
-        // `should_abort` poll guards the pipeline-wide hard limit.
+        // Re-seed the source node's buffer keyed by the crossing edge's producer
+        // output port, so a multi-output source (Route branch / Cull port) lands
+        // in the exact slot the consumer's edge-based drain reads. The parked
+        // tee holds exactly the records this crossing edge delivered on the
+        // forward pass, so REPLACE the slot rather than append: the forward-pass
+        // producer emit left its own copy in this same slot (the member-clear
+        // above only drains member/output slots, not an upstream producer's
+        // port slot), and appending would double it. Draining first also
+        // releases that forward copy's registered `NodeBufferConsumer`.
         let producer_port = current_dag.graph[edge_id].producer_port.as_deref();
+        let slot_key = NodeBufferKey::with_port(source_idx, producer_port);
+        drain_node_buffer_slot(ctx, slot_key.clone());
         let slot = ctx
             .node_buffers
-            .entry(NodeBufferKey::with_port(source_idx, producer_port))
+            .entry(slot_key)
             .or_insert_with(|| NodeBuffer::Memory(Vec::new()));
         for (record, rn) in parked {
             slot.push(record, rn);
