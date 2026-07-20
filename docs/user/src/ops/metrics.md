@@ -93,8 +93,14 @@ schema bump means draining the spool first.
 | `dlq_path` | string/null | Path to the DLQ file, or null if none |
 | `error` | string/null | Error message on exit 1/3/4, or null on success (exit 0) and partial success (exit 2) |
 | `retraction` | object | Correlation-key retraction counters (see below). All-zero on strict pipelines, which never enter the relaxed loop |
-| `per_source_record_counts` | object | Ingest record count per Source node, keyed by node name |
-| `per_source_dlq_counts` | object | DLQ entry count per Source node; sources with zero DLQ entries are absent |
+| `per_source_record_counts` | object | Ingest record count per Source node, keyed by node name. A source that read zero records is present with a count of `0` |
+| `per_source_dlq_counts` | object | DLQ entry count per Source node; sources with zero DLQ entries are absent. The values sum to **at most** `records_dlq` — see the note below |
+
+The sum of `per_source_dlq_counts` values is at most `records_dlq`, and can
+be less: a failure in a Combine emit or a post-aggregate row is not traceable
+to a single declared source, so it is counted in `records_dlq` but not in this
+per-source breakdown. For pipelines whose dead-letters all originate at a
+declared source, the two match exactly.
 
 The `retraction` object carries the relaxed correlation-key retraction
 orchestrator's counters: `groups_recomputed`, `partitions_dispatched`,

@@ -180,6 +180,43 @@ pub fn write_spool(metrics: &ExecutionMetrics, spool_dir: &Path) -> io::Result<(
     Ok(())
 }
 
+/// Schema version this collector accepts. Spool files stamped with any other
+/// integer `schema_version` are skipped as version-incompatible; files with no
+/// integer `schema_version` at all are treated as corrupt. Kept in sync with
+/// the version stamped by the run's metrics producer.
+const CURRENT_SCHEMA_VERSION: u32 = 3;
+
+/// Outcome of the pre-deserialize `schema_version` gate applied to a spool
+/// file's raw JSON.
+///
+/// The check runs against a `serde_json::Value` *before* the full
+/// [`ExecutionMetrics`] deserialize so a structurally-valid pre-v3 file (which
+/// lacks the v3-only per-source maps) surfaces as a version mismatch rather
+/// than the missing-field parse error a direct deserialize would raise.
+#[derive(Debug, PartialEq, Eq)]
+enum SchemaVersionGate {
+    /// `schema_version == CURRENT_SCHEMA_VERSION`; proceed to full deserialize.
+    Current,
+    /// A recognizable spool file written under a different, unsupported schema
+    /// version. Carries the observed version for the skip warning.
+    Unsupported(u64),
+    /// No integer `schema_version` field — not a recognizable spool file, so it
+    /// is routed to the corrupt/parse-error skip branch alongside malformed JSON.
+    Unrecognized,
+}
+
+/// Classify a spool file's `schema_version` from its raw JSON.
+fn classify_schema_version(raw: &serde_json::Value) -> SchemaVersionGate {
+    match raw
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+    {
+        Some(v) if v == u64::from(CURRENT_SCHEMA_VERSION) => SchemaVersionGate::Current,
+        Some(v) => SchemaVersionGate::Unsupported(v),
+        None => SchemaVersionGate::Unrecognized,
+    }
+}
+
 /// One entry produced by `collect_spool` — a parsed file and its path.
 pub struct SpoolEntry {
     /// Path to the spool file (used for deletion by the caller if desired).
@@ -188,11 +225,22 @@ pub struct SpoolEntry {
     pub metrics: ExecutionMetrics,
 }
 
-/// Sweep `spool_dir` for completed `.json` files (skipping `.tmp`).
+/// Sweep `spool_dir` for completed `.json` files (skipping `.tmp`) and return
+/// the surviving [`ExecutionMetrics`] entries sorted by `execution_id`.
 ///
-/// Returns an iterator of `(path, ExecutionMetrics)` pairs. Files that fail
-/// to parse are skipped with a `tracing::warn!` — the collector never
-/// corrupts its output by writing a partially valid record.
+/// Each file is gated in two stages so a version mismatch is reported as such
+/// rather than as corruption. A file is skipped with a `tracing::warn!` when:
+///
+/// - it is not valid JSON (the raw parse fails), or has no integer
+///   `schema_version` field — reported as `failed to parse spool file`;
+/// - its `schema_version` is an integer other than
+///   [`CURRENT_SCHEMA_VERSION`] — reported as `unsupported schema_version`,
+///   the path a pre-v3 spool file (missing the per-source maps) takes; or
+/// - the version matches but the full [`ExecutionMetrics`] deserialize still
+///   fails — reported as `failed to parse spool file`.
+///
+/// Skipping never corrupts the collector's output: a file that cannot be
+/// parsed cleanly is dropped rather than partially collected.
 ///
 /// Caller is responsible for deletion after successful collection:
 /// ```rust,ignore
@@ -222,22 +270,47 @@ pub fn collect_spool(spool_dir: &Path) -> io::Result<impl Iterator<Item = SpoolE
             }
         };
 
-        let metrics: ExecutionMetrics = match serde_json::from_reader(file) {
-            Ok(m) => m,
+        // First pass: read the raw JSON so the `schema_version` guard fires
+        // before the full deserialize. A pre-v3 file is missing the v3-only
+        // per-source maps; deserializing it straight into `ExecutionMetrics`
+        // would fail with a missing-field error and mask a structurally-valid
+        // older file as corruption instead of a version mismatch.
+        let raw: serde_json::Value = match serde_json::from_reader(file) {
+            Ok(v) => v,
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "metrics collect: failed to parse spool file — skipping");
                 continue;
             }
         };
 
-        if metrics.schema_version != 3 {
-            tracing::warn!(
-                path = %path.display(),
-                schema_version = metrics.schema_version,
-                "metrics collect: unsupported schema_version — skipping"
-            );
-            continue;
+        match classify_schema_version(&raw) {
+            SchemaVersionGate::Current => {}
+            SchemaVersionGate::Unsupported(version) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    schema_version = version,
+                    "metrics collect: unsupported schema_version — skipping"
+                );
+                continue;
+            }
+            SchemaVersionGate::Unrecognized => {
+                tracing::warn!(
+                    path = %path.display(),
+                    reason = "missing schema_version",
+                    "metrics collect: failed to parse spool file — skipping"
+                );
+                continue;
+            }
         }
+
+        // Second pass: full deserialization, now guaranteed to be v3-shaped.
+        let metrics: ExecutionMetrics = match serde_json::from_value(raw) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "metrics collect: failed to parse spool file — skipping");
+                continue;
+            }
+        };
 
         entries.push(SpoolEntry { path, metrics });
     }
@@ -447,5 +520,121 @@ mod tests {
         unsafe { std::env::remove_var("CLINKER_METRICS_SPOOL_DIR") };
         let result = resolve_spool_dir(None, None);
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn classify_schema_version_gates_by_raw_version() {
+        let current: serde_json::Value =
+            serde_json::from_str(r#"{"schema_version": 3, "execution_id": "v3"}"#).unwrap();
+        assert_eq!(
+            classify_schema_version(&current),
+            SchemaVersionGate::Current,
+            "an exact v3 stamp proceeds to full deserialization"
+        );
+
+        let older: serde_json::Value =
+            serde_json::from_str(r#"{"schema_version": 2, "execution_id": "v2"}"#).unwrap();
+        assert_eq!(
+            classify_schema_version(&older),
+            SchemaVersionGate::Unsupported(2),
+            "a pre-v3 stamp is a version mismatch, not corruption"
+        );
+
+        let missing: serde_json::Value =
+            serde_json::from_str(r#"{"execution_id": "no-version"}"#).unwrap();
+        assert_eq!(
+            classify_schema_version(&missing),
+            SchemaVersionGate::Unrecognized,
+            "a valid JSON object with no schema_version is not a recognizable spool file"
+        );
+
+        let non_integer: serde_json::Value =
+            serde_json::from_str(r#"{"schema_version": "3"}"#).unwrap();
+        assert_eq!(
+            classify_schema_version(&non_integer),
+            SchemaVersionGate::Unrecognized,
+            "a non-integer schema_version does not satisfy the gate"
+        );
+    }
+
+    /// A synthetic pre-v3 spool file — structurally valid JSON stamped with an
+    /// older `schema_version` and lacking the v3-only per-source maps — is
+    /// skipped via the version-mismatch gate, before the deserialize step that
+    /// would otherwise raise a missing-field error and misreport it as
+    /// corruption. Genuinely-corrupt files (no `schema_version`, malformed
+    /// JSON) are also skipped, while a valid v3 file in the same directory is
+    /// still collected.
+    #[test]
+    fn collect_spool_skips_incompatible_files_and_keeps_v3() {
+        let dir = TempDir::new().unwrap();
+
+        // A pre-v3 file: the v2 shape omits `per_source_record_counts` /
+        // `per_source_dlq_counts`, so a direct `ExecutionMetrics` deserialize
+        // would fail on the missing fields.
+        fs::write(
+            dir.path().join("019571b2-0000-7000-0000-0000000000a2.json"),
+            br#"{"schema_version": 2, "execution_id": "019571b2-0000-7000-0000-0000000000a2", "records_ok": 5, "records_written": 5}"#,
+        )
+        .unwrap();
+
+        // A file with no `schema_version` at all — corrupt from the
+        // collector's view, routed to the parse-error branch.
+        fs::write(
+            dir.path().join("019571b2-0000-7000-0000-0000000000a3.json"),
+            br#"{"execution_id": "019571b2-0000-7000-0000-0000000000a3"}"#,
+        )
+        .unwrap();
+
+        // Malformed JSON — the raw parse itself fails.
+        fs::write(
+            dir.path().join("019571b2-0000-7000-0000-0000000000a4.json"),
+            b"{ this is not valid json",
+        )
+        .unwrap();
+
+        // A valid v3 file written by the real producer path.
+        let good_id = "019571b2-0000-7000-0000-0000000000a5";
+        write_spool(&sample_metrics(good_id), dir.path()).unwrap();
+
+        let entries: Vec<SpoolEntry> = collect_spool(dir.path()).unwrap().collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the v3 file survives; the pre-v3, missing-version, and \
+             malformed files are all skipped"
+        );
+        assert_eq!(
+            entries[0].metrics.execution_id, good_id,
+            "the surviving entry is the v3 file"
+        );
+        assert_eq!(entries[0].metrics.schema_version, CURRENT_SCHEMA_VERSION);
+    }
+
+    /// Populated per-source maps survive the write→read round-trip. The
+    /// `sample_metrics` helper seeds empty maps, so this test asserts the
+    /// non-empty case the spool actually carries in production.
+    #[test]
+    fn collect_spool_preserves_populated_per_source_maps() {
+        let dir = TempDir::new().unwrap();
+        let id = "019571b2-0000-7000-0000-0000000000b1";
+        let mut metrics = sample_metrics(id);
+        metrics.per_source_record_counts =
+            BTreeMap::from([("src_a".to_string(), 7), ("src_b".to_string(), 3)]);
+        metrics.per_source_dlq_counts = BTreeMap::from([("src_b".to_string(), 2)]);
+
+        write_spool(&metrics, dir.path()).unwrap();
+        let entries: Vec<SpoolEntry> = collect_spool(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1);
+        let round_tripped = &entries[0].metrics;
+        assert_eq!(
+            round_tripped.per_source_record_counts,
+            BTreeMap::from([("src_a".to_string(), 7), ("src_b".to_string(), 3)]),
+            "record-count map survives write→read with every entry intact"
+        );
+        assert_eq!(
+            round_tripped.per_source_dlq_counts,
+            BTreeMap::from([("src_b".to_string(), 2)]),
+            "dlq-count map survives write→read"
+        );
     }
 }

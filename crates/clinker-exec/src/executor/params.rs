@@ -139,9 +139,17 @@ pub struct ExecutionReport {
     /// Per-source DLQ entry counts, keyed by Source-node name. A
     /// source with no DLQ entries is absent from the map, matching
     /// the "absent = none landed" precedent on
-    /// `per_source_rollback_cursors`. Sums across this map equal
-    /// `counters.dlq_count` minus any entries the executor failed to
-    /// attribute to a declared source.
+    /// `per_source_rollback_cursors`.
+    ///
+    /// Contract: the sum of the values is `<=` `counters.dlq_count`,
+    /// never `==` in general. The difference is the DLQ
+    /// entries the executor could not attribute to a single declared
+    /// source and stamped under the synthetic `<merged>` rollup —
+    /// Combine emits and post-aggregate synthetic rows carry no
+    /// originating source stamp, so a failure downstream of them is
+    /// counted in `dlq_count` but filtered out of this map. Equality
+    /// holds only for pipelines whose every DLQ entry traces to a
+    /// declared source (e.g. a Transform funnel over plain sources).
     pub per_source_dlq_counts: BTreeMap<String, u64>,
     /// Bytes committed to spill files across every spill site
     /// (`node_buffers` admission, grace-hash partition flush, sort-merge
