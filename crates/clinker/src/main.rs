@@ -10,15 +10,19 @@ use clinker_plan::error::PipelineError;
 
 mod refactor;
 
-/// CXL streaming ETL engine.
+/// Bounded-memory batch ETL engine for CXL pipelines.
 #[derive(Parser, Debug)]
 #[command(
     name = "clinker",
     version,
-    about = "CXL streaming ETL engine",
+    about = "Bounded-memory batch ETL engine for CXL pipelines",
     long_about = "\
-Clinker is a streaming ETL engine that reads tabular data (CSV, NDJSON), \
-applies CXL transformation expressions, and writes the results to output files.\n\n\
+Clinker is a bounded-memory, single-process batch ETL engine. It reads finite \
+tabular inputs (CSV, NDJSON), applies CXL transformation expressions to each \
+record, and writes the results to output files. A run is a finite job: sources \
+read until EOF, the DAG drains, and the process exits — it is not a \
+long-running stream processor. Records are evaluated one at a time within that \
+bounded run, so memory stays capped regardless of input size.\n\n\
 Pipelines are defined in YAML configuration files that specify inputs, outputs, \
 field mappings with CXL expressions, and optional channel overrides for \
 multi-tenant customization.",
