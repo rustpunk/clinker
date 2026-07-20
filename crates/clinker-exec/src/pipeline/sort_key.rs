@@ -93,6 +93,36 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
     }
 }
 
+/// Canonical fixed-point decimal order grid — finest (`N = 28`) resolution.
+///
+/// Every order-bearing decimal encoder places a `Decimal` value `v` (a 96-bit
+/// signed `mantissa` at some `scale`) on a fixed-point grid of resolution
+/// `10^-N` as the exact integer `mantissa × 10^(N − scale)`. That integer is
+/// order-preserving and value-canonical — scale-invariant, so `2.5` and `2.50`
+/// map identically — for every value representable at resolution `N`. The two
+/// decimal order consumers use ONE such grid family and therefore cannot induce
+/// different orders; they differ only in the resolution `N` their output width
+/// affords, and the coarser grid is an exact `10^-(28−18) = 10^-10` rescaling of
+/// the finer one, so wherever both accept a value they place it at the same
+/// point of one shared order:
+///
+/// * this `N = 28` grid backs the memcomparable sort/group key
+///   ([`encode_decimal_order`]). Its bytes decide GROUP IDENTITY in a spilled
+///   aggregation, so it must stay exact over the full `rust_decimal` precision
+///   (up to 28 fractional digits); the scaled magnitude reaches ≈ 2^190 and is
+///   emitted as a 256-bit big-endian magnitude, not an `i128`.
+/// * the `N = 18` grid ([`DECIMAL_RANGE_SCALE`]) backs the inequality-join range
+///   axis. It carries keys as `i128` so a full `i64` integer operand widens onto
+///   the SAME axis (`i64::MAX · 10^18 < i128::MAX`); an `i128` cannot hold the
+///   scale-28 grid over that integer range, so the axis uses the coarser grid
+///   and fails loud — never truncates — on a value with detail finer than
+///   `10^-18`.
+///
+/// The two resolutions are pinned to one order by the differential test
+/// `decimal_encoders_induce_one_total_order`, and the exact `10^10` factor
+/// between the grids by `decimal_axis_is_ten_pow_ten_rescaling_of_sort_key_grid`.
+const DECIMAL_SORT_KEY_SCALE: u32 = 28; // rust_decimal's maximum scale
+
 /// Append the EXACT, value-canonical, order-preserving memcomparable encoding
 /// of a `Decimal` (a fixed 33 bytes).
 ///
@@ -106,18 +136,17 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
 /// encoding avoids that divergence from the in-memory `GroupByKey::Decimal`
 /// path.
 ///
-/// Encoding: the value scaled to a fixed 10^28 grid is the integer
-/// `mantissa × 10^(28 − scale)` (identical for `2.50` and `2.5`), which fits
-/// in 256 bits over `rust_decimal`'s range. It is emitted as a sign marker
+/// Encoding: the value on the finest [`DECIMAL_SORT_KEY_SCALE`] grid is the
+/// integer `mantissa × 10^(28 − scale)` (identical for `2.50` and `2.5`), which
+/// fits in 256 bits over `rust_decimal`'s range. It is emitted as a sign marker
 /// (`0x00` negative sorts before `0x01` non-negative) followed by the 32-byte
 /// big-endian magnitude — bit-inverted for negatives so a larger magnitude
 /// sorts earlier. `-0` normalizes to `0`, so there is no signed-zero ambiguity.
 fn encode_decimal_order(d: rust_decimal::Decimal, buf: &mut Vec<u8>) {
-    const FIXED_SCALE: u32 = 28; // rust_decimal's maximum scale
     let negative = d.is_sign_negative() && !d.is_zero();
     let magnitude = d.mantissa().unsigned_abs();
     // scale ≤ 28, so 28 − scale ≥ 0 and 10^(28−scale) ≤ 10^28 < u128::MAX.
-    let pow = 10u128.pow(FIXED_SCALE - d.scale());
+    let pow = 10u128.pow(DECIMAL_SORT_KEY_SCALE - d.scale());
     let scaled = mul_u128_to_u256_be(magnitude, pow);
     if negative {
         buf.push(0x00);
@@ -205,12 +234,18 @@ pub(crate) fn float_to_orderable_i128(f: f64) -> i128 {
     float_to_orderable_i64(f) as i128
 }
 
-/// Canonical scale of the inequality-join decimal range axis: every decimal on
-/// a decimal axis is placed on a common `10^18` fixed-point grid. 18 fractional
-/// digits are preserved exactly, and the integer magnitude reaches
-/// `i128::MAX / 10^18 ≈ 1.7e20` — far beyond any realistic monetary value.
-/// Chosen so a full `i64` operand widened onto the same grid always fits
-/// (`i64::MAX · 10^18 < i128::MAX`), keeping a mixed decimal/integer axis exact.
+/// Canonical fixed-point decimal order grid — coarse (`N = 18`) resolution; the
+/// `i128`-axis member of the grid family documented on `DECIMAL_SORT_KEY_SCALE`.
+///
+/// Every decimal on a decimal inequality-join axis is placed on this common
+/// `10^18` fixed-point grid. 18 fractional digits are preserved exactly, and the
+/// integer magnitude reaches `i128::MAX / 10^18 ≈ 1.7e20` — far beyond any
+/// realistic monetary value. Chosen so a full `i64` operand widened onto the same
+/// grid always fits (`i64::MAX · 10^18 < i128::MAX`), keeping a mixed
+/// decimal/integer axis exact. This grid is exactly the finer scale-28 sort/group
+/// key grid rescaled by `10^-10`, so the range axis and the memcomparable
+/// sort/group key never disagree on order (pinned by the differential test
+/// `decimal_encoders_induce_one_total_order`).
 pub(crate) const DECIMAL_RANGE_SCALE: u32 = 18;
 
 /// Order-preserving, value-canonical `Decimal` → `i128` for the inequality-join
@@ -641,6 +676,134 @@ mod tests {
         // A value with genuine (nonzero) digits past 18 places still truncates.
         let genuine = Decimal::from_str("1.0000000000000000001").unwrap();
         assert_eq!(decimal_to_orderable_i128(genuine), None);
+    }
+
+    /// The single differential guard for decimals: over an adversarial corpus,
+    /// the two decimal order encoders — the IEJoin i128 range axis (through the
+    /// real `value_to_i128` consumer) and the memcomparable sort/group-key bytes
+    /// (through `encode_sort_key`) — MUST induce the identical total order as the
+    /// evaluator's own `compare_values`. The two grids run at different
+    /// resolutions (scale 28 vs 18) for hard width-budget reasons, so this pins
+    /// that the split can never drift them into disagreeing on order.
+    #[test]
+    fn decimal_encoders_induce_one_total_order() {
+        use crate::pipeline::iejoin::value_to_i128;
+        use crate::pipeline::sort::compare_values;
+        use clinker_plan::plan::combine::RangeKeyType;
+        use std::str::FromStr;
+
+        // Every value is representable on BOTH grids (scale ≤ 18, in i128 range),
+        // so all three legs participate: cross-scale equals (2.5 / 2.50 / 2.500,
+        // 42 / 42.00, 0 / 0.00000), a sub-10^-17 near-tie of 2.5, the finest axis
+        // grid point (±10^-18), negatives, and magnitudes near the axis ceiling.
+        let decimals = [
+            Decimal::new(0, 0),
+            Decimal::new(0, 5),  // 0.00000 — cross-scale zero
+            Decimal::new(1, 18), // 0.000000000000000001 — finest axis point
+            Decimal::new(2, 18),
+            Decimal::new(-1, 18),
+            Decimal::new(1, 2), // 0.01
+            Decimal::new(-1, 2),
+            Decimal::new(1, 0),
+            Decimal::new(-1, 0),
+            Decimal::new(25, 1),                                // 2.5
+            Decimal::new(250, 2),                               // 2.50  — cross-scale equal of 2.5
+            Decimal::new(2500, 3),                              // 2.500 — cross-scale equal of 2.5
+            Decimal::from_str("2.500000000000000001").unwrap(), // sub-10^-17 successor of 2.5
+            Decimal::new(-25, 1),                               // -2.5
+            Decimal::new(-250, 2),                              // -2.50
+            Decimal::new(42, 0),
+            Decimal::new(4200, 2), // 42.00 — cross-scale equal of 42
+            Decimal::new(99_999_999_999_999_999, 0), // ~1e17, well inside the axis ceiling
+            Decimal::new(-99_999_999_999_999_999, 0),
+        ];
+
+        let sort_field = [sf("d", SortOrder::Asc)];
+        let byte_key = |d: Decimal| -> Vec<u8> {
+            encode_sort_key(&make_record(&[("d", Value::Decimal(d))]), &sort_field)
+        };
+        let axis = |v: &Value| -> i128 {
+            value_to_i128(RangeKeyType::Decimal, v)
+                .expect("in-range decimal/integer never errors")
+                .expect("value reduces to an axis key")
+        };
+
+        for &a in &decimals {
+            for &b in &decimals {
+                let (va, vb) = (Value::Decimal(a), Value::Decimal(b));
+                let oracle = compare_values(&va, &vb);
+                assert_eq!(
+                    axis(&va).cmp(&axis(&vb)),
+                    oracle,
+                    "i128 range-axis order disagrees with compare_values for {a} vs {b}"
+                );
+                assert_eq!(
+                    byte_key(a).cmp(&byte_key(b)),
+                    oracle,
+                    "memcomparable byte-key order disagrees with compare_values for {a} vs {b}"
+                );
+                assert_eq!(
+                    decimal_to_orderable_i128(a).cmp(&decimal_to_orderable_i128(b)),
+                    oracle,
+                    "reducer order disagrees with compare_values for {a} vs {b}"
+                );
+            }
+        }
+
+        // The mixed decimal/integer axis: an `int` operand widened onto the same
+        // 10^18 grid (`integer_on_decimal_grid`, via `value_to_i128`) must order
+        // against the decimals exactly as `compare_values` widens int into the
+        // decimal context. The byte key is intentionally type-specific and is
+        // never asked to compare an integer's bytes against a decimal's, so only
+        // the axis leg participates here.
+        for i in [-2i64, -1, 0, 1, 2, 3, 42, -42] {
+            let iv = Value::Integer(i);
+            for &d in &decimals {
+                let dv = Value::Decimal(d);
+                assert_eq!(
+                    axis(&iv).cmp(&axis(&dv)),
+                    compare_values(&iv, &dv),
+                    "widened-integer axis order disagrees with compare_values for {i} vs {d}"
+                );
+            }
+        }
+    }
+
+    /// The scale-18 range axis is exactly the scale-28 sort/group-key grid
+    /// rescaled by `10^(28−18) = 10^10`: for any decimal whose scale-28 grid
+    /// magnitude also fits an `i128`, `axis × 10^10 == mantissa × 10^(28−scale)`.
+    /// This pins the single `10^10` factor the two grid `const`s encode, so
+    /// changing one scale without the other fails here rather than silently
+    /// splitting the two encodings onto unrelated grids.
+    #[test]
+    fn decimal_axis_is_ten_pow_ten_rescaling_of_sort_key_grid() {
+        // Magnitudes chosen so `mantissa × 10^(28−scale)` stays inside i128
+        // (|value| ≲ 1.7e10), letting the finer grid be computed as a plain i128.
+        let corpus = [
+            Decimal::new(0, 0),
+            Decimal::new(1, 18),
+            Decimal::new(-1, 18),
+            Decimal::new(25, 1),
+            Decimal::new(250, 2),
+            Decimal::new(-25, 1),
+            Decimal::new(42, 0),
+            Decimal::new(123_456, 3),
+            Decimal::new(-987_654_321, 4),
+        ];
+        let factor = 10i128.pow(DECIMAL_SORT_KEY_SCALE - DECIMAL_RANGE_SCALE);
+        for &d in &corpus {
+            let fine = d
+                .mantissa()
+                .checked_mul(10i128.pow(DECIMAL_SORT_KEY_SCALE - d.scale()))
+                .expect("corpus chosen so the scale-28 grid fits i128");
+            let axis = decimal_to_orderable_i128(d).expect("representable on the axis");
+            assert_eq!(
+                axis.checked_mul(factor)
+                    .expect("axis × 10^10 fits i128 here"),
+                fine,
+                "axis key must be the scale-28 grid magnitude rescaled by 10^10 for {d}"
+            );
+        }
     }
 
     /// Build a `NaiveDateTime` at nanosecond resolution.
