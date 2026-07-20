@@ -310,6 +310,16 @@ field the declared section does not declare, is rejected with error `E341`
 (`$doc.Summry.total` against a declared `Summary`). Run
 `clinker explain --code E341` for the full write-up.
 
+**Multi-record CSV / fixed-width sources** — a source whose schema declares
+`discriminator:` + `records:` exposes a header record type as a `$doc`
+section through the `record_type` extract. The reader coerces the matched
+header record's columns through the section's declared `fields:` and serves
+exactly those fields, so the section is closed just like an XML/JSON one: a
+reference naming an undeclared section, or a field the section does not
+declare, is rejected with error `E341`. (A plain single-schema CSV /
+fixed-width source has no such structure — declaring an `envelope:` on one
+is rejected with error `E356`.)
+
 **Segment/positional sources (X12, EDIFACT, HL7)** — the file-level header
 (`ISA`/`UNB`/`FHS`) is declared through `envelope:` and is closed, but the
 reader *also* synthesizes nested envelope levels the config never names —
@@ -326,12 +336,11 @@ positional element (`$doc.transaction_set.e99`) is rejected with error
 [Network (REST) sources carry no `$doc` context](#network-rest-sources-carry-no-doc-context)
 above (`E349`).
 
-CSV, fixed-width, and SWIFT MT sources are not statically checked. A plain
-flat file synthesizes no `$doc` sections; a multi-record flat file's
-`record_type` sections are author-declared but their served vocabulary is
-not reconstructed at this layer; and SWIFT serves declared sections under
-user-chosen *or* default block labels — none fits the closed or positional
-model cleanly.
+Plain (single-schema) CSV / fixed-width and SWIFT MT sources are not
+statically checked. A plain flat file synthesizes no `$doc` sections, and
+SWIFT serves declared sections under user-chosen *or* default block labels —
+neither fits the closed or positional model cleanly. (A *multi-record* CSV /
+fixed-width source is checked — see above.)
 
 ## Indexed `$doc` access
 
