@@ -160,10 +160,37 @@ fn nearest_existing_dir(path: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Removes a probe file when it goes out of scope, so the case-sensitivity
+/// probe leaves no residue on **any** return path — the normal one, an early
+/// `?` bubble, or an unwinding panic between creating the file and reading the
+/// result.
+///
+/// The probe cannot be relocated to an OS temp dir to sidestep the residue
+/// concern: it must be created in the very directory being classified, because
+/// case-sensitivity is a per-*filesystem* (and, on Windows, a per-*directory*)
+/// property that only a file created on that exact target reveals. Since the
+/// target is frequently a tracked directory (the collision-detection path
+/// probes the current working directory for a bare output filename), guaranteed
+/// cleanup is the mechanism that keeps a probe from ever littering the working
+/// tree.
+struct ProbeFile {
+    path: std::path::PathBuf,
+}
+
+impl Drop for ProbeFile {
+    fn drop(&mut self) {
+        // Best-effort: a genuine OS unlink failure is outside our control, and a
+        // removal error must never mask the probe result the caller is after.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Create a uniquely-named lowercase probe file in `dir` and report whether its
 /// uppercased name resolves to the same file. OS-agnostic: it measures the
 /// filesystem's actual behavior rather than inferring it from a type table, so
-/// no `#[cfg]` arm is needed.
+/// no `#[cfg]` arm is needed. The probe file is registered with a [`ProbeFile`]
+/// guard the instant it exists, so it is removed on every exit path rather than
+/// only on the success path.
 fn probe_case_sensitive(dir: &Path) -> io::Result<bool> {
     // A lowercase, process+time-unique stem so two concurrent probes in one
     // directory never clash. The extension stays lowercase; only the stem case
@@ -183,17 +210,17 @@ fn probe_case_sensitive(dir: &Path) -> io::Result<bool> {
         .write(true)
         .create_new(true)
         .open(&lower)?;
+    // Adopt the probe into an RAII guard the moment it exists on disk, so any
+    // subsequent early return or panic still removes it. The binding is named
+    // (`_probe`, not `_`) so it lives to the end of the scope rather than being
+    // dropped immediately.
+    let _probe = ProbeFile { path: lower };
     drop(file);
 
     let upper = dir.join(format!("{}.TMP", stem.to_ascii_uppercase()));
     // If the uppercased name resolves to a file, the filesystem folded the case
     // back onto the lowercase probe we just created — it is case-insensitive.
     let insensitive = upper.exists();
-
-    // Best-effort cleanup; a leaked probe file is harmless and the temp dir is
-    // the writer's own output directory, but removal failure must not mask the
-    // probe result.
-    let _ = std::fs::remove_file(&lower);
 
     Ok(!insensitive)
 }
@@ -552,5 +579,41 @@ mod tests {
         // Case-insensitive filesystem ⇔ the uppercase twin folded onto the
         // lowercase file.
         assert_eq!(sensitive, !folded);
+    }
+
+    #[test]
+    fn probe_file_guard_removes_its_file_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("residue.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        assert!(p.exists());
+        {
+            let _guard = ProbeFile { path: p.clone() };
+        }
+        assert!(!p.exists(), "ProbeFile must remove its file on drop");
+    }
+
+    #[test]
+    fn probe_file_guard_removes_its_file_even_when_unwinding() {
+        // A probe file created against a tracked directory must not survive a
+        // panic between creation and the point where it would otherwise be
+        // cleaned up. A plain best-effort `remove_file` at the end of the
+        // function would leak here; the RAII guard removes the file while the
+        // stack unwinds.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("residue-panic.tmp");
+        std::fs::write(&p, b"x").unwrap();
+        let path_for_closure = p.clone();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ProbeFile {
+                path: path_for_closure,
+            };
+            panic!("boom");
+        }));
+        assert!(caught.is_err(), "the closure was expected to panic");
+        assert!(
+            !p.exists(),
+            "ProbeFile must remove its file even while the stack unwinds"
+        );
     }
 }
