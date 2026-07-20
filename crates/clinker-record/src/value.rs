@@ -58,8 +58,11 @@ pub enum Value {
 //
 // Date payload: i32 days from proleptic Gregorian ordinal
 //   (chrono::Datelike::num_days_from_ce, where 1 = 0001-01-01).
-// DateTime payload: i64 nanoseconds since Unix epoch (1970-01-01T00:00:00 UTC).
-//   Sub-second resolution is preserved; subsecond = nanos % 1_000_000_000.
+// DateTime payload: i128 nanoseconds since the Unix epoch (1970-01-01T00:00:00
+//   UTC). Sub-second resolution is preserved; subsecond = nanos.rem_euclid(1e9).
+//   The count is i128, not i64, so the full NaiveDateTime range (±262 143 years)
+//   round-trips exactly; an i64 nanosecond count saturates outside roughly
+//   1677-09-21..2262-04-11.
 //
 // Array payload: Vec<Value> (length-prefixed by serde/postcard).
 // Map payload:   Vec<(String, Value)> pairs in insertion order.
@@ -90,8 +93,17 @@ impl Serialize for Value {
                 serializer.serialize_newtype_variant("Value", 5, "Date", &d.num_days_from_ce())
             }
             Value::DateTime(dt) => {
-                // nanoseconds since Unix epoch
-                let nanos = dt.and_utc().timestamp_nanos_opt().unwrap_or(0);
+                // Signed nanoseconds since the Unix epoch, assembled directly as
+                // i128. `timestamp_nanos_opt`'s i64 result saturates outside
+                // ~1677..2262; chrono caps the year at ±262 143, bounding the
+                // nanosecond magnitude under ~8.3e21 — sixteen orders below
+                // i128::MAX — so extreme-era datetimes round-trip exactly instead
+                // of collapsing to the window boundary. This is the same reduction
+                // the sort/join/group order key uses (`datetime_to_orderable_i128`
+                // in clinker-exec), so a spilled value and its key agree.
+                let utc = dt.and_utc();
+                let nanos = (utc.timestamp() as i128) * 1_000_000_000
+                    + utc.timestamp_subsec_nanos() as i128;
                 serializer.serialize_newtype_variant("Value", 6, "DateTime", &nanos)
             }
             Value::Array(arr) => {
@@ -159,9 +171,14 @@ impl<'de> Visitor<'de> for ValueVisitor {
                     .ok_or_else(|| de::Error::custom(format!("invalid date ordinal: {days}")))
             }
             6 => {
-                let nanos: i64 = va.newtype_variant()?;
+                let nanos: i128 = va.newtype_variant()?;
                 let secs = nanos.div_euclid(1_000_000_000);
+                // rem_euclid keeps the subsecond in [0, 1e9), so the `as u32` is
+                // lossless; the leading `secs` carries the sign and full range.
                 let subsec = nanos.rem_euclid(1_000_000_000) as u32;
+                let secs = i64::try_from(secs).map_err(|_| {
+                    de::Error::custom(format!("datetime seconds out of range: {secs}"))
+                })?;
                 let dt = chrono::DateTime::from_timestamp(secs, subsec)
                     .ok_or_else(|| de::Error::custom(format!("invalid timestamp nanos: {nanos}")))?
                     .naive_utc();
@@ -628,6 +645,54 @@ mod tests {
         for dt in [epoch_dt, future_dt] {
             let v = Value::DateTime(dt);
             assert_eq!(v, roundtrip(&v), "datetime boundary roundtrip failed: {dt}");
+        }
+    }
+
+    #[test]
+    fn test_value_postcard_roundtrip_datetime_extreme_era() {
+        // The spill payload carries i128 nanoseconds, so datetimes OUTSIDE the
+        // i64-nanosecond window (~1677-09-21 .. 2262-04-11) survive the
+        // spill/reload cycle exactly instead of saturating to the window edge.
+        // With the old i64 payload every case below serialized to 0 nanoseconds
+        // (`timestamp_nanos_opt` returns None out of range) and reloaded as the
+        // Unix epoch. Each carries a distinct sub-second fraction to prove full
+        // nanosecond precision, not just the whole second, round-trips.
+        let cases = [
+            // Pre-1677: an i64-nanosecond count underflows here.
+            NaiveDate::from_ymd_opt(1600, 1, 1)
+                .unwrap()
+                .and_hms_nano_opt(0, 0, 0, 123_456_789)
+                .unwrap(),
+            NaiveDate::from_ymd_opt(1, 1, 1)
+                .unwrap()
+                .and_hms_nano_opt(12, 0, 0, 1)
+                .unwrap(),
+            // Post-2262: an i64-nanosecond count overflows here.
+            NaiveDate::from_ymd_opt(2300, 6, 15)
+                .unwrap()
+                .and_hms_nano_opt(23, 59, 59, 999_999_999)
+                .unwrap(),
+            NaiveDate::from_ymd_opt(9999, 12, 31)
+                .unwrap()
+                .and_hms_nano_opt(23, 59, 59, 987_654_321)
+                .unwrap(),
+            // Far past either century-scale boundary, near chrono's ±262 143 cap.
+            NaiveDate::from_ymd_opt(200_000, 7, 4)
+                .unwrap()
+                .and_hms_nano_opt(6, 30, 15, 500_000_000)
+                .unwrap(),
+            NaiveDate::from_ymd_opt(-50_000, 3, 21)
+                .unwrap()
+                .and_hms_nano_opt(9, 15, 0, 250_000_000)
+                .unwrap(),
+        ];
+        for dt in cases {
+            let v = Value::DateTime(dt);
+            assert_eq!(
+                v,
+                roundtrip(&v),
+                "extreme-era datetime did not round-trip exactly: {dt}"
+            );
         }
     }
 
