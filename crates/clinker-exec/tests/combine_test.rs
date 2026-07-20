@@ -3414,8 +3414,10 @@ nodes:
     input: collected
     config:
       name: collected_out
-      type: csv
-      path: collected.csv
+      type: json
+      options:
+        format: ndjson
+      path: collected.ndjson
       include_unmapped: true
 "#;
         let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
@@ -3427,8 +3429,9 @@ nodes:
         )
         .expect("match:collect must run");
         let out = result.primary_output();
-        // The array serializes as bracketed content in CSV; each
-        // matched build record appears as a nested map representation.
+        // A non-JSON writer rejects the collect `Value::Array`; NDJSON
+        // serializes it natively, with each matched build record a nested
+        // JSON object inside the array.
         assert!(
             out.contains("Widget"),
             "collect array should carry Widget; got: {out:?}"
@@ -3437,8 +3440,9 @@ nodes:
             out.contains("WidgetV2"),
             "collect array should carry WidgetV2; got: {out:?}"
         );
-        // Exactly one output row per driver record under Collect.
-        let data_rows = out.lines().skip(1).filter(|l| !l.is_empty()).count();
+        // Exactly one output record per driver under Collect (NDJSON emits one
+        // JSON object per line, with no header row).
+        let data_rows = out.lines().filter(|l| !l.trim().is_empty()).count();
         assert_eq!(data_rows, 1, "match:collect emits one row per driver");
     }
 
@@ -3487,8 +3491,10 @@ nodes:
     input: collected
     config:
       name: collected_out
-      type: csv
-      path: collected_empty.csv
+      type: json
+      options:
+        format: ndjson
+      path: collected_empty.ndjson
       include_unmapped: true
 "#;
         // ORD-1's product_id is PROD-X — no matching build row.
@@ -3501,13 +3507,12 @@ nodes:
         )
         .expect("collect empty-array must run");
         let out = result.primary_output();
-        // Exactly one data row (the driver row, with an empty array).
-        let data_rows = out.lines().skip(1).filter(|l| !l.is_empty()).count();
+        // Exactly one data record (the driver row, with an empty array).
+        let data_rows = out.lines().filter(|l| !l.trim().is_empty()).count();
         assert_eq!(data_rows, 1, "collect emits the driver row even on miss");
-        // The `products` column carries the array serialization. Empty
-        // array stringifies as `[]` in Value::Display; verify we see
-        // `[]` and not `null` in the row.
-        let data = out.lines().nth(1).unwrap_or("");
+        // The `products` field carries the array serialization. An empty
+        // match serializes as a native empty JSON array `[]`, not `null`.
+        let data = out.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
         assert!(
             data.contains("[]"),
             "empty-match collect must emit `[]`, not null; got row: {data:?}",
@@ -3559,8 +3564,10 @@ nodes:
     input: collected
     config:
       name: collected_out
-      type: csv
-      path: collected_cap.csv
+      type: json
+      options:
+        format: ndjson
+      path: collected_cap.ndjson
       include_unmapped: true
 "#;
         let orders = "order_id,product_id,amount\nORD-1,PROD-A,10\n";
@@ -3575,8 +3582,8 @@ nodes:
         )
         .expect("collect cap must run");
         let out = result.primary_output();
-        // The driver row is emitted.
-        let data_rows = out.lines().skip(1).filter(|l| !l.is_empty()).count();
+        // The driver row is emitted (NDJSON: one JSON object per line).
+        let data_rows = out.lines().filter(|l| !l.trim().is_empty()).count();
         assert_eq!(data_rows, 1, "collect emits one row per driver");
         // Expect exactly 10_000 occurrences of the substring `Widget-`
         // in the serialized array — the 10_001st match was truncated.

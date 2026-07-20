@@ -221,8 +221,9 @@ nodes:
 
 #[test]
 fn test_e2e_aggregate_collect() {
-    // Collect produces a JSON-array-like string in CSV output. We assert
-    // length and membership rather than exact serialization to avoid
+    // Collect produces a `Value::Array`, which the non-JSON writers reject as
+    // a stray collection (see #46); a JSON output serializes it natively. We
+    // assert membership per group rather than exact serialization to avoid
     // coupling to formatter details.
     let yaml = r#"
 pipeline:
@@ -263,29 +264,32 @@ nodes:
   input: by_dept
   config:
     name: out
-    type: csv
-    path: out.csv
+    type: json
+    path: out.json
     include_unmapped: true
 "#;
     let csv = "dept,name\neng,Alice\neng,Bob\nsales,Carol\n";
     let (report, output) = run_single(yaml, csv);
     assert_eq!(report.dlq_entries.len(), 0);
     assert_eq!(report.counters.ok_count, 2);
-    let body = sorted_body_lines(&output);
-    assert_eq!(body.len(), 2);
-    let eng_line = body
-        .iter()
-        .find(|l| l.starts_with("eng,"))
-        .expect("eng row");
+    // The JSON array output writes one object per group on its own line, with
+    // the collected names as a native JSON array.
+    let eng_line = output
+        .lines()
+        .find(|l| l.contains(r#""dept":"eng""#))
+        .expect("eng object");
     assert!(
         eng_line.contains("Alice") && eng_line.contains("Bob"),
-        "eng line missing collected names: {eng_line}"
+        "eng object missing collected names: {eng_line}"
     );
-    let sales_line = body
-        .iter()
-        .find(|l| l.starts_with("sales,"))
-        .expect("sales row");
-    assert!(sales_line.contains("Carol"));
+    let sales_line = output
+        .lines()
+        .find(|l| l.contains(r#""dept":"sales""#))
+        .expect("sales object");
+    assert!(
+        sales_line.contains("Carol"),
+        "sales object missing collected name: {sales_line}"
+    );
 }
 
 #[test]

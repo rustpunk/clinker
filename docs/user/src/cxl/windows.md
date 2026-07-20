@@ -221,6 +221,12 @@ Collects distinct values of the field in the window into an array.
 emit unique_regions = $window.distinct(region)
 ```
 
+`$window.collect` and `$window.distinct` emit arrays. The CSV, XML,
+and fixed-width writers reject an array-valued field, so route such a
+result to a JSON output, or coerce the emitted array to a scalar in a
+downstream `Transform` (for example `emit regions = unique_regions.join(";")`)
+before a tabular sink.
+
 ## Complete example
 
 ```yaml

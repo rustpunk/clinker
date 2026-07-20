@@ -58,17 +58,25 @@ HR group:
 
 ```
 department,day,total,min_amount,n,order_ids,anomaly_check
-ENG,2024-01-01,500,500,1,"[{""String"":""O05""}]",0
-ENG,2024-01-02,1190,440,2,"[{""String"":""O06""},{""String"":""O07""}]",0
-ENG,2024-01-03,940,330,2,"[{""String"":""O10""},{""String"":""O11""}]",0
+ENG,2024-01-01,500,500,1,O05,0
+ENG,2024-01-02,1190,440,2,O06;O07,0
+ENG,2024-01-03,940,330,2,O10;O11,0
 ```
+
+The `order_ids` cell is the aggregate's `collect(order_id)` binding
+joined into a `;`-separated scalar by the `dept_validate` Transform.
+The CSV writer rejects a raw array field (a stray collection reaching
+a tabular sink is treated as a routing bug), so a `collect` result
+bound for CSV/XML/fixed-width output is coerced to a scalar first —
+here with `order_ids.join(";")`; route to JSON output instead if you
+want the array serialized natively.
 
 If you remove the BAD row from `data/orders.csv` and rerun, the
 post-aggregate failures fire on the same three HR groups (the
 predicate is a property of the surviving totals, not of the
 sentinel) and the writer payload is bit-for-bit identical to the
 retract-corrected run. The smoke test at
-`crates/clinker-core/tests/retract_demo_smoke.rs` asserts this
+`crates/clinker-exec/tests/retract_demo_smoke.rs` asserts this
 equivalence.
 
 ## Inspect the plan

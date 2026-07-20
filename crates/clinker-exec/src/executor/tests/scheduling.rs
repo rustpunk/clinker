@@ -515,8 +515,8 @@ nodes:
     input: agg
     config:
       name: out
-      type: csv
-      path: out.csv
+      type: json
+      path: out.json
       include_unmapped: true
 "#;
 
@@ -617,8 +617,8 @@ nodes:
     input: agg
     config:
       name: out
-      type: csv
-      path: out.csv
+      type: json
+      path: out.json
       include_unmapped: true
 "#;
 

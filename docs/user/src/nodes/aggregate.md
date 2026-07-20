@@ -381,6 +381,13 @@ cargo run -p clinker -- run examples/pipelines/multi_source_session.yaml
   input: account_summary
   config:
     name: summary_output
-    type: csv
-    path: "./output/account_summary.csv"
+    type: json
+    path: "./output/account_summary.json"
 ```
+
+The output is JSON because `collect(category)` emits an array. The
+CSV, XML, and fixed-width writers reject an array-valued field (a
+stray collection reaching a tabular sink is treated as a routing
+bug); route such a pipeline to JSON, which serializes arrays
+natively, or coerce the array to a scalar first with a downstream
+`Transform` (for example `emit categories = categories.join(";")`).

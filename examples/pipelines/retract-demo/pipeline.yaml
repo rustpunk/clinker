@@ -158,6 +158,12 @@ nodes:
   # to the original orders rows — every row that fed the failing
   # group lands in the DLQ alongside the aggregate output row,
   # matching the upstream-failure DLQ-fan-out semantic.
+  #
+  # This Transform also joins `order_ids` (the aggregate's
+  # `collect(order_id)` array) into a `;`-separated scalar: the CSV
+  # sink rejects a raw array cell, so a `collect` binding bound for a
+  # tabular output must be coerced to a scalar here (or the Output
+  # routed to JSON, which serializes arrays natively).
   - type: transform
     name: dept_validate
     input: dept_totals
@@ -168,7 +174,7 @@ nodes:
         emit total = total
         emit min_amount = min_amount
         emit n = n
-        emit order_ids = order_ids
+        emit order_ids = order_ids.join(";")
         emit anomaly_check = if total < 500 then "x".to_int() else 0
 
   # Sink. `include_correlation_keys: true` surfaces the `$ck.*`
