@@ -283,9 +283,23 @@ impl<W: Write> EdifactWriter<W> {
             None => String::new(),
         };
 
-        if matches!(seg_id.as_str(), "UNB" | "UNZ" | "UNH" | "UNT") {
-            // Drive message grouping from the UNH record's identity but
-            // never echo the service segment verbatim.
+        if seg_id == "UNH" {
+            // An explicit UNH record opens (or re-drives) a message.
+            // Reconstruct the header from the record's positional columns so
+            // elements past the message type — a common access reference, a
+            // message subset identification, and so on — survive the
+            // round-trip rather than collapsing to a two-element UNH. The
+            // reader stamps element 1 into `msg_ref`/`e01` and element 2 into
+            // `msg_type`/`e02`, so elements 3 onward are `record_elements`
+            // past the second slot.
+            let header = self.record_elements(record)?;
+            let header_tail = header.get(2..).unwrap_or(&[]);
+            self.transition_message_with_header(&msg_ref, &msg_type, header_tail)?;
+            return Ok(());
+        }
+        if matches!(seg_id.as_str(), "UNB" | "UNZ" | "UNT") {
+            // Drive message grouping from the service segment's identity but
+            // never echo it verbatim — the writer reconstructs envelopes.
             self.transition_message(&msg_ref, &msg_type)?;
             return Ok(());
         }
@@ -304,7 +318,31 @@ impl<W: Write> EdifactWriter<W> {
     /// `msg_ref` changes, or open the first message. A record with an
     /// empty `msg_ref` joins the current message; if none is open, it
     /// opens an anonymous single message.
+    ///
+    /// The auto-open path (a body record with no preceding explicit `UNH`
+    /// record) has only the reference and type, so it emits a two-element
+    /// `UNH`; [`Self::transition_message_with_header`] carries a header tail
+    /// for the explicit-`UNH`-record path.
     fn transition_message(&mut self, msg_ref: &str, msg_type: &str) -> Result<(), FormatError> {
+        self.transition_message_with_header(msg_ref, msg_type, &[])
+    }
+
+    /// Open a new `UNH` message as [`Self::transition_message`] does, but
+    /// reconstruct the header with `header_tail` appended after the reference
+    /// and message type — the `UNH` data elements past element 2 (a common
+    /// access reference, a message subset identification, and so on) that an
+    /// explicit `UNH` record carries in its `e03`, `e04`, … columns.
+    ///
+    /// Element 1 (the reference) and element 2 (the message type) always come
+    /// from the resolved `msg_ref`/`msg_type`, never the tail, so element 1
+    /// stays identical to the reference the `UNT`/`UNZ` echo checks use; the
+    /// tail contributes only elements 3 onward.
+    fn transition_message_with_header(
+        &mut self,
+        msg_ref: &str,
+        msg_type: &str,
+        header_tail: &[String],
+    ) -> Result<(), FormatError> {
         let need_new = match &self.open_message {
             None => true,
             Some(open) => !msg_ref.is_empty() && open.reference != *msg_ref,
@@ -330,7 +368,18 @@ impl<W: Write> EdifactWriter<W> {
         } else {
             msg_ref.to_string()
         };
-        self.write_segment("UNH", &[reference.clone(), resolved_type])?;
+        let mut unh_elements = Vec::with_capacity(2 + header_tail.len());
+        unh_elements.push(reference.clone());
+        unh_elements.push(resolved_type);
+        unh_elements.extend_from_slice(header_tail);
+        // Trim trailing empty elements past the mandatory reference+type pair
+        // so a tail padded with empties does not fabricate spurious element
+        // separators; the pair itself is always emitted (never trimmed below
+        // two elements), keeping a plain two-element UNH byte-identical.
+        while unh_elements.len() > 2 && unh_elements.last().is_some_and(|s| s.is_empty()) {
+            unh_elements.pop();
+        }
+        self.write_segment("UNH", &unh_elements)?;
         self.message_count += 1;
         self.open_message = Some(OpenMessage {
             reference,
@@ -860,6 +909,58 @@ mod tests {
             &s,
         );
         assert!(out.contains("UNZ+2+REF1'"), "output was: {out}");
+    }
+
+    #[test]
+    fn explicit_unh_record_reconstructs_elements_past_message_type() {
+        // A UNH record carrying a third element (a common access reference in
+        // e03) must reconstruct that element on the wire, not collapse to a
+        // two-element UNH. Element 1/2 stay the resolved reference and type.
+        let s = schema();
+        let out = write_all(
+            literal_config(),
+            &[
+                body(
+                    &s,
+                    "UNH",
+                    "M1",
+                    "ORDERS:D:96A:UN",
+                    &["M1", "ORDERS:D:96A:UN", "CAR-ACCESS-REF"],
+                ),
+                body(&s, "BGM", "M1", "ORDERS:D:96A:UN", &["220"]),
+            ],
+            &s,
+        );
+        assert!(
+            out.contains("UNH+M1+ORDERS:D:96A:UN+CAR-ACCESS-REF'"),
+            "UNH lost the element past the message type: {out}"
+        );
+    }
+
+    #[test]
+    fn explicit_unh_record_without_extras_stays_two_element() {
+        // A UNH record whose only elements are the reference and type must
+        // still emit a plain two-element UNH — no fabricated empty tail.
+        let s = schema();
+        let out = write_all(
+            literal_config(),
+            &[
+                body(
+                    &s,
+                    "UNH",
+                    "M1",
+                    "ORDERS:D:96A:UN",
+                    &["M1", "ORDERS:D:96A:UN"],
+                ),
+                body(&s, "BGM", "M1", "ORDERS:D:96A:UN", &["220"]),
+            ],
+            &s,
+        );
+        assert!(out.contains("UNH+M1+ORDERS:D:96A:UN'"), "{out}");
+        assert!(
+            !out.contains("UNH+M1+ORDERS:D:96A:UN+'"),
+            "spurious trailing element: {out}"
+        );
     }
 
     #[test]

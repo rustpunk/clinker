@@ -13,7 +13,7 @@
 //! byte cap turns a missing terminator (truncated / corrupt input)
 //! into an error rather than letting the buffer grow without limit.
 
-use std::io::{BufRead, Read};
+use std::io::{self, BufRead, Read};
 
 use crate::edifact::charset::Charset;
 use crate::error::FormatError;
@@ -26,6 +26,90 @@ use crate::segment_tokenizer::{
 /// with no terminator byte fails fast instead of buffering the whole
 /// file into one "segment".
 pub(crate) const MAX_SEGMENT_BYTES: usize = 64 * 1024;
+
+/// The three-byte tag that introduces a `UNA` service-string advice.
+const UNA_TAG: &[u8] = b"UNA";
+
+/// Total byte length of a `UNA` service string: the `UNA` tag plus the six
+/// service characters. `UNA` is not terminator-delimited, so its length is
+/// fixed rather than discovered.
+const UNA_LEN: usize = 9;
+
+/// A [`BufRead`] that yields a small stashed prefix before delegating to an
+/// inner buffered reader.
+///
+/// The EDIFACT tokenizer must peek up to the nine `UNA` bytes to discover the
+/// delimiter set, but a chunking, non-file source can deliver those bytes
+/// across several reads and [`BufRead::fill_buf`] on a `BufReader` never grows
+/// a partially-filled buffer. Peeking therefore has to *consume* bytes to
+/// accumulate them. When the stream turns out to carry no `UNA`, the consumed
+/// bytes belong to the first real segment, so they are restored here via
+/// [`Self::push_front`] and re-yielded ahead of the inner reader on the next
+/// read. A present `UNA` is consumed outright and never pushed back.
+struct PrefixedReader<R> {
+    /// Bytes to re-yield before the inner reader; empty once fully drained.
+    prefix: Vec<u8>,
+    /// Consumed offset into `prefix`.
+    pos: usize,
+    inner: R,
+}
+
+impl<R> PrefixedReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            prefix: Vec::new(),
+            pos: 0,
+            inner,
+        }
+    }
+
+    /// Stash `bytes` to be re-yielded ahead of the inner reader. Only called
+    /// while no prefix is pending (a single push during `UNA` resolution),
+    /// so it replaces rather than accumulates.
+    fn push_front(&mut self, bytes: &[u8]) {
+        self.prefix = bytes.to_vec();
+        self.pos = 0;
+    }
+}
+
+impl<R: Read> Read for PrefixedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos < self.prefix.len() {
+            let n = (&self.prefix[self.pos..]).read(buf)?;
+            self.pos += n;
+            if self.pos >= self.prefix.len() {
+                self.prefix.clear();
+                self.pos = 0;
+            }
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl<R: BufRead> BufRead for PrefixedReader<R> {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if self.pos < self.prefix.len() {
+            return Ok(&self.prefix[self.pos..]);
+        }
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        // Per the `BufRead` contract `amt` never exceeds the last `fill_buf`
+        // slice, which is the prefix alone while one is pending, so a single
+        // `consume` stays within whichever source `fill_buf` returned.
+        if self.pos < self.prefix.len() {
+            self.pos += amt;
+            if self.pos >= self.prefix.len() {
+                self.prefix.clear();
+                self.pos = 0;
+            }
+        } else {
+            self.inner.consume(amt);
+        }
+    }
+}
 
 /// The six EDIFACT service characters discovered from `UNA` (or the
 /// Level-A defaults when `UNA` is absent).
@@ -75,7 +159,7 @@ impl Delimiters {
 /// is therefore set before any byte is interpreted, so no element is ever
 /// decoded under a wrong repertoire.
 pub(crate) struct SegmentTokenizer<R: Read> {
-    reader: R,
+    reader: PrefixedReader<R>,
     delimiters: Delimiters,
     charset: Charset,
     initialized: bool,
@@ -93,7 +177,7 @@ impl<R: BufRead> SegmentTokenizer<R> {
     /// decoded, so the placeholder is never used to interpret bytes.
     pub(crate) fn new(reader: R) -> Self {
         Self {
-            reader,
+            reader: PrefixedReader::new(reader),
             delimiters: Delimiters::level_a(),
             charset: Charset::default(),
             initialized: false,
@@ -128,41 +212,77 @@ impl<R: BufRead> SegmentTokenizer<R> {
         self.charset.decode(raw)
     }
 
-    /// Resolve the optional `UNA` prefix. Peeks the first bytes of the
-    /// stream: a `UNA` tag consumes the 9-byte service string and the
-    /// (optional) single separator byte that follows it; otherwise the
-    /// Level-A defaults stand and no bytes are consumed.
+    /// Resolve the optional `UNA` prefix. A `UNA` tag consumes the 9-byte
+    /// service string and any single separator byte that follows it and
+    /// overrides the delimiter set; otherwise the Level-A defaults stand and
+    /// no bytes are consumed by the interchange.
+    ///
+    /// The `UNA` bytes can arrive across several reads from a chunking,
+    /// non-file source, and `BufRead::fill_buf` never grows a partially-filled
+    /// buffer, so the scan accumulates by consuming: it peeks the three-byte
+    /// tag first (enough to decide `UNA`-vs-not), then, only for a `UNA`, the
+    /// remaining service bytes — looping until nine bytes are gathered or the
+    /// stream genuinely ends, mirroring the X12 `ISA` header accumulation. A
+    /// present `UNA` is consumed outright; when no `UNA` is present the peeked
+    /// tag bytes belong to the first real segment and are pushed back for the
+    /// segment read.
     fn initialize(&mut self) -> Result<(), FormatError> {
         if self.initialized {
             return Ok(());
         }
         self.initialized = true;
 
-        let head = self.reader.fill_buf()?;
-        if head.starts_with(b"UNA") {
-            if head.len() < 9 {
-                // A truncated UNA is unrecoverable — the delimiter set is
-                // undefined, so nothing downstream can be tokenized.
-                return Err(FormatError::Edifact(
-                    "truncated UNA service string: need 9 bytes after the stream start, \
-                     the interchange is corrupt or truncated"
-                        .into(),
-                ));
+        // Phase 1: peek the three-byte tag (or fewer, at a genuine EOF).
+        let mut peeked: Vec<u8> = Vec::with_capacity(UNA_LEN);
+        self.accumulate_up_to(&mut peeked, UNA_TAG.len())?;
+
+        if !peeked.starts_with(UNA_TAG) {
+            // No `UNA`: the Level-A defaults stand, and the tag bytes peeked
+            // to decide that belong to the first real segment, so restore them
+            // ahead of the inner reader for the segment read.
+            self.reader.push_front(&peeked);
+            return Ok(());
+        }
+
+        // Phase 2: a `UNA` is present — gather the remaining service bytes.
+        self.accumulate_up_to(&mut peeked, UNA_LEN)?;
+        if peeked.len() < UNA_LEN {
+            // A truncated UNA is unrecoverable — the delimiter set is
+            // undefined, so nothing downstream can be tokenized.
+            return Err(FormatError::Edifact(
+                "truncated UNA service string: need 9 bytes after the stream start, \
+                 the interchange is corrupt or truncated"
+                    .into(),
+            ));
+        }
+        // UNA layout: bytes 3..9 are component, element, decimal, release,
+        // repetition, terminator in that fixed order.
+        let una = &peeked[3..9];
+        self.delimiters = Delimiters {
+            component: una[0],
+            element: una[1],
+            decimal: una[2],
+            release: una[3],
+            repetition: una[4],
+            terminator: una[5],
+        };
+        skip_inter_segment_whitespace(&mut self.reader)?;
+        Ok(())
+    }
+
+    /// Consume bytes from the reader into `buf` until it holds `target` bytes
+    /// or the stream ends, returning early on a genuine EOF. A single
+    /// `fill_buf` may return fewer bytes than requested when a non-file source
+    /// chunks its reads, so this loops rather than trusting one fill.
+    fn accumulate_up_to(&mut self, buf: &mut Vec<u8>, target: usize) -> Result<(), FormatError> {
+        while buf.len() < target {
+            let chunk = self.reader.fill_buf()?;
+            if chunk.is_empty() {
+                break;
             }
-            // UNA layout: bytes 3..9 are component, element, decimal,
-            // release, repetition, terminator in that fixed order.
-            let una = &head[3..9];
-            let delimiters = Delimiters {
-                component: una[0],
-                element: una[1],
-                decimal: una[2],
-                release: una[3],
-                repetition: una[4],
-                terminator: una[5],
-            };
-            self.delimiters = delimiters;
-            self.reader.consume(9);
-            skip_inter_segment_whitespace(&mut self.reader)?;
+            let take = (target - buf.len()).min(chunk.len());
+            buf.extend_from_slice(&chunk[..take]);
+            self.reader.consume(take);
         }
         Ok(())
     }
@@ -318,10 +438,44 @@ fn bytes_to_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{BufReader, Cursor};
 
     fn tok(data: &[u8]) -> SegmentTokenizer<Cursor<Vec<u8>>> {
         SegmentTokenizer::new(Cursor::new(data.to_vec()))
+    }
+
+    /// A `Read` source that hands out at most `chunk` bytes per `read` call,
+    /// modelling a network/pipe reader whose first fills fall short of the
+    /// nine `UNA` bytes. Wrapped in a `BufReader` (as the source ingest path
+    /// wraps a file), each `fill_buf` then returns only that short chunk.
+    struct ChunkedReader {
+        data: Vec<u8>,
+        pos: usize,
+        chunk: usize,
+    }
+
+    impl ChunkedReader {
+        fn new(data: &[u8], chunk: usize) -> Self {
+            Self {
+                data: data.to_vec(),
+                pos: 0,
+                chunk,
+            }
+        }
+    }
+
+    impl Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let remaining = &self.data[self.pos..];
+            let n = remaining.len().min(self.chunk).min(buf.len());
+            buf[..n].copy_from_slice(&remaining[..n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    fn chunked_tok(data: &[u8], chunk: usize) -> SegmentTokenizer<BufReader<ChunkedReader>> {
+        SegmentTokenizer::new(BufReader::new(ChunkedReader::new(data, chunk)))
     }
 
     #[test]
@@ -436,6 +590,56 @@ mod tests {
     #[test]
     fn truncated_una_errors() {
         let mut t = tok(b"UNA:+");
+        let err = t.next_segment().unwrap_err();
+        assert!(matches!(err, FormatError::Edifact(msg) if msg.contains("UNA")));
+    }
+
+    #[test]
+    fn chunked_una_is_not_misread_as_truncated() {
+        // A valid UNA delivered across reads that each fall short of the nine
+        // service-string bytes must still resolve the delimiters, not be
+        // rejected as a truncated UNA. The custom UNA declares component '|',
+        // element '*', decimal ',', release '#', repetition ' ', terminator
+        // '~'. A four-byte chunk splits the service string mid-way.
+        for chunk in [1usize, 2, 3, 4, 5] {
+            let mut t = chunked_tok(b"UNA|*,# ~UNB*UNOA|1~", chunk);
+            let first = t.next_segment().unwrap().unwrap();
+            let d = t.delimiters();
+            assert_eq!(d.component, b'|', "chunk={chunk}");
+            assert_eq!(d.element, b'*', "chunk={chunk}");
+            assert_eq!(d.terminator, b'~', "chunk={chunk}");
+            assert_eq!(first, "UNB*UNOA|1", "chunk={chunk}");
+        }
+    }
+
+    #[test]
+    fn chunked_absent_una_keeps_first_segment_bytes() {
+        // With no UNA, the tag bytes peeked to decide that must be restored so
+        // the first real segment is read whole — a chunked source that splits
+        // the leading "UNB" must not lose those bytes to the UNA probe.
+        for chunk in [1usize, 2, 3, 4] {
+            let mut t = chunked_tok(b"UNB+UNOA:1'BGM+220'", chunk);
+            assert_eq!(t.delimiters(), Delimiters::level_a(), "chunk={chunk}");
+            assert_eq!(
+                t.next_segment().unwrap().unwrap(),
+                "UNB+UNOA:1",
+                "chunk={chunk}"
+            );
+            assert_eq!(
+                t.next_segment().unwrap().unwrap(),
+                "BGM+220",
+                "chunk={chunk}"
+            );
+            assert!(t.next_segment().unwrap().is_none(), "chunk={chunk}");
+        }
+    }
+
+    #[test]
+    fn chunked_truncated_una_still_errors() {
+        // A genuinely truncated UNA (fewer than nine bytes, then EOF)
+        // delivered in small chunks is still an error — the accumulate loop
+        // stops at real EOF, not at a short fill.
+        let mut t = chunked_tok(b"UNA:+", 2);
         let err = t.next_segment().unwrap_err();
         assert!(matches!(err, FormatError::Edifact(msg) if msg.contains("UNA")));
     }
