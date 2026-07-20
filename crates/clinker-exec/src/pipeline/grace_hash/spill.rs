@@ -286,7 +286,7 @@ pub(super) fn process_spilled_partition(
             if budget.record_spill_bytes(name, b_written) {
                 return Err(PipelineError::spill_cap_exceeded(
                     name,
-                    budget.disk_quota(),
+                    budget.max_spill_bytes(),
                     b_written,
                     budget.cumulative_spill_bytes(),
                 ));
@@ -310,7 +310,7 @@ pub(super) fn process_spilled_partition(
                 if budget.record_spill_bytes(name, p_written) {
                     return Err(PipelineError::spill_cap_exceeded(
                         name,
-                        budget.disk_quota(),
+                        budget.max_spill_bytes(),
                         p_written,
                         budget.cumulative_spill_bytes(),
                     ));

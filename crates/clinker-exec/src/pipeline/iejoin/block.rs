@@ -1372,7 +1372,7 @@ pub(super) fn execute_block_band(
     if residue > 0 && budget.record_spill_bytes(name, residue) {
         return Err(PipelineError::spill_cap_exceeded(
             name,
-            budget.disk_quota(),
+            budget.max_spill_bytes(),
             residue,
             budget.cumulative_spill_bytes(),
         ));
@@ -1617,7 +1617,7 @@ fn charge_block_spill(ctx: &DrainCtx<'_>, written: u64) -> Result<(), PipelineEr
     if written > 0 && ctx.budget.record_spill_bytes(ctx.name, written) {
         return Err(PipelineError::spill_cap_exceeded(
             ctx.name,
-            ctx.budget.disk_quota(),
+            ctx.budget.max_spill_bytes(),
             written,
             ctx.budget.cumulative_spill_bytes(),
         ));

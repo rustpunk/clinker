@@ -1192,7 +1192,7 @@ impl EmitSink<'_> {
             if written > 0 && self.budget.record_spill_bytes(self.name, written) {
                 return Err(PipelineError::spill_cap_exceeded(
                     self.name,
-                    self.budget.disk_quota(),
+                    self.budget.max_spill_bytes(),
                     written,
                     self.budget.cumulative_spill_bytes(),
                 ));

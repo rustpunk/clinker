@@ -21,7 +21,9 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, Value};
 use petgraph::graph::NodeIndex;
 
-use crate::executor::dispatch::{NodeBufferKey, service_pending_node_buffer_spills};
+use crate::executor::dispatch::{
+    NodeBufferKey, NodeBufferSpillSweep, service_pending_node_buffer_spills,
+};
 use crate::executor::node_buffer::{NodeBuffer, NodeBufferConsumer, record_byte_cost};
 use crate::pipeline::memory::{ConsumerHandle, ConsumerId, MemoryArbitrator, NoOpPolicy};
 
@@ -86,18 +88,20 @@ fn flagged_resident_memory_slot_spills_and_discharges_via_sweep() {
 
     service_pending_node_buffer_spills(
         &mut node_buffers,
-        &consumer_ids,
-        &arb,
-        spill_dir.path(),
-        clinker_plan::config::CompressMode::On,
-        2048,
-        |_idx| true,
-        |idx| {
-            if idx == idx_a {
-                "stage_a".to_string()
-            } else {
-                "stage_b".to_string()
-            }
+        &NodeBufferSpillSweep {
+            consumer_ids: &consumer_ids,
+            arbitrator: &arb,
+            spill_root: spill_dir.path(),
+            spill_compress: clinker_plan::config::CompressMode::On,
+            batch_size: 2048,
+            is_spill_allowed: &|_idx| true,
+            node_name: &|idx| {
+                if idx == idx_a {
+                    "stage_a".to_string()
+                } else {
+                    "stage_b".to_string()
+                }
+            },
         },
     )
     .expect("resident-slot spill sweep");
@@ -177,13 +181,15 @@ fn flagged_non_spillable_slot_is_skipped_by_sweep() {
 
     service_pending_node_buffer_spills(
         &mut node_buffers,
-        &consumer_ids,
-        &arb,
-        spill_dir.path(),
-        clinker_plan::config::CompressMode::On,
-        2048,
-        |_idx| false,
-        |_idx| "fanout".to_string(),
+        &NodeBufferSpillSweep {
+            consumer_ids: &consumer_ids,
+            arbitrator: &arb,
+            spill_root: spill_dir.path(),
+            spill_compress: clinker_plan::config::CompressMode::On,
+            batch_size: 2048,
+            is_spill_allowed: &|_idx| false,
+            node_name: &|_idx| "fanout".to_string(),
+        },
     )
     .expect("sweep skips non-spillable slots without error");
 

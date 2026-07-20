@@ -48,6 +48,22 @@ fn aggregate_spill_schema(compiled: &cxl::plan::CompiledAggregate) -> Arc<Schema
         .build()
 }
 
+/// Compiled identity of an `aggregate:` node — its name plus the typed and
+/// compiled programs, output schema, strategy, and distinct-ness the dispatch
+/// arm reads off [`PlanNode::Aggregation`]. Bundling the six fields lets
+/// [`dispatch_aggregation`] thread one value into both the per-document
+/// factory ([`DocAggregatorFactory::from_ctx`]) and the streaming-ingest
+/// helper ([`run_streaming_aggregate_ingest`]) instead of re-passing the same
+/// list to each.
+struct AggregateSpec<'a> {
+    name: &'a str,
+    typed: &'a Arc<cxl::typecheck::TypedProgram>,
+    compiled: &'a Arc<cxl::plan::CompiledAggregate>,
+    output_schema: &'a Arc<Schema>,
+    strategy: AggregateStrategy,
+    has_distinct: bool,
+}
+
 /// Execute the `Aggregation` arm for `node_idx`: select hash or streaming
 /// strategy, ingest the predecessor's records (per-record for hash, sorted
 /// for streaming), trip soft/hard spill thresholds inside the RSS budget,
@@ -72,6 +88,14 @@ pub(crate) fn dispatch_aggregation(
     } = *node
     else {
         unreachable!("dispatch_aggregation called with non-Aggregation node");
+    };
+    let spec = AggregateSpec {
+        name: name.as_str(),
+        typed,
+        compiled,
+        output_schema,
+        strategy: agg_strategy,
+        has_distinct,
     };
     // Whether this aggregate participates in retraction-mode
     // commit is fully determined by the planner-set
@@ -128,28 +152,9 @@ pub(crate) fn dispatch_aggregation(
     let agg_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
 
     if let Some(producer_idx) = streaming_ingest_producer {
-        let ingest = run_streaming_aggregate_ingest(
-            ctx,
-            current_dag,
-            node_idx,
-            producer_idx,
-            name,
-            typed,
-            has_distinct,
-            agg_strategy,
-            compiled,
-            output_schema,
-        )?;
-        return finalize_aggregate_emit(
-            ctx,
-            current_dag,
-            node_idx,
-            name,
-            agg_timer,
-            ingest.input_count,
-            ingest.out_rows,
-            ingest.puncts,
-        );
+        let ingest =
+            run_streaming_aggregate_ingest(ctx, current_dag, node_idx, producer_idx, &spec)?;
+        return finalize_aggregate_emit(ctx, current_dag, node_idx, name, agg_timer, ingest);
     }
 
     let (input, input_puncts): (
@@ -376,15 +381,7 @@ pub(crate) fn dispatch_aggregation(
         // Builds nothing in the prelude: each document's table derives its
         // own evaluator + spill schema through the `ctx`-free factory, so a
         // strict run allocates no throwaway evaluator or spill schema here.
-        let factory = DocAggregatorFactory::from_ctx(
-            ctx,
-            name,
-            typed,
-            has_distinct,
-            agg_strategy,
-            compiled,
-            output_schema,
-        )?;
+        let factory = DocAggregatorFactory::from_ctx(ctx, &spec)?;
         run_strict_aggregate_per_document(ctx, factory, name, output_schema, &input, &input_puncts)?
     };
 
@@ -394,9 +391,11 @@ pub(crate) fn dispatch_aggregation(
         node_idx,
         name,
         agg_timer,
-        input_count,
-        out_rows,
-        input_puncts,
+        AggregateEmit {
+            input_count,
+            out_rows,
+            input_puncts,
+        },
     )
 }
 
@@ -406,17 +405,19 @@ pub(crate) fn dispatch_aggregation(
 /// the output tail. Shared by the materialized ingest path and the
 /// streaming-ingest path ([`run_streaming_aggregate_ingest`]) — both
 /// produce the same finalized `out_rows`, so the emit half is identical.
-#[allow(clippy::too_many_arguments)]
 fn finalize_aggregate_emit(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     name: &str,
     agg_timer: stage_metrics::StageTimer,
-    input_count: u64,
-    out_rows: Vec<crate::aggregation::SortRow>,
-    input_puncts: Vec<crate::executor::stream_event::Punctuation>,
+    emit: AggregateEmit,
 ) -> Result<(), PipelineError> {
+    let AggregateEmit {
+        input_count,
+        out_rows,
+        input_puncts,
+    } = emit;
     ctx.collector
         .record(agg_timer.finish(input_count, out_rows.len() as u64));
     if let Some(region) = current_dag.deferred_region_at_producer(node_idx) {
@@ -558,34 +559,29 @@ impl DocAggregatorFactory {
     /// aggregate's fan-out ceiling is always [`cxl::eval::DEFAULT_MAX_EXPANSION`].
     fn from_ctx(
         ctx: &ExecutorContext<'_>,
-        node_name: &str,
-        typed: &Arc<cxl::typecheck::TypedProgram>,
-        has_distinct: bool,
-        strategy: AggregateStrategy,
-        compiled: &Arc<cxl::plan::CompiledAggregate>,
-        output_schema: &Arc<Schema>,
+        spec: &AggregateSpec<'_>,
     ) -> Result<Self, PipelineError> {
         // The compression mode resolves against the output-schema width and
         // batch size so a spilled table's on-disk format matches what
         // `--explain` reports.
-        let spill_schema = aggregate_spill_schema(compiled);
+        let spill_schema = aggregate_spill_schema(spec.compiled);
         let spill_compress = ctx
             .spill_compress
-            .resolve_for_schema(output_schema.column_count(), ctx.batch_size as u64);
+            .resolve_for_schema(spec.output_schema.column_count(), ctx.batch_size as u64);
         Ok(Self {
-            strategy,
-            compiled: Arc::clone(compiled),
-            typed: Arc::clone(typed),
-            has_distinct,
+            strategy: spec.strategy,
+            compiled: Arc::clone(spec.compiled),
+            typed: Arc::clone(spec.typed),
+            has_distinct: spec.has_distinct,
             max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
-            output_schema: Arc::clone(output_schema),
+            output_schema: Arc::clone(spec.output_schema),
             spill_schema,
             mem_limit: parse_memory_limit(ctx.config),
             spill_dir: ctx.spill_root_path.to_path_buf(),
             spill_compress,
-            transform_name: node_name.to_string(),
+            transform_name: spec.name.to_string(),
             arbitrator: Arc::clone(&ctx.memory_budget),
-            is_global_fold: compiled.group_by_fields.is_empty(),
+            is_global_fold: spec.compiled.group_by_fields.is_empty(),
         })
     }
 
@@ -1055,13 +1051,15 @@ struct StreamingIngestEffects {
     add_errors: Vec<(Record, u64, String)>,
 }
 
-/// Streaming-ingest result handed back to [`dispatch_aggregation`]: the
-/// finalized group rows, the document-boundary punctuations forwarded at
-/// the output tail, and the count of records the producer fed in.
-struct StreamingIngestOutput {
-    out_rows: Vec<crate::aggregation::SortRow>,
-    puncts: Vec<crate::executor::stream_event::Punctuation>,
+/// Finalized aggregate output handed to [`finalize_aggregate_emit`]: the
+/// finalized group rows, the document-boundary punctuations forwarded at the
+/// output tail, and the count of records ingested. Produced identically by the
+/// materialized drain path and the streaming-ingest path
+/// ([`run_streaming_aggregate_ingest`]), so both feed the same emit half.
+struct AggregateEmit {
     input_count: u64,
+    out_rows: Vec<crate::aggregation::SortRow>,
+    input_puncts: Vec<crate::executor::stream_event::Punctuation>,
 }
 
 /// Drive a strict (non-relaxed, non-time-windowed) Aggregate's ingest off
@@ -1111,21 +1109,17 @@ struct StreamingIngestOutput {
 /// streaming finalize path, matching the prior behavior). Spill stays
 /// RSS-triggered inside `add_record` / `finalize`, never
 /// channel-depth-triggered.
-#[allow(clippy::too_many_arguments)]
 fn run_streaming_aggregate_ingest(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     producer_idx: NodeIndex,
-    name: &str,
-    typed: &Arc<cxl::typecheck::TypedProgram>,
-    has_distinct: bool,
-    agg_strategy: AggregateStrategy,
-    compiled: &Arc<cxl::plan::CompiledAggregate>,
-    output_schema: &Arc<Schema>,
-) -> Result<StreamingIngestOutput, PipelineError> {
+    spec: &AggregateSpec<'_>,
+) -> Result<AggregateEmit, PipelineError> {
     use crate::aggregation::SortRow as AggSortRow;
     use crate::executor::stream_event::StreamEvent;
+
+    let name = spec.name;
 
     let expected_input = current_dag.graph[node_idx]
         .expected_input_schema_in(current_dag)
@@ -1140,15 +1134,7 @@ fn run_streaming_aggregate_ingest(
     // `sum_consumer_usage` while live, and is unregistered when that
     // document flushes (on its `DocumentClose`, or at disconnect for the
     // document left open).
-    let factory = DocAggregatorFactory::from_ctx(
-        ctx,
-        name,
-        typed,
-        has_distinct,
-        agg_strategy,
-        compiled,
-        output_schema,
-    )?;
+    let factory = DocAggregatorFactory::from_ctx(ctx, spec)?;
 
     // Install the bounded streaming-ingest channel keyed by the producer's
     // index, so its dispatch arm streams into it with no producer-side
@@ -1408,10 +1394,10 @@ fn run_streaming_aggregate_ingest(
         }
     }
 
-    Ok(StreamingIngestOutput {
-        out_rows,
-        puncts,
+    Ok(AggregateEmit {
         input_count,
+        out_rows,
+        input_puncts: puncts,
     })
 }
 

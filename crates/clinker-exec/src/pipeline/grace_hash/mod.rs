@@ -298,7 +298,7 @@ fn charge_grace_spill(
     if budget.record_spill_bytes(name, written) {
         return Err(GraceSpillError::CapExceeded {
             attempted: written,
-            cap: budget.disk_quota(),
+            cap: budget.max_spill_bytes(),
             cumulative: budget.cumulative_spill_bytes(),
         });
     }
@@ -317,7 +317,7 @@ impl GraceHashExecutor {
         consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
         spill_compress: bool,
         name: &str,
-    ) -> std::io::Result<Self> {
+    ) -> Self {
         let assigner = PartitionAssigner::new(partition_bits.max(1));
         let n = assigner.num_partitions();
         let mut partitions = Vec::with_capacity(n);
@@ -328,7 +328,7 @@ impl GraceHashExecutor {
                 distinct_sketch: GraceHll::new(),
             });
         }
-        Ok(Self {
+        Self {
             assigner,
             partitions,
             spill_dir: spill_dir.to_path_buf(),
@@ -336,7 +336,7 @@ impl GraceHashExecutor {
             name: name.to_string(),
             consumer_handle,
             spill_compress,
-        })
+        }
     }
 
     /// Path of the spill directory hosting per-partition files.
@@ -784,12 +784,7 @@ pub(crate) fn execute_combine_grace_hash(
         consumer_handle,
         spill_compress,
         name,
-    )
-    .map_err(|e| PipelineError::Internal {
-        op: "combine",
-        node: name.to_string(),
-        detail: format!("grace hash spill dir bind failed: {e}"),
-    })?;
+    );
 
     // ── Build phase ────────────────────────────────────────────────────
     //

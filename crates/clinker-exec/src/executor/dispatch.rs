@@ -2894,16 +2894,42 @@ fn service_node_buffer_spill_requests(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
 ) -> Result<(), PipelineError> {
+    let is_spill_allowed = |idx: NodeIndex| node_buffer_spill_allowed(current_dag, idx);
+    let node_name = |idx: NodeIndex| current_dag.graph[idx].name().to_string();
     service_pending_node_buffer_spills(
         &mut ctx.node_buffers,
-        &ctx.node_buffer_consumer_ids,
-        &ctx.memory_budget,
-        ctx.spill_root_path.as_ref(),
-        ctx.spill_compress,
-        ctx.batch_size,
-        |idx| node_buffer_spill_allowed(current_dag, idx),
-        |idx| current_dag.graph[idx].name().to_string(),
+        &NodeBufferSpillSweep {
+            consumer_ids: &ctx.node_buffer_consumer_ids,
+            arbitrator: &ctx.memory_budget,
+            spill_root: ctx.spill_root_path.as_ref(),
+            spill_compress: ctx.spill_compress,
+            batch_size: ctx.batch_size,
+            is_spill_allowed: &is_spill_allowed,
+            node_name: &node_name,
+        },
     )
+}
+
+/// Non-buffer inputs to [`service_pending_node_buffer_spills`]: the per-slot
+/// consumer registry, the arbitrator, the run's spill settings, and the
+/// `is_spill_allowed` / `node_name` resolvers the caller derives from the live
+/// DAG. Bundling them keeps the sweep's signature within clippy's argument
+/// budget and gives the thin [`service_node_buffer_spill_requests`] adapter
+/// and the white-box test one shape to construct.
+pub(crate) struct NodeBufferSpillSweep<'a> {
+    pub(crate) consumer_ids: &'a HashMap<
+        NodeBufferKey,
+        (
+            crate::pipeline::memory::ConsumerId,
+            Arc<crate::pipeline::memory::ConsumerHandle>,
+        ),
+    >,
+    pub(crate) arbitrator: &'a crate::pipeline::memory::MemoryArbitrator,
+    pub(crate) spill_root: &'a std::path::Path,
+    pub(crate) spill_compress: clinker_plan::config::CompressMode,
+    pub(crate) batch_size: usize,
+    pub(crate) is_spill_allowed: &'a dyn Fn(NodeIndex) -> bool,
+    pub(crate) node_name: &'a dyn Fn(NodeIndex) -> String,
 }
 
 /// Spill every resident `node_buffers` slot whose consumer flagged a
@@ -2911,39 +2937,26 @@ fn service_node_buffer_spill_requests(
 /// file against the arbitrator's disk quota.
 ///
 /// The `ExecutorContext`-free core of [`service_node_buffer_spill_requests`]:
-/// it takes the slot map, the per-slot consumer registry, the arbitrator,
-/// and the run's spill settings directly, plus `is_spill_allowed` /
-/// `node_name` resolvers the caller derives from the live DAG. Splitting it
-/// out lets a white-box test drive the resident-slot spill path
-/// deterministically — a live pipeline run cannot, because the RSS-vs-
+/// it takes the slot map plus a [`NodeBufferSpillSweep`] carrying the per-slot
+/// consumer registry, the arbitrator, the run's spill settings, and the
+/// `is_spill_allowed` / `node_name` resolvers the caller derives from the live
+/// DAG. Splitting it out lets a white-box test drive the resident-slot spill
+/// path deterministically — a live pipeline run cannot, because the RSS-vs-
 /// charged arms of `should_spill` cannot be made to transition false→true
 /// between two admissions with real record footprints.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn service_pending_node_buffer_spills(
     node_buffers: &mut HashMap<NodeBufferKey, NodeBuffer>,
-    consumer_ids: &HashMap<
-        NodeBufferKey,
-        (
-            crate::pipeline::memory::ConsumerId,
-            Arc<crate::pipeline::memory::ConsumerHandle>,
-        ),
-    >,
-    arbitrator: &crate::pipeline::memory::MemoryArbitrator,
-    spill_root: &std::path::Path,
-    spill_compress: clinker_plan::config::CompressMode,
-    batch_size: usize,
-    is_spill_allowed: impl Fn(NodeIndex) -> bool,
-    node_name: impl Fn(NodeIndex) -> String,
+    sweep: &NodeBufferSpillSweep<'_>,
 ) -> Result<(), PipelineError> {
     // Phase 1: collect the slots whose consumer flagged a spill request and
     // that are eligible to spill (resident `Memory` + single-drain
     // topology). `take_spill_request` read-and-clears the flag for every
     // flagged slot, spillable or not, so a non-spillable flag does not spin.
     let mut to_spill: Vec<NodeBufferKey> = Vec::new();
-    for (key, (_id, handle)) in consumer_ids {
+    for (key, (_id, handle)) in sweep.consumer_ids {
         if handle.take_spill_request()
             && matches!(node_buffers.get(key), Some(NodeBuffer::Memory(_)))
-            && is_spill_allowed(key.node)
+            && (sweep.is_spill_allowed)(key.node)
         {
             to_spill.push(key.clone());
         }
@@ -2952,7 +2965,8 @@ pub(crate) fn service_pending_node_buffer_spills(
     // nothing mutated the slot between the two phases, so it is still the
     // `Memory` variant Phase 1 saw.
     for key in to_spill {
-        let Some(handle) = consumer_ids
+        let Some(handle) = sweep
+            .consumer_ids
             .get(&key)
             .map(|(_id, handle)| Arc::clone(handle))
         else {
@@ -2961,23 +2975,26 @@ pub(crate) fn service_pending_node_buffer_spills(
         let Some(buffer) = node_buffers.remove(&key) else {
             continue;
         };
-        let name = node_name(key.node);
+        let name = (sweep.node_name)(key.node);
         // Resolve the compression mode against this slot's schema width and
         // the run's batch size, matching the admission path so the on-disk
         // format agrees with what `--explain` projects.
         let column_count = buffer.first_record_column_count();
-        let compress = spill_compress.resolve_for_schema(column_count, batch_size as u64);
-        let (spilled, file_bytes) = buffer.spill_resident_memory(Some(spill_root), compress)?;
+        let compress = sweep
+            .spill_compress
+            .resolve_for_schema(column_count, sweep.batch_size as u64);
+        let (spilled, file_bytes) =
+            buffer.spill_resident_memory(Some(sweep.spill_root), compress)?;
         node_buffers.insert(key, spilled);
         if file_bytes > 0 {
             // Rows are on disk now; the slot's in-memory charge is zero.
             handle.set_bytes(0);
-            if arbitrator.record_spill_bytes(&name, file_bytes) {
+            if sweep.arbitrator.record_spill_bytes(&name, file_bytes) {
                 return Err(PipelineError::spill_cap_exceeded(
                     name,
-                    arbitrator.max_spill_bytes(),
+                    sweep.arbitrator.max_spill_bytes(),
                     file_bytes,
-                    arbitrator.cumulative_spill_bytes(),
+                    sweep.arbitrator.cumulative_spill_bytes(),
                 ));
             }
         }
