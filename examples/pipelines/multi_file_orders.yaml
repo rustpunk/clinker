@@ -1,12 +1,12 @@
 pipeline:
   name: multi_file_orders
-  description: |
-    Demo of flexible-file-matching: glob, modified_after, sort_by + take_first.
-    `glob: ./data/orders_*.csv` matches every shard at runtime; the executor's
-    MultiFileFormatReader concatenates them into one record stream and stamps
-    `$source.file` per record. Downstream `group_by` operates per-file by
-    default thanks to plan-time `FilePartitioned` lineage; insert a `merge:`
-    node before the aggregate to roll up across files.
+
+# Demo of flexible-file-matching: glob, modified_after, sort_by + take_first.
+# `glob: ./data/orders_*.csv` matches every shard at runtime; the executor's
+# MultiFileFormatReader concatenates them into one record stream and stamps
+# `$source.file` per record. Downstream `group_by` operates per-file by
+# default thanks to plan-time `FilePartitioned` lineage; insert a `merge:`
+# node before the aggregate to roll up across files.
 nodes:
   - type: source
     name: orders
