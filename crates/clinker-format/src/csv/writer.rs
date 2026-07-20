@@ -396,8 +396,12 @@ fn write_csv_cell(buf: &mut String, col: &str, value: &Value) -> Result<(), Form
         Value::Date(d) => {
             let _ = write!(buf, "{}", d.format("%Y-%m-%d"));
         }
+        // `%.f` appends the fractional second only when the sub-second field is
+        // non-zero, and trims to 3/6/9 digits — so a whole-second datetime stays
+        // byte-identical to the plain `%Y-%m-%dT%H:%M:%S` rendering while
+        // millisecond/microsecond/nanosecond precision survives to text (#883).
         Value::DateTime(dt) => {
-            let _ = write!(buf, "{}", dt.format("%Y-%m-%dT%H:%M:%S"));
+            let _ = write!(buf, "{}", dt.format("%Y-%m-%dT%H:%M:%S%.f"));
         }
         Value::Array(_) => {
             return Err(FormatError::UnserializableArrayValue {
@@ -516,6 +520,59 @@ mod tests {
         let output = write_to_string(&schema, CsvWriterConfig::default(), &records);
         // Null becomes empty string between delimiters
         assert_eq!(output, "a,b,c\nx,,z\n");
+    }
+
+    /// Sub-second datetimes must carry their fractional part into CSV text. The
+    /// prior whole-second `%Y-%m-%dT%H:%M:%S` rendering silently dropped
+    /// millisecond/microsecond/nanosecond precision (#883). `%.f` emits nothing
+    /// for a whole-second value (nanos=0 stays byte-identical) and otherwise
+    /// trims to a 3/6/9-digit group, so each precision tier renders exactly.
+    #[test]
+    fn test_csv_writer_datetime_subsecond_preserved() {
+        use chrono::NaiveDate;
+        let schema = make_schema(&["ts"]);
+        let base = NaiveDate::from_ymd_opt(2024, 1, 15).unwrap();
+        let cases = [
+            (0, "2024-01-15T10:30:00"),
+            (123_000_000, "2024-01-15T10:30:00.123"),
+            (123_456_000, "2024-01-15T10:30:00.123456"),
+            (123_456_789, "2024-01-15T10:30:00.123456789"),
+            (1, "2024-01-15T10:30:00.000000001"),
+        ];
+        for (nanos, expected) in cases {
+            let dt = base.and_hms_nano_opt(10, 30, 0, nanos).unwrap();
+            let record = make_record(&schema, vec![Value::DateTime(dt)]);
+            let output = write_to_string(&schema, CsvWriterConfig::default(), &[record]);
+            assert_eq!(output, format!("ts\n{expected}\n"), "nanos={nanos}");
+        }
+    }
+
+    /// The emitted sub-second text is round-trippable: reading the CSV cell back
+    /// out and parsing it with a fractional-second-aware pattern reconstructs
+    /// the exact `NaiveDateTime`, nanoseconds intact.
+    #[test]
+    fn test_csv_writer_datetime_subsecond_roundtrips() {
+        use chrono::{NaiveDate, NaiveDateTime};
+        let schema = make_schema(&["ts"]);
+        let dt = NaiveDate::from_ymd_opt(2024, 1, 15)
+            .unwrap()
+            .and_hms_nano_opt(10, 30, 0, 123_456_789)
+            .unwrap();
+        let record = make_record(&schema, vec![Value::DateTime(dt)]);
+        let output = write_to_string(&schema, CsvWriterConfig::default(), &[record]);
+
+        // Read the single data cell back out through the CSV reader (which
+        // yields the raw text as a string — no typed coercion on this path).
+        let mut reader = CsvReader::from_reader(output.as_bytes(), CsvReaderConfig::default());
+        let _ = reader.schema().unwrap();
+        let row = reader.next_record().unwrap().unwrap();
+        let cell = match row.get("ts").unwrap() {
+            Value::String(s) => s.as_str().to_owned(),
+            other => panic!("expected string cell, got {other:?}"),
+        };
+
+        let parsed = NaiveDateTime::parse_from_str(&cell, "%Y-%m-%dT%H:%M:%S%.f").unwrap();
+        assert_eq!(parsed, dt);
     }
 
     fn make_schema_with_engine_stamp(user_col: &str, stamp_col: &str) -> Arc<Schema> {
