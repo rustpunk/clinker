@@ -116,6 +116,27 @@ pub enum FormatError {
         format: &'static str,
         column: String,
     },
+    /// A non-JSON writer (CSV / XML / fixed-width) was handed a record
+    /// carrying a `Value::Array` payload at a regular column slot.
+    /// JSON / NDJSON writers serialize arrays natively; the other formats
+    /// have no canonical scalar serialization for an array and would
+    /// otherwise silently degrade it — JSON-encoding the array into a
+    /// single cell (CSV), comma-joining its elements inside one element
+    /// (XML), or emitting an empty field (fixed-width). A stray array
+    /// reaching a non-JSON writer is far more often a routing bug (e.g. a
+    /// `match: collect` combine output sent to CSV) than a deliberate
+    /// choice, so raise it explicitly rather than hide the misroute.
+    ///
+    /// Routes to fix this at the user level:
+    ///
+    /// - Coerce the array to a scalar in CXL (`to_string`, or an
+    ///   equivalent join / aggregate) before the emit.
+    /// - Or route to a self-describing format (JSON / NDJSON) that
+    ///   serializes arrays natively.
+    UnserializableArrayValue {
+        format: &'static str,
+        column: String,
+    },
     /// A tabular / positional writer (CSV under envelope framing, or
     /// fixed-width) was handed a record carrying a user column its output
     /// column set does not declare. Such a writer emits a FIXED column set —
@@ -190,6 +211,14 @@ impl fmt::Display for FormatError {
                  If this is the `$widened` auto_widen sidecar, set `include_unmapped: true` on \
                  the Output node to expand the map to top-level columns before write. If the \
                  user emitted a map explicitly, coerce to a scalar in CXL before the emit."
+            ),
+            Self::UnserializableArrayValue { format, column } => write!(
+                f,
+                "{format} writer cannot serialize a `Value::Array` payload at column {column:?}. \
+                 A stray array reaching a non-JSON writer is usually a routing bug (e.g. a \
+                 `match: collect` combine output sent to CSV). Coerce the array to a scalar in \
+                 CXL (`to_string`, or an equivalent join) before the emit, or route to a \
+                 self-describing format (JSON / NDJSON) that serializes arrays natively."
             ),
             Self::SchemaDrift { format, column } => write!(
                 f,

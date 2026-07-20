@@ -202,11 +202,13 @@ impl<W: Write> FixedWidthWriter<W> {
     /// column. The fixed-width writer is the single point of truth
     /// for map rejection on this path; there is no upstream pre-walk.
     ///
-    /// `Value::Array` retains the prior empty-cell shape because
-    /// fixed-width's strict positional layout makes JSON-in-cell
-    /// unworkable. Users who need an array's contents in a
-    /// fixed-width field must coerce to a scalar in CXL before
-    /// the emit.
+    /// `Value::Array` is rejected the same way
+    /// (`FormatError::UnserializableArrayValue`): fixed-width's strict
+    /// positional layout has no scalar rendering for an array, and the prior
+    /// empty-cell shape silently dropped the payload — hiding a misroute
+    /// (e.g. a `match: collect` combine output sent to a fixed-width
+    /// output). Users who need an array's contents in a fixed-width field
+    /// must coerce to a scalar in CXL before the emit.
     fn format_value(&self, field: &WriteField, value: &Value) -> Result<String, FormatError> {
         Ok(match value {
             Value::Null => String::new(),
@@ -222,7 +224,12 @@ impl<W: Write> FixedWidthWriter<W> {
             Value::Bool(b) => b.to_string(),
             Value::Date(d) => d.format("%Y%m%d").to_string(),
             Value::DateTime(dt) => dt.format("%Y%m%d%H%M%S").to_string(),
-            Value::Array(_) => String::new(),
+            Value::Array(_) => {
+                return Err(FormatError::UnserializableArrayValue {
+                    format: "fixed-width",
+                    column: field.name.clone(),
+                });
+            }
             Value::Map(_) => {
                 return Err(FormatError::UnserializableMapValue {
                     format: "fixed-width",
@@ -864,6 +871,39 @@ mod tests {
                 assert_eq!(column, "payload");
             }
             other => panic!("expected UnserializableMapValue, got {other:?}"),
+        }
+    }
+
+    /// Fixed-width writer rejects `Value::Array` payloads with
+    /// `FormatError::UnserializableArrayValue`, parallel to the map
+    /// rejection. The prior behavior emitted an empty positional cell for
+    /// any array, silently dropping the payload and hiding a misroute (e.g.
+    /// a `match: collect` combine output sent to a fixed-width output).
+    #[test]
+    fn test_fixed_width_writer_rejects_array_value() {
+        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![
+                Value::Integer(7),
+                Value::Array(vec![Value::String("a".into()), Value::String("b".into())]),
+            ],
+        );
+        let mut id_field = field("id");
+        id_field.width = Some(5);
+        let mut tags_field = field("tags");
+        tags_field.width = Some(10);
+        let fields = vec![id_field, tags_field];
+        let mut buf = Vec::new();
+        let mut writer =
+            FixedWidthWriter::new(&mut buf, fields, FixedWidthWriterConfig::default()).unwrap();
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::UnserializableArrayValue { format, column } => {
+                assert_eq!(format, "fixed-width");
+                assert_eq!(column, "tags");
+            }
+            other => panic!("expected UnserializableArrayValue, got {other:?}"),
         }
     }
 

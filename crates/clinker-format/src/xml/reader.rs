@@ -804,7 +804,9 @@ impl FormatReader for XmlReader {
             let typed =
                 coerce_section_fields(payload, &section.fields).map_err(FormatError::Xml)?;
             let path = doc_path_for_section(&name);
-            index.insert(&path, Value::Map(Box::new(typed)))?;
+            index
+                .insert(&path, Value::Map(Box::new(typed)))
+                .map_err(FormatError::Xml)?;
         }
         Ok(index.into_sections())
     }

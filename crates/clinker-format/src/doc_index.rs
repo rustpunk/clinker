@@ -21,8 +21,6 @@ use clinker_record::Value;
 use cxl::analyzer::doc_paths::DocPath;
 use indexmap::IndexMap;
 
-use crate::error::FormatError;
-
 /// Compact, path-pruned retention of a document's declared `$doc.*`
 /// subtrees.
 ///
@@ -142,10 +140,15 @@ impl DocArenaIndex {
     ///
     /// # Errors
     ///
-    /// Returns [`FormatError::Json`] naming the offending section and the
+    /// Returns a format-neutral message naming the offending section and the
     /// cap when retaining `value` would push total retained bytes past
-    /// `max_index_bytes`.
-    pub fn insert(&mut self, path: &DocPath, value: Value) -> Result<(), FormatError> {
+    /// `max_index_bytes`. The message carries no format label: the calling
+    /// reader wraps it in its own `FormatError` variant (`FormatError::Json`
+    /// for the JSON reader, `FormatError::Xml` for the XML reader), so the
+    /// surfaced error matches the format that built the index — mirroring how
+    /// the readers wrap the `String` a section-coercion helper returns. This
+    /// keeps `DocArenaIndex` parser-agnostic (no format enum baked in).
+    pub fn insert(&mut self, path: &DocPath, value: Value) -> Result<(), String> {
         // `Value::heap_size` is the canonical real-heap-bytes estimate the
         // engine uses for allocation accounting elsewhere; reuse it so the
         // index cap measures the same bytes the RSS budget does. Add the
@@ -155,13 +158,13 @@ impl DocArenaIndex {
         if let Some(cap) = self.max_index_bytes
             && projected > cap
         {
-            return Err(FormatError::Json(format!(
+            return Err(format!(
                 "envelope document-index cap exceeded: retaining section {section:?} \
                  ({charge} bytes) would push the index to {projected} bytes, over the \
                  {cap}-byte `max_index_bytes` cap. Raise `max_index_bytes` on the source, \
                  or narrow the `$doc.*` paths the pipeline reads.",
                 section = path.section,
-            )));
+            ));
         }
         self.retained_bytes = projected;
         self.sections.insert(path.section.clone(), value);
@@ -359,18 +362,38 @@ mod tests {
         let err = idx
             .insert(&path("Big", "blob"), payload)
             .expect_err("over-cap insert must error");
-        match err {
-            FormatError::Json(msg) => {
-                assert!(
-                    msg.contains("max_index_bytes"),
-                    "message names the cap: {msg}"
-                );
-                assert!(msg.contains("Big"), "message names the section: {msg}");
-            }
-            other => panic!("expected FormatError::Json, got {other:?}"),
-        }
+        assert!(
+            err.contains("max_index_bytes"),
+            "message names the cap: {err}"
+        );
+        assert!(err.contains("Big"), "message names the section: {err}");
         // The over-cap value was not stored.
         assert!(idx.into_sections().is_empty());
+    }
+
+    /// The cap-exceeded error is a bare, format-neutral message — it names the
+    /// section and cap but no format, so each reader wraps it in its own
+    /// `FormatError` variant (`Json` for JSON, `Xml` for XML). Regression
+    /// guard for the hardcoded-`FormatError::Json` bug that surfaced a
+    /// JSON-flavored error even when the XML reader built the index.
+    #[test]
+    fn insert_cap_error_is_format_neutral() {
+        let mut idx = DocArenaIndex::new(&[path("Big", "blob")], Some(64));
+        let payload = map(&[("blob", Value::String("z".repeat(10_000).into()))]);
+        // The return type itself is format-neutral: a plain `String`, not a
+        // `FormatError`.
+        let err: String = idx
+            .insert(&path("Big", "blob"), payload)
+            .expect_err("over-cap insert must error");
+        assert!(err.contains("max_index_bytes"), "names the cap: {err}");
+        assert!(err.contains("Big"), "names the section: {err}");
+        // The message must not pre-label a format; the owning reader supplies
+        // that when it wraps the string in its `FormatError` variant.
+        assert!(
+            !err.contains("JSON"),
+            "message must not hardcode JSON: {err}"
+        );
+        assert!(!err.contains("XML"), "message must not hardcode XML: {err}");
     }
 
     #[test]
@@ -389,7 +412,10 @@ mod tests {
                 map(&[("y", Value::String("b".repeat(400).into()))]),
             )
             .expect_err("second insert tips the running total over the cap");
-        assert!(matches!(err, FormatError::Json(msg) if msg.contains("B")));
+        assert!(
+            err.contains("B"),
+            "message names the tipping section: {err}"
+        );
         // Only the first section survived.
         let sections = idx.into_sections();
         assert_eq!(sections.len(), 1);
@@ -446,7 +472,7 @@ mod tests {
         let err = tight
             .insert(&path(section, "a"), build())
             .expect_err("structural backing must push the charge over the cap");
-        assert!(matches!(err, FormatError::Json(msg) if msg.contains("max_index_bytes")));
+        assert!(err.contains("max_index_bytes"), "cap named: {err}");
         assert!(tight.into_sections().is_empty());
 
         // A cap equal to the full charge clears, confirming the rejection above
