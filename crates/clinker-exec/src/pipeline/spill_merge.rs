@@ -438,7 +438,7 @@ fn merge_group<P: Serialize + DeserializeOwned + Ord>(
     if written > 0 && budget.budget.record_spill_bytes(budget.node, written) {
         return Err(PipelineError::spill_cap_exceeded(
             budget.node,
-            budget.budget.disk_quota(),
+            budget.budget.max_spill_bytes(),
             written,
             budget.budget.cumulative_spill_bytes(),
         ));

@@ -1118,12 +1118,7 @@ impl MemoryArbitrator {
         self.peak_rss.store(n, Ordering::Relaxed);
     }
 
-    /// Disk-spill quota in bytes. `u64::MAX` = unlimited.
-    pub fn disk_quota(&self) -> u64 {
-        self.max_spill_bytes.load(Ordering::Relaxed)
-    }
-
-    /// Configured disk-spill quota in bytes.
+    /// Configured disk-spill quota in bytes. `u64::MAX` = unlimited.
     pub fn max_spill_bytes(&self) -> u64 {
         self.max_spill_bytes.load(Ordering::Relaxed)
     }
@@ -2264,10 +2259,10 @@ mod tests {
     }
 
     #[test]
-    fn test_disk_quota_default_unlimited() {
+    fn test_max_spill_bytes_default_unlimited() {
         let arbitrator =
             MemoryArbitrator::with_policy(512 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
-        assert_eq!(arbitrator.disk_quota(), u64::MAX);
+        assert_eq!(arbitrator.max_spill_bytes(), u64::MAX);
         assert_eq!(arbitrator.cumulative_spill_bytes(), 0);
     }
 

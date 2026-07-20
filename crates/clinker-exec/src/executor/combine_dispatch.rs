@@ -1232,7 +1232,6 @@ struct StreamingProbeEffects {
 /// sequencing match the drain-to-`Vec` path exactly. Mid-stream
 /// `$source.count` is `None` (the driver total is unknown until disconnect),
 /// the same defer-emit semantic the streaming Aggregate ingest uses.
-#[allow(clippy::too_many_arguments)]
 fn run_streaming_combine_probe(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,

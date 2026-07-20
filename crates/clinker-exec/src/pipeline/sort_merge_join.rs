@@ -291,7 +291,7 @@ impl MatchWindow {
         if written > 0 && ctx.budget.record_spill_bytes(ctx.name, written) {
             return Err(PipelineError::spill_cap_exceeded(
                 ctx.name,
-                ctx.budget.disk_quota(),
+                ctx.budget.max_spill_bytes(),
                 written,
                 ctx.budget.cumulative_spill_bytes(),
             ));
@@ -1144,7 +1144,7 @@ fn execute_combine_sort_merge_with_stats(
     if residue > 0 && budget.record_spill_bytes(name, residue) {
         return Err(PipelineError::spill_cap_exceeded(
             name,
-            budget.disk_quota(),
+            budget.max_spill_bytes(),
             residue,
             budget.cumulative_spill_bytes(),
         ));
@@ -1358,7 +1358,7 @@ where
             if written > 0 && budget.record_spill_bytes(name, written) {
                 return Err(PipelineError::spill_cap_exceeded(
                     name,
-                    budget.disk_quota(),
+                    budget.max_spill_bytes(),
                     written,
                     budget.cumulative_spill_bytes(),
                 ));
@@ -1372,7 +1372,7 @@ where
     if residue > 0 && budget.record_spill_bytes(name, residue) {
         return Err(PipelineError::spill_cap_exceeded(
             name,
-            budget.disk_quota(),
+            budget.max_spill_bytes(),
             residue,
             budget.cumulative_spill_bytes(),
         ));
@@ -1507,7 +1507,7 @@ fn push_output_row(
         if written > 0 && mspill.budget.record_spill_bytes(mspill.name, written) {
             return Err(PipelineError::spill_cap_exceeded(
                 mspill.name,
-                mspill.budget.disk_quota(),
+                mspill.budget.max_spill_bytes(),
                 written,
                 mspill.budget.cumulative_spill_bytes(),
             ));

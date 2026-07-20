@@ -148,8 +148,7 @@ fn pipeline_temp_dir_owns_spill_files_on_drop() {
         crate::pipeline::memory::ConsumerHandle::new(),
         true,
         "grace_test",
-    )
-    .unwrap();
+    );
     let schema = schema_with(&["k"]);
     // Deposit a record and force a spill so a file actually exists.
     let rec = record_for(&schema, vec![Value::Integer(7)]);
@@ -188,8 +187,7 @@ fn pipeline_temp_dir_cleans_on_panic_unwind() {
             crate::pipeline::memory::ConsumerHandle::new(),
             true,
             "grace_test",
-        )
-        .unwrap();
+        );
         let schema = schema_with(&["k"]);
         let rec = record_for(&schema, vec![Value::Integer(99)]);
         let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
@@ -220,8 +218,7 @@ fn spill_activates_under_tiny_budget() {
         crate::pipeline::memory::ConsumerHandle::new(),
         true,
         "grace_test",
-    )
-    .unwrap();
+    );
     let budget = tiny_budget();
     for i in 0..256i64 {
         let rec = record_for(
@@ -262,7 +259,7 @@ fn spill_activates_on_charged_bytes_without_rss() {
         .unwrap();
     let consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
     let mut exec =
-        GraceHashExecutor::new(4, dir.path(), consumer_handle.clone(), true, "grace_test").unwrap();
+        GraceHashExecutor::new(4, dir.path(), consumer_handle.clone(), true, "grace_test");
 
     // 1 GiB hard limit → 800 MiB soft limit, above any host's test RSS,
     // so the RSS arm of `should_spill` cannot trip. Register the handle so
@@ -316,8 +313,7 @@ fn lazy_probe_spill_routes_to_partition_file() {
         crate::pipeline::memory::ConsumerHandle::new(),
         true,
         "grace_test",
-    )
-    .unwrap();
+    );
     let budget = tiny_budget();
 
     // Send 64 records all to partition 0 (top 4 bits = 0). Use a
@@ -1029,8 +1025,7 @@ fn build_eviction_spill_commit_trips_disk_cap_mid_stream() {
         crate::pipeline::memory::ConsumerHandle::new(),
         true,
         "join_build",
-    )
-    .unwrap();
+    );
 
     // Tiny soft limit so `should_spill` fires continuously; 1-byte cap so
     // the first eviction commit overshoots; hard limit huge so
@@ -1139,8 +1134,7 @@ fn build_ondisk_immediate_write_commit_trips_disk_cap() {
         crate::pipeline::memory::ConsumerHandle::new(),
         true,
         "join_ondisk",
-    )
-    .unwrap();
+    );
 
     // A budget that does NOT auto-spill (soft limit ~8 GiB) so the test
     // controls exactly when a commit happens; the cap starts unlimited so
@@ -1254,8 +1248,7 @@ fn probe_finalize_spill_commit_trips_disk_cap_per_partition() {
         crate::pipeline::memory::ConsumerHandle::new(),
         true,
         "join_probe",
-    )
-    .unwrap();
+    );
     let budget =
         MemoryArbitrator::with_policy(10 * 1024 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
 
@@ -1395,8 +1388,7 @@ fn build_spill_reload_records_match() {
         crate::pipeline::memory::ConsumerHandle::new(),
         true,
         "grace_test",
-    )
-    .unwrap();
+    );
     let budget = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy)); // never spills via budget
     let originals: Vec<Record> = (0..16i64)
         .map(|i| {
