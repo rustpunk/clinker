@@ -2326,13 +2326,22 @@ pub(crate) fn decompose_nary_combines(
             node_by_name.get(upstream_name).copied()
         };
         for (i, step) in steps.iter().enumerate() {
-            let driver_idx = if i == 0 {
+            // Carry the producer output port onto the step edge when the driver
+            // draws a multi-output producer's port (a Cull `removed_to` / Route
+            // branch); step i>0 draws the prior step's single unnamed output, so
+            // no port. Without this the edge tag disagrees with the step's
+            // `combine_inputs.producer_port` and `resolve_side` cannot pick the
+            // right slot for a step that draws two ports of one producer.
+            let (driver_idx, driver_producer_port) = if i == 0 {
                 let original_driver_input = inputs
                     .get(&driving)
                     .expect("driver qualifier present in combine_inputs");
-                resolve_chain_input(original_driver_input.upstream_name.as_ref())
+                (
+                    resolve_chain_input(original_driver_input.upstream_name.as_ref()),
+                    original_driver_input.producer_port.clone(),
+                )
             } else {
-                Some(step_indices[i - 1])
+                (Some(step_indices[i - 1]), None)
             };
             let build_input_meta = inputs
                 .get(&step.build_input)
@@ -2346,7 +2355,7 @@ pub(crate) fn decompose_nary_combines(
                     PlanEdge {
                         dependency_type: DependencyType::Data,
                         port: None,
-                        producer_port: None,
+                        producer_port: driver_producer_port,
                     },
                 );
             }
@@ -2357,7 +2366,7 @@ pub(crate) fn decompose_nary_combines(
                     PlanEdge {
                         dependency_type: DependencyType::Data,
                         port: None,
-                        producer_port: None,
+                        producer_port: build_input_meta.producer_port.clone(),
                     },
                 );
             }

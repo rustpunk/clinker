@@ -18,7 +18,7 @@ use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
-    ExecutorContext, NodeBufferKey, admit_node_buffer, advance_cursor, drain_node_buffer_slot,
+    ExecutorContext, NodeBufferKey, admit_node_buffer, advance_cursor, drain_or_clone_shared_input,
     finalize_node_rooted_windows, node_buffer_spill_allowed, push_dlq,
     record_error_to_buffer_if_grouped, source_file_arc_of, source_name_arc_of,
     stream_linear_producer_emit, tee_emit_to_region_input_buffers,
@@ -308,8 +308,9 @@ pub(crate) fn dispatch_combine(
     ) = if streaming_probe_driver.is_some() {
         (Vec::new(), Vec::new())
     } else {
-        match drain_node_buffer_slot(
+        match drain_or_clone_shared_input(
             ctx,
+            current_dag,
             NodeBufferKey::with_port(driver_pred, driver_port.as_deref()),
         ) {
             Some(nb) => nb.drain_split()?,
@@ -319,8 +320,9 @@ pub(crate) fn dispatch_combine(
     let (build_buf, build_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
-    ) = match drain_node_buffer_slot(
+    ) = match drain_or_clone_shared_input(
         ctx,
+        current_dag,
         NodeBufferKey::with_port(build_pred, build_port.as_deref()),
     ) {
         Some(nb) => nb.drain_split()?,

@@ -308,6 +308,10 @@ fn execute_composition_body(
     // not top-level sources. Any non-port-seeded body Source surfaces
     // as the defense-in-depth `Internal` error from the Source arm.
     let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
+    // Shared-input drain counts key by the body-local `NodeBufferKey` space, so
+    // swap to a fresh map alongside `node_buffers` — a pending parent fanout
+    // count must not collide with a body slot of the same index/port.
+    let saved_shared_drains = std::mem::take(&mut ctx.shared_input_drains);
     let saved_combine = std::mem::take(&mut ctx.source_records);
     // Window-arena consumer ids key by slot index, which the body
     // re-uses from zero alongside its window-runtime overlay. Swap to a
@@ -410,6 +414,7 @@ fn execute_composition_body(
     // sync by hand on every exit path through this function.
     ctx.recursion_depth = ctx.recursion_depth.saturating_sub(1);
     ctx.node_buffers = saved_buffers;
+    ctx.shared_input_drains = saved_shared_drains;
     ctx.source_records = saved_combine;
     ctx.current_body_node_input_refs = saved_body_refs;
     // Unregister body-local window-arena consumers and restore the

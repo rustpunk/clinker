@@ -516,3 +516,68 @@ fn combine_driver_and_build_from_same_route_resolve_by_port() {
         out["out"]
     );
 }
+
+// ── Test 7: one producer port fanned out to two predecessor-slot readers ──
+
+const ROUTE_BRANCH_FANOUT_TWO_MERGES: &str = r#"
+pipeline:
+  name: route_branch_fanout_two_merges
+nodes:
+  - type: source
+    name: a
+    config: { name: a, type: csv, path: a.csv, schema: [ { name: k, type: string }, { name: v, type: int } ] }
+  - type: source
+    name: b
+    config: { name: b, type: csv, path: b.csv, schema: [ { name: k, type: string }, { name: v, type: int } ] }
+  - type: source
+    name: c
+    config: { name: c, type: csv, path: c.csv, schema: [ { name: k, type: string }, { name: v, type: int } ] }
+  - type: route
+    name: splitter
+    input: a
+    config:
+      conditions:
+        big: "v >= 10"
+      default: small
+  - type: merge
+    name: m1
+    inputs: [splitter.big, b]
+  - type: merge
+    name: m2
+    inputs: [splitter.big, c]
+  - type: output
+    name: out1
+    input: m1
+    config: { name: out1, type: csv, path: o1.csv }
+  - type: output
+    name: out2
+    input: m2
+    config: { name: out2, type: csv, path: o2.csv }
+"#;
+
+#[test]
+fn route_branch_fanned_to_two_merges_reaches_both() {
+    // A single Route branch (`splitter.big`) feeds TWO Merge consumers. They
+    // share one `(splitter, "big")` slot; the first to drain must clone it so
+    // the second still sees the records, rather than draining it empty. Both
+    // merges must therefore carry the big-branch row plus their own input.
+    let a = "k,v\nx,15\n";
+    let b = "k,v\nb1,1\n";
+    let c = "k,v\nc1,2\n";
+    let (out, dlq) = run(
+        ROUTE_BRANCH_FANOUT_TWO_MERGES,
+        &[("a", a), ("b", b), ("c", c)],
+        &["out1", "out2"],
+    );
+    assert_eq!(dlq, 0, "no DLQ entries");
+    assert!(
+        out["out1"].contains("x,15") && out["out1"].contains("b1,1"),
+        "m1 must see the shared route.big row and its own input b:\n{}",
+        out["out1"]
+    );
+    assert!(
+        out["out2"].contains("x,15") && out["out2"].contains("c1,2"),
+        "m2 must see the shared route.big row and its own input c:\n{}",
+        out["out2"]
+    );
+}

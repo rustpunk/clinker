@@ -567,6 +567,12 @@ pub(crate) struct ExecutorContext<'a> {
             std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
         ),
     >,
+    /// Count of consumers that have already drained a shared predecessor-slot
+    /// (a producer output port fanned out to more than one Merge/Combine).
+    /// `drain_or_clone_shared_input` clones the slot for every consumer except
+    /// the last, which removes it — the count makes "who is last" independent
+    /// of the memory-arbitrated dispatch order.
+    pub(crate) shared_input_drains: HashMap<NodeBufferKey, usize>,
     /// Per-slot consumer registration for window-runtime arenas.
     /// `finalize_node_rooted_windows` registers an `ArenaConsumer` with
     /// the pipeline-scoped arbitrator after each arena builds and stores
@@ -1560,6 +1566,53 @@ pub(crate) fn drain_node_buffer_slot(
         ctx.memory_budget.unregister_consumer(id);
     }
     ctx.node_buffers.remove(&key)
+}
+
+/// Take a predecessor-slot reader's input from `key`, cloning the slot (leaving
+/// it intact) when other predecessor-slot consumers of the SAME
+/// `(producer, port)` slot still need it — so one producer output port fanned
+/// out to several Merge/Combine consumers reaches all of them, not just the
+/// first to drain. The last consumer to drain (the one after which the tracked
+/// drain count reaches the total number of such consumers) removes the slot;
+/// every earlier one clones. Counting drains rather than comparing `NodeIndex`
+/// keeps this correct under the memory-arbitrated dispatch order, which is not
+/// `NodeIndex`-monotonic.
+///
+/// A fanned port has more than one outgoing edge on its producer, so
+/// [`node_buffer_spill_allowed`] keeps the slot unspilled; the clone therefore
+/// never reaches `clone_memory_only`'s spill panic. The clone preserves
+/// punctuations (it copies the full `StreamEvent` vector), which the Output
+/// fan-out path does not need but a multi-input consumer does.
+pub(crate) fn drain_or_clone_shared_input(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    key: NodeBufferKey,
+) -> Option<NodeBuffer> {
+    use petgraph::visit::EdgeRef;
+    let port = key.producer_port.as_deref();
+    let total_consumers = current_dag
+        .graph
+        .edges_directed(key.node, Direction::Outgoing)
+        .filter(|e| {
+            e.weight().producer_port.as_deref() == port
+                && crate::executor::cull_dispatch::reads_predecessor_slot(
+                    &current_dag.graph[e.target()],
+                )
+        })
+        .count();
+    if total_consumers <= 1 {
+        return drain_node_buffer_slot(ctx, key);
+    }
+    let drained = ctx.shared_input_drains.entry(key.clone()).or_insert(0);
+    *drained += 1;
+    if *drained >= total_consumers {
+        ctx.shared_input_drains.remove(&key);
+        drain_node_buffer_slot(ctx, key)
+    } else {
+        ctx.node_buffers
+            .get(&key)
+            .map(|nb| NodeBuffer::Memory(nb.clone_memory_only()))
+    }
 }
 
 pub(crate) fn admit_node_buffer(
