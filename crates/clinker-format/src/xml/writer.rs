@@ -153,7 +153,8 @@ impl<W: Write> XmlWriter<W> {
     /// for a section the document actually carries (a missing section emits no
     /// wrapper at all).
     fn write_section_element(
-        &mut self,
+        writer: &mut XmlEmitter<W>,
+        config: &XmlWriterConfig,
         wrapper: &str,
         fields: &indexmap::IndexMap<Box<str>, Value>,
         count: Option<(&str, i64)>,
@@ -168,19 +169,15 @@ impl<W: Write> XmlWriter<W> {
         if let Some((field, ref v)) = count_value {
             pairs.push((field, v));
         }
-        let tree = build_field_tree(
-            &pairs,
-            self.config.preserve_nulls,
-            &self.config.attribute_prefix,
-        )?;
+        let tree = build_field_tree(&pairs, config.preserve_nulls, &config.attribute_prefix)?;
         let mut start = BytesStart::new(wrapper);
         push_attributes(&mut start, &tree.attrs);
-        self.writer
+        writer
             .write_event(Event::Start(start))
             .map_err(|e| FormatError::Xml(e.to_string()))?;
-        self.write_field_tree(&tree.children)?;
+        write_field_tree(writer, &tree.children)?;
         let end = BytesEnd::new(wrapper);
-        self.writer
+        writer
             .write_event(Event::End(end))
             .map_err(|e| FormatError::Xml(e.to_string()))?;
         Ok(())
@@ -203,57 +200,62 @@ impl<W: Write> XmlWriter<W> {
         }
         Ok(())
     }
+}
 
-    /// Recursively write a field tree as nested XML elements.
-    fn write_field_tree(&mut self, nodes: &[FieldNode]) -> Result<(), FormatError> {
-        for node in nodes {
-            match node {
-                FieldNode::Leaf { name, text } => {
-                    if text.is_empty() {
-                        // Self-closing empty element (for preserve_nulls: true)
-                        let elem = BytesStart::new(name.as_str());
-                        self.writer
-                            .write_event(Event::Empty(elem))
-                            .map_err(|e| FormatError::Xml(e.to_string()))?;
-                    } else {
-                        let start = BytesStart::new(name.as_str());
-                        self.writer
-                            .write_event(Event::Start(start))
-                            .map_err(|e| FormatError::Xml(e.to_string()))?;
-                        let text_event = BytesText::new(text);
-                        self.writer
-                            .write_event(Event::Text(text_event))
-                            .map_err(|e| FormatError::Xml(e.to_string()))?;
-                        let end = BytesEnd::new(name.as_str());
-                        self.writer
-                            .write_event(Event::End(end))
-                            .map_err(|e| FormatError::Xml(e.to_string()))?;
-                    }
+/// Recursively write a field tree as nested XML elements. Takes the emitter
+/// directly rather than `&mut self`, so a caller can render an envelope section
+/// while holding a disjoint borrow of the framer.
+fn write_field_tree<W: Write>(
+    writer: &mut XmlEmitter<W>,
+    nodes: &[FieldNode],
+) -> Result<(), FormatError> {
+    for node in nodes {
+        match node {
+            FieldNode::Leaf { name, text } => {
+                if text.is_empty() {
+                    // Self-closing empty element (for preserve_nulls: true)
+                    let elem = BytesStart::new(name.as_str());
+                    writer
+                        .write_event(Event::Empty(elem))
+                        .map_err(|e| FormatError::Xml(e.to_string()))?;
+                } else {
+                    let start = BytesStart::new(name.as_str());
+                    writer
+                        .write_event(Event::Start(start))
+                        .map_err(|e| FormatError::Xml(e.to_string()))?;
+                    let text_event = BytesText::new(text);
+                    writer
+                        .write_event(Event::Text(text_event))
+                        .map_err(|e| FormatError::Xml(e.to_string()))?;
+                    let end = BytesEnd::new(name.as_str());
+                    writer
+                        .write_event(Event::End(end))
+                        .map_err(|e| FormatError::Xml(e.to_string()))?;
                 }
-                FieldNode::Branch { name, body } => {
-                    let mut start = BytesStart::new(name.as_str());
-                    push_attributes(&mut start, &body.attrs);
-                    if body.children.is_empty() {
-                        // Attribute-only branch: nothing nests inside, so the
-                        // element self-closes carrying its attributes.
-                        self.writer
-                            .write_event(Event::Empty(start))
-                            .map_err(|e| FormatError::Xml(e.to_string()))?;
-                    } else {
-                        self.writer
-                            .write_event(Event::Start(start))
-                            .map_err(|e| FormatError::Xml(e.to_string()))?;
-                        self.write_field_tree(&body.children)?;
-                        let end = BytesEnd::new(name.as_str());
-                        self.writer
-                            .write_event(Event::End(end))
-                            .map_err(|e| FormatError::Xml(e.to_string()))?;
-                    }
+            }
+            FieldNode::Branch { name, body } => {
+                let mut start = BytesStart::new(name.as_str());
+                push_attributes(&mut start, &body.attrs);
+                if body.children.is_empty() {
+                    // Attribute-only branch: nothing nests inside, so the
+                    // element self-closes carrying its attributes.
+                    writer
+                        .write_event(Event::Empty(start))
+                        .map_err(|e| FormatError::Xml(e.to_string()))?;
+                } else {
+                    writer
+                        .write_event(Event::Start(start))
+                        .map_err(|e| FormatError::Xml(e.to_string()))?;
+                    write_field_tree(writer, &body.children)?;
+                    let end = BytesEnd::new(name.as_str());
+                    writer
+                        .write_event(Event::End(end))
+                        .map_err(|e| FormatError::Xml(e.to_string()))?;
                 }
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 impl<W: Write + Send> FormatWriter for XmlWriter<W> {
@@ -328,17 +330,15 @@ impl<W: Write + Send> FormatWriter for XmlWriter<W> {
         self.writer
             .write_event(Event::Start(start))
             .map_err(|e| FormatError::Xml(e.to_string()))?;
-        // Reset the per-document counter and clone the header section's fields
-        // out (so the immutable framer borrow ends before the `&mut self`
-        // write below). `None` when the document lacks the configured section
-        // — then no `<header>` is emitted.
-        let header_owned: Option<indexmap::IndexMap<Box<str>, Value>> = {
-            let framer = self.framer.as_mut().expect("framer checked above");
-            framer.begin();
-            framer.header_fields(doc).cloned()
-        };
-        if let Some(fields) = header_owned.as_ref() {
-            self.write_section_element("header", fields, None)?;
+        // Reset the per-document counter, then render the header directly off
+        // the framer's borrow into the DocumentContext. `write_section_element`
+        // takes the disjoint `writer` field, so it runs while the framer borrow
+        // is live. `None` (the document lacks the configured section) emits no
+        // `<header>`.
+        let framer = self.framer.as_mut().expect("framer checked above");
+        framer.begin();
+        if let Some(fields) = framer.header_fields(doc) {
+            Self::write_section_element(&mut self.writer, &self.config, "header", fields, None)?;
         }
         Ok(())
     }
@@ -347,16 +347,13 @@ impl<W: Write + Send> FormatWriter for XmlWriter<W> {
         let Some(framer) = self.framer.as_ref() else {
             return Ok(());
         };
-        // `None` when the document lacks the configured footer section — then
-        // no `<footer>` is emitted (the count rides the present section only).
-        let footer_owned: Option<indexmap::IndexMap<Box<str>, Value>> =
-            framer.footer_fields(doc).cloned();
-        let count_owned: Option<(String, i64)> = framer
-            .footer_count()
-            .map(|(field, n)| (field.to_string(), n));
-        if let Some(fields) = footer_owned.as_ref() {
-            let count_ref = count_owned.as_ref().map(|(f, n)| (f.as_str(), *n));
-            self.write_section_element("footer", fields, count_ref)?;
+        // Render the footer directly off the framer's borrow: the section map
+        // and the computed count stay borrowed while the disjoint `writer` field
+        // is written. `None` (the document lacks the configured footer section)
+        // emits no `<footer>` — the count rides a present section only.
+        if let Some(fields) = framer.footer_fields(doc) {
+            let count = framer.footer_count();
+            Self::write_section_element(&mut self.writer, &self.config, "footer", fields, count)?;
         }
         let end = BytesEnd::new("Document");
         self.writer
@@ -1845,6 +1842,60 @@ mod tests {
         assert!(
             out.contains(r#"<header version="1.1"><batch_id>A</batch_id></header>"#),
             "got: {out}"
+        );
+    }
+
+    #[test]
+    fn xml_envelope_two_documents_each_reframed_with_reset_count() {
+        // Two documents in one stream: each carries its own header/footer
+        // rendered from its own `$doc` sections, and the streaming record count
+        // resets per document (1, then 2). Exercises the per-document framing
+        // across `begin_document` / `end_document` more than once — the section
+        // maps are rendered in place off the framer's borrow into each
+        // DocumentContext.
+        let schema = Arc::new(Schema::new(vec!["amount".into()]));
+        let config = XmlWriterConfig {
+            envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                footer_from_doc: Some("Foot".into()),
+                footer_record_count_field: Some("count".into()),
+            }),
+            ..Default::default()
+        };
+        let doc1 = doc_with_sections(&[
+            ("Head", &[("batch_id", Value::String("A".into()))]),
+            ("Foot", &[("checksum", Value::String("S1".into()))]),
+        ]);
+        let doc2 = doc_with_sections(&[
+            ("Head", &[("batch_id", Value::String("B".into()))]),
+            ("Foot", &[("checksum", Value::String("S2".into()))]),
+        ]);
+        let mut buf = Vec::new();
+        {
+            let mut w = XmlWriter::new(&mut buf, Arc::clone(&schema), config);
+            w.begin_document(&doc1).unwrap();
+            w.write_record(&Record::new(Arc::clone(&schema), vec![Value::Integer(10)]))
+                .unwrap();
+            w.end_document(&doc1).unwrap();
+            w.begin_document(&doc2).unwrap();
+            w.write_record(&Record::new(Arc::clone(&schema), vec![Value::Integer(20)]))
+                .unwrap();
+            w.write_record(&Record::new(Arc::clone(&schema), vec![Value::Integer(30)]))
+                .unwrap();
+            w.end_document(&doc2).unwrap();
+            w.flush().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(
+            out,
+            "<Root>\
+             <Document><header><batch_id>A</batch_id></header>\
+             <Record><amount>10</amount></Record>\
+             <footer><checksum>S1</checksum><count>1</count></footer></Document>\
+             <Document><header><batch_id>B</batch_id></header>\
+             <Record><amount>20</amount></Record><Record><amount>30</amount></Record>\
+             <footer><checksum>S2</checksum><count>2</count></footer></Document>\
+             </Root>"
         );
     }
 }
