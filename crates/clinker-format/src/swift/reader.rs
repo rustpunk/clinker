@@ -85,6 +85,10 @@ pub struct SwiftReader<R: Read> {
     /// The block-4 field lines, framed at first body pull and drained one
     /// record per `next_record`.
     body_lines: std::collections::VecDeque<ParsedBlock4Line>,
+    /// The constant block-4 discriminator (`TEXT_BLOCK_ID`) as a `Value`,
+    /// interned once so every body record clones the cheap shared handle
+    /// instead of re-rendering the constant to a fresh `String` per record.
+    block_value: Value,
     /// `true` once the message-level `OpenLevel` has been queued, so the
     /// matching `CloseLevel` is queued exactly once at end-of-message.
     level_open: bool,
@@ -108,6 +112,7 @@ impl<R: Read> SwiftReader<R> {
             user_header: None,
             trailer: None,
             body_lines: std::collections::VecDeque::new(),
+            block_value: Value::String(TEXT_BLOCK_ID.to_string().as_str().into()),
             level_open: false,
             pending_events: Vec::new(),
             done: false,
@@ -218,7 +223,7 @@ impl<R: Read> SwiftReader<R> {
     /// distinguish body lines from any future block-keyed record shape.
     fn body_record(&self, line: &ParsedBlock4Line) -> Record {
         let values = vec![
-            Value::String(TEXT_BLOCK_ID.to_string().as_str().into()),
+            self.block_value.clone(),
             Value::String(line.tag.as_str().into()),
             string_or_null(&line.value),
         ];

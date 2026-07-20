@@ -79,7 +79,12 @@ schema:
 Service segments (`UNB`, `UNZ`, `UNH`, `UNT`) are consumed by the reader
 to drive envelope state and validation — they are never emitted as body
 records. The `UNH` segment that opens a message **is** emitted as a body
-record (its `seg_id` is `UNH`), carrying the message reference and type.
+record (its `seg_id` is `UNH`), carrying the message reference in `msg_ref`
+and the message-type composite in `msg_type`, with its full positional
+element list also stamped onto `e01`, `e02`, … — so any `UNH` element past
+the message type (a common access reference, a message subset
+identification, and so on) is available as `e03` onward and is
+reconstructed on write.
 
 The number of `eNN` columns is controlled by the source `max_elements`
 option (default 32). A segment carrying more data elements than that is
@@ -258,10 +263,6 @@ represent (a non-ASCII character under `UNOA`/`UNOB`, or a codepoint above
 - **Functional groups.** A single `UNB..UNZ` interchange is supported;
   `UNG`/`UNE` functional-group segments are rejected with a precise
   error.
-- **UNH composite fidelity.** The reader stamps the `UNH` reference
-  (element 1) and the full message-type composite (element 2). A `UNH`
-  carrying additional elements (e.g. a common access reference) is
-  reconstructed as a two-element `UNH` on round-trip.
 - **Output splitting.** An interchange is a single `UNB..UNZ` envelope and
   cannot be divided across files. An `edifact` output combined with a
   `split:` block is rejected at config-validation time (diagnostic

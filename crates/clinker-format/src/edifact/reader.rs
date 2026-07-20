@@ -979,6 +979,80 @@ mod tests {
         assert_eq!(recs2[1].get("e01"), Some(&Value::String("O'BRIEN".into())));
     }
 
+    /// Full reader → `$doc` → writer → reader round-trip of a UNH that carries
+    /// a data element past the message type (a common access reference in the
+    /// third element). The writer must reconstruct the full UNH rather than
+    /// collapsing it to a two-element header, so the extra element survives.
+    #[test]
+    fn reader_writer_round_trip_preserves_unh_element_past_message_type() {
+        use crate::edifact::writer::{EdifactWriter, EdifactWriterConfig};
+        use crate::envelope::EnvelopeFieldType;
+        use crate::traits::FormatWriter;
+        use clinker_record::{DocumentContext, DocumentId, EnvelopeRecord};
+
+        // The UNH carries a third element "CAR-ACCESS-REF" after the message
+        // reference and the message-type composite; UNT counts UNH+BGM+UNT=3.
+        let input = "UNB+UNOA:1+SENDER+RECEIVER+240101:1200+REF1'\
+            UNH+M1+ORDERS:D:96A:UN+CAR-ACCESS-REF'BGM+220'UNT+3+M1'UNZ+1+REF1'";
+
+        // 1. Read: the UNH body record exposes the extra element in e03.
+        let cfg = unb_section(&[("e05", EnvelopeFieldType::String)]);
+        let mut r = reader(input);
+        let sections = r.prepare_document(&cfg).unwrap();
+        let body_recs: Vec<Record> = std::iter::from_fn(|| r.next_record().unwrap()).collect();
+        assert_eq!(body_recs.len(), 2); // UNH, BGM
+        assert_eq!(
+            body_recs[0].get("seg_id"),
+            Some(&Value::String("UNH".into()))
+        );
+        assert_eq!(
+            body_recs[0].get("e03"),
+            Some(&Value::String("CAR-ACCESS-REF".into())),
+            "reader dropped the UNH element past the message type"
+        );
+
+        // 2. Re-emit through the writer.
+        let ctx = Arc::new(DocumentContext::new(
+            DocumentId::next(),
+            Arc::from("orders.edi"),
+            EnvelopeRecord::from_sections(sections),
+        ));
+        let schema = r.schema().unwrap();
+        let out = {
+            let mut buf = Vec::new();
+            let mut w = EdifactWriter::new(
+                std::io::Cursor::new(&mut buf),
+                Arc::clone(&schema),
+                EdifactWriterConfig {
+                    interchange_from_doc: Some("interchange".into()),
+                    segment_newline: false,
+                    ..Default::default()
+                },
+            );
+            for rec in &body_recs {
+                let mut rec = rec.clone();
+                rec.set_doc_ctx(Arc::clone(&ctx));
+                w.write_record(&rec).unwrap();
+            }
+            w.flush().unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+
+        // The reconstructed UNH keeps all three elements verbatim.
+        assert!(
+            out.contains("UNH+M1+ORDERS:D:96A:UN+CAR-ACCESS-REF'"),
+            "UNH not reconstructed with its third element: {out}"
+        );
+
+        // 3. Re-read: the extra element still round-trips.
+        let recs2 = collect(&out);
+        assert_eq!(recs2[0].get("seg_id"), Some(&Value::String("UNH".into())));
+        assert_eq!(
+            recs2[0].get("e03"),
+            Some(&Value::String("CAR-ACCESS-REF".into()))
+        );
+    }
+
     /// Collect every body record from a raw byte interchange — the
     /// Latin-1 path carries high bytes that are not valid UTF-8, so the
     /// fixture cannot be a `&str`.
