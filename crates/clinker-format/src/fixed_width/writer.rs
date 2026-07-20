@@ -170,17 +170,18 @@ impl<W: Write> FixedWidthWriter<W> {
     /// carries (a missing section emits no line). A computed footer count is
     /// rejected at plan time for fixed-width (E346).
     fn write_section_line(
-        &mut self,
+        writer: &mut W,
+        config: &FixedWidthWriterConfig,
         fields: &indexmap::IndexMap<Box<str>, Value>,
     ) -> Result<(), FormatError> {
         let mut line = String::new();
         for value in fields.values() {
             line.push_str(&value_to_envelope_cell(value));
         }
-        self.writer.write_all(line.as_bytes())?;
-        match self.config.line_separator {
-            LineSeparator::Lf => self.writer.write_all(b"\n")?,
-            LineSeparator::CrLf => self.writer.write_all(b"\r\n")?,
+        writer.write_all(line.as_bytes())?;
+        match config.line_separator {
+            LineSeparator::Lf => writer.write_all(b"\n")?,
+            LineSeparator::CrLf => writer.write_all(b"\r\n")?,
             LineSeparator::None => {}
         }
         Ok(())
@@ -369,12 +370,12 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
             return Ok(());
         };
         framer.begin();
-        // Clone the header fields out so the immutable framer borrow ends
-        // before the `&mut self` write below; `None` (document lacks the
-        // configured section) emits no header line.
-        let header = framer.header_fields(doc).cloned();
-        if let Some(fields) = header.as_ref() {
-            self.write_section_line(fields)?;
+        // Render the header directly off the framer's borrow into the
+        // DocumentContext: `write_section_line` takes the disjoint `writer`
+        // field, so it runs while the framer borrow is live. `None` (document
+        // lacks the configured section) emits no header line.
+        if let Some(fields) = framer.header_fields(doc) {
+            Self::write_section_line(&mut self.writer, &self.config, fields)?;
         }
         Ok(())
     }
@@ -383,9 +384,8 @@ impl<W: Write + Send> FormatWriter for FixedWidthWriter<W> {
         let Some(framer) = self.framer.as_ref() else {
             return Ok(());
         };
-        let footer = framer.footer_fields(doc).cloned();
-        if let Some(fields) = footer.as_ref() {
-            self.write_section_line(fields)?;
+        if let Some(fields) = framer.footer_fields(doc) {
+            Self::write_section_line(&mut self.writer, &self.config, fields)?;
         }
         Ok(())
     }
@@ -1283,5 +1283,49 @@ mod tests {
         }
         let out = String::from_utf8(buf).unwrap();
         assert_eq!(out, "HDR\n00007\nTRL\n", "got: {out}");
+    }
+
+    #[test]
+    fn fixed_width_envelope_two_documents_each_reframed() {
+        // Two documents in one stream each get their own header/footer line
+        // rendered from their own `$doc` sections. Exercises the per-document
+        // framing across `begin_document` / `end_document` more than once — the
+        // section maps are rendered in place off the framer's borrow.
+        let mut amount = field("amount");
+        amount.ty = Type::Int;
+        amount.width = Some(5);
+        amount.justify = Some(Justify::Right);
+        amount.pad = Some("0".into());
+        let config = FixedWidthWriterConfig {
+            line_separator: LineSeparator::Lf,
+            envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                footer_from_doc: Some("Foot".into()),
+                footer_record_count_field: None,
+            }),
+        };
+        let doc1 = doc_with_sections(&[
+            ("Head", &[("tag", Value::String("H1".into()))]),
+            ("Foot", &[("tag", Value::String("T1".into()))]),
+        ]);
+        let doc2 = doc_with_sections(&[
+            ("Head", &[("tag", Value::String("H2".into()))]),
+            ("Foot", &[("tag", Value::String("T2".into()))]),
+        ]);
+        let mut buf = Vec::new();
+        {
+            let mut w = FixedWidthWriter::new(&mut buf, vec![amount], config).unwrap();
+            w.begin_document(&doc1).unwrap();
+            w.write_record(&make_record(&["amount"], vec![Value::Integer(7)]))
+                .unwrap();
+            w.end_document(&doc1).unwrap();
+            w.begin_document(&doc2).unwrap();
+            w.write_record(&make_record(&["amount"], vec![Value::Integer(8)]))
+                .unwrap();
+            w.end_document(&doc2).unwrap();
+            w.flush().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out, "H1\n00007\nT1\nH2\n00008\nT2\n", "got: {out}");
     }
 }
