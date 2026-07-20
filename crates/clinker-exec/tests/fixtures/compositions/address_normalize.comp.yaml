@@ -1,5 +1,3 @@
-# FORWARD-ONLY: baseline captured in Task 16c.2.4
-#
 # 1 input, 2 outputs (normalized, rejected), 1 config param.
 # Normalizes addresses; routes invalid ones to rejected output.
 _compose:

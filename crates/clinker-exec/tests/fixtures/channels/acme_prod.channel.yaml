@@ -1,5 +1,3 @@
-# FORWARD-ONLY: baseline captured in Task 16c.2.4
-#
 # Binds to channel_target_pipeline, fixed + default overrides.
 channel:
   name: acme_prod

@@ -1,5 +1,3 @@
-# FORWARD-ONLY: baseline captured in Task 16c.2.4
-#
 # Targets a composition directly (tests ChannelTarget::Composition).
 # Uses config.fixed only — binding cannot be overridden.
 channel:

@@ -1,5 +1,3 @@
-# FORWARD-ONLY: baseline captured in Task 16c.2.4
-#
 # Uses nested_caller (which uses address_normalize internally).
 pipeline:
   name: nested_composition_pipeline

@@ -1,5 +1,3 @@
-# FORWARD-ONLY: baseline captured in Task 16c.2.4
-#
 # Target of acme_prod, acme_staging, and empty_defaults channels.
 pipeline:
   name: channel_target_pipeline

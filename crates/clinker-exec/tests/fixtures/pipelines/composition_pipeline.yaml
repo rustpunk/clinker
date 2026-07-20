@@ -1,5 +1,3 @@
-# FORWARD-ONLY: baseline captured in Task 16c.2.4
-#
 # Uses customer_enrich and address_normalize compositions.
 pipeline:
   name: composition_pipeline
