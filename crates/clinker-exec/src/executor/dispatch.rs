@@ -1570,7 +1570,7 @@ pub(crate) fn admit_node_buffer(
     puncts: Vec<crate::executor::stream_event::Punctuation>,
     spill_allowed: bool,
 ) -> Result<NodeBuffer, PipelineError> {
-    let node_idx = key.into();
+    let slot_key = key.into();
     if rows.is_empty() && puncts.is_empty() {
         return Ok(NodeBuffer::Memory(Vec::new()));
     }
@@ -1593,7 +1593,7 @@ pub(crate) fn admit_node_buffer(
     // discharge — e.g. the post-recompute aggregate emit path)
     // unregisters first so the arbitrator's registry holds exactly
     // one wrapper per live slot.
-    if let Some((prev_id, _)) = ctx.node_buffer_consumer_ids.remove(&node_idx) {
+    if let Some((prev_id, _)) = ctx.node_buffer_consumer_ids.remove(&slot_key) {
         ctx.memory_budget.unregister_consumer(prev_id);
     }
     let handle = crate::pipeline::memory::ConsumerHandle::new();
@@ -1602,7 +1602,7 @@ pub(crate) fn admit_node_buffer(
         crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
     ));
     ctx.node_buffer_consumer_ids
-        .insert(node_idx, (consumer_id, handle.clone()));
+        .insert(slot_key, (consumer_id, handle.clone()));
     // Raise the run's high-water mark now that this slot's charge has
     // joined the registry. Sampling at admission (not only on streaming
     // batch charges) makes `peak_consumer_usage_bytes` a faithful peak
