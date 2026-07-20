@@ -15,13 +15,13 @@ use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
-    ExecutorContext, FusedMergeOutput, MergeStreamHandoff, admit_node_buffer,
+    ExecutorContext, FusedMergeOutput, MergeStreamHandoff, NodeBufferKey, admit_node_buffer,
     drain_node_buffer_slot, finalize_node_rooted_windows, merge_fused_interleave,
     node_buffer_spill_allowed, stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
 use clinker_plan::error::PipelineError;
-use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, matches_upstream_name};
 
 /// Execute the `Merge` arm for `node_idx`: concatenate predecessor buffers
 /// in declaration order (Concat), round-robin across them (Interleave), or —
@@ -103,6 +103,39 @@ pub(crate) fn dispatch_merge(
             .unwrap_or(usize::MAX)
     });
 
+    // Ordered incoming inputs as `(source, producer_port)` — one per incoming
+    // edge, keyed by the producer output port the edge draws. A Merge that
+    // draws several ports of one producer (Route branches, or a Cull's `main`
+    // and `removed_to`) has several edges from the same source, each landing in
+    // a distinct `(source, Some(port))` slot; draining per edge keeps every
+    // port. Ordered by declaration order of the `node.port` (or bare `node`)
+    // reference so Concat output is deterministic and byte-stable for the
+    // single-output case.
+    use petgraph::visit::EdgeRef;
+    let mut ordered_inputs: Vec<(NodeIndex, Option<Box<str>>)> = current_dag
+        .graph
+        .edges_directed(node_idx, Direction::Incoming)
+        .map(|e| {
+            (
+                e.source(),
+                e.weight().producer_port.as_deref().map(Box::from),
+            )
+        })
+        .collect();
+    ordered_inputs.sort_by_key(|(src, port)| {
+        let node_name = current_dag.graph[*src].name();
+        declaration_order
+            .iter()
+            .position(|d| match d.split_once('.') {
+                Some((decl_node, decl_port)) => {
+                    matches_upstream_name(node_name, decl_node)
+                        && port.as_deref() == Some(decl_port)
+                }
+                None => matches_upstream_name(node_name, d) && port.is_none(),
+            })
+            .unwrap_or(usize::MAX)
+    });
+
     let merge_output_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
     // Detect fused mode: every predecessor is a Source whose
     // name is in `ctx.fused_sources`. The pre-pass at executor
@@ -172,9 +205,13 @@ pub(crate) fn dispatch_merge(
         )?
     } else {
         nonfused_sender = streaming_sender;
-        let total: usize = sorted_preds
+        let total: usize = ordered_inputs
             .iter()
-            .map(|p| ctx.node_buffers.get(p).map_or(0, |b| b.len_hint()))
+            .map(|(src, port)| {
+                ctx.node_buffers
+                    .get(&NodeBufferKey::with_port(*src, port.as_deref()))
+                    .map_or(0, |b| b.len_hint())
+            })
             .sum();
         let mut merged = Vec::with_capacity(total);
         let emit = |merged: &mut Vec<(Record, u64)>,
@@ -206,9 +243,11 @@ pub(crate) fn dispatch_merge(
         // `DocumentClose` traverses downstream exactly once.
         match mode {
             clinker_plan::config::MergeMode::Concat => {
-                for pred in &sorted_preds {
-                    let upstream_name = current_dag.graph[*pred].name().to_string();
-                    if let Some(buf) = drain_node_buffer_slot(ctx, *pred) {
+                for (src, port) in &ordered_inputs {
+                    let upstream_name = current_dag.graph[*src].name().to_string();
+                    if let Some(buf) =
+                        drain_node_buffer_slot(ctx, NodeBufferKey::with_port(*src, port.as_deref()))
+                    {
                         for event in buf.drain() {
                             match event? {
                                 crate::executor::stream_event::StreamEvent::Record(record, rn) => {
@@ -229,22 +268,27 @@ pub(crate) fn dispatch_merge(
                 // those); the inputs are produced by upstream
                 // operator arms that wrote to `node_buffers`.
                 use std::collections::VecDeque;
-                let upstream_names: Vec<String> = sorted_preds
+                let upstream_names: Vec<String> = ordered_inputs
                     .iter()
-                    .map(|p| current_dag.graph[*p].name().to_string())
+                    .map(|(src, _)| current_dag.graph[*src].name().to_string())
                     .collect();
-                let mut deques: Vec<VecDeque<(Record, u64)>> = sorted_preds
+                let mut deques: Vec<VecDeque<(Record, u64)>> = ordered_inputs
                     .iter()
-                    .map(|pred| -> Result<VecDeque<(Record, u64)>, PipelineError> {
-                        match drain_node_buffer_slot(ctx, *pred) {
-                            Some(nb) => {
-                                let (records, puncts) = nb.drain_split()?;
-                                all_puncts.extend(puncts);
-                                Ok(VecDeque::from(records))
+                    .map(
+                        |(src, port)| -> Result<VecDeque<(Record, u64)>, PipelineError> {
+                            match drain_node_buffer_slot(
+                                ctx,
+                                NodeBufferKey::with_port(*src, port.as_deref()),
+                            ) {
+                                Some(nb) => {
+                                    let (records, puncts) = nb.drain_split()?;
+                                    all_puncts.extend(puncts);
+                                    Ok(VecDeque::from(records))
+                                }
+                                None => Ok(VecDeque::new()),
                             }
-                            None => Ok(VecDeque::new()),
-                        }
-                    })
+                        },
+                    )
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut rng = interleave_seed.map(fastrand::Rng::with_seed);
                 let mut cursor = 0usize;
@@ -344,7 +388,7 @@ pub(crate) fn dispatch_merge(
         deduped_puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
-    ctx.node_buffers.insert(node_idx, nb);
+    ctx.node_buffers.insert(node_idx.into(), nb);
 
     Ok(())
 }

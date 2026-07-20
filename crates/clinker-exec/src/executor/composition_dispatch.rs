@@ -17,7 +17,7 @@ use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
-    ExecutorContext, admit_node_buffer, dispatch_plan_node, drain_node_buffer_slot,
+    ExecutorContext, NodeBufferKey, admit_node_buffer, dispatch_plan_node, drain_node_buffer_slot,
     finalize_node_rooted_windows, node_buffer_spill_allowed, tee_emit_to_region_input_buffers,
 };
 use crate::executor::node_buffer::NodeBuffer;
@@ -84,7 +84,7 @@ pub(crate) fn dispatch_composition(
         // by their producer's buffer until `collect_port_records`
         // claims them below.
         if let Some(&first_pred) = predecessors.first()
-            && let Some(records) = ctx.node_buffers.get(&first_pred)
+            && let Some(records) = ctx.node_buffers.get(&first_pred.into())
         {
             for (record, _) in records.peek_mem_records() {
                 check_input_schema(
@@ -142,7 +142,7 @@ pub(crate) fn dispatch_composition(
         Vec::new(),
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
-    ctx.node_buffers.insert(node_idx, nb);
+    ctx.node_buffers.insert(node_idx.into(), nb);
 
     Ok(())
 }
@@ -208,7 +208,7 @@ fn collect_port_records(
         // errors that bubble out of `execute_composition_body`'s
         // topo walk get that wrapper. Detail string discriminates
         // this site from the generic admit in `admit_node_buffer`.
-        let cloned_with_bytes = ctx.node_buffers.get(&edge.source()).map(|nb| {
+        let cloned_with_bytes = ctx.node_buffers.get(&edge.source().into()).map(|nb| {
             // Composition port seeding clones records only; the
             // composition body operates inside its own document-
             // boundary scope and re-emits punctuations at the call-
@@ -284,13 +284,13 @@ fn execute_composition_body(
     }
 
     // Seed body-scope buffers from parent records keyed by port.
-    let mut body_buffers: HashMap<NodeIndex, NodeBuffer> = HashMap::new();
+    let mut body_buffers: HashMap<NodeBufferKey, NodeBuffer> = HashMap::new();
     for (port_name, records) in port_records {
         let body_idx = bound_body
             .port_name_to_node_idx
             .get(port_name.as_str())
             .ok_or_else(|| PipelineError::compose_unknown_port(composition_name, &port_name))?;
-        body_buffers.insert(*body_idx, NodeBuffer::memory_from_records(records));
+        body_buffers.insert((*body_idx).into(), NodeBuffer::memory_from_records(records));
     }
 
     // Pick the body's terminal output node. The bind-time alias

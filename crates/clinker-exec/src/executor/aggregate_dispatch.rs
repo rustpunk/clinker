@@ -453,7 +453,7 @@ fn finalize_aggregate_emit(
             input_puncts,
             node_buffer_spill_allowed(current_dag, node_idx),
         )?;
-        ctx.node_buffers.insert(node_idx, nb);
+        ctx.node_buffers.insert(node_idx.into(), nb);
     } else {
         // Streaming-Output handoff: a streaming-strategy
         // aggregate (the planner certified pre-sorted input)
@@ -506,7 +506,7 @@ fn finalize_aggregate_emit(
             input_puncts,
             node_buffer_spill_allowed(current_dag, node_idx),
         )?;
-        ctx.node_buffers.insert(node_idx, nb);
+        ctx.node_buffers.insert(node_idx.into(), nb);
     }
 
     Ok(())

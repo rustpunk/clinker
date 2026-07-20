@@ -21,7 +21,7 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema, Value};
 use petgraph::graph::NodeIndex;
 
-use crate::executor::dispatch::service_pending_node_buffer_spills;
+use crate::executor::dispatch::{NodeBufferKey, service_pending_node_buffer_spills};
 use crate::executor::node_buffer::{NodeBuffer, NodeBufferConsumer, record_byte_cost};
 use crate::pipeline::memory::{ConsumerHandle, ConsumerId, MemoryArbitrator, NoOpPolicy};
 
@@ -61,12 +61,12 @@ fn flagged_resident_memory_slot_spills_and_discharges_via_sweep() {
 
     // Slot A: three records, elected as victim. Slot B: one record, never
     // flagged — its presence proves the sweep touches only flagged slots.
-    let mut node_buffers: HashMap<NodeIndex, NodeBuffer> = HashMap::new();
+    let mut node_buffers: HashMap<NodeBufferKey, NodeBuffer> = HashMap::new();
     node_buffers.insert(
-        idx_a,
+        idx_a.into(),
         memory_slot(&s, &[(1, "a", 10), (2, "b", 11), (3, "c", 12)]),
     );
-    node_buffers.insert(idx_b, memory_slot(&s, &[(9, "z", 99)]));
+    node_buffers.insert(idx_b.into(), memory_slot(&s, &[(9, "z", 99)]));
 
     let handle_a = ConsumerHandle::new();
     handle_a.set_bytes(record_byte_cost(2) * 3);
@@ -75,9 +75,10 @@ fn flagged_resident_memory_slot_spills_and_discharges_via_sweep() {
     handle_b.set_bytes(record_byte_cost(2));
     let id_b = register(&arb, &handle_b);
 
-    let mut consumer_ids: HashMap<NodeIndex, (ConsumerId, Arc<ConsumerHandle>)> = HashMap::new();
-    consumer_ids.insert(idx_a, (id_a, handle_a.clone()));
-    consumer_ids.insert(idx_b, (id_b, handle_b.clone()));
+    let mut consumer_ids: HashMap<NodeBufferKey, (ConsumerId, Arc<ConsumerHandle>)> =
+        HashMap::new();
+    consumer_ids.insert(idx_a.into(), (id_a, handle_a.clone()));
+    consumer_ids.insert(idx_b.into(), (id_b, handle_b.clone()));
 
     // The arbitration round elected A and flipped its spill-request flag; the
     // sweep is the half that actually frees the bytes.
@@ -103,7 +104,10 @@ fn flagged_resident_memory_slot_spills_and_discharges_via_sweep() {
 
     // A transitioned Memory → Spilled and its in-memory charge is discharged.
     assert!(
-        matches!(node_buffers.get(&idx_a), Some(NodeBuffer::Spilled { .. })),
+        matches!(
+            node_buffers.get(&idx_a.into()),
+            Some(NodeBuffer::Spilled { .. })
+        ),
         "the elected resident slot must spill to disk"
     );
     assert_eq!(
@@ -113,7 +117,7 @@ fn flagged_resident_memory_slot_spills_and_discharges_via_sweep() {
     );
     // B was never flagged: still resident, still charged.
     assert!(
-        matches!(node_buffers.get(&idx_b), Some(NodeBuffer::Memory(_))),
+        matches!(node_buffers.get(&idx_b.into()), Some(NodeBuffer::Memory(_))),
         "an unflagged slot must stay resident"
     );
     assert!(handle_b.bytes() > 0, "the unflagged slot keeps its charge");
@@ -134,7 +138,7 @@ fn flagged_resident_memory_slot_spills_and_discharges_via_sweep() {
     );
 
     // A's records round-trip from disk in arrival order with values intact.
-    let a = node_buffers.remove(&idx_a).expect("slot A present");
+    let a = node_buffers.remove(&idx_a.into()).expect("slot A present");
     let (records, _puncts) = a.drain_split().expect("drain spilled slot");
     let rns: Vec<u64> = records.iter().map(|(_, rn)| *rn).collect();
     assert_eq!(
@@ -159,14 +163,15 @@ fn flagged_non_spillable_slot_is_skipped_by_sweep() {
     // A fan-out / composition-port slot: its consumer would reach
     // `clone_memory_only`, which panics on a spill-backed variant, so the
     // sweep must never spill it even when the arbitrator flags it.
-    let mut node_buffers: HashMap<NodeIndex, NodeBuffer> = HashMap::new();
-    node_buffers.insert(idx, memory_slot(&s, &[(1, "a", 1), (2, "b", 2)]));
+    let mut node_buffers: HashMap<NodeBufferKey, NodeBuffer> = HashMap::new();
+    node_buffers.insert(idx.into(), memory_slot(&s, &[(1, "a", 1), (2, "b", 2)]));
 
     let handle = ConsumerHandle::new();
     handle.set_bytes(record_byte_cost(2) * 2);
     let id = register(&arb, &handle);
-    let mut consumer_ids: HashMap<NodeIndex, (ConsumerId, Arc<ConsumerHandle>)> = HashMap::new();
-    consumer_ids.insert(idx, (id, handle.clone()));
+    let mut consumer_ids: HashMap<NodeBufferKey, (ConsumerId, Arc<ConsumerHandle>)> =
+        HashMap::new();
+    consumer_ids.insert(idx.into(), (id, handle.clone()));
 
     handle.request_spill();
 
@@ -183,7 +188,7 @@ fn flagged_non_spillable_slot_is_skipped_by_sweep() {
     .expect("sweep skips non-spillable slots without error");
 
     assert!(
-        matches!(node_buffers.get(&idx), Some(NodeBuffer::Memory(_))),
+        matches!(node_buffers.get(&idx.into()), Some(NodeBuffer::Memory(_))),
         "a non-spillable slot must stay resident (spilling it would later panic)"
     );
     assert!(handle.bytes() > 0, "its charge is untouched");

@@ -66,8 +66,8 @@ use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 
 use crate::executor::dispatch::{
-    ExecutorContext, admit_node_buffer, drain_node_buffer_slot, node_buffer_spill_allowed,
-    source_file_arc_of, source_name_arc_of,
+    ExecutorContext, NodeBufferKey, admit_node_buffer, drain_node_buffer_slot,
+    node_buffer_spill_allowed, source_file_arc_of, source_name_arc_of,
 };
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
@@ -471,16 +471,14 @@ fn compute_drop_decisions(
 /// draws removed rows; every other successor (the bare main reference, tagged
 /// `None`) draws kept rows.
 ///
-/// Records are accumulated **per successor across both ports** before a single
-/// admission, so a node drawing from both ports lands the union in one slot —
-/// the second port's records never overwrite the first's (the per-successor
-/// accumulation Route uses for its branches).
-///
 /// Where the records land depends on how the successor reads its input. A
 /// single-output consumer (Transform / Output / Reshape / Cull) checks its own
-/// `node_buffers` slot first, so its records go there. A multi-input consumer
-/// (Merge / Combine) reads its *predecessor's* slot directly, so its records go
-/// into this Cull's own slot (`node_idx`) instead. Both ports broadcast
+/// `node_buffers` slot first, so its port-selected records go into the
+/// successor's own slot (`(succ, None)`). A multi-input consumer (Merge /
+/// Combine) reads its *predecessor's* slot directly, keyed by the incoming
+/// edge's producer port, so each distinct producer port lands in this Cull's
+/// own `(node_idx, Some(port))` slot — the `main` and `removed_to` ports stay
+/// separate, which a Combine build side depends on. Both ports broadcast
 /// `input_puncts` so each downstream subgraph drives its own per-document
 /// accumulators.
 #[allow(clippy::too_many_arguments)]
@@ -494,51 +492,53 @@ fn emit_ports(
     removed: Vec<(Record, u64)>,
     input_puncts: Vec<crate::executor::stream_event::Punctuation>,
 ) -> Result<(), PipelineError> {
-    // Accumulate each successor's port-selected records keyed by successor
-    // index. The edge's `producer_port` tag is the source of truth:
-    // `Some(removed_to)` → removed rows, anything else (the untagged main
-    // reference) → kept rows. A record set is cloned into a successor's bucket
-    // only when that successor draws the matching port, so the bucket is the
-    // exact set the port selected; a node drawing both ports gets the union.
+    // The edge's `producer_port` tag selects the record set: `Some(removed_to)`
+    // → removed rows, anything else (the untagged main reference, or an
+    // explicit `main`) → kept rows.
     let removed_port = config.removed_to.as_str();
-    let mut succ_records: HashMap<NodeIndex, Vec<(Record, u64)>> = HashMap::new();
-    let mut succ_order: Vec<NodeIndex> = Vec::new();
-    for edge in current_dag
-        .graph
-        .edges_directed(node_idx, Direction::Outgoing)
-    {
-        let succ = edge.target();
-        if !succ_records.contains_key(&succ) {
-            succ_order.push(succ);
-        }
-        let bucket = succ_records.entry(succ).or_default();
-        match edge.weight().producer_port.as_deref() {
-            Some(port) if port == removed_port => bucket.extend(removed.iter().cloned()),
-            _ => bucket.extend(kept.iter().cloned()),
-        }
-    }
+    let is_removed_port = |port: Option<&str>| matches!(port, Some(p) if p == removed_port);
 
     let cull_region_producer = current_dag.deferred_region_at(node_idx).map(|r| r.producer);
     let active_body = ctx.window_runtime.active_stack.last().copied();
-    // Records destined for a predecessor-slot reader (Merge / Combine)
-    // accumulate into this Cull's own slot, where that consumer drains them.
-    let mut predecessor_slot: Vec<(Record, u64)> = Vec::new();
-    let mut wrote_predecessor_slot = false;
-    // Iterate in first-seen successor order so admission is deterministic.
-    for succ in succ_order {
-        let records = succ_records.remove(&succ).unwrap_or_default();
+
+    // Predecessor-slot readers (Merge / Combine) drain by incoming edge, so one
+    // slot per distinct producer output port lands in this Cull's own slot
+    // keyed `(node_idx, Some(port))`. Materialize each port's set once (multiple
+    // consumers of the same port share the slot, as they did pre-port). Own-slot
+    // readers admit inline into their own slot.
+    let mut pred_ports: Vec<Option<Box<str>>> = Vec::new();
+    // Collect outgoing edges first so the mutable `ctx` admissions below do not
+    // overlap the immutable graph borrow.
+    let outgoing: Vec<(NodeIndex, Option<Box<str>>, petgraph::graph::EdgeIndex)> = current_dag
+        .graph
+        .edges_directed(node_idx, Direction::Outgoing)
+        .map(|edge| {
+            (
+                edge.target(),
+                edge.weight().producer_port.as_deref().map(Box::from),
+                edge.id(),
+            )
+        })
+        .collect();
+
+    for (succ, port, edge_id) in outgoing {
+        let records: &Vec<(Record, u64)> = if is_removed_port(port.as_deref()) {
+            &removed
+        } else {
+            &kept
+        };
         // Cross-region tee: a successor inside a deferred region this Cull is
-        // not in needs the port-selected records parked on the matching
-        // outgoing edge so the commit-time deferred dispatcher receives exactly
-        // them. In-region and non-deferred edges skip the tee; their
-        // `node_buffers` slot already covers them.
+        // not in needs this port's records parked on the matching outgoing edge
+        // so the commit-time deferred dispatcher receives exactly them.
+        // In-region and non-deferred edges skip the tee; their `node_buffers`
+        // slot already covers them.
         let succ_region_producer = current_dag.deferred_region_at(succ).map(|r| r.producer);
         let crosses = match (cull_region_producer, succ_region_producer) {
             (None, Some(_)) => true,
             (Some(p), Some(t)) if p != t => true,
             _ => false,
         };
-        if crosses && let Some(edge) = current_dag.graph.find_edge(node_idx, succ) {
+        if crosses {
             let row_bytes_each: u64 = records
                 .first()
                 .map(|(rec, _)| {
@@ -546,7 +546,7 @@ fn emit_ports(
                         + std::mem::size_of::<(Record, u64)>()) as u64
                 })
                 .unwrap_or(0);
-            for (record, rn) in &records {
+            for (record, rn) in records {
                 // Fail loud if an oversized cross-region tee would blow the
                 // budget, mirroring the Route tee — parking unbounded records
                 // into `region_input_buffers` must not silently overshoot.
@@ -560,18 +560,18 @@ fn emit_ports(
                     });
                 }
                 ctx.region_input_buffers
-                    .entry((active_body, edge))
+                    .entry((active_body, edge_id))
                     .or_default()
                     .push((record.clone(), *rn));
             }
         }
         if reads_predecessor_slot(&current_dag.graph[succ]) {
-            // Merge / Combine drains its predecessor's slot, not its own, so
-            // its records join this Cull's slot (deduped across such
-            // successors into one accumulation — they all read the same slot).
-            predecessor_slot.extend(records);
-            wrote_predecessor_slot = true;
+            if !pred_ports.contains(&port) {
+                pred_ports.push(port);
+            }
         } else {
+            // Own-slot reader: its port-selected records go into its own slot.
+            let records = records.clone();
             let nb = admit_node_buffer(
                 ctx,
                 name,
@@ -580,19 +580,26 @@ fn emit_ports(
                 input_puncts.clone(),
                 node_buffer_spill_allowed(current_dag, succ),
             )?;
-            ctx.node_buffers.insert(succ, nb);
+            ctx.node_buffers.insert(succ.into(), nb);
         }
     }
-    if wrote_predecessor_slot {
+    let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
+    for port in pred_ports {
+        let records = if is_removed_port(port.as_deref()) {
+            removed.clone()
+        } else {
+            kept.clone()
+        };
+        let key = NodeBufferKey::with_port(node_idx, port.as_deref());
         let nb = admit_node_buffer(
             ctx,
             name,
-            node_idx,
-            predecessor_slot,
-            input_puncts,
-            node_buffer_spill_allowed(current_dag, node_idx),
+            key.clone(),
+            records,
+            input_puncts.clone(),
+            spill_allowed,
         )?;
-        ctx.node_buffers.insert(node_idx, nb);
+        ctx.node_buffers.insert(key, nb);
     }
     Ok(())
 }
@@ -602,7 +609,7 @@ fn emit_ports(
 /// directly; every other consumer (Transform / Output / Reshape / Cull / Sort
 /// / Aggregation) checks its own slot first, so a producer writes into the
 /// consumer's slot for those.
-fn reads_predecessor_slot(node: &PlanNode) -> bool {
+pub(crate) fn reads_predecessor_slot(node: &PlanNode) -> bool {
     matches!(node, PlanNode::Merge { .. } | PlanNode::Combine { .. })
 }
 

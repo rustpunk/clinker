@@ -446,6 +446,44 @@ use clinker_plan::plan::composition_body::CompositionBodies;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 use clinker_record::Schema;
 
+/// Key for a `node_buffers` slot.
+///
+/// A single-output producer keys its slot by node index alone; the
+/// `From<NodeIndex>` conversion yields `producer_port: None`, so every
+/// single-output insert/get/drain stays byte-identical to the pre-port model.
+/// A multi-output producer (a [`PlanNode::Route`] branch or a
+/// [`PlanNode::Cull`] `main` / `removed_to` port) writes each port to its own
+/// `(node, Some(port))` slot, and a predecessor-slot consumer (Merge / Combine)
+/// drains the slot named by its incoming edge's
+/// [`producer_port`](clinker_plan::plan::execution::PlanEdge::producer_port).
+/// Keeping `node_buffers` and `node_buffer_consumer_ids` keyed by the same type
+/// keeps the arbitrator's consumer registry aligned with the live slot map.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct NodeBufferKey {
+    pub(crate) node: NodeIndex,
+    pub(crate) producer_port: Option<Box<str>>,
+}
+
+impl NodeBufferKey {
+    /// Slot for `node` on producer output `port`; `None` is the single unnamed
+    /// output (identical to `NodeBufferKey::from(node)`).
+    pub(crate) fn with_port(node: NodeIndex, port: Option<&str>) -> Self {
+        Self {
+            node,
+            producer_port: port.map(Box::from),
+        }
+    }
+}
+
+impl From<NodeIndex> for NodeBufferKey {
+    fn from(node: NodeIndex) -> Self {
+        Self {
+            node,
+            producer_port: None,
+        }
+    }
+}
+
 /// Mutable per-walk and borrowed plan-time state passed to
 /// [`dispatch_plan_node`].
 ///
@@ -513,7 +551,7 @@ pub(crate) struct ExecutorContext<'a> {
     pub(crate) strategy: ErrorStrategy,
 
     // Owned mutable per-walk state.
-    pub(crate) node_buffers: HashMap<NodeIndex, NodeBuffer>,
+    pub(crate) node_buffers: HashMap<NodeBufferKey, NodeBuffer>,
     /// Per-slot consumer registration for `node_buffers`. `admit_node_buffer`
     /// registers a `NodeBufferConsumer` with the pipeline-scoped arbitrator
     /// and stores both the returned `ConsumerId` (used to `unregister_consumer`
@@ -523,7 +561,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// `node_buffers` so a body walk does not pollute the parent scope's
     /// registry.
     pub(crate) node_buffer_consumer_ids: HashMap<
-        NodeIndex,
+        NodeBufferKey,
         (
             crate::pipeline::memory::ConsumerId,
             std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
@@ -1515,22 +1553,24 @@ pub(crate) fn node_buffer_spill_allowed(
 /// so the arbitrator's registry stays aligned with the live slot map.
 pub(crate) fn drain_node_buffer_slot(
     ctx: &mut ExecutorContext<'_>,
-    node_idx: NodeIndex,
+    key: impl Into<NodeBufferKey>,
 ) -> Option<NodeBuffer> {
-    if let Some((id, _)) = ctx.node_buffer_consumer_ids.remove(&node_idx) {
+    let key = key.into();
+    if let Some((id, _)) = ctx.node_buffer_consumer_ids.remove(&key) {
         ctx.memory_budget.unregister_consumer(id);
     }
-    ctx.node_buffers.remove(&node_idx)
+    ctx.node_buffers.remove(&key)
 }
 
 pub(crate) fn admit_node_buffer(
     ctx: &mut ExecutorContext<'_>,
     node_name: &str,
-    node_idx: NodeIndex,
+    key: impl Into<NodeBufferKey>,
     rows: Vec<(Record, u64)>,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
     spill_allowed: bool,
 ) -> Result<NodeBuffer, PipelineError> {
+    let node_idx = key.into();
     if rows.is_empty() && puncts.is_empty() {
         return Ok(NodeBuffer::Memory(Vec::new()));
     }
@@ -2757,7 +2797,7 @@ pub(crate) fn transform_fused_consume(
         forwarded_puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
-    ctx.node_buffers.insert(node_idx, nb);
+    ctx.node_buffers.insert(node_idx.into(), nb);
     Ok(())
 }
 
@@ -2818,9 +2858,9 @@ fn service_node_buffer_spill_requests(
 /// between two admissions with real record footprints.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn service_pending_node_buffer_spills(
-    node_buffers: &mut HashMap<NodeIndex, NodeBuffer>,
+    node_buffers: &mut HashMap<NodeBufferKey, NodeBuffer>,
     consumer_ids: &HashMap<
-        NodeIndex,
+        NodeBufferKey,
         (
             crate::pipeline::memory::ConsumerId,
             Arc<crate::pipeline::memory::ConsumerHandle>,
@@ -2837,36 +2877,36 @@ pub(crate) fn service_pending_node_buffer_spills(
     // that are eligible to spill (resident `Memory` + single-drain
     // topology). `take_spill_request` read-and-clears the flag for every
     // flagged slot, spillable or not, so a non-spillable flag does not spin.
-    let mut to_spill: Vec<NodeIndex> = Vec::new();
-    for (idx, (_id, handle)) in consumer_ids {
+    let mut to_spill: Vec<NodeBufferKey> = Vec::new();
+    for (key, (_id, handle)) in consumer_ids {
         if handle.take_spill_request()
-            && matches!(node_buffers.get(idx), Some(NodeBuffer::Memory(_)))
-            && is_spill_allowed(*idx)
+            && matches!(node_buffers.get(key), Some(NodeBuffer::Memory(_)))
+            && is_spill_allowed(key.node)
         {
-            to_spill.push(*idx);
+            to_spill.push(key.clone());
         }
     }
     // Phase 2: flush each elected slot. Single-threaded dispatch means
     // nothing mutated the slot between the two phases, so it is still the
     // `Memory` variant Phase 1 saw.
-    for idx in to_spill {
+    for key in to_spill {
         let Some(handle) = consumer_ids
-            .get(&idx)
+            .get(&key)
             .map(|(_id, handle)| Arc::clone(handle))
         else {
             continue;
         };
-        let Some(buffer) = node_buffers.remove(&idx) else {
+        let Some(buffer) = node_buffers.remove(&key) else {
             continue;
         };
-        let name = node_name(idx);
+        let name = node_name(key.node);
         // Resolve the compression mode against this slot's schema width and
         // the run's batch size, matching the admission path so the on-disk
         // format agrees with what `--explain` projects.
         let column_count = buffer.first_record_column_count();
         let compress = spill_compress.resolve_for_schema(column_count, batch_size as u64);
         let (spilled, file_bytes) = buffer.spill_resident_memory(Some(spill_root), compress)?;
-        node_buffers.insert(idx, spilled);
+        node_buffers.insert(key, spilled);
         if file_bytes > 0 {
             // Rows are on disk now; the slot's in-memory charge is zero.
             handle.set_bytes(0);

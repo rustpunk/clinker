@@ -249,6 +249,6 @@ pub(crate) fn emit_post_recompute(
         // aggregate output.
         HashAggError::Spill(format!("post-recompute node-buffer admission: {e}"))
     })?;
-    ctx.node_buffers.insert(agg_idx, nb);
+    ctx.node_buffers.insert(agg_idx.into(), nb);
     Ok(emitted)
 }

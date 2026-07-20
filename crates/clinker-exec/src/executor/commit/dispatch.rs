@@ -43,7 +43,9 @@ use petgraph::visit::{EdgeRef, Topo};
 
 use super::DlqEvent;
 use super::detect::RetractScope;
-use crate::executor::dispatch::{ExecutorContext, dispatch_plan_node, drain_node_buffer_slot};
+use crate::executor::dispatch::{
+    ExecutorContext, NodeBufferKey, dispatch_plan_node, drain_node_buffer_slot,
+};
 use crate::executor::node_buffer::NodeBuffer;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::CompositionBodyId;
@@ -324,15 +326,17 @@ fn seed_cross_region_inputs_for(
         let Some(parked) = ctx.region_input_buffers.remove(&key) else {
             continue;
         };
-        // Append onto the source node's buffer so the consumer's
-        // existing predecessor-walk logic resolves them. Per-row
-        // attribution flows through the slot's registered
+        // Append onto the source node's buffer, keyed by the crossing edge's
+        // producer output port so a multi-output source (Route branch / Cull
+        // port) lands in the exact slot the consumer's edge-based drain reads.
+        // Per-row attribution flows through the slot's registered
         // `NodeBufferConsumer` once `admit_node_buffer` re-keys this
         // slot at the next bulk admission; the arbitrator's
         // `should_abort` poll guards the pipeline-wide hard limit.
+        let producer_port = current_dag.graph[edge_id].producer_port.as_deref();
         let slot = ctx
             .node_buffers
-            .entry(source_idx)
+            .entry(NodeBufferKey::with_port(source_idx, producer_port))
             .or_insert_with(|| NodeBuffer::Memory(Vec::new()));
         for (record, rn) in parked {
             slot.push(record, rn);
@@ -391,7 +395,7 @@ fn recurse_into_body(
     // collide numerically). Restore on every exit. The paired
     // consumer-id map swaps alongside so body-scope NodeBufferConsumer
     // registrations don't survive into the parent scope's arbitrator.
-    let body_buffers: HashMap<NodeIndex, NodeBuffer> = HashMap::new();
+    let body_buffers: HashMap<NodeBufferKey, NodeBuffer> = HashMap::new();
     let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
     let saved_consumer_ids = std::mem::take(&mut ctx.node_buffer_consumer_ids);
     // Window-arena consumer ids are keyed by slot index, which the body
@@ -464,7 +468,7 @@ fn recurse_into_body(
         // body region.
         for body_region in body_dag.deferred_regions.values() {
             let producer = body_region.producer;
-            if ctx.node_buffers.contains_key(&producer) {
+            if ctx.node_buffers.contains_key(&producer.into()) {
                 continue;
             }
             if !ctx.relaxed_aggregator_states.contains_key(&producer) {
@@ -540,7 +544,7 @@ fn recurse_into_body(
         // batch boundaries.
         let slot = ctx
             .node_buffers
-            .entry(composition_idx)
+            .entry(composition_idx.into())
             .or_insert_with(|| NodeBuffer::Memory(Vec::new()));
         for (record, rn) in harvested {
             slot.push(record, rn);
