@@ -222,29 +222,46 @@ pub(crate) fn dispatch_combine(
             .edges_directed(node_idx, Direction::Incoming)
             .filter(|e| matches_upstream_name(current_dag.graph[e.source()].name(), upstream))
             .collect();
-        let chosen = if candidates.len() > 1 {
-            candidates
-                .iter()
-                .find(|e| e.weight().producer_port.as_deref() == port_ref)
-                .or_else(|| candidates.first())
-        } else {
-            candidates.first()
-        };
-        chosen
-            .map(|e| {
-                (
-                    e.source(),
-                    e.weight().producer_port.as_deref().map(Box::from),
-                )
-            })
-            .ok_or_else(|| PipelineError::Internal {
+        let chosen = if candidates.len() == 1 {
+            // Single candidate: the declared port is not needed to
+            // disambiguate, and a spliced single-output passthrough
+            // (`inject_correlation_sort`) carries `producer_port: None` even
+            // when the qualifier named a port — so use the one edge directly.
+            candidates[0]
+        } else if candidates.is_empty() {
+            return Err(PipelineError::Internal {
                 op: "combine",
                 node: name.clone(),
                 detail: format!(
                     "combine {side} upstream {upstream:?} is not an \
                          incoming neighbor in the DAG"
                 ),
-            })
+            });
+        } else {
+            // Driver and build resolve to the same predecessor via distinct
+            // output ports (a Cull's `main` + `removed_to`, or two Route
+            // branches): the qualifier's declared port must identify exactly
+            // one incoming edge. A miss means the node's declared port and the
+            // DAG edge tag disagree — an invariant violation surfaced loud
+            // rather than silently draining an arbitrary port's slot.
+            *candidates
+                .iter()
+                .find(|e| e.weight().producer_port.as_deref() == port_ref)
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "combine",
+                    node: name.clone(),
+                    detail: format!(
+                        "combine {side} input {upstream:?} declares producer port \
+                         {port_ref:?}, which matched none of the {} incoming edges \
+                         from that node",
+                        candidates.len()
+                    ),
+                })?
+        };
+        Ok((
+            chosen.source(),
+            chosen.weight().producer_port.as_deref().map(Box::from),
+        ))
     };
     let (driver_pred, driver_port) =
         resolve_side(driver_upstream, driver_port_ref.as_deref(), "driver")?;

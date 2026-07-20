@@ -262,7 +262,10 @@ pub(crate) fn dispatch_route(
     // last into this Route's own per-branch slots.
     let mut pred_branches: Vec<String> = Vec::new();
     for (branch, succ_idx, edge_id) in outgoing {
-        let records = branch_records.get(&branch).cloned().unwrap_or_default();
+        // Borrow the branch's record set; it is cloned only at the own-slot
+        // admit below (a predecessor-slot reader re-reads it in the second loop
+        // instead), so a non-crossing Merge/Combine branch costs no clone here.
+        let records: &[(Record, u64)] = branch_records.get(&branch).map_or(&[], |v| v.as_slice());
         let succ_region_producer = current_dag.deferred_region_at(succ_idx).map(|r| r.producer);
         let crosses = match (route_region_producer, succ_region_producer) {
             (None, Some(_)) => true,
@@ -277,7 +280,7 @@ pub(crate) fn dispatch_route(
                         + std::mem::size_of::<(Record, u64)>()) as u64
                 })
                 .unwrap_or(0);
-            for (record, rn) in &records {
+            for (record, rn) in records {
                 if row_bytes_each > 0 && ctx.memory_budget.should_abort() {
                     return Err(PipelineError::MemoryBudgetExceeded {
                         node: name.to_string(),
@@ -305,7 +308,7 @@ pub(crate) fn dispatch_route(
                 ctx,
                 name,
                 succ_idx,
-                records,
+                records.to_vec(),
                 input_puncts.clone(),
                 node_buffer_spill_allowed(current_dag, succ_idx),
             )?;
