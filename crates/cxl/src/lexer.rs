@@ -387,8 +387,14 @@ impl<'src> Lexer<'src> {
         }
 
         let text = std::str::from_utf8(&self.source[start..self.pos]).unwrap();
-        let val: i64 = text.parse().unwrap();
-        (Token::IntLit(val), Span::new(start, self.pos))
+        match text.parse::<i64>() {
+            Ok(val) => (Token::IntLit(val), Span::new(start, self.pos)),
+            // An integer literal wider than `i64` has no representation; emit a
+            // lexer error on the same channel as an invalid date literal rather
+            // than panicking on `.unwrap()`. The parser surfaces the resulting
+            // `Token::Error` as an "unexpected token" diagnostic.
+            Err(_) => (Token::Error, Span::new(start, self.pos)),
+        }
     }
 
     fn lex_ident(&mut self, start: usize) -> (Token, Span) {
@@ -576,6 +582,21 @@ mod tests {
     fn test_lex_date_literal_invalid() {
         let tokens = Lexer::tokenize("#9999-99-99#");
         assert_eq!(tokens[0].0, Token::Error);
+    }
+
+    #[test]
+    fn test_lex_int_literal_overflow_is_error() {
+        // An integer literal wider than i64 must lex to Token::Error rather
+        // than panic.
+        let tokens = Lexer::tokenize("99999999999999999999");
+        assert_eq!(tokens[0].0, Token::Error);
+    }
+
+    #[test]
+    fn test_lex_int_literal_i64_max_ok() {
+        // The largest representable i64 still lexes as an integer.
+        let tokens = Lexer::tokenize("9223372036854775807");
+        assert_eq!(tokens[0].0, Token::IntLit(i64::MAX));
     }
 
     #[test]

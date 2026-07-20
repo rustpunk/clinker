@@ -147,7 +147,6 @@ impl BuiltinRegistry {
             s("split", vec![TypeTag::String], 1, Some(1), TypeTag::Array),
             s("join", vec![TypeTag::String], 1, Some(1), TypeTag::String),
             s("matches", vec![TypeTag::String], 1, Some(1), TypeTag::Bool),
-            s("format", vec![TypeTag::String], 1, Some(1), TypeTag::String),
             s("concat", vec![TypeTag::String], 1, None, TypeTag::String),
             s("find", vec![TypeTag::String], 1, Some(1), TypeTag::Bool),
             s(
@@ -160,6 +159,23 @@ impl BuiltinRegistry {
         ] {
             methods.insert(n, d);
         }
+
+        // `format` renders the receiver value as a string, so it accepts ANY
+        // receiver (e.g. `42.format("")` → "42"), not just strings — the
+        // evaluator's `format!("{}", ValueDisplay(receiver))` is total over
+        // every value type. It keeps the String category for grouping/docs.
+        methods.insert(
+            "format",
+            BuiltinDef {
+                name: "format",
+                receiver: TypeTag::Any,
+                args: vec![TypeTag::String],
+                min_args: 1,
+                max_args: Some(1),
+                return_type: TypeTag::String,
+                category: Category::String,
+            },
+        );
 
         // ── Path (5) ──
         let p = |name: &'static str| {
@@ -527,8 +543,11 @@ impl BuiltinRegistry {
             BuiltinDef {
                 name: "debug",
                 receiver: TypeTag::Any,
+                // The prefix label is optional: `.debug()` logs the value with
+                // no prefix, `.debug("tag")` prepends one. `min_args` must be 0
+                // to match the evaluator (and the `.debug()` no-prefix test).
                 args: vec![TypeTag::String],
-                min_args: 1,
+                min_args: 0,
                 max_args: Some(1),
                 return_type: TypeTag::Any,
                 category: Category::Debug,

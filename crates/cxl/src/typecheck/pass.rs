@@ -7,7 +7,7 @@ use regex::Regex;
 use super::row::{ColumnLookup, QualifiedField, Row};
 use super::types::Type;
 use crate::ast::{BinOp, Expr, LiteralValue, NodeId, Program, Statement, UnaryOp};
-use crate::builtins::BuiltinRegistry;
+use crate::builtins::{BuiltinDef, BuiltinRegistry, TypeTag};
 use crate::lexer::Span;
 use crate::resolve::pass::{ResolvedBinding, ResolvedProgram};
 use crate::resolve::scoped_vars::{ScopedVarType, ScopedVarsRegistry};
@@ -192,6 +192,20 @@ pub fn type_check_with_mode_and_vars(
         node_count: _,
     } = resolved;
 
+    // Root node of each top-level `let` RHS, in declaration order. Matches the
+    // `ResolvedBinding::LetVar(i)` index for top-level lets (nested emit-each /
+    // closure bindings sit above these on the resolver's scope stack and are
+    // popped before the next top-level statement, so they never shift a
+    // top-level let's ordinal).
+    let let_binding_nodes: Vec<NodeId> = program
+        .statements
+        .iter()
+        .filter_map(|s| match s {
+            Statement::Let { expr, .. } => Some(expr.node_id()),
+            _ => None,
+        })
+        .collect();
+
     let mut checker = TypeChecker {
         bindings: &bindings,
         schema,
@@ -200,6 +214,7 @@ pub fn type_check_with_mode_and_vars(
         types: vec![None; node_count as usize],
         regexes: vec![None; node_count as usize],
         field_constraints: HashMap::new(),
+        let_binding_nodes,
         diagnostics: Vec::new(),
         aggregate_mode: aggregate_mode.clone(),
         agg_function_depth: 0,
@@ -252,6 +267,21 @@ struct TypeChecker<'a> {
     types: Vec<Option<Type>>,
     regexes: Vec<Option<Regex>>,
     field_constraints: HashMap<String, Vec<FieldConstraint>>,
+    /// Root `NodeId` of each top-level `let` binding's RHS, in declaration
+    /// order. `ResolvedBinding::LetVar(i)` indexes this to recover a let-var's
+    /// type from its RHS node.
+    ///
+    /// Soundness: a *genuine* top-level let-var reference has `i` equal to that
+    /// let's ordinal here, and — because the resolver forbids forward
+    /// references and statements are walked in order — its RHS was annotated
+    /// before the reference is visited, so `get_type` returns the real type.
+    /// `LetVar(i)` is *also* produced for emit-each iterators and closure
+    /// params; their scope-stack index either exceeds this vec (→ `Type::Any`)
+    /// or aliases a *later* top-level let whose RHS is not yet annotated at that
+    /// point in the walk (→ `Type::Any` via the unset default). Both erase to
+    /// `Any`, which is correct: an iterator/closure element type is unknown
+    /// here. No index ever aliases an already-annotated unrelated binding.
+    let_binding_nodes: Vec<NodeId>,
     diagnostics: Vec<TypeDiagnostic>,
     // Note: in_predicate_expr tracking is done via the resolver's context,
     // but we track it here for the nested-window check
@@ -273,6 +303,82 @@ fn scoped_var_type_to_type(t: ScopedVarType) -> Type {
         ScopedVarType::Bool => Type::Bool,
         ScopedVarType::Date => Type::Date,
         ScopedVarType::DateTime => Type::DateTime,
+    }
+}
+
+/// Whether `recv` (nullability already stripped) is an acceptable receiver for
+/// a builtin whose registered receiver tag is `def_receiver`.
+///
+/// The name-keyed registry stores one receiver `TypeTag` per method, but eval
+/// dispatches several methods on the runtime value, so the single tag
+/// under-describes the true receiver set. `Any` on either side is permissive
+/// (open rows / composition-tail receivers). Beyond an exact unify, three
+/// families are value-dispatched overloads the registry cannot express under
+/// one key:
+/// - numeric methods (`abs`, `round`, `clamp`, …) also accept `Decimal` —
+///   exact decimals run the same evaluation paths, and `Decimal` deliberately
+///   does not *unify* with the `int|float` `Numeric` union yet is a valid
+///   numeric receiver;
+/// - date methods (`year`, `hour`, `format_date`, …) also accept `DateTime`;
+/// - `join` / `length` / `find` also accept `Array` (String/Array overloads
+///   collapsed onto one name key, dispatched by receiver value at eval).
+fn receiver_compatible(def_receiver: TypeTag, method: &str, recv: &Type) -> bool {
+    if def_receiver == TypeTag::Any || matches!(recv, Type::Any) {
+        return true;
+    }
+    if recv.unify(&Type::from_type_tag(def_receiver)).is_some() {
+        return true;
+    }
+    match def_receiver {
+        TypeTag::Numeric => matches!(recv, Type::Decimal),
+        TypeTag::Date => matches!(recv, Type::DateTime),
+        TypeTag::String => {
+            matches!(recv, Type::Array) && matches!(method, "join" | "length" | "find")
+        }
+        _ => false,
+    }
+}
+
+/// Whether an argument of (nullability-stripped) type `got` satisfies a builtin
+/// parameter whose declared tag is `want`. `Any` on either side is permissive —
+/// this is what keeps closure arguments (which type as `Any`) and open-row
+/// values valid. Numeric parameters additionally accept `Decimal`, mirroring
+/// [`receiver_compatible`].
+fn arg_compatible(want: TypeTag, got: &Type) -> bool {
+    if want == TypeTag::Any || matches!(got, Type::Any) {
+        return true;
+    }
+    if got.unify(&Type::from_type_tag(want)).is_some() {
+        return true;
+    }
+    matches!(want, TypeTag::Numeric) && matches!(got, Type::Decimal)
+}
+
+/// Return type of a builtin `MethodCall`, applying the receiver-dependent
+/// overrides the name-keyed registry cannot express under one `return_type`
+/// tag. Each override tracks what the evaluator actually returns for that
+/// receiver form; without them the wrong type poisons the operand/method
+/// checks on the surrounding expression.
+fn method_return_type(method: &str, recv_ty: &Type, def: &BuiltinDef) -> Type {
+    let recv = recv_ty.unwrap_nullable();
+    match method {
+        // Exact decimals run these numeric methods closed over the decimal
+        // domain, so the result stays `Decimal` even though the registry types
+        // them over the general `Numeric` receiver (which never unifies with
+        // `Decimal`). `clamp`/`min`/`max` are excluded: they may return an
+        // argument value, so the result is not guaranteed to be a decimal.
+        "abs" | "ceil" | "floor" | "round" | "round_to" if matches!(recv, Type::Decimal) => {
+            Type::Decimal
+        }
+        // `add_days` preserves the receiver's date kind (`Date`→`Date`,
+        // `DateTime`→`DateTime`); the registry stores only the `Date` return.
+        "add_days" if matches!(recv, Type::DateTime) => Type::DateTime,
+        // `find` is a String/Array overload sharing one registry key: on a
+        // String it returns `Bool` (regex match), on an Array it returns the
+        // matched element. Erase the non-String form to `Any` rather than
+        // propagate the wrong `Bool`.
+        "find" if !matches!(recv, Type::String) => Type::Any,
+        _ => Type::from_type_tag(def.return_type),
     }
 }
 
@@ -461,7 +567,18 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
                     }
-                    Some(ResolvedBinding::LetVar(_)) => Type::Any, // Inferred from RHS
+                    Some(ResolvedBinding::LetVar(i)) => {
+                        // Infer the let-var's type from its binding RHS so it
+                        // participates in the operand checks below like any
+                        // other value. An `Any`-typed let-var would unify with
+                        // everything and silently bypass the arithmetic /
+                        // comparison / method checks.
+                        self.let_binding_nodes
+                            .get(*i)
+                            .copied()
+                            .map(|node| self.get_type(node))
+                            .unwrap_or(Type::Any)
+                    }
                     Some(ResolvedBinding::IteratorBinding) => Type::Any, // `it` — runtime type
                     _ => Type::Any,
                 };
@@ -816,26 +933,17 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
 
-                // Look up return type from registry
-                let ty = if let Some(def) = self.registry.lookup_method(method) {
-                    // An exact-decimal receiver stays in the decimal domain
-                    // for the numeric methods whose evaluation is closed over
-                    // decimals: abs, whole-valued ceil/floor, and banker's
-                    // rounding for round/round_to. The registry declares
-                    // these over the general Numeric receiver with
-                    // Float/Int/Numeric results; taking that at face value
-                    // here would poison decimal composition downstream,
-                    // because decimal deliberately never unifies with float
-                    // or the Numeric supertype. clamp/min/max are excluded:
-                    // their evaluation may return an argument value, so the
-                    // result is not guaranteed to be a decimal.
-                    if matches!(recv_ty.unwrap_nullable(), Type::Decimal)
-                        && matches!(&**method, "abs" | "ceil" | "floor" | "round" | "round_to")
-                    {
-                        Type::Decimal
-                    } else {
-                        Type::from_type_tag(def.return_type)
-                    }
+                // Look up return type from registry. `self.registry` is a
+                // shared `&BuiltinRegistry`, so `def` borrows the registry (not
+                // `*self`) and the `&mut self` validation call below is free.
+                let registry = self.registry;
+                let ty = if let Some(def) = registry.lookup_method(method) {
+                    // Validate receiver / arity / argument types against the
+                    // registered signature. Mismatches are recorded but we keep
+                    // computing the return type so one pass surfaces every
+                    // downstream error too.
+                    self.check_method_signature(def, method, &recv_ty, &arg_types, args, *span);
+                    method_return_type(method, &recv_ty, def)
                 } else {
                     Type::Any
                 };
@@ -1368,6 +1476,75 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    /// Validate a `MethodCall` against its registered builtin signature:
+    /// receiver type, argument count, and per-argument types. Every mismatch
+    /// is recorded as a diagnostic; the caller still computes a recovery
+    /// return type so a single pass reports the whole expression's errors.
+    fn check_method_signature(
+        &mut self,
+        def: &BuiltinDef,
+        method: &str,
+        recv_ty: &Type,
+        arg_types: &[Type],
+        args: &[Expr],
+        span: Span,
+    ) {
+        // (i) Receiver type.
+        if !receiver_compatible(def.receiver, method, recv_ty.unwrap_nullable()) {
+            self.error(
+                span,
+                format!(
+                    "method '{method}' expects a {} receiver, but got {recv_ty}",
+                    Type::from_type_tag(def.receiver)
+                ),
+                Some(format!("'{method}' is not defined for {recv_ty} values")),
+            );
+        }
+
+        // (ii) Argument count.
+        let n = args.len();
+        let within_max = def.max_args.map(|m| n <= m).unwrap_or(true);
+        if n < def.min_args || !within_max {
+            let want = match def.max_args {
+                Some(max) if max == def.min_args => def.min_args.to_string(),
+                Some(max) => format!("between {} and {max}", def.min_args),
+                None => format!("at least {}", def.min_args),
+            };
+            self.error(
+                span,
+                format!("method '{method}' takes {want} argument(s), but got {n}"),
+                None,
+            );
+            // The count is wrong; positional arg-type checks below would
+            // produce misaligned, cascading diagnostics, so stop here.
+            return;
+        }
+
+        // (iii) Per-argument types.
+        for (i, arg_ty) in arg_types.iter().enumerate() {
+            let want = if i < def.args.len() {
+                Some(def.args[i])
+            } else if def.max_args.is_none() {
+                // Variadic tail repeats the last declared parameter type.
+                def.args.last().copied()
+            } else {
+                None
+            };
+            let Some(want) = want else { continue };
+            if !arg_compatible(want, arg_ty.unwrap_nullable()) {
+                self.error(
+                    args[i].span(),
+                    format!(
+                        "argument {} of '{method}' expects {}, but got {arg_ty}",
+                        i + 1,
+                        Type::from_type_tag(want)
+                    ),
+                    None,
+                );
+            }
+        }
+    }
+
     fn check_binary_op(
         &mut self,
         node_id: NodeId,
@@ -1418,17 +1595,89 @@ impl<'a> TypeChecker<'a> {
             });
         }
 
+        // A `decimal` mixed with the `numeric` supertype (`int | float`) is NOT
+        // provably incompatible: `numeric` may resolve to `int` at runtime,
+        // which widens exactly into the decimal domain. So it is left permissive
+        // here rather than flagged as a hard type error — the definitely-invalid
+        // decimal/float half is already diagnosed above, and the contexts that
+        // require an exact axis (combine range joins → E327, `weighted_avg`)
+        // reject the ambiguous pairing with their own targeted checks. A common
+        // trigger is `numeric`-returning builtins over a decimal receiver
+        // (`decimal.clamp(lo, hi)`, `decimal.min(x)`), whose exact result would
+        // otherwise be rejected when composed with another decimal.
+        let is_decimal_numeric_mix = matches!(
+            (lt_inner, rt_inner),
+            (Type::Decimal, Type::Numeric) | (Type::Numeric, Type::Decimal)
+        );
+
+        // Unify the (nullability-stripped) operands once. `None` means the two
+        // types are provably disjoint: `Any`, `Numeric`, `Null`, and
+        // `Nullable` all unify, so a failure here — excluding the two decimal
+        // mixings handled above — is a genuine type clash the operator can't
+        // bridge. Such expressions used to type-check clean and then evaluate
+        // to a silent `Null` / `false`.
+        let unified = lt_inner.unify(rt_inner);
+
         let result = match op {
-            // Arithmetic: result is the unified numeric type
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
-                lt_inner.unify(rt_inner).unwrap_or(Type::Any)
+            // Arithmetic: result is the unified numeric type. A failed unify
+            // that is not the already-diagnosed decimal/float mix is a hard
+            // error (e.g. `"x" + 1`). Keep the widened `Any` for error recovery
+            // so the enclosing expression still type-checks.
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => match &unified {
+                Some(t) => t.clone(),
+                None => {
+                    if !is_decimal_float_mix && !is_decimal_numeric_mix {
+                        self.error(
+                            span,
+                            format!(
+                                "arithmetic operator cannot combine operands of type {lt} and {rt}"
+                            ),
+                            Some(
+                                "arithmetic operands must be mutually compatible numeric types; \
+                                 convert one side (e.g. `.to_int()`, `.to_float()`) so both share a type"
+                                    .into(),
+                            ),
+                        );
+                    }
+                    Type::Any
+                }
+            },
+
+            // Comparison: result is Bool, but the operands must be mutually
+            // orderable. Ordering provably-disjoint types (e.g.
+            // `len(name) > "5"`) silently evaluated to `false` before.
+            BinOp::Gt | BinOp::Lt | BinOp::Gte | BinOp::Lte => {
+                if unified.is_none() && !is_decimal_float_mix && !is_decimal_numeric_mix {
+                    self.error(
+                        span,
+                        format!("cannot compare {lt} and {rt} with an ordering operator"),
+                        Some(
+                            "comparison operands must be mutually compatible \
+                             (both numeric, both strings, both dates, …)"
+                                .into(),
+                        ),
+                    );
+                }
+                Type::Bool
             }
 
-            // Comparison: result is Bool
-            BinOp::Gt | BinOp::Lt | BinOp::Gte | BinOp::Lte => Type::Bool,
-
-            // Equality: always Bool, never nullable
+            // Equality: always Bool, never nullable. Provably-disjoint non-`Any`
+            // operands can never be equal, so `5 == "5"` is a type error rather
+            // than a constant `false`.
             BinOp::Eq | BinOp::Neq => {
+                if unified.is_none() && !is_decimal_float_mix && !is_decimal_numeric_mix {
+                    self.error(
+                        span,
+                        format!(
+                            "cannot compare {lt} and {rt} for equality — they are different types"
+                        ),
+                        Some(
+                            "equality operands must share a type; convert one side or compare \
+                             against a matching literal"
+                                .into(),
+                        ),
+                    );
+                }
                 self.set_type(node_id, Type::Bool);
                 return Type::Bool;
             }
@@ -2775,6 +3024,265 @@ mod tests {
             first_emit_expr_type(&typed),
             Type::String,
             "products.product_id must resolve to String via lookup_qualified"
+        );
+    }
+
+    // ── language soundness (#489 let-var inference, #464 binary-op
+    // mismatch, #488 method receiver/arity/argtype) ──────────────────
+    //
+    // Positive tests assert a DIAGNOSTIC; negative tests prove legitimate
+    // expressions — including the value-dispatch receiver families and open
+    // rows — still type-check clean (the dominant false-positive risk).
+
+    #[test]
+    fn test_typecheck_string_plus_int_rejected() {
+        // #464: `"x" + 1` has provably disjoint operands. It used to widen to
+        // Any silently; now it must emit a diagnostic.
+        let diags = typecheck_err("emit v = \"x\" + 1", &[], &empty_row());
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("String") && d.message.contains("Int")),
+            "expected a String/Int arithmetic mismatch, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_length_gt_string_rejected() {
+        // #464 + #488: `name.length() > "5"` compares Int to String — a silent
+        // `false` before, now a diagnostic.
+        let mut cols = IndexMap::new();
+        cols.insert("name".into(), Type::String);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let diags = typecheck_err("emit v = name.length() > \"5\"", &["name"], &schema);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("compare") && d.message.contains("ordering")),
+            "expected an ordering-comparison mismatch, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_eq_disjoint_types_rejected() {
+        // #464: equality over provably disjoint non-Any types is a type error,
+        // not a constant `false`.
+        let mut cols = IndexMap::new();
+        cols.insert("qty".into(), Type::Int);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let diags = typecheck_err("emit v = qty == \"5\"", &["qty"], &schema);
+        assert!(
+            diags.iter().any(|d| d.message.contains("equality")
+                || (d.message.contains("Int") && d.message.contains("String"))),
+            "expected an equality type mismatch, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_letvar_rhs_type_misuse_rejected() {
+        // #489: a let-var must take its RHS type so operand checks apply.
+        // `tag` is String; `tag + 1` is then a String/Int arithmetic mismatch.
+        // An `Any`-typed let-var would unify with everything and bypass it.
+        let diags = typecheck_err("let tag = \"x\"\nemit v = tag + 1", &[], &empty_row());
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("String") && d.message.contains("Int")),
+            "expected the let-var's String RHS to reject `+ 1`, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_letvar_rhs_type_flows_to_method_receiver() {
+        // #489 + #488: a let-var bound to an Int, used as a String-method
+        // receiver, is rejected — the inferred let-var type reaches the
+        // receiver check.
+        let diags = typecheck_err("let n = 5\nemit v = n.upper()", &[], &empty_row());
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("upper") && d.message.contains("String")),
+            "expected `(let n = 5).upper()` to be rejected, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_method_receiver_mismatch_rejected() {
+        // #488: `(5).upper()` — Int receiver on a String method.
+        let diags = typecheck_err("emit v = (5).upper()", &[], &empty_row());
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("upper") && d.message.contains("receiver")),
+            "expected a receiver mismatch for (5).upper(), got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_method_arg_type_mismatch_rejected() {
+        // #488: `name.starts_with(5)` — Int where a String argument is required.
+        let mut cols = IndexMap::new();
+        cols.insert("name".into(), Type::String);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let diags = typecheck_err("emit v = name.starts_with(5)", &["name"], &schema);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("starts_with") && d.message.contains("String")),
+            "expected an arg-type mismatch, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_method_arity_mismatch_rejected() {
+        // #488: `name.upper("x")` — upper takes no arguments.
+        let mut cols = IndexMap::new();
+        cols.insert("name".into(), Type::String);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let diags = typecheck_err("emit v = name.upper(\"x\")", &["name"], &schema);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("upper") && d.message.contains("argument")),
+            "expected an arity mismatch, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_typecheck_valid_arithmetic_and_methods_still_clean() {
+        // #464/#488 false-positive guard: legitimate arithmetic, comparison,
+        // and method calls — including nullable operands — stay clean.
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Int);
+        cols.insert("name".into(), Type::String);
+        cols.insert("nullable_amount".into(), Type::nullable(Type::Int));
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let fields = ["amount", "name", "nullable_amount"];
+        for src in [
+            "emit v = amount + 1",              // Int + Int
+            "emit v = amount > 5",              // Int comparison
+            "emit v = amount == 5",             // Int equality
+            "emit v = name.upper()",            // String method, no args
+            "emit v = name.starts_with(\"a\")", // String argument
+            "emit v = nullable_amount + 1",     // nullable Int arithmetic
+            "emit v = nullable_amount > 5",     // nullable Int comparison
+        ] {
+            let _ = typecheck_ok(src, &fields, &schema);
+        }
+    }
+
+    #[test]
+    fn test_typecheck_receiver_polymorphism_still_clean() {
+        // #488 false-positive guard for the value-dispatched receiver families
+        // the single-key registry cannot express: numeric methods on Decimal,
+        // date methods on DateTime, and join/length/find on Array must all
+        // remain clean.
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Decimal);
+        cols.insert("ts".into(), Type::DateTime);
+        cols.insert("tags".into(), Type::Array);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let fields = ["amount", "ts", "tags"];
+        for src in [
+            "emit v = amount.abs()",           // numeric method on Decimal
+            "emit v = amount.clamp(0, 100)",   // numeric args over a Decimal receiver
+            "emit v = ts.year()",              // date component on DateTime
+            "emit v = ts.hour()",              // time component on DateTime
+            "emit v = ts.format_date(\"%Y\")", // date method on DateTime
+            // add_days preserves the DateTime receiver kind, so comparing the
+            // shifted timestamp against another DateTime must stay clean.
+            "emit v = ts.add_days(1) > ts",
+            "emit v = ts.add_days(1).year()",
+            "emit v = tags.length()",                // length on Array
+            "emit v = tags.join(\",\")",             // join on Array
+            "emit v = tags.find(it => it == \"x\")", // find (closure) on Array
+            // Array `.find` returns the matched element (Any), not the String
+            // form's Bool, so composing on its result must stay clean.
+            "emit v = tags.find(it => it == \"x\").upper()",
+            "emit v = tags.find(it => it == \"x\") == \"x\"",
+            "emit v = ts.format(\"\")",     // format renders any receiver
+            "emit v = amount.format(\"\")", // format on a Decimal receiver
+        ] {
+            let _ = typecheck_ok(src, &fields, &schema);
+        }
+    }
+
+    #[test]
+    fn test_typecheck_decimal_numeric_composition_still_clean() {
+        // #464 false-positive guard: `numeric`-returning builtins over a decimal
+        // receiver (`clamp`/`min`/`max` are typed `Numeric`, not `Decimal`)
+        // compose with another decimal without a spurious mismatch. `numeric`
+        // may resolve to `int` at runtime, which widens exactly into decimal, so
+        // the pairing is not provably incompatible and must stay permissive.
+        let mut cols = IndexMap::new();
+        cols.insert("amount".into(), Type::Decimal);
+        cols.insert("fee".into(), Type::Decimal);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let fields = ["amount", "fee"];
+        for src in [
+            "emit v = amount.clamp(0, 100) + fee", // Numeric (clamp) + Decimal
+            "emit v = amount.min(fee) > fee",      // Numeric (min) ordered vs Decimal
+            "emit v = amount.max(fee) == fee",     // Numeric (max) equated with Decimal
+        ] {
+            let _ = typecheck_ok(src, &fields, &schema);
+        }
+    }
+
+    #[test]
+    fn test_typecheck_open_row_receiver_and_operands_permissive() {
+        // #464/#488 false-positive guard: on an open row, unknown fields type
+        // as Any (PassThrough), so method calls and arithmetic/comparison over
+        // them stay permissive rather than hard-error.
+        use super::super::row::TailVarId;
+        let cols = IndexMap::new();
+        let schema = Row::open(cols, Span::new(0, 0), TailVarId(0));
+        let fields = ["ext"];
+        for src in [
+            "emit v = ext.upper()",  // Any receiver
+            "emit v = ext + 1",      // Any operand arithmetic
+            "emit v = ext > 5",      // Any operand comparison
+            "emit v = ext == \"z\"", // Any operand equality
+        ] {
+            let _ = typecheck_ok(src, &fields, &schema);
+        }
+    }
+
+    #[test]
+    fn test_typecheck_debug_optional_prefix_arity() {
+        // #488: `.debug()` (no prefix) and `.debug("tag")` both type-check;
+        // `.debug("a", "b")` exceeds the single optional argument.
+        let mut cols = IndexMap::new();
+        cols.insert("name".into(), Type::String);
+        let schema = Row::closed(cols, Span::new(0, 0));
+        let _ = typecheck_ok("emit v = name.debug()", &["name"], &schema);
+        let _ = typecheck_ok("emit v = name.debug(\"tag\")", &["name"], &schema);
+        let diags = typecheck_err("emit v = name.debug(\"a\", \"b\")", &["name"], &schema);
+        assert!(
+            diags
+                .iter()
+                .any(|d| d.message.contains("debug") && d.message.contains("argument")),
+            "expected an over-arity diagnostic for debug, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_compile_oversized_int_literal_yields_diagnostic() {
+        // #448: an integer literal wider than i64 must surface as a parse
+        // diagnostic (the lexer emits Token::Error, the parser rejects it)
+        // rather than panicking in the lexer.
+        let parsed = Parser::parse("emit v = 99999999999999999999");
+        assert!(
+            !parsed.errors.is_empty(),
+            "expected a parse diagnostic for an oversized integer literal"
         );
     }
 }
