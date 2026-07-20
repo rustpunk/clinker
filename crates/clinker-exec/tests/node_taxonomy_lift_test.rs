@@ -761,10 +761,10 @@ nodes:
 // ---------------------------------------------------------------------
 
 #[test]
-fn test_compile_surfaces_cxl_type_error() {
+fn test_compile_surfaces_cxl_name_resolution_error() {
     // A transform that references a column absent from the upstream
-    // source schema must produce an E200 diagnostic during `compile()`,
-    // BEFORE any I/O occurs.
+    // source schema fails CXL name resolution, producing an E203
+    // diagnostic during `compile()`, BEFORE any I/O occurs.
     let yaml = r#"
 pipeline:
   name: bad_ref
@@ -792,11 +792,11 @@ nodes:
 "#;
     let cfg = parse_pipeline(yaml);
     let res = cfg.compile(&clinker_plan::config::CompileContext::default());
-    assert!(res.is_err(), "compile must fail on CXL type error");
+    assert!(res.is_err(), "compile must fail on unresolved CXL column");
     let diags = res.err().unwrap();
     assert!(
-        diags.iter().any(|d| d.code == "E200"),
-        "expected E200, got: {:?}",
+        diags.iter().any(|d| d.code == "E203"),
+        "expected E203, got: {:?}",
         diags.iter().map(|d| &d.code).collect::<Vec<_>>()
     );
 }

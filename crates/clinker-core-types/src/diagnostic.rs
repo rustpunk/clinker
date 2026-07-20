@@ -29,6 +29,8 @@
 //! | `E115`      | error    | Composition body node fails node-scoped config validation (same checks as top-level nodes) |
 //! | `E200`      | error    | CXL type error (compile-time typecheck failure)      |
 //! | `E201`      | error    | Source declaration missing required `schema:` field  |
+//! | `E202`      | error    | CXL parse error (compile-time CXL syntax failure)    |
+//! | `E203`      | error    | CXL name-resolution error (unresolved field / variable / module reference) |
 //! | `E210`      | error    | Source declares more than one of `{path,glob,regex,paths}` |
 //! | `E211`      | error    | Source declares none of `{path,glob,regex,paths}`    |
 //! | `E212`      | error    | Invalid glob pattern in source matcher               |

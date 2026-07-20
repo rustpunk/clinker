@@ -349,12 +349,13 @@ nodes:
         .expect_err("a predicate referencing an unknown column must fail to compile");
     // The diagnostic names both the offending rule (only the per-rule
     // attribution path, which is comment-tolerant, adds the rule name) and
-    // the unknown column.
+    // the unknown column. An unknown column is a CXL name-resolution
+    // failure, so the code is E203.
     assert!(
-        diags.iter().any(|d| d.code == "E200"
+        diags.iter().any(|d| d.code == "E203"
             && d.message.contains("bad_rule")
             && d.message.contains("nonexistent")),
-        "expected an E200 naming rule `bad_rule` and the unknown column, got {:?}",
+        "expected an E203 naming rule `bad_rule` and the unknown column, got {:?}",
         diags
             .iter()
             .map(|d| (d.code.clone(), d.message.clone()))

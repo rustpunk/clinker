@@ -124,10 +124,10 @@ fn footer_collect_is_e354() {
 
 #[test]
 fn footer_median_is_a_compile_error() {
-    // `median` is not a CXL aggregate function at all, so it fails typechecking
-    // as an unknown function (surfaced as E200) — a compile error either way,
-    // satisfying the "median(x) is a compile error" acceptance without a
-    // special case in the allow-list.
+    // `median` is not a CXL aggregate function at all, so it fails name
+    // resolution as an unresolved identifier (surfaced as E203) — a compile
+    // error either way, satisfying the "median(x) is a compile error"
+    // acceptance without a special case in the allow-list.
     let yaml = pipeline_with_envelope_config(
         "strategy: concat\nfooter:\n  interchange:\n    mid: median(amount)",
     );
@@ -136,7 +136,7 @@ fn footer_median_is_a_compile_error() {
         .compile(&CompileContext::default())
         .expect_err("median is not a CXL aggregate and must fail to compile");
     assert!(
-        err.iter().any(|d| d.code == "E200" || d.code == "E354"),
+        err.iter().any(|d| d.code == "E203" || d.code == "E354"),
         "median must surface a compile diagnostic (unknown function), got: {err:?}"
     );
 }

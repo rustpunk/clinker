@@ -204,8 +204,9 @@ target: normalize
 fn spliced_bad_cxl_errors_anchored_to_op() {
     // The op engine does not typecheck CXL, so a spliced node with a bad body
     // applies structurally and then fails in the ordinary `bind_schema` pass.
-    // Because the engine stamps the injected node with the op's location, that
-    // typecheck diagnostic (E200) still points at the op, not the base.
+    // The body references an unknown column, so it fails name resolution
+    // (E203). Because the engine stamps the injected node with the op's
+    // location, that diagnostic still points at the op, not the base.
     let op = parse_op(
         r#"
 op: add
@@ -226,7 +227,7 @@ after: normalize
 
     let cxl_err = diags
         .iter()
-        .find(|d| d.code == "E200" && d.primary.span.synthetic_line_number() == Some(op_line))
+        .find(|d| d.code == "E203" && d.primary.span.synthetic_line_number() == Some(op_line))
         .unwrap_or_else(|| {
             panic!("expected an op-spanned CXL diagnostic at line {op_line}, got: {diags:?}")
         });
