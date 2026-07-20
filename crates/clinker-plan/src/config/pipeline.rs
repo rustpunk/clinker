@@ -2814,9 +2814,7 @@ fn trace_output_lineage(config: &PipelineConfig, output_name: &str) -> OutputLin
             PipelineNode::Source { .. } => {
                 feeding_sources.insert(node_name.to_string());
             }
-            PipelineNode::Aggregate { .. }
-            | PipelineNode::Combine { .. }
-            | PipelineNode::Composition { .. } => {
+            PipelineNode::Aggregate { .. } | PipelineNode::Combine { .. } => {
                 // Record the first stripper found (deterministic by the
                 // declaration-order traversal seed), but keep walking so the
                 // feeding-source set stays complete for the E346 scoping.
@@ -2825,6 +2823,21 @@ fn trace_output_lineage(config: &PipelineConfig, output_name: &str) -> OutputLin
                 }
                 for up in node.direct_input_names() {
                     stack.push(up);
+                }
+            }
+            PipelineNode::Composition { inputs, .. } => {
+                // A Composition is a lineage stripper, but its feeding sources
+                // reach through EVERY bound `inputs:` port, not just the single
+                // primary port `direct_input_names` reports (`header.input`). A
+                // header/footer section declared on a source bound to a
+                // non-primary port is genuinely reachable, so the E346 scoping
+                // must union all ports — matching the all-ports resolution
+                // `build_node_source_sets` uses for the register / E348 passes.
+                if lineage_stripper.is_none() {
+                    lineage_stripper = Some(node_name.to_string());
+                }
+                for upstream in inputs.values() {
+                    stack.push(upstream.split('.').next().unwrap_or(upstream));
                 }
             }
             _ => {
@@ -3158,6 +3171,30 @@ fn doc_schema_for(source: &crate::config::SourceConfig) -> DocSchema {
     }
 }
 
+/// The single file-level header segment tag a segment/positional EDI format
+/// exposes as a declared `envelope.sections` entry, or `None` for a format
+/// with no such restriction.
+///
+/// Mirrors the readers' `prepare_document` check: X12 serves only `ISA`,
+/// EDIFACT only `UNB`, HL7 only `FHS` — the one segment each resolves from its
+/// bounded header pre-scan. Every other segment (and every non-`segment`
+/// extract) is rejected at read time; [`validate_config`] uses this to reject
+/// it at plan time instead (`E357`). SWIFT is deliberately absent: its reader
+/// serves declared sections under user-chosen or default block labels, so it
+/// has no single file-level tag to enforce.
+fn edi_file_level_segment(format: &InputFormat) -> Option<&'static str> {
+    match format {
+        InputFormat::X12(_) => Some("ISA"),
+        InputFormat::Edifact(_) => Some("UNB"),
+        InputFormat::Hl7(_) => Some("FHS"),
+        InputFormat::Csv(_)
+        | InputFormat::Json(_)
+        | InputFormat::Xml(_)
+        | InputFormat::FixedWidth(_)
+        | InputFormat::Swift(_) => None,
+    }
+}
+
 /// A rejected `$doc` path: the diagnostic code, formatted message, and
 /// fix-it help text. The code distinguishes a closed-schema rejection
 /// (`E341`) from a segment/positional one (`E348`).
@@ -3230,8 +3267,14 @@ fn closed_doc_path_problem(
 /// - a **synthesized level given a typed nested schema** (X12
 ///   `group_section` / `set_section`) is closed to its declared fields.
 ///
+/// When a declared `envelope.sections` name collides with a synthesized
+/// level (the engine reserves no names, so this is legal), the reader exposes
+/// BOTH views, so the field check is their UNION: a field valid under the
+/// declared closed view OR the synthesized level view resolves. The declared
+/// view is not allowed to shadow the synthesized positional access.
+///
 /// Returns the `E348` diagnostic content for a section outside the known
-/// set, or a field that section's reader will not serve.
+/// set, or a field neither view's reader will serve.
 fn segment_positional_doc_path_problem(
     source: &crate::config::SourceConfig,
     schema: &SegmentPositionalSchema,
@@ -3280,26 +3323,26 @@ fn segment_positional_doc_path_problem(
         });
     }
 
-    // A declared file-level section (`ISA`/`UNB`/`FHS`) is closed: the
-    // reader serves only its declared fields.
-    if let Some(section) = declared_section {
-        if section.fields.contains_key(field_name) {
-            return None;
-        }
-        return Some(undeclared_field_in_closed_section(
-            source_name,
-            format,
-            section_name,
-            field_name,
-            "`envelope.sections`",
-        ));
+    // A field resolves at run time if EITHER the declared closed view OR the
+    // synthesized level view serves it. When a declared `envelope.sections`
+    // name collides with a synthesized level (e.g. a user names a declared
+    // section `transaction_set`), the reader exposes BOTH — the declared
+    // file-level section and the synthesized positional level — so a field
+    // valid under either must be accepted. Resolving declared-first would let
+    // the closed declared view shadow the synthesized positional access and
+    // reject a legitimate `eNN`/`fNN` element the reader would serve.
+
+    // Declared closed view: a declared file-level section serves only its
+    // declared fields.
+    if declared_section.is_some_and(|s| s.fields.contains_key(field_name)) {
+        return None;
     }
 
-    // A synthesized nested level: closed to its declared schema if it has
-    // one, else keyed by positional elements up to the bound. `synthesized`
-    // is `Some` here — the both-`None` case returned above, and the
-    // `declared_section` case returned just above — but match it rather than
-    // unwrap so the exhaustive path is explicit.
+    // Not served by the declared view (no declared section for this name, or
+    // the field is not one it declares). Fall through to the synthesized level,
+    // which may serve the field even when a same-named declared section does
+    // not: closed to its declared schema if it has one, else keyed by
+    // positional elements up to the bound.
     match synthesized.map(|s| &s.fields) {
         Some(SynthesizedFields::Declared(fields)) => {
             if fields.iter().any(|f| f == field_name) {
@@ -3321,7 +3364,16 @@ fn segment_positional_doc_path_problem(
             schema.positional_prefix,
             schema.max_positional,
         ),
-        None => None,
+        // No synthesized level for this name — the section is a declared
+        // file-level section only (the both-`None` case returned earlier), and
+        // the declared view above already rejected the field, so it is a typo.
+        None => Some(undeclared_field_in_closed_section(
+            source_name,
+            format,
+            section_name,
+            field_name,
+            "`envelope.sections`",
+        )),
     }
 }
 
@@ -4490,6 +4542,52 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                          `/{pointer}`)",
                         source = input.name,
                     )));
+                }
+            }
+
+            // For X12 / EDIFACT / HL7, only the file-level header segment is
+            // extractable as a declared envelope section: X12 `ISA`, EDIFACT
+            // `UNB`, HL7 `FHS`. The readers reject any other `extract.segment:`
+            // tag — and any non-`segment` extract — at read time in
+            // `prepare_document`; the nested tiers (X12 GS/ST, EDIFACT UNH, HL7
+            // BHS/MSH) surface as nested `$doc` levels rather than declared
+            // sections, and trailer segments are validated as they stream, not
+            // exposed as sections. Mirror that check here so the mistake fails
+            // on `--explain` rather than only when the reader opens the source.
+            if let Some(file_level_tag) = edi_file_level_segment(&input.format) {
+                for (section_name, section) in &envelope.sections {
+                    let extractable = matches!(
+                        &section.extract,
+                        clinker_format::EnvelopeExtract::Segment(tag) if tag == file_level_tag
+                    );
+                    if !extractable {
+                        let declared = match &section.extract {
+                            clinker_format::EnvelopeExtract::Segment(tag) => {
+                                format!("segment `{tag}`")
+                            }
+                            clinker_format::EnvelopeExtract::XmlPath(_) => {
+                                "an `xml_path` extract".to_string()
+                            }
+                            clinker_format::EnvelopeExtract::JsonPointer(_) => {
+                                "a `json_pointer` extract".to_string()
+                            }
+                            clinker_format::EnvelopeExtract::RecordType(_) => {
+                                "a `record_type` extract".to_string()
+                            }
+                        };
+                        return Err(ConfigError::Validation(format!(
+                            "[E357] source '{source}': envelope section '{section_name}' declares \
+                             {declared} on a {fmt} source, but only the file-level header segment \
+                             `{file_level_tag}` is extractable as a declared section — it is the \
+                             one segment the reader resolves from its bounded header pre-scan. \
+                             Nested tiers surface as nested `$doc` levels, not declared sections, \
+                             and trailer segments are validated by the reader, not exposed as \
+                             sections. Use `extract: {{ segment: {file_level_tag} }}`, or drop the \
+                             section",
+                            source = input.name,
+                            fmt = input.format.format_name(),
+                        )));
+                    }
                 }
             }
         }
