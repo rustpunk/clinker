@@ -368,13 +368,15 @@ fn value_to_csv_cell(col: &str, value: &Value) -> Result<String, FormatError> {
 /// Append a Value's CSV cell rendering to `buf`. Sharing one renderer keeps the
 /// record hot path and the envelope section path byte-identical.
 ///
-/// `Value::Map` has no canonical scalar serialization for a CSV cell
-/// (silently JSON-encoding hides routing bugs — e.g. a `$widened`
-/// sidecar reaching the writer without the projection layer's
-/// `include_unmapped: true` expansion), so this returns
-/// `FormatError::UnserializableMapValue` carrying the offending
-/// column. CSV is the single point of truth for map rejection on
-/// this path; there is no upstream pre-walk.
+/// `Value::Map` and `Value::Array` have no canonical scalar serialization
+/// for a CSV cell (silently JSON-encoding either one hides routing bugs —
+/// e.g. a `$widened` sidecar reaching the writer without the projection
+/// layer's `include_unmapped: true` expansion for a map, or a
+/// `match: collect` combine output misrouted to CSV for an array), so this
+/// returns `FormatError::UnserializableMapValue` /
+/// `FormatError::UnserializableArrayValue` carrying the offending column.
+/// CSV is the single point of truth for collection rejection on this path;
+/// there is no upstream pre-walk.
 fn write_csv_cell(buf: &mut String, col: &str, value: &Value) -> Result<(), FormatError> {
     use std::fmt::Write as _;
     match value {
@@ -397,7 +399,12 @@ fn write_csv_cell(buf: &mut String, col: &str, value: &Value) -> Result<(), Form
         Value::DateTime(dt) => {
             let _ = write!(buf, "{}", dt.format("%Y-%m-%dT%H:%M:%S"));
         }
-        Value::Array(arr) => buf.push_str(&serde_json::to_string(arr).unwrap_or_default()),
+        Value::Array(_) => {
+            return Err(FormatError::UnserializableArrayValue {
+                format: "CSV",
+                column: col.to_string(),
+            });
+        }
         Value::Map(_) => {
             return Err(FormatError::UnserializableMapValue {
                 format: "CSV",
@@ -722,6 +729,40 @@ mod tests {
             }
             other => panic!("expected UnserializableMapValue, got {other:?}"),
         }
+    }
+
+    /// CSV writer rejects `Value::Array` payloads with
+    /// `FormatError::UnserializableArrayValue`, parallel to the map
+    /// rejection. A stray array at a CSV cell (e.g. a `match: collect`
+    /// combine output misrouted to CSV) previously JSON-encoded into a
+    /// single cell, silently hiding the misroute.
+    #[test]
+    fn test_csv_writer_rejects_array_value() {
+        let schema = make_schema(&["id", "tags"]);
+        let record = make_record(
+            &schema,
+            vec![
+                Value::Integer(7),
+                Value::Array(vec![Value::String("a".into()), Value::String("b".into())]),
+            ],
+        );
+        let mut buf = Vec::new();
+        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), CsvWriterConfig::default());
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::UnserializableArrayValue { format, column } => {
+                assert_eq!(format, "CSV");
+                assert_eq!(column, "tags");
+            }
+            other => panic!("expected UnserializableArrayValue, got {other:?}"),
+        }
+        // The header row wrote before the failing cell, but no body row with a
+        // JSON-encoded array cell was emitted.
+        drop(writer);
+        assert!(
+            !String::from_utf8_lossy(&buf).contains("[\"a\""),
+            "the array must not be JSON-encoded into a cell"
+        );
     }
 
     use crate::envelope_writer::test_doc_with_sections as doc_with_sections;

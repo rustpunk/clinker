@@ -44,11 +44,12 @@ cargo run -p clinker -- run pipeline.yaml
 You should see something like:
 
 ```
-INFO clinker: Pipeline complete: 12 total, 3 ok, 3 written, 4 dlq
+INFO clinker: Pipeline complete: 24 total, 3 ok, 3 written, 4 dlq
 ```
 
-12 source rows produce 6 initial aggregate output rows (one per
-`(department, day)` group). The post-aggregate `dept_validate`
+The 24 total counts both inputs (12 orders joined with 12 audit
+events). The 12 orders produce 6 initial aggregate output rows (one
+per `(department, day)` group). The post-aggregate `dept_validate`
 predicate fails on every HR group; the synthetic-CK fan-out
 retracts the contributing source rows so the final report
 `output/report.csv` contains only the three ENG rows. The DLQ
@@ -57,18 +58,29 @@ sentinel) plus one `transform:dept_validate` trigger per failing
 HR group:
 
 ```
-department,day,total,min_amount,n,order_ids,anomaly_check
-ENG,2024-01-01,500,500,1,"[{""String"":""O05""}]",0
-ENG,2024-01-02,1190,440,2,"[{""String"":""O06""},{""String"":""O07""}]",0
-ENG,2024-01-03,940,330,2,"[{""String"":""O10""},{""String"":""O11""}]",0
+department,day,total,min_amount,n,order_ids,$ck.aggregate.dept_totals,anomaly_check
+ENG,2024-01-01,500,500,1,O05,3,0
+ENG,2024-01-02,1190,440,2,O06;O07,4,0
+ENG,2024-01-03,940,330,2,O10;O11,5,0
 ```
+
+The `order_ids` cell is the aggregate's `collect(order_id)` binding
+joined into a `;`-separated scalar by the `dept_validate` Transform.
+The CSV writer rejects a raw array field (a stray collection reaching
+a tabular sink is treated as a routing bug), so a `collect` result
+bound for CSV/XML/fixed-width output is coerced to a scalar first —
+here with `order_ids.join(";")`; route to JSON output instead if you
+want the array serialized natively. The trailing
+`$ck.aggregate.dept_totals` column is the relaxed-CK aggregate's
+synthetic lineage key, surfaced here only because the Output sets
+`include_correlation_keys: true` (it is hidden from default writers).
 
 If you remove the BAD row from `data/orders.csv` and rerun, the
 post-aggregate failures fire on the same three HR groups (the
 predicate is a property of the surviving totals, not of the
 sentinel) and the writer payload is bit-for-bit identical to the
 retract-corrected run. The smoke test at
-`crates/clinker-core/tests/retract_demo_smoke.rs` asserts this
+`crates/clinker-exec/tests/retract_demo_smoke.rs` asserts this
 equivalence.
 
 ## Inspect the plan

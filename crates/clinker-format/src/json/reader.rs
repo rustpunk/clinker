@@ -486,7 +486,9 @@ impl FormatReader for JsonReader {
             };
             let typed = coerce_json_section_fields(name, payload_obj, &section.fields, &index)?;
             let path = doc_path_for_section(name);
-            index.insert(&path, Value::Map(Box::new(typed)))?;
+            index
+                .insert(&path, Value::Map(Box::new(typed)))
+                .map_err(FormatError::Json)?;
         }
         Ok(index.into_sections())
     }

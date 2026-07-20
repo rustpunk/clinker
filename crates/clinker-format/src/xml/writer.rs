@@ -188,6 +188,13 @@ impl<W: Write> XmlWriter<W> {
 
     fn write_header(&mut self) -> Result<(), FormatError> {
         if !self.header_written {
+            // The root and record element names come straight from config into
+            // `BytesStart::new`; validate them before opening the root so a
+            // malformed configured name fails loud rather than corrupting the
+            // document. Both are checked here, once, before any record element
+            // is emitted (every write path opens the header first).
+            check_xml_name(&self.config.root_element, "root element")?;
+            check_xml_name(&self.config.record_element, "record element")?;
             self.header_written = true;
             let start = BytesStart::new(&self.config.root_element);
             self.writer
@@ -522,6 +529,23 @@ fn is_valid_xml_name(name: &str) -> bool {
     chars.all(is_xml_name_char)
 }
 
+/// Reject a tag name quick-xml would otherwise write verbatim into a start
+/// tag via `BytesStart::new`. Element (leaf / branch) names derive from
+/// user field names and the configured root / record element names, so a
+/// name with a leading digit, a space, or an illegal character (e.g. a
+/// field literally named `1st` or `a b`) would emit malformed markup while
+/// still reporting run success. `context` describes the name's origin for
+/// the diagnostic (e.g. `"field 'X': element"`, `"root element"`).
+fn check_xml_name(name: &str, context: &str) -> Result<(), FormatError> {
+    if is_valid_xml_name(name) {
+        Ok(())
+    } else {
+        Err(FormatError::Xml(format!(
+            "{context} name '{name}' is not a well-formed XML name"
+        )))
+    }
+}
+
 /// Insert a dotted field name into the tree, creating branches as needed.
 /// An attribute-prefixed segment must be the path's final segment (an
 /// attribute is a leaf — nothing can nest under it); `field` is the full
@@ -540,6 +564,7 @@ fn insert_field(
                  cannot have fields nested under it — an XML attribute is a leaf"
             )));
         }
+        check_xml_name(first, &format!("field '{field}': element"))?;
         // Find or create a branch for `first`
         let branch = body
             .children
@@ -576,6 +601,7 @@ fn insert_field(
         body.attrs.push((attr_name.to_string(), text.to_string()));
         Ok(())
     } else {
+        check_xml_name(path, &format!("field '{field}': element"))?;
         body.children.push(FieldNode::Leaf {
             name: path.to_string(),
             text: text.to_string(),
@@ -586,16 +612,15 @@ fn insert_field(
 
 /// Convert a clinker Value to XML text content.
 ///
-/// `Value::Map` has no canonical scalar serialization for an XML
-/// element body (silently JSON-encoding hides routing bugs — e.g. a
-/// `$widened` sidecar reaching the writer without
-/// `include_unmapped: true` expansion), so this returns
-/// `FormatError::UnserializableMapValue` carrying the offending
-/// column. XML is the single point of truth for map rejection on
-/// this path; there is no upstream pre-walk.
-///
-/// Array elements that themselves contain a `Value::Map` propagate
-/// the same rejection (the array is joined element-wise).
+/// `Value::Map` and `Value::Array` have no canonical scalar serialization
+/// for an XML element body (silently JSON-encoding a map, or comma-joining
+/// an array, hides routing bugs — e.g. a `$widened` sidecar reaching the
+/// writer without `include_unmapped: true` expansion for a map, or a
+/// `match: collect` combine output misrouted to XML for an array), so this
+/// returns `FormatError::UnserializableMapValue` /
+/// `FormatError::UnserializableArrayValue` carrying the offending column.
+/// XML is the single point of truth for collection rejection on this path;
+/// there is no upstream pre-walk.
 fn value_to_text(col: &str, val: &Value) -> Result<String, FormatError> {
     let mut buf = String::new();
     write_value_text(&mut buf, col, val)?;
@@ -604,8 +629,8 @@ fn value_to_text(col: &str, val: &Value) -> Result<String, FormatError> {
 
 /// Render a clinker Value as XML text content into `buf` (appending). Shares
 /// its logic with [`value_to_text`] so the record fast path and the envelope
-/// section path stay byte-identical. `Value::Map` is rejected exactly as
-/// `value_to_text` documents.
+/// section path stay byte-identical. `Value::Map` and `Value::Array` are
+/// rejected exactly as `value_to_text` documents.
 fn write_value_text(buf: &mut String, col: &str, val: &Value) -> Result<(), FormatError> {
     use std::fmt::Write as _;
     match val {
@@ -629,13 +654,11 @@ fn write_value_text(buf: &mut String, col: &str, val: &Value) -> Result<(), Form
         Value::DateTime(dt) => {
             let _ = write!(buf, "{dt}");
         }
-        Value::Array(arr) => {
-            for (idx, v) in arr.iter().enumerate() {
-                if idx > 0 {
-                    buf.push(',');
-                }
-                write_value_text(buf, col, v)?;
-            }
+        Value::Array(_) => {
+            return Err(FormatError::UnserializableArrayValue {
+                format: "XML",
+                column: col.to_string(),
+            });
         }
         Value::Map(_) => {
             return Err(FormatError::UnserializableMapValue {
@@ -736,6 +759,7 @@ fn plan_insert_field(
                  cannot have fields nested under it — an XML attribute is a leaf"
             )));
         }
+        check_xml_name(first, &format!("field '{field}': element"))?;
         let branch = body
             .children
             .iter_mut()
@@ -789,6 +813,7 @@ fn plan_insert_field(
         });
         Ok(())
     } else {
+        check_xml_name(path, &format!("field '{field}': element"))?;
         body.children.push(PlanNode::Leaf {
             name: path.to_string(),
             field: field_index,
@@ -1153,6 +1178,156 @@ mod tests {
             }
             other => panic!("expected UnserializableMapValue, got {other:?}"),
         }
+    }
+
+    /// XML writer rejects `Value::Array` payloads with
+    /// `FormatError::UnserializableArrayValue`, parallel to the map
+    /// rejection. The prior behavior comma-joined the array's elements
+    /// inside a single element, silently hiding a misroute (e.g. a
+    /// `match: collect` combine output sent to XML). `fill_values` runs
+    /// before any bytes, so the rejected record leaves no partial output.
+    #[test]
+    fn test_xml_writer_rejects_array_value() {
+        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![
+                Value::Integer(7),
+                Value::Array(vec![Value::String("a".into()), Value::String("b".into())]),
+            ],
+        );
+        let mut buf = Vec::new();
+        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::UnserializableArrayValue { format, column } => {
+                assert_eq!(format, "XML");
+                assert_eq!(column, "tags");
+            }
+            other => panic!("expected UnserializableArrayValue, got {other:?}"),
+        }
+        drop(writer);
+        assert!(
+            buf.is_empty(),
+            "rejected record must not leave partial output behind"
+        );
+    }
+
+    /// Assert that writing a single record whose only field is `field`
+    /// fails with `FormatError::Xml` naming the field and explaining the
+    /// malformed element name, leaving no partial bytes behind.
+    fn assert_element_name_rejected(field: &str) {
+        let schema = Arc::new(Schema::new(vec![field.into()]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
+        let mut buf = Vec::new();
+        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::Xml(msg) => {
+                assert!(msg.contains(field), "message names the field: {msg}");
+                assert!(
+                    msg.contains("well-formed XML name"),
+                    "message explains the failure is a malformed name: {msg}"
+                );
+            }
+            other => panic!("expected FormatError::Xml, got {other:?}"),
+        }
+        drop(writer);
+        assert!(
+            buf.is_empty(),
+            "rejected record must not leave partial output behind"
+        );
+    }
+
+    #[test]
+    fn test_xml_write_leaf_element_name_starting_with_digit_rejected() {
+        // A digit is a NameChar but not a NameStartChar, so a field literally
+        // named `1st` cannot become an XML element `<1st>`.
+        assert_element_name_rejected("1st");
+    }
+
+    #[test]
+    fn test_xml_write_leaf_element_name_with_space_rejected() {
+        // A space is not an XML NameChar; writing it unvalidated would emit
+        // `<first name>`, corrupting the start tag.
+        assert_element_name_rejected("first name");
+    }
+
+    #[test]
+    fn test_xml_write_branch_element_name_invalid_rejected() {
+        // The dotted branch segment `1bad` cannot begin an XML name, so
+        // `1bad.city` is rejected before an `<1bad>` branch is emitted.
+        assert_element_name_rejected("1bad.city");
+    }
+
+    #[test]
+    fn test_xml_write_unicode_leaf_element_name_accepted() {
+        // `café` is a well-formed XML name (`é` is a NameChar), so the new
+        // element-name validation does not over-reject non-ASCII field names.
+        let schema = Arc::new(Schema::new(vec!["café".into()]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::Integer(1)]);
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert_eq!(output, "<Root><Record><café>1</café></Record></Root>");
+    }
+
+    #[test]
+    fn test_xml_write_invalid_record_element_name_rejected() {
+        // The configured record element name flows straight into
+        // `BytesStart::new`; a malformed one fails loud before any output.
+        let schema = Arc::new(Schema::new(vec!["name".into()]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::String("A".into())]);
+        let config = XmlWriterConfig {
+            record_element: "1record".into(),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), config);
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::Xml(msg) => {
+                assert!(
+                    msg.contains("record element"),
+                    "message names the record element: {msg}"
+                );
+                assert!(msg.contains("1record"), "message names the value: {msg}");
+            }
+            other => panic!("expected FormatError::Xml, got {other:?}"),
+        }
+        drop(writer);
+        assert!(
+            buf.is_empty(),
+            "no output before a rejected record element name"
+        );
+    }
+
+    #[test]
+    fn test_xml_write_invalid_root_element_name_rejected() {
+        // The configured root element name is validated at header open, so a
+        // malformed one fails loud rather than emitting `<1root>`.
+        let schema = Arc::new(Schema::new(vec!["name".into()]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::String("A".into())]);
+        let config = XmlWriterConfig {
+            root_element: "1root".into(),
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), config);
+        let err = writer.write_record(&record).unwrap_err();
+        match err {
+            FormatError::Xml(msg) => {
+                assert!(
+                    msg.contains("root element"),
+                    "message names the root element: {msg}"
+                );
+                assert!(msg.contains("1root"), "message names the value: {msg}");
+            }
+            other => panic!("expected FormatError::Xml, got {other:?}"),
+        }
+        drop(writer);
+        assert!(
+            buf.is_empty(),
+            "no output before a rejected root element name"
+        );
     }
 
     #[test]

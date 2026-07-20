@@ -4,6 +4,9 @@
 # Stresses the Collect per-group cap and array-valued output path.
 # `cxl:` must be empty under collect — the executor synthesizes the
 # output schema as {driver fields..., <build_qualifier>: Array}.
+# Output is NDJSON: the tabular writers reject an array-valued field,
+# so a `collect` result is routed to a format that serializes arrays
+# natively.
 
 pipeline:
   name: bench-combine-equi-2input-collect
@@ -54,6 +57,8 @@ nodes:
     input: gather_trips
     config:
       name: drivers_with_trips_out
-      type: csv
-      path: bench://output.csv
+      type: json
+      options:
+        format: ndjson
+      path: bench://output.ndjson
       include_unmapped: true

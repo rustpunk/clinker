@@ -14,6 +14,9 @@ nodes:
         - { name: f0, type: string }
         - { name: f1, type: string }
 
+  # `split` returns an array; the CSV sink rejects an array-valued field,
+  # so the result is joined back to a scalar to keep this a tabular
+  # CSV-output workload (route to JSON instead to keep the raw array).
   - type: transform
     name: strings
     input: source
@@ -32,7 +35,7 @@ nodes:
         emit s_sw = f1.starts_with("a")
         emit s_ct = f1.contains("e")
         emit s_find = f1.find("e")
-        emit s_split = f1.split(",")
+        emit s_split = f1.split(",").join(";")
 
   - type: output
     name: sink

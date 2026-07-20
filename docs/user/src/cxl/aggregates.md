@@ -98,6 +98,11 @@ cxl: |
   emit all_order_ids = collect(order_id)
 ```
 
+Because `collect` emits an array, route the result to a JSON output
+(which serializes arrays natively) or coerce it to a scalar in a
+downstream `Transform` (for example `emit ids = all_order_ids.join(";")`).
+The CSV, XML, and fixed-width writers reject an array-valued field.
+
 ### weighted_avg(value, weight) -> Float or Decimal
 
 Computes a weighted average: `sum(value * weight) / sum(weight)`. Takes two arguments.
@@ -172,6 +177,11 @@ pipeline:
     - name: output
       type: output
       input: monthly_summary
-      format: csv
-      path: summary.csv
+      format: json
+      path: summary.json
 ```
+
+This pipeline outputs JSON because `all_reps = collect(sales_rep)`
+emits an array, which the tabular writers (CSV/XML/fixed-width)
+reject; drop the `collect` binding or coerce it with a downstream
+`Transform` to keep a CSV sink.

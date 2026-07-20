@@ -355,8 +355,10 @@ nodes:
     input: collect_call
     config:
       name: out
-      type: csv
-      path: out.csv
+      type: json
+      options:
+        format: ndjson
+      path: out.ndjson
       include_unmapped: true
 "#;
     // Driver row 1 matches two build rows (A → Widget, A → WidgetPro);
@@ -368,21 +370,22 @@ nodes:
         &[("orders_src", orders_csv), ("products_src", products_csv)],
     );
 
-    // Driver columns appear in the output header; the build-side
-    // qualifier (`products`) appears as the trailing Array column.
+    // Driver columns appear as object keys; the build-side qualifier
+    // (`products`) is the collect Array field a non-JSON writer would
+    // reject, serialized natively here as an NDJSON array.
     assert!(
         output.contains("order_id"),
-        "output header must include driver column order_id; got:\n{output}"
+        "output must include driver column order_id; got:\n{output}"
     );
     assert!(
         output.contains("products"),
-        "output header must include collect-mode trailing array column \
-         named after the build qualifier; got:\n{output}"
+        "output must include collect-mode array field named after the build \
+         qualifier; got:\n{output}"
     );
     // Each driver row shows up once in the output — collect emits
     // ONE row per driver regardless of match count.
-    let order_1_count = output.matches("\n1,").count();
-    let order_2_count = output.matches("\n2,").count();
+    let order_1_count = output.matches(r#""order_id":"1""#).count();
+    let order_2_count = output.matches(r#""order_id":"2""#).count();
     assert_eq!(
         order_1_count, 1,
         "driver row 1 must appear exactly once; got:\n{output}"
@@ -391,10 +394,8 @@ nodes:
         order_2_count, 1,
         "driver row 2 must appear exactly once; got:\n{output}"
     );
-    // Both build rows for product_id=A must be encoded in row 1's
-    // trailing array column. CSV array encoding is implementation-
-    // defined, but both build names must appear somewhere in the
-    // text serialisation.
+    // Both build rows for product_id=A must be encoded in row 1's array
+    // field; both build names must appear in the JSON serialization.
     assert!(
         output.contains("Widget"),
         "row for A must reference build product 'Widget'; got:\n{output}"

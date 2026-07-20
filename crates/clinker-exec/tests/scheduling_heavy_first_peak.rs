@@ -115,8 +115,8 @@ nodes:
     input: joined
     config:
       name: out
-      type: csv
-      path: out.csv
+      type: json
+      path: out.json
       include_unmapped: true
 "#
     )

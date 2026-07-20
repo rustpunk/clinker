@@ -246,6 +246,8 @@ nodes:
       path: in.json
       options:
         record_path: small.rows
+      array_paths:
+        - { path: tags, mode: join }
       schema:
         - { name: id, type: string }
         - { name: tags, type: array }
@@ -271,7 +273,9 @@ sources:
 ",
     );
 
-    // Base: record_path points at the single-row array; no explosion.
+    // Base: record_path points at the single-row array; `tags` joins to a
+    // scalar cell (non-JSON writers reject a stray `Value::Array`, so an
+    // unexploded array column must collapse to a scalar before the CSV emit).
     let base = run_in(p, &[]);
     assert!(base.status.success(), "base json run failed");
     let base_out = std::fs::read_to_string(p.join("out.csv")).expect("read out.csv");
@@ -279,7 +283,8 @@ sources:
     assert_eq!(base_rows, 1, "base output:\n{base_out}");
 
     // Channel: record_path override selects the three-row array, and the
-    // array_paths explode fans each record out per tag → 4 rows.
+    // array_paths op flips `tags` from join to explode, fanning each record
+    // out per tag → 4 rows.
     let patched = run_in(p, &["--channel", "jfix"]);
     assert!(
         patched.status.success(),
