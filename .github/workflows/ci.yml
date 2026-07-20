@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Auto-update PR branches rebases open PRs with the default GITHUB_TOKEN, and
+  # pushes made with that token never start a workflow run. Manual dispatch is
+  # therefore the only way to re-validate a rebased branch without pushing to it.
+  # Dispatched runs report against the selected branch rather than the PR's merge
+  # ref, so they appear in the Actions tab instead of the PR's check list.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
