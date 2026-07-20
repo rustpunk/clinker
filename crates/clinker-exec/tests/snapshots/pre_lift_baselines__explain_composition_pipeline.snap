@@ -86,8 +86,8 @@ Worker threads: 4
 
 === DAG Topology ===
 
-  ● [source] addresses_src (line:17)
-  │ [composition:body=<ID>] addr_norm (line:40)
-  ● [source] customers_src (line:7)
-  │ [composition:body=<ID>] enrich1 (line:29)
-  │ [output] enriched_out (line:49)
+  ● [source] addresses_src (line:15)
+  │ [composition:body=<ID>] addr_norm (line:38)
+  ● [source] customers_src (line:5)
+  │ [composition:body=<ID>] enrich1 (line:27)
+  │ [output] enriched_out (line:47)
