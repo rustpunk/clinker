@@ -1907,9 +1907,9 @@ nodes:
     /// sibling node would have triggered a CXL error in bind_schema.
     ///
     /// Previously combine undeclared-input emission lived in stage-5
-    /// edge wiring AFTER bind_schema. A fixture with both an E200 (CXL)
+    /// edge wiring AFTER bind_schema. A fixture with both a CXL error
     /// on one node and a combine-undeclared on another would surface
-    /// ONLY the E200; the combine typo was invisible until the user
+    /// ONLY the CXL error; the combine typo was invisible until the user
     /// fixed the unrelated CXL error first. The unified
     /// `resolve_all_input_references` pass moves combine-undeclared
     /// forward to the structural stage so it fires regardless of what
@@ -1917,8 +1917,8 @@ nodes:
     ///
     /// `compile_topology_only`'s early return still short-circuits
     /// bind_schema once any structural-stage E004 exists, so this
-    /// fixture surfaces ONLY E004 (not both E200 and E004 in the same
-    /// pass). The load-bearing user-facing fix — combine typo no
+    /// fixture surfaces ONLY E004 (not both the CXL error and E004 in
+    /// the same pass). The load-bearing user-facing fix — combine typo no
     /// longer hidden by a sibling CXL error — is what this regression
     /// locks in.
     #[test]
@@ -1960,8 +1960,8 @@ nodes:
         // The load-bearing assertion: combine-undeclared is visible
         // here, with the structured payload identifying the broken
         // qualifier. Pre-remediation this combine typo would have been
-        // hidden behind cxl_broken's sibling E200 (because E307 lived
-        // in stage-5 Phase-2 after bind_schema's early return).
+        // hidden behind cxl_broken's sibling CXL error (because E307
+        // lived in stage-5 Phase-2 after bind_schema's early return).
         let combine_e004 = diags
             .iter()
             .find(|d| {
@@ -1971,7 +1971,7 @@ nodes:
                 panic!(
                     "expected an E004 with combine-arm payload from \
                      broken_combine.products → nowhere even though \
-                     cxl_broken would have triggered an E200 in bind_schema. \
+                     cxl_broken would have triggered a CXL error in bind_schema. \
                      The unified input-reference pass at stage 3.5 must \
                      fire BEFORE bind_schema. got: {diags:#?}"
                 )

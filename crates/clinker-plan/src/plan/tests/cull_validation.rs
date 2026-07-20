@@ -175,14 +175,15 @@ fn drop_group_when_unknown_field_rejected() {
           drop_group_when: "sum(nonexistent) > 0""#,
     );
     let diags = compile_diagnostics(&yaml);
-    // The typecheck reports the unknown field; the exact wording comes from
-    // the CXL resolver, so pin the field name and the node label.
+    // The CXL resolver reports the unknown field, so this is a
+    // name-resolution failure (E203), not a type error. Pin the field
+    // name and the node label.
     let found = diags
         .iter()
-        .any(|(code, msg)| code == "E200" && msg.contains("nonexistent"));
+        .any(|(code, msg)| code == "E203" && msg.contains("nonexistent"));
     assert!(
         found,
-        "expected an E200 naming the unknown field `nonexistent`, got {diags:?}"
+        "expected an E203 naming the unknown field `nonexistent`, got {diags:?}"
     );
 }
 

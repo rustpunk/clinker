@@ -347,6 +347,9 @@ fn parse_dotted_path(path: &str) -> Result<(&str, &str), ProvenanceExplainError>
 /// contract is enforced by `test_explain_docs_all_have_required_sections`.
 pub fn explain_code(code: &str) -> Option<&'static str> {
     match code {
+        "E200" => Some(include_str!("../../../../docs/explain/E200.md")),
+        "E202" => Some(include_str!("../../../../docs/explain/E202.md")),
+        "E203" => Some(include_str!("../../../../docs/explain/E203.md")),
         "E101" => Some(include_str!("../../../../docs/explain/E101.md")),
         "E102" => Some(include_str!("../../../../docs/explain/E102.md")),
         "E103" => Some(include_str!("../../../../docs/explain/E103.md")),
@@ -616,13 +619,13 @@ mod tests {
     #[test]
     fn test_explain_docs_all_have_required_sections() {
         let codes = [
-            "E101", "E102", "E103", "E104", "E106", "E107", "E108", "E115", "E150b", "E150c",
-            "E150d", "E150e", "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308",
-            "E309", "E310", "E311", "E312", "E313", "E319", "E320", "E321", "E323", "E324", "E325",
-            "E326", "E327", "E330", "E331", "E332", "E333", "E334", "E335", "E336", "E337", "E338",
-            "E339", "E340", "E341", "E342", "E343", "E344", "E345", "E346", "E347", "E348", "E349",
-            "E350", "E351", "E352", "E353", "E354", "E355", "E356", "E357", "E15Y", "W101", "W302",
-            "W305", "W306",
+            "E200", "E202", "E203", "E101", "E102", "E103", "E104", "E106", "E107", "E108", "E115",
+            "E150b", "E150c", "E150d", "E150e", "E300", "E301", "E303", "E304", "E305", "E306",
+            "E307", "E308", "E309", "E310", "E311", "E312", "E313", "E319", "E320", "E321", "E323",
+            "E324", "E325", "E326", "E327", "E330", "E331", "E332", "E333", "E334", "E335", "E336",
+            "E337", "E338", "E339", "E340", "E341", "E342", "E343", "E344", "E345", "E346", "E347",
+            "E348", "E349", "E350", "E351", "E352", "E353", "E354", "E355", "E356", "E357", "E15Y",
+            "W101", "W302", "W305", "W306",
         ];
         let required_sections = [
             "## What it means",

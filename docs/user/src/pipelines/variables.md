@@ -101,7 +101,7 @@ CXL access is identical for declared and built-in keys:
       emit confidence = $record.fuzzy_score
 ```
 
-Reads of undeclared keys are rejected with **E200** (CXL name
+Reads of undeclared keys are rejected with **E203** (CXL name
 resolution failed) at compile time, with a "did you mean" suggestion
 that scans the declared registry.
 
@@ -200,7 +200,7 @@ checked against the pipeline. Each code below tells you what to fix.
 | E173 | Composition body reads a parent scoped var without opting in.          |
 | E174 | Composition `_compose.scoped_vars` declares a different type than the parent. |
 | E175 | An init-phase node reads a runtime-only writer's variable.             |
-| E200 | A reference to an undeclared scoped variable (resolver-level failure). |
+| E203 | A reference to an undeclared scoped variable (resolver-level failure). |
 
 Cross-Transform duplicate `declares:` (the same `(scope, name)` declared
 on two Transforms) is rejected before the run starts. `$pipeline`,

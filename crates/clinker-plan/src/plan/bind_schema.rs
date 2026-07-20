@@ -11,9 +11,10 @@
 //! binds the composition body at the call-site boundary using
 //! row-polymorphic type propagation (Leijen 2005).
 //!
-//! Errors surface as E200 diagnostics (CXL type error), E201
-//! diagnostics (missing source schema), and E102–E109 / W101
-//! diagnostics for composition binding.
+//! A CXL body's own compilation surfaces one of three codes by failure
+//! class: E202 (parse), E203 (name resolution), E200 (type check). Other
+//! errors surface as E201 (missing source schema) and E102–E109 / W101
+//! (composition binding).
 
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
@@ -1438,7 +1439,8 @@ struct ReshapeNodeBinding<'a> {
 /// CXL against that schema, enforce the group-identity and synthesis
 /// invariants, and publish the audit-widened output row.
 ///
-/// Validation enforced here (compile errors, code E200):
+/// Validation enforced here (structural checks use code E200; a rule
+/// expression's own CXL compilation uses E202/E203/E200 by failure class):
 /// - every `partition_by` field exists upstream;
 /// - each rule's `when` predicate and every `set` / `overrides` value
 ///   expression typechecks against the upstream row;
@@ -1789,7 +1791,8 @@ struct CullNodeBinding<'a> {
 /// predicate in aggregate context, validate the `removed_to` port name,
 /// and publish the (unchanged) upstream row as the node's output.
 ///
-/// Validation enforced here (compile errors, code E200):
+/// Validation enforced here (structural checks use code E200; a rule
+/// predicate's own CXL compilation uses E202/E203/E200 by failure class):
 /// - every `partition_by` and `order_by` field exists upstream;
 /// - at least one removal rule is declared;
 /// - each rule's `drop_group_when` predicate typechecks against the
@@ -4319,7 +4322,7 @@ fn typecheck_cxl(
             .map(|e| e.message.clone())
             .collect();
         return Err(Diagnostic::error(
-            "E200",
+            "E202",
             format!("CXL parse error in {node_name:?}: {}", messages.join("; ")),
             LabeledSpan::primary(span, String::new()),
         ));
@@ -4379,7 +4382,7 @@ fn typecheck_parsed_program(
     )
     .map_err(|diags| {
         Diagnostic::error(
-            "E200",
+            "E203",
             format!(
                 "CXL name resolution failed in {node_name:?}: {}",
                 diags
@@ -4438,7 +4441,7 @@ const CULL_RULE_PARSE_PREFIX: &str = "emit __cull_pred = ";
 /// stay in this wrapper's coordinate space; the caller rebases them into
 /// the reconstructed decision source via [`cxl::ast::rebase_expr_spans`].
 /// Returns the relocated predicate and the rule program's node count (the
-/// id span the caller must skip). `Err` is an E200 parse diagnostic
+/// id span the caller must skip). `Err` is an E202 parse diagnostic
 /// already attributed to `node_name`.
 #[allow(clippy::result_large_err)]
 fn parse_cull_rule_predicate(
@@ -4451,7 +4454,7 @@ fn parse_cull_rule_predicate(
     if !parsed.errors.is_empty() {
         let messages: Vec<String> = parsed.errors.iter().map(|e| e.message.clone()).collect();
         return Err(Diagnostic::error(
-            "E200",
+            "E202",
             format!("CXL parse error in {node_name:?}: {}", messages.join("; ")),
             LabeledSpan::primary(span, String::new()),
         ));
@@ -4469,7 +4472,7 @@ fn parse_cull_rule_predicate(
         }) => expr,
         _ => {
             return Err(Diagnostic::error(
-                "E200",
+                "E202",
                 format!(
                     "CXL parse error in {node_name:?}: drop_group_when must be a single \
                      expression"
@@ -5533,7 +5536,8 @@ fn walk_expr_for_qualified_refs(
 ///
 /// Wraps the source as `"filter {where_src}"` so the CXL parser
 /// produces a `Statement::Filter`. Routes diagnostics by category:
-/// - Parse / name-resolution failures → E200 (general compile error)
+/// - Parse failures → E202
+/// - Name-resolution failures → E203
 /// - Typecheck "filter predicate must be type Bool" → E303
 /// - Other typecheck errors → E200
 fn typecheck_combine_where(
@@ -5553,7 +5557,7 @@ fn typecheck_combine_where(
             .collect::<Vec<_>>()
             .join("; ");
         return Err(vec![Diagnostic::error(
-            "E200",
+            "E202",
             format!("combine {combine_name:?} where-clause parse error: {msg}"),
             LabeledSpan::primary(span, String::new()),
         )]);
@@ -5578,7 +5582,7 @@ fn typecheck_combine_where(
                 .collect::<Vec<_>>()
                 .join("; ");
             return Err(vec![Diagnostic::error(
-                "E200",
+                "E203",
                 format!("combine {combine_name:?} where-clause name resolution: {msg}"),
                 LabeledSpan::primary(span, String::new()),
             )]);

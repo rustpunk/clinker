@@ -129,14 +129,14 @@ nodes:
 fn route_condition_parse_error_is_diagnosed_at_bind_time() {
     // A syntactically invalid condition (`amount >` has no right operand) is a
     // valid YAML scalar but not a valid CXL predicate. The binder must reject
-    // it at compile time with a branch-qualified E200 anchored at the Route
+    // it at compile time with a branch-qualified E202 anchored at the Route
     // node's source line — not defer it to run start.
     let err = compile_route_condition("amount >")
         .expect_err("a route condition that fails to parse must fail the compile");
     let diag = err
         .iter()
-        .find(|d| d.code == "E200" && d.message.contains("parse error"))
-        .unwrap_or_else(|| panic!("expected an E200 parse-error diagnostic, got: {err:?}"));
+        .find(|d| d.code == "E202" && d.message.contains("parse error"))
+        .unwrap_or_else(|| panic!("expected an E202 parse-error diagnostic, got: {err:?}"));
     assert!(
         diag.message.contains("branch big"),
         "the diagnostic must name the offending branch, got: {}",
@@ -152,13 +152,13 @@ fn route_condition_parse_error_is_diagnosed_at_bind_time() {
 fn route_condition_unknown_field_is_diagnosed_at_bind_time() {
     // A condition that references a field the upstream schema does not declare
     // fails name resolution. The binder must surface that as a branch-qualified
-    // E200 naming the unresolved identifier, anchored at the Route node.
+    // E203 naming the unresolved identifier, anchored at the Route node.
     let err = compile_route_condition("nonexistent_field > 100")
         .expect_err("a route condition referencing an unknown field must fail the compile");
     let diag = err
         .iter()
-        .find(|d| d.code == "E200" && d.message.contains("name resolution"))
-        .unwrap_or_else(|| panic!("expected an E200 name-resolution diagnostic, got: {err:?}"));
+        .find(|d| d.code == "E203" && d.message.contains("name resolution"))
+        .unwrap_or_else(|| panic!("expected an E203 name-resolution diagnostic, got: {err:?}"));
     assert!(
         diag.message.contains("nonexistent_field") && diag.message.contains("branch big"),
         "the diagnostic must name the unresolved field and the offending branch, got: {}",

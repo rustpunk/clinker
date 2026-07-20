@@ -36,7 +36,7 @@ Condition keys become the port names used in downstream `input:` wiring.
 
 Branch conditions are typechecked when the pipeline is compiled -- the same plan-building pass you trigger with `clinker run pipeline.yaml --dry-run` (see [Validation & Dry Run](../ops/validation.md)). Each condition is checked against the concrete column types of the route's input, so a condition that references an unknown column or compares incompatible types fails at compile time rather than partway through a run.
 
-Compile failures surface as an **E200** diagnostic (the shared CXL resolution/type-error code) and name the offending branch -- for example `split_by_value (branch high)` -- so in a multi-branch route the error points at the specific branch rather than just the route node.
+Compile failures surface as a CXL diagnostic keyed to the failure class -- **E202** for a branch condition that does not parse, **E203** for one that references an unknown column, and **E200** for one that compares incompatible types -- and name the offending branch, for example `split_by_value (branch high)`, so in a multi-branch route the error points at the specific branch rather than just the route node.
 
 ## Default branch
 

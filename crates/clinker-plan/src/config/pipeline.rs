@@ -730,9 +730,10 @@ impl PipelineConfig {
         // per stage-3 validation), seeds each source's schema from its
         // author-declared `schema:` block, and typechecks every
         // CXL-bearing node against the propagated upstream schema.
-        // E200 diagnostics surface here with per-node spans. Also
-        // recurses into composition bodies via bind_composition,
-        // populating CompileArtifacts.composition_bodies.
+        // CXL compile diagnostics (E202 parse / E203 name-resolution /
+        // E200 type) surface here with per-node spans. Also recurses into
+        // composition bodies via bind_composition, populating
+        // CompileArtifacts.composition_bodies.
         let scoped_vars_registry =
             build_scoped_vars_registry(self.pipeline.vars.as_ref(), &self.nodes);
         // Channel `sources:` patches addressed at a source inside a composition
@@ -770,8 +771,9 @@ impl PipelineConfig {
             &mut diags,
         );
 
-        // Early-abort optimization: CXL type errors (E200/E201), source-CK
-        // validation errors (E153), and DLQ/output-path errors
+        // Early-abort optimization: CXL compile errors (parse E202,
+        // name-resolution E203, type E200), source-schema errors (E201),
+        // source-CK validation errors (E153), and DLQ/output-path errors
         // (E317/E318) make per-variant lowering meaningless, so stop here
         // rather than lowering a plan that cannot run. Every other
         // error-severity diagnostic — composition-binding errors
@@ -779,7 +781,10 @@ impl PipelineConfig {
         // which lets lowering accumulate the full diagnostic set first.
         let has_cxl_errors = diags.iter().any(|d| {
             matches!(d.severity, clinker_core_types::Severity::Error)
-                && matches!(d.code.as_str(), "E200" | "E201" | "E153" | "E317" | "E318")
+                && matches!(
+                    d.code.as_str(),
+                    "E200" | "E202" | "E203" | "E201" | "E153" | "E317" | "E318"
+                )
         });
         if has_cxl_errors {
             return Err(diags);

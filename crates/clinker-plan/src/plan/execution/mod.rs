@@ -640,9 +640,10 @@ pub struct PlanTransformPayload {
     pub dlq_node: Option<NodeIndex>,
     /// Compile-time-typechecked CXL program. Populated by
     /// `PipelineConfig::compile` via `bind_schema::bind_schema` and
-    /// NEVER `None`: a transform whose CXL fails to typecheck surfaces
-    /// as a compile-time E200 diagnostic and the enclosing `compile()`
-    /// call returns `Err` before this payload is built.
+    /// NEVER `None`: a transform whose CXL fails to compile surfaces as a
+    /// compile-time diagnostic (E202 parse / E203 name-resolution / E200
+    /// type) and the enclosing `compile()` call returns `Err` before this
+    /// payload is built.
     pub typed: Arc<TypedProgram>,
     /// Producer-declared scoped variables this transform writes via
     /// `emit $<scope>.<key>`. Empty list means no scope writes.
