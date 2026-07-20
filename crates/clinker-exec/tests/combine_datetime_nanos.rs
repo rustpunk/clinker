@@ -15,10 +15,11 @@
 //!   group identity by sort-key bytes, so a truncated key would have merged them.
 //!
 //! The CSV writer renders datetimes to whole seconds, so assertions key off
-//! derived id/count columns rather than the rendered timestamps. Datetimes stay
-//! in the ordinary era because `Value::DateTime`'s own spill serialization is
-//! i64 nanoseconds; the out-of-range key exactness is pinned by the in-crate
-//! `sort_key` unit tests instead.
+//! derived id/count columns rather than the rendered timestamps. These tests
+//! exercise sub-microsecond ordering, for which the calendar era is irrelevant,
+//! so the fixtures stay in the ordinary era; out-of-range key exactness is pinned
+//! by the in-crate `sort_key` unit tests and out-of-range `Value::DateTime`
+//! spill/reload exactness by the `clinker-record` value round-trip tests.
 
 use std::collections::HashMap;
 use std::io::{Cursor, Write};

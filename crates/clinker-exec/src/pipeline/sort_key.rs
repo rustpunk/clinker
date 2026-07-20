@@ -288,7 +288,7 @@ pub(crate) fn integer_on_decimal_grid(i: i64) -> Option<i128> {
 /// Leap seconds are the lone exception: chrono stores them as second `:59` with
 /// a sub-second field in `[10^9, 2·10^9)`, which Unix `timestamp()` does not
 /// count, so this key places a leap instant onto the following second. That
-/// matches Unix-time convention and the `i64`-nanosecond `Value::DateTime` spill
+/// matches Unix-time convention and the `i128`-nanosecond `Value::DateTime` spill
 /// serialization (which collapses leap seconds identically), but not
 /// `NaiveDateTime::cmp`. All three encoders reduce through this function, so they
 /// still agree with EACH OTHER on leap seconds — cross-strategy join/sort/group
