@@ -1535,3 +1535,134 @@ nodes:
 "#;
     parse_config(yaml).expect("the empty (whole-document) json_pointer must validate");
 }
+
+#[test]
+fn test_declared_section_colliding_with_synthesized_level_unions_field_views() {
+    // A declared `envelope.sections` name may collide with a synthesized level
+    // (the engine reserves no names). When it does, the reader exposes BOTH —
+    // the declared file-level section AND the synthesized positional level — so
+    // a `$doc` field valid under EITHER view must resolve. Resolving
+    // declared-first would let the closed declared view shadow the synthesized
+    // positional access and falsely reject a legitimate `eNN` element (#560).
+    fn compile(transform_cxl: &str) -> Result<crate::plan::CompiledPlan, Vec<Diagnostic>> {
+        let mut yaml = String::from(
+            r#"
+pipeline:
+  name: x12_section_name_collision
+nodes:
+  - type: source
+    name: interchange
+    config:
+      name: interchange
+      type: x12
+      path: po.x12
+      envelope:
+        sections:
+          transaction_set:
+            extract: { segment: "ISA" }
+            fields:
+              note: string
+      schema:
+        - { name: seg_id, type: string }
+  - type: transform
+    name: t0
+    input: interchange
+    config:
+      cxl: |
+"#,
+        );
+        for line in transform_cxl.lines() {
+            yaml.push_str(&format!("        {line}\n"));
+        }
+        yaml.push_str(
+            "  - type: output\n    name: out\n    input: t0\n    config:\n      name: out\n      type: csv\n      path: out.csv\n",
+        );
+        let config = parse_config(&yaml).expect("parse x12 name-collision pipeline");
+        config.compile(&CompileContext::default())
+    }
+
+    // The declared field on the collided section resolves via the declared view.
+    compile("emit seg = seg_id\nemit n = $doc.transaction_set.note")
+        .expect("a declared field on the collided section must compile");
+
+    // A positional element the synthesized `transaction_set` level serves must
+    // compile via the union — declared-first shadowing would falsely reject it.
+    compile("emit seg = seg_id\nemit e = $doc.transaction_set.e02")
+        .expect("an in-range positional element on the collided level must compile via the union");
+
+    // A field served by NEITHER view (out-of-range positional, and not a
+    // declared field) is still a typo — the union does not weaken that check.
+    let err = compile("emit seg = seg_id\nemit e = $doc.transaction_set.e99")
+        .expect_err("a field served by neither view must still fail");
+    assert!(
+        err.iter().any(|d| d.code == "E348"),
+        "expected an E348 diagnostic for the field served by neither view, got: {err:?}"
+    );
+}
+
+#[test]
+fn test_edi_declared_section_wrong_tier_segment_rejected_e357() {
+    // Only the file-level header segment is extractable as a declared envelope
+    // section — X12 `ISA`, EDIFACT `UNB`, HL7 `FHS`. A declared section with any
+    // other `segment:` tag (or a non-`segment` extract) errors at read time;
+    // reject it at plan time so it fails on `--explain` instead (#561).
+    fn source_yaml(fmt: &str, extract: &str) -> String {
+        format!(
+            r#"
+pipeline:
+  name: edi_section_tier
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: {fmt}
+      path: in.edi
+      envelope:
+        sections:
+          sec:
+            extract: {extract}
+            fields:
+              a: string
+      schema:
+        - {{ name: seg_id, type: string }}
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+        )
+    }
+
+    // A wrong-tier nested segment on each EDI format is rejected, and the
+    // format's own file-level header segment is accepted.
+    for (fmt, bad, good) in [
+        ("x12", r#"{ segment: "GS" }"#, r#"{ segment: "ISA" }"#),
+        ("edifact", r#"{ segment: "UNH" }"#, r#"{ segment: "UNB" }"#),
+        ("hl7", r#"{ segment: "MSH" }"#, r#"{ segment: "FHS" }"#),
+    ] {
+        let err = parse_config(&source_yaml(fmt, bad)).expect_err(&format!(
+            "a wrong-tier {fmt} segment section must be rejected"
+        ));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("E357"),
+            "expected E357 for {fmt} {bad}, got: {msg}"
+        );
+
+        parse_config(&source_yaml(fmt, good))
+            .unwrap_or_else(|e| panic!("the file-level {fmt} segment must validate: {e}"));
+    }
+
+    // A non-`segment` extract on an EDI source is rejected too — the reader
+    // serves the file-level header only through a `segment` extract.
+    let err = parse_config(&source_yaml("x12", r#"{ json_pointer: "/Head" }"#))
+        .expect_err("a non-segment extract on an X12 source must be rejected");
+    assert!(
+        err.to_string().contains("E357"),
+        "expected E357 for a non-segment extract, got: {err}"
+    );
+}
