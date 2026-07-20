@@ -607,9 +607,14 @@ impl DocAggregatorFactory {
             self.max_expansion,
         );
         let handle = crate::pipeline::memory::ConsumerHandle::new();
-        let consumer_id = self.arbitrator.register_consumer(Arc::new(
-            crate::aggregation::AggregateConsumer::new(handle.clone()),
-        ));
+        // Build the stream before registering the arbitrator consumer.
+        // `AggregateStream::for_node` is fallible, so registering first would
+        // strand the consumer id in the arbitrator's registry on an early `?`:
+        // the registry holds an independent `Arc` keyed by the id, so a stream
+        // that failed to construct (and so never entered `RegisteredTables`'
+        // map) leaves nothing that can release it. Registering only after a
+        // live table exists keeps the invariant that every registered consumer
+        // accounts for a real table.
         let stream = crate::aggregation::AggregateStream::for_node(
             self.strategy,
             crate::aggregation::AggregatorConfig {
@@ -626,10 +631,13 @@ impl DocAggregatorFactory {
                 spill_dir: Some(self.spill_dir.clone()),
                 spill_compress: self.spill_compress,
                 transform_name: self.transform_name.clone(),
-                consumer_handle: handle,
+                consumer_handle: Arc::clone(&handle),
                 arbitrator: Arc::clone(&self.arbitrator),
             },
         )?;
+        let consumer_id = self
+            .arbitrator
+            .register_consumer(Arc::new(crate::aggregation::AggregateConsumer::new(handle)));
         Ok((stream, consumer_id))
     }
 }
@@ -2154,6 +2162,88 @@ fn emit_aggregate_finalize_dlq(
 mod tests {
     use super::*;
     use clinker_record::{DocumentContext, Value};
+    use cxl::eval::StableEvalContext;
+    use cxl::parser::Parser;
+    use cxl::plan::extract_aggregates;
+    use cxl::resolve::pass::resolve_program;
+    use cxl::typecheck::pass::{AggregateMode, type_check_with_mode};
+    use cxl::typecheck::types::Type;
+    use cxl::typecheck::{QualifiedField, Row};
+    use indexmap::IndexMap;
+
+    /// A disk-spill-unbounded arbitrator for the consumer-lifecycle tests, so
+    /// the registry-count assertions never race an incidental spill. Mirrors
+    /// the `aggregation::hash` spill-trigger test builder.
+    fn test_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
+        Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            0,
+            0.8,
+            0.70,
+            crate::pipeline::memory::MemoryArbitrator::default_policy(),
+        ))
+    }
+
+    /// Compile a strict-aggregate CXL snippet and assemble a
+    /// [`DocAggregatorFactory`] over `arbitrator`, so the per-document
+    /// consumer-lifecycle and zero-record-close branches can be driven without
+    /// a full `ExecutorContext`. The compile pipeline mirrors the one the
+    /// planner runs (`Parser` → resolve → typecheck → `extract_aggregates`);
+    /// `group_by` empty selects the global-fold shape.
+    fn build_factory(
+        arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
+        input_fields: &[(&str, Type)],
+        group_by: &[&str],
+        cxl_src: &str,
+    ) -> DocAggregatorFactory {
+        let parsed = Parser::parse(cxl_src);
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let field_names: Vec<&str> = input_fields.iter().map(|(n, _)| *n).collect();
+        let resolved =
+            resolve_program(parsed.ast, &field_names, parsed.node_count).expect("resolve");
+        let schema_map: IndexMap<QualifiedField, Type> = input_fields
+            .iter()
+            .map(|(n, t)| (QualifiedField::bare(*n), t.clone()))
+            .collect();
+        let row = Row::closed(schema_map, cxl::lexer::Span::new(0, 0));
+        let mode = AggregateMode::GroupBy {
+            group_by_fields: group_by.iter().map(|s| (*s).to_string()).collect(),
+        };
+        let typed = type_check_with_mode(resolved, &row, mode).expect("typecheck");
+        let schema_names: Vec<String> =
+            input_fields.iter().map(|(n, _)| (*n).to_string()).collect();
+        let group_by_owned: Vec<String> = group_by.iter().map(|s| (*s).to_string()).collect();
+        let compiled = Arc::new(
+            extract_aggregates(&typed, &group_by_owned, &schema_names).expect("extract_aggregates"),
+        );
+        let output_schema = Arc::new(Schema::new(
+            compiled
+                .emits
+                .iter()
+                .map(|e| e.output_name.clone())
+                .collect::<Vec<Box<str>>>(),
+        ));
+        let spill_schema = aggregate_spill_schema(&compiled);
+        let is_global_fold = compiled.group_by_fields.is_empty();
+        DocAggregatorFactory {
+            strategy: AggregateStrategy::Hash,
+            compiled,
+            typed: Arc::new(typed),
+            has_distinct: false,
+            max_expansion: cxl::eval::DEFAULT_MAX_EXPANSION,
+            output_schema,
+            spill_schema,
+            mem_limit: 512 * 1024 * 1024,
+            spill_dir: std::env::temp_dir(),
+            spill_compress: false,
+            transform_name: "test_agg".to_string(),
+            arbitrator,
+            is_global_fold,
+        }
+    }
 
     fn record_in_document(doc_id: DocumentId, tag: &str) -> Record {
         let schema = Arc::new(Schema::new(vec!["tag".into()]));
@@ -2224,5 +2314,180 @@ mod tests {
         // The empty-input case yields an empty slice (no record to attribute).
         let empty: Vec<(Record, u64)> = Vec::new();
         assert!(document_attribution_record(&empty, absent).is_empty());
+    }
+
+    /// A successful `DocAggregatorFactory::make` registers exactly one
+    /// arbitrator consumer — the one whose id it returns — and only after the
+    /// stream is built. This pins the register-after-construct ordering: the
+    /// registry never gains an entry that no live table accounts for.
+    #[test]
+    fn factory_make_registers_exactly_one_consumer_for_the_built_table() {
+        let arbitrator = test_arbitrator();
+        let factory = build_factory(
+            Arc::clone(&arbitrator),
+            &[("amount", Type::Int)],
+            &[],
+            "emit total = sum(amount)\nemit n = count(*)",
+        );
+        assert_eq!(
+            arbitrator.consumer_count(),
+            0,
+            "no consumer is registered before a table is built",
+        );
+
+        let (stream, consumer_id) = factory.make().expect("make builds a table");
+        assert_eq!(
+            arbitrator.consumer_count(),
+            1,
+            "make registers exactly one consumer for the live table",
+        );
+
+        // The returned id is the one that was registered: unregistering it
+        // drains the registry back to empty, so no second/stranded entry hides
+        // behind a different id.
+        drop(stream);
+        assert!(
+            arbitrator.unregister_consumer(consumer_id).is_some(),
+            "the returned id names the registered consumer",
+        );
+        assert_eq!(
+            arbitrator.consumer_count(),
+            0,
+            "unregistering the returned id releases the sole entry",
+        );
+    }
+
+    /// An aggregate error-exit (a mid-ingest `?` that leaves per-document
+    /// tables live) must not strand their arbitrator consumers. Dropping
+    /// `RegisteredTables` with tables still present — exactly what an early
+    /// return does — fires the guard, which unregisters every open table's
+    /// consumer. Regression guard for the `impl Drop for RegisteredTables`:
+    /// remove it and the registry would keep both entries.
+    #[test]
+    fn error_exit_releases_open_document_table_consumers() {
+        let arbitrator = test_arbitrator();
+        let factory = build_factory(
+            Arc::clone(&arbitrator),
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+        );
+        assert_eq!(arbitrator.consumer_count(), 0);
+
+        {
+            let mut tables = RegisteredTables::new(Arc::clone(&arbitrator));
+            // Two documents open concurrently — the state a mid-stream error
+            // leaves behind (records ingested into several buckets, none
+            // flushed yet).
+            tables
+                .entry_or_make(DocumentId::next(), &factory)
+                .expect("build first document table");
+            tables
+                .entry_or_make(DocumentId::next(), &factory)
+                .expect("build second document table");
+            assert_eq!(
+                arbitrator.consumer_count(),
+                2,
+                "each open document table registers its own consumer",
+            );
+            // `tables` drops here without flushing — the aggregate's error-exit
+            // shape. The guard must release both consumers.
+        }
+
+        assert_eq!(
+            arbitrator.consumer_count(),
+            0,
+            "the Drop guard releases every open table's consumer on error-exit",
+        );
+    }
+
+    /// A global fold owes one defaulted row for a document that delivers a
+    /// zero-record `DocumentClose` boundary (the mid-stream empty-document
+    /// case no shipped source reader reaches today). The materialized flush
+    /// force-opens a fresh table for the absent bucket, finalizes it to the
+    /// fold's default (`sum` null, `count(*) == 0`), and releases the
+    /// force-opened consumer afterward.
+    #[test]
+    fn mid_stream_zero_record_close_emits_global_fold_default_row() {
+        let arbitrator = test_arbitrator();
+        let factory = build_factory(
+            Arc::clone(&arbitrator),
+            &[("amount", Type::Int)],
+            &[],
+            "emit total = sum(amount)\nemit n = count(*)",
+        );
+        let mut tables = RegisteredTables::new(Arc::clone(&arbitrator));
+        let stable = StableEvalContext::test_default();
+        let finalize_ctx = EvalContext::test_default_borrowed(&stable);
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+
+        // The closing document contributed zero records, so `tables` has no
+        // bucket for it. The global fold still owes its single defaulted row.
+        let empty_doc = DocumentId::next();
+        tables
+            .flush_closing_document(empty_doc, &factory, &finalize_ctx, &mut out, |result| {
+                result.map_err(Into::into)
+            })
+            .expect("flush the zero-record closing document");
+
+        assert_eq!(
+            out.len(),
+            1,
+            "a global fold emits exactly one defaulted row for a zero-record close",
+        );
+        assert_eq!(
+            out[0].0.get("n"),
+            Some(&Value::Integer(0)),
+            "the defaulted row carries count(*) == 0",
+        );
+        assert_eq!(
+            out[0].0.get("total"),
+            Some(&Value::Null),
+            "sum over no records is null in the defaulted row",
+        );
+        assert_eq!(
+            arbitrator.consumer_count(),
+            0,
+            "the force-opened table's consumer is released once it finalizes",
+        );
+    }
+
+    /// The grouped-fold control for the zero-record close: a grouped aggregate
+    /// owns no group for an empty document, so its `DocumentClose` emits
+    /// nothing and force-opens no table — the global-fold force-open must not
+    /// fabricate a phantom grouped row.
+    #[test]
+    fn mid_stream_zero_record_close_emits_nothing_for_grouped_fold() {
+        let arbitrator = test_arbitrator();
+        let factory = build_factory(
+            Arc::clone(&arbitrator),
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+        );
+        let mut tables = RegisteredTables::new(Arc::clone(&arbitrator));
+        let stable = StableEvalContext::test_default();
+        let finalize_ctx = EvalContext::test_default_borrowed(&stable);
+        let mut out: Vec<crate::aggregation::SortRow> = Vec::new();
+
+        tables
+            .flush_closing_document(
+                DocumentId::next(),
+                &factory,
+                &finalize_ctx,
+                &mut out,
+                |result| result.map_err(Into::into),
+            )
+            .expect("flush the zero-record closing document");
+
+        assert!(
+            out.is_empty(),
+            "a grouped fold emits nothing for a zero-record closing document, got {out:?}",
+        );
+        assert_eq!(
+            arbitrator.consumer_count(),
+            0,
+            "a grouped zero-record close force-opens no table, so nothing is registered",
+        );
     }
 }

@@ -852,3 +852,152 @@ nodes:
          not a folded x=5",
     );
 }
+
+/// The MATERIALIZED counterpart to
+/// `fused_interleave_merge_forwards_per_source_document_close`. That test feeds
+/// the fused Merge straight into a group-by Aggregate — a streaming edge, so the
+/// reconciled boundaries flow through the bounded channel at the tail. Here a
+/// passthrough Transform sits between the fused Merge and the Aggregate.
+///
+/// The Transform's sole upstream is the Merge (not a Source), so it is NOT a
+/// fused `Source → Transform`, and a Transform is not a certified streaming
+/// consumer kind. The fused Merge therefore installs no streaming sender and
+/// instead admits its records and reconciled per-document boundaries into a
+/// materialized node buffer — the `FusedMergeOutput` materialized path — which
+/// the Transform drains and forwards into its own node buffer. The downstream
+/// group-by Aggregate is likewise materialized (its producer, the non-fused
+/// Transform, is not a streaming producer), so it drains that buffer and
+/// flushes per document.
+///
+/// This is the regression guard for the materialized fused-interleave boundary
+/// path. If the fused Merge dropped its reconciled closes when admitting the
+/// node buffer, no `DocumentClose` would reach the Aggregate until end-of-input
+/// and both documents would fold into a single `x,5` + `y,1`. Forwarding them
+/// splits the fold per document — `x,3` from sa and `x,2` + `y,1` from sb.
+#[test]
+fn fused_interleave_merge_materialized_consumer_preserves_document_boundaries() {
+    let yaml = r#"
+pipeline:
+  name: fused_interleave_materialized_agg
+nodes:
+  - type: source
+    name: sa
+    config:
+      name: sa
+      type: csv
+      path: ./sa.csv
+      schema:
+        - { name: category, type: string }
+  - type: source
+    name: sb
+    config:
+      name: sb
+      type: csv
+      path: ./sb.csv
+      schema:
+        - { name: category, type: string }
+  - type: merge
+    name: m
+    inputs: [sa, sb]
+    config:
+      mode: interleave
+  - type: transform
+    name: pass
+    input: m
+    config:
+      cxl: |
+        emit category = category
+  - type: aggregate
+    name: by_category
+    input: pass
+    config:
+      group_by:
+        - category
+      cxl: |
+        emit category = category
+        emit n = count(*)
+  - type: output
+    name: out
+    input: by_category
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+    let config = parse_config(yaml).expect("parse fused-interleave-materialized pipeline");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile fused-interleave-materialized pipeline");
+
+    // The Merge fuses both Sources (unseeded all-Source interleave), so the
+    // fused arm runs regardless of what sits downstream of it.
+    let (dag, _) =
+        clinker_exec::executor::PipelineExecutor::explain_plan_dag(&plan).expect("explain dag");
+    let fused =
+        clinker_plan::plan::execution::compute_merge_interleave_fused_sources(&dag, plan.config());
+    assert!(
+        fused.contains("sa") && fused.contains("sb"),
+        "an unseeded all-Source interleave Merge must fuse both Sources, got: {fused:?}",
+    );
+
+    // Prove the fused Merge takes the MATERIALIZED output path, not the
+    // streaming one: a passthrough Transform is not a streaming consumer kind,
+    // so the Merge admits a charged inter-stage node-buffer slot (which the
+    // explain renders as an edge) rather than installing a streaming sender.
+    // The streaming sibling test asserts the ABSENCE of such an edge.
+    let explain = dag.explain_text(&config);
+    assert!(
+        explain.contains("edge merge.m -> transform.pass"),
+        "the fused Merge must feed the Transform through a materialized \
+         node-buffer edge (the FusedMergeOutput materialized path), got:\n{explain}",
+    );
+
+    // sa: x×3 (one document); sb: x×2, y×1 (another document). The fused Merge
+    // reconciles each Source's per-document close and admits it into the
+    // materialized node buffer; the Transform forwards it; the Aggregate
+    // flushes per document — x=3 from sa's document, x=2 and y=1 from sb's,
+    // never a folded x=5.
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([
+        (
+            "sa".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "sa.csv",
+                Box::new(Cursor::new(b"category\nx\nx\nx\n".to_vec())),
+            ),
+        ),
+        (
+            "sb".to_string(),
+            clinker_exec::executor::single_file_reader(
+                "sb.csv",
+                Box::new(Cursor::new(b"category\nx\nx\ny\n".to_vec())),
+            ),
+        ),
+    ]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "e".to_string(),
+        batch_id: "b".to_string(),
+        pipeline_vars: indexmap::IndexMap::new(),
+        shutdown_token: None,
+        ..Default::default()
+    };
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("run fused-interleave-materialized pipeline");
+    assert_eq!(report.counters.dlq_count, 0);
+
+    let output = buf.as_string();
+    let mut body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
+    body.sort();
+    assert_eq!(
+        body,
+        vec!["x,2".to_string(), "x,3".to_string(), "y,1".to_string()],
+        "the materialized fused interleave Merge must forward each Source's \
+         per-document close through the node buffer, so the Aggregate flushes \
+         per document (x=3 from sa; x=2,y=1 from sb), not a folded x=5",
+    );
+}
