@@ -1220,6 +1220,7 @@ impl PipelineExecutor {
 
             node_buffers: HashMap::new(),
             node_buffer_consumer_ids: HashMap::new(),
+            shared_input_drains: HashMap::new(),
             window_arena_consumer_ids: HashMap::new(),
             source_records,
             source_consumers,

@@ -172,7 +172,7 @@ pub(crate) fn dispatch_output(
                     // that need the document boundary read it from
                     // the non-cloned (last-consumer) drain through
                     // their own arm.
-                    let cloned = ctx.node_buffers.get(&p).map(|nb| {
+                    let cloned = ctx.node_buffers.get(&p.into()).map(|nb| {
                         nb.clone_memory_only()
                             .into_iter()
                             .filter_map(|e| e.into_record())
@@ -823,7 +823,11 @@ fn drain_output_input_event_iter(
             if let Some(nb) = drain_node_buffer_slot(ctx, p) {
                 return Box::new(nb.drain());
             }
-        } else if let Some(cloned) = ctx.node_buffers.get(&p).map(|nb| nb.clone_memory_only()) {
+        } else if let Some(cloned) = ctx
+            .node_buffers
+            .get(&p.into())
+            .map(|nb| nb.clone_memory_only())
+        {
             return Box::new(cloned.into_iter().map(Ok));
         }
     }

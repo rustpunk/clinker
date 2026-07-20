@@ -43,7 +43,9 @@ use petgraph::visit::{EdgeRef, Topo};
 
 use super::DlqEvent;
 use super::detect::RetractScope;
-use crate::executor::dispatch::{ExecutorContext, dispatch_plan_node, drain_node_buffer_slot};
+use crate::executor::dispatch::{
+    ExecutorContext, NodeBufferKey, admit_node_buffer, dispatch_plan_node, drain_node_buffer_slot,
+};
 use crate::executor::node_buffer::NodeBuffer;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::CompositionBodyId;
@@ -217,14 +219,29 @@ fn dispatch_one_region(
     // (and similar own-buffer-write arms) parks records into
     // `node_buffers[succ_idx]` BEFORE the consumer arm gets a chance
     // to short-circuit, so the slot carries pre-recompute records the
-    // commit pass must not re-read. The producer's slot is preserved
-    // — `recompute_aggregates` populates it with the post-recompute
-    // narrow rows.
+    // commit pass must not re-read. This includes any `(member, Some(port))`
+    // port slots a member Route/Cull wrote for an in-region Merge/Combine —
+    // draining only the `(member, None)` slot would leave those stale. The
+    // producer's slot is preserved — `recompute_aggregates` populates it with
+    // the post-recompute narrow rows.
+    let stale_ported: Vec<NodeBufferKey> = ctx
+        .node_buffers
+        .keys()
+        .filter(|k| {
+            k.producer_port.is_some()
+                && k.node != region.producer
+                && (region.members.contains(&k.node) || region.outputs.contains(&k.node))
+        })
+        .cloned()
+        .collect();
     for &m in &region.members {
         drain_node_buffer_slot(ctx, m);
     }
     for &o in &region.outputs {
         drain_node_buffer_slot(ctx, o);
+    }
+    for k in stale_ported {
+        drain_node_buffer_slot(ctx, k);
     }
 
     let active_body = ctx.window_runtime.active_stack.last().copied();
@@ -324,19 +341,31 @@ fn seed_cross_region_inputs_for(
         let Some(parked) = ctx.region_input_buffers.remove(&key) else {
             continue;
         };
-        // Append onto the source node's buffer so the consumer's
-        // existing predecessor-walk logic resolves them. Per-row
-        // attribution flows through the slot's registered
-        // `NodeBufferConsumer` once `admit_node_buffer` re-keys this
-        // slot at the next bulk admission; the arbitrator's
-        // `should_abort` poll guards the pipeline-wide hard limit.
-        let slot = ctx
-            .node_buffers
-            .entry(source_idx)
-            .or_insert_with(|| NodeBuffer::Memory(Vec::new()));
-        for (record, rn) in parked {
-            slot.push(record, rn);
-        }
+        // Re-seed the source node's buffer keyed by the crossing edge's producer
+        // output port, so a multi-output source (Route branch / Cull port) lands
+        // in the exact slot the consumer's edge-based drain reads. The parked
+        // tee holds exactly the records this crossing edge delivered on the
+        // forward pass, so REPLACE the slot rather than append: the forward-pass
+        // producer emit left its own copy in this same slot, and appending would
+        // double it. Draining first releases that forward copy's registered
+        // consumer; `admit_node_buffer` then re-registers the re-seeded slot so
+        // its bytes are attributed and bound-checked like every other slot (a
+        // raw insert would leave the replayed records off the arbitrator's
+        // books). The slot is non-spillable — the consumer edge carries a
+        // producer port — so `spill_allowed` is false.
+        let producer_port = current_dag.graph[edge_id].producer_port.as_deref();
+        let slot_key = NodeBufferKey::with_port(source_idx, producer_port);
+        drain_node_buffer_slot(ctx, slot_key.clone());
+        let source_name = current_dag.graph[source_idx].name();
+        let nb = admit_node_buffer(
+            ctx,
+            source_name,
+            slot_key.clone(),
+            parked,
+            Vec::new(),
+            false,
+        )?;
+        ctx.node_buffers.insert(slot_key, nb);
     }
 
     Ok(())
@@ -391,9 +420,13 @@ fn recurse_into_body(
     // collide numerically). Restore on every exit. The paired
     // consumer-id map swaps alongside so body-scope NodeBufferConsumer
     // registrations don't survive into the parent scope's arbitrator.
-    let body_buffers: HashMap<NodeIndex, NodeBuffer> = HashMap::new();
+    let body_buffers: HashMap<NodeBufferKey, NodeBuffer> = HashMap::new();
     let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
     let saved_consumer_ids = std::mem::take(&mut ctx.node_buffer_consumer_ids);
+    // Shared-input drain counts key by the body-local `NodeBufferKey` space;
+    // swap alongside `node_buffers` so a body fanout does not collide with a
+    // parent count.
+    let saved_shared_drains = std::mem::take(&mut ctx.shared_input_drains);
     // Window-arena consumer ids are keyed by slot index, which the body
     // re-uses from zero just like its window-runtime overlay. Swap to a
     // fresh map so a body slot-0 arena registration does not clobber the
@@ -464,7 +497,7 @@ fn recurse_into_body(
         // body region.
         for body_region in body_dag.deferred_regions.values() {
             let producer = body_region.producer;
-            if ctx.node_buffers.contains_key(&producer) {
+            if ctx.node_buffers.contains_key(&producer.into()) {
                 continue;
             }
             if !ctx.relaxed_aggregator_states.contains_key(&producer) {
@@ -527,6 +560,7 @@ fn recurse_into_body(
     ctx.source_records = saved_combine;
     ctx.node_buffers = saved_buffers;
     ctx.node_buffer_consumer_ids = saved_consumer_ids;
+    ctx.shared_input_drains = saved_shared_drains;
     ctx.window_arena_consumer_ids = saved_arena_ids;
 
     let harvested = walk_and_harvest?;
@@ -540,7 +574,7 @@ fn recurse_into_body(
         // batch boundaries.
         let slot = ctx
             .node_buffers
-            .entry(composition_idx)
+            .entry(composition_idx.into())
             .or_insert_with(|| NodeBuffer::Memory(Vec::new()));
         for (record, rn) in harvested {
             slot.push(record, rn);

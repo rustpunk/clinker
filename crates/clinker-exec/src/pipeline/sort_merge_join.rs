@@ -2214,6 +2214,7 @@ mod tests {
             left_qual.to_string(),
             CombineInput {
                 upstream_name: Arc::from(left_qual),
+                producer_port: None,
                 row: left_row,
             },
         );
@@ -2221,6 +2222,7 @@ mod tests {
             right_qual.to_string(),
             CombineInput {
                 upstream_name: Arc::from(right_qual),
+                producer_port: None,
                 row: right_row,
             },
         );

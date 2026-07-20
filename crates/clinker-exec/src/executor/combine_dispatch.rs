@@ -18,7 +18,7 @@ use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
-    ExecutorContext, admit_node_buffer, advance_cursor, drain_node_buffer_slot,
+    ExecutorContext, NodeBufferKey, admit_node_buffer, advance_cursor, drain_or_clone_shared_input,
     finalize_node_rooted_windows, node_buffer_spill_allowed, push_dlq,
     record_error_to_buffer_if_grouped, source_file_arc_of, source_name_arc_of,
     stream_linear_producer_emit, tee_emit_to_region_input_buffers,
@@ -29,7 +29,7 @@ use crate::pipeline::iejoin::RecordOrder;
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
-use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, matches_upstream_name};
 
 /// Cap on matches collected per driver row under `match: collect` before
 /// truncation. 10K mirrors the module constants in `pipeline/combine.rs`
@@ -194,37 +194,79 @@ pub(crate) fn dispatch_combine(
     // any such Sort as an alias for its prefix-stripped
     // upstream lets the combine arm transparently resolve
     // through the splice. See `plan::execution::CORRELATION_SORT_PREFIX`.
-    let predecessors: Vec<NodeIndex> = current_dag
-        .graph
-        .neighbors_directed(node_idx, Direction::Incoming)
-        .collect();
-    let predecessor_matches = |p: NodeIndex, target: &str| -> bool {
-        clinker_plan::plan::execution::matches_upstream_name(current_dag.graph[p].name(), target)
+    // Resolve each side to its incoming edge, so the drain reads the exact
+    // producer-port slot the edge carries. When the driver and build sides
+    // resolve to the SAME predecessor node via different output ports — a
+    // Combine drawing a Cull's `main` and `removed_to`, or two Route branches —
+    // name matching alone cannot tell them apart, so disambiguate by the
+    // qualifier's declared port (read off the combine node's `input:` map).
+    // A single matching edge is used directly, which keeps a spliced
+    // passthrough (e.g. `inject_correlation_sort`) working: its edge carries
+    // `producer_port: None` and the passthrough re-materialised the records
+    // into its own `(idx, None)` slot.
+    use petgraph::visit::EdgeRef;
+    // The qualifier's declared producer port, read off the node's own
+    // `combine_inputs` so it is scope-correct inside a composition body (a
+    // by-name lookup into `ctx.config.nodes` would miss a body combine, or
+    // resolve to a same-named top-level one).
+    let driver_port_ref = combine_inputs[driving_input.as_str()].producer_port.clone();
+    let build_port_ref = combine_inputs[build_qualifier.as_str()]
+        .producer_port
+        .clone();
+    let resolve_side = |upstream: &str,
+                        port_ref: Option<&str>,
+                        side: &str|
+     -> Result<(NodeIndex, Option<Box<str>>), PipelineError> {
+        let candidates: Vec<_> = current_dag
+            .graph
+            .edges_directed(node_idx, Direction::Incoming)
+            .filter(|e| matches_upstream_name(current_dag.graph[e.source()].name(), upstream))
+            .collect();
+        let chosen = if candidates.len() == 1 {
+            // Single candidate: the declared port is not needed to
+            // disambiguate, and a spliced single-output passthrough
+            // (`inject_correlation_sort`) carries `producer_port: None` even
+            // when the qualifier named a port — so use the one edge directly.
+            candidates[0]
+        } else if candidates.is_empty() {
+            return Err(PipelineError::Internal {
+                op: "combine",
+                node: name.clone(),
+                detail: format!(
+                    "combine {side} upstream {upstream:?} is not an \
+                         incoming neighbor in the DAG"
+                ),
+            });
+        } else {
+            // Driver and build resolve to the same predecessor via distinct
+            // output ports (a Cull's `main` + `removed_to`, or two Route
+            // branches): the qualifier's declared port must identify exactly
+            // one incoming edge. A miss means the node's declared port and the
+            // DAG edge tag disagree — an invariant violation surfaced loud
+            // rather than silently draining an arbitrary port's slot.
+            *candidates
+                .iter()
+                .find(|e| e.weight().producer_port.as_deref() == port_ref)
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "combine",
+                    node: name.clone(),
+                    detail: format!(
+                        "combine {side} input {upstream:?} declares producer port \
+                         {port_ref:?}, which matched none of the {} incoming edges \
+                         from that node",
+                        candidates.len()
+                    ),
+                })?
+        };
+        Ok((
+            chosen.source(),
+            chosen.weight().producer_port.as_deref().map(Box::from),
+        ))
     };
-    let driver_pred = predecessors
-        .iter()
-        .copied()
-        .find(|p| predecessor_matches(*p, driver_upstream))
-        .ok_or_else(|| PipelineError::Internal {
-            op: "combine",
-            node: name.clone(),
-            detail: format!(
-                "combine driver upstream {driver_upstream:?} is not an \
-                         incoming neighbor in the DAG"
-            ),
-        })?;
-    let build_pred = predecessors
-        .iter()
-        .copied()
-        .find(|p| predecessor_matches(*p, build_upstream))
-        .ok_or_else(|| PipelineError::Internal {
-            op: "combine",
-            node: name.clone(),
-            detail: format!(
-                "combine build upstream {build_upstream:?} is not an \
-                         incoming neighbor in the DAG"
-            ),
-        })?;
+    let (driver_pred, driver_port) =
+        resolve_side(driver_upstream, driver_port_ref.as_deref(), "driver")?;
+    let (build_pred, build_port) =
+        resolve_side(build_upstream, build_port_ref.as_deref(), "build")?;
 
     // Streaming-probe detection (issue #300). When the driver predecessor
     // is the certified probe-side streaming producer for this Combine
@@ -266,7 +308,11 @@ pub(crate) fn dispatch_combine(
     ) = if streaming_probe_driver.is_some() {
         (Vec::new(), Vec::new())
     } else {
-        match drain_node_buffer_slot(ctx, driver_pred) {
+        match drain_or_clone_shared_input(
+            ctx,
+            current_dag,
+            NodeBufferKey::with_port(driver_pred, driver_port.as_deref()),
+        ) {
             Some(nb) => nb.drain_split()?,
             None => (Vec::new(), Vec::new()),
         }
@@ -274,7 +320,11 @@ pub(crate) fn dispatch_combine(
     let (build_buf, build_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
-    ) = match drain_node_buffer_slot(ctx, build_pred) {
+    ) = match drain_or_clone_shared_input(
+        ctx,
+        current_dag,
+        NodeBufferKey::with_port(build_pred, build_port.as_deref()),
+    ) {
         Some(nb) => nb.drain_split()?,
         None => (Vec::new(), Vec::new()),
     };
@@ -551,7 +601,7 @@ pub(crate) fn dispatch_combine(
                         nb
                     }
                 };
-                ctx.node_buffers.insert(node_idx, nb);
+                ctx.node_buffers.insert(node_idx.into(), nb);
                 // Combine arm clean-exit: drop the per-fold cursor
                 // snapshot. Every emitted record has cleared into
                 // `node_buffers` without rewind, so the snapshot is
@@ -691,7 +741,7 @@ pub(crate) fn dispatch_combine(
                     combined_puncts,
                     node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
-                ctx.node_buffers.insert(node_idx, nb);
+                ctx.node_buffers.insert(node_idx.into(), nb);
                 // Combine arm clean-exit: drop the per-fold cursor
                 // snapshot. Mirrors the inline arm's post-emit
                 // clear so non-inline strategies do not leak
@@ -832,7 +882,7 @@ pub(crate) fn dispatch_combine(
                         let probe_records_out = nb.len_hint() as u64;
                         ctx.collector
                             .record(probe_timer.finish(probe_records_in, probe_records_out));
-                        ctx.node_buffers.insert(node_idx, nb);
+                        ctx.node_buffers.insert(node_idx.into(), nb);
                     }
                 }
                 // Combine arm clean-exit: drop the per-fold cursor snapshot.
@@ -1114,7 +1164,7 @@ pub(crate) fn dispatch_combine(
             combined_puncts,
             node_buffer_spill_allowed(current_dag, node_idx),
         )?;
-        ctx.node_buffers.insert(node_idx, nb);
+        ctx.node_buffers.insert(node_idx.into(), nb);
         // Drop the per-fold cursor snapshot: every emitted record
         // has cleared into `node_buffers` without rewind, so the
         // snapshot is no longer needed. The rewind path on a
@@ -2206,7 +2256,7 @@ fn adopt_spilled_runs_into_node_buffer(
     // Register the slot's node-buffer consumer at zero resident bytes so its
     // later drain unregisters through the same path `admit_node_buffer` sets up.
     // A prior registration at this slot is replaced first.
-    if let Some((prev_id, _)) = ctx.node_buffer_consumer_ids.remove(&node_idx) {
+    if let Some((prev_id, _)) = ctx.node_buffer_consumer_ids.remove(&node_idx.into()) {
         ctx.memory_budget.unregister_consumer(prev_id);
     }
     let handle = crate::pipeline::memory::ConsumerHandle::new();
@@ -2215,7 +2265,7 @@ fn adopt_spilled_runs_into_node_buffer(
         .memory_budget
         .register_consumer(Arc::new(NodeBufferConsumer::new(handle.clone())));
     ctx.node_buffer_consumer_ids
-        .insert(node_idx, (consumer_id, handle));
+        .insert(node_idx.into(), (consumer_id, handle));
     ctx.memory_budget.sample_peak_consumer_usage();
     // Park a charging context on the slot so that if this adopted run set is too
     // fragmented, the drain's k-way merge folds it down under the disk quota

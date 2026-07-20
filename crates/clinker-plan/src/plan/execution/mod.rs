@@ -184,6 +184,20 @@ pub enum PlanNode {
         id: PlanNodeId,
         #[serde(skip)]
         span: Span,
+        /// Merge combination mode (concat / interleave). Carried on the node so
+        /// a Merge inside a composition body resolves it scope-correctly — the
+        /// executor otherwise looks it up by name in the top-level
+        /// `PipelineConfig.nodes`, which does not contain body nodes.
+        #[serde(skip)]
+        mode: crate::config::MergeMode,
+        /// Deterministic interleave seed, when configured.
+        #[serde(skip)]
+        interleave_seed: Option<u64>,
+        /// Input references in declaration order (`node` or `node.port`), used
+        /// to order Concat output. Carried on the node for the same
+        /// scope-correctness reason as `mode`.
+        #[serde(skip)]
+        input_order: Vec<String>,
         /// Canonical output schema adopted from `input[0]`. All Merge inputs
         /// are structurally equal per the Merge contract (validated in
         /// `bind_schema`); picking one canonical `Arc` lets Merge emit every

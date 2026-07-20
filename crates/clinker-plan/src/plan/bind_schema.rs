@@ -5079,10 +5079,15 @@ fn bind_combine(
             // in the C.1.0 corrective (Decisions Log #15).
             merged_declared.insert(qf, ty.clone());
         }
+        let producer_port = match &node_input_spanned.value {
+            crate::config::node_header::NodeInput::Port { port, .. } => Some(port.clone()),
+            crate::config::node_header::NodeInput::Single(_) => None,
+        };
         combine_inputs_entries.insert(
             qualifier.clone(),
             CombineInput {
                 upstream_name: Arc::from(upstream_target),
+                producer_port,
                 row: upstream_row.clone(),
             },
         );

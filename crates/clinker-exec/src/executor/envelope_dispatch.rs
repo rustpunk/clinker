@@ -189,7 +189,7 @@ pub(crate) fn dispatch_envelope(
         puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
-    ctx.node_buffers.insert(node_idx, nb);
+    ctx.node_buffers.insert(node_idx.into(), nb);
     Ok(())
 }
 

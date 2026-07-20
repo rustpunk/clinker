@@ -252,6 +252,7 @@ mod tests {
         }
         CombineInput {
             upstream_name: Arc::from(name),
+            producer_port: None,
             row: clinker_plan::plan::row_type::Row::closed(declared, CxlSpan::new(0, 0)),
         }
     }

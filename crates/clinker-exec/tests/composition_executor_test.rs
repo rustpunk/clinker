@@ -467,3 +467,61 @@ nodes:
         "error must wrap inner failure with composition name; got: {msg}"
     );
 }
+
+#[test]
+fn composition_body_merge_uses_declared_interleave_mode() {
+    // The body's Merge declares `mode: interleave`. Because merge mode is now
+    // carried on the plan node (not looked up by name in the top-level config,
+    // which does not contain body nodes), the body Merge round-robins its two
+    // branches. A regression to the name lookup would miss the body node,
+    // default to Concat, and emit lo,lo,hi,hi instead of lo,hi,lo,hi.
+    let yaml = r#"
+pipeline:
+  name: composition_body_merge_interleave
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: a, type: int }
+  - type: composition
+    name: split_merge
+    input: src
+    use: ../compositions/exec_merge_interleave_check.comp.yaml
+    inputs:
+      inp: src
+  - type: output
+    name: out
+    input: split_merge
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+"#;
+    // Route sends a<10 to `lo`, a>=10 to `hi`: lo_branch=[5,6], hi_branch=[15,16].
+    let csv_input = "a\n5\n15\n6\n16\n";
+    let (_report, output) = run_with_composition(yaml, csv_input);
+
+    let buckets: Vec<&str> = output
+        .lines()
+        .filter_map(|l| {
+            if l.contains("lo") {
+                Some("lo")
+            } else if l.contains("hi") {
+                Some("hi")
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(
+        buckets,
+        vec!["lo", "hi", "lo", "hi"],
+        "body Merge must interleave (round-robin) per its declared mode, not \
+         concatenate:\n{output}"
+    );
+}

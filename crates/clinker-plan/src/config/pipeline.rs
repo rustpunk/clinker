@@ -3881,12 +3881,30 @@ pub(crate) fn lower_node_to_plan_node(
                 branch_programs,
             })
         }
-        PipelineNode::Merge { .. } => Some(PlanNode::Merge {
-            name: name.to_string(),
-            id,
-            span,
-            output_schema: schema_from_bound(),
-        }),
+        PipelineNode::Merge { header, config } => {
+            // Carry mode + declaration order onto the node so a Merge inside a
+            // composition body resolves them scope-correctly (the executor's
+            // by-name lookup into the top-level config misses body nodes).
+            let input_order = header
+                .inputs
+                .iter()
+                .map(|ni| match &ni.value {
+                    crate::config::node_header::NodeInput::Single(s) => s.clone(),
+                    crate::config::node_header::NodeInput::Port { node, port } => {
+                        format!("{node}.{port}")
+                    }
+                })
+                .collect();
+            Some(PlanNode::Merge {
+                name: name.to_string(),
+                id,
+                span,
+                mode: config.mode,
+                interleave_seed: config.interleave_seed,
+                input_order,
+                output_schema: schema_from_bound(),
+            })
+        }
         PipelineNode::Composition { .. } => {
             // Look up the body assigned by bind_composition. If binding
             // failed (E102–E109), there's no entry — omit the node from

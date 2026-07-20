@@ -325,6 +325,14 @@ pub struct CombineInput {
     /// Name of the upstream node this input resolves to. Looked up in
     /// the DAG's `node_by_name` table when a `NodeIndex` is needed.
     pub upstream_name: Arc<str>,
+    /// Producer output port this input draws from: `Some(port)` for a
+    /// `<producer>.<port>` reference (a Cull `removed_to` / Route branch),
+    /// `None` for a bare producer reference. Carried on the node so the
+    /// combine dispatcher can disambiguate a driver/build pair that resolves
+    /// to the same predecessor node via two different ports — scope-correctly,
+    /// including inside a composition body where the node's `input:` map is not
+    /// in the top-level `config.nodes`.
+    pub producer_port: Option<String>,
     /// Schema of the upstream row, cloned at bind_schema time. Used by
     /// C.2+ execution strategies without having to re-traverse
     /// `schema_by_name`.
@@ -2318,13 +2326,22 @@ pub(crate) fn decompose_nary_combines(
             node_by_name.get(upstream_name).copied()
         };
         for (i, step) in steps.iter().enumerate() {
-            let driver_idx = if i == 0 {
+            // Carry the producer output port onto the step edge when the driver
+            // draws a multi-output producer's port (a Cull `removed_to` / Route
+            // branch); step i>0 draws the prior step's single unnamed output, so
+            // no port. Without this the edge tag disagrees with the step's
+            // `combine_inputs.producer_port` and `resolve_side` cannot pick the
+            // right slot for a step that draws two ports of one producer.
+            let (driver_idx, driver_producer_port) = if i == 0 {
                 let original_driver_input = inputs
                     .get(&driving)
                     .expect("driver qualifier present in combine_inputs");
-                resolve_chain_input(original_driver_input.upstream_name.as_ref())
+                (
+                    resolve_chain_input(original_driver_input.upstream_name.as_ref()),
+                    original_driver_input.producer_port.clone(),
+                )
             } else {
-                Some(step_indices[i - 1])
+                (Some(step_indices[i - 1]), None)
             };
             let build_input_meta = inputs
                 .get(&step.build_input)
@@ -2338,7 +2355,7 @@ pub(crate) fn decompose_nary_combines(
                     PlanEdge {
                         dependency_type: DependencyType::Data,
                         port: None,
-                        producer_port: None,
+                        producer_port: driver_producer_port,
                     },
                 );
             }
@@ -2349,7 +2366,7 @@ pub(crate) fn decompose_nary_combines(
                     PlanEdge {
                         dependency_type: DependencyType::Data,
                         port: None,
-                        producer_port: None,
+                        producer_port: build_input_meta.producer_port.clone(),
                     },
                 );
             }
@@ -2374,10 +2391,16 @@ pub(crate) fn decompose_nary_combines(
             } else {
                 steps[i - 1].intermediate_row.clone()
             };
-            let driver_upstream: Arc<str> = if i == 0 {
-                Arc::clone(&inputs.get(&driving).unwrap().upstream_name)
+            let (driver_upstream, driver_producer_port): (Arc<str>, Option<String>) = if i == 0 {
+                let driver_meta = inputs.get(&driving).unwrap();
+                (
+                    Arc::clone(&driver_meta.upstream_name),
+                    driver_meta.producer_port.clone(),
+                )
             } else {
-                Arc::from(steps[i - 1].name.as_str())
+                // Later steps draw the driver from the prior step's single
+                // unnamed output.
+                (Arc::from(steps[i - 1].name.as_str()), None)
             };
             let build_meta = inputs
                 .get(&step.build_input)
@@ -2388,6 +2411,7 @@ pub(crate) fn decompose_nary_combines(
                 step.driving_input.clone(),
                 CombineInput {
                     upstream_name: driver_upstream,
+                    producer_port: driver_producer_port,
                     row: driver_row,
                 },
             );
@@ -2395,6 +2419,7 @@ pub(crate) fn decompose_nary_combines(
                 step.build_input.clone(),
                 CombineInput {
                     upstream_name: Arc::clone(&build_meta.upstream_name),
+                    producer_port: build_meta.producer_port.clone(),
                     row: build_meta.row.clone(),
                 },
             );
@@ -2760,6 +2785,7 @@ mod tests {
             qualifier.to_string(),
             CombineInput {
                 upstream_name: Arc::from(qualifier),
+                producer_port: None,
                 row,
             },
         )
@@ -2896,6 +2922,7 @@ mod tests {
                 (*qual).to_string(),
                 CombineInput {
                     upstream_name: Arc::from(*qual),
+                    producer_port: None,
                     row: Row::closed(IndexMap::new(), CxlSpan::new(0, 0)),
                 },
             );
@@ -3231,6 +3258,7 @@ mod tests {
                 (*qual).to_string(),
                 CombineInput {
                     upstream_name: Arc::from(*qual),
+                    producer_port: None,
                     row: Row::closed(row_fields, CxlSpan::new(0, 0)),
                 },
             );
@@ -3673,6 +3701,7 @@ mod tests {
                 q.to_string(),
                 CombineInput {
                     upstream_name: Arc::from(q),
+                    producer_port: None,
                     row: Row::closed(row_fields, cxl::lexer::Span::new(0, 0)),
                 },
             );
@@ -3772,6 +3801,7 @@ mod tests {
                 q.to_string(),
                 CombineInput {
                     upstream_name: Arc::from(q),
+                    producer_port: None,
                     row: Row::closed(row_fields, cxl::lexer::Span::new(0, 0)),
                 },
             );
