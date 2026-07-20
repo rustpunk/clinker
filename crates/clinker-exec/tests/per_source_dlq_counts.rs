@@ -123,9 +123,36 @@ nodes:
         "only the offending source surfaces; no synthetic '<merged>' key"
     );
 
+    // Per-source ingest counts are independent of DLQ outcome: every source's
+    // records still count at ingest even when all of them later DLQ. src_bad's
+    // two rows both DLQ but remain in the record-count map.
+    assert_eq!(
+        report.per_source_record_counts.get("src_good"),
+        Some(&3),
+        "src_good's three clean rows count at ingest"
+    );
+    assert_eq!(
+        report.per_source_record_counts.get("src_bad"),
+        Some(&2),
+        "src_bad's DLQ'd rows still count at ingest — record count is \
+         independent of DLQ outcome"
+    );
+
+    // The sum-<=-aggregate contract: for this Transform-funnel pipeline every
+    // DLQ entry traces to a declared source, so the surfaced sum reaches the
+    // aggregate. The invariant is `<=`, not `==`, because pipelines with
+    // Combine / post-aggregate synthetic emits attribute some entries to the
+    // filtered-out `<merged>` slot (see per_source_merged_dlq.rs).
     let attributed: u64 = report.per_source_dlq_counts.values().sum();
+    assert!(
+        attributed <= report.counters.dlq_count,
+        "per-source DLQ counts never exceed the aggregate dlq_count \
+         (attributed={attributed}, dlq_count={})",
+        report.counters.dlq_count
+    );
     assert_eq!(
         attributed, report.counters.dlq_count,
-        "per-source DLQ counts sum to the aggregate dlq_count"
+        "every DLQ entry in this plain-source funnel traces to a declared \
+         source, so the surfaced sum reaches the aggregate"
     );
 }

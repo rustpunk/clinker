@@ -1532,18 +1532,10 @@ impl PipelineExecutor {
             .map(|(k, &v)| (k.as_ref().to_string(), v))
             .collect();
         let merged_key: &Arc<str> = &crate::executor::dispatch::MERGED_SOURCE_NAME;
-        let per_source_record_counts: BTreeMap<String, u64> = ctx
-            .source_count_per_source
-            .iter()
-            .filter(|(k, _)| !Arc::ptr_eq(k, merged_key))
-            .filter_map(|(k, v)| v.map(|n| (k.as_ref().to_string(), n)))
-            .collect();
-        let per_source_dlq_counts: BTreeMap<String, u64> = ctx
-            .dlq_per_source
-            .iter()
-            .filter(|(k, v)| !Arc::ptr_eq(k, merged_key) && **v > 0)
-            .map(|(k, v)| (k.as_ref().to_string(), *v))
-            .collect();
+        let per_source_record_counts =
+            project_declared_source_record_counts(&ctx.source_count_per_source, merged_key);
+        let per_source_dlq_counts =
+            project_declared_source_dlq_counts(&ctx.dlq_per_source, merged_key);
 
         let cumulative_spill_bytes = ctx.memory_budget.cumulative_spill_bytes();
         let per_stage_spill_bytes = ctx.memory_budget.per_stage_spill_bytes();
@@ -1595,6 +1587,41 @@ impl PipelineExecutor {
     }
 }
 
+/// Project the per-source finalized ingest counts into the report-facing map:
+/// drop the synthetic `<merged>` rollup slot (matched by pointer identity, so
+/// a user source literally named `<merged>` is not confused with it) and any
+/// source whose finalize slot is still `None` (never finalized), keying the
+/// survivors by declared source name. A source that finalized with zero
+/// records is kept as `Some(0)` — "stream closed empty" is distinct from
+/// "never finished".
+fn project_declared_source_record_counts(
+    source_count_per_source: &HashMap<Arc<str>, Option<u64>>,
+    merged_key: &Arc<str>,
+) -> BTreeMap<String, u64> {
+    source_count_per_source
+        .iter()
+        .filter(|(k, _)| !Arc::ptr_eq(k, merged_key))
+        .filter_map(|(k, v)| v.map(|n| (k.as_ref().to_string(), n)))
+        .collect()
+}
+
+/// Project the per-source DLQ counters into the report-facing map: drop the
+/// synthetic `<merged>` rollup slot (by pointer identity) and any source with
+/// zero entries, keying survivors by declared source name. The sum of the
+/// surfaced values is therefore `<= counters.dlq_count`; the remainder is the
+/// DLQ entries the executor attributed to `<merged>` — Combine emits and
+/// post-aggregate synthetic rows that carry no originating source stamp.
+fn project_declared_source_dlq_counts(
+    dlq_per_source: &HashMap<Arc<str>, u64>,
+    merged_key: &Arc<str>,
+) -> BTreeMap<String, u64> {
+    dlq_per_source
+        .iter()
+        .filter(|(k, v)| !Arc::ptr_eq(k, merged_key) && **v > 0)
+        .map(|(k, v)| (k.as_ref().to_string(), *v))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     //! Executor white-box tests — submodules below each read a crate-private
@@ -1622,6 +1649,7 @@ mod tests {
     mod iejoin_pre_output_budget;
     mod multi_output;
     mod nested_composition_overshoot;
+    mod per_source_projection;
     mod resident_node_buffer_spill;
     mod scheduling;
     mod source_consumer_release;
