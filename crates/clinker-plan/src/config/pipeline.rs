@@ -1202,18 +1202,99 @@ impl PipelineConfig {
                 );
             }
         }
+        // E360 — a source still carrying the superseded `array_paths:` block.
+        // Nothing reads it any more, and a source config is flattened into its
+        // node so serde discards an unrecognized key silently: without this
+        // gate the pipeline compiles and runs, emitting one record per document
+        // where it used to emit one per array element.
+        for spanned in &self.nodes {
+            let PipelineNode::Source {
+                header,
+                config: body,
+            } = &spanned.value
+            else {
+                continue;
+            };
+            if body.source.array_paths.is_none() {
+                continue;
+            }
+            let primary = doc_node_line_by_name
+                .get(header.name.as_str())
+                .map(|&line| Span::line_only(line))
+                .unwrap_or(Span::SYNTHETIC);
+            diags.push(
+                Diagnostic::error(
+                    "E360",
+                    format!(
+                        "source '{}' declares `array_paths:`, which the multi-value \
+                         declarations replaced — the key is no longer read, so leaving it in \
+                         place would drop the fan-out silently",
+                        header.name
+                    ),
+                    LabeledSpan::primary(primary, String::new()),
+                )
+                .with_help(
+                    "replace it: an `explode` path becomes a `split_to_rows:` entry (`mode: \
+                     extract` reproduces the old projection, `mode: split` keeps the record \
+                     shape), a delimited cell becomes a `split_values:` entry, and a path kept \
+                     as an array becomes `multiple: true` on the schema column"
+                        .to_string(),
+                ),
+            );
+        }
         // E358 — a malformed multi-value declaration on a source: duplicate or
         // nested `split_to_rows` fields, a duplicate `split_values` field, or a
         // `split_values` field the schema does not declare `multiple: true`.
         // The nesting/duplicate rejection used to run at XML reader
         // construction as an unspanned string error and never ran for JSON at
         // all; both now fail at compile, anchored to the source node.
-        for body in self.source_bodies() {
+        //
+        // Both gates read the schema's declared columns, so they run against
+        // the map below rather than `body.schema`: an external
+        // `.schema.yaml` (`SourceSchema::File`) is still unresolved at this
+        // point — the resolution pass that folds it inline sits further down,
+        // past the fatal-error return — and an unresolved `File` declares no
+        // columns to inspect, which would leave both gates inert for every
+        // pipeline that keeps its schema in a file.
+        let resolved_source_schemas: HashMap<&str, clinker_format::SourceSchema> = self
+            .nodes
+            .iter()
+            .filter_map(|spanned| match &spanned.value {
+                PipelineNode::Source {
+                    header,
+                    config: body,
+                } => {
+                    let schema = match &body.schema {
+                        // A file that fails to load is left out entirely: the
+                        // resolution pass below reports it as E157, and
+                        // reporting it twice from two passes would be worse
+                        // than these two gates skipping the source.
+                        clinker_format::SourceSchema::File(path) => {
+                            crate::schema::load_source_schema(std::path::Path::new(path)).ok()?
+                        }
+                        inline => inline.clone(),
+                    };
+                    Some((header.name.as_str(), schema))
+                }
+                _ => None,
+            })
+            .collect();
+        for spanned in &self.nodes {
+            let PipelineNode::Source {
+                header,
+                config: body,
+            } = &spanned.value
+            else {
+                continue;
+            };
+            let Some(schema) = resolved_source_schemas.get(header.name.as_str()) else {
+                continue;
+            };
             for fault in
-                crate::config::multi_value::validate_source_declarations(&body.source, &body.schema)
+                crate::config::multi_value::validate_source_declarations(&body.source, schema)
             {
                 let primary = doc_node_line_by_name
-                    .get(body.source.name.as_str())
+                    .get(header.name.as_str())
                     .map(|&line| Span::line_only(line))
                     .unwrap_or(Span::SYNTHETIC);
                 diags.push(
@@ -1240,12 +1321,16 @@ impl PipelineConfig {
         // formats qualify lives in one per-format table
         // (`output_encodes_multi_value`), so a writer gaining support relaxes
         // exactly one entry.
-        let multi_value_by_source: HashMap<&str, Vec<String>> = self
-            .source_bodies()
-            .map(|body| {
+        //
+        // Both sides key on the NODE name (`header.name`), which the
+        // reachability walk is built from and which can differ from the nested
+        // `config.name:` the diagnostic text quotes.
+        let multi_value_by_source: HashMap<&str, Vec<String>> = resolved_source_schemas
+            .iter()
+            .map(|(name, schema)| {
                 (
-                    body.source.name.as_str(),
-                    crate::config::multi_value::multi_value_columns(&body.schema),
+                    *name,
+                    crate::config::multi_value::multi_value_columns(schema),
                 )
             })
             .filter(|(_, columns)| !columns.is_empty())
@@ -1253,11 +1338,19 @@ impl PipelineConfig {
         if !multi_value_by_source.is_empty() {
             let data_reachability =
                 crate::config::multi_value::source_data_reachability(&self.nodes);
-            for output in self.output_configs() {
+            for spanned in &self.nodes {
+                let PipelineNode::Output {
+                    header,
+                    config: body,
+                } = &spanned.value
+                else {
+                    continue;
+                };
+                let output = &body.output;
                 if crate::config::multi_value::output_encodes_multi_value(&output.format) {
                     continue;
                 }
-                let Some(feeding) = data_reachability.get(output.name.as_str()) else {
+                let Some(feeding) = data_reachability.get(header.name.as_str()) else {
                     continue;
                 };
                 for source_name in feeding {
@@ -1265,7 +1358,7 @@ impl PipelineConfig {
                         continue;
                     };
                     let primary = doc_node_line_by_name
-                        .get(output.name.as_str())
+                        .get(header.name.as_str())
                         .map(|&line| Span::line_only(line))
                         .unwrap_or(Span::SYNTHETIC);
                     diags.push(
@@ -1276,7 +1369,7 @@ impl PipelineConfig {
                                  multi-value column(s) {columns} (`multiple: true`), and a \
                                  `{format}` output has no encoding for a field holding more \
                                  than one value",
-                                out = output.name,
+                                out = header.name,
                                 columns = columns
                                     .iter()
                                     .map(|c| format!("'{c}'"))

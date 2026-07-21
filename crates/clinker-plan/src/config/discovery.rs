@@ -460,6 +460,7 @@ mod tests {
             declared_doc_paths: Vec::new(),
             split_to_rows: None,
             split_values: None,
+            array_paths: None,
             sort_order: None,
             transport: crate::config::SourceTransport::File,
             format: InputFormat::Csv(None),

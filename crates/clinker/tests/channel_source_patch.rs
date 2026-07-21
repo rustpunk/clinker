@@ -307,6 +307,81 @@ sources:
     assert_eq!(rows[2], "2,z,1", "numbering restarts per record:\n{out}");
 }
 
+/// An omitted patch key means "keep current", so resetting a `split_values`
+/// delimiter needs the explicit-null form. Without a three-state delimiter the
+/// null read as an omitted key and the run silently kept splitting on the
+/// pipeline's separator.
+#[test]
+fn split_values_delimiter_reset_takes_effect_at_run_time() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p = dir.path();
+    write(p, "in.json", "{\"id\":\"1\",\"codes\":\"a;b\"}\n");
+    write(
+        p,
+        "pipe.yaml",
+        "\
+pipeline:
+  name: delimiter_reset
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: in.json
+      options:
+        format: ndjson
+      split_values:
+        - field: codes
+          delimiter: \"|\"
+      schema:
+        - { name: id, type: string }
+        - { name: codes, type: string, multiple: true }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: json
+      path: out.json
+",
+    );
+    write_channel(
+        p,
+        "reset",
+        "\
+sources:
+  src:
+    split_values:
+      codes: { delimiter: ~ }
+",
+    );
+
+    // Base: `|` never appears in the cell, so the whole text is one value.
+    let base = run_in(p, &[]);
+    assert!(
+        base.status.success(),
+        "base run failed:\n{}",
+        String::from_utf8_lossy(&base.stderr)
+    );
+    let base_out = std::fs::read_to_string(p.join("out.json")).expect("read out.json");
+    assert!(base_out.contains("\"a;b\""), "base output:\n{base_out}");
+
+    // Channel: the explicit null restores the `;` default, so the cell parses
+    // into the two values the column holds.
+    let patched = run_in(p, &["--channel", "reset"]);
+    assert!(
+        patched.status.success(),
+        "patched run failed:\n{}",
+        String::from_utf8_lossy(&patched.stderr)
+    );
+    let out = std::fs::read_to_string(p.join("out.json")).expect("read out.json");
+    assert!(
+        out.contains("\"a\"") && out.contains("\"b\"") && !out.contains("\"a;b\""),
+        "patched output:\n{out}"
+    );
+}
+
 /// A `multiple: true` column reaching a CSV output is rejected at compile
 /// (E359) rather than failing partway through the run: the CSV writer has no
 /// multi-value encoding yet.

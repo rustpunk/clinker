@@ -15,7 +15,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use clinker_format::{Column, SourceSchema, under_field_path};
 
-use crate::config::format::OutputFormat;
+use crate::config::format::{InputFormat, OutputFormat};
 use crate::config::pipeline_node::PipelineNode;
 use crate::config::source::SourceConfig;
 use crate::yaml::Spanned;
@@ -58,9 +58,8 @@ pub struct DeclarationFault {
 /// Validate one source's `split_to_rows` / `split_values` declarations against
 /// its resolved schema (E358).
 ///
-/// Declared fan-out fields must name **disjoint** element groups: occurrence
-/// tracking assigns each extracted field to at most one declared group, so a
-/// duplicated field would fan the same group out twice and a nested one would
+/// A duplicated fan-out field would fan the same group out twice, and on a
+/// format whose reader tracks occurrences positionally a nested pair would
 /// leave the inner group's membership ambiguous. This ran at XML reader
 /// construction as an untyped, unspanned string error and never ran at all for
 /// JSON; both formats are checked here instead, before any input is opened.
@@ -70,7 +69,29 @@ pub fn validate_source_declarations(
 ) -> Vec<DeclarationFault> {
     let mut faults = Vec::new();
     let fan_out = source.split_to_rows.as_deref().unwrap_or(&[]);
+    // Whether the reader assigns each extracted field to at most one declared
+    // group by document position. The XML reader does — it records one index
+    // range per occurrence while parsing, and a nested pair leaves a field
+    // inside both ranges with no rule for which group owns it. The JSON reader
+    // does not: it applies entries in declaration order over the flattened map,
+    // so an outer fan-out leaves the inner field addressable for the next
+    // entry, and a nested pair is a valid two-level expansion.
+    let occurrence_tracked = matches!(source.format, InputFormat::Xml(_));
     for (i, a) in fan_out.iter().enumerate() {
+        // A dotted element path with an empty segment matches no flattened key,
+        // so the entry would fan nothing out and be a silent no-op.
+        if a.field.is_empty() || a.field.split('.').any(str::is_empty) {
+            faults.push(DeclarationFault {
+                message: format!(
+                    "source '{}': `split_to_rows` declares the field path '{}', which has an \
+                     empty path segment",
+                    source.name, a.field
+                ),
+                help: "name the repeated element by its record-relative dotted path \
+                       (`line_items`, `Items.Item`) — no leading, trailing, or doubled dot"
+                    .to_string(),
+            });
+        }
         for b in &fan_out[i + 1..] {
             if a.field == b.field {
                 faults.push(DeclarationFault {
@@ -82,15 +103,19 @@ pub fn validate_source_declarations(
                            occurrence of that element out to its own record"
                         .to_string(),
                 });
-            } else if under_field_path(&a.field, &b.field) || under_field_path(&b.field, &a.field) {
+            } else if occurrence_tracked
+                && (under_field_path(&a.field, &b.field) || under_field_path(&b.field, &a.field))
+            {
                 faults.push(DeclarationFault {
                     message: format!(
-                        "source '{}': `split_to_rows` fields '{}' and '{}' nest — declared \
-                         fan-out fields must name disjoint (non-nested) element groups",
+                        "source '{}': `split_to_rows` fields '{}' and '{}' nest — on an xml \
+                         source, declared fan-out fields must name disjoint (non-nested) \
+                         element groups",
                         source.name, a.field, b.field
                     ),
-                    help: "fan out on the outer field alone, or on the inner one alone; a \
-                           nested pair leaves each occurrence's membership ambiguous"
+                    help: "fan out on the outer field alone, or on the inner one alone; the \
+                           xml reader assigns each element to one occurrence group by document \
+                           position, and a nested pair leaves that membership ambiguous"
                         .to_string(),
                 });
             }
@@ -163,19 +188,14 @@ pub fn validate_source_declarations(
         }
     }
 
-    // A `split_values` entry produces several values, which only a
-    // `multiple: true` column can hold. Without the declaration the column
-    // would be typed as a single value while carrying an array.
     if let Some(columns) = schema.bound_columns() {
+        // A `split_values` entry produces several values, which only a
+        // `multiple: true` column can hold. Without the declaration the column
+        // would be typed as a single value while carrying an array.
         for entry in in_cell {
-            if declares_multiple(&columns, &entry.field) {
-                continue;
-            }
-            let known = columns
-                .iter()
-                .any(|c| c.name == entry.field || c.physical_name() == entry.field);
-            if known {
-                faults.push(DeclarationFault {
+            match resolve_declared_field(&columns, &entry.field) {
+                DeclaredField::Multiple => {}
+                DeclaredField::Single => faults.push(DeclarationFault {
                     message: format!(
                         "source '{}': `split_values` names the field '{}', which the schema \
                          does not declare `multiple: true` — splitting it would produce \
@@ -187,9 +207,20 @@ pub fn validate_source_declarations(
                          `split_values` entry",
                         entry.field
                     ),
-                });
-            } else {
-                faults.push(DeclarationFault {
+                }),
+                DeclaredField::AliasedTo(physical) => faults.push(DeclarationFault {
+                    message: format!(
+                        "source '{}': `split_values` names the field '{}', which is the \
+                         column's exposed name — the column reads from the input field '{}', \
+                         and the split runs against the names the document carries",
+                        source.name, entry.field, physical
+                    ),
+                    help: format!(
+                        "name the input field: `split_values` on '{physical}' (the column's \
+                         `source_name`), not on the exposed column name"
+                    ),
+                }),
+                DeclaredField::Absent => faults.push(DeclarationFault {
                     message: format!(
                         "source '{}': `split_values` names the field '{}', which the schema \
                          does not declare at all",
@@ -201,6 +232,30 @@ pub fn validate_source_declarations(
                          produces",
                         entry.field
                     ),
+                }),
+            }
+        }
+        // Fanning a field out to rows spends its occurrences one per record;
+        // `multiple: true` collects them into one array on a single record.
+        // Declaring both on the same field asks for both shapes at once.
+        for entry in fan_out {
+            if matches!(
+                resolve_declared_field(&columns, &entry.field),
+                DeclaredField::Multiple
+            ) {
+                faults.push(DeclarationFault {
+                    message: format!(
+                        "source '{}': field '{}' is declared `multiple: true` and also fanned \
+                         out by `split_to_rows` — the first collects its occurrences into one \
+                         array, the second spends them one per record",
+                        source.name, entry.field
+                    ),
+                    help: format!(
+                        "drop `multiple: true` from the '{}' schema column to fan its \
+                         occurrences out to rows, or drop the `split_to_rows` entry to \
+                         collect them into one array",
+                        entry.field
+                    ),
                 });
             }
         }
@@ -208,14 +263,39 @@ pub fn validate_source_declarations(
     faults
 }
 
-/// Whether the schema declares a column (by exposed or physical name)
-/// `multiple: true`. Both names are accepted because a `split_values` entry
-/// names a field of the source document, which an aliased column reads through
-/// its physical name while the author may think of it by either.
-fn declares_multiple(columns: &[Column], field: &str) -> bool {
-    columns
-        .iter()
-        .any(|c| c.is_multiple() && (c.name == field || c.physical_name() == field))
+/// How a declared field name relates to the schema.
+///
+/// `split_values` and `split_to_rows` name fields of the source DOCUMENT, and
+/// every reader matches them against the names the document carries — before
+/// the declared-schema reprojection renames anything (the same rule
+/// `multi_value_fields` applies when it hands the readers physical names). So
+/// an aliased column is addressable only by its `source_name`, and naming its
+/// exposed name instead is reported as its own fault rather than accepted:
+/// accepting it would compile clean and then never match at run time.
+enum DeclaredField {
+    /// A column reads this input field and is declared `multiple: true`.
+    Multiple,
+    /// A column reads this input field, declared single-valued.
+    Single,
+    /// No column reads this input field, but one is EXPOSED under this name and
+    /// reads the carried physical name instead.
+    AliasedTo(String),
+    /// The schema names this field nowhere.
+    Absent,
+}
+
+fn resolve_declared_field(columns: &[Column], field: &str) -> DeclaredField {
+    if let Some(column) = columns.iter().find(|c| c.physical_name() == field) {
+        return if column.is_multiple() {
+            DeclaredField::Multiple
+        } else {
+            DeclaredField::Single
+        };
+    }
+    match columns.iter().find(|c| c.name == field) {
+        Some(column) => DeclaredField::AliasedTo(column.physical_name().to_string()),
+        None => DeclaredField::Absent,
+    }
 }
 
 /// The `multiple: true` columns a source declares, by exposed name.

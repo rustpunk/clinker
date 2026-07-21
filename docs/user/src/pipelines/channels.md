@@ -507,6 +507,7 @@ sources:
       line_items: remove                    # drop an entry (unknown field -> E234)
     split_values:                           # keyed by field name
       codes:      { delimiter: "|" }        # add-or-modify an entry
+      tags:       { delimiter: ~ }          # reset to the default delimiter
       notes:      remove                    # drop an entry (unknown field -> E234)
     schema:                                 # keyed by column name
       amount:      { type: float, scale: 2 }
@@ -519,8 +520,9 @@ All ops are keyed and leaf-replace — there is no deep-merge. On an existing
 `split_to_rows` / `split_values` entry a partial map is a modify: an omitted key
 keeps its current value, and a new entry takes the same defaults hand-written
 config would. Because an omitted key means "keep current", clearing an attribute
-that is already set needs its own form — an explicit YAML null
-(`position_column: ~`). `options` are
+that is already set needs its own form — an explicit YAML null. On
+`position_column` that removes the attribute; on `delimiter`, which always holds
+some separator, it restores the `;` default. `options` are
 merged onto the source's current options and re-validated through the format's
 option struct, so an unknown or mistyped key is rejected exactly as in
 hand-written config. A `schema` `rename` is a source-column alias — the same

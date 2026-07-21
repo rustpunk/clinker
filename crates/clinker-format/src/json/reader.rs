@@ -300,8 +300,13 @@ impl JsonReader {
     /// A record whose field holds an empty array, or carries no such field at
     /// all, survives under the default `keep_empty: true` — several widely
     /// deployed engines drop it instead, and a vanished row is the costliest
-    /// failure mode for this audience. A field holding a non-array value has
-    /// nothing to fan out and passes through untouched.
+    /// failure mode for this audience.
+    ///
+    /// A field present but NOT holding an array is one occurrence, projected
+    /// exactly as a single-element array would be. JSON producers routinely
+    /// unwrap a one-element array, and XML — where a document cannot say
+    /// "array" at all — fans a lone repeated element out the same way, so the
+    /// same logical feed must not come out differently on the two paths.
     fn apply_split_to_rows(
         &self,
         flat: serde_json::Map<String, serde_json::Value>,
@@ -313,7 +318,26 @@ impl JsonReader {
         let mut result = vec![flat];
         for entry in &self.config.split_to_rows {
             let mut next = Vec::new();
-            for rec in result {
+            for mut rec in result {
+                // The lone occurrence a non-array value contributes, lifted out
+                // of the record so the projection below can put it back under
+                // the mode's rules. An object occurrence has no value to read:
+                // `flatten_value` dissolved it into dotted child keys before
+                // this ran, and reading that as an absent field would treat a
+                // populated group as an empty one.
+                let single = match rec.get(&entry.field) {
+                    Some(serde_json::Value::Array(_)) => None,
+                    Some(_) => rec.shift_remove(&entry.field),
+                    None => take_dissolved_object(&mut rec, &entry.field),
+                };
+                if let Some(elem) = single {
+                    project_element(&mut rec, entry, &elem);
+                    if let Some(column) = &entry.position_column {
+                        rec.insert(column.clone(), 1.into());
+                    }
+                    next.push(rec);
+                    continue;
+                }
                 match rec.get(&entry.field) {
                     Some(serde_json::Value::Array(arr)) if !arr.is_empty() => {
                         for (position, elem) in arr.iter().enumerate() {
@@ -332,14 +356,13 @@ impl JsonReader {
                         }
                     }
                     // An empty array or an absent field: nothing to fan out.
-                    Some(serde_json::Value::Array(_)) | None => {
+                    _ => {
                         if entry.keep_empty {
                             let mut r = rec;
                             r.shift_remove(&entry.field);
                             next.push(r);
                         }
                     }
-                    Some(_) => next.push(rec),
                 }
             }
             result = next;
@@ -570,6 +593,35 @@ impl FormatReader for JsonReader {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/// Reassemble the object a fan-out field held, from the dotted child keys
+/// [`JsonReader::flatten_value`] dissolved it into, removing them from the
+/// record. `None` when the record carries no such child — the field really is
+/// absent.
+///
+/// The children are themselves already flattened, so the reassembled object is
+/// one level deep and re-flattening it under any prefix restores exactly the
+/// keys taken out.
+fn take_dissolved_object(
+    rec: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<serde_json::Value> {
+    let prefix = format!("{field}.");
+    let keys: Vec<String> = rec
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
+    let mut object = serde_json::Map::with_capacity(keys.len());
+    for key in keys {
+        let value = rec.shift_remove(&key).expect("key just collected");
+        object.insert(key[prefix.len()..].to_string(), value);
+    }
+    Some(serde_json::Value::Object(object))
+}
 
 /// Write one fan-out element onto its output record.
 ///
@@ -1302,10 +1354,10 @@ mod tests {
     }
 
     #[test]
-    fn split_to_rows_passes_a_non_array_field_through_untouched() {
-        // A scalar where several values were expected has nothing to fan out;
-        // the record survives with the value intact rather than being dropped
-        // or half-extracted.
+    fn split_to_rows_fans_a_scalar_field_out_as_one_occurrence() {
+        // A producer that unwraps its one-element arrays still means one
+        // occurrence, so the record is projected exactly as `["solo"]` would
+        // be — under `extract` the scalar keeps the path's last segment.
         let input = r#"[{"id":1,"orders":"solo"}]"#;
         let config = JsonReaderConfig {
             split_to_rows: vec![SplitToRows::bare("orders")],
@@ -1320,11 +1372,12 @@ mod tests {
     }
 
     #[test]
-    fn split_to_rows_on_a_nested_object_field_keeps_the_flattened_record() {
+    fn split_to_rows_fans_a_single_object_field_out_as_one_occurrence() {
         // A single object under the declared name is flattened away before the
-        // fan-out sees it (`orders.sku`), so the field itself is absent and
-        // `keep_empty` governs — the record survives with its flattened
-        // columns rather than vanishing.
+        // fan-out sees it (`orders.sku`). Reading that as an absent field would
+        // treat a populated group as an empty one: under `keep_empty: false`
+        // the record would vanish, and under the default it would keep a
+        // column no fanned-out sibling has.
         let input = r#"[{"id":1,"orders":{"sku":"x"}}]"#;
         let config = JsonReaderConfig {
             split_to_rows: vec![SplitToRows::bare("orders")],
@@ -1334,8 +1387,68 @@ mod tests {
         let _s = r.schema().unwrap();
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
-        assert_eq!(r1.get("orders.sku"), Some(&Value::String("x".into())));
+        assert_eq!(r1.get("sku"), Some(&Value::String("x".into())));
+        assert_eq!(r1.get("orders.sku"), None);
         assert!(r.next_record().unwrap().is_none());
+    }
+
+    /// The same feed, one order with two line items and one with a single
+    /// unwrapped object, must produce the same column set on every record —
+    /// and the same shape the array form produces.
+    #[test]
+    fn split_to_rows_gives_an_unwrapped_object_the_same_columns_as_an_array() {
+        let input =
+            r#"[{"id":1,"orders":[{"sku":"a"},{"sku":"b"}]},{"id":2,"orders":{"sku":"c"}}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows {
+                position_column: Some("line_no".into()),
+                ..SplitToRows::bare("orders")
+            }],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let mut seen = Vec::new();
+        while let Some(rec) = r.next_record().unwrap() {
+            seen.push((
+                rec.schema()
+                    .columns()
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>(),
+                rec.get("sku").cloned(),
+                rec.get("line_no").cloned(),
+            ));
+        }
+        assert_eq!(seen.len(), 3, "two fanned-out lines plus the unwrapped one");
+        let columns = &seen[0].0;
+        for (i, row) in seen.iter().enumerate() {
+            assert_eq!(&row.0, columns, "record {i} must share one column set");
+        }
+        assert_eq!(seen[2].1, Some(Value::String("c".into())));
+        assert_eq!(seen[2].2, Some(Value::Integer(1)));
+    }
+
+    #[test]
+    fn split_to_rows_keep_empty_false_drops_a_record_with_no_occurrence() {
+        // `keep_empty: false` governs the absent field and the empty array
+        // alike; a record whose field is genuinely missing carries no
+        // occurrence to fan out and is dropped as asked.
+        let input = r#"[{"id":1,"orders":[{"sku":"x"}]},{"id":2},{"id":3,"orders":[]}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows {
+                keep_empty: false,
+                ..SplitToRows::bare("orders")
+            }],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let mut ids = Vec::new();
+        while let Some(rec) = r.next_record().unwrap() {
+            ids.push(rec.get("id").cloned());
+        }
+        assert_eq!(ids, vec![Some(Value::Integer(1))]);
     }
 
     #[test]

@@ -71,7 +71,9 @@ sources:
     // split_values ops: a set-by-field and a remove.
     assert!(matches!(
         patch.split_values.get("tags"),
-        Some(SplitValuesOp::Set { delimiter: Some(d) }) if d == ";"
+        Some(SplitValuesOp::Set {
+            delimiter: Some(Some(d))
+        }) if d == ";"
     ));
     assert!(matches!(
         patch.split_values.get("codes"),
@@ -153,6 +155,28 @@ sources:
         Some(SplitToRowsOp::Set {
             position_column: Some(None),
             ..
+        })
+    ));
+}
+
+#[test]
+fn split_values_explicit_null_parses_as_a_clear() {
+    // Same rule on the sibling surface: `delimiter: ~` is a reset request, and
+    // it must not deserialize to the same `None` an omitted key produces.
+    let o = overlay(
+        br#"
+channel:
+  target: ../../pipeline/base.yaml
+sources:
+  src:
+    split_values:
+      codes: { delimiter: ~ }
+"#,
+    );
+    assert!(matches!(
+        o.sources["src"].split_values.get("codes"),
+        Some(SplitValuesOp::Set {
+            delimiter: Some(None)
         })
     ));
 }

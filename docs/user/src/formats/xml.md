@@ -143,16 +143,23 @@ occurrence wins: under `extract` it is the record, so its own field is not
 shadowed by the parent it was merged with. Use `mode: split` when you need both
 values, which keeps them at `name` and `Item.name`.
 
+A declared `position_column` wins over any field of that name, inside the
+occurrence or outside it. `position_column: line_no` against an `<Item>` that
+carries its own `<line_no>` child yields the occurrence's index, not the
+document's value — you named the column, so the index is what it holds.
+
 An occurrence with no content (`<Item></Item>`) still emits a record, one
 carrying only the fields outside the group. A record with **no** occurrence of
 the element is governed by `keep_empty`: XML cannot distinguish an empty
 repetition from an absent element, and the default `keep_empty: true` passes
 the record through unchanged.
 
-Entries apply in declaration order, so two declared fields multiply. Fields
-must name **disjoint** element groups — a duplicated field, or one extending
-another (`Item` and `Item.part`) — which is rejected at compile (`E358`), before
-the source opens.
+Entries apply in declaration order, so two declared fields multiply. Fields must
+name **disjoint** element groups — a duplicated field, or one extending another
+(`Item` and `Item.part`) — which is rejected at compile (`E358`), before the
+source opens. The disjointness rule is this reader's: it assigns each element to
+one occurrence group by document position, which is sound exactly when the
+declared groups do not nest. A JSON source has no such constraint.
 
 ### All occurrences in one field: `multiple: true`
 
@@ -169,6 +176,9 @@ first:
 `<Tag>a</Tag><Tag>b</Tag>` yields `["a", "b"]`, and a single `<Tag>` still
 yields a one-element array. Declaring the flattened children of a repeated
 container (`Item.name`, `Item.qty`) collects each of them independently.
+
+A field cannot be both collected and fanned out: naming a `multiple: true`
+column in `split_to_rows` is rejected at compile (`E358`).
 
 Repeated fields named by neither a `split_to_rows` entry nor a `multiple:`
 column keep the default duplicate-key collapse: the first value wins and later

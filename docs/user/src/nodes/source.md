@@ -311,6 +311,10 @@ forms mix freely in one list:
 | `mode` | `extract` | `extract` — the occurrence becomes the record; `split` — the record shape is kept |
 | `position_column` | none | Column receiving each occurrence's 1-based position |
 
+The field is named as it appears in the **input document**, not as the schema
+exposes it: a column declared `source_name:` is addressed by that
+`source_name`. The same rule applies to `split_values` below.
+
 **`keep_empty` defaults to `true`.** A record whose field holds an empty array,
 or carries no such field at all, is emitted with that field unset rather than
 disappearing. Several widely used engines drop the record instead; a vanished
@@ -322,15 +326,22 @@ group is merged onto each output. `{"orders": [{"id": 1}]}` yields a top-level
 `id`, and repeated `<Item><name>` children yield `name`. When lifting lands an
 occurrence's field on a name an outside field already occupies, the occurrence
 wins — it is the record, so its own value is not shadowed by the parent it was
-merged with.
+merged with. A `position_column` wins over both: you named it, so a field of
+the same name inside or outside the occurrence gives way to the index.
 
 **`mode: split`** preserves the record shape: the occurrence's fields keep
 their dotted path (`orders.id`, `Item.name`) and each output carries exactly
 one occurrence.
 
-Entries apply in declaration order, so two entries multiply. Declared fields
-must name disjoint (non-nested) element groups — a duplicate or a nested pair
-is rejected at compile (`E358`).
+Entries apply in declaration order, so two entries multiply. Declaring the same
+field twice is rejected at compile (`E358`), as is fanning out a field the
+schema also declares `multiple: true` — the attribute collects the occurrences
+into one array, the fan-out spends them one per record, and a field cannot be
+both. On an **XML** source, two entries may not name nested element groups
+either (`Item` and `Item.part`): that reader assigns each element to one
+occurrence group by document position, and a nested pair leaves the inner
+group's membership ambiguous. A JSON source accepts the nested pair, applying
+the entries in order to produce a two-level expansion.
 
 ### Several values in one cell: `split_values`
 
@@ -349,7 +360,19 @@ column holds. It takes the same bare-name-or-mapping shorthand:
 
 The delimiter defaults to `;`. A `split_values` field the schema does not
 declare `multiple: true` is rejected at compile (`E358`): splitting produces
-several values, and only a multi-value column can hold them.
+several values, and only a multi-value column can hold them. So is an entry
+naming a column's exposed name when that column reads a differently-named input
+field — the split runs against the document's own field names, so name the
+`source_name`.
+
+### Migrating from `array_paths`
+
+`array_paths:` was the earlier form of these declarations. It is no longer read,
+and a source still carrying it is rejected at compile (`E360`) rather than
+running with the fan-out silently dropped. An `explode` path becomes a
+`split_to_rows:` entry (`mode: extract` reproduces the old projection), a
+delimited cell becomes a `split_values:` entry, and a path kept as an array
+becomes `multiple: true` on the schema column.
 
 ### Format notes
 
@@ -361,8 +384,12 @@ formats accept the declarations and do not act on them — see
 decoding XML.
 
 **JSON** — the field names the key holding the array (`line_items`, or
-`order.line_items` for an array nested under an object). A field holding a
-non-array value has nothing to fan out and passes through untouched.
+`order.line_items` for an array nested under an object). A field present but
+holding a single object or scalar rather than an array counts as one
+occurrence, and is projected exactly as a one-element array would be — many
+producers unwrap a lone element, and XML cannot express the difference at all,
+so the two readers agree on this. Only a field that is absent, or holds an
+empty array, has no occurrence and is governed by `keep_empty`.
 
 **XML** — the field is the repeated child element's dotted path relative to the
 record element (`Item`, or `Items.Item` when nested). Repetition and absence

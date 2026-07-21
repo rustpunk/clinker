@@ -105,6 +105,18 @@ pub struct SourceConfig {
     /// split into the several values a `multiple: true` column holds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub split_values: Option<Vec<SplitValues>>,
+    /// Capture slot for the superseded `array_paths:` block, read by the E360
+    /// gate and by nothing else.
+    ///
+    /// A source config is embedded with `#[serde(flatten)]`, which rules out
+    /// `deny_unknown_fields`, so a key this struct does not name is discarded
+    /// without a parse error. For a fan-out declaration that silently drops one
+    /// record per group down to one record per document — every downstream
+    /// count, join, and aggregate quietly wrong — so the key is still parsed,
+    /// as an opaque value, purely so the gate can name it and point at what
+    /// replaced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub array_paths: Option<serde_json::Value>,
     /// Record-level sortedness inside the file (used by combine/aggregate
     /// planning to enable streaming strategies). Distinct from
     /// `files.sort_order` which orders the file set itself.

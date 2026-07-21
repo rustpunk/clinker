@@ -978,12 +978,19 @@ fn strip_field_prefix<'a>(key: &'a str, path: &'a str) -> &'a str {
 /// receives each occurrence's 1-based position.
 ///
 /// Lifting a prefix off under [`SplitToRowsMode::Extract`], or synthesizing a
-/// `position_column`, can land a field on a name a field outside the group
-/// already occupies (`<Order><name>` alongside `<Item><name>`). The occurrence
-/// wins: it is the record under `extract`, and a position column was explicitly
-/// asked for. The displaced field is dropped rather than carried alongside,
+/// `position_column`, can land a field on a name another field already occupies
+/// — one outside the group (`<Order><name>` alongside `<Item><name>`) or, for a
+/// position column, one inside the occurrence itself (`<Item><line_no>` under
+/// `position_column: line_no`). The occurrence wins the first: it IS the record
+/// under `extract`. The synthesized position wins the second: it is what the
+/// author asked for by name, and the JSON reader resolves the same collision
+/// the same way. The displaced field is dropped rather than carried alongside,
 /// because the duplicate-key collapse downstream is first-wins and would
 /// otherwise silently keep the shadowed value.
+///
+/// One pass over the record buckets every field, so the work is linear in the
+/// record's fields plus the fan-out it emits — a rescan per occurrence would
+/// make reading a single record quadratic in its occurrence count.
 fn split_field_to_rows(
     rec: &[IndexedField],
     entry: &SplitToRows,
@@ -991,66 +998,61 @@ fn split_field_to_rows(
     out: &mut Vec<Vec<IndexedField>>,
 ) {
     let anchor = instances[0].start;
-    // Any-occurrence membership, precomputed once: probing every range from
-    // inside the per-occurrence loop would make the fan-out quadratic in the
-    // occurrence count. Ranges are recorded in document order, so the last
-    // range's end spans them all.
+    // Field index → the occurrence that owns it. Ranges are recorded in
+    // document order and never overlap, so the last range's end spans them all
+    // and a field outside that span belongs to no occurrence.
     let span = instances.last().map_or(0, |r| r.end);
-    let mut in_occurrence = vec![false; span];
-    for range in instances {
-        in_occurrence[range.clone()].fill(true);
+    let mut owner: Vec<Option<u32>> = vec![None; span];
+    for (position, range) in instances.iter().enumerate() {
+        for slot in &mut owner[range.clone()] {
+            *slot = Some(position as u32);
+        }
     }
-    for (position, instance) in instances.iter().enumerate() {
-        let mut head: Vec<IndexedField> = Vec::new();
-        let mut inside: Vec<IndexedField> = Vec::new();
-        let mut tail: Vec<IndexedField> = Vec::new();
-        // Names this occurrence puts on the output record that an outside
-        // field could also occupy. The occurrence wins both cases: under
-        // `extract` it IS the record, and a `position_column` was explicitly
-        // asked for. Dropping the outside field is what makes that stick — the
-        // duplicate-key collapse downstream is first-wins and would otherwise
-        // silently keep the shadowed value.
-        let mut shadowed: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        if entry.mode == SplitToRowsMode::Extract {
-            for field in rec {
-                if instance.contains(&field.0) {
-                    shadowed.insert(strip_field_prefix(&field.1, &entry.field));
-                }
-            }
+    let mut inside: Vec<Vec<IndexedField>> = vec![Vec::new(); instances.len()];
+    let mut head: Vec<IndexedField> = Vec::new();
+    let mut tail: Vec<IndexedField> = Vec::new();
+    for field in rec {
+        let idx = field.0;
+        match owner.get(idx).copied().flatten() {
+            Some(position) => inside[position as usize].push((
+                idx,
+                projected_key(&field.1, &entry.field, entry.mode),
+                field.2.clone(),
+            )),
+            None if idx < anchor => head.push(field.clone()),
+            None => tail.push(field.clone()),
         }
+    }
+    for (position, mut fields) in inside.into_iter().enumerate() {
         if let Some(column) = &entry.position_column {
-            shadowed.insert(column.as_str());
-        }
-        for field in rec {
-            let idx = field.0;
-            if instance.contains(&idx) {
-                inside.push((
-                    idx,
-                    projected_key(&field.1, &entry.field, entry.mode),
-                    field.2.clone(),
-                ));
-            } else if idx < span && in_occurrence[idx] {
-                // A different occurrence of this field: not part of this output.
-                continue;
-            } else if shadowed.contains(field.1.as_str()) {
-                // Displaced by a field this occurrence puts on the record.
-                continue;
-            } else if idx < anchor {
-                head.push(field.clone());
-            } else {
-                tail.push(field.clone());
-            }
-        }
-        if let Some(column) = &entry.position_column {
-            inside.push((
+            fields.retain(|field| field.1 != *column);
+            fields.push((
                 SYNTHETIC_FIELD_INDEX,
                 column.clone(),
                 (position + 1).to_string(),
             ));
         }
-        head.extend(inside);
-        head.extend(tail);
-        out.push(head);
+        // Names this occurrence puts on the output record that a field outside
+        // the group could also occupy.
+        let (kept_head, kept_tail) = {
+            let mut shadowed: std::collections::HashSet<&str> =
+                std::collections::HashSet::with_capacity(fields.len());
+            if entry.mode == SplitToRowsMode::Extract {
+                shadowed.extend(fields.iter().map(|field| field.1.as_str()));
+            }
+            if let Some(column) = &entry.position_column {
+                shadowed.insert(column.as_str());
+            }
+            let keep = |field: &&IndexedField| !shadowed.contains(field.1.as_str());
+            (
+                head.iter().filter(keep).cloned().collect::<Vec<_>>(),
+                tail.iter().filter(keep).cloned().collect::<Vec<_>>(),
+            )
+        };
+        let mut record = kept_head;
+        record.extend(fields);
+        record.extend(kept_tail);
+        out.push(record);
     }
 }
 
@@ -1689,6 +1691,32 @@ mod tests {
         let r2 = r.next_record().unwrap().unwrap();
         assert_eq!(r2.get("Tag"), Some(&Value::String("b".into())));
         assert_eq!(r2.get("tag_no"), Some(&Value::Integer(2)));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn position_column_wins_over_a_same_named_child_of_the_occurrence() {
+        // The author named the position column; a child of the occurrence that
+        // happens to share the name loses it. Without this the record carried
+        // both, and the first-wins duplicate collapse in `fields_to_record`
+        // kept the document's value and discarded the position — while the
+        // JSON reader kept the position, so one declaration meant two things.
+        let xml = r#"<Root><Order><id>1</id><Item><line_no>99</line_no><sku>a</sku></Item>
+                     <Item><line_no>98</line_no><sku>b</sku></Item></Order></Root>"#;
+        let entry = SplitToRows {
+            position_column: Some("line_no".into()),
+            ..extract("Item")
+        };
+        let config = split_config("Root/Order", vec![entry]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("sku"), Some(&Value::String("a".into())));
+        assert_eq!(r1.get("line_no"), Some(&Value::Integer(1)));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("sku"), Some(&Value::String("b".into())));
+        assert_eq!(r2.get("line_no"), Some(&Value::Integer(2)));
         assert!(r.next_record().unwrap().is_none());
     }
 

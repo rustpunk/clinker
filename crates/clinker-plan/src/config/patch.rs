@@ -403,6 +403,7 @@ impl<'de> Deserialize<'de> for SplitToRowsOp {
 ///
 /// ```yaml
 /// tags:  { delimiter: "|" }   # add-or-modify the entry
+/// codes: { delimiter: ~ }     # reset the delimiter to the default
 /// codes: remove               # drop the entry
 /// ```
 ///
@@ -411,9 +412,15 @@ impl<'de> Deserialize<'de> for SplitToRowsOp {
 pub enum SplitValuesOp {
     /// Drop the keyed in-cell-parse entry.
     Remove,
-    /// Add-or-modify the keyed entry. `None` = keep current (existing) / the
-    /// default delimiter (new).
-    Set { delimiter: Option<String> },
+    /// Add-or-modify the keyed entry.
+    Set {
+        /// Three-state, matching [`SplitToRowsOp::Set::position_column`]:
+        /// `None` = key omitted, keep current; `Some(None)` = an explicit YAML
+        /// null (`~`), reset to the default delimiter; `Some(Some(v))` = set
+        /// it. The attribute has no unset state — it always holds a separator —
+        /// so the clear form restores the default rather than removing it.
+        delimiter: Option<Option<String>>,
+    },
 }
 
 /// Same node-kind dispatch and rationale as [`SplitToRowsOp`]'s.
@@ -425,8 +432,8 @@ impl<'de> Deserialize<'de> for SplitValuesOp {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct SetMap {
-            #[serde(default)]
-            delimiter: Option<String>,
+            #[serde(default, deserialize_with = "explicit_option")]
+            delimiter: Option<Option<String>>,
         }
 
         struct V;
@@ -434,7 +441,10 @@ impl<'de> Deserialize<'de> for SplitValuesOp {
             type Value = SplitValuesOp;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a `split_values` op: either `remove` or a map `{ delimiter: <str> }`")
+                f.write_str(
+                    "a `split_values` op: either `remove` or a map `{ delimiter: <str> }` \
+                     (`delimiter: ~` resets it to the default)",
+                )
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
@@ -443,7 +453,8 @@ impl<'de> Deserialize<'de> for SplitValuesOp {
                 }
                 Err(de::Error::custom(format!(
                     "unknown split_values op {v:?}; the bare scalar form only accepts `remove` \
-                     — use `{{ delimiter: <str> }}` to add or modify an entry"
+                     — use `{{ delimiter: <str> }}` to add or modify an entry, with \
+                     `delimiter: ~` to reset it to the default"
                 )))
             }
 
@@ -1272,8 +1283,12 @@ fn apply_split_values_ops(
                         entries.last_mut().expect("just pushed")
                     }
                 };
+                // `Some(None)` is an explicit null — a delimiter is never
+                // unset, so clearing it restores the default separator.
                 if let Some(d) = delimiter {
-                    entry.delimiter = d.clone();
+                    entry.delimiter = d
+                        .clone()
+                        .unwrap_or_else(|| clinker_format::DEFAULT_VALUE_DELIMITER.to_string());
                 }
             }
         }

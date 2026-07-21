@@ -55,11 +55,20 @@ documented on the
 - `split_values` parses a delimited string cell into several values.
 
 A record whose declared field holds an empty array, or carries no such field at
-all, is preserved by default — `keep_empty` defaults to `true`. A field holding
-a non-array value has nothing to fan out and passes through untouched.
+all, is preserved by default — `keep_empty` defaults to `true`, and setting it
+to `false` drops such a record.
 
-Two declared fan-out fields apply in declaration order and multiply; a
-duplicated or nested pair is rejected at compile (`E358`).
+A field that IS present but holds a single object or scalar rather than an array
+is one occurrence, projected exactly as a one-element array would be. Producers
+routinely unwrap a lone element, so a feed where some documents carry
+`"line_items": [{…}, {…}]` and others carry `"line_items": {…}` fans both out
+the same way and every output record ends up with the same columns. The XML
+reader, where a document cannot express the difference at all, already behaved
+this way.
+
+Two declared fan-out fields apply in declaration order and multiply, including a
+nested pair (`orders` then `orders.items`), which produces the two-level
+expansion. A duplicated field is rejected at compile (`E358`).
 
 ## Bounding envelope retention: `max_index_bytes`
 

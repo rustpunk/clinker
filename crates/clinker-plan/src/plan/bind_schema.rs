@@ -2245,9 +2245,15 @@ fn bind_schema_inner(
                                  block, or remove the `watermark:` declaration",
                             ),
                         ),
+                        // `bound_type()`, not `ty`: on a `multiple: true`
+                        // column `ty` describes each ELEMENT, and the column
+                        // binds — and reaches the watermark extractor — as an
+                        // array. Reading `ty` here would accept a multi-value
+                        // date column and then hand the extractor an array,
+                        // leaving event time frozen with no diagnostic.
                         Some(col)
                             if !matches!(
-                                col.ty,
+                                col.bound_type(),
                                 cxl::typecheck::Type::DateTime | cxl::typecheck::Type::Date,
                             ) =>
                         {
@@ -2259,14 +2265,17 @@ fn bind_schema_inner(
                                          but its declared type {ty:?} is not event-time-coercible; \
                                          watermark columns must be `date_time` or `date`.",
                                         col_name = wm.column,
-                                        ty = col.ty.display_name(),
+                                        ty = col.bound_type().display_name(),
                                     ),
                                     LabeledSpan::primary(span, String::new()),
                                 )
                                 .with_help(
                                     "change the column's declared `type:` to `date_time` \
                                      or `date`, or point `watermark.column` at a column \
-                                     that already has one of those types",
+                                     that already has one of those types; a `multiple: true` \
+                                     column holds an array and cannot carry event time, so \
+                                     drop the declaration if the watermark column is the one \
+                                     that repeats",
                                 ),
                             );
                         }

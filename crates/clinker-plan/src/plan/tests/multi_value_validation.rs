@@ -38,6 +38,32 @@ nodes:
     )
 }
 
+/// The same shape as [`pipeline`] over a JSON source, for the rules that turn
+/// on the source's format.
+fn json_pipeline(source_body: &str, output_format: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: multi_value_gate
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: ./in.json
+{source_body}
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: {output_format}
+      path: out.txt
+"#
+    )
+}
+
 fn compile_err(yaml: &str) -> Vec<Diagnostic> {
     let config = parse_config(yaml).expect("pipeline parses");
     config
@@ -222,8 +248,19 @@ fn a_field_in_both_blocks_is_rejected() {
         "json",
     );
     let found = coded(&compile_err(&yaml), "E358");
-    assert_eq!(found.len(), 1, "expected one E358");
-    assert!(found[0].0.contains("both"), "{}", found[0].0);
+    // Two independent faults: the field is in both blocks, and the column it
+    // names is `multiple: true` while also being fanned out.
+    assert_eq!(found.len(), 2, "expected two E358: {found:?}");
+    assert!(
+        found.iter().any(|(message, _)| message.contains("both")),
+        "no both-blocks fault: {found:?}"
+    );
+    assert!(
+        found
+            .iter()
+            .any(|(message, _)| message.contains("multiple: true")),
+        "no multiple-and-fanned-out fault: {found:?}"
+    );
 }
 
 #[test]
@@ -387,6 +424,239 @@ fn a_source_with_no_multi_value_column_is_unaffected() {
         r#"      schema:
         - { name: tags, type: string }"#,
         "csv",
+    );
+    compile_ok(&yaml);
+}
+
+/// A node's `name:` and its nested `config.name:` are independent, and the
+/// reachability walk is built from node names. Keying the gate on the config
+/// name instead left every pipeline that names them differently uncovered.
+#[test]
+fn e359_fires_when_the_node_name_and_the_config_name_differ() {
+    let yaml = r#"
+pipeline:
+  name: name_mismatch
+nodes:
+  - type: source
+    name: orders_src
+    config:
+      name: orders
+      type: json
+      path: ./orders.json
+      schema:
+        - { name: id, type: string }
+        - { name: tags, type: string, multiple: true }
+  - type: output
+    name: report_sink
+    input: orders_src
+    config:
+      name: report
+      type: csv
+      path: out.csv
+"#;
+    let found = coded(&compile_err(yaml), "E359");
+    assert_eq!(found.len(), 1, "expected one E359: {found:?}");
+    assert!(found[0].0.contains("'tags'"), "{}", found[0].0);
+    assert!(found[0].1, "E359 must carry a source span");
+}
+
+/// The gates read declared columns, which an unresolved external schema has
+/// none of. They must therefore see the file's contents, not the `File`
+/// placeholder that stands in for it until later in compilation.
+#[test]
+fn e359_sees_a_schema_declared_in_an_external_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let schema_path = dir.path().join("orders.schema.yaml");
+    std::fs::write(
+        &schema_path,
+        "- { name: id, type: string }\n- { name: tags, type: string, multiple: true }\n",
+    )
+    .expect("write schema file");
+    let yaml = format!(
+        r#"
+pipeline:
+  name: external_schema
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: ./orders.json
+      schema: {}
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+        schema_path.display()
+    );
+    let found = coded(&compile_err(&yaml), "E359");
+    assert_eq!(found.len(), 1, "expected one E359: {found:?}");
+    assert!(found[0].0.contains("'tags'"), "{}", found[0].0);
+}
+
+#[test]
+fn e358_sees_a_schema_declared_in_an_external_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let schema_path = dir.path().join("orders.schema.yaml");
+    std::fs::write(&schema_path, "- { name: tags, type: string }\n").expect("write schema file");
+    let yaml = format!(
+        r#"
+pipeline:
+  name: external_schema
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: ./orders.json
+      split_values:
+        - tags
+      schema: {}
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: json
+      path: out.json
+"#,
+        schema_path.display()
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert_eq!(found.len(), 1, "expected one E358: {found:?}");
+    assert!(found[0].0.contains("multiple: true"), "{}", found[0].0);
+}
+
+/// The disjointness rule is the XML reader's positional occurrence tracking,
+/// not a property of the declaration. The JSON reader applies entries in
+/// declaration order over the flattened record, where the outer fan-out leaves
+/// the inner field addressable for the next entry.
+#[test]
+fn nested_split_to_rows_fields_compile_on_a_json_source() {
+    let yaml = json_pipeline(
+        r#"      split_to_rows:
+        - { field: orders, mode: split }
+        - { field: orders.items, mode: split }
+      schema:
+        - { name: "orders.items.sku", type: string }"#,
+        "json",
+    );
+    compile_ok(&yaml);
+}
+
+/// `split_values` runs against the names the DOCUMENT carries, so an aliased
+/// column is addressable only by its `source_name`. Accepting the exposed name
+/// compiled clean and then never matched at run time.
+#[test]
+fn split_values_naming_an_aliased_columns_exposed_name_is_rejected() {
+    let yaml = pipeline(
+        r#"      split_values:
+        - cost_centres
+      schema:
+        - { name: cost_centres, source_name: CostCentres, type: string, multiple: true }"#,
+        "json",
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert_eq!(found.len(), 1, "expected one E358: {found:?}");
+    assert!(found[0].0.contains("exposed name"), "{}", found[0].0);
+    assert!(found[0].0.contains("CostCentres"), "{}", found[0].0);
+}
+
+#[test]
+fn split_values_naming_the_physical_field_of_an_aliased_column_compiles() {
+    let yaml = pipeline(
+        r#"      split_values:
+        - CostCentres
+      schema:
+        - { name: cost_centres, source_name: CostCentres, type: string, multiple: true }"#,
+        "json",
+    );
+    compile_ok(&yaml);
+}
+
+#[test]
+fn split_to_rows_field_path_with_an_empty_segment_is_rejected() {
+    let yaml = pipeline(
+        r#"      split_to_rows:
+        - Items..Item
+      schema:
+        - { name: sku, type: string }"#,
+        "json",
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert_eq!(found.len(), 1, "expected one E358: {found:?}");
+    assert!(found[0].0.contains("empty path segment"), "{}", found[0].0);
+}
+
+/// `multiple: true` collects a field's occurrences into one array; a fan-out
+/// spends them one per record. Declaring both asks for two shapes at once.
+#[test]
+fn fanning_out_a_multiple_true_column_is_rejected() {
+    let yaml = pipeline(
+        r#"      split_to_rows:
+        - Tag
+      schema:
+        - { name: Tag, type: string, multiple: true }"#,
+        "json",
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert_eq!(found.len(), 1, "expected one E358: {found:?}");
+    assert!(found[0].0.contains("multiple: true"), "{}", found[0].0);
+}
+
+/// A source config is flattened into its node, which rules out rejecting
+/// unknown keys, so the retired key is parsed only to be rejected here — a
+/// pipeline that kept it would otherwise run and emit one record per document
+/// where it used to emit one per array element.
+#[test]
+fn the_retired_array_paths_key_is_rejected_with_a_span() {
+    let yaml = json_pipeline(
+        r#"      array_paths:
+        - path: line_items
+          mode: explode
+      schema:
+        - { name: sku, type: string }"#,
+        "json",
+    );
+    let found = coded(&compile_err(&yaml), "E360");
+    assert_eq!(found.len(), 1, "expected one E360: {found:?}");
+    assert!(found[0].0.contains("array_paths"), "{}", found[0].0);
+    assert!(found[0].1, "E360 must carry a source span");
+}
+
+/// A `multiple: true` column binds as an array, and an array carries no event
+/// time. Reading the declared element type instead let the pipeline compile
+/// and then leave the watermark frozen with no diagnostic.
+#[test]
+fn a_watermark_on_a_multi_value_column_is_rejected() {
+    let yaml = json_pipeline(
+        r#"      watermark:
+        column: event_ts
+      schema:
+        - { name: id, type: string }
+        - { name: event_ts, type: date_time, multiple: true }"#,
+        "json",
+    );
+    let found = coded(&compile_err(&yaml), "E155");
+    assert_eq!(found.len(), 1, "expected one E155: {found:?}");
+    assert!(found[0].0.contains("event_ts"), "{}", found[0].0);
+}
+
+#[test]
+fn a_watermark_on_a_single_valued_date_column_still_compiles() {
+    let yaml = json_pipeline(
+        r#"      watermark:
+        column: event_ts
+      schema:
+        - { name: id, type: string }
+        - { name: event_ts, type: date_time }"#,
+        "json",
     );
     compile_ok(&yaml);
 }
