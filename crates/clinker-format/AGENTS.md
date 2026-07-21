@@ -45,6 +45,7 @@ helpers.
 - `splitting/`: format-agnostic split rotation over writer factories.
 - `csv/`, `json/`, `xml/`, and `fixed_width/`: generic data formats.
 - `multi_record.rs`: heterogeneous flat-file header/body/trailer reader.
+- `multi_value.rs`: source-level multi-value declarations (`split_to_rows` fan-out, `split_values` in-cell parsing) and the field-path nesting predicate.
 - `edifact/`, `x12/`, `hl7/`, and `swift/`: structured interchange/message formats.
 - `segment_tokenizer.rs`: crate-private segment framing helper.
 
@@ -128,6 +129,7 @@ or public format APIs:
 - `crates/clinker-format/src/envelope_writer.rs`
 - `crates/clinker-format/src/counting.rs`
 - `crates/clinker-format/src/splitting/mod.rs`
+- `crates/clinker-format/src/multi_value.rs`
 - `crates/clinker-format/src/json/reader.rs`
 - `crates/clinker-format/src/xml/reader.rs`
 - `crates/clinker-format/tests/streaming_doc_index_json.rs`
