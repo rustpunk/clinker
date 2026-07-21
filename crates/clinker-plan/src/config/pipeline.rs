@@ -1142,7 +1142,7 @@ impl PipelineConfig {
                         "remove the `envelope:` block from this rest source; envelope \
                          sections are a file-document concept. Pull document-level metadata \
                          into record fields through the API's response shape (`record_path`, \
-                         `array_paths`) instead"
+                         `split_to_rows`) instead"
                             .to_string(),
                     ),
                 );
@@ -1200,6 +1200,99 @@ impl PipelineConfig {
                             .to_string(),
                     ),
                 );
+            }
+        }
+        // E358 — a malformed multi-value declaration on a source: duplicate or
+        // nested `split_to_rows` fields, a duplicate `split_values` field, or a
+        // `split_values` field the schema does not declare `multiple: true`.
+        // The nesting/duplicate rejection used to run at XML reader
+        // construction as an unspanned string error and never ran for JSON at
+        // all; both now fail at compile, anchored to the source node.
+        for body in self.source_bodies() {
+            for fault in
+                crate::config::multi_value::validate_source_declarations(&body.source, &body.schema)
+            {
+                let primary = doc_node_line_by_name
+                    .get(body.source.name.as_str())
+                    .map(|&line| Span::line_only(line))
+                    .unwrap_or(Span::SYNTHETIC);
+                diags.push(
+                    Diagnostic::error(
+                        "E358",
+                        fault.message,
+                        LabeledSpan::primary(primary, String::new()),
+                    )
+                    .with_help(fault.help),
+                );
+            }
+        }
+        // E359 — a `multiple: true` column on a source feeding an output whose
+        // format has no multi-value encoding. The writers reject a multi-value
+        // payload at run time, so without this gate the failure lands
+        // mid-stream on record N rather than at compile. Reachability is
+        // source-to-output through the DAG: a column that a transform drops
+        // before the sink is still reported, which is the conservative
+        // direction — a false positive is a compile error the author can see
+        // and resolve, a false negative is a run that dies partway through.
+        // Which formats qualify lives in one per-format table
+        // (`output_encodes_multi_value`), so a writer gaining support relaxes
+        // exactly one entry.
+        let multi_value_by_source: HashMap<&str, Vec<String>> = self
+            .source_bodies()
+            .map(|body| {
+                (
+                    body.source.name.as_str(),
+                    crate::config::multi_value::multi_value_columns(&body.schema),
+                )
+            })
+            .filter(|(_, columns)| !columns.is_empty())
+            .collect();
+        if !multi_value_by_source.is_empty() {
+            for output in self.output_configs() {
+                if crate::config::multi_value::output_encodes_multi_value(&output.format) {
+                    continue;
+                }
+                let Some(feeding) = top_level_ids
+                    .get(output.name.as_str())
+                    .and_then(|id| node_sources.get(id))
+                else {
+                    continue;
+                };
+                for source_name in feeding {
+                    let Some(columns) = multi_value_by_source.get(source_name.as_str()) else {
+                        continue;
+                    };
+                    let primary = doc_node_line_by_name
+                        .get(output.name.as_str())
+                        .map(|&line| Span::line_only(line))
+                        .unwrap_or(Span::SYNTHETIC);
+                    diags.push(
+                        Diagnostic::error(
+                            "E359",
+                            format!(
+                                "output '{out}': source '{source_name}' declares the \
+                                 multi-value column(s) {columns} (`multiple: true`), and a \
+                                 `{format}` output has no encoding for a field holding more \
+                                 than one value",
+                                out = output.name,
+                                columns = columns
+                                    .iter()
+                                    .map(|c| format!("'{c}'"))
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                                format = output.format.format_name(),
+                            ),
+                            LabeledSpan::primary(primary, String::new()),
+                        )
+                        .with_help(
+                            "write this stream to a `json` output, collapse the column to a \
+                             single value in a transform before the sink, or drop \
+                             `multiple: true` from the source column if the field never \
+                             actually repeats"
+                                .to_string(),
+                        ),
+                    );
+                }
             }
         }
         for (doc_path, ref_nodes) in &doc_path_set.by_node {
@@ -3550,7 +3643,7 @@ fn rest_doc_access_diagnostic(
     .with_help(
         "remove the `$doc` access; a rest source has no document envelope. Pull \
          document-level metadata into record fields through the API's response shape \
-         (`record_path`, `array_paths`) instead"
+         (`record_path`, `split_to_rows`) instead"
             .to_string(),
     )
 }

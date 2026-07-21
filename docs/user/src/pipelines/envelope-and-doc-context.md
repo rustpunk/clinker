@@ -185,7 +185,7 @@ letting them silently resolve to `null`:
   error (`E349`) — the access can never resolve.
 
 Pull the document-level metadata into record fields through the API's own
-response shape (`record_path`, `array_paths`) instead, so the value travels
+response shape (`record_path`, `split_to_rows`) instead, so the value travels
 as a normal field rather than as document-envelope context.
 
 ### EDIFACT `segment` extract

@@ -47,7 +47,7 @@ pub(crate) struct RestRecordSource {
     agent: ureq::Agent,
     cfg: RestSourceConfig,
     format: InputFormat,
-    array_paths: Option<Vec<clinker_plan::config::ArrayPathConfig>>,
+    multi_value: MultiValueRead,
     schema_decl: Vec<Column>,
     on_unmapped: OnUnmapped,
     source_name: String,
@@ -165,7 +165,7 @@ impl RestRecordSource {
             agent,
             cfg,
             format: source.format.clone(),
-            array_paths: source.array_paths.clone(),
+            multi_value: MultiValueRead::from_source(source, schema_decl),
             schema_decl: schema_decl.to_vec(),
             on_unmapped,
             source_name: source.name.clone(),
@@ -215,7 +215,7 @@ impl RestRecordSource {
         // its advance is deferred to `on_page_drained`.
         self.advance_cursor(&bytes)?;
 
-        let reader = decode_body(&self.format, self.array_paths.as_deref(), bytes.body)?;
+        let reader = decode_body(&self.format, &self.multi_value, bytes.body)?;
         // A REST body decodes to native/untyped records (JSON), so this is the
         // sole coercion pass (`pretyped: false`) — declared types and each
         // column's `format:` are applied here.
@@ -475,24 +475,48 @@ fn build_output_schema(schema_decl: &[Column], on_unmapped: &OnUnmapped) -> Arc<
     builder.build()
 }
 
+/// A source's multi-value read declarations, resolved once at construction:
+/// the schema columns declared `multiple: true` plus the source's
+/// `split_to_rows` / `split_values` entries. Held on the source so every page's
+/// body decodes through the same declaration.
+struct MultiValueRead {
+    fields: Vec<String>,
+    split_to_rows: Vec<clinker_format::SplitToRows>,
+    split_values: Vec<clinker_format::SplitValues>,
+}
+
+impl MultiValueRead {
+    fn from_source(source: &SourceConfig, schema_decl: &[Column]) -> Self {
+        MultiValueRead {
+            fields: schema_decl
+                .iter()
+                .filter(|c| c.is_multiple())
+                .map(|c| c.physical_name().to_string())
+                .collect(),
+            split_to_rows: source.split_to_rows.clone().unwrap_or_default(),
+            split_values: source.split_values.clone().unwrap_or_default(),
+        }
+    }
+}
+
 /// Decode a response body into a byte-stream format reader. Only the
 /// multi-record byte formats (`json`/`xml`) are valid for REST bodies;
 /// the config validator (E220) rejects others before this runs.
 fn decode_body(
     format: &InputFormat,
-    array_paths: Option<&[clinker_plan::config::ArrayPathConfig]>,
+    multi_value: &MultiValueRead,
     body: Vec<u8>,
 ) -> Result<Box<dyn FormatReader>, FormatError> {
     let cursor = Cursor::new(body);
     match format {
         InputFormat::Json(opts) => {
-            let config = build_json_config(opts.as_ref(), array_paths);
+            let config = build_json_config(opts.as_ref(), multi_value);
             Ok(Box::new(
                 clinker_format::json::reader::JsonReader::from_reader(cursor, config)?,
             ))
         }
         InputFormat::Xml(opts) => {
-            let config = build_xml_config(opts.as_ref(), array_paths);
+            let config = build_xml_config(opts.as_ref());
             Ok(Box::new(
                 clinker_format::xml::reader::XmlReader::from_reader(cursor, config)?,
             ))
@@ -578,9 +602,9 @@ fn parse_next_link(header: &str) -> Option<String> {
 
 fn build_json_config(
     opts: Option<&clinker_plan::config::JsonInputOptions>,
-    array_paths: Option<&[clinker_plan::config::ArrayPathConfig]>,
+    multi_value: &MultiValueRead,
 ) -> clinker_format::json::reader::JsonReaderConfig {
-    use clinker_format::json::reader::{ArrayPathMode, ArrayPathSpec, JsonMode, JsonReaderConfig};
+    use clinker_format::json::reader::{JsonMode, JsonReaderConfig};
     let mut config = JsonReaderConfig::default();
     if let Some(opts) = opts {
         config.format = opts.format.as_ref().map(|f| match f {
@@ -590,32 +614,27 @@ fn build_json_config(
         });
         config.record_path = opts.record_path.clone();
     }
-    if let Some(paths) = array_paths {
-        config.array_paths = paths
-            .iter()
-            .map(|p| ArrayPathSpec {
-                path: p.path.clone(),
-                mode: match p.mode {
-                    clinker_plan::config::ArrayMode::Explode => ArrayPathMode::Explode,
-                    clinker_plan::config::ArrayMode::Join => ArrayPathMode::Join,
-                },
-                separator: p.separator.clone().unwrap_or_else(|| ",".to_string()),
-            })
-            .collect();
-    }
+    config.multi_value_fields = multi_value.fields.clone();
+    config.split_to_rows = multi_value.split_to_rows.clone();
+    config.split_values = multi_value.split_values.clone();
     config
 }
 
+/// Build the XML reader config for a REST body.
+///
+/// The XML branch carries only `record_path`: a REST source's
+/// `attribute_prefix`, `namespace_handling`, `max_index_bytes`, and multi-value
+/// declarations are not plumbed through, which is tracked at
+/// https://github.com/rustpunk/clinker/issues/911 and deliberately left as it
+/// stands here.
 fn build_xml_config(
     opts: Option<&clinker_plan::config::XmlInputOptions>,
-    array_paths: Option<&[clinker_plan::config::ArrayPathConfig]>,
 ) -> clinker_format::xml::reader::XmlReaderConfig {
     use clinker_format::xml::reader::XmlReaderConfig;
     let mut config = XmlReaderConfig::default();
     if let Some(opts) = opts {
         config.record_path = opts.record_path.clone();
     }
-    let _ = array_paths;
     config
 }
 

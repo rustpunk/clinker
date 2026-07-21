@@ -141,6 +141,7 @@ pub fn column_attrs(col: &Column) -> Vec<(&'static str, serde_json::Value)> {
         coerce,
         allowed_values,
         long_unique,
+        multiple,
     } = col;
 
     let mut attrs: Vec<(&'static str, serde_json::Value)> = Vec::new();
@@ -176,6 +177,7 @@ pub fn column_attrs(col: &Column) -> Vec<(&'static str, serde_json::Value)> {
     opt!(coerce, "coerce");
     opt!(allowed_values, "enum");
     opt!(long_unique, "long_unique");
+    opt!(multiple, "multiple");
     attrs
 }
 

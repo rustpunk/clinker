@@ -11,8 +11,9 @@
 //! round-tripped through a span-losing intermediate value.
 //!
 //! Handled surfaces: the format-agnostic schema-shaping ops — the CXL-typed
-//! column list (`schema`), nested-array explosion/join (`array_paths`), and
-//! scalar per-format input options (`options`) — the format-structure ops for
+//! column list (`schema`), multi-value fan-out and in-cell parsing
+//! (`split_to_rows` / `split_values`), and scalar per-format input options
+//! (`options`) — the format-structure ops for
 //! X12 nested-envelope declarations (`group_section` / `set_section`) and HL7
 //! composite-field splits (`split_fields`), and the multi-record flat-file ops
 //! for discriminator-driven record types (`records` / `discriminator`).
@@ -23,6 +24,7 @@ use crate::config::pipeline_node::{PipelineNode, SourceBody};
 use crate::yaml::Spanned;
 use clinker_format::{
     Column, Discriminator, EnvelopeFieldType, NestedEnvelopeSection, RecordType, SourceSchema,
+    SplitToRows, SplitToRowsMode, SplitValues,
 };
 use clinker_record::schema_def::{Justify, TruncationPolicy};
 use cxl::typecheck::Type;
@@ -32,9 +34,9 @@ use serde::{Deserialize, Serialize};
 
 /// Per-source config patch carried by a channel.
 ///
-/// Keyed forms only. `schema` ops are keyed by column name, `array_paths` ops
-/// by array path, and `options` sets a scalar per-format input option by its
-/// key. `Serialize` is derived for config-identity hashing only (folding the
+/// Keyed forms only. `schema` ops are keyed by column name, `split_to_rows` /
+/// `split_values` ops by field name, and `options` sets a scalar per-format
+/// input option by its key. `Serialize` is derived for config-identity hashing only (folding the
 /// applied patches into the pipeline `source_hash`); the wire deserialize form
 /// is the channel YAML.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -42,8 +44,10 @@ use serde::{Deserialize, Serialize};
 pub struct SourceConfigPatch {
     /// Column-name-keyed schema ops (`modify` / `rename` / `add` / `remove`).
     pub schema: IndexMap<String, SchemaColumnOp>,
-    /// Array-path-keyed ops: set-by-path (add-or-modify) or `remove`.
-    pub array_paths: IndexMap<String, ArrayPathOp>,
+    /// Field-keyed fan-out ops: set-by-field (add-or-modify) or `remove`.
+    pub split_to_rows: IndexMap<String, SplitToRowsOp>,
+    /// Field-keyed in-cell-parse ops: set-by-field (add-or-modify) or `remove`.
+    pub split_values: IndexMap<String, SplitValuesOp>,
     /// Scalar per-format input options, keyed by option name. Merged onto the
     /// source's current options and re-validated through the format's option
     /// struct, so an unknown key is rejected exactly as in hand-written config.
@@ -78,7 +82,8 @@ impl SourceConfigPatch {
     /// Whether this patch carries no ops — a no-op the apply pass can skip.
     pub fn is_empty(&self) -> bool {
         self.schema.is_empty()
-            && self.array_paths.is_empty()
+            && self.split_to_rows.is_empty()
+            && self.split_values.is_empty()
             && self.options.is_empty()
             && self.group_section.is_none()
             && self.set_section.is_none()
@@ -151,6 +156,10 @@ pub struct ColumnPatch {
     /// Advisory storage hint.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub long_unique: Option<bool>,
+    /// Whether the column holds more than one value. `multiple: false` clears
+    /// the declaration on a column that had it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multiple: Option<bool>,
 }
 
 impl ColumnPatch {
@@ -225,6 +234,7 @@ impl<'de> Deserialize<'de> for SchemaColumnOp {
             #[serde(rename = "enum")]
             allowed_values: Option<Vec<String>>,
             long_unique: Option<bool>,
+            multiple: Option<bool>,
         }
 
         impl OpMap {
@@ -248,6 +258,7 @@ impl<'de> Deserialize<'de> for SchemaColumnOp {
                     coerce: self.coerce,
                     allowed_values: self.allowed_values,
                     long_unique: self.long_unique,
+                    multiple: self.multiple,
                 }
             }
         }
@@ -296,44 +307,51 @@ impl<'de> Deserialize<'de> for SchemaColumnOp {
     }
 }
 
-/// One array-path-keyed op.
+/// One field-keyed `split_to_rows` op.
 ///
-/// YAML forms (the map key is the array path):
+/// YAML forms (the map key is the field name):
 ///
 /// ```yaml
-/// items:      { mode: join, separator: ";" }  # add-or-modify the entry
-/// line_items: remove                          # drop the entry
+/// line_items: { mode: split, position_column: line_no }  # add-or-modify
+/// tags:       { position_column: ~ }                     # clear one attribute
+/// items:      remove                                     # drop the entry
 /// ```
 ///
 /// `Serialize` is derived for config-identity hashing only.
 #[derive(Debug, Clone, Serialize)]
-pub enum ArrayPathOp {
-    /// Drop the keyed array-path entry.
+pub enum SplitToRowsOp {
+    /// Drop the keyed fan-out entry.
     Remove,
-    /// Add-or-modify the keyed array-path entry. A field is optional so a
-    /// partial modify keeps the omitted field: on an **existing** entry an
-    /// omitted `mode`/`separator` retains the current value; on a **new** entry
-    /// an omitted `mode` defaults to explode and an omitted `separator` is none.
+    /// Add-or-modify the keyed fan-out entry. Each attribute is optional so a
+    /// partial modify keeps the omitted ones: on an **existing** entry an
+    /// omitted attribute retains its current value; on a **new** entry an
+    /// omitted attribute takes the same default hand-written config would.
     Set {
-        /// Explode or join; `None` = keep current (existing) / explode (new).
-        mode: Option<ArrayMode>,
-        /// Join separator; `None` = keep current (existing) / none (new).
-        separator: Option<String>,
+        /// `None` = keep current (existing) / `true` (new).
+        keep_empty: Option<bool>,
+        /// `None` = keep current (existing) / `extract` (new).
+        mode: Option<SplitToRowsMode>,
+        /// Three-state, so an attribute can be CLEARED rather than only
+        /// overwritten: `None` = key omitted, keep current; `Some(None)` = an
+        /// explicit YAML null (`~`), clear it; `Some(Some(v))` = set it.
+        position_column: Option<Option<String>>,
     },
 }
 
-impl<'de> Deserialize<'de> for ArrayPathOp {
+impl<'de> Deserialize<'de> for SplitToRowsOp {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         // Two accepted YAML shapes:
-        //   remove                       (bare scalar)
-        //   { mode?, separator? }        (entry map)
+        //   remove                                            (bare scalar)
+        //   { keep_empty?, mode?, position_column? }           (entry map)
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct SetMap {
             #[serde(default)]
-            mode: Option<ArrayMode>,
+            keep_empty: Option<bool>,
             #[serde(default)]
-            separator: Option<String>,
+            mode: Option<SplitToRowsMode>,
+            #[serde(default, deserialize_with = "explicit_option")]
+            position_column: Option<Option<String>>,
         }
 
         #[derive(Deserialize)]
@@ -344,17 +362,87 @@ impl<'de> Deserialize<'de> for ArrayPathOp {
         }
 
         match Either::deserialize(d)? {
-            Either::Scalar(s) if s == "remove" => Ok(ArrayPathOp::Remove),
+            Either::Scalar(s) if s == "remove" => Ok(SplitToRowsOp::Remove),
             Either::Scalar(other) => Err(de::Error::custom(format!(
-                "unknown array_paths op {other:?}; the bare scalar form only accepts `remove` — \
-                 use `{{ mode: explode|join, separator: <str> }}` to add or modify an entry"
+                "unknown split_to_rows op {other:?}; the bare scalar form only accepts `remove` \
+                 — use `{{ keep_empty: <bool>, mode: extract|split, position_column: <name> }}` \
+                 to add or modify an entry, with `position_column: ~` to clear it"
             ))),
-            Either::Map(m) => Ok(ArrayPathOp::Set {
+            Either::Map(m) => Ok(SplitToRowsOp::Set {
+                keep_empty: m.keep_empty,
                 mode: m.mode,
-                separator: m.separator,
+                position_column: m.position_column,
             }),
         }
     }
+}
+
+/// One field-keyed `split_values` op.
+///
+/// YAML forms (the map key is the field name):
+///
+/// ```yaml
+/// tags:  { delimiter: "|" }   # add-or-modify the entry
+/// codes: remove               # drop the entry
+/// ```
+///
+/// `Serialize` is derived for config-identity hashing only.
+#[derive(Debug, Clone, Serialize)]
+pub enum SplitValuesOp {
+    /// Drop the keyed in-cell-parse entry.
+    Remove,
+    /// Add-or-modify the keyed entry. `None` = keep current (existing) / the
+    /// default delimiter (new).
+    Set { delimiter: Option<String> },
+}
+
+impl<'de> Deserialize<'de> for SplitValuesOp {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        // Two accepted YAML shapes:
+        //   remove             (bare scalar)
+        //   { delimiter? }     (entry map)
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SetMap {
+            #[serde(default)]
+            delimiter: Option<String>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Either {
+            Scalar(String),
+            Map(SetMap),
+        }
+
+        match Either::deserialize(d)? {
+            Either::Scalar(s) if s == "remove" => Ok(SplitValuesOp::Remove),
+            Either::Scalar(other) => Err(de::Error::custom(format!(
+                "unknown split_values op {other:?}; the bare scalar form only accepts `remove` \
+                 — use `{{ delimiter: <str> }}` to add or modify an entry"
+            ))),
+            Either::Map(m) => Ok(SplitValuesOp::Set {
+                delimiter: m.delimiter,
+            }),
+        }
+    }
+}
+
+/// Deserialize an optional field so an explicit YAML null is distinguishable
+/// from an absent key: `None` when the key is absent (serde supplies the
+/// `#[serde(default)]`), `Some(None)` for an explicit `~` / `null`, and
+/// `Some(Some(v))` for a value.
+///
+/// The patch grammar is otherwise "an omitted field keeps the current value",
+/// which leaves no way to clear an attribute once set. This is the escape
+/// hatch, and it reuses YAML's own null rather than inventing a sentinel
+/// string that a legitimate value could collide with.
+fn explicit_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(d).map(Some)
 }
 
 /// One op on an X12 nested-envelope declaration (`group_section` /
@@ -779,7 +867,8 @@ pub(crate) fn apply_patch_to_source_body(
     src: &str,
 ) -> Result<(), ConfigError> {
     apply_schema_ops(&mut body.schema, &patch.schema, src, None)?;
-    apply_array_path_ops(&mut body.source, &patch.array_paths, src)?;
+    apply_split_to_rows_ops(&mut body.source, &patch.split_to_rows, src)?;
+    apply_split_values_ops(&mut body.source, &patch.split_values, src)?;
     apply_option_ops(&mut body.source, &patch.options, src)?;
     apply_nested_section_op(
         &mut body.source,
@@ -1076,43 +1165,50 @@ fn apply_column_patch(
     set!(coerce, "coerce");
     set!(allowed_values, "enum");
     set!(long_unique, "long_unique");
+    set!(multiple, "multiple");
 }
 
-fn apply_array_path_ops(
+fn apply_split_to_rows_ops(
     source: &mut SourceConfig,
-    ops: &IndexMap<String, ArrayPathOp>,
+    ops: &IndexMap<String, SplitToRowsOp>,
     src: &str,
 ) -> Result<(), ConfigError> {
-    for (path, op) in ops {
+    for (field, op) in ops {
         match op {
-            ArrayPathOp::Remove => {
-                let Some(entries) = source.array_paths.as_mut() else {
-                    return Err(unknown_array_path(src, path));
+            SplitToRowsOp::Remove => {
+                let Some(entries) = source.split_to_rows.as_mut() else {
+                    return Err(unknown_split_entry(src, "split_to_rows", field));
                 };
-                let Some(idx) = entries.iter().position(|a| a.path == *path) else {
-                    return Err(unknown_array_path(src, path));
+                let Some(idx) = entries.iter().position(|e| e.field == *field) else {
+                    return Err(unknown_split_entry(src, "split_to_rows", field));
                 };
                 entries.remove(idx);
             }
-            ArrayPathOp::Set { mode, separator } => {
-                let entries = source.array_paths.get_or_insert_with(Vec::new);
-                if let Some(existing) = entries.iter_mut().find(|a| a.path == *path) {
-                    // Partial modify: an omitted field keeps the current value,
-                    // so setting only `separator` on a `join` entry does not
-                    // silently revert its mode to explode.
-                    if let Some(m) = mode {
-                        existing.mode = m.clone();
+            SplitToRowsOp::Set {
+                keep_empty,
+                mode,
+                position_column,
+            } => {
+                let entries = source.split_to_rows.get_or_insert_with(Vec::new);
+                let entry = match entries.iter_mut().find(|e| e.field == *field) {
+                    // Partial modify: an omitted attribute keeps the current
+                    // value, so setting only `mode` on an entry does not
+                    // silently revert its `keep_empty`.
+                    Some(existing) => existing,
+                    None => {
+                        entries.push(SplitToRows::bare(field.clone()));
+                        entries.last_mut().expect("just pushed")
                     }
-                    if let Some(s) = separator {
-                        existing.separator = Some(s.clone());
-                    }
-                } else {
-                    // New entry: an omitted `mode` defaults to explode.
-                    entries.push(ArrayPathConfig {
-                        path: path.clone(),
-                        mode: mode.clone().unwrap_or_default(),
-                        separator: separator.clone(),
-                    });
+                };
+                if let Some(k) = keep_empty {
+                    entry.keep_empty = *k;
+                }
+                if let Some(m) = mode {
+                    entry.mode = *m;
+                }
+                // `Some(None)` is an explicit null — clear the attribute.
+                if let Some(pc) = position_column {
+                    entry.position_column = pc.clone();
                 }
             }
         }
@@ -1120,9 +1216,43 @@ fn apply_array_path_ops(
     Ok(())
 }
 
-fn unknown_array_path(src: &str, path: &str) -> ConfigError {
+fn apply_split_values_ops(
+    source: &mut SourceConfig,
+    ops: &IndexMap<String, SplitValuesOp>,
+    src: &str,
+) -> Result<(), ConfigError> {
+    for (field, op) in ops {
+        match op {
+            SplitValuesOp::Remove => {
+                let Some(entries) = source.split_values.as_mut() else {
+                    return Err(unknown_split_entry(src, "split_values", field));
+                };
+                let Some(idx) = entries.iter().position(|e| e.field == *field) else {
+                    return Err(unknown_split_entry(src, "split_values", field));
+                };
+                entries.remove(idx);
+            }
+            SplitValuesOp::Set { delimiter } => {
+                let entries = source.split_values.get_or_insert_with(Vec::new);
+                let entry = match entries.iter_mut().find(|e| e.field == *field) {
+                    Some(existing) => existing,
+                    None => {
+                        entries.push(SplitValues::bare(field.clone()));
+                        entries.last_mut().expect("just pushed")
+                    }
+                };
+                if let Some(d) = delimiter {
+                    entry.delimiter = d.clone();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unknown_split_entry(src: &str, key: &str, field: &str) -> ConfigError {
     ConfigError::Validation(format!(
-        "[E234] channel array_paths patch on source '{src}': remove of unknown path '{path}'"
+        "[E234] channel {key} patch on source '{src}': remove of unknown field '{field}'"
     ))
 }
 
@@ -2137,7 +2267,8 @@ nodes:
         assert!(err.to_string().contains("E230"), "{err}");
     }
 
-    /// A JSON source declaring a `record_path` option and one array-path entry.
+    /// A JSON source declaring a `record_path` option, one fan-out entry, and
+    /// one in-cell-parse entry over a multi-value column.
     fn json_pipeline() -> PipelineConfig {
         let yaml = "\
 pipeline:
@@ -2151,10 +2282,13 @@ nodes:
       path: /tmp/in.json
       options:
         record_path: data.rows
-      array_paths:
-        - { path: items, mode: explode }
+      split_to_rows:
+        - items
+      split_values:
+        - field: tags
       schema:
         - { name: id, type: int }
+        - { name: tags, type: string, multiple: true }
   - type: output
     name: out
     input: src
@@ -2166,114 +2300,207 @@ nodes:
         crate::yaml::from_str(yaml).expect("parse json pipeline")
     }
 
-    fn array_paths(config: &PipelineConfig) -> Vec<(String, ArrayMode, Option<String>)> {
+    fn split_to_rows(config: &PipelineConfig) -> Vec<SplitToRows> {
         config
             .source_configs()
             .next()
             .unwrap()
-            .array_paths
+            .split_to_rows
             .clone()
             .unwrap_or_default()
-            .into_iter()
-            .map(|a| (a.path, a.mode, a.separator))
-            .collect()
+    }
+
+    fn split_values(config: &PipelineConfig) -> Vec<SplitValues> {
+        config
+            .source_configs()
+            .next()
+            .unwrap()
+            .split_values
+            .clone()
+            .unwrap_or_default()
     }
 
     #[test]
-    fn array_paths_modify_existing_entry() {
+    fn split_to_rows_modify_existing_entry() {
         let mut config = json_pipeline();
         apply(
             &mut config,
             "src",
-            patch_from_yaml("array_paths:\n  items: { mode: join, separator: \";\" }\n"),
+            patch_from_yaml("split_to_rows:\n  items: { mode: split, position_column: line_no }\n"),
         )
         .unwrap();
-        let entries = array_paths(&config);
+        let entries = split_to_rows(&config);
         assert_eq!(entries.len(), 1);
-        assert!(matches!(entries[0].1, ArrayMode::Join));
-        assert_eq!(entries[0].2.as_deref(), Some(";"));
+        assert_eq!(entries[0].mode, SplitToRowsMode::Split);
+        assert_eq!(entries[0].position_column.as_deref(), Some("line_no"));
     }
 
     #[test]
-    fn array_paths_add_new_entry() {
+    fn split_to_rows_add_new_entry() {
         let mut config = json_pipeline();
         apply(
             &mut config,
             "src",
-            patch_from_yaml("array_paths:\n  tags: { mode: explode }\n"),
+            patch_from_yaml("split_to_rows:\n  tags: { mode: extract }\n"),
         )
         .unwrap();
-        let entries = array_paths(&config);
+        let entries = split_to_rows(&config);
         assert_eq!(entries.len(), 2);
-        assert!(entries.iter().any(|(p, _, _)| p == "tags"));
+        assert!(entries.iter().any(|e| e.field == "tags"));
     }
 
     #[test]
-    fn array_paths_partial_modify_keeps_omitted_mode() {
+    fn split_to_rows_partial_modify_keeps_omitted_attributes() {
         let mut config = json_pipeline();
-        // Make `items` a join entry...
+        // Make `items` a split entry with a position column...
         apply(
             &mut config,
             "src",
-            patch_from_yaml("array_paths:\n  items: { mode: join, separator: \";\" }\n"),
+            patch_from_yaml("split_to_rows:\n  items: { mode: split, position_column: line_no }\n"),
         )
         .unwrap();
-        // ...then patch only the separator: the mode must stay join, not
-        // silently revert to explode.
+        // ...then patch only `keep_empty`: the mode and position column must
+        // stay put, not silently revert to their defaults.
         apply(
             &mut config,
             "src",
-            patch_from_yaml("array_paths:\n  items: { separator: \"|\" }\n"),
+            patch_from_yaml("split_to_rows:\n  items: { keep_empty: false }\n"),
         )
         .unwrap();
-        let entries = array_paths(&config);
+        let entries = split_to_rows(&config);
         assert_eq!(entries.len(), 1);
-        assert!(
-            matches!(entries[0].1, ArrayMode::Join),
-            "mode must remain join, got {:?}",
-            entries[0].1
+        assert_eq!(
+            entries[0].mode,
+            SplitToRowsMode::Split,
+            "mode must remain split, got {:?}",
+            entries[0].mode
         );
-        assert_eq!(entries[0].2.as_deref(), Some("|"));
+        assert_eq!(entries[0].position_column.as_deref(), Some("line_no"));
+        assert!(!entries[0].keep_empty);
     }
 
     #[test]
-    fn array_paths_new_entry_defaults_mode_explode() {
-        let mut config = json_pipeline();
-        // A new entry with no `mode` defaults to explode.
-        apply(
-            &mut config,
-            "src",
-            patch_from_yaml("array_paths:\n  tags: { separator: \",\" }\n"),
-        )
-        .unwrap();
-        let entries = array_paths(&config);
-        let tags = entries.iter().find(|(p, _, _)| p == "tags").unwrap();
-        assert!(matches!(tags.1, ArrayMode::Explode));
-        assert_eq!(tags.2.as_deref(), Some(","));
-    }
-
-    #[test]
-    fn array_paths_remove_entry() {
+    fn split_to_rows_explicit_null_clears_an_attribute() {
+        // An omitted key keeps the current value, so a set attribute needs an
+        // explicit way to be cleared: YAML's own null.
         let mut config = json_pipeline();
         apply(
             &mut config,
             "src",
-            patch_from_yaml("array_paths:\n  items: remove\n"),
+            patch_from_yaml("split_to_rows:\n  items: { position_column: line_no }\n"),
         )
         .unwrap();
-        assert!(array_paths(&config).is_empty());
+        assert_eq!(
+            split_to_rows(&config)[0].position_column.as_deref(),
+            Some("line_no")
+        );
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_to_rows:\n  items: { position_column: ~ }\n"),
+        )
+        .unwrap();
+        assert_eq!(split_to_rows(&config)[0].position_column, None);
     }
 
     #[test]
-    fn array_paths_remove_unknown_errors() {
+    fn split_to_rows_new_entry_takes_the_hand_written_defaults() {
+        let mut config = json_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_to_rows:\n  tags: {}\n"),
+        )
+        .unwrap();
+        let entries = split_to_rows(&config);
+        let tags = entries.iter().find(|e| e.field == "tags").unwrap();
+        assert_eq!(tags.mode, SplitToRowsMode::Extract);
+        assert!(tags.keep_empty, "keep_empty defaults to true");
+        assert_eq!(tags.position_column, None);
+    }
+
+    #[test]
+    fn split_to_rows_remove_entry() {
+        let mut config = json_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_to_rows:\n  items: remove\n"),
+        )
+        .unwrap();
+        assert!(split_to_rows(&config).is_empty());
+    }
+
+    #[test]
+    fn split_to_rows_remove_unknown_errors() {
         let mut config = json_pipeline();
         let err = apply(
             &mut config,
             "src",
-            patch_from_yaml("array_paths:\n  ghost: remove\n"),
+            patch_from_yaml("split_to_rows:\n  ghost: remove\n"),
         )
         .unwrap_err();
         assert!(err.to_string().contains("E234"), "{err}");
+    }
+
+    #[test]
+    fn split_values_modify_and_remove() {
+        let mut config = json_pipeline();
+        assert_eq!(split_values(&config)[0].delimiter, ";");
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_values:\n  tags: { delimiter: \"|\" }\n"),
+        )
+        .unwrap();
+        assert_eq!(split_values(&config)[0].delimiter, "|");
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_values:\n  tags: remove\n"),
+        )
+        .unwrap();
+        assert!(split_values(&config).is_empty());
+    }
+
+    #[test]
+    fn split_values_remove_unknown_errors() {
+        let mut config = json_pipeline();
+        let err = apply(
+            &mut config,
+            "src",
+            patch_from_yaml("split_values:\n  ghost: remove\n"),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("E234"), "{err}");
+    }
+
+    #[test]
+    fn schema_patch_sets_and_clears_multiple() {
+        let mut config = json_pipeline();
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("schema:\n  id: { multiple: true }\n"),
+        )
+        .unwrap();
+        let columns = |c: &PipelineConfig| {
+            c.source_bodies()
+                .next()
+                .unwrap()
+                .schema
+                .as_columns()
+                .unwrap()
+                .to_vec()
+        };
+        assert!(columns(&config)[0].is_multiple());
+        apply(
+            &mut config,
+            "src",
+            patch_from_yaml("schema:\n  id: { multiple: false }\n"),
+        )
+        .unwrap();
+        assert!(!columns(&config)[0].is_multiple());
     }
 
     #[test]

@@ -33,6 +33,13 @@ use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// Separator a multi-value field is parsed from (read) and encoded with
+/// (write) when the author declares none. Semicolon rather than comma: it is
+/// the separator the business-facing bulk-loaders this audience already uses
+/// mandate for multi-value cells, and it does not collide with the CSV field
+/// delimiter. One constant, so read and write never drift apart.
+pub const DEFAULT_VALUE_DELIMITER: &str = ";";
+
 /// One declared source column — the superset of the historical format-layer
 /// `FieldDef` and CXL-layer `ColumnDecl`. Carries a single `type`
 /// ([`cxl::typecheck::Type`]) that drives both byte-level parsing and
@@ -113,6 +120,16 @@ pub struct Column {
     /// changes in-memory footprint only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub long_unique: Option<bool>,
+    /// Whether this column holds more than one value. A `multiple: true` column
+    /// is always array-valued: reading collects every occurrence of the field
+    /// into a [`clinker_record::Value::Array`] (a single occurrence becomes a
+    /// one-element array), and each element carries the column's declared
+    /// [`ty`](Self::ty). The declaration is direction-neutral — it states the
+    /// shape of the data, so a writer that can encode repetition uses the same
+    /// declaration. An output format with no multi-value encoding rejects the
+    /// column at plan time (E359) rather than degrading it at run time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiple: Option<bool>,
 }
 
 impl Column {
@@ -139,12 +156,18 @@ impl Column {
             coerce: None,
             allowed_values: None,
             long_unique: None,
+            multiple: None,
         }
     }
 
     /// Whether the `long_unique` storage hint is set.
     pub fn is_long_unique(&self) -> bool {
         self.long_unique.unwrap_or(false)
+    }
+
+    /// Whether the column is declared multi-value (`multiple: true`).
+    pub fn is_multiple(&self) -> bool {
+        self.multiple.unwrap_or(false)
     }
 
     /// The physical input-field name this column reads FROM: `source_name`

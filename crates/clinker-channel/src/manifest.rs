@@ -125,7 +125,8 @@ pub struct OverlayFile {
     /// parsed pipeline config before validation/compile (via
     /// [`apply_source_patches`](clinker_plan::config::apply_source_patches)), so
     /// the run behaves as if the source YAML had been hand-edited: CXL-typed
-    /// column ops (`schema`), nested-array explosion/join (`array_paths`),
+    /// column ops (`schema`), multi-value fan-out and in-cell parsing
+    /// (`split_to_rows` / `split_values`),
     /// scalar per-format input `options`, X12 nested-envelope declarations
     /// (`group_section` / `set_section`), HL7 composite-field splits
     /// (`split_fields`), and multi-record flat-file record types

@@ -17,6 +17,7 @@ mod dup_body_node_name;
 mod envelope_synthesis;
 mod explain_buffer_class;
 mod explain_polish;
+mod multi_value_validation;
 mod overlay_compile;
 mod plan_time_window_root;
 mod predicate_support;

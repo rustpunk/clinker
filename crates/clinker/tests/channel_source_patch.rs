@@ -1,7 +1,8 @@
 //! End-to-end coverage for the channel `sources:` config-patch block.
 //!
 //! A channel's per-target overlay patches a source's parsed config (schema
-//! column ops, `array_paths` ops, scalar `options`) before the pipeline is
+//! column ops, `split_to_rows` / `split_values` ops, scalar `options`) before
+//! the pipeline is
 //! validated and compiled, so a run behaves as if the source YAML had been
 //! hand-edited. These tests shell out to the built `clinker` binary and drive
 //! the channel by tenant id (`--channel <id>`), resolving the tenant folder
@@ -220,7 +221,7 @@ fn csv_schema_patch_is_reflected_by_explain() {
 }
 
 #[test]
-fn json_options_and_array_paths_patch_changes_run_output() {
+fn json_options_and_split_to_rows_patch_changes_run_output() {
     let dir = tempfile::tempdir().expect("tempdir");
     let p = dir.path();
     write(
@@ -246,11 +247,12 @@ nodes:
       path: in.json
       options:
         record_path: small.rows
-      array_paths:
-        - { path: tags, mode: join }
+      split_to_rows:
+        - tags
       schema:
         - { name: id, type: string }
-        - { name: tags, type: array }
+        - { name: tags, type: string }
+        - { name: tag_no, type: int }
   - type: output
     name: out
     input: src
@@ -268,23 +270,26 @@ sources:
   src:
     options:
       record_path: big.rows
-    array_paths:
-      tags: { mode: explode }
+    split_to_rows:
+      tags: { position_column: tag_no }
 ",
     );
 
-    // Base: record_path points at the single-row array; `tags` joins to a
-    // scalar cell (non-JSON writers reject a stray `Value::Array`, so an
-    // unexploded array column must collapse to a scalar before the CSV emit).
+    // Base: record_path points at the single-row array, whose two tags fan
+    // out to two rows; no position column is declared, so `tag_no` is empty.
     let base = run_in(p, &[]);
     assert!(base.status.success(), "base json run failed");
     let base_out = std::fs::read_to_string(p.join("out.csv")).expect("read out.csv");
-    let base_rows = base_out.lines().skip(1).filter(|l| !l.is_empty()).count();
-    assert_eq!(base_rows, 1, "base output:\n{base_out}");
+    let base_rows: Vec<&str> = base_out.lines().skip(1).filter(|l| !l.is_empty()).collect();
+    assert_eq!(base_rows.len(), 2, "base output:\n{base_out}");
+    assert!(
+        base_rows.iter().all(|r| r.ends_with(',')),
+        "tag_no must be empty without the patch:\n{base_out}"
+    );
 
-    // Channel: record_path override selects the three-row array, and the
-    // array_paths op flips `tags` from join to explode, fanning each record
-    // out per tag → 4 rows.
+    // Channel: the options override selects the three-row array and the
+    // split_to_rows op adds a position column, so each fanned-out row is
+    // numbered within its parent record.
     let patched = run_in(p, &["--channel", "jfix"]);
     assert!(
         patched.status.success(),
@@ -292,11 +297,59 @@ sources:
         String::from_utf8_lossy(&patched.stderr)
     );
     let out = std::fs::read_to_string(p.join("out.csv")).expect("read out.csv");
-    let rows = out.lines().skip(1).filter(|l| !l.is_empty()).count();
-    assert_eq!(rows, 4, "expected 4 exploded rows, got:\n{out}");
+    let rows: Vec<&str> = out.lines().skip(1).filter(|l| !l.is_empty()).collect();
+    assert_eq!(rows.len(), 4, "expected 4 fanned-out rows, got:\n{out}");
     for tag in ["x", "y", "z", "w"] {
-        assert!(out.contains(tag), "missing exploded tag {tag}:\n{out}");
+        assert!(out.contains(tag), "missing fanned-out tag {tag}:\n{out}");
     }
+    assert_eq!(rows[0], "1,x,1", "first row numbering:\n{out}");
+    assert_eq!(rows[1], "1,y,2", "second row numbering:\n{out}");
+    assert_eq!(rows[2], "2,z,1", "numbering restarts per record:\n{out}");
+}
+
+/// A `multiple: true` column reaching a CSV output is rejected at compile
+/// (E359) rather than failing partway through the run: the CSV writer has no
+/// multi-value encoding yet.
+#[test]
+fn multi_value_column_into_csv_output_fails_at_compile() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p = dir.path();
+    write(p, "in.json", "[{\"id\":\"1\",\"tags\":[\"x\",\"y\"]}]\n");
+    write(
+        p,
+        "pipe.yaml",
+        "\
+pipeline:
+  name: multi_value_csv
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: in.json
+      schema:
+        - { name: id, type: string }
+        - { name: tags, type: string, multiple: true }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+",
+    );
+    let out = run_in(p, &[]);
+    assert!(
+        !out.status.success(),
+        "a multi-value column bound to a CSV output must not compile"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("no encoding for a field") && stderr.contains("more than one value"),
+        "stderr:\n{stderr}"
+    );
 }
 
 #[test]

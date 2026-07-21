@@ -172,7 +172,8 @@ impl OverlayResolution {
     /// Applied to the parsed pipeline config *before* validation/compile via
     /// [`apply_source_patches`](clinker_plan::config::apply_source_patches), so
     /// the effective plan observes the patched source shape (schema column ops,
-    /// `array_paths`, and per-format `options`). Per-target scoping keeps the
+    /// `split_to_rows` / `split_values`, and per-format `options`). Per-target
+    /// scoping keeps the
     /// source-node keys resolvable against exactly the overlaid pipeline.
     pub fn source_patches(&self) -> Option<&indexmap::IndexMap<String, SourceConfigPatch>> {
         self.channel

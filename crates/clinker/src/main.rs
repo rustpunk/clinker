@@ -965,7 +965,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     }
 
     // Apply the resolved channel's per-source config patches (schema /
-    // array_paths / options) to the parsed config before it is validated and
+    // multi-value / options) to the parsed config before it is validated and
     // compiled, so every run path — normal run, `--explain`, and `--lineage` —
     // observes the patched shape. An absent channel (or one whose per-target
     // overlay declares no `sources:` block) is an empty map, making this
@@ -2683,7 +2683,7 @@ fn compile_effective_plan(
             .map_err(|e| format!("YAML parse error: {e}"))?;
 
     // Per-source patches shape the parsed config before compile, so the
-    // effective DAG this reports reflects the same schema / array_paths /
+    // effective DAG this reports reflects the same schema / multi-value /
     // options changes a `run --channel` would execute.
     if let Some(patches) = res.source_patches() {
         clinker_plan::config::apply_source_patches(&mut config, patches)

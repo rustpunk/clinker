@@ -494,16 +494,20 @@ Independent of the overlay op engine, a channel file can patch a **source**
 node's parsed config directly through a `sources:` block, applied before
 validation and compile so the run behaves exactly as if the source YAML had been
 hand-edited. This is the same column-keyed schema grammar `patch_schema` reuses,
-plus array-path and per-format option patches.
+plus multi-value and per-format option patches.
 
 ```yaml
 sources:
   transactions:                            # source-node name (unknown -> E230)
     options:
       record_path: batch_records           # set a scalar per-format option (bad key -> E235)
-    array_paths:                            # keyed by array path
-      items:      { mode: join, separator: ";" }   # add-or-modify an entry
-      line_items: remove                    # drop an entry (unknown path -> E234)
+    split_to_rows:                          # keyed by field name
+      items:      { mode: split, position_column: line_no }  # add-or-modify
+      tags:       { position_column: ~ }    # clear one attribute
+      line_items: remove                    # drop an entry (unknown field -> E234)
+    split_values:                           # keyed by field name
+      codes:      { delimiter: "|" }        # add-or-modify an entry
+      notes:      remove                    # drop an entry (unknown field -> E234)
     schema:                                 # keyed by column name
       amount:      { type: float, scale: 2 }
       cust_id:     { rename: customer_id }
@@ -512,8 +516,11 @@ sources:
 ```
 
 All ops are keyed and leaf-replace — there is no deep-merge. On an existing
-`array_paths` entry a partial map is a modify (an omitted field keeps its current
-value); on a new entry an omitted `mode` defaults to explode. `options` are
+`split_to_rows` / `split_values` entry a partial map is a modify: an omitted key
+keeps its current value, and a new entry takes the same defaults hand-written
+config would. Because an omitted key means "keep current", clearing an attribute
+that is already set needs its own form — an explicit YAML null
+(`position_column: ~`). `options` are
 merged onto the source's current options and re-validated through the format's
 option struct, so an unknown or mistyped key is rejected exactly as in
 hand-written config. A `schema` `rename` is a source-column alias — the same
@@ -638,7 +645,7 @@ lineage do not collide.
 | **E231** | A schema `rename` / `modify` / `remove` of a column that does not exist. |
 | **E232** | A schema `add` of a column name that already exists. |
 | **E233** | A schema `rename` whose target name collides with an existing column. |
-| **E234** | An `array_paths` `remove` of a path with no matching entry. |
+| **E234** | A `split_to_rows` / `split_values` `remove` of a field with no matching entry. |
 | **E235** | An `options` patch sets an unknown or mistyped option key for the source's format. |
 | **E236** | A renamed/aliased column's exposed name collides with a real input field, which would mislocate that field. Raised at read time. |
 | **E237** | A `schema` patch on a multi-record / generated / external-file schema — column ops apply only to a single-record column list. |

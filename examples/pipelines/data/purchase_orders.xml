@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PurchaseOrders>
+  <Order>
+    <order_id>PO-1001</order_id>
+    <customer>Northwind Supply</customer>
+    <Tag>rush</Tag>
+    <Tag>fragile</Tag>
+    <cost_centres>CC-10;CC-42</cost_centres>
+    <LineItem>
+      <sku>WID-100</sku>
+      <qty>4</qty>
+      <unit_price>12.50</unit_price>
+    </LineItem>
+    <LineItem>
+      <sku>GAD-220</sku>
+      <qty>1</qty>
+      <unit_price>99.00</unit_price>
+    </LineItem>
+  </Order>
+  <Order>
+    <order_id>PO-1002</order_id>
+    <customer>Eastfield Works</customer>
+    <Tag>standard</Tag>
+    <cost_centres>CC-10</cost_centres>
+    <LineItem>
+      <sku>WID-100</sku>
+      <qty>10</qty>
+      <unit_price>11.75</unit_price>
+    </LineItem>
+  </Order>
+  <Order>
+    <order_id>PO-1003</order_id>
+    <customer>Harborline Ltd</customer>
+  </Order>
+</PurchaseOrders>

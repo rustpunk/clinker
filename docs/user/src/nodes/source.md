@@ -252,11 +252,33 @@ event-time progress can never advance and the window can never close —
 the planner rejects this with
 [**E156**](../ops/exit-codes.md#plan-time-diagnostic-codes).
 
-## Array paths
+## Multi-value fields
 
-For nested data (JSON/XML sources with embedded repetition), `array_paths`
-controls whether each repetition becomes its own record or collapses into
-a delimited string:
+A field that holds more than one value is declared on the **schema column**,
+not on the pipeline:
+
+```yaml
+schema:
+  - { name: order_id, type: string }
+  - { name: tags, type: string, multiple: true }
+```
+
+`multiple: true` says the column holds zero or more values of its declared
+type. Reading collects every occurrence of the field into one array — a single
+occurrence is still an array, so downstream code never has to branch on how
+many values happened to arrive. The declaration describes the shape of the
+data, so it serves both directions: a writer that can encode repetition reads
+the same declaration.
+
+Only the `json` output can encode a multi-value field today. Binding one to any
+other output format is a compile error (`E359`) rather than a value silently
+degraded at the sink. Run `clinker explain E359` for the full remediation.
+
+### One record per value: `split_to_rows`
+
+`split_to_rows` fans a record out to one record per occurrence of a repeated
+field. Each entry is either a bare field name or a full mapping, and the two
+forms mix freely in one list:
 
 ```yaml
 - type: source
@@ -270,39 +292,69 @@ a delimited string:
       - { name: customer, type: string }
       - { name: line_item, type: string }
       - { name: line_amount, type: float }
-    array_paths:
-      - path: "line_items"
-        mode: explode         # One output record per array element
-      - path: "tags"
-        mode: join            # Concatenate array elements into a string
-        separator: ","
+      - { name: line_no, type: int }
+    split_to_rows:
+      - line_items                # shorthand: field name, all defaults
+      - field: tags               # full form
+        keep_empty: true
+        mode: extract
+        position_column: line_no
 ```
 
-- `explode` (default) -- produces one output record per array element,
-  with parent fields repeated onto each.
-- `join` -- concatenates the array's elements into a single string using
-  the specified `separator` (default `,`).
+| Key | Default | Meaning |
+|-----|---------|---------|
+| `field` | — | The repeated field, as a flattened dotted name |
+| `keep_empty` | `true` | Whether a record whose field is empty or absent survives |
+| `mode` | `extract` | `extract` — the occurrence becomes the record; `split` — the record shape is kept |
+| `position_column` | none | Column receiving each occurrence's 1-based position |
 
-Entries apply in declaration order: a join's collapsed value lands on
-every record an earlier explode fanned out, and two exploded paths
-multiply.
+**`keep_empty` defaults to `true`.** A record whose field holds an empty array,
+or carries no such field at all, is emitted with that field unset rather than
+disappearing. Several widely used engines drop the record instead; a vanished
+row is the costliest failure mode there is, so dropping is opt-in here.
 
-The `path` is a flattened field name, in the same dotted form the source's
-field names use — there is no `$.` sigil.
+**`mode: extract`** (the default) makes the occurrence the record: its own
+fields are lifted out from under the field name and every field outside the
+group is merged onto each output. `{"orders": [{"id": 1}]}` yields a top-level
+`id`, and repeated `<Item><name>` children yield `name`.
 
-**JSON** — the path names the field holding the array (`line_items`, or
-`order.line_items` for an array nested under an object). Exploding an
-array of objects hoists each element's keys onto the output record
-(`{"line_item": …}` becomes a top-level `line_item` field); exploding an
-array of scalars keeps the value under the path's own name. An empty
-array explodes to no records (the parent record is suppressed) and joins
-to an empty string; a record without the field passes through unchanged.
+**`mode: split`** preserves the record shape: the occurrence's fields keep
+their dotted path (`orders.id`, `Item.name`) and each output carries exactly
+one occurrence.
 
-**XML** — the path is the repeated child element's dotted path relative to
-the record element (`Item`, or `Items.Item` when nested). Exploded fields
-keep their full dotted names (`Item.name`); join collapses each repeated
-flattened field under the path independently. Repetition and absence are
-indistinguishable in XML, so a record without the element always passes
-through unchanged, and paths must name disjoint (non-nested) element
-groups. See [XML Format](../formats/xml.md#nested-arrays) for the full
-rules.
+Entries apply in declaration order, so two entries multiply. Declared fields
+must name disjoint (non-nested) element groups — a duplicate or a nested pair
+is rejected at compile (`E358`).
+
+### Several values in one cell: `split_values`
+
+`split_values` parses a delimited cell into the several values a `multiple:`
+column holds. It takes the same bare-name-or-mapping shorthand:
+
+```yaml
+    split_values:
+      - tags                      # shorthand: default delimiter `;`
+      - field: codes              # full form
+        delimiter: "|"
+    schema:
+      - { name: tags,  type: string, multiple: true }
+      - { name: codes, type: string, multiple: true }
+```
+
+The delimiter defaults to `;`. A `split_values` field the schema does not
+declare `multiple: true` is rejected at compile (`E358`): splitting produces
+several values, and only a multi-value column can hold them.
+
+### Format notes
+
+Both knobs are honored by the **JSON** and **XML** readers.
+
+**JSON** — the field names the key holding the array (`line_items`, or
+`order.line_items` for an array nested under an object). A field holding a
+non-array value has nothing to fan out and passes through untouched.
+
+**XML** — the field is the repeated child element's dotted path relative to the
+record element (`Item`, or `Items.Item` when nested). Repetition and absence
+are indistinguishable in XML, so a record with no occurrence of the element is
+governed by `keep_empty` exactly as an empty array is. See
+[XML Format](../formats/xml.md#repeated-elements) for the full rules.
