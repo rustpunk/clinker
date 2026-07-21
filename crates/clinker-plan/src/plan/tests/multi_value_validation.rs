@@ -660,3 +660,168 @@ fn a_watermark_on_a_single_valued_date_column_still_compiles() {
     );
     compile_ok(&yaml);
 }
+
+/// A pipeline over `source_format`, whose source body is `source_body`, writing
+/// JSON so nothing but the read-side gate can fire.
+fn source_format_pipeline(source_format: &str, source_body: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: multi_value_input_gate
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: {source_format}
+      path: ./in.dat
+{source_body}
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: json
+      path: out.json
+"#
+    )
+}
+
+/// The read-side arrow of E359: a `multiple: true` column binds as an array
+/// for every format, so a source whose reader cannot produce one would hand
+/// CXL a scalar where it typechecked an array.
+#[test]
+fn e361_fires_on_a_csv_source_with_a_bare_multi_value_column() {
+    let yaml = source_format_pipeline(
+        "csv",
+        r#"      schema:
+        - { name: order_id, type: string }
+        - { name: tags, type: string, multiple: true }"#,
+    );
+    let found = coded(&compile_err(&yaml), "E361");
+    assert_eq!(found.len(), 1, "expected one E361: {found:?}");
+    assert!(
+        found[0].0.contains("'tags'") && found[0].0.contains("csv"),
+        "{}",
+        found[0].0
+    );
+    assert!(found[0].1, "E361 must carry a source span");
+}
+
+/// A `split_values` entry is what makes the several values on a delimited-cell
+/// format, and E358 already enforces the converse — that such a field is
+/// declared `multiple: true`. This is that arrow pointing back.
+#[test]
+fn e361_is_suppressed_by_a_matching_split_values_entry() {
+    for format in ["csv", "fixed_width"] {
+        let yaml = source_format_pipeline(
+            format,
+            r#"      split_values:
+        - field: tags
+          delimiter: ";"
+      schema:
+        - { name: order_id, type: string }
+        - { name: tags, type: string, multiple: true }"#,
+        );
+        compile_ok(&yaml);
+    }
+}
+
+/// The entry has to name the column that needs it. A `split_values` entry on a
+/// different field leaves the declared one unsupplied.
+#[test]
+fn e361_still_fires_for_a_column_no_split_values_entry_covers() {
+    let yaml = source_format_pipeline(
+        "csv",
+        r#"      split_values:
+        - field: tags
+          delimiter: ";"
+      schema:
+        - { name: tags, type: string, multiple: true }
+        - { name: codes, type: string, multiple: true }"#,
+    );
+    let found = coded(&compile_err(&yaml), "E361");
+    assert_eq!(found.len(), 1, "expected one E361: {found:?}");
+    assert!(found[0].0.contains("'codes'"), "{}", found[0].0);
+    assert!(
+        !found[0].0.contains("'tags'"),
+        "the covered column must not be reported: {}",
+        found[0].0
+    );
+}
+
+/// Repetition in a segment format is a positional coordinate, not a list, so no
+/// `split_values` entry rescues the declaration — the help must not promise one.
+#[test]
+fn e361_fires_on_every_segment_format_and_offers_no_in_cell_route() {
+    for format in ["edifact", "x12", "hl7", "swift"] {
+        let yaml = source_format_pipeline(
+            format,
+            r#"      split_values:
+        - field: tags
+          delimiter: ";"
+      schema:
+        - { name: tags, type: string, multiple: true }"#,
+        );
+        let diags = compile_err(&yaml);
+        let found = coded(&diags, "E361");
+        assert_eq!(found.len(), 1, "expected one E361 for {format}: {found:?}");
+        assert!(found[0].0.contains("'tags'"), "{format}: {}", found[0].0);
+        let help = diags
+            .iter()
+            .find(|d| d.code == "E361")
+            .and_then(|d| d.help.clone())
+            .unwrap_or_else(|| panic!("{format}: E361 must carry help"));
+        assert!(
+            help.contains("positional axis"),
+            "{format} help must name the positional axis: {help}"
+        );
+        assert!(
+            !help.contains("split_values"),
+            "{format} help must not dangle an in-cell route: {help}"
+        );
+    }
+}
+
+/// HL7 is the one segment format that exposes the positional axes as its own
+/// declaration, so its help names that rather than only saying no.
+#[test]
+fn e361_points_an_hl7_source_at_split_fields() {
+    let yaml = source_format_pipeline(
+        "hl7",
+        r#"      schema:
+        - { name: tags, type: string, multiple: true }"#,
+    );
+    let help = compile_err(&yaml)
+        .iter()
+        .find(|d| d.code == "E361")
+        .and_then(|d| d.help.clone())
+        .expect("E361 with help");
+    assert!(help.contains("split_fields"), "{help}");
+}
+
+#[test]
+fn e361_does_not_fire_on_json_or_xml_sources() {
+    for format in ["json", "xml"] {
+        let yaml = source_format_pipeline(
+            format,
+            r#"      schema:
+        - { name: order_id, type: string }
+        - { name: tags, type: string, multiple: true }"#,
+        );
+        compile_ok(&yaml);
+    }
+}
+
+/// A source with no multi-value column is untouched whatever its format.
+#[test]
+fn e361_is_silent_without_a_multi_value_column() {
+    for format in ["csv", "x12", "json"] {
+        let yaml = source_format_pipeline(
+            format,
+            r#"      schema:
+        - { name: order_id, type: string }"#,
+        );
+        compile_ok(&yaml);
+    }
+}

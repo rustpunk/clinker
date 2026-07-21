@@ -273,9 +273,35 @@ coercion. The declaration describes the shape of the
 data, so it serves both directions: a writer that can encode repetition reads
 the same declaration.
 
-Only the `json` output can encode a multi-value field today. Binding one to any
-other output format is a compile error (`E359`) rather than a value silently
-degraded at the sink. Run `clinker explain --code E359` for the full remediation.
+Both ends of the declaration are checked at compile, so a shape the formats
+cannot carry fails before a run starts rather than mid-stream:
+
+| Format | As a source | As an output |
+|---|---|---|
+| `json` | native — an array | native — an array |
+| `xml` | native — repeated child elements | not yet ([issue 916](https://github.com/rustpunk/clinker/issues/916)) |
+| `csv` | needs a `split_values` entry | not yet ([issue 917](https://github.com/rustpunk/clinker/issues/917)) |
+| `fixed_width` | needs a `split_values` entry | not yet ([issue 918](https://github.com/rustpunk/clinker/issues/918)) |
+| `edifact`, `x12`, `hl7`, `swift` | no — repetition is positional | no — repetition is positional |
+
+A `multiple: true` column reaching an output that cannot encode it is `E359`; one
+on a source that cannot produce it is `E361`. Run `clinker explain --code E361`
+for the full remediation of either.
+
+**`csv` and `fixed_width` opt in through `split_values`.** Neither wire format
+repeats a field, but a cell's text may hold several values separated by a
+delimiter, which is what a `split_values` entry declares. Until the entry is
+there the column has nothing to fill it and `E361` says so; once it is, the
+column is accepted. (Acting on the entry in those two readers is
+[issue 917](https://github.com/rustpunk/clinker/issues/917) — the plan-time
+contract lands first.)
+
+**The segment formats are a permanent no**, not a pending one. Repetition there
+is a positional coordinate rather than a list: a repeated composite is written
+as two axes interleaved in one element (`11:B:1^12:B:2`), which a flat array
+cannot represent without losing the component axis. The faithful shape is one
+column per coordinate — for HL7, that is what `options.split_fields` produces,
+with a writer that reassembles the wire field byte-for-byte.
 
 ### One record per value: `split_to_rows`
 
@@ -377,11 +403,13 @@ becomes `multiple: true` on the schema column.
 ### Format notes
 
 Both knobs are honored by the **JSON** and **XML** file readers, and
-`split_to_rows` / `split_values` by a `rest` source decoding JSON. Other input
-formats accept the declarations and do not act on them — see
-[issue 912](https://github.com/rustpunk/clinker/issues/912) for that gap and
-[issue 911](https://github.com/rustpunk/clinker/issues/911) for a `rest` source
-decoding XML.
+`split_to_rows` / `split_values` by a `rest` source decoding JSON. A
+`multiple: true` column on any other input format is rejected at compile
+(`E361`) rather than accepted and ignored; `split_to_rows` on one is still
+accepted and inert, tracked at
+[issue 912](https://github.com/rustpunk/clinker/issues/912), and a `rest` source
+decoding XML at
+[issue 911](https://github.com/rustpunk/clinker/issues/911).
 
 **JSON** — the field names the key holding the array (`line_items`, or
 `order.line_items` for an array nested under an object). A field present but

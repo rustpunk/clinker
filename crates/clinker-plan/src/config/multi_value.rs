@@ -1,7 +1,7 @@
 //! Plan-time validation of the multi-value surface.
 //!
-//! Two gates, both fired from `compile_with_diagnostics` so a failure is a
-//! spanned `clinker explain` diagnostic rather than a mid-run abort:
+//! Gates fired from `compile_with_diagnostics`, so a failure is a spanned
+//! `clinker explain` diagnostic rather than a mid-run abort:
 //!
 //! - **E358** — a malformed declaration on a source: two `split_to_rows`
 //!   entries naming the same or nested field groups, a duplicate
@@ -10,6 +10,13 @@
 //! - **E359** — a `multiple: true` column reaching an output whose format has
 //!   no multi-value encoding, which would degrade or reject the value at the
 //!   sink instead of at compile.
+//! - **E361** — a `multiple: true` column on a source whose format has no way
+//!   to PRODUCE one, which would bind the column as an array and then hand
+//!   CXL a scalar.
+//!
+//! E359 and E361 are the two arrows of the same rule, and each reads its own
+//! per-format capability table: [`output_encodes_multi_value`] for the write
+//! side, `input_multi_value_support` for the read side.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -45,6 +52,56 @@ pub fn output_encodes_multi_value(format: &OutputFormat) -> bool {
         | OutputFormat::X12(_)
         | OutputFormat::Hl7(_)
         | OutputFormat::Swift(_) => false,
+    }
+}
+
+/// How an input format can carry a column declared `multiple: true`.
+///
+/// The read-side counterpart of [`output_encodes_multi_value`], and the single
+/// per-format capability table behind `E361`. A verdict rather than a bool
+/// because the three answers need three different remediations, and collapsing
+/// them would either reject a workable `csv` declaration or accept an
+/// unworkable `x12` one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultiValueInput {
+    /// The reader materializes an array from the document's own repetition, so
+    /// a bare `multiple: true` is enough.
+    Native,
+    /// The format carries one value per field, but a field's text can hold
+    /// several separated by a delimiter — so the column works once a
+    /// `split_values` entry says what that delimiter is, and not before.
+    InCell,
+    /// Repetition is a positional coordinate, not a list. A repeated composite
+    /// serializes as two axes interleaved in one element (`11:B:1^12:B:2`),
+    /// which a flat array cannot express; the faithful shape is one column per
+    /// occurrence, which is what the HL7 `split_fields` declaration produces.
+    /// This is permanent, not pending — wiring the array binding in would
+    /// misrepresent the wire format rather than complete it.
+    PositionalAxis,
+}
+
+/// Which of the three a format is.
+///
+/// One arm per format, so adding an input format forces a decision here rather
+/// than defaulting into a verdict nobody chose.
+///
+/// - `json` — a JSON array is the format's own native shape.
+/// - `xml` — repeated child elements, collected in document order.
+/// - `csv` / `fixed_width` — one value per cell on the wire, but
+///   delimited-in-cell text is a long-standing convention for both. Reading it
+///   is a `split_values` entry, whose wiring into these two readers is tracked
+///   at https://github.com/rustpunk/clinker/issues/917.
+/// - `edifact` / `x12` / `hl7` / `swift` — positional segment grammars.
+fn input_multi_value_support(format: &InputFormat) -> MultiValueInput {
+    match format {
+        InputFormat::Json(_) => MultiValueInput::Native,
+        InputFormat::Xml(_) => MultiValueInput::Native,
+        InputFormat::Csv(_) => MultiValueInput::InCell,
+        InputFormat::FixedWidth(_) => MultiValueInput::InCell,
+        InputFormat::Edifact(_)
+        | InputFormat::X12(_)
+        | InputFormat::Hl7(_)
+        | InputFormat::Swift(_) => MultiValueInput::PositionalAxis,
     }
 }
 
@@ -263,6 +320,87 @@ pub fn validate_source_declarations(
     faults
 }
 
+/// Validate that a source's format can produce the `multiple: true` columns
+/// its schema declares (E361).
+///
+/// The read-side arrow of the rule `E359` enforces on the write side.
+/// `Column::bound_type` binds every `multiple: true` column as `Type::Array`
+/// regardless of format, so without this a `csv` or `x12` source typechecks
+/// downstream code against an array and then delivers the scalar its reader
+/// actually produced.
+///
+/// A per-source check, not a reachability walk: the mismatch is between one
+/// source's schema and its own format, with no path through the DAG involved.
+///
+/// On a delimited-cell format a column named by a `split_values`
+/// entry is fine — that entry is what makes the several values, and `E358`
+/// already enforces the converse (a `split_values` field must be
+/// `multiple: true`). Both are reported per source, listing every column the
+/// format cannot supply, so one source yields one diagnostic.
+pub fn validate_multi_value_input(
+    source: &SourceConfig,
+    schema: &SourceSchema,
+) -> Option<DeclarationFault> {
+    let support = input_multi_value_support(&source.format);
+    if support == MultiValueInput::Native {
+        return None;
+    }
+    let columns = schema.bound_columns()?;
+    let in_cell = source.split_values.as_deref().unwrap_or(&[]);
+    let unsupplied: Vec<&Column> = columns
+        .iter()
+        .filter(|c| c.is_multiple())
+        .filter(|c| {
+            support != MultiValueInput::InCell
+                || !in_cell.iter().any(|e| e.field == c.physical_name())
+        })
+        .collect();
+    if unsupplied.is_empty() {
+        return None;
+    }
+    let format = source.format.format_name();
+    let named = unsupplied
+        .iter()
+        .map(|c| format!("'{}'", c.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let first = unsupplied[0];
+    // `None` for a format that needs no remediation, which is also the answer
+    // to whether there is a fault at all — so the native arm short-circuits the
+    // whole function rather than asserting it cannot be reached.
+    let help = match support {
+        MultiValueInput::Native => None,
+        MultiValueInput::InCell => Some(format!(
+            "add a `split_values` entry naming the input field and the delimiter its cells use \
+             (e.g. `split_values: [{{ field: {field}, delimiter: \";\" }}]`), or drop \
+             `multiple: true` from the column if each cell holds a single value",
+            field = first.physical_name()
+        )),
+        // HL7 exposes the positional axes as its own declaration; the other
+        // three segment formats do not, so promising one would dangle.
+        MultiValueInput::PositionalAxis if matches!(source.format, InputFormat::Hl7(_)) => Some(
+            "HL7 repetition is a positional axis, not a list: declare the field under \
+             `options.split_fields` with its repetition and component counts so each occurrence \
+             gets its own column, and drop `multiple: true` from the schema column"
+                .to_string(),
+        ),
+        MultiValueInput::PositionalAxis => Some(format!(
+            "{format} repetition is a positional axis, not a list, and a flat array cannot \
+             express it — drop `multiple: true` from the column; each occurrence arrives \
+             verbatim in the element text"
+        )),
+    }?;
+    Some(DeclarationFault {
+        message: format!(
+            "source '{name}': the schema declares the multi-value column(s) {named} \
+             (`multiple: true`), and a `{format}` source has no way to produce a field holding \
+             more than one value",
+            name = source.name
+        ),
+        help,
+    })
+}
+
 /// How a declared field name relates to the schema.
 ///
 /// `split_values` and `split_to_rows` name fields of the source DOCUMENT, and
@@ -368,6 +506,32 @@ fn union_reach(inputs: &[&str], reach: &HashMap<String, BTreeSet<String>>) -> BT
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The read-side table, pinned verdict by verdict. Adding an input format
+    /// fails to compile at `input_multi_value_support` — the match names every
+    /// variant with no wildcard — and this pins what each existing one answers,
+    /// so a verdict cannot be changed silently either.
+    #[test]
+    fn every_input_formats_multi_value_verdict_is_pinned() {
+        let cases = [
+            (InputFormat::Json(None), MultiValueInput::Native),
+            (InputFormat::Xml(None), MultiValueInput::Native),
+            (InputFormat::Csv(None), MultiValueInput::InCell),
+            (InputFormat::FixedWidth(None), MultiValueInput::InCell),
+            (InputFormat::Edifact(None), MultiValueInput::PositionalAxis),
+            (InputFormat::X12(None), MultiValueInput::PositionalAxis),
+            (InputFormat::Hl7(None), MultiValueInput::PositionalAxis),
+            (InputFormat::Swift(None), MultiValueInput::PositionalAxis),
+        ];
+        for (format, expected) in cases {
+            assert_eq!(
+                input_multi_value_support(&format),
+                expected,
+                "{}",
+                format.format_name()
+            );
+        }
+    }
 
     #[test]
     fn only_json_encodes_multi_value_today() {

@@ -303,6 +303,13 @@ impl CoercingReader {
                             })
                             .collect(),
                     ),
+                    // Defensive. E361 owns the invariant that a declared-
+                    // multiple column comes from a format whose reader
+                    // produces an array, so this arm is unreachable for a
+                    // compiled plan. It stays a coerce-and-pass rather than a
+                    // panic because that is cheaper than the alternative and
+                    // does not put a second, drifting copy of the gate's rule
+                    // on the record path.
                     scalar => {
                         coerce_value(&scalar, target, self.formats[i].as_deref(), self.scales[i])
                             .unwrap_or(scalar)

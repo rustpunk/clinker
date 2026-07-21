@@ -1290,13 +1290,32 @@ impl PipelineConfig {
             let Some(schema) = resolved_source_schemas.get(header.name.as_str()) else {
                 continue;
             };
+            let primary = doc_node_line_by_name
+                .get(header.name.as_str())
+                .map(|&line| Span::line_only(line))
+                .unwrap_or(Span::SYNTHETIC);
+            // E361 — a `multiple: true` column on a source whose format has no
+            // way to produce one. The read-side arrow of E359: `bound_type`
+            // binds the column as an array for every format, so without this
+            // the typechecker sees an array downstream while the reader
+            // delivers the scalar it actually parsed. Direct per-source, with
+            // no reachability walk — the mismatch is between one source's
+            // schema and its own format.
+            if let Some(fault) =
+                crate::config::multi_value::validate_multi_value_input(&body.source, schema)
+            {
+                diags.push(
+                    Diagnostic::error(
+                        "E361",
+                        fault.message,
+                        LabeledSpan::primary(primary, String::new()),
+                    )
+                    .with_help(fault.help),
+                );
+            }
             for fault in
                 crate::config::multi_value::validate_source_declarations(&body.source, schema)
             {
-                let primary = doc_node_line_by_name
-                    .get(header.name.as_str())
-                    .map(|&line| Span::line_only(line))
-                    .unwrap_or(Span::SYNTHETIC);
                 diags.push(
                     Diagnostic::error(
                         "E358",
@@ -1383,7 +1402,10 @@ impl PipelineConfig {
                             "write this stream to a `json` output, collapse the column to a \
                              single value in a transform before the sink, or drop \
                              `multiple: true` from the source column if the field never \
-                             actually repeats"
+                             actually repeats; when the schema is shared across sources and \
+                             only some of them repeat the field, clear it for this one with a \
+                             channel source patch (`schema: { <column>: { multiple: false } }`) \
+                             rather than editing the shared declaration"
                                 .to_string(),
                         ),
                     );
