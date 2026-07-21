@@ -117,7 +117,7 @@ pub fn under_field_path(key: &str, path: &str) -> bool {
 
 /// `keep_empty`'s default. Named rather than inlined so the inverted-industry
 /// default has exactly one definition.
-pub fn default_keep_empty() -> bool {
+fn default_keep_empty() -> bool {
     true
 }
 

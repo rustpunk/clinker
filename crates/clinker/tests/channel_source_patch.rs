@@ -347,8 +347,16 @@ nodes:
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("no encoding for a field") && stderr.contains("more than one value"),
+        stderr.contains("'tags'")
+            && stderr.contains("no encoding for a field")
+            && stderr.contains("more than one value"),
         "stderr:\n{stderr}"
+    );
+    // Rejected at compile, so the sink never opened: no partial file is left
+    // behind for a downstream consumer to pick up.
+    assert!(
+        !p.join("out.csv").exists(),
+        "no output may be written when the pipeline does not compile"
     );
 }
 

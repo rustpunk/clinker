@@ -36,7 +36,6 @@ pub use discovery::{DiscoveredFile, DiscoveryError, DiscoveryOutcome, discover};
 pub use error::*;
 pub use format::*;
 pub use fs_type::{FsKind, case_sensitive_dir, classify, collision_key, same_device};
-pub use multi_value::{multi_value_columns, output_encodes_multi_value};
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use output::*;
 pub use patch::{
