@@ -1217,13 +1217,13 @@ fn build_json_reader_config(
 ///
 /// Physical (`source_name` when the column aliases a differently-named input
 /// field) because the readers match against the names the document carries,
-/// before the declared-schema reprojection renames anything. A multi-record or
-/// generated schema declares no multi-value column — the flat formats those
-/// shapes describe have no repetition to collect.
+/// before the declared-schema reprojection renames anything. Reads the BOUND
+/// column list so a multi-record schema's record types are covered by the same
+/// rule the plan-time gate applies.
 fn multi_value_fields(schema: &SourceSchema) -> Vec<String> {
     schema
-        .as_columns()
-        .unwrap_or(&[])
+        .bound_columns()
+        .unwrap_or_default()
         .iter()
         .filter(|c| c.is_multiple())
         .map(|c| c.physical_name().to_string())

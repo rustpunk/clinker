@@ -17,7 +17,7 @@ pipeline:
 #
 # The sink is JSON because that is the one output format that can encode a
 # multi-value field today; binding `tags` or `cost_centres` to a CSV,
-# XML, or fixed-width output is rejected at compile (`clinker explain E359`).
+# XML, or fixed-width output is rejected at compile (`clinker explain --code E359`).
 
 nodes:
   - type: source

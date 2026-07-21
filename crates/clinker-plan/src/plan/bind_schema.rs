@@ -3860,7 +3860,7 @@ fn port_columns(decl: &PortDecl) -> IndexMap<QualifiedField, Type> {
     match &decl.schema {
         Some(columns) => columns
             .iter()
-            .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
+            .map(|c| (QualifiedField::bare(c.name.as_str()), c.bound_type()))
             .collect(),
         None => IndexMap::new(),
     }
@@ -4219,7 +4219,7 @@ fn columns_from_decl(
 ) -> (IndexMap<QualifiedField, Type>, Vec<String>) {
     let mut cols: IndexMap<QualifiedField, Type> = columns
         .iter()
-        .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
+        .map(|c| (QualifiedField::bare(c.name.as_str()), c.bound_type()))
         .collect();
     // Engine-stamped tail order: `$ck.<field>` shadow columns first,
     // then the `$widened` sidecar, then `$source.file`, then
@@ -4240,7 +4240,7 @@ fn columns_from_decl(
             match columns
                 .iter()
                 .find(|c| c.name.as_str() == field)
-                .map(|c| c.ty.clone())
+                .map(|c| c.bound_type())
             {
                 Some(ty) => {
                     let shadow_name = format!("$ck.{field}");

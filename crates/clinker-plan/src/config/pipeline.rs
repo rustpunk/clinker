@@ -1234,7 +1234,10 @@ impl PipelineConfig {
         // before the sink is still reported, which is the conservative
         // direction — a false positive is a compile error the author can see
         // and resolve, a false negative is a run that dies partway through.
-        // Which formats qualify lives in one per-format table
+        // The walk is `source_data_reachability`, NOT the `$doc` attribution
+        // above: that one narrows a Combine to its driving input, which would
+        // miss a column the combine projects off its reference side. Which
+        // formats qualify lives in one per-format table
         // (`output_encodes_multi_value`), so a writer gaining support relaxes
         // exactly one entry.
         let multi_value_by_source: HashMap<&str, Vec<String>> = self
@@ -1248,14 +1251,13 @@ impl PipelineConfig {
             .filter(|(_, columns)| !columns.is_empty())
             .collect();
         if !multi_value_by_source.is_empty() {
+            let data_reachability =
+                crate::config::multi_value::source_data_reachability(&self.nodes);
             for output in self.output_configs() {
                 if crate::config::multi_value::output_encodes_multi_value(&output.format) {
                     continue;
                 }
-                let Some(feeding) = top_level_ids
-                    .get(output.name.as_str())
-                    .and_then(|id| node_sources.get(id))
-                else {
+                let Some(feeding) = data_reachability.get(output.name.as_str()) else {
                     continue;
                 };
                 for source_name in feeding {

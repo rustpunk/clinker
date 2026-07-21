@@ -187,9 +187,9 @@ pub struct XmlReader {
     /// Current XML depth (incremented on Start, decremented on End).
     xml_depth: usize,
     /// Expanded records awaiting emission: schema inference reads the first
-    /// record element eagerly, and an array-path explode fans one element
-    /// out into several records. Bounded by one element's expansion, never
-    /// the whole input.
+    /// record element eagerly, and a `split_to_rows` fan-out expands one
+    /// element into several records. Bounded by one element's expansion,
+    /// never the whole input.
     pending: VecDeque<Record>,
     /// Whether we've finished all records.
     done: bool,
@@ -659,26 +659,31 @@ impl FormatReader for XmlReader {
             return Ok(Arc::clone(s));
         }
 
-        let first = self.read_next_record_raw()?;
-        let first = match first {
-            Some(raw) => raw,
-            None => {
+        // Infer schema from the first expanded record's field names
+        // (preserving order). The fan-out applies before inference, so the
+        // columns it lifts or synthesizes are what the schema reflects.
+        //
+        // Read forward until a record element actually expands to something: a
+        // `keep_empty: false` entry drops an element with no occurrence, and
+        // inferring from that dropped expansion would cache a column-less
+        // schema for the whole source while records kept flowing.
+        let expanded = loop {
+            let Some(raw) = self.read_next_record_raw()? else {
                 let s = SchemaBuilder::new().build();
                 self.schema = Some(Arc::clone(&s));
                 self.done = true;
                 return Ok(s);
+            };
+            let expanded = self.apply_split_to_rows(raw);
+            if !expanded.is_empty() {
+                break expanded;
             }
         };
 
-        // Infer schema from the first expanded record's field names
-        // (preserving order). The fan-out applies before inference, so the
-        // columns it lifts or synthesizes are what the schema reflects.
-        let expanded = self.apply_split_to_rows(first);
-        let empty = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let schema = expanded
             .first()
-            .unwrap_or(&empty)
+            .expect("non-empty checked above")
             .iter()
             .filter_map(|(k, _)| {
                 if seen.insert(k.clone()) {
@@ -951,10 +956,17 @@ pub(crate) fn split_text_value(value: &Value, delimiter: &str) -> Value {
 fn projected_key(key: &str, path: &str, mode: SplitToRowsMode) -> String {
     match mode {
         SplitToRowsMode::Split => key.to_string(),
-        SplitToRowsMode::Extract => match key.strip_prefix(path) {
-            Some(rest) if !rest.is_empty() => rest.trim_start_matches('.').to_string(),
-            _ => path.rsplit('.').next().unwrap_or(path).to_string(),
-        },
+        SplitToRowsMode::Extract => strip_field_prefix(key, path).to_string(),
+    }
+}
+
+/// The name `key` carries once `path`'s prefix is lifted off it. Borrows from
+/// whichever input survives, so the shadowing check can build a set without
+/// allocating a string per occurrence field.
+fn strip_field_prefix<'a>(key: &'a str, path: &'a str) -> &'a str {
+    match key.strip_prefix(path) {
+        Some(rest) if !rest.is_empty() => rest.trim_start_matches('.'),
+        _ => path.rsplit('.').next().unwrap_or(path),
     }
 }
 
@@ -964,6 +976,14 @@ fn projected_key(key: &str, path: &str, mode: SplitToRowsMode) -> String {
 /// Occurrence fields are spliced where the first occurrence sat, so all
 /// fanned-out siblings share one column order. A declared `position_column`
 /// receives each occurrence's 1-based position.
+///
+/// Lifting a prefix off under [`SplitToRowsMode::Extract`], or synthesizing a
+/// `position_column`, can land a field on a name a field outside the group
+/// already occupies (`<Order><name>` alongside `<Item><name>`). The occurrence
+/// wins: it is the record under `extract`, and a position column was explicitly
+/// asked for. The displaced field is dropped rather than carried alongside,
+/// because the duplicate-key collapse downstream is first-wins and would
+/// otherwise silently keep the shadowed value.
 fn split_field_to_rows(
     rec: &[IndexedField],
     entry: &SplitToRows,
@@ -984,6 +1004,23 @@ fn split_field_to_rows(
         let mut head: Vec<IndexedField> = Vec::new();
         let mut inside: Vec<IndexedField> = Vec::new();
         let mut tail: Vec<IndexedField> = Vec::new();
+        // Names this occurrence puts on the output record that an outside
+        // field could also occupy. The occurrence wins both cases: under
+        // `extract` it IS the record, and a `position_column` was explicitly
+        // asked for. Dropping the outside field is what makes that stick — the
+        // duplicate-key collapse downstream is first-wins and would otherwise
+        // silently keep the shadowed value.
+        let mut shadowed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        if entry.mode == SplitToRowsMode::Extract {
+            for field in rec {
+                if instance.contains(&field.0) {
+                    shadowed.insert(strip_field_prefix(&field.1, &entry.field));
+                }
+            }
+        }
+        if let Some(column) = &entry.position_column {
+            shadowed.insert(column.as_str());
+        }
         for field in rec {
             let idx = field.0;
             if instance.contains(&idx) {
@@ -994,6 +1031,9 @@ fn split_field_to_rows(
                 ));
             } else if idx < span && in_occurrence[idx] {
                 // A different occurrence of this field: not part of this output.
+                continue;
+            } else if shadowed.contains(field.1.as_str()) {
+                // Displaced by a field this occurrence puts on the record.
                 continue;
             } else if idx < anchor {
                 head.push(field.clone());
@@ -1602,6 +1642,37 @@ mod tests {
     }
 
     #[test]
+    fn extract_lifted_field_wins_over_a_same_named_parent_field() {
+        // Under `extract` the occurrence IS the record, so its own `name` must
+        // reach the output — not be shadowed by the parent's `name` that the
+        // merge brought along.
+        let xml =
+            r#"<Root><Order><name>OUTER</name><Item><name>INNER</name></Item></Order></Root>"#;
+        let config = split_config("Root/Order", vec![extract("Item")]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("name"), Some(&Value::String("INNER".into())));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn split_mode_keeps_both_sides_of_a_name_clash() {
+        // `split` keeps the dotted path, so the two fields never collide and
+        // the parent's value survives alongside the occurrence's.
+        let xml =
+            r#"<Root><Order><name>OUTER</name><Item><name>INNER</name></Item></Order></Root>"#;
+        let config = split_config("Root/Order", vec![split("Item")]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("name"), Some(&Value::String("OUTER".into())));
+        assert_eq!(r1.get("Item.name"), Some(&Value::String("INNER".into())));
+    }
+
+    #[test]
     fn split_to_rows_position_column_numbers_the_occurrences() {
         let xml = r#"<Root><Order><id>1</id><Tag>a</Tag><Tag>b</Tag></Order></Root>"#;
         let entry = SplitToRows {
@@ -1703,10 +1774,100 @@ mod tests {
     }
 
     #[test]
+    fn multiple_on_an_empty_element_still_yields_an_array() {
+        // `<Tag></Tag>` carries no text, so the collected array holds one
+        // empty value rather than the record losing the column.
+        let xml = r#"<Root><Row><id>1</id><Tag></Tag></Row></Root>"#;
+        let config = multi_value_config("Root/Row", &["Tag"]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(r1.get("Tag"), None);
+    }
+
+    #[test]
+    fn split_values_on_an_absent_field_leaves_the_record_intact() {
+        let xml = r#"<Root><Row><id>1</id></Row></Root>"#;
+        let config = XmlReaderConfig {
+            split_values: vec![SplitValues::bare("Tag")],
+            ..multi_value_config("Root/Row", &["Tag"])
+        };
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(r1.get("Tag"), None);
+    }
+
+    #[test]
+    fn extract_names_a_dotted_scalar_field_by_its_last_segment() {
+        // The prefix is lifted off, so a repeated scalar under a dotted path
+        // lands under the element's own name — the same column the JSON
+        // reader produces for the same declaration.
+        let xml = r#"<Root><Row><Tags><Tag>a</Tag><Tag>b</Tag></Tags></Row></Root>"#;
+        let config = split_config("Root/Row", vec![extract("Tags.Tag")]);
+        let mut r = reader_from_str(xml, config);
+        let s = r.schema().unwrap();
+        assert_eq!(column_names(&s), ["Tag"]);
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("Tag"), Some(&Value::String("a".into())));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("Tag"), Some(&Value::String("b".into())));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn position_column_wins_over_a_same_named_data_field() {
+        // The index was explicitly asked for, so it is not shadowed by a
+        // document field that happens to share the name.
+        let xml = r#"<Root><Row><line_no>99</line_no><Tag>a</Tag><Tag>b</Tag></Row></Root>"#;
+        let entry = SplitToRows {
+            position_column: Some("line_no".into()),
+            ..SplitToRows::bare("Tag")
+        };
+        let config = split_config("Root/Row", vec![entry]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("line_no"), Some(&Value::Integer(1)));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("line_no"), Some(&Value::Integer(2)));
+    }
+
+    #[test]
+    fn keep_empty_false_on_the_first_element_still_infers_a_schema() {
+        // The first record element is dropped, so inference must read forward
+        // rather than caching a column-less schema for a source that goes on
+        // emitting records.
+        let xml = r#"<Root>
+            <Order><id>1</id></Order>
+            <Order><id>2</id><Item><name>A</name></Item></Order>
+        </Root>"#;
+        let entry = SplitToRows {
+            keep_empty: false,
+            mode: SplitToRowsMode::Split,
+            ..SplitToRows::bare("Item")
+        };
+        let config = split_config("Root/Order", vec![entry]);
+        let mut r = reader_from_str(xml, config);
+        let s = r.schema().unwrap();
+        assert_eq!(column_names(&s), ["id", "Item.name"]);
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(2)));
+        assert_eq!(r1.get("Item.name"), Some(&Value::String("A".into())));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
     fn split_values_parses_a_delimited_cell_into_several_values() {
         let xml = r#"<Root><Row><id>7</id><Tag>a;b;c</Tag></Row></Root>"#;
         let config = XmlReaderConfig {
-            multi_value_fields: vec!["Tag".into()],
             split_values: vec![SplitValues::bare("Tag")],
             ..multi_value_config("Root/Row", &["Tag"])
         };

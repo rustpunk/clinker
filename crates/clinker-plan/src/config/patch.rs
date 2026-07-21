@@ -338,6 +338,12 @@ pub enum SplitToRowsOp {
     },
 }
 
+/// Dispatches on the YAML node kind rather than routing through
+/// `#[serde(untagged)]`. An untagged enum buffers both variants and reports
+/// only `data did not match any variant`, which names neither the offending key
+/// nor the accepted shapes; dispatching keeps `SetMap`'s own
+/// `deny_unknown_fields` message (which names the bad key and the valid ones)
+/// intact, and a node that is neither shape gets a message naming both forms.
 impl<'de> Deserialize<'de> for SplitToRowsOp {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         // Two accepted YAML shapes:
@@ -354,26 +360,40 @@ impl<'de> Deserialize<'de> for SplitToRowsOp {
             position_column: Option<Option<String>>,
         }
 
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Either {
-            Scalar(String),
-            Map(SetMap),
+        struct V;
+        impl<'de> de::Visitor<'de> for V {
+            type Value = SplitToRowsOp;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a `split_to_rows` op: either `remove` or a map \
+                     `{ keep_empty: <bool>, mode: extract|split, position_column: <name> }` \
+                     (`position_column: ~` clears it)",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v == "remove" {
+                    return Ok(SplitToRowsOp::Remove);
+                }
+                Err(de::Error::custom(format!(
+                    "unknown split_to_rows op {v:?}; the bare scalar form only accepts `remove` \
+                     — use `{{ keep_empty: <bool>, mode: extract|split, position_column: \
+                     <name> }}` to add or modify an entry, with `position_column: ~` to clear it"
+                )))
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                let m = SetMap::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(SplitToRowsOp::Set {
+                    keep_empty: m.keep_empty,
+                    mode: m.mode,
+                    position_column: m.position_column,
+                })
+            }
         }
 
-        match Either::deserialize(d)? {
-            Either::Scalar(s) if s == "remove" => Ok(SplitToRowsOp::Remove),
-            Either::Scalar(other) => Err(de::Error::custom(format!(
-                "unknown split_to_rows op {other:?}; the bare scalar form only accepts `remove` \
-                 — use `{{ keep_empty: <bool>, mode: extract|split, position_column: <name> }}` \
-                 to add or modify an entry, with `position_column: ~` to clear it"
-            ))),
-            Either::Map(m) => Ok(SplitToRowsOp::Set {
-                keep_empty: m.keep_empty,
-                mode: m.mode,
-                position_column: m.position_column,
-            }),
-        }
+        d.deserialize_any(V)
     }
 }
 
@@ -396,6 +416,7 @@ pub enum SplitValuesOp {
     Set { delimiter: Option<String> },
 }
 
+/// Same node-kind dispatch and rationale as [`SplitToRowsOp`]'s.
 impl<'de> Deserialize<'de> for SplitValuesOp {
     fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         // Two accepted YAML shapes:
@@ -408,23 +429,33 @@ impl<'de> Deserialize<'de> for SplitValuesOp {
             delimiter: Option<String>,
         }
 
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Either {
-            Scalar(String),
-            Map(SetMap),
+        struct V;
+        impl<'de> de::Visitor<'de> for V {
+            type Value = SplitValuesOp;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a `split_values` op: either `remove` or a map `{ delimiter: <str> }`")
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                if v == "remove" {
+                    return Ok(SplitValuesOp::Remove);
+                }
+                Err(de::Error::custom(format!(
+                    "unknown split_values op {v:?}; the bare scalar form only accepts `remove` \
+                     — use `{{ delimiter: <str> }}` to add or modify an entry"
+                )))
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                let m = SetMap::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(SplitValuesOp::Set {
+                    delimiter: m.delimiter,
+                })
+            }
         }
 
-        match Either::deserialize(d)? {
-            Either::Scalar(s) if s == "remove" => Ok(SplitValuesOp::Remove),
-            Either::Scalar(other) => Err(de::Error::custom(format!(
-                "unknown split_values op {other:?}; the bare scalar form only accepts `remove` \
-                 — use `{{ delimiter: <str> }}` to add or modify an entry"
-            ))),
-            Either::Map(m) => Ok(SplitValuesOp::Set {
-                delimiter: m.delimiter,
-            }),
-        }
+        d.deserialize_any(V)
     }
 }
 
@@ -2473,6 +2504,43 @@ nodes:
         )
         .unwrap_err();
         assert!(err.to_string().contains("E234"), "{err}");
+    }
+
+    /// A typo'd key inside a patch op must NAME the offending key and the
+    /// valid ones, not collapse into one message that says only that nothing
+    /// matched — and it must point at the key, not at the block around it.
+    #[test]
+    fn split_op_typo_names_the_offending_key() {
+        let err = crate::yaml::from_str::<SourceConfigPatch>(
+            "split_to_rows:\n  items: { keep_emty: false }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("keep_emty"), "{err}");
+        assert!(err.contains("keep_empty"), "{err}");
+
+        let err = crate::yaml::from_str::<SourceConfigPatch>(
+            "split_values:\n  tags: { delimeter: \";\" }\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("delimeter"), "{err}");
+        assert!(err.contains("delimiter"), "{err}");
+    }
+
+    #[test]
+    fn unknown_split_op_scalar_names_both_accepted_forms() {
+        let err = crate::yaml::from_str::<SourceConfigPatch>("split_to_rows:\n  items: drop\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("remove"), "{err}");
+        assert!(err.contains("keep_empty"), "{err}");
+
+        let err = crate::yaml::from_str::<SourceConfigPatch>("split_values:\n  tags: drop\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("remove"), "{err}");
+        assert!(err.contains("delimiter"), "{err}");
     }
 
     #[test]

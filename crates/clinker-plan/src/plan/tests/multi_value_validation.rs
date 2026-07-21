@@ -177,6 +177,211 @@ fn multi_value_column_into_a_non_encoding_output_is_rejected_with_a_span() {
 }
 
 #[test]
+fn empty_split_values_delimiter_is_rejected() {
+    let yaml = pipeline(
+        r#"      split_values:
+        - field: tags
+          delimiter: ""
+      schema:
+        - { name: tags, type: string, multiple: true }"#,
+        "json",
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert_eq!(found.len(), 1, "expected one E358");
+    assert!(found[0].0.contains("empty delimiter"), "{}", found[0].0);
+}
+
+#[test]
+fn two_entries_writing_one_position_column_are_rejected() {
+    let yaml = pipeline(
+        r#"      split_to_rows:
+        - field: Item
+          position_column: line_no
+        - field: Tag
+          position_column: line_no
+      schema:
+        - { name: line_no, type: int }"#,
+        "json",
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert_eq!(found.len(), 1, "expected one E358");
+    assert!(found[0].0.contains("position column"), "{}", found[0].0);
+}
+
+#[test]
+fn a_field_in_both_blocks_is_rejected() {
+    // Fanning a field out consumes it; parsing it in-cell keeps it and makes
+    // it multi-valued. Declaring both leaves no single shape for the column.
+    let yaml = pipeline(
+        r#"      split_to_rows:
+        - tags
+      split_values:
+        - tags
+      schema:
+        - { name: tags, type: string, multiple: true }"#,
+        "json",
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert_eq!(found.len(), 1, "expected one E358");
+    assert!(found[0].0.contains("both"), "{}", found[0].0);
+}
+
+#[test]
+fn split_values_naming_an_undeclared_field_says_so() {
+    // A typo must not be reported as "add `multiple: true` to the 'ghost'
+    // column" — there is no such column to add it to.
+    let yaml = pipeline(
+        r#"      split_values:
+        - ghost
+      schema:
+        - { name: tags, type: string, multiple: true }"#,
+        "json",
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert_eq!(found.len(), 1, "expected one E358");
+    assert!(
+        found[0].0.contains("does not declare at all"),
+        "{}",
+        found[0].0
+    );
+}
+
+/// A multi-value column reaching a non-encoding output through an intervening
+/// node, rather than on a direct source→output edge.
+#[test]
+fn multi_value_column_is_traced_through_an_intervening_transform() {
+    let yaml = r#"
+pipeline:
+  name: through_transform
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: ./in.json
+      schema:
+        - { name: id, type: string }
+        - { name: tags, type: string, multiple: true }
+  - type: transform
+    name: pick
+    input: src
+    config:
+      cxl: |
+        emit id = id
+  - type: output
+    name: out
+    input: pick
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let found = coded(&compile_err(yaml), "E359");
+    assert_eq!(found.len(), 1, "expected one E359 through the transform");
+}
+
+/// A combine projects columns off its REFERENCE input, not just its driver, so
+/// reachability for this gate must union every input — the `$doc` attribution
+/// walk narrows a combine to its driving input and would miss this.
+#[test]
+fn multi_value_column_on_a_combines_reference_input_is_caught() {
+    let yaml = r#"
+pipeline:
+  name: combine_reference
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: json
+      path: ./orders.json
+      schema:
+        - { name: id, type: string }
+  - type: source
+    name: events
+    config:
+      name: events
+      type: json
+      path: ./events.json
+      schema:
+        - { name: id, type: string }
+        - { name: tags, type: string, multiple: true }
+  - type: combine
+    name: enriched
+    input:
+      orders: orders
+      events: events
+    config:
+      where: "orders.id == events.id"
+      match: first
+      on_miss: null_fields
+      cxl: |
+        emit id = orders.id
+        emit tags = events.tags
+      propagate_ck: driver
+  - type: output
+    name: report
+    input: enriched
+    config:
+      name: report
+      type: csv
+      path: out.csv
+"#;
+    let found = coded(&compile_err(yaml), "E359");
+    assert_eq!(
+        found.len(),
+        1,
+        "expected one E359 for the combine's reference input"
+    );
+    assert!(found[0].0.contains("events"), "{}", found[0].0);
+}
+
+/// `multiple: true` inside a multi-record schema's record types is the same
+/// `Column` attribute and reaches the same superset, so the gate must see it.
+#[test]
+fn multi_value_column_inside_a_multi_record_schema_is_caught() {
+    let yaml = r#"
+pipeline:
+  name: multi_record
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: ./in.csv
+      schema:
+        discriminator: { field: kind }
+        records:
+          - id: header
+            tag: H
+            columns:
+              - { name: kind, type: string }
+              - { name: batch, type: string }
+          - id: detail
+            tag: D
+            columns:
+              - { name: kind, type: string }
+              - { name: tags, type: string, multiple: true }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let found = coded(&compile_err(yaml), "E359");
+    assert_eq!(
+        found.len(),
+        1,
+        "expected one E359 for the record-type column"
+    );
+    assert!(found[0].0.contains("'tags'"), "{}", found[0].0);
+}
+
+#[test]
 fn a_source_with_no_multi_value_column_is_unaffected() {
     let yaml = pipeline(
         r#"      schema:

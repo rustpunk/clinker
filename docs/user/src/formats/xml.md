@@ -134,7 +134,14 @@ Under `mode: split` the occurrence's fields keep their full dotted names
 (`Item.name`, `Item.@sku`), including the element's attributes. Under the
 default `mode: extract` the declared field's prefix is lifted off, so the same
 document yields `name` and `qty`; a repeated scalar element (`<Tag>a</Tag>`)
-has no remainder to lift and keeps the element's own name under both modes.
+has no remainder to lift and takes the declared field's last segment, so
+`Tags.Tag` yields `Tag` under `extract` and stays `Tags.Tag` under `split`.
+
+Lifting a prefix off can land an occurrence's field on a name a field outside
+the group already occupies — `<Order><name>` alongside `<Item><name>`. The
+occurrence wins: under `extract` it is the record, so its own field is not
+shadowed by the parent it was merged with. Use `mode: split` when you need both
+values, which keeps them at `name` and `Item.name`.
 
 An occurrence with no content (`<Item></Item>`) still emits a record, one
 carrying only the fields outside the group. A record with **no** occurrence of

@@ -266,13 +266,16 @@ schema:
 `multiple: true` says the column holds zero or more values of its declared
 type. Reading collects every occurrence of the field into one array — a single
 occurrence is still an array, so downstream code never has to branch on how
-many values happened to arrive. The declaration describes the shape of the
+many values happened to arrive. A field absent from a record has no column at
+all and resolves to null, exactly as any other absent column does. CXL sees the
+column as an `array`; the declared `type:` describes each element and drives
+coercion. The declaration describes the shape of the
 data, so it serves both directions: a writer that can encode repetition reads
 the same declaration.
 
 Only the `json` output can encode a multi-value field today. Binding one to any
 other output format is a compile error (`E359`) rather than a value silently
-degraded at the sink. Run `clinker explain E359` for the full remediation.
+degraded at the sink. Run `clinker explain --code E359` for the full remediation.
 
 ### One record per value: `split_to_rows`
 
@@ -294,8 +297,8 @@ forms mix freely in one list:
       - { name: line_amount, type: float }
       - { name: line_no, type: int }
     split_to_rows:
-      - line_items                # shorthand: field name, all defaults
-      - field: tags               # full form
+      - tags                      # shorthand: field name, all defaults
+      - field: line_items         # full form
         keep_empty: true
         mode: extract
         position_column: line_no
@@ -316,7 +319,10 @@ row is the costliest failure mode there is, so dropping is opt-in here.
 **`mode: extract`** (the default) makes the occurrence the record: its own
 fields are lifted out from under the field name and every field outside the
 group is merged onto each output. `{"orders": [{"id": 1}]}` yields a top-level
-`id`, and repeated `<Item><name>` children yield `name`.
+`id`, and repeated `<Item><name>` children yield `name`. When lifting lands an
+occurrence's field on a name an outside field already occupies, the occurrence
+wins — it is the record, so its own value is not shadowed by the parent it was
+merged with.
 
 **`mode: split`** preserves the record shape: the occurrence's fields keep
 their dotted path (`orders.id`, `Item.name`) and each output carries exactly
@@ -347,7 +353,12 @@ several values, and only a multi-value column can hold them.
 
 ### Format notes
 
-Both knobs are honored by the **JSON** and **XML** readers.
+Both knobs are honored by the **JSON** and **XML** file readers, and
+`split_to_rows` / `split_values` by a `rest` source decoding JSON. Other input
+formats accept the declarations and do not act on them — see
+[issue 912](https://github.com/rustpunk/clinker/issues/912) for that gap and
+[issue 911](https://github.com/rustpunk/clinker/issues/911) for a `rest` source
+decoding XML.
 
 **JSON** — the field names the key holding the array (`line_items`, or
 `order.line_items` for an array nested under an object). A field holding a

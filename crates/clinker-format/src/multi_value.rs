@@ -7,9 +7,12 @@
 //!
 //! Both live in the format layer next to [`crate::Column`] because they are
 //! deserialized from the same author-written YAML and consumed by the same
-//! readers. Serde discipline matches `Column`'s: a hand-written visitor
-//! dispatching on the YAML node kind, never `#[serde(untagged)]`, so spans and
-//! `deny_unknown_fields` messages survive.
+//! readers. Each accepts a bare field name or a full mapping, so — like
+//! [`crate::SourceSchema`], the other sum over YAML node shapes in this crate —
+//! they deserialize through a hand-written visitor dispatching on the node kind
+//! rather than `#[serde(untagged)]`, which would buffer both shapes and collapse
+//! every mistake into one message naming neither the offending key nor the
+//! accepted forms.
 
 use serde::de::{self};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -107,9 +110,9 @@ impl SplitValues {
 /// True when a flattened key sits at or under a declared field path: the key
 /// IS the path (the element's own text) or extends it past a dot (its children
 /// and attributes). Also the nesting test between two declared fields, since a
-/// field name is itself a dotted element path — so the reader's occurrence
-/// tracking and the plan-time disjointness gate read one predicate, never two
-/// that could drift.
+/// field name is itself a dotted element path. The XML reader's key-to-group
+/// membership and the plan-time disjointness gate (E358) both read this one
+/// predicate, so the rule the gate enforces is the rule the reader relies on.
 pub fn under_field_path(key: &str, path: &str) -> bool {
     key.strip_prefix(path)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))

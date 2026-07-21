@@ -170,6 +170,21 @@ impl Column {
         self.multiple.unwrap_or(false)
     }
 
+    /// The type this column binds into CXL.
+    ///
+    /// A `multiple: true` column holds a [`clinker_record::Value::Array`], so
+    /// it binds as [`Type::Array`]; its declared [`ty`](Self::ty) describes each
+    /// ELEMENT and drives coercion, not the shape a CXL expression sees. Binding
+    /// the element type instead would let `upper(tags)` typecheck against an
+    /// array at run time.
+    pub fn bound_type(&self) -> Type {
+        if self.is_multiple() {
+            Type::Array
+        } else {
+            self.ty.clone()
+        }
+    }
+
     /// The physical input-field name this column reads FROM: `source_name`
     /// when it aliases a differently-named field, else the exposed `name`.
     pub fn physical_name(&self) -> &str {
