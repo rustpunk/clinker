@@ -324,9 +324,12 @@ impl JsonReader {
                 // the mode's rules. An object occurrence has no value to read:
                 // `flatten_value` dissolved it into dotted child keys before
                 // this ran, and reading that as an absent field would treat a
-                // populated group as an empty one.
+                // populated group as an empty one. An explicit `null` is no
+                // occurrence at all — JSON producers routinely write one where
+                // a group is absent — so it falls through to the empty arm and
+                // is governed by `keep_empty`, exactly as an absent field is.
                 let single = match rec.get(&entry.field) {
-                    Some(serde_json::Value::Array(_)) => None,
+                    Some(serde_json::Value::Array(_) | serde_json::Value::Null) => None,
                     Some(_) => rec.shift_remove(&entry.field),
                     None => take_dissolved_object(&mut rec, &entry.field),
                 };
@@ -373,6 +376,13 @@ impl JsonReader {
     /// Apply the schema-level `multiple:` declarations and the `split_values`
     /// in-cell parse to one flattened record, so every declared multi-value
     /// field arrives at the record boundary array-valued.
+    ///
+    /// A scalar is normalized to a one-element array — a JSON producer that
+    /// unwraps a single-element array must not read as a different cardinality
+    /// from one that does not. An explicit `null` is left alone: it carries no
+    /// value, so wrapping it would report `size() == 1` for a field holding
+    /// nothing, diverging both from the absent-field case on this same reader
+    /// and from XML, which cannot express an explicit null at all.
     fn apply_multi_value(&self, flat: &mut serde_json::Map<String, serde_json::Value>) {
         for entry in &self.config.split_values {
             if let Some(value) = flat.get_mut(&entry.field) {
@@ -382,6 +392,7 @@ impl JsonReader {
         for field in &self.config.multi_value_fields {
             if let Some(value) = flat.get_mut(field)
                 && !value.is_array()
+                && !value.is_null()
             {
                 *value = serde_json::Value::Array(vec![value.take()]);
             }
@@ -661,7 +672,9 @@ fn project_element(
 /// element and flattens the result, so the two declarations compose instead of
 /// fighting. Empty parts are preserved — an author who declared the delimiter
 /// is the authority on what sits between two of them. A non-string scalar has
-/// no text to split and is wrapped as a single value.
+/// no text to split and is wrapped as a single value; an explicit `null` holds
+/// no value at all and stays null, matching what a field absent from the
+/// document resolves to.
 fn split_text_value(value: &serde_json::Value, delimiter: &str) -> serde_json::Value {
     fn parts(text: &str, delimiter: &str) -> Vec<serde_json::Value> {
         text.split(delimiter)
@@ -669,6 +682,7 @@ fn split_text_value(value: &serde_json::Value, delimiter: &str) -> serde_json::V
             .collect()
     }
     match value {
+        serde_json::Value::Null => serde_json::Value::Null,
         serde_json::Value::String(s) => serde_json::Value::Array(parts(s, delimiter)),
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
@@ -1607,6 +1621,128 @@ mod tests {
         let r2 = r.next_record().unwrap().unwrap();
         assert_eq!(r2.get("name"), Some(&Value::String("Bob".into())));
         assert_eq!(r2.get("id"), Some(&Value::Integer(1)));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn split_to_rows_explicit_null_is_no_occurrence() {
+        // A JSON producer routinely writes `null` where a group is absent.
+        // That is nothing to fan out, so `keep_empty` governs it exactly as it
+        // governs the absent field and the empty array — treating it as one
+        // real occurrence would both survive `keep_empty: false` and leave a
+        // stray column no fanned-out sibling carries.
+        let input = r#"[{"id":1,"line_items":null},{"id":2,"line_items":[{"sku":"x"}]}]"#;
+        let kept = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows::bare("line_items")],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, kept);
+        let _s = r.schema().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(r1.get("line_items"), None, "the null column is consumed");
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("sku"),
+            Some(&Value::String("x".into()))
+        );
+        assert!(r.next_record().unwrap().is_none());
+
+        let dropped = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows {
+                keep_empty: false,
+                ..SplitToRows::bare("line_items")
+            }],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, dropped);
+        let _s = r.schema().unwrap();
+        let only = r.next_record().unwrap().unwrap();
+        assert_eq!(only.get("id"), Some(&Value::Integer(2)));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn multi_value_column_leaves_an_explicit_null_null() {
+        // A `multiple: true` column normalizes a scalar to a one-element array
+        // so an unwrapped single occurrence reads the same as a wrapped one.
+        // An explicit null carries no value, so wrapping it would report
+        // `size() == 1` for a field holding nothing — diverging from the
+        // absent-field case on this same reader, and from XML, which cannot
+        // express an explicit null at all.
+        let input = concat!(
+            r#"{"id":"1","tags":["a","b"]}"#,
+            "\n",
+            r#"{"id":"2","tags":"solo"}"#,
+            "\n",
+            r#"{"id":"3","tags":null}"#,
+            "\n",
+            r#"{"id":"4"}"#,
+            "\n",
+            r#"{"id":"5","tags":[]}"#,
+            "\n",
+        );
+        let config = JsonReaderConfig {
+            format: Some(JsonMode::Ndjson),
+            multi_value_fields: vec!["tags".to_string()],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let tags = |r: &mut JsonReader| r.next_record().unwrap().unwrap().get("tags").cloned();
+        assert_eq!(
+            tags(&mut r),
+            Some(Value::Array(vec![
+                Value::String("a".into()),
+                Value::String("b".into())
+            ]))
+        );
+        assert_eq!(
+            tags(&mut r),
+            Some(Value::Array(vec![Value::String("solo".into())]))
+        );
+        assert_eq!(tags(&mut r), Some(Value::Null), "explicit null stays null");
+        assert_eq!(tags(&mut r), None, "absent field contributes no column");
+        assert_eq!(tags(&mut r), Some(Value::Array(vec![])));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn nested_split_to_rows_compose_under_split_mode() {
+        // The outer entry has to keep the group's dotted path for the inner
+        // entry to still address it. `mode: split` does; `mode: extract` lifts
+        // the occurrence's keys to the top level, so `orders.items` stops
+        // existing and the inner entry matches nothing. E358 rejects the
+        // extract pairing at compile time, and this pins the shape that works.
+        let input = r#"[{"cust":"A","orders":[{"id":1,"items":[{"sku":"x"},{"sku":"y"}]}]}]"#;
+        let nested = |mode| JsonReaderConfig {
+            split_to_rows: vec![
+                SplitToRows {
+                    mode,
+                    ..SplitToRows::bare("orders")
+                },
+                SplitToRows {
+                    mode,
+                    ..SplitToRows::bare("orders.items")
+                },
+            ],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, nested(SplitToRowsMode::Split));
+        let _s = r.schema().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("orders.items.sku"), Some(&Value::String("x".into())));
+        assert_eq!(r1.get("orders.id"), Some(&Value::Integer(1)));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("orders.items.sku"), Some(&Value::String("y".into())));
+        assert!(r.next_record().unwrap().is_none());
+
+        // The extract pairing collapses to one record with the inner array
+        // never expanded — the reason E358 rejects it rather than letting it
+        // undercount silently.
+        let mut r = reader_from_str(input, nested(SplitToRowsMode::Extract));
+        let _s = r.schema().unwrap();
+        let only = r.next_record().unwrap().unwrap();
+        assert!(matches!(only.get("items"), Some(Value::Array(_))));
         assert!(r.next_record().unwrap().is_none());
     }
 

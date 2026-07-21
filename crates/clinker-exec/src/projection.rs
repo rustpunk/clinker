@@ -231,14 +231,28 @@ fn round_declared_output_decimals(record: &mut Record, config: &OutputConfig) {
         if !matches!(col.ty.unwrap_nullable(), Type::Decimal) {
             continue;
         }
-        // Copy the decimal out (it is `Copy`) so the immutable `get` borrow is
-        // released before the `set`; a non-decimal value in the slot is left
-        // untouched.
+        // Copy the value out so the immutable `get` borrow is released before
+        // the `set`; a non-decimal value in the slot is left untouched. A
+        // `multiple: true` column arrives as an array whose declared `type:`
+        // and `scale:` describe each ELEMENT, so the scale applies element-wise
+        // — the same rule the read-side coercion follows. Non-decimal elements
+        // pass through, matching the scalar arm.
         let rounded = match record.get(&col.name) {
-            Some(&Value::Decimal(d)) => round_decimal_to_scale(d, Some(scale)),
+            Some(&Value::Decimal(d)) => Value::Decimal(round_decimal_to_scale(d, Some(scale))),
+            Some(Value::Array(items)) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| match item {
+                        Value::Decimal(d) => {
+                            Value::Decimal(round_decimal_to_scale(*d, Some(scale)))
+                        }
+                        other => other.clone(),
+                    })
+                    .collect(),
+            ),
             _ => continue,
         };
-        record.set(&col.name, Value::Decimal(rounded));
+        record.set(&col.name, rounded);
     }
 }
 
@@ -715,6 +729,39 @@ mod tests {
         assert_eq!(
             out.get("average"),
             Some(&Value::Decimal(Decimal::new(133, 2)))
+        );
+    }
+
+    /// A `multiple: true` column arrives as an array whose declared `type:` and
+    /// `scale:` describe each ELEMENT, so the scale applies element-wise —
+    /// otherwise a multi-value decimal column is the one place a declared scale
+    /// is silently not honored, writing full internal precision into the sink.
+    /// Non-decimal elements pass through, matching the scalar arm.
+    #[test]
+    fn output_scale_rounds_each_element_of_a_multi_value_column() {
+        let quotient = Decimal::from(4)
+            .checked_div(Decimal::from(3))
+            .expect("4 / 3");
+        let input = one_field_record(
+            "amounts",
+            Value::Array(vec![
+                Value::Decimal(quotient),
+                Value::Decimal(Decimal::new(2125, 3)),
+                Value::String("n/a".into()),
+            ]),
+        );
+        let schema = SourceSchema::Columns(vec![Column {
+            multiple: Some(true),
+            ..decimal_col("amounts", Some(2))
+        }]);
+        let out = project_output_from_record(&input, &scale_config(Some(schema)), None);
+        assert_eq!(
+            out.get("amounts"),
+            Some(&Value::Array(vec![
+                Value::Decimal(Decimal::new(133, 2)),
+                Value::Decimal(Decimal::new(212, 2)),
+                Value::String("n/a".into()),
+            ]))
         );
     }
 

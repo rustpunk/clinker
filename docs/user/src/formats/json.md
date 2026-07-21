@@ -54,9 +54,12 @@ documented on the
   depends on what a particular document happened to carry.
 - `split_values` parses a delimited string cell into several values.
 
-A record whose declared field holds an empty array, or carries no such field at
-all, is preserved by default — `keep_empty` defaults to `true`, and setting it
-to `false` drops such a record.
+A record whose declared field holds an empty array, is explicitly `null`, or
+carries no such field at all, is preserved by default — `keep_empty` defaults to
+`true`, and setting it to `false` drops such a record. An explicit null is how
+many producers write "no value", so it counts as no occurrence rather than one;
+for the same reason a `multiple: true` column holding an explicit null stays
+null rather than becoming `[null]`.
 
 A field that IS present but holds a single object or scalar rather than an array
 is one occurrence, projected exactly as a one-element array would be. Producers
@@ -66,9 +69,20 @@ the same way and every output record ends up with the same columns. The XML
 reader, where a document cannot express the difference at all, already behaved
 this way.
 
-Two declared fan-out fields apply in declaration order and multiply, including a
-nested pair (`orders` then `orders.items`), which produces the two-level
-expansion. A duplicated field is rejected at compile (`E358`).
+Two declared fan-out fields apply in declaration order and multiply. A nested
+pair (`orders` then `orders.items`) produces the two-level expansion when the
+outer entry declares `mode: split`:
+
+```yaml
+    split_to_rows:
+      - { field: orders, mode: split }
+      - { field: orders.items, mode: split }
+```
+
+Under `mode: extract` the outer entry lifts the occurrence's keys to the top
+level, which removes the `orders.items` path the inner entry addresses — so that
+pairing is rejected at compile (`E358`) rather than silently fanning out only
+one level. A duplicated field is rejected too.
 
 ## Bounding envelope retention: `max_index_bytes`
 

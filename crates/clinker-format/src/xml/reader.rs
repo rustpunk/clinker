@@ -613,12 +613,17 @@ impl XmlReader {
     /// element — the per-Source `OnUnmapped` policy at the dispatch
     /// layer reconciles records against the user-declared schema.
     fn fields_to_record(&self, fields: Vec<(String, String)>) -> Result<Record, FormatError> {
-        let mut slot: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        // Keyed by the boxed column name so the slot map costs exactly one
+        // clone per distinct field, the same as the `HashSet` first-wins dedup
+        // it replaced: this runs once per field per record on every XML
+        // pipeline, including the majority that declare no multi-value column.
+        let mut slot: std::collections::HashMap<Box<str>, usize> =
+            std::collections::HashMap::with_capacity(fields.len());
         let mut columns: Vec<Box<str>> = Vec::with_capacity(fields.len());
         let mut values: Vec<Value> = Vec::with_capacity(fields.len());
         for (key, val) in fields {
             let value = infer_value(&val);
-            match slot.get(&key) {
+            match slot.get(key.as_str()) {
                 // A repeated key on a `multiple:` column accumulates in
                 // document order; on any other column the first occurrence
                 // wins, which is the long-standing duplicate-key collapse.
@@ -628,9 +633,11 @@ impl XmlReader {
                     }
                 }
                 None => {
-                    slot.insert(key.clone(), columns.len());
-                    columns.push(key.clone().into_boxed_str());
-                    values.push(if self.is_multi_value(&key) {
+                    let multiple = self.is_multi_value(&key);
+                    let name = key.into_boxed_str();
+                    slot.insert(name.clone(), columns.len());
+                    columns.push(name);
+                    values.push(if multiple {
                         Value::Array(vec![value])
                     } else {
                         value

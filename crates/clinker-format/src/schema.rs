@@ -298,6 +298,16 @@ pub const RECORD_TYPE_COLUMN: &str = "record_type";
 /// unify compatibility rule, so the typechecked row and the emitted records
 /// cannot disagree on a shared column's type. A pair that does not unify keeps
 /// the first declaration's type here; the reader rejects that config at build.
+///
+/// `multiple:` widens the same way, by OR rather than first-wins: a name any
+/// record type declares `multiple: true` is multi-valued in the superset. The
+/// superset is the one column list every consumer reads — the reader's
+/// collect-these-fields set and both multi-value gates come off
+/// `bound_columns()` — so first-wins would let a later record type's
+/// declaration vanish, leaving its repeated occurrences to collapse to the
+/// first value with no diagnostic anywhere. Single-valued is a subset of
+/// array-valued (one occurrence yields a one-element array), which is why the
+/// widening direction is sound.
 pub fn multi_record_superset(record_types: &[RecordType]) -> Vec<Column> {
     let mut columns: Vec<Column> = vec![Column::bare(RECORD_TYPE_COLUMN, Type::String)];
     for rt in record_types {
@@ -305,6 +315,9 @@ pub fn multi_record_superset(record_types: &[RecordType]) -> Vec<Column> {
             if let Some(existing) = columns.iter_mut().find(|c| c.name == col.name) {
                 if let Some(unified) = existing.ty.unify(&col.ty) {
                     existing.ty = unified;
+                }
+                if col.is_multiple() {
+                    existing.multiple = Some(true);
                 }
             } else {
                 columns.push(col.clone());
@@ -444,6 +457,32 @@ mod tests {
         assert_eq!(cols[0].name, "id");
         assert_eq!(cols[0].ty, Type::Int);
         assert!(cols[1].is_long_unique());
+    }
+
+    #[test]
+    fn superset_widens_multiple_across_record_types_in_either_order() {
+        // Every multi-value consumer — the reader's collect-these-fields set,
+        // both plan-time gates — reads the superset, so a `multiple: true` any
+        // record type declares has to survive into it. First-wins would drop a
+        // later record type's declaration and let its repeated occurrences
+        // collapse to the first value with no diagnostic anywhere.
+        let single = r#"{"name":"code","type":"string"}"#;
+        let multiple = r#"{"name":"code","type":"string","multiple":true}"#;
+        for (first, second) in [(single, multiple), (multiple, single)] {
+            let schema: SourceSchema = from_json(&format!(
+                r#"{{"discriminator":{{"field":"kind"}},
+                    "records":[
+                      {{"id":"header","tag":"H","columns":[{first}]}},
+                      {{"id":"detail","tag":"D","columns":[{second}]}}
+                    ]}}"#
+            ));
+            let columns = schema.bound_columns().expect("superset");
+            let code = columns.iter().find(|c| c.name == "code").expect("code");
+            assert!(
+                code.is_multiple(),
+                "declaration order must not decide the shape"
+            );
+        }
     }
 
     #[test]

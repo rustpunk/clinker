@@ -125,6 +125,62 @@ fn nested_split_to_rows_fields_are_rejected() {
     assert!(found[0].0.contains("nest"), "{}", found[0].0);
 }
 
+/// On JSON the two entries compose only when the outer keeps the group's
+/// dotted path. `mode: extract` — the default — lifts the occurrence's own keys
+/// to the top level, so `orders.items` stops existing, the inner entry matches
+/// nothing, and `keep_empty`'s default passes the record through unfanned: one
+/// record where the author asked for one per line item.
+#[test]
+fn nested_split_to_rows_under_extract_mode_is_rejected_on_json() {
+    let yaml = json_pipeline(
+        r#"      split_to_rows:
+        - orders
+        - orders.items
+      schema:
+        - { name: sku, type: string }"#,
+        "json",
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert_eq!(found.len(), 1, "expected one E358: {found:?}");
+    assert!(
+        found[0].0.contains("nest") && found[0].0.contains("mode: extract"),
+        "{}",
+        found[0].0
+    );
+    assert!(found[0].1, "E358 must carry a source span");
+}
+
+/// The pairing the reader really does expand two levels deep.
+#[test]
+fn nested_split_to_rows_under_split_mode_compiles_on_json() {
+    let yaml = json_pipeline(
+        r#"      split_to_rows:
+        - { field: orders, mode: split }
+        - { field: orders.items, mode: split }
+      schema:
+        - { name: "orders.items.sku", type: string }"#,
+        "json",
+    );
+    compile_ok(&yaml);
+}
+
+/// XML tracks occurrence membership positionally, so nesting is ambiguous there
+/// whatever the mode — `split` does not rescue it the way it does on JSON.
+#[test]
+fn nested_split_to_rows_under_split_mode_is_still_rejected_on_xml() {
+    let yaml = pipeline(
+        r#"      split_to_rows:
+        - { field: Item, mode: split }
+        - { field: Item.part, mode: split }
+      schema:
+        - { name: "Item.part.code", type: string }"#,
+        "json",
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert_eq!(found.len(), 1, "expected one E358: {found:?}");
+    assert!(found[0].0.contains("xml source"), "{}", found[0].0);
+}
+
 #[test]
 fn disjoint_split_to_rows_fields_compile() {
     let yaml = pipeline(
@@ -316,6 +372,118 @@ nodes:
 "#;
     let found = coded(&compile_err(yaml), "E359");
     assert_eq!(found.len(), 1, "expected one E359 through the transform");
+}
+
+/// Nothing requires a node to be declared after its producer, and the gate has
+/// to hold whichever order the author wrote. A single declaration-order pass
+/// leaves the output's reaching-source set empty and the run dies at the CSV
+/// writer on record 1 instead.
+#[test]
+fn multi_value_column_is_caught_with_the_output_declared_before_its_producer() {
+    let yaml = r#"
+pipeline:
+  name: out_before_producer
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: ./in.json
+      schema:
+        - { name: id, type: string }
+        - { name: tags, type: string, multiple: true }
+  - type: output
+    name: out
+    input: pick
+    config:
+      name: out
+      type: csv
+      path: out.csv
+  - type: transform
+    name: pick
+    input: src
+    config:
+      cxl: |
+        emit id = id
+"#;
+    let diags = compile_err(yaml);
+    let found = coded(&diags, "E359");
+    assert_eq!(
+        found.len(),
+        1,
+        "declaration order must not decide whether the gate fires: {diags:?}"
+    );
+}
+
+/// The output's own `schema:` block is the same `Column` type and accepts
+/// `multiple: true`, but no writer honors it — the fixed-width writer's
+/// `Column -> FieldDef` conversion drops the attribute outright. It is the
+/// surface an author is most likely to write the declaration on.
+#[test]
+fn multi_value_column_on_an_outputs_own_schema_is_rejected() {
+    let yaml = r#"
+pipeline:
+  name: output_schema_gate
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: ./in.json
+      schema:
+        - { name: id, type: string }
+        - { name: codes, type: string }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      schema:
+        - { name: id, type: string }
+        - { name: codes, type: string, multiple: true }
+"#;
+    let found = coded(&compile_err(yaml), "E359");
+    assert_eq!(found.len(), 1, "expected one E359: {found:?}");
+    assert!(
+        found[0].0.contains("its own `schema:`") && found[0].0.contains("'codes'"),
+        "{}",
+        found[0].0
+    );
+    assert!(found[0].1, "E359 must carry a source span");
+}
+
+/// The same declaration on a `json` output is honored, so it compiles.
+#[test]
+fn multi_value_column_on_a_json_outputs_own_schema_compiles() {
+    let yaml = r#"
+pipeline:
+  name: output_schema_json
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: ./in.json
+      schema:
+        - { name: id, type: string }
+        - { name: codes, type: string, multiple: true }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: json
+      path: out.json
+      schema:
+        - { name: id, type: string }
+        - { name: codes, type: string, multiple: true }
+"#;
+    compile_ok(yaml);
 }
 
 /// A combine projects columns off its REFERENCE input, not just its driver, so
@@ -708,11 +876,14 @@ fn e361_fires_on_a_csv_source_with_a_bare_multi_value_column() {
     assert!(found[0].1, "E361 must carry a source span");
 }
 
-/// A `split_values` entry is what makes the several values on a delimited-cell
-/// format, and E358 already enforces the converse — that such a field is
-/// declared `multiple: true`. This is that arrow pointing back.
+/// A `split_values` entry does not rescue the declaration on a delimited-cell
+/// format. No CSV or fixed-width reader is handed that block — only the JSON
+/// and XML readers are — so accepting the pair would bind the column as an
+/// array and then deliver the raw cell, which is precisely what E361 exists to
+/// stop. The gate has to reject what the runtime cannot honor, not what the
+/// format could honor once the wiring lands.
 #[test]
-fn e361_is_suppressed_by_a_matching_split_values_entry() {
+fn e361_fires_on_a_delimited_cell_format_even_with_a_split_values_entry() {
     for format in ["csv", "fixed_width"] {
         let yaml = source_format_pipeline(
             format,
@@ -723,14 +894,27 @@ fn e361_is_suppressed_by_a_matching_split_values_entry() {
         - { name: order_id, type: string }
         - { name: tags, type: string, multiple: true }"#,
         );
-        compile_ok(&yaml);
+        let diags = compile_err(&yaml);
+        let found = coded(&diags, "E361");
+        assert_eq!(found.len(), 1, "expected one E361 for {format}: {found:?}");
+        assert!(found[0].0.contains("'tags'"), "{format}: {}", found[0].0);
+        let help = diags
+            .iter()
+            .find(|d| d.code == "E361")
+            .and_then(|d| d.help.clone())
+            .unwrap_or_default();
+        assert!(
+            help.contains("917") && help.contains("not implemented yet"),
+            "the help must name the outstanding wiring rather than prescribe \
+             `split_values`: {help}"
+        );
     }
 }
 
-/// The entry has to name the column that needs it. A `split_values` entry on a
-/// different field leaves the declared one unsupplied.
+/// Every declared column is reported, not just the ones no `split_values` entry
+/// names: the entry has no bearing on the verdict.
 #[test]
-fn e361_still_fires_for_a_column_no_split_values_entry_covers() {
+fn e361_reports_every_multi_value_column_on_a_delimited_cell_format() {
     let yaml = source_format_pipeline(
         "csv",
         r#"      split_values:
@@ -743,11 +927,51 @@ fn e361_still_fires_for_a_column_no_split_values_entry_covers() {
     let found = coded(&compile_err(&yaml), "E361");
     assert_eq!(found.len(), 1, "expected one E361: {found:?}");
     assert!(found[0].0.contains("'codes'"), "{}", found[0].0);
-    assert!(
-        !found[0].0.contains("'tags'"),
-        "the covered column must not be reported: {}",
-        found[0].0
-    );
+    assert!(found[0].0.contains("'tags'"), "{}", found[0].0);
+}
+
+/// The other half of the same hole: a `split_values` block on a format whose
+/// reader never receives it is a silent no-op, reported on its own rather than
+/// left to be inferred from the E361 above.
+#[test]
+fn e358_rejects_multi_value_declarations_a_format_never_receives() {
+    for (format, key, body) in [
+        (
+            "csv",
+            "split_values",
+            r#"      split_values:
+        - field: tags
+          delimiter: ";"
+      schema:
+        - { name: tags, type: string }"#,
+        ),
+        (
+            "fixed_width",
+            "split_to_rows",
+            r#"      split_to_rows:
+        - line_items
+      schema:
+        - { name: sku, type: string }"#,
+        ),
+        (
+            "x12",
+            "split_to_rows",
+            r#"      split_to_rows:
+        - line_items
+      schema:
+        - { name: sku, type: string }"#,
+        ),
+    ] {
+        let yaml = source_format_pipeline(format, body);
+        let found = coded(&compile_err(&yaml), "E358");
+        assert_eq!(found.len(), 1, "expected one E358 for {format}: {found:?}");
+        assert!(
+            found[0].0.contains(key) && found[0].0.contains("silent no-op"),
+            "{format}: {}",
+            found[0].0
+        );
+        assert!(found[0].1, "{format}: E358 must carry a source span");
+    }
 }
 
 /// Repetition in a segment format is a positional coordinate, not a list, so no

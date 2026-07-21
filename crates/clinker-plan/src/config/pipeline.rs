@@ -1202,215 +1202,28 @@ impl PipelineConfig {
                 );
             }
         }
-        // E360 — a source still carrying the superseded `array_paths:` block.
-        // Nothing reads it any more, and a source config is flattened into its
-        // node so serde discards an unrecognized key silently: without this
-        // gate the pipeline compiles and runs, emitting one record per document
-        // where it used to emit one per array element.
-        for spanned in &self.nodes {
-            let PipelineNode::Source {
-                header,
-                config: body,
-            } = &spanned.value
-            else {
-                continue;
-            };
-            if body.source.array_paths.is_none() {
-                continue;
-            }
+        // Every per-source multi-value gate (E360, E361, E358) and the
+        // source-to-output E359 gate, run over this pipeline's own nodes. The
+        // same two passes run again inside `bind_composition` over each
+        // composition body's node list, which never appears here: the body file
+        // is re-read and bound separately, so a body source gated only from
+        // this loop would be gated by nothing at all.
+        for fault in crate::config::multi_value::source_node_faults(&self.nodes)
+            .into_iter()
+            .chain(crate::config::multi_value::output_node_faults(&self.nodes))
+        {
             let primary = doc_node_line_by_name
-                .get(header.name.as_str())
+                .get(self.nodes[fault.node_index].value.name())
                 .map(|&line| Span::line_only(line))
                 .unwrap_or(Span::SYNTHETIC);
             diags.push(
                 Diagnostic::error(
-                    "E360",
-                    format!(
-                        "source '{}' declares `array_paths:`, which the multi-value \
-                         declarations replaced — the key is no longer read, so leaving it in \
-                         place would drop the fan-out silently",
-                        header.name
-                    ),
+                    fault.code,
+                    fault.message,
                     LabeledSpan::primary(primary, String::new()),
                 )
-                .with_help(
-                    "replace it: an `explode` path becomes a `split_to_rows:` entry (`mode: \
-                     extract` reproduces the old projection, `mode: split` keeps the record \
-                     shape), a delimited cell becomes a `split_values:` entry, and a path kept \
-                     as an array becomes `multiple: true` on the schema column"
-                        .to_string(),
-                ),
+                .with_help(fault.help),
             );
-        }
-        // E358 — a malformed multi-value declaration on a source: duplicate or
-        // nested `split_to_rows` fields, a duplicate `split_values` field, or a
-        // `split_values` field the schema does not declare `multiple: true`.
-        // The nesting/duplicate rejection used to run at XML reader
-        // construction as an unspanned string error and never ran for JSON at
-        // all; both now fail at compile, anchored to the source node.
-        //
-        // Both gates read the schema's declared columns, so they run against
-        // the map below rather than `body.schema`: an external
-        // `.schema.yaml` (`SourceSchema::File`) is still unresolved at this
-        // point — the resolution pass that folds it inline sits further down,
-        // past the fatal-error return — and an unresolved `File` declares no
-        // columns to inspect, which would leave both gates inert for every
-        // pipeline that keeps its schema in a file.
-        let resolved_source_schemas: HashMap<&str, clinker_format::SourceSchema> = self
-            .nodes
-            .iter()
-            .filter_map(|spanned| match &spanned.value {
-                PipelineNode::Source {
-                    header,
-                    config: body,
-                } => {
-                    let schema = match &body.schema {
-                        // A file that fails to load is left out entirely: the
-                        // resolution pass below reports it as E157, and
-                        // reporting it twice from two passes would be worse
-                        // than these two gates skipping the source.
-                        clinker_format::SourceSchema::File(path) => {
-                            crate::schema::load_source_schema(std::path::Path::new(path)).ok()?
-                        }
-                        inline => inline.clone(),
-                    };
-                    Some((header.name.as_str(), schema))
-                }
-                _ => None,
-            })
-            .collect();
-        for spanned in &self.nodes {
-            let PipelineNode::Source {
-                header,
-                config: body,
-            } = &spanned.value
-            else {
-                continue;
-            };
-            let Some(schema) = resolved_source_schemas.get(header.name.as_str()) else {
-                continue;
-            };
-            let primary = doc_node_line_by_name
-                .get(header.name.as_str())
-                .map(|&line| Span::line_only(line))
-                .unwrap_or(Span::SYNTHETIC);
-            // E361 — a `multiple: true` column on a source whose format has no
-            // way to produce one. The read-side arrow of E359: `bound_type`
-            // binds the column as an array for every format, so without this
-            // the typechecker sees an array downstream while the reader
-            // delivers the scalar it actually parsed. Direct per-source, with
-            // no reachability walk — the mismatch is between one source's
-            // schema and its own format.
-            if let Some(fault) =
-                crate::config::multi_value::validate_multi_value_input(&body.source, schema)
-            {
-                diags.push(
-                    Diagnostic::error(
-                        "E361",
-                        fault.message,
-                        LabeledSpan::primary(primary, String::new()),
-                    )
-                    .with_help(fault.help),
-                );
-            }
-            for fault in
-                crate::config::multi_value::validate_source_declarations(&body.source, schema)
-            {
-                diags.push(
-                    Diagnostic::error(
-                        "E358",
-                        fault.message,
-                        LabeledSpan::primary(primary, String::new()),
-                    )
-                    .with_help(fault.help),
-                );
-            }
-        }
-        // E359 — a `multiple: true` column on a source feeding an output whose
-        // format has no multi-value encoding. The writers reject a multi-value
-        // payload at run time, so without this gate the failure lands
-        // mid-stream on record N rather than at compile. Reachability is
-        // source-to-output through the DAG: a column that a transform drops
-        // before the sink is still reported, which is the conservative
-        // direction — a false positive is a compile error the author can see
-        // and resolve, a false negative is a run that dies partway through.
-        // The walk is `source_data_reachability`, NOT the `$doc` attribution
-        // above: that one narrows a Combine to its driving input, which would
-        // miss a column the combine projects off its reference side. Which
-        // formats qualify lives in one per-format table
-        // (`output_encodes_multi_value`), so a writer gaining support relaxes
-        // exactly one entry.
-        //
-        // Both sides key on the NODE name (`header.name`), which the
-        // reachability walk is built from and which can differ from the nested
-        // `config.name:` the diagnostic text quotes.
-        let multi_value_by_source: HashMap<&str, Vec<String>> = resolved_source_schemas
-            .iter()
-            .map(|(name, schema)| {
-                (
-                    *name,
-                    crate::config::multi_value::multi_value_columns(schema),
-                )
-            })
-            .filter(|(_, columns)| !columns.is_empty())
-            .collect();
-        if !multi_value_by_source.is_empty() {
-            let data_reachability =
-                crate::config::multi_value::source_data_reachability(&self.nodes);
-            for spanned in &self.nodes {
-                let PipelineNode::Output {
-                    header,
-                    config: body,
-                } = &spanned.value
-                else {
-                    continue;
-                };
-                let output = &body.output;
-                if crate::config::multi_value::output_encodes_multi_value(&output.format) {
-                    continue;
-                }
-                let Some(feeding) = data_reachability.get(header.name.as_str()) else {
-                    continue;
-                };
-                for source_name in feeding {
-                    let Some(columns) = multi_value_by_source.get(source_name.as_str()) else {
-                        continue;
-                    };
-                    let primary = doc_node_line_by_name
-                        .get(header.name.as_str())
-                        .map(|&line| Span::line_only(line))
-                        .unwrap_or(Span::SYNTHETIC);
-                    diags.push(
-                        Diagnostic::error(
-                            "E359",
-                            format!(
-                                "output '{out}': source '{source_name}' declares the \
-                                 multi-value column(s) {columns} (`multiple: true`), and a \
-                                 `{format}` output has no encoding for a field holding more \
-                                 than one value",
-                                out = header.name,
-                                columns = columns
-                                    .iter()
-                                    .map(|c| format!("'{c}'"))
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                                format = output.format.format_name(),
-                            ),
-                            LabeledSpan::primary(primary, String::new()),
-                        )
-                        .with_help(
-                            "write this stream to a `json` output, collapse the column to a \
-                             single value in a transform before the sink, or drop \
-                             `multiple: true` from the source column if the field never \
-                             actually repeats; when the schema is shared across sources and \
-                             only some of them repeat the field, clear it for this one with a \
-                             channel source patch (`schema: { <column>: { multiple: false } }`) \
-                             rather than editing the shared declaration"
-                                .to_string(),
-                        ),
-                    );
-                }
-            }
         }
         for (doc_path, ref_nodes) in &doc_path_set.by_node {
             for node_id in ref_nodes {

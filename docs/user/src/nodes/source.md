@@ -280,21 +280,25 @@ cannot carry fails before a run starts rather than mid-stream:
 |---|---|---|
 | `json` | native — an array | native — an array |
 | `xml` | native — repeated child elements | not yet ([issue 916](https://github.com/rustpunk/clinker/issues/916)) |
-| `csv` | needs a `split_values` entry | not yet ([issue 917](https://github.com/rustpunk/clinker/issues/917)) |
-| `fixed_width` | needs a `split_values` entry | not yet ([issue 918](https://github.com/rustpunk/clinker/issues/918)) |
+| `csv` | not yet ([issue 917](https://github.com/rustpunk/clinker/issues/917)) | not yet ([issue 917](https://github.com/rustpunk/clinker/issues/917)) |
+| `fixed_width` | not yet ([issue 917](https://github.com/rustpunk/clinker/issues/917)) | not yet ([issue 918](https://github.com/rustpunk/clinker/issues/918)) |
 | `edifact`, `x12`, `hl7`, `swift` | no — repetition is positional | no — repetition is positional |
 
 A `multiple: true` column reaching an output that cannot encode it is `E359`; one
-on a source that cannot produce it is `E361`. Run `clinker explain --code E361`
-for the full remediation of either.
+on a source that cannot produce it is `E361`. `E359` covers an output's own
+`schema:` block too — the attribute is direction-neutral, but no writer encodes
+repetition yet, so declaring it on a sink would be accepted and ignored. Run
+`clinker explain --code E361` for the full remediation of either.
 
-**`csv` and `fixed_width` opt in through `split_values`.** Neither wire format
-repeats a field, but a cell's text may hold several values separated by a
-delimiter, which is what a `split_values` entry declares. Until the entry is
-there the column has nothing to fill it and `E361` says so; once it is, the
-column is accepted. (Acting on the entry in those two readers is
-[issue 917](https://github.com/rustpunk/clinker/issues/917) — the plan-time
-contract lands first.)
+**`csv` and `fixed_width` are a pending no, not a permanent one.** Neither wire
+format repeats a field, but a cell's text may hold several values separated by a
+delimiter — the shape a `split_values` entry is meant to declare. No CSV or
+fixed-width reader is handed that entry yet
+([issue 917](https://github.com/rustpunk/clinker/issues/917)), so a
+`multiple: true` column on one of these formats would bind as an array and then
+receive the raw cell. `E361` rejects it until the reader can honor it. In the
+meantime, leave the column single-valued and split it where the parts are
+needed: `tags.split(";")` in a transform.
 
 **The segment formats are a permanent no**, not a pending one. Repetition there
 is a positional coordinate rather than a list: a repeated composite is written
@@ -366,8 +370,19 @@ into one array, the fan-out spends them one per record, and a field cannot be
 both. On an **XML** source, two entries may not name nested element groups
 either (`Item` and `Item.part`): that reader assigns each element to one
 occurrence group by document position, and a nested pair leaves the inner
-group's membership ambiguous. A JSON source accepts the nested pair, applying
-the entries in order to produce a two-level expansion.
+group's membership ambiguous.
+
+A **JSON** source accepts a nested pair to produce a two-level expansion, but
+only when the outer entry declares `mode: split`. `mode: extract` lifts the
+occurrence's own keys to the top level, which removes the dotted path the inner
+entry addresses — the inner entry would then match nothing and fan nothing out,
+so the pairing is rejected (`E358`):
+
+```yaml
+    split_to_rows:
+      - { field: orders, mode: split }
+      - { field: orders.items, mode: split }
+```
 
 ### Several values in one cell: `split_values`
 
@@ -391,33 +406,46 @@ naming a column's exposed name when that column reads a differently-named input
 field — the split runs against the document's own field names, so name the
 `source_name`.
 
+The entry is read by the **JSON** and **XML** readers. Declaring it on any other
+format is rejected (`E358`) rather than silently ignored: those readers are
+never handed it, so the cell would arrive unsplit with nothing to say so.
+
 ### Migrating from `array_paths`
 
 `array_paths:` was the earlier form of these declarations. It is no longer read,
 and a source still carrying it is rejected at compile (`E360`) rather than
 running with the fan-out silently dropped. An `explode` path becomes a
-`split_to_rows:` entry (`mode: extract` reproduces the old projection), a
-delimited cell becomes a `split_values:` entry, and a path kept as an array
-becomes `multiple: true` on the schema column.
+`split_to_rows:` entry, a delimited cell becomes a `split_values:` entry, and a
+path kept as an array becomes `multiple: true` on the schema column.
+
+`mode: extract` (the default) reproduces the old **projection** — the element's
+own fields lifted to the top level of each output record. It does not reproduce
+the old **cardinality**: `explode` dropped a record whose array was empty, while
+`keep_empty` defaults to `true` here and keeps it with the element's fields
+unset. Add `keep_empty: false` to the entry to migrate row-for-row.
 
 ### Format notes
 
-Both knobs are honored by the **JSON** and **XML** file readers, and
-`split_to_rows` / `split_values` by a `rest` source decoding JSON. A
-`multiple: true` column on any other input format is rejected at compile
-(`E361`) rather than accepted and ignored; `split_to_rows` on one is still
-accepted and inert, tracked at
-[issue 912](https://github.com/rustpunk/clinker/issues/912), and a `rest` source
-decoding XML at
-[issue 911](https://github.com/rustpunk/clinker/issues/911).
+Both knobs are honored by the **JSON** and **XML** readers, over a file path and
+over a `rest` response body alike. Declaring either on a format whose reader is
+never handed it — `csv`, `fixed_width`, or any segment format — is rejected at
+compile (`E358`) rather than accepted and inert, and a `multiple: true` column on
+such a source is rejected by `E361`.
+
+Composition body files are gated by the same four checks as the pipeline that
+calls them.
 
 **JSON** — the field names the key holding the array (`line_items`, or
 `order.line_items` for an array nested under an object). A field present but
 holding a single object or scalar rather than an array counts as one
 occurrence, and is projected exactly as a one-element array would be — many
 producers unwrap a lone element, and XML cannot express the difference at all,
-so the two readers agree on this. Only a field that is absent, or holds an
-empty array, has no occurrence and is governed by `keep_empty`.
+so the two readers agree on this. A field that is absent, holds an empty array,
+or is explicitly `null` has no occurrence and is governed by `keep_empty`: an
+explicit null is how many producers write "no value", and it counts as none
+rather than as one. For the same reason a `multiple: true` column holding an
+explicit null stays null rather than becoming `[null]`, so `size()` over it
+reads the same as it does for a field the document omits.
 
 **XML** — the field is the repeated child element's dotted path relative to the
 record element (`Item`, or `Items.Item` when nested). Repetition and absence

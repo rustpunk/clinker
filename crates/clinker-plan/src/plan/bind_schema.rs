@@ -3037,6 +3037,48 @@ fn bind_composition(
         }
     }
 
+    // 7e. The multi-value gates (E358 / E359 / E360 / E361), which the
+    // call-site pipeline runs over its OWN `nodes:` — a list that never
+    // contains a body's nodes. Without this pass a body source declaring the
+    // retired `array_paths:`, a `multiple: true` column its format cannot
+    // produce, or a malformed `split_to_rows` block reaches the executor
+    // ungated and emits one record per document where the author asked for one
+    // per element. The XML reader's construction-time nesting/duplicate
+    // rejection used to catch part of that for body sources and was replaced by
+    // the plan-time gate, so running the gate here is what keeps the
+    // replacement whole. Runs after 7d so an external `.schema.yaml` is already
+    // folded inline and the gates see its columns. Collect every finding, then
+    // abandon the body, mirroring the passes above.
+    {
+        let faults = crate::config::multi_value::source_node_faults(&body_file.nodes)
+            .into_iter()
+            .chain(crate::config::multi_value::output_node_faults(
+                &body_file.nodes,
+            ));
+        let mut has_multi_value_violation = false;
+        for fault in faults {
+            diags.push(
+                Diagnostic::error(
+                    fault.code,
+                    format!(
+                        "composition node {node_name:?}: body file {}: {}",
+                        resolved_path.display(),
+                        fault.message
+                    ),
+                    LabeledSpan::primary(
+                        span_for_node(&body_file.nodes[fault.node_index]),
+                        String::new(),
+                    ),
+                )
+                .with_help(fault.help),
+            );
+            has_multi_value_violation = true;
+        }
+        if has_multi_value_violation {
+            return;
+        }
+    }
+
     // 8. Enter nested scope.
     let body_id = artifacts.fresh_body_id();
 

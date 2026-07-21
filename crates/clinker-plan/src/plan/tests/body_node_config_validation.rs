@@ -11,13 +11,15 @@
 //! the shared `validate_node_configs` pass over body nodes and rejects
 //! each violation with an E115 diagnostic at compile time.
 //!
-//! Two more parity gaps close on the same body walk: a body Source/Output
+//! Three more parity gaps close on the same body walk: a body Source/Output
 //! CSV `delimiter` / `quote_char` is validated with the same one-ASCII-byte
 //! rule top-level nodes get (so a bad byte fails at compile, not first at
-//! run), and a body Source/Output external `.schema.yaml` reference is
+//! run); a body Source/Output external `.schema.yaml` reference is
 //! resolved to its inline columns relative to the composition file's own
 //! directory (so a body Output's declared-decimal `scale` reaches the write
-//! boundary and a body Source's file schema resolves from the right base).
+//! boundary and a body Source's file schema resolves from the right base);
+//! and the multi-value gates (E358 / E359 / E360 / E361) run over body nodes,
+//! which the call-site pipeline's own `nodes:` walk never sees.
 
 use std::path::PathBuf;
 
@@ -372,6 +374,160 @@ nodes:
             && d.message.contains("quote_char")
             && d.message.contains("one ASCII byte")),
         "expected an E115 naming the body source, quote_char, and the one-byte rule; got: {err:?}"
+    );
+}
+
+/// Compile a pipeline whose composition body declares one Source (spliced in
+/// verbatim) feeding a transform, and return the diagnostics. The body is the
+/// only place the source appears — the call-site pipeline's `nodes:` never
+/// contains it.
+fn compile_body_source(source_node: &str) -> Vec<clinker_core_types::Diagnostic> {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let comp_dir = workspace.path().join("compositions");
+    std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
+    std::fs::write(
+        comp_dir.join("mv_body.comp.yaml"),
+        format!(
+            r#"_compose:
+  name: mv_body
+  inputs:
+    driver:
+      schema:
+        - {{ name: x, type: int }}
+  outputs:
+    out: shape
+  config_schema: {{}}
+
+nodes:
+{source_node}
+  - type: transform
+    name: shape
+    input: body_src
+    config:
+      cxl: |
+        emit label = sku
+"#
+        ),
+    )
+    .expect("write comp");
+
+    let pipelines_dir = workspace.path().join("pipelines");
+    std::fs::create_dir_all(&pipelines_dir).expect("mkdir pipelines");
+
+    let yaml = r#"
+pipeline:
+  name: body_multi_value_demo
+nodes:
+  - type: source
+    name: drv
+    config:
+      name: drv
+      type: csv
+      path: drv.csv
+      schema:
+        - { name: x, type: int }
+  - type: composition
+    name: enrich
+    input: drv
+    use: ../compositions/mv_body.comp.yaml
+    inputs:
+      driver: drv
+  - type: output
+    name: out
+    input: enrich
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config: PipelineConfig = parse_config(yaml).expect("parse pipeline");
+    let ctx = CompileContext::with_pipeline_dir(workspace.path(), PathBuf::from("pipelines"));
+    config
+        .compile(&ctx)
+        .expect_err("the body source must fail the multi-value gates")
+}
+
+/// The retired `array_paths:` key on a body source. Nothing reads it, so the
+/// pipeline would compile and emit one record per document where it used to
+/// emit one per element — the exact failure E360 was written to stop, and one
+/// the call-site `nodes:` walk cannot see because the body is bound separately.
+#[test]
+fn body_source_retired_array_paths_rejected_with_e360() {
+    let diags = compile_body_source(
+        r#"  - type: source
+    name: body_src
+    config:
+      name: body_src
+      type: xml
+      path: body_src.xml
+      array_paths:
+        - path: Item
+          mode: explode
+      schema:
+        - { name: sku, type: string }"#,
+    );
+    let diag = diags
+        .iter()
+        .find(|d| d.code == "E360")
+        .unwrap_or_else(|| panic!("expected an E360 for the body source; got: {diags:?}"));
+    assert!(
+        diag.message.contains("body_src") && diag.message.contains("mv_body.comp.yaml"),
+        "the diagnostic must name the body source and its file: {:?}",
+        diag.message
+    );
+}
+
+/// Nested fan-out fields on a body XML source. The XML reader's
+/// construction-time rejection of this shape moved to the plan-time gate, so
+/// without the body walk the check would exist for top-level sources only and
+/// body sources would silently truncate their fan-out.
+#[test]
+fn body_source_nested_split_to_rows_rejected_with_e358() {
+    let diags = compile_body_source(
+        r#"  - type: source
+    name: body_src
+    config:
+      name: body_src
+      type: xml
+      path: body_src.xml
+      split_to_rows:
+        - Item
+        - Item.part
+      schema:
+        - { name: sku, type: string }"#,
+    );
+    let diag = diags
+        .iter()
+        .find(|d| d.code == "E358")
+        .unwrap_or_else(|| panic!("expected an E358 for the body source; got: {diags:?}"));
+    assert!(
+        diag.message.contains("nest") && diag.message.contains("mv_body.comp.yaml"),
+        "the diagnostic must report the nesting and name the body file: {:?}",
+        diag.message
+    );
+}
+
+/// A `multiple: true` column on a body source whose format cannot produce one.
+#[test]
+fn body_source_unproducible_multi_value_column_rejected_with_e361() {
+    let diags = compile_body_source(
+        r#"  - type: source
+    name: body_src
+    config:
+      name: body_src
+      type: csv
+      path: body_src.csv
+      schema:
+        - { name: sku, type: string, multiple: true }"#,
+    );
+    let diag = diags
+        .iter()
+        .find(|d| d.code == "E361")
+        .unwrap_or_else(|| panic!("expected an E361 for the body source; got: {diags:?}"));
+    assert!(
+        diag.message.contains("'sku'") && diag.message.contains("mv_body.comp.yaml"),
+        "the diagnostic must name the column and the body file: {:?}",
+        diag.message
     );
 }
 
