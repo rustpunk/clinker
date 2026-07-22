@@ -11,15 +11,11 @@ use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
 use clinker_format::edifact::reader::{EdifactReader, EdifactReaderConfig};
 use clinker_format::fixed_width::reader::{FixedWidthReader, FixedWidthReaderConfig};
 use clinker_format::hl7::reader::{Hl7Reader, Hl7ReaderConfig};
-use clinker_format::json::reader::{
-    ArrayPathMode, ArrayPathSpec, JsonMode, JsonReader, JsonReaderConfig,
-};
+use clinker_format::json::reader::{JsonMode, JsonReader, JsonReaderConfig};
 use clinker_format::swift::reader::{SwiftReader, SwiftReaderConfig};
 use clinker_format::traits::FormatReader;
 use clinker_format::x12::reader::{X12Reader, X12ReaderConfig};
-use clinker_format::xml::reader::{
-    NamespaceMode, XmlArrayMode, XmlArrayPath, XmlReader, XmlReaderConfig,
-};
+use clinker_format::xml::reader::{NamespaceMode, XmlReader, XmlReaderConfig};
 use clinker_format::{Column, SourceSchema};
 use clinker_plan::config::PipelineConfig;
 use clinker_plan::error::PipelineError;
@@ -72,19 +68,11 @@ fn build_format_reader(
             }
         },
         clinker_plan::config::InputFormat::Json(opts) => {
-            let config = build_json_reader_config(
-                opts.as_ref(),
-                input.array_paths.as_deref(),
-                &input.declared_doc_paths,
-            );
+            let config = build_json_reader_config(opts.as_ref(), input, schema);
             Ok(Box::new(JsonReader::from_source(source, config)?))
         }
         clinker_plan::config::InputFormat::Xml(opts) => {
-            let config = build_xml_reader_config(
-                opts.as_ref(),
-                input.array_paths.as_deref(),
-                &input.declared_doc_paths,
-            );
+            let config = build_xml_reader_config(opts.as_ref(), input, schema);
             Ok(Box::new(XmlReader::from_source(source, config)?))
         }
         clinker_plan::config::InputFormat::FixedWidth(opts) => match schema {
@@ -1200,11 +1188,11 @@ const DEFAULT_JSON_MAX_INDEX_BYTES: usize = 64 * 1_000_000;
 /// [`DEFAULT_JSON_MAX_INDEX_BYTES`].
 fn build_json_reader_config(
     opts: Option<&clinker_plan::config::JsonInputOptions>,
-    array_paths: Option<&[clinker_plan::config::ArrayPathConfig]>,
-    declared_doc_paths: &[cxl::analyzer::doc_paths::DocPath],
+    input: &clinker_plan::config::SourceConfig,
+    schema: &SourceSchema,
 ) -> JsonReaderConfig {
     let mut config = JsonReaderConfig {
-        declared_doc_paths: declared_doc_paths.to_vec(),
+        declared_doc_paths: input.declared_doc_paths.clone(),
         max_index_bytes: Some(DEFAULT_JSON_MAX_INDEX_BYTES),
         ..Default::default()
     };
@@ -1219,20 +1207,27 @@ fn build_json_reader_config(
             config.max_index_bytes = Some(cap.0 as usize);
         }
     }
-    if let Some(paths) = array_paths {
-        config.array_paths = paths
-            .iter()
-            .map(|p| ArrayPathSpec {
-                path: p.path.clone(),
-                mode: match p.mode {
-                    clinker_plan::config::ArrayMode::Explode => ArrayPathMode::Explode,
-                    clinker_plan::config::ArrayMode::Join => ArrayPathMode::Join,
-                },
-                separator: p.separator.clone().unwrap_or_else(|| ",".to_string()),
-            })
-            .collect();
-    }
+    config.multi_value_fields = multi_value_fields(schema);
+    config.split_to_rows = input.split_to_rows.clone().unwrap_or_default();
+    config.split_values = input.split_values.clone().unwrap_or_default();
     config
+}
+
+/// The physical field names a source schema declares `multiple: true`.
+///
+/// Physical (`source_name` when the column aliases a differently-named input
+/// field) because the readers match against the names the document carries,
+/// before the declared-schema reprojection renames anything. Reads the BOUND
+/// column list so a multi-record schema's record types are covered by the same
+/// rule the plan-time gate applies.
+fn multi_value_fields(schema: &SourceSchema) -> Vec<String> {
+    schema
+        .bound_columns()
+        .unwrap_or_default()
+        .iter()
+        .filter(|c| c.is_multiple())
+        .map(|c| c.physical_name().to_string())
+        .collect()
 }
 
 /// Default cap on the XML envelope pre-scan's path-pruned document index
@@ -1251,11 +1246,11 @@ const DEFAULT_XML_MAX_INDEX_BYTES: usize = 64 * 1_000_000;
 /// the pre-scan index is capped at [`DEFAULT_XML_MAX_INDEX_BYTES`].
 fn build_xml_reader_config(
     opts: Option<&clinker_plan::config::XmlInputOptions>,
-    array_paths: Option<&[clinker_plan::config::ArrayPathConfig]>,
-    declared_doc_paths: &[cxl::analyzer::doc_paths::DocPath],
+    input: &clinker_plan::config::SourceConfig,
+    schema: &SourceSchema,
 ) -> XmlReaderConfig {
     let mut config = XmlReaderConfig {
-        declared_doc_paths: declared_doc_paths.to_vec(),
+        declared_doc_paths: input.declared_doc_paths.clone(),
         max_index_bytes: Some(DEFAULT_XML_MAX_INDEX_BYTES),
         ..Default::default()
     };
@@ -1272,19 +1267,9 @@ fn build_xml_reader_config(
             config.max_index_bytes = Some(cap.0 as usize);
         }
     }
-    if let Some(paths) = array_paths {
-        config.array_paths = paths
-            .iter()
-            .map(|p| XmlArrayPath {
-                path: p.path.clone(),
-                mode: match p.mode {
-                    clinker_plan::config::ArrayMode::Explode => XmlArrayMode::Explode,
-                    clinker_plan::config::ArrayMode::Join => XmlArrayMode::Join,
-                },
-                separator: p.separator.clone().unwrap_or_else(|| ",".to_string()),
-            })
-            .collect();
-    }
+    config.multi_value_fields = multi_value_fields(schema);
+    config.split_to_rows = input.split_to_rows.clone().unwrap_or_default();
+    config.split_values = input.split_values.clone().unwrap_or_default();
     config
 }
 

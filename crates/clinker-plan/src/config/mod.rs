@@ -5,6 +5,7 @@ pub mod discovery;
 pub mod error;
 pub mod format;
 pub mod fs_type;
+pub mod multi_value;
 pub mod node_header;
 pub mod output;
 pub mod patch;
@@ -38,9 +39,9 @@ pub use fs_type::{FsKind, case_sensitive_dir, classify, collision_key, same_devi
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use output::*;
 pub use patch::{
-    ArrayPathOp, BodySourcePatchMap, ColumnPatch, DiscriminatorPatch, EnvelopeFieldOp,
-    NestedSectionOp, RecordTypeAdd, RecordTypeOp, RecordTypePatch, SchemaColumnOp,
-    SourceConfigPatch, SplitFieldOp, apply_source_patches,
+    BodySourcePatchMap, ColumnPatch, DiscriminatorPatch, EnvelopeFieldOp, NestedSectionOp,
+    RecordTypeAdd, RecordTypeOp, RecordTypePatch, SchemaColumnOp, SourceConfigPatch, SplitFieldOp,
+    SplitToRowsOp, SplitValuesOp, apply_source_patches,
 };
 pub use pipeline::*;
 pub use pipeline_node::{

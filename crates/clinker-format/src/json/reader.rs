@@ -1,5 +1,7 @@
 //! Streaming JSON reader with auto-detect (array/NDJSON/object), schema inference,
-//! nested flattening, and array_paths explode/join.
+//! nested flattening, and the source's multi-value declarations
+//! (`split_to_rows` fan-out, `split_values` in-cell parsing, and schema-level
+//! `multiple:` collection).
 //!
 //! **All modes stream with O(1 record) memory, with no whole-file buffer held
 //! for a re-openable (file) source:**
@@ -38,6 +40,7 @@ use crate::envelope::{EnvelopeConfig, EnvelopeExtract, EnvelopeFieldType};
 use crate::error::FormatError;
 use crate::json::body_stream::{JsonArrayStream, is_json_ws};
 use crate::json::streaming::{SectionTarget, extract_sections};
+use crate::multi_value::{SplitToRows, SplitToRowsMode, SplitValues};
 use crate::source::{ReopenableSource, SourceIdentity};
 use crate::traits::FormatReader;
 
@@ -47,7 +50,16 @@ use crate::traits::FormatReader;
 pub struct JsonReaderConfig {
     pub format: Option<JsonMode>,
     pub record_path: Option<String>,
-    pub array_paths: Vec<ArrayPathSpec>,
+    /// Fields the source schema declares `multiple: true`, by physical name.
+    /// A declared field is always array-valued: an array passes through, and a
+    /// scalar is normalized to a one-element array.
+    pub multi_value_fields: Vec<String>,
+    /// Fan-out declarations, applied in declaration order — so two entries
+    /// multiply, exactly as two nested loops would.
+    pub split_to_rows: Vec<SplitToRows>,
+    /// In-cell parse declarations: a field's text is split on its delimiter
+    /// into the several values a `multiple: true` column holds.
+    pub split_values: Vec<SplitValues>,
     /// `$doc.*` envelope paths a program downstream of this source
     /// references, attributed to this source by the planner. The envelope
     /// pre-scan retains only the sections these paths name; a declared
@@ -66,19 +78,6 @@ pub enum JsonMode {
     Array,
     Ndjson,
     Object,
-}
-
-#[derive(Debug, Clone)]
-pub struct ArrayPathSpec {
-    pub path: String,
-    pub mode: ArrayPathMode,
-    pub separator: String,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum ArrayPathMode {
-    Explode,
-    Join,
 }
 
 // ── JsonReader ───────────────────────────────────────────────────────
@@ -294,66 +293,110 @@ impl JsonReader {
         }
     }
 
-    fn apply_array_paths(
+    /// Expand one flattened record through the declared `split_to_rows`
+    /// fields, applied in declaration order: each emits one output per array
+    /// element, duplicating every other field onto each.
+    ///
+    /// A record whose field holds an empty array, or carries no such field at
+    /// all, survives under the default `keep_empty: true` — several widely
+    /// deployed engines drop it instead, and a vanished row is the costliest
+    /// failure mode for this audience.
+    ///
+    /// A field present but NOT holding an array is one occurrence, projected
+    /// exactly as a single-element array would be. JSON producers routinely
+    /// unwrap a one-element array, and XML — where a document cannot say
+    /// "array" at all — fans a lone repeated element out the same way, so the
+    /// same logical feed must not come out differently on the two paths.
+    fn apply_split_to_rows(
         &self,
         flat: serde_json::Map<String, serde_json::Value>,
     ) -> Vec<serde_json::Map<String, serde_json::Value>> {
-        if self.config.array_paths.is_empty() {
+        if self.config.split_to_rows.is_empty() {
             return vec![flat];
         }
 
         let mut result = vec![flat];
-        for ap in &self.config.array_paths {
+        for entry in &self.config.split_to_rows {
             let mut next = Vec::new();
-            for rec in result {
-                if let Some(serde_json::Value::Array(arr)) = rec.get(&ap.path) {
-                    if arr.is_empty() {
-                        match ap.mode {
-                            ArrayPathMode::Explode => {}
-                            ArrayPathMode::Join => {
-                                let mut r = rec.clone();
-                                r.insert(ap.path.clone(), serde_json::Value::String(String::new()));
-                                next.push(r);
-                            }
-                        }
-                        continue;
+            for mut rec in result {
+                // The lone occurrence a non-array value contributes, lifted out
+                // of the record so the projection below can put it back under
+                // the mode's rules. An object occurrence has no value to read:
+                // `flatten_value` dissolved it into dotted child keys before
+                // this ran, and reading that as an absent field would treat a
+                // populated group as an empty one. An explicit `null` is no
+                // occurrence at all — JSON producers routinely write one where
+                // a group is absent — so it falls through to the empty arm and
+                // is governed by `keep_empty`, exactly as an absent field is.
+                let single = match rec.get(&entry.field) {
+                    Some(serde_json::Value::Array(_) | serde_json::Value::Null) => None,
+                    Some(_) => rec.shift_remove(&entry.field),
+                    None => take_dissolved_object(&mut rec, &entry.field),
+                };
+                if let Some(elem) = single {
+                    project_element(&mut rec, entry, &elem);
+                    if let Some(column) = &entry.position_column {
+                        rec.insert(column.clone(), 1.into());
                     }
-                    match ap.mode {
-                        ArrayPathMode::Explode => {
-                            for elem in arr {
-                                let mut r = rec.clone();
-                                if let serde_json::Value::Object(obj) = elem {
-                                    r.remove(&ap.path);
-                                    for (k, v) in obj {
-                                        r.insert(k.clone(), v.clone());
-                                    }
-                                } else {
-                                    r.insert(ap.path.clone(), elem.clone());
-                                }
-                                next.push(r);
-                            }
-                        }
-                        ArrayPathMode::Join => {
-                            let joined: String = arr
-                                .iter()
-                                .map(|v| match v {
-                                    serde_json::Value::String(s) => s.clone(),
-                                    o => o.to_string(),
-                                })
-                                .collect::<Vec<_>>()
-                                .join(&ap.separator);
+                    next.push(rec);
+                    continue;
+                }
+                match rec.get(&entry.field) {
+                    Some(serde_json::Value::Array(arr)) if !arr.is_empty() => {
+                        for (position, elem) in arr.iter().enumerate() {
                             let mut r = rec.clone();
-                            r.insert(ap.path.clone(), serde_json::Value::String(joined));
+                            // `shift_remove`, not `remove`: with
+                            // `preserve_order` the latter is a swap-remove that
+                            // would drag the last column into the vacated slot,
+                            // scrambling column order across fanned-out
+                            // siblings that must share one shape.
+                            r.shift_remove(&entry.field);
+                            project_element(&mut r, entry, elem);
+                            if let Some(column) = &entry.position_column {
+                                r.insert(column.clone(), (position + 1).into());
+                            }
                             next.push(r);
                         }
                     }
-                } else {
-                    next.push(rec);
+                    // An empty array or an absent field: nothing to fan out.
+                    _ => {
+                        if entry.keep_empty {
+                            let mut r = rec;
+                            r.shift_remove(&entry.field);
+                            next.push(r);
+                        }
+                    }
                 }
             }
             result = next;
         }
         result
+    }
+
+    /// Apply the schema-level `multiple:` declarations and the `split_values`
+    /// in-cell parse to one flattened record, so every declared multi-value
+    /// field arrives at the record boundary array-valued.
+    ///
+    /// A scalar is normalized to a one-element array — a JSON producer that
+    /// unwraps a single-element array must not read as a different cardinality
+    /// from one that does not. An explicit `null` is left alone: it carries no
+    /// value, so wrapping it would report `size() == 1` for a field holding
+    /// nothing, diverging both from the absent-field case on this same reader
+    /// and from XML, which cannot express an explicit null at all.
+    fn apply_multi_value(&self, flat: &mut serde_json::Map<String, serde_json::Value>) {
+        for entry in &self.config.split_values {
+            if let Some(value) = flat.get_mut(&entry.field) {
+                *value = split_text_value(value, &entry.delimiter);
+            }
+        }
+        for field in &self.config.multi_value_fields {
+            if let Some(value) = flat.get_mut(field)
+                && !value.is_array()
+                && !value.is_null()
+            {
+                *value = serde_json::Value::Array(vec![value.take()]);
+            }
+        }
     }
 
     /// Builds a Record carrying the JSON object's actual keys (per-record
@@ -364,8 +407,9 @@ impl JsonReader {
     /// silently dropping on `drop`).
     fn map_to_record(
         &self,
-        flat: &serde_json::Map<String, serde_json::Value>,
+        mut flat: serde_json::Map<String, serde_json::Value>,
     ) -> Result<Record, FormatError> {
+        self.apply_multi_value(&mut flat);
         let columns: Vec<Box<str>> = flat.keys().map(|k| k.clone().into_boxed_str()).collect();
         let schema = Arc::new(Schema::new(columns));
         let values: Vec<Value> = flat.values().map(json_to_value).collect();
@@ -498,24 +542,28 @@ impl FormatReader for JsonReader {
             return Ok(Arc::clone(s));
         }
 
-        let first = self.next_raw()?;
-        let first = match first {
-            Some(v) => v,
-            None => {
+        // Read forward until a raw record actually expands to something. A
+        // `keep_empty: false` entry drops a record whose field is empty, and
+        // inferring the schema from that dropped expansion would cache a
+        // column-less schema for the whole source while records kept flowing.
+        let expanded = loop {
+            let Some(raw) = self.next_raw()? else {
                 let s = SchemaBuilder::new().build();
                 self.schema = Some(Arc::clone(&s));
                 self.inner = InnerReader::Done;
                 return Ok(s);
+            };
+            let mut flat = serde_json::Map::new();
+            Self::flatten_value("", &raw, &mut flat, 0);
+            let expanded = self.apply_split_to_rows(flat);
+            if !expanded.is_empty() {
+                break expanded;
             }
         };
 
-        let mut flat = serde_json::Map::new();
-        Self::flatten_value("", &first, &mut flat, 0);
-        let expanded = self.apply_array_paths(flat);
-
-        let empty = serde_json::Map::new();
-        let first_flat = expanded.first().unwrap_or(&empty);
-        let schema = first_flat
+        let schema = expanded
+            .first()
+            .expect("non-empty checked above")
             .keys()
             .map(|k| k.clone().into_boxed_str())
             .collect::<SchemaBuilder>()
@@ -532,7 +580,7 @@ impl FormatReader for JsonReader {
 
         if !self.pending.is_empty() {
             let flat = self.pending.remove(0);
-            return Ok(Some(self.map_to_record(&flat)?));
+            return Ok(Some(self.map_to_record(flat)?));
         }
 
         loop {
@@ -542,18 +590,112 @@ impl FormatReader for JsonReader {
             };
             let mut flat = serde_json::Map::new();
             Self::flatten_value("", &raw, &mut flat, 0);
-            let expanded = self.apply_array_paths(flat);
+            let expanded = self.apply_split_to_rows(flat);
             if expanded.is_empty() {
                 continue;
             }
-            let record = self.map_to_record(&expanded[0])?;
-            self.pending = expanded.into_iter().skip(1).collect();
+            let mut expanded = expanded.into_iter();
+            let first = expanded.next().expect("non-empty checked above");
+            let record = self.map_to_record(first)?;
+            self.pending = expanded.collect();
             return Ok(Some(record));
         }
     }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+/// Reassemble the object a fan-out field held, from the dotted child keys
+/// [`JsonReader::flatten_value`] dissolved it into, removing them from the
+/// record. `None` when the record carries no such child — the field really is
+/// absent.
+///
+/// The children are themselves already flattened, so the reassembled object is
+/// one level deep and re-flattening it under any prefix restores exactly the
+/// keys taken out.
+fn take_dissolved_object(
+    rec: &mut serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<serde_json::Value> {
+    let prefix = format!("{field}.");
+    let keys: Vec<String> = rec
+        .keys()
+        .filter(|k| k.starts_with(&prefix))
+        .cloned()
+        .collect();
+    if keys.is_empty() {
+        return None;
+    }
+    let mut object = serde_json::Map::with_capacity(keys.len());
+    for key in keys {
+        let value = rec.shift_remove(&key).expect("key just collected");
+        object.insert(key[prefix.len()..].to_string(), value);
+    }
+    Some(serde_json::Value::Object(object))
+}
+
+/// Write one fan-out element onto its output record.
+///
+/// Under [`SplitToRowsMode::Extract`] the element becomes the record: an object
+/// element's own keys are flattened onto the output at top level, so the parent
+/// fields already there are simply merged around them. Under
+/// [`SplitToRowsMode::Split`] the record shape is preserved: the element is
+/// flattened back under the declared field name. A scalar element has no keys
+/// to lift, so both modes key it by the field name — the only name it has.
+fn project_element(
+    out: &mut serde_json::Map<String, serde_json::Value>,
+    entry: &SplitToRows,
+    elem: &serde_json::Value,
+) {
+    match (entry.mode, elem) {
+        (SplitToRowsMode::Extract, serde_json::Value::Object(_)) => {
+            JsonReader::flatten_value("", elem, out, 0);
+        }
+        (SplitToRowsMode::Extract, other) => {
+            let name = entry
+                .field
+                .rsplit('.')
+                .next()
+                .unwrap_or(entry.field.as_str());
+            out.insert(name.to_string(), other.clone());
+        }
+        (SplitToRowsMode::Split, _) => {
+            JsonReader::flatten_value(&entry.field, elem, out, 0);
+        }
+    }
+}
+
+/// Parse a delimited cell into the several values a `multiple:` column holds.
+///
+/// A string becomes an array of its delimiter-separated parts; an array (a
+/// field that both repeats and carries delimited text) splits each string
+/// element and flattens the result, so the two declarations compose instead of
+/// fighting. Empty parts are preserved — an author who declared the delimiter
+/// is the authority on what sits between two of them. A non-string scalar has
+/// no text to split and is wrapped as a single value; an explicit `null` holds
+/// no value at all and stays null, matching what a field absent from the
+/// document resolves to.
+fn split_text_value(value: &serde_json::Value, delimiter: &str) -> serde_json::Value {
+    fn parts(text: &str, delimiter: &str) -> Vec<serde_json::Value> {
+        text.split(delimiter)
+            .map(|p| serde_json::Value::String(p.to_string()))
+            .collect()
+    }
+    match value {
+        serde_json::Value::Null => serde_json::Value::Null,
+        serde_json::Value::String(s) => serde_json::Value::Array(parts(s, delimiter)),
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .flat_map(|item| match item {
+                    serde_json::Value::String(s) => parts(s, delimiter),
+                    other => vec![other.clone()],
+                })
+                .collect(),
+        ),
+        other => serde_json::Value::Array(vec![other.clone()]),
+    }
+}
 
 fn json_to_value(v: &serde_json::Value) -> Value {
     match v {
@@ -1083,14 +1225,12 @@ mod tests {
     }
 
     #[test]
-    fn test_json_array_paths_explode() {
+    fn split_to_rows_extract_hoists_object_element_keys() {
+        // The default mode makes the element the record: its keys land at
+        // top level and the parent's fields merge onto each output.
         let input = r#"[{"name":"Alice","orders":[{"id":1},{"id":2}]}]"#;
         let config = JsonReaderConfig {
-            array_paths: vec![ArrayPathSpec {
-                path: "orders".into(),
-                mode: ArrayPathMode::Explode,
-                separator: ",".into(),
-            }],
+            split_to_rows: vec![SplitToRows::bare("orders")],
             ..default_config()
         };
         let mut r = reader_from_str(input, config);
@@ -1104,13 +1244,290 @@ mod tests {
     }
 
     #[test]
-    fn test_json_array_paths_join() {
-        let input = r#"[{"name":"Alice","tags":["a","b","c"]}]"#;
+    fn split_to_rows_split_keeps_the_record_shape() {
+        // `mode: split` preserves the record shape: the element stays under
+        // the declared field name rather than being lifted out of it.
+        let input = r#"[{"name":"Alice","orders":[{"id":1},{"id":2}]}]"#;
         let config = JsonReaderConfig {
-            array_paths: vec![ArrayPathSpec {
-                path: "tags".into(),
-                mode: ArrayPathMode::Join,
-                separator: ",".into(),
+            split_to_rows: vec![SplitToRows {
+                mode: SplitToRowsMode::Split,
+                ..SplitToRows::bare("orders")
+            }],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("name"), Some(&Value::String("Alice".into())));
+        assert_eq!(r1.get("orders.id"), Some(&Value::Integer(1)));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("orders.id"), Some(&Value::Integer(2)));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn split_to_rows_position_column_numbers_the_elements() {
+        let input = r#"[{"name":"Alice","tags":["x","y"]}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows {
+                position_column: Some("tag_no".into()),
+                ..SplitToRows::bare("tags")
+            }],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("tags"), Some(&Value::String("x".into())));
+        assert_eq!(r1.get("tag_no"), Some(&Value::Integer(1)));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("tags"), Some(&Value::String("y".into())));
+        assert_eq!(r2.get("tag_no"), Some(&Value::Integer(2)));
+    }
+
+    #[test]
+    fn multiple_keeps_the_array_and_normalizes_a_lone_scalar() {
+        // A `multiple: true` column is always array-valued: an array passes
+        // through, and a scalar that arrived where several values were
+        // declared is wrapped rather than silently differing in shape.
+        let input = r#"[{"tags":["a","b","c"]},{"tags":"solo"}]"#;
+        let config = JsonReaderConfig {
+            multi_value_fields: vec!["tags".into()],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("tags"),
+            Some(&Value::Array(vec![
+                Value::String("a".into()),
+                Value::String("b".into()),
+                Value::String("c".into()),
+            ]))
+        );
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("tags"),
+            Some(&Value::Array(vec![Value::String("solo".into())]))
+        );
+    }
+
+    #[test]
+    fn split_values_parses_a_delimited_cell_into_several_values() {
+        let input = r#"[{"name":"Alice","tags":"a;b;c"}]"#;
+        let config = JsonReaderConfig {
+            multi_value_fields: vec!["tags".into()],
+            split_values: vec![SplitValues::bare("tags")],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("tags"),
+            Some(&Value::Array(vec![
+                Value::String("a".into()),
+                Value::String("b".into()),
+                Value::String("c".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn multiple_on_an_absent_or_empty_field_leaves_the_record_intact() {
+        // Neither shape suppresses the record: an empty array stays an empty
+        // array, and an absent field simply has no column for the
+        // declared-schema reprojection to fill.
+        let input = r#"[{"id":1,"tags":[]},{"id":2}]"#;
+        let config = JsonReaderConfig {
+            multi_value_fields: vec!["tags".into()],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(r1.get("tags"), Some(&Value::Array(vec![])));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("id"), Some(&Value::Integer(2)));
+        assert_eq!(r2.get("tags"), None);
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn split_values_on_an_absent_field_leaves_the_record_intact() {
+        let input = r#"[{"id":1}]"#;
+        let config = JsonReaderConfig {
+            multi_value_fields: vec!["tags".into()],
+            split_values: vec![SplitValues::bare("tags")],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(r1.get("tags"), None);
+    }
+
+    #[test]
+    fn split_to_rows_fans_a_scalar_field_out_as_one_occurrence() {
+        // A producer that unwraps its one-element arrays still means one
+        // occurrence, so the record is projected exactly as `["solo"]` would
+        // be — under `extract` the scalar keeps the path's last segment.
+        let input = r#"[{"id":1,"orders":"solo"}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows::bare("orders")],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(r1.get("orders"), Some(&Value::String("solo".into())));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn split_to_rows_fans_a_single_object_field_out_as_one_occurrence() {
+        // A single object under the declared name is flattened away before the
+        // fan-out sees it (`orders.sku`). Reading that as an absent field would
+        // treat a populated group as an empty one: under `keep_empty: false`
+        // the record would vanish, and under the default it would keep a
+        // column no fanned-out sibling has.
+        let input = r#"[{"id":1,"orders":{"sku":"x"}}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows::bare("orders")],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(r1.get("sku"), Some(&Value::String("x".into())));
+        assert_eq!(r1.get("orders.sku"), None);
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    /// The same feed, one order with two line items and one with a single
+    /// unwrapped object, must produce the same column set on every record —
+    /// and the same shape the array form produces.
+    #[test]
+    fn split_to_rows_gives_an_unwrapped_object_the_same_columns_as_an_array() {
+        let input =
+            r#"[{"id":1,"orders":[{"sku":"a"},{"sku":"b"}]},{"id":2,"orders":{"sku":"c"}}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows {
+                position_column: Some("line_no".into()),
+                ..SplitToRows::bare("orders")
+            }],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let mut seen = Vec::new();
+        while let Some(rec) = r.next_record().unwrap() {
+            seen.push((
+                rec.schema()
+                    .columns()
+                    .iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>(),
+                rec.get("sku").cloned(),
+                rec.get("line_no").cloned(),
+            ));
+        }
+        assert_eq!(seen.len(), 3, "two fanned-out lines plus the unwrapped one");
+        let columns = &seen[0].0;
+        for (i, row) in seen.iter().enumerate() {
+            assert_eq!(&row.0, columns, "record {i} must share one column set");
+        }
+        assert_eq!(seen[2].1, Some(Value::String("c".into())));
+        assert_eq!(seen[2].2, Some(Value::Integer(1)));
+    }
+
+    #[test]
+    fn split_to_rows_keep_empty_false_drops_a_record_with_no_occurrence() {
+        // `keep_empty: false` governs the absent field and the empty array
+        // alike; a record whose field is genuinely missing carries no
+        // occurrence to fan out and is dropped as asked.
+        let input = r#"[{"id":1,"orders":[{"sku":"x"}]},{"id":2},{"id":3,"orders":[]}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows {
+                keep_empty: false,
+                ..SplitToRows::bare("orders")
+            }],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let mut ids = Vec::new();
+        while let Some(rec) = r.next_record().unwrap() {
+            ids.push(rec.get("id").cloned());
+        }
+        assert_eq!(ids, vec![Some(Value::Integer(1))]);
+    }
+
+    #[test]
+    fn split_to_rows_preserves_column_order_around_the_fanned_out_field() {
+        // The fan-out removes the array field and appends the element's keys;
+        // the columns that surrounded it must keep their relative order rather
+        // than being swapped into the vacated slot.
+        let input = r#"[{"a":1,"orders":[{"sku":"x"}],"z":9}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows::bare("orders")],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let s = r.schema().unwrap();
+        let columns: Vec<&str> = s.columns().iter().map(|c| &**c).collect();
+        assert_eq!(columns, ["a", "z", "sku"]);
+    }
+
+    #[test]
+    fn split_to_rows_keep_empty_false_still_infers_a_schema() {
+        // The first record is dropped by `keep_empty: false`, so schema
+        // inference must read forward rather than caching a column-less schema
+        // for a source that goes on emitting records.
+        let input = r#"[{"name":"Alice","orders":[]},{"name":"Bob","orders":[{"id":1}]}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows {
+                keep_empty: false,
+                ..SplitToRows::bare("orders")
+            }],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let s = r.schema().unwrap();
+        let columns: Vec<&str> = s.columns().iter().map(|c| &**c).collect();
+        assert_eq!(columns, ["name", "id"]);
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("name"), Some(&Value::String("Bob".into())));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn split_to_rows_extract_names_a_scalar_element_by_the_fields_last_segment() {
+        // Matches the XML reader for the same declaration: `extract` lifts the
+        // prefix off, so a dotted field's scalar elements land under its last
+        // segment and one declared schema serves both formats.
+        let input = r#"[{"a":{"tags":["x","y"]}}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows::bare("a.tags")],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("tags"), Some(&Value::String("x".into())));
+        assert_eq!(r1.get("a.tags"), None);
+    }
+
+    #[test]
+    fn split_values_honors_a_declared_delimiter() {
+        let input = r#"[{"tags":"a|b"}]"#;
+        let config = JsonReaderConfig {
+            multi_value_fields: vec!["tags".into()],
+            split_values: vec![SplitValues {
+                field: "tags".into(),
+                delimiter: "|".into(),
             }],
             ..default_config()
         };
@@ -1118,7 +1535,10 @@ mod tests {
         let _s = r.schema().unwrap();
         assert_eq!(
             r.next_record().unwrap().unwrap().get("tags"),
-            Some(&Value::String("a,b,c".into()))
+            Some(&Value::Array(vec![
+                Value::String("a".into()),
+                Value::String("b".into()),
+            ]))
         );
     }
 
@@ -1182,32 +1602,188 @@ mod tests {
     }
 
     #[test]
-    fn test_json_array_paths_empty_array() {
-        // Alice's empty `orders` array suppresses her record entirely
-        // under Explode mode; Bob's expanded record is the only output.
-        // Keys absent from the inferred schema (which here is just
-        // `orders.id`) are silently dropped.
+    fn split_to_rows_empty_array_keeps_the_record_by_default() {
+        // `keep_empty` defaults to true, so Alice's empty `orders` array
+        // leaves her record intact rather than deleting her from the output.
+        // Several widely deployed engines drop it instead; a vanished row is
+        // the costliest failure mode for this audience, so the default is
+        // deliberately inverted.
         let input = r#"[{"name":"Alice","orders":[]},{"name":"Bob","orders":[{"id":1}]}]"#;
         let config = JsonReaderConfig {
-            array_paths: vec![ArrayPathSpec {
-                path: "orders".into(),
-                mode: ArrayPathMode::Explode,
-                separator: ",".into(),
+            split_to_rows: vec![SplitToRows::bare("orders")],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("name"), Some(&Value::String("Alice".into())));
+        assert_eq!(r1.get("id"), None);
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("name"), Some(&Value::String("Bob".into())));
+        assert_eq!(r2.get("id"), Some(&Value::Integer(1)));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn split_to_rows_explicit_null_is_no_occurrence() {
+        // A JSON producer routinely writes `null` where a group is absent.
+        // That is nothing to fan out, so `keep_empty` governs it exactly as it
+        // governs the absent field and the empty array — treating it as one
+        // real occurrence would both survive `keep_empty: false` and leave a
+        // stray column no fanned-out sibling carries.
+        let input = r#"[{"id":1,"line_items":null},{"id":2,"line_items":[{"sku":"x"}]}]"#;
+        let kept = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows::bare("line_items")],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, kept);
+        let _s = r.schema().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(r1.get("line_items"), None, "the null column is consumed");
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("sku"),
+            Some(&Value::String("x".into()))
+        );
+        assert!(r.next_record().unwrap().is_none());
+
+        let dropped = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows {
+                keep_empty: false,
+                ..SplitToRows::bare("line_items")
+            }],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, dropped);
+        let _s = r.schema().unwrap();
+        let only = r.next_record().unwrap().unwrap();
+        assert_eq!(only.get("id"), Some(&Value::Integer(2)));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn multi_value_column_leaves_an_explicit_null_null() {
+        // A `multiple: true` column normalizes a scalar to a one-element array
+        // so an unwrapped single occurrence reads the same as a wrapped one.
+        // An explicit null carries no value, so wrapping it would report
+        // `size() == 1` for a field holding nothing — diverging from the
+        // absent-field case on this same reader, and from XML, which cannot
+        // express an explicit null at all.
+        let input = concat!(
+            r#"{"id":"1","tags":["a","b"]}"#,
+            "\n",
+            r#"{"id":"2","tags":"solo"}"#,
+            "\n",
+            r#"{"id":"3","tags":null}"#,
+            "\n",
+            r#"{"id":"4"}"#,
+            "\n",
+            r#"{"id":"5","tags":[]}"#,
+            "\n",
+        );
+        let config = JsonReaderConfig {
+            format: Some(JsonMode::Ndjson),
+            multi_value_fields: vec!["tags".to_string()],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        let tags = |r: &mut JsonReader| r.next_record().unwrap().unwrap().get("tags").cloned();
+        assert_eq!(
+            tags(&mut r),
+            Some(Value::Array(vec![
+                Value::String("a".into()),
+                Value::String("b".into())
+            ]))
+        );
+        assert_eq!(
+            tags(&mut r),
+            Some(Value::Array(vec![Value::String("solo".into())]))
+        );
+        assert_eq!(tags(&mut r), Some(Value::Null), "explicit null stays null");
+        assert_eq!(tags(&mut r), None, "absent field contributes no column");
+        assert_eq!(tags(&mut r), Some(Value::Array(vec![])));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn nested_split_to_rows_compose_under_split_mode() {
+        // The outer entry has to keep the group's dotted path for the inner
+        // entry to still address it. `mode: split` does; `mode: extract` lifts
+        // the occurrence's keys to the top level, so `orders.items` stops
+        // existing and the inner entry matches nothing. E358 rejects the
+        // extract pairing at compile time, and this pins the shape that works.
+        let input = r#"[{"cust":"A","orders":[{"id":1,"items":[{"sku":"x"},{"sku":"y"}]}]}]"#;
+        let nested = |mode| JsonReaderConfig {
+            split_to_rows: vec![
+                SplitToRows {
+                    mode,
+                    ..SplitToRows::bare("orders")
+                },
+                SplitToRows {
+                    mode,
+                    ..SplitToRows::bare("orders.items")
+                },
+            ],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, nested(SplitToRowsMode::Split));
+        let _s = r.schema().unwrap();
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(r1.get("orders.items.sku"), Some(&Value::String("x".into())));
+        assert_eq!(r1.get("orders.id"), Some(&Value::Integer(1)));
+        let r2 = r.next_record().unwrap().unwrap();
+        assert_eq!(r2.get("orders.items.sku"), Some(&Value::String("y".into())));
+        assert!(r.next_record().unwrap().is_none());
+
+        // The extract pairing collapses to one record with the inner array
+        // never expanded — the reason E358 rejects it rather than letting it
+        // undercount silently.
+        let mut r = reader_from_str(input, nested(SplitToRowsMode::Extract));
+        let _s = r.schema().unwrap();
+        let only = r.next_record().unwrap().unwrap();
+        assert!(matches!(only.get("items"), Some(Value::Array(_))));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn split_to_rows_absent_field_keeps_the_record_by_default() {
+        // The complementary case: a record carrying no such field at all is
+        // preserved just as an empty array is.
+        let input = r#"[{"name":"Alice"},{"name":"Bob","orders":[{"id":1}]}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows::bare("orders")],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("name"),
+            Some(&Value::String("Alice".into()))
+        );
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("id"),
+            Some(&Value::Integer(1))
+        );
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn split_to_rows_keep_empty_false_drops_the_empty_record() {
+        // Opting out is the only way to lose the record.
+        let input = r#"[{"name":"Alice","orders":[]},{"name":"Bob","orders":[{"id":1}]}]"#;
+        let config = JsonReaderConfig {
+            split_to_rows: vec![SplitToRows {
+                keep_empty: false,
+                ..SplitToRows::bare("orders")
             }],
             ..default_config()
         };
         let mut r = reader_from_str(input, config);
-        let s = r.schema().unwrap();
-        // Schema inference walks Alice's record only (the streaming
-        // reader can't peek further); her empty `orders` array yields
-        // no nested columns, so the inferred schema is empty. Bob's
-        // expanded record carries its own per-record schema with
-        // `name` and the exploded `orders.id` field — the dispatch
-        // layer applies the per-Source `OnUnmapped` policy against
-        // the user-declared schema.
-        assert_eq!(s.columns().len(), 0);
+        let _s = r.schema().unwrap();
         let r1 = r.next_record().unwrap().unwrap();
-        assert_eq!(r1.iter_all_fields().count(), 2);
+        assert_eq!(r1.get("name"), Some(&Value::String("Bob".into())));
+        assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
         assert!(r.next_record().unwrap().is_none());
     }
 }

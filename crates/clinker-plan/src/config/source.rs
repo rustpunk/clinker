@@ -1,6 +1,7 @@
 //! Source node configuration: file discovery, transports, and per-format input options.
 
 use super::*;
+use clinker_format::{SplitToRows, SplitValues};
 use clinker_record::schema_def::LineSeparator;
 use serde::de::{self};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -95,8 +96,27 @@ pub struct SourceConfig {
     #[serde(skip)]
     pub declared_doc_paths: Vec<cxl::analyzer::doc_paths::DocPath>,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub array_paths: Option<Vec<ArrayPathConfig>>,
+    /// Fan-out declarations: each names a repeated field whose occurrences
+    /// become one output record apiece. Honored by the JSON and XML readers.
+    /// Entries apply in declaration order, so two fan-outs multiply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_to_rows: Option<Vec<SplitToRows>>,
+    /// In-cell parse declarations: each names a field whose delimited text is
+    /// split into the several values a `multiple: true` column holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_values: Option<Vec<SplitValues>>,
+    /// Capture slot for the superseded `array_paths:` block, read by the E360
+    /// gate and by nothing else.
+    ///
+    /// A source config is embedded with `#[serde(flatten)]`, which rules out
+    /// `deny_unknown_fields`, so a key this struct does not name is discarded
+    /// without a parse error. For a fan-out declaration that silently drops one
+    /// record per group down to one record per document — every downstream
+    /// count, join, and aggregate quietly wrong — so the key is still parsed,
+    /// as an opaque value, purely so the gate can name it and point at what
+    /// replaced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub array_paths: Option<serde_json::Value>,
     /// Record-level sortedness inside the file (used by combine/aggregate
     /// planning to enable streaming strategies). Distinct from
     /// `files.sort_order` which orders the file set itself.
@@ -535,25 +555,6 @@ pub enum NamespaceHandling {
     Qualify,
 }
 
-/// Array path configuration for nested array explosion/joining.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ArrayPathConfig {
-    pub path: String,
-    #[serde(default)]
-    pub mode: ArrayMode,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub separator: Option<String>,
-}
-
-/// Array path processing mode.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ArrayMode {
-    #[default]
-    Explode,
-    Join,
-}
-
 impl SourceConfig {
     /// Borrow the literal `path:` for the simple-case source. Returns `""`
     /// for sources using `glob`/`regex`/`paths` matchers — the latter
@@ -752,6 +753,80 @@ fn one() -> usize {
 mod tests {
     use super::*;
     use crate::config::ByteSize;
+    use clinker_format::SplitToRowsMode;
+
+    /// The `split_to_rows` shorthand: a bare field name and a full mapping mix
+    /// freely in one sequence, and the shorthand materializes the same
+    /// defaults hand-written config would.
+    #[test]
+    fn split_to_rows_mixes_shorthand_and_full_form() {
+        let entries: Vec<SplitToRows> = crate::yaml::from_str(
+            "- line_items\n\
+             - field: tags\n  \
+               keep_empty: false\n  \
+               mode: split\n  \
+               position_column: tag_no\n",
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+
+        assert_eq!(entries[0].field, "line_items");
+        assert!(entries[0].keep_empty, "keep_empty defaults to true");
+        assert_eq!(entries[0].mode, SplitToRowsMode::Extract);
+        assert_eq!(entries[0].position_column, None);
+
+        assert_eq!(entries[1].field, "tags");
+        assert!(!entries[1].keep_empty);
+        assert_eq!(entries[1].mode, SplitToRowsMode::Split);
+        assert_eq!(entries[1].position_column.as_deref(), Some("tag_no"));
+    }
+
+    /// A misspelled key inside the full form is rejected and NAMED, rather
+    /// than being silently dropped or collapsing into one message that says
+    /// only that nothing matched.
+    #[test]
+    fn split_to_rows_rejects_a_misspelled_key() {
+        let err = crate::yaml::from_str::<Vec<SplitToRows>>("- field: tags\n  keep_emty: false\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("keep_emty"), "{err}");
+        assert!(err.contains("keep_empty"), "{err}");
+    }
+
+    /// A node that is neither accepted form names BOTH forms, so the author
+    /// can see what to write instead.
+    #[test]
+    fn split_to_rows_rejects_an_unrecognized_node_shape() {
+        let err = crate::yaml::from_str::<Vec<SplitToRows>>("- [tags]\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("field name"), "{err}");
+        assert!(err.contains("keep_empty"), "{err}");
+    }
+
+    #[test]
+    fn split_values_mixes_shorthand_and_full_form() {
+        let entries: Vec<SplitValues> =
+            crate::yaml::from_str("- tags\n- field: codes\n  delimiter: \"|\"\n").unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].field, "tags");
+        assert_eq!(
+            entries[0].delimiter,
+            clinker_format::DEFAULT_VALUE_DELIMITER,
+            "the shorthand takes the one shared default delimiter"
+        );
+        assert_eq!(entries[1].field, "codes");
+        assert_eq!(entries[1].delimiter, "|");
+    }
+
+    #[test]
+    fn split_values_rejects_a_misspelled_key() {
+        let err = crate::yaml::from_str::<Vec<SplitValues>>("- field: tags\n  delimeter: \";\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("delimeter"), "{err}");
+        assert!(err.contains("delimiter"), "{err}");
+    }
 
     #[test]
     fn json_options_parse_max_index_bytes_size_string() {

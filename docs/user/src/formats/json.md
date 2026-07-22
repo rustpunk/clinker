@@ -40,10 +40,49 @@ to skip detection, or when an `object` wrapper needs a `record_path`.
 ## Nested arrays
 
 JSON records frequently embed arrays — line items on an invoice, tags on a
-product. The [`array_paths`](../nodes/source.md#array-paths) field on the
-source controls whether each nested array **explodes** into one record per
-element or **joins** into a delimited string. That field is shared with
-the XML reader and documented on the Source Nodes page.
+product. Three source-level declarations decide what happens to them, all
+documented on the
+[Source Nodes](../nodes/source.md#multi-value-fields) page:
+
+- `split_to_rows` fans the array out to one record per element. `mode: extract`
+  (the default) hoists an object element's keys onto the output record;
+  `mode: split` keeps the record shape, flattening the element back under the
+  field name (`orders.id`). An array of scalars keeps the value under the
+  field's own name under both modes.
+- A schema column declared `multiple: true` keeps the array as an array, and
+  normalizes a lone scalar into a one-element array so the column's shape never
+  depends on what a particular document happened to carry.
+- `split_values` parses a delimited string cell into several values.
+
+A record whose declared field holds an empty array, is explicitly `null`, or
+carries no such field at all, is preserved by default — `keep_empty` defaults to
+`true`, and setting it to `false` drops such a record. An explicit null is how
+many producers write "no value", so it counts as no occurrence rather than one;
+for the same reason a `multiple: true` column holding an explicit null stays
+null rather than becoming `[null]`.
+
+A field that IS present but holds a single object or scalar rather than an array
+is one occurrence, projected exactly as a one-element array would be. Producers
+routinely unwrap a lone element, so a feed where some documents carry
+`"line_items": [{…}, {…}]` and others carry `"line_items": {…}` fans both out
+the same way and every output record ends up with the same columns. The XML
+reader, where a document cannot express the difference at all, already behaved
+this way.
+
+Two declared fan-out fields apply in declaration order and multiply. A nested
+pair (`orders` then `orders.items`) produces the two-level expansion when the
+outer entry declares `mode: split`:
+
+```yaml
+    split_to_rows:
+      - { field: orders, mode: split }
+      - { field: orders.items, mode: split }
+```
+
+Under `mode: extract` the outer entry lifts the occurrence's keys to the top
+level, which removes the `orders.items` path the inner entry addresses — so that
+pairing is rejected at compile (`E358`) rather than silently fanning out only
+one level. A duplicated field is rejected too.
 
 ## Bounding envelope retention: `max_index_bytes`
 

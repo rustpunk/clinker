@@ -26,8 +26,10 @@
 //! declared with a concrete type (`Type::Int`, `Type::Float`, `Type::Bool`,
 //! `Type::Date`, `Type::DateTime`, `Type::Numeric`) are coerced here,
 //! honoring each column's `format:` strftime string for `date` / `date_time`;
-//! `Type::String` / `Type::Any` skip coercion, and native `Map` / `Array`
-//! pass through untouched. The `to_*` / `try_*` CXL builtins remain available
+//! `Type::String` / `Type::Any` skip coercion, and a native `Map` passes
+//! through untouched. A `multiple:` column arrives array-valued and its
+//! declared type describes each element, so coercion recurses into the array
+//! one element at a time. The `to_*` / `try_*` CXL builtins remain available
 //! for derived fields computed during the pipeline.
 //!
 //! Positional formats (fixed-width / multi-record) parse their bytes into
@@ -95,6 +97,11 @@ pub struct CoercingReader {
     /// sidecar slot is always `false` (its payload is a `Value::Map`, never a
     /// top-level string).
     long_unique: Vec<bool>,
+    /// Per-output-column `multiple:` declaration, indexed alongside `targets`.
+    /// A set column's declared type describes each ELEMENT, so coercion
+    /// recurses into the array rather than trying to coerce the array itself.
+    /// The `$widened` sidecar slot is always `false`.
+    multiple: Vec<bool>,
     /// Position of the `$widened` sidecar column in `output_schema`,
     /// or `None` for `Drop` / `Reject` policies (no sidecar slot).
     widened_idx: Option<usize>,
@@ -175,6 +182,7 @@ impl CoercingReader {
             schema_decl.iter().map(|c| c.format.clone()).collect();
         let mut scales: Vec<Option<u8>> = schema_decl.iter().map(|c| c.scale).collect();
         let mut long_unique: Vec<bool> = schema_decl.iter().map(|c| c.is_long_unique()).collect();
+        let mut multiple: Vec<bool> = schema_decl.iter().map(|c| c.is_multiple()).collect();
 
         let mut builder = SchemaBuilder::new();
         for c in schema_decl {
@@ -192,6 +200,7 @@ impl CoercingReader {
             formats.push(None);
             scales.push(None);
             long_unique.push(false);
+            multiple.push(false);
             Some(idx)
         } else {
             None
@@ -208,6 +217,7 @@ impl CoercingReader {
             formats,
             scales,
             long_unique,
+            multiple,
             widened_idx,
             policy,
             source_name: source_name.into(),
@@ -272,6 +282,44 @@ impl CoercingReader {
             };
             let raw = record.get(physical).cloned().unwrap_or(Value::Null);
             let coerced = match &self.targets[i] {
+                // A `multiple:` column's declared type describes each ELEMENT,
+                // so coercion applies element-wise; the array itself has no
+                // scalar type to coerce to and would otherwise pass through as
+                // a vector of raw strings. A one-off scalar under the same
+                // declaration still coerces, so a reader that produced a bare
+                // value is not left uncoerced.
+                Some(target) if self.multiple[i] => match raw {
+                    Value::Array(items) => Value::Array(
+                        items
+                            .into_iter()
+                            .map(|item| {
+                                coerce_value(
+                                    &item,
+                                    target,
+                                    self.formats[i].as_deref(),
+                                    self.scales[i],
+                                )
+                                .unwrap_or(item)
+                            })
+                            .collect(),
+                    ),
+                    // Defensive. E361 owns the invariant that a declared-
+                    // multiple column comes from a format whose reader
+                    // produces an array, so this arm is unreachable for a
+                    // compiled plan. It normalizes rather than panicking —
+                    // cheaper, and it keeps no second, drifting copy of the
+                    // gate's rule on the record path — but it wraps the
+                    // coerced value into a one-element array rather than
+                    // passing it through bare, so a gate regression upstream
+                    // cannot put a scalar in a slot the planner typed as an
+                    // array and have every downstream array expression read it
+                    // as the wrong shape.
+                    Value::Null => Value::Null,
+                    scalar => Value::Array(vec![
+                        coerce_value(&scalar, target, self.formats[i].as_deref(), self.scales[i])
+                            .unwrap_or(scalar),
+                    ]),
+                },
                 Some(target) => {
                     coerce_value(&raw, target, self.formats[i].as_deref(), self.scales[i])
                         .unwrap_or(raw)
@@ -449,6 +497,34 @@ mod tests {
         let rec2 = coercing.next_record().unwrap().unwrap();
         assert_eq!(rec2.get("age"), Some(&Value::Integer(25)));
         assert_eq!(rec2.get("score"), Some(&Value::Float(88.0)));
+    }
+
+    /// E361 owns the invariant that a `multiple:` column comes from a format
+    /// whose reader produces an array, so the defensive arm is unreachable for
+    /// a compiled plan. It still has to leave the slot holding the shape the
+    /// planner typed it as: a bare scalar there would let every downstream
+    /// array expression read the wrong shape, and a JSON sink would emit a
+    /// scalar where the schema promised a list. An absent field stays null,
+    /// which is what a `multiple:` column reads as everywhere else.
+    #[test]
+    fn defensive_scalar_arm_normalizes_a_multi_value_column_to_an_array() {
+        let multi = |name: &str| Column {
+            multiple: Some(true),
+            ..col(name, Type::Int)
+        };
+        // `absent` is declared but not carried by the input, which is the one
+        // route to a null here.
+        let schema = vec![multi("codes"), multi("absent")];
+        let reader = csv_reader("codes\n7\n");
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
+
+        let rec = coercing.next_record().unwrap().unwrap();
+        assert_eq!(
+            rec.get("codes"),
+            Some(&Value::Array(vec![Value::Integer(7)]))
+        );
+        assert_eq!(rec.get("absent"), Some(&Value::Null));
     }
 
     #[test]

@@ -94,18 +94,20 @@ Attribute handling details:
 - An element with only attribute fields and no children self-closes:
   `Address.@type` alone emits `<Address type="home"/>`.
 
-## Nested arrays
+## Repeated elements
 
-When a record element contains repeated child elements, the
-[`array_paths`](../nodes/source.md#array-paths) field on the source
-controls whether each repetition **explodes** into its own record or
-**joins** into a delimited string. The field is shared with the JSON
-reader; the XML-specific matching rules are below.
+When a record element contains repeated child elements, two source-level
+declarations decide what happens to them, and both take the flattened dotted
+field name — see
+[Source Nodes → Multi-value fields](../nodes/source.md#multi-value-fields) for
+the shared grammar. The XML-specific matching rules are below.
 
-An entry's `path` is the repeated element's dotted path **relative to the
-record element** — the same form the flattened field names use. For a
-record element `<Order>` containing repeated `<Item>` children, the path
-is `Item`; for `<Order><Items><Item>…`, it is `Items.Item`.
+A declared field is the repeated element's dotted path **relative to the record
+element** — the same form the flattened field names use. For a record element
+`<Order>` containing repeated `<Item>` children, the field is `Item`; for
+`<Order><Items><Item>…`, it is `Items.Item`.
+
+### One record per occurrence: `split_to_rows`
 
 ```yaml
 - type: source
@@ -120,39 +122,72 @@ is `Item`; for `<Order><Items><Item>…`, it is `Items.Item`.
       - { name: id, type: int }
       - { name: "Item.name", type: string }
       - { name: "Item.qty", type: int }
-      - { name: "Tag", type: string }
-    array_paths:
-      - path: "Item"
-        mode: explode          # one output record per <Item> occurrence
-      - path: "Tag"
-        mode: join             # <Tag>a</Tag><Tag>b</Tag> -> "a,b"
-        separator: ","
+    split_to_rows:
+      - field: "Item"
+        mode: split            # one output record per <Item> occurrence
 ```
 
-**`explode`** emits one output record per occurrence of the element. Each
-output carries that occurrence's fields — which keep their full dotted
-names (`Item.name`, `Item.@sku`), including the element's attributes —
-plus every field outside the path, duplicated onto each record. An
-occurrence with no content (`<Item></Item>`) still emits a record, one
-carrying only the fields outside the path. A record with **no** occurrence
-of the element passes through unchanged: XML cannot distinguish an empty
-repetition from an absent element.
+Each output carries one occurrence's fields plus every field outside the
+group, duplicated onto each record.
 
-**`join`** concatenates values instead of fanning out. Every repeated
-flattened field at or under the path is collapsed independently into a
-single field whose value joins the occurrences' values with `separator`
-(default `,`), in document order: repeated `<Tag>` text joins under `Tag`,
-and repeated `<Item><name>` children join under `Item.name`.
+Under `mode: split` the occurrence's fields keep their full dotted names
+(`Item.name`, `Item.@sku`), including the element's attributes. Under the
+default `mode: extract` the declared field's prefix is lifted off, so the same
+document yields `name` and `qty`; a repeated scalar element (`<Tag>a</Tag>`)
+has no remainder to lift and takes the declared field's last segment, so
+`Tags.Tag` yields `Tag` under `extract` and stays `Tags.Tag` under `split`.
 
-Entries apply in declaration order, so a join's collapsed value lands on
-every record an earlier explode fanned out, and two exploded paths
-multiply. Paths must name **disjoint** element groups — a duplicated path,
-or one path extending another (`Item` and `Item.part`), is rejected when
-the source opens.
+Lifting a prefix off can land an occurrence's field on a name a field outside
+the group already occupies — `<Order><name>` alongside `<Item><name>`. The
+occurrence wins: under `extract` it is the record, so its own field is not
+shadowed by the parent it was merged with. Use `mode: split` when you need both
+values, which keeps them at `name` and `Item.name`.
 
-Repeated fields *not* named by any array path keep the default
-duplicate-key collapse: the first value wins and later repetitions are
-dropped.
+A declared `position_column` wins over any field of that name, inside the
+occurrence or outside it. `position_column: line_no` against an `<Item>` that
+carries its own `<line_no>` child yields the occurrence's index, not the
+document's value — you named the column, so the index is what it holds.
+
+An occurrence with no content (`<Item></Item>`) still emits a record, one
+carrying only the fields outside the group. A record with **no** occurrence of
+the element is governed by `keep_empty`: XML cannot distinguish an empty
+repetition from an absent element, and the default `keep_empty: true` passes
+the record through unchanged.
+
+Entries apply in declaration order, so two declared fields multiply. Fields must
+name **disjoint** element groups — a duplicated field, or one extending another
+(`Item` and `Item.part`) — which is rejected at compile (`E358`), before the
+source opens. The disjointness rule is this reader's: it assigns each element to
+one occurrence group by document position, which is sound exactly when the
+declared groups do not nest. A JSON source has no such constraint.
+
+### All occurrences in one field: `multiple: true`
+
+Declaring a schema column `multiple: true` collects every occurrence of that
+flattened field into one array, in document order, instead of keeping only the
+first:
+
+```yaml
+    schema:
+      - { name: id, type: int }
+      - { name: "Tag", type: string, multiple: true }
+```
+
+`<Tag>a</Tag><Tag>b</Tag>` yields `["a", "b"]`, and a single `<Tag>` still
+yields a one-element array. Declaring the flattened children of a repeated
+container (`Item.name`, `Item.qty`) collects each of them independently.
+
+A field cannot be both collected and fanned out: naming a `multiple: true`
+column in `split_to_rows` is rejected at compile (`E358`).
+
+Repeated fields named by neither a `split_to_rows` entry nor a `multiple:`
+column keep the default duplicate-key collapse: the first value wins and later
+repetitions are dropped.
+
+### Delimited text in one element: `split_values`
+
+`split_values` parses `<Tag>a;b;c</Tag>` into `["a", "b", "c"]`. The field must
+also be declared `multiple: true`.
 
 ## Bounding envelope retention: `max_index_bytes`
 

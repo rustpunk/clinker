@@ -2,8 +2,8 @@
 //!
 //! These tests pin the on-the-wire YAML surface for the per-source patch a
 //! channel's per-target overlay carries: the schema column ops (`add` /
-//! `rename` / `modify` / `remove`), the `array_paths` ops (set-by-path /
-//! `remove`), and the scalar `options` map. Applying the parsed patch to a
+//! `rename` / `modify` / `remove`), the `split_to_rows` / `split_values` ops
+//! (set-by-field / `remove`), and the scalar `options` map. Applying the parsed patch to a
 //! pipeline is covered in `clinker-plan`; here we only assert that every
 //! documented form deserializes into the typed [`SourceConfigPatch`] carried on
 //! the overlay.
@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use clinker_channel::OverlayFile;
-use clinker_plan::config::{ArrayPathOp, SchemaColumnOp};
+use clinker_plan::config::{SchemaColumnOp, SplitToRowsOp, SplitValuesOp};
 
 fn overlay(yaml: &[u8]) -> OverlayFile {
     OverlayFile::from_yaml_bytes(yaml, PathBuf::from("base.channel.yaml"))
@@ -31,9 +31,12 @@ sources:
       cust_id:     { rename: customer_id }
       order_notes: remove
       region:      { add: { type: string } }
-    array_paths:
-      items:      { mode: join, separator: ";" }
+    split_to_rows:
+      items:      { mode: split, position_column: line_no }
       line_items: remove
+    split_values:
+      tags:       { delimiter: ";" }
+      codes:      remove
     options:
       record_path: batch_records
 "#,
@@ -52,14 +55,29 @@ sources:
     assert!(matches!(schema[2].1, SchemaColumnOp::Remove));
     assert!(matches!(schema[3].1, SchemaColumnOp::Add(_)));
 
-    // array_paths ops: a set-by-path and a remove.
+    // split_to_rows ops: a set-by-field and a remove.
     assert!(matches!(
-        patch.array_paths.get("items"),
-        Some(ArrayPathOp::Set { separator: Some(s), .. }) if s == ";"
+        patch.split_to_rows.get("items"),
+        Some(SplitToRowsOp::Set {
+            position_column: Some(Some(c)),
+            ..
+        }) if c == "line_no"
     ));
     assert!(matches!(
-        patch.array_paths.get("line_items"),
-        Some(ArrayPathOp::Remove)
+        patch.split_to_rows.get("line_items"),
+        Some(SplitToRowsOp::Remove)
+    ));
+
+    // split_values ops: a set-by-field and a remove.
+    assert!(matches!(
+        patch.split_values.get("tags"),
+        Some(SplitValuesOp::Set {
+            delimiter: Some(Some(d))
+        }) if d == ";"
+    ));
+    assert!(matches!(
+        patch.split_values.get("codes"),
+        Some(SplitValuesOp::Remove)
     ));
 
     // options: one scalar key.
@@ -115,6 +133,69 @@ sources:
     match o.sources["src"].schema.get("uuid") {
         Some(SchemaColumnOp::Add(add)) => assert_eq!(add.long_unique, Some(true)),
         other => panic!("expected add op, got {other:?}"),
+    }
+}
+
+#[test]
+fn split_to_rows_explicit_null_parses_as_a_clear() {
+    // An omitted key means "keep current", so clearing needs its own form:
+    // an explicit YAML null, distinguishable from absence.
+    let o = overlay(
+        br#"
+channel:
+  target: ../../pipeline/base.yaml
+sources:
+  src:
+    split_to_rows:
+      items: { position_column: ~ }
+"#,
+    );
+    assert!(matches!(
+        o.sources["src"].split_to_rows.get("items"),
+        Some(SplitToRowsOp::Set {
+            position_column: Some(None),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn split_values_explicit_null_parses_as_a_clear() {
+    // Same rule on the sibling surface: `delimiter: ~` is a reset request, and
+    // it must not deserialize to the same `None` an omitted key produces.
+    let o = overlay(
+        br#"
+channel:
+  target: ../../pipeline/base.yaml
+sources:
+  src:
+    split_values:
+      codes: { delimiter: ~ }
+"#,
+    );
+    assert!(matches!(
+        o.sources["src"].split_values.get("codes"),
+        Some(SplitValuesOp::Set {
+            delimiter: Some(None)
+        })
+    ));
+}
+
+#[test]
+fn schema_modify_carries_multiple_flag() {
+    let o = overlay(
+        br#"
+channel:
+  target: ../../pipeline/base.yaml
+sources:
+  src:
+    schema:
+      tags: { multiple: true }
+"#,
+    );
+    match o.sources["src"].schema.get("tags") {
+        Some(SchemaColumnOp::Modify(patch)) => assert_eq!(patch.multiple, Some(true)),
+        other => panic!("expected modify op, got {other:?}"),
     }
 }
 

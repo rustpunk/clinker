@@ -33,6 +33,13 @@ use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
+/// Separator a multi-value field is parsed from (read) and encoded with
+/// (write) when the author declares none. Semicolon rather than comma: it is
+/// the separator the business-facing bulk-loaders this audience already uses
+/// mandate for multi-value cells, and it does not collide with the CSV field
+/// delimiter. One constant, so read and write never drift apart.
+pub const DEFAULT_VALUE_DELIMITER: &str = ";";
+
 /// One declared source column — the superset of the historical format-layer
 /// `FieldDef` and CXL-layer `ColumnDecl`. Carries a single `type`
 /// ([`cxl::typecheck::Type`]) that drives both byte-level parsing and
@@ -113,6 +120,16 @@ pub struct Column {
     /// changes in-memory footprint only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub long_unique: Option<bool>,
+    /// Whether this column holds more than one value. A `multiple: true` column
+    /// is always array-valued: reading collects every occurrence of the field
+    /// into a [`clinker_record::Value::Array`] (a single occurrence becomes a
+    /// one-element array), and each element carries the column's declared
+    /// [`ty`](Self::ty). The declaration is direction-neutral — it states the
+    /// shape of the data, so a writer that can encode repetition uses the same
+    /// declaration. An output format with no multi-value encoding rejects the
+    /// column at plan time (E359) rather than degrading it at run time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiple: Option<bool>,
 }
 
 impl Column {
@@ -139,12 +156,33 @@ impl Column {
             coerce: None,
             allowed_values: None,
             long_unique: None,
+            multiple: None,
         }
     }
 
     /// Whether the `long_unique` storage hint is set.
     pub fn is_long_unique(&self) -> bool {
         self.long_unique.unwrap_or(false)
+    }
+
+    /// Whether the column is declared multi-value (`multiple: true`).
+    pub fn is_multiple(&self) -> bool {
+        self.multiple.unwrap_or(false)
+    }
+
+    /// The type this column binds into CXL.
+    ///
+    /// A `multiple: true` column holds a [`clinker_record::Value::Array`], so
+    /// it binds as [`Type::Array`]; its declared [`ty`](Self::ty) describes each
+    /// ELEMENT and drives coercion, not the shape a CXL expression sees. Binding
+    /// the element type instead would let `upper(tags)` typecheck against an
+    /// array at run time.
+    pub fn bound_type(&self) -> Type {
+        if self.is_multiple() {
+            Type::Array
+        } else {
+            self.ty.clone()
+        }
     }
 
     /// The physical input-field name this column reads FROM: `source_name`
@@ -260,6 +298,16 @@ pub const RECORD_TYPE_COLUMN: &str = "record_type";
 /// unify compatibility rule, so the typechecked row and the emitted records
 /// cannot disagree on a shared column's type. A pair that does not unify keeps
 /// the first declaration's type here; the reader rejects that config at build.
+///
+/// `multiple:` widens the same way, by OR rather than first-wins: a name any
+/// record type declares `multiple: true` is multi-valued in the superset. The
+/// superset is the one column list every consumer reads — the reader's
+/// collect-these-fields set and both multi-value gates come off
+/// `bound_columns()` — so first-wins would let a later record type's
+/// declaration vanish, leaving its repeated occurrences to collapse to the
+/// first value with no diagnostic anywhere. Single-valued is a subset of
+/// array-valued (one occurrence yields a one-element array), which is why the
+/// widening direction is sound.
 pub fn multi_record_superset(record_types: &[RecordType]) -> Vec<Column> {
     let mut columns: Vec<Column> = vec![Column::bare(RECORD_TYPE_COLUMN, Type::String)];
     for rt in record_types {
@@ -267,6 +315,9 @@ pub fn multi_record_superset(record_types: &[RecordType]) -> Vec<Column> {
             if let Some(existing) = columns.iter_mut().find(|c| c.name == col.name) {
                 if let Some(unified) = existing.ty.unify(&col.ty) {
                     existing.ty = unified;
+                }
+                if col.is_multiple() {
+                    existing.multiple = Some(true);
                 }
             } else {
                 columns.push(col.clone());
@@ -406,6 +457,32 @@ mod tests {
         assert_eq!(cols[0].name, "id");
         assert_eq!(cols[0].ty, Type::Int);
         assert!(cols[1].is_long_unique());
+    }
+
+    #[test]
+    fn superset_widens_multiple_across_record_types_in_either_order() {
+        // Every multi-value consumer — the reader's collect-these-fields set,
+        // both plan-time gates — reads the superset, so a `multiple: true` any
+        // record type declares has to survive into it. First-wins would drop a
+        // later record type's declaration and let its repeated occurrences
+        // collapse to the first value with no diagnostic anywhere.
+        let single = r#"{"name":"code","type":"string"}"#;
+        let multiple = r#"{"name":"code","type":"string","multiple":true}"#;
+        for (first, second) in [(single, multiple), (multiple, single)] {
+            let schema: SourceSchema = from_json(&format!(
+                r#"{{"discriminator":{{"field":"kind"}},
+                    "records":[
+                      {{"id":"header","tag":"H","columns":[{first}]}},
+                      {{"id":"detail","tag":"D","columns":[{second}]}}
+                    ]}}"#
+            ));
+            let columns = schema.bound_columns().expect("superset");
+            let code = columns.iter().find(|c| c.name == "code").expect("code");
+            assert!(
+                code.is_multiple(),
+                "declaration order must not decide the shape"
+            );
+        }
     }
 
     #[test]

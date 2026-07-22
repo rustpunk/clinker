@@ -1,0 +1,74 @@
+pipeline:
+  name: multi_value_purchase_orders
+
+# Reads purchase orders whose XML carries repeated elements, exercising all
+# three multi-value declarations at once:
+#
+#   split_to_rows  — each <LineItem> becomes its own record, with the order's
+#                    own fields merged onto it and a 1-based line number
+#   multiple: true — the repeated <Tag> elements collect into one array, and
+#                    so do the values parsed out of <cost_centres>
+#   split_values   — the semicolon-delimited <cost_centres> cell is parsed
+#                    into several values
+#
+# PO-1003 carries no <LineItem> at all. It still reaches the output, with the
+# line fields unset: `keep_empty` defaults to true, so an order with nothing to
+# fan out is never silently deleted.
+#
+# The sink is JSON because that is the one output format that can encode a
+# multi-value field today; binding `tags` or `cost_centres` to a CSV,
+# XML, or fixed-width output is rejected at compile (`clinker explain --code E359`).
+
+nodes:
+  - type: source
+    name: purchase_orders
+    config:
+      name: purchase_orders
+      type: xml
+      path: ./data/purchase_orders.xml
+      options:
+        record_path: PurchaseOrders/Order
+      split_to_rows:
+        - field: LineItem
+          mode: extract
+          position_column: line_no
+      split_values:
+        - field: cost_centres
+          delimiter: ";"
+      schema:
+        - { name: order_id, type: string }
+        - { name: customer, type: string }
+        - { name: tags, type: string, source_name: Tag, multiple: true }
+        - { name: cost_centres, type: string, multiple: true }
+        - { name: line_no, type: int }
+        - { name: sku, type: string }
+        - { name: qty, type: int }
+        - { name: unit_price, type: float }
+
+  - type: transform
+    name: priced_lines
+    description: Extend each line with its own total
+    input: purchase_orders
+    config:
+      cxl: |
+        emit order_id = order_id
+        emit customer = customer
+        emit tags = tags
+        emit cost_centres = cost_centres
+        emit line_no = line_no
+        emit sku = sku
+        emit qty = qty
+        emit unit_price = unit_price
+        emit line_total = qty * unit_price
+
+  - type: output
+    name: lines
+    input: priced_lines
+    config:
+      name: lines
+      type: json
+      path: ./output/purchase_order_lines.json
+      include_unmapped: false
+
+error_handling:
+  strategy: fail_fast

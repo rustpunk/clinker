@@ -1142,7 +1142,7 @@ impl PipelineConfig {
                         "remove the `envelope:` block from this rest source; envelope \
                          sections are a file-document concept. Pull document-level metadata \
                          into record fields through the API's response shape (`record_path`, \
-                         `array_paths`) instead"
+                         `split_to_rows`) instead"
                             .to_string(),
                     ),
                 );
@@ -1201,6 +1201,29 @@ impl PipelineConfig {
                     ),
                 );
             }
+        }
+        // Every per-source multi-value gate (E360, E361, E358) and the
+        // source-to-output E359 gate, run over this pipeline's own nodes. The
+        // same two passes run again inside `bind_composition` over each
+        // composition body's node list, which never appears here: the body file
+        // is re-read and bound separately, so a body source gated only from
+        // this loop would be gated by nothing at all.
+        for fault in crate::config::multi_value::source_node_faults(&self.nodes)
+            .into_iter()
+            .chain(crate::config::multi_value::output_node_faults(&self.nodes))
+        {
+            let primary = doc_node_line_by_name
+                .get(self.nodes[fault.node_index].value.name())
+                .map(|&line| Span::line_only(line))
+                .unwrap_or(Span::SYNTHETIC);
+            diags.push(
+                Diagnostic::error(
+                    fault.code,
+                    fault.message,
+                    LabeledSpan::primary(primary, String::new()),
+                )
+                .with_help(fault.help),
+            );
         }
         for (doc_path, ref_nodes) in &doc_path_set.by_node {
             for node_id in ref_nodes {
@@ -3550,7 +3573,7 @@ fn rest_doc_access_diagnostic(
     .with_help(
         "remove the `$doc` access; a rest source has no document envelope. Pull \
          document-level metadata into record fields through the API's response shape \
-         (`record_path`, `array_paths`) instead"
+         (`record_path`, `split_to_rows`) instead"
             .to_string(),
     )
 }

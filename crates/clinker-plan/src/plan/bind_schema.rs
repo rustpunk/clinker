@@ -2245,9 +2245,15 @@ fn bind_schema_inner(
                                  block, or remove the `watermark:` declaration",
                             ),
                         ),
+                        // `bound_type()`, not `ty`: on a `multiple: true`
+                        // column `ty` describes each ELEMENT, and the column
+                        // binds — and reaches the watermark extractor — as an
+                        // array. Reading `ty` here would accept a multi-value
+                        // date column and then hand the extractor an array,
+                        // leaving event time frozen with no diagnostic.
                         Some(col)
                             if !matches!(
-                                col.ty,
+                                col.bound_type(),
                                 cxl::typecheck::Type::DateTime | cxl::typecheck::Type::Date,
                             ) =>
                         {
@@ -2259,14 +2265,17 @@ fn bind_schema_inner(
                                          but its declared type {ty:?} is not event-time-coercible; \
                                          watermark columns must be `date_time` or `date`.",
                                         col_name = wm.column,
-                                        ty = col.ty.display_name(),
+                                        ty = col.bound_type().display_name(),
                                     ),
                                     LabeledSpan::primary(span, String::new()),
                                 )
                                 .with_help(
                                     "change the column's declared `type:` to `date_time` \
                                      or `date`, or point `watermark.column` at a column \
-                                     that already has one of those types",
+                                     that already has one of those types; a `multiple: true` \
+                                     column holds an array and cannot carry event time, so \
+                                     drop the declaration if the watermark column is the one \
+                                     that repeats",
                                 ),
                             );
                         }
@@ -3025,6 +3034,48 @@ fn bind_composition(
                 PipelineNode::Output { config, .. } => config.output.schema = Some(inline),
                 _ => {}
             }
+        }
+    }
+
+    // 7e. The multi-value gates (E358 / E359 / E360 / E361), which the
+    // call-site pipeline runs over its OWN `nodes:` — a list that never
+    // contains a body's nodes. Without this pass a body source declaring the
+    // retired `array_paths:`, a `multiple: true` column its format cannot
+    // produce, or a malformed `split_to_rows` block reaches the executor
+    // ungated and emits one record per document where the author asked for one
+    // per element. The XML reader's construction-time nesting/duplicate
+    // rejection used to catch part of that for body sources and was replaced by
+    // the plan-time gate, so running the gate here is what keeps the
+    // replacement whole. Runs after 7d so an external `.schema.yaml` is already
+    // folded inline and the gates see its columns. Collect every finding, then
+    // abandon the body, mirroring the passes above.
+    {
+        let faults = crate::config::multi_value::source_node_faults(&body_file.nodes)
+            .into_iter()
+            .chain(crate::config::multi_value::output_node_faults(
+                &body_file.nodes,
+            ));
+        let mut has_multi_value_violation = false;
+        for fault in faults {
+            diags.push(
+                Diagnostic::error(
+                    fault.code,
+                    format!(
+                        "composition node {node_name:?}: body file {}: {}",
+                        resolved_path.display(),
+                        fault.message
+                    ),
+                    LabeledSpan::primary(
+                        span_for_node(&body_file.nodes[fault.node_index]),
+                        String::new(),
+                    ),
+                )
+                .with_help(fault.help),
+            );
+            has_multi_value_violation = true;
+        }
+        if has_multi_value_violation {
+            return;
         }
     }
 
@@ -3860,7 +3911,7 @@ fn port_columns(decl: &PortDecl) -> IndexMap<QualifiedField, Type> {
     match &decl.schema {
         Some(columns) => columns
             .iter()
-            .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
+            .map(|c| (QualifiedField::bare(c.name.as_str()), c.bound_type()))
             .collect(),
         None => IndexMap::new(),
     }
@@ -4219,7 +4270,7 @@ fn columns_from_decl(
 ) -> (IndexMap<QualifiedField, Type>, Vec<String>) {
     let mut cols: IndexMap<QualifiedField, Type> = columns
         .iter()
-        .map(|c| (QualifiedField::bare(c.name.as_str()), c.ty.clone()))
+        .map(|c| (QualifiedField::bare(c.name.as_str()), c.bound_type()))
         .collect();
     // Engine-stamped tail order: `$ck.<field>` shadow columns first,
     // then the `$widened` sidecar, then `$source.file`, then
@@ -4240,7 +4291,7 @@ fn columns_from_decl(
             match columns
                 .iter()
                 .find(|c| c.name.as_str() == field)
-                .map(|c| c.ty.clone())
+                .map(|c| c.bound_type())
             {
                 Some(ty) => {
                     let shadow_name = format!("$ck.{field}");
