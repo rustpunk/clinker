@@ -506,13 +506,24 @@ fn validate_multi_value_input(
     // whole function rather than asserting it cannot be reached.
     let help = match support {
         MultiValueInput::Native => None,
-        MultiValueInput::InCell => Some(format!(
+        // A single-schema delimited-cell reader consumes `split_values`, so
+        // declaring one is the fix. A multi-record reader does not (E358 rejects
+        // the block as a no-op on the same source), so recommending it here would
+        // contradict that gate — point only at the transform route instead.
+        MultiValueInput::InCell if reads_in_cell => Some(format!(
             "declare a `split_values` entry so the {format} reader parses the cell into the \
              array the column holds (`split_values:` `- {{ field: {phys}, delimiter: \";\" }}`), \
              naming the column's input field and the delimiter its text uses; or drop \
              `multiple: true` and split the cell in a transform where the parts are needed \
              (`{col}.split(\";\")`)",
             phys = unsupplied[0].physical_name(),
+            col = unsupplied[0].name,
+        )),
+        MultiValueInput::InCell => Some(format!(
+            "this multi-record {format} source's reader does not consume `split_values`, so \
+             declaring the split there is a no-op — drop `multiple: true` and split the cell in a \
+             transform where the parts are needed (`{col}.split(\";\")`), or restructure the \
+             source as a single-schema {format} where a `split_values` entry is read",
             col = unsupplied[0].name,
         )),
         // HL7 exposes the positional axes as its own declaration; the other

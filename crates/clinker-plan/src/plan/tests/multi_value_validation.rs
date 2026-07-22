@@ -1019,12 +1019,32 @@ nodes:
       type: json
       path: out.json
 "#;
-    let found = coded(&compile_err(yaml), "E358");
+    let diags = compile_err(yaml);
+    let found = coded(&diags, "E358");
     assert_eq!(found.len(), 1, "expected one E358 no-op: {found:?}");
     assert!(
         found[0].0.contains("split_values") && found[0].0.contains("silent no-op"),
         "{}",
         found[0].0
+    );
+
+    // E361 fires on the same source (`tags` is `multiple: true` and the
+    // multi-record reader cannot produce it). Its remediation must AGREE with
+    // E358's "remove the `split_values` block": it must not tell the author to
+    // declare the very block E358 rejects.
+    let e361_help = diags
+        .iter()
+        .find(|d| d.code == "E361")
+        .and_then(|d| d.help.clone())
+        .expect("E361 also fires on the multi-record source");
+    assert!(
+        e361_help.contains("does not consume `split_values`")
+            && e361_help.contains("drop `multiple: true`"),
+        "E361 help must point at the transform route, not contradict E358: {e361_help}"
+    );
+    assert!(
+        !e361_help.contains("declare a `split_values`"),
+        "E361 must not recommend the block E358 just rejected: {e361_help}"
     );
 }
 
