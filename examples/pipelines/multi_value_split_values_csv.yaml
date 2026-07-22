@@ -1,0 +1,43 @@
+pipeline:
+  name: multi_value_split_values_csv
+
+# A CSV cell holds one string, but that string can pack several values behind a
+# delimiter. Declaring the column `multiple: true` and adding a `split_values`
+# entry parses each `tags` cell into an array on the way in:
+#
+#   1,electronics;sale;featured  ->  tags = ["electronics", "sale", "featured"]
+#   2,                           ->  tags = []            (empty cell → zero values)
+#   3,clearance                  ->  tags = ["clearance"] (no delimiter → one value)
+#
+# Each element is coerced to the column's declared `type:`. A `multiple: true`
+# column with no covering `split_values` entry is rejected at compile
+# (`clinker explain --code E361`).
+#
+# The sink is JSON because that is the one output format that can encode a
+# multi-value field today (`clinker explain --code E359`). The reverse
+# direction — joining an array back into a delimited CSV cell — is tracked
+# separately (issue 917).
+
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./data/orders_tags.csv
+      split_values:
+        - { field: tags, delimiter: ";" }
+      schema:
+        - { name: order_id, type: string }
+        - { name: tags, type: string, multiple: true }
+
+  - type: output
+    name: tagged_orders
+    input: orders
+    config:
+      name: tagged_orders
+      type: json
+      path: ./output/tagged_orders.json
+
+error_handling:
+  strategy: fail_fast

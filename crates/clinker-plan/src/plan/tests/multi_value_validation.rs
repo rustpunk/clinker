@@ -876,45 +876,40 @@ fn e361_fires_on_a_csv_source_with_a_bare_multi_value_column() {
     assert!(found[0].1, "E361 must carry a source span");
 }
 
-/// A `split_values` entry does not rescue the declaration on a delimited-cell
-/// format. No CSV or fixed-width reader is handed that block — only the JSON
-/// and XML readers are — so accepting the pair would bind the column as an
-/// array and then deliver the raw cell, which is precisely what E361 exists to
-/// stop. The gate has to reject what the runtime cannot honor, not what the
-/// format could honor once the wiring lands.
+/// A `split_values` entry now rescues a `multiple: true` column on a
+/// single-schema delimited-cell source: the CSV and fixed-width readers parse
+/// the cell into the array the column holds (#930), so the pair that used to
+/// fault E361 compiles clean. The JSON output encodes the resulting array.
 #[test]
-fn e361_fires_on_a_delimited_cell_format_even_with_a_split_values_entry() {
-    for format in ["csv", "fixed_width"] {
-        let yaml = source_format_pipeline(
-            format,
-            r#"      split_values:
+fn e361_accepts_a_delimited_cell_column_a_split_values_entry_covers() {
+    let csv = source_format_pipeline(
+        "csv",
+        r#"      split_values:
         - field: tags
           delimiter: ";"
       schema:
         - { name: order_id, type: string }
         - { name: tags, type: string, multiple: true }"#,
-        );
-        let diags = compile_err(&yaml);
-        let found = coded(&diags, "E361");
-        assert_eq!(found.len(), 1, "expected one E361 for {format}: {found:?}");
-        assert!(found[0].0.contains("'tags'"), "{format}: {}", found[0].0);
-        let help = diags
-            .iter()
-            .find(|d| d.code == "E361")
-            .and_then(|d| d.help.clone())
-            .unwrap_or_default();
-        assert!(
-            help.contains("917") && help.contains("not implemented yet"),
-            "the help must name the outstanding wiring rather than prescribe \
-             `split_values`: {help}"
-        );
-    }
+    );
+    compile_ok(&csv);
+
+    let fixed_width = source_format_pipeline(
+        "fixed_width",
+        r#"      split_values:
+        - field: tags
+          delimiter: ";"
+      schema:
+        - { name: order_id, type: string, start: 0, width: 4 }
+        - { name: tags, type: string, start: 4, width: 20, multiple: true }"#,
+    );
+    compile_ok(&fixed_width);
 }
 
-/// Every declared column is reported, not just the ones no `split_values` entry
-/// names: the entry has no bearing on the verdict.
+/// Coverage is per column: an entry rescues the column it names and no other.
+/// A source with two `multiple: true` columns and one `split_values` entry
+/// accepts the covered column and still faults the uncovered one.
 #[test]
-fn e361_reports_every_multi_value_column_on_a_delimited_cell_format() {
+fn e361_faults_only_the_delimited_cell_columns_no_split_values_entry_covers() {
     let yaml = source_format_pipeline(
         "csv",
         r#"      split_values:
@@ -926,24 +921,34 @@ fn e361_reports_every_multi_value_column_on_a_delimited_cell_format() {
     );
     let found = coded(&compile_err(&yaml), "E361");
     assert_eq!(found.len(), 1, "expected one E361: {found:?}");
-    assert!(found[0].0.contains("'codes'"), "{}", found[0].0);
-    assert!(found[0].0.contains("'tags'"), "{}", found[0].0);
+    assert!(
+        found[0].0.contains("'codes'"),
+        "the uncovered column must fault: {}",
+        found[0].0
+    );
+    assert!(
+        !found[0].0.contains("'tags'"),
+        "the covered column must not fault: {}",
+        found[0].0
+    );
 }
 
-/// The other half of the same hole: a `split_values` block on a format whose
-/// reader never receives it is a silent no-op, reported on its own rather than
-/// left to be inferred from the E361 above.
+/// The other half of the same hole: a declaration a format's reader never
+/// receives is a silent no-op, reported on its own rather than left to be
+/// inferred from the E361 above. Each declaration kind has its own capability —
+/// the delimited-cell formats read `split_values` but not `split_to_rows`, so a
+/// `split_to_rows` block on `csv` is the no-op here even though `split_values`
+/// is not.
 #[test]
 fn e358_rejects_multi_value_declarations_a_format_never_receives() {
     for (format, key, body) in [
         (
             "csv",
-            "split_values",
-            r#"      split_values:
-        - field: tags
-          delimiter: ";"
+            "split_to_rows",
+            r#"      split_to_rows:
+        - line_items
       schema:
-        - { name: tags, type: string }"#,
+        - { name: sku, type: string }"#,
         ),
         (
             "fixed_width",
@@ -972,6 +977,55 @@ fn e358_rejects_multi_value_declarations_a_format_never_receives() {
         );
         assert!(found[0].1, "{format}: E358 must carry a source span");
     }
+}
+
+/// `split_values` is consumed only by the single-schema CSV and fixed-width
+/// readers; a multi-record source of either format runs a different backend that
+/// never receives the block, so declaring it there is the same silent no-op E358
+/// rejects on any other unreading format. The guard keeps the gate flip from
+/// opening a hole the multi-record path cannot honor.
+#[test]
+fn split_values_on_a_multi_record_csv_source_is_a_no_op() {
+    let yaml = r#"
+pipeline:
+  name: multi_record_split_values
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: ./in.csv
+      split_values:
+        - field: tags
+          delimiter: ";"
+      schema:
+        discriminator: { field: kind }
+        records:
+          - id: header
+            tag: H
+            columns:
+              - { name: kind, type: string }
+          - id: detail
+            tag: D
+            columns:
+              - { name: kind, type: string }
+              - { name: tags, type: string, multiple: true }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: json
+      path: out.json
+"#;
+    let found = coded(&compile_err(yaml), "E358");
+    assert_eq!(found.len(), 1, "expected one E358 no-op: {found:?}");
+    assert!(
+        found[0].0.contains("split_values") && found[0].0.contains("silent no-op"),
+        "{}",
+        found[0].0
+    );
 }
 
 /// Repetition in a segment format is a positional coordinate, not a list, so no

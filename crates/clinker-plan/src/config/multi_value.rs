@@ -68,14 +68,15 @@ enum MultiValueInput {
     /// a bare `multiple: true` is enough.
     Native,
     /// The format carries one value per field, but a field's text can hold
-    /// several separated by a delimiter, so the shape is expressible once a
-    /// `split_values` entry says what that delimiter is. Rejected all the same
-    /// until that entry reaches the reader: no CSV or fixed-width reader is
-    /// given the source's `split_values` today, so the column would bind as an
-    /// array and receive the raw cell. This verdict records that the format
-    /// CAN support the declaration, which is what separates it from
-    /// [`MultiValueInput::PositionalAxis`]; only the remediation differs while
-    /// the wiring is outstanding.
+    /// several separated by a delimiter. A `multiple: true` column is supplied
+    /// once a `split_values` entry says what that delimiter is: the
+    /// single-schema CSV and fixed-width readers then parse the cell into the
+    /// array the column holds. A column no entry covers — or any such column on
+    /// a multi-record source, whose backend never receives the block — is
+    /// rejected all the same, since it would bind as an array and receive the
+    /// raw cell. This verdict records that the format CAN support the
+    /// declaration, which is what separates it from
+    /// [`MultiValueInput::PositionalAxis`]; only the remediation differs.
     InCell,
     /// Repetition is a positional coordinate, not a list. A repeated composite
     /// serializes as two axes interleaved in one element (`11:B:1^12:B:2`),
@@ -94,9 +95,9 @@ enum MultiValueInput {
 /// - `json` — a JSON array is the format's own native shape.
 /// - `xml` — repeated child elements, collected in document order.
 /// - `csv` / `fixed_width` — one value per cell on the wire, but
-///   delimited-in-cell text is a long-standing convention for both. Reading it
-///   is a `split_values` entry, whose wiring into these two readers is tracked
-///   at https://github.com/rustpunk/clinker/issues/930.
+///   delimited-in-cell text is a long-standing convention for both. A
+///   `split_values` entry declares the delimiter, and the single-schema readers
+///   parse the cell into the array a `multiple: true` column holds (#930).
 /// - `edifact` / `x12` / `hl7` / `swift` — positional segment grammars.
 fn input_multi_value_support(format: &InputFormat) -> MultiValueInput {
     match format {
@@ -111,18 +112,30 @@ fn input_multi_value_support(format: &InputFormat) -> MultiValueInput {
     }
 }
 
-/// Whether a format's reader is handed the source's `split_to_rows` and
-/// `split_values` declarations at all.
+/// Whether a format's reader is handed the source's `split_to_rows`
+/// declarations. A declaration a reader never receives is a silent no-op — the
+/// same failure `E360` exists to stop for the retired `array_paths:` key — so
+/// each declaration kind carries its own capability. Only the JSON and XML
+/// readers fan a repeated field out to rows (over a file, and for both formats
+/// over a REST response body); the delimited-cell formats do not.
+fn format_reads_split_to_rows(format: &InputFormat) -> bool {
+    matches!(format, InputFormat::Json(_) | InputFormat::Xml(_))
+}
+
+/// Whether a format's reader is handed the source's `split_values` declarations.
 ///
-/// The third per-format capability table, and the one that keeps the other two
-/// honest: a declaration a reader never receives is a silent no-op, which is
-/// the same failure `E360` exists to stop for the retired `array_paths:` key.
-/// Only the JSON and XML readers are given these two blocks — over a file, and
-/// (for both formats) over a REST response body.
-fn format_reads_multi_value_declarations(format: &InputFormat) -> bool {
+/// JSON and XML always are. The delimited-cell formats (`csv`, `fixed_width`)
+/// are too — a `split_values` entry parses a cell into the array a
+/// `multiple: true` column holds — but only on their single-schema reader: the
+/// multi-record backend does not consume the block, so declaring it on a
+/// multi-record source of either format is a no-op the gate rejects. Segment
+/// grammars never carry the block.
+fn format_reads_split_values(format: &InputFormat, schema: &SourceSchema) -> bool {
     match format {
         InputFormat::Json(_) | InputFormat::Xml(_) => true,
-        InputFormat::Csv(_) | InputFormat::FixedWidth(_) => false,
+        InputFormat::Csv(_) | InputFormat::FixedWidth(_) => {
+            !matches!(schema, SourceSchema::MultiRecord { .. })
+        }
         InputFormat::Edifact(_)
         | InputFormat::X12(_)
         | InputFormat::Hl7(_)
@@ -169,43 +182,48 @@ fn validate_source_declarations(
     let in_cell = source.split_values.as_deref().unwrap_or(&[]);
 
     // A declaration the format's reader is never handed does nothing at all,
-    // and nothing downstream reports it: the run emits one record per input row
-    // where the author asked for one per occurrence. Reject the block itself
-    // rather than only its contents, so the no-op fails at compile the way the
-    // retired `array_paths:` key does under E360. Every check below inspects
-    // the contents of these same two blocks, so a source that must delete them
-    // returns here rather than also being told what is wrong inside them.
-    if !format_reads_multi_value_declarations(&source.format) {
-        let format = source.format.format_name();
-        for (key, declared, remedy) in [
-            (
-                "split_to_rows",
-                !fan_out.is_empty(),
-                "fanning a repeated field out to one record per occurrence is read by the `json` \
-                 and `xml` readers",
-            ),
-            (
-                "split_values",
-                !in_cell.is_empty(),
-                "parsing a delimited cell into several values is read by the `json` and `xml` \
-                 readers; support for the delimited-cell formats is tracked at \
-                 https://github.com/rustpunk/clinker/issues/930",
-            ),
-        ] {
-            if !declared {
-                continue;
-            }
-            faults.push(DeclarationFault {
-                message: format!(
-                    "source '{}': `{key}` is declared on a `{format}` source, whose reader is \
-                     never handed it — the declaration would be a silent no-op",
-                    source.name
-                ),
-                help: format!("remove the `{key}` block from this source: {remedy}"),
-            });
+    // and nothing downstream reports it. Reject the block itself rather than
+    // only its contents, so the no-op fails at compile the way the retired
+    // `array_paths:` key does under E360. Each declaration kind has its own
+    // per-format capability: the delimited-cell formats read `split_values` but
+    // not `split_to_rows`, so a source can legitimately carry one block and be
+    // told to delete the other.
+    let reads_fan_out = format_reads_split_to_rows(&source.format);
+    let reads_in_cell = format_reads_split_values(&source.format, schema);
+    let format = source.format.format_name();
+    for (key, unread, remedy) in [
+        (
+            "split_to_rows",
+            !reads_fan_out && !fan_out.is_empty(),
+            "fanning a repeated field out to one record per occurrence is read by the `json` \
+             and `xml` readers",
+        ),
+        (
+            "split_values",
+            !reads_in_cell && !in_cell.is_empty(),
+            "parsing a delimited cell into several values is read by the `json`, `xml`, and — on \
+             a single-schema source — `csv` and `fixed_width` readers",
+        ),
+    ] {
+        if !unread {
+            continue;
         }
-        return faults;
+        faults.push(DeclarationFault {
+            message: format!(
+                "source '{}': `{key}` is declared on a `{format}` source, whose reader is \
+                 never handed it — the declaration would be a silent no-op",
+                source.name
+            ),
+            help: format!("remove the `{key}` block from this source: {remedy}"),
+        });
     }
+
+    // The content checks below run only against declarations the reader
+    // actually consumes; a block rejected above as an unread no-op is treated as
+    // empty here, so the author is told to delete it rather than also what is
+    // wrong inside it.
+    let fan_out: &[clinker_format::SplitToRows] = if reads_fan_out { fan_out } else { &[] };
+    let in_cell: &[clinker_format::SplitValues] = if reads_in_cell { in_cell } else { &[] };
 
     // Whether the reader assigns each extracted field to at most one declared
     // group by document position. The XML reader does — it records one index
@@ -440,13 +458,16 @@ fn validate_source_declarations(
 /// A per-source check, not a reachability walk: the mismatch is between one
 /// source's schema and its own format, with no path through the DAG involved.
 ///
-/// A delimited-cell format is rejected together with the segment formats, and a
-/// `split_values` entry does not excuse it: no CSV or fixed-width reader is
-/// handed that block today (see [`format_reads_multi_value_declarations`]), so
-/// accepting the pair would bind the column as an array and then deliver the
-/// raw cell — the exact disagreement this gate exists to prevent. Only the
-/// remediation differs between the two verdicts. Reported per source, listing
-/// every column the format cannot supply, so one source yields one diagnostic.
+/// A delimited-cell format supplies the column only when a `split_values` entry
+/// names its input field: the single-schema CSV and fixed-width readers then
+/// parse the cell into the array the column holds (see
+/// [`format_reads_split_values`]). A `multiple: true` column no entry covers —
+/// or any such column on a multi-record source, whose backend never receives
+/// the block — is rejected together with the segment formats, since accepting
+/// it would bind the column as an array and then deliver the raw cell, the exact
+/// disagreement this gate exists to prevent. Only the remediation differs
+/// between the verdicts. Reported per source, listing every column the format
+/// cannot supply, so one source yields one diagnostic.
 fn validate_multi_value_input(
     source: &SourceConfig,
     schema: &SourceSchema,
@@ -456,7 +477,21 @@ fn validate_multi_value_input(
         return None;
     }
     let columns = schema.bound_columns()?;
-    let unsupplied: Vec<&Column> = columns.iter().filter(|c| c.is_multiple()).collect();
+    // A delimited-cell format supplies a `multiple: true` column when a
+    // `split_values` entry names its input field: the reader parses the cell
+    // into the array the column holds. That excuse applies only where the reader
+    // consumes the block (single-schema csv / fixed_width — json/xml are Native
+    // and never reach here); a column no entry covers stays unsupplied and
+    // still faults.
+    let reads_in_cell = format_reads_split_values(&source.format, schema);
+    let declared = source.split_values.as_deref().unwrap_or(&[]);
+    let unsupplied: Vec<&Column> = columns
+        .iter()
+        .filter(|c| {
+            c.is_multiple()
+                && !(reads_in_cell && declared.iter().any(|e| e.field == c.physical_name()))
+        })
+        .collect();
     if unsupplied.is_empty() {
         return None;
     }
@@ -472,13 +507,13 @@ fn validate_multi_value_input(
     let help = match support {
         MultiValueInput::Native => None,
         MultiValueInput::InCell => Some(format!(
-            "drop `multiple: true` from the column — the cell arrives as one string, and a \
-             transform can split it where the parts are needed (`{field}.split(\";\")`). \
-             Declaring the split at the source is a `split_values` entry, whose wiring into the \
-             {format} reader is not implemented yet and is tracked at \
-             https://github.com/rustpunk/clinker/issues/930; a `json` or `xml` source carries \
-             that declaration today",
-            field = unsupplied[0].name
+            "declare a `split_values` entry so the {format} reader parses the cell into the \
+             array the column holds (`split_values:` `- {{ field: {phys}, delimiter: \";\" }}`), \
+             naming the column's input field and the delimiter its text uses; or drop \
+             `multiple: true` and split the cell in a transform where the parts are needed \
+             (`{col}.split(\";\")`)",
+            phys = unsupplied[0].physical_name(),
+            col = unsupplied[0].name,
         )),
         // HL7 exposes the positional axes as its own declaration; the other
         // three segment formats do not, so promising one would dangle.

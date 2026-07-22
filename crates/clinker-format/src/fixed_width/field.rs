@@ -262,6 +262,46 @@ pub fn extract_value(field: &ResolvedField, line: &[u8], row: u64) -> Result<Val
     parse_field_value(field, &raw, row)
 }
 
+/// Extract a field a `split_values` entry covers as a `Value::Array` of typed
+/// elements: strip the field's padding, split the text on `delimiter`, and
+/// coerce each part to the declared type.
+///
+/// Unlike CSV — where cells stay `Value::String` and downstream coercion types
+/// them — the fixed-width read path is the sole coercion pass, so each element
+/// is typed here. An absent or blank field yields an empty array (zero values),
+/// mirroring the CSV reader; a field with no delimiter yields a one-element
+/// array. Each part is coerced independently, so an interior empty part fails
+/// the same way an empty scalar of that type would (`""` is a valid `string`,
+/// not a valid `int`).
+///
+/// # Errors
+///
+/// Returns [`FormatError::InvalidRecord`] at `row` when the field is truncated,
+/// not valid UTF-8, or any part fails to parse as the declared type.
+pub fn extract_split_value(
+    field: &ResolvedField,
+    line: &[u8],
+    row: u64,
+    delimiter: &str,
+) -> Result<Value, FormatError> {
+    let raw = field_text(field, line, row)?;
+    if raw.is_empty() {
+        return Ok(Value::Array(Vec::new()));
+    }
+    let parts = raw
+        .split(delimiter)
+        .map(|part| {
+            coerce_scalar(&field.ty, field.format.as_deref(), field.scale, part).map_err(
+                |message| FormatError::InvalidRecord {
+                    row,
+                    message: with_field(&field.name, &message),
+                },
+            )
+        })
+        .collect::<Result<Vec<Value>, _>>()?;
+    Ok(Value::Array(parts))
+}
+
 /// Borrow a field's raw (un-coerced) text from a record line, stripped of
 /// padding per the field's justification and `trim` policy.
 ///

@@ -74,6 +74,36 @@ Input columns the schema does not name are governed by the source's
 [`on_unmapped`](../formats/auto-widen.md) policy, the same as every other
 format.
 
+## Multi-value cells (`split_values`)
+
+A CSV cell holds one string, but that string may pack several values behind a
+delimiter (`1,a;b;c`). Declare the column `multiple: true` and add a
+`split_values` entry naming the field and its delimiter, and the reader parses
+the cell into an array:
+
+```yaml
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: ./orders.csv
+    split_values:
+      - { field: tags, delimiter: ";" }
+    schema:
+      - { name: order_id, type: string }
+      - { name: tags, type: string, multiple: true }
+```
+
+`tags` reads as `["a", "b", "c"]`. An empty cell is an empty array; a cell with
+no delimiter is a one-element array; each element is coerced to the column's
+declared `type:`. A quoted cell is unquoted first, so a delimiter inside the
+quotes is not a boundary. A `multiple: true` column with no covering
+`split_values` entry is rejected at compile ([E361](../../explain/E361.md)). The
+entry is read only on a single-schema source, not the multi-record reader below.
+See [`split_values`](../nodes/source.md#several-values-in-one-cell-split_values)
+in the Source reference for the full grammar.
+
 ## Writing CSV
 
 On output, the writer emits one row per record with cells in the
