@@ -96,7 +96,7 @@ enum MultiValueInput {
 /// - `csv` / `fixed_width` — one value per cell on the wire, but
 ///   delimited-in-cell text is a long-standing convention for both. Reading it
 ///   is a `split_values` entry, whose wiring into these two readers is tracked
-///   at https://github.com/rustpunk/clinker/issues/917.
+///   at https://github.com/rustpunk/clinker/issues/930.
 /// - `edifact` / `x12` / `hl7` / `swift` — positional segment grammars.
 fn input_multi_value_support(format: &InputFormat) -> MultiValueInput {
     match format {
@@ -189,7 +189,7 @@ fn validate_source_declarations(
                 !in_cell.is_empty(),
                 "parsing a delimited cell into several values is read by the `json` and `xml` \
                  readers; support for the delimited-cell formats is tracked at \
-                 https://github.com/rustpunk/clinker/issues/917",
+                 https://github.com/rustpunk/clinker/issues/930",
             ),
         ] {
             if !declared {
@@ -476,7 +476,7 @@ fn validate_multi_value_input(
              transform can split it where the parts are needed (`{field}.split(\";\")`). \
              Declaring the split at the source is a `split_values` entry, whose wiring into the \
              {format} reader is not implemented yet and is tracked at \
-             https://github.com/rustpunk/clinker/issues/917; a `json` or `xml` source carries \
+             https://github.com/rustpunk/clinker/issues/930; a `json` or `xml` source carries \
              that declaration today",
             field = unsupplied[0].name
         )),
