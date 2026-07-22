@@ -280,8 +280,8 @@ cannot carry fails before a run starts rather than mid-stream:
 |---|---|---|
 | `json` | native — an array | native — an array |
 | `xml` | native — repeated child elements | not yet ([issue 916](https://github.com/rustpunk/clinker/issues/916)) |
-| `csv` | not yet ([issue 917](https://github.com/rustpunk/clinker/issues/917)) | not yet ([issue 917](https://github.com/rustpunk/clinker/issues/917)) |
-| `fixed_width` | not yet ([issue 917](https://github.com/rustpunk/clinker/issues/917)) | not yet ([issue 918](https://github.com/rustpunk/clinker/issues/918)) |
+| `csv` | delimited cell via `split_values` | not yet ([issue 917](https://github.com/rustpunk/clinker/issues/917)) |
+| `fixed_width` | delimited cell via `split_values` | not yet ([issue 918](https://github.com/rustpunk/clinker/issues/918)) |
 | `edifact`, `x12`, `hl7`, `swift` | no — repetition is positional | no — repetition is positional |
 
 A `multiple: true` column reaching an output that cannot encode it is `E359`; one
@@ -290,15 +290,19 @@ on a source that cannot produce it is `E361`. `E359` covers an output's own
 repetition yet, so declaring it on a sink would be accepted and ignored. Run
 `clinker explain --code E361` for the full remediation of either.
 
-**`csv` and `fixed_width` are a pending no, not a permanent one.** Neither wire
-format repeats a field, but a cell's text may hold several values separated by a
-delimiter — the shape a `split_values` entry is meant to declare. No CSV or
-fixed-width reader is handed that entry yet
-([issue 917](https://github.com/rustpunk/clinker/issues/917)), so a
-`multiple: true` column on one of these formats would bind as an array and then
-receive the raw cell. `E361` rejects it until the reader can honor it. In the
-meantime, leave the column single-valued and split it where the parts are
-needed: `tags.split(";")` in a transform.
+**`csv` and `fixed_width` read a `multiple: true` column through a
+`split_values` entry.** Neither wire format repeats a field, but a cell's text
+may hold several values separated by a delimiter. Declare that delimiter with a
+[`split_values`](#several-values-in-one-cell-split_values) entry and the reader
+parses the cell into the array the column holds. A `multiple: true` column no
+entry covers is rejected by `E361` — the reader would have no delimiter and
+deliver the raw cell; either add the entry or leave the column single-valued and
+split it in a transform (`tags.split(";")`). The entry is read only on a
+single-schema source: a multi-record source of either format runs a backend that
+does not consume it. The **output** side is still pending
+([csv #917](https://github.com/rustpunk/clinker/issues/917),
+[fixed_width #918](https://github.com/rustpunk/clinker/issues/918)) — no writer
+encodes repetition yet.
 
 **The segment formats are a permanent no**, not a pending one. Repetition there
 is a positional coordinate rather than a list: a repeated composite is written
@@ -406,9 +410,11 @@ naming a column's exposed name when that column reads a differently-named input
 field — the split runs against the document's own field names, so name the
 `source_name`.
 
-The entry is read by the **JSON** and **XML** readers. Declaring it on any other
-format is rejected (`E358`) rather than silently ignored: those readers are
-never handed it, so the cell would arrive unsplit with nothing to say so.
+The entry is read by the **JSON** and **XML** readers, and — on a single-schema
+source — by the **CSV** and **fixed-width** readers. On a multi-record CSV or
+fixed-width source, or on any segment format, declaring it is rejected (`E358`)
+rather than silently ignored: those readers are never handed it, so the cell
+would arrive unsplit with nothing to say so.
 
 ### Migrating from `array_paths`
 
@@ -426,11 +432,13 @@ unset. Add `keep_empty: false` to the entry to migrate row-for-row.
 
 ### Format notes
 
-Both knobs are honored by the **JSON** and **XML** readers, over a file path and
-over a `rest` response body alike. Declaring either on a format whose reader is
-never handed it — `csv`, `fixed_width`, or any segment format — is rejected at
-compile (`E358`) rather than accepted and inert, and a `multiple: true` column on
-such a source is rejected by `E361`.
+`split_to_rows` is honored by the **JSON** and **XML** readers, over a file path
+and over a `rest` response body alike. `split_values` is honored by those two and
+also by the single-schema **CSV** and **fixed-width** readers. Declaring a knob on
+a reader that is never handed it — `split_to_rows` on any delimited-cell or
+segment format, `split_values` on a multi-record or segment source — is rejected
+at compile (`E358`) rather than accepted and inert, and a `multiple: true` column
+no `split_values` entry can cover is rejected by `E361`.
 
 Composition body files are gated by the same four checks as the pipeline that
 calls them.

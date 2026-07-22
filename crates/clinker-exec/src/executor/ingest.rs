@@ -60,7 +60,11 @@ fn build_format_reader(
                 open_one_shot(&source)?,
             ),
             _ => {
-                let config = build_csv_reader_config(opts.as_ref())?;
+                let mut config = build_csv_reader_config(opts.as_ref())?;
+                // `split_values` is applied only on the single-schema CSV
+                // reader. The multi-record backend does not consume it, and the
+                // plan-time gate rejects a multi-record source that declares it.
+                config.split_values = input.split_values.clone().unwrap_or_default();
                 Ok(Box::new(CsvReader::from_reader(
                     open_one_shot(&source)?,
                     config,
@@ -85,7 +89,11 @@ fn build_format_reader(
                 open_one_shot(&source)?,
             ),
             SourceSchema::Columns(cols) => {
-                let config = build_fw_reader_config(opts.as_ref());
+                let mut config = build_fw_reader_config(opts.as_ref());
+                // Single-layout fixed-width only; the multi-record backend does
+                // not consume `split_values` and the plan-time gate rejects a
+                // multi-record source that declares it.
+                config.split_values = input.split_values.clone().unwrap_or_default();
                 Ok(Box::new(FixedWidthReader::new(
                     open_one_shot(&source)?,
                     cols.clone(),

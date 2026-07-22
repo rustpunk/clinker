@@ -87,6 +87,28 @@ cannot grow a single record until end of input: memory stays bounded regardless
 of how long the physical line runs. A final line with no trailing newline reads
 normally as long as its declared fields fit within the width.
 
+## Multi-value cells (`split_values`)
+
+A fixed-width field holds one value, but its text may pack several behind a
+delimiter within the field's byte range. Declare the column `multiple: true`
+and add a `split_values` entry, and the reader splits the (padding-stripped)
+field text and coerces each part to the column's declared type:
+
+```yaml
+    split_values:
+      - { field: tags, delimiter: ";" }
+    schema:
+      - { name: order_id, type: string, start: 0, width: 4 }
+      - { name: tags, type: string, start: 4, width: 20, multiple: true }
+```
+
+Because the fixed-width reader is the sole coercion pass, each element is typed
+here — a `multiple: true` `int` field over `1;2;3` reads as `[1, 2, 3]`. A blank
+field is an empty array; a field with no delimiter is a one-element array. A
+`multiple: true` column with no covering `split_values` entry is rejected at
+compile ([E361](../../explain/E361.md)). The entry is read only on a
+single-schema source, not the multi-record reader below.
+
 ## Schema drift
 
 Fixed-width is **inert** with respect to

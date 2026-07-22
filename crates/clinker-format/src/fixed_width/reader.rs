@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use crate::bom::SkipBom;
 use crate::fixed_width::field::{self, ResolvedField};
+use crate::multi_value::SplitValues;
 use crate::schema::Column;
 use clinker_record::schema_def::LineSeparator;
 use clinker_record::{Record, Schema, SchemaBuilder};
@@ -32,12 +33,17 @@ use crate::traits::FormatReader;
 /// Configuration for the fixed-width reader.
 pub struct FixedWidthReaderConfig {
     pub line_separator: LineSeparator,
+    /// In-cell parse declarations: a field's text is split on its delimiter
+    /// into the several values a `multiple: true` column holds. Empty by
+    /// default; populated from the source's `split_values`.
+    pub split_values: Vec<SplitValues>,
 }
 
 impl Default for FixedWidthReaderConfig {
     fn default() -> Self {
         Self {
             line_separator: LineSeparator::Lf,
+            split_values: Vec::new(),
         }
     }
 }
@@ -51,6 +57,10 @@ pub struct FixedWidthReader<R: Read> {
     // otherwise shift every field of the first record.
     reader: BufReader<SkipBom<R>>,
     fields: Vec<ResolvedField>,
+    /// Per-field split delimiter, index-aligned to `fields`: `Some(delim)` for
+    /// a field a `split_values` entry covers, `None` otherwise. Built once at
+    /// construction so per-record extraction is a positional lookup.
+    split_delims: Vec<Option<String>>,
     schema: Arc<Schema>,
     config: FixedWidthReaderConfig,
     record_length: usize,
@@ -76,9 +86,29 @@ impl<R: Read> FixedWidthReader<R> {
             .build();
         let record_length = resolved.iter().map(ResolvedField::end).max().unwrap_or(0);
 
+        // Map each field to its split delimiter, if any. The entry's `field` is
+        // the document field name, which for fixed-width is the column name.
+        // E358 has already verified at plan time that every entry names a real
+        // `multiple: true` column; an unmatched entry is inert.
+        let split_delims: Vec<Option<String>> = if config.split_values.is_empty() {
+            Vec::new()
+        } else {
+            resolved
+                .iter()
+                .map(|f| {
+                    config
+                        .split_values
+                        .iter()
+                        .find(|e| e.field == f.name)
+                        .map(|e| e.delimiter.clone())
+                })
+                .collect()
+        };
+
         Ok(Self {
             reader: BufReader::new(SkipBom::new(reader)),
             fields: resolved,
+            split_delims,
             schema,
             config,
             record_length,
@@ -106,8 +136,14 @@ impl<R: Read + Send> FormatReader for FixedWidthReader<R> {
         self.row_number += 1;
 
         let mut values = Vec::with_capacity(self.fields.len());
-        for f in &self.fields {
-            values.push(field::extract_value(f, &self.line_buf, self.row_number)?);
+        for (i, f) in self.fields.iter().enumerate() {
+            let value = match self.split_delims.get(i).and_then(Option::as_deref) {
+                Some(delim) => {
+                    field::extract_split_value(f, &self.line_buf, self.row_number, delim)?
+                }
+                None => field::extract_value(f, &self.line_buf, self.row_number)?,
+            };
+            values.push(value);
         }
 
         Ok(Some(Record::new(Arc::clone(&self.schema), values)))
@@ -124,6 +160,104 @@ mod tests {
 
     fn field(name: &str) -> Column {
         Column::bare(name, Type::String)
+    }
+
+    fn split_config(field: &str, delimiter: &str) -> FixedWidthReaderConfig {
+        FixedWidthReaderConfig {
+            split_values: vec![SplitValues {
+                field: field.to_string(),
+                delimiter: delimiter.to_string(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A `tags` string field over a fixed byte range parses into a string array.
+    #[test]
+    fn split_values_parses_fixed_field_into_string_array() {
+        // "01" id (0..2 int), "a;b;c     " tags (2..12 string, space-padded)
+        let data = b"01a;b;c     \n";
+        let fields = vec![
+            {
+                let mut f = field("id");
+                f.ty = Type::Int;
+                f.start = Some(0);
+                f.width = Some(2);
+                f
+            },
+            {
+                let mut f = field("tags");
+                f.ty = Type::String;
+                f.start = Some(2);
+                f.width = Some(10);
+                f
+            },
+        ];
+        let mut reader =
+            FixedWidthReader::new(&data[..], fields, split_config("tags", ";")).unwrap();
+        let record = reader.next_record().unwrap().unwrap();
+        assert_eq!(record.get("id"), Some(&Value::Integer(1)));
+        assert_eq!(
+            record.get("tags"),
+            Some(&Value::Array(vec![
+                Value::String("a".into()),
+                Value::String("b".into()),
+                Value::String("c".into()),
+            ]))
+        );
+    }
+
+    /// Fixed-width types each element itself (it is the sole coercion pass), so
+    /// an `int` multiple field materializes as an array of integers.
+    #[test]
+    fn split_values_types_each_element_for_numeric_field() {
+        // "1;2;3     " codes (0..10 int, space-padded)
+        let data = b"1;2;3     \n";
+        let fields = vec![{
+            let mut f = field("codes");
+            f.ty = Type::Int;
+            f.start = Some(0);
+            f.width = Some(10);
+            f
+        }];
+        let mut reader =
+            FixedWidthReader::new(&data[..], fields, split_config("codes", ";")).unwrap();
+        let record = reader.next_record().unwrap().unwrap();
+        assert_eq!(
+            record.get("codes"),
+            Some(&Value::Array(vec![
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(3),
+            ]))
+        );
+    }
+
+    /// A blank field (all padding) yields an empty array, not one empty value.
+    #[test]
+    fn split_values_blank_fixed_field_yields_empty_array() {
+        // id "01", tags all spaces over 2..12
+        let data = b"01          \n";
+        let fields = vec![
+            {
+                let mut f = field("id");
+                f.ty = Type::Int;
+                f.start = Some(0);
+                f.width = Some(2);
+                f
+            },
+            {
+                let mut f = field("tags");
+                f.ty = Type::String;
+                f.start = Some(2);
+                f.width = Some(10);
+                f
+            },
+        ];
+        let mut reader =
+            FixedWidthReader::new(&data[..], fields, split_config("tags", ";")).unwrap();
+        let record = reader.next_record().unwrap().unwrap();
+        assert_eq!(record.get("tags"), Some(&Value::Array(Vec::new())));
     }
 
     #[test]
@@ -369,6 +503,7 @@ mod tests {
 
         let config = FixedWidthReaderConfig {
             line_separator: LineSeparator::CrLf,
+            ..Default::default()
         };
         let mut reader = FixedWidthReader::new(&data[..], fields, config).unwrap();
 
@@ -407,6 +542,7 @@ mod tests {
 
         let config = FixedWidthReaderConfig {
             line_separator: LineSeparator::None,
+            ..Default::default()
         };
         let mut reader = FixedWidthReader::new(&data[..], fields, config).unwrap();
 

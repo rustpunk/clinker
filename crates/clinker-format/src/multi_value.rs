@@ -14,6 +14,7 @@
 //! every mistake into one message naming neither the offending key nor the
 //! accepted forms.
 
+use clinker_record::Value;
 use serde::de::{self};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -116,6 +117,39 @@ impl SplitValues {
 pub fn under_field_path(key: &str, path: &str) -> bool {
     key.strip_prefix(path)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+/// Parse a delimited cell into the several values a `multiple:` column holds.
+///
+/// A scalar becomes an array of its delimiter-separated parts; an array (a
+/// field that both repeats and carries delimited text) splits each element and
+/// flattens the result, so the two declarations compose instead of fighting.
+/// Empty parts are preserved — an author who declared the delimiter is the
+/// authority on what sits between two of them. A fully empty cell is the
+/// reader's own decision (a CSV blank means zero values, an XML empty element
+/// means one), so callers special-case it before reaching here.
+///
+/// Format-agnostic over [`clinker_record::Value`]: the XML, CSV, and
+/// fixed-width readers all share this one implementation.
+pub(crate) fn split_text_value(value: &Value, delimiter: &str) -> Value {
+    fn parts(text: &str, delimiter: &str) -> Vec<Value> {
+        text.split(delimiter)
+            .map(|p| Value::String(p.into()))
+            .collect()
+    }
+    match value {
+        Value::String(s) => Value::Array(parts(s.as_str(), delimiter)),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .flat_map(|item| match item {
+                    Value::String(s) => parts(s.as_str(), delimiter),
+                    other => vec![other.clone()],
+                })
+                .collect(),
+        ),
+        other => Value::Array(vec![other.clone()]),
+    }
 }
 
 /// `keep_empty`'s default. Named rather than inlined so the inverted-industry

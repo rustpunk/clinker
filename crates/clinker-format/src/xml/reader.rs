@@ -43,7 +43,7 @@ use crate::bom::UTF8_BOM;
 use crate::doc_index::DocArenaIndex;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
 use crate::error::FormatError;
-use crate::multi_value::{SplitToRows, SplitToRowsMode, SplitValues};
+use crate::multi_value::{SplitToRows, SplitToRowsMode, SplitValues, split_text_value};
 use crate::source::{ReopenableSource, SourceIdentity};
 use crate::traits::FormatReader;
 use crate::xml::streaming::{SectionTarget, extract_sections};
@@ -922,34 +922,6 @@ pub(crate) fn finalize_text_run(raw: &str) -> Result<String, FormatError> {
     let trimmed = raw.trim_matches(is_xml_whitespace);
     let value = escape::unescape(trimmed).map_err(|e| FormatError::Xml(e.to_string()))?;
     Ok(value.into_owned())
-}
-
-/// Parse a delimited cell into the several values a `multiple:` column holds.
-///
-/// A scalar becomes an array of its delimiter-separated parts; an array (a
-/// field that both repeats and carries delimited text) splits each element and
-/// flattens the result, so the two declarations compose instead of fighting.
-/// Empty parts are preserved — an author who declared the delimiter is the
-/// authority on what sits between two of them.
-pub(crate) fn split_text_value(value: &Value, delimiter: &str) -> Value {
-    fn parts(text: &str, delimiter: &str) -> Vec<Value> {
-        text.split(delimiter)
-            .map(|p| Value::String(p.into()))
-            .collect()
-    }
-    match value {
-        Value::String(s) => Value::Array(parts(s.as_str(), delimiter)),
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .flat_map(|item| match item {
-                    Value::String(s) => parts(s.as_str(), delimiter),
-                    other => vec![other.clone()],
-                })
-                .collect(),
-        ),
-        other => Value::Array(vec![other.clone()]),
-    }
 }
 
 /// The name an occurrence's field carries on the output record.
