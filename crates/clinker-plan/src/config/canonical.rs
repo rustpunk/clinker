@@ -329,6 +329,15 @@ fn region_has_interior_noise(region: &str) -> bool {
 /// silently drops it, and a literal `#` inside a quoted value (e.g. a delimiter
 /// spelled `" #"`) is *not* mistaken for a comment, so a sequence carrying one
 /// still expands.
+///
+/// A line that ends still "inside" a quote had an unbalanced quote — a bare `'`
+/// or `"` in a plain scalar (`it's`, `5" nail`) rather than a real quoted
+/// region. The scanner cannot then trust its position, so it conservatively
+/// counts the line as noise: the sequence is passed through unexpanded (valid
+/// YAML, re-parses identically) rather than regenerated, which could drop a
+/// genuine trailing comment the runaway quote skipped over. The only cost is
+/// that a quote-bearing bare item with no comment stops expanding — the safe
+/// direction for a canonicalizer whose first duty is to never lose a comment.
 fn line_has_comment(line: &str) -> bool {
     let bytes = line.as_bytes();
     let mut in_single = false;
@@ -376,7 +385,10 @@ fn line_has_comment(line: &str) -> bool {
         }
         i += 1;
     }
-    false
+    // An unbalanced quote (a bare `'`/`"` in a plain scalar) leaves the scanner
+    // "inside" a quote at end of line, having skipped past any real comment.
+    // Bail conservatively: treat the line as noise so the comment is preserved.
+    in_single || in_double
 }
 
 /// End (exclusive) of the flow sequence that opens at `raw[start] == '['`.
@@ -1154,6 +1166,44 @@ nodes:
         assert!(out.contains("field: tags"), "block should expand:\n{out}");
         assert!(out.contains("field: notes"), "\n{out}");
         // `assert_parse_identity` guarantees the quoted `#` delimiter survived.
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn bare_apostrophe_item_with_comment_is_preserved() {
+        // A plain scalar containing a bare apostrophe (`it's`) has an odd quote
+        // count. The comment scanner must not run away into quote-mode past the
+        // trailing comment and let the block be regenerated (which would drop
+        // the comment) — the sequence is passed through byte-identical instead.
+        let raw = "nodes:\n  - type: source\n    name: s\n    config:\n      name: s\n      \
+                   type: csv\n      path: in.csv\n      split_values:\n        \
+                   - it's  # KEEP THIS COMMENT\n      schema:\n        \
+                   - { name: order_id, type: string }\n";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert_eq!(
+            raw, out,
+            "an apostrophe-bearing bare item with a comment must be left untouched:\n{out}"
+        );
+        assert!(out.contains("# KEEP THIS COMMENT"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn bare_double_quote_item_with_comment_is_preserved() {
+        // The double-quote variant of the odd-quote case (`5" nail`, inches):
+        // same conservative bail keeps the trailing comment.
+        let raw = "nodes:\n  - type: source\n    name: s\n    config:\n      name: s\n      \
+                   type: csv\n      path: in.csv\n      split_values:\n        \
+                   - 5\" nail  # KEEP THIS COMMENT\n      schema:\n        \
+                   - { name: order_id, type: string }\n";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert_eq!(
+            raw, out,
+            "an inch-quote-bearing bare item with a comment must be left untouched:\n{out}"
+        );
+        assert!(out.contains("# KEEP THIS COMMENT"), "\n{out}");
         assert_parse_identity(raw, &out);
         assert_idempotent(raw);
     }
