@@ -494,27 +494,26 @@ fn write_joined_cell(
     }
 
     let mut elem = String::new();
+    // `encode_json` returned above, so only `escape` and `error` reach the join
+    // loop. `escape` rewrites each value into `escaped`; `error` uses the value
+    // verbatim after checking for a delimiter collision.
+    let escaping = on_conflict == OnConflict::Escape;
     let mut escaped = String::new();
     for (i, item) in items.iter().enumerate() {
         elem.clear();
         write_scalar_cell(&mut elem, col, item)?;
-        let piece: &str = match on_conflict {
-            OnConflict::Error => {
-                if elem.contains(delimiter) {
-                    return Err(FormatError::MultiValueDelimiterCollision {
-                        format: "CSV",
-                        column: col.to_string(),
-                        value: elem,
-                    });
-                }
-                elem.as_str()
-            }
-            OnConflict::Escape => {
-                escaped.clear();
-                escape_into(&elem, delimiter, escape, &mut escaped);
-                escaped.as_str()
-            }
-            OnConflict::EncodeJson => unreachable!("encode_json is handled before the loop"),
+        let piece: &str = if escaping {
+            escaped.clear();
+            escape_into(&elem, delimiter, escape, &mut escaped);
+            escaped.as_str()
+        } else if elem.contains(delimiter) {
+            return Err(FormatError::MultiValueDelimiterCollision {
+                format: "CSV",
+                column: col.to_string(),
+                value: elem,
+            });
+        } else {
+            elem.as_str()
         };
         if i > 0 {
             buf.push_str(delimiter);
