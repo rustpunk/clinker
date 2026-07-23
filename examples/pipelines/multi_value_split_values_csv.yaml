@@ -13,10 +13,10 @@ pipeline:
 # column with no covering `split_values` entry is rejected at compile
 # (`clinker explain --code E361`).
 #
-# The sink is JSON because that is the one output format that can encode a
-# multi-value field today (`clinker explain --code E359`). The reverse
-# direction — joining an array back into a delimited CSV cell — is tracked
-# separately (issue 917).
+# The sink is JSON, one of the output formats that can encode a multi-value
+# field (`clinker explain --code E359`). The reverse direction — joining an
+# array back into a delimited CSV cell — is shown in
+# `multi_value_join_values_csv.yaml`.
 
 nodes:
   - type: source

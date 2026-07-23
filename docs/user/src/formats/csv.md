@@ -115,6 +115,63 @@ field the output schema does not name is not written. See
 [Output Nodes](../nodes/output.md) for header control, field mapping,
 and null handling.
 
+### Writing multi-value cells (`join_values`)
+
+A `multiple:` field is joined into one delimited cell on write — the write-side
+inverse of [`split_values`](#multi-value-cells-split_values). The default needs
+no configuration: values join with `;`, and a value that itself contains the
+delimiter is a hard error rather than a cell that would split back wrongly.
+
+```yaml
+- type: output
+  name: report
+  input: orders
+  config:
+    name: report
+    type: csv
+    path: ./out/report.csv
+    join_values:
+      - tags                              # delimiter ";", on_conflict: error
+      - { field: notes, delimiter: "|", on_conflict: escape, escape: "\\" }
+```
+
+A field with no `join_values` entry still joins, with the defaults. An entry
+overrides, per field:
+
+- **`delimiter`** — the separator written between values (default `;`).
+- **`on_conflict`** — what to do when a value contains the delimiter:
+  - `error` (default) — dead-letter the record, naming the field and the
+    offending value, rather than emit a cell that splits back wrongly. This is
+    what makes a defaulted delimiter safe.
+    Under `error_handling.strategy: continue`, the offending record goes to the
+    [dead-letter queue](../pipelines/error-handling.md) (category
+    `multi_value_join_collision`) and the run continues; under `fail_fast` it
+    aborts.
+  - `escape` — prefix each delimiter (and each escape character) inside a value
+    with `escape` (default `\`), so a matching `split_values` `escape:` recovers
+    the original. Lossless. `delimiter` and `escape` must each be a single
+    character.
+  - `encode_json` — encode the whole field as an embedded JSON array, recovered
+    by a matching `split_values` `json: true`. Lossless for any value, including
+    ones carrying the delimiter, quotes, or newlines.
+
+An empty field emits an empty cell; a single value emits that value with no
+delimiter. The joined cell is quoted by the normal CSV rules when it contains the
+field delimiter, a quote, or a newline. Declaring `join_values` on a non-CSV
+output is rejected at compile ([E362](../../explain/E362.md)).
+
+**Round trip.** `on_conflict: escape` and `encode_json` are recovered exactly by
+a matching source `split_values` entry:
+
+```yaml
+# write side
+join_values:
+  - { field: tags, on_conflict: escape, escape: "\\" }
+# read side (a later pipeline)
+split_values:
+  - { field: tags, escape: "\\" }
+```
+
 ### Header widening under auto-widen
 
 When [`auto_widen`](auto-widen.md) is in effect and the Output leaves

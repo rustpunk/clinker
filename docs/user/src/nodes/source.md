@@ -280,15 +280,16 @@ cannot carry fails before a run starts rather than mid-stream:
 |---|---|---|
 | `json` | native — an array | native — an array |
 | `xml` | native — repeated child elements | not yet ([issue 916](https://github.com/rustpunk/clinker/issues/916)) |
-| `csv` | delimited cell via `split_values` | not yet ([issue 917](https://github.com/rustpunk/clinker/issues/917)) |
+| `csv` | delimited cell via `split_values` | delimited cell via `join_values` |
 | `fixed_width` | delimited cell via `split_values` | not yet ([issue 918](https://github.com/rustpunk/clinker/issues/918)) |
 | `edifact`, `x12`, `hl7`, `swift` | no — repetition is positional | no — repetition is positional |
 
 A `multiple: true` column reaching an output that cannot encode it is `E359`; one
 on a source that cannot produce it is `E361`. `E359` covers an output's own
-`schema:` block too — the attribute is direction-neutral, but no writer encodes
-repetition yet, so declaring it on a sink would be accepted and ignored. Run
-`clinker explain --code E361` for the full remediation of either.
+`schema:` block too — the attribute is direction-neutral, but the remaining
+writers do not encode repetition yet, so declaring it on such a sink would be
+accepted and ignored. Run `clinker explain --code E361` for the full remediation
+of either.
 
 **`csv` and `fixed_width` read a `multiple: true` column through a
 `split_values` entry.** Neither wire format repeats a field, but a cell's text
@@ -299,10 +300,14 @@ entry covers is rejected by `E361` — the reader would have no delimiter and
 deliver the raw cell; either add the entry or leave the column single-valued and
 split it in a transform (`tags.split(";")`). The entry is read only on a
 single-schema source: a multi-record source of either format runs a backend that
-does not consume it. The **output** side is still pending
-([csv #917](https://github.com/rustpunk/clinker/issues/917),
-[fixed_width #918](https://github.com/rustpunk/clinker/issues/918)) — no writer
-encodes repetition yet.
+does not consume it. On the **output** side, a CSV sink joins a `multiple:` field
+into one delimited cell with [`join_values`](../formats/csv.md#writing-multi-value-cells-join_values)
+(defaulting to `;` / `on_conflict: error`); `fixed_width` output is still pending
+([#918](https://github.com/rustpunk/clinker/issues/918)).
+
+A `split_values` entry also recovers a CSV cell a sink wrote under `join_values`
+`on_conflict: escape` or `encode_json`: add `escape: "\\"` to un-escape an escaped
+delimiter, or `json: true` to read the whole cell as an embedded JSON array.
 
 **The segment formats are a permanent no**, not a pending one. Repetition there
 is a positional coordinate rather than a list: a repeated composite is written
