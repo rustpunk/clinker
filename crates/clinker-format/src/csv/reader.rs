@@ -211,31 +211,28 @@ fn decode_record(
                 // A `multiple:` column must hold an array; a non-array JSON cell
                 // (a bare scalar or object) would bind a scalar/map at an array
                 // column, so reject it loudly rather than deliver the wrong shape.
-                let serde_json::Value::Array(items) = &parsed else {
+                if !parsed.is_array() {
                     return Err(FormatError::Json(format!(
                         "split_values `json: true` on field '{}': cell is JSON but not an array \
                          (a `multiple:` column holds an array)",
                         entry.field
                     )));
-                };
+                }
                 // `json_to_value` binds a JSON integer via `as_i64()` and falls
                 // back to `as_f64()`, so an integer that fits `u64` but not `i64`
                 // — which serde preserved exactly — would be silently coerced to a
-                // lossy float. Reject it loudly instead. (A value clinker itself
-                // wrote via `encode_json` is always an `i64`, so this only guards
-                // an externally-authored cell; an integer beyond `u64` is already
-                // a float at parse time, a serde_json limitation.)
-                for item in items {
-                    if let serde_json::Value::Number(n) = item
-                        && n.is_u64()
-                        && !n.is_i64()
-                    {
-                        return Err(FormatError::Json(format!(
-                            "split_values `json: true` on field '{}': integer {n} exceeds the \
-                             supported range and would lose precision as a float",
-                            entry.field
-                        )));
-                    }
+                // lossy float. Reject it loudly instead, scanning the whole value
+                // because `json_to_value` recurses (and `encode_json` round-trips
+                // nested structure). (A value clinker itself wrote via
+                // `encode_json` is always an `i64`, so this only guards an
+                // externally-authored cell; an integer beyond `u64` is already a
+                // float at parse time, a serde_json limitation.)
+                if let Some(n) = first_lossy_integer(&parsed) {
+                    return Err(FormatError::Json(format!(
+                        "split_values `json: true` on field '{}': integer {n} exceeds the \
+                         supported range and would lose precision as a float",
+                        entry.field
+                    )));
                 }
                 return Ok(crate::json::reader::json_to_value(&parsed));
             }
@@ -246,6 +243,19 @@ fn decode_record(
             ))
         })
         .collect()
+}
+
+/// The first JSON integer anywhere in `v` that fits `u64` but not `i64` — the
+/// value `json_to_value` would silently coerce to a lossy float. Recurses into
+/// arrays and objects so a nested integer is caught the same as a top-level one.
+/// `None` when every number is representable exactly (or already a float).
+fn first_lossy_integer(v: &serde_json::Value) -> Option<u64> {
+    match v {
+        serde_json::Value::Number(n) if n.is_u64() && !n.is_i64() => n.as_u64(),
+        serde_json::Value::Array(items) => items.iter().find_map(first_lossy_integer),
+        serde_json::Value::Object(map) => map.values().find_map(first_lossy_integer),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -522,6 +532,29 @@ mod tests {
         assert!(
             matches!(&err, FormatError::Json(m) if m.contains("exceeds the supported range")),
             "expected an out-of-range integer error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn split_values_json_nested_integer_out_of_range_errors() {
+        // A u64-range integer nested inside an element is caught too (the guard
+        // recurses, matching json_to_value).
+        let csv = "order_id,ids\n1,[[12345678901234567890]]";
+        let config = CsvReaderConfig {
+            split_values: vec![SplitValues {
+                field: "ids".into(),
+                delimiter: ";".into(),
+                escape: String::new(),
+                json: true,
+            }],
+            ..Default::default()
+        };
+        let mut reader = CsvReader::from_reader(csv.as_bytes(), config);
+        reader.schema().unwrap();
+        let err = reader.next_record().unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Json(m) if m.contains("exceeds the supported range")),
+            "nested out-of-range integer must be rejected, got {err:?}"
         );
     }
 

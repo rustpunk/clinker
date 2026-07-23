@@ -222,8 +222,10 @@ pub fn under_field_path(key: &str, path: &str) -> bool {
 /// reader's own decision (a CSV blank means zero values, an XML empty element
 /// means one), so callers special-case it before reaching here.
 ///
-/// Format-agnostic over [`clinker_record::Value`]: the XML, CSV, and
-/// fixed-width readers all share this one implementation.
+/// Format-agnostic over [`clinker_record::Value`]. The XML reader calls this
+/// plain form; the CSV reader calls [`split_text_value_escaped`] directly (it
+/// also supports the `escape` recovery mode), and the fixed-width reader has its
+/// own per-element coercion in `field::extract_split_value`.
 pub(crate) fn split_text_value(value: &Value, delimiter: &str) -> Value {
     split_text_value_escaped(value, delimiter, "")
 }

@@ -402,8 +402,11 @@ fn validate_source_declarations(
             });
         }
         // `json: true` reads the whole cell as an embedded JSON array and ignores
-        // the delimiter, so a co-declared `escape` would never apply.
-        if a.json && !a.escape.is_empty() {
+        // the delimiter, so a co-declared `escape` would never apply. Gated on
+        // `csv_source` for the same reason as the escape shape checks below: a
+        // non-CSV source already got the "only the CSV reader honors escape/json"
+        // fault, so this would be a redundant second diagnostic there.
+        if csv_source && a.json && !a.escape.is_empty() {
             faults.push(DeclarationFault {
                 message: format!(
                     "source '{}': `split_values` on field '{}' sets both `json: true` and \
