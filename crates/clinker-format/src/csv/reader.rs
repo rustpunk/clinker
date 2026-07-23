@@ -211,12 +211,31 @@ fn decode_record(
                 // A `multiple:` column must hold an array; a non-array JSON cell
                 // (a bare scalar or object) would bind a scalar/map at an array
                 // column, so reject it loudly rather than deliver the wrong shape.
-                if !parsed.is_array() {
+                let serde_json::Value::Array(items) = &parsed else {
                     return Err(FormatError::Json(format!(
                         "split_values `json: true` on field '{}': cell is JSON but not an array \
                          (a `multiple:` column holds an array)",
                         entry.field
                     )));
+                };
+                // `json_to_value` binds a JSON integer via `as_i64()` and falls
+                // back to `as_f64()`, so an integer that fits `u64` but not `i64`
+                // — which serde preserved exactly — would be silently coerced to a
+                // lossy float. Reject it loudly instead. (A value clinker itself
+                // wrote via `encode_json` is always an `i64`, so this only guards
+                // an externally-authored cell; an integer beyond `u64` is already
+                // a float at parse time, a serde_json limitation.)
+                for item in items {
+                    if let serde_json::Value::Number(n) = item
+                        && n.is_u64()
+                        && !n.is_i64()
+                    {
+                        return Err(FormatError::Json(format!(
+                            "split_values `json: true` on field '{}': integer {n} exceeds the \
+                             supported range and would lose precision as a float",
+                            entry.field
+                        )));
+                    }
                 }
                 return Ok(crate::json::reader::json_to_value(&parsed));
             }
@@ -480,6 +499,55 @@ mod tests {
         assert!(
             matches!(&err, FormatError::Json(m) if m.contains("not an array")),
             "expected a not-an-array error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn split_values_json_integer_out_of_i64_range_errors() {
+        // An integer that fits u64 but not i64 would be silently coerced to a
+        // lossy float by json_to_value; the CSV json decode rejects it loudly.
+        let csv = "order_id,ids\n1,[12345678901234567890]";
+        let config = CsvReaderConfig {
+            split_values: vec![SplitValues {
+                field: "ids".into(),
+                delimiter: ";".into(),
+                escape: String::new(),
+                json: true,
+            }],
+            ..Default::default()
+        };
+        let mut reader = CsvReader::from_reader(csv.as_bytes(), config);
+        reader.schema().unwrap();
+        let err = reader.next_record().unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Json(m) if m.contains("exceeds the supported range")),
+            "expected an out-of-range integer error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn split_values_json_in_range_integers_decode() {
+        // An i64-range integer array decodes exactly (no spurious rejection).
+        let csv = "order_id,ids\n1,\"[1,2,9007199254740993]\"";
+        let config = CsvReaderConfig {
+            split_values: vec![SplitValues {
+                field: "ids".into(),
+                delimiter: ";".into(),
+                escape: String::new(),
+                json: true,
+            }],
+            ..Default::default()
+        };
+        let mut reader = CsvReader::from_reader(csv.as_bytes(), config);
+        reader.schema().unwrap();
+        let record = reader.next_record().unwrap().unwrap();
+        assert_eq!(
+            record.get("ids"),
+            Some(&Value::Array(vec![
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(9007199254740993),
+            ]))
         );
     }
 

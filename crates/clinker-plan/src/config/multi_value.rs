@@ -418,7 +418,11 @@ fn validate_source_declarations(
         // The escape-aware split un-escapes character by character (the read-side
         // inverse of the sink's `on_conflict: escape`), so under `escape` the
         // delimiter and escape must each be a single character and must differ.
-        if !a.escape.is_empty() && !a.json {
+        // Gated on `csv_source`: a non-CSV source already got the "only the CSV
+        // reader honors escape/json" fault above, so running the shape checks
+        // there too would emit a redundant second diagnostic for a declaration
+        // that is already rejected and whose escape the reader ignores anyway.
+        if csv_source && !a.escape.is_empty() && !a.json {
             if a.delimiter.chars().count() != 1 {
                 faults.push(DeclarationFault {
                     message: format!(

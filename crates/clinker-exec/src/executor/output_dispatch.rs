@@ -379,6 +379,15 @@ pub(crate) fn dispatch_output(
     } else {
         None
     };
+    // Whether this Output actually has a writer to emit through. When it does
+    // not — a dry-run, or an Output whose writer a sibling already took — no
+    // record is written, but the counters still bump per record so a dry-run
+    // reports what WOULD be written and flag-on (no-op envelope hooks) stays
+    // count-identical to flag-off (the invariant the envelope arm documents).
+    // With a writer present, only the records actually written are counted, so a
+    // `join_values` collision that dead-letters a record does not also count it
+    // as written.
+    let had_writer = fan_out_writers.is_some() || single_writer.is_some();
     let strategy = ctx.strategy;
     // Collected inside the writer helpers (which hold only partial `ctx`
     // borrows) and applied below once `ctx` is free again: `dlq_pending` drains
@@ -405,23 +414,33 @@ pub(crate) fn dispatch_output(
             emit_single_writer(&mut fan_ctx, raw_writer, &unbuffered, scan_timer);
         }
     }
-    // Count ok / written / emitted from the records actually written — one entry
-    // in `written_rows` per successful `write_record`. Insert each into the
-    // run-shared `ok_source_rows` on success only (never remove), matching the
-    // streaming arm: a record a collision dead-letters is never in `written_rows`,
-    // yet a written sibling that merely shares its source row_num (a
-    // `combine match: all` fan-out) still counts, and a source row written OK at
-    // one Output and dead-lettered at another counts as ok exactly once
-    // regardless of Output order.
+    // With a writer present, count ok / written / emitted from the records
+    // actually written — one entry in `written_rows` per successful
+    // `write_record`. Insert each into the run-shared `ok_source_rows` on success
+    // only (never remove), matching the streaming arm: a record a collision
+    // dead-letters is never in `written_rows`, yet a written sibling that merely
+    // shares its source row_num (a `combine match: all` fan-out) still counts,
+    // and a source row written OK at one Output and dead-lettered at another
+    // counts as ok exactly once regardless of Output order. Without a writer, no
+    // record was written, so `written_rows` is empty; fall back to the per-record
+    // bump over `unbuffered` to preserve the dry-run / flag-parity count.
+    let counted: &[(Record, u64)] = if had_writer { &[] } else { &unbuffered };
     let mut newly_ok: u64 = 0;
+    let mut written_total: u64 = written_rows.len() as u64;
     for row_num in &written_rows {
         if ctx.ok_source_rows.insert(*row_num) {
             newly_ok += 1;
         }
     }
+    for (_, row_num) in counted {
+        written_total += 1;
+        if ctx.ok_source_rows.insert(*row_num) {
+            newly_ok += 1;
+        }
+    }
     ctx.counters.ok_count += newly_ok;
-    ctx.counters.records_written += written_rows.len() as u64;
-    ctx.records_emitted += written_rows.len() as u64;
+    ctx.counters.records_written += written_total;
+    ctx.records_emitted += written_total;
 
     // Drain the collected collision entries; `push_dlq` enforces the DLQ rate
     // ceiling (E315/E316), which can still abort the run.
@@ -658,12 +677,14 @@ fn dispatch_output_envelope(
                 Some(build_format_writer(&out_cfg, raw_writer, schema))
             });
         }
-        // Count exactly as the records-only arm does: both counters bump
-        // unconditionally per record, independent of whether a writer is open
-        // or even registered. That keeps flag-on (with no-op hooks) invariant
-        // against flag-off — same input yields the same `records_written` /
-        // `ok_count` even on the no-writer / dry-run path where no byte is
-        // emitted.
+        // Count unconditionally per record, independent of whether a writer is
+        // open or even registered, so flag-on (with no-op hooks) stays invariant
+        // against flag-off on the no-writer / dry-run path where no byte is
+        // emitted — the records-only arm makes the same unconditional bump there.
+        // The two arms diverge only on a `join_values` collision: the records-only
+        // arm dead-letters that record and excludes it from the write count, while
+        // this envelope arm keeps a collision fatal (documented above), so a
+        // successfully-written stream counts identically on both.
         ctx.counters.records_written += 1;
         ctx.records_emitted += 1;
         if ctx.ok_source_rows.insert(row_num) {

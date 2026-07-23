@@ -1448,3 +1448,29 @@ nodes:
 "#;
     compile_ok(yaml);
 }
+
+#[test]
+fn split_values_escape_on_non_csv_source_emits_single_fault() {
+    // A non-CSV source that also sets a malformed multi-char escape must get
+    // ONE fault (escape not honored), not also the CSV-only shape-check faults.
+    let yaml = split_modes_pipeline(
+        "json",
+        r#"      split_values:
+        - { field: tags, delimiter: ";", escape: "!!" }"#,
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    let escape_faults: Vec<_> = found
+        .iter()
+        .filter(|f| f.0.contains("escape") || f.0.contains("only the CSV reader honors"))
+        .collect();
+    assert_eq!(
+        escape_faults.len(),
+        1,
+        "exactly one escape-related E358 for a non-CSV source: {found:?}"
+    );
+    assert!(
+        escape_faults[0].0.contains("only the CSV reader honors"),
+        "the single fault is the CSV-only one: {}",
+        escape_faults[0].0
+    );
+}
