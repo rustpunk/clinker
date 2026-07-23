@@ -425,7 +425,10 @@ fn validate_source_declarations(
         // reader honors escape/json" fault above, so running the shape checks
         // there too would emit a redundant second diagnostic for a declaration
         // that is already rejected and whose escape the reader ignores anyway.
-        if csv_source && !a.escape.is_empty() && !a.json {
+        // Also skipped when the delimiter is empty: that already produced its own
+        // fault, and the single-character check below would otherwise contradict
+        // it by calling an empty delimiter "multi-character".
+        if csv_source && !a.escape.is_empty() && !a.json && !a.delimiter.is_empty() {
             if a.delimiter.chars().count() != 1 {
                 faults.push(DeclarationFault {
                     message: format!(

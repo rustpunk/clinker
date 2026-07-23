@@ -1474,3 +1474,43 @@ fn split_values_escape_on_non_csv_source_emits_single_fault() {
         escape_faults[0].0
     );
 }
+
+#[test]
+fn split_values_empty_delimiter_with_escape_emits_one_fault() {
+    // An empty delimiter + escape must not also produce a self-contradictory
+    // "multi-character delimiter ''" fault — just the empty-delimiter one.
+    let yaml = r#"
+pipeline:
+  name: split_empty_delim_escape
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: ./in.csv
+      split_values:
+        - { field: tags, delimiter: "", escape: "\\" }
+      schema:
+        - { name: tags, type: string, multiple: true }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: json
+      path: out.json
+"#;
+    let found = coded(&compile_err(yaml), "E358");
+    assert_eq!(
+        found.len(),
+        1,
+        "exactly one E358 for empty delimiter: {found:?}"
+    );
+    assert!(found[0].0.contains("empty delimiter"), "{}", found[0].0);
+    assert!(
+        !found[0].0.contains("multi-character"),
+        "no contradictory multi-character label: {}",
+        found[0].0
+    );
+}
