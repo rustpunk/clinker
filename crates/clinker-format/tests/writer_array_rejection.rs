@@ -1,13 +1,13 @@
-//! Crate-boundary handling of `Value::Array` payloads in the non-JSON writers.
+//! Crate-boundary handling of `Value::Array` payloads across the writers.
 //!
-//! The XML and fixed-width writers still reject a stray array — most often a
+//! The fixed-width writer still rejects a stray array — most often a
 //! `match: collect` combine output misrouted to a positional format — as an
 //! explicit `FormatError::UnserializableArrayValue` naming the offending column,
 //! listing the two remedies (coerce to a scalar in CXL, or route to JSON). The
-//! CSV writer instead JOINS an array into one delimited cell (#917): with
-//! multi-value CSV output a supported shape, an array is expected there, so it
-//! is encoded rather than rejected. JSON output serializes arrays natively.
-//! See #46, #917.
+//! CSV writer JOINS an array into one delimited cell (#917), and the XML writer
+//! emits it as repeated child elements (#916): with multi-value output a
+//! supported shape for both, an array is expected there, so it is encoded rather
+//! than rejected. JSON output serializes arrays natively. See #46, #917, #916.
 
 use std::sync::Arc;
 
@@ -65,24 +65,25 @@ fn csv_writer_joins_array_into_delimited_cell() {
     assert_eq!(out, "id,tags\n7,a;b\n");
 }
 
+/// The XML writer now emits an array as repeated child elements (#916) rather
+/// than rejecting it: with `multiple:` XML output supported, a repeated element
+/// is the expected shape. The default (no `join_values` config) names each
+/// element after the field.
 #[test]
-fn xml_writer_rejects_array_payload() {
+fn xml_writer_emits_repeated_elements_for_array() {
     let (schema, record) = record_with_array();
     let mut buf = Vec::new();
-    let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
-    let err = writer.write_record(&record).unwrap_err();
-    assert!(
-        matches!(&err, FormatError::UnserializableArrayValue { format, column }
-            if *format == "XML" && column == "tags"),
-        "expected UnserializableArrayValue for XML/tags, got {err:?}"
-    );
-    assert_lists_remedies(&err);
-    // The XML writer fills and validates every value before emitting any byte,
-    // so a rejected record leaves no partial output.
-    drop(writer);
-    assert!(
-        buf.is_empty(),
-        "rejected record leaves no partial XML output"
+    {
+        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        writer
+            .write_record(&record)
+            .expect("XML writer emits repeated elements for a scalar array");
+        writer.flush().expect("flush succeeds");
+    }
+    let out = String::from_utf8(buf).expect("XML output is UTF-8");
+    assert_eq!(
+        out,
+        "<Root><Record><id>7</id><tags>a</tags><tags>b</tags></Record></Root>"
     );
 }
 

@@ -94,6 +94,71 @@ Attribute handling details:
 - An element with only attribute fields and no children self-closes:
   `Address.@type` alone emits `<Address type="home"/>`.
 
+### Writing multi-value fields (repeated elements)
+
+A `multiple:` field is written as **repeated child elements**, one per value, in
+order — the XML counterpart to the CSV writer's delimited
+[`join_values`](csv.md#writing-multi-value-cells-join_values) cell, and the
+write-side inverse of reading [`multiple: true`](#all-occurrences-in-one-field-multiple-true).
+The default needs no configuration:
+
+```xml
+<Order><id>1</id><tags>a</tags><tags>b</tags></Order>
+```
+
+The value itself carries whether it repeats, so no per-field declaration is
+needed to decide *whether* to repeat — only to rename the elements. A field with
+one value emits exactly one element, byte-identical to a scalar field's output; a
+field with an empty array emits **nothing** (no element, and no container even
+when one is configured); an empty-string value emits a self-closing item element
+(`<tags/>`).
+
+An array reaching an **attribute** field (`@tags` declared `multiple: true`) is
+rejected — an XML attribute holds a single value and cannot repeat.
+
+To rename the elements, add a `join_values` entry — the same block the CSV writer
+reads, sharing the `field` key. The XML writer reads two keys from it and ignores
+the CSV-only `delimiter` / `on_conflict` / `escape`:
+
+```yaml
+- type: output
+  name: xml_out
+  input: processed
+  config:
+    name: xml_out
+    type: xml
+    path: "./output/result.xml"
+    join_values:
+      - field: tags
+        repeat_as: Tag      # per-item element name; defaults to the field name
+        wrap_in: Tags       # optional container; omit for bare repeats
+```
+
+- **`repeat_as`** — the element name emitted per item. Defaults to the field's
+  own element name.
+- **`wrap_in`** — a container element bracketing the repeated items. Omit it for
+  bare repeats with no container.
+
+The two combine into the four arrangements, with no other key:
+
+| `repeat_as` | `wrap_in` | Output for `tags = [a, b]` |
+|-------------|-----------|-----------------------------|
+| —           | —         | `<tags>a</tags><tags>b</tags>` |
+| `Tag`       | —         | `<Tag>a</Tag><Tag>b</Tag>` |
+| —           | `Tags`    | `<Tags><tags>a</tags><tags>b</tags></Tags>` |
+| `Tag`       | `Tags`    | `<Tags><Tag>a</Tag><Tag>b</Tag></Tags>` |
+
+`repeat_as` and `wrap_in` must each be a well-formed XML name, validated the same
+way as the `root_element` / `record_element` names. Declaring `join_values` on an
+output format that is neither `csv` nor `xml` is rejected at compile
+([E362](../../explain/E362.md)).
+
+**Round trip.** A document read into a `multiple: true` column with the default
+naming writes back to the identical repeated elements — reading
+`<Order><id>1</id><tags>a</tags><tags>b</tags></Order>` into a `tags` column and
+writing it to an XML output with `record_element: Order` reproduces the input
+byte-for-byte.
+
 ## Repeated elements
 
 When a record element contains repeated child elements, two source-level
