@@ -100,10 +100,15 @@ longer collide. As with XML, detection is per document at read time, so the run
 aborts under `fail_fast` and dead-letters the document under `continue` /
 `best_effort` with `dlq_granularity: document`.
 
-Detection covers collisions at the top level of a record. A collision *inside*
-an array element that a `split_to_rows: extract` fan-out lifts to the top level
-(one element key clashing with a parent field or with another element key) is
-not yet detected and still resolves last-wins — tracked by
+Detection covers two **distinct** source keys that flatten to the same dotted
+name — the nested `{"a": {"b": 1}}` plus literal `{"a.b": 2}` case above. It does
+**not** cover a key that is *literally duplicated* within one JSON object
+(`{"tags": "x", "tags": "y"}`): the JSON parser collapses such duplicates
+last-wins (keeping `"y"`) before the record reaches collision detection, so that
+repeat is silently dropped rather than reported. A collision *inside* an array
+element that a `split_to_rows: extract` fan-out lifts to the top level (one
+element key clashing with a parent field or with another element key) is
+likewise not yet detected and still resolves last-wins — tracked by
 [issue 920](https://github.com/rustpunk/clinker/issues/920).
 
 ## Bounding envelope retention: `max_index_bytes`

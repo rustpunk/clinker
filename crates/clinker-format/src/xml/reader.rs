@@ -108,6 +108,13 @@ struct RawRecord {
     /// fields (`<Item></Item>`) contributes an empty range, so the fan-out
     /// still emits a record for it.
     split_instances: Vec<Vec<Range<usize>>>,
+    /// Dotted names of value-less, non-fan-out self-closing elements (`<x/>`)
+    /// that pushed no field of their own. These are recorded only so schema
+    /// inference can see the column — record assembly never reads them, which
+    /// is what keeps a repeated `<x/><x/>` on a non-`multiple:` column from
+    /// tripping the undeclared-repeat guard while a column appearing ONLY as
+    /// `<x/>` in the first record still surfaces in the inferred schema.
+    presence: Vec<String>,
 }
 
 impl RawRecord {
@@ -117,6 +124,7 @@ impl RawRecord {
         RawRecord {
             fields,
             split_instances: vec![Vec::new(); field_count],
+            presence: Vec::new(),
         }
     }
 }
@@ -407,6 +415,7 @@ impl XmlReader {
         let mut fields = start_attrs;
         let mut split_instances: Vec<Vec<Range<usize>>> =
             vec![Vec::new(); self.config.split_to_rows.len()];
+        let mut presence: Vec<String> = Vec::new();
         let mut open_instance: Option<OpenInstance> = None;
         let record_depth = self.xml_depth;
         let mut element_stack: Vec<String> = Vec::new();
@@ -428,7 +437,12 @@ impl XmlReader {
             // Any event other than a text fragment terminates the current text
             // node; resolve and push it before handling the structural event.
             if !matches!(&event, Event::Text(_) | Event::GeneralRef(_)) {
-                flush_text_field(&mut fields, &element_stack, &mut text_run)?;
+                flush_text_field(
+                    &mut fields,
+                    &element_stack,
+                    &mut text_run,
+                    &self.config.multi_value_fields,
+                )?;
             }
 
             match event {
@@ -476,17 +490,20 @@ impl XmlReader {
                         format!("{}.{name}", element_stack.join("."))
                     };
                     let instance_from = fields.len();
-                    // A value-less self-closing element pushes no field of its
-                    // own, exactly as the empty-body form `<x></x>` does through
-                    // `flush_text_field`'s non-empty guard. Pushing an empty
-                    // leader here instead would make `<x/><x/>` look like a
-                    // repeated field and wrongly trip `UndeclaredRepeatedField`,
-                    // while the identical `<x></x><x></x>` passes — so only the
-                    // element's attributes (if any) are recorded.
+                    // A value-less self-closing element mirrors the empty-body
+                    // form `<x></x>` (see `flush_text_field`): on a declared
+                    // `multiple:` column it is a real empty occurrence collected
+                    // into the array, and on any other column it pushes NO field
+                    // — so `<x/><x/>` on a non-`multiple:` column cannot look
+                    // like a repeated field and trip `UndeclaredRepeatedField`.
+                    // Only its attributes (if any) go into `fields` here; the
+                    // empty-occurrence push and schema-presence record happen
+                    // below.
                     let child_attrs = extract_attributes_static(&self.config.attribute_prefix, e)?;
                     for (key, val) in child_attrs {
                         fields.push((format!("{prefix}.{key}"), val));
                     }
+                    let is_split_field = self.split_field_index(&prefix).is_some();
                     // A self-closing element named by a declared fan-out field
                     // is a complete occurrence on its own; its range spans the
                     // attributes pushed above, or is empty when it has none —
@@ -495,6 +512,21 @@ impl XmlReader {
                         && let Some(pi) = self.split_field_index(&prefix)
                     {
                         split_instances[pi].push(instance_from..fields.len());
+                    }
+                    // A value-less, non-fan-out self-closing element: on a
+                    // declared `multiple:` column, push an empty occurrence
+                    // (collected as `Null`), preserving array position exactly as
+                    // the empty-body form does. On any other column, push no
+                    // field — keeping a repeated `<x/><x/>` from tripping the
+                    // undeclared-repeat guard — but record its bare column
+                    // presence so a column appearing ONLY as `<x/>` in the first
+                    // record does not vanish from the inferred schema.
+                    if !is_split_field && fields.len() == instance_from {
+                        if self.is_multi_value(&prefix) {
+                            fields.push((prefix, String::new()));
+                        } else if !presence.contains(&prefix) {
+                            presence.push(prefix);
+                        }
                     }
                 }
                 Event::Text(ref t) => {
@@ -534,6 +566,7 @@ impl XmlReader {
         Ok(RawRecord {
             fields,
             split_instances,
+            presence,
         })
     }
 
@@ -706,27 +739,35 @@ impl FormatReader for XmlReader {
         // `keep_empty: false` entry drops an element with no occurrence, and
         // inferring from that dropped expansion would cache a column-less
         // schema for the whole source while records kept flowing.
-        let expanded = loop {
+        let (expanded, presence) = loop {
             let Some(raw) = self.read_next_record_raw()? else {
                 let s = SchemaBuilder::new().build();
                 self.schema = Some(Arc::clone(&s));
                 self.done = true;
                 return Ok(s);
             };
+            // Value-less self-closing columns push no field, so they never reach
+            // the expansion; carry their names alongside so inference keeps them.
+            let presence = raw.presence.clone();
             let expanded = self.apply_split_to_rows(raw);
             if !expanded.is_empty() {
-                break expanded;
+                break (expanded, presence);
             }
         };
 
         let mut seen = std::collections::HashSet::new();
+        // Real field names first (in document order), then any value-less
+        // self-closing columns that contributed no field — so a column present
+        // only as `<x/>` in the first record is not silently absent.
         let schema = expanded
             .first()
             .expect("non-empty checked above")
             .iter()
-            .filter_map(|(k, _)| {
+            .map(|(k, _)| k.clone())
+            .chain(presence)
+            .filter_map(|k| {
                 if seen.insert(k.clone()) {
-                    Some(k.clone().into_boxed_str())
+                    Some(k.into_boxed_str())
                 } else {
                     None
                 }
@@ -1069,22 +1110,30 @@ fn split_field_to_rows(
     }
 }
 
-/// Resolve the current text run and push it, if non-empty, as a field keyed by
-/// the innermost open element's dotted path. Text directly under the record
-/// element (empty path) or an empty resolved value pushes nothing. Clears
+/// Resolve the current text run and push it as a field keyed by the innermost
+/// open element's dotted path. Text directly under the record element (empty
+/// path) pushes nothing. A non-empty value is always a field; an empty resolved
+/// value pushes nothing UNLESS its column is declared `multiple:`, where an
+/// empty repeated element is a real positional array element that must be
+/// preserved (`<tags>a</tags><tags></tags><tags>b</tags>` collects `[a, "", b]`,
+/// not `[a, b]`). For any other column an empty text node still pushes nothing,
+/// matching the value-less self-closing form and keeping `<x></x><x></x>` on a
+/// non-`multiple:` column from tripping the undeclared-repeat guard. Clears
 /// `text_run` for the next node.
 fn flush_text_field(
     fields: &mut Vec<(String, String)>,
     element_stack: &[String],
     text_run: &mut String,
+    multi_value_fields: &[String],
 ) -> Result<(), FormatError> {
     let value = finalize_text_run(text_run)?;
     text_run.clear();
-    if !value.is_empty() {
-        let field_name = element_stack.join(".");
-        if !field_name.is_empty() {
-            fields.push((field_name, value));
-        }
+    let field_name = element_stack.join(".");
+    if field_name.is_empty() {
+        return Ok(());
+    }
+    if !value.is_empty() || multi_value_fields.iter().any(|f| f == &field_name) {
+        fields.push((field_name, value));
     }
     Ok(())
 }
@@ -1817,7 +1866,10 @@ mod tests {
     #[test]
     fn multiple_on_an_empty_element_still_yields_an_array() {
         // `<Tag></Tag>` carries no text, so the collected array holds one
-        // empty value rather than the record losing the column.
+        // empty value rather than the record losing the column. An empty text
+        // node resolves to `Null` (the reader's empty-string rule), and a
+        // declared `multiple:` column preserves that occurrence instead of
+        // dropping it.
         let xml = r#"<Root><Row><id>1</id><Tag></Tag></Row></Root>"#;
         let config = multi_value_config("Root/Row", &["Tag"]);
         let mut r = reader_from_str(xml, config);
@@ -1825,7 +1877,51 @@ mod tests {
 
         let r1 = r.next_record().unwrap().unwrap();
         assert_eq!(r1.get("id"), Some(&Value::Integer(1)));
-        assert_eq!(r1.get("Tag"), None);
+        assert_eq!(r1.get("Tag"), Some(&Value::Array(vec![Value::Null])));
+    }
+
+    #[test]
+    fn multiple_preserves_an_empty_repeated_element_positionally() {
+        // `<Tag>a</Tag><Tag></Tag><Tag>b</Tag>` on a `multiple:` column must
+        // collect three occurrences in order — the empty middle element is a
+        // real array element, not a gap to be squeezed out. Dropping it would
+        // lose position and prevent a faithful round-trip.
+        let xml = r#"<Root><Row><Tag>a</Tag><Tag></Tag><Tag>b</Tag></Row></Root>"#;
+        let config = multi_value_config("Root/Row", &["Tag"]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(
+            r1.get("Tag"),
+            Some(&Value::Array(vec![
+                Value::String("a".into()),
+                Value::Null,
+                Value::String("b".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn multiple_preserves_an_empty_self_closing_element_positionally() {
+        // The self-closing empty form `<Tag/>` must behave exactly like the
+        // empty-body `<Tag></Tag>` on a `multiple:` column: a real empty
+        // occurrence collected in position, so the two forms stay symmetric and
+        // neither squeezes the empty middle out of `[a, "", b]`.
+        let xml = r#"<Root><Row><Tag>a</Tag><Tag/><Tag>b</Tag></Row></Root>"#;
+        let config = multi_value_config("Root/Row", &["Tag"]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(
+            r1.get("Tag"),
+            Some(&Value::Array(vec![
+                Value::String("a".into()),
+                Value::Null,
+                Value::String("b".into()),
+            ]))
+        );
     }
 
     #[test]
@@ -2078,6 +2174,49 @@ mod tests {
         // The value-less element yields no field at all, matching `<x></x>`.
         assert_eq!(rec.get("middle_name"), None);
         assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn self_closing_only_column_is_present_in_the_inferred_schema() {
+        // A column that appears ONLY as a value-less self-closing `<x/>` in the
+        // first record pushes no field, but it must not vanish from the inferred
+        // schema — otherwise the column is silently absent for the whole source.
+        // Its bare presence is recorded for schema inference without a repeated
+        // `<x/><x/>` tripping the undeclared-repeat guard.
+        let xml = r#"<Root><Row><id>1</id><middle_name/></Row></Root>"#;
+        let config = XmlReaderConfig {
+            record_path: Some("Root/Row".into()),
+            ..Default::default()
+        };
+        let mut r = reader_from_str(xml, config);
+        let s = r.schema().unwrap();
+        assert!(
+            s.columns().iter().any(|c| &**c == "middle_name"),
+            "self-closing-only column must stay in the schema: {:?}",
+            s.columns()
+        );
+        assert!(s.columns().iter().any(|c| &**c == "id"));
+    }
+
+    #[test]
+    fn repeated_self_closing_only_column_is_present_and_does_not_error() {
+        // The presence contribution must not resurrect the undeclared-repeat
+        // false positive: a column appearing only as a repeated `<x/><x/>` on a
+        // non-`multiple:` schema still surfaces in the inferred schema AND
+        // assembles a record without a loud error.
+        let xml = r#"<Root><Row><id>1</id><middle_name/><middle_name/></Row></Root>"#;
+        let config = XmlReaderConfig {
+            record_path: Some("Root/Row".into()),
+            ..Default::default()
+        };
+        let mut r = reader_from_str(xml, config);
+        let s = r.schema().unwrap();
+        assert!(s.columns().iter().any(|c| &**c == "middle_name"));
+        let rec = r
+            .next_record()
+            .expect("repeated self-closing must not error")
+            .expect("one record");
+        assert_eq!(rec.get("id"), Some(&Value::Integer(1)));
     }
 
     #[test]
