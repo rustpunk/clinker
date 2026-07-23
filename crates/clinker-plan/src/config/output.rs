@@ -1,6 +1,7 @@
 //! Output node configuration: split policy and per-format output options.
 
 use super::*;
+use clinker_format::JoinValues;
 use clinker_record::schema_def::LineSeparator;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,14 @@ pub struct OutputConfig {
     /// format implements `begin_document` / `end_document`.
     #[serde(default, skip_serializing_if = "is_false_bool")]
     pub reconstruct_envelope: bool,
+    /// In-cell join declarations: each names a `multiple:` field whose values a
+    /// CSV writer collapses into one delimited cell, with a per-field delimiter
+    /// and collision policy. The write-side inverse of `split_values`. Empty by
+    /// default; a `multiple:` field with no entry joins with the default `;` and
+    /// `on_conflict: error`. Consumed by the CSV writer only — declaring it on
+    /// another output format is rejected (E362).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_values: Option<Vec<JoinValues>>,
     #[serde(flatten)]
     pub format: OutputFormat,
     /// External tooling metadata: stage notes + field annotations. Ignored by the engine.

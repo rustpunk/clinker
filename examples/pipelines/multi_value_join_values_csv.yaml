@@ -1,0 +1,49 @@
+pipeline:
+  name: multi_value_join_values_csv
+
+# The write-side inverse of `multi_value_split_values_csv.yaml`: this reads the
+# same `tags` column as an array (via `split_values`) and writes it back to CSV,
+# joining each array into one delimited cell (via `join_values`) — a lossless
+# round trip through the delimited-cell convention.
+#
+#   tags = ["electronics", "sale", "featured"]  ->  electronics;sale;featured
+#   tags = []                                    ->  (empty cell)
+#   tags = ["clearance"]                         ->  clearance
+#
+# A `multiple:` field with no `join_values` entry still joins, with the default
+# `;` delimiter and `on_conflict: error`. `on_conflict: error` is what makes a
+# defaulted delimiter safe: a value that itself contained the delimiter would be
+# refused rather than emitted as a cell that splits back wrongly. Under the
+# `strategy: continue` below, that refusal dead-letters the offending record
+# (naming the field and value) and the run carries on; under `fail_fast` it
+# aborts. This fixture's tags never contain the delimiter, so the run is clean.
+# The lossless escape hatches are `on_conflict: escape` (escapes the delimiter,
+# recovered by a `split_values` `escape:`) and `encode_json` (a JSON array,
+# recovered by a `split_values` `json: true`). See `clinker explain --code E362`
+# for the declaration rules.
+
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./data/orders_tags.csv
+      split_values:
+        - { field: tags, delimiter: ";" }
+      schema:
+        - { name: order_id, type: string }
+        - { name: tags, type: string, multiple: true }
+
+  - type: output
+    name: tagged_orders
+    input: orders
+    config:
+      name: tagged_orders
+      type: csv
+      path: ./output/tagged_orders.csv
+      join_values:
+        - { field: tags, delimiter: ";", on_conflict: error }
+
+error_handling:
+  strategy: continue

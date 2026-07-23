@@ -1,15 +1,13 @@
-//! Crate-boundary rejection of `Value::Array` payloads in the non-JSON
-//! writers (CSV / XML / fixed-width), parallel to the shipped `Value::Map`
-//! rejection.
+//! Crate-boundary handling of `Value::Array` payloads in the non-JSON writers.
 //!
-//! A stray array reaching one of these writers — most often a `match: collect`
-//! combine output misrouted to a tabular / positional format — is surfaced as
-//! an explicit `FormatError::UnserializableArrayValue` naming the offending
-//! column, rather than silently degraded (JSON-encoded into a CSV cell,
-//! comma-joined inside an XML element, or dropped to an empty fixed-width
-//! field). The error message lists the two user remedies: coerce the array to
-//! a scalar in CXL (`to_string`), or route to a self-describing JSON output.
-//! JSON output itself is unaffected — it serializes arrays natively. See #46.
+//! The XML and fixed-width writers still reject a stray array — most often a
+//! `match: collect` combine output misrouted to a positional format — as an
+//! explicit `FormatError::UnserializableArrayValue` naming the offending column,
+//! listing the two remedies (coerce to a scalar in CXL, or route to JSON). The
+//! CSV writer instead JOINS an array into one delimited cell (#917): with
+//! multi-value CSV output a supported shape, an array is expected there, so it
+//! is encoded rather than rejected. JSON output serializes arrays natively.
+//! See #46, #917.
 
 use std::sync::Arc;
 
@@ -49,24 +47,22 @@ fn assert_lists_remedies(err: &FormatError) {
     );
 }
 
+/// The CSV writer now JOINS an array into one delimited cell (#917) rather than
+/// rejecting it: with `multiple:` CSV output supported, an array cell is the
+/// expected shape. The default `;` delimiter applies with no configuration.
 #[test]
-fn csv_writer_rejects_array_payload() {
+fn csv_writer_joins_array_into_delimited_cell() {
     let (schema, record) = record_with_array();
     let mut buf = Vec::new();
-    let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), CsvWriterConfig::default());
-    let err = writer.write_record(&record).unwrap_err();
-    assert!(
-        matches!(&err, FormatError::UnserializableArrayValue { format, column }
-            if *format == "CSV" && column == "tags"),
-        "expected UnserializableArrayValue for CSV/tags, got {err:?}"
-    );
-    assert_lists_remedies(&err);
-    // The array must not have been JSON-encoded into a cell.
-    drop(writer);
-    assert!(
-        !String::from_utf8_lossy(&buf).contains("[\"a\""),
-        "the array must not be JSON-encoded into a CSV cell"
-    );
+    {
+        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), CsvWriterConfig::default());
+        writer
+            .write_record(&record)
+            .expect("CSV writer joins a scalar array into one cell");
+        writer.flush().expect("flush succeeds");
+    }
+    let out = String::from_utf8(buf).expect("CSV output is UTF-8");
+    assert_eq!(out, "id,tags\n7,a;b\n");
 }
 
 #[test]

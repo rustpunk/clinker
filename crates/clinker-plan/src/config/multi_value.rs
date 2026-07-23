@@ -13,6 +13,10 @@
 //! - **E361** — a `multiple: true` column on a source whose format has no way
 //!   to PRODUCE one, which would bind the column as an array and then hand
 //!   CXL a scalar.
+//! - **E362** — a malformed `join_values` declaration on an output: declared on
+//!   a format whose writer never consumes it, a duplicate field, an empty
+//!   delimiter, or an escape/delimiter that is not a single character under
+//!   `on_conflict: escape`. The write-side mirror of E358.
 //!
 //! E359 and E361 are the two arrows of the same rule, and each reads its own
 //! per-format capability table: [`output_encodes_multi_value`] for the write
@@ -20,8 +24,9 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use clinker_format::{Column, SourceSchema, SplitToRowsMode, under_field_path};
+use clinker_format::{Column, OnConflict, SourceSchema, SplitToRowsMode, under_field_path};
 
+use crate::config::OutputConfig;
 use crate::config::format::{InputFormat, OutputFormat};
 use crate::config::pipeline_node::PipelineNode;
 use crate::config::source::SourceConfig;
@@ -34,10 +39,12 @@ use crate::yaml::Spanned;
 /// one line here and nothing else in the gate changes.
 ///
 /// - `json` — a JSON array is the format's own native shape.
+/// - `csv` — a `multiple:` field joins into one delimited cell, defaulting to
+///   `;` with `on_conflict: error`; `join_values` overrides the policy per
+///   field (#917). No multi-record CSV writer exists, so the answer is
+///   unconditional.
 /// - `xml` — repeated child elements: tracked at
 ///   https://github.com/rustpunk/clinker/issues/916.
-/// - `csv` — delimited-in-cell: tracked at
-///   https://github.com/rustpunk/clinker/issues/917.
 /// - `fixed_width` — repeating field groups: tracked at
 ///   https://github.com/rustpunk/clinker/issues/918.
 /// - `edifact` / `x12` / `hl7` / `swift` — these writers emit a fixed
@@ -45,8 +52,8 @@ use crate::yaml::Spanned;
 fn output_encodes_multi_value(format: &OutputFormat) -> bool {
     match format {
         OutputFormat::Json(_) => true,
+        OutputFormat::Csv(_) => true,
         OutputFormat::Xml(_) => false,
-        OutputFormat::Csv(_) => false,
         OutputFormat::FixedWidth(_) => false,
         OutputFormat::Edifact(_)
         | OutputFormat::X12(_)
@@ -343,8 +350,11 @@ fn validate_source_declarations(
         // `str::split("")` matches at every character boundary, so an empty
         // delimiter would turn one cell into a run of single characters
         // bracketed by two empty values. There is no reading of "split on
-        // nothing" that produces what an author meant.
-        if a.delimiter.is_empty() {
+        // nothing" that produces what an author meant. `json: true` reads the
+        // whole cell as a JSON array and ignores the delimiter, so it is exempt —
+        // symmetric with the write-side E362, which exempts an empty delimiter
+        // under `encode_json`.
+        if a.delimiter.is_empty() && !a.json {
             faults.push(DeclarationFault {
                 message: format!(
                     "source '{}': `split_values` on field '{}' declares an empty delimiter",
@@ -368,6 +378,91 @@ fn validate_source_declarations(
                        — declaring both leaves no single shape for the column"
                     .to_string(),
             });
+        }
+        // The `escape` / `json` recovery modes — the read-side inverses of the
+        // CSV sink's `join_values` `on_conflict: escape` / `encode_json` — are
+        // honored only by the single-schema CSV reader (this loop runs on a block
+        // the reader consumes, so a CSV block here is single-schema). On any other
+        // read format the reader splits on the bare delimiter and silently ignores
+        // them, so declaring them is a no-op the gate rejects.
+        let csv_source = matches!(source.format, InputFormat::Csv(_));
+        if (!a.escape.is_empty() || a.json) && !csv_source {
+            faults.push(DeclarationFault {
+                message: format!(
+                    "source '{}': `split_values` on field '{}' sets `{}`, which only the CSV \
+                     reader honors — a `{}` reader splits on the bare delimiter and ignores it",
+                    source.name,
+                    a.field,
+                    if a.json { "json" } else { "escape" },
+                    source.format.format_name(),
+                ),
+                help: "drop `escape` / `json` on a non-CSV source: a JSON or XML array recovers \
+                       natively, and the delimited readers split on the plain delimiter"
+                    .to_string(),
+            });
+        }
+        // `json: true` reads the whole cell as an embedded JSON array and ignores
+        // the delimiter, so a co-declared `escape` would never apply. Gated on
+        // `csv_source` for the same reason as the escape shape checks below: a
+        // non-CSV source already got the "only the CSV reader honors escape/json"
+        // fault, so this would be a redundant second diagnostic there.
+        if csv_source && a.json && !a.escape.is_empty() {
+            faults.push(DeclarationFault {
+                message: format!(
+                    "source '{}': `split_values` on field '{}' sets both `json: true` and \
+                     `escape` — `json` reads the whole cell as a JSON array, so `escape` is unused",
+                    source.name, a.field
+                ),
+                help: "drop `escape` when `json: true`, or drop `json` to split on the delimiter \
+                       with escape handling"
+                    .to_string(),
+            });
+        }
+        // The escape-aware split un-escapes character by character (the read-side
+        // inverse of the sink's `on_conflict: escape`), so under `escape` the
+        // delimiter and escape must each be a single character and must differ.
+        // Gated on `csv_source`: a non-CSV source already got the "only the CSV
+        // reader honors escape/json" fault above, so running the shape checks
+        // there too would emit a redundant second diagnostic for a declaration
+        // that is already rejected and whose escape the reader ignores anyway.
+        // Also skipped when the delimiter is empty: that already produced its own
+        // fault, and the single-character check below would otherwise contradict
+        // it by calling an empty delimiter "multi-character".
+        if csv_source && !a.escape.is_empty() && !a.json && !a.delimiter.is_empty() {
+            if a.delimiter.chars().count() != 1 {
+                faults.push(DeclarationFault {
+                    message: format!(
+                        "source '{}': `split_values` on field '{}' sets `escape` with a \
+                         multi-character delimiter '{}'",
+                        source.name, a.field, a.delimiter
+                    ),
+                    help: "use a single-character `delimiter` with `escape`, or drop `escape` to \
+                           split on the plain multi-character delimiter"
+                        .to_string(),
+                });
+            } else if a.escape.chars().count() != 1 {
+                faults.push(DeclarationFault {
+                    message: format!(
+                        "source '{}': `split_values` on field '{}' sets an `escape` '{}' that is \
+                         not a single character",
+                        source.name, a.field, a.escape
+                    ),
+                    help: "give a single-character `escape` (`\\` matches the sink default)"
+                        .to_string(),
+                });
+            } else if a.escape == a.delimiter {
+                faults.push(DeclarationFault {
+                    message: format!(
+                        "source '{}': `split_values` on field '{}' sets the `escape` equal to the \
+                         delimiter '{}'",
+                        source.name, a.field, a.delimiter
+                    ),
+                    help:
+                        "give an `escape` different from the `delimiter` — sharing one character \
+                           makes an escaped delimiter and an escape marker indistinguishable"
+                            .to_string(),
+                });
+            }
         }
     }
 
@@ -782,24 +877,159 @@ pub fn source_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
     faults
 }
 
-/// The E359 output gate over one node list: a `multiple: true` column reaching
-/// — or declared directly on — an output whose format has no multi-value
-/// encoding.
+/// Validate an output's `join_values` declarations (E362), the write-side
+/// mirror of E358's source-declaration checks.
 ///
-/// The writers reject a multi-value payload at run time, so without this the
-/// failure lands mid-stream on record N rather than at compile. Reachability is
-/// source-to-output through the DAG: a column a transform drops before the sink
-/// is still reported, which is the conservative direction — a false positive is
-/// a compile error the author can see and resolve, a false negative is a run
-/// that dies partway through. The walk is [`source_data_reachability`], NOT the
-/// `$doc` attribution walk: that one narrows a Combine to its driving input,
-/// which would miss a column the combine projects off its reference side.
+/// The block is consumed by the CSV writer only, so declaring it on any other
+/// output format is a silent no-op the gate rejects — the same LD-011 spirit as
+/// E358's "reader never handed it". On a CSV output each entry is checked: no
+/// duplicate field, a non-empty delimiter, and — under `on_conflict: escape`,
+/// whose invertible escaping is defined char-wise — a single-character delimiter
+/// and escape.
 ///
-/// An output's OWN `schema:` block is checked too. It is the same `Column`
-/// type, it accepts `multiple: true`, and no writer honors the attribute — the
-/// fixed-width writer's `Column -> FieldDef` conversion drops it outright — so
-/// an author who declares repetition on the surface they are writing to would
-/// otherwise get it silently ignored.
+/// Deliberately does NOT require the field to be a statically-declared
+/// `multiple:` column, unlike E358's `split_values` check. A write-side array
+/// can arise at runtime (a `match: collect` combine output), so a static
+/// requirement would reject a legitimate override; an entry that never matches
+/// an array is simply an inert override.
+fn validate_join_declarations(output: &OutputConfig) -> Vec<DeclarationFault> {
+    let mut faults = Vec::new();
+    let entries = output.join_values.as_deref().unwrap_or(&[]);
+    if entries.is_empty() {
+        return faults;
+    }
+    let format = output.format.format_name();
+    if !matches!(output.format, OutputFormat::Csv(_)) {
+        faults.push(DeclarationFault {
+            message: format!(
+                "output '{}': `join_values` is declared on a `{format}` output, whose writer \
+                 never consumes it — the declaration would be a silent no-op",
+                output.name
+            ),
+            help: "remove the `join_values` block: joining several values into one delimited \
+                   cell is written by the `csv` writer only. A `json` output emits a native \
+                   array, and the `xml` / `fixed_width` / segment writers have no delimited-cell \
+                   join."
+                .to_string(),
+        });
+        // Once the format cannot consume the block at all, the per-entry checks
+        // are moot — the author is told to delete the whole block.
+        return faults;
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        if entries[i + 1..].iter().any(|o| o.field == entry.field) {
+            faults.push(DeclarationFault {
+                message: format!(
+                    "output '{}': `join_values` declares the field '{}' more than once",
+                    output.name, entry.field
+                ),
+                help: "declare each field once, with the delimiter and policy it should join with"
+                    .to_string(),
+            });
+        }
+        // The delimiter matters only for the delimited policies (`error`,
+        // `escape`); `encode_json` ignores it, so an empty or multi-character
+        // delimiter under `encode_json` is harmless and exempt.
+        if entry.on_conflict != OnConflict::EncodeJson && entry.delimiter.is_empty() {
+            faults.push(DeclarationFault {
+                message: format!(
+                    "output '{}': `join_values` on field '{}' declares an empty delimiter",
+                    output.name, entry.field
+                ),
+                help: "give a non-empty delimiter (the default is `;`) to separate the values in \
+                       the joined cell"
+                    .to_string(),
+            });
+        }
+        // The delimited policies (`error`, `escape`) need a single-character
+        // delimiter. Under `error` the collision check tests whether a value
+        // contains the delimiter, which misses a spurious boundary a
+        // multi-character delimiter can form between two adjacent values; under
+        // `escape` the char-by-char escaping cannot round-trip a multi-character
+        // delimiter.
+        if entry.on_conflict != OnConflict::EncodeJson && entry.delimiter.chars().count() > 1 {
+            faults.push(DeclarationFault {
+                message: format!(
+                    "output '{}': `join_values` on field '{}' uses a multi-character delimiter \
+                     '{}' with `on_conflict: {}`",
+                    output.name,
+                    entry.field,
+                    entry.delimiter,
+                    on_conflict_name(entry.on_conflict),
+                ),
+                help: "use a single-character `delimiter` for `on_conflict: error` / `escape`, or \
+                       switch to `encode_json`, which encodes the whole field as a JSON array and \
+                       places no constraint on the delimiter"
+                    .to_string(),
+            });
+        }
+        // `on_conflict: escape` escapes and un-escapes character by character, so
+        // the escape must be a single character and must differ from the
+        // delimiter — otherwise an escaped delimiter and an escape marker are
+        // indistinguishable on read.
+        if entry.on_conflict == OnConflict::Escape {
+            if entry.escape.chars().count() != 1 {
+                faults.push(DeclarationFault {
+                    message: format!(
+                        "output '{}': `join_values` on field '{}' uses `on_conflict: escape` with \
+                         an escape '{}' that is not a single character",
+                        output.name, entry.field, entry.escape
+                    ),
+                    help: "give a single-character `escape` (the default is `\\`) — the reader \
+                           un-escapes character by character"
+                        .to_string(),
+                });
+            } else if entry.escape == entry.delimiter {
+                faults.push(DeclarationFault {
+                    message: format!(
+                        "output '{}': `join_values` on field '{}' uses `on_conflict: escape` with \
+                         the escape equal to the delimiter '{}'",
+                        output.name, entry.field, entry.delimiter
+                    ),
+                    help: "give an `escape` different from the `delimiter`; sharing one character \
+                           makes an escaped delimiter and an escape marker indistinguishable on \
+                           read"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    faults
+}
+
+/// The `on_conflict` policy's YAML spelling, for a diagnostic message.
+fn on_conflict_name(policy: OnConflict) -> &'static str {
+    match policy {
+        OnConflict::Error => "error",
+        OnConflict::Escape => "escape",
+        OnConflict::EncodeJson => "encode_json",
+    }
+}
+
+/// The E359 output gate over one node list (and the E362 `join_values` gate): a
+/// `multiple: true` column reaching — or declared directly on — an output whose
+/// format has no multi-value encoding.
+///
+/// The remaining non-encoding writers reject a multi-value payload at run time,
+/// so without this the failure lands mid-stream on record N rather than at
+/// compile. Reachability is source-to-output through the DAG: a column a
+/// transform drops before the sink is still reported, which is the conservative
+/// direction — a false positive is a compile error the author can see and
+/// resolve, a false negative is a run that dies partway through. The walk is
+/// [`source_data_reachability`], NOT the `$doc` attribution walk: that one
+/// narrows a Combine to its driving input, which would miss a column the combine
+/// projects off its reference side.
+///
+/// An output's OWN `schema:` block is checked too, for a non-encoding format: it
+/// is the same `Column` type, it accepts `multiple: true`, and a non-encoding
+/// writer does not honor the attribute — the fixed-width writer's
+/// `Column -> FieldDef` conversion drops it outright — so an author who declares
+/// repetition on the surface they are writing to would otherwise get it silently
+/// ignored. `json` and `csv` encode it, so the gate skips them.
+///
+/// Also runs the per-output E362 gate ([`validate_join_declarations`]) over the
+/// output's `join_values` block, which — unlike E359 — applies whatever the
+/// format is, since a `csv` output legitimately carries it.
 pub fn output_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
     let schemas = resolved_source_schemas(nodes);
     let multi_value_by_source: HashMap<&str, Vec<String>> = schemas
@@ -818,6 +1048,17 @@ pub fn output_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
             continue;
         };
         let output = &body.output;
+        // E362 — a malformed `join_values` declaration, checked before the
+        // encoding gate below: `csv` (the format that consumes it) short-circuits
+        // that gate, so its own per-entry checks must run here or never.
+        for fault in validate_join_declarations(output) {
+            faults.push(NodeFault {
+                node_index,
+                code: "E362",
+                message: fault.message,
+                help: fault.help,
+            });
+        }
         if output_encodes_multi_value(&output.format) {
             continue;
         }
@@ -910,10 +1151,12 @@ mod tests {
     }
 
     #[test]
-    fn only_json_encodes_multi_value_today() {
+    fn json_and_csv_encode_multi_value_today() {
+        // `json` (native arrays) and `csv` (join into a delimited cell, #917)
+        // encode a `multiple:` field; the remaining writers do not yet.
         assert!(output_encodes_multi_value(&OutputFormat::Json(None)));
+        assert!(output_encodes_multi_value(&OutputFormat::Csv(None)));
         for format in [
-            OutputFormat::Csv(None),
             OutputFormat::Xml(None),
             OutputFormat::FixedWidth(None),
             OutputFormat::Edifact(None),

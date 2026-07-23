@@ -19,3 +19,7 @@ notes/
 # Filesystem case-sensitivity probe files clinker writes (and cleans up) during
 # test runs; they can linger if a run is interrupted.
 clinker-case-probe-*.tmp
+
+# Stray CLI output an integration test writes with a relative `path: out.csv`
+# when run from the crate directory; never a source artifact.
+crates/clinker/out.csv

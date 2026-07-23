@@ -438,6 +438,42 @@ pub(crate) fn push_write_error(
     output_errors.push(e.into());
 }
 
+/// Build the DLQ entry for a CSV `join_values` `on_conflict: error` collision —
+/// a value being joined into one delimited cell that itself contains the
+/// delimiter. Returns `None` for any other write error, which stays fatal (an
+/// `Io`/`Csv` failure aborts the run the way it always has).
+///
+/// The entry names the offending column via `triggering_field` and the value
+/// via `triggering_value`, and stamps `stage: output:<name>` — the first DLQ
+/// category to originate at the sink-write stage. The sink dispatch arms build
+/// it while holding only a partial `ctx` borrow (the writer helpers) and drain
+/// it through [`push_dlq`] once the full `ctx` is free, so the DLQ rate ceiling
+/// (E315/E316) is still enforced.
+pub(crate) fn sink_collision_dlq_entry(
+    record: &Record,
+    row_num: u64,
+    output_name: &str,
+    err: &clinker_format::error::FormatError,
+) -> Option<DlqEntry> {
+    let clinker_format::error::FormatError::MultiValueDelimiterCollision { column, value, .. } =
+        err
+    else {
+        return None;
+    };
+    Some(DlqEntry {
+        source_row: row_num,
+        category: clinker_core_types::dlq::DlqErrorCategory::MultiValueJoinCollision,
+        error_message: err.to_string(),
+        original_record: record.clone(),
+        stage: Some(DlqEntry::stage_output(output_name)),
+        route: None,
+        trigger: true,
+        source_name: source_name_arc_of(record),
+        triggering_field: Some(Arc::from(column.as_str())),
+        triggering_value: Some(Value::String(value.clone().into())),
+    })
+}
+
 use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, evaluate_single_transform, stage_metrics};

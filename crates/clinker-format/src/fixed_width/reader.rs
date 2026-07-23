@@ -167,6 +167,8 @@ mod tests {
             split_values: vec![SplitValues {
                 field: field.to_string(),
                 delimiter: delimiter.to_string(),
+                escape: String::new(),
+                json: false,
             }],
             ..Default::default()
         }

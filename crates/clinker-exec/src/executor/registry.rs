@@ -244,18 +244,26 @@ fn resolve_envelope_spec(
 }
 
 fn build_writer_factory(
-    format: &OutputFormat,
-    include_header: Option<bool>,
+    output: &OutputConfig,
     repeat_header: bool,
     field_defs: Option<Vec<clinker_format::Column>>,
-    include_engine_stamped: bool,
-    reconstruct_envelope: bool,
-    include_unmapped: bool,
 ) -> Result<WriterFactory, PipelineError> {
-    match format {
+    // Every per-format config field derives from the Output config; bind them
+    // once so the format arms below read them by their original names.
+    let include_header = output.include_header;
+    let include_engine_stamped = output.include_correlation_keys;
+    let reconstruct_envelope = output.reconstruct_envelope;
+    let include_unmapped = output.include_unmapped;
+    let join_values = output.join_values.clone().unwrap_or_default();
+    match &output.format {
         OutputFormat::Csv(opts) => {
             let mut csv_config = build_csv_writer_config(opts.as_ref(), include_header)?;
             csv_config.include_engine_stamped = include_engine_stamped;
+            // Per-column join overrides; a `multiple:` field with no entry joins
+            // with the default `;` / `on_conflict: error`. The plan-time E362
+            // gate has already rejected `join_values` on a non-CSV output, so
+            // only the CSV arm consumes it.
+            csv_config.join_values = join_values;
             // Lossless mode: when the Output carries every column through
             // (`include_unmapped: true`), a record column the pinned header
             // lacks must fail loudly rather than be silently dropped. The
@@ -420,15 +428,7 @@ pub(crate) fn build_format_writer(
     };
 
     let repeat_header = output.split.as_ref().is_some_and(|s| s.repeat_header);
-    let writer_factory = build_writer_factory(
-        &output.format,
-        output.include_header,
-        repeat_header,
-        field_defs,
-        output.include_correlation_keys,
-        output.reconstruct_envelope,
-        output.include_unmapped,
-    )?;
+    let writer_factory = build_writer_factory(output, repeat_header, field_defs)?;
 
     if let Some(ref split) = output.split {
         let policy = build_split_policy(split);

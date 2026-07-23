@@ -387,12 +387,17 @@ impl<W: Write + Send> FormatWriter for JsonWriter<W> {
 
 /// Converts a clinker [`Value`] to a `serde_json::Value`.
 ///
+/// `pub(crate)` because the CSV writer's `join_values` `on_conflict: encode_json`
+/// policy reuses this exact conversion to embed a multi-value field as a JSON
+/// array in a CSV cell — never the `Value` serde impl, which is externally
+/// tagged (`{"Integer":42}`) for postcard round-trip, not clean JSON.
+///
 /// # Errors
 ///
 /// Returns [`FormatError::Json`] for a non-finite float (NaN or an infinity):
 /// JSON numbers cannot represent them, and mapping to `null` would be
 /// indistinguishable from a source null on read-back.
-fn clinker_to_json(val: &Value) -> Result<serde_json::Value, FormatError> {
+pub(crate) fn clinker_to_json(val: &Value) -> Result<serde_json::Value, FormatError> {
     use serde_json::Value as Jv;
     Ok(match val {
         Value::Null => Jv::Null,

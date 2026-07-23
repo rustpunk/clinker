@@ -18,14 +18,15 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
     CorrelationRecordSlot, ExecutorContext, buffer_key_for_record, drain_node_buffer_slot,
-    push_write_error, source_file_path_of,
+    push_dlq, push_write_error, sink_collision_dlq_entry, source_file_path_of,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::structured_output_guard::{
     StructuredOutputDocumentGuard, structured_output_format,
 };
-use crate::executor::{build_format_writer, stage_metrics};
+use crate::executor::{DlqEntry, build_format_writer, stage_metrics};
 use crate::projection::project_output_from_record;
+use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
@@ -287,17 +288,12 @@ pub(crate) fn dispatch_output(
     // Buffered records DEFER counter increments to the
     // `CorrelationCommit` arm — clean groups bump
     // counters at flush time; dirty groups never count
-    // toward `ok_count`.
-    let unbuffered_record_count = unbuffered.len() as u64;
-    let mut newly_ok: u64 = 0;
-    for (_, row_num) in &unbuffered {
-        if ctx.ok_source_rows.insert(*row_num) {
-            newly_ok += 1;
-        }
-    }
-    ctx.counters.ok_count += newly_ok;
-    ctx.counters.records_written += unbuffered_record_count;
-    ctx.records_emitted += unbuffered_record_count;
+    // toward `ok_count`. The unbuffered records' ok / written / emitted counts
+    // are applied AFTER the write below, so a record a `join_values` collision
+    // dead-letters is counted once (as DLQ) rather than as both written and DLQ
+    // — and `ok_source_rows` is only ever inserted into on a successful write,
+    // never removed, so a row written OK at one Output and dead-lettered at
+    // another still counts as ok exactly once regardless of Output order.
 
     // Derive output schema from first emitted record.
     // The Record is authoritative post-rip; materialize
@@ -383,20 +379,73 @@ pub(crate) fn dispatch_output(
     } else {
         None
     };
-    let mut fan_ctx = FanOutContext {
-        name,
-        out_cfg,
-        cxl_emit_names_opt,
-        output_schema: &output_schema,
-        output_errors: &mut ctx.output_errors,
-        write_timer: &mut ctx.write_timer,
-        projection_timer: &mut ctx.projection_timer,
-        collector: &mut *ctx.collector,
-    };
-    if let Some(per_file) = fan_out_writers {
-        emit_fan_out(&mut fan_ctx, &unbuffered, per_file, scan_timer);
-    } else if let Some(raw_writer) = single_writer {
-        emit_single_writer(&mut fan_ctx, raw_writer, &unbuffered, scan_timer);
+    // Whether this Output actually has a writer to emit through. When it does
+    // not — a dry-run, or an Output whose writer a sibling already took — no
+    // record is written, but the counters still bump per record so a dry-run
+    // reports what WOULD be written and flag-on (no-op envelope hooks) stays
+    // count-identical to flag-off (the invariant the envelope arm documents).
+    // With a writer present, only the records actually written are counted, so a
+    // `join_values` collision that dead-letters a record does not also count it
+    // as written.
+    let had_writer = fan_out_writers.is_some() || single_writer.is_some();
+    let strategy = ctx.strategy;
+    // Collected inside the writer helpers (which hold only partial `ctx`
+    // borrows) and applied below once `ctx` is free again: `dlq_pending` drains
+    // through `push_dlq`, `written_rows` drives the ok/written/emitted counts.
+    let mut dlq_pending: Vec<DlqEntry> = Vec::new();
+    let mut written_rows: Vec<u64> = Vec::new();
+    {
+        let mut fan_ctx = FanOutContext {
+            name,
+            out_cfg,
+            cxl_emit_names_opt,
+            output_schema: &output_schema,
+            output_errors: &mut ctx.output_errors,
+            write_timer: &mut ctx.write_timer,
+            projection_timer: &mut ctx.projection_timer,
+            collector: &mut *ctx.collector,
+            strategy,
+            dlq_pending: &mut dlq_pending,
+            written_rows: &mut written_rows,
+        };
+        if let Some(per_file) = fan_out_writers {
+            emit_fan_out(&mut fan_ctx, &unbuffered, per_file, scan_timer);
+        } else if let Some(raw_writer) = single_writer {
+            emit_single_writer(&mut fan_ctx, raw_writer, &unbuffered, scan_timer);
+        }
+    }
+    // With a writer present, count ok / written / emitted from the records
+    // actually written — one entry in `written_rows` per successful
+    // `write_record`. Insert each into the run-shared `ok_source_rows` on success
+    // only (never remove), matching the streaming arm: a record a collision
+    // dead-letters is never in `written_rows`, yet a written sibling that merely
+    // shares its source row_num (a `combine match: all` fan-out) still counts,
+    // and a source row written OK at one Output and dead-lettered at another
+    // counts as ok exactly once regardless of Output order. Without a writer, no
+    // record was written, so `written_rows` is empty; fall back to the per-record
+    // bump over `unbuffered` to preserve the dry-run / flag-parity count.
+    let counted: &[(Record, u64)] = if had_writer { &[] } else { &unbuffered };
+    let mut newly_ok: u64 = 0;
+    let mut written_total: u64 = written_rows.len() as u64;
+    for row_num in &written_rows {
+        if ctx.ok_source_rows.insert(*row_num) {
+            newly_ok += 1;
+        }
+    }
+    for (_, row_num) in counted {
+        written_total += 1;
+        if ctx.ok_source_rows.insert(*row_num) {
+            newly_ok += 1;
+        }
+    }
+    ctx.counters.ok_count += newly_ok;
+    ctx.counters.records_written += written_total;
+    ctx.records_emitted += written_total;
+
+    // Drain the collected collision entries; `push_dlq` enforces the DLQ rate
+    // ceiling (E315/E316), which can still abort the run.
+    for entry in dlq_pending {
+        push_dlq(ctx, entry)?;
     }
 
     Ok(())
@@ -628,12 +677,14 @@ fn dispatch_output_envelope(
                 Some(build_format_writer(&out_cfg, raw_writer, schema))
             });
         }
-        // Count exactly as the records-only arm does: both counters bump
-        // unconditionally per record, independent of whether a writer is open
-        // or even registered. That keeps flag-on (with no-op hooks) invariant
-        // against flag-off — same input yields the same `records_written` /
-        // `ok_count` even on the no-writer / dry-run path where no byte is
-        // emitted.
+        // Count unconditionally per record, independent of whether a writer is
+        // open or even registered, so flag-on (with no-op hooks) stays invariant
+        // against flag-off on the no-writer / dry-run path where no byte is
+        // emitted — the records-only arm makes the same unconditional bump there.
+        // The two arms diverge only on a `join_values` collision: the records-only
+        // arm dead-letters that record and excludes it from the write count, while
+        // this envelope arm keeps a collision fatal (documented above), so a
+        // successfully-written stream counts identically on both.
         ctx.counters.records_written += 1;
         ctx.records_emitted += 1;
         if ctx.ok_source_rows.insert(row_num) {
@@ -725,6 +776,13 @@ impl EnvelopeWriterDriver {
         self.maybe_cross_boundary(doc_ctx);
         let writer = self.writer.as_mut().expect("writer opened above");
         if let Err(e) = writer.write_record(projected) {
+            // A `join_values` `on_conflict: error` collision is routed to the DLQ
+            // on the record-granularity Output arms (buffered + streaming). This
+            // envelope-reconstruction arm holds only the projected record and no
+            // `ctx` here, and a collision interacts with the per-document framing
+            // it drives, so — like the correlation-commit and document-DLQ arms —
+            // it keeps the existing fatal disposition, tracked as a follow-up
+            // rather than approximated here.
             self.errors.push(e.into());
         }
     }
@@ -852,6 +910,23 @@ struct FanOutContext<'a> {
     write_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
     projection_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
     collector: &'a mut crate::executor::stage_metrics::StageCollector,
+    /// The run's error strategy, so a `join_values` `on_conflict: error`
+    /// collision dead-letters under `Continue` / `BestEffort` but still aborts
+    /// under `FailFast` — the same disposition every other per-record failure
+    /// gets.
+    strategy: ErrorStrategy,
+    /// Collision DLQ entries gathered during the write. Drained through
+    /// [`push_dlq`] by the caller once the full `ctx` borrow is free (the
+    /// writer helpers hold only partial borrows of it).
+    dlq_pending: &'a mut Vec<DlqEntry>,
+    /// The source `row_num` of every record actually written, in write order —
+    /// one entry per successful `write_record`, so a `combine match: all`
+    /// fan-out that emits several output records for one driver row contributes
+    /// several entries. The caller counts `records_written`/`records_emitted`
+    /// from its length and inserts each into `ok_source_rows`, matching the
+    /// streaming arm; a record a collision dead-letters is simply never pushed
+    /// here, so a written sibling sharing its row_num still counts.
+    written_rows: &'a mut Vec<u64>,
 }
 
 /// Write `unbuffered` through a single pre-opened writer. Errors from
@@ -872,7 +947,7 @@ fn emit_single_writer(
         Ok(mut csv_writer) => {
             fan_ctx.collector.record(scan_timer.finish(1, 1));
             let mut write_failed = false;
-            for (record, _rn) in unbuffered {
+            for (record, rn) in unbuffered {
                 let projected = {
                     let _guard = fan_ctx.projection_timer.guard();
                     project_output_from_record(record, fan_ctx.out_cfg, fan_ctx.cxl_emit_names_opt)
@@ -882,10 +957,20 @@ fn emit_single_writer(
                     csv_writer.write_record(&projected)
                 };
                 if let Err(e) = write_result {
+                    // A `join_values` `on_conflict: error` collision dead-letters
+                    // the one offending record and keeps writing the rest (unless
+                    // FailFast); any other write error is fatal for this writer.
+                    if fan_ctx.strategy != ErrorStrategy::FailFast
+                        && let Some(entry) = sink_collision_dlq_entry(record, *rn, fan_ctx.name, &e)
+                    {
+                        fan_ctx.dlq_pending.push(entry);
+                        continue;
+                    }
                     push_write_error(fan_ctx.output_errors, e);
                     write_failed = true;
                     break;
                 }
+                fan_ctx.written_rows.push(*rn);
             }
             if !write_failed {
                 let flush_result = {
@@ -969,8 +1054,16 @@ fn emit_fan_out(
             fw.write_record(&projected)
         };
         if let Err(e) = write_result {
+            if fan_ctx.strategy != ErrorStrategy::FailFast
+                && let Some(entry) = sink_collision_dlq_entry(record, *rn, fan_ctx.name, &e)
+            {
+                fan_ctx.dlq_pending.push(entry);
+                continue;
+            }
             push_write_error(fan_ctx.output_errors, e);
+            continue;
         }
+        fan_ctx.written_rows.push(*rn);
     }
 
     // Flush every writer regardless of per-record errors so partial
