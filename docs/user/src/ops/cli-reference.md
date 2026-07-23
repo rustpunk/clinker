@@ -264,6 +264,67 @@ clinker refactor rename-node pipeline/order_fulfillment.yaml orders purchases
 
 ---
 
+## clinker config
+
+Inspect a pipeline configuration file.
+
+```bash
+clinker config --resolved <CONFIG>
+```
+
+### clinker config --resolved
+
+Prints the config with the **multi-value shorthand expanded to canonical form**.
+The bare-field forms of `split_to_rows:`, `split_values:`, and `join_values:`
+are rewritten to full mappings with every default spelled out — so you can see
+exactly what the engine runs:
+
+- a bare `- line_items` under `split_to_rows:` becomes
+  `- { field: line_items, keep_empty: true, mode: extract }`;
+- a bare `- tags` under `split_values:` becomes
+  `- { field: tags, delimiter: ";" }`;
+- a bare `- tags` under `join_values:` becomes
+  `- { field: tags, delimiter: ";", on_conflict: error, escape: "\\" }`.
+
+The rewrite is **surgical**: only those shorthand blocks change. Comments, key
+order, indentation, and every other surface are preserved byte-for-byte, so the
+output parses to a plan semantically identical to the input, and running
+`config --resolved` on the result is a no-op. Schema columns are already
+canonical (`multiple: true` is always written explicitly), so the schema block is
+left untouched.
+
+This is config canonicalization for the pipeline file itself. It is distinct
+from [`clinker channels resolve`](#clinker-channels-resolve), which renders the
+effective *post-overlay* plan for a specific tenant.
+
+A few surfaces are deliberately left as written rather than expanded, since
+regenerating them would lose information: a shorthand block that carries an
+**interior comment or blank line** between its items is passed through unchanged
+(so the comment is never dropped), and a value written as a **YAML alias**
+(`*anchor`) is left in place — the anchor it points to is expanded at its
+definition, so the alias still resolves to the expanded value. The output uses
+the input file's line endings (LF or CRLF).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `<CONFIG>` | -- | Path to the pipeline YAML config file (required). The file is validated before it is rewritten, so a malformed config fails with a config error rather than emitting a half-expanded document. |
+| `--resolved` | -- | Print the fully-expanded canonical form to stdout. Currently the only mode; required. |
+
+### Examples
+
+```bash
+# Show the fully-expanded canonical form
+clinker config --resolved pipeline.yaml
+
+# Materialize the shorthand into a new file
+clinker config --resolved pipeline.yaml > pipeline.canonical.yaml
+```
+
+See [Source Nodes → Multi-value fields](../nodes/source.md#multi-value-fields)
+for the shorthand these forms expand from.
+
+---
+
 ## Environment Variables
 
 | Variable | Description |

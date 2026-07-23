@@ -1,4 +1,5 @@
 pub mod aggregate;
+pub mod canonical;
 pub mod compile_context;
 pub mod composition;
 pub mod discovery;
@@ -22,6 +23,7 @@ pub mod utils;
 
 pub use crate::plan::index::AnalyticWindowSpec;
 pub use aggregate::*;
+pub use canonical::{CanonicalError, expand_multi_value_shorthand};
 pub use clinker_format::{
     Column, Discriminator, RECORD_TYPE_COLUMN, RecordType, SourceSchema, StructureConstraint,
 };
