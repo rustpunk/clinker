@@ -327,6 +327,11 @@ fn build_writer_factory(
         OutputFormat::Xml(opts) => {
             let mut xml_config = build_xml_writer_config(opts.as_ref());
             xml_config.include_engine_stamped = include_engine_stamped;
+            // Per-field repeated-element overrides (`repeat_as` / `wrap_in`); a
+            // `multiple:` field with no entry emits bare repeats named after the
+            // field. The plan-time E362 gate has already validated the block, so
+            // the XML and CSV arms each consume the sub-vocabulary they read.
+            xml_config.join_values = join_values;
             xml_config.envelope = resolve_envelope_spec(
                 reconstruct_envelope,
                 opts.as_ref().and_then(|o| o.envelope.as_ref()),

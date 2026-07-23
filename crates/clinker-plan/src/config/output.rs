@@ -80,12 +80,15 @@ pub struct OutputConfig {
     /// format implements `begin_document` / `end_document`.
     #[serde(default, skip_serializing_if = "is_false_bool")]
     pub reconstruct_envelope: bool,
-    /// In-cell join declarations: each names a `multiple:` field whose values a
-    /// CSV writer collapses into one delimited cell, with a per-field delimiter
-    /// and collision policy. The write-side inverse of `split_values`. Empty by
-    /// default; a `multiple:` field with no entry joins with the default `;` and
-    /// `on_conflict: error`. Consumed by the CSV writer only — declaring it on
-    /// another output format is rejected (E362).
+    /// Write-side multi-value declarations: each names a `multiple:` field and
+    /// says how the writer encodes it. The CSV writer collapses the values into
+    /// one delimited cell (`delimiter` / `on_conflict` / `escape`); the XML
+    /// writer emits them as repeated child elements (`repeat_as` for the per-item
+    /// element name, `wrap_in` for an optional container). The write-side inverse
+    /// of `split_values`. Empty by default; a `multiple:` field with no entry
+    /// takes each writer's default (CSV joins with `;` / `on_conflict: error`,
+    /// XML repeats elements named after the field). Consumed by the CSV and XML
+    /// writers only — declaring it on another output format is rejected (E362).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_values: Option<Vec<JoinValues>>,
     #[serde(flatten)]

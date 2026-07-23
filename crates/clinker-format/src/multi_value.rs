@@ -161,42 +161,68 @@ pub enum OnConflict {
     EncodeJson,
 }
 
-/// One `join_values` entry: collapse a `multiple:` field into one delimited
-/// CSV cell on write. The write-side inverse of [`SplitValues`].
+/// One `join_values` entry: the write-side declaration for a `multiple:` field,
+/// the inverse of [`SplitValues`]. Each writer reads the sub-vocabulary that
+/// applies to it:
+///
+/// - The **CSV** writer collapses the values into one delimited cell, honoring
+///   `delimiter` / `on_conflict` / `escape`.
+/// - The **XML** writer emits the values as repeated child elements, honoring
+///   `repeat_as` (the per-item element name) and `wrap_in` (an optional
+///   container). It ignores `delimiter` / `on_conflict` / `escape`, which have no
+///   meaning for repeated elements; the CSV writer likewise ignores
+///   `repeat_as` / `wrap_in`.
 ///
 /// Two accepted YAML shapes, freely mixable in one sequence:
 ///
 /// ```yaml
 /// join_values:
 ///   - tags                          # shorthand: delimiter ";", on_conflict: error
-///   - field: notes                  # full form
+///   - field: notes                  # full form (CSV)
 ///     delimiter: "|"
 ///     on_conflict: escape           # error | escape | encode_json
 ///     escape: "\\"                  # only meaningful with on_conflict: escape
+///   - field: tags                   # full form (XML)
+///     repeat_as: Tag                # per-item element name; defaults to the field
+///     wrap_in: Tags                 # optional container; omit for bare repeats
 /// ```
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct JoinValues {
     /// Flattened field name whose values are joined into one cell.
     pub field: String,
     /// Separator written between values. Defaults to
-    /// [`crate::schema::DEFAULT_VALUE_DELIMITER`].
+    /// [`crate::schema::DEFAULT_VALUE_DELIMITER`]. CSV output only.
     pub delimiter: String,
-    /// What to do when a value being joined contains the delimiter.
+    /// What to do when a value being joined contains the delimiter. CSV output
+    /// only.
     pub on_conflict: OnConflict,
     /// Escape character used under [`OnConflict::Escape`]. Defaults to a
-    /// backslash. Ignored by the other policies.
+    /// backslash. Ignored by the other policies. CSV output only.
     pub escape: String,
+    /// XML output only: the element name emitted per array item. `None` (the
+    /// default) names each item after the field's own element. Ignored by the
+    /// CSV writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat_as: Option<String>,
+    /// XML output only: a container element wrapping the repeated items. `None`
+    /// (the default) emits bare repeats with no container. Ignored by the CSV
+    /// writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrap_in: Option<String>,
 }
 
 impl JoinValues {
     /// A `join_values` entry using the default delimiter, `on_conflict: error`,
-    /// and the default escape — what the bare-scalar shorthand deserializes to.
+    /// the default escape, and no XML repeat/wrap overrides — what the
+    /// bare-scalar shorthand deserializes to.
     pub fn bare(field: impl Into<String>) -> Self {
         JoinValues {
             field: field.into(),
             delimiter: crate::schema::DEFAULT_VALUE_DELIMITER.to_string(),
             on_conflict: OnConflict::default(),
             escape: default_escape(),
+            repeat_as: None,
+            wrap_in: None,
         }
     }
 }
@@ -423,6 +449,10 @@ impl<'de> Deserialize<'de> for JoinValues {
             on_conflict: OnConflict,
             #[serde(default = "default_escape")]
             escape: String,
+            #[serde(default)]
+            repeat_as: Option<String>,
+            #[serde(default)]
+            wrap_in: Option<String>,
         }
 
         struct V;
@@ -433,7 +463,7 @@ impl<'de> Deserialize<'de> for JoinValues {
                 f.write_str(
                     "a `join_values` entry: either a field name (`tags`) or a map \
                      `{ field: <name>, delimiter: <str>, on_conflict: error|escape|encode_json, \
-                     escape: <str> }`",
+                     escape: <str>, repeat_as: <name>, wrap_in: <name> }`",
                 )
             }
 
@@ -448,6 +478,8 @@ impl<'de> Deserialize<'de> for JoinValues {
                     delimiter: full.delimiter,
                     on_conflict: full.on_conflict,
                     escape: full.escape,
+                    repeat_as: full.repeat_as,
+                    wrap_in: full.wrap_in,
                 })
             }
         }

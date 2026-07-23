@@ -14,9 +14,10 @@
 //!   to PRODUCE one, which would bind the column as an array and then hand
 //!   CXL a scalar.
 //! - **E362** — a malformed `join_values` declaration on an output: declared on
-//!   a format whose writer never consumes it, a duplicate field, an empty
-//!   delimiter, or an escape/delimiter that is not a single character under
-//!   `on_conflict: escape`. The write-side mirror of E358.
+//!   a format whose writer never consumes it (only `csv` and `xml` do), a
+//!   duplicate field, or — on a CSV output — an empty delimiter or an
+//!   escape/delimiter that is not a single character under `on_conflict: escape`.
+//!   The write-side mirror of E358.
 //!
 //! E359 and E361 are the two arrows of the same rule, and each reads its own
 //! per-format capability table: [`output_encodes_multi_value`] for the write
@@ -43,8 +44,9 @@ use crate::yaml::Spanned;
 ///   `;` with `on_conflict: error`; `join_values` overrides the policy per
 ///   field (#917). No multi-record CSV writer exists, so the answer is
 ///   unconditional.
-/// - `xml` — repeated child elements: tracked at
-///   https://github.com/rustpunk/clinker/issues/916.
+/// - `xml` — repeated child elements, one per array value, named after the
+///   field; `join_values` `repeat_as` / `wrap_in` override the item and
+///   container element names.
 /// - `fixed_width` — repeating field groups: tracked at
 ///   https://github.com/rustpunk/clinker/issues/918.
 /// - `edifact` / `x12` / `hl7` / `swift` — these writers emit a fixed
@@ -53,7 +55,7 @@ fn output_encodes_multi_value(format: &OutputFormat) -> bool {
     match format {
         OutputFormat::Json(_) => true,
         OutputFormat::Csv(_) => true,
-        OutputFormat::Xml(_) => false,
+        OutputFormat::Xml(_) => true,
         OutputFormat::FixedWidth(_) => false,
         OutputFormat::Edifact(_)
         | OutputFormat::X12(_)
@@ -880,12 +882,18 @@ pub fn source_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
 /// Validate an output's `join_values` declarations (E362), the write-side
 /// mirror of E358's source-declaration checks.
 ///
-/// The block is consumed by the CSV writer only, so declaring it on any other
-/// output format is a silent no-op the gate rejects — the same LD-011 spirit as
-/// E358's "reader never handed it". On a CSV output each entry is checked: no
-/// duplicate field, a non-empty delimiter, and — under `on_conflict: escape`,
-/// whose invertible escaping is defined char-wise — a single-character delimiter
-/// and escape.
+/// The block is consumed by two writers: the CSV writer joins the values into
+/// one delimited cell, and the XML writer emits them as repeated child elements.
+/// Declaring it on any other output format is a silent no-op the gate rejects —
+/// the same no-op-rejection principle as E358's "reader never handed it".
+///
+/// The duplicate-field check applies to both consumers. The delimiter / escape
+/// shape checks are the CSV writer's alone — a non-empty delimiter, and under
+/// `on_conflict: escape` (whose invertible escaping is defined char-wise) a
+/// single-character delimiter and escape. The XML writer reads only `repeat_as`
+/// and `wrap_in`, validated as legal XML names at write time (consistent with
+/// the configured root / record element names), so those shape checks would
+/// wrongly fault an XML entry's defaulted delimiter.
 ///
 /// Deliberately does NOT require the field to be a statically-declared
 /// `multiple:` column, unlike E358's `split_values` check. A write-side array
@@ -899,23 +907,26 @@ fn validate_join_declarations(output: &OutputConfig) -> Vec<DeclarationFault> {
         return faults;
     }
     let format = output.format.format_name();
-    if !matches!(output.format, OutputFormat::Csv(_)) {
+    let consumes = matches!(output.format, OutputFormat::Csv(_) | OutputFormat::Xml(_));
+    if !consumes {
         faults.push(DeclarationFault {
             message: format!(
                 "output '{}': `join_values` is declared on a `{format}` output, whose writer \
                  never consumes it — the declaration would be a silent no-op",
                 output.name
             ),
-            help: "remove the `join_values` block: joining several values into one delimited \
-                   cell is written by the `csv` writer only. A `json` output emits a native \
-                   array, and the `xml` / `fixed_width` / segment writers have no delimited-cell \
-                   join."
+            help: "remove the `join_values` block: the `csv` writer joins several values into \
+                   one delimited cell, and the `xml` writer emits them as repeated child \
+                   elements. A `json` output emits a native array, and the `fixed_width` / \
+                   segment writers have no multi-value encoding to configure."
                 .to_string(),
         });
         // Once the format cannot consume the block at all, the per-entry checks
         // are moot — the author is told to delete the whole block.
         return faults;
     }
+    // Two entries for one field leave its encoding ambiguous, whichever writer
+    // consumes it.
     for (i, entry) in entries.iter().enumerate() {
         if entries[i + 1..].iter().any(|o| o.field == entry.field) {
             faults.push(DeclarationFault {
@@ -923,10 +934,17 @@ fn validate_join_declarations(output: &OutputConfig) -> Vec<DeclarationFault> {
                     "output '{}': `join_values` declares the field '{}' more than once",
                     output.name, entry.field
                 ),
-                help: "declare each field once, with the delimiter and policy it should join with"
-                    .to_string(),
+                help: "declare each field once, with the encoding it should use".to_string(),
             });
         }
+    }
+    // The delimiter / escape shape checks below are the CSV writer's; the XML
+    // writer ignores delimiter / on_conflict / escape, so an XML entry's
+    // defaulted values are not faults.
+    if !matches!(output.format, OutputFormat::Csv(_)) {
+        return faults;
+    }
+    for entry in entries {
         // The delimiter matters only for the delimited policies (`error`,
         // `escape`); `encode_json` ignores it, so an empty or multi-character
         // delimiter under `encode_json` is harmless and exempt.
@@ -1151,13 +1169,14 @@ mod tests {
     }
 
     #[test]
-    fn json_and_csv_encode_multi_value_today() {
-        // `json` (native arrays) and `csv` (join into a delimited cell, #917)
-        // encode a `multiple:` field; the remaining writers do not yet.
+    fn json_csv_and_xml_encode_multi_value_today() {
+        // `json` (native arrays), `csv` (join into a delimited cell, #917), and
+        // `xml` (repeated child elements, #916) encode a `multiple:` field; the
+        // remaining writers do not yet.
         assert!(output_encodes_multi_value(&OutputFormat::Json(None)));
         assert!(output_encodes_multi_value(&OutputFormat::Csv(None)));
+        assert!(output_encodes_multi_value(&OutputFormat::Xml(None)));
         for format in [
-            OutputFormat::Xml(None),
             OutputFormat::FixedWidth(None),
             OutputFormat::Edifact(None),
             OutputFormat::X12(None),

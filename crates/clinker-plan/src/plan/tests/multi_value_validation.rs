@@ -7,8 +7,9 @@
 //! at reader construction (XML only) or nothing at all, so these pin the move to
 //! compile time with a diagnostic code and a source span.
 //!
-//! CSV now encodes a multi-value field (it joins into a delimited cell, #917),
-//! so the E359 reachability tests below drive a still-non-encoding sink (`xml`).
+//! CSV and XML now encode a multi-value field (a delimited cell, #917; repeated
+//! child elements, #916), so the E359 reachability tests below drive a
+//! still-non-encoding sink (`fixed_width`).
 
 use clinker_core_types::Diagnostic;
 
@@ -232,11 +233,11 @@ fn duplicate_split_values_field_is_rejected() {
 }
 
 #[test]
-fn multi_value_column_into_a_json_or_csv_output_compiles() {
-    // JSON (native arrays) and CSV (join into a delimited cell, #917) both
-    // encode a multi-value field, so the E359 capability table lets them
-    // through — the join defaults to `;` / `on_conflict: error`, no config.
-    for format in ["json", "csv"] {
+fn multi_value_column_into_a_json_csv_or_xml_output_compiles() {
+    // JSON (native arrays), CSV (join into a delimited cell, #917), and XML
+    // (repeated child elements, #916) all encode a multi-value field, so the
+    // E359 capability table lets them through with no per-field config.
+    for format in ["json", "csv", "xml"] {
         let yaml = pipeline(
             r#"      schema:
         - { name: tags, type: string, multiple: true }"#,
@@ -248,22 +249,22 @@ fn multi_value_column_into_a_json_or_csv_output_compiles() {
 
 #[test]
 fn multi_value_column_into_a_non_encoding_output_is_rejected_with_a_span() {
-    // CSV now encodes (#917); XML and fixed-width still have no writer for it.
-    for format in ["xml", "fixed_width"] {
-        let yaml = pipeline(
-            r#"      schema:
+    // CSV (#917) and XML (#916) now encode; fixed-width still has no writer for
+    // a `multiple:` field.
+    let format = "fixed_width";
+    let yaml = pipeline(
+        r#"      schema:
         - { name: tags, type: string, multiple: true }"#,
-            format,
-        );
-        let found = coded(&compile_err(&yaml), "E359");
-        assert_eq!(found.len(), 1, "expected one E359 for {format}");
-        assert!(
-            found[0].0.contains("'tags'") && found[0].0.contains(format),
-            "{format}: {}",
-            found[0].0
-        );
-        assert!(found[0].1, "E359 must carry a source span for {format}");
-    }
+        format,
+    );
+    let found = coded(&compile_err(&yaml), "E359");
+    assert_eq!(found.len(), 1, "expected one E359 for {format}");
+    assert!(
+        found[0].0.contains("'tags'") && found[0].0.contains(format),
+        "{format}: {}",
+        found[0].0
+    );
+    assert!(found[0].1, "E359 must carry a source span for {format}");
 }
 
 #[test]
@@ -375,8 +376,8 @@ nodes:
     input: pick
     config:
       name: out
-      type: xml
-      path: out.xml
+      type: fixed_width
+      path: out.fw
 "#;
     let found = coded(&compile_err(yaml), "E359");
     assert_eq!(found.len(), 1, "expected one E359 through the transform");
@@ -406,8 +407,8 @@ nodes:
     input: pick
     config:
       name: out
-      type: xml
-      path: out.xml
+      type: fixed_width
+      path: out.fw
   - type: transform
     name: pick
     input: src
@@ -448,8 +449,8 @@ nodes:
     input: src
     config:
       name: out
-      type: xml
-      path: out.xml
+      type: fixed_width
+      path: out.fw
       schema:
         - { name: id, type: string }
         - { name: codes, type: string, multiple: true }
@@ -538,8 +539,8 @@ nodes:
     input: enriched
     config:
       name: report
-      type: xml
-      path: out.xml
+      type: fixed_width
+      path: out.fw
 "#;
     let found = coded(&compile_err(yaml), "E359");
     assert_eq!(
@@ -582,8 +583,8 @@ nodes:
     input: src
     config:
       name: out
-      type: xml
-      path: out.xml
+      type: fixed_width
+      path: out.fw
 "#;
     let found = coded(&compile_err(yaml), "E359");
     assert_eq!(
@@ -627,8 +628,8 @@ nodes:
     input: orders_src
     config:
       name: report
-      type: xml
-      path: out.xml
+      type: fixed_width
+      path: out.fw
 "#;
     let found = coded(&compile_err(yaml), "E359");
     assert_eq!(found.len(), 1, "expected one E359: {found:?}");
@@ -665,8 +666,8 @@ nodes:
     input: src
     config:
       name: out
-      type: xml
-      path: out.xml
+      type: fixed_width
+      path: out.fw
 "#,
         schema_path.display()
     );
@@ -1203,6 +1204,46 @@ fn join_values_on_a_non_csv_output_is_rejected() {
         found[0].0
     );
     assert!(found[0].1, "E362 must carry a source span");
+}
+
+#[test]
+fn join_values_repeat_and_wrap_on_an_xml_output_compiles() {
+    // The XML writer consumes `join_values` for repeated-element naming (#916),
+    // so `repeat_as` / `wrap_in` on an XML sink is a valid override, not a no-op.
+    let yaml = join_pipeline(
+        "xml",
+        r#"      join_values:
+        - { field: tags, repeat_as: Tag, wrap_in: Tags }"#,
+    );
+    compile_ok(&yaml);
+}
+
+#[test]
+fn join_values_csv_shape_knobs_on_an_xml_output_are_not_faults() {
+    // The delimiter / escape shape checks are the CSV writer's alone; the XML
+    // writer ignores them, so a multi-character delimiter that E362 would reject
+    // on a CSV output is simply inert on an XML output.
+    let yaml = join_pipeline(
+        "xml",
+        r#"      join_values:
+        - { field: tags, delimiter: "::" }"#,
+    );
+    compile_ok(&yaml);
+}
+
+#[test]
+fn join_values_duplicate_field_on_an_xml_output_is_rejected() {
+    // The duplicate-field check applies to every consumer of the block, XML
+    // included — two entries for one field leave its encoding ambiguous.
+    let yaml = join_pipeline(
+        "xml",
+        r#"      join_values:
+        - { field: tags, repeat_as: Tag }
+        - { field: tags, wrap_in: Tags }"#,
+    );
+    let found = coded(&compile_err(&yaml), "E362");
+    assert_eq!(found.len(), 1, "expected one E362: {found:?}");
+    assert!(found[0].0.contains("more than once"), "{}", found[0].0);
 }
 
 #[test]

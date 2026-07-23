@@ -21,6 +21,7 @@ use clinker_record::{DocumentContext, Record, Schema, Value};
 
 use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
 use crate::error::FormatError;
+use crate::multi_value::JoinValues;
 use crate::traits::FormatWriter;
 
 #[derive(Clone)]
@@ -45,6 +46,14 @@ pub struct XmlWriterConfig {
     /// the executor under `reconstruct_envelope: true` and wraps each document
     /// in a `<Document>` frame with header/footer elements.
     pub envelope: Option<OutputEnvelopeSpec>,
+    /// Per-field overrides for how a `multiple:` field's values are emitted as
+    /// repeated child elements. A `Value::Array` at any element field emits one
+    /// child element per value, named after the field, unless an entry here
+    /// names the field and sets `repeat_as` (the per-item element name) and/or
+    /// `wrap_in` (a container element). Empty by default; populated from the
+    /// output's `join_values`. Mirrors the CSV writer's `join_values` field —
+    /// the two writers read disjoint sub-vocabularies of the same declaration.
+    pub join_values: Vec<JoinValues>,
 }
 
 impl Default for XmlWriterConfig {
@@ -56,6 +65,7 @@ impl Default for XmlWriterConfig {
             attribute_prefix: "@".into(),
             include_engine_stamped: false,
             envelope: None,
+            join_values: Vec::new(),
         }
     }
 }
@@ -609,15 +619,18 @@ fn insert_field(
 
 /// Convert a clinker Value to XML text content.
 ///
-/// `Value::Map` and `Value::Array` have no canonical scalar serialization
-/// for an XML element body (silently JSON-encoding a map, or comma-joining
-/// an array, hides routing bugs — e.g. a `$widened` sidecar reaching the
-/// writer without `include_unmapped: true` expansion for a map, or a
-/// `match: collect` combine output misrouted to XML for an array), so this
-/// returns `FormatError::UnserializableMapValue` /
-/// `FormatError::UnserializableArrayValue` carrying the offending column.
-/// XML is the single point of truth for collection rejection on this path;
-/// there is no upstream pre-walk.
+/// This renders a single scalar into one element body. A top-level
+/// `Value::Array` at a record element field is a `multiple:` field, emitted as
+/// repeated child elements before reaching here (see [`fill_slot`] and
+/// [`emit_repeated_leaf`]) — so an array reaching this scalar renderer is a
+/// NESTED collection (an array or map inside a `multiple:` field), which has no
+/// element-body serialization. A `Value::Map` likewise has none. Both return
+/// `FormatError::UnserializableMapValue` / `FormatError::UnserializableArrayValue`
+/// carrying the offending column rather than being silently flattened, which
+/// would hide a routing bug (e.g. a `$widened` sidecar reaching the writer
+/// without `include_unmapped: true` expansion). The envelope-section path also
+/// renders through here, so a section field carrying a collection is rejected
+/// the same way.
 fn value_to_text(col: &str, val: &Value) -> Result<String, FormatError> {
     let mut buf = String::new();
     write_value_text(&mut buf, col, val)?;
@@ -694,8 +707,32 @@ struct PlanAttr {
 
 /// A precompiled child node: a leaf element or a nested branch.
 enum PlanNode {
-    Leaf { name: String, field: usize },
-    Branch { name: String, body: PlanBody },
+    Leaf {
+        name: String,
+        field: usize,
+        /// Per-item naming when this leaf's value is a `Value::Array`. `None`
+        /// emits bare repeats named after the leaf; `Some` carries the
+        /// `repeat_as` / `wrap_in` overrides from the field's `join_values`
+        /// entry (validated at plan build). A scalar value ignores this.
+        repeat: Option<XmlRepeat>,
+    },
+    Branch {
+        name: String,
+        body: PlanBody,
+    },
+}
+
+/// How a `multiple:` field's repeated child elements are named, resolved from a
+/// `join_values` entry at plan build. Both names are validated as legal XML
+/// names when the plan is built, so a malformed override fails the write cleanly
+/// before any byte is emitted — the same point the element/attribute names are
+/// checked.
+struct XmlRepeat {
+    /// Element name emitted per array item (a `repeat_as`, or the leaf's own
+    /// element name when the entry did not set one).
+    item_name: String,
+    /// Optional container element wrapping the repeated items (`wrap_in`).
+    wrap_in: Option<String>,
 }
 
 /// The memoized plan plus the identity it was built for. `field_is_attr` marks,
@@ -727,6 +764,7 @@ fn build_plan_cache(record: &Record, config: &XmlWriterConfig) -> Result<PlanCac
             name,
             name,
             &config.attribute_prefix,
+            &config.join_values,
             &mut field_is_attr,
         )?;
     }
@@ -747,6 +785,7 @@ fn plan_insert_field(
     field: &str,
     path: &str,
     attribute_prefix: &str,
+    join_values: &[JoinValues],
     field_is_attr: &mut [bool],
 ) -> Result<(), FormatError> {
     if let Some((first, rest)) = path.split_once('.') {
@@ -771,6 +810,7 @@ fn plan_insert_field(
                 field,
                 rest,
                 attribute_prefix,
+                join_values,
                 field_is_attr,
             )
         } else {
@@ -781,6 +821,7 @@ fn plan_insert_field(
                 field,
                 rest,
                 attribute_prefix,
+                join_values,
                 field_is_attr,
             )?;
             body.children.push(PlanNode::Branch {
@@ -811,12 +852,50 @@ fn plan_insert_field(
         Ok(())
     } else {
         check_xml_name(path, &format!("field '{field}': element"))?;
+        let repeat = build_repeat_spec(field, path, join_values)?;
         body.children.push(PlanNode::Leaf {
             name: path.to_string(),
             field: field_index,
+            repeat,
         });
         Ok(())
     }
+}
+
+/// Resolve a leaf's repeated-element naming from the output's `join_values`.
+///
+/// The entry is matched by the leaf's full flattened field name (the same
+/// name the CSV writer matches on). Returns `None` when no entry names the field
+/// or the entry carries neither XML override — the array then emits bare repeats
+/// named after the leaf. When an override is present, `repeat_as` / `wrap_in` are
+/// validated as legal XML names here, before any byte is written, so a malformed
+/// name fails the write cleanly the same way an illegal element name does.
+fn build_repeat_spec(
+    field: &str,
+    leaf_name: &str,
+    join_values: &[JoinValues],
+) -> Result<Option<XmlRepeat>, FormatError> {
+    let Some(entry) = join_values.iter().find(|j| j.field == field) else {
+        return Ok(None);
+    };
+    if entry.repeat_as.is_none() && entry.wrap_in.is_none() {
+        return Ok(None);
+    }
+    let item_name = match &entry.repeat_as {
+        Some(name) => {
+            check_xml_name(name, &format!("field '{field}': `repeat_as` element"))?;
+            name.clone()
+        }
+        None => leaf_name.to_string(),
+    };
+    let wrap_in = match &entry.wrap_in {
+        Some(name) => {
+            check_xml_name(name, &format!("field '{field}': `wrap_in` element"))?;
+            Some(name.clone())
+        }
+        None => None,
+    };
+    Ok(Some(XmlRepeat { item_name, wrap_in }))
 }
 
 /// Per-record scratch, one slot per field in iterator order. Slot `String`
@@ -829,7 +908,16 @@ struct FillBuf {
 
 #[derive(Default)]
 struct FillSlot {
+    /// Scalar rendering. Empty when the field is null-dropped or holds an array.
     text: String,
+    /// Per-element renderings when the field's value is a `Value::Array`. The
+    /// live entries are `parts[..part_count]`; the `Vec` and each inner `String`
+    /// retain their capacity across records, like `text` does.
+    parts: Vec<String>,
+    part_count: usize,
+    /// True when this slot holds an array — the repeated-element emit path reads
+    /// `parts` rather than `text`.
+    is_array: bool,
     emits: bool,
 }
 
@@ -855,12 +943,28 @@ impl FillBuf {
     fn text(&self, field: usize) -> &str {
         &self.slots[field].text
     }
+
+    /// The per-element renderings for an array field, or `None` for a scalar.
+    /// A returned slice is always non-empty: an empty array sets `emits = false`,
+    /// so callers gate on `emits` before reaching here.
+    fn parts(&self, field: usize) -> Option<&[String]> {
+        let slot = &self.slots[field];
+        slot.is_array.then_some(&slot.parts[..slot.part_count])
+    }
 }
 
-/// Fill a single slot with a field's presence and rendered text. A field is
-/// dropped (`emits = false`) when it is a null attribute, or a null element
-/// under `preserve_nulls: false`; otherwise its text is rendered (a preserved
-/// null element renders to the empty string, emitted as a self-closing tag).
+/// Fill a single slot with a field's presence and rendered value(s).
+///
+/// A scalar field is dropped (`emits = false`) when it is a null attribute, or a
+/// null element under `preserve_nulls: false`; otherwise its text is rendered (a
+/// preserved null element renders to the empty string, emitted as a self-closing
+/// tag).
+///
+/// A `Value::Array` at an ELEMENT field is a `multiple:` field: each element is
+/// rendered into `parts` for the repeated-element emit path, and an empty array
+/// drops the field (`emits = false`) so it emits nothing. An array at an
+/// ATTRIBUTE field is rejected — an XML attribute holds a single value and
+/// cannot repeat.
 fn fill_slot(
     slot: &mut FillSlot,
     is_attr: bool,
@@ -868,16 +972,50 @@ fn fill_slot(
     name: &str,
     val: &Value,
 ) -> Result<(), FormatError> {
-    let skip = if is_attr {
-        val.is_null()
-    } else {
-        val.is_null() && !preserve_nulls
-    };
-    slot.emits = !skip;
-    slot.text.clear();
-    if !skip {
-        write_value_text(&mut slot.text, name, val)?;
+    slot.is_array = false;
+    slot.part_count = 0;
+    match val {
+        Value::Array(items) if !is_attr => {
+            slot.is_array = true;
+            slot.text.clear();
+            fill_parts(slot, name, items)?;
+            slot.emits = !items.is_empty();
+        }
+        Value::Array(_) => {
+            return Err(FormatError::Xml(format!(
+                "field '{name}': an XML attribute cannot hold multiple values — a \
+                 `multiple:` field maps to repeated elements, not an attribute"
+            )));
+        }
+        _ => {
+            let skip = if is_attr {
+                val.is_null()
+            } else {
+                val.is_null() && !preserve_nulls
+            };
+            slot.emits = !skip;
+            slot.text.clear();
+            if !skip {
+                write_value_text(&mut slot.text, name, val)?;
+            }
+        }
     }
+    Ok(())
+}
+
+/// Render each element of a `multiple:` field's array into the slot's `parts`,
+/// reusing the existing `String` capacity. A nested collection element (an array
+/// or map inside the field) has no element body and is rejected by
+/// [`write_value_text`], the same misroute detection the scalar path applies.
+fn fill_parts(slot: &mut FillSlot, name: &str, items: &[Value]) -> Result<(), FormatError> {
+    if slot.parts.len() < items.len() {
+        slot.parts.resize_with(items.len(), String::new);
+    }
+    for (i, item) in items.iter().enumerate() {
+        slot.parts[i].clear();
+        write_value_text(&mut slot.parts[i], name, item)?;
+    }
+    slot.part_count = items.len();
     Ok(())
 }
 
@@ -893,8 +1031,16 @@ fn emit_body<W: Write>(
 ) -> Result<(), FormatError> {
     for child in &body.children {
         match child {
-            PlanNode::Leaf { name, field } => {
+            PlanNode::Leaf {
+                name,
+                field,
+                repeat,
+            } => {
                 if !fill.emits(*field) {
+                    continue;
+                }
+                if let Some(parts) = fill.parts(*field) {
+                    emit_repeated_leaf(writer, name, repeat, parts)?;
                     continue;
                 }
                 let text = fill.text(*field);
@@ -937,6 +1083,52 @@ fn emit_body<W: Write>(
                 }
             }
         }
+    }
+    Ok(())
+}
+
+/// Emit a `multiple:` field's values as repeated child elements. `parts` holds
+/// the per-element rendered text and is non-empty (an empty array sets
+/// `emits = false`, so the caller skips it). Each item is
+/// `<item_name>text</item_name>`, or a self-closing `<item_name/>` when its text
+/// is empty; a `wrap_in` container, when set, brackets the whole run.
+///
+/// `item_name` and any `wrap_in` were validated as legal XML names at plan build
+/// ([`build_repeat_spec`]), so no per-record name check is needed here.
+fn emit_repeated_leaf<W: Write>(
+    writer: &mut XmlEmitter<W>,
+    leaf_name: &str,
+    repeat: &Option<XmlRepeat>,
+    parts: &[String],
+) -> Result<(), FormatError> {
+    let item_name = repeat.as_ref().map_or(leaf_name, |r| r.item_name.as_str());
+    let wrap_in = repeat.as_ref().and_then(|r| r.wrap_in.as_deref());
+    if let Some(container) = wrap_in {
+        writer
+            .write_event(Event::Start(BytesStart::new(container)))
+            .map_err(xml_err)?;
+    }
+    for part in parts {
+        if part.is_empty() {
+            writer
+                .write_event(Event::Empty(BytesStart::new(item_name)))
+                .map_err(xml_err)?;
+        } else {
+            writer
+                .write_event(Event::Start(BytesStart::new(item_name)))
+                .map_err(xml_err)?;
+            writer
+                .write_event(Event::Text(BytesText::new(part)))
+                .map_err(xml_err)?;
+            writer
+                .write_event(Event::End(BytesEnd::new(item_name)))
+                .map_err(xml_err)?;
+        }
+    }
+    if let Some(container) = wrap_in {
+        writer
+            .write_event(Event::End(BytesEnd::new(container)))
+            .map_err(xml_err)?;
     }
     Ok(())
 }
@@ -1177,37 +1369,285 @@ mod tests {
         }
     }
 
-    /// XML writer rejects `Value::Array` payloads with
-    /// `FormatError::UnserializableArrayValue`, parallel to the map
-    /// rejection. The prior behavior comma-joined the array's elements
-    /// inside a single element, silently hiding a misroute (e.g. a
-    /// `match: collect` combine output sent to XML). `fill_values` runs
-    /// before any bytes, so the rejected record leaves no partial output.
+    /// Build a `[id, tags]` record whose `tags` field carries `values`.
+    fn record_with_tags(schema: &Arc<Schema>, id: i64, values: Vec<Value>) -> Record {
+        Record::new(
+            Arc::clone(schema),
+            vec![Value::Integer(id), Value::Array(values)],
+        )
+    }
+
+    /// A `join_values` config naming one field with the given XML overrides.
+    fn xml_join_config(
+        field: &str,
+        repeat_as: Option<&str>,
+        wrap_in: Option<&str>,
+    ) -> XmlWriterConfig {
+        XmlWriterConfig {
+            join_values: vec![JoinValues {
+                field: field.into(),
+                repeat_as: repeat_as.map(str::to_string),
+                wrap_in: wrap_in.map(str::to_string),
+                ..JoinValues::bare(field)
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// A `multiple:` field emits one child element per value, in order, named
+    /// after the field — the XML counterpart to CSV's delimited join (#916).
     #[test]
-    fn test_xml_writer_rejects_array_value() {
+    fn test_xml_write_multi_value_emits_repeated_elements() {
         let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let record = record_with_tags(
+            &schema,
+            7,
+            vec![Value::String("a".into()), Value::String("b".into())],
+        );
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert_eq!(
+            output,
+            "<Root><Record><id>7</id><tags>a</tags><tags>b</tags></Record></Root>"
+        );
+    }
+
+    /// A single-element array yields exactly one element, byte-identical to a
+    /// scalar field's output (criterion 3).
+    #[test]
+    fn test_xml_write_multi_value_single_element_matches_scalar() {
+        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let array = record_with_tags(&schema, 7, vec![Value::String("a".into())]);
+        let array_out = write_records(XmlWriterConfig::default(), &[array], &schema);
+        let scalar = Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(7), Value::String("a".into())],
+        );
+        let scalar_out = write_records(XmlWriterConfig::default(), &[scalar], &schema);
+        assert_eq!(array_out, scalar_out);
+        assert_eq!(
+            array_out,
+            "<Root><Record><id>7</id><tags>a</tags></Record></Root>"
+        );
+    }
+
+    /// An empty multi-value field emits nothing — no items and, with `wrap_in`
+    /// set, no container either (criterion 3).
+    #[test]
+    fn test_xml_write_multi_value_empty_array_emits_nothing() {
+        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let bare = record_with_tags(&schema, 7, vec![]);
+        assert_eq!(
+            write_records(XmlWriterConfig::default(), &[bare], &schema),
+            "<Root><Record><id>7</id></Record></Root>"
+        );
+        let wrapped = record_with_tags(&schema, 7, vec![]);
+        assert_eq!(
+            write_records(
+                xml_join_config("tags", Some("Tag"), Some("Tags")),
+                &[wrapped],
+                &schema
+            ),
+            "<Root><Record><id>7</id></Record></Root>",
+            "an empty array emits no container even when wrap_in is set"
+        );
+    }
+
+    /// An empty-string value renders to a self-closing item element, so a run of
+    /// mixed present/empty values round-trips its per-item shape.
+    #[test]
+    fn test_xml_write_multi_value_empty_string_value_self_closes() {
+        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let record = record_with_tags(
+            &schema,
+            7,
+            vec![Value::String("a".into()), Value::String("".into())],
+        );
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert_eq!(
+            output,
+            "<Root><Record><id>7</id><tags>a</tags><tags/></Record></Root>"
+        );
+    }
+
+    /// `repeat_as` renames the per-item element; the field name is no longer the
+    /// element name.
+    #[test]
+    fn test_xml_write_multi_value_repeat_as_renames_item() {
+        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let record = record_with_tags(
+            &schema,
+            7,
+            vec![Value::String("a".into()), Value::String("b".into())],
+        );
+        let output = write_records(
+            xml_join_config("tags", Some("Tag"), None),
+            &[record],
+            &schema,
+        );
+        assert_eq!(
+            output,
+            "<Root><Record><id>7</id><Tag>a</Tag><Tag>b</Tag></Record></Root>"
+        );
+    }
+
+    /// `wrap_in` alone adds a container around items still named after the field.
+    #[test]
+    fn test_xml_write_multi_value_wrap_in_adds_container() {
+        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let record = record_with_tags(
+            &schema,
+            7,
+            vec![Value::String("a".into()), Value::String("b".into())],
+        );
+        let output = write_records(
+            xml_join_config("tags", None, Some("Tags")),
+            &[record],
+            &schema,
+        );
+        assert_eq!(
+            output,
+            "<Root><Record><id>7</id><Tags><tags>a</tags><tags>b</tags></Tags></Record></Root>"
+        );
+    }
+
+    /// `repeat_as` and `wrap_in` together produce a named container with named
+    /// items (criterion 2).
+    #[test]
+    fn test_xml_write_multi_value_repeat_as_and_wrap_in_together() {
+        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let record = record_with_tags(
+            &schema,
+            7,
+            vec![Value::String("a".into()), Value::String("b".into())],
+        );
+        let output = write_records(
+            xml_join_config("tags", Some("Tag"), Some("Tags")),
+            &[record],
+            &schema,
+        );
+        assert_eq!(
+            output,
+            "<Root><Record><id>7</id><Tags><Tag>a</Tag><Tag>b</Tag></Tags></Record></Root>"
+        );
+    }
+
+    /// An illegal `repeat_as` / `wrap_in` name fails the write with
+    /// `FormatError::Xml`, leaving no partial output — element names are
+    /// validated as legal XML names (criterion 5), like the record/root names.
+    #[test]
+    fn test_xml_write_multi_value_invalid_override_name_rejected() {
+        for (repeat_as, wrap_in, bad) in [(Some("1bad"), None, "1bad"), (None, Some("a b"), "a b")]
+        {
+            let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+            let record = record_with_tags(&schema, 7, vec![Value::String("a".into())]);
+            let mut buf = Vec::new();
+            let mut writer = XmlWriter::new(
+                &mut buf,
+                Arc::clone(&schema),
+                xml_join_config("tags", repeat_as, wrap_in),
+            );
+            let err = writer.write_record(&record).unwrap_err();
+            match err {
+                FormatError::Xml(msg) => {
+                    assert!(msg.contains(bad), "message names the bad name: {msg}");
+                    assert!(
+                        msg.contains("well-formed XML name"),
+                        "message explains the malformed name: {msg}"
+                    );
+                }
+                other => panic!("expected FormatError::Xml, got {other:?}"),
+            }
+            drop(writer);
+            assert!(
+                buf.is_empty(),
+                "no partial output before a rejected override name"
+            );
+        }
+    }
+
+    /// An array reaching an attribute-classified field is rejected — an XML
+    /// attribute holds a single value and cannot repeat.
+    #[test]
+    fn test_xml_write_multi_value_array_on_attribute_rejected() {
+        let schema = Arc::new(Schema::new(vec!["@tags".into()]));
         let record = Record::new(
             Arc::clone(&schema),
-            vec![
-                Value::Integer(7),
-                Value::Array(vec![Value::String("a".into()), Value::String("b".into())]),
-            ],
+            vec![Value::Array(vec![Value::String("a".into())])],
         );
         let mut buf = Vec::new();
         let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
         let err = writer.write_record(&record).unwrap_err();
         match err {
-            FormatError::UnserializableArrayValue { format, column } => {
-                assert_eq!(format, "XML");
-                assert_eq!(column, "tags");
+            FormatError::Xml(msg) => {
+                assert!(
+                    msg.contains("@tags") && msg.contains("cannot hold multiple values"),
+                    "message names the field and the reason: {msg}"
+                );
             }
-            other => panic!("expected UnserializableArrayValue, got {other:?}"),
+            other => panic!("expected FormatError::Xml, got {other:?}"),
         }
         drop(writer);
         assert!(
             buf.is_empty(),
-            "rejected record must not leave partial output behind"
+            "no partial output before a rejected attribute array"
         );
+    }
+
+    /// A nested collection inside a `multiple:` field (an array element that is
+    /// itself an array) has no element body and is still rejected.
+    #[test]
+    fn test_xml_write_multi_value_nested_collection_element_rejected() {
+        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let record = record_with_tags(
+            &schema,
+            7,
+            vec![Value::Array(vec![Value::String("a".into())])],
+        );
+        let mut buf = Vec::new();
+        let mut writer = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let err = writer.write_record(&record).unwrap_err();
+        assert!(
+            matches!(&err, FormatError::UnserializableArrayValue { column, .. } if column == "tags"),
+            "expected UnserializableArrayValue for the nested array, got {err:?}"
+        );
+    }
+
+    /// Read a document with repeated child elements into a `multiple:` column and
+    /// write it back to XML: the repeated elements reappear byte-identically
+    /// (criterion 4).
+    #[test]
+    fn test_xml_write_multi_value_read_write_round_trip() {
+        let input = "<Root><Order><id>1</id><tags>a</tags><tags>b</tags></Order></Root>";
+        let cursor = std::io::Cursor::new(input.as_bytes().to_vec());
+        let mut reader = XmlReader::from_reader(
+            cursor,
+            XmlReaderConfig {
+                record_path: Some("Root/Order".into()),
+                multi_value_fields: vec!["tags".into()],
+                ..Default::default()
+            },
+        )
+        .expect("XML buffer read");
+        let schema = reader.schema().unwrap();
+        let record = reader.next_record().unwrap().unwrap();
+        assert!(reader.next_record().unwrap().is_none());
+        assert_eq!(
+            record.get("tags"),
+            Some(&Value::Array(vec![
+                Value::String("a".into()),
+                Value::String("b".into()),
+            ]))
+        );
+
+        let output = write_records(
+            XmlWriterConfig {
+                record_element: "Order".into(),
+                ..Default::default()
+            },
+            &[record],
+            &schema,
+        );
+        assert_eq!(output, input, "repeated elements round-trip byte-for-byte");
     }
 
     /// Assert that writing a single record whose only field is `field`

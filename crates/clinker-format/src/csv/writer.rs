@@ -993,6 +993,8 @@ mod tests {
             delimiter: "|".into(),
             on_conflict: OnConflict::Error,
             escape: "\\".into(),
+            repeat_as: None,
+            wrap_in: None,
         }]);
         let output = write_to_string(&schema, config, &[record]);
         assert_eq!(output, "codes\nx|y\n");
@@ -1052,6 +1054,8 @@ mod tests {
             delimiter: ";".into(),
             on_conflict: OnConflict::Escape,
             escape: "\\".into(),
+            repeat_as: None,
+            wrap_in: None,
         }]);
         let output = write_to_string(&schema, config, &[record]);
 
@@ -1086,6 +1090,8 @@ mod tests {
             delimiter: ";".into(),
             on_conflict: OnConflict::EncodeJson,
             escape: "\\".into(),
+            repeat_as: None,
+            wrap_in: None,
         }]);
         let output = write_to_string(&schema, config, &[record]);
 
@@ -1124,6 +1130,8 @@ mod tests {
             delimiter: ";".into(),
             on_conflict: OnConflict::Escape,
             escape: "\\".into(),
+            repeat_as: None,
+            wrap_in: None,
         }]);
         let out = write_to_string(&schema, config, &[record]);
         let read_config = CsvReaderConfig {
@@ -1169,6 +1177,8 @@ mod tests {
             delimiter: ";".into(),
             on_conflict: OnConflict::EncodeJson,
             escape: "\\".into(),
+            repeat_as: None,
+            wrap_in: None,
         }]);
         let json = write_to_string(&schema, json_cfg, &[record]);
         assert_eq!(json, "id,tags\n1,\"[\"\"\"\"]\"\n");
