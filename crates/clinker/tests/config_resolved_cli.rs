@@ -66,6 +66,65 @@ fn resolve(path: &std::path::Path) -> String {
     String::from_utf8(out.stdout).expect("utf8 stdout")
 }
 
+/// A same-indent block sequence (dash at the parent key's own column) — the
+/// common yq/hand-written form that a naive splice corrupts into non-parseable
+/// YAML. The resolved output must expand and still re-load cleanly.
+const SAME_INDENT_PIPELINE: &str = r#"pipeline:
+  name: same_indent_demo
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: in.csv
+      split_values:
+      - tags
+      schema:
+        - { name: order_id, type: string }
+        - { name: tags, type: string, multiple: true }
+  - type: output
+    name: tagged
+    input: orders
+    config:
+      name: tagged
+      type: json
+      path: out.json
+"#;
+
+#[test]
+fn resolved_same_indent_block_expands_and_reloads() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let path = write_pipeline(tmp.path(), SAME_INDENT_PIPELINE);
+    let resolved = resolve(&path);
+
+    // Expanded, and not corrupted into a doubled dash.
+    assert!(resolved.contains("field: tags"), "\n{resolved}");
+    assert!(
+        !resolved.contains("- - "),
+        "no doubled-dash corruption\n{resolved}"
+    );
+
+    // The resolved output re-loads as a valid plan (the corruption bug produced
+    // non-parseable YAML here).
+    let resolved_path = tmp.path().join("same_indent.resolved.yaml");
+    std::fs::write(&resolved_path, &resolved).expect("write resolved");
+    let dry = Command::new(clinker_bin())
+        .args(["run", "--dry-run"])
+        .arg(&resolved_path)
+        .output()
+        .expect("dry-run resolved config");
+    assert!(
+        dry.status.success(),
+        "resolved same-indent config failed to re-load: {}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+
+    // And idempotent.
+    let twice = resolve(&resolved_path);
+    assert_eq!(resolved, twice, "same-indent expansion must be idempotent");
+}
+
 #[test]
 fn resolved_expands_shorthand_and_preserves_document() {
     let tmp = tempfile::tempdir().expect("tempdir");

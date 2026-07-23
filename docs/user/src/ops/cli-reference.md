@@ -297,6 +297,14 @@ This is config canonicalization for the pipeline file itself. It is distinct
 from [`clinker channels resolve`](#clinker-channels-resolve), which renders the
 effective *post-overlay* plan for a specific tenant.
 
+A few surfaces are deliberately left as written rather than expanded, since
+regenerating them would lose information: a shorthand block that carries an
+**interior comment or blank line** between its items is passed through unchanged
+(so the comment is never dropped), and a value written as a **YAML alias**
+(`*anchor`) is left in place — the anchor it points to is expanded at its
+definition, so the alias still resolves to the expanded value. The output uses
+the input file's line endings (LF or CRLF).
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `<CONFIG>` | -- | Path to the pipeline YAML config file (required). The file is validated before it is rewritten, so a malformed config fails with a config error rather than emitting a half-expanded document. |

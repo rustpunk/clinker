@@ -103,12 +103,16 @@ struct Edit {
 pub fn expand_multi_value_shorthand(raw: &str) -> Result<String, CanonicalError> {
     let doc: DocProbe = yaml::from_str(raw).map_err(|e| CanonicalError::Parse(e.to_string()))?;
 
+    // Match the document's line ending so a CRLF file is not spliced with lone
+    // `\n`s. `to_string` always emits `\n`; the renderer rewrites them.
+    let newline = if raw.contains("\r\n") { "\r\n" } else { "\n" };
+
     let mut edits: Vec<Edit> = Vec::new();
     for node in &doc.nodes {
         let Some(cfg) = &node.config else { continue };
-        push_edit(raw, cfg.split_to_rows.as_ref(), &mut edits)?;
-        push_edit(raw, cfg.split_values.as_ref(), &mut edits)?;
-        push_edit(raw, cfg.join_values.as_ref(), &mut edits)?;
+        push_edit(raw, cfg.split_to_rows.as_ref(), newline, &mut edits)?;
+        push_edit(raw, cfg.split_values.as_ref(), newline, &mut edits)?;
+        push_edit(raw, cfg.join_values.as_ref(), newline, &mut edits)?;
     }
 
     // Apply the replacements from the end of the document backwards so each
@@ -132,12 +136,64 @@ pub fn expand_multi_value_shorthand(raw: &str) -> Result<String, CanonicalError>
     Ok(out)
 }
 
+/// Where a shorthand sequence's real opening token lives, relative to the
+/// offset the parser reported for its value.
+enum SequenceStart {
+    /// Splice the region beginning at this byte — guaranteed to be `-` or `[`.
+    Splice(usize),
+    /// The value is a YAML alias (`*anchor`); leave it byte-identical.
+    PassThrough,
+    /// The region does not begin with a sequence token and is not an alias —
+    /// refuse to splice rather than risk corrupting it.
+    Unexpected(String),
+}
+
+/// Resolve the reported value offset to the sequence's actual opening token.
+///
+/// serde-saphyr does not always report the opening `-` / `[`:
+///
+/// - a flow sequence reports the `[` itself (inline or on its own line);
+/// - a YAML alias reports the `*anchor` use-site token;
+/// - a block sequence reports the `-` when the item is indented deeper than its
+///   key, but the first item's *value* (two bytes past `- `) when the dash sits
+///   at the key's own indent — the common `key:\n- item` form.
+///
+/// In every block case the dash lives at the indent of the line the reported
+/// offset falls on, so recovering it is a fixed rule rather than a guess.
+fn resolve_sequence_start(raw: &str, reported: usize) -> SequenceStart {
+    let bytes = raw.as_bytes();
+    match bytes[reported] {
+        b'[' => SequenceStart::Splice(reported),
+        b'*' => SequenceStart::PassThrough,
+        _ => {
+            let line_start = raw[..reported].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let after = &raw[line_start..];
+            let indent = after.len() - after.trim_start_matches(' ').len();
+            let dash = line_start + indent;
+            let is_item = bytes.get(dash) == Some(&b'-')
+                && matches!(
+                    bytes.get(dash + 1).copied(),
+                    None | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+                );
+            if dash <= reported && is_item {
+                SequenceStart::Splice(dash)
+            } else {
+                SequenceStart::Unexpected(format!(
+                    "shorthand sequence at offset {reported} does not begin with a '-' or \
+                     '[' token"
+                ))
+            }
+        }
+    }
+}
+
 /// Plan the replacement for one located shorthand sequence and push it onto
 /// `edits`. A `None` sequence (the key was absent) or an empty one (nothing to
 /// expand) contributes nothing.
 fn push_edit<T: Serialize>(
     raw: &str,
     spanned: Option<&Spanned<Vec<T>>>,
+    newline: &str,
     edits: &mut Vec<Edit>,
 ) -> Result<(), CanonicalError> {
     let Some(sp) = spanned else { return Ok(()) };
@@ -146,35 +202,59 @@ fn push_edit<T: Serialize>(
     }
     // Byte offsets are always populated for a string source (they are absent
     // only when parsing from a reader), so a missing one is an invariant break.
-    let start = sp.referenced.span().byte_offset().ok_or_else(|| {
+    let reported = sp.referenced.span().byte_offset().ok_or_else(|| {
         CanonicalError::Internal("shorthand sequence has no source byte offset".to_string())
     })? as usize;
-    if start >= raw.len() {
+    if reported >= raw.len() {
         return Err(CanonicalError::Internal(
             "shorthand sequence offset past end of source".to_string(),
         ));
     }
 
+    // The reported offset is not always the opening token (a same-indent dash's
+    // value, or an alias use-site), so normalize it and refuse to splice
+    // anything that is not a real sequence token.
+    let start = match resolve_sequence_start(raw, reported) {
+        SequenceStart::Splice(pos) => pos,
+        SequenceStart::PassThrough => return Ok(()),
+        SequenceStart::Unexpected(why) => return Err(CanonicalError::Internal(why)),
+    };
+
+    // Hard guard: never splice a region that does not open with a block (`-`)
+    // or flow (`[`) token. Splicing anywhere else is exactly the corruption the
+    // normalization above exists to prevent, so fail loudly if it is reached.
+    let first = raw.as_bytes()[start];
+    if first != b'-' && first != b'[' {
+        return Err(CanonicalError::Internal(format!(
+            "resolved sequence start at offset {start} is '{}', not '-' or '['",
+            first as char
+        )));
+    }
+
+    let end = if first == b'[' {
+        flow_sequence_end(raw, start)?
+    } else {
+        block_sequence_end(raw, start)
+    };
+
+    // Regenerating a sequence discards any comment or blank line interleaved
+    // among its items. Rather than silently drop an author's comment, leave a
+    // sequence carrying interior comments/blanks untouched: it stays valid and
+    // re-parses identically — only its shorthand is not expanded.
+    if region_has_interior_noise(&raw[start..end]) {
+        return Ok(());
+    }
+
     let line_start = raw[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let prefix = &raw[line_start..start];
-
-    let (end, rendered) = if raw.as_bytes()[start] == b'[' {
-        // Flow sequence. Render as a block sequence when the `[` opens its own
-        // line (only whitespace precedes it), matching how every block sequence
-        // is emitted; otherwise it sits inline after `key:` on the same line,
-        // where a block value is not legal, so keep it a flow sequence.
-        let end = flow_sequence_end(raw, start)?;
-        if prefix.bytes().all(|b| b == b' ') {
-            (end, render_block(&sp.value, prefix.len())?)
-        } else {
-            (end, render_flow(&sp.value)?)
-        }
+    let rendered = if first == b'[' && !prefix.bytes().all(|b| b == b' ') {
+        // A flow sequence inline after `key:` on one line: a block value is not
+        // legal there, so keep it a flow sequence.
+        render_flow(&sp.value)?
     } else {
-        // Block sequence: `start` points at the first `-`, and everything before
-        // it on the line is the indentation the rendered continuation lines must
-        // match.
-        let end = block_sequence_end(raw, start);
-        (end, render_block(&sp.value, prefix.len())?)
+        // A block sequence, or a flow sequence opening its own line — both
+        // render as a canonical block sequence indented under `prefix`.
+        render_block(&sp.value, prefix.len(), newline)?
     };
 
     edits.push(Edit {
@@ -183,6 +263,17 @@ fn push_edit<T: Serialize>(
         rendered,
     });
     Ok(())
+}
+
+/// Whether a sequence's byte range carries a comment or blank line that
+/// regenerating it would drop. Any line whose trimmed form is empty or opens a
+/// comment, and any line carrying a trailing ` #` comment, counts — erring
+/// toward leaving the sequence untouched so no author comment is ever lost.
+fn region_has_interior_noise(region: &str) -> bool {
+    region.split('\n').any(|line| {
+        let trimmed = line.trim();
+        trimmed.is_empty() || trimmed.starts_with('#') || line.contains(" #")
+    })
 }
 
 /// End (exclusive) of the flow sequence that opens at `raw[start] == '['`.
@@ -270,8 +361,12 @@ fn block_sequence_end(raw: &str, start: usize) -> usize {
         } else if indent > base_indent {
             // Continuation of the current item's mapping/scalar.
             last_content_end = line_content_end;
-        } else if indent == base_indent && (content == "-" || content.starts_with("- ")) {
-            // A further item at the sequence indent.
+        } else if indent == base_indent && {
+            // A further item at the sequence indent (`trim_end` so a trailing
+            // `\r` under CRLF does not hide the dash).
+            let item = content.trim_end();
+            item == "-" || item.starts_with("- ")
+        } {
             last_content_end = line_content_end;
         } else {
             // A sibling key at the sequence indent, or a dedent below it.
@@ -299,15 +394,20 @@ fn leading_indent(raw: &str, offset: usize) -> usize {
 /// serde-saphyr emits the sequence at column zero (`- key: val\n  key2: ...`);
 /// the first line is spliced directly where the document already provides the
 /// leading indent, and every subsequent line is shifted right by `base_indent`
-/// so continuations and later items align under it.
-fn render_block<T: Serialize>(items: &[T], base_indent: usize) -> Result<String, CanonicalError> {
+/// so continuations and later items align under it. `newline` is the document's
+/// own line ending, so a CRLF file is not spliced with lone `\n`s.
+fn render_block<T: Serialize>(
+    items: &[T],
+    base_indent: usize,
+    newline: &str,
+) -> Result<String, CanonicalError> {
     let yaml = yaml::to_string(&items).map_err(CanonicalError::Internal)?;
     let body = yaml.trim_end_matches('\n');
     let pad = " ".repeat(base_indent);
     let mut out = String::new();
     for (i, line) in body.split('\n').enumerate() {
         if i > 0 {
-            out.push('\n');
+            out.push_str(newline);
             if !line.is_empty() {
                 out.push_str(&pad);
             }
@@ -337,34 +437,39 @@ fn render_flow<T: Serialize>(items: &[T]) -> Result<String, CanonicalError> {
 mod tests {
     use super::*;
 
+    /// Every normalized shorthand sequence a document declares, grouped by
+    /// surface — the semantic content that must survive canonicalization.
+    #[derive(Debug, PartialEq)]
+    struct Probed {
+        split_to_rows: Vec<Vec<SplitToRows>>,
+        split_values: Vec<Vec<SplitValues>>,
+        join_values: Vec<Vec<JoinValues>>,
+    }
+
     /// Re-extract the normalized shorthand values from a document, so a
     /// before/after pair can be compared for semantic identity of every
     /// multi-value surface.
-    fn probe(
-        raw: &str,
-    ) -> (
-        Vec<Vec<SplitToRows>>,
-        Vec<Vec<SplitValues>>,
-        Vec<Vec<JoinValues>>,
-    ) {
+    fn probe(raw: &str) -> Probed {
         let doc: DocProbe = yaml::from_str(raw).expect("probe parse");
-        let mut str_ = Vec::new();
-        let mut sv = Vec::new();
-        let mut jv = Vec::new();
+        let mut out = Probed {
+            split_to_rows: Vec::new(),
+            split_values: Vec::new(),
+            join_values: Vec::new(),
+        };
         for node in &doc.nodes {
             if let Some(cfg) = &node.config {
                 if let Some(s) = &cfg.split_to_rows {
-                    str_.push(s.value.clone());
+                    out.split_to_rows.push(s.value.clone());
                 }
                 if let Some(s) = &cfg.split_values {
-                    sv.push(s.value.clone());
+                    out.split_values.push(s.value.clone());
                 }
                 if let Some(s) = &cfg.join_values {
-                    jv.push(s.value.clone());
+                    out.join_values.push(s.value.clone());
                 }
             }
         }
-        (str_, sv, jv)
+        out
     }
 
     fn assert_parse_identity(before: &str, after: &str) {
@@ -645,5 +750,205 @@ nodes:
 ";
         let out = expand_multi_value_shorthand(raw).unwrap();
         assert_eq!(raw, out, "no shorthand present, document must be unchanged");
+    }
+
+    // ---- Splice-corruption regressions: the reported offset is not always
+    // the sequence's opening token ----
+
+    #[test]
+    fn same_indent_block_single_item_expands_without_corruption() {
+        // The dash sits at the parent key's own indent (the `key:\n- item`
+        // form); serde-saphyr reports the item's value, not the dash.
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: json
+      path: in.json
+      split_to_rows:
+      - line_items
+      schema:
+        - { name: order_id, type: string }
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert!(!out.contains("- - "), "no doubled dash corruption:\n{out}");
+        assert!(out.contains("field: line_items"), "\n{out}");
+        assert!(out.contains("keep_empty: true"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn same_indent_block_multi_item_expands_without_corruption() {
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: in.csv
+      split_values:
+      - tags
+      - codes
+      schema:
+        - { name: tags, type: string, multiple: true }
+        - { name: codes, type: string, multiple: true }
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert!(!out.contains("- - "), "no doubled dash corruption:\n{out}");
+        assert!(out.contains("field: tags"), "\n{out}");
+        assert!(out.contains("field: codes"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn same_indent_block_mapping_item_expands_without_corruption() {
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: xml
+      path: in.xml
+      split_to_rows:
+      - field: LineItem
+        mode: extract
+      schema:
+        - { name: order_id, type: string }
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert!(!out.contains("- - "), "no doubled dash corruption:\n{out}");
+        assert!(out.contains("field: LineItem"), "\n{out}");
+        // The omitted default is materialized.
+        assert!(out.contains("keep_empty: true"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn same_indent_at_nonzero_indent_expands_without_corruption() {
+        // Key and dash both at indent 6 (the same-indent form at a nonzero indent).
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: json
+      path: in.json
+      split_values:
+      - tags
+      schema:
+        - { name: tags, type: string, multiple: true }
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert!(!out.contains("- - "), "no doubled dash corruption:\n{out}");
+        assert!(
+            out.contains("      - field: tags"),
+            "correct indent:\n{out}"
+        );
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn alias_use_site_is_left_untouched() {
+        // An anchored shorthand sequence reused by an alias: the definition
+        // expands, the `*sv` use-site is left byte-identical (it still resolves
+        // to the expanded value on re-parse).
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: in.csv
+      split_values: &sv
+        - field: tags
+          delimiter: \"|\"
+      schema:
+        - { name: tags, type: string, multiple: true }
+  - type: output
+    name: o
+    input: s
+    config:
+      name: o
+      type: csv
+      path: out.csv
+      join_values: *sv
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert!(
+            out.contains("join_values: *sv"),
+            "alias use-site must be byte-identical:\n{out}"
+        );
+        // Not corrupted by an inline block splice.
+        assert!(!out.contains("join_values: *sv\n        -"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn interior_comment_between_items_is_preserved() {
+        // A comment between items cannot survive regeneration, so the sequence
+        // is passed through byte-identical rather than expanded — never dropping
+        // the comment.
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: in.csv
+      split_values:
+        - tags
+        # keep this comment
+        - codes
+      schema:
+        - { name: tags, type: string, multiple: true }
+        - { name: codes, type: string, multiple: true }
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert_eq!(
+            raw, out,
+            "a sequence with an interior comment is left untouched"
+        );
+        assert!(out.contains("# keep this comment"), "\n{out}");
+    }
+
+    #[test]
+    fn crlf_document_keeps_crlf_line_endings() {
+        let lf = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: json
+      path: in.json
+      split_to_rows:
+        - line_items
+      schema:
+        - { name: order_id, type: string }
+";
+        let raw = lf.replace('\n', "\r\n");
+        let out = expand_multi_value_shorthand(&raw).unwrap();
+        assert!(out.contains("keep_empty: true"), "\n{out}");
+        // No lone `\n` survives: removing every CRLF leaves no bare newline.
+        assert!(
+            !out.replace("\r\n", "").contains('\n'),
+            "mixed line endings in:\n{out:?}"
+        );
+        assert_parse_identity(&raw, &out);
+        // Idempotent on the CRLF form too.
+        let twice = expand_multi_value_shorthand(&out).unwrap();
+        assert_eq!(out, twice);
     }
 }
