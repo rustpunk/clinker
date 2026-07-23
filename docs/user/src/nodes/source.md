@@ -273,6 +273,14 @@ coercion. The declaration describes the shape of the
 data, so it serves both directions: a writer that can encode repetition reads
 the same declaration.
 
+The `split_to_rows`, `split_values`, and `join_values` blocks below accept a
+compact shorthand (a bare field name, or a mapping that omits defaults). To see
+the fully-materialized form the engine actually runs — every default spelled
+out — print the canonical config with
+[`clinker config --resolved`](../ops/cli-reference.md#clinker-config-resolved).
+It rewrites only those shorthand blocks and leaves the rest of the file
+untouched.
+
 Both ends of the declaration are checked at compile, so a shape the formats
 cannot carry fails before a run starts rather than mid-stream:
 

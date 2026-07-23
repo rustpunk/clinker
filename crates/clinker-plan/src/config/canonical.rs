@@ -1,0 +1,649 @@
+//! Canonical expansion of the multi-value shorthand surfaces.
+//!
+//! `clinker config --resolved` prints a pipeline config with the multi-value
+//! shorthand materialized: the bare-field forms of `split_to_rows:`,
+//! `split_values:`, and `join_values:` rewritten to their full mappings with
+//! every default spelled out. The rewrite is **surgical** — only the bytes of
+//! those shorthand sequences change; comments, key order, indentation, and every
+//! other surface of the document are preserved verbatim. A full `serde`
+//! reserialize would reorder keys, drop comments, and reformat unrelated
+//! surfaces, which is why the expansion works on the raw text and touches
+//! nothing it does not have to.
+//!
+//! ## How the surfaces are located
+//!
+//! The three shorthand types already normalize to full form at deserialize time
+//! (a bare scalar fills every default; the derived `Serialize` re-emits the full
+//! mapping), so the canonical value of each sequence is just its parsed
+//! [`Vec`]. To find *where* each sequence lives in the source, the raw YAML is
+//! parsed a second time into a lenient probe whose shorthand fields are wrapped
+//! in [`Spanned`]: the span's byte offset is the reliable START of the sequence
+//! (the first `-` of a block sequence, or the `[` of a flow one). serde-saphyr
+//! does not report a container's END, so the end of each sequence is derived by
+//! scanning — bracket matching for flow, an indentation walk for block. The
+//! probe uses plain nested structs (never a `#[serde(tag)]`/`flatten` context),
+//! which is the documented way to keep `Spanned` locations from collapsing to
+//! `UNKNOWN`.
+//!
+//! Schema columns carry no shorthand: a `multiple: true` column is always
+//! written explicitly (the plan-time gates reject an implied one), so the schema
+//! block is already canonical and is left byte-identical.
+
+use serde::{Deserialize, Serialize};
+
+use clinker_format::{JoinValues, SplitToRows, SplitValues};
+
+use crate::yaml::{self, Spanned};
+
+/// Failure canonicalizing a config's multi-value shorthand.
+#[derive(Debug)]
+pub enum CanonicalError {
+    /// The source did not parse as YAML.
+    Parse(String),
+    /// A located shorthand sequence could not be re-serialized or its extent
+    /// could not be resolved. An invariant violation for input that parsed —
+    /// surfaced loudly rather than emitting a silently-wrong document.
+    Internal(String),
+}
+
+impl std::fmt::Display for CanonicalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CanonicalError::Parse(m) => write!(f, "could not parse config: {m}"),
+            CanonicalError::Internal(m) => write!(f, "internal canonicalization error: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalError {}
+
+/// Lenient view of a pipeline document that captures only the multi-value
+/// shorthand sequences, each wrapped in [`Spanned`] to recover its byte offset.
+///
+/// Unknown fields are ignored (no `deny_unknown_fields`), so the same bytes the
+/// strict [`super::PipelineConfig`] loader accepts parse here too, and any node
+/// shape — source, transform, output — flows through with its irrelevant fields
+/// discarded.
+#[derive(Deserialize)]
+struct DocProbe {
+    #[serde(default)]
+    nodes: Vec<NodeProbe>,
+}
+
+#[derive(Deserialize)]
+struct NodeProbe {
+    #[serde(default)]
+    config: Option<ConfigProbe>,
+}
+
+#[derive(Deserialize)]
+struct ConfigProbe {
+    #[serde(default)]
+    split_to_rows: Option<Spanned<Vec<SplitToRows>>>,
+    #[serde(default)]
+    split_values: Option<Spanned<Vec<SplitValues>>>,
+    #[serde(default)]
+    join_values: Option<Spanned<Vec<JoinValues>>>,
+}
+
+/// One byte-range replacement: swap `raw[start..end]` for `rendered`.
+struct Edit {
+    start: usize,
+    end: usize,
+    rendered: String,
+}
+
+/// Rewrite `raw` so every `split_to_rows` / `split_values` / `join_values`
+/// shorthand sequence is expanded to its canonical full-mapping form, leaving
+/// all other bytes untouched.
+///
+/// The output parses to a plan semantically identical to the input, and
+/// re-running the expansion on the output is a no-op (each rendered sequence
+/// re-parses to the same value and re-renders identically).
+pub fn expand_multi_value_shorthand(raw: &str) -> Result<String, CanonicalError> {
+    let doc: DocProbe = yaml::from_str(raw).map_err(|e| CanonicalError::Parse(e.to_string()))?;
+
+    let mut edits: Vec<Edit> = Vec::new();
+    for node in &doc.nodes {
+        let Some(cfg) = &node.config else { continue };
+        push_edit(raw, cfg.split_to_rows.as_ref(), &mut edits)?;
+        push_edit(raw, cfg.split_values.as_ref(), &mut edits)?;
+        push_edit(raw, cfg.join_values.as_ref(), &mut edits)?;
+    }
+
+    // Apply the replacements from the end of the document backwards so each
+    // splice leaves every not-yet-applied (earlier) offset valid.
+    edits.sort_by(|a, b| b.start.cmp(&a.start));
+    for pair in edits.windows(2) {
+        // Sorted descending: pair[0] is the later span. The two shorthand
+        // surfaces are disjoint by construction; a violation means the extent
+        // scan overran, which would corrupt the document — fail instead.
+        if pair[1].end > pair[0].start {
+            return Err(CanonicalError::Internal(
+                "shorthand sequence extents overlap".to_string(),
+            ));
+        }
+    }
+
+    let mut out = raw.to_string();
+    for edit in &edits {
+        out.replace_range(edit.start..edit.end, &edit.rendered);
+    }
+    Ok(out)
+}
+
+/// Plan the replacement for one located shorthand sequence and push it onto
+/// `edits`. A `None` sequence (the key was absent) or an empty one (nothing to
+/// expand) contributes nothing.
+fn push_edit<T: Serialize>(
+    raw: &str,
+    spanned: Option<&Spanned<Vec<T>>>,
+    edits: &mut Vec<Edit>,
+) -> Result<(), CanonicalError> {
+    let Some(sp) = spanned else { return Ok(()) };
+    if sp.value.is_empty() {
+        return Ok(());
+    }
+    // Byte offsets are always populated for a string source (they are absent
+    // only when parsing from a reader), so a missing one is an invariant break.
+    let start = sp.referenced.span().byte_offset().ok_or_else(|| {
+        CanonicalError::Internal("shorthand sequence has no source byte offset".to_string())
+    })? as usize;
+    if start >= raw.len() {
+        return Err(CanonicalError::Internal(
+            "shorthand sequence offset past end of source".to_string(),
+        ));
+    }
+
+    let line_start = raw[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let prefix = &raw[line_start..start];
+
+    let (end, rendered) = if raw.as_bytes()[start] == b'[' {
+        // Flow sequence. Render as a block sequence when the `[` opens its own
+        // line (only whitespace precedes it), matching how every block sequence
+        // is emitted; otherwise it sits inline after `key:` on the same line,
+        // where a block value is not legal, so keep it a flow sequence.
+        let end = flow_sequence_end(raw, start)?;
+        if prefix.bytes().all(|b| b == b' ') {
+            (end, render_block(&sp.value, prefix.len())?)
+        } else {
+            (end, render_flow(&sp.value)?)
+        }
+    } else {
+        // Block sequence: `start` points at the first `-`, and everything before
+        // it on the line is the indentation the rendered continuation lines must
+        // match.
+        let end = block_sequence_end(raw, start);
+        (end, render_block(&sp.value, prefix.len())?)
+    };
+
+    edits.push(Edit {
+        start,
+        end,
+        rendered,
+    });
+    Ok(())
+}
+
+/// End (exclusive) of the flow sequence that opens at `raw[start] == '['`.
+///
+/// Matches brackets and braces at depth, honoring single- and double-quoted
+/// scalars so a delimiter like `"]"` inside a value is not mistaken for the
+/// closing bracket. Input that already parsed is balanced, so the scan
+/// terminates at the matching close.
+fn flow_sequence_end(raw: &str, start: usize) -> Result<usize, CanonicalError> {
+    let bytes = raw.as_bytes();
+    let mut depth: i32 = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut i = start;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_single {
+            if c == b'\'' {
+                // A doubled `''` is an escaped quote, not a close.
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+        } else if in_double {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_double = false;
+            }
+        } else {
+            match c {
+                b'\'' => in_single = true,
+                b'"' => in_double = true,
+                b'[' | b'{' => depth += 1,
+                b']' | b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok(i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    Err(CanonicalError::Internal(
+        "unterminated flow sequence".to_string(),
+    ))
+}
+
+/// End (exclusive) of the block sequence whose first `-` is at `raw[start]`.
+///
+/// The sequence spans its item lines (a `-` at the sequence's own indent) and
+/// their more-indented continuations. It ends at the first line that dedents to
+/// the sequence indent as a sibling key, or below it. Trailing blank and
+/// comment-only lines are excluded so they stay part of the surrounding
+/// document rather than being swallowed into the replaced span.
+fn block_sequence_end(raw: &str, start: usize) -> usize {
+    let base_indent = leading_indent(raw, start);
+    let mut line_start = raw[..start].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let mut last_content_end = start;
+    let mut first = true;
+    loop {
+        let line_end = raw[line_start..]
+            .find('\n')
+            .map(|i| line_start + i)
+            .unwrap_or(raw.len());
+        let line = &raw[line_start..line_end];
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let content = &line[indent..];
+        let line_content_end = line_start + line.trim_end().len();
+
+        if first {
+            // The line carrying the first `-` is always part of the sequence.
+            last_content_end = line_content_end;
+            first = false;
+        } else if content.trim().is_empty() || content.starts_with('#') {
+            // Blank or comment line: never extends the span. If a later item
+            // follows, that item's line re-extends past this one; if nothing
+            // follows, this line and the rest belong to the document.
+        } else if indent > base_indent {
+            // Continuation of the current item's mapping/scalar.
+            last_content_end = line_content_end;
+        } else if indent == base_indent && (content == "-" || content.starts_with("- ")) {
+            // A further item at the sequence indent.
+            last_content_end = line_content_end;
+        } else {
+            // A sibling key at the sequence indent, or a dedent below it.
+            break;
+        }
+
+        if line_end >= raw.len() {
+            break;
+        }
+        line_start = line_end + 1;
+    }
+    last_content_end
+}
+
+/// Count of leading spaces on the line containing `offset`, i.e. the column the
+/// sequence's first token sits at. Assumes YAML indentation (spaces, never
+/// tabs), which the parser enforces upstream.
+fn leading_indent(raw: &str, offset: usize) -> usize {
+    let line_start = raw[..offset].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    offset - line_start
+}
+
+/// Render a sequence as a canonical block sequence indented by `base_indent`.
+///
+/// serde-saphyr emits the sequence at column zero (`- key: val\n  key2: ...`);
+/// the first line is spliced directly where the document already provides the
+/// leading indent, and every subsequent line is shifted right by `base_indent`
+/// so continuations and later items align under it.
+fn render_block<T: Serialize>(items: &[T], base_indent: usize) -> Result<String, CanonicalError> {
+    let yaml = yaml::to_string(&items).map_err(CanonicalError::Internal)?;
+    let body = yaml.trim_end_matches('\n');
+    let pad = " ".repeat(base_indent);
+    let mut out = String::new();
+    for (i, line) in body.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+            if !line.is_empty() {
+                out.push_str(&pad);
+            }
+        }
+        out.push_str(line);
+    }
+    Ok(out)
+}
+
+/// Render a sequence as a single-line flow sequence.
+///
+/// Used only for a shorthand sequence that sits inline after `key:` on one
+/// line, where a block value is not legal. Each entry is emitted as JSON, which
+/// is valid YAML flow and quotes every value unambiguously, so the result
+/// re-parses to the identical sequence.
+fn render_flow<T: Serialize>(items: &[T]) -> Result<String, CanonicalError> {
+    let mut parts = Vec::with_capacity(items.len());
+    for item in items {
+        parts.push(
+            serde_json::to_string(item).map_err(|e| CanonicalError::Internal(e.to_string()))?,
+        );
+    }
+    Ok(format!("[{}]", parts.join(", ")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Re-extract the normalized shorthand values from a document, so a
+    /// before/after pair can be compared for semantic identity of every
+    /// multi-value surface.
+    fn probe(
+        raw: &str,
+    ) -> (
+        Vec<Vec<SplitToRows>>,
+        Vec<Vec<SplitValues>>,
+        Vec<Vec<JoinValues>>,
+    ) {
+        let doc: DocProbe = yaml::from_str(raw).expect("probe parse");
+        let mut str_ = Vec::new();
+        let mut sv = Vec::new();
+        let mut jv = Vec::new();
+        for node in &doc.nodes {
+            if let Some(cfg) = &node.config {
+                if let Some(s) = &cfg.split_to_rows {
+                    str_.push(s.value.clone());
+                }
+                if let Some(s) = &cfg.split_values {
+                    sv.push(s.value.clone());
+                }
+                if let Some(s) = &cfg.join_values {
+                    jv.push(s.value.clone());
+                }
+            }
+        }
+        (str_, sv, jv)
+    }
+
+    fn assert_parse_identity(before: &str, after: &str) {
+        assert_eq!(probe(before), probe(after), "shorthand values must match");
+    }
+
+    fn assert_idempotent(raw: &str) {
+        let once = expand_multi_value_shorthand(raw).expect("first pass");
+        let twice = expand_multi_value_shorthand(&once).expect("second pass");
+        assert_eq!(once, twice, "expansion must be idempotent");
+    }
+
+    const SPLIT_TO_ROWS_BARE: &str = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: json
+      path: in.json
+      split_to_rows:
+        - line_items
+      schema:
+        - { name: order_id, type: string }
+";
+
+    #[test]
+    fn bare_split_to_rows_expands_with_defaults() {
+        let out = expand_multi_value_shorthand(SPLIT_TO_ROWS_BARE).unwrap();
+        assert!(out.contains("field: line_items"), "\n{out}");
+        assert!(out.contains("keep_empty: true"), "\n{out}");
+        assert!(out.contains("mode: extract"), "\n{out}");
+        // The bare form is gone.
+        assert!(!out.contains("- line_items"), "\n{out}");
+        assert_parse_identity(SPLIT_TO_ROWS_BARE, &out);
+        assert_idempotent(SPLIT_TO_ROWS_BARE);
+    }
+
+    #[test]
+    fn partial_split_to_rows_mapping_materializes_missing_defaults() {
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: xml
+      path: in.xml
+      split_to_rows:
+        - field: LineItem
+          mode: extract
+          position_column: line_no
+      schema:
+        - { name: line_no, type: int }
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        // `keep_empty` was omitted; the canonical form spells it out.
+        assert!(out.contains("keep_empty: true"), "\n{out}");
+        assert!(out.contains("position_column: line_no"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn split_values_bare_and_escape_and_json_expand() {
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: in.csv
+      split_values:
+        - tags
+        - field: notes
+          delimiter: \"|\"
+          escape: \"\\\\\"
+        - field: payload
+          json: true
+      schema:
+        - { name: tags, type: string, multiple: true }
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        // Bare `tags` gains the default delimiter.
+        assert!(out.contains("field: tags"), "\n{out}");
+        assert!(
+            out.contains("delimiter: ';'") || out.contains("delimiter: ;"),
+            "\n{out}"
+        );
+        // The escape entry keeps its explicit escape.
+        assert!(out.contains("field: notes"), "\n{out}");
+        // The JSON entry keeps its flag.
+        assert!(out.contains("json: true"), "\n{out}");
+        assert!(!out.contains("- tags\n"), "bare form gone:\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn join_values_bare_expands() {
+        let raw = "\
+nodes:
+  - type: output
+    name: o
+    input: s
+    config:
+      name: o
+      type: csv
+      path: out.csv
+      join_values:
+        - tags
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert!(out.contains("field: tags"), "\n{out}");
+        assert!(out.contains("on_conflict: error"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn surrounding_document_is_preserved_verbatim() {
+        let raw = "\
+pipeline:
+  name: demo   # a trailing comment
+
+# A header comment describing the source.
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: json
+      path: in.json   # inline comment on path
+      split_to_rows:
+        - line_items
+      schema:
+        - { name: order_id, type: string }   # keep me
+error_handling:
+  strategy: fail_fast
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        // Every non-shorthand line survives byte-for-byte.
+        assert!(
+            out.contains("  name: demo   # a trailing comment"),
+            "\n{out}"
+        );
+        assert!(
+            out.contains("# A header comment describing the source."),
+            "\n{out}"
+        );
+        assert!(
+            out.contains("      path: in.json   # inline comment on path"),
+            "\n{out}"
+        );
+        assert!(
+            out.contains("        - { name: order_id, type: string }   # keep me"),
+            "\n{out}"
+        );
+        assert!(out.contains("  strategy: fail_fast"), "\n{out}");
+        // And the shorthand did expand.
+        assert!(out.contains("keep_empty: true"), "\n{out}");
+    }
+
+    #[test]
+    fn multiple_shorthand_blocks_in_one_node_all_expand() {
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: xml
+      path: in.xml
+      split_to_rows:
+        - LineItem
+      split_values:
+        - cost_centres
+      schema:
+        - { name: cost_centres, type: string, multiple: true }
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert!(out.contains("field: LineItem"), "\n{out}");
+        assert!(out.contains("field: cost_centres"), "\n{out}");
+        assert!(out.contains("mode: extract"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn schema_multiple_column_is_left_unchanged() {
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: in.csv
+      split_values:
+        - tags
+      schema:
+        - { name: order_id, type: string }
+        - { name: tags, type: string, multiple: true }
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        // The schema block is already canonical and must survive untouched.
+        assert!(
+            out.contains("        - { name: tags, type: string, multiple: true }"),
+            "\n{out}"
+        );
+    }
+
+    #[test]
+    fn inline_flow_sequence_expands_in_place() {
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: json
+      path: in.json
+      split_to_rows: [line_items]
+      schema:
+        - { name: order_id, type: string }
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        // Stays on one line (flow), but the field/default are materialized.
+        assert!(out.contains("split_to_rows: ["), "\n{out}");
+        assert!(out.contains("\"field\":\"line_items\""), "\n{out}");
+        assert!(out.contains("\"keep_empty\":true"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn flow_sequence_on_its_own_line_becomes_block() {
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: json
+      path: in.json
+      split_to_rows:
+        [line_items]
+      schema:
+        - { name: order_id, type: string }
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert!(out.contains("- field: line_items"), "\n{out}");
+        assert!(out.contains("keep_empty: true"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn config_without_shorthand_is_unchanged() {
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: in.csv
+      schema:
+        - { name: order_id, type: string }
+  - type: output
+    name: o
+    input: s
+    config:
+      name: o
+      type: json
+      path: out.json
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert_eq!(raw, out, "no shorthand present, document must be unchanged");
+    }
+}

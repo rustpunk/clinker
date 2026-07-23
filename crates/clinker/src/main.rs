@@ -165,6 +165,28 @@ EXAMPLES:
         #[command(subcommand)]
         subcommand: RefactorCommands,
     },
+    /// Inspect and canonicalize a pipeline config file.
+    #[command(
+        long_about = "\
+Inspect a pipeline configuration file.\n\n\
+`--resolved` prints the config with the multi-value shorthand expanded to its \
+canonical, fully-materialized form: the bare-field forms of `split_to_rows:`, \
+`split_values:`, and `join_values:` are rewritten to full mappings with every \
+default spelled out (`keep_empty`, `mode`, `delimiter`, `on_conflict`, …). The \
+rewrite is surgical — only those shorthand blocks change; comments, key order, \
+indentation, and every other surface are preserved byte-for-byte, so the output \
+parses to the same plan and re-resolving it is a no-op. This is config \
+canonicalization, distinct from `channels resolve`, which renders the effective \
+post-overlay plan for a tenant.",
+        after_long_help = "\
+EXAMPLES:
+  # Show the fully-expanded canonical form of a pipeline's shorthand
+  clinker config --resolved pipeline.yaml
+
+  # Overwrite a file in place with its canonical form
+  clinker config --resolved pipeline.yaml > pipeline.canonical.yaml"
+    )]
+    Config(ConfigArgs),
 }
 
 /// Subcommands for `clinker channels`.
@@ -205,6 +227,20 @@ pub enum LabelCommands {
 pub enum RefactorCommands {
     /// Rename a base node and propagate the rename to every overlay reference.
     RenameNode(RenameNodeArgs),
+}
+
+/// Arguments for `clinker config`.
+#[derive(Parser, Debug)]
+pub struct ConfigArgs {
+    /// Path to the pipeline YAML configuration file.
+    pub config: PathBuf,
+
+    /// Print the config with the multi-value shorthand (`split_to_rows`,
+    /// `split_values`, `join_values`) expanded to canonical full-mapping form
+    /// with every default materialized. Everything outside those blocks is
+    /// preserved byte-for-byte.
+    #[arg(long)]
+    pub resolved: bool,
 }
 
 /// Arguments for `clinker channels group members`.
@@ -680,6 +716,18 @@ fn main() -> ExitCode {
                 Ok(code) => ExitCode::from(code),
                 Err(e) => {
                     eprintln!("clinker refactor error: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Commands::Config(args) => {
+            tracing_subscriber::fmt()
+                .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
+                .init();
+            match run_config(args) {
+                Ok(code) => ExitCode::from(code),
+                Err(e) => {
+                    eprintln!("clinker config error: {e}");
                     ExitCode::FAILURE
                 }
             }
@@ -2499,6 +2547,33 @@ fn hostname_string() -> String {
             std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string())
         })
         .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// `clinker config` — inspect / canonicalize a pipeline config.
+///
+/// The only mode today is `--resolved`, which expands the multi-value shorthand
+/// in place. The config is loaded and validated first so a malformed file fails
+/// with a real config error rather than emitting a half-canonicalized document;
+/// the raw text is then rewritten surgically (only the shorthand sequences
+/// change) and printed to stdout.
+fn run_config(args: &ConfigArgs) -> Result<u8, Box<dyn std::error::Error>> {
+    if !args.resolved {
+        return Err(
+            "nothing to do: pass --resolved to print the canonical, fully-expanded config".into(),
+        );
+    }
+
+    // Validate before rewriting: a parse or schema error surfaces here rather
+    // than producing a document that no longer matches a loadable plan.
+    clinker_plan::config::load_config(&args.config)
+        .map_err(|e| format!("{}: {e}", args.config.display()))?;
+
+    let raw = std::fs::read_to_string(&args.config)
+        .map_err(|e| format!("{}: {e}", args.config.display()))?;
+    let resolved = clinker_plan::config::expand_multi_value_shorthand(&raw)
+        .map_err(|e| format!("{}: {e}", args.config.display()))?;
+    print!("{resolved}");
+    Ok(0)
 }
 
 fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
