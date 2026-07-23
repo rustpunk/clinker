@@ -138,6 +138,7 @@ pub fn expand_multi_value_shorthand(raw: &str) -> Result<String, CanonicalError>
 
 /// Where a shorthand sequence's real opening token lives, relative to the
 /// offset the parser reported for its value.
+#[derive(Debug)]
 enum SequenceStart {
     /// Splice the region beginning at this byte — guaranteed to be `-` or `[`.
     Splice(usize),
@@ -154,6 +155,10 @@ enum SequenceStart {
 ///
 /// - a flow sequence reports the `[` itself (inline or on its own line);
 /// - a YAML alias reports the `*anchor` use-site token;
+/// - an anchored sequence definition (`key: &anchor` then the sequence) reports
+///   its content token in this parser version, but the reported offset landing
+///   on the `&anchor` token is handled defensively — the anchor is skipped to
+///   the real `-` / `[` so a valid anchored config is never refused;
 /// - a block sequence reports the `-` when the item is indented deeper than its
 ///   key, but the first item's *value* (two bytes past `- `) when the dash sits
 ///   at the key's own indent — the common `key:\n- item` form.
@@ -165,6 +170,7 @@ fn resolve_sequence_start(raw: &str, reported: usize) -> SequenceStart {
     match bytes[reported] {
         b'[' => SequenceStart::Splice(reported),
         b'*' => SequenceStart::PassThrough,
+        b'&' => resolve_anchor_start(raw, reported),
         _ => {
             let line_start = raw[..reported].rfind('\n').map(|i| i + 1).unwrap_or(0);
             let after = &raw[line_start..];
@@ -184,6 +190,45 @@ fn resolve_sequence_start(raw: &str, reported: usize) -> SequenceStart {
                 ))
             }
         }
+    }
+}
+
+/// Resolve a reported offset that lands on an anchor token (`&anchor`) to the
+/// sequence's real opening `-` / `[`.
+///
+/// Skips the anchor name and the whitespace / line break that separates it from
+/// the value, then reports the sequence token that follows. A shape with no
+/// `-` / `[` after the anchor is passed through byte-identical rather than
+/// erroring: an anchored value that already parsed is never corrupted, and the
+/// unexpanded sequence still re-parses as authored.
+fn resolve_anchor_start(raw: &str, anchor_at: usize) -> SequenceStart {
+    let bytes = raw.as_bytes();
+    // Skip `&` and the anchor name. A YAML anchor name runs until whitespace,
+    // a line break, or a flow indicator.
+    let mut i = anchor_at + 1;
+    while i < bytes.len()
+        && !matches!(
+            bytes[i],
+            b' ' | b'\t' | b'\r' | b'\n' | b'[' | b']' | b'{' | b'}' | b','
+        )
+    {
+        i += 1;
+    }
+    // Skip the whitespace / newline between the anchor and its value.
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\r' | b'\n') {
+        i += 1;
+    }
+    match bytes.get(i) {
+        Some(b'[') => SequenceStart::Splice(i),
+        Some(b'-')
+            if matches!(
+                bytes.get(i + 1).copied(),
+                None | Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+            ) =>
+        {
+            SequenceStart::Splice(i)
+        }
+        _ => SequenceStart::PassThrough,
     }
 }
 
@@ -266,14 +311,72 @@ fn push_edit<T: Serialize>(
 }
 
 /// Whether a sequence's byte range carries a comment or blank line that
-/// regenerating it would drop. Any line whose trimmed form is empty or opens a
-/// comment, and any line carrying a trailing ` #` comment, counts — erring
-/// toward leaving the sequence untouched so no author comment is ever lost.
+/// regenerating it would drop. A blank line, or any line carrying a YAML
+/// comment, counts — erring toward leaving the sequence untouched so no author
+/// comment is ever lost.
 fn region_has_interior_noise(region: &str) -> bool {
-    region.split('\n').any(|line| {
-        let trimmed = line.trim();
-        trimmed.is_empty() || trimmed.starts_with('#') || line.contains(" #")
-    })
+    region
+        .split('\n')
+        .any(|line| line.trim().is_empty() || line_has_comment(line))
+}
+
+/// Whether `line` carries a YAML comment: an unquoted `#` at the line start
+/// (after indentation) or preceded by whitespace — a space **or a tab** — and
+/// not inside a single- or double-quoted scalar.
+///
+/// This is stricter than a plain `" #"` substring on two axes: a tab-separated
+/// comment (`- item\t# note`) is recognized so regenerating the sequence never
+/// silently drops it, and a literal `#` inside a quoted value (e.g. a delimiter
+/// spelled `" #"`) is *not* mistaken for a comment, so a sequence carrying one
+/// still expands.
+fn line_has_comment(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    // The start of a line counts as "preceded by whitespace", so a comment-only
+    // line is detected even with no leading space.
+    let mut prev_ws = true;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_single {
+            // A doubled `''` is an escaped quote, not a close.
+            if c == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    i += 2;
+                    continue;
+                }
+                in_single = false;
+            }
+            prev_ws = false;
+        } else if in_double {
+            if c == b'\\' {
+                i += 2;
+                prev_ws = false;
+                continue;
+            }
+            if c == b'"' {
+                in_double = false;
+            }
+            prev_ws = false;
+        } else {
+            match c {
+                b'#' if prev_ws => return true,
+                b'\'' => {
+                    in_single = true;
+                    prev_ws = false;
+                }
+                b'"' => {
+                    in_double = true;
+                    prev_ws = false;
+                }
+                b' ' | b'\t' => prev_ws = true,
+                _ => prev_ws = false,
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// End (exclusive) of the flow sequence that opens at `raw[start] == '['`.
@@ -921,6 +1024,138 @@ nodes:
             "a sequence with an interior comment is left untouched"
         );
         assert!(out.contains("# keep this comment"), "\n{out}");
+    }
+
+    #[test]
+    fn anchored_block_same_indent_single_item_expands_and_reparses() {
+        // An anchor on the sequence definition, with the block at the key's own
+        // indent (`key: &sv\n- item`). The definition must expand — never error
+        // — and the anchor must survive so a later alias still resolves.
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: in.csv
+      split_values: &sv
+      - tags
+      schema:
+        - { name: tags, type: string, multiple: true }
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert!(!out.contains("- - "), "no doubled dash corruption:\n{out}");
+        assert!(out.contains("field: tags"), "\n{out}");
+        assert!(out.contains("delimiter:"), "defaults materialized:\n{out}");
+        assert!(
+            out.contains("split_values: &sv"),
+            "anchor must be preserved:\n{out}"
+        );
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn anchored_block_deeper_multi_item_expands_and_reparses() {
+        // An anchor on the sequence definition, with a deeper-indented block of
+        // several items. All items expand and the anchor is preserved.
+        let raw = "\
+nodes:
+  - type: source
+    name: s
+    config:
+      name: s
+      type: csv
+      path: in.csv
+      split_values: &sv
+        - tags
+        - codes
+      schema:
+        - { name: tags, type: string, multiple: true }
+        - { name: codes, type: string, multiple: true }
+";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert!(!out.contains("- - "), "no doubled dash corruption:\n{out}");
+        assert!(out.contains("field: tags"), "\n{out}");
+        assert!(out.contains("field: codes"), "\n{out}");
+        assert!(
+            out.contains("split_values: &sv"),
+            "anchor must be preserved:\n{out}"
+        );
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn resolve_sequence_start_skips_anchor_at_reported_offset() {
+        // Defensive contract: if the parser ever reports the `&anchor` token as
+        // the sequence value's offset, the resolver skips it to the real
+        // `-` / `[` rather than classifying the region `Unexpected` (which
+        // would hard-error on a valid anchored config).
+        for (src, want_byte) in [
+            ("key: &sv\n  - a\n", b'-'),
+            ("key: &sv\n- a\n", b'-'),
+            ("key: &sv [a]\n", b'['),
+            ("key: &longer_name\n  - a\n", b'-'),
+        ] {
+            let amp = src.find('&').expect("anchor token");
+            match resolve_sequence_start(src, amp) {
+                SequenceStart::Splice(pos) => assert_eq!(
+                    src.as_bytes()[pos],
+                    want_byte,
+                    "resolved to {:?}, want {:?} in {src:?}",
+                    src.as_bytes()[pos] as char,
+                    want_byte as char
+                ),
+                other => panic!("expected Splice for {src:?}, got {other:?}"),
+            }
+        }
+
+        // An anchor with no sequence token after it is passed through, not
+        // errored — a valid document is never corrupted.
+        match resolve_sequence_start("key: &sv scalar\n", 5) {
+            SequenceStart::PassThrough => {}
+            other => panic!("expected PassThrough for a scalar anchor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tab_preceded_comment_is_preserved() {
+        // A shorthand item ending in a TAB-separated comment must not be
+        // dropped: the sequence is passed through byte-identical rather than
+        // regenerated (which would discard the comment).
+        let raw = "nodes:\n  - type: source\n    name: s\n    config:\n      name: s\n      \
+                   type: csv\n      path: in.csv\n      split_values:\n        \
+                   - tags\t# keep this\n      schema:\n        \
+                   - { name: tags, type: string, multiple: true }\n";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert_eq!(
+            raw, out,
+            "a tab-preceded comment must leave the sequence untouched:\n{out}"
+        );
+        assert!(out.contains("# keep this"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn quoted_hash_value_still_expands() {
+        // A value containing `" #"` inside a quoted scalar must not be mistaken
+        // for a comment: the sequence still expands, materializing the bare
+        // item's defaults while the quoted value is preserved verbatim.
+        let raw = "nodes:\n  - type: source\n    name: s\n    config:\n      name: s\n      \
+                   type: csv\n      path: in.csv\n      split_values:\n        \
+                   - field: notes\n          delimiter: \" #\"\n        - tags\n      \
+                   schema:\n        - { name: notes, type: string, multiple: true }\n        \
+                   - { name: tags, type: string, multiple: true }\n";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        // The bare `- tags` gained its default delimiter — the block expanded.
+        assert!(out.contains("field: tags"), "block should expand:\n{out}");
+        assert!(out.contains("field: notes"), "\n{out}");
+        // `assert_parse_identity` guarantees the quoted `#` delimiter survived.
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
     }
 
     #[test]

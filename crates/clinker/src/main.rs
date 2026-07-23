@@ -2563,13 +2563,18 @@ fn run_config(args: &ConfigArgs) -> Result<u8, Box<dyn std::error::Error>> {
         );
     }
 
-    // Validate before rewriting: a parse or schema error surfaces here rather
-    // than producing a document that no longer matches a loadable plan.
-    clinker_plan::config::load_config(&args.config)
-        .map_err(|e| format!("{}: {e}", args.config.display()))?;
-
+    // Read the source once and reuse it for both validation and the rewrite.
+    // A second read would reopen the file after validation, leaving a TOCTOU
+    // window in which the resolved output could reflect different bytes than the
+    // ones just validated.
     let raw = std::fs::read_to_string(&args.config)
         .map_err(|e| format!("{}: {e}", args.config.display()))?;
+
+    // Validate before rewriting: a parse or schema error surfaces here rather
+    // than producing a document that no longer matches a loadable plan.
+    clinker_plan::config::load_config_from_str(&raw)
+        .map_err(|e| format!("{}: {e}", args.config.display()))?;
+
     let resolved = clinker_plan::config::expand_multi_value_shorthand(&raw)
         .map_err(|e| format!("{}: {e}", args.config.display()))?;
     print!("{resolved}");

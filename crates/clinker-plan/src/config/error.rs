@@ -156,7 +156,18 @@ pub fn parse_config_with_vars(
     extra_vars: &[(&str, &str)],
 ) -> Result<PipelineConfig, ConfigError> {
     let yaml = std::fs::read_to_string(path)?;
-    let interpolated = interpolate_env_vars(&yaml, extra_vars)?;
+    parse_config_source(&yaml, extra_vars)
+}
+
+/// Interpolate, parse, and external-schema-resolve a config from an
+/// already-read YAML string, stamping `source_hash` — the file-independent core
+/// of [`parse_config_with_vars`]. Callers that already hold the source bytes use
+/// this to avoid re-reading (and re-`stat`-ing) the file.
+fn parse_config_source(
+    yaml: &str,
+    extra_vars: &[(&str, &str)],
+) -> Result<PipelineConfig, ConfigError> {
+    let interpolated = interpolate_env_vars(yaml, extra_vars)?;
     let mut config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
     config.source_hash = *blake3::hash(interpolated.as_bytes()).as_bytes();
     // Resolve any external `.schema.yaml` (`SourceSchema::File`) references to
@@ -304,6 +315,20 @@ pub fn load_config_with_vars_and_patches(
 /// Load and parse a pipeline config from a YAML file path.
 pub fn load_config(path: &std::path::Path) -> Result<PipelineConfig, ConfigError> {
     load_config_with_vars(path, &[])
+}
+
+/// Load and validate a pipeline config from an already-read YAML string,
+/// running the same interpolation, external-schema resolution, and validation
+/// as [`load_config`].
+///
+/// Exists so a caller holding the source bytes — e.g. `clinker config
+/// --resolved`, which both validates and then rewrites the same text — validates
+/// without a second read of the file. Reading once removes the TOCTOU window in
+/// which the file could change between validation and the rewrite.
+pub fn load_config_from_str(yaml: &str) -> Result<PipelineConfig, ConfigError> {
+    let config = parse_config_source(yaml, &[])?;
+    validate_config(&config)?;
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -459,6 +484,45 @@ mod external_schema_tests {
             config.source_hash,
             *blake3::hash(interpolated.as_bytes()).as_bytes(),
             "an inline-schema config hashes to exactly the YAML-text BLAKE3"
+        );
+    }
+
+    /// `load_config_from_str` validates the same YAML the path loader does,
+    /// producing an identical config — the property that lets `config
+    /// --resolved` validate the bytes it already read instead of re-reading the
+    /// file (closing the TOCTOU window between validation and the rewrite).
+    #[test]
+    fn load_config_from_str_matches_path_loader_and_validates() {
+        let yaml = "pipeline:\n  name: read_once\n\
+             nodes:\n  - type: source\n    name: src\n    config:\n      \
+             name: src\n      type: csv\n      path: /tmp/in.csv\n      \
+             schema:\n        - { name: amount, type: int }\n  - type: output\n    \
+             name: out\n    input: src\n    config:\n      name: out\n      \
+             type: csv\n      path: /tmp/out.csv\n";
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("pipeline.yaml");
+        std::fs::write(&p, yaml).unwrap();
+
+        let from_path = load_config(&p).expect("path loader");
+        let from_str = load_config_from_str(yaml).expect("string loader");
+        assert_eq!(
+            from_path.source_hash, from_str.source_hash,
+            "reading once must produce the same pipeline identity as the path loader"
+        );
+        assert_eq!(from_path.nodes.len(), from_str.nodes.len());
+
+        // Validation still runs: a config that parses but is out of range is
+        // rejected (here an out-of-band `resume_threshold`, [E324]).
+        let invalid = "pipeline:\n  name: bad\n  memory:\n    resume_threshold: 2.0\n\
+             nodes:\n  - type: source\n    name: src\n    config:\n      \
+             name: src\n      type: csv\n      path: /tmp/in.csv\n      \
+             schema:\n        - { name: amount, type: int }\n";
+        assert!(
+            matches!(
+                load_config_from_str(invalid),
+                Err(ConfigError::Validation(_))
+            ),
+            "load_config_from_str must run validate_config, not just parse"
         );
     }
 }

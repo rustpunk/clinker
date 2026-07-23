@@ -269,9 +269,13 @@ fn check(block: &MarkedBlock, eval: &Evaluation) -> Option<String> {
     match &block.expectation {
         Expectation::Code(code) => {
             let matched = match eval {
-                // Parse-time validation embeds the code in its message text,
-                // e.g. `[E357] source '...'`.
-                Evaluation::ParseRejected(msg) => msg.contains(code.as_str()),
+                // Parse-time validation embeds the code as a bracketed token,
+                // e.g. `[E357] source '...'`. Match that whole token rather than
+                // a bare substring, so a coincidental substring (a shorter code
+                // that is a prefix of the real one, or the code text appearing
+                // in prose) cannot pass a block spuriously — as precise as the
+                // compile-time `c == code` check below.
+                Evaluation::ParseRejected(msg) => msg.contains(&format!("[{code}]")),
                 Evaluation::CompileErrors(codes) | Evaluation::Compiled(codes) => {
                     codes.iter().any(|c| c == code)
                 }
@@ -318,6 +322,40 @@ fn describe(eval: &Evaluation) -> String {
             }
         }
     }
+}
+
+#[test]
+fn parse_rejected_expect_code_matches_bracketed_token_not_substring() {
+    // A parse-time rejection carries its code as a bracketed token, e.g.
+    // `[E357] source '...'`. The harness must require that exact token, not a
+    // bare substring, so a wrong expected code cannot ride on a coincidence.
+    let rejected = Evaluation::ParseRejected(
+        "[E357] source 'x': envelope section 'a' declares ...".to_string(),
+    );
+
+    let exact = MarkedBlock {
+        page: "E357.md".to_string(),
+        marker_line: 1,
+        expectation: Expectation::Code("E357".to_string()),
+        yaml: String::new(),
+    };
+    assert!(
+        check(&exact, &rejected).is_none(),
+        "the documented code must match its own parse-time rejection"
+    );
+
+    // `E35` is a substring of the emitted `E357`; a bare-substring check passed
+    // this spuriously. The tightened token match must report it as a mismatch.
+    let wrong = MarkedBlock {
+        page: "E357.md".to_string(),
+        marker_line: 1,
+        expectation: Expectation::Code("E35".to_string()),
+        yaml: String::new(),
+    };
+    assert!(
+        check(&wrong, &rejected).is_some(),
+        "a wrong expected code must fail even when it is a substring of the real one"
+    );
 }
 
 #[test]
