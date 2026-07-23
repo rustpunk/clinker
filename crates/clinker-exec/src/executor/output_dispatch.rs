@@ -381,8 +381,10 @@ pub(crate) fn dispatch_output(
     };
     let strategy = ctx.strategy;
     // Collected inside the writer helpers (which hold only partial `ctx`
-    // borrows) and drained through `push_dlq` below once `ctx` is free again.
+    // borrows) and applied below once `ctx` is free again: `dlq_pending` drains
+    // through `push_dlq`, `written_rows` drives the ok/written/emitted counts.
     let mut dlq_pending: Vec<DlqEntry> = Vec::new();
+    let mut written_rows: Vec<u64> = Vec::new();
     {
         let mut fan_ctx = FanOutContext {
             name,
@@ -395,6 +397,7 @@ pub(crate) fn dispatch_output(
             collector: &mut *ctx.collector,
             strategy,
             dlq_pending: &mut dlq_pending,
+            written_rows: &mut written_rows,
         };
         if let Some(per_file) = fan_out_writers {
             emit_fan_out(&mut fan_ctx, &unbuffered, per_file, scan_timer);
@@ -402,27 +405,23 @@ pub(crate) fn dispatch_output(
             emit_single_writer(&mut fan_ctx, raw_writer, &unbuffered, scan_timer);
         }
     }
-    // Count ok / written / emitted for the records actually written — every
-    // unbuffered record except one a collision dead-lettered. Insert into the
+    // Count ok / written / emitted from the records actually written — one entry
+    // in `written_rows` per successful `write_record`. Insert each into the
     // run-shared `ok_source_rows` on success only (never remove), matching the
-    // streaming arm: a source row written OK at one Output and dead-lettered at
-    // another still counts as ok exactly once, independent of Output order.
-    let collided: std::collections::HashSet<u64> =
-        dlq_pending.iter().map(|e| e.source_row).collect();
+    // streaming arm: a record a collision dead-letters is never in `written_rows`,
+    // yet a written sibling that merely shares its source row_num (a
+    // `combine match: all` fan-out) still counts, and a source row written OK at
+    // one Output and dead-lettered at another counts as ok exactly once
+    // regardless of Output order.
     let mut newly_ok: u64 = 0;
-    let mut written: u64 = 0;
-    for (_, row_num) in &unbuffered {
-        if collided.contains(row_num) {
-            continue;
-        }
-        written += 1;
+    for row_num in &written_rows {
         if ctx.ok_source_rows.insert(*row_num) {
             newly_ok += 1;
         }
     }
     ctx.counters.ok_count += newly_ok;
-    ctx.counters.records_written += written;
-    ctx.records_emitted += written;
+    ctx.counters.records_written += written_rows.len() as u64;
+    ctx.records_emitted += written_rows.len() as u64;
 
     // Drain the collected collision entries; `push_dlq` enforces the DLQ rate
     // ceiling (E315/E316), which can still abort the run.
@@ -899,6 +898,14 @@ struct FanOutContext<'a> {
     /// [`push_dlq`] by the caller once the full `ctx` borrow is free (the
     /// writer helpers hold only partial borrows of it).
     dlq_pending: &'a mut Vec<DlqEntry>,
+    /// The source `row_num` of every record actually written, in write order —
+    /// one entry per successful `write_record`, so a `combine match: all`
+    /// fan-out that emits several output records for one driver row contributes
+    /// several entries. The caller counts `records_written`/`records_emitted`
+    /// from its length and inserts each into `ok_source_rows`, matching the
+    /// streaming arm; a record a collision dead-letters is simply never pushed
+    /// here, so a written sibling sharing its row_num still counts.
+    written_rows: &'a mut Vec<u64>,
 }
 
 /// Write `unbuffered` through a single pre-opened writer. Errors from
@@ -942,6 +949,7 @@ fn emit_single_writer(
                     write_failed = true;
                     break;
                 }
+                fan_ctx.written_rows.push(*rn);
             }
             if !write_failed {
                 let flush_result = {
@@ -1032,7 +1040,9 @@ fn emit_fan_out(
                 continue;
             }
             push_write_error(fan_ctx.output_errors, e);
+            continue;
         }
+        fan_ctx.written_rows.push(*rn);
     }
 
     // Flush every writer regardless of per-record errors so partial

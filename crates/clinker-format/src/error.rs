@@ -341,12 +341,14 @@ impl FormatError {
         )
     }
 
-    /// `true` only for a [`FormatError::MultiValueDelimiterCollision`] — a
-    /// CSV `join_values` `on_conflict: error` collision. The sink dispatch arms
-    /// use this to route the failing record to the DLQ (naming the field and the
-    /// offending value) under the configured error strategy, rather than
-    /// aborting the run the way an `Io`/`Csv` write failure does. Every other
-    /// variant keeps its existing disposition.
+    /// `true` only for a [`FormatError::MultiValueDelimiterCollision`] — a CSV
+    /// `join_values` `on_conflict: error` collision, which the record-granularity
+    /// sink arms route to the DLQ (naming the field and the offending value)
+    /// under `Continue` / `BestEffort` rather than aborting the run the way an
+    /// `Io`/`Csv` write failure does. A boolean classifier for that variant; the
+    /// executor's own `sink_collision_dlq_entry` destructures the variant
+    /// directly to build the DLQ entry, so this predicate is used by tests and by
+    /// any caller that only needs the yes/no.
     pub fn is_join_collision(&self) -> bool {
         matches!(self, Self::MultiValueDelimiterCollision { .. })
     }

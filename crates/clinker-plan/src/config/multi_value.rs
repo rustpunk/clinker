@@ -350,8 +350,11 @@ fn validate_source_declarations(
         // `str::split("")` matches at every character boundary, so an empty
         // delimiter would turn one cell into a run of single characters
         // bracketed by two empty values. There is no reading of "split on
-        // nothing" that produces what an author meant.
-        if a.delimiter.is_empty() {
+        // nothing" that produces what an author meant. `json: true` reads the
+        // whole cell as a JSON array and ignores the delimiter, so it is exempt —
+        // symmetric with the write-side E362, which exempts an empty delimiter
+        // under `encode_json`.
+        if a.delimiter.is_empty() && !a.json {
             faults.push(DeclarationFault {
                 message: format!(
                     "source '{}': `split_values` on field '{}' declares an empty delimiter",

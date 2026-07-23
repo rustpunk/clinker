@@ -1419,3 +1419,32 @@ fn join_values_encode_json_empty_delimiter_compiles() {
     );
     compile_ok(&yaml);
 }
+
+#[test]
+fn split_values_json_empty_delimiter_compiles() {
+    // `json: true` ignores the delimiter, so an empty delimiter under it is
+    // harmless — symmetric with the write-side E362 encode_json exemption.
+    let yaml = r#"
+pipeline:
+  name: split_json_empty_delim
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: ./in.csv
+      split_values:
+        - { field: tags, json: true, delimiter: "" }
+      schema:
+        - { name: tags, type: string, multiple: true }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: json
+      path: out.json
+"#;
+    compile_ok(yaml);
+}

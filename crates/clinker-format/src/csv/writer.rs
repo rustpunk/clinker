@@ -486,8 +486,9 @@ fn write_scalar_cell(buf: &mut String, col: &str, value: &Value) -> Result<(), F
 ///   shared [`clinker_to_json`]), recovered by a matching `split_values`
 ///   `json: true`. Lossless for any value.
 ///
-/// Any nested `Value::Array`/`Value::Map` element is rejected — a flat cell
-/// cannot hold nested structure.
+/// Under `error` and `escape` a nested `Value::Array`/`Value::Map` element is
+/// rejected — a flat delimited cell cannot hold nested structure. `encode_json`
+/// serializes nested structure as nested JSON, so it accepts it.
 fn write_joined_cell(
     buf: &mut String,
     col: &str,
