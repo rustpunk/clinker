@@ -87,6 +87,12 @@ pub struct JsonReader {
     schema: Option<Arc<Schema>>,
     config: JsonReaderConfig,
     pending: Vec<serde_json::Map<String, serde_json::Value>>,
+    /// The first raw record, read eagerly by schema inference and held UN-parsed
+    /// so its fallible flatten (which rejects an undeclared flattened-name
+    /// collision) runs in `next_record`, inside the executor's record loop,
+    /// rather than in the eager `schema` call the ingest setup makes before that
+    /// loop. `None` once consumed or when the source is empty.
+    deferred_first: Option<serde_json::Value>,
     /// The re-openable byte source. Body iteration and the envelope pre-scan
     /// each open their own fresh [`Read`] from it, so no whole-file buffer is
     /// held for a file-backed (`ReopenableSource::Path`) source.
@@ -139,6 +145,7 @@ impl JsonReader {
             schema: None,
             config,
             pending: Vec::new(),
+            deferred_first: None,
             source,
             body_identity,
         })
@@ -612,17 +619,27 @@ impl FormatReader for JsonReader {
         // `keep_empty: false` entry drops a record whose field is empty, and
         // inferring the schema from that dropped expansion would cache a
         // column-less schema for the whole source while records kept flowing.
-        let expanded = loop {
+        //
+        // Name inference flattens WITHOUT collision detection: it needs only the
+        // column names, which a flattened-name collision does not change. The
+        // fallible detecting flatten is deferred — the raw record is stashed in
+        // `deferred_first` and re-flattened in `next_record`, so an undeclared
+        // collision in the FIRST record surfaces through the executor's record
+        // loop (where it can be dead-lettered) rather than through this eager
+        // `schema` call, which the ingest setup makes before the loop begins and
+        // whose error would abort the whole run.
+        let (raw, expanded) = loop {
             let Some(raw) = self.next_raw()? else {
                 let s = SchemaBuilder::new().build();
                 self.schema = Some(Arc::clone(&s));
                 self.inner = InnerReader::Done;
                 return Ok(s);
             };
-            let flat = self.flatten_record_body(&raw)?;
+            let mut flat = serde_json::Map::new();
+            Self::flatten_value("", &raw, &mut flat, 0, None, &[]);
             let expanded = self.apply_split_to_rows(flat);
             if !expanded.is_empty() {
-                break expanded;
+                break (raw, expanded);
             }
         };
 
@@ -633,14 +650,29 @@ impl FormatReader for JsonReader {
             .map(|k| k.clone().into_boxed_str())
             .collect::<SchemaBuilder>()
             .build();
+        self.deferred_first = Some(raw);
         self.schema = Some(Arc::clone(&schema));
-        self.pending = expanded;
         Ok(schema)
     }
 
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
         if self.schema.is_none() {
             self.schema()?;
+        }
+
+        // Assemble the record schema inference stashed, detecting an undeclared
+        // flattened-name collision here rather than in the eager `schema` call.
+        if let Some(raw) = self.deferred_first.take() {
+            let flat = self.flatten_record_body(&raw)?;
+            let mut expanded = self.apply_split_to_rows(flat).into_iter();
+            if let Some(first) = expanded.next() {
+                let record = self.map_to_record(first)?;
+                self.pending = expanded.collect();
+                return Ok(Some(record));
+            }
+            // The deferred record expanded to nothing after all (only reachable
+            // if detection changed the expansion, which it does not) — fall
+            // through to the pending/main-loop path.
         }
 
         if !self.pending.is_empty() {
@@ -714,7 +746,14 @@ fn project_element(
     match (entry.mode, elem) {
         (SplitToRowsMode::Extract, serde_json::Value::Object(_)) => {
             // Merge the occurrence's keys onto the already-populated parent
-            // record: a deliberate merge, so no collision detection (last-wins).
+            // record. Collision detection is off (`None`) here: an element key
+            // that clashes with a parent field, or with another element key,
+            // still resolves last-wins rather than raising
+            // `UndeclaredRepeatedField`. That element-internal / element-vs-parent
+            // collision under `extract` is the fan-out half of the read-side
+            // collision gap and is tracked separately by issue #920 — the
+            // top-level record collision this module now rejects does not cover
+            // it.
             JsonReader::flatten_value("", elem, out, 0, None, &[]);
         }
         (SplitToRowsMode::Extract, other) => {
@@ -726,6 +765,10 @@ fn project_element(
             out.insert(name.to_string(), other.clone());
         }
         (SplitToRowsMode::Split, _) => {
+            // Split mode re-nests the element under its own field name, so a
+            // clash with a parent field is possible but a within-element clash
+            // is not; collision detection stays off for the same #920 reason as
+            // the extract arm above.
             JsonReader::flatten_value(&entry.field, elem, out, 0, None, &[]);
         }
     }
@@ -1389,8 +1432,15 @@ mod tests {
         // dropping the other, matching the XML undeclared-repeat behavior.
         let input = r#"[{"a":{"b":1},"a.b":2}]"#;
         let mut r = reader_from_str(input, default_config());
-        let err = r
+        // Schema inference is infallible (names only), so the loud error is
+        // deferred to record assembly in `next_record` — this lets the executor
+        // dead-letter a first-record collision instead of aborting during its
+        // eager pre-loop `schema` call.
+        let _s = r
             .schema()
+            .expect("schema inference does not detect collisions");
+        let err = r
+            .next_record()
             .expect_err("flattened-name collision must fail loud");
         assert!(
             matches!(err, FormatError::UndeclaredRepeatedField { format: "JSON", ref field } if field == "a.b"),

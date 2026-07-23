@@ -100,6 +100,12 @@ longer collide. As with XML, detection is per document at read time, so the run
 aborts under `fail_fast` and dead-letters the document under `continue` /
 `best_effort` with `dlq_granularity: document`.
 
+Detection covers collisions at the top level of a record. A collision *inside*
+an array element that a `split_to_rows: extract` fan-out lifts to the top level
+(one element key clashing with a parent field or with another element key) is
+not yet detected and still resolves last-wins — tracked by
+[issue 920](https://github.com/rustpunk/clinker/issues/920).
+
 ## Bounding envelope retention: `max_index_bytes`
 
 When a source declares an `envelope:` and a pipeline reads `$doc.*` paths

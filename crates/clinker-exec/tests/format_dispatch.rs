@@ -284,6 +284,142 @@ nodes:
     );
 }
 
+/// The undeclared repeat in RECORD 1 must be dead-lettered, not aborted.
+/// Schema inference reads the first record eagerly during ingest setup, before
+/// the executor's record loop; if the loud error surfaced there it would bypass
+/// the document-DLQ reclassification and abort the run. The reader defers the
+/// fallible assembly to the loop so even a first-record repeat dead-letters.
+#[test]
+fn test_xml_undeclared_repeat_in_first_record_dead_letters() {
+    let yaml = r#"
+pipeline:
+  name: xml-first-record-repeat
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: xml
+    path: input.xml
+    dlq_granularity: document
+    options:
+      record_path: records/record
+    schema:
+      - { name: name, type: string }
+      - { name: age, type: string }
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+"#;
+    // The very FIRST record repeats `<name>`, which is not declared `multiple:`.
+    let input_data = xml_input(
+        "records",
+        "record",
+        &[
+            vec![("name", "Alice"), ("name", "Ally"), ("age", "30")],
+            vec![("name", "Bob"), ("age", "25")],
+        ],
+    );
+    let (counters, dlq, output) = run_format_test(yaml, "src", input_data)
+        .expect("a first-record repeat must dead-letter, not abort the run");
+    assert!(
+        counters.dlq_count >= 1,
+        "the first-record repeat is dead-lettered, got dlq_count={}",
+        counters.dlq_count
+    );
+    assert_eq!(counters.ok_count, 0, "the condemned document emits nothing");
+    assert!(!dlq.is_empty());
+    let body: Vec<&str> = output.lines().skip(1).filter(|l| !l.is_empty()).collect();
+    assert!(
+        body.is_empty(),
+        "no data row reaches the sink, got {body:?}"
+    );
+}
+
+/// A first-record repeat in one file dead-letters that file's document while a
+/// clean SECOND file streams through — proving the run continues past the
+/// condemned document rather than aborting.
+#[test]
+fn test_xml_undeclared_repeat_first_file_condemned_second_file_processes() {
+    let yaml = r#"
+pipeline:
+  name: xml-multi-file-repeat
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: xml
+    glob: ./*.xml
+    dlq_granularity: document
+    files:
+      on_no_match: skip
+    options:
+      record_path: records/record
+    schema:
+      - { name: name, type: string }
+      - { name: age, type: string }
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+"#;
+    let config = clinker_plan::config::parse_config(yaml).unwrap();
+    // File a: record 1 repeats <name> → whole document condemned.
+    let file_a =
+        "<records><record><name>Alice</name><name>Ally</name><age>30</age></record></records>";
+    // File b: clean → streams through.
+    let file_b = "<records><record><name>Carol</name><age>40</age></record></records>";
+    let slots = vec![
+        clinker_exec::source::multi_file::FileSlot::new(
+            std::path::PathBuf::from("a.xml"),
+            Box::new(Cursor::new(file_a.as_bytes().to_vec())),
+        ),
+        clinker_exec::source::multi_file::FileSlot::new(
+            std::path::PathBuf::from("b.xml"),
+            Box::new(Cursor::new(file_b.as_bytes().to_vec())),
+        ),
+    ];
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+        "src".to_string(),
+        clinker_exec::source::SourceInput::Files(slots),
+    )]);
+    let buf = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "dest".to_string(),
+        Box::new(buf.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = test_params();
+    let report = common::run_config(&config, readers, writers, &params)
+        .expect("a condemned first file must not abort the run");
+    assert!(
+        report.counters.dlq_count >= 1,
+        "the first file's document is dead-lettered"
+    );
+    let output = buf.as_string();
+    assert!(
+        output.contains("Carol"),
+        "the clean second file still processes: {output}"
+    );
+    assert!(
+        !output.contains("Alice"),
+        "the condemned first file emits nothing: {output}"
+    );
+}
+
 /// JSON NDJSON output produces valid newline-delimited JSON.
 /// CSV input → NDJSON output, verify each line parses as JSON.
 #[test]
