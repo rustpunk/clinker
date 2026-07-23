@@ -1232,6 +1232,28 @@ fn join_values_csv_shape_knobs_on_an_xml_output_are_not_faults() {
 }
 
 #[test]
+fn join_values_xml_knobs_on_a_csv_output_are_rejected() {
+    // The reverse of `join_values_csv_shape_knobs_on_an_xml_output_are_not_faults`:
+    // `repeat_as` / `wrap_in` are XML-output-only. The CSV writer never reads
+    // them, so setting one on a CSV output is a silent no-op E362 rejects — these
+    // are `Option` fields, so an explicit value is detectable.
+    for knob in [
+        r#"{ field: tags, repeat_as: Tag }"#,
+        r#"{ field: tags, wrap_in: Tags }"#,
+    ] {
+        let yaml = join_pipeline("csv", &format!("      join_values:\n        - {knob}"));
+        let found = coded(&compile_err(&yaml), "E362");
+        assert_eq!(found.len(), 1, "expected one E362 for {knob}: {found:?}");
+        assert!(
+            found[0].0.contains("only the `xml` writer honors"),
+            "{}",
+            found[0].0
+        );
+        assert!(found[0].1, "E362 must carry a source span");
+    }
+}
+
+#[test]
 fn join_values_duplicate_field_on_an_xml_output_is_rejected() {
     // The duplicate-field check applies to every consumer of the block, XML
     // included — two entries for one field leave its encoding ambiguous.

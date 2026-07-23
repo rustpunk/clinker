@@ -887,13 +887,16 @@ pub fn source_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
 /// Declaring it on any other output format is a silent no-op the gate rejects —
 /// the same no-op-rejection principle as E358's "reader never handed it".
 ///
-/// The duplicate-field check applies to both consumers. The delimiter / escape
-/// shape checks are the CSV writer's alone — a non-empty delimiter, and under
-/// `on_conflict: escape` (whose invertible escaping is defined char-wise) a
-/// single-character delimiter and escape. The XML writer reads only `repeat_as`
-/// and `wrap_in`, validated as legal XML names at write time (consistent with
-/// the configured root / record element names), so those shape checks would
-/// wrongly fault an XML entry's defaulted delimiter.
+/// The duplicate-field check applies to both consumers. Each writer reads a
+/// disjoint subset of the remaining keys, so a key aimed at the other writer is a
+/// silent no-op the gate rejects: `repeat_as` / `wrap_in` on a CSV output (the
+/// CSV writer never reads them, and they are `Option` so an explicit value is
+/// detectable). The delimiter / escape shape checks are the CSV writer's alone —
+/// a non-empty delimiter, and under `on_conflict: escape` (whose invertible
+/// escaping is defined char-wise) a single-character delimiter and escape. The
+/// XML writer reads only `repeat_as` and `wrap_in`, validated as legal XML names
+/// at write time (consistent with the configured root / record element names),
+/// so a defaulted `delimiter` on an XML entry is inert rather than faulted.
 ///
 /// Deliberately does NOT require the field to be a statically-declared
 /// `multiple:` column, unlike E358's `split_values` check. A write-side array
@@ -945,6 +948,30 @@ fn validate_join_declarations(output: &OutputConfig) -> Vec<DeclarationFault> {
         return faults;
     }
     for entry in entries {
+        // `repeat_as` / `wrap_in` name the repeated-element and container of the
+        // XML writer's output; the CSV writer never reads them, so setting one on
+        // a CSV output is a silent no-op — the values would join into one cell
+        // with the author's naming intent discarded. Unlike a defaulted
+        // `delimiter` (which cannot be told set-from-unset), these are `Option`
+        // fields, so an explicit value is detectable and faulted here.
+        if entry.repeat_as.is_some() || entry.wrap_in.is_some() {
+            let knob = if entry.repeat_as.is_some() {
+                "repeat_as"
+            } else {
+                "wrap_in"
+            };
+            faults.push(DeclarationFault {
+                message: format!(
+                    "output '{}': `join_values` on field '{}' sets `{knob}`, which only the `xml` \
+                     writer honors — a `csv` output joins the values into one delimited cell and \
+                     never reads it",
+                    output.name, entry.field
+                ),
+                help: "drop `repeat_as` / `wrap_in` on a CSV output (they name XML repeated \
+                       elements), or write this stream to an `xml` output where they take effect"
+                    .to_string(),
+            });
+        }
         // The delimiter matters only for the delimited policies (`error`,
         // `escape`); `encode_json` ignores it, so an empty or multi-character
         // delimiter under `encode_json` is harmless and exempt.
