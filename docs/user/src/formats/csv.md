@@ -152,13 +152,20 @@ overrides, per field:
     the original. Lossless. `delimiter` and `escape` must each be a single
     character.
   - `encode_json` — encode the whole field as an embedded JSON array, recovered
-    by a matching `split_values` `json: true`. Lossless for any value, including
-    ones carrying the delimiter, quotes, or newlines.
+    by a matching `split_values` `json: true`. Preserves every value's text
+    exactly, including ones carrying the delimiter, quotes, or newlines — nothing
+    is lost or mis-split. (A decimal/date/datetime element serializes as its JSON
+    string form and reads back as a string, re-typed by the column's declared
+    `type:`, the same round trip every CSV cell takes.)
 
-An empty field emits an empty cell; a single value emits that value with no
-delimiter. The joined cell is quoted by the normal CSV rules when it contains the
-field delimiter, a quote, or a newline. Declaring `join_values` on a non-CSV
-output is rejected at compile ([E362](../../explain/E362.md)).
+An empty field emits an empty cell — and, under the delimited policies (`error`,
+`escape`), a single empty-string value `[""]` emits an empty cell too, which
+reads back as zero values: the delimited encoding cannot tell an empty field from
+one empty value. Use `encode_json` when that distinction matters. A single
+non-empty value emits that value with no delimiter. The joined cell is quoted by
+the normal CSV rules when it contains the field delimiter, a quote, or a newline.
+Declaring `join_values` on a non-CSV output is rejected at compile
+([E362](../../explain/E362.md)).
 
 **Round trip.** `on_conflict: escape` and `encode_json` are recovered exactly by
 a matching source `split_values` entry:

@@ -376,6 +376,81 @@ fn validate_source_declarations(
                     .to_string(),
             });
         }
+        // The `escape` / `json` recovery modes — the read-side inverses of the
+        // CSV sink's `join_values` `on_conflict: escape` / `encode_json` — are
+        // honored only by the single-schema CSV reader (this loop runs on a block
+        // the reader consumes, so a CSV block here is single-schema). On any other
+        // read format the reader splits on the bare delimiter and silently ignores
+        // them, so declaring them is a no-op the gate rejects.
+        let csv_source = matches!(source.format, InputFormat::Csv(_));
+        if (!a.escape.is_empty() || a.json) && !csv_source {
+            faults.push(DeclarationFault {
+                message: format!(
+                    "source '{}': `split_values` on field '{}' sets `{}`, which only the CSV \
+                     reader honors — a `{}` reader splits on the bare delimiter and ignores it",
+                    source.name,
+                    a.field,
+                    if a.json { "json" } else { "escape" },
+                    source.format.format_name(),
+                ),
+                help: "drop `escape` / `json` on a non-CSV source: a JSON or XML array recovers \
+                       natively, and the delimited readers split on the plain delimiter"
+                    .to_string(),
+            });
+        }
+        // `json: true` reads the whole cell as an embedded JSON array and ignores
+        // the delimiter, so a co-declared `escape` would never apply.
+        if a.json && !a.escape.is_empty() {
+            faults.push(DeclarationFault {
+                message: format!(
+                    "source '{}': `split_values` on field '{}' sets both `json: true` and \
+                     `escape` — `json` reads the whole cell as a JSON array, so `escape` is unused",
+                    source.name, a.field
+                ),
+                help: "drop `escape` when `json: true`, or drop `json` to split on the delimiter \
+                       with escape handling"
+                    .to_string(),
+            });
+        }
+        // The escape-aware split un-escapes character by character (the read-side
+        // inverse of the sink's `on_conflict: escape`), so under `escape` the
+        // delimiter and escape must each be a single character and must differ.
+        if !a.escape.is_empty() && !a.json {
+            if a.delimiter.chars().count() != 1 {
+                faults.push(DeclarationFault {
+                    message: format!(
+                        "source '{}': `split_values` on field '{}' sets `escape` with a \
+                         multi-character delimiter '{}'",
+                        source.name, a.field, a.delimiter
+                    ),
+                    help: "use a single-character `delimiter` with `escape`, or drop `escape` to \
+                           split on the plain multi-character delimiter"
+                        .to_string(),
+                });
+            } else if a.escape.chars().count() != 1 {
+                faults.push(DeclarationFault {
+                    message: format!(
+                        "source '{}': `split_values` on field '{}' sets an `escape` '{}' that is \
+                         not a single character",
+                        source.name, a.field, a.escape
+                    ),
+                    help: "give a single-character `escape` (`\\` matches the sink default)"
+                        .to_string(),
+                });
+            } else if a.escape == a.delimiter {
+                faults.push(DeclarationFault {
+                    message: format!(
+                        "source '{}': `split_values` on field '{}' sets the `escape` equal to the \
+                         delimiter '{}'",
+                        source.name, a.field, a.delimiter
+                    ),
+                    help:
+                        "give an `escape` different from the `delimiter` — sharing one character \
+                           makes an escaped delimiter and an escape marker indistinguishable"
+                            .to_string(),
+                });
+            }
+        }
     }
 
     if let Some(columns) = schema.bound_columns() {
@@ -868,22 +943,33 @@ fn validate_join_declarations(output: &OutputConfig) -> Vec<DeclarationFault> {
                     .to_string(),
             });
         }
+        // The delimited policies (`error`, `escape`) need a single-character
+        // delimiter. Under `error` the collision check tests whether a value
+        // contains the delimiter, which misses a spurious boundary a
+        // multi-character delimiter can form between two adjacent values; under
+        // `escape` the char-by-char escaping cannot round-trip a multi-character
+        // delimiter. `encode_json` ignores the delimiter, so it is exempt.
+        if entry.on_conflict != OnConflict::EncodeJson && entry.delimiter.chars().count() > 1 {
+            faults.push(DeclarationFault {
+                message: format!(
+                    "output '{}': `join_values` on field '{}' uses a multi-character delimiter \
+                     '{}' with `on_conflict: {}`",
+                    output.name,
+                    entry.field,
+                    entry.delimiter,
+                    on_conflict_name(entry.on_conflict),
+                ),
+                help: "use a single-character `delimiter` for `on_conflict: error` / `escape`, or \
+                       switch to `encode_json`, which encodes the whole field as a JSON array and \
+                       places no constraint on the delimiter"
+                    .to_string(),
+            });
+        }
         // `on_conflict: escape` escapes and un-escapes character by character, so
-        // a multi-character delimiter or escape could not round-trip exactly.
+        // the escape must be a single character and must differ from the
+        // delimiter — otherwise an escaped delimiter and an escape marker are
+        // indistinguishable on read.
         if entry.on_conflict == OnConflict::Escape {
-            if entry.delimiter.chars().count() != 1 {
-                faults.push(DeclarationFault {
-                    message: format!(
-                        "output '{}': `join_values` on field '{}' uses `on_conflict: escape` with \
-                         a multi-character delimiter '{}'",
-                        output.name, entry.field, entry.delimiter
-                    ),
-                    help: "escaping is defined per character, so `on_conflict: escape` needs a \
-                           single-character `delimiter`; use `encode_json` for an arbitrary \
-                           delimiter, or shorten the delimiter to one character"
-                        .to_string(),
-                });
-            }
             if entry.escape.chars().count() != 1 {
                 faults.push(DeclarationFault {
                     message: format!(
@@ -895,10 +981,31 @@ fn validate_join_declarations(output: &OutputConfig) -> Vec<DeclarationFault> {
                            un-escapes character by character"
                         .to_string(),
                 });
+            } else if entry.escape == entry.delimiter {
+                faults.push(DeclarationFault {
+                    message: format!(
+                        "output '{}': `join_values` on field '{}' uses `on_conflict: escape` with \
+                         the escape equal to the delimiter '{}'",
+                        output.name, entry.field, entry.delimiter
+                    ),
+                    help: "give an `escape` different from the `delimiter`; sharing one character \
+                           makes an escaped delimiter and an escape marker indistinguishable on \
+                           read"
+                        .to_string(),
+                });
             }
         }
     }
     faults
+}
+
+/// The `on_conflict` policy's YAML spelling, for a diagnostic message.
+fn on_conflict_name(policy: OnConflict) -> &'static str {
+    match policy {
+        OnConflict::Error => "error",
+        OnConflict::Escape => "escape",
+        OnConflict::EncodeJson => "encode_json",
+    }
 }
 
 pub fn output_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {

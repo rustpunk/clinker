@@ -26,6 +26,15 @@ use super::stream_event::{Punctuation, StreamEvent};
 use super::structured_output_guard::StructuredOutputDocumentGuard;
 use super::{DlqEntry, WriterRegistry, build_format_writer, dispatch, stage_metrics};
 
+/// Hard cap on the number of `join_values` collision DLQ entries a streaming
+/// Output thread buffers before draining them at thread-join. The thread has no
+/// live `ctx`, so it cannot enforce the run-scoped DLQ rate ceiling itself; this
+/// input-independent cap keeps the bounded-memory contract on the streaming path
+/// — a stream that collides past it aborts loudly rather than holding a cloned
+/// record per collision. Generous, so a normal continue-with-DLQ run never trips
+/// it; the authoritative rate check still runs at join for what did accumulate.
+const STREAMING_DLQ_BUFFER_CAP: u64 = 65_536;
+
 /// Identify fused producer → single `Output` chains eligible for
 /// streaming writes and build a [`StreamingOutputSpec`] for each.
 ///
@@ -461,6 +470,28 @@ impl StreamingConsumer for OutputStreamConsumer {
                     )
                 {
                     self.out.dlq_pending.push(entry);
+                    // The authoritative DLQ rate ceiling (E315/E316) is enforced
+                    // at thread-join, where the run-scoped per-source totals live;
+                    // this thread cannot see them. A hard cap on the pending
+                    // buffer keeps the streaming path bounded-memory: a stream
+                    // that collides past the cap fails loud here rather than
+                    // buffering a cloned record per collision until it exhausts
+                    // memory. The cap is independent of input size, so it does not
+                    // scale with the stream.
+                    if self.out.dlq_pending.len() as u64 >= STREAMING_DLQ_BUFFER_CAP {
+                        self.out.errors.push(PipelineError::Internal {
+                            op: "streaming_output",
+                            node: self.spec.output_name.clone(),
+                            detail: format!(
+                                "more than {STREAMING_DLQ_BUFFER_CAP} `join_values` collisions \
+                                 buffered on the streaming output path; lower the collision rate \
+                                 (a lossless `on_conflict: escape` / `encode_json`), set a DLQ \
+                                 `max_rate` to abort earlier, or route this stream to a buffered \
+                                 output",
+                            ),
+                        });
+                        return ControlFlow::Break(());
+                    }
                     return ControlFlow::Continue(());
                 }
                 self.out.errors.push(PipelineError::from(e));

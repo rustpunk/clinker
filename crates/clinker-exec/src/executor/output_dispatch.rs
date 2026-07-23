@@ -407,6 +407,19 @@ pub(crate) fn dispatch_output(
             emit_single_writer(&mut fan_ctx, raw_writer, &unbuffered, scan_timer);
         }
     }
+    // Every unbuffered record was pre-counted as ok / written / emitted above,
+    // but a collision record was dead-lettered instead of written. Undo those
+    // counts for each dead-lettered record so it is counted once (as DLQ), not
+    // twice — matching the streaming arm, which counts only on a successful
+    // write. `saturating_sub` guards the (impossible-here) underflow.
+    let dead_lettered = dlq_pending.len() as u64;
+    ctx.counters.records_written = ctx.counters.records_written.saturating_sub(dead_lettered);
+    ctx.records_emitted = ctx.records_emitted.saturating_sub(dead_lettered);
+    for entry in &dlq_pending {
+        if ctx.ok_source_rows.remove(&entry.source_row) {
+            ctx.counters.ok_count = ctx.counters.ok_count.saturating_sub(1);
+        }
+    }
     // Drain the collected collision entries; `push_dlq` enforces the DLQ rate
     // ceiling (E315/E316), which can still abort the run.
     for entry in dlq_pending {

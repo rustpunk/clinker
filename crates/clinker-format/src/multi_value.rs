@@ -152,8 +152,12 @@ pub enum OnConflict {
     /// original. Lossless.
     Escape,
     /// Encode the whole field as an embedded JSON array, recovered by a matching
-    /// `split_values` `json: true`. Lossless for any value, including ones
-    /// carrying the delimiter, quotes, or newlines.
+    /// `split_values` `json: true`. Preserves the text of every value exactly,
+    /// including ones carrying the delimiter, quotes, or newlines — so no value
+    /// is ever lost or mis-split, unlike the delimited policies. A non-string
+    /// element (a decimal, date, or datetime built in CXL) serializes as its JSON
+    /// string form and reads back as a string, to be re-typed by the column's
+    /// declared `type:` — the same round trip every CSV cell takes.
     EncodeJson,
 }
 

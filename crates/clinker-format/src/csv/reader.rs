@@ -208,6 +208,16 @@ fn decode_record(
                         entry.field
                     ))
                 })?;
+                // A `multiple:` column must hold an array; a non-array JSON cell
+                // (a bare scalar or object) would bind a scalar/map at an array
+                // column, so reject it loudly rather than deliver the wrong shape.
+                if !parsed.is_array() {
+                    return Err(FormatError::Json(format!(
+                        "split_values `json: true` on field '{}': cell is JSON but not an array \
+                         (a `multiple:` column holds an array)",
+                        entry.field
+                    )));
+                }
                 return Ok(crate::json::reader::json_to_value(&parsed));
             }
             Ok(split_text_value_escaped(
@@ -448,6 +458,29 @@ mod tests {
         reader.schema().unwrap();
         let record = reader.next_record().unwrap().unwrap();
         assert_eq!(record.get("tags"), Some(&Value::Array(Vec::new())));
+    }
+
+    #[test]
+    fn split_values_json_non_array_cell_errors() {
+        // A `multiple:` column must hold an array; a JSON scalar/object cell is
+        // rejected loudly rather than binding a non-array Value at the column.
+        let csv = "order_id,tags\n1,\"{\"\"a\"\":1}\"";
+        let config = CsvReaderConfig {
+            split_values: vec![SplitValues {
+                field: "tags".into(),
+                delimiter: ";".into(),
+                escape: String::new(),
+                json: true,
+            }],
+            ..Default::default()
+        };
+        let mut reader = CsvReader::from_reader(csv.as_bytes(), config);
+        reader.schema().unwrap();
+        let err = reader.next_record().unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Json(m) if m.contains("not an array")),
+            "expected a not-an-array error, got {err:?}"
+        );
     }
 
     #[test]

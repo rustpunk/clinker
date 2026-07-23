@@ -1264,3 +1264,146 @@ fn join_values_escape_with_multichar_escape_is_rejected() {
         found[0].0
     );
 }
+
+// ---- E362 / E358: delimited-policy safety constraints (review follow-up) ----
+
+#[test]
+fn join_values_multichar_delimiter_under_error_is_rejected() {
+    // A multi-character delimiter under `on_conflict: error` can form a spurious
+    // boundary between two adjacent values that the collision check misses.
+    let yaml = join_pipeline(
+        "csv",
+        r#"      join_values:
+        - { field: tags, delimiter: "::" }"#,
+    );
+    let found = coded(&compile_err(&yaml), "E362");
+    assert_eq!(found.len(), 1, "expected one E362: {found:?}");
+    assert!(
+        found[0].0.contains("multi-character delimiter"),
+        "{}",
+        found[0].0
+    );
+}
+
+#[test]
+fn join_values_multichar_delimiter_under_encode_json_compiles() {
+    // encode_json ignores the delimiter, so the single-char constraint does not
+    // apply.
+    let yaml = join_pipeline(
+        "csv",
+        r#"      join_values:
+        - { field: tags, delimiter: "::", on_conflict: encode_json }"#,
+    );
+    compile_ok(&yaml);
+}
+
+#[test]
+fn join_values_escape_equal_to_delimiter_is_rejected() {
+    let yaml = join_pipeline(
+        "csv",
+        r#"      join_values:
+        - { field: tags, delimiter: ";", on_conflict: escape, escape: ";" }"#,
+    );
+    let found = coded(&compile_err(&yaml), "E362");
+    assert_eq!(found.len(), 1, "expected one E362: {found:?}");
+    assert!(
+        found[0].0.contains("equal to the delimiter"),
+        "{}",
+        found[0].0
+    );
+}
+
+/// A source whose `split_values` entry uses `escape` / `json` on a format whose
+/// reader does not honor them (only the single-schema CSV reader does).
+fn split_modes_pipeline(source_type: &str, split_block: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: split_modes_gate
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: {source_type}
+      path: ./in.dat
+{split_block}
+      schema:
+        - {{ name: tags, type: string, multiple: true }}
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: json
+      path: out.json
+"#
+    )
+}
+
+#[test]
+fn split_values_escape_on_a_non_csv_source_is_rejected() {
+    // The JSON reader splits on the bare delimiter and ignores `escape`, so
+    // declaring it is a silent no-op the gate rejects.
+    let yaml = split_modes_pipeline(
+        "json",
+        r#"      split_values:
+        - { field: tags, delimiter: ";", escape: "\\" }"#,
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert!(
+        found
+            .iter()
+            .any(|f| f.0.contains("only the CSV reader honors")),
+        "expected an E358 naming the CSV-only recovery mode: {found:?}"
+    );
+}
+
+#[test]
+fn split_values_json_on_a_non_csv_source_is_rejected() {
+    let yaml = split_modes_pipeline(
+        "json",
+        r#"      split_values:
+        - { field: tags, json: true }"#,
+    );
+    let found = coded(&compile_err(&yaml), "E358");
+    assert!(
+        found
+            .iter()
+            .any(|f| f.0.contains("only the CSV reader honors")),
+        "expected an E358: {found:?}"
+    );
+}
+
+#[test]
+fn split_values_multichar_delimiter_under_escape_is_rejected() {
+    let yaml = r#"
+pipeline:
+  name: split_escape_gate
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: ./in.csv
+      split_values:
+        - { field: tags, delimiter: "::", escape: "\\" }
+      schema:
+        - { name: tags, type: string, multiple: true }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: json
+      path: out.json
+"#;
+    let found = coded(&compile_err(yaml), "E358");
+    assert!(
+        found
+            .iter()
+            .any(|f| f.0.contains("multi-character delimiter")),
+        "expected an E358 for the multi-char delimiter under escape: {found:?}"
+    );
+}

@@ -13,11 +13,14 @@ pipeline:
 # A `multiple:` field with no `join_values` entry still joins, with the default
 # `;` delimiter and `on_conflict: error`. `on_conflict: error` is what makes a
 # defaulted delimiter safe: a value that itself contained the delimiter would be
-# dead-lettered (naming the field and value) rather than emitted as a cell that
-# splits back wrongly. The lossless escape hatches are `on_conflict: escape`
-# (escapes the delimiter, recovered by a `split_values` `escape:`) and
-# `encode_json` (a JSON array, recovered by a `split_values` `json: true`).
-# See `clinker explain --code E362` for the declaration rules.
+# refused rather than emitted as a cell that splits back wrongly. Under the
+# `strategy: continue` below, that refusal dead-letters the offending record
+# (naming the field and value) and the run carries on; under `fail_fast` it
+# aborts. This fixture's tags never contain the delimiter, so the run is clean.
+# The lossless escape hatches are `on_conflict: escape` (escapes the delimiter,
+# recovered by a `split_values` `escape:`) and `encode_json` (a JSON array,
+# recovered by a `split_values` `json: true`). See `clinker explain --code E362`
+# for the declaration rules.
 
 nodes:
   - type: source
@@ -43,4 +46,4 @@ nodes:
         - { field: tags, delimiter: ";", on_conflict: error }
 
 error_handling:
-  strategy: fail_fast
+  strategy: continue

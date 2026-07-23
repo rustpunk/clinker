@@ -1122,6 +1122,39 @@ mod tests {
         assert_eq!(back.get("tags"), Some(&Value::Array(original)));
     }
 
+    /// A single empty-string value `[""]` is indistinguishable from an empty
+    /// field under the delimited policies (both emit an empty cell, which reads
+    /// back as zero values); `encode_json` preserves it. This pins the documented
+    /// limitation so a future change to the empty-cell contract is deliberate.
+    #[test]
+    fn join_values_single_empty_string_collapses_under_delimited_but_not_json() {
+        let schema = make_schema(&["id", "tags"]);
+        let record = make_record(
+            &schema,
+            vec![
+                Value::Integer(1),
+                Value::Array(vec![Value::String("".into())]),
+            ],
+        );
+        // Delimited (default error): empty cell, reads back as [] (0 values).
+        let delimited = write_to_string(
+            &schema,
+            CsvWriterConfig::default(),
+            std::slice::from_ref(&record),
+        );
+        assert_eq!(delimited, "id,tags\n1,\n");
+
+        // encode_json: [""], distinguishable from an empty field.
+        let json_cfg = join_config(vec![JoinValues {
+            field: "tags".into(),
+            delimiter: ";".into(),
+            on_conflict: OnConflict::EncodeJson,
+            escape: "\\".into(),
+        }]);
+        let json = write_to_string(&schema, json_cfg, &[record]);
+        assert_eq!(json, "id,tags\n1,\"[\"\"\"\"]\"\n");
+    }
+
     /// A `Value::Array` carrying a nested `Array`/`Map` element is still
     /// rejected — a flat cell cannot hold nested structure, so the misroute
     /// detection is not lost when scalar arrays start joining.
