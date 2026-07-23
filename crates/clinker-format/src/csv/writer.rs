@@ -950,7 +950,10 @@ mod tests {
         let empty = make_record(&schema, vec![Value::Integer(1), Value::Array(Vec::new())]);
         let single = make_record(
             &schema,
-            vec![Value::Integer(2), Value::Array(vec![Value::String("solo".into())])],
+            vec![
+                Value::Integer(2),
+                Value::Array(vec![Value::String("solo".into())]),
+            ],
         );
         let output = write_to_string(&schema, CsvWriterConfig::default(), &[empty, single]);
         assert_eq!(output, "id,tags\n1,\n2,solo\n");

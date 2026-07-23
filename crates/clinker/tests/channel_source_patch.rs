@@ -382,11 +382,11 @@ sources:
     );
 }
 
-/// A `multiple: true` column reaching a CSV output is rejected at compile
-/// (E359) rather than failing partway through the run: the CSV writer has no
-/// multi-value encoding yet.
+/// A `multiple: true` column reaching a CSV output is joined into one delimited
+/// cell (#917), defaulting to `;` with no `join_values` configuration — the
+/// end-to-end CLI counterpart to the writer/gate unit tests.
 #[test]
-fn multi_value_column_into_csv_output_fails_at_compile() {
+fn multi_value_column_into_csv_output_joins_into_a_delimited_cell() {
     let dir = tempfile::tempdir().expect("tempdir");
     let p = dir.path();
     write(p, "in.json", "[{\"id\":\"1\",\"tags\":[\"x\",\"y\"]}]\n");
@@ -417,21 +417,14 @@ nodes:
     );
     let out = run_in(p, &[]);
     assert!(
-        !out.status.success(),
-        "a multi-value column bound to a CSV output must not compile"
+        out.status.success(),
+        "a multi-value column now joins into a CSV cell; stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let written = std::fs::read_to_string(p.join("out.csv")).expect("read out.csv");
     assert!(
-        stderr.contains("'tags'")
-            && stderr.contains("no encoding for a field")
-            && stderr.contains("more than one value"),
-        "stderr:\n{stderr}"
-    );
-    // Rejected at compile, so the sink never opened: no partial file is left
-    // behind for a downstream consumer to pick up.
-    assert!(
-        !p.join("out.csv").exists(),
-        "no output may be written when the pipeline does not compile"
+        written.contains("1,x;y"),
+        "the tags array joins with the default `;`:\n{written}"
     );
 }
 
