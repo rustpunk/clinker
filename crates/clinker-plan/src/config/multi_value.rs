@@ -864,24 +864,6 @@ pub fn source_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
     faults
 }
 
-/// The E359 output gate over one node list: a `multiple: true` column reaching
-/// — or declared directly on — an output whose format has no multi-value
-/// encoding.
-///
-/// The writers reject a multi-value payload at run time, so without this the
-/// failure lands mid-stream on record N rather than at compile. Reachability is
-/// source-to-output through the DAG: a column a transform drops before the sink
-/// is still reported, which is the conservative direction — a false positive is
-/// a compile error the author can see and resolve, a false negative is a run
-/// that dies partway through. The walk is [`source_data_reachability`], NOT the
-/// `$doc` attribution walk: that one narrows a Combine to its driving input,
-/// which would miss a column the combine projects off its reference side.
-///
-/// An output's OWN `schema:` block is checked too. It is the same `Column`
-/// type, it accepts `multiple: true`, and no writer honors the attribute — the
-/// fixed-width writer's `Column -> FieldDef` conversion drops it outright — so
-/// an author who declares repetition on the surface they are writing to would
-/// otherwise get it silently ignored.
 /// Validate an output's `join_values` declarations (E362), the write-side
 /// mirror of E358's source-declaration checks.
 ///
@@ -932,7 +914,10 @@ fn validate_join_declarations(output: &OutputConfig) -> Vec<DeclarationFault> {
                     .to_string(),
             });
         }
-        if entry.delimiter.is_empty() {
+        // The delimiter matters only for the delimited policies (`error`,
+        // `escape`); `encode_json` ignores it, so an empty or multi-character
+        // delimiter under `encode_json` is harmless and exempt.
+        if entry.on_conflict != OnConflict::EncodeJson && entry.delimiter.is_empty() {
             faults.push(DeclarationFault {
                 message: format!(
                     "output '{}': `join_values` on field '{}' declares an empty delimiter",
@@ -948,7 +933,7 @@ fn validate_join_declarations(output: &OutputConfig) -> Vec<DeclarationFault> {
         // contains the delimiter, which misses a spurious boundary a
         // multi-character delimiter can form between two adjacent values; under
         // `escape` the char-by-char escaping cannot round-trip a multi-character
-        // delimiter. `encode_json` ignores the delimiter, so it is exempt.
+        // delimiter.
         if entry.on_conflict != OnConflict::EncodeJson && entry.delimiter.chars().count() > 1 {
             faults.push(DeclarationFault {
                 message: format!(
@@ -1008,6 +993,30 @@ fn on_conflict_name(policy: OnConflict) -> &'static str {
     }
 }
 
+/// The E359 output gate over one node list (and the E362 `join_values` gate): a
+/// `multiple: true` column reaching — or declared directly on — an output whose
+/// format has no multi-value encoding.
+///
+/// The remaining non-encoding writers reject a multi-value payload at run time,
+/// so without this the failure lands mid-stream on record N rather than at
+/// compile. Reachability is source-to-output through the DAG: a column a
+/// transform drops before the sink is still reported, which is the conservative
+/// direction — a false positive is a compile error the author can see and
+/// resolve, a false negative is a run that dies partway through. The walk is
+/// [`source_data_reachability`], NOT the `$doc` attribution walk: that one
+/// narrows a Combine to its driving input, which would miss a column the combine
+/// projects off its reference side.
+///
+/// An output's OWN `schema:` block is checked too, for a non-encoding format: it
+/// is the same `Column` type, it accepts `multiple: true`, and a non-encoding
+/// writer does not honor the attribute — the fixed-width writer's
+/// `Column -> FieldDef` conversion drops it outright — so an author who declares
+/// repetition on the surface they are writing to would otherwise get it silently
+/// ignored. `json` and `csv` encode it, so the gate skips them.
+///
+/// Also runs the per-output E362 gate ([`validate_join_declarations`]) over the
+/// output's `join_values` block, which — unlike E359 — applies whatever the
+/// format is, since a `csv` output legitimately carries it.
 pub fn output_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
     let schemas = resolved_source_schemas(nodes);
     let multi_value_by_source: HashMap<&str, Vec<String>> = schemas

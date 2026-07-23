@@ -288,17 +288,12 @@ pub(crate) fn dispatch_output(
     // Buffered records DEFER counter increments to the
     // `CorrelationCommit` arm — clean groups bump
     // counters at flush time; dirty groups never count
-    // toward `ok_count`.
-    let unbuffered_record_count = unbuffered.len() as u64;
-    let mut newly_ok: u64 = 0;
-    for (_, row_num) in &unbuffered {
-        if ctx.ok_source_rows.insert(*row_num) {
-            newly_ok += 1;
-        }
-    }
-    ctx.counters.ok_count += newly_ok;
-    ctx.counters.records_written += unbuffered_record_count;
-    ctx.records_emitted += unbuffered_record_count;
+    // toward `ok_count`. The unbuffered records' ok / written / emitted counts
+    // are applied AFTER the write below, so a record a `join_values` collision
+    // dead-letters is counted once (as DLQ) rather than as both written and DLQ
+    // — and `ok_source_rows` is only ever inserted into on a successful write,
+    // never removed, so a row written OK at one Output and dead-lettered at
+    // another still counts as ok exactly once regardless of Output order.
 
     // Derive output schema from first emitted record.
     // The Record is authoritative post-rip; materialize
@@ -407,19 +402,28 @@ pub(crate) fn dispatch_output(
             emit_single_writer(&mut fan_ctx, raw_writer, &unbuffered, scan_timer);
         }
     }
-    // Every unbuffered record was pre-counted as ok / written / emitted above,
-    // but a collision record was dead-lettered instead of written. Undo those
-    // counts for each dead-lettered record so it is counted once (as DLQ), not
-    // twice — matching the streaming arm, which counts only on a successful
-    // write. `saturating_sub` guards the (impossible-here) underflow.
-    let dead_lettered = dlq_pending.len() as u64;
-    ctx.counters.records_written = ctx.counters.records_written.saturating_sub(dead_lettered);
-    ctx.records_emitted = ctx.records_emitted.saturating_sub(dead_lettered);
-    for entry in &dlq_pending {
-        if ctx.ok_source_rows.remove(&entry.source_row) {
-            ctx.counters.ok_count = ctx.counters.ok_count.saturating_sub(1);
+    // Count ok / written / emitted for the records actually written — every
+    // unbuffered record except one a collision dead-lettered. Insert into the
+    // run-shared `ok_source_rows` on success only (never remove), matching the
+    // streaming arm: a source row written OK at one Output and dead-lettered at
+    // another still counts as ok exactly once, independent of Output order.
+    let collided: std::collections::HashSet<u64> =
+        dlq_pending.iter().map(|e| e.source_row).collect();
+    let mut newly_ok: u64 = 0;
+    let mut written: u64 = 0;
+    for (_, row_num) in &unbuffered {
+        if collided.contains(row_num) {
+            continue;
+        }
+        written += 1;
+        if ctx.ok_source_rows.insert(*row_num) {
+            newly_ok += 1;
         }
     }
+    ctx.counters.ok_count += newly_ok;
+    ctx.counters.records_written += written;
+    ctx.records_emitted += written;
+
     // Drain the collected collision entries; `push_dlq` enforces the DLQ rate
     // ceiling (E315/E316), which can still abort the run.
     for entry in dlq_pending {
@@ -752,6 +756,13 @@ impl EnvelopeWriterDriver {
         self.maybe_cross_boundary(doc_ctx);
         let writer = self.writer.as_mut().expect("writer opened above");
         if let Err(e) = writer.write_record(projected) {
+            // A `join_values` `on_conflict: error` collision is routed to the DLQ
+            // on the record-granularity Output arms (buffered + streaming). This
+            // envelope-reconstruction arm holds only the projected record and no
+            // `ctx` here, and a collision interacts with the per-document framing
+            // it drives, so — like the correlation-commit and document-DLQ arms —
+            // it keeps the existing fatal disposition, tracked as a follow-up
+            // rather than approximated here.
             self.errors.push(e.into());
         }
     }

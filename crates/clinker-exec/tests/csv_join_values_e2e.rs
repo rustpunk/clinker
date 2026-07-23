@@ -86,6 +86,11 @@ nodes:
     assert_eq!(output, "order_id,tags\n2,x;y\n", "got: {output}");
 
     assert_join_collision_entry(&report.dlq_entries);
+    // The colliding record is counted once (as DLQ), not as both written and
+    // dead-lettered: one row written/ok (row 2), one row dead-lettered (row 1).
+    assert_eq!(report.counters.records_written, 1, "only row 2 was written");
+    assert_eq!(report.counters.ok_count, 1, "only row 2 is ok");
+    assert_eq!(report.counters.dlq_count, 1, "row 1 collided");
 }
 
 /// The streaming fused Output arm (a `source → transform → output` chain fuses
@@ -137,6 +142,9 @@ nodes:
     assert_eq!(output, "order_id,tags\n2,x;y\n", "got: {output}");
 
     assert_join_collision_entry(&report.dlq_entries);
+    assert_eq!(report.counters.records_written, 1, "only row 2 was written");
+    assert_eq!(report.counters.ok_count, 1, "only row 2 is ok");
+    assert_eq!(report.counters.dlq_count, 1, "row 1 collided");
 }
 
 /// Exactly one `MultiValueJoinCollision` entry, naming the `tags` field and the

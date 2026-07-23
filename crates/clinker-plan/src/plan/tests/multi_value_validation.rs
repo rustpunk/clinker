@@ -1407,3 +1407,15 @@ nodes:
         "expected an E358 for the multi-char delimiter under escape: {found:?}"
     );
 }
+
+#[test]
+fn join_values_encode_json_empty_delimiter_compiles() {
+    // encode_json ignores the delimiter, so an empty delimiter under it is
+    // harmless — consistent with the multi-char-delimiter exemption.
+    let yaml = join_pipeline(
+        "csv",
+        r#"      join_values:
+        - { field: tags, delimiter: "", on_conflict: encode_json }"#,
+    );
+    compile_ok(&yaml);
+}

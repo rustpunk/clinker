@@ -89,6 +89,12 @@ pub struct CsvWriter<W: Write> {
     /// row clears and rewrites these in place, retaining their capacity across
     /// records rather than allocating a fresh row vector every record.
     row_buf: Vec<String>,
+    /// Per-emitted-column `join_values` override, index-aligned to
+    /// `column_indices`: `Some(entry)` for a column a `join_values` entry names,
+    /// `None` otherwise. Built once at construction so a body row's array cell is
+    /// a positional lookup rather than a name scan over `config.join_values` per
+    /// column per record (mirrors the CSV reader's `split_specs`).
+    join_overrides: Vec<Option<JoinValues>>,
     /// Per-document envelope framer, present only when `config.envelope` is.
     framer: Option<EnvelopeFramer>,
 }
@@ -111,6 +117,13 @@ impl<W: Write> CsvWriter<W> {
             .from_writer(writer);
         let column_indices = filtered_column_indices(&schema, config.include_engine_stamped);
         let row_buf = vec![String::new(); column_indices.len()];
+        let join_overrides: Vec<Option<JoinValues>> = column_indices
+            .iter()
+            .map(|&idx| {
+                let name = schema.columns()[idx].as_ref();
+                config.join_values.iter().find(|j| j.field == name).cloned()
+            })
+            .collect();
         Self {
             inner,
             schema,
@@ -118,6 +131,7 @@ impl<W: Write> CsvWriter<W> {
             header_written: false,
             column_indices,
             row_buf,
+            join_overrides,
             framer,
         }
     }
@@ -211,19 +225,22 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
         let Self {
             inner,
             schema,
-            config,
             column_indices,
             row_buf,
+            join_overrides,
             framer,
             ..
         } = self;
         let columns = schema.columns();
-        for (slot, &idx) in row_buf.iter_mut().zip(column_indices.iter()) {
+        for ((slot, &idx), join) in row_buf
+            .iter_mut()
+            .zip(column_indices.iter())
+            .zip(join_overrides.iter())
+        {
             let col = columns[idx].as_ref();
             slot.clear();
             if let Some(v) = record.get(col) {
-                let join = config.join_values.iter().find(|j| j.field == col);
-                write_csv_cell(slot, col, v, join)?;
+                write_csv_cell(slot, col, v, join.as_ref())?;
             }
         }
 
@@ -368,13 +385,14 @@ fn filtered_column_indices(schema: &Arc<Schema>, include_engine_stamped: bool) -
         .collect()
 }
 
-/// Serialize a Value into a CSV cell string. Thin owned-`String` wrapper over
-/// [`write_csv_cell`], used by the envelope section-row path (not the record
-/// hot path). Envelope `$doc` section values carry no `join_values` override, so
-/// an array there (rare) joins with the defaults.
+/// Serialize a Value into a CSV cell string for an envelope `$doc` section row
+/// (not the record hot path). Envelope section values are document metadata, not
+/// `multiple:` data columns, so this renders scalars and rejects an `Array`/`Map`
+/// loudly via [`write_scalar_cell`] — a section value that is a collection is a
+/// misroute, and joining it silently would ship malformed envelope output.
 fn value_to_csv_cell(col: &str, value: &Value) -> Result<String, FormatError> {
     let mut buf = String::new();
-    write_csv_cell(&mut buf, col, value, None)?;
+    write_scalar_cell(&mut buf, col, value)?;
     Ok(buf)
 }
 
@@ -1153,6 +1171,22 @@ mod tests {
         }]);
         let json = write_to_string(&schema, json_cfg, &[record]);
         assert_eq!(json, "id,tags\n1,\"[\"\"\"\"]\"\n");
+    }
+
+    /// An envelope `$doc` section value that is an array is rejected loudly (it
+    /// is document metadata, not a `multiple:` data column) — it must not be
+    /// silently joined the way a record cell is.
+    #[test]
+    fn envelope_section_cell_rejects_an_array() {
+        let err = value_to_csv_cell("checksum", &Value::Array(vec![Value::String("a".into())]))
+            .unwrap_err();
+        match err {
+            FormatError::UnserializableArrayValue { format, column } => {
+                assert_eq!(format, "CSV");
+                assert_eq!(column, "checksum");
+            }
+            other => panic!("expected UnserializableArrayValue, got {other:?}"),
+        }
     }
 
     /// A `Value::Array` carrying a nested `Array`/`Map` element is still
