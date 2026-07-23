@@ -186,11 +186,15 @@ pub struct XmlReader {
     matched_depth: usize,
     /// Current XML depth (incremented on Start, decremented on End).
     xml_depth: usize,
-    /// Expanded records awaiting emission: schema inference reads the first
-    /// record element eagerly, and a `split_to_rows` fan-out expands one
-    /// element into several records. Bounded by one element's expansion,
-    /// never the whole input.
-    pending: VecDeque<Record>,
+    /// Expanded field lists awaiting assembly into records: schema inference
+    /// reads the first record element eagerly, and a `split_to_rows` fan-out
+    /// expands one element into several. Held as RAW `(key, value)` lists —
+    /// not assembled `Record`s — so the fallible assembly step (which rejects
+    /// an undeclared repeated field) runs in `next_record`, inside the
+    /// executor's record loop, rather than in the eager `schema` call the
+    /// ingest setup makes before that loop. Bounded by one element's
+    /// expansion, never the whole input.
+    pending: VecDeque<Vec<(String, String)>>,
     /// Whether we've finished all records.
     done: bool,
 }
@@ -472,13 +476,21 @@ impl XmlReader {
                         format!("{}.{name}", element_stack.join("."))
                     };
                     let instance_from = fields.len();
-                    fields.push((prefix.clone(), String::new()));
+                    // A value-less self-closing element pushes no field of its
+                    // own, exactly as the empty-body form `<x></x>` does through
+                    // `flush_text_field`'s non-empty guard. Pushing an empty
+                    // leader here instead would make `<x/><x/>` look like a
+                    // repeated field and wrongly trip `UndeclaredRepeatedField`,
+                    // while the identical `<x></x><x></x>` passes — so only the
+                    // element's attributes (if any) are recorded.
                     let child_attrs = extract_attributes_static(&self.config.attribute_prefix, e)?;
                     for (key, val) in child_attrs {
                         fields.push((format!("{prefix}.{key}"), val));
                     }
                     // A self-closing element named by a declared fan-out field
-                    // is a complete occurrence on its own.
+                    // is a complete occurrence on its own; its range spans the
+                    // attributes pushed above, or is empty when it has none —
+                    // the same empty range the empty-body form contributes.
                     if open_instance.is_none()
                         && let Some(pi) = self.split_field_index(&prefix)
                     {
@@ -612,6 +624,11 @@ impl XmlReader {
     /// `Arc<Schema>` reflects exactly the keys present in that XML
     /// element — the per-Source `OnUnmapped` policy at the dispatch
     /// layer reconciles records against the user-declared schema.
+    ///
+    /// A child element that repeats is collected into a `Value::Array` only
+    /// when its column is declared `multiple: true`; a repeat on any other
+    /// column returns [`FormatError::UndeclaredRepeatedField`] rather than
+    /// silently keeping the first occurrence and dropping the rest.
     fn fields_to_record(&self, fields: Vec<(String, String)>) -> Result<Record, FormatError> {
         // Keyed by the boxed column name so the slot map costs exactly one
         // clone per distinct field, the same as the `HashSet` first-wins dedup
@@ -624,14 +641,21 @@ impl XmlReader {
         for (key, val) in fields {
             let value = infer_value(&val);
             match slot.get(key.as_str()) {
-                // A repeated key on a `multiple:` column accumulates in
-                // document order; on any other column the first occurrence
-                // wins, which is the long-standing duplicate-key collapse.
-                Some(&i) => {
-                    if let Value::Array(items) = &mut values[i] {
-                        items.push(value);
+                Some(&i) => match &mut values[i] {
+                    // A repeated key on a `multiple:` column accumulates in
+                    // document order.
+                    Value::Array(items) => items.push(value),
+                    // A repeated key on any other column would keep the first
+                    // value and silently drop this one. Refuse loudly instead:
+                    // an undeclared repeat is a data-loss hazard, not a
+                    // first-wins convenience.
+                    _ => {
+                        return Err(FormatError::UndeclaredRepeatedField {
+                            format: "XML",
+                            field: key,
+                        });
                     }
-                }
+                },
                 None => {
                     let multiple = self.is_multi_value(&key);
                     let name = key.into_boxed_str();
@@ -666,9 +690,17 @@ impl FormatReader for XmlReader {
             return Ok(Arc::clone(s));
         }
 
-        // Infer schema from the first expanded record's field names
+        // Infer the schema from the first expanded record's field NAMES
         // (preserving order). The fan-out applies before inference, so the
         // columns it lifts or synthesizes are what the schema reflects.
+        //
+        // Name inference is deliberately infallible. The per-record assembly
+        // that CAN fail — an undeclared repeated field on a non-`multiple:`
+        // column — is deferred to `next_record`, so a first-record repeat
+        // surfaces through the executor's record loop (where it can be
+        // dead-lettered under `dlq_granularity: document`) rather than through
+        // this eager `schema` call, which the ingest setup makes before the
+        // loop begins and whose error would abort the whole run.
         //
         // Read forward until a record element actually expands to something: a
         // `keep_empty: false` entry drops an element with no occurrence, and
@@ -701,13 +733,15 @@ impl FormatReader for XmlReader {
             })
             .collect::<SchemaBuilder>()
             .build();
-        self.schema = Some(Arc::clone(&schema));
 
-        // Buffer every record the first element expanded to.
+        // Buffer the first element's expansions as RAW field lists; the
+        // fallible `fields_to_record` assembly runs in `next_record`. Set the
+        // cached schema only after buffering so a caller never sees a schema
+        // paired with an unbuffered first record.
         for fields in expanded {
-            let record = self.fields_to_record(fields)?;
-            self.pending.push_back(record);
+            self.pending.push_back(fields);
         }
+        self.schema = Some(Arc::clone(&schema));
 
         Ok(schema)
     }
@@ -718,16 +752,15 @@ impl FormatReader for XmlReader {
         }
 
         loop {
-            if let Some(record) = self.pending.pop_front() {
-                return Ok(Some(record));
+            if let Some(fields) = self.pending.pop_front() {
+                return Ok(Some(self.fields_to_record(fields)?));
             }
             let raw = match self.read_next_record_raw()? {
                 Some(r) => r,
                 None => return Ok(None),
             };
             for fields in self.apply_split_to_rows(raw) {
-                let record = self.fields_to_record(fields)?;
-                self.pending.push_back(record);
+                self.pending.push_back(fields);
             }
         }
     }
@@ -963,9 +996,10 @@ fn strip_field_prefix<'a>(key: &'a str, path: &'a str) -> &'a str {
 /// `position_column: line_no`). The occurrence wins the first: it IS the record
 /// under `extract`. The synthesized position wins the second: it is what the
 /// author asked for by name, and the JSON reader resolves the same collision
-/// the same way. The displaced field is dropped rather than carried alongside,
-/// because the duplicate-key collapse downstream is first-wins and would
-/// otherwise silently keep the shadowed value.
+/// the same way. The displaced field is dropped here rather than carried
+/// alongside: two fields sharing one name would otherwise reach record assembly
+/// as a repeat and trip its loud `UndeclaredRepeatedField` error, turning this
+/// intended fan-out shadow into a spurious rejection.
 ///
 /// One pass over the record buckets every field, so the work is linear in the
 /// record's fields plus the fan-out it emits — a rescan per occurrence would
@@ -1994,21 +2028,93 @@ mod tests {
     }
 
     #[test]
-    fn xml_unmatched_repeated_keys_keep_first_value() {
-        // Repeated keys named by neither a fan-out nor a `multiple:` column
-        // keep the existing duplicate-key collapse: the first value wins, on
-        // every fanned-out record.
+    fn xml_undeclared_repeated_element_is_a_loud_error() {
+        // A child element that repeats while its column is named by neither a
+        // fan-out nor a `multiple:` declaration is refused loudly: keeping the
+        // first value and dropping the rest is silent data loss. `<Dup>`
+        // repeats here; `<Tag>` is fanned out so it never repeats per record.
         let xml = r#"<Root><Row><Dup>x</Dup><Dup>y</Dup><Tag>a</Tag><Tag>b</Tag></Row></Root>"#;
         let config = split_config("Root/Row", vec![split("Tag")]);
         let mut r = reader_from_str(xml, config);
-        let _s = r.schema().unwrap();
 
-        let r1 = r.next_record().unwrap().unwrap();
-        assert_eq!(r1.get("Dup"), Some(&Value::String("x".into())));
-        assert_eq!(r1.get("Tag"), Some(&Value::String("a".into())));
-        let r2 = r.next_record().unwrap().unwrap();
-        assert_eq!(r2.get("Dup"), Some(&Value::String("x".into())));
-        assert_eq!(r2.get("Tag"), Some(&Value::String("b".into())));
+        // Schema inference is infallible (it only reads the column names), so
+        // the loud error is deferred to record assembly in `next_record` — this
+        // is what lets the executor dead-letter a first-record repeat instead of
+        // aborting during its eager pre-loop `schema` call.
+        let _s = r
+            .schema()
+            .expect("schema inference does not assemble records");
+        let err = r
+            .next_record()
+            .expect_err("undeclared repeat must fail loud");
+        assert!(
+            matches!(err, FormatError::UndeclaredRepeatedField { format: "XML", ref field } if field == "Dup"),
+            "names the offending field: {err:?}"
+        );
+        assert!(
+            err.is_document_structural(),
+            "dead-letterable, not fatal-only"
+        );
+    }
+
+    #[test]
+    fn xml_repeated_self_closing_empty_element_is_not_an_error() {
+        // Repeated value-less self-closing elements must behave exactly like
+        // their empty-body twins: they contribute no field, so a non-`multiple:`
+        // column that merely appears twice as `<x/>` is NOT a data-loss repeat
+        // and must not be rejected. (Regression guard for the self-closing /
+        // empty-body asymmetry adjacent to issue #920.)
+        let xml = r#"<Root><Row><id>1</id><middle_name/><middle_name/></Row></Root>"#;
+        let config = XmlReaderConfig {
+            record_path: Some("Root/Row".into()),
+            ..Default::default()
+        };
+        let mut r = reader_from_str(xml, config);
+        let rec = r
+            .next_record()
+            .expect("repeated empty self-closing element must not error")
+            .expect("one record");
+        assert_eq!(rec.get("id"), Some(&Value::Integer(1)));
+        // The value-less element yields no field at all, matching `<x></x>`.
+        assert_eq!(rec.get("middle_name"), None);
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn xml_undeclared_repeat_without_any_fan_out_is_a_loud_error() {
+        // A bare reproduction: no fan-out at all, a plainly repeated
+        // element on a column that is not `multiple:`. The first
+        // `next_record` surfaces the loud error rather than a first-wins record.
+        let xml = r#"<Root><Row><Dup>x</Dup><Dup>y</Dup></Row></Root>"#;
+        let config = XmlReaderConfig {
+            record_path: Some("Root/Row".into()),
+            ..Default::default()
+        };
+        let mut r = reader_from_str(xml, config);
+        let err = r
+            .next_record()
+            .expect_err("undeclared repeat must fail loud");
+        assert!(
+            matches!(err, FormatError::UndeclaredRepeatedField { format: "XML", ref field } if field == "Dup"),
+            "names the offending field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn xml_declared_multiple_repeat_still_collects() {
+        // The escape hatch: declaring the column `multiple: true` collects
+        // every occurrence into an array, in document order — no error.
+        let xml = r#"<Root><Row><Dup>x</Dup><Dup>y</Dup></Row></Root>"#;
+        let config = multi_value_config("Root/Row", &["Dup"]);
+        let mut r = reader_from_str(xml, config);
+        let rec = r.next_record().unwrap().unwrap();
+        assert_eq!(
+            rec.get("Dup"),
+            Some(&Value::Array(vec![
+                Value::String("x".into()),
+                Value::String("y".into()),
+            ]))
+        );
         assert!(r.next_record().unwrap().is_none());
     }
 
