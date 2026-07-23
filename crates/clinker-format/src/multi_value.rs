@@ -1,13 +1,17 @@
-//! Multi-value field declarations carried by a source.
+//! Multi-value field declarations carried by a source or sink.
 //!
 //! A column declared `multiple: true` in the schema holds several values; these
-//! two source-level knobs say how a reader arrives at that shape:
-//! [`SplitToRows`] fans one record out to one record per occurrence, and
-//! [`SplitValues`] parses one delimited cell into several values.
+//! knobs say how a reader arrives at that shape and how a writer collapses it:
+//! [`SplitToRows`] fans one record out to one record per occurrence,
+//! [`SplitValues`] parses one delimited cell into several values (read), and
+//! [`JoinValues`] joins several values back into one delimited cell (write).
+//! `split_values` and `join_values` are deliberately distinct key names with a
+//! shared `delimiter`/`escape` sub-vocabulary, so a declaration used on the
+//! wrong side is a rejected no-op rather than a silent one.
 //!
-//! Both live in the format layer next to [`crate::Column`] because they are
+//! All live in the format layer next to [`crate::Column`] because they are
 //! deserialized from the same author-written YAML and consumed by the same
-//! readers. Each accepts a bare field name or a full mapping, so — like
+//! readers and writers. Each accepts a bare field name or a full mapping, so — like
 //! [`crate::SourceSchema`], the other sum over YAML node shapes in this crate —
 //! they deserialize through a hand-written visitor dispatching on the node kind
 //! rather than `#[serde(untagged)]`, which would buffer both shapes and collapse
@@ -74,7 +78,16 @@ pub enum SplitToRowsMode {
 ///   - tags                          # shorthand: the field name, default delimiter
 ///   - field: codes                  # full form
 ///     delimiter: "|"
+///   - field: notes                  # recover an escape-encoded write
+///     delimiter: "|"
+///     escape: "\\"
+///   - field: payload                # recover a JSON-encoded write
+///     json: true
 /// ```
+///
+/// `escape` and `json` are the read-side inverses of the sink's [`JoinValues`]
+/// `on_conflict: escape` / `encode_json` policies, so a value that could not
+/// survive a plain delimited join round-trips exactly.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SplitValues {
     /// Flattened field name holding the delimited text.
@@ -82,6 +95,19 @@ pub struct SplitValues {
     /// Separator the text is split on. Defaults to
     /// [`crate::schema::DEFAULT_VALUE_DELIMITER`].
     pub delimiter: String,
+    /// Escape character honored when splitting: an escaped delimiter is a
+    /// literal part of a value, not a boundary, and an escaped escape is a
+    /// literal escape. Empty (the default) means a plain split with no escape
+    /// handling. Set it to recover a cell a sink wrote under `join_values`
+    /// `on_conflict: escape`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub escape: String,
+    /// Read the whole cell as an embedded JSON array — the read-side inverse of
+    /// the sink's `on_conflict: encode_json`. When `true`, `delimiter` and
+    /// `escape` are unused: the cell is parsed as JSON and each array element
+    /// becomes one value. Defaults to `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub json: bool,
 }
 
 impl SplitToRows {
@@ -98,12 +124,75 @@ impl SplitToRows {
 }
 
 impl SplitValues {
-    /// A `split_values` entry using the default delimiter — what the
-    /// bare-scalar shorthand deserializes to.
+    /// A `split_values` entry using the default delimiter and no escape/JSON
+    /// decoding — what the bare-scalar shorthand deserializes to.
     pub fn bare(field: impl Into<String>) -> Self {
         SplitValues {
             field: field.into(),
             delimiter: crate::schema::DEFAULT_VALUE_DELIMITER.to_string(),
+            escape: String::new(),
+            json: false,
+        }
+    }
+}
+
+/// The join-collision policy a sink applies when a value being joined into one
+/// delimited CSV cell itself contains the delimiter.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnConflict {
+    /// Refuse to emit a cell that would split back wrongly: the record is
+    /// dead-lettered (naming the field and the offending value) rather than
+    /// silently corrupted. The default — it is what makes a defaulted delimiter
+    /// safe rather than merely convenient.
+    #[default]
+    Error,
+    /// Prefix each delimiter (and each escape character) inside a value with the
+    /// escape character, so a matching `split_values` `escape:` recovers the
+    /// original. Lossless.
+    Escape,
+    /// Encode the whole field as an embedded JSON array, recovered by a matching
+    /// `split_values` `json: true`. Lossless for any value, including ones
+    /// carrying the delimiter, quotes, or newlines.
+    EncodeJson,
+}
+
+/// One `join_values` entry: collapse a `multiple:` field into one delimited
+/// CSV cell on write. The write-side inverse of [`SplitValues`].
+///
+/// Two accepted YAML shapes, freely mixable in one sequence:
+///
+/// ```yaml
+/// join_values:
+///   - tags                          # shorthand: delimiter ";", on_conflict: error
+///   - field: notes                  # full form
+///     delimiter: "|"
+///     on_conflict: escape           # error | escape | encode_json
+///     escape: "\\"                  # only meaningful with on_conflict: escape
+/// ```
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct JoinValues {
+    /// Flattened field name whose values are joined into one cell.
+    pub field: String,
+    /// Separator written between values. Defaults to
+    /// [`crate::schema::DEFAULT_VALUE_DELIMITER`].
+    pub delimiter: String,
+    /// What to do when a value being joined contains the delimiter.
+    pub on_conflict: OnConflict,
+    /// Escape character used under [`OnConflict::Escape`]. Defaults to a
+    /// backslash. Ignored by the other policies.
+    pub escape: String,
+}
+
+impl JoinValues {
+    /// A `join_values` entry using the default delimiter, `on_conflict: error`,
+    /// and the default escape — what the bare-scalar shorthand deserializes to.
+    pub fn bare(field: impl Into<String>) -> Self {
+        JoinValues {
+            field: field.into(),
+            delimiter: crate::schema::DEFAULT_VALUE_DELIMITER.to_string(),
+            on_conflict: OnConflict::default(),
+            escape: default_escape(),
         }
     }
 }
@@ -132,18 +221,56 @@ pub fn under_field_path(key: &str, path: &str) -> bool {
 /// Format-agnostic over [`clinker_record::Value`]: the XML, CSV, and
 /// fixed-width readers all share this one implementation.
 pub(crate) fn split_text_value(value: &Value, delimiter: &str) -> Value {
-    fn parts(text: &str, delimiter: &str) -> Vec<Value> {
-        text.split(delimiter)
-            .map(|p| Value::String(p.into()))
-            .collect()
+    split_text_value_escaped(value, delimiter, "")
+}
+
+/// Like [`split_text_value`], but honoring an escape character: an escaped
+/// delimiter is a literal part of a value, and an escaped escape is a literal
+/// escape. This is the read-side inverse of a sink's `on_conflict: escape`
+/// join, so a value that itself contained the delimiter round-trips exactly.
+///
+/// An empty `escape` reduces to a plain split, keeping the shared helper
+/// byte-identical for every caller that declares no escape. Escape handling
+/// treats `delimiter` and `escape` as single characters (their first `char`);
+/// the plan-time gate rejects a multi-character escape so this stays exact.
+pub(crate) fn split_text_value_escaped(value: &Value, delimiter: &str, escape: &str) -> Value {
+    fn parts(text: &str, delimiter: &str, escape: &str) -> Vec<Value> {
+        let (Some(esc), Some(delim)) = (escape.chars().next(), delimiter.chars().next()) else {
+            // Empty escape (or empty delimiter): a plain split with no escape
+            // handling, identical to `split_text_value`.
+            return text
+                .split(delimiter)
+                .map(|p| Value::String(p.into()))
+                .collect();
+        };
+        let mut out = Vec::new();
+        let mut cur = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == esc {
+                // The escape marks the NEXT character as literal (an escaped
+                // delimiter or an escaped escape). A trailing escape with no
+                // following character is kept as a literal escape.
+                match chars.next() {
+                    Some(next) => cur.push(next),
+                    None => cur.push(esc),
+                }
+            } else if c == delim {
+                out.push(Value::String(std::mem::take(&mut cur).into()));
+            } else {
+                cur.push(c);
+            }
+        }
+        out.push(Value::String(cur.into()));
+        out
     }
     match value {
-        Value::String(s) => Value::Array(parts(s.as_str(), delimiter)),
+        Value::String(s) => Value::Array(parts(s.as_str(), delimiter, escape)),
         Value::Array(items) => Value::Array(
             items
                 .iter()
                 .flat_map(|item| match item {
-                    Value::String(s) => parts(s.as_str(), delimiter),
+                    Value::String(s) => parts(s.as_str(), delimiter, escape),
                     other => vec![other.clone()],
                 })
                 .collect(),
@@ -160,6 +287,18 @@ fn default_keep_empty() -> bool {
 
 fn default_delimiter() -> String {
     crate::schema::DEFAULT_VALUE_DELIMITER.to_string()
+}
+
+/// The default `join_values` / `split_values` escape character. A single
+/// backslash, the near-universal escape convention, defined once so the write
+/// and read sides never drift.
+fn default_escape() -> String {
+    "\\".to_string()
+}
+
+/// `skip_serializing_if` predicate for a `false` boolean flag.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Deserialize the `split_to_rows` shorthand grammar: a **two-way** union of a
@@ -228,6 +367,10 @@ impl<'de> Deserialize<'de> for SplitValues {
             field: String,
             #[serde(default = "default_delimiter")]
             delimiter: String,
+            #[serde(default)]
+            escape: String,
+            #[serde(default)]
+            json: bool,
         }
 
         struct V;
@@ -237,7 +380,7 @@ impl<'de> Deserialize<'de> for SplitValues {
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
                 f.write_str(
                     "a `split_values` entry: either a field name (`tags`) or a map \
-                     `{ field: <name>, delimiter: <str> }`",
+                     `{ field: <name>, delimiter: <str>, escape: <str>, json: <bool> }`",
                 )
             }
 
@@ -250,6 +393,55 @@ impl<'de> Deserialize<'de> for SplitValues {
                 Ok(SplitValues {
                     field: full.field,
                     delimiter: full.delimiter,
+                    escape: full.escape,
+                    json: full.json,
+                })
+            }
+        }
+
+        d.deserialize_any(V)
+    }
+}
+
+/// Deserialize the `join_values` shorthand grammar. Same two-way union and
+/// same rationale as [`SplitToRows`]'s.
+impl<'de> Deserialize<'de> for JoinValues {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Full {
+            field: String,
+            #[serde(default = "default_delimiter")]
+            delimiter: String,
+            #[serde(default)]
+            on_conflict: OnConflict,
+            #[serde(default = "default_escape")]
+            escape: String,
+        }
+
+        struct V;
+        impl<'de> de::Visitor<'de> for V {
+            type Value = JoinValues;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str(
+                    "a `join_values` entry: either a field name (`tags`) or a map \
+                     `{ field: <name>, delimiter: <str>, on_conflict: error|escape|encode_json, \
+                     escape: <str> }`",
+                )
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(JoinValues::bare(v))
+            }
+
+            fn visit_map<A: de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                let full = Full::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(JoinValues {
+                    field: full.field,
+                    delimiter: full.delimiter,
+                    on_conflict: full.on_conflict,
+                    escape: full.escape,
                 })
             }
         }

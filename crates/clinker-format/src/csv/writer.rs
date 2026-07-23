@@ -5,6 +5,9 @@ use clinker_record::{DocumentContext, Record, Schema, Value};
 
 use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
 use crate::error::FormatError;
+use crate::json::writer::clinker_to_json;
+use crate::multi_value::{JoinValues, OnConflict};
+use crate::schema::DEFAULT_VALUE_DELIMITER;
 use crate::traits::FormatWriter;
 
 /// Configuration for the CSV writer.
@@ -38,6 +41,12 @@ pub struct CsvWriterConfig {
     /// column contract — extra record fields are not written" behavior, which
     /// `include_unmapped: false` relies on to narrow output deliberately.
     pub error_on_undeclared_columns: bool,
+    /// Per-column overrides for how a `multiple:` field is joined into one
+    /// delimited cell. A `Value::Array` at any column joins with the default
+    /// delimiter `;` and `on_conflict: error` unless an entry here names the
+    /// column, mirroring the source-side `split_values`. Empty by default;
+    /// populated from the output's `join_values`.
+    pub join_values: Vec<JoinValues>,
 }
 
 impl Default for CsvWriterConfig {
@@ -48,6 +57,7 @@ impl Default for CsvWriterConfig {
             include_engine_stamped: false,
             envelope: None,
             error_on_undeclared_columns: false,
+            join_values: Vec::new(),
         }
     }
 }
@@ -201,6 +211,7 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
         let Self {
             inner,
             schema,
+            config,
             column_indices,
             row_buf,
             framer,
@@ -211,7 +222,8 @@ impl<W: Write + Send> FormatWriter for CsvWriter<W> {
             let col = columns[idx].as_ref();
             slot.clear();
             if let Some(v) = record.get(col) {
-                write_csv_cell(slot, col, v)?;
+                let join = config.join_values.iter().find(|j| j.field == col);
+                write_csv_cell(slot, col, v, join)?;
             }
         }
 
@@ -358,26 +370,48 @@ fn filtered_column_indices(schema: &Arc<Schema>, include_engine_stamped: bool) -
 
 /// Serialize a Value into a CSV cell string. Thin owned-`String` wrapper over
 /// [`write_csv_cell`], used by the envelope section-row path (not the record
-/// hot path).
+/// hot path). Envelope `$doc` section values carry no `join_values` override, so
+/// an array there (rare) joins with the defaults.
 fn value_to_csv_cell(col: &str, value: &Value) -> Result<String, FormatError> {
     let mut buf = String::new();
-    write_csv_cell(&mut buf, col, value)?;
+    write_csv_cell(&mut buf, col, value, None)?;
     Ok(buf)
 }
 
 /// Append a Value's CSV cell rendering to `buf`. Sharing one renderer keeps the
 /// record hot path and the envelope section path byte-identical.
 ///
-/// `Value::Map` and `Value::Array` have no canonical scalar serialization
-/// for a CSV cell (silently JSON-encoding either one hides routing bugs —
-/// e.g. a `$widened` sidecar reaching the writer without the projection
-/// layer's `include_unmapped: true` expansion for a map, or a
-/// `match: collect` combine output misrouted to CSV for an array), so this
-/// returns `FormatError::UnserializableMapValue` /
-/// `FormatError::UnserializableArrayValue` carrying the offending column.
-/// CSV is the single point of truth for collection rejection on this path;
-/// there is no upstream pre-walk.
-fn write_csv_cell(buf: &mut String, col: &str, value: &Value) -> Result<(), FormatError> {
+/// A `Value::Array` is a `multiple:` field: it is JOINED into one delimited cell
+/// per the column's `join_values` policy (`join`, defaulting to `;` /
+/// `on_conflict: error` when the column has no entry). See [`write_joined_cell`].
+///
+/// `Value::Map` still has no canonical scalar serialization for a CSV cell
+/// (silently JSON-encoding it hides routing bugs — e.g. a `$widened` sidecar
+/// reaching the writer without the projection layer's `include_unmapped: true`
+/// expansion), so it returns `FormatError::UnserializableMapValue`. CSV is the
+/// single point of truth for map rejection on this path; there is no upstream
+/// pre-walk.
+fn write_csv_cell(
+    buf: &mut String,
+    col: &str,
+    value: &Value,
+    join: Option<&JoinValues>,
+) -> Result<(), FormatError> {
+    match value {
+        Value::Array(items) => write_joined_cell(buf, col, value, items, join),
+        Value::Map(_) => Err(FormatError::UnserializableMapValue {
+            format: "CSV",
+            column: col.to_string(),
+        }),
+        scalar => write_scalar_cell(buf, col, scalar),
+    }
+}
+
+/// Render one scalar `Value` into a CSV cell. A `Value::Array`/`Value::Map`
+/// reaching here is a nested element inside a `multiple:` field (a flat cell
+/// cannot hold nested structure) and is rejected — the same misroute detection
+/// the top-level cell renderer applies.
+fn write_scalar_cell(buf: &mut String, col: &str, value: &Value) -> Result<(), FormatError> {
     use std::fmt::Write as _;
     match value {
         Value::Null => {}
@@ -417,6 +451,95 @@ fn write_csv_cell(buf: &mut String, col: &str, value: &Value) -> Result<(), Form
         }
     }
     Ok(())
+}
+
+/// Join a `multiple:` field's values into one delimited CSV cell.
+///
+/// `join` supplies the delimiter, collision policy, and escape character; when
+/// the column has no `join_values` entry the defaults apply (`;`,
+/// `on_conflict: error`, backslash escape). The three policies:
+///
+/// - `error`: if any rendered value contains the delimiter, refuse the record
+///   with [`FormatError::MultiValueDelimiterCollision`] (routed to the DLQ by
+///   the sink) rather than emit a cell that would split back wrongly.
+/// - `escape`: escape both the delimiter and the escape character inside each
+///   value, invertible by a matching `split_values` `escape:`.
+/// - `encode_json`: emit the whole field as an embedded JSON array (via the
+///   shared [`clinker_to_json`]), recovered by a matching `split_values`
+///   `json: true`. Lossless for any value.
+///
+/// Any nested `Value::Array`/`Value::Map` element is rejected — a flat cell
+/// cannot hold nested structure.
+fn write_joined_cell(
+    buf: &mut String,
+    col: &str,
+    value: &Value,
+    items: &[Value],
+    join: Option<&JoinValues>,
+) -> Result<(), FormatError> {
+    let delimiter = join.map_or(DEFAULT_VALUE_DELIMITER, |j| j.delimiter.as_str());
+    let on_conflict = join.map_or(OnConflict::Error, |j| j.on_conflict);
+    let escape = join.map_or("\\", |j| j.escape.as_str());
+
+    if on_conflict == OnConflict::EncodeJson {
+        // The whole field becomes a JSON array. `clinker_to_json` walks the
+        // array (rejecting a non-finite float the same way the JSON writer
+        // does); a nested element serializes as nested JSON, which is lossless.
+        let json = clinker_to_json(value)?;
+        let text = serde_json::to_string(&json).map_err(|e| {
+            FormatError::Json(format!("encode_json for column {col:?} failed: {e}"))
+        })?;
+        buf.push_str(&text);
+        return Ok(());
+    }
+
+    let mut elem = String::new();
+    let mut escaped = String::new();
+    for (i, item) in items.iter().enumerate() {
+        elem.clear();
+        write_scalar_cell(&mut elem, col, item)?;
+        let piece: &str = match on_conflict {
+            OnConflict::Error => {
+                if elem.contains(delimiter) {
+                    return Err(FormatError::MultiValueDelimiterCollision {
+                        format: "CSV",
+                        column: col.to_string(),
+                        value: elem,
+                    });
+                }
+                elem.as_str()
+            }
+            OnConflict::Escape => {
+                escaped.clear();
+                escape_into(&elem, delimiter, escape, &mut escaped);
+                escaped.as_str()
+            }
+            OnConflict::EncodeJson => unreachable!("encode_json is handled before the loop"),
+        };
+        if i > 0 {
+            buf.push_str(delimiter);
+        }
+        buf.push_str(piece);
+    }
+    Ok(())
+}
+
+/// Append `text` to `out`, prefixing each delimiter and each escape character
+/// with the escape character. The inverse of the reader's un-escaping split, so
+/// a value carrying the delimiter (or the escape char itself) round-trips
+/// exactly. Delimiter and escape are treated as single characters (their first
+/// `char`); the plan-time gate rejects a multi-character escape.
+fn escape_into(text: &str, delimiter: &str, escape: &str, out: &mut String) {
+    let (Some(esc), Some(delim)) = (escape.chars().next(), delimiter.chars().next()) else {
+        out.push_str(text);
+        return;
+    };
+    for c in text.chars() {
+        if c == esc || c == delim {
+            out.push(esc);
+        }
+        out.push(c);
+    }
 }
 
 #[cfg(test)]
@@ -788,38 +911,234 @@ mod tests {
         }
     }
 
-    /// CSV writer rejects `Value::Array` payloads with
-    /// `FormatError::UnserializableArrayValue`, parallel to the map
-    /// rejection. A stray array at a CSV cell (e.g. a `match: collect`
-    /// combine output misrouted to CSV) previously JSON-encoded into a
-    /// single cell, silently hiding the misroute.
+    use crate::multi_value::{JoinValues, OnConflict};
+
+    fn join_config(entries: Vec<JoinValues>) -> CsvWriterConfig {
+        CsvWriterConfig {
+            join_values: entries,
+            ..Default::default()
+        }
+    }
+
+    /// With no `join_values` entry, a `Value::Array` of scalars joins into one
+    /// cell with the default `;` delimiter — AC#1, the write-side inverse of the
+    /// reader's default split, requiring no configuration.
     #[test]
-    fn test_csv_writer_rejects_array_value() {
+    fn join_values_default_semicolon_no_config() {
         let schema = make_schema(&["id", "tags"]);
         let record = make_record(
             &schema,
             vec![
                 Value::Integer(7),
-                Value::Array(vec![Value::String("a".into()), Value::String("b".into())]),
+                Value::Array(vec![
+                    Value::String("a".into()),
+                    Value::String("b".into()),
+                    Value::String("c".into()),
+                ]),
             ],
+        );
+        let output = write_to_string(&schema, CsvWriterConfig::default(), &[record]);
+        assert_eq!(output, "id,tags\n7,a;b;c\n");
+    }
+
+    /// An empty array emits an empty cell; a one-element array emits that value
+    /// with no delimiter (AC#5). A second column keeps the empty cell
+    /// unambiguous (a lone empty field on a one-column row is CSV-quoted `""`).
+    #[test]
+    fn join_values_empty_and_single() {
+        let schema = make_schema(&["id", "tags"]);
+        let empty = make_record(&schema, vec![Value::Integer(1), Value::Array(Vec::new())]);
+        let single = make_record(
+            &schema,
+            vec![Value::Integer(2), Value::Array(vec![Value::String("solo".into())])],
+        );
+        let output = write_to_string(&schema, CsvWriterConfig::default(), &[empty, single]);
+        assert_eq!(output, "id,tags\n1,\n2,solo\n");
+    }
+
+    /// A custom per-column delimiter is honored.
+    #[test]
+    fn join_values_custom_delimiter() {
+        let schema = make_schema(&["codes"]);
+        let record = make_record(
+            &schema,
+            vec![Value::Array(vec![
+                Value::String("x".into()),
+                Value::String("y".into()),
+            ])],
+        );
+        let config = join_config(vec![JoinValues {
+            field: "codes".into(),
+            delimiter: "|".into(),
+            on_conflict: OnConflict::Error,
+            escape: "\\".into(),
+        }]);
+        let output = write_to_string(&schema, config, &[record]);
+        assert_eq!(output, "codes\nx|y\n");
+    }
+
+    /// The central AC#2 test at the writer boundary: a value that contains the
+    /// delimiter under `on_conflict: error` refuses the record with a
+    /// `MultiValueDelimiterCollision` naming the field and the offending value,
+    /// and no corrupted body cell is emitted.
+    #[test]
+    fn join_values_on_conflict_error_names_field_and_value() {
+        let schema = make_schema(&["tags"]);
+        let record = make_record(
+            &schema,
+            vec![Value::Array(vec![
+                Value::String("a;b".into()),
+                Value::String("c".into()),
+            ])],
         );
         let mut buf = Vec::new();
         let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), CsvWriterConfig::default());
         let err = writer.write_record(&record).unwrap_err();
+        assert!(err.is_join_collision());
         match err {
-            FormatError::UnserializableArrayValue { format, column } => {
+            FormatError::MultiValueDelimiterCollision {
+                format,
+                column,
+                value,
+            } => {
                 assert_eq!(format, "CSV");
                 assert_eq!(column, "tags");
+                assert_eq!(value, "a;b");
             }
-            other => panic!("expected UnserializableArrayValue, got {other:?}"),
+            other => panic!("expected MultiValueDelimiterCollision, got {other:?}"),
         }
-        // The header row wrote before the failing cell, but no body row with a
-        // JSON-encoded array cell was emitted.
         drop(writer);
         assert!(
-            !String::from_utf8_lossy(&buf).contains("[\"a\""),
-            "the array must not be JSON-encoded into a cell"
+            !String::from_utf8_lossy(&buf).contains("a;b"),
+            "no corrupted cell must be emitted for the failing record"
         );
+    }
+
+    /// `on_conflict: escape` escapes the delimiter (and the escape char itself),
+    /// and the CSV reader's matching `split_values` `escape:` recovers the exact
+    /// original values — a full round trip (AC#3).
+    #[test]
+    fn join_values_escape_round_trips() {
+        let schema = make_schema(&["tags"]);
+        let original = vec![
+            Value::String("a;b".into()),
+            Value::String(r"c\d".into()),
+            Value::String("e".into()),
+        ];
+        let record = make_record(&schema, vec![Value::Array(original.clone())]);
+        let config = join_config(vec![JoinValues {
+            field: "tags".into(),
+            delimiter: ";".into(),
+            on_conflict: OnConflict::Escape,
+            escape: "\\".into(),
+        }]);
+        let output = write_to_string(&schema, config, &[record]);
+
+        let read_config = CsvReaderConfig {
+            split_values: vec![crate::multi_value::SplitValues {
+                field: "tags".into(),
+                delimiter: ";".into(),
+                escape: "\\".into(),
+                json: false,
+            }],
+            ..Default::default()
+        };
+        let mut reader = CsvReader::from_reader(output.as_bytes(), read_config);
+        reader.schema().unwrap();
+        let back = reader.next_record().unwrap().unwrap();
+        assert_eq!(back.get("tags"), Some(&Value::Array(original)));
+    }
+
+    /// `on_conflict: encode_json` round-trips exactly, including values carrying
+    /// the delimiter, quotes, and newlines (AC#4).
+    #[test]
+    fn join_values_encode_json_round_trips() {
+        let schema = make_schema(&["payload"]);
+        let original = vec![
+            Value::String("a;b".into()),
+            Value::String("c\"d".into()),
+            Value::String("e\nf".into()),
+        ];
+        let record = make_record(&schema, vec![Value::Array(original.clone())]);
+        let config = join_config(vec![JoinValues {
+            field: "payload".into(),
+            delimiter: ";".into(),
+            on_conflict: OnConflict::EncodeJson,
+            escape: "\\".into(),
+        }]);
+        let output = write_to_string(&schema, config, &[record]);
+
+        let read_config = CsvReaderConfig {
+            split_values: vec![crate::multi_value::SplitValues {
+                field: "payload".into(),
+                delimiter: ";".into(),
+                escape: String::new(),
+                json: true,
+            }],
+            ..Default::default()
+        };
+        let mut reader = CsvReader::from_reader(output.as_bytes(), read_config);
+        reader.schema().unwrap();
+        let back = reader.next_record().unwrap().unwrap();
+        assert_eq!(back.get("payload"), Some(&Value::Array(original)));
+    }
+
+    /// AC#6 interaction: a value containing BOTH the intra-cell delimiter and the
+    /// CSV field delimiter is handled correctly under each policy. Under
+    /// `escape` the cell is CSV-quoted (it holds a comma) yet still recovers.
+    #[test]
+    fn join_values_interaction_with_csv_field_delimiter() {
+        let schema = make_schema(&["tags"]);
+        let original = vec![Value::String("a,b;c".into()), Value::String("d".into())];
+        let record = make_record(&schema, vec![Value::Array(original.clone())]);
+
+        // error: the ';' inside "a,b;c" collides.
+        let mut buf = Vec::new();
+        let mut w = CsvWriter::new(&mut buf, Arc::clone(&schema), CsvWriterConfig::default());
+        assert!(w.write_record(&record).unwrap_err().is_join_collision());
+
+        // escape: round-trips through the reader despite the CSV comma-quoting.
+        let config = join_config(vec![JoinValues {
+            field: "tags".into(),
+            delimiter: ";".into(),
+            on_conflict: OnConflict::Escape,
+            escape: "\\".into(),
+        }]);
+        let out = write_to_string(&schema, config, &[record]);
+        let read_config = CsvReaderConfig {
+            split_values: vec![crate::multi_value::SplitValues {
+                field: "tags".into(),
+                delimiter: ";".into(),
+                escape: "\\".into(),
+                json: false,
+            }],
+            ..Default::default()
+        };
+        let mut reader = CsvReader::from_reader(out.as_bytes(), read_config);
+        reader.schema().unwrap();
+        let back = reader.next_record().unwrap().unwrap();
+        assert_eq!(back.get("tags"), Some(&Value::Array(original)));
+    }
+
+    /// A `Value::Array` carrying a nested `Array`/`Map` element is still
+    /// rejected — a flat cell cannot hold nested structure, so the misroute
+    /// detection is not lost when scalar arrays start joining.
+    #[test]
+    fn join_values_rejects_nested_element() {
+        let schema = make_schema(&["tags"]);
+        let record = make_record(
+            &schema,
+            vec![Value::Array(vec![
+                Value::String("a".into()),
+                Value::Array(vec![Value::String("nested".into())]),
+            ])],
+        );
+        let mut buf = Vec::new();
+        let mut writer = CsvWriter::new(&mut buf, Arc::clone(&schema), CsvWriterConfig::default());
+        match writer.write_record(&record).unwrap_err() {
+            FormatError::UnserializableArrayValue { column, .. } => assert_eq!(column, "tags"),
+            other => panic!("expected UnserializableArrayValue for nested element, got {other:?}"),
+        }
     }
 
     use crate::envelope_writer::test_doc_with_sections as doc_with_sections;

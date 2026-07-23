@@ -18,13 +18,13 @@ use std::sync::Arc;
 use clinker_record::{Record, Schema};
 
 use clinker_format::traits::FormatWriter;
-use clinker_plan::config::{OutputConfig, PipelineConfig};
+use clinker_plan::config::{ErrorStrategy, OutputConfig, PipelineConfig};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::certify_streaming_edge;
 
 use super::stream_event::{Punctuation, StreamEvent};
 use super::structured_output_guard::StructuredOutputDocumentGuard;
-use super::{WriterRegistry, build_format_writer, dispatch, stage_metrics};
+use super::{DlqEntry, WriterRegistry, build_format_writer, dispatch, stage_metrics};
 
 /// Identify fused producer → single `Output` chains eligible for
 /// streaming writes and build a [`StreamingOutputSpec`] for each.
@@ -123,6 +123,7 @@ pub(super) fn compute_streaming_output_specs(
             out_cfg: out_cfg.clone(),
             expected_input_schema,
             cxl_emit_names,
+            strategy: config.error_handling.strategy,
         });
     }
     specs
@@ -158,6 +159,11 @@ pub(crate) struct StreamingOutputSpec {
     /// passthroughs the user didn't explicitly emit (matching the
     /// buffered path's `include_unmapped: false` semantic).
     pub(crate) cxl_emit_names: Vec<String>,
+    /// The run's error strategy, carried in owned form so the detached
+    /// streaming thread can route a `join_values` `on_conflict: error`
+    /// collision to the DLQ under `Continue` / `BestEffort` (and abort under
+    /// `FailFast`) with no borrow back into the config.
+    pub(crate) strategy: ErrorStrategy,
 }
 
 /// Per-thread return shape merged into the dispatcher's
@@ -175,6 +181,10 @@ pub(crate) struct StreamingOutputTaskOutput {
     pub(crate) projection_timer: stage_metrics::CumulativeTimer,
     pub(crate) errors: Vec<PipelineError>,
     pub(crate) stage_metrics: Vec<stage_metrics::StageMetrics>,
+    /// Collision DLQ entries gathered on the streaming thread (which has no
+    /// live `ctx`), drained through `push_dlq` in [`Self::fold_into`] once the
+    /// thread is joined and the dispatcher's `ctx` is available again.
+    pub(crate) dlq_pending: Vec<DlqEntry>,
 }
 
 impl StreamingOutputTaskOutput {
@@ -198,6 +208,16 @@ impl StreamingOutputTaskOutput {
         ctx.write_timer.add(self.write_timer);
         ctx.projection_timer.add(self.projection_timer);
         ctx.output_errors.extend(self.errors);
+        // Drain the collision DLQ entries gathered on the thread. `push_dlq`
+        // enforces the DLQ rate ceiling (E315/E316); a breach is itself a fatal
+        // run error, so it lands in `output_errors` (aborting at run end)
+        // rather than changing this fold's signature.
+        for entry in self.dlq_pending {
+            if let Err(e) = dispatch::push_dlq(ctx, entry) {
+                ctx.output_errors.push(e);
+                break;
+            }
+        }
         for sm in self.stage_metrics {
             ctx.collector.record(sm);
         }
@@ -337,6 +357,7 @@ impl OutputStreamConsumer {
                 projection_timer: stage_metrics::CumulativeTimer::new(),
                 errors: Vec::new(),
                 stage_metrics: Vec::new(),
+                dlq_pending: Vec::new(),
             },
             scan_timer_slot: Some(stage_metrics::StageTimer::new(
                 stage_metrics::StageName::SchemaScan,
@@ -427,6 +448,21 @@ impl StreamingConsumer for OutputStreamConsumer {
                 ControlFlow::Continue(())
             }
             Err(e) => {
+                // A `join_values` `on_conflict: error` collision dead-letters the
+                // one offending record and keeps streaming (unless FailFast); the
+                // entry is drained to the DLQ when the thread is joined. Any other
+                // write error is fatal for this streaming output.
+                if self.spec.strategy != ErrorStrategy::FailFast
+                    && let Some(entry) = dispatch::sink_collision_dlq_entry(
+                        &record,
+                        row_num,
+                        &self.spec.output_name,
+                        &e,
+                    )
+                {
+                    self.out.dlq_pending.push(entry);
+                    return ControlFlow::Continue(());
+                }
                 self.out.errors.push(PipelineError::from(e));
                 ControlFlow::Break(())
             }

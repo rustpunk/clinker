@@ -697,7 +697,12 @@ fn split_text_value(value: &serde_json::Value, delimiter: &str) -> serde_json::V
     }
 }
 
-fn json_to_value(v: &serde_json::Value) -> Value {
+/// Convert a `serde_json::Value` into a clinker [`Value`].
+///
+/// `pub(crate)` because the CSV reader's `split_values` `json: true` decode
+/// reuses it to recover a cell a sink wrote under `join_values`
+/// `on_conflict: encode_json`.
+pub(crate) fn json_to_value(v: &serde_json::Value) -> Value {
     match v {
         serde_json::Value::Null => Value::Null,
         serde_json::Value::Bool(b) => Value::Bool(*b),
@@ -1528,6 +1533,8 @@ mod tests {
             split_values: vec![SplitValues {
                 field: "tags".into(),
                 delimiter: "|".into(),
+                escape: String::new(),
+                json: false,
             }],
             ..default_config()
         };

@@ -378,6 +378,14 @@ fn flush_clean_records_to_writers(
                         writer.write_record(&slot.projected)
                     };
                     if let Err(e) = write_result {
+                        // A `join_values` `on_conflict: error` collision is
+                        // routed to the DLQ on the record-granularity Output
+                        // arms (buffered + streaming). On this correlation-commit
+                        // arm it keeps the existing fatal disposition: routing one
+                        // record of a committed group to the DLQ mid-write would
+                        // cross group-atomicity and ok/dlq accounting that this
+                        // arm owns, so that combination is tracked as a follow-up
+                        // rather than approximated here.
                         push_write_error(&mut ctx.output_errors, e);
                         write_failed = true;
                         break;

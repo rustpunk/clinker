@@ -164,6 +164,29 @@ pub enum FormatError {
         format: &'static str,
         column: String,
     },
+    /// A CSV writer joining a `multiple:` field into one delimited cell under
+    /// `join_values` `on_conflict: error` found a value that itself contains the
+    /// delimiter. Joining it would emit a cell that splits back into the wrong
+    /// number of values downstream, so the record is refused rather than
+    /// silently corrupted. This is a per-record write failure that disposes
+    /// through the DLQ under the configured error strategy (see
+    /// [`FormatError::is_join_collision`]) — not document-structural — so a
+    /// single offending record is dead-lettered while the rest of the stream
+    /// continues.
+    ///
+    /// Routes to fix this at the user level:
+    ///
+    /// - Switch the field's `on_conflict` to `escape` (escapes the delimiter,
+    ///   recovered by a matching `split_values` `escape:`) or `encode_json`
+    ///   (a lossless JSON array, recovered by a matching `split_values`
+    ///   `json: true`).
+    /// - Or choose a `delimiter` the values never contain.
+    MultiValueDelimiterCollision {
+        format: &'static str,
+        column: String,
+        /// The offending value — the one that contains the delimiter.
+        value: String,
+    },
 }
 
 impl fmt::Display for FormatError {
@@ -230,6 +253,18 @@ impl fmt::Display for FormatError {
                  dropped. Declare {column:?} in the output (or source) `schema:` so every \
                  record carries it, or route to a self-describing format (JSON / NDJSON / XML) \
                  that needs no shared column set."
+            ),
+            Self::MultiValueDelimiterCollision {
+                format,
+                column,
+                value,
+            } => write!(
+                f,
+                "{format} writer joining column {column:?} into one delimited cell found a value \
+                 {value:?} that contains the join delimiter — under `on_conflict: error` the \
+                 record is refused rather than emit a cell that would split back wrongly. Set the \
+                 field's `on_conflict` to `escape` or `encode_json` for a lossless join, or pick \
+                 a `delimiter` the values never contain."
             ),
         }
     }
@@ -304,6 +339,16 @@ impl FormatError {
             self,
             Self::StructuralCount { .. } | Self::StructuralValidation { .. }
         )
+    }
+
+    /// `true` only for a [`FormatError::MultiValueDelimiterCollision`] — a
+    /// CSV `join_values` `on_conflict: error` collision. The sink dispatch arms
+    /// use this to route the failing record to the DLQ (naming the field and the
+    /// offending value) under the configured error strategy, rather than
+    /// aborting the run the way an `Io`/`Csv` write failure does. Every other
+    /// variant keeps its existing disposition.
+    pub fn is_join_collision(&self) -> bool {
+        matches!(self, Self::MultiValueDelimiterCollision { .. })
     }
 }
 

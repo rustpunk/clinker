@@ -251,11 +251,17 @@ fn build_writer_factory(
     include_engine_stamped: bool,
     reconstruct_envelope: bool,
     include_unmapped: bool,
+    join_values: Vec<clinker_format::JoinValues>,
 ) -> Result<WriterFactory, PipelineError> {
     match format {
         OutputFormat::Csv(opts) => {
             let mut csv_config = build_csv_writer_config(opts.as_ref(), include_header)?;
             csv_config.include_engine_stamped = include_engine_stamped;
+            // Per-column join overrides; a `multiple:` field with no entry joins
+            // with the default `;` / `on_conflict: error`. The plan-time E362
+            // gate has already rejected `join_values` on a non-CSV output, so
+            // only the CSV arm consumes it.
+            csv_config.join_values = join_values;
             // Lossless mode: when the Output carries every column through
             // (`include_unmapped: true`), a record column the pinned header
             // lacks must fail loudly rather than be silently dropped. The
@@ -428,6 +434,7 @@ pub(crate) fn build_format_writer(
         output.include_correlation_keys,
         output.reconstruct_envelope,
         output.include_unmapped,
+        output.join_values.clone().unwrap_or_default(),
     )?;
 
     if let Some(ref split) = output.split {

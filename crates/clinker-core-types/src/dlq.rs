@@ -87,6 +87,14 @@ pub enum DlqErrorCategory {
     /// granularity opt-in; under the default `record` granularity a count
     /// mismatch still aborts the run.
     StructuralValidation,
+    /// A CSV sink joining a `multiple:` field into one delimited cell under
+    /// `join_values` `on_conflict: error` found a value that itself contains the
+    /// delimiter, which would split back wrongly downstream. The failing record
+    /// is dead-lettered (the entry's `triggering_field` names the column and
+    /// `triggering_value` carries the offending value) rather than emitting a
+    /// corrupted cell. The first `DlqErrorCategory` originating at the sink-write
+    /// stage; routed by the Output dispatch arms under `Continue` / `BestEffort`.
+    MultiValueJoinCollision,
 }
 
 impl DlqErrorCategory {
@@ -107,6 +115,7 @@ impl DlqErrorCategory {
             Self::CombineOutputRow => "combine_output_row",
             Self::MutationConflict => "mutation_conflict",
             Self::StructuralValidation => "structural_validation",
+            Self::MultiValueJoinCollision => "multi_value_join_collision",
         }
     }
 }
@@ -190,6 +199,10 @@ mod tests {
         assert_eq!(
             DlqErrorCategory::StructuralValidation.as_str(),
             "structural_validation"
+        );
+        assert_eq!(
+            DlqErrorCategory::MultiValueJoinCollision.as_str(),
+            "multi_value_join_collision"
         );
     }
 

@@ -18,14 +18,15 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
     CorrelationRecordSlot, ExecutorContext, buffer_key_for_record, drain_node_buffer_slot,
-    push_write_error, source_file_path_of,
+    push_dlq, push_write_error, sink_collision_dlq_entry, source_file_path_of,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::structured_output_guard::{
     StructuredOutputDocumentGuard, structured_output_format,
 };
-use crate::executor::{build_format_writer, stage_metrics};
+use crate::executor::{DlqEntry, build_format_writer, stage_metrics};
 use crate::projection::project_output_from_record;
+use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
@@ -383,20 +384,33 @@ pub(crate) fn dispatch_output(
     } else {
         None
     };
-    let mut fan_ctx = FanOutContext {
-        name,
-        out_cfg,
-        cxl_emit_names_opt,
-        output_schema: &output_schema,
-        output_errors: &mut ctx.output_errors,
-        write_timer: &mut ctx.write_timer,
-        projection_timer: &mut ctx.projection_timer,
-        collector: &mut *ctx.collector,
-    };
-    if let Some(per_file) = fan_out_writers {
-        emit_fan_out(&mut fan_ctx, &unbuffered, per_file, scan_timer);
-    } else if let Some(raw_writer) = single_writer {
-        emit_single_writer(&mut fan_ctx, raw_writer, &unbuffered, scan_timer);
+    let strategy = ctx.strategy;
+    // Collected inside the writer helpers (which hold only partial `ctx`
+    // borrows) and drained through `push_dlq` below once `ctx` is free again.
+    let mut dlq_pending: Vec<DlqEntry> = Vec::new();
+    {
+        let mut fan_ctx = FanOutContext {
+            name,
+            out_cfg,
+            cxl_emit_names_opt,
+            output_schema: &output_schema,
+            output_errors: &mut ctx.output_errors,
+            write_timer: &mut ctx.write_timer,
+            projection_timer: &mut ctx.projection_timer,
+            collector: &mut *ctx.collector,
+            strategy,
+            dlq_pending: &mut dlq_pending,
+        };
+        if let Some(per_file) = fan_out_writers {
+            emit_fan_out(&mut fan_ctx, &unbuffered, per_file, scan_timer);
+        } else if let Some(raw_writer) = single_writer {
+            emit_single_writer(&mut fan_ctx, raw_writer, &unbuffered, scan_timer);
+        }
+    }
+    // Drain the collected collision entries; `push_dlq` enforces the DLQ rate
+    // ceiling (E315/E316), which can still abort the run.
+    for entry in dlq_pending {
+        push_dlq(ctx, entry)?;
     }
 
     Ok(())
@@ -852,6 +866,15 @@ struct FanOutContext<'a> {
     write_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
     projection_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
     collector: &'a mut crate::executor::stage_metrics::StageCollector,
+    /// The run's error strategy, so a `join_values` `on_conflict: error`
+    /// collision dead-letters under `Continue` / `BestEffort` but still aborts
+    /// under `FailFast` — the same disposition every other per-record failure
+    /// gets.
+    strategy: ErrorStrategy,
+    /// Collision DLQ entries gathered during the write. Drained through
+    /// [`push_dlq`] by the caller once the full `ctx` borrow is free (the
+    /// writer helpers hold only partial borrows of it).
+    dlq_pending: &'a mut Vec<DlqEntry>,
 }
 
 /// Write `unbuffered` through a single pre-opened writer. Errors from
@@ -872,7 +895,7 @@ fn emit_single_writer(
         Ok(mut csv_writer) => {
             fan_ctx.collector.record(scan_timer.finish(1, 1));
             let mut write_failed = false;
-            for (record, _rn) in unbuffered {
+            for (record, rn) in unbuffered {
                 let projected = {
                     let _guard = fan_ctx.projection_timer.guard();
                     project_output_from_record(record, fan_ctx.out_cfg, fan_ctx.cxl_emit_names_opt)
@@ -882,6 +905,15 @@ fn emit_single_writer(
                     csv_writer.write_record(&projected)
                 };
                 if let Err(e) = write_result {
+                    // A `join_values` `on_conflict: error` collision dead-letters
+                    // the one offending record and keeps writing the rest (unless
+                    // FailFast); any other write error is fatal for this writer.
+                    if fan_ctx.strategy != ErrorStrategy::FailFast
+                        && let Some(entry) = sink_collision_dlq_entry(record, *rn, fan_ctx.name, &e)
+                    {
+                        fan_ctx.dlq_pending.push(entry);
+                        continue;
+                    }
                     push_write_error(fan_ctx.output_errors, e);
                     write_failed = true;
                     break;
@@ -969,6 +1001,12 @@ fn emit_fan_out(
             fw.write_record(&projected)
         };
         if let Err(e) = write_result {
+            if fan_ctx.strategy != ErrorStrategy::FailFast
+                && let Some(entry) = sink_collision_dlq_entry(record, *rn, fan_ctx.name, &e)
+            {
+                fan_ctx.dlq_pending.push(entry);
+                continue;
+            }
             push_write_error(fan_ctx.output_errors, e);
         }
     }

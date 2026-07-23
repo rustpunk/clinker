@@ -554,6 +554,13 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                 writer.write_record(record)
             };
             if let Err(e) = write_result {
+                // A `join_values` `on_conflict: error` collision routes to the
+                // DLQ on the record-granularity Output arms (buffered +
+                // streaming). This document-DLQ arm writes projected records and
+                // does not hold each original record here, and a collision
+                // interacts with the document's own accept/reject verdict, so
+                // that combination keeps the existing disposition and is tracked
+                // as a follow-up rather than approximated here.
                 ctx.output_errors.push(e.into());
                 break;
             }

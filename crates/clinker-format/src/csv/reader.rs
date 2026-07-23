@@ -6,7 +6,7 @@ use clinker_record::{Record, Schema, SchemaBuilder, Value};
 use crate::bom::SkipBom;
 use crate::charset::Charset;
 use crate::error::FormatError;
-use crate::multi_value::{SplitValues, split_text_value};
+use crate::multi_value::{SplitValues, split_text_value_escaped};
 use crate::traits::FormatReader;
 
 /// Configuration for the CSV reader.
@@ -57,12 +57,14 @@ pub struct CsvReader<R: Read> {
     inner: csv::Reader<SkipBom<R>>,
     schema: Option<Arc<Schema>>,
     config: CsvReaderConfig,
-    /// Per-column split delimiter, index-aligned to the schema columns:
-    /// `Some(delim)` for a column a `split_values` entry covers, `None`
+    /// Per-column split declaration, index-aligned to the schema columns:
+    /// `Some(entry)` for a column a `split_values` entry covers, `None`
     /// otherwise. Built once alongside the schema so per-record decoding is a
     /// positional lookup rather than a name scan. Empty until the schema is
-    /// resolved and when no `split_values` are declared.
-    split_delims: Vec<Option<String>>,
+    /// resolved and when no `split_values` are declared. The whole entry is
+    /// stored (not just the delimiter) so a column can carry an `escape:` or
+    /// `json:` recovery mode as well.
+    split_specs: Vec<Option<SplitValues>>,
     row_count: u64,
     record_buf: csv::ByteRecord,
 }
@@ -78,7 +80,7 @@ impl<R: Read> CsvReader<R> {
             inner,
             schema: None,
             config,
-            split_delims: Vec::new(),
+            split_specs: Vec::new(),
             row_count: 0,
             record_buf: csv::ByteRecord::new(),
         }
@@ -115,13 +117,13 @@ impl<R: Read> CsvReader<R> {
         };
 
         // Build the index-aligned split map: for each column a `split_values`
-        // entry names, record its delimiter at that column's position. The
-        // entry's `field` is the document field name, which for CSV is the
+        // entry names, record its whole declaration at that column's position.
+        // The entry's `field` is the document field name, which for CSV is the
         // column (header) name. E358 has already checked, at plan time, that
         // every entry names a real `multiple: true` column; an entry that
         // matches no column here is simply inert.
         if !self.config.split_values.is_empty() {
-            self.split_delims = schema
+            self.split_specs = schema
                 .columns()
                 .iter()
                 .map(|name| {
@@ -129,7 +131,7 @@ impl<R: Read> CsvReader<R> {
                         .split_values
                         .iter()
                         .find(|e| e.field.as_str() == name.as_ref())
-                        .map(|e| e.delimiter.clone())
+                        .cloned()
                 })
                 .collect();
         }
@@ -151,7 +153,7 @@ impl<R: Read + Send> FormatReader for CsvReader<R> {
         // If we peeked a record during no-header schema inference, consume it first
         if !self.config.has_header && self.row_count == 0 && !self.record_buf.is_empty() {
             self.row_count += 1;
-            let values = decode_record(&self.record_buf, charset, &self.split_delims)?;
+            let values = decode_record(&self.record_buf, charset, &self.split_specs)?;
             return Ok(Some(Record::new(schema, values)));
         }
 
@@ -160,7 +162,7 @@ impl<R: Read + Send> FormatReader for CsvReader<R> {
         }
 
         self.row_count += 1;
-        let values = decode_record(&self.record_buf, charset, &self.split_delims)?;
+        let values = decode_record(&self.record_buf, charset, &self.split_specs)?;
         Ok(Some(Record::new(schema, values)))
     }
 }
@@ -170,27 +172,49 @@ impl<R: Read + Send> FormatReader for CsvReader<R> {
 /// possible under [`Charset::Utf8`]) fails the record loudly rather than
 /// substituting replacement bytes.
 ///
-/// A column carrying a `Some(delimiter)` in `split_delims` — a `multiple: true`
-/// column a `split_values` entry covers — materializes as a `Value::Array` of
-/// the cell's delimiter-separated parts. An empty cell yields an empty array
-/// (zero values), not a one-element array holding an empty string: a blank CSV
-/// cell means the column has no values, whereas an author who wrote a delimiter
-/// between two empties meant those empties. Every other column stays a scalar
-/// `Value::String`; element typing is CXL's responsibility downstream.
+/// A column carrying a `Some(entry)` in `split_specs` — a `multiple: true`
+/// column a `split_values` entry covers — materializes as a `Value::Array`:
+///
+/// - the default delimited decode splits the cell on the entry's delimiter;
+/// - a non-empty `escape` un-escapes as it splits, recovering a sink's
+///   `on_conflict: escape` output exactly;
+/// - `json: true` parses the whole cell as an embedded JSON array, recovering a
+///   sink's `on_conflict: encode_json` output.
+///
+/// An empty cell yields an empty array (zero values) under every mode, not a
+/// one-element array holding an empty string: a blank CSV cell means the column
+/// has no values, whereas an author who wrote a delimiter between two empties
+/// meant those empties. Every other column stays a scalar `Value::String`;
+/// element typing is CXL's responsibility downstream.
 fn decode_record(
     rec: &csv::ByteRecord,
     charset: Charset,
-    split_delims: &[Option<String>],
+    split_specs: &[Option<SplitValues>],
 ) -> Result<Vec<Value>, FormatError> {
     rec.iter()
         .enumerate()
         .map(|(i, f)| {
             let s = charset.decode(f.to_vec())?;
-            Ok(match split_delims.get(i).and_then(Option::as_deref) {
-                Some(_) if s.is_empty() => Value::Array(Vec::new()),
-                Some(delim) => split_text_value(&Value::String(s.into()), delim),
-                None => Value::String(s.into()),
-            })
+            let Some(entry) = split_specs.get(i).and_then(Option::as_ref) else {
+                return Ok(Value::String(s.into()));
+            };
+            if s.is_empty() {
+                return Ok(Value::Array(Vec::new()));
+            }
+            if entry.json {
+                let parsed: serde_json::Value = serde_json::from_str(&s).map_err(|e| {
+                    FormatError::Json(format!(
+                        "split_values `json: true` on field '{}': cell is not valid JSON: {e}",
+                        entry.field
+                    ))
+                })?;
+                return Ok(crate::json::reader::json_to_value(&parsed));
+            }
+            Ok(split_text_value_escaped(
+                &Value::String(s.into()),
+                &entry.delimiter,
+                &entry.escape,
+            ))
         })
         .collect()
 }
@@ -232,6 +256,8 @@ mod tests {
             split_values: vec![SplitValues {
                 field: field.to_string(),
                 delimiter: delimiter.to_string(),
+                escape: String::new(),
+                json: false,
             }],
             ..Default::default()
         }
@@ -326,6 +352,122 @@ mod tests {
                 Value::String("a,b".into()),
                 Value::String("c".into()),
             ]))
+        );
+    }
+
+    #[test]
+    fn split_values_escape_recovers_escaped_delimiter() {
+        // A cell written under `on_conflict: escape`: `a\;b` is one value
+        // "a;b", `c` is another. The escape-aware split recovers both.
+        let csv = "order_id,tags\n1,a\\;b;c";
+        let config = CsvReaderConfig {
+            split_values: vec![SplitValues {
+                field: "tags".into(),
+                delimiter: ";".into(),
+                escape: "\\".into(),
+                json: false,
+            }],
+            ..Default::default()
+        };
+        let mut reader = CsvReader::from_reader(csv.as_bytes(), config);
+        reader.schema().unwrap();
+        let record = reader.next_record().unwrap().unwrap();
+        assert_eq!(
+            record.get("tags"),
+            Some(&Value::Array(vec![
+                Value::String("a;b".into()),
+                Value::String("c".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn split_values_escape_recovers_escaped_escape_char() {
+        // An escaped escape `\\` is one literal backslash, not a boundary.
+        let csv = "order_id,tags\n1,a\\\\b;c";
+        let config = CsvReaderConfig {
+            split_values: vec![SplitValues {
+                field: "tags".into(),
+                delimiter: ";".into(),
+                escape: "\\".into(),
+                json: false,
+            }],
+            ..Default::default()
+        };
+        let mut reader = CsvReader::from_reader(csv.as_bytes(), config);
+        reader.schema().unwrap();
+        let record = reader.next_record().unwrap().unwrap();
+        assert_eq!(
+            record.get("tags"),
+            Some(&Value::Array(vec![
+                Value::String("a\\b".into()),
+                Value::String("c".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn split_values_json_decodes_embedded_array() {
+        // A cell written under `on_conflict: encode_json` is a JSON array,
+        // recovered whole regardless of delimiters/quotes inside the values.
+        let csv = "order_id,tags\n1,\"[\"\"a;b\"\",\"\"c\"\"]\"";
+        let config = CsvReaderConfig {
+            split_values: vec![SplitValues {
+                field: "tags".into(),
+                delimiter: ";".into(),
+                escape: String::new(),
+                json: true,
+            }],
+            ..Default::default()
+        };
+        let mut reader = CsvReader::from_reader(csv.as_bytes(), config);
+        reader.schema().unwrap();
+        let record = reader.next_record().unwrap().unwrap();
+        assert_eq!(
+            record.get("tags"),
+            Some(&Value::Array(vec![
+                Value::String("a;b".into()),
+                Value::String("c".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn split_values_json_empty_cell_yields_empty_array() {
+        let csv = "order_id,tags\n1,";
+        let config = CsvReaderConfig {
+            split_values: vec![SplitValues {
+                field: "tags".into(),
+                delimiter: ";".into(),
+                escape: String::new(),
+                json: true,
+            }],
+            ..Default::default()
+        };
+        let mut reader = CsvReader::from_reader(csv.as_bytes(), config);
+        reader.schema().unwrap();
+        let record = reader.next_record().unwrap().unwrap();
+        assert_eq!(record.get("tags"), Some(&Value::Array(Vec::new())));
+    }
+
+    #[test]
+    fn split_values_json_invalid_cell_errors() {
+        let csv = "order_id,tags\n1,not-json";
+        let config = CsvReaderConfig {
+            split_values: vec![SplitValues {
+                field: "tags".into(),
+                delimiter: ";".into(),
+                escape: String::new(),
+                json: true,
+            }],
+            ..Default::default()
+        };
+        let mut reader = CsvReader::from_reader(csv.as_bytes(), config);
+        reader.schema().unwrap();
+        let err = reader.next_record().unwrap_err();
+        assert!(
+            matches!(&err, FormatError::Json(m) if m.contains("not valid JSON")),
+            "expected a JSON decode error, got {err:?}"
         );
     }
 
