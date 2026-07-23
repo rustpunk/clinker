@@ -262,11 +262,23 @@ impl JsonReader {
         }
     }
 
+    /// Flatten a JSON value into dotted keys on `out`.
+    ///
+    /// When `collisions` is `Some`, a second value landing on a name already
+    /// present is treated as an undeclared repeat (the JSON analogue of a
+    /// repeated XML element): if the name is a `multiple:` column both values
+    /// collect into an array in document order, otherwise the name is recorded
+    /// so the caller can refuse the record loudly rather than silently keeping
+    /// one value. When `collisions` is `None` a later value overwrites an
+    /// earlier one (last-wins) — used by the fan-out element projection, whose
+    /// merge onto the already-populated parent record is deliberate.
     fn flatten_value(
         prefix: &str,
         value: &serde_json::Value,
         out: &mut serde_json::Map<String, serde_json::Value>,
         depth: usize,
+        mut collisions: Option<&mut Vec<String>>,
+        multi_value: &[String],
     ) {
         const MAX_DEPTH: usize = 64;
         if depth > MAX_DEPTH {
@@ -284,13 +296,67 @@ impl JsonReader {
                     } else {
                         format!("{prefix}.{key}")
                     };
-                    Self::flatten_value(&name, val, out, depth + 1);
+                    Self::flatten_value(
+                        &name,
+                        val,
+                        out,
+                        depth + 1,
+                        collisions.as_deref_mut(),
+                        multi_value,
+                    );
                 }
             }
-            other => {
-                out.insert(prefix.to_string(), other.clone());
-            }
+            other => match collisions {
+                Some(sink) if out.contains_key(prefix) => {
+                    if multi_value.iter().any(|f| f.as_str() == prefix) {
+                        // Declared `multiple:` — collect in document order.
+                        match out.get_mut(prefix).expect("contains_key just held") {
+                            serde_json::Value::Array(items) => items.push(other.clone()),
+                            slot => {
+                                let first = slot.take();
+                                *slot = serde_json::Value::Array(vec![first, other.clone()]);
+                            }
+                        }
+                    } else {
+                        // Undeclared flattened-name collision — the caller
+                        // turns this into a loud error. The overwrite is
+                        // immaterial because the record is never kept.
+                        sink.push(prefix.to_string());
+                        out.insert(prefix.to_string(), other.clone());
+                    }
+                }
+                _ => {
+                    out.insert(prefix.to_string(), other.clone());
+                }
+            },
         }
+    }
+
+    /// Flatten one raw JSON record into dotted keys, refusing a flattened-name
+    /// collision on a column not declared `multiple: true` — the JSON analogue
+    /// of an undeclared repeated XML element. A collision on a `multiple:`
+    /// column instead collects both values into an array, in document order.
+    fn flatten_record_body(
+        &self,
+        raw: &serde_json::Value,
+    ) -> Result<serde_json::Map<String, serde_json::Value>, FormatError> {
+        let mut flat = serde_json::Map::new();
+        let mut collisions: Vec<String> = Vec::new();
+        Self::flatten_value(
+            "",
+            raw,
+            &mut flat,
+            0,
+            Some(&mut collisions),
+            &self.config.multi_value_fields,
+        );
+        if let Some(field) = collisions.into_iter().next() {
+            return Err(FormatError::UndeclaredRepeatedField {
+                format: "JSON",
+                field,
+            });
+        }
+        Ok(flat)
     }
 
     /// Expand one flattened record through the declared `split_to_rows`
@@ -553,8 +619,7 @@ impl FormatReader for JsonReader {
                 self.inner = InnerReader::Done;
                 return Ok(s);
             };
-            let mut flat = serde_json::Map::new();
-            Self::flatten_value("", &raw, &mut flat, 0);
+            let flat = self.flatten_record_body(&raw)?;
             let expanded = self.apply_split_to_rows(flat);
             if !expanded.is_empty() {
                 break expanded;
@@ -588,8 +653,7 @@ impl FormatReader for JsonReader {
                 Some(v) => v,
                 None => return Ok(None),
             };
-            let mut flat = serde_json::Map::new();
-            Self::flatten_value("", &raw, &mut flat, 0);
+            let flat = self.flatten_record_body(&raw)?;
             let expanded = self.apply_split_to_rows(flat);
             if expanded.is_empty() {
                 continue;
@@ -649,7 +713,9 @@ fn project_element(
 ) {
     match (entry.mode, elem) {
         (SplitToRowsMode::Extract, serde_json::Value::Object(_)) => {
-            JsonReader::flatten_value("", elem, out, 0);
+            // Merge the occurrence's keys onto the already-populated parent
+            // record: a deliberate merge, so no collision detection (last-wins).
+            JsonReader::flatten_value("", elem, out, 0, None, &[]);
         }
         (SplitToRowsMode::Extract, other) => {
             let name = entry
@@ -660,7 +726,7 @@ fn project_element(
             out.insert(name.to_string(), other.clone());
         }
         (SplitToRowsMode::Split, _) => {
-            JsonReader::flatten_value(&entry.field, elem, out, 0);
+            JsonReader::flatten_value(&entry.field, elem, out, 0, None, &[]);
         }
     }
 }
@@ -1313,6 +1379,44 @@ mod tests {
         assert_eq!(
             r.next_record().unwrap().unwrap().get("tags"),
             Some(&Value::Array(vec![Value::String("solo".into())]))
+        );
+    }
+
+    #[test]
+    fn undeclared_flattened_name_collision_is_a_loud_error() {
+        // A literal dotted key and a nested object both flatten to `a.b`. Only
+        // one would survive last-write-wins; refuse loudly instead of silently
+        // dropping the other, matching the XML undeclared-repeat behavior.
+        let input = r#"[{"a":{"b":1},"a.b":2}]"#;
+        let mut r = reader_from_str(input, default_config());
+        let err = r
+            .schema()
+            .expect_err("flattened-name collision must fail loud");
+        assert!(
+            matches!(err, FormatError::UndeclaredRepeatedField { format: "JSON", ref field } if field == "a.b"),
+            "names the offending field: {err:?}"
+        );
+        assert!(
+            err.is_document_structural(),
+            "dead-letterable, not fatal-only"
+        );
+    }
+
+    #[test]
+    fn flattened_name_collision_on_a_multiple_column_collects() {
+        // The escape hatch, symmetric with XML: declaring the colliding name
+        // `multiple: true` collects both values into an array in document order
+        // rather than erroring.
+        let input = r#"[{"a":{"b":1},"a.b":2}]"#;
+        let config = JsonReaderConfig {
+            multi_value_fields: vec!["a.b".into()],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("a.b"),
+            Some(&Value::Array(vec![Value::Integer(1), Value::Integer(2)]))
         );
     }
 

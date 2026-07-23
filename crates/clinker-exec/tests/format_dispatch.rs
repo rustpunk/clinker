@@ -176,6 +176,114 @@ nodes:
     assert!(output.contains("Bob"), "output missing Bob: {output}");
 }
 
+/// An XML element that repeats while its column is not declared `multiple: true`
+/// is a loud runtime error under the default fail-fast strategy — the run aborts
+/// with a diagnostic naming the remedy, rather than silently keeping the first
+/// value and dropping the rest.
+#[test]
+fn test_xml_undeclared_repeat_aborts_under_fail_fast() {
+    let yaml = r#"
+pipeline:
+  name: xml-undeclared-repeat
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: xml
+    path: input.xml
+    options:
+      record_path: records/record
+    schema:
+      - { name: name, type: string }
+      - { name: age, type: string }
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+"#;
+    // The second record repeats `<name>`, which is not declared `multiple:`.
+    let input_data = xml_input(
+        "records",
+        "record",
+        &[
+            vec![("name", "Alice"), ("age", "30")],
+            vec![("name", "Bob"), ("name", "Bobby"), ("age", "25")],
+        ],
+    );
+    let err = run_format_test(yaml, "src", input_data)
+        .expect_err("undeclared repeat must abort the run, not drop silently");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("multiple: true") && msg.contains("name"),
+        "diagnostic names the field and remedy: {msg}"
+    );
+}
+
+/// Under `error_handling.strategy: continue` + `dlq_granularity: document`, the
+/// same undeclared repeat is dead-lettered rather than aborting the run: the
+/// offending document is routed to the DLQ and no record of it reaches the
+/// success sink.
+#[test]
+fn test_xml_undeclared_repeat_dead_letters_under_document_dlq() {
+    let yaml = r#"
+pipeline:
+  name: xml-undeclared-repeat-dlq
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    type: xml
+    path: input.xml
+    dlq_granularity: document
+    options:
+      record_path: records/record
+    schema:
+      - { name: name, type: string }
+      - { name: age, type: string }
+- type: output
+  name: dest
+  input: src
+  config:
+    name: dest
+    type: csv
+    path: output.csv
+    include_unmapped: true
+"#;
+    let input_data = xml_input(
+        "records",
+        "record",
+        &[
+            vec![("name", "Alice"), ("age", "30")],
+            vec![("name", "Bob"), ("name", "Bobby"), ("age", "25")],
+        ],
+    );
+    let (counters, dlq, output) = run_format_test(yaml, "src", input_data)
+        .expect("document-granularity DLQ dead-letters rather than aborting");
+    assert!(
+        counters.dlq_count >= 1,
+        "the undeclared repeat is dead-lettered, got dlq_count={}",
+        counters.dlq_count
+    );
+    assert_eq!(
+        counters.ok_count, 0,
+        "no record of the condemned document reaches the success sink"
+    );
+    assert!(!dlq.is_empty(), "a DLQ entry is recorded");
+    let body: Vec<&str> = output.lines().skip(1).filter(|l| !l.is_empty()).collect();
+    assert!(
+        body.is_empty(),
+        "no data row reaches the success sink, got {body:?}"
+    );
+}
+
 /// JSON NDJSON output produces valid newline-delimited JSON.
 /// CSV input → NDJSON output, verify each line parses as JSON.
 #[test]

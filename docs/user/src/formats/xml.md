@@ -180,9 +180,17 @@ container (`Item.name`, `Item.qty`) collects each of them independently.
 A field cannot be both collected and fanned out: naming a `multiple: true`
 column in `split_to_rows` is rejected at compile (`E358`).
 
-Repeated fields named by neither a `split_to_rows` entry nor a `multiple:`
-column keep the default duplicate-key collapse: the first value wins and later
-repetitions are dropped.
+A repeated element named by neither a `split_to_rows` entry nor a `multiple:`
+column is a **loud error**, not a silent drop. Keeping the first occurrence and
+discarding the rest would lose data without warning, so the reader refuses the
+record and names the offending field, pointing at the two ways to handle a
+repeat on purpose: declare the column `multiple: true` to collect every
+occurrence into an array, or add a `split_to_rows` entry to fan each occurrence
+out to its own record. Detection is per document at read time — a plan cannot
+know in advance that a particular document repeats a field. Under the default
+`fail_fast` strategy the run aborts with the diagnostic; under `continue` /
+`best_effort` with `dlq_granularity: document` the offending document is routed
+to the dead-letter queue and the run continues.
 
 ### Delimited text in one element: `split_values`
 

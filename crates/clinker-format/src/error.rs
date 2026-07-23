@@ -187,6 +187,33 @@ pub enum FormatError {
         /// The offending value — the one that contains the delimiter.
         value: String,
     },
+    /// A self-describing reader (XML, JSON) found more than one value landing on
+    /// one flattened field of a single record while that field's schema column is
+    /// NOT declared `multiple: true`. In XML this is a child element that repeats
+    /// (`<Tag>a</Tag><Tag>b</Tag>`); in JSON it is two keys that flatten to the
+    /// same dotted name (`{"a": {"b": 1}, "a.b": 2}`). Only a `multiple:` column
+    /// collects every occurrence into an array — for any other column the reader
+    /// would keep one value and silently discard the rest, the exact data loss
+    /// this variant refuses.
+    ///
+    /// Routed to the document-level DLQ under `dlq_granularity: document` (see
+    /// [`FormatError::is_document_structural`]) so one malformed document does not
+    /// abort the run when the author opted into continuing past bad data;
+    /// otherwise it aborts loudly rather than dropping values. `field` names the
+    /// offending flattened field.
+    ///
+    /// Routes to fix this at the user level:
+    ///
+    /// - Declare the column `multiple: true` so every occurrence collects into an
+    ///   array, in document order.
+    /// - Or add a `split_to_rows` entry so each occurrence fans out to its own
+    ///   record.
+    /// - In JSON, a genuine flattened-name clash between two distinct keys is
+    ///   resolved by renaming one so they no longer collide.
+    UndeclaredRepeatedField {
+        format: &'static str,
+        field: String,
+    },
 }
 
 impl fmt::Display for FormatError {
@@ -266,6 +293,15 @@ impl fmt::Display for FormatError {
                  field's `on_conflict` to `escape` or `encode_json` for a lossless join, or pick \
                  a `delimiter` the values never contain."
             ),
+            Self::UndeclaredRepeatedField { format, field } => write!(
+                f,
+                "{format} source: field {field:?} occurs more than once in a single record, but \
+                 its schema column is not declared `multiple: true`, so all but one value would \
+                 be silently dropped. Declare the column `multiple: true` to keep every \
+                 occurrence as an array (in document order), or add a `split_to_rows` entry to \
+                 fan each occurrence out to its own record. (In JSON this also fires when two \
+                 distinct keys flatten to the same dotted name — rename one to disambiguate.)"
+            ),
         }
     }
 }
@@ -330,14 +366,18 @@ impl FormatError {
 
     /// `true` for the error classes the executor reclassifies from
     /// run-aborting to document-DLQ under `dlq_granularity: document`: a
-    /// trailer count mismatch ([`FormatError::StructuralCount`]) or a
+    /// trailer count mismatch ([`FormatError::StructuralCount`]), a
     /// non-count structural failure of a multi-record document
-    /// ([`FormatError::StructuralValidation`]). Every other variant keeps
+    /// ([`FormatError::StructuralValidation`]), or an undeclared repeated
+    /// field a self-describing reader detected
+    /// ([`FormatError::UndeclaredRepeatedField`]). Every other variant keeps
     /// aborting the run.
     pub fn is_document_structural(&self) -> bool {
         matches!(
             self,
-            Self::StructuralCount { .. } | Self::StructuralValidation { .. }
+            Self::StructuralCount { .. }
+                | Self::StructuralValidation { .. }
+                | Self::UndeclaredRepeatedField { .. }
         )
     }
 
@@ -409,6 +449,39 @@ mod tests {
             column: "x".to_string(),
         };
         assert!(!e.is_document_structural());
+        assert!(!e.is_structural_count());
+    }
+
+    #[test]
+    fn undeclared_repeated_field_display_names_field_and_remedies() {
+        let e = FormatError::UndeclaredRepeatedField {
+            format: "XML",
+            field: "Tag".to_string(),
+        };
+        let msg = e.to_string();
+        assert!(msg.contains("XML"), "names the format: {msg}");
+        assert!(msg.contains("\"Tag\""), "names the field: {msg}");
+        assert!(
+            msg.contains("multiple: true"),
+            "points to the collect remedy: {msg}"
+        );
+        assert!(
+            msg.contains("split_to_rows"),
+            "points to the fan-out remedy: {msg}"
+        );
+    }
+
+    #[test]
+    fn undeclared_repeated_field_is_document_structural() {
+        // Routed to the document-level DLQ under `dlq_granularity: document`
+        // (dead-lettered, not fatal), mirroring the other reader-detected
+        // structural failures; it aborts loudly otherwise rather than dropping
+        // values silently. It is not a trailer count claim.
+        let e = FormatError::UndeclaredRepeatedField {
+            format: "JSON",
+            field: "a.b".to_string(),
+        };
+        assert!(e.is_document_structural());
         assert!(!e.is_structural_count());
     }
 }

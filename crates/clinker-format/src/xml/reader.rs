@@ -612,6 +612,11 @@ impl XmlReader {
     /// `Arc<Schema>` reflects exactly the keys present in that XML
     /// element — the per-Source `OnUnmapped` policy at the dispatch
     /// layer reconciles records against the user-declared schema.
+    ///
+    /// A child element that repeats is collected into a `Value::Array` only
+    /// when its column is declared `multiple: true`; a repeat on any other
+    /// column returns [`FormatError::UndeclaredRepeatedField`] rather than
+    /// silently keeping the first occurrence and dropping the rest.
     fn fields_to_record(&self, fields: Vec<(String, String)>) -> Result<Record, FormatError> {
         // Keyed by the boxed column name so the slot map costs exactly one
         // clone per distinct field, the same as the `HashSet` first-wins dedup
@@ -624,14 +629,21 @@ impl XmlReader {
         for (key, val) in fields {
             let value = infer_value(&val);
             match slot.get(key.as_str()) {
-                // A repeated key on a `multiple:` column accumulates in
-                // document order; on any other column the first occurrence
-                // wins, which is the long-standing duplicate-key collapse.
-                Some(&i) => {
-                    if let Value::Array(items) = &mut values[i] {
-                        items.push(value);
+                Some(&i) => match &mut values[i] {
+                    // A repeated key on a `multiple:` column accumulates in
+                    // document order.
+                    Value::Array(items) => items.push(value),
+                    // A repeated key on any other column would keep the first
+                    // value and silently drop this one. Refuse loudly instead:
+                    // an undeclared repeat is a data-loss hazard, not a
+                    // first-wins convenience.
+                    _ => {
+                        return Err(FormatError::UndeclaredRepeatedField {
+                            format: "XML",
+                            field: key,
+                        });
                     }
-                }
+                },
                 None => {
                     let multiple = self.is_multi_value(&key);
                     let name = key.into_boxed_str();
@@ -1994,21 +2006,64 @@ mod tests {
     }
 
     #[test]
-    fn xml_unmatched_repeated_keys_keep_first_value() {
-        // Repeated keys named by neither a fan-out nor a `multiple:` column
-        // keep the existing duplicate-key collapse: the first value wins, on
-        // every fanned-out record.
+    fn xml_undeclared_repeated_element_is_a_loud_error() {
+        // A child element that repeats while its column is named by neither a
+        // fan-out nor a `multiple:` declaration is refused loudly: keeping the
+        // first value and dropping the rest is silent data loss. `<Dup>`
+        // repeats here; `<Tag>` is fanned out so it never repeats per record.
         let xml = r#"<Root><Row><Dup>x</Dup><Dup>y</Dup><Tag>a</Tag><Tag>b</Tag></Row></Root>"#;
         let config = split_config("Root/Row", vec![split("Tag")]);
         let mut r = reader_from_str(xml, config);
-        let _s = r.schema().unwrap();
 
-        let r1 = r.next_record().unwrap().unwrap();
-        assert_eq!(r1.get("Dup"), Some(&Value::String("x".into())));
-        assert_eq!(r1.get("Tag"), Some(&Value::String("a".into())));
-        let r2 = r.next_record().unwrap().unwrap();
-        assert_eq!(r2.get("Dup"), Some(&Value::String("x".into())));
-        assert_eq!(r2.get("Tag"), Some(&Value::String("b".into())));
+        // Schema inference buffers the first element through the same record
+        // assembly, so the loud error surfaces there too — inference and
+        // assembly agree instead of the inference quietly deduping the column.
+        let err = r.schema().expect_err("undeclared repeat must fail loud");
+        assert!(
+            matches!(err, FormatError::UndeclaredRepeatedField { format: "XML", ref field } if field == "Dup"),
+            "names the offending field: {err:?}"
+        );
+        assert!(
+            err.is_document_structural(),
+            "dead-letterable, not fatal-only"
+        );
+    }
+
+    #[test]
+    fn xml_undeclared_repeat_without_any_fan_out_is_a_loud_error() {
+        // A bare reproduction: no fan-out at all, a plainly repeated
+        // element on a column that is not `multiple:`. The first
+        // `next_record` surfaces the loud error rather than a first-wins record.
+        let xml = r#"<Root><Row><Dup>x</Dup><Dup>y</Dup></Row></Root>"#;
+        let config = XmlReaderConfig {
+            record_path: Some("Root/Row".into()),
+            ..Default::default()
+        };
+        let mut r = reader_from_str(xml, config);
+        let err = r
+            .next_record()
+            .expect_err("undeclared repeat must fail loud");
+        assert!(
+            matches!(err, FormatError::UndeclaredRepeatedField { format: "XML", ref field } if field == "Dup"),
+            "names the offending field: {err:?}"
+        );
+    }
+
+    #[test]
+    fn xml_declared_multiple_repeat_still_collects() {
+        // The escape hatch: declaring the column `multiple: true` collects
+        // every occurrence into an array, in document order — no error.
+        let xml = r#"<Root><Row><Dup>x</Dup><Dup>y</Dup></Row></Root>"#;
+        let config = multi_value_config("Root/Row", &["Dup"]);
+        let mut r = reader_from_str(xml, config);
+        let rec = r.next_record().unwrap().unwrap();
+        assert_eq!(
+            rec.get("Dup"),
+            Some(&Value::Array(vec![
+                Value::String("x".into()),
+                Value::String("y".into()),
+            ]))
+        );
         assert!(r.next_record().unwrap().is_none());
     }
 

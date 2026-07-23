@@ -84,6 +84,22 @@ level, which removes the `orders.items` path the inner entry addresses — so th
 pairing is rejected at compile (`E358`) rather than silently fanning out only
 one level. A duplicated field is rejected too.
 
+## Flattened-name collisions
+
+The reader dissolves nested objects into dotted keys, so `{"a": {"b": 1}}`
+becomes the field `a.b`. When two distinct keys flatten to the **same** name —
+for example a nested `{"a": {"b": 1}}` alongside a literal `{"a.b": 2}` in the
+same record — only one value could survive, and keeping one while dropping the
+other is silent data loss. The reader refuses the record instead, naming the
+colliding field. This mirrors the XML reader's treatment of a repeated element:
+both formats now fail loud on an undeclared collision rather than one keeping the
+first value and the other the last. If the collision is intentional (both values
+belong together), declare the column `multiple: true` to collect them into an
+array in document order; otherwise rename one of the source keys so they no
+longer collide. As with XML, detection is per document at read time, so the run
+aborts under `fail_fast` and dead-letters the document under `continue` /
+`best_effort` with `dlq_granularity: document`.
+
 ## Bounding envelope retention: `max_index_bytes`
 
 When a source declares an `envelope:` and a pipeline reads `$doc.*` paths
