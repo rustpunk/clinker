@@ -1157,6 +1157,26 @@ pub fn output_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
                     consider(column);
                 }
             }
+            // Classifying a reachable SOURCE column by name is sound even though
+            // attribute-vs-element is a SINK-side property, because the only
+            // name transforms between source and this sink cannot change a
+            // column's attribute status. That status is a LEAF-only property —
+            // `column_maps_to_xml_attribute` reads `rsplit('.').next()`, the same
+            // last-segment rule the XML writer's `is_attribute_path` uses — and:
+            //   * `multi_value_columns` yields the EXPOSED `Column::name` (what
+            //     downstream CXL and the output see), not the physical
+            //     `source_name`, so a straight source→output path already carries
+            //     the sink-facing name, and a channel-patch `rename` writes the
+            //     new exposed name here too;
+            //   * `split_to_rows` fan-out projection lifts only the non-leaf
+            //     GROUP PREFIX (`Item.@tag` → `@tag`, `Item.tag` → `tag`), never
+            //     touching the leaf, so the leaf-based verdict is invariant under it;
+            //   * a CXL transform cannot manufacture or reference a leaf that
+            //     starts with the attribute prefix — `@` is not a legal CXL
+            //     identifier byte (it lexes to an error), so no `emit` can add or
+            //     strip an attribute prefix on a column's leaf.
+            // Hence a source-name classification never diverges from the name the
+            // writer sees at the sink for attribute purposes.
             if let Some(feeding) = reachability.get(header.name.as_str()) {
                 for source_name in feeding {
                     if let Some(columns) = multi_value_by_source.get(source_name.as_str()) {
