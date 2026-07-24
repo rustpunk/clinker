@@ -1,5 +1,7 @@
 # AI Onboarding: Performance Notes
 
+Verified against origin/main cf6609b9 (2026-07-24).
+
 Purpose: Preserve verified performance assumptions, benchmark entry points, and memory-model notes for future AI agents.
 
 Use the labels below carefully:
@@ -49,27 +51,27 @@ Primary source evidence used:
 4. **Avoid:** Do not widen `FieldStr`/`Value`, remove inline storage, make long shared clones deep-copy by default, or serialize the in-memory storage arm unless all memory/spill assumptions and record benchmarks are updated.
 5. **Benchmarks/tests available:** `cargo bench -p clinker-record --bench record_ops`; size/clone/serde tests in `clinker-record`.
 6. **Confidence:** High.
-7. **Evidence:** `Cargo.toml:45`; `crates/clinker-record/src/field_str.rs:1`, `:27`, `:111`, `:300`; `crates/clinker-record/src/value.rs:13`, `:36`, `:126`; `crates/clinker-record/benches/record_ops.rs:27`, `:88`, `:130`.
+7. **Evidence:** `Cargo.toml` (`smol_str` dependency comment); `crates/clinker-record/src/field_str.rs:1`, `:27`, `:111`, `:300`; `crates/clinker-record/src/value.rs:13`, `:36`, `:126`; `crates/clinker-record/benches/record_ops.rs:27`, `:88`, `:130`.
 
 ### Memory Arbitration, Node Buffers, And Spill
 
 1. **Area/module:** `clinker-exec::pipeline::memory`, `executor::node_buffer`, `pipeline::spill`.
 2. **Why performance-sensitive:** A single `MemoryArbitrator` governs spill/abort decisions across Aggregate, sort, grace-hash, sort-merge join, IEJoin, and inter-stage `node_buffers`. `should_spill` is the shared poll point.
-3. **Existing optimization choices:** Consumer bytes are mirrored through atomics; pause fast path is lock-free; consumer registry reads use `ArcSwap<Vec<_>>` snapshots; rare register/unregister operations clone-and-swap. Node buffers can be memory, spilled, or mixed, and spilled drains stream from disk. Spill files use a JSON schema header plus postcard frames, optional LZ4, document-context interning, and a max frame-size cap before allocation.
-4. **Avoid:** Do not add locks to arbitration hot reads, clone spill-backed buffers for fan-out, remove spill frame caps, or let each operator create its own independent memory budget.
+3. **Existing optimization choices:** Consumer bytes are mirrored through atomics; pause fast path is lock-free; consumer registry reads use `ArcSwap<Vec<_>>` snapshots; rare register/unregister operations clone-and-swap. Node buffers can be memory, spilled, or mixed, and spilled drains stream from disk; buffer drains are metered and admission is gated under pressure. Paused producers are un-paused by the resume controller once usage drops below the `resume_threshold` fraction of the limit (default `DEFAULT_RESUME_THRESHOLD` in `clinker-plan::config::utils`, configurable as `pipeline.memory.resume_threshold`). Spill files use a JSON schema header plus postcard frames, optional LZ4, document-context interning, and a max frame-size cap before allocation; one spill-disk-cap accounting path covers aggregate, sort, sort-merge, and grace-hash spill writers. Wide multi-run spill merges use a loser-tree with a bounded k-way fan-in, cascading into multiple passes instead of opening every run at once.
+4. **Avoid:** Do not add locks to arbitration hot reads, clone spill-backed buffers for fan-out, remove spill frame caps, let each operator create its own independent memory budget, or bypass the shared spill-disk-cap accounting when adding a new spill writer.
 5. **Benchmarks/tests available:** `cargo bench -p clinker-exec --bench arbitration_poll`, `arena`, `spill_compression`; spill/memory tests such as `memory_backpressure.rs`, `storage_spill_dir.rs`, `route_fanout_soft_spill.rs`, `post_aggregate_window_spilled.rs`.
 6. **Confidence:** High.
-7. **Evidence:** `crates/clinker-exec/src/pipeline/memory.rs:17`, `:293`, `:358`, `:708`; `crates/clinker-exec/benches/arbitration_poll.rs:1`, `:12`; `crates/clinker-exec/src/executor/node_buffer.rs:1`, `:34`, `:173`, `:263`; `crates/clinker-exec/src/pipeline/spill.rs:1`, `:27`, `:82`, `:152`.
+7. **Evidence:** `crates/clinker-exec/src/pipeline/memory.rs:17`, `:293`, `:358`, `:708`; `crates/clinker-exec/benches/arbitration_poll.rs:1`, `:12`; `crates/clinker-exec/src/executor/node_buffer.rs:1`, `:34`, `:173`, `:263`; `crates/clinker-exec/src/pipeline/spill.rs:1`, `:27`, `:82`, `:152`; `crates/clinker-exec/src/pipeline/loser_tree.rs`; `crates/clinker-exec/src/pipeline/spill_merge.rs`; `crates/clinker-exec/src/executor/util.rs` (resume threshold); `crates/clinker-exec/src/executor/tests/source_pause_liveness.rs`.
 
 ### Combine, Grace Hash, And IEJoin
 
 1. **Area/module:** `clinker-exec::pipeline::{combine,grace_hash,iejoin}` and `executor::combine_dispatch`.
 2. **Why performance-sensitive:** Combine materializes build-side records, hashes or range-joins against probe-side records, can spill, and has dedicated Criterion targets and test guards.
-3. **Existing optimization choices:** Build-side hash table is immutable after construction and index-separated; hash keys are canonicalized; probe accepts pre-extracted keys so callers can reuse a `Vec<Value>` buffer, documented as eliminating one per-row heap allocation at 100K driver rows. IEJoin implements the VLDB Union Arrays variant with coarse bit-array skipping to avoid nested-loop blow-up. Match-collect has a cap of 10,000 matches per driver.
+3. **Existing optimization choices:** Build-side hash table is immutable after construction and index-separated; hash keys are canonicalized; probe accepts pre-extracted keys so callers can reuse a `Vec<Value>` buffer, documented as eliminating one per-row heap allocation at 100K driver rows. IEJoin implements the VLDB Union Arrays variant with coarse bit-array skipping to avoid nested-loop blow-up, and the block-band variant (`pipeline/iejoin/block.rs`) bounds both the input and output axes so pure-range joins stay within the memory budget via spill-backed blocks. The external sort-merge join sorts each side with multi-run external sort and merges runs through the bounded loser-tree cascade. Match-collect has a cap of 10,000 matches per driver.
 4. **Avoid:** Do not replace IEJoin with nested loops, remove NULL short-circuits, allocate probe key vectors per driver row, skip full-key collision verification, or change collect caps without combine benches and tests.
 5. **Benchmarks/tests available:** `cargo bench -p clinker-exec --bench combine`, `combine_grace_hash`, `combine_iejoin`, `combine_nary_3input`; `crates/clinker-exec/tests/combine_test.rs` includes bench-scaffold and strategy/correctness gates.
 6. **Confidence:** High.
-7. **Evidence:** `crates/clinker-exec/src/pipeline/combine.rs:13`, `:44`, `:675`, `:715`; `crates/clinker-exec/src/pipeline/grace_hash/probe.rs:1`, `:59`, `:83`; `crates/clinker-exec/src/pipeline/iejoin.rs:1`, `:33`, `:69`, `:82`; `crates/clinker-exec/tests/combine_test.rs:44`, `:4531`.
+7. **Evidence:** `crates/clinker-exec/src/pipeline/combine.rs:13`, `:44`, `:675`, `:715`; `crates/clinker-exec/src/pipeline/grace_hash/probe.rs:1`, `:59`, `:83`; `crates/clinker-exec/src/pipeline/iejoin.rs:1`, `:33`, `:69`, `:82`; `crates/clinker-exec/src/pipeline/iejoin/block.rs`; `crates/clinker-exec/src/pipeline/sort_merge_join.rs`; `crates/clinker-exec/tests/combine_test.rs:44`, `:4531`.
 
 ### Hash Aggregation And Window Runtime
 
@@ -97,7 +99,7 @@ Primary source evidence used:
 
 1. **Area/module:** `clinker-format::{source,csv,json,xml,...}`, executor reader/writer registry.
 2. **Why performance-sensitive:** Format IO is on all pipeline edges. JSON/XML envelope paths can require multiple passes and document indexing.
-3. **Existing optimization choices:** `ReopenableSource` reopens paths without whole-file buffering; one-shot pathless readers are consumed lazily for one-pass formats and buffered only when a multi-pass reader needs it. CSV reuses `csv::StringRecord` and strips BOM via a wrapper. JSON arrays/NDJSON stream record-by-record; envelope pre-scan retains only declared `$doc.*` sections and caps retained index bytes.
+3. **Existing optimization choices:** `ReopenableSource` reopens paths without whole-file buffering; one-shot pathless readers are consumed lazily for one-pass formats and buffered only when a multi-pass reader needs it. CSV reuses `csv::StringRecord` and strips BOM via a wrapper. JSON arrays/NDJSON stream record-by-record; envelope pre-scan retains only declared `$doc.*` sections and caps retained index bytes. Writer hot paths across JSON, XML, CSV, and fixed-width were de-allocated to avoid per-record buffer churn — keep new writer code allocation-free per record where the sibling writers are.
 4. **Avoid:** Do not buffer file-backed inputs whole, collect JSON arrays into `Vec`, remove source-identity checks between passes, or make one-pass formats force `into_reopenable`.
 5. **Benchmarks/tests available:** `cargo bench -p clinker-format --bench io_throughput`; format pipeline benchmarks under `benches/pipelines/format/`; tests under `crates/clinker-format/tests/` and many executor format tests.
 6. **Confidence:** High for resource sensitivity; medium for exact hotness.
@@ -131,7 +133,7 @@ Primary source evidence used:
 4. **Avoid:** Do not introduce async into executor/REST paths without redesigning back-pressure, lock, and shutdown behavior.
 5. **Benchmarks/tests available:** REST tests under `crates/clinker-net/tests/`; executor streaming/back-pressure tests; `parallel` bench.
 6. **Confidence:** High.
-7. **Evidence:** `Cargo.toml:75`; `crates/clinker-exec/src/executor/mod.rs:283`; `crates/clinker-net/src/lib.rs:1`; `crates/clinker-net/src/rest.rs:1`, `:36`.
+7. **Evidence:** `Cargo.toml` (`tokio` workspace dependency); `crates/clinker-exec/src/executor/mod.rs:283`; `crates/clinker-net/src/lib.rs:1`; `crates/clinker-net/src/rest.rs:1`, `:36`.
 
 ### Profiling Hooks And Metrics
 
