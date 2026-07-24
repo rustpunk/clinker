@@ -113,8 +113,11 @@ field with an empty array emits **nothing** (no element, and no container even
 when one is configured); an empty-string value emits a self-closing item element
 (`<tags/>`).
 
-An array reaching an **attribute** field (`@tags` declared `multiple: true`) is
-rejected — an XML attribute holds a single value and cannot repeat.
+A `multiple:` column that maps to an **attribute** field (a column whose name
+maps to an XML attribute, e.g. `@tags`, declared `multiple: true`) is rejected at
+compile with [E359](../../explain/E359.md) — an XML attribute holds a single
+value and cannot repeat, and the writer emits repetition only as child elements.
+A runtime array reaching an attribute field is likewise rejected by the writer.
 
 To rename the elements, add a `join_values` entry — the same block the CSV writer
 reads, sharing the `field` key. The XML writer reads two keys from it and ignores
@@ -138,6 +141,13 @@ the CSV-only `delimiter` / `on_conflict` / `escape`:
   own element name.
 - **`wrap_in`** — a container element bracketing the repeated items. Omit it for
   bare repeats with no container.
+
+A **scalar** value on a field that carries a `join_values` entry is treated as a
+one-element sequence: it receives the same `repeat_as` / `wrap_in` naming an
+array of length one would, so the emitted shape does not depend on whether a lone
+value arrived wrapped (`[a]`) or bare (`a`) — mirroring how the reader normalizes
+a lone scalar into a one-element array. A field with no entry emits the plain
+`<field>value</field>` element.
 
 The two combine into the four arrangements, with no other key:
 
@@ -241,6 +251,13 @@ first:
 `<Tag>a</Tag><Tag>b</Tag>` yields `["a", "b"]`, and a single `<Tag>` still
 yields a one-element array. Declaring the flattened children of a repeated
 container (`Item.name`, `Item.qty`) collects each of them independently.
+
+An empty occurrence — an empty-body `<Tag></Tag>` or a self-closing `<Tag/>` — is
+a real array element, collected in position as a null:
+`<Tag>a</Tag><Tag></Tag><Tag>b</Tag>` yields `["a", null, "b"]` rather than
+squeezing the empty element out, so the array round-trips its per-item shape. (An
+empty text value reads as null, the same rule the reader applies elsewhere; the
+self-closing and empty-body forms behave identically.)
 
 A field cannot be both collected and fanned out: naming a `multiple: true`
 column in `split_to_rows` is rejected at compile (`E358`).

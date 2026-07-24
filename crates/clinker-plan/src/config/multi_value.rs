@@ -9,7 +9,10 @@
 //!   declare `multiple: true`.
 //! - **E359** — a `multiple: true` column reaching an output whose format has
 //!   no multi-value encoding, which would degrade or reject the value at the
-//!   sink instead of at compile.
+//!   sink instead of at compile. The `xml` writer encodes a `multiple:` column
+//!   as repeated child ELEMENTS, so a `multiple:` column that maps to an XML
+//!   attribute (its name starts with the `attribute_prefix`) is rejected here
+//!   too — an attribute holds a single value and cannot repeat.
 //! - **E361** — a `multiple: true` column on a source whose format has no way
 //!   to PRODUCE one, which would bind the column as an array and then hand
 //!   CXL a scalar.
@@ -27,10 +30,10 @@ use std::collections::{BTreeSet, HashMap};
 
 use clinker_format::{Column, OnConflict, SourceSchema, SplitToRowsMode, under_field_path};
 
-use crate::config::OutputConfig;
 use crate::config::format::{InputFormat, OutputFormat};
 use crate::config::pipeline_node::PipelineNode;
 use crate::config::source::SourceConfig;
+use crate::config::{OutputConfig, XmlOutputOptions};
 use crate::yaml::Spanned;
 
 /// Whether an output format can encode a `multiple: true` field.
@@ -62,6 +65,27 @@ fn output_encodes_multi_value(format: &OutputFormat) -> bool {
         | OutputFormat::Hl7(_)
         | OutputFormat::Swift(_) => false,
     }
+}
+
+/// The `attribute_prefix` an XML output resolves to: the declared value, or the
+/// writer default `@` when unset — matching `build_xml_writer_config`, so the
+/// plan-time attribute classification and the runtime writer agree.
+fn xml_output_attribute_prefix(opts: Option<&XmlOutputOptions>) -> String {
+    opts.and_then(|o| o.attribute_prefix.clone())
+        .unwrap_or_else(|| "@".to_string())
+}
+
+/// Whether a flattened column name maps to an XML attribute rather than a child
+/// element: its last dotted segment starts with `attribute_prefix`. Mirrors the
+/// XML writer's classification (a top-level `@id` on the record element, a
+/// nested `Address.@type` on the `<Address>` branch). An empty prefix disables
+/// attribute classification, so no column is an attribute — matching the writer.
+fn column_maps_to_xml_attribute(column: &str, attribute_prefix: &str) -> bool {
+    if attribute_prefix.is_empty() {
+        return false;
+    }
+    let last_segment = column.rsplit('.').next().unwrap_or(column);
+    last_segment.starts_with(attribute_prefix)
 }
 
 /// How an input format can carry a column declared `multiple: true`.
@@ -942,8 +966,14 @@ fn validate_join_declarations(output: &OutputConfig) -> Vec<DeclarationFault> {
         }
     }
     // The delimiter / escape shape checks below are the CSV writer's; the XML
-    // writer ignores delimiter / on_conflict / escape, so an XML entry's
-    // defaulted values are not faults.
+    // writer ignores delimiter / on_conflict / escape. Unlike `repeat_as` /
+    // `wrap_in` — faulted on a CSV output above because they are `Option`, so an
+    // explicit value is distinguishable from the default — `delimiter` and
+    // `escape` are defaulted `String`s (default `;` and `\`), so a set value
+    // cannot be told from the default. A CSV-only shape knob on an XML entry is
+    // therefore left inert rather than faulted: the alternative would be a
+    // non-default heuristic that the module's Option-based detectability rule
+    // deliberately avoids, and it would fault `delimiter` and `escape` alike.
     if !matches!(output.format, OutputFormat::Csv(_)) {
         return faults;
     }
@@ -1103,6 +1133,58 @@ pub fn output_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
                 message: fault.message,
                 help: fault.help,
             });
+        }
+        // E359 (XML attribute variant): the XML writer encodes a `multiple:`
+        // column as repeated child ELEMENTS, never as an attribute — an XML
+        // attribute holds one value and cannot repeat. `output_encodes_multi_value`
+        // answers `true` for `xml` (it encodes via elements), so without this a
+        // `multiple:` column whose name maps to an attribute (its last dotted
+        // segment starts with the output's `attribute_prefix`) would compile
+        // clean and then abort at write on every record with a non-dead-letterable
+        // error. Catch it here instead.
+        if let OutputFormat::Xml(opts) = &output.format {
+            let prefix = xml_output_attribute_prefix(opts.as_ref());
+            let mut attr_cols: Vec<String> = Vec::new();
+            let mut consider = |column: &str| {
+                if column_maps_to_xml_attribute(column, &prefix)
+                    && !attr_cols.iter().any(|c| c == column)
+                {
+                    attr_cols.push(column.to_string());
+                }
+            };
+            if let Some(declared) = output.schema.as_ref().map(multi_value_columns) {
+                for column in &declared {
+                    consider(column);
+                }
+            }
+            if let Some(feeding) = reachability.get(header.name.as_str()) {
+                for source_name in feeding {
+                    if let Some(columns) = multi_value_by_source.get(source_name.as_str()) {
+                        for column in columns {
+                            consider(column);
+                        }
+                    }
+                }
+            }
+            if !attr_cols.is_empty() {
+                faults.push(NodeFault {
+                    node_index,
+                    code: "E359",
+                    message: format!(
+                        "output '{out}': the multi-value column(s) {columns} (`multiple: true`) \
+                         map to XML attribute(s) — the name's last segment starts with the \
+                         attribute prefix '{prefix}' — and the XML writer encodes a `multiple:` \
+                         field as repeated child elements, which an attribute cannot hold",
+                        out = header.name,
+                        columns = quoted_list(&attr_cols),
+                    ),
+                    help: format!(
+                        "emit the repeating field as a child element by removing the '{prefix}' \
+                         attribute prefix from the column name, or collapse it to a single value \
+                         in a transform before the sink"
+                    ),
+                });
+            }
         }
         if output_encodes_multi_value(&output.format) {
             continue;

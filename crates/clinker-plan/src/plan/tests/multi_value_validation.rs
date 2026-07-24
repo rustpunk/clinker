@@ -268,6 +268,41 @@ fn multi_value_column_into_a_non_encoding_output_is_rejected_with_a_span() {
 }
 
 #[test]
+fn multi_value_column_mapping_to_an_xml_attribute_is_rejected() {
+    // XML encodes a `multiple:` column as repeated child ELEMENTS. A column whose
+    // name maps to an XML attribute (its last dotted segment starts with the
+    // attribute prefix `@`) cannot repeat, so — unlike an element-mapped
+    // `multiple:` column, which XML encodes fine — it must be caught at plan time
+    // (E359) rather than aborting at write for every record.
+    let yaml = pipeline(
+        r#"      schema:
+        - { name: "@tags", type: string, multiple: true }"#,
+        "xml",
+    );
+    let found = coded(&compile_err(&yaml), "E359");
+    assert_eq!(found.len(), 1, "expected one E359: {found:?}");
+    assert!(
+        found[0].0.contains("@tags") && found[0].0.contains("attribute"),
+        "{}",
+        found[0].0
+    );
+    assert!(found[0].1, "E359 must carry a source span");
+}
+
+#[test]
+fn multi_value_column_mapping_to_an_xml_element_still_compiles() {
+    // The complement of the attribute rejection: an element-mapped `multiple:`
+    // column (no attribute prefix) is exactly what XML encodes as repeated child
+    // elements, so it must NOT be faulted.
+    let yaml = pipeline(
+        r#"      schema:
+        - { name: tags, type: string, multiple: true }"#,
+        "xml",
+    );
+    compile_ok(&yaml);
+}
+
+#[test]
 fn empty_split_values_delimiter_is_rejected() {
     let yaml = pipeline(
         r#"      split_values:
@@ -1221,14 +1256,20 @@ fn join_values_repeat_and_wrap_on_an_xml_output_compiles() {
 #[test]
 fn join_values_csv_shape_knobs_on_an_xml_output_are_not_faults() {
     // The delimiter / escape shape checks are the CSV writer's alone; the XML
-    // writer ignores them, so a multi-character delimiter that E362 would reject
-    // on a CSV output is simply inert on an XML output.
-    let yaml = join_pipeline(
-        "xml",
-        r#"      join_values:
-        - { field: tags, delimiter: "::" }"#,
-    );
-    compile_ok(&yaml);
+    // writer ignores them, so a multi-character delimiter — and an `escape`,
+    // which is a defaulted `String` like `delimiter` and cannot be told set from
+    // unset — that E362 would constrain on a CSV output is simply inert on an XML
+    // output. (`escape` is NOT an `Option`, so there is no clean way to fault a
+    // set-vs-defaulted escape; the asymmetry with the Option-typed `repeat_as` /
+    // `wrap_in` is intentional, not an oversight.)
+    for knob in [
+        r#"{ field: tags, delimiter: "::" }"#,
+        r#"{ field: tags, escape: "|" }"#,
+        r#"{ field: tags, delimiter: "::", escape: "|" }"#,
+    ] {
+        let yaml = join_pipeline("xml", &format!("      join_values:\n        - {knob}"));
+        compile_ok(&yaml);
+    }
 }
 
 #[test]

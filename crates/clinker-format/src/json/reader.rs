@@ -22,6 +22,7 @@
 //! small `ReopenableSource::Buffered` — the honest one-shot fallback, bounded
 //! because such inputs are small by construction.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read};
 use std::sync::Arc;
 
@@ -115,6 +116,20 @@ enum InnerReader {
     Array(JsonArrayStream),
     /// Exhausted (empty document).
     Done,
+}
+
+/// Collision-tracking state threaded through [`JsonReader::flatten_value`] for a
+/// single record.
+///
+/// `undeclared` collects flattened-name collisions on columns NOT declared
+/// `multiple:`, which the caller turns into a loud `UndeclaredRepeatedField`.
+/// `accumulated` records which `multiple:` keys have already been promoted to an
+/// occurrence-accumulator array; it is what lets the collector tell a slot that
+/// is accumulating several occurrences apart from a single first occurrence that
+/// is itself array-valued, so each distinct occurrence stays one element.
+struct CollisionSink<'a> {
+    undeclared: &'a mut Vec<String>,
+    accumulated: &'a mut HashSet<String>,
 }
 
 impl JsonReader {
@@ -284,7 +299,7 @@ impl JsonReader {
         value: &serde_json::Value,
         out: &mut serde_json::Map<String, serde_json::Value>,
         depth: usize,
-        mut collisions: Option<&mut Vec<String>>,
+        mut collisions: Option<&mut CollisionSink<'_>>,
         multi_value: &[String],
     ) {
         const MAX_DEPTH: usize = 64;
@@ -316,19 +331,34 @@ impl JsonReader {
             other => match collisions {
                 Some(sink) if out.contains_key(prefix) => {
                     if multi_value.iter().any(|f| f.as_str() == prefix) {
-                        // Declared `multiple:` — collect in document order.
-                        match out.get_mut(prefix).expect("contains_key just held") {
-                            serde_json::Value::Array(items) => items.push(other.clone()),
-                            slot => {
-                                let first = slot.take();
-                                *slot = serde_json::Value::Array(vec![first, other.clone()]);
+                        // Declared `multiple:` — collect one element per
+                        // occurrence, in document order. `accumulated` tells a
+                        // slot already holding several collected occurrences
+                        // apart from a single first occurrence that is itself
+                        // array-valued, so only a true accumulator is extended:
+                        // `{"a":{"b":[1,2]},"a.b":3}` collects `[[1,2], 3]`, not
+                        // the boundary-erasing `[1,2,3]`.
+                        let slot = out.get_mut(prefix).expect("contains_key just held");
+                        if sink.accumulated.contains(prefix) {
+                            match slot {
+                                serde_json::Value::Array(items) => items.push(other.clone()),
+                                // An accumulated key is always array-valued; wrap
+                                // rather than panic if that invariant ever breaks.
+                                lone => {
+                                    let first = lone.take();
+                                    *lone = serde_json::Value::Array(vec![first, other.clone()]);
+                                }
                             }
+                        } else {
+                            let first = slot.take();
+                            *slot = serde_json::Value::Array(vec![first, other.clone()]);
+                            sink.accumulated.insert(prefix.to_string());
                         }
                     } else {
                         // Undeclared flattened-name collision — the caller
                         // turns this into a loud error. The overwrite is
                         // immaterial because the record is never kept.
-                        sink.push(prefix.to_string());
+                        sink.undeclared.push(prefix.to_string());
                         out.insert(prefix.to_string(), other.clone());
                     }
                 }
@@ -348,16 +378,21 @@ impl JsonReader {
         raw: &serde_json::Value,
     ) -> Result<serde_json::Map<String, serde_json::Value>, FormatError> {
         let mut flat = serde_json::Map::new();
-        let mut collisions: Vec<String> = Vec::new();
+        let mut undeclared: Vec<String> = Vec::new();
+        let mut accumulated: HashSet<String> = HashSet::new();
+        let mut sink = CollisionSink {
+            undeclared: &mut undeclared,
+            accumulated: &mut accumulated,
+        };
         Self::flatten_value(
             "",
             raw,
             &mut flat,
             0,
-            Some(&mut collisions),
+            Some(&mut sink),
             &self.config.multi_value_fields,
         );
-        if let Some(field) = collisions.into_iter().next() {
+        if let Some(field) = undeclared.into_iter().next() {
             return Err(FormatError::UndeclaredRepeatedField {
                 format: "JSON",
                 field,
@@ -751,9 +786,9 @@ fn project_element(
             // still resolves last-wins rather than raising
             // `UndeclaredRepeatedField`. That element-internal / element-vs-parent
             // collision under `extract` is the fan-out half of the read-side
-            // collision gap and is tracked separately by issue #920 — the
-            // top-level record collision this module now rejects does not cover
-            // it.
+            // collision gap, tracked at
+            // https://github.com/rustpunk/clinker/issues/920 — the top-level
+            // record collision this module now rejects does not cover it.
             JsonReader::flatten_value("", elem, out, 0, None, &[]);
         }
         (SplitToRowsMode::Extract, other) => {
@@ -767,8 +802,9 @@ fn project_element(
         (SplitToRowsMode::Split, _) => {
             // Split mode re-nests the element under its own field name, so a
             // clash with a parent field is possible but a within-element clash
-            // is not; collision detection stays off for the same #920 reason as
-            // the extract arm above.
+            // is not; collision detection stays off for the same reason as the
+            // extract arm above — the element-internal collision gap tracked at
+            // https://github.com/rustpunk/clinker/issues/920.
             JsonReader::flatten_value(&entry.field, elem, out, 0, None, &[]);
         }
     }
@@ -1467,6 +1503,28 @@ mod tests {
         assert_eq!(
             r.next_record().unwrap().unwrap().get("a.b"),
             Some(&Value::Array(vec![Value::Integer(1), Value::Integer(2)]))
+        );
+    }
+
+    #[test]
+    fn multiple_column_collision_keeps_each_occurrence_a_distinct_element() {
+        // The first occurrence is itself array-valued (`a.b == [1,2]` from the
+        // nested object) and the second is a scalar (`a.b == 3`). Each distinct
+        // occurrence must be one element, so the array-valued first occurrence
+        // is wrapped rather than extended into: `[[1,2], 3]`, never `[1,2,3]`.
+        let input = r#"[{"a":{"b":[1,2]},"a.b":3}]"#;
+        let config = JsonReaderConfig {
+            multi_value_fields: vec!["a.b".into()],
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
+        let _s = r.schema().unwrap();
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("a.b"),
+            Some(&Value::Array(vec![
+                Value::Array(vec![Value::Integer(1), Value::Integer(2)]),
+                Value::Integer(3),
+            ]))
         );
     }
 

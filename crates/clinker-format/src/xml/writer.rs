@@ -976,6 +976,19 @@ fn fill_slot(
     slot.part_count = 0;
     match val {
         Value::Array(items) if !is_attr => {
+            // BACKSTOP GAP: this treats ANY top-level array at an element field
+            // as a `multiple:` field and emits repeated elements, because the
+            // writer is not given the declared-`multiple:` column set — its
+            // config carries only the `join_values` override subset, not every
+            // declared-multiple field. A misrouted runtime array on a column
+            // that is NOT declared `multiple:` (e.g. a stray `match: collect`
+            // result) is therefore emitted as repeats rather than failing loud
+            // with `UnserializableArrayValue`. A NESTED array (array-inside-a-
+            // field) is still caught by `write_value_text` in `fill_parts`;
+            // only the top-level non-multiple case slips through. Restoring the
+            // loud backstop needs the plan to thread the declared-multiple set
+            // into `XmlWriterConfig` — the same missing plumbing the CSV writer
+            // has at https://github.com/rustpunk/clinker/issues/853.
             slot.is_array = true;
             slot.text.clear();
             fill_parts(slot, name, items)?;
@@ -1044,6 +1057,18 @@ fn emit_body<W: Write>(
                     continue;
                 }
                 let text = fill.text(*field);
+                // A scalar on a field carrying a `repeat_as` / `wrap_in` override
+                // is a one-element sequence: apply the same naming an array of
+                // length one would get, so the emitted shape does not depend on
+                // whether a lone value arrived wrapped (`[x]`) or bare (`x`) —
+                // symmetric with the reader normalizing a lone scalar to a
+                // one-element array. A field with no override (`repeat` is
+                // `None`) keeps the plain `<name>text</name>` rendering.
+                if repeat.is_some() {
+                    let one = [text.to_owned()];
+                    emit_repeated_leaf(writer, name, repeat, &one)?;
+                    continue;
+                }
                 if text.is_empty() {
                     writer
                         .write_event(Event::Empty(BytesStart::new(name.as_str())))
@@ -1529,6 +1554,36 @@ mod tests {
             output,
             "<Root><Record><id>7</id><Tags><Tag>a</Tag><Tag>b</Tag></Tags></Record></Root>"
         );
+    }
+
+    /// A SCALAR value on a field carrying `repeat_as` / `wrap_in` is treated as
+    /// a one-element sequence and gets the same container/item naming an array of
+    /// length one would — so the output shape does not depend on whether a lone
+    /// value arrived bare (`a`) or wrapped (`[a]`).
+    #[test]
+    fn test_xml_write_multi_value_scalar_applies_repeat_and_wrap() {
+        let schema = Arc::new(Schema::new(vec!["id".into(), "tags".into()]));
+        let scalar = Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(7), Value::String("a".into())],
+        );
+        let scalar_out = write_records(
+            xml_join_config("tags", Some("Tag"), Some("Tags")),
+            &[scalar],
+            &schema,
+        );
+        assert_eq!(
+            scalar_out,
+            "<Root><Record><id>7</id><Tags><Tag>a</Tag></Tags></Record></Root>"
+        );
+        // Byte-identical to the same lone value delivered as a one-element array.
+        let array = record_with_tags(&schema, 7, vec![Value::String("a".into())]);
+        let array_out = write_records(
+            xml_join_config("tags", Some("Tag"), Some("Tags")),
+            &[array],
+            &schema,
+        );
+        assert_eq!(scalar_out, array_out);
     }
 
     /// An illegal `repeat_as` / `wrap_in` name fails the write with
