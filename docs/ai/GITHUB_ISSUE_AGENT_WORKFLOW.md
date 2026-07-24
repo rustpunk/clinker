@@ -1,5 +1,7 @@
 # GitHub Issue Agent Workflow
 
+Verified against origin/main cf6609b9 (2026-07-24).
+
 Purpose: Define the entry point and routing rules for GitHub-issue-driven
 agent work in this repository.
 
@@ -27,6 +29,8 @@ Read only the workflow slice that matches the work:
   [github-workflow/REVIEW.md](github-workflow/REVIEW.md)
 - Labels, project status, sizing, WIP limits, and failure controls:
   [github-workflow/OPERATIONS.md](github-workflow/OPERATIONS.md)
+- Milestone-level coordination across queueing, dispatch, review, and closeout:
+  [github-workflow/ORCHESTRATION.md](github-workflow/ORCHESTRATION.md)
 
 An implementation agent usually needs this file,
 [github-workflow/IMPLEMENTATION.md](github-workflow/IMPLEMENTATION.md), and
@@ -51,7 +55,7 @@ Agent Task issue
   -> one autonomous implementation packet
 
 Pull Request
-  -> evidence that the Agent Task is complete
+  -> evidence that its linked Agent Tasks are complete
 ```
 
 Agents own bounded work packets through implementation, verification, and PR
@@ -70,7 +74,8 @@ explicitly instructs otherwise.
   compatibility choice is unresolved.
 - **Agent Task:** implementation-ready work packet with one outcome, clear
   boundaries, observable acceptance criteria, and verification commands.
-- **Pull Request:** proposed evidence that one Agent Task is complete.
+- **Pull Request:** proposed evidence that its linked Agent Tasks are
+  complete.
 
 ## Routing Rules
 
@@ -85,8 +90,10 @@ explicitly instructs otherwise.
   issues are not agent-ready.
 - Add workflow-relevant issues and PRs to the active GitHub Project, defaulting
   new items to `Intake` until routed.
-- One Agent Task should normally produce one PR.
-- One PR should normally close one Agent Task.
+- A PR closes a coherent group of Agent Tasks — grouped by shared subsystem,
+  dependency chain, or review context; a single-task PR is the degenerate case
+  when no coherent grouping exists.
+- Never split one Agent Task across multiple PRs.
 - Agents must not merge PRs by default; leave PRs for maintainer review and
   merge unless a maintainer explicitly instructs otherwise.
 

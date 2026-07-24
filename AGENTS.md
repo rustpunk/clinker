@@ -53,10 +53,10 @@ bench, socket, and file-descriptor caveats.
 
 ## Safety Rules
 
-- Do not modify Rust source unless the user explicitly asks.
+- During documentation-only tasks, do not modify Rust source.
 - Do not revert or overwrite user changes. Check `git status --short` before editing.
 - Keep edits scoped. Avoid unrelated refactors, destructive commands, and metadata churn.
-- Never push.
+- Never push to main directly; push only feature branches created for an explicitly requested task.
 - If a term, architecture rule, or behavior is unclear, record it in [docs/ai/80_OPEN_QUESTIONS.md](docs/ai/80_OPEN_QUESTIONS.md) instead of guessing.
 
 ## Rust Conventions
@@ -93,8 +93,8 @@ Agent workflow policy:
 - Agents may implement only scoped Agent Task issues marked `agent-ready`.
 - Route vague, stale, broad, or under-specified work through a Readiness Review.
 - Route unresolved product, architecture, dependency, public API, schema, auth, security, memory, or compatibility choices through a Decision Gate.
-- One Agent Task should normally produce one PR, and one PR should close one Agent Task.
-- Agents must not merge PRs by default; leave PRs for maintainer review and merge unless a maintainer explicitly instructs otherwise.
+- A PR closes a coherent group of Agent Tasks — grouped by shared subsystem, dependency chain, or review context; a single-task PR is the degenerate case when no coherent grouping exists. Never split one Agent Task across multiple PRs.
+- Agents must not merge PRs by default; leave PRs for maintainer review and merge unless a maintainer explicitly instructs otherwise. A maintainer-approved delivery plan that specifies merge-on-green for a set of PRs counts as explicit instruction for those PRs.
 
 ## Definition Of Done
 
