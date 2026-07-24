@@ -1,5 +1,7 @@
 # AI Onboarding: Architecture
 
+Verified against origin/main cf6609b9 (2026-07-24).
+
 Purpose: Give a senior Rust engineer or AI coding agent a practical, source-backed architecture overview before changing Clinker.
 
 ## Source Evidence
@@ -17,11 +19,11 @@ Primary evidence used for this pass:
 
 Verified facts:
 
-- Clinker is a Rust workspace with 13 active members. The main executable is `crates/clinker`; the standalone CXL tool is `crates/cxl-cli`; lower layers are split into records, CXL, format, planning, execution, channel, network, schema, and benchmark support crates.
+- Clinker is a Rust workspace with 14 active members. The main executable is `crates/clinker`; the standalone CXL tool is `crates/cxl-cli`; lower layers are split into records, CXL, format, planning, execution, channel, network, schema, lineage, and benchmark support crates.
 - Pipelines are YAML documents using a unified top-level `nodes:` list. `PipelineConfig` has `nodes: Vec<Spanned<PipelineNode>>`, and comments say legacy top-level `inputs:` / `outputs:` / `transformations:` are rejected by serde.
 - The executable workload is finite batch-style pipeline execution. `RecordSource::next_record` is explicitly finite by contract, `clinker-net` describes REST as a finite-pull source with `max_pages` / `max_records`, and `PipelineExecutor` says no async runtime is required.
 - CXL is the per-record expression language layer. The `cxl` crate exposes parser, resolver, typechecker, analyzer, aggregate extraction, and evaluator modules; plan and exec compile and evaluate CXL-bearing nodes.
-- Clinker is not currently an editor application in this repository. Tooling-facing surfaces appear to be data/API outputs such as `ExplainFormat::Json`, `CompiledPlan::provenance`, `CompiledPlan::typed_output_row`, and `clinker-schema`.
+- Clinker is not currently an editor application in this repository. Tooling-facing surfaces appear to be data/API outputs such as `ExplainFormat::Json`, `CompiledPlan::provenance`, `CompiledPlan::bound_schemas`, OpenLineage NDJSON from `clinker-lineage`, and `clinker-schema`.
 
 Current description:
 
@@ -39,7 +41,8 @@ Verified facts:
 - **Network source layer:** `clinker-net` currently exposes `build_rest_source`, adapting REST pages into `Box<dyn clinker_exec::source::RecordSource>`.
 - **Channel/deployment layer:** `clinker-channel` owns channel binding, overlays, dotted paths, and source staging copies. Channels override declared config/resources only.
 - **Schema workspace layer:** `clinker-schema` parses `.schema.yaml`, discovers schema files, builds `SchemaIndex`, and validates pipeline schema references.
-- **CLI layer:** `crates/clinker/src/main.rs` exposes `run`, `metrics`, and `explain` commands through Clap and calls into plan/exec/channel/net/format code.
+- **Lineage layer:** `clinker-lineage` walks a `CompiledPlan` to compute OpenLineage column-level lineage (DIRECT value derivation plus dataset-level INDIRECT influence, traced through composition bodies) and emits run events as NDJSON. Wired to the CLI as `run --lineage` (plan-derived, no data processing) and `run --lineage-events` (live run lifecycle).
+- **CLI layer:** `crates/clinker/src/main.rs` exposes `run`, `metrics`, `explain`, `channels`, `refactor`, and `config` commands through Clap and calls into plan/exec/channel/net/format/lineage code.
 - **Benchmark/test layer:** `clinker-bench-support` and `clinker-benchmarks` own generators, cached data, benchmark runners, and optional allocation instrumentation.
 
 ## Data Flow
@@ -89,7 +92,7 @@ Verified API surfaces future agents should recognize:
 
 - `clinker_plan::config::PipelineConfig::{compile, compile_with_diagnostics, compile_topology_only, source_configs, output_configs}`.
 - `clinker_plan::config::{load_config, load_config_with_vars}` and `clinker_plan::yaml::{from_str, to_string, Spanned, CxlSource}`.
-- `clinker_plan::plan::CompiledPlan::{dag, config, artifacts, body_of, typed_output_row, provenance, provenance_mut, channel_identity, pipeline_hash}`.
+- `clinker_plan::plan::CompiledPlan::{dag, config, composition_bodies, statistics, body_of, provenance, provenance_mut, channel_identity, pipeline_hash, bound_schemas, schema_provenance}`.
 - `clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, PlanEdge, NodeExecutionReqs}`.
 - `clinker_exec::executor::{PipelineExecutor, PipelineRunParams, ExecutionReport, WriterRegistry, SourceReaders, SourceInput, RecordSource, single_file_reader}`.
 - `clinker_exec::source::{RecordSource, SourceInput}` for non-file source integration.
@@ -98,7 +101,8 @@ Verified API surfaces future agents should recognize:
 - `clinker_channel::{resolve, OverlayResolution, resolve_channel_overlay, scan_channels, scan_groups, DottedPath, ChannelManifest, OverlayFile, Group, ChannelOverlayResult, SourceStager}`.
 - `clinker_net::build_rest_source`.
 - `clinker_schema::{parse_schema, parse_schema_file, build_workspace_schema_index, validate_pipeline}`.
-- CLI commands in `crates/clinker/src/main.rs`: `run`, `metrics collect`, and `explain`.
+- `clinker_lineage::{column_lineage, dataset_identity, run_events, LiveRunEmitter, write_ndjson}`.
+- CLI commands in `crates/clinker/src/main.rs`: `run`, `metrics collect`, `explain`, `channels`, `refactor`, and `config`.
 
 ## Ownership And Lifetime Patterns
 
@@ -122,7 +126,7 @@ Verified facts:
 - CPU-heavy kernels such as sort, grace-hash, IEJoin, and sort-merge run under one run-scoped Rayon `ThreadPool`, sized by `pipeline.concurrency.threads` when configured.
 - Streaming output and some streaming producer/consumer paths use bounded crossbeam channels plus `std::thread::JoinHandle`s.
 - Shutdown uses per-run `ShutdownToken` values backed by `Arc<AtomicBool>`. A process-wide `ctrlc` handler broadcasts to registered live tokens through a `Weak` registry.
-- Memory arbitration is concurrent but centralized. Registered consumers expose usage/pause/spill hooks; operators poll `should_spill` / `should_abort` at chunk boundaries.
+- Memory arbitration is concurrent but centralized. Registered consumers expose usage/pause/spill hooks; operators poll `should_spill` / `should_abort` at chunk boundaries, and the resume controller un-pauses paused producers once usage falls back below the configured `resume_threshold` fraction of the budget.
 
 Current guidance:
 
@@ -210,4 +214,4 @@ These are supported by current code structure or source comments:
 
 ## Open Question Routing
 
-Current unresolved architecture questions are tracked in `docs/ai/80_OPEN_QUESTIONS.md`. In particular, check that registry before changing layering around `clinker-format`, `clinker-net`, plan reuse in `PipelineExecutor`, async/Tokio usage, or the non-workspace `reserve/` package.
+Current unresolved architecture questions are tracked in `docs/ai/80_OPEN_QUESTIONS.md`. In particular, check that registry before changing layering around `clinker-format`, `clinker-net`, plan reuse in `PipelineExecutor`, or async/Tokio usage.

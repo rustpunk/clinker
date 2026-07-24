@@ -1,5 +1,7 @@
 # Crate-Level AGENTS.md Inventory
 
+Verified against origin/main cf6609b9 (2026-07-24).
+
 Purpose: Track the current crate-level `AGENTS.md` coverage, guidance
 ownership, and remaining local-agent-doc gaps.
 
@@ -24,6 +26,7 @@ Every current workspace crate has a crate-level `AGENTS.md` file:
 | `clinker-net` | `crates/clinker-net/AGENTS.md` | Finite REST transport, `RecordSource` adaptation, blocking HTTP, source error handling |
 | `clinker` | `crates/clinker/AGENTS.md` | CLI orchestration, diagnostics, exit codes, output promotion, metrics, channels, sources |
 | `clinker-schema` | `crates/clinker-schema/AGENTS.md` | `.schema.yaml` parsing, discovery, advisory validation, planner boundary uncertainty |
+| `clinker-lineage` | `crates/clinker-lineage/AGENTS.md` | OpenLineage column-level lineage emission from compiled plans: DAG-derived DIRECT/INDIRECT facets, dataset naming, NDJSON file transport |
 | `clinker-bench-support` | `crates/clinker-bench-support/AGENTS.md` | Deterministic generated data, benchmark discovery/cache, feature-gated allocation accounting |
 | `clinker-benchmarks` | `crates/clinker-benchmarks/AGENTS.md` | End-to-end benchmark harness, report output, feature-gated large benchmarks |
 
@@ -67,8 +70,6 @@ include:
   `clinker-plan`.
 - Whether `clinker-format -> cxl` is permanent layering or transitional
   coupling.
-- Whether `clinker-net` manifest wording around SQL cursors is roadmap text or
-  should be removed until implementation exists.
 - Which public planner/CXL APIs are stable user-facing API versus exposed
   internal surface.
 

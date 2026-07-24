@@ -1,10 +1,12 @@
 # AI Onboarding: Crate Map
 
+Verified against origin/main cf6609b9 (2026-07-24).
+
 Purpose: Give future AI agents a factual map of the current Cargo workspace, with dependency direction, crate roles, and evidence anchors for safe code changes.
 
 ## Workspace Overview
 
-The root workspace has 14 members: `clinker-record`, `cxl`, `cxl-cli`, `clinker-format`, `clinker-core-types`, `clinker-plan`, `clinker-exec`, `clinker-net`, `clinker-channel`, `clinker`, `clinker-schema`, `clinker-lineage`, `clinker-bench-support`, and `clinker-benchmarks` (`Cargo.toml`). `reserve/` is a separate non-member Cargo package named `clinker` with its own `[workspace]` table; `reserve/src/lib.rs` identifies it as a crates.io name-reservation placeholder, not runtime code.
+The root workspace has 14 members: `clinker-record`, `cxl`, `cxl-cli`, `clinker-format`, `clinker-core-types`, `clinker-plan`, `clinker-exec`, `clinker-net`, `clinker-channel`, `clinker`, `clinker-schema`, `clinker-lineage`, `clinker-bench-support`, and `clinker-benchmarks` (`Cargo.toml`). A separate non-member Cargo package named `clinker` (a crates.io name-reservation placeholder, directory `reserve/`) is maintained outside the tracked tree — it is untracked, absent from fresh clones, and nothing in the workspace depends on it.
 
 No Cargo `examples` targets were found. The repository does contain YAML pipeline examples and fixtures under `examples/pipelines/` plus benchmark pipeline configs under `benches/pipelines/`.
 
@@ -56,7 +58,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Path: `crates/clinker-record`
 - Role: Library crate plus `record_ops` Criterion bench.
 - Purpose: Defines Clinker's core in-memory data model: `Value`, `Record`, `Schema`, field strings, coercion, grouping keys, provenance, document context, storage traits, pipeline counters, and aggregate accumulator state.
-- Important public modules: `accumulator`, `coercion`, `counters`, `document_context`, `field_str`, `group_key`, `minimal`, `provenance`, `record`, `record_view`, `resolver`, `schema`, `schema_def`, `storage`, `value`.
+- Important public modules: `accumulator`, `coercion`, `counters`, `decimal_serde`, `document_context`, `field_str`, `group_key`, `minimal`, `provenance`, `record`, `record_view`, `resolver`, `schema`, `schema_def`, `storage`, `value`.
 - Internal dependencies: none for normal build; dev-depends on `clinker-bench-support`.
 - Architecturally important external dependencies: `serde`, `serde_json`, `chrono`, `ahash`, `indexmap`, `smol_str`; `postcard` and `criterion` for dev/bench.
 - Known tests/examples/benches: unit tests across module files; `crates/clinker-record/src/accumulator/tests.rs`; `crates/clinker-record/benches/record_ops.rs`. Many downstream `clinker-exec` tests exercise records indirectly.
@@ -108,7 +110,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Path: `crates/clinker-format`
 - Role: Library crate plus integration tests and `io_throughput` bench.
 - Purpose: Owns streaming format IO, including CSV, JSON/NDJSON, XML, fixed-width, HL7, X12, EDIFACT, SWIFT, multi-record support, document indexes, source reopenability, output envelopes, counting writers, BOM handling, and output splitting.
-- Important public modules: `bom`, `counting`, `csv`, `doc_index`, `edifact`, `envelope`, `envelope_writer`, `error`, `fixed_width`, `hl7`, `json`, `multi_record`, `source`, `splitting`, `swift`, `traits`, `x12`, `xml`. `segment_tokenizer` is crate-private.
+- Important public modules: `bom`, `charset`, `counting`, `csv`, `doc_index`, `edifact`, `envelope`, `envelope_writer`, `error`, `fixed_width`, `hl7`, `json`, `multi_record`, `schema`, `source`, `splitting`, `swift`, `traits`, `x12`, `xml`. `segment_tokenizer` is crate-private.
 - Internal dependencies: `clinker-record`, `cxl`; dev-depends on `clinker-bench-support`.
 - Architecturally important external dependencies: `csv`, `quick-xml`, `serde`, `serde_json`, `miette`, `tracing`, `indexmap`, `chrono`.
 - Known tests/examples/benches: `crates/clinker-format/tests/streaming_doc_index_json.rs`; `crates/clinker-format/tests/streaming_doc_index_xml.rs`; `crates/clinker-format/src/splitting/tests.rs`; `crates/clinker-format/benches/io_throughput.rs`.
@@ -121,7 +123,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Path: `crates/clinker-plan`
 - Role: Library crate with in-crate plan/config tests.
 - Purpose: Parses YAML pipeline/composition configuration, resolve schemas and source discovery, validate configs, compile CXL against row types, and produce typed execution DAGs consumed by `clinker-exec`.
-- Important public modules: `config`, `error`, `plan`, `runtime_error`, `schema`, `security`, `span`, `validation`, `yaml`. `config` exposes source/output/format/route/aggregate/storage/composition modules; `plan` exposes `compiled`, `execution`, `properties`, `statistics`, `streaming_eligibility`, `deferred_region`, and `envelope_synthesis`.
+- Important public modules: `config`, `error`, `overlay_ops`, `plan`, `runtime_error`, `schema`, `security`, `span`, `validation`, `yaml`. `config` exposes source/output/format/route/aggregate/storage/composition modules; `plan` exposes `compiled`, `execution`, `properties`, `statistics`, `streaming_eligibility`, `deferred_region`, and `envelope_synthesis`.
 - Internal dependencies: `clinker-core-types`, `clinker-format`, `clinker-record`, `cxl`.
 - Architecturally important external dependencies: `serde`, `serde_json`, `serde-saphyr`, `toml`, `indexmap`, `miette`, `petgraph`, `regex`, `tracing`, `walkdir`, `glob`, `blake3`, `postcard`, `lz4_flex`, `tempfile`, platform `nix`/`windows-sys`.
 - Known tests/examples/benches: in-crate rename gates in `src/lib.rs`; plan tests under `crates/clinker-plan/src/plan/tests/` for DAGs, CK lattice/aligned partitions, cull validation, deferred regions, route ports, watermark validation, doc paths, envelope synthesis, and explain output; config composition tests in `crates/clinker-plan/src/config/composition/tests.rs`.
@@ -147,7 +149,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Path: `crates/clinker-channel`
 - Role: Library crate plus integration tests and `channel_merge` bench.
 - Purpose: Manages channel files for multi-tenant pipeline/composition launches: binding channel targets, validating config override paths, applying overlays, and staging source copies with reuse/crash-safety logic.
-- Important public modules: `binding`, `error`, `overlay`, `staging_copy`.
+- Important public modules: `derivation`, `discovery`, `dotted`, `error`, `group`, `manifest`, `overlay`, `resolve`, `selector`, `staging_copy`.
 - Internal dependencies: `clinker-core-types`, `clinker-plan`, `clinker-record`.
 - Architecturally important external dependencies: `serde-saphyr`, `serde`, `serde_json`, `blake3`, `indexmap`, `tracing`, `thiserror`, `walkdir`, `uuid`, `tempfile`, `fs4`, Unix `nix`.
 - Known tests/examples/benches: `crates/clinker-channel/tests/overlay_resolution_test.rs`, `discovery_test.rs`, `channel_manifest_test.rs`, `group_parse_test.rs`, `source_patch_parse_test.rs`, `staging_reuse_concurrent.rs`; `crates/clinker-channel/benches/channel_merge.rs`; the multitenant overlay workspace under `examples/multitenant/`.
@@ -172,13 +174,13 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Crate name: `clinker`
 - Path: `crates/clinker`
 - Role: Binary crate for the main CLI.
-- Purpose: Provides the user-facing ETL CLI that runs pipelines, performs dry-run/explain flows, applies channels, resolves memory/threads/output behavior, collects metrics, and explains diagnostic codes.
-- Important public modules: none; all code is in `src/main.rs`. Main symbols include `Cli`, `Commands`, `RunArgs`, `MetricsCommands`, `CollectArgs`, and `ExplainArgs`.
-- Internal dependencies: `clinker-channel`, `clinker-core-types`, `clinker-exec`, `clinker-format`, `clinker-net`, `clinker-plan`, `clinker-record`.
+- Purpose: Provides the user-facing ETL CLI that runs pipelines, performs dry-run/explain flows, applies channels, resolves memory/threads/output behavior, collects metrics, explains diagnostic codes, lists channels/groups, applies workspace-wide refactors (node rename), and prints resolved config (`config --resolved` expands multi-value shorthand to canonical form).
+- Important public modules: `refactor` (workspace-wide rename support in `src/refactor.rs` + `src/refactor/`); the rest of the CLI lives in `src/main.rs`. Main symbols include `Cli`, `Commands`, `RunArgs`, `MetricsCommands`, `CollectArgs`, `ExplainArgs`, `ConfigArgs`, `RenameNodeArgs`, `ResolveArgs`, and `LintArgs`.
+- Internal dependencies: `clinker-channel`, `clinker-core-types`, `clinker-exec`, `clinker-format`, `clinker-lineage`, `clinker-net`, `clinker-plan`, `clinker-record`.
 - Architecturally important external dependencies: `clap`, `miette`, `tracing`, `tracing-subscriber`, `serde-saphyr`, `serde_json`, `indexmap`, `chrono`, `num_cpus`, `uuid`, `tempfile`.
 - Known tests/examples/benches: integration tests `crates/clinker/tests/atomic_output_test.rs`, `explain_provenance_test.rs`, `miette_rendering.rs`, `storage_config_cli.rs`; unit tests in `src/main.rs`; YAML examples under `examples/pipelines/` are primarily CLI-facing runnable examples.
 - Confidence: High.
-- Evidence: `crates/clinker/Cargo.toml`; `crates/clinker/src/main.rs` Clap command help for `run`, `metrics`, and `explain`; uses `clinker_exec::executor::PipelineExecutor`.
+- Evidence: `crates/clinker/Cargo.toml`; `crates/clinker/src/main.rs` Clap command help for `run`, `metrics`, `explain`, `channels`, `refactor`, and `config`; uses `clinker_exec::executor::PipelineExecutor`.
 
 ### clinker-schema
 
@@ -192,6 +194,19 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Known tests/examples/benches: unit tests in `parse.rs`, `discovery.rs`, and `validate.rs`; schema examples/fixtures under `examples/pipelines/retract-demo/*.schema.yaml`.
 - Confidence: Medium. The crate is an edge/authoring support crate, and its long-term boundary with `clinker-plan` is tracked as an open question.
 - Evidence: `crates/clinker-schema/src/lib.rs`; public symbols `build_workspace_schema_index`, `parse_schema`, `parse_schema_file`, `validate_pipeline`, `SourceSchema`, and `SchemaIndex`.
+
+### clinker-lineage
+
+- Crate name: `clinker-lineage`
+- Path: `crates/clinker-lineage`
+- Role: Library crate plus composition-lineage integration test.
+- Purpose: Serializes pipeline lineage as OpenLineage events: maps Source/Output nodes to dataset identities, walks a `CompiledPlan` DAG to compute DIRECT per-column lineage and dataset-level INDIRECT influence (traced through composition bodies and `$doc` reads), and assembles run events for NDJSON output — a static START/COMPLETE pair for plan-derived export or live run-lifecycle events via `LiveRunEmitter`.
+- Important public modules: `builder`, `dataset`, `emit`, `openlineage` (`event`, `facet`, `ndjson`).
+- Internal dependencies: `clinker-plan`, `clinker-record`, `cxl`; dev-depends on `clinker-core-types`.
+- Architecturally important external dependencies: `petgraph`, `serde`, `serde_json`.
+- Known tests/examples/benches: `crates/clinker-lineage/tests/composition_lineage.rs` plus fixtures; unit tests in module files; CLI-level behavior exercised through `crates/clinker` (`run --lineage`, `run --lineage-events`).
+- Confidence: High.
+- Evidence: `crates/clinker-lineage/src/lib.rs` (pinned to OpenLineage core `2-0-2`, `ColumnLineageDatasetFacet` `1-2-0`; re-exports `column_lineage`, `dataset_identity`, `run_events`, `LiveRunEmitter`, `write_ndjson`); `crates/clinker-lineage/Cargo.toml`.
 
 ### clinker-bench-support
 
@@ -222,15 +237,11 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 ### reserve package
 
 - Crate name: `clinker`
-- Path: `reserve`
-- Role: Separate non-workspace library package.
+- Path: `reserve` (untracked; not part of the tracked repository tree)
+- Role: Separate non-workspace library package used as a crates.io name-reservation placeholder.
 - Purpose: Reserves the published crate name while implementation continues in the main workspace.
-- Important public modules: none.
-- Internal dependencies: none.
-- Architecturally important external dependencies: none.
-- Known tests/examples/benches: none found.
-- Confidence: High.
-- Evidence: `reserve/Cargo.toml` has package metadata, `[lib] path = "src/lib.rs"`, and its own `[workspace]`; `reserve/src/lib.rs` says "Name reservation for the `clinker` crate" and "placeholder release."
+- Internal dependencies: none; nothing in the workspace depends on it.
+- Confidence: High that it is intentionally untracked local-only scaffolding — it does not exist in fresh clones, so do not cite its files as repository evidence.
 
 ## Examples, Tests, Benches, And CI
 

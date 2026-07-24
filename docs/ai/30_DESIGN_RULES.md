@@ -1,5 +1,7 @@
 # AI Onboarding: Design Rules
 
+Verified against origin/main cf6609b9 (2026-07-24).
+
 Purpose: Collect design constraints and review rules that AI agents must validate before changing behavior.
 
 ## Source Evidence
@@ -29,7 +31,8 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
   `ExecutionPlanDag`; it does not depend on runtime operators. `clinker-exec`
   consumes compiled plans and owns runtime dispatch. `clinker-record` and
   `clinker-core-types` are lower-level vocabulary crates. Edge crates
-  (`clinker`, `cxl-cli`, `clinker-channel`, `clinker-net`, `clinker-schema`)
+  (`clinker`, `cxl-cli`, `clinker-channel`, `clinker-net`, `clinker-schema`,
+  `clinker-lineage`)
   should not become back-edges into lower layers without a deliberate design
   review.
 - The executor public entry point is compiled-plan based. The
@@ -85,7 +88,7 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
   `crates/clinker-format/src/lib.rs`;
   `crates/clinker-format/src/error.rs`.
 - Channel boundary: `crates/clinker-channel/src/lib.rs`;
-  `crates/clinker-channel/src/binding.rs`;
+  `crates/clinker-channel/src/resolve.rs`;
   `crates/clinker-channel/src/overlay.rs`.
 - Security: `crates/clinker-plan/src/security.rs`.
 - CI/dependency gates: `.github/workflows/ci.yml`; `deny.toml`; root
