@@ -321,8 +321,8 @@ fn region_has_interior_noise(region: &str) -> bool {
 }
 
 /// Whether `line` carries a YAML comment: an unquoted `#` at the line start
-/// (after indentation) or preceded by whitespace — a space **or a tab** — and
-/// not inside a single- or double-quoted scalar.
+/// (after indentation) or preceded by whitespace — a space **or a tab** — that
+/// is not inside a quoted scalar.
 ///
 /// This is stricter than a plain `" #"` substring on two axes: a tab-separated
 /// comment (`- item\t# note`) is recognized so regenerating the sequence never
@@ -330,111 +330,141 @@ fn region_has_interior_noise(region: &str) -> bool {
 /// spelled `" #"`) is *not* mistaken for a comment, so a sequence carrying one
 /// still expands.
 ///
-/// A line that ends still "inside" a quote had an unbalanced quote — a bare `'`
-/// or `"` in a plain scalar (`it's`, `5" nail`) rather than a real quoted
-/// region. The scanner cannot then trust its position, so it conservatively
-/// counts the line as noise: the sequence is passed through unexpanded (valid
-/// YAML, re-parses identically) rather than regenerated, which could drop a
-/// genuine trailing comment the runaway quote skipped over. The only cost is
-/// that a quote-bearing bare item with no comment stops expanding — the safe
-/// direction for a canonicalizer whose first duty is to never lose a comment.
+/// The distinction between a real quoted scalar and a bare quote character is
+/// positional, not a quote count: in YAML a `'`/`"` opens a quoted scalar only
+/// at a VALUE-START position — immediately after the `- ` block-sequence
+/// indicator, after a `key:` separator, or at the start of the line's content.
+/// A quote anywhere else is an ordinary character of a plain scalar, so `5'`,
+/// `don't`, and `5" nail` never open a region that could swallow a following
+/// `#`. This is what a bare quote-count scanner got wrong: an even number of
+/// stray quotes (`- 5'  # feet, don't drop`) balanced out and hid the real
+/// trailing comment.
+///
+/// A quote that DOES open at value-start but never closes leaves the scan unable
+/// to trust its position; the line is then reported as a comment so the sequence
+/// is passed through unexpanded (valid YAML, re-parses identically) rather than
+/// regenerated over a possibly-skipped comment. The whole function biases toward
+/// TRUE when ambiguous for the same reason: a false positive merely leaves a
+/// block un-expanded, while a false negative silently drops an author's comment.
 fn line_has_comment(line: &str) -> bool {
     let bytes = line.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    // The start of a line counts as "preceded by whitespace", so a comment-only
-    // line is detected even with no leading space.
+    // `value_start`: a quote here would open a quoted scalar. True at the start
+    // of the line's content and again right after a `- ` indicator or a `key:`
+    // separator. `prev_ws`: the previous byte was whitespace (or the line start),
+    // so a `#` here begins a comment.
+    let mut value_start = true;
     let mut prev_ws = true;
     let mut i = 0;
     while i < bytes.len() {
-        let c = bytes[i];
-        if in_single {
-            // A doubled `''` is an escaped quote, not a close.
-            if c == b'\'' {
-                if bytes.get(i + 1) == Some(&b'\'') {
-                    i += 2;
-                    continue;
-                }
-                in_single = false;
+        match bytes[i] {
+            b' ' | b'\t' => {
+                prev_ws = true;
+                i += 1;
             }
-            prev_ws = false;
-        } else if in_double {
-            if c == b'\\' {
-                i += 2;
+            // Outside any quoted scalar, a whitespace-preceded `#` is a comment.
+            b'#' if prev_ws => return true,
+            b'\'' | b'"' if value_start => match scan_quoted(bytes, i) {
+                // A closed quoted scalar cannot hide a `#` from the rest of the
+                // scan; resume just past it, no longer at a value start.
+                Some(end) => {
+                    value_start = false;
+                    prev_ws = false;
+                    i = end;
+                }
+                // An unterminated quote opened at value-start: preserve.
+                None => return true,
+            },
+            // A block-sequence indicator (`- `): the value begins after it, so
+            // the next token is still a value start.
+            b'-' if value_start && is_ws_or_eol(bytes.get(i + 1)) => {
                 prev_ws = false;
-                continue;
+                i += 1;
             }
-            if c == b'"' {
-                in_double = false;
+            // A `key:` mapping separator: the value begins after it.
+            b':' if is_ws_or_eol(bytes.get(i + 1)) => {
+                value_start = true;
+                prev_ws = false;
+                i += 1;
             }
-            prev_ws = false;
-        } else {
-            match c {
-                b'#' if prev_ws => return true,
-                b'\'' => {
-                    in_single = true;
-                    prev_ws = false;
-                }
-                b'"' => {
-                    in_double = true;
-                    prev_ws = false;
-                }
-                b' ' | b'\t' => prev_ws = true,
-                _ => prev_ws = false,
+            // Any other byte is part of a plain scalar; a bare quote or a `#`
+            // without leading whitespace here is an ordinary character.
+            _ => {
+                value_start = false;
+                prev_ws = false;
+                i += 1;
             }
         }
-        i += 1;
     }
-    // An unbalanced quote (a bare `'`/`"` in a plain scalar) leaves the scanner
-    // "inside" a quote at end of line, having skipped past any real comment.
-    // Bail conservatively: treat the line as noise so the comment is preserved.
-    in_single || in_double
+    false
 }
 
-/// End (exclusive) of the flow sequence that opens at `raw[start] == '['`.
+/// Whether `b` is whitespace or the end of the line — the lookahead a
+/// value-start indicator (`- `, `key:`) needs to tell an indicator from a plain
+/// scalar character (`-5`, `a:b`).
+fn is_ws_or_eol(b: Option<&u8>) -> bool {
+    matches!(b, None | Some(b' ') | Some(b'\t'))
+}
+
+/// Scan the quoted scalar that opens at `bytes[start]` (a `'` or `"`), returning
+/// the index just past its closing quote, or `None` when the line ends first.
 ///
-/// Matches brackets and braces at depth, honoring single- and double-quoted
-/// scalars so a delimiter like `"]"` inside a value is not mistaken for the
-/// closing bracket. Input that already parsed is balanced, so the scan
-/// terminates at the matching close.
-fn flow_sequence_end(raw: &str, start: usize) -> Result<usize, CanonicalError> {
-    let bytes = raw.as_bytes();
-    let mut depth: i32 = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut i = start;
+/// Single quotes take a doubled `''` as an escaped quote; double quotes take a
+/// backslash as escaping the next character. Shared by [`line_has_comment`] and
+/// [`flow_sequence_end`] so the two cannot drift on the escape rules.
+fn scan_quoted(bytes: &[u8], start: usize) -> Option<usize> {
+    let quote = bytes[start];
+    let mut i = start + 1;
     while i < bytes.len() {
         let c = bytes[i];
-        if in_single {
+        if quote == b'\'' {
             if c == b'\'' {
                 // A doubled `''` is an escaped quote, not a close.
                 if bytes.get(i + 1) == Some(&b'\'') {
                     i += 2;
                     continue;
                 }
-                in_single = false;
+                return Some(i + 1);
             }
-        } else if in_double {
-            if c == b'\\' {
-                i += 2;
-                continue;
-            }
-            if c == b'"' {
-                in_double = false;
-            }
-        } else {
-            match c {
-                b'\'' => in_single = true,
-                b'"' => in_double = true,
-                b'[' | b'{' => depth += 1,
-                b']' | b'}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Ok(i + 1);
-                    }
+        } else if c == b'\\' {
+            i += 2;
+            continue;
+        } else if c == b'"' {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// End (exclusive) of the flow sequence that opens at `raw[start] == '['`.
+///
+/// Matches brackets and braces at depth, skipping over single- and
+/// double-quoted scalars via [`scan_quoted`] so a delimiter like `"]"` inside a
+/// value is not mistaken for the closing bracket. Input that already parsed is
+/// balanced, so the scan terminates at the matching close. Unlike
+/// [`line_has_comment`], every quote in a flow sequence sits at a value-start
+/// position (after `[`, `,`, or `:`), so this opens on any quote it meets.
+fn flow_sequence_end(raw: &str, start: usize) -> Result<usize, CanonicalError> {
+    let bytes = raw.as_bytes();
+    let mut depth: i32 = 0;
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' => match scan_quoted(bytes, i) {
+                Some(end) => {
+                    i = end;
+                    continue;
                 }
-                _ => {}
+                None => break,
+            },
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(i + 1);
+                }
             }
+            _ => {}
         }
         i += 1;
     }
@@ -1172,10 +1202,10 @@ nodes:
 
     #[test]
     fn bare_apostrophe_item_with_comment_is_preserved() {
-        // A plain scalar containing a bare apostrophe (`it's`) has an odd quote
-        // count. The comment scanner must not run away into quote-mode past the
-        // trailing comment and let the block be regenerated (which would drop
-        // the comment) — the sequence is passed through byte-identical instead.
+        // A plain scalar carries a bare apostrophe (`it's`) mid-value: the `'` is
+        // not at a value-start position, so it opens no quoted scalar and the
+        // trailing `#` is seen as the real comment it is. The sequence is passed
+        // through byte-identical rather than regenerated (which would drop it).
         let raw = "nodes:\n  - type: source\n    name: s\n    config:\n      name: s\n      \
                    type: csv\n      path: in.csv\n      split_values:\n        \
                    - it's  # KEEP THIS COMMENT\n      schema:\n        \
@@ -1192,8 +1222,9 @@ nodes:
 
     #[test]
     fn bare_double_quote_item_with_comment_is_preserved() {
-        // The double-quote variant of the odd-quote case (`5" nail`, inches):
-        // same conservative bail keeps the trailing comment.
+        // The double-quote variant (`5" nail`, inches): the `"` sits mid-scalar,
+        // not at a value start, so it is an ordinary character and the trailing
+        // comment is preserved.
         let raw = "nodes:\n  - type: source\n    name: s\n    config:\n      name: s\n      \
                    type: csv\n      path: in.csv\n      split_values:\n        \
                    - 5\" nail  # KEEP THIS COMMENT\n      schema:\n        \
@@ -1206,6 +1237,84 @@ nodes:
         assert!(out.contains("# KEEP THIS COMMENT"), "\n{out}");
         assert_parse_identity(raw, &out);
         assert_idempotent(raw);
+    }
+
+    #[test]
+    fn bare_apostrophe_item_without_comment_expands_safely() {
+        // The behavior the value-start rule changes: a quote-bearing plain scalar
+        // with NO comment (`- it's`) now EXPANDS rather than bailing, because the
+        // mid-scalar `'` opens no quoted region and there is no `#` to protect.
+        // The expansion must re-parse to the same shorthand values and be
+        // idempotent — corruption-safety is the whole point of the gate.
+        let raw = "nodes:\n  - type: source\n    name: s\n    config:\n      name: s\n      \
+                   type: csv\n      path: in.csv\n      split_values:\n        \
+                   - it's\n      schema:\n        \
+                   - { name: it's, type: string, multiple: true }\n";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        // The bare item gained its materialized defaults — the block expanded.
+        assert!(out.contains("field: it's"), "block should expand:\n{out}");
+        assert!(out.contains("delimiter:"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn even_count_stray_quote_before_a_comment_is_preserved() {
+        // The regression the value-start rule closes: `- 5'  # feet, don't drop`
+        // has an EVEN number of apostrophes (`5'` … `don't`). A quote-count
+        // scanner opened a fake region on `5'` and closed it on the `'` in
+        // `don't`, ending balanced and skipping the real `#` — dropping the
+        // comment. Neither apostrophe is at a value-start position, so no quoted
+        // scalar opens and the comment is seen and preserved.
+        let raw = "nodes:\n  - type: source\n    name: s\n    config:\n      name: s\n      \
+                   type: csv\n      path: in.csv\n      split_values:\n        \
+                   - 5'  # feet, don't drop\n      schema:\n        \
+                   - { name: order_id, type: string }\n";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert_eq!(
+            raw, out,
+            "an even-count stray-quote line with a comment must be left untouched:\n{out}"
+        );
+        assert!(out.contains("# feet, don't drop"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn mapping_value_trailing_comment_is_preserved() {
+        // A `key: value  # c` line inside a shorthand item's mapping: the value
+        // begins after `key:` and is a plain scalar, so the whitespace-preceded
+        // `#` is a real comment and the block is passed through untouched.
+        let raw = "nodes:\n  - type: source\n    name: s\n    config:\n      name: s\n      \
+                   type: csv\n      path: in.csv\n      split_values:\n        \
+                   - field: tags  # keep this trailing comment\n      schema:\n        \
+                   - { name: tags, type: string, multiple: true }\n";
+        let out = expand_multi_value_shorthand(raw).unwrap();
+        assert_eq!(
+            raw, out,
+            "a mapping value's trailing comment must be left untouched:\n{out}"
+        );
+        assert!(out.contains("# keep this trailing comment"), "\n{out}");
+        assert_parse_identity(raw, &out);
+        assert_idempotent(raw);
+    }
+
+    #[test]
+    fn value_start_quote_with_interior_hash_still_expands() {
+        // A quote AT a value-start position (`delimiter: " #"`) opens a real
+        // quoted scalar, so the `#` inside it is not a comment and the block
+        // still expands. This is the counterpart to the stray-quote cases: the
+        // value-start rule must still recognize a genuine quoted delimiter.
+        assert!(!line_has_comment(r#"      delimiter: " #""#));
+        assert!(!line_has_comment(r#"      escape: "\\""#));
+        // The stray-quote and comment cases the block-level tests exercise, at
+        // the unit boundary.
+        assert!(line_has_comment("- 5'  # feet, don't drop"));
+        assert!(line_has_comment("- tags\t# keep"));
+        assert!(line_has_comment("key: value  # c"));
+        // No comment: these expand.
+        assert!(!line_has_comment("- it's"));
+        assert!(!line_has_comment("- tags"));
     }
 
     #[test]

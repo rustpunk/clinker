@@ -754,19 +754,28 @@ impl XmlReader {
     /// column appearing ONLY as an empty element in the first record still
     /// surfaces in the inferred schema. A declared fan-out field is handled by
     /// its occurrence range, not here.
+    ///
+    /// The `multiple:` decision is taken on the PROJECTED name, not the raw dotted
+    /// `name`. `multi_value_fields` holds the projected physical name (`tag`),
+    /// while inside a `split_to_rows` group `name` is still the raw path
+    /// (`Item.tag`); classifying on the raw name would miss the declaration and
+    /// silently drop the null occurrence, whereas the valued sibling — which runs
+    /// through `fields_to_record` AFTER fan-out projection — collects it. Project
+    /// first so both paths agree and the empty middle occurrence keeps its array
+    /// slot (`<tag>a</tag><tag/><tag>b</tag>` → `[a, null, b]`). The null field is
+    /// pushed under its RAW `name` so it fans out and projects exactly like every
+    /// valued sibling.
     fn record_value_less_occurrence(
         &self,
         name: String,
         fields: &mut Vec<(String, String)>,
         presence: &mut Vec<String>,
     ) {
-        if self.is_multi_value(&name) {
+        let projected = self.project_presence_name(&name);
+        if self.is_multi_value(&projected) {
             fields.push((name, String::new()));
-        } else if self.split_field_index(&name).is_none() {
-            let projected = self.project_presence_name(&name);
-            if !presence.contains(&projected) {
-                presence.push(projected);
-            }
+        } else if self.split_field_index(&name).is_none() && !presence.contains(&projected) {
+            presence.push(projected);
         }
     }
 
@@ -2442,6 +2451,83 @@ mod tests {
         let r2 = r.next_record().unwrap().unwrap();
         assert_eq!(r2.get("Item.name"), Some(&Value::String("B".into())));
         assert_eq!(r2.get("Tag"), Some(&tags));
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_occurrence_inside_extract_fan_out_keeps_its_array_slot() {
+        // A `multiple:` column INSIDE a `split_to_rows: extract` group: the raw
+        // occurrences are `Item.tag`, projected to `tag` (the group prefix is
+        // lifted off). An empty middle `<tag/>` must survive as a positional null
+        // in the collected array, exactly as its valued siblings survive — the
+        // empty-occurrence path must classify on the projected name (`tag`), not
+        // the raw path (`Item.tag`), which `multi_value_fields` never holds.
+        let xml = r#"<Root><Order><Item><tag>a</tag><tag/><tag>b</tag></Item></Order></Root>"#;
+        let config = XmlReaderConfig {
+            multi_value_fields: vec!["tag".into()],
+            ..split_config("Root/Order", vec![extract("Item")])
+        };
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(
+            r1.get("tag"),
+            Some(&Value::Array(vec![
+                Value::String("a".into()),
+                Value::Null,
+                Value::String("b".into()),
+            ])),
+            "empty middle occurrence keeps its positional null inside the fan-out"
+        );
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_occurrence_inside_split_fan_out_keeps_its_array_slot() {
+        // Under `split` mode the occurrence keeps its dotted name (`Item.tag`), so
+        // that is the projected/physical name the schema declares `multiple:`. The
+        // empty middle occurrence must still be a positional null under that name.
+        let xml = r#"<Root><Order><Item><tag>a</tag><tag/><tag>b</tag></Item></Order></Root>"#;
+        let config = XmlReaderConfig {
+            multi_value_fields: vec!["Item.tag".into()],
+            ..split_config("Root/Order", vec![split("Item")])
+        };
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(
+            r1.get("Item.tag"),
+            Some(&Value::Array(vec![
+                Value::String("a".into()),
+                Value::Null,
+                Value::String("b".into()),
+            ])),
+            "split mode keeps the dotted name and the positional null"
+        );
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_occurrence_at_top_level_keeps_its_array_slot() {
+        // The top-level case (no fan-out): raw name == projected name, so this
+        // path already worked. Pinned so the fan-out projection change cannot
+        // regress the simplest case.
+        let xml = r#"<Root><Row><tag>a</tag><tag/><tag>b</tag></Row></Root>"#;
+        let config = multi_value_config("Root/Row", &["tag"]);
+        let mut r = reader_from_str(xml, config);
+        let _s = r.schema().unwrap();
+
+        let r1 = r.next_record().unwrap().unwrap();
+        assert_eq!(
+            r1.get("tag"),
+            Some(&Value::Array(vec![
+                Value::String("a".into()),
+                Value::Null,
+                Value::String("b".into()),
+            ]))
+        );
         assert!(r.next_record().unwrap().is_none());
     }
 
