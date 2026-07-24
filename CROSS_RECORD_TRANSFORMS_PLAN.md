@@ -8,13 +8,9 @@ rows based on criteria observed across other records in the same correlation
 group" while honouring the existing memory budget and DLQ + correlation-key
 rollback contracts.
 
-Status: implemented. The `Reshape` and `Cull` node variants shipped
-(`crates/clinker-exec/src/executor/reshape_dispatch.rs`,
-`crates/clinker-exec/src/executor/cull_dispatch.rs`, with planning support in
-`crates/clinker-plan`); this document is the design record for that arc.
-Whether it remains active guidance or is a historical record is tracked in
-`docs/ai/80_OPEN_QUESTIONS.md` (question 21). Where this document and current
-source disagree, source wins.
+Status: design locked, not yet implemented. This document is the single
+source of truth for the sprint arc; per LD-011 the rip is full and is
+sealed at the end of each sprint.
 
 ---
 

@@ -324,24 +324,6 @@ stale-user-docs sweep.)
   acceptance/rejection tests for non-UTF-8 cases and update docs to match.
 - Priority: Medium
 
-### 21. Should `CROSS_RECORD_TRANSFORMS_PLAN.md` be marked historical or active?
-
-- Question: Is `CROSS_RECORD_TRANSFORMS_PLAN.md` obsolete planning history, or
-  does it still contain active design guidance?
-- Why it matters: The file references old paths such as
-  `crates/clinker-core/...`, while related concepts now exist as `reshape` and
-  `cull` under current plan/exec crates. Agents may mistake it for current
-  architecture.
-- Files/modules involved: `CROSS_RECORD_TRANSFORMS_PLAN.md`,
-  `crates/clinker-plan/src/config/pipeline_node.rs`,
-  `crates/clinker-exec/src/executor/reshape_dispatch.rs`,
-  `crates/clinker-exec/src/executor/cull_dispatch.rs`,
-  `docs/user/src/nodes/reshape.md`, `docs/user/src/nodes/cull.md`.
-- Suggested way to resolve it: Add an explicit status note to the plan file:
-  historical, superseded, or active. If active, update paths and open work
-  items to current crate names.
-- Priority: Medium
-
 ## Low Priority
 
 ### 22. What is the intended expansion of "CXL"?
@@ -527,6 +509,13 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   objects inside maps and arrays (`crates/cxl-cli/src/main.rs`).
 - **20 (merged 2026-07-24):** Folded into question 6 — canonical
   envelope/document-context docs are part of the stale-user-docs sweep.
+- **21 (resolved by maintainer decision, 2026-07-24):**
+  `CROSS_RECORD_TRANSFORMS_PLAN.md` is a historical design record, not active
+  guidance — its design shipped as the `Reshape` and `Cull` nodes
+  (`crates/clinker-exec/src/executor/reshape_dispatch.rs`,
+  `crates/clinker-exec/src/executor/cull_dispatch.rs`) — and the maintainer is
+  retiring the file from the tracked tree to local working notes. Treat any
+  surviving copy as history; where it disagrees with source, source wins.
 - **23 (resolved):** The `reserve/` package is a crates.io name-reservation
   placeholder only — its README states the role and "pre-release placeholder"
   status. It is intentionally untracked (absent from clones); do not cite its
