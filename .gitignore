@@ -4,7 +4,12 @@
 !.claude/skills/post-impl-followup/
 lancedb/
 docs/internal/
-docs/*/book/
+# Generated mdBook output. `**` rather than `*` so this covers a build at any
+# depth: the two books default to docs/user/book/ and docs/engine/book/, but an
+# ad-hoc `mdbook build docs/user -d docs/book` lands one directory higher, which
+# a single-segment glob misses. That gap left several MB of stale generated HTML
+# untracked-but-committable in the working tree.
+docs/**/book/
 !docs/ai/
 !docs/ai/**
 target/
