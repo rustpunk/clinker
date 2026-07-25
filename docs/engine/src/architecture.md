@@ -8,7 +8,7 @@ Within a run, stateless operators (Transform, Route, most Combine probe-side wor
 
 Every design decision cascades from three commitments. They are permanent — an architectural proposal that violates any of them is rejected at design review, not implementation review.
 
-1. **Finite inputs only.** Files (CSV / JSON / XML / fixed-width) and finite-cursor network sources (paginated REST, SQL `SELECT` cursors) — both reach EOF after exhausting their cursor. Unbounded sources (Kafka, Kinesis, SSE, webhooks, `tail -f`) are out of scope permanently.
+1. **Finite inputs only.** Files (CSV / JSON / XML / fixed-width / EDIFACT / X12 / HL7 v2 / SWIFT MT) and finite-cursor network sources (paginated REST with hard page/record caps) — both reach EOF after exhausting their cursor. Unbounded sources (Kafka, Kinesis, SSE, webhooks, `tail -f`) are out of scope permanently.
 
 2. **Finite jobs.** No daemon mode, no service surface, no infinite event loop. `clinker run` invokes, drains, exits.
 

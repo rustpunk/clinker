@@ -37,9 +37,10 @@ memory ceiling.
 
 **Three pillars of what Clinker is:**
 
-1. **Finite inputs.** Files (CSV, JSON, XML, fixed-width) are the canonical
-   shape. Finite-cursor network sources (paginated REST APIs, SQL `SELECT`
-   cursors) fit the same model -- they exhaust their cursor and EOF.
+1. **Finite inputs.** Files (CSV, JSON, XML, fixed-width, EDIFACT, X12,
+   HL7 v2, SWIFT MT) are the canonical shape. Finite-cursor network
+   sources (paginated REST APIs with hard page/record caps) fit the same
+   model -- they exhaust their cursor and EOF.
    Unbounded sources (Kafka topics, Kinesis streams, Server-Sent Events,
    webhooks, `tail -f`-style file followers) are out of scope and will
    remain so.

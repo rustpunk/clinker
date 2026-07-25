@@ -25,9 +25,9 @@ through.
 ### Finite inputs only
 
 Clinker reads sources that have an end. Files are the canonical shape, and
-finite-cursor network sources (paginated REST APIs, SQL `SELECT` cursors)
-fit the same model -- they exhaust their cursor and EOF. Unbounded sources
-(Kafka, Kinesis, Server-Sent Events, webhooks, `tail -f`-style file
+finite-cursor network sources (paginated REST APIs with hard page/record
+caps) fit the same model -- they exhaust their cursor and EOF. Unbounded
+sources (Kafka, Kinesis, Server-Sent Events, webhooks, `tail -f`-style file
 followers) are explicitly **out of scope** and will remain so.
 
 ### Single process, ever
