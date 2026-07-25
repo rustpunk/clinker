@@ -1,0 +1,13 @@
+ticket_id,opened_at,customer_email,category,first_response_mins,priority,sla_breached
+TK-200001,2026-01-28T07:00:00Z,sunniva.dunmore@example.org,other,421,standard,true
+TK-200005,2026-01-23T10:54:00Z,nadia.cardenas@example.org,product-defect,242,standard,true
+TK-200006,2026-01-25T10:16:00Z,chiara.ashgrove@example.org,billing,363,standard,true
+TK-200012,2026-01-14T18:08:00Z,amara.bergstrom@example.com,billing,369,standard,true
+TK-200013,2026-02-01T17:03:00Z,kwame.ashgrove@example.org,returns,168,standard,false
+TK-200017,2026-01-06T18:32:00Z,reza.cardenas@example.com,account-access,408,standard,true
+TK-200019,2026-01-09T12:51:00Z,mateo.whitfield@example.org,other,267,standard,true
+TK-200023,2026-01-19T17:11:00Z,marta.thackeray@example.com,account-access,411,standard,true
+TK-200027,2026-01-26T14:31:00Z,nadia.thackeray@example.org,shipping,361,standard,true
+TK-200036,2026-01-28T12:32:00Z,freya.marchetti@example.net,other,452,standard,true
+TK-200052,2026-01-06T17:20:00Z,mateo.voss@example.net,shipping,144,standard,false
+TK-200057,2026-02-03T14:19:00Z,nadia.whitfield@example.net,returns,389,standard,true

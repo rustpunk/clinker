@@ -1,0 +1,120 @@
+# Helpdesk export -> three triage queues, with unparseable rows dead-lettered.
+#
+# Two things happen here that a first pipeline does not do.
+#
+# The upstream export types `first_response_mins` as a number but agents put
+# free text in it ("n/a", "pending", "--", empty). The schema declares the
+# column `int`, so those rows fail at ingest. With `strategy: continue` they go
+# to the dead-letter queue with a reason attached and the run keeps going —
+# the rest of the export is still worth processing.
+#
+# Priorities arrive inconsistently cased and abbreviated, so they are folded to
+# one vocabulary before anything routes on them. Routing on the raw value would
+# scatter "P1", "p1" and "URGENT" across different queues.
+pipeline:
+  name: support_triage
+
+nodes:
+  - type: source
+    name: tickets
+    config:
+      name: tickets
+      type: csv
+      path: ./data/tickets.csv
+      options:
+        has_header: true
+      schema:
+        - { name: ticket_id, type: string }
+        - { name: opened_at, type: date_time }
+        - { name: customer_email, type: string }
+        - { name: raw_priority, type: string }
+        - { name: category, type: string }
+        - { name: subject, type: string }
+        # Read as text, converted explicitly below. The upstream export is
+        # untyped and agents put free text in this column, so declaring it
+        # `string` here states what the file actually contains; `to_int()` in
+        # the transform is then the single place the conversion can fail, and
+        # it fails loudly into the DLQ.
+        - { name: first_response_mins, type: string }
+        - { name: satisfaction, type: string }
+
+  - type: transform
+    name: normalize
+    description: Fold the priority vocabulary and derive an SLA breach flag
+    input: tickets
+    config:
+      cxl: |
+        let p = raw_priority.upper()
+        let tier = if p == "P1" or p == "HIGH" or p == "URGENT" then "urgent"
+                   else if p == "P2" or p == "NORMAL" then "standard"
+                   else "backlog"
+
+        # Strict conversion. `to_int` raises on anything that is not an
+        # integer, so the rows carrying "n/a", "pending", "--" or an empty
+        # cell dead-letter here with a reason rather than flowing onward as
+        # an unusable value. The lenient `try_int` would yield null instead —
+        # the right choice when a missing value is normal, the wrong one when
+        # an unreadable response time means the row cannot be triaged.
+        let mins = first_response_mins.to_int()
+
+        emit ticket_id = ticket_id
+        emit opened_at = opened_at
+        emit customer_email = customer_email
+        emit category = category
+        emit priority = tier
+        emit first_response_mins = mins
+        # Urgent work is held to a tighter response target than everything else.
+        emit sla_breached = if tier == "urgent" then mins > 60 else mins > 240
+
+  - type: route
+    name: triage
+    description: Exclusive routing — each ticket lands in exactly one queue
+    input: normalize
+    config:
+      mode: exclusive
+      conditions:
+        urgent_queue: 'priority == "urgent"'
+        standard_queue: 'priority == "standard"'
+      default: backlog_queue
+
+  - type: output
+    name: urgent_queue
+    input: triage.urgent_queue
+    config:
+      name: urgent_queue
+      type: csv
+      path: ./output/urgent.csv
+      include_unmapped: false
+      sort_order:
+        - field: ticket_id
+
+  - type: output
+    name: standard_queue
+    input: triage.standard_queue
+    config:
+      name: standard_queue
+      type: csv
+      path: ./output/standard.csv
+      include_unmapped: false
+      sort_order:
+        - field: ticket_id
+
+  - type: output
+    name: backlog_queue
+    input: triage.backlog_queue
+    config:
+      name: backlog_queue
+      type: json
+      path: ./output/backlog.json
+      include_unmapped: false
+      sort_order:
+        - field: ticket_id
+
+error_handling:
+  # Keep going past a bad row rather than aborting the export. Without this the
+  # first free-text response time would end the run.
+  strategy: continue
+  dlq:
+    path: ./output/rejected.csv
+    include_reason: true
+    include_source_row: true

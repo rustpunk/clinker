@@ -1,0 +1,83 @@
+# Storefront order export -> billing-ready order lines.
+#
+# The shape almost every ETL job starts as: read one export, drop the rows that
+# should not be billed, derive the money column the downstream system wants, and
+# write a narrow file with a stable row order.
+#
+# Money is `decimal`, never `float`. Decimal arithmetic is exact, so 24.50 x 2
+# less 10% is exactly 44.10 on every platform — which is also what makes the
+# committed golden for this scenario meaningful.
+pipeline:
+  name: storefront_orders
+
+nodes:
+  - type: source
+    name: orders
+    config:
+      name: orders
+      type: csv
+      path: ./data/orders.csv
+      options:
+        has_header: true
+      schema:
+        - { name: order_id, type: string }
+        - { name: order_date, type: date }
+        - { name: customer_id, type: string }
+        - { name: customer_name, type: string }
+        - { name: customer_email, type: string }
+        - { name: channel, type: string }
+        - { name: sku, type: string }
+        - { name: quantity, type: int }
+        - { name: unit_price, type: decimal }
+        - { name: discount_pct, type: int }
+        - { name: ship_country, type: string }
+        - { name: status, type: string }
+
+  - type: transform
+    name: billable_lines
+    description: Drop non-billable orders and derive the discounted line total
+    input: orders
+    config:
+      cxl: |
+        # Cancelled and refunded orders are not billed. `filter` drops the
+        # record outright — it is not an error, so it never reaches the DLQ.
+        filter status != "cancelled" and status != "refunded"
+
+        let gross = unit_price * quantity.to_decimal()
+        let discount_amount = gross * discount_pct.to_decimal() / "100".to_decimal()
+
+        emit order_id = order_id
+        emit order_date = order_date
+        emit customer_id = customer_id
+        emit customer_email = customer_email
+        emit channel = channel
+        emit sku = sku
+        emit quantity = quantity
+        emit unit_price = unit_price
+        emit discount_pct = discount_pct
+        emit gross_amount = gross.round_to(2)
+        emit line_total = (gross - discount_amount).round_to(2)
+        emit ship_country = ship_country
+        emit status = status
+
+  - type: output
+    name: billable
+    input: billable_lines
+    config:
+      name: billable
+      type: csv
+      path: ./output/billable_lines.csv
+      # `include_unmapped: false` restricts the file to the columns the
+      # transform emitted, so `customer_name` — read but never emitted — does
+      # not ride along. Column order is source-schema order first, then derived
+      # columns in emit order, which is why `gross_amount` and `line_total`
+      # appear last.
+      #
+      # Renaming happens in the transform above rather than through the Output
+      # node's `mapping:`, which is under review in #974.
+      include_unmapped: false
+      # An explicit order makes the output byte-stable regardless of how the
+      # engine schedules the read, which is what lets this file be compared
+      # byte-for-byte against a committed golden.
+      sort_order:
+        - field: order_id
