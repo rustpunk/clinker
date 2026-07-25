@@ -76,8 +76,12 @@ actionable, rather than as an inexplicable diff.
 If you change a pipeline and the new output is correct, re-bless the goldens:
 
 ```bash
-UPDATE_SCENARIO_GOLDENS=1 cargo test -p clinker --test scenarios
+UPDATE_SCENARIO_GOLDENS=1 cargo test -p clinker --test scenarios -- --nocapture
 ```
+
+`--nocapture` is required rather than optional: libtest swallows stdout on a
+passing test, and a re-bless run passes, so without it the input digest the next
+step tells you to copy is never printed.
 
 Then **read the diff**. A few changed lines in the shape you intended is the
 signal you want. Every row changing usually means the generator moved rather

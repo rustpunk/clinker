@@ -23,6 +23,24 @@ const SEED_STOREFRONT: u64 = 0x5701_0001;
 const SEED_PRODUCT_FEED: u64 = 0x5701_0002;
 const SEED_SUPPORT: u64 = 0x5701_0003;
 
+/// Draw an integer in `0..n`, identically on every target.
+///
+/// `fastrand`'s `usize` methods dispatch on `target_pointer_width` — 32-bit
+/// builds go through `gen_mod_u32`, 64-bit through `gen_mod_u64` — so the same
+/// seed yields different values on different architectures, and every
+/// subsequent draw diverges from there. `u32` has one implementation
+/// everywhere. Every draw in this module goes through this function or
+/// `rng.i64`/`rng.u32` directly, so the crate's promise of identical bytes on
+/// every machine holds off 64-bit as well as on it.
+fn below(rng: &mut fastrand::Rng, n: usize) -> usize {
+    rng.u32(..u32::try_from(n).expect("scenario draw bounds fit in u32")) as usize
+}
+
+/// Pick an element of `items` with an architecture-independent draw.
+fn pick<'a, T>(rng: &mut fastrand::Rng, items: &'a [T]) -> &'a T {
+    &items[below(rng, items.len())]
+}
+
 /// Scenario 01 — a storefront order export.
 ///
 /// One CSV of order lines. Carries cancelled and refunded rows so the pipeline's
@@ -52,30 +70,30 @@ pub fn storefront_orders() -> GeneratedData {
     );
 
     for i in 0..ROWS {
-        let first = FIRST_NAMES[rng.usize(..FIRST_NAMES.len())];
-        let last = LAST_NAMES[rng.usize(..LAST_NAMES.len())];
-        let domain = EMAIL_DOMAINS[rng.usize(..EMAIL_DOMAINS.len())];
-        let (sku, _, _, price_cents) = CATALOGUE[rng.usize(..CATALOGUE.len())];
-        let channel = CHANNELS[rng.usize(..CHANNELS.len())];
-        let country = SHIP_COUNTRIES[rng.usize(..SHIP_COUNTRIES.len())];
+        let first = *pick(&mut rng, FIRST_NAMES);
+        let last = *pick(&mut rng, LAST_NAMES);
+        let domain = *pick(&mut rng, EMAIL_DOMAINS);
+        let (sku, _, _, price_cents) = *pick(&mut rng, CATALOGUE);
+        let channel = *pick(&mut rng, CHANNELS);
+        let country = *pick(&mut rng, SHIP_COUNTRIES);
 
         // Weighted so most orders are healthy: the last two statuses
         // (cancelled, refunded) appear roughly one row in six.
-        let status = if rng.usize(..6) == 0 {
-            ORDER_STATUSES[3 + rng.usize(..2)]
+        let status = if below(&mut rng, 6) == 0 {
+            ORDER_STATUSES[3 + below(&mut rng, 2)]
         } else {
-            ORDER_STATUSES[rng.usize(..3)]
+            ORDER_STATUSES[below(&mut rng, 3)]
         };
 
-        let qty = 1 + rng.usize(..4);
-        let discount = [0, 0, 0, 5, 10, 15, 25][rng.usize(..7)];
+        let qty = 1 + below(&mut rng, 4);
+        let discount = [0, 0, 0, 5, 10, 15, 25][below(&mut rng, 7)];
 
         csv_row(
             &mut out,
             &[
                 &format!("SO-{:05}", 10_000 + i),
                 &day(rng.i64(0..60)),
-                &format!("C-{:04}", 1000 + rng.usize(..240)),
+                &format!("C-{:04}", 1000 + below(&mut rng, 240)),
                 &format!("{first} {last}"),
                 &format!("{}@{domain}", email_local(first, last)),
                 channel,
@@ -128,10 +146,10 @@ pub fn product_feed() -> GeneratedData {
                 format!("{name} (Refill)")
             };
             // Deterministic 1..=3 categories, never repeating within a product.
-            let cat_count = 1 + rng.usize(..3);
+            let cat_count = 1 + below(&mut rng, 3);
             let mut chosen: Vec<&str> = Vec::with_capacity(cat_count);
             while chosen.len() < cat_count {
-                let c = CATEGORIES[rng.usize(..CATEGORIES.len())];
+                let c = *pick(&mut rng, CATEGORIES);
                 if !chosen.contains(&c) {
                     chosen.push(c);
                 }
@@ -149,7 +167,12 @@ pub fn product_feed() -> GeneratedData {
                 xml_leaf(&mut out, 3, "category", c);
             }
             out.push_str("    </categories>\n");
-            xml_leaf(&mut out, 2, "stock_on_hand", &rng.usize(0..500).to_string());
+            xml_leaf(
+                &mut out,
+                2,
+                "stock_on_hand",
+                &below(&mut rng, 500).to_string(),
+            );
             out.push_str("  </product>\n");
         }
     }
@@ -192,24 +215,24 @@ pub fn support_triage() -> GeneratedData {
     );
 
     for i in 0..ROWS {
-        let first = FIRST_NAMES[rng.usize(..FIRST_NAMES.len())];
-        let last = LAST_NAMES[rng.usize(..LAST_NAMES.len())];
-        let domain = EMAIL_DOMAINS[rng.usize(..EMAIL_DOMAINS.len())];
-        let category = TICKET_CATEGORIES[rng.usize(..TICKET_CATEGORIES.len())];
-        let priority = RAW_PRIORITIES[rng.usize(..RAW_PRIORITIES.len())];
-        let locality = LOCALITIES[rng.usize(..LOCALITIES.len())];
+        let first = *pick(&mut rng, FIRST_NAMES);
+        let last = *pick(&mut rng, LAST_NAMES);
+        let domain = *pick(&mut rng, EMAIL_DOMAINS);
+        let category = *pick(&mut rng, TICKET_CATEGORIES);
+        let priority = *pick(&mut rng, RAW_PRIORITIES);
+        let locality = *pick(&mut rng, LOCALITIES);
 
         // Roughly one row in ten carries an unparseable response time.
-        let response = if rng.usize(..10) == 0 {
-            BAD_RESPONSE[rng.usize(..BAD_RESPONSE.len())].to_string()
+        let response = if below(&mut rng, 10) == 0 {
+            pick(&mut rng, BAD_RESPONSE).to_string()
         } else {
-            rng.usize(2..480).to_string()
+            (2 + below(&mut rng, 478)).to_string()
         };
 
-        let satisfaction = if rng.usize(..8) == 0 {
+        let satisfaction = if below(&mut rng, 8) == 0 {
             String::new()
         } else {
-            (1 + rng.usize(..5)).to_string()
+            (1 + below(&mut rng, 5)).to_string()
         };
 
         csv_row(

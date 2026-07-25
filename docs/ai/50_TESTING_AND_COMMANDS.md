@@ -99,7 +99,27 @@ cargo test -p clinker
 cargo test -p clinker-schema
 cargo test -p clinker-lineage
 cargo test -p clinker-benchmarks
+cargo test -p clinker-scenarios
 ```
+
+The scenario corpus gate is a `clinker` integration test, because
+`CARGO_BIN_EXE_clinker` is only defined for that package:
+
+```bash
+cargo test -p clinker --test scenarios
+```
+
+It generates each scenario's input into a temporary directory, runs the real
+CLI, and byte-compares every output against the committed goldens under
+`examples/scenarios/*/expected/`. To re-bless after an intended change:
+
+```bash
+UPDATE_SCENARIO_GOLDENS=1 cargo test -p clinker --test scenarios -- --nocapture
+```
+
+`--nocapture` is required — libtest swallows stdout on a passing test, and a
+re-bless run passes, so without it the input digest to paste back into the
+harness's `GATES` table is never printed.
 
 Status: **Inferred for the exact per-crate commands.** The full workspace test command above covered these packages successfully outside the sandbox with `ulimit -n 4096`.
 

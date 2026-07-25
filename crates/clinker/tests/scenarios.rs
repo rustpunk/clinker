@@ -26,10 +26,17 @@
 //!
 //! # Re-blessing
 //!
-//! `UPDATE_SCENARIO_GOLDENS=1 cargo test -p clinker --test scenarios` rewrites
-//! every golden and prints each scenario's current input digest for pasting
-//! back into [`GATES`]. Review the resulting diff: a change in *shape* is the
-//! signal, a change in every row usually means the generator moved.
+//! ```text
+//! UPDATE_SCENARIO_GOLDENS=1 cargo test -p clinker --test scenarios -- --nocapture
+//! ```
+//!
+//! rewrites every golden and prints each scenario's current input digest for
+//! pasting back into [`GATES`]. `--nocapture` is required rather than optional:
+//! libtest swallows stdout on a passing test, and a re-bless run passes, so
+//! without it the digest this instruction tells you to copy is never shown.
+//!
+//! Review the resulting diff: a change in *shape* is the signal, a change in
+//! every row usually means the generator moved.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,7 +50,8 @@ struct Gate {
     /// blake3 digest of the generated input, from `clinker_scenarios`.
     ///
     /// Pinned so a generator change cannot silently invalidate the goldens
-    /// below. Refresh with `UPDATE_SCENARIO_GOLDENS=1`, which prints it.
+    /// below. Refresh with a re-bless run (see the module docs); printing the
+    /// new digest needs `-- --nocapture`.
     input_digest: &'static str,
     /// Output files, relative to the scenario directory, compared byte-for-byte.
     outputs: &'static [&'static str],
@@ -72,19 +80,19 @@ const VOLATILE_DLQ_COLUMNS: usize = 2;
 const GATES: &[Gate] = &[
     Gate {
         id: "01-storefront-orders",
-        input_digest: "5e4ce8d65831",
+        input_digest: "56c1401e7ea6",
         outputs: &["output/billable_lines.csv"],
         counters: Counters {
             total: 48,
-            ok: 42,
-            written: 42,
+            ok: 38,
+            written: 38,
             dlq: 0,
         },
         known_broken: None,
     },
     Gate {
         id: "03-support-triage",
-        input_digest: "6ac434427917",
+        input_digest: "d4c149c9653f",
         outputs: &[
             "output/urgent.csv",
             "output/standard.csv",
@@ -93,9 +101,9 @@ const GATES: &[Gate] = &[
         ],
         counters: Counters {
             total: 60,
-            ok: 57,
-            written: 57,
-            dlq: 3,
+            ok: 54,
+            written: 54,
+            dlq: 6,
         },
         known_broken: None,
     },
@@ -181,11 +189,44 @@ fn find_scenario(id: &str) -> &'static Scenario {
         .unwrap_or_else(|| panic!("gate names scenario '{id}', absent from the generator registry"))
 }
 
+/// One problem found while running a gate.
+///
+/// `tolerable` distinguishes the two kinds. A golden mismatch is what a
+/// `known_broken` marker is *for* and may be suppressed. Everything else —
+/// generator-digest drift, a wrong exit code, a missing output file, an
+/// unparseable summary — indicates the scenario is not doing what the gate
+/// believes at all, and must surface even on a known-broken scenario. Without
+/// that split, a scenario parked on an issue could silently start crashing, or
+/// its input could drift, and the eventual un-parking would bless goldens
+/// against data nobody reasoned about.
+struct Failure {
+    tolerable: bool,
+    message: String,
+}
+
+impl Failure {
+    /// A golden mismatch — the defect class `known_broken` may suppress.
+    fn golden(message: String) -> Self {
+        Self {
+            tolerable: true,
+            message,
+        }
+    }
+
+    /// Anything else; surfaces regardless of `known_broken`.
+    fn fatal(message: String) -> Self {
+        Self {
+            tolerable: false,
+            message,
+        }
+    }
+}
+
 /// Run one gate, returning a description of every mismatch found.
 ///
 /// Collects rather than asserting so one run reports every scenario's problems
 /// at once, matching the aggregate-report style of `examples_explain.rs`.
-fn run_gate(gate: &Gate) -> Vec<String> {
+fn run_gate(gate: &Gate) -> Vec<Failure> {
     let mut failures = Vec::new();
     let root = repo_root();
     let scenario_dir = root.join("examples/scenarios").join(gate.id);
@@ -219,12 +260,14 @@ fn run_gate(gate: &Gate) -> Vec<String> {
     if updating() {
         println!("{}: input_digest = \"{short}\"", gate.id);
     } else if short != gate.input_digest {
-        failures.push(format!(
+        failures.push(Failure::fatal(format!(
             "{}: generated input digest is {short}, gate pins {}. The generator moved; \
-             bump GENERATOR_VERSION, re-bless with UPDATE_SCENARIO_GOLDENS=1, and review \
-             the golden diff before trusting it.",
+             bump GENERATOR_VERSION, re-bless with \
+             `UPDATE_SCENARIO_GOLDENS=1 cargo test -p clinker --test scenarios -- --nocapture` \
+             (--nocapture is required to see the new digest), then review the golden diff \
+             before trusting it.",
             gate.id, gate.input_digest
-        ));
+        )));
         return failures;
     }
     materialize(&data, &work.join("data"), true).expect("materialize input");
@@ -250,29 +293,29 @@ fn run_gate(gate: &Gate) -> Vec<String> {
     match output.status.code() {
         Some(code) if code == expected_exit => {}
         Some(code) => {
-            failures.push(format!(
+            failures.push(Failure::fatal(format!(
                 "{}: exit code {code}, expected {expected_exit} ({} DLQ entries).\
                  \nstdout:\n{stdout}\nstderr:\n{stderr}",
                 gate.id, gate.counters.dlq
-            ));
+            )));
             return failures;
         }
         None => {
-            failures.push(format!("{}: terminated by signal", gate.id));
+            failures.push(Failure::fatal(format!("{}: terminated by signal", gate.id)));
             return failures;
         }
     }
 
     // The run summary is written to stdout.
     match parse_counters(&stdout) {
-        Some(actual) if actual != gate.counters => failures.push(format!(
+        Some(actual) if actual != gate.counters => failures.push(Failure::fatal(format!(
             "{}: run summary {:?} does not match the gate's {:?}",
             gate.id, actual, gate.counters
-        )),
-        None => failures.push(format!(
+        ))),
+        None => failures.push(Failure::fatal(format!(
             "{}: could not find a 'Pipeline complete:' summary in stdout:\n{stdout}",
             gate.id
-        )),
+        ))),
         Some(_) => {}
     }
 
@@ -283,10 +326,10 @@ fn run_gate(gate: &Gate) -> Vec<String> {
             .join(Path::new(rel).file_name().expect("output file name"));
 
         let Ok(raw) = std::fs::read(&produced) else {
-            failures.push(format!(
+            failures.push(Failure::fatal(format!(
                 "{}: expected output {rel} was not written",
                 gate.id
-            ));
+            )));
             continue;
         };
         let actual = normalize(rel, &raw);
@@ -300,17 +343,17 @@ fn run_gate(gate: &Gate) -> Vec<String> {
 
         match std::fs::read(&golden) {
             Ok(expected) if expected == actual => {}
-            Ok(expected) => failures.push(format!(
+            Ok(expected) => failures.push(Failure::golden(format!(
                 "{}: {rel} does not match its golden.\n{}",
                 gate.id,
                 first_difference(&expected, &actual)
-            )),
-            Err(_) => failures.push(format!(
+            ))),
+            Err(_) => failures.push(Failure::fatal(format!(
                 "{}: no committed golden at {}. Create it with \
                  UPDATE_SCENARIO_GOLDENS=1 and review the result.",
                 gate.id,
                 golden.display()
-            )),
+            ))),
         }
     }
 
@@ -342,17 +385,36 @@ fn every_scenario_matches_its_golden() {
 
     for gate in GATES {
         let failures = run_gate(gate);
+
+        // Anything that is not a golden mismatch surfaces regardless of the
+        // marker: a parked scenario must still be running, reading the input
+        // the gate pins, and exiting as expected.
+        report.extend(
+            failures
+                .iter()
+                .filter(|f| !f.tolerable)
+                .map(|f| f.message.clone()),
+        );
+
         match gate.known_broken {
-            // A gate marked known-broken must actually be broken. If it starts
-            // passing, the marker is stale and the test says so rather than
-            // quietly continuing to skip a now-working scenario.
-            Some(issue) if failures.is_empty() && !updating() => report.push(format!(
-                "{}: marked known-broken against {issue}, but it now passes. \
-                 Remove `known_broken` and land the golden.",
-                gate.id
-            )),
+            // A gate marked known-broken must actually be broken *in the way
+            // the marker claims*. If the golden now matches, the marker is
+            // stale and the test says so rather than quietly continuing to skip
+            // a now-working scenario.
+            Some(issue) if !failures.iter().any(|f| f.tolerable) && !updating() => {
+                report.push(format!(
+                    "{}: marked known-broken against {issue}, but its golden now matches. \
+                     Remove `known_broken` and land the golden.",
+                    gate.id
+                ));
+            }
             Some(_) => {}
-            None => report.extend(failures),
+            None => report.extend(
+                failures
+                    .iter()
+                    .filter(|f| f.tolerable)
+                    .map(|f| f.message.clone()),
+            ),
         }
     }
 
@@ -374,11 +436,28 @@ fn every_gate_names_a_real_scenario_directory() {
             gate.id,
             dir.display()
         );
-        // A generator entry without a gate is a scenario nobody is checking.
         assert!(
             REGISTRY.iter().any(|s| s.id == gate.id),
             "gate {} is absent from the generator registry",
             gate.id
+        );
+    }
+}
+
+#[test]
+fn every_registered_scenario_has_a_gate() {
+    // The coverage direction that actually matters, and the one the enclosing
+    // `for gate in GATES` loops cannot express. A contributor who adds a
+    // scenario to REGISTRY, commits its pipeline, README and goldens, but
+    // forgets the GATES entry would otherwise get a fully green suite while
+    // that scenario is never executed and its committed golden asserts nothing.
+    for scenario in REGISTRY {
+        assert!(
+            GATES.iter().any(|g| g.id == scenario.id),
+            "scenario '{}' is in the generator registry but has no gate, so it is \
+             generated and never executed. Add a Gate entry with its pinned input \
+             digest, expected outputs and run counters.",
+            scenario.id
         );
     }
 }

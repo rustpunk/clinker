@@ -77,7 +77,20 @@ fn run_gen(only: Option<&str>, force: bool, root: &std::path::Path) -> ExitCode 
 
     for s in selected {
         let data = (s.generate)();
-        let dir = root.join(s.id).join("data");
+        let scenario_root = root.join(s.id);
+        let dir = scenario_root.join("data");
+
+        // The engine does not create a missing output directory — it opens the
+        // sink before anything creates the parent — and `output/` is
+        // git-ignored, so a fresh clone has no such directory and the first
+        // documented `clinker run` would fail with a bare "No such file or
+        // directory". Creating it here is what makes the README's sequence
+        // work from a clone.
+        if let Err(e) = std::fs::create_dir_all(scenario_root.join("output")) {
+            eprintln!("{}: failed to create output directory: {e}", s.id);
+            return ExitCode::FAILURE;
+        }
+
         match materialize(&data, &dir, force) {
             Ok(Materialized::Written) => {
                 println!(
