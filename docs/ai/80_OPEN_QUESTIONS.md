@@ -1,7 +1,15 @@
 # AI Onboarding: Open Questions
 
+Verified against origin/main cf6609b9 (2026-07-24).
+
 Purpose: Track unresolved documentation, architecture, API-stability, and
 testing questions before future agents treat them as facts.
+
+Dating convention: questions 1-27 were filed 2026-06-15 with the initial
+registry; entries filed later carry an explicit `Filed:` line, and every new
+question must include one. Question numbers are stable and never reused;
+resolved or merged entries move to the Resolved Archive at the end of this
+file, keeping their numbers.
 
 ## Source Evidence
 
@@ -40,36 +48,41 @@ evidence.
   document the deliberate recompile step with its invariants.
 - Priority: High
 
-### 2. Should the folder overlay gain a `resources:` surface? (per-value `fixed` locking now done)
+### 2. Should the folder overlay gain a `resources:` surface, and how broad should composition resources become?
 
-- Resolved (per-value `fixed` lock): The folder overlay now carries a `fixed:`
-  block beside `config:` on every layer file (group, channel manifest, per-target
-  overlay). A `fixed:` value applies via `ResolvedValue::apply_layer_fixed`, so a
-  lower layer can lock a value against every higher layer; the `$config` fold and
-  `channels resolve` (a `(fixed)` marker) both honor it. See issue #772 and
-  `docs/user/src/pipelines/channels.md` ("Locking a value: `fixed`").
+(Absorbs former question 9, which asked how far composition resource kinds
+should extend beyond file resources — the same declaration-only subsystem.
+The per-value `fixed`-lock half of this entry is resolved; see the archive.)
+
 - Open (resources fork): A `resources:` overlay surface is still absent, and
   restoring it is a genuine scope fork. The retired file-based `resources:` split
   was parsed into `ChannelBinding.resources_default` / `resources_fixed` but
   **never applied** — it took effect in no version. The broader composition
   resource subsystem is declaration-only: `_compose.resources_schema` and the
   call-site node `resources:` field parse, but `validate_resources`
-  (`bind_schema.rs`) is a stub, resources get no `ProvenanceDb` entry, no
-  production code constructs `Resource::File`, and nothing consumes a resolved
-  resource at runtime. So a `resources:` overlay that merely round-trips would be
-  an inert authoring surface, while making it "take effect" means building a new
-  supply→resolution→consumption subsystem — a scope decision, not a wiring task.
+  (`bind_schema.rs`) is a stub, resources get no `ProvenanceDb` entry,
+  `Resource::File` is constructed at parse (`config/composition/raw.rs`) but
+  never consumed at runtime. So a `resources:` overlay that merely round-trips
+  would be an inert authoring surface, while making it "take effect" means
+  building a new supply→resolution→consumption subsystem — a scope decision,
+  not a wiring task.
 - Why it matters: Deciding requires choosing between (a) deferring resources to a
   dedicated issue that designs the resource runtime, (b) restoring a parse-only /
   validated surface that does not affect execution, or (c) building the full
-  subsystem now. These have materially different scope.
+  subsystem now. These have materially different scope. The same decision should
+  fix the intended resource-kind breadth (file-only versus a typed model) —
+  agents must not invent new resource kinds by inference in the meantime.
 - Files/modules involved: `crates/clinker-channel/src/manifest.rs`,
   `crates/clinker-channel/src/resolve.rs`,
   `crates/clinker-plan/src/config/composition/resource.rs`,
-  `crates/clinker-plan/src/plan/bind_schema.rs` (`validate_resources` stub).
-- Suggested way to resolve it: Route the `resources:` surface through a Decision
-  Gate; it is closely related to open question 9 (resource-kind breadth).
+  `crates/clinker-plan/src/config/composition/raw.rs`,
+  `crates/clinker-plan/src/plan/bind_schema.rs` (`validate_resources` stub),
+  `docs/user/src/pipelines/compositions.md`.
+- Suggested way to resolve it: Route the `resources:` surface and resource-kind
+  breadth through one Decision Gate.
 - Priority: Medium
+- Filed: 2026-06-15; updated 2026-07-03 (fixed-lock half landed) and 2026-07-24
+  (merged question 9).
 
 ### 3. Should pipeline-target channel config keys be validated before overlay application?
 
@@ -81,23 +94,32 @@ evidence.
   validation can hide misspelled overrides until later or allow inconsistent
   provenance.
 - Files/modules involved: `crates/clinker-channel/AGENTS.md`,
-  `crates/clinker-channel/src/binding.rs`,
+  `crates/clinker-channel/src/resolve.rs`,
   `crates/clinker-channel/src/overlay.rs`,
-  `crates/clinker-channel/tests/channel_binding_test.rs`,
+  `crates/clinker-channel/src/manifest.rs`,
+  `crates/clinker-channel/tests/overlay_resolution_test.rs`,
   `docs/user/src/pipelines/channels.md`.
 - Suggested way to resolve it: Define the intended pipeline-target validation
   surface. Add tests for valid keys, unknown keys, precedence, diagnostics, and
   the exact point where invalid overlays fail.
 - Priority: High
 
-### 4. What is the intended boundary between `clinker-schema` and `clinker-plan`?
+### 4. What is the intended boundary between `clinker-schema` and `clinker-plan`, and how complete should its validation be?
+
+(Absorbs former question 5 — discovery/validation depth is one half of the same
+strengthen-or-keep-advisory decision.)
 
 - Question: Should `clinker-schema` remain an advisory edge/authoring crate, or
   should schema discovery and validation move into the planner's compile-time
-  boundary?
+  boundary? If it stays advisory, how complete should `extract_schema_refs`,
+  include/exclude glob behavior, format matching, and CXL field validation be?
 - Why it matters: `clinker-schema` currently depends on `clinker-plan`, returns
-  warnings, and uses lighter validation than the planner. Agents need to know
-  whether to strengthen this crate or keep it separate from canonical planning.
+  warnings, and uses lighter validation than the planner: glob matching is
+  simple filename wildcards, `schema:` extraction is line-oriented, CXL field
+  extraction is heuristic, and some warning variants appear unused. Agents need
+  to know whether to strengthen this crate or keep it separate from canonical
+  planning; docs and tests should not imply full workspace validation unless it
+  is implemented.
 - Files/modules involved: `docs/ai/20_CRATE_MAP.md`,
   `docs/ai/90_CRATE_AGENT_PLAN.md`, `crates/clinker-schema/AGENTS.md`,
   `crates/clinker-schema/src/lib.rs`, `crates/clinker-schema/src/validate.rs`,
@@ -105,65 +127,38 @@ evidence.
   `crates/clinker-plan/src/config/pipeline.rs`.
 - Suggested way to resolve it: Maintainers should choose the boundary and
   document it in crate docs and AI docs. If `clinker-schema` stays advisory,
-  user docs should avoid compiler-grade claims. If it moves toward planning,
-  add parser-backed validation and planner tests.
+  user docs should avoid compiler-grade claims and tests should pin the current
+  heuristic limitations; if it moves toward planning, replace heuristics with
+  structured YAML/CXL parsing, expand warning coverage, and add planner tests.
 - Priority: High
-
-### 5. How complete should `clinker-schema` discovery and validation be?
-
-- Question: Should `extract_schema_refs`, include/exclude glob behavior, format
-  matching, and CXL field validation become YAML/parser-backed, or is the
-  current heuristic authoring support enough?
-- Why it matters: Current guidance says include/exclude glob behavior is
-  simple filename wildcard matching, `schema:` extraction is line-oriented,
-  CXL field extraction is heuristic, and some warning variants appear unused.
-  Docs and tests should not imply full workspace validation unless that is
-  implemented.
-- Files/modules involved: `crates/clinker-schema/AGENTS.md`,
-  `crates/clinker-schema/src/discovery.rs`,
-  `crates/clinker-schema/src/validate.rs`,
-  `crates/clinker-schema/src/model.rs`,
-  `examples/pipelines/retract-demo/*.schema.yaml`.
-- Suggested way to resolve it: Decide supported validation depth. Either
-  document current limitations clearly and add tests that pin them, or replace
-  heuristics with structured YAML/CXL parsing and expand warning coverage.
-- Priority: High
+- Filed: 2026-06-15; merged question 5 on 2026-07-24.
 
 ### 6. Should user-facing docs be updated to the unified `nodes:` shape and all current node types?
 
+(Absorbs former question 20 — choosing canonical envelope/document-context
+docs and marking stale envelope examples historical is part of the same
+stale-user-docs sweep.)
+
 - Question: Which older user/engine docs still describe retired
   `inputs:` / `outputs:` / `transformations:` shapes or "eight node types",
-  and should they be modernized now?
+  which envelope/document-context examples use retired shapes, and should they
+  be modernized now?
 - Why it matters: Current planning code accepts a unified `nodes:` list with
   eleven node variants. Stale docs can cause agents to revive retired config
-  shapes or omit active nodes such as `reshape`, `cull`, and `envelope`.
+  shapes, omit active nodes such as `reshape`, `cull`, and `envelope`, or copy
+  stale envelope snippets into tests and examples.
 - Files/modules involved: `docs/ai/70_GLOSSARY.md`,
-  `docs/ai/80_OPEN_QUESTIONS.md`, `crates/clinker-plan/AGENTS.md`,
+  `crates/clinker-plan/AGENTS.md`,
   `crates/clinker/AGENTS.md`, `docs/user/src/getting-started/concepts.md`,
   `docs/user/src/pipelines/structure.md`, `docs/user/src/pipelines/envelope-and-doc-context.md`,
-  `crates/clinker-plan/src/config/pipeline_node.rs`.
+  `docs/user/src/nodes/envelope.md`,
+  `crates/clinker-plan/src/config/pipeline_node.rs`,
+  `crates/clinker-exec/src/executor/envelope_dispatch.rs`.
 - Suggested way to resolve it: Audit user and engine docs for retired shapes,
-  update examples to unified `nodes:`, and add doc/example checks where
-  feasible so future changes do not drift.
+  update examples to unified `nodes:`, pick canonical envelope examples, and
+  add doc/example checks where feasible so future changes do not drift.
 - Priority: High
-
-### 7. Should source-node docs and transport docs mention REST as implemented, and SQL cursors as roadmap only?
-
-- Question: Should `source` documentation say current transports are file and
-  finite REST, while SQL cursor wording is future or unsupported?
-- Why it matters: `clinker-net` implements REST only, but docs and manifests
-  mention SQL cursors. Agents should not infer SQL support or document file as
-  the only current transport.
-- Files/modules involved: `crates/clinker-net/AGENTS.md`,
-  `docs/ai/20_CRATE_MAP.md`, `docs/user/src/nodes/source.md`,
-  `docs/user/src/formats/source-network.md`,
-  `crates/clinker-net/Cargo.toml`, `crates/clinker-net/src/lib.rs`,
-  `crates/clinker-net/src/rest.rs`,
-  `crates/clinker-exec/tests/transport_validation.rs`.
-- Suggested way to resolve it: Align manifest descriptions, user docs, and AI
-  docs with implemented REST behavior. Mark SQL cursors explicitly as roadmap
-  or remove the wording until implementation exists.
-- Priority: High
+- Filed: 2026-06-15; merged question 20 on 2026-07-24.
 
 ## Medium Priority
 
@@ -184,24 +179,6 @@ evidence.
   `clinker-format`; if not, plan a refactor boundary and tests.
 - Priority: Medium
 
-### 9. How broad should composition resource support become beyond file resources?
-
-- Question: Are composition resources intended to stay file-only for now, or is
-  a broader typed resource model planned?
-- Why it matters: The planning layer has resource declaration and payload types,
-  but AI docs say evidence currently shows only file resources and validation is
-  partly stubbed. Agents should not invent new resource kinds by inference.
-- Files/modules involved: `docs/ai/40_COMMON_PATTERNS.md`,
-  `crates/clinker-plan/AGENTS.md`,
-  `crates/clinker-plan/src/config/composition/resource.rs`,
-  `crates/clinker-plan/src/config/composition/raw.rs`,
-  `crates/clinker-plan/src/config/composition/tests.rs`,
-  `docs/user/src/pipelines/compositions.md`.
-- Suggested way to resolve it: Document current supported resource kinds and add
-  tests that reject unsupported kinds. If expanding support, design the resource
-  model first and update channel/resource overlay semantics at the same time.
-- Priority: Medium
-
 ### 10. Which planner and CXL public APIs are stable user-facing API versus internal exposed surface?
 
 - Question: Should public symbols such as `cxl::resolve::HashMapResolver`,
@@ -211,7 +188,7 @@ evidence.
   public visibility does not always imply a compatibility promise. Extending or
   documenting test doubles and legacy config structs as stable would freeze
   accidental surface area.
-- Files/modules involved: `docs/ai/80_OPEN_QUESTIONS.md`,
+- Files/modules involved:
   `crates/cxl/AGENTS.md`, `crates/cxl/src/resolve/mod.rs`,
   `crates/cxl/src/resolve/test_double.rs`,
   `crates/cxl/src/typecheck/row.rs`,
@@ -230,7 +207,7 @@ evidence.
   that are not used in the run path, and agents should not wire them casually in
   core crates without tests.
 - Files/modules involved: `crates/clinker/AGENTS.md`,
-  `docs/ai/80_OPEN_QUESTIONS.md`, `crates/clinker/src/main.rs`,
+  `crates/clinker/src/main.rs`,
   `docs/user/src/ops/cli-reference.md`,
   `crates/clinker/tests/`.
 - Suggested way to resolve it: Audit `RunArgs` fields from parsing through
@@ -238,33 +215,14 @@ evidence.
   if intentionally reserved.
 - Priority: Medium
 
-### 12. Should `cxl-cli` docs, manifest description, and CLI behavior be aligned? (RESOLVED)
-
-- Resolution: `Command::Eval.expr` remains a single `Option<String>`.
-  User docs now show multiple CXL statements inside one `-e` value, and the
-  `cxl-cli` package description says validator/evaluator/formatter.
-- Files/modules involved: `crates/cxl-cli/AGENTS.md`,
-  `crates/cxl-cli/Cargo.toml`, `crates/cxl-cli/src/main.rs`,
-  `docs/user/src/cxl/cxl-cli.md`, `docs/ai/20_CRATE_MAP.md`.
-- Priority: Resolved
-
-### 13. Should `cxl-cli --record` preserve nested JSON objects as `Value::Map`? (RESOLVED)
-
-- Resolution: `json_to_value` now recursively maps JSON objects to
-  `Value::Map`; the CXL CLI docs list `{object}` as `Map`, and unit coverage
-  pins nested objects inside maps and arrays.
-- Files/modules involved: `crates/cxl-cli/AGENTS.md`,
-  `crates/cxl-cli/src/main.rs`, `crates/clinker-record/src/value.rs`,
-  `docs/user/src/cxl/cxl-cli.md`.
-- Priority: Resolved
-
 ### 14. Should `PipelineCounters::ok_count` use a globally unique source-row identity?
 
 - Question: Should successful-record deduplication use source plus row identity
   instead of `row_num` alone?
-- Why it matters: Current crate guidance says row-number collisions across
-  sources can undercount distinct inputs. Counter semantics are visible through
-  metrics and `$pipeline` CXL counters.
+- Why it matters: Row-number collisions across sources can undercount distinct
+  inputs; `counters.rs` now documents this as a known limitation but still keys
+  by `row_num`. Counter semantics are visible through metrics and `$pipeline`
+  CXL counters.
 - Files/modules involved: `crates/clinker-record/AGENTS.md`,
   `crates/clinker-record/src/counters.rs`,
   `crates/clinker-exec/src/executor/params.rs`,
@@ -339,7 +297,7 @@ evidence.
 - Why it matters: Channel var overlay failures are user-visible diagnostics.
   Diagnostic-code lookup should be consistent for errors emitted by channel and
   planning layers.
-- Files/modules involved: `docs/ai/80_OPEN_QUESTIONS.md`,
+- Files/modules involved:
   `crates/clinker-channel/src/overlay.rs`,
   `docs/user/src/pipelines/channels.md`,
   `docs/user/src/pipelines/variables.md`,
@@ -366,41 +324,6 @@ evidence.
   acceptance/rejection tests for non-UTF-8 cases and update docs to match.
 - Priority: Medium
 
-### 20. Which envelope and document-context docs are canonical?
-
-- Question: Should older envelope/document examples using retired shapes be
-  modernized or explicitly marked historical?
-- Why it matters: Envelope and document context behavior is complex and used by
-  source readers, stream events, output framing, and docs. Future agents should
-  not copy stale snippets into tests or examples.
-- Files/modules involved: `docs/user/src/pipelines/envelope-and-doc-context.md`,
-  `docs/user/src/nodes/envelope.md`, `docs/ai/70_GLOSSARY.md`,
-  `crates/clinker-format/AGENTS.md`, `crates/clinker-exec/AGENTS.md`,
-  `crates/clinker-plan/src/config/pipeline_node.rs`,
-  `crates/clinker-exec/src/executor/envelope_dispatch.rs`.
-- Suggested way to resolve it: Pick canonical examples, rewrite stale snippets
-  to unified `nodes:` syntax, and add example or docs tests if practical.
-- Priority: Medium
-
-### 21. Should `CROSS_RECORD_TRANSFORMS_PLAN.md` be marked historical or active?
-
-- Question: Is `CROSS_RECORD_TRANSFORMS_PLAN.md` obsolete planning history, or
-  does it still contain active design guidance?
-- Why it matters: The file references old paths such as
-  `crates/clinker-core/...`, while related concepts now exist as `reshape` and
-  `cull` under current plan/exec crates. Agents may mistake it for current
-  architecture.
-- Files/modules involved: `CROSS_RECORD_TRANSFORMS_PLAN.md`,
-  `docs/ai/80_OPEN_QUESTIONS.md`,
-  `crates/clinker-plan/src/config/pipeline_node.rs`,
-  `crates/clinker-exec/src/executor/reshape_dispatch.rs`,
-  `crates/clinker-exec/src/executor/cull_dispatch.rs`,
-  `docs/user/src/nodes/reshape.md`, `docs/user/src/nodes/cull.md`.
-- Suggested way to resolve it: Add an explicit status note to the plan file:
-  historical, superseded, or active. If active, update paths and open work
-  items to current crate names.
-- Priority: Medium
-
 ## Low Priority
 
 ### 22. What is the intended expansion of "CXL"?
@@ -415,20 +338,6 @@ evidence.
   `crates/cxl/src/lib.rs`.
 - Suggested way to resolve it: Ask maintainers for the canonical expansion. If
   none exists, add a note that CXL is a name, not an expanded acronym.
-- Priority: Low
-
-### 23. Is `reserve/` definitively only a crates.io name-reservation package?
-
-- Question: Does `reserve/` have any active release workflow or maintenance
-  role beyond reserving the `clinker` crate name?
-- Why it matters: AI docs currently mark it as inferred from local files. Agents
-  should not modify or document it as runtime code.
-- Files/modules involved: `docs/ai/10_ARCHITECTURE.md`,
-  `docs/ai/20_CRATE_MAP.md`, `docs/ai/70_GLOSSARY.md`,
-  `docs/ai/90_CRATE_AGENT_PLAN.md`, `reserve/Cargo.toml`,
-  `reserve/src/lib.rs`, `reserve/README.md`.
-- Suggested way to resolve it: Ask maintainers to confirm the package role.
-  Add a short status note in `reserve/README.md` or AI docs.
 - Priority: Low
 
 ### 24. Are weakly used declared dependencies intentional compatibility hooks or cleanup debt?
@@ -495,45 +404,6 @@ evidence.
   renderer or link checker becomes required.
 - Priority: Low
 
-### 28. Should compiled per-node CXL artifacts be keyed by scope, not bare node name? (RESOLVED)
-
-- Resolution: Every per-node-identity side-table in `CompileArtifacts`
-  (`typed`, `combine_where_typed`, `route_branch_typed`, the `combine_*` maps,
-  `envelope_synthesis`, `composition_body_assignments`) is now keyed by a dense
-  `PlanNodeId` minted once at graph construction — a stronger guarantee than
-  `(scope, name)`, since two instantiations of one composition body get
-  disjoint id sets by construction. `ScopedNodeId`/`NodeScope` were deleted, and
-  the cross-scope last-writer-wins collision can no longer occur for these
-  tables. One name-keyed facility remains by design — see open question 29.
-
-- Question: `CompileArtifacts.typed` and `CompileArtifacts.combine_where_typed`
-  are flat maps keyed by the bare node name, shared across the top-level
-  pipeline and every composition body. Body-local node names have no
-  cross-scope uniqueness guarantee, so a node name reused by a `Combine` (or
-  other CXL-bearing node) in a nested composition body overwrites the entry for
-  the enclosing body. Should these tables be keyed by `(scope, name)` instead?
-- Why it matters: The collision lives in the bare-name-keyed
-  `CompileArtifacts` maps that every per-node CXL consumer shares — the
-  compile-time `where`/doc-paths consumers and the lowering populate that pull
-  the combine body program onto `PlanNode::Combine.typed`. A node name reused
-  by a `Combine` (or other CXL-bearing node) in a nested composition body wins
-  last-writer-wins in the flat map, so the program lowered onto the node — and
-  any lineage derived from it — can be the wrong one. The on-node program is
-  scope-correct once it is read off the node, but it is fed from the
-  collision-exposed flat map at lowering. Tracked for the node-artifact rework
-  (scope-correct keying via `(scope, name)`).
-- Files/modules involved:
-  `crates/clinker-plan/src/plan/bind_schema.rs` (`CompileArtifacts`,
-  `bind_combine`, `bind_composition`),
-  `crates/clinker-plan/src/config/pipeline.rs` (combine lowering),
-  `crates/clinker-exec/src/executor/combine_dispatch.rs`.
-- Suggested way to resolve it: Decide whether cross-scope node-name reuse is
-  supported. If so, key per-node CXL artifacts by scope (`(scope, name)`) at
-  the flat-map source so the program lowered onto each node is unambiguous;
-  add a regression test with a nested composition that reuses a combine name.
-  If not, add a bind-time diagnostic rejecting the collision.
-- Priority: Low
-
 ### 29. Should `ProvenanceDb` be keyed by `PlanNodeId` despite its name-addressed query contract?
 
 - Question: After the `PlanNodeId` identity rip, `CompileArtifacts.provenance`
@@ -559,6 +429,7 @@ evidence.
   test. If not, add a bind-time diagnostic rejecting the same-name collision, or
   document that provenance is attributed by scoped path.
 - Priority: Low
+- Filed: 2026-06-24 (residual of resolved question 28).
 
 ### 30. Analytic windows inside a nested composition body are never resolved
 
@@ -587,43 +458,79 @@ evidence.
   bind-time diagnostic rejecting `analytic_window:` in a body reachable only
   through a nested composition.
 - Priority: Low
+- Filed: 2026-06-24.
 
-### 31. Schema-resolver unification: what still needs one resolved schema per source
+### 31. Authoring-time `numeric -> int|float` inference (`clinker guess`) is unbuilt
 
-- Landed: the dead `schema_overrides` strategic-merge surface
-  (`schema/resolve.rs`, `SourceConfig.schema_overrides`, the override-only
-  `FieldDef.drop`/`record` fields, and the inline-schema/overrides conflict
-  check) is removed. The keyed-map `patch_schema` op (`config/patch.rs::apply_schema_ops`,
-  E230–E235) is now the single sanctioned schema-override path — no parallel
-  override merger remains. The `decimal` type token is retired: a decimal is a
-  `float` field carrying `precision`/`scale` attributes, so the format-layer
-  `FieldType` and the CXL `Type` vocabularies agree on the fractional type.
-- Resolved (unified-source-schema, phases 1-4): the two per-source schema
-  representations have collapsed into one `Column` / `SourceSchema`. The
-  format-layer `FieldType` / `FieldDef` byte-layout vocabulary is retired; each
-  `Column` carries one `cxl::typecheck::Type` that drives both byte parsing and
-  typecheck, and the schema resolves at compile (external `.schema.yaml` folded
-  into `source_hash`), not lazily at ingest. `CompiledPlan` carries the resolved
-  per-source schema (`bound_schemas`); per-attribute schema provenance is built
-  (`SchemaProvenanceDb`, `--explain --field <source>.<column>.<attr>`); and the
-  `numeric` "never survives a resolved schema" invariant is enforced — a declared
-  `type: numeric` that has not been concretized is rejected at compile (E158),
-  and the `numeric` user-doc examples now declare concrete `int`/`float`. The
-  EDI-family `generated` schema synthesizes its positional columns
-  (`seg_id`/`e01…`/`f01…`/`block,tag,value`) at compile from the format's count
-  options via `clinker_format::*_generated_columns` — the same functions the
-  runtime readers build their schema from — so a Generated source's typechecked
-  row matches the emitted records (E159 rejects `generated` on a non-EDI format).
-  The one remaining follow-on is the authoring-time `numeric -> int|float`
-  inference path (`clinker guess`, unbuilt).
-- Why it matters: a single authoritative source-column type now backs both byte
-  parsing and CXL typecheck; `numeric` is an inference-only union that must be
-  resolved before it reaches the compiled plan.
+(The schema-resolver unification this question originally tracked has landed;
+see the Resolved Archive. This entry keeps the one remaining follow-on.)
+
+- Question: The `numeric` type is an inference-only union that never survives a
+  resolved schema (compile rejects unresolved `type: numeric` with E158). The
+  planned authoring-time path that concretizes it — a `clinker guess` flow that
+  infers `int` versus `float` from sample data — is unbuilt. Should it be built,
+  and with what sampling/precision rules?
+- Why it matters: Until an inference path exists, users must hand-resolve
+  `numeric` columns; docs and examples must keep declaring concrete
+  `int`/`float`, and agents must not treat `numeric` as a runtime type.
 - Files/modules involved: `crates/clinker-plan/src/schema/mod.rs`,
-  `crates/clinker-plan/src/config/patch.rs`,
-  `crates/clinker-plan/src/plan/bind_schema.rs`,
-  `crates/clinker-plan/src/plan/compiled.rs`,
-  `crates/clinker-exec/src/executor/ingest.rs`,
-  `crates/clinker-exec/src/pipeline/schema_coerce.rs`,
-  `crates/cxl/src/typecheck/types.rs`.
+  `crates/cxl/src/typecheck/types.rs`, `crates/clinker/src/main.rs`,
+  `docs/user/src/nodes/source.md`.
+- Suggested way to resolve it: Design the `clinker guess` sampling and
+  concretization rules, then implement it as an authoring-time CLI flow that
+  rewrites the schema declaration; keep runtime strictness unchanged.
 - Priority: Medium
+- Filed: 2026-07-02; narrowed to the `clinker guess` follow-on 2026-07-24.
+
+## Resolved Archive
+
+Numbers are never reused. One line per entry: the answer and its evidence.
+
+- **2 (partial, `fixed` lock; resolved 2026-07-03):** The folder overlay carries
+  a `fixed:` block beside `config:` on every layer file; a lower layer locks a
+  value against every higher layer via `ResolvedValue::apply_layer_fixed`, and
+  `$config` folding plus `channels resolve` honor it (issue #772;
+  `docs/user/src/pipelines/channels.md`, "Locking a value: `fixed`"). The
+  `resources:` fork remains open as question 2.
+- **5 (merged 2026-07-24):** Folded into question 4 — discovery/validation depth
+  is one half of the strengthen-or-keep-advisory decision.
+- **7 (resolved by documentation):** Current transports are file and finite
+  REST; SQL-cursor wording is roadmap-only, stated in
+  `crates/clinker-net/AGENTS.md`. Only HTTP pagination cursors exist
+  (`crates/clinker-net/src/rest.rs`).
+- **9 (merged 2026-07-24):** Folded into question 2 — resource-kind breadth and
+  the `resources:` overlay surface are one scope decision.
+- **12 (resolved):** `Command::Eval.expr` stays a single `Option<String>`; user
+  docs show multiple CXL statements inside one `-e` value; the `cxl-cli`
+  package description says validator/evaluator/formatter
+  (`crates/cxl-cli/src/main.rs`; `docs/user/src/cxl/cxl-cli.md`).
+- **13 (resolved):** `json_to_value` recursively maps JSON objects to
+  `Value::Map`; docs list `{object}` as `Map`; unit coverage pins nested
+  objects inside maps and arrays (`crates/cxl-cli/src/main.rs`).
+- **20 (merged 2026-07-24):** Folded into question 6 — canonical
+  envelope/document-context docs are part of the stale-user-docs sweep.
+- **21 (resolved by maintainer decision, 2026-07-24):**
+  `CROSS_RECORD_TRANSFORMS_PLAN.md` is a historical design record, not active
+  guidance — its design shipped as the `Reshape` and `Cull` nodes
+  (`crates/clinker-exec/src/executor/reshape_dispatch.rs`,
+  `crates/clinker-exec/src/executor/cull_dispatch.rs`) — and the maintainer is
+  retiring the file from the tracked tree to local working notes. Treat any
+  surviving copy as history; where it disagrees with source, source wins.
+- **23 (resolved):** The `reserve/` package is a crates.io name-reservation
+  placeholder only — its README states the role and "pre-release placeholder"
+  status. It is intentionally untracked (absent from clones); do not cite its
+  files as repository evidence.
+- **28 (filed 2026-06-22, resolved 2026-06-24):** Per-node CXL artifact tables
+  in `CompileArtifacts` are keyed by a dense `PlanNodeId` minted at graph
+  construction (stronger than `(scope, name)`; `ScopedNodeId`/`NodeScope`
+  deleted), eliminating the cross-scope last-writer-wins collision
+  (`crates/clinker-plan/src/plan/bind_schema.rs`). The one name-keyed facility
+  left by design is `ProvenanceDb` — open question 29.
+- **31 (partial, schema-resolver unification; resolved 2026-07-03):** The two
+  per-source schema representations collapsed into one `Column`/`SourceSchema`;
+  the format-layer `FieldType`/`FieldDef` vocabulary and the `decimal` type
+  token are retired (decimal = `float` + `precision`/`scale`); `patch_schema`
+  (E230-E235) is the single schema-override path; `CompiledPlan` carries
+  `bound_schemas` + `SchemaProvenanceDb`; unresolved `type: numeric` is
+  rejected at compile (E158) and `generated` on a non-EDI format is rejected
+  (E159). The `clinker guess` inference follow-on remains open as question 31.

@@ -1,5 +1,7 @@
 # AI Onboarding: Common Patterns
 
+Verified against origin/main cf6609b9 (2026-07-24).
+
 Purpose: Identify repeated implementation and documentation patterns that AI
 agents should verify and reuse when making future changes.
 
@@ -151,7 +153,7 @@ manifests, tests, examples, or safe local commands before being copied here.
 6. Evidence: `crates/clinker-core-types/src/span.rs`;
    `crates/clinker-record/src/document_context.rs`;
    `crates/cxl/src/ast.rs`; `crates/cxl/src/typecheck/row.rs`;
-   `crates/clinker-channel/src/binding.rs`;
+   `crates/clinker-channel/src/dotted.rs`;
    `crates/clinker-plan/src/yaml.rs`;
    `crates/clinker-plan/src/security.rs`;
    `crates/clinker-format/src/source.rs`;
@@ -192,7 +194,7 @@ manifests, tests, examples, or safe local commands before being copied here.
 
 1. Pattern name: Records and control messages share the same ordered stream.
 2. Where it appears: `StreamEvent`, `Punctuation`, `PunctuationKind`,
-   `StructuralReject`, `EventBatch`, `EventBatcher`, `SourceStream`, and
+   `StructuralReject`, `EventBatch`, `EventBatcher`, `SourceConsumer`, and
    executor dispatch arms that preserve or reconcile punctuations.
 3. Rationale: document-boundary signals must preserve strict order
    relative to records. The code explicitly rejects out-of-band signaling for
@@ -422,8 +424,9 @@ manifests, tests, examples, or safe local commands before being copied here.
 1. Pattern name: YAML examples and benchmark pipelines live outside Cargo
    example targets.
 2. Where it appears: `examples/pipelines`, `examples/pipelines/data`,
-   `examples/pipelines/channels`, `examples/pipelines/compositions`,
-   `examples/pipelines/tests/baseline`, and `benches/pipelines`.
+   `examples/pipelines/compositions`, `examples/pipelines/tests/baseline`,
+   the channel-overlay workspace under `examples/multitenant`, and
+   `benches/pipelines`.
 3. Rationale: examples double as user-facing pipeline material and
    integration/benchmark fixtures. Bench configs are grouped by feature area
    rather than by Rust crate.

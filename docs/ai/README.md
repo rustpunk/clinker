@@ -1,5 +1,7 @@
 # AI Agent Workspace
 
+Verified against origin/main cf6609b9 (2026-07-24).
+
 Purpose: Explain how future Codex and Claude agents should use the AI onboarding documentation.
 
 ## How Agents Should Use This Folder
@@ -36,6 +38,7 @@ Validate this page against:
 - `20_CRATE_MAP.md`: current workspace crate roles and dependency direction.
 - `30_DESIGN_RULES.md`: architecture, dependency, config, and review rules.
 - `40_COMMON_PATTERNS.md`: repeated implementation patterns and local conventions.
+- `45_COMMON_AGENT_MISTAKES.md`: recurring agent mistakes and the drift traps behind them; companion to `40_COMMON_PATTERNS.md`.
 - `50_TESTING_AND_COMMANDS.md`: canonical command guide.
 - `60_PERFORMANCE_NOTES.md`: hot paths, memory-sensitive code, and benchmark entry points.
 - `70_GLOSSARY.md`: project-specific terms.
@@ -43,5 +46,5 @@ Validate this page against:
 - `90_CRATE_AGENT_PLAN.md`: crate-level `AGENTS.md` inventory and ownership map.
 - `GITHUB_ISSUE_AGENT_WORKFLOW.md`: issue-driven agent workflow entry point.
 - `github-workflow/`: focused workflow slices for planning, grounding,
-  decisions, implementation, review, and operations.
+  decisions, implementation, review, operations, and milestone orchestration.
 - `AI_CHANGELOG.md`: lightweight AI documentation history and decision notes.

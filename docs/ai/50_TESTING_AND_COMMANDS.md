@@ -1,5 +1,7 @@
 # AI Onboarding: Testing And Commands
 
+Verified against origin/main cf6609b9 (2026-07-24).
+
 Purpose: Give future Codex sessions a practical, current command guide for building, testing, linting, documenting, and validating Clinker changes.
 
 Status labels:
@@ -95,6 +97,7 @@ cargo test -p clinker-channel
 cargo test -p clinker-net
 cargo test -p clinker
 cargo test -p clinker-schema
+cargo test -p clinker-lineage
 cargo test -p clinker-benchmarks
 ```
 
@@ -227,7 +230,8 @@ Status: **Inferred from file discovery.**
 
 ## 11. Benchmark/Performance Commands
 
-CI bench gates:
+CI bench gates (local `--locked --offline` variants; CI runs the plain online
+forms shown in section 12):
 
 ```bash
 cargo check --benches --workspace --locked --offline
@@ -316,6 +320,13 @@ cargo test --benches -p clinker-benchmarks
 cargo deny check
 ```
 
+CI's `check` job additionally smoke-checks every example pipeline: it builds
+the CLI (`cargo build --locked -p clinker`) and runs each
+`examples/pipelines/*.yaml` through `clinker ... --explain`
+(`.github/workflows/ci.yml`, "Smoke-check example pipelines" step). If a change
+touches example pipelines, plan/config validation, or CLI explain behavior,
+run that smoke pass locally before pushing.
+
 Status: **Inferred from CI for the exact online forms.** Locked/offline variants of all Rust compile/test/bench commands above were verified where practical; `cargo deny check` was verified outside the filesystem sandbox.
 
 ## 13. Expensive, Flaky, Or Environment-Dependent Commands
@@ -335,4 +346,4 @@ Status: **Inferred from CI for the exact online forms.** Locked/offline variants
 - `cargo test --workspace` can run for a long time: the workspace has a large test suite with many integration tests. Use `cargo test -p <package>` or an exact test filter while iterating.
 - `cargo test --benches -p clinker-benchmarks` runs many `Testing e2e/...` cases: this is expected. It is CI's benchmark smoke gate, not a quick compile check.
 - Rustdoc warnings from `cargo doc --workspace --no-deps`: current docs build exits 0 with warnings for broken/private intra-doc links, invalid HTML tags, and bare URLs. Do not treat these warnings as a new failure unless your change introduced them or the command becomes warning-denied.
-- Missing `README.md`: there is no root README in this checkout. Use `CLAUDE.md`, `Cargo.toml`, CI, crate manifests, `docs/user`, `docs/engine`, examples, tests, and benches as primary command evidence.
+- A root `README.md` exists (project overview and pillars). For command evidence, still prefer `CLAUDE.md`, `Cargo.toml`, CI, crate manifests, `docs/user`, `docs/engine`, examples, tests, and benches over README prose.

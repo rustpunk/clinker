@@ -23,3 +23,12 @@ clinker-case-probe-*.tmp
 # Stray CLI output an integration test writes with a relative `path: out.csv`
 # when run from the crate directory; never a source artifact.
 crates/clinker/out.csv
+
+# Local review/audit scratch trees written by ad-hoc tooling during code
+# review and auditing; never source artifacts.
+.audit/
+.pi/
+.review-scratch/
+.review-tmp/
+.review_scratch/
+.review_tmp/

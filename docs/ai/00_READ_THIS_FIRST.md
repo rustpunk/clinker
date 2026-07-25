@@ -1,5 +1,7 @@
 # 00 — Read This First
 
+Verified against origin/main cf6609b9 (2026-07-24).
+
 ## Purpose
 
 This file is the entry point for AI agents and senior Rust contributors using
@@ -126,6 +128,9 @@ git diff --check
 - [docs/ai/40_COMMON_PATTERNS.md](40_COMMON_PATTERNS.md): repeated local
   implementation patterns such as streaming traits, proof tokens, registries,
   span-aware YAML, error enums, and test organization.
+- [docs/ai/45_COMMON_AGENT_MISTAKES.md](45_COMMON_AGENT_MISTAKES.md): recurring
+  agent mistakes and the drift traps behind them; companion to the
+  common-patterns doc.
 - [docs/ai/50_TESTING_AND_COMMANDS.md](50_TESTING_AND_COMMANDS.md): practical
   build, test, lint, docs, benchmark, and troubleshooting command guide.
 - [docs/ai/60_PERFORMANCE_NOTES.md](60_PERFORMANCE_NOTES.md): performance- and
@@ -171,7 +176,7 @@ docs, or intended behavior need clarification.
 
 The full list is in
 [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md). The most important
-current uncertainties are:
+uncertainties as of the verification date above are:
 
 - `PipelineExecutor::run_plan_with_readers_writers` accepts `CompiledPlan`, but
   the intended relationship between the stored DAG and runtime recompilation
@@ -182,8 +187,6 @@ current uncertainties are:
   `clinker-plan` remain unresolved.
 - Some user-facing docs may still describe retired config shapes, an outdated
   node count, or unclear envelope/document-context examples.
-- Transport docs need alignment around implemented file and finite REST support
-  versus SQL cursor wording.
 - The `clinker-format -> cxl` dependency edge is current, but whether it is a
   permanent layering rule remains open.
 - Some public planner/CXL symbols may be exposed without a clear stability
