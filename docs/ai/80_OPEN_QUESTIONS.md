@@ -509,12 +509,12 @@ Numbers are never reused. One line per entry: the answer and its evidence.
   objects inside maps and arrays (`crates/cxl-cli/src/main.rs`).
 - **20 (merged 2026-07-24):** Folded into question 6 — canonical
   envelope/document-context docs are part of the stale-user-docs sweep.
-- **21 (resolved by maintainer decision, 2026-07-24):**
-  `CROSS_RECORD_TRANSFORMS_PLAN.md` is a historical design record, not active
-  guidance — its design shipped as the `Reshape` and `Cull` nodes
+- **21 (resolved by maintainer decision, 2026-07-24):** The cross-record
+  document-level transforms design is a historical record, not active
+  guidance — it shipped as the `Reshape` and `Cull` nodes
   (`crates/clinker-exec/src/executor/reshape_dispatch.rs`,
-  `crates/clinker-exec/src/executor/cull_dispatch.rs`) — and the maintainer is
-  retiring the file from the tracked tree to local working notes. Treat any
+  `crates/clinker-exec/src/executor/cull_dispatch.rs`) — and its plan file has
+  been retired from the tracked tree to local working notes. Treat any
   surviving copy as history; where it disagrees with source, source wins.
 - **23 (resolved):** The `reserve/` package is a crates.io name-reservation
   placeholder only — its README states the role and "pre-release placeholder"
