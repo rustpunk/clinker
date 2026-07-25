@@ -6,9 +6,11 @@ Purpose: Give future AI agents a factual map of the current Cargo workspace, wit
 
 ## Workspace Overview
 
-The root workspace has 14 members: `clinker-record`, `cxl`, `cxl-cli`, `clinker-format`, `clinker-core-types`, `clinker-plan`, `clinker-exec`, `clinker-net`, `clinker-channel`, `clinker`, `clinker-schema`, `clinker-lineage`, `clinker-bench-support`, and `clinker-benchmarks` (`Cargo.toml`). A separate non-member Cargo package named `clinker` (a crates.io name-reservation placeholder, directory `reserve/`) is maintained outside the tracked tree — it is untracked, absent from fresh clones, and nothing in the workspace depends on it.
+The root workspace has 15 members: `clinker-record`, `cxl`, `cxl-cli`, `clinker-format`, `clinker-core-types`, `clinker-plan`, `clinker-exec`, `clinker-net`, `clinker-channel`, `clinker`, `clinker-schema`, `clinker-lineage`, `clinker-bench-support`, `clinker-benchmarks`, and `clinker-scenarios` (`Cargo.toml`). A separate non-member Cargo package named `clinker` (a crates.io name-reservation placeholder, directory `reserve/`) is maintained outside the tracked tree — it is untracked, absent from fresh clones, and nothing in the workspace depends on it.
 
-No Cargo `examples` targets were found. The repository does contain YAML pipeline examples and fixtures under `examples/pipelines/` plus benchmark pipeline configs under `benches/pipelines/`.
+No Cargo `examples` targets were found. The repository does contain YAML pipeline examples and fixtures under `examples/pipelines/`, the executed scenario corpus under `examples/scenarios/`, plus benchmark pipeline configs under `benches/pipelines/`.
+
+`clinker-scenarios` sits at the edge alongside the benchmark crates: it depends on nothing in the workspace and nothing in the runtime depends on it. It generates the input data for `examples/scenarios/`, which `crates/clinker/tests/scenarios.rs` executes against committed goldens. Scenario inputs are generated rather than committed; the expected output is committed.
 
 ## Dependency Direction Summary
 
@@ -28,6 +30,7 @@ clinker-record
 
 clinker-bench-support -> clinker-record
 clinker-benchmarks -> clinker-bench-support + clinker-exec + clinker-plan + cxl
+clinker-scenarios -> (no workspace dependencies; dev-dependency of clinker)
 ```
 
 Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clinker-record`; `clinker-format -> clinker-record, cxl`; `clinker-plan -> clinker-core-types, clinker-format, clinker-record, cxl`; `clinker-exec -> clinker-core-types, clinker-format, clinker-plan, clinker-record, cxl`; `clinker-channel -> clinker-core-types, clinker-plan, clinker-record`; `clinker-net -> clinker-exec, clinker-format, clinker-plan, clinker-record`; `clinker -> clinker-channel, clinker-core-types, clinker-exec, clinker-format, clinker-lineage, clinker-net, clinker-plan, clinker-record`; `cxl-cli -> cxl, clinker-record`; `clinker-schema -> clinker-plan`; `clinker-lineage -> clinker-plan, clinker-record, cxl`.

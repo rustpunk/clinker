@@ -1,0 +1,14 @@
+ticket_id,opened_at,customer_email,category,first_response_mins,priority,sla_breached
+TK-200009,2026-01-21T08:37:00Z,marta.okonkwo@example.com,billing,246,standard,true
+TK-200011,2026-01-06T18:07:00Z,amara.voss@example.com,billing,188,standard,false
+TK-200012,2026-01-28T14:56:00Z,dana.nakamura@example.com,shipping,95,standard,false
+TK-200021,2026-01-12T11:21:00Z,tomas.bergstrom@example.net,account-access,360,standard,true
+TK-200023,2026-01-30T09:53:00Z,bo.petrov@example.com,billing,440,standard,true
+TK-200024,2026-01-17T15:11:00Z,amara.nakamura@example.net,shipping,151,standard,false
+TK-200025,2026-01-15T07:38:00Z,bo.kaur@example.net,product-defect,430,standard,true
+TK-200026,2026-01-27T13:00:00Z,saskia.ilves@example.net,account-access,397,standard,true
+TK-200029,2026-01-18T09:32:00Z,ewan.nikolaidis@example.com,shipping,260,standard,true
+TK-200034,2026-01-11T11:41:00Z,ingrid.bergstrom@example.com,shipping,370,standard,true
+TK-200036,2026-02-02T13:39:00Z,callum.petrov@example.net,account-access,273,standard,true
+TK-200037,2026-02-03T15:10:00Z,tomas.dunmore@example.org,account-access,116,standard,false
+TK-200058,2026-01-25T17:01:00Z,joaquin.ferreira@example.com,account-access,234,standard,false

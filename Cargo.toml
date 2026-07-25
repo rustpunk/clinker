@@ -15,6 +15,7 @@ members = [
     "crates/clinker-lineage",
     "crates/clinker-bench-support",
     "crates/clinker-benchmarks",
+    "crates/clinker-scenarios",
 ]
 
 [workspace.package]
@@ -93,6 +94,7 @@ quick-xml = "0.41"
 # path so no openssl/native-tls/cmake enters the graph.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 clinker-bench-support = { path = "crates/clinker-bench-support" }
+clinker-scenarios = { path = "crates/clinker-scenarios" }
 tempfile = "3"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 proptest = "1.11"

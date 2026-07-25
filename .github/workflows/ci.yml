@@ -74,6 +74,17 @@ jobs:
           done
           exit $rc
 
+      # The --explain gate above proves a pipeline COMPILES. It cannot prove the
+      # engine computes the right answer: a pipeline can plan cleanly, run
+      # cleanly, exit 0 and write silently wrong output. The scenario corpus
+      # closes that gap — it generates its input, executes the real CLI, and
+      # compares every output byte-for-byte against a committed golden.
+      # `cargo test` above already runs this via crates/clinker/tests/scenarios.rs
+      # on all three platforms; this step is the fast, explicit signal and keeps
+      # the command discoverable, matching the --explain step's rationale.
+      - name: Execute scenario corpus against committed goldens
+        run: cargo test --locked -p clinker --test scenarios
+
       # Bench infrastructure CI gate (compile + smoke)
       - run: cargo check --benches --workspace
       - run: cargo check --features bench-alloc -p clinker-benchmarks

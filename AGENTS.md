@@ -29,8 +29,10 @@ Treat older docs as secondary context when they conflict with current code.
 - `crates/clinker`: main CLI.
 - `crates/clinker-channel`, `clinker-net`, `clinker-schema`: integration crates.
 - `crates/clinker-bench-support`, `clinker-benchmarks`: test/benchmark support.
+- `crates/clinker-scenarios`: deterministic generator for the `examples/scenarios` corpus.
 - `docs/user`, `docs/engine`, `docs/ai`: user docs, internals docs, AI onboarding.
 - `examples/pipelines`, `benches/pipelines`: runnable and benchmark pipeline YAML.
+- `examples/scenarios`: end-to-end scenarios executed against committed goldens.
 
 ## Architecture Rules
 

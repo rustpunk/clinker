@@ -438,6 +438,7 @@ dependencies = [
  "clinker-net",
  "clinker-plan",
  "clinker-record",
+ "clinker-scenarios",
  "cxl",
  "indexmap",
  "insta",
@@ -654,6 +655,18 @@ dependencies = [
  "serde",
  "serde_json",
  "smol_str",
+]
+
+[[package]]
+name = "clinker-scenarios"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "chrono",
+ "clap",
+ "fastrand",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
