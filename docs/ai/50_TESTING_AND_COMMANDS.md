@@ -85,19 +85,19 @@ ceiling.
 
 Measured on a 32-core host (`nproc` = 32), sampling `/proc/<pid>/fd` of the
 `clinker-exec` lib test binary about 16 000 times per run across five runs:
-the peak concurrent descriptor count is **4165–4222**. That is above the
-`4096` this document used to prescribe, which is why the documented command
-was itself the cause of the failures it claimed to prevent. The floor of
-`65536` gives roughly 15x headroom over the measured peak, which absorbs
-higher core counts — demand scales with `available_parallelism()`, so a
-128-core host lands near ~17 000 and still fits.
+the peak concurrent descriptor count is **4165–4222**. Any floor at or below
+`4096` is therefore below what the suite actually needs on a host this size.
+The floor of `65536` gives roughly 15x headroom over the measured peak,
+which absorbs higher core counts — demand scales with
+`available_parallelism()`, so a 128-core host lands near ~17 000 and still
+fits.
 
 End-to-end confirmation on the same host, running
 `cargo test -p clinker-exec --lib --locked --offline`:
 
 | soft `ulimit -n` | result |
 |---|---|
-| 4096 (the value this document used to prescribe) | FAILED — 868 passed, 2 failed, both `Too many open files (os error 24)` |
+| 4096 | FAILED — 868 passed, 2 failed, both `Too many open files (os error 24)` |
 | 4096 with `-- --test-threads=4` | FAILED — 868 passed, 2 failed |
 | 65536 | ok — 870 passed, 0 failed |
 
