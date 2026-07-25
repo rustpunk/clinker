@@ -58,13 +58,14 @@ Status: **Inferred from CI.**
 
 ```bash
 # Raise the file-descriptor soft limit to the 65536 floor the spill tests
-# need. Raise-only by construction: the branch runs only when the current
+# need. Raise-only by construction: the body runs only when the current
 # soft limit is below the floor, and both targets are >= the current soft
 # limit — so an already-sufficient limit is never lowered. `-S` is
 # load-bearing: a bare `ulimit -n N` sets the soft AND the hard limit, and
 # an unprivileged process can never raise a hard limit back.
-[ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ] \
-  && { ulimit -S -n 65536 2>/dev/null || ulimit -S -n "$(ulimit -Hn)"; }
+if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then
+  ulimit -S -n 65536 2>/dev/null || ulimit -S -n "$(ulimit -Hn)"
+fi
 
 cargo test --workspace --locked --offline
 ```
@@ -103,6 +104,10 @@ End-to-end confirmation on the same host, running
 
 Cutting the thread count does not rescue 4096: a single grace-hash or
 cascaded-merge test can sit near the per-operator bound on its own.
+
+On a host that is already at or above the floor the `if` is a no-op, not a
+failure: it changes nothing and succeeds, so the block is safe to lift into
+a setup script or chain with `&&` without stranding the command after it.
 
 Never write a bare `ulimit -n <n>` before the suite. On a host whose soft
 limit already exceeds `<n>` that command *lowers* the limit into the failing
@@ -377,7 +382,7 @@ cargo test --workspace --locked --offline
 
 Status: **Verified outside the sandbox for the full test command.** Apply
 the raise-only fd snippet from section 4 before the test command; the
-spill tests need a soft `ulimit -n` of at least 65536. If REST e2e tests
+spill tests need a soft `ulimit -n` of at least the 65536 floor. If REST e2e tests
 are involved, the full test command may need unsandboxed localhost socket
 access.
 
@@ -406,7 +411,7 @@ Status: **Inferred from CI for the exact online forms.** Locked/offline variants
 ## 13. Expensive, Flaky, Or Environment-Dependent Commands
 
 - **Environment-dependent:** `cargo test --workspace` needs local socket permission for `clinker-net` REST e2e tests. The restricted sandbox produced `Operation not permitted`; the unsandboxed run passed.
-- **Environment-dependent:** spill-heavy tests need a soft `ulimit -n` of at least 65536; demand scales with the libtest thread count, which defaults to the core count. At 1024 a `clinker-exec` spill test fails with `Too many open files (os error 24)`; at 4096 on a 32-core host several do, because the measured peak there is 4165-4222 descriptors. Raise the limit with the raise-only snippet in section 4 — a bare `ulimit -n <n>` lowers an already-higher limit into the failing range. CI is unaffected: `.github/workflows/ci.yml` sets no `ulimit`, so every job inherits the runner default.
+- **Environment-dependent:** spill-heavy tests need a soft `ulimit -n` of at least 65536; demand scales with the libtest thread count, which defaults to the core count. At 1024 a `clinker-exec` spill test fails with `Too many open files (os error 24)`; at 4096 on a 32-core host two do, because the measured peak there is 4165-4222 descriptors. Raise the limit with the raise-only snippet in section 4 — a bare `ulimit -n <n>` lowers an already-higher limit into the failing range. CI is unaffected: `.github/workflows/ci.yml` sets no `ulimit`, so every job inherits the runner default.
 - **Expensive:** `cargo test --benches -p clinker-benchmarks` runs the e2e benchmark smoke matrix and took several minutes.
 - **Expensive:** `cargo bench ...` runs real Criterion measurements and should be reserved for performance-sensitive changes.
 - **Expensive:** `cargo test -- --ignored` includes at least one XML generator test that reports generating about 600 MB.
@@ -414,7 +419,7 @@ Status: **Inferred from CI for the exact online forms.** Locked/offline variants
 
 ## 14. Troubleshooting Common Failures
 
-- `Too many open files (os error 24)` in spill tests: check `ulimit -Sn`. It must be at least 65536; raise it with the raise-only snippet in section 4. Do not prefix a fixed `ulimit -n <n>` — that lowers an already-sufficient limit. If the hard limit (`ulimit -Hn`) is itself below the floor, raise the hard limit at the OS level or cut the parallelism with `cargo test -- --test-threads=<n>`; fewer threads reduces the demand but does not remove it, because a single grace-hash or cascaded-merge test can be near the per-operator bound on its own.
+- `Too many open files (os error 24)` in spill tests: check `ulimit -Sn`. It must be at least the 65536 floor (see section 4 for the measurement behind it and the headroom it carries); raise it with the raise-only snippet there. Do not prefix a fixed `ulimit -n <n>` — that lowers an already-sufficient limit. If the hard limit (`ulimit -Hn`) is itself below the floor, raise the hard limit at the OS level or cut the parallelism with `cargo test -- --test-threads=<n>`; fewer threads reduces the demand but does not remove it, because a single grace-hash or cascaded-merge test can be near the per-operator bound on its own.
 - A `proptest` failure caused by fd exhaustion writes a regression seed under `crates/clinker-exec/proptest-regressions/` and asks you to commit it. **Do not.** Replayed at a healthy fd limit those seeds pass — they are environment artifacts, not counterexamples, and committing one adds permanent noise implying a bug that does not exist. Delete the file, fix the fd limit, and re-run. The tracked regression files are `pipeline/iejoin.txt`, `pipeline/sort_key.txt`, and `pipeline/sort_merge_join.txt`; anything else appearing after a `Too many open files` run is an artifact.
 - `Operation not permitted` in `crates/clinker-net/tests/rest_executor_e2e.rs`: the test likely cannot bind a local socket in the sandbox. Rerun outside the sandbox or in normal CI.
 - `cargo deny check` cannot acquire `~/.cargo/advisory-dbs/db.lock`: the filesystem sandbox is read-only for that cargo advisory DB path. Rerun with permission to write/read the cargo advisory database.

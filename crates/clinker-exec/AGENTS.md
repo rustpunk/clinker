@@ -93,11 +93,11 @@ Existing normal dependencies are intentional evidence:
 - **Inferred:** `cargo check -p clinker-exec --features bench-alloc --locked --offline`
 - **Inferred:** `cargo check --benches -p clinker-exec --locked --offline`
 - **Inferred:** `cargo test -p clinker-exec --locked --offline <test_name>`
-- **Inferred:** `cargo test -p clinker-exec --locked --offline` (needs a soft `ulimit -n` of at least 65536 — see `docs/ai/50_TESTING_AND_COMMANDS.md` section 4 for the raise-only snippet)
+- **Inferred:** `cargo test -p clinker-exec --locked --offline` (needs a soft `ulimit -n` of at least the 65536 floor — see `docs/ai/50_TESTING_AND_COMMANDS.md` section 4 for the measurement behind it and the raise-only snippet)
 
 For Rust source changes, also run the workspace gates from the root
 `AGENTS.md` unless the user explicitly scopes validation narrower.
-Spill-heavy tests need a soft `ulimit -n` of at least 65536; raise it with
+Spill-heavy tests need a soft `ulimit -n` of at least the 65536 floor; raise it with
 the raise-only snippet in `docs/ai/50_TESTING_AND_COMMANDS.md` section 4
 rather than a fixed `ulimit -n <n>`, which can lower an already-sufficient
 limit.
