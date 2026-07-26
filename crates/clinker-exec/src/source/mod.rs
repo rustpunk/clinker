@@ -20,21 +20,24 @@ use indexmap::IndexMap;
 /// Transport-agnostic record yielder driving one Source's ingest thread.
 ///
 /// Generalizes the byte-oriented [`FormatReader`] contract: where a
-/// `FormatReader` decodes a `Box<dyn Read>` byte stream, a `RecordSource`
-/// makes no byte-stream assumption. A file transport reaches this contract
-/// by wrapping its `FormatReader` (see the blanket impl below); a network
-/// transport that yields rows without a byte body (a SQL `SELECT` cursor)
-/// implements `RecordSource` directly. The executor's ingest loop drives
-/// either through these four methods identically — the widening,
-/// document-boundary, watermark, and channel-push work downstream of
-/// `next_record` is shared by both arms.
+/// `FormatReader` decodes one `Box<dyn Read>` byte stream, a `RecordSource`
+/// makes no single-byte-stream assumption. A file transport reaches this
+/// contract by wrapping its `FormatReader` (see the blanket impl below); a
+/// transport whose records do not arrive as one continuous stream implements
+/// `RecordSource` directly. The paginated REST source in `clinker-net` is the
+/// only direct implementor shipping today — it issues one request per page and
+/// yields records across page boundaries, so there is no single body to hand a
+/// `FormatReader`. A row-cursor transport would take the same arm; none exists
+/// yet. The executor's ingest loop drives every implementor through these four
+/// methods identically — the widening, document-boundary, watermark, and
+/// channel-push work downstream of `next_record` is shared by all arms.
 ///
 /// Must be `Send` for the per-Source `std::thread` to own it; not `Sync`
 /// — each source is single-threaded streaming.
 pub trait RecordSource: Send {
-    /// Resolve the record schema. `&mut self` because some sources (CSV,
-    /// a cursor that must issue its query) discover columns only after
-    /// reading the first row / executing the statement.
+    /// Resolve the record schema. `&mut self` because some sources discover
+    /// their columns only by reading — a CSV reader has to consume the header
+    /// row before it can answer.
     fn schema(&mut self) -> Result<Arc<Schema>, FormatError>;
 
     /// Yield the next record, or `None` at end of input. Finite by
