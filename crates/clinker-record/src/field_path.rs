@@ -51,8 +51,11 @@ use std::fmt;
 
 /// Maximum number of segments a single field name may decode to.
 ///
-/// Matches the JSON reader's nesting cap, so a name the reader can produce is
-/// always a name a writer can expand.
+/// Chosen to match the depth at which the JSON reader stops flattening, so a
+/// name that reader produces is always a name a writer can expand. The XML
+/// reader flattens with no depth bound, so a pathologically deep document can
+/// still produce a name past this cap — the writer refuses it rather than
+/// recursing without limit, which is the point of having the cap at all.
 pub const MAX_FIELD_PATH_DEPTH: usize = 64;
 
 /// Characters that carry structural meaning in a field name and therefore need
@@ -138,26 +141,79 @@ impl fmt::Display for FieldPathError {
 
 impl std::error::Error for FieldPathError {}
 
-/// Decode a field name into its segments, lazily.
+/// Decode a field name into its ordered segments.
 ///
-/// Every segment that carries no escape borrows from `name`; only a segment
-/// with an escape allocates. The iterator always yields at least one item (the
-/// empty name decodes to one empty segment) and stops at the first error.
-pub fn segments(name: &str) -> Segments<'_> {
-    Segments {
-        name,
-        pos: 0,
-        emitted: 0,
-        done: false,
+/// A segment carrying no escape borrows from `name`; only a segment with an
+/// escape allocates, so an ordinary name costs one `Vec` and no string copies.
+/// Always yields at least one segment: the empty name decodes to one empty
+/// segment. Bounded by [`MAX_FIELD_PATH_DEPTH`] entries.
+///
+/// Callers decode once per schema (a writer building its expansion plan) or per
+/// document (an envelope section), never per record.
+pub fn decode(name: &str) -> Result<Vec<Cow<'_, str>>, FieldPathError> {
+    let mut out: Vec<Cow<'_, str>> = Vec::new();
+    // `decoded` stays `None` while the current segment is escape-free, so the
+    // common case borrows straight out of `name`. `chunk` marks the start of the
+    // verbatim run not yet copied into it.
+    let mut decoded: Option<String> = None;
+    let mut chunk = 0;
+    let mut i = 0;
+    let bytes = name.as_bytes();
+    loop {
+        if out.len() == MAX_FIELD_PATH_DEPTH {
+            return Err(FieldPathError::TooDeep {
+                name: name.to_string(),
+                limit: MAX_FIELD_PATH_DEPTH,
+            });
+        }
+        // `.`, `\` and `[` are ASCII and cannot occur inside a multi-byte UTF-8
+        // sequence, so scanning by byte never splits a character.
+        match bytes.get(i) {
+            None => {
+                out.push(close_segment(name, decoded, chunk, i));
+                return Ok(out);
+            }
+            Some(b'.') => {
+                out.push(close_segment(name, decoded.take(), chunk, i));
+                i += 1;
+                chunk = i;
+            }
+            Some(b'\\') => {
+                let Some(&escape) = bytes.get(i + 1) else {
+                    return Err(FieldPathError::TrailingEscape {
+                        name: name.to_string(),
+                    });
+                };
+                if !matches!(escape, b'.' | b'[' | b'\\') {
+                    return Err(FieldPathError::UnknownEscape {
+                        name: name.to_string(),
+                        escape: name[i + 1..]
+                            .chars()
+                            .next()
+                            .expect("a byte past the backslash implies a character"),
+                    });
+                }
+                let buf = decoded.get_or_insert_with(String::new);
+                buf.push_str(&name[chunk..i]);
+                buf.push(char::from(escape));
+                i += 2;
+                chunk = i;
+            }
+            Some(_) => i += 1,
+        }
     }
 }
 
-/// Decode a field name into an owned segment vector, surfacing the first error.
-///
-/// The convenience form of [`segments`] for callers that build a tree and need
-/// the whole path in hand. Bounded by [`MAX_FIELD_PATH_DEPTH`] entries.
-pub fn decode(name: &str) -> Result<Vec<Cow<'_, str>>, FieldPathError> {
-    segments(name).collect()
+/// Close a segment: borrow it whole when nothing was escaped, otherwise append
+/// the trailing verbatim run to the buffer the escapes were decoded into.
+fn close_segment(name: &str, decoded: Option<String>, chunk: usize, end: usize) -> Cow<'_, str> {
+    match decoded {
+        None => Cow::Borrowed(&name[chunk..end]),
+        Some(mut buf) => {
+            buf.push_str(&name[chunk..end]);
+            Cow::Owned(buf)
+        }
+    }
 }
 
 /// Encode one literal segment so it survives [`decode`] as exactly itself,
@@ -198,12 +254,12 @@ pub fn check_expandable<'a>(
 ) -> Result<(), FieldPathError> {
     let mut root = TrieNode::default();
     for name in names {
+        let path = decode(name)?;
+        let depth = path.len();
         let mut node = &mut root;
-        let mut path = segments(name).peekable();
-        while let Some(seg) = path.next() {
-            let seg = seg?;
-            let last = path.peek().is_none();
-            node = node.children.entry(seg).or_default();
+        for (at, segment) in path.into_iter().enumerate() {
+            let last = at + 1 == depth;
+            node = node.children.entry(segment).or_default();
             match (last, node.terminal, node.interior) {
                 // A shorter name already ends where this one keeps descending.
                 (false, Some(shorter), _) => return Err(nesting_clash(shorter, name)),
@@ -249,93 +305,6 @@ struct TrieNode<'a> {
     terminal: Option<&'a str>,
     interior: Option<&'a str>,
     children: HashMap<Cow<'a, str>, TrieNode<'a>>,
-}
-
-/// Lazy decoder over a field name, yielding one segment per unescaped `.`-
-/// separated run. See [`segments`].
-pub struct Segments<'a> {
-    name: &'a str,
-    /// Byte offset where the next segment starts.
-    pos: usize,
-    emitted: usize,
-    done: bool,
-}
-
-impl<'a> Iterator for Segments<'a> {
-    type Item = Result<Cow<'a, str>, FieldPathError>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
-            return None;
-        }
-        if self.emitted >= MAX_FIELD_PATH_DEPTH {
-            self.done = true;
-            return Some(Err(FieldPathError::TooDeep {
-                name: self.name.to_string(),
-                limit: MAX_FIELD_PATH_DEPTH,
-            }));
-        }
-        let bytes = self.name.as_bytes();
-        // `decoded` stays `None` while the segment is escape-free, so the
-        // common case borrows straight out of `name`. `chunk` marks the start
-        // of the verbatim run not yet copied into it.
-        let mut decoded: Option<String> = None;
-        let mut chunk = self.pos;
-        let mut i = self.pos;
-        loop {
-            // `.`, `\` and `[` are ASCII and cannot occur inside a multi-byte
-            // UTF-8 sequence, so scanning by byte never splits a character.
-            match bytes.get(i) {
-                None => {
-                    self.done = true;
-                    self.emitted += 1;
-                    return Some(Ok(finish(self.name, decoded, chunk, i)));
-                }
-                Some(b'.') => {
-                    self.pos = i + 1;
-                    self.emitted += 1;
-                    return Some(Ok(finish(self.name, decoded, chunk, i)));
-                }
-                Some(b'\\') => {
-                    let Some(&esc) = bytes.get(i + 1) else {
-                        self.done = true;
-                        return Some(Err(FieldPathError::TrailingEscape {
-                            name: self.name.to_string(),
-                        }));
-                    };
-                    if !matches!(esc, b'.' | b'[' | b'\\') {
-                        self.done = true;
-                        let escape = self.name[i + 1..]
-                            .chars()
-                            .next()
-                            .expect("a byte past the backslash implies a character");
-                        return Some(Err(FieldPathError::UnknownEscape {
-                            name: self.name.to_string(),
-                            escape,
-                        }));
-                    }
-                    let buf = decoded.get_or_insert_with(String::new);
-                    buf.push_str(&self.name[chunk..i]);
-                    buf.push(char::from(esc));
-                    i += 2;
-                    chunk = i;
-                }
-                Some(_) => i += 1,
-            }
-        }
-    }
-}
-
-/// Close a segment: borrow it whole when nothing was escaped, otherwise append
-/// the trailing verbatim run to the decoded buffer.
-fn finish(name: &str, decoded: Option<String>, chunk: usize, end: usize) -> Cow<'_, str> {
-    match decoded {
-        None => Cow::Borrowed(&name[chunk..end]),
-        Some(mut buf) => {
-            buf.push_str(&name[chunk..end]);
-            Cow::Owned(buf)
-        }
-    }
 }
 
 #[cfg(test)]

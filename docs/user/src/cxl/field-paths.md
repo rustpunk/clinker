@@ -47,8 +47,10 @@ Three consequences worth stating outright:
   and `b`. An empty key is a value a document can genuinely carry, so the
   grammar does not reject it.
 - **A name may nest at most 64 levels deep.** This matches the depth at which
-  the JSON reader stops flattening, so any name a reader can produce is a name a
-  writer can expand.
+  the JSON reader stops flattening, so any name that reader produces is a name a
+  writer can expand. The XML reader flattens with no depth bound, so an
+  extraordinarily deep XML document can produce a name past the cap; writing it
+  back out fails with a clear error rather than recursing without limit.
 
 ### Writing a literal bracket
 

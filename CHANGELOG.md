@@ -36,7 +36,8 @@ engine-stamped `$ck.<field>` columns, which now nest under a `"$ck"` object.
 
 Known gap: the readers still join flattened path segments without escaping them,
 so a source key that literally contains a `.` arrives as an unescaped column
-name and writes back nested. Tracked separately.
+name and writes back nested. The read-side inverse is tracked at
+<https://github.com/rustpunk/clinker/issues/920>.
 
 ### Added — scoped variables and the `state` node
 

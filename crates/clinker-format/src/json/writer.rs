@@ -491,10 +491,7 @@ pub(crate) fn clinker_to_json(val: &Value) -> Result<serde_json::Value, FormatEr
 
 /// Wrap a field-name grammar failure as this writer's error.
 fn field_path_error(source: FieldPathError) -> FormatError {
-    FormatError::FieldPath {
-        format: "JSON",
-        source,
-    }
+    FormatError::field_path("JSON", source)
 }
 
 // ── Column name → nested object expansion ────────────────────────────
@@ -508,10 +505,7 @@ struct PlanCache {
 /// One object's contents: the ordered keys it emits. Key order is
 /// first-insertion order, so columns sharing a prefix group at the position
 /// where that prefix first appeared even when the schema interleaves them.
-#[derive(Default)]
-struct PlanBody {
-    children: Vec<PlanNode>,
-}
+type PlanBody = Vec<PlanNode>;
 
 enum PlanNode {
     /// A key holding a column's value, addressed by its schema position.
@@ -535,47 +529,44 @@ fn build_plan_cache(
     schema: &Arc<Schema>,
     include_engine_stamped: bool,
 ) -> Result<PlanCache, FormatError> {
-    let emitted = || {
-        (0..schema.column_count())
-            .filter(move |&i| include_engine_stamped || !schema.is_engine_stamped(i))
-    };
-    field_path::check_expandable(emitted().map(|i| schema.columns()[i].as_ref()))
+    let emitted: Vec<(usize, &str)> = (0..schema.column_count())
+        .filter(|&i| include_engine_stamped || !schema.is_engine_stamped(i))
+        .map(|i| (i, schema.columns()[i].as_ref()))
+        .collect();
+    field_path::check_expandable(emitted.iter().map(|&(_, name)| name))
         .map_err(field_path_error)?;
 
     let mut root = PlanBody::default();
-    for i in emitted() {
-        let name = schema.columns()[i].as_ref();
+    for &(field, name) in &emitted {
+        let path = field_path::decode(name).map_err(field_path_error)?;
+        let (leaf, branches) = path
+            .split_last()
+            .expect("decoding yields at least one segment");
         let mut body = &mut root;
-        let mut path = field_path::segments(name).peekable();
-        while let Some(segment) = path.next() {
-            let segment = segment.map_err(field_path_error)?;
-            if path.peek().is_none() {
-                body.children.push(PlanNode::Leaf {
-                    name: segment.into_owned(),
-                    field: i,
-                });
-                break;
-            }
+        for segment in branches {
             // Descend into the branch this segment already opened, so a shared
             // prefix groups at the position where it first appeared.
             let at = body
-                .children
                 .iter()
-                .position(|n| matches!(n, PlanNode::Branch { name, .. } if *name == *segment))
+                .position(|n| matches!(n, PlanNode::Branch { name, .. } if *name == **segment))
                 .unwrap_or_else(|| {
-                    body.children.push(PlanNode::Branch {
-                        name: segment.into_owned(),
+                    body.push(PlanNode::Branch {
+                        name: segment.to_string(),
                         body: PlanBody::default(),
                     });
-                    body.children.len() - 1
+                    body.len() - 1
                 });
-            body = match &mut body.children[at] {
+            body = match &mut body[at] {
                 PlanNode::Branch { body, .. } => body,
                 PlanNode::Leaf { .. } => {
                     unreachable!("check_expandable rejects a column nesting under a value column")
                 }
             };
         }
+        body.push(PlanNode::Leaf {
+            name: leaf.to_string(),
+            field,
+        });
     }
     Ok(PlanCache {
         schema: Arc::clone(schema),
@@ -623,7 +614,7 @@ impl serde::Serialize for PlanBodySer<'_> {
         // `None` length hint: serde_json ignores it, and the exact post-null-
         // skip entry count would need a second pass over the plan.
         let mut map = serializer.serialize_map(None)?;
-        for node in &self.body.children {
+        for node in self.body {
             match node {
                 PlanNode::Leaf { name, field } => {
                     let value = &self.values[*field];
@@ -635,8 +626,9 @@ impl serde::Serialize for PlanBodySer<'_> {
                 PlanNode::Branch { name, body } => {
                     // An object whose every descendant is omitted emits no key
                     // at all rather than an empty object, so it reads back as
-                    // the absent column it stands for.
-                    if !body_emits(body, self.values, self.preserve_nulls) {
+                    // the absent column it stands for. Under `preserve_nulls`
+                    // every leaf emits, so no subtree can be empty.
+                    if !self.preserve_nulls && !has_present_leaf(body, self.values) {
                         continue;
                     }
                     map.serialize_entry(
@@ -654,17 +646,18 @@ impl serde::Serialize for PlanBodySer<'_> {
     }
 }
 
-/// Whether any leaf under `body` contributes a key for this record.
+/// Whether any leaf under `body` holds a non-null value. Only meaningful under
+/// `preserve_nulls: false`, the one mode in which a subtree can go unemitted.
 ///
 /// Re-walks the subtree rather than caching per-record presence flags: the walk
 /// is bounded by the plan, which is already retained, while a presence buffer
-/// would be per-record state proportional to record width.
-fn body_emits(body: &PlanBody, values: &[Value], preserve_nulls: bool) -> bool {
-    preserve_nulls
-        || body.children.iter().any(|node| match node {
-            PlanNode::Leaf { field, .. } => !values[*field].is_null(),
-            PlanNode::Branch { body, .. } => body_emits(body, values, preserve_nulls),
-        })
+/// would be per-record state proportional to record width. It short-circuits on
+/// the first present leaf, so the cost is paid only by sparse records.
+fn has_present_leaf(body: &PlanBody, values: &[Value]) -> bool {
+    body.iter().any(|node| match node {
+        PlanNode::Leaf { field, .. } => !values[*field].is_null(),
+        PlanNode::Branch { body, .. } => has_present_leaf(body, values),
+    })
 }
 
 /// Borrows a clinker [`Value`] and serializes it directly, mirroring

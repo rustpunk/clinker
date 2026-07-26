@@ -385,10 +385,7 @@ impl<W: Write + Send> FormatWriter for XmlWriter<W> {
 
 /// Wrap a field-name grammar failure as this writer's error.
 fn field_path_error(source: FieldPathError) -> FormatError {
-    FormatError::FieldPath {
-        format: "XML",
-        source,
-    }
+    FormatError::field_path("XML", source)
 }
 
 /// One element's content: the attributes attached to its start tag plus its

@@ -344,6 +344,16 @@ impl FormatError {
         }
     }
 
+    /// Build a [`FormatError::FieldPath`] for a writer that could not expand
+    /// its output's column names into nested output. `format` names the writer
+    /// for the diagnostic; the grammar failure itself is format-independent.
+    pub fn field_path(
+        format: &'static str,
+        source: clinker_record::field_path::FieldPathError,
+    ) -> Self {
+        Self::FieldPath { format, source }
+    }
+
     /// Build a [`FormatError::StructuralCount`] for an HL7 batch/file
     /// envelope count mismatch (`BTS`/`FTS`).
     pub fn hl7_structural_count(message: impl Into<String>) -> Self {

@@ -244,11 +244,13 @@ impl Schema {
     }
 
     /// Whether column `idx` is engine-stamped rather than user-declared — the
-    /// predicate that decides what the default writer surface emits.
+    /// predicate deciding what the default writer surface and the default
+    /// projection path emit.
     ///
-    /// The by-index form exists for callers that must keep the column's schema
-    /// position (a writer precompiling a plan against `Record::values`), which
-    /// the field iterators do not hand back.
+    /// The by-index form serves callers that must keep the column's schema
+    /// position, which the field iterators on [`Record`](crate::Record) do not
+    /// hand back — a writer precompiling a plan against `Record::values`, or
+    /// any pass building a positional column map.
     pub fn is_engine_stamped(&self, idx: usize) -> bool {
         self.field_metadata(idx)
             .is_some_and(FieldMetadata::is_engine_stamped)

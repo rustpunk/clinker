@@ -84,8 +84,15 @@ fn column_maps_to_xml_attribute(column: &str, attribute_prefix: &str) -> bool {
     if attribute_prefix.is_empty() {
         return false;
     }
-    let last_segment = column.rsplit('.').next().unwrap_or(column);
-    last_segment.starts_with(attribute_prefix)
+    // Decoded with the shared field-path grammar, so an escaped separator is
+    // classified the way the writer will classify it: `a\.@x` is one segment
+    // named `a.@x`, an element, not an `@x` attribute of `a`. A name the
+    // grammar rejects outright is not an attribute either — the writer raises
+    // the grammar error itself, with the remedy.
+    clinker_record::field_path::decode(column)
+        .ok()
+        .and_then(|path| path.last().map(|s| s.starts_with(attribute_prefix)))
+        .unwrap_or(false)
 }
 
 /// How an input format can carry a column declared `multiple: true`.
@@ -1161,8 +1168,8 @@ pub fn output_node_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
             // attribute-vs-element is a SINK-side property, because the only
             // name transforms between source and this sink cannot change a
             // column's attribute status. That status is a LEAF-only property —
-            // `column_maps_to_xml_attribute` reads `rsplit('.').next()`, the same
-            // last-segment rule the XML writer's `is_attribute_path` uses — and:
+            // `column_maps_to_xml_attribute` reads the last decoded segment, the
+            // same rule the XML writer's `is_attribute_path` uses — and:
             //   * `multi_value_columns` yields the EXPOSED `Column::name` (what
             //     downstream CXL and the output see), not the physical
             //     `source_name`, so a straight source→output path already carries
