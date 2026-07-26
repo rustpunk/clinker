@@ -990,12 +990,23 @@ fn malformed_qualified_key(key: &str) -> ConfigError {
 /// remaining message. Channel-patch [`ConfigError`]s embed their stable E-code
 /// as a `[E2xx]` prefix; the composition-body patch pass re-emits an op failure
 /// as a structured `Diagnostic` and lifts the code back out here, so a
-/// body-source op error carries the same code a top-level one would. Falls back
-/// to the generic source-patch code when no prefix is present.
+/// body-source op error carries the same code a top-level one would.
+///
+/// The bracketed segment is accepted only when it names a registered
+/// diagnostic code. Anything else — no prefix at all, or a bracketed segment
+/// that is not a code — falls back to the generic source-patch code with the
+/// message left whole, brackets included. The caller hands the result to
+/// `Diagnostic::error`, whose contract is that the code is registered, so
+/// splitting on the bracket alone would let an unrecognized prefix through as
+/// an orphan code. Nothing produces such a prefix today, but a `ConfigError`
+/// message beginning with a user-supplied name would: neither source nor node
+/// names are constrained against `[`.
 pub(crate) fn split_diagnostic_code(msg: &str) -> (&str, &str) {
     match msg.strip_prefix('[').and_then(|rest| rest.split_once(']')) {
-        Some((code, tail)) => (code, tail.trim_start()),
-        None => ("E230", msg),
+        Some((code, tail)) if clinker_core_types::diagnostic::is_registered(code) => {
+            (code, tail.trim_start())
+        }
+        _ => ("E230", msg),
     }
 }
 
@@ -3449,5 +3460,38 @@ nodes:
     fn patch_with_only_multi_record_ops_is_not_empty() {
         assert!(!patch_from_yaml("records:\n  detail: remove\n").is_empty());
         assert!(!patch_from_yaml("discriminator: { start: 1 }\n").is_empty());
+    }
+
+    #[test]
+    fn split_diagnostic_code_lifts_a_registered_prefix() {
+        let (code, detail) = split_diagnostic_code("[E231] channel schema patch: unknown column");
+        assert_eq!(code, "E231");
+        assert_eq!(detail, "channel schema patch: unknown column");
+    }
+
+    #[test]
+    fn split_diagnostic_code_falls_back_when_there_is_no_prefix() {
+        let (code, detail) = split_diagnostic_code("channel source patch failed");
+        assert_eq!(code, "E230");
+        assert_eq!(detail, "channel source patch failed");
+    }
+
+    #[test]
+    fn split_diagnostic_code_falls_back_on_a_bracketed_non_code() {
+        // The result is handed to `Diagnostic::error`, which requires a
+        // registered code. A bracketed segment that is not one — here a
+        // source name, which nothing constrains against `[` — must not be
+        // mistaken for a code. The message survives whole, brackets included,
+        // so nothing the user wrote is lost from the diagnostic.
+        for msg in [
+            "[orders] channel source patch failed",
+            "[E999] channel source patch failed",
+            "[] channel source patch failed",
+            "[E231 channel source patch failed",
+        ] {
+            let (code, detail) = split_diagnostic_code(msg);
+            assert_eq!(code, "E230", "input: {msg}");
+            assert_eq!(detail, msg, "input: {msg}");
+        }
     }
 }
