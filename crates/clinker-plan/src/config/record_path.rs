@@ -8,9 +8,9 @@
 
 use clinker_format::{RecordPath, RecordPathSyntax};
 
+use crate::config::InputFormat;
 use crate::config::multi_value::NodeFault;
 use crate::config::pipeline_node::PipelineNode;
-use crate::config::{InputFormat, JsonInputOptions, XmlInputOptions};
 use crate::yaml::Spanned;
 
 /// Every source whose `record_path` is not a path in its format's grammar.
@@ -29,14 +29,14 @@ pub fn record_path_faults(nodes: &[Spanned<PipelineNode>]) -> Vec<NodeFault> {
             continue;
         };
         let declared = match &body.source.format {
-            InputFormat::Json(opts) => opts.as_ref().and_then(|o: &JsonInputOptions| {
-                o.record_path
-                    .as_deref()
-                    .map(|p| (RecordPathSyntax::Json, p))
-            }),
-            InputFormat::Xml(opts) => opts.as_ref().and_then(|o: &XmlInputOptions| {
-                o.record_path.as_deref().map(|p| (RecordPathSyntax::Xml, p))
-            }),
+            InputFormat::Json(opts) => opts
+                .as_ref()
+                .and_then(|o| o.record_path.as_deref())
+                .map(|p| (RecordPathSyntax::Json, p)),
+            InputFormat::Xml(opts) => opts
+                .as_ref()
+                .and_then(|o| o.record_path.as_deref())
+                .map(|p| (RecordPathSyntax::Xml, p)),
             _ => None,
         };
         let Some((syntax, raw)) = declared else {

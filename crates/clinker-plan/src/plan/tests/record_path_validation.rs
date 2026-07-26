@@ -11,119 +11,46 @@ use clinker_core_types::Diagnostic;
 
 use crate::config::{CompileContext, parse_config};
 
-/// A single-source XML pipeline declaring `record_path: raw`. `raw` is written
-/// through `{:?}` so a value containing YAML-significant characters (`*`, a
-/// leading `/`, the empty string) reaches the parser intact.
+/// A single-source pipeline over `format`, with `options` (already indented,
+/// empty for a source that declares none) spliced under the source's `config:`.
+fn pipeline(format: &str, options: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: record_path_gate
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: {format}
+      path: ./in.{format}
+{options}      schema:
+        - {{ name: id, type: int }}
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    )
+}
+
+/// An `options:` block declaring `record_path: raw`, plus any extra option
+/// lines. `raw` is written through `{:?}` so a value carrying YAML-significant
+/// characters (`*`, a leading `/`, the empty string) reaches the parser intact.
+fn record_path_options(raw: &str, extra: &str) -> String {
+    format!("      options:\n        record_path: {raw:?}\n{extra}")
+}
+
 fn xml_pipeline(raw: &str) -> String {
-    xml_pipeline_with(raw, "")
+    pipeline("xml", &record_path_options(raw, ""))
 }
 
-/// [`xml_pipeline`] plus extra lines spliced into the source's `options:`
-/// block, for the namespace-qualified case.
-fn xml_pipeline_with(raw: &str, extra_options: &str) -> String {
-    format!(
-        r#"
-pipeline:
-  name: record_path_gate
-nodes:
-  - type: source
-    name: src
-    config:
-      name: src
-      type: xml
-      path: ./in.xml
-      options:
-        record_path: {raw:?}
-{extra_options}
-      schema:
-        - {{ name: id, type: int }}
-  - type: output
-    name: out
-    input: src
-    config:
-      name: out
-      type: csv
-      path: out.csv
-"#
-    )
-}
-
-/// An XML pipeline that declares no `record_path` at all — the supported form
-/// an empty string is NOT equivalent to.
-fn xml_pipeline_without_record_path() -> String {
-    r#"
-pipeline:
-  name: record_path_gate
-nodes:
-  - type: source
-    name: src
-    config:
-      name: src
-      type: xml
-      path: ./in.xml
-      schema:
-        - { name: id, type: int }
-  - type: output
-    name: out
-    input: src
-    config:
-      name: out
-      type: csv
-      path: out.csv
-"#
-    .to_string()
-}
-
-/// The JSON twin of [`xml_pipeline`].
 fn json_pipeline(raw: &str) -> String {
-    format!(
-        r#"
-pipeline:
-  name: record_path_gate
-nodes:
-  - type: source
-    name: src
-    config:
-      name: src
-      type: json
-      path: ./in.json
-      options:
-        record_path: {raw:?}
-      schema:
-        - {{ name: id, type: int }}
-  - type: output
-    name: out
-    input: src
-    config:
-      name: out
-      type: csv
-      path: out.csv
-"#
-    )
-}
-
-fn json_pipeline_without_record_path() -> String {
-    r#"
-pipeline:
-  name: record_path_gate
-nodes:
-  - type: source
-    name: src
-    config:
-      name: src
-      type: json
-      path: ./in.json
-      schema:
-        - { name: id, type: int }
-  - type: output
-    name: out
-    input: src
-    config:
-      name: out
-      type: csv
-      path: out.csv
-"#
-    .to_string()
+    pipeline("json", &record_path_options(raw, ""))
 }
 
 fn compile_err(yaml: &str) -> Vec<Diagnostic> {
@@ -203,7 +130,7 @@ fn an_empty_xml_record_path_is_rejected_though_omitting_it_is_fine() {
         msg.contains("every top-level element becomes one record"),
         "{msg}"
     );
-    compile_ok(&xml_pipeline_without_record_path());
+    compile_ok(&pipeline("xml", ""));
 }
 
 #[test]
@@ -244,7 +171,7 @@ fn rooted_and_empty_segment_json_paths_are_rejected() {
 fn an_empty_json_record_path_is_rejected_though_omitting_it_is_fine() {
     let msg = sole_e363(&json_pipeline(""));
     assert!(msg.contains("empty"), "{msg}");
-    compile_ok(&json_pipeline_without_record_path());
+    compile_ok(&pipeline("json", ""));
 }
 
 #[test]
@@ -266,9 +193,12 @@ fn a_namespace_qualified_xml_path_still_compiles() {
     // `:` is a legal XML NameChar and `namespace_handling: qualify` keeps the
     // prefix on every element name, so a qualified path must survive the
     // XML-name segment rule.
-    compile_ok(&xml_pipeline_with(
-        "ns:Orders/ns:Order",
-        "        namespace_handling: qualify",
+    compile_ok(&pipeline(
+        "xml",
+        &record_path_options(
+            "ns:Orders/ns:Order",
+            "        namespace_handling: qualify\n",
+        ),
     ));
 }
 

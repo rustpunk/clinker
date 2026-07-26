@@ -34,7 +34,7 @@ pub use error::FormatError;
 pub use multi_value::{
     JoinValues, OnConflict, SplitToRows, SplitToRowsMode, SplitValues, under_field_path,
 };
-pub use record_path::{RecordPath, RecordPathError, RecordPathErrorKind, RecordPathSyntax};
+pub use record_path::{RecordPath, RecordPathError, RecordPathSyntax};
 pub use schema::{
     Column, DEFAULT_VALUE_DELIMITER, Discriminator, GeneratedSchema, RECORD_TYPE_COLUMN,
     RecordType, SourceSchema, StructureConstraint, multi_record_superset,

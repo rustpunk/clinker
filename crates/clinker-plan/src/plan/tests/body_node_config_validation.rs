@@ -18,7 +18,8 @@
 //! resolved to its inline columns relative to the composition file's own
 //! directory (so a body Output's declared-decimal `scale` reaches the write
 //! boundary and a body Source's file schema resolves from the right base);
-//! and the multi-value gates (E358 / E359 / E360 / E361) run over body nodes,
+//! and the per-source config gates — the multi-value family (E358 / E359 /
+//! E360 / E361) and the `record_path` grammar (E363) — run over body nodes,
 //! which the call-site pipeline's own `nodes:` walk never sees.
 
 use std::path::PathBuf;

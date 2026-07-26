@@ -60,7 +60,7 @@ impl RecordPathSyntax {
     }
 
     /// The full guidance paragraph a plan-time diagnostic attaches as help.
-    pub fn help(self) -> String {
+    fn help(self) -> String {
         match self {
             RecordPathSyntax::Xml => "`record_path` on an `xml` source is a slash-separated path \
                                       of XML element names, matched level by level from the \
@@ -85,9 +85,11 @@ impl RecordPathSyntax {
     }
 }
 
-/// Why a `record_path` string is not a path in its declared grammar.
+/// Why a `record_path` string is not a path in its declared grammar. Selects
+/// the message [`RecordPathError`] renders; callers act on the message, not on
+/// the taxonomy, so it stays inside the module.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RecordPathErrorKind {
+enum RecordPathErrorKind {
     /// The string is present but empty — distinct from omitting the key.
     Empty,
     /// An XPath descendant-or-self step (`//`), which matches at any depth.
@@ -106,9 +108,9 @@ pub enum RecordPathErrorKind {
 /// render a message that names the actual grammar and a corrected path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RecordPathError {
-    pub syntax: RecordPathSyntax,
-    pub raw: String,
-    pub kind: RecordPathErrorKind,
+    syntax: RecordPathSyntax,
+    raw: String,
+    kind: RecordPathErrorKind,
 }
 
 impl RecordPathError {
