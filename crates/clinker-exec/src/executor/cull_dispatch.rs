@@ -1048,8 +1048,8 @@ fn sort_group(group: &mut [(Record, u64)], order_by: &[SortField]) {
 /// grace-hash paths map the same `SpillError` to `PipelineError::Spill`, which
 /// keeps the E321 disk-full diagnostic and exits 4; this path flattens it to a
 /// string and exits 1, so an orchestrator that retries infrastructure faults
-/// treats a full disk here as a bad pipeline. Tracked separately — changing it
-/// moves an exit code, so it is not folded into an unrelated change.
+/// treats a full disk here as a bad pipeline. Tracked in issue #1021 — changing
+/// it moves an exit code, so it is not folded into an unrelated change.
 fn cull_spill_error(node_name: &str, e: clinker_plan::SpillError) -> PipelineError {
     PipelineError::Internal {
         op: "cull",
@@ -1068,7 +1068,7 @@ fn cull_spill_error(node_name: &str, e: clinker_plan::SpillError) -> PipelineErr
 /// `drop_group_when` expression aborts as an engine bug at exit 1 rather than
 /// routing to the DLQ under `strategy: continue`, which is what the same class
 /// of fault does elsewhere. It also flattens `SpillCapExceeded` (E320, exit 4)
-/// into the same bucket. Tracked separately with the sibling spill-fault
+/// into the same bucket. Tracked in issue #1021 with the sibling spill-fault
 /// misclassification — the fix moves user-visible exit codes and DLQ routing,
 /// so the whole family lands under one review rather than riding along here.
 fn cull_predicate_error(node_name: &str, e: crate::aggregation::HashAggError) -> PipelineError {
@@ -1117,22 +1117,32 @@ fn cull_giant_group_error(
     hard_limit: u64,
 ) -> PipelineError {
     let group = format_partition_group(partition_by, key);
+    // `partition_key` routes only two shapes into the null group here — Cull
+    // hard-errors on a NaN, array, or map partition value rather than folding
+    // it in, so this enumeration is deliberately shorter than Reshape's.
+    let null_note = if key.iter().any(|k| matches!(k, GroupByKey::Null)) {
+        " A `null` here covers both an explicit null and a row missing the column entirely, so \
+         either may be inflating this group."
+    } else {
+        ""
+    };
     PipelineError::MemoryBudgetExceeded {
         node: node_name.to_string(),
         used: group_bytes,
         limit: hard_limit,
         source: BudgetCategory::Arena,
         detail: Some(format!(
-            "one Cull correlation group {group} does not fit; the reported use is that group's \
-             reload footprint alone. Cull evaluates its `drop_group_when` predicate against the \
-             whole group at once, so a single group must fit the budget even though cross-group \
-             and ingest-time peaks spill to disk. Raising `memory.limit` clear of this figure is \
-             the only fix that leaves your output unchanged — finalize also holds the run's \
-             remaining groups and its per-group decision map, so treat that figure as a floor. \
-             Dropping columns this node does not read, in an upstream Transform, also shrinks \
-             the group, but Cull writes every input column through, so those columns leave the \
-             output too. Narrowing `partition_by` shrinks it as well, but it changes what \
-             `drop_group_when` counts and changes which rows are removed."
+            "one Cull correlation group {group} does not fit; the reported use ({group_bytes} \
+             bytes) is that group's reload footprint alone. Cull evaluates its `drop_group_when` \
+             predicate against the whole group at once, so a single group must fit the budget \
+             even though cross-group and ingest-time peaks spill to disk. Raising `memory.limit` \
+             clear of {group_bytes} bytes is the only fix that leaves your output unchanged — \
+             finalize also holds the run's remaining groups and its per-group decision map, so \
+             treat that figure as a floor. Dropping columns this node does not read, in an \
+             upstream Transform, also shrinks the group, but Cull writes every input column \
+             through, so those columns leave the output too. Narrowing `partition_by` shrinks it \
+             as well, but it changes what `drop_group_when` counts and changes which rows are \
+             removed.{null_note}"
         )),
     }
 }

@@ -77,6 +77,26 @@ nodes:
     )
 }
 
+// An empty `partition_by` has no correlation key, so every record would form
+// one group and the rules would observe the whole input at once. Nothing
+// downstream can describe that group either — a budget overrun could only name
+// it as `[]`. Reject it at bind time rather than running a shape no author
+// meant to ask for.
+#[test]
+fn empty_partition_by_rejected() {
+    let yaml = pipeline_with_reshape_config(
+        r#"      partition_by: []
+      rules:
+        - name: r
+          when: "amount > 0"
+          mutate:
+            set:
+              label: "'x'""#,
+    );
+    let diags = compile_diagnostics(&yaml);
+    assert_e200_contains(&diags, &["partition_by", "at least one field"]);
+}
+
 #[test]
 fn partition_by_unknown_field_rejected() {
     let yaml = pipeline_with_reshape_config(

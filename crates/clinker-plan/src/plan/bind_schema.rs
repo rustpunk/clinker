@@ -1466,6 +1466,24 @@ fn bind_reshape(
     } = node;
     let mut ok = true;
 
+    // An empty `partition_by` has no correlation key, so every record forms
+    // one group. Rules would then observe the whole input as a single group,
+    // and a budget overrun could only name that group as `[]`.
+    if config.partition_by.is_empty() {
+        diags.push(
+            Diagnostic::error(
+                "E200",
+                format!("reshape {name:?}: partition_by must name at least one field"),
+                LabeledSpan::primary(span, String::new()),
+            )
+            .with_help(
+                "name the column that identifies one correlation group, for example \
+                 `partition_by: [employee_id]`",
+            ),
+        );
+        ok = false;
+    }
+
     // `partition_by` fields must exist upstream.
     for pk in &config.partition_by {
         if !upstream.has_field(pk) {
@@ -1818,6 +1836,24 @@ fn bind_cull(
         id,
     } = node;
     let mut ok = true;
+
+    // An empty `partition_by` has no correlation key, so every record forms
+    // one group. `drop_group_when` would then decide the whole input at once,
+    // and a budget overrun could only name that group as `[]`.
+    if config.partition_by.is_empty() {
+        diags.push(
+            Diagnostic::error(
+                "E200",
+                format!("cull {name:?}: partition_by must name at least one field"),
+                LabeledSpan::primary(span, String::new()),
+            )
+            .with_help(
+                "name the column that identifies one correlation group, for example \
+                 `partition_by: [account]`",
+            ),
+        );
+        ok = false;
+    }
 
     // `partition_by` fields must exist upstream.
     for pk in &config.partition_by {

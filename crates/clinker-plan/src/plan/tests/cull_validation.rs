@@ -83,6 +83,22 @@ nodes:
     )
 }
 
+// An empty `partition_by` has no correlation key, so `drop_group_when` would
+// decide the entire input as one group — keeping or removing everything. A
+// budget overrun could only name that group as `[]`. Reject it at bind time.
+#[test]
+fn empty_partition_by_rejected() {
+    let yaml = pipeline_with_cull_config(
+        r#"      partition_by: []
+      removed_to: removed
+      rules:
+        - name: drop_errors
+          drop_group_when: "sum(if status == 'error' then 1 else 0) > 0""#,
+    );
+    let diags = compile_diagnostics(&yaml);
+    assert_e200_contains(&diags, &["partition_by", "at least one field"]);
+}
+
 #[test]
 fn partition_by_unknown_field_rejected() {
     let yaml = pipeline_with_cull_config(

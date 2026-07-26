@@ -800,8 +800,8 @@ fn estimated_input_bytes(record: &Record) -> usize {
 /// grace-hash paths map the same `SpillError` to `PipelineError::Spill`, which
 /// keeps the E321 disk-full diagnostic and exits 4; this path flattens it to a
 /// string and exits 1, so an orchestrator that retries infrastructure faults
-/// treats a full disk here as a bad pipeline. Tracked separately — changing it
-/// moves an exit code, so it is not folded into an unrelated change.
+/// treats a full disk here as a bad pipeline. Tracked in issue #1021 — changing
+/// it moves an exit code, so it is not folded into an unrelated change.
 fn reshape_spill_error(node_name: &str, e: clinker_plan::SpillError) -> PipelineError {
     PipelineError::Internal {
         op: "reshape",
@@ -861,16 +861,17 @@ fn reshape_giant_group_error(
         limit: hard_limit,
         source: BudgetCategory::Arena,
         detail: Some(format!(
-            "one Reshape correlation group {group} does not fit; the reported use is that \
-             group's reload footprint alone. Reshape applies its rules against the whole group \
-             at once (the no-cascade contract), so a single group must fit the budget even \
-             though cross-group and ingest-time peaks spill to disk. Raising `memory.limit` \
-             clear of this figure is the only fix that leaves your output unchanged — finalize \
-             also holds the run's remaining groups, so treat that figure as a floor. Dropping \
-             columns this node does not read, in an upstream Transform, also shrinks the group, \
-             but Reshape writes every input column through, so those columns leave the output \
-             too. Narrowing `partition_by` shrinks it as well, but it redefines the group the \
-             rules evaluate against and changes results.{null_note}"
+            "one Reshape correlation group {group} does not fit; the reported use \
+             ({group_bytes} bytes) is that group's reload footprint alone. Reshape applies its \
+             rules against the whole group at once (the no-cascade contract), so a single group \
+             must fit the budget even though cross-group and ingest-time peaks spill to disk. \
+             Raising `memory.limit` clear of {group_bytes} bytes is the only fix that leaves \
+             your output unchanged — finalize also holds the run's remaining groups, so treat \
+             that figure as a floor. Dropping columns this node does not read, in an upstream \
+             Transform, also shrinks the group, but Reshape writes every input column through, \
+             so those columns leave the output too. Narrowing `partition_by` shrinks it as \
+             well, but it redefines the group the rules evaluate against and changes \
+             results.{null_note}"
         )),
     }
 }

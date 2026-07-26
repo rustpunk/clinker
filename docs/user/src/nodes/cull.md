@@ -37,7 +37,7 @@ Cull groups a record under a single **null group** in two cases: the column is a
 Everything else is either its own group or a hard error:
 
 - An **empty string** (`""`) is its own group, distinct from `account=null`.
-- A `NaN` float, or an array- or map-valued cell, **aborts the run** rather than grouping — a partition key must be a single scalar value.
+- A `NaN` float, or an array- or map-valued cell, **aborts the run** rather than grouping — a partition key must be a single scalar value. This abort currently presents as an *internal error*, but it is a data condition, not an engine defect: fix the offending column rather than filing a bug. The misclassification is tracked in [#1021](https://github.com/rustpunk/clinker/issues/1021).
 
 [Reshape](reshape.md#values-reshape-cannot-key) treats both of those differently: it folds empty strings, NaNs, and multi-value cells all into its null group instead. So the same input can group one way under Cull and another under Reshape. The divergence is unintentional and tracked in [#1022](https://github.com/rustpunk/clinker/issues/1022); until it is resolved, do not assume one node's grouping matches the other's.
 
