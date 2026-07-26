@@ -1479,6 +1479,7 @@ fn validate_output_mapping_columns(
         }
     }
     for (entry_index, name) in missing {
+        let entry = &mapping.entries()[entry_index];
         let near = cxl::resolve::levenshtein::best_match(name, &candidate_refs, 3);
         // Edit distance is useful help only after absence is known. A sidecar
         // can legitimately carry a drift column whose spelling happens to be
@@ -1489,10 +1490,14 @@ fn validate_output_mapping_columns(
             continue;
         }
         let help = match near {
-            Some(near) => format!(
-                "did you mean `- <output_name>: {near}`? Columns available at output \
-                 {node_name:?}: {available}"
-            ),
+            Some(near) => {
+                let corrected =
+                    crate::config::output_mapping::render_mapping_item(&entry.output, near);
+                format!(
+                    "did you mean `{corrected}`? Columns available at output \
+                     {node_name:?}: {available}"
+                )
+            }
             None => format!(
                 "columns available at output {node_name:?}: {available}. If '{name}' reaches \
                  the sink only through `on_unmapped: auto_widen`, either set \

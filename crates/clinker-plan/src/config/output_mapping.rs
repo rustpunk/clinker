@@ -270,6 +270,53 @@ const MAPPING_SHAPE_HELP: &str = "`mapping:` is a sequence, one item per output 
      `output_name: source_column` pair to rename it:\n  \
      mapping:\n    - order_id\n    - sold_to: customer_id";
 
+/// Render one pasteable `mapping:` sequence item.
+///
+/// Ordinary identifier-shaped names stay bare. Everything else uses a JSON
+/// string literal, which is also a valid one-line YAML double-quoted scalar;
+/// this keeps colons, whitespace, control characters, and YAML 1.1 boolean or
+/// null spellings from changing the suggested block's meaning.
+pub(crate) fn render_mapping_item(output: &str, source: &str) -> String {
+    fn scalar(name: &str) -> String {
+        let lower = name.to_ascii_lowercase();
+        let ambiguous_word = matches!(
+            lower.as_str(),
+            "y" | "yes"
+                | "true"
+                | "on"
+                | "n"
+                | "no"
+                | "false"
+                | "off"
+                | "null"
+                | "~"
+                | "nan"
+                | "inf"
+                | "-inf"
+                | "+inf"
+        );
+        let plain_identifier = !ambiguous_word
+            && name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        if plain_identifier {
+            name.to_string()
+        } else {
+            serde_json::to_string(name).expect("serializing a string cannot fail")
+        }
+    }
+
+    if output == source {
+        format!("- {}", scalar(output))
+    } else {
+        format!("- {}: {}", scalar(output), scalar(source))
+    }
+}
+
 /// A mapping entry plus its YAML line when the active deserializer supports
 /// serde-saphyr's `__yaml_spanned` protocol. Other serde formats fall back to
 /// an ordinary unspanned entry, preserving `OutputMapping`'s format-neutral
@@ -606,13 +653,7 @@ pub(crate) fn output_mapping_faults_spanned(
             // to the old documentation, which renamed nothing at all.
             let rewritten = legacy
                 .iter()
-                .map(|(k, v)| {
-                    if k == v {
-                        format!("    - {k}")
-                    } else {
-                        format!("    - {v}: {k}")
-                    }
-                })
+                .map(|(k, v)| format!("    {}", render_mapping_item(v, k)))
                 .collect::<Vec<_>>()
                 .join("\n");
             let help = if legacy.is_empty() {
@@ -790,6 +831,30 @@ mod tests {
         assert_eq!(mapping.entry_line(0), None);
         assert_eq!(mapping.entry_line(1), None);
         assert_eq!(mapping.entry_line(2), None);
+    }
+
+    #[test]
+    fn diagnostic_mapping_items_are_yaml_safe_and_keep_identifiers_short() {
+        assert_eq!(
+            render_mapping_item("sold to", "customer: id"),
+            r#"- "sold to": "customer: id""#
+        );
+        assert_eq!(
+            render_mapping_item("yes", "line\nitem"),
+            r#"- "yes": "line\nitem""#
+        );
+        assert_eq!(
+            render_mapping_item("given_name", "first_name"),
+            "- given_name: first_name"
+        );
+
+        let rendered = render_mapping_item("sold to", "customer: id");
+        let parsed: OutputMapping =
+            crate::yaml::from_str(&rendered).expect("diagnostic item parses as YAML");
+        assert_eq!(
+            parsed.entries(),
+            &[MappingEntry::rename("sold to", "customer: id")]
+        );
     }
 
     /// The superseded map form parses into the capture slot and declares no

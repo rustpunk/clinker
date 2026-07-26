@@ -108,6 +108,19 @@ fn map_form_is_rejected_with_the_authors_own_block_rewritten() {
     );
 }
 
+#[test]
+fn map_form_rewrite_quotes_names_that_are_not_plain_yaml_scalars() {
+    let diags = compile_err(&pipeline(
+        "      mapping:\n        \"customer: id\": \"sold to\"\n",
+    ));
+    let d = only(&diags, "E364");
+    let help = d.help.as_deref().unwrap_or_default();
+    assert!(
+        help.contains(r#"- "sold to": "customer: id""#),
+        "the swapped rewrite must remain pasteable YAML: {help}"
+    );
+}
+
 /// An empty block passes every content-based check — no legacy pairs, no
 /// duplicates, no exclude clash — but under `include_unmapped: false` it states
 /// that the file carries no columns at all, which is a header line and one blank
@@ -211,8 +224,8 @@ fn unknown_source_column_is_rejected_with_a_suggestion() {
     );
     let help = d.help.as_deref().unwrap_or_default();
     assert!(
-        help.contains("did you mean `- <output_name>: first_name`"),
-        "help must offer the near miss in the corrected shape: {help}"
+        help.contains("did you mean `- given_name: first_name`"),
+        "help must preserve the authored output name and offer the corrected source: {help}"
     );
     assert!(
         help.contains("'department'"),
