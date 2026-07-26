@@ -42,6 +42,7 @@ use crate::error::FormatError;
 use crate::json::body_stream::{JsonArrayStream, is_json_ws};
 use crate::json::streaming::{SectionTarget, extract_sections};
 use crate::multi_value::{SplitToRows, SplitToRowsMode, SplitValues};
+use crate::record_path::{RecordPath, RecordPathSyntax};
 use crate::source::{ReopenableSource, SourceIdentity};
 use crate::traits::FormatReader;
 
@@ -210,10 +211,11 @@ impl JsonReader {
     ) -> Result<(InnerReader, SourceIdentity), FormatError> {
         // record_path → navigate then stream the named array lazily.
         if let Some(ref rp) = config.record_path {
-            let path_segments: Vec<String> = rp.split('.').map(String::from).collect();
+            let path = RecordPath::parse(RecordPathSyntax::Json, rp)
+                .map_err(|e| FormatError::Json(e.to_string()))?;
             let (buf, identity) = Self::open_buf(source)?;
             return Ok((
-                InnerReader::Array(JsonArrayStream::at_path(buf, &path_segments)?),
+                InnerReader::Array(JsonArrayStream::at_path(buf, path.segments())?),
                 identity,
             ));
         }
@@ -1340,6 +1342,52 @@ mod tests {
         let mut r = reader_from_str(input, config);
         let s = r.schema().unwrap();
         assert_eq!(&*s.columns()[0], "x");
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("x"),
+            Some(&Value::Integer(1))
+        );
+        assert_eq!(
+            r.next_record().unwrap().unwrap().get("x"),
+            Some(&Value::Integer(2))
+        );
+        assert!(r.next_record().unwrap().is_none());
+    }
+
+    #[test]
+    fn jsonpath_shaped_record_path_fails_at_construction() {
+        // `$.data` used to reach the body stream and surface as
+        // `record_path: key '$' not found in object` — a message about the
+        // document rather than about the path the author wrote.
+        let input = r#"{"data":{"rows":[{"x":1}]}}"#;
+        for raw in ["$.data", "/data", ".data", "data..rows", "data.", ""] {
+            let Err(err) = JsonReader::from_reader(
+                std::io::Cursor::new(input.as_bytes().to_vec()),
+                JsonReaderConfig {
+                    record_path: Some(raw.into()),
+                    ..default_config()
+                },
+            ) else {
+                panic!("{raw:?}: must be rejected at construction");
+            };
+            let msg = match err {
+                FormatError::Json(m) => m,
+                other => panic!("{raw:?}: expected FormatError::Json, got {other:?}"),
+            };
+            assert!(msg.contains("record_path"), "{raw:?}: {msg}");
+            if raw == "$.data" {
+                assert!(msg.contains("JSONPath"), "{msg}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_corrected_json_record_path_still_streams_every_record() {
+        let input = r#"{"data":{"rows":[{"x":1},{"x":2}]}}"#;
+        let config = JsonReaderConfig {
+            record_path: Some("data.rows".into()),
+            ..default_config()
+        };
+        let mut r = reader_from_str(input, config);
         assert_eq!(
             r.next_record().unwrap().unwrap().get("x"),
             Some(&Value::Integer(1))

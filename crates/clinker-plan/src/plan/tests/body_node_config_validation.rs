@@ -531,6 +531,35 @@ fn body_source_unproducible_multi_value_column_rejected_with_e361() {
     );
 }
 
+/// A JSONPath-shaped `record_path` on a body source. Without the body walk the
+/// grammar gate would exist for top-level sources only, and a body source would
+/// keep failing obscurely from inside the reader — or, for the XPath-shaped
+/// forms, reading zero records with no error at all.
+#[test]
+fn body_source_jsonpath_record_path_rejected_with_e363() {
+    let diags = compile_body_source(
+        r#"  - type: source
+    name: body_src
+    config:
+      name: body_src
+      type: json
+      path: body_src.json
+      options:
+        record_path: "$.data"
+      schema:
+        - { name: sku, type: string }"#,
+    );
+    let diag = diags
+        .iter()
+        .find(|d| d.code == "E363")
+        .unwrap_or_else(|| panic!("expected an E363 for the body source; got: {diags:?}"));
+    assert!(
+        diag.message.contains("JSONPath") && diag.message.contains("mv_body.comp.yaml"),
+        "the diagnostic must name the grammar and the body file: {:?}",
+        diag.message
+    );
+}
+
 /// A body Output whose `schema:` names an external `.schema.yaml` with a
 /// scaled `decimal` column resolves to inline columns at bind time. The
 /// resolved schema yields `as_columns() == Some`, which is the exact

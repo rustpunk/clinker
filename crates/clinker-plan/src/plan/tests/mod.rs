@@ -22,6 +22,7 @@ mod multi_value_validation;
 mod overlay_compile;
 mod plan_time_window_root;
 mod predicate_support;
+mod record_path_validation;
 mod reshape_validation;
 mod route_ports;
 mod typed_scoped_key;

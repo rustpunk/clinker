@@ -503,6 +503,11 @@ pub struct CsvInputOptions {
 pub struct JsonInputOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<JsonFormat>,
+    /// Dot-separated object keys locating the records array, descended from
+    /// the document root (`data.rows`). Not JSONPath: a `$.` root marker, a
+    /// leading `/`, and an empty segment are all rejected at compile time
+    /// (E363). Takes precedence over `format:`. Omitted, the reader
+    /// auto-detects the document shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record_path: Option<String>,
     /// Hard cap on the bytes the envelope pre-scan's path-pruned document
@@ -520,6 +525,12 @@ pub struct JsonInputOptions {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct XmlInputOptions {
+    /// Slash-separated XML element names locating the record elements,
+    /// matched level by level from the document element (`catalog/product`).
+    /// Not XPath: a `//` descendant step, a leading `/`, an empty segment, and
+    /// a segment that is not a legal XML element name are all rejected at
+    /// compile time (E363). Omitted, every top-level element becomes one
+    /// record.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

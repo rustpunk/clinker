@@ -20,8 +20,8 @@ rules.
       - { name: timestamp, type: date_time }
       - { name: payload, type: string }
     options:
-      format: ndjson          # array | ndjson | object (auto-detect if omitted)
-      record_path: "$.data"   # JSONPath to the records array (object format)
+      format: object          # array | ndjson | object (auto-detect if omitted)
+      record_path: "data"     # dot-separated keys to the records array
       max_index_bytes: 64MB   # cap on retained envelope sections (optional)
 ```
 
@@ -31,11 +31,46 @@ rules.
 |----------|--------|
 | `array` | The file is a single JSON array of objects. |
 | `ndjson` | One JSON object per line (newline-delimited JSON). |
-| `object` | A single top-level object; `record_path` locates the records array within it. |
+| `object` | A single top-level object; [`record_path`](#record_path) locates the records array within it. |
 
 If `format` is omitted, Clinker auto-detects the shape from the file
 content. Declare it explicitly when the file is large enough that you want
-to skip detection, or when an `object` wrapper needs a `record_path`.
+to skip detection, or when an `object` wrapper needs a
+[`record_path`](#record_path).
+
+## `record_path`
+
+`record_path` is a **dot-separated path of object keys**, descended from the
+document root. `data.rows` selects the array at `{"data": {"rows": [ … ]}}`, and
+each of its elements becomes one record. This is the canonical statement of the
+grammar; other pages link here rather than restate it.
+
+The rules, in full:
+
+- **No `$.` root marker.** It is not JSONPath. Write `data.rows`, not
+  `$.data.rows`. Only the exact leading `$.` is rejected, so a key that merely
+  starts with `$` (`$schema.rows`) is still addressable.
+- **No leading `/`.** A leading slash is how a JSON Pointer is anchored;
+  `record_path` is already anchored at the document root.
+- **No empty segments** — no doubled separator (`data..rows`) and no trailing
+  one (`data.`).
+- **Omitting `record_path` entirely** lets the reader auto-detect the document
+  shape. That is not the same as `record_path: ""`, which is a path naming a key
+  called "" and is rejected.
+
+A value breaking any of these fails at compile time with
+[E363](../../explain/E363.md), before any input is opened. The diagnostic names
+the corrected path where one can be derived.
+
+**`record_path` takes precedence over `format:`.** When both are declared the
+reader navigates the path and streams the array it finds, whatever `format:`
+says — so pair `record_path` with `format: object` (or leave `format:` off).
+Declaring `format: ndjson` alongside a `record_path` does not read NDJSON.
+
+Because a JSON key may contain any character, the two rejected prefixes give up
+a sliver of addressing: a top-level key literally named `$` followed by a nested
+key, and a top-level key whose name starts with `/`, are not reachable through
+`record_path`.
 
 ## Nested arrays
 

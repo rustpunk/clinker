@@ -541,7 +541,10 @@ fn is_xml_name_char(c: char) -> bool {
 /// well-formedness check, so an illegal name (e.g. one containing a space
 /// or `=`) would otherwise be written verbatim into the start tag and
 /// corrupt the document.
-fn is_valid_xml_name(name: &str) -> bool {
+///
+/// Shared with the `record_path` grammar, which needs the same predicate to
+/// reject a path segment no element can be named.
+pub(crate) fn is_valid_xml_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(first) if is_xml_name_start_char(first) => {}

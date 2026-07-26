@@ -1202,15 +1202,16 @@ impl PipelineConfig {
                 );
             }
         }
-        // Every per-source multi-value gate (E360, E361, E358) and the
-        // source-to-output E359 gate, run over this pipeline's own nodes. The
-        // same two passes run again inside `bind_composition` over each
-        // composition body's node list, which never appears here: the body file
-        // is re-read and bound separately, so a body source gated only from
-        // this loop would be gated by nothing at all.
+        // Every per-source multi-value gate (E360, E361, E358), the
+        // source-to-output E359 gate, and the E363 `record_path` grammar gate,
+        // run over this pipeline's own nodes. The same passes run again inside
+        // `bind_composition` over each composition body's node list, which never
+        // appears here: the body file is re-read and bound separately, so a body
+        // source gated only from this loop would be gated by nothing at all.
         for fault in crate::config::multi_value::source_node_faults(&self.nodes)
             .into_iter()
             .chain(crate::config::multi_value::output_node_faults(&self.nodes))
+            .chain(crate::config::record_path::record_path_faults(&self.nodes))
         {
             let primary = doc_node_line_by_name
                 .get(self.nodes[fault.node_index].value.name())

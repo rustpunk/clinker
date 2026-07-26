@@ -147,6 +147,12 @@ Each section declares how the reader locates its payload:
 | HL7 v2  | `segment`        | A header-segment tag — only `FHS` (BHS/MSH surface as nested levels) |
 | Multi-record CSV / fixed-width | `record_type` | A header record-type tag, e.g. `H` |
 
+`xml_path` and the source-level `record_path` option are both slash-paths over
+XML but root differently: `xml_path` tolerates a leading `/` (`/doc/Head` is its
+documented form), while `record_path` rejects one. They locate different things
+and are deliberately not aligned — see
+[XML Format → `record_path` and `xml_path` root differently](../formats/xml.md#record_path-and-xml_path-root-differently).
+
 Declaring an `xml_path` section against a JSON source (or vice versa),
 a `segment` extract against XML/JSON, a `record_type` extract against
 any format other than multi-record CSV / fixed-width, or any `envelope:`

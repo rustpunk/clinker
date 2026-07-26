@@ -123,7 +123,7 @@ has its own reference page covering its options and decoding model:
 |---------|--------|-----------|
 | `csv` | Delimited text (RFC 4180) | [CSV Format](../formats/csv.md) |
 | `json` | Array / NDJSON / wrapper object | [JSON Format](../formats/json.md) |
-| `xml` | XPath-selected record elements | [XML Format](../formats/xml.md) |
+| `xml` | Element-path-selected record elements | [XML Format](../formats/xml.md) |
 | `fixed_width` | Column-positioned legacy extracts | [Fixed-Width Format](../formats/fixed-width.md) |
 | `edifact` | UN/EDIFACT interchanges | [EDIFACT Format](../formats/edifact.md) |
 | `x12` | ANSI ASC X12 interchanges | [X12 Format](../formats/x12.md) |

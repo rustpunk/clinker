@@ -13,6 +13,7 @@ pub mod patch;
 pub mod path_template;
 pub mod pipeline;
 pub mod pipeline_node;
+pub mod record_path;
 pub mod route;
 pub mod scoped_var;
 pub mod sort;

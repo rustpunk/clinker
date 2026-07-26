@@ -1,9 +1,9 @@
 # XML Format
 
-The XML reader selects record elements by XPath and maps each one onto the
-source's declared `schema:`. Child elements bind to fields by name;
-attributes bind under a configurable prefix. Namespaces are stripped by
-default so schema field names stay clean. See
+The XML reader selects record elements by a slash-separated path of element
+names and maps each one onto the source's declared `schema:`. Child elements
+bind to fields by name; attributes bind under a configurable prefix. Namespaces
+are stripped by default so schema field names stay clean. See
 [Source Nodes](../nodes/source.md) for the shared schema and transport
 rules.
 
@@ -19,7 +19,7 @@ rules.
       - { name: name, type: string }
       - { name: price, type: float }
     options:
-      record_path: "//product"          # XPath to record elements
+      record_path: "catalog/product"    # slash-separated element path
       attribute_prefix: "@"             # prefix for XML attribute fields
       namespace_handling: strip         # strip | qualify
       max_index_bytes: 64MB             # cap on retained envelope sections (optional)
@@ -29,10 +29,54 @@ rules.
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `record_path` | — | XPath selecting the elements that each become one record. |
+| `record_path` | — | Slash-separated path of element names selecting the elements that each become one record — see [`record_path`](#record_path). Omitted, every top-level element becomes one record. |
 | `attribute_prefix` | `@` | Prefix that distinguishes an element's attributes from its child elements when both map to schema fields. |
 | `namespace_handling` | `strip` | `strip` removes namespace prefixes from element and attribute names; `qualify` preserves the namespace-qualified names. |
 | `max_index_bytes` | `64MB` | Cap on the bytes the envelope pre-scan retains while extracting declared `$doc.*` sections. |
+
+## `record_path`
+
+`record_path` is a **slash-separated path of XML element names**, matched level
+by level starting at the document element. `catalog/product` selects every
+`<product>` that is a child of the document element `<catalog>`. This is the
+canonical statement of the grammar; other pages link here rather than restate
+it.
+
+The rules, in full:
+
+- The path is already anchored at the document element, so it carries **no
+  leading `/`**. Write `Orders/Order`, not `/Orders/Order`.
+- **No `//`.** It is not XPath: there is no descendant-or-any-depth step. Name
+  every enclosing element.
+- **No empty segments** — no doubled separator (`Orders//Order`) and no trailing
+  one (`Orders/`).
+- **No XPath predicates, axes, or wildcards** (`product[@id='7']`,
+  `child::product`, `*`). Select the elements by path and filter the records in
+  a transform.
+- Every segment must be a **legal XML element name**. Under
+  `namespace_handling: qualify` element names keep their prefix, so a qualified
+  segment (`ns:Order`) is allowed and is what matches; under the default
+  `strip` the prefix is gone and the segment is the local name.
+- **Omitting `record_path` entirely** makes every top-level element one record.
+  That is not the same as `record_path: ""`, which is a path naming an element
+  called "" and is rejected.
+
+A value breaking any of these fails at compile time with
+[E363](../../explain/E363.md), before any input is opened. The diagnostic names
+the corrected path where one can be derived.
+
+### `record_path` and `xml_path` root differently
+
+The envelope option
+[`extract: { xml_path: … }`](../pipelines/envelope-and-doc-context.md#extract-rules-per-format)
+is also a slash-path over XML, but it **tolerates a leading `/`** — `/doc/Head`
+is its documented form. `record_path` rejects one.
+
+The two are separate grammars addressing separate things: `xml_path` locates a
+single envelope section anywhere in the document, `record_path` locates the
+record elements the body streams. They are deliberately not aligned — writing
+`record_path: "/catalog/product"` is an error, and writing
+`xml_path: "/doc/Head"` is correct.
 
 ## Truncated input
 

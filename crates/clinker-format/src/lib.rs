@@ -12,6 +12,7 @@ pub mod hl7;
 pub mod json;
 pub mod multi_record;
 pub mod multi_value;
+pub mod record_path;
 pub mod schema;
 pub(crate) mod segment_tokenizer;
 pub mod source;
@@ -33,6 +34,7 @@ pub use error::FormatError;
 pub use multi_value::{
     JoinValues, OnConflict, SplitToRows, SplitToRowsMode, SplitValues, under_field_path,
 };
+pub use record_path::{RecordPath, RecordPathError, RecordPathErrorKind, RecordPathSyntax};
 pub use schema::{
     Column, DEFAULT_VALUE_DELIMITER, Discriminator, GeneratedSchema, RECORD_TYPE_COLUMN,
     RecordType, SourceSchema, StructureConstraint, multi_record_superset,

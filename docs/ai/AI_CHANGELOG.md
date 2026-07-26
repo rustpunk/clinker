@@ -39,6 +39,22 @@ Representative code and manifest evidence cited by those docs includes:
 
 ## Entries
 
+### 2026-07-25: `record_path` Has One Grammar, Enforced at Both Layers
+
+Type: Source-backed fact (issue #949).
+
+Summary: A source's `record_path` is parsed through a single grammar rather than
+split ad hoc by each reader. XML takes a slash-separated path of XML element
+names rooted at the document element; JSON takes a dot-separated path of object
+keys from the document root. XPath and JSONPath shapes (`//product`, `$.data`, a
+leading `/`, empty segments) are rejected — an XPath-shaped value used to split
+into a segment no element name can equal, so the run emitted zero records and
+reported success. Rejection happens at plan time with E363 (over the call-site
+pipeline's nodes and each composition body's nodes) and again at reader
+construction, which covers callers that build a reader config directly.
+Evidence: `crates/clinker-format/src/record_path.rs`;
+`crates/clinker-plan/src/config/record_path.rs`; `docs/explain/E363.md`.
+
 ### 2026-07-24: Multi-Value Fields Replace `array_paths`
 
 Type: Source-backed fact (PRs #925, #930-#932, #934, #935, #938, #939,
