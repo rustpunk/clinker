@@ -38,6 +38,20 @@ For each `employee_id` group, every row where `plan_start - plan_end > 365` (the
 
 A list of field names. Records sharing the same values for all `partition_by` fields form one group, and every rule observes and acts within a single group. This is the correlation key the operator reasons over.
 
+### Values Reshape cannot key
+
+Reshape groups a record under a single **null group** whenever it cannot build a key from the partition value. Today that covers all of:
+
+- the column being absent from the record
+- an explicit null
+- an **empty string** (`""`)
+- a `NaN` float
+- an array- or map-valued cell (a multi-value column)
+
+So `account=""` and `account=null` land in the *same* Reshape group. Note that [Cull](cull.md#values-cull-cannot-key) does **not** fold empty strings — there, `account=""` and `account=null` are two groups. The difference is unintentional and tracked in [#1022](https://github.com/rustpunk/clinker/issues/1022); until it is resolved, do not assume one node's grouping matches the other's for blank values.
+
+If a blank-heavy column is your partition key, expect one large null group. Normalize blanks upstream (a Transform that maps `""` to a real sentinel) when you want them grouped separately.
+
 ## `order_by`
 
 Optional. A list of sort fields (`{ field, order }`, where `order` is `asc` or `desc`) applied within each group before rules run, so order-dependent synthesis is deterministic. Nulls sort last. Arrival order breaks ties.
@@ -137,9 +151,14 @@ Two current limitations qualify the "identical whether spilled or resident" guar
   group's reload footprint alone. ...]
   ```
 
-  Two remedies preserve your results: raise `memory.limit` clear of the reported figure — finalize also holds the run's remaining groups, so the group's own size is a floor, not a target — or shrink each record with an upstream Transform that drops columns this node does not read.
+  **Raising `memory.limit` is the only fix that leaves your output unchanged.** Raise it clear of the reported figure — finalize also holds the run's remaining groups, so that figure is a floor, not a target.
 
-  **Do not narrow `partition_by` to clear this error.** It would make the group smaller and the run succeed, but `partition_by` defines the group the rules evaluate against, so a narrower key changes which records each rule sees and therefore changes your output. Treat the grouping key as a modelling decision, never as a memory knob. (A future two-pass finalize could lift this limit.)
+  The other two levers both change what you get, and are worth knowing only so you can weigh them deliberately:
 
-  Note that `clinker explain --code E310` currently describes only the Combine case and suggests a `drive:` hint, which Reshape has no equivalent for — see [#1017](https://github.com/rustpunk/clinker/issues/1017). The guidance above is the one to follow for Reshape.
+  - *Dropping columns this node does not read*, in an upstream Transform, shrinks each buffered record. But Reshape's output row is the upstream columns plus its `$meta.*` audit columns — it never drops a column itself — so anything you strip upstream is also missing from the written output.
+  - *Narrowing `partition_by`* shrinks the group too, but that key **defines** the group the rules evaluate against, so a narrower key changes which records each rule sees and therefore changes your results. Treat the grouping key as a modelling decision, never as a memory knob.
+
+  (A future two-pass finalize could lift this limit.)
+
+  Run `clinker explain --code E310` for remediation keyed to whichever memory surface overran.
 - **Reshape rules cannot reference `$doc` document context.** Because the spill round-trip does not yet preserve [document envelope context](../pipelines/envelope-and-doc-context.md), a `$doc.*` reference in a rule's `when`, `mutate.set`, or `synthesize` expression would resolve to the real envelope for a resident group but to null for a spilled one — output that depends on the memory budget. A pipeline whose Reshape rules reference `$doc` is **rejected at compile time**. Move the `$doc` lookup into an upstream Transform that copies the value into a record column, then reference that column in the Reshape rule.

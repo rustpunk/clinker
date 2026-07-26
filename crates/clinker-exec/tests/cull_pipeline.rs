@@ -621,8 +621,18 @@ fn cull_giant_group_exceeds_budget_fails_loud() {
                 "the detail must explain why one group must fit the budget: {detail}"
             );
             assert!(
-                detail.contains("memory.limit") && detail.contains("upstream Transform"),
-                "the detail must give the author a result-preserving remedy: {detail}"
+                detail.contains("memory.limit")
+                    && detail.contains("only fix that leaves your output unchanged"),
+                "the detail must name raising the budget as the one output-preserving fix: \
+                 {detail}"
+            );
+            // The column-dropping remedy is offered, so it must carry its
+            // consequence: this node writes every input column through, so
+            // dropped columns leave the written output as well.
+            assert!(
+                !detail.contains("upstream Transform") || detail.contains("leave the output too"),
+                "offering the column-drop remedy requires disclosing that it changes which \
+                 columns are written: {detail}"
             );
             // This pipeline's rule is `count(*) > 100`. Splitting `account`
             // across a finer key drops each per-group count below the

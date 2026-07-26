@@ -66,7 +66,7 @@ pub(crate) fn commit_correlation_buffers(
     // Stable iteration order — sort by formatted group key so DLQ
     // emission and writer flush are deterministic across runs.
     let mut group_keys: Vec<Vec<GroupByKey>> = buffers.keys().cloned().collect();
-    group_keys.sort_by_key(|k| format_group_key(k));
+    group_keys.sort_by_cached_key(|k| format_group_key(k));
 
     // Phase 1: per-group disposition. Clean groups' records flow
     // into `clean_per_output` keyed by output_name; the BTreeMap key

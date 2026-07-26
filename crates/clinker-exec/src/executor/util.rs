@@ -367,32 +367,44 @@ pub(crate) fn build_arbitrator_from_config(
     )
 }
 
-/// Render a correlation / partition group key as a display string.
+/// Render a group key as a bare bracketed value list: `["A-1", 3]`.
 ///
-/// Every operator that groups records — correlation commit, cascading-retract
-/// detection, Reshape, Cull — names a group with this one spelling, so a group
-/// key a user learns to read in one diagnostic reads the same in all of them.
-/// Strings are quoted (`"A-1"`) so an empty or space-padded key stays visible;
-/// a `Decimal` round-trips through [`GroupByKey::to_value`] to keep its exact
-/// scale.
+/// One of two group-key spellings in this module. This one drops the field
+/// names; [`format_partition_group`] keeps them (`[account="A-1"]`). Correlation
+/// commit and cascading-retract detection use this form; the Reshape and Cull
+/// budget diagnostics use the named form. They are not interchangeable, and a
+/// change to either does not propagate to the other — only
+/// [`format_group_key_part`], which both call, is shared.
 ///
-/// **This is an output-ordering contract, not only a diagnostic one.**
-/// Correlation commit and cascading-retract detection both sort their group
-/// keys by this string to fix the order groups flush to writers, so the
-/// rendering decides emitted record order. Changing the escaping, the field
-/// order, or adding truncation reorders committed output — such a change needs
-/// the golden fixtures re-read, not just a diagnostic eyeballed.
+/// **This form carries an output-ordering contract.** Correlation commit and
+/// cascading-retract detection sort their group keys by this string to fix the
+/// order groups flush to writers, so its rendering decides emitted record
+/// order. See [`format_group_key_part`] for what that constrains.
 ///
-/// Pure and non-blocking. Allocates per key part, so it stays off the
-/// per-record hot loop; the sort callers pay it once per group.
+/// Pure and non-blocking; allocates per key part. The sort callers pass it to
+/// `sort_by_cached_key`, which renders each key once rather than once per
+/// comparison.
 pub(crate) fn format_group_key(key: &[GroupByKey]) -> String {
     let parts: Vec<String> = key.iter().map(format_group_key_part).collect();
     format!("[{}]", parts.join(", "))
 }
 
-/// Render one group-key component. The bracketed whole-key and the
-/// `field=value` pair forms both build on this, so a key value renders
-/// identically whichever form the diagnostic uses.
+/// Render one group-key component. Both whole-key forms build on this, so a
+/// key value renders identically whichever one a caller uses.
+///
+/// **The escaping and formatting decisions here are load-bearing for output
+/// order, not only for diagnostics.** [`format_group_key`] feeds the
+/// correlation-commit and retract-detection sorts, so unquoting a string for
+/// readability, changing numeric formatting, or adding truncation reorders
+/// committed records and diverges the byte-stable goldens. Such a change needs
+/// those fixtures re-read, not just a diagnostic eyeballed.
+///
+/// Rendering fidelity, by variant: `Str` is quoted (so an empty or
+/// space-padded key stays visible) and `Decimal` round-trips through
+/// [`GroupByKey::to_value`] at its exact scale. `Float` is not exact — and
+/// because `value_to_group_key` widens every `Value::Integer` to `f64`, an
+/// integer partition value above 2^53 renders rounded, so the printed name of
+/// such a group is not a literal copy of the author's cell.
 fn format_group_key_part(k: &GroupByKey) -> String {
     match k {
         GroupByKey::Null => "null".to_string(),
@@ -407,8 +419,18 @@ fn format_group_key_part(k: &GroupByKey) -> String {
 }
 
 /// Render a group key paired with the `partition_by` fields that produced it,
-/// as `field=value` pairs in declaration order — the shape a pipeline author
-/// can match against their own YAML.
+/// as `field=value` pairs in declaration order: `[account="A-1", day=3]`.
+///
+/// The second of this module's two group-key spellings — [`format_group_key`]
+/// renders the same key without field names, and the two do not share a
+/// format, only [`format_group_key_part`]. Used by the Reshape and Cull budget
+/// diagnostics; no caller sorts by this form, so unlike `format_group_key` it
+/// carries no output-ordering contract of its own (the part renderer it shares
+/// still does).
+///
+/// The field names are the author's own, so they match the YAML directly. The
+/// values are rendered, not echoed: see [`format_group_key_part`] for where a
+/// rendered value can differ from the cell it came from.
 ///
 /// Falls back to the bare key rendering when the field list and the key
 /// disagree on length, so a length mismatch degrades the diagnostic instead

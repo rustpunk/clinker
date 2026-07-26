@@ -30,6 +30,17 @@ For each `employee_id` group, if the group holds more than three rows the **whol
 
 A list of field names. Records sharing the same values for all `partition_by` fields form one group, and the removal predicate observes one whole group at a time. This is the correlation key the operator reasons over. `partition_by` must cover every visible correlation-key field so group identity is preserved on both output ports.
 
+### Values Cull cannot key
+
+Cull groups a record under a single **null group** in two cases: the column is absent from the record, or its value is an explicit null.
+
+Everything else is either its own group or a hard error:
+
+- An **empty string** (`""`) is its own group, distinct from `account=null`.
+- A `NaN` float, or an array- or map-valued cell, **aborts the run** rather than grouping — a partition key must be a single scalar value.
+
+[Reshape](reshape.md#values-reshape-cannot-key) treats both of those differently: it folds empty strings, NaNs, and multi-value cells all into its null group instead. So the same input can group one way under Cull and another under Reshape. The divergence is unintentional and tracked in [#1022](https://github.com/rustpunk/clinker/issues/1022); until it is resolved, do not assume one node's grouping matches the other's.
+
 ## `order_by`
 
 Optional. A list of sort fields (`{ field, order }`, where `order` is `asc` or `desc`) applied within each group before its predicate runs, so an order-sensitive predicate is deterministic. Nulls sort last. Arrival order breaks ties.
@@ -144,12 +155,15 @@ group [account="BIG"] does not fit; the reported use is that group's reload
 footprint alone. ...]
 ```
 
-Two remedies preserve your results: raise `memory.limit` clear of the reported figure — finalize also holds the run's remaining groups and the per-group decision map, so the group's own size is a floor, not a target — or shrink each record with an upstream Transform that drops columns this node does not read.
+**Raising `memory.limit` is the only fix that leaves your output unchanged.** Raise it clear of the reported figure — finalize also holds the run's remaining groups and the per-group decision map, so that figure is a floor, not a target.
 
-**Do not narrow `partition_by` to clear this error.** It would make the group smaller and the run succeed, but `partition_by` defines the group `drop_group_when` evaluates over. With a rule like `count(*) > 100`, splitting one account across a finer key drops each resulting group below the threshold, so an account that should have been removed is emitted on the main port instead — the run "works" and quietly returns a different result set. Treat the grouping key as a modelling decision, never as a memory knob.
+The other two levers both change what you get, and are worth knowing only so you can weigh them deliberately:
 
-Note that `clinker explain --code E310` currently describes only the Combine case and suggests a `drive:` hint, which Cull has no equivalent for — see [#1017](https://github.com/rustpunk/clinker/issues/1017). The guidance above is the one to follow for Cull.
+- *Dropping columns this node does not read*, in an upstream Transform, shrinks each buffered record. But Cull filters rows, never columns — both its ports carry the unchanged upstream schema — so anything you strip upstream is also missing from the main and `removed_to` outputs.
+- *Narrowing `partition_by`* shrinks the group too, but that key **defines** the group `drop_group_when` evaluates over. With a rule like `count(*) > 100`, splitting one account across a finer key drops each resulting group below the threshold, so an account that should have been removed is emitted on the main port instead — the run "works" and quietly returns a different result set. Treat the grouping key as a modelling decision, never as a memory knob.
+
+Run `clinker explain --code E310` for remediation keyed to whichever memory surface overran, or see the [memory guide](../ops/memory.md#behavior-under-memory-pressure).
 
 There is a second, symmetric bound on the **number** of groups. The per-group removal decision is held in an in-memory aggregate that is `O(distinct groups)` and — unlike the raw records — cannot spill. If a partition key is so high-cardinality that the decision state alone would exceed `memory.limit` (many small groups rather than one giant group), the run likewise **fails loud** with `E310`, rather than growing that state unbounded. Here, coarsening `partition_by` is a legitimate fix only if the coarser key is the grouping you actually meant — the same caveat as above applies. Otherwise, raise `memory.limit`.
 
-Cull raises `E310` from three sites in total, told apart by what the diagnostic names: a specific `Cull correlation group [...]` for the giant-group case above, `Cull drop-decision aggregate state` for the group-count bound, and `Cull cross-region tee admission` when a downstream stage in a different deferred region forces this node's output to be parked in memory.
+Several distinct memory surfaces can raise `E310` against a Cull node, so read the `[...]` detail to see which one overran. The ones documented here are `Cull correlation group [...]` (the giant-group case above), `Cull drop-decision aggregate state` (the group-count bound), `Cull cross-region tee admission` (a downstream stage in a different deferred region forces this node's output to be parked in memory), and `non-spillable node-buffer admission` (the main port fans out to more than one consumer, or feeds a composition port, so its handoff buffer cannot spill). Other surfaces the shared runtime charges may name this node too — the detail string is the authority, not this list.

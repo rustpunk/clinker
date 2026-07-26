@@ -824,8 +824,13 @@ fn reshape_spill_error(node_name: &str, e: clinker_plan::SpillError) -> Pipeline
 /// The remediation deliberately does NOT suggest a finer `partition_by`.
 /// `partition_by` defines the group the rules evaluate against, so narrowing
 /// it makes the run succeed by silently changing the answer — a suggestion the
-/// engine must never make. The safe levers are a larger budget and a smaller
-/// per-record footprint.
+/// engine must never make.
+///
+/// Only one lever here leaves the output untouched: a larger budget. Dropping
+/// columns upstream also shrinks the group, but this node's bound output row is
+/// the upstream columns plus the `$meta.*` audit columns, so every dropped
+/// column vanishes from what is written. The text offers it labelled with that
+/// consequence rather than as a free win.
 ///
 /// `used` is this one group's reload footprint while `limit` is the run-wide
 /// ceiling, so the two are not directly comparable as a target: finalize also
@@ -839,12 +844,14 @@ fn reshape_giant_group_error(
     hard_limit: u64,
 ) -> PipelineError {
     let group = format_partition_group(partition_by, key);
-    // This node folds a blank partition value into the null group, so a
-    // rendered `null` covers both and an author grepping for missing values
-    // alone would not find the group.
-    let blank_note = if key.iter().any(|k| matches!(k, GroupByKey::Null)) {
-        " This node groups blank and missing partition values together, so `null` here covers \
-         empty-string values too."
+    // `partition_key` routes every value it cannot key into the null group, so
+    // a rendered `null` is not only "missing data" — an author who greps for
+    // blanks alone can find far too few rows to explain the size and stop
+    // looking. Enumerate what actually lands there.
+    let null_note = if key.iter().any(|k| matches!(k, GroupByKey::Null)) {
+        " A `null` here is where this node puts every row whose partition value it cannot use as \
+         a key: a missing column, an explicit null, an empty string, a NaN, or an array- or \
+         map-valued cell. Any of those may be inflating this group."
     } else {
         ""
     };
@@ -857,11 +864,13 @@ fn reshape_giant_group_error(
             "one Reshape correlation group {group} does not fit; the reported use is that \
              group's reload footprint alone. Reshape applies its rules against the whole group \
              at once (the no-cascade contract), so a single group must fit the budget even \
-             though cross-group and ingest-time peaks spill to disk. Raise `memory.limit` clear \
-             of this figure — finalize also holds the run's remaining groups — or shrink each \
-             record with an upstream Transform that drops columns this node does not read. \
-             Narrowing `partition_by` would also shrink the group, but it redefines the group \
-             the rules evaluate against and changes results.{blank_note}"
+             though cross-group and ingest-time peaks spill to disk. Raising `memory.limit` \
+             clear of this figure is the only fix that leaves your output unchanged — finalize \
+             also holds the run's remaining groups, so treat that figure as a floor. Dropping \
+             columns this node does not read, in an upstream Transform, also shrinks the group, \
+             but Reshape writes every input column through, so those columns leave the output \
+             too. Narrowing `partition_by` shrinks it as well, but it redefines the group the \
+             rules evaluate against and changes results.{null_note}"
         )),
     }
 }
@@ -1358,8 +1367,20 @@ mod tests {
                     "the detail must explain why one group must fit the budget: {detail}"
                 );
                 assert!(
-                    detail.contains("memory.limit") && detail.contains("upstream Transform"),
-                    "the detail must give the author a result-preserving remedy: {detail}"
+                    detail.contains("memory.limit")
+                        && detail.contains("only fix that leaves your output unchanged"),
+                    "the detail must name raising the budget as the one output-preserving fix: \
+                     {detail}"
+                );
+                // The column-dropping remedy is offered, so it must carry its
+                // consequence: this node writes every input column through, so
+                // dropped columns leave the written output as well. A test that
+                // certified it as free would pin a false guarantee.
+                assert!(
+                    !detail.contains("upstream Transform")
+                        || detail.contains("leave the output too"),
+                    "offering the column-drop remedy requires disclosing that it changes which \
+                     columns are written: {detail}"
                 );
                 // The engine must never recommend narrowing `partition_by` as a
                 // memory fix. It redefines the group the rules evaluate
@@ -1430,10 +1451,22 @@ mod tests {
             detail.contains("[gid=null]"),
             "the group must still be named: {detail}"
         );
-        assert!(
-            detail.contains("blank and missing"),
-            "a null-keyed group must disclose that blank values are folded in: {detail}"
-        );
+        // `partition_key` funnels six distinct causes into the null group, and
+        // naming only the blank case sends an author looking for blanks, finding
+        // too few to explain the size, and stopping. Every cause the code folds
+        // in must be named.
+        for cause in [
+            "missing column",
+            "explicit null",
+            "empty string",
+            "NaN",
+            "array- or map-valued",
+        ] {
+            assert!(
+                detail.contains(cause),
+                "a null-keyed group must disclose that {cause:?} lands here too: {detail}"
+            );
+        }
     }
 
     // The disk-spill cap must abort the spill instead of writing past

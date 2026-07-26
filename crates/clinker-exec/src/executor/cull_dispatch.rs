@@ -1061,6 +1061,16 @@ fn cull_spill_error(node_name: &str, e: clinker_plan::SpillError) -> PipelineErr
 /// Wrap a predicate-aggregate compile or eval fault as a hard pipeline error.
 /// `bind_cull` already typechecked each rule fragment, so a failure here is a
 /// setup-invariant violation that aborts the run.
+///
+/// The blanket `Internal` classification here is known to be wrong and is not a
+/// contract to build on. Typechecking proves the fragment's shape, not that
+/// every row evaluates: a runtime data error in the author's own
+/// `drop_group_when` expression aborts as an engine bug at exit 1 rather than
+/// routing to the DLQ under `strategy: continue`, which is what the same class
+/// of fault does elsewhere. It also flattens `SpillCapExceeded` (E320, exit 4)
+/// into the same bucket. Tracked separately with the sibling spill-fault
+/// misclassification — the fix moves user-visible exit codes and DLQ routing,
+/// so the whole family lands under one review rather than riding along here.
 fn cull_predicate_error(node_name: &str, e: crate::aggregation::HashAggError) -> PipelineError {
     PipelineError::Internal {
         op: "cull",
@@ -1089,6 +1099,12 @@ fn cull_predicate_error(node_name: &str, e: crate::aggregation::HashAggError) ->
 /// `removed_to` land on the main port instead. A memory diagnostic must never
 /// recommend a fix that changes the result set.
 ///
+/// Only one lever here leaves the output untouched: a larger budget. Dropping
+/// columns upstream also shrinks the group, but Cull's bound output row equals
+/// its upstream row — it filters rows, never columns — so every dropped column
+/// vanishes from both the main and `removed_to` ports. The text offers it
+/// labelled with that consequence rather than as a free win.
+///
 /// `used` is this one group's reload footprint while `limit` is the run-wide
 /// ceiling, so the two are not directly comparable as a target: finalize also
 /// holds the remaining groups and the O(groups) decision map. The wording says
@@ -1110,11 +1126,13 @@ fn cull_giant_group_error(
             "one Cull correlation group {group} does not fit; the reported use is that group's \
              reload footprint alone. Cull evaluates its `drop_group_when` predicate against the \
              whole group at once, so a single group must fit the budget even though cross-group \
-             and ingest-time peaks spill to disk. Raise `memory.limit` clear of this figure — \
-             finalize also holds the run's remaining groups and its per-group decision map — or \
-             shrink each record with an upstream Transform that drops columns this node does \
-             not read. Narrowing `partition_by` would also shrink the group, but it changes \
-             what `drop_group_when` counts and changes which rows are removed."
+             and ingest-time peaks spill to disk. Raising `memory.limit` clear of this figure is \
+             the only fix that leaves your output unchanged — finalize also holds the run's \
+             remaining groups and its per-group decision map, so treat that figure as a floor. \
+             Dropping columns this node does not read, in an upstream Transform, also shrinks \
+             the group, but Cull writes every input column through, so those columns leave the \
+             output too. Narrowing `partition_by` shrinks it as well, but it changes what \
+             `drop_group_when` counts and changes which rows are removed."
         )),
     }
 }
@@ -1259,8 +1277,20 @@ mod tests {
                     "the detail must explain why one group must fit the budget: {detail}"
                 );
                 assert!(
-                    detail.contains("memory.limit") && detail.contains("upstream Transform"),
-                    "the detail must give the author a result-preserving remedy: {detail}"
+                    detail.contains("memory.limit")
+                        && detail.contains("only fix that leaves your output unchanged"),
+                    "the detail must name raising the budget as the one output-preserving fix: \
+                     {detail}"
+                );
+                // The column-dropping remedy is offered, so it must carry its
+                // consequence: this node writes every input column through, so
+                // dropped columns leave the written output as well. A test that
+                // certified it as free would pin a false guarantee.
+                assert!(
+                    !detail.contains("upstream Transform")
+                        || detail.contains("leave the output too"),
+                    "offering the column-drop remedy requires disclosing that it changes which \
+                     columns are written: {detail}"
                 );
                 // Narrowing `partition_by` splits the group, so a
                 // `count(*) > 100` rule can stop firing and rows that should
