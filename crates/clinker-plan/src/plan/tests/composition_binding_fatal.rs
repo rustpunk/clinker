@@ -1,4 +1,4 @@
-//! Composition-binding errors (E102–E109) are fatal at compile.
+//! Composition-binding errors (E102–E108) are fatal at compile.
 //!
 //! A composition whose `use:` cannot be resolved — or whose call site is
 //! otherwise ill-bound — drops the composition node from the lowered DAG.

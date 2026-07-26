@@ -188,8 +188,8 @@ E363
         shape. Run `clinker explain --code E363` for the full grammar.
 ```
 
-- **The code** (`E363`) heads the report. Hand it to
-  `clinker explain --code` for the worked example.
+- **The code** (`E363`) heads the report. Where a page exists for it, hand it
+  to `clinker explain --code` for the worked example.
 - **The message** names the offending input and the rule it broke.
 - **The source line** is quoted from your YAML, with the offending node
   underlined.
@@ -215,10 +215,15 @@ Two notes on where the snippet comes from:
 
 ## Looking up diagnostic codes
 
-`clinker explain --code <CODE>` prints the documentation for any registered error or warning code, including retraction-specific codes:
+`clinker explain --code <CODE>` prints the documentation page for a code that
+has one, including retraction-specific codes:
 
 ```bash
 clinker explain --code E15Y   # retraction-mode aggregate incompatible with strategy: streaming
 ```
 
-The full set of codes is enumerated in the error returned when an unknown code is passed.
+Not every code that can head a report has a page yet — pages are written per
+condition, and the code set is larger. **The report itself tells you which:** the
+`See: clinker explain --code <CODE>` line is appended only when that code has a
+page, so a report carrying it is a code this command can answer for. Passing a
+code with no page reports it as unknown and lists every code that does have one.

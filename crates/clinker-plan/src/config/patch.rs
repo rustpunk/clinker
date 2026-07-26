@@ -1015,7 +1015,7 @@ pub(crate) fn split_diagnostic_code(msg: &str) -> (&str, &str) {
 ///
 /// The channel system keys sources by node identity — the `name:` on the node
 /// header — which can differ from the nested `config.name:`. Every other
-/// channel block (`vars.source`, E111) resolves the same way, so the patch
+/// channel block (`vars.source`, E118) resolves the same way, so the patch
 /// target resolves by `header.name` for consistency.
 pub(crate) fn source_body_in_nodes<'a>(
     nodes: &'a mut [Spanned<PipelineNode>],

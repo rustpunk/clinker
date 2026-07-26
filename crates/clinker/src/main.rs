@@ -609,6 +609,7 @@ fn main() -> ExitCode {
                         PipelineError::Config(_)
                         | PipelineError::Schema(_)
                         | PipelineError::PlanDiagnostics(_)
+                        | PipelineError::OverlayDiagnostics(_)
                         | PipelineError::Compilation { .. }
                         | PipelineError::Internal { .. }
                         | PipelineError::SortOrderViolation { .. }
@@ -703,6 +704,9 @@ fn main() -> ExitCode {
             };
             match result {
                 Ok(code) => ExitCode::from(code),
+                // A plan diagnostic has already been rendered in full; saying
+                // it again in one flat line would bury the report above it.
+                Err(e) if e.is::<AlreadyReported>() => ExitCode::FAILURE,
                 Err(e) => {
                     eprintln!("clinker channels error: {e}");
                     ExitCode::FAILURE
@@ -871,9 +875,10 @@ fn plan_line_anchors_trusted(
 /// Marker for a failure whose diagnostic has already been printed by
 /// [`render_pipeline_error`].
 ///
-/// `run_explain` returns `Box<dyn Error>` and its caller prints whatever comes
-/// back. Returning this instead of a message keeps the caller from printing a
-/// second, flatter version of a report the user has already been shown.
+/// `run_explain` and `run_channels_resolve` return `Box<dyn Error>` and their
+/// callers print whatever comes back. Returning this instead of a message keeps
+/// them from printing a second, flatter version of a report the user has
+/// already been shown.
 #[derive(Debug)]
 struct AlreadyReported;
 
@@ -925,6 +930,44 @@ fn miette_severity(severity: clinker_core_types::Severity) -> miette::Severity {
     }
 }
 
+/// Append `See: clinker explain --code <CODE>` to `help`.
+///
+/// Only when a page exists for `code` — the pointer is a promise that the
+/// command answers, and `explain --code` on a code with no page reports it as
+/// unknown.
+///
+/// Gates that already spell the pointer themselves keep the one they wrote, so
+/// a report never says the same thing twice. `message` is checked alongside
+/// `help` because the two families put it in different places: a structured
+/// diagnostic attaches it to its help, while a `ConfigError::Validation`
+/// carries it at the end of the message text.
+fn with_explain_pointer(code: &str, message: &str, help: Option<String>) -> Option<String> {
+    let pointer = format!("clinker explain --code {code}");
+    if message.contains(&pointer)
+        || help.as_deref().is_some_and(|h| h.contains(&pointer))
+        || clinker_plan::plan::explain_provenance::explain_code(code).is_none()
+    {
+        return help;
+    }
+    Some(match help {
+        Some(h) => format!("{h}\nSee: {pointer}"),
+        None => format!("See: {pointer}"),
+    })
+}
+
+/// Split a message that opens with its own registered `[CODE]` into that code
+/// and the body after it.
+///
+/// A large family of plan-time gates reports through
+/// `ConfigError::Validation(format!("[E346] ..."))` rather than as a structured
+/// `Diagnostic`, so the code the user needs is carried in the message text.
+/// `None` for a message that names no code, or names one the registry does not
+/// list — an unregistered `[...]` is ordinary prose, not a code.
+fn split_leading_code(message: &str) -> Option<(&str, &str)> {
+    let (code, body) = message.strip_prefix('[')?.split_once(']')?;
+    clinker_core_types::diagnostic::is_registered(code).then(|| (code, body.trim_start()))
+}
+
 /// Turn one of a diagnostic's spans into a miette label against `text`.
 fn plan_label(
     span: clinker_core_types::span::Span,
@@ -954,7 +997,7 @@ fn plan_label(
 /// coded failure.
 fn render_plan_diagnostic(
     diag: &clinker_core_types::Diagnostic,
-    filename: &str,
+    filename: Option<&str>,
     source: Option<&std::sync::Arc<miette::NamedSource<String>>>,
     source_text: Option<&str>,
 ) {
@@ -980,20 +1023,6 @@ fn render_plan_diagnostic(
         }
     }
 
-    let mut help = diag.help.clone();
-    let pointer = format!("clinker explain --code {}", diag.code);
-    // Some gates already point at their explain page in the help they attach;
-    // appending a second pointer would say the same thing twice.
-    let already_pointed = help.as_deref().is_some_and(|h| h.contains(&pointer));
-    if !already_pointed
-        && clinker_plan::plan::explain_provenance::explain_code(&diag.code).is_some()
-    {
-        help = Some(match help {
-            Some(h) => format!("{h}\nSee: {pointer}"),
-            None => format!("See: {pointer}"),
-        });
-    }
-
     // Some messages open with their own `[CODE]` prefix -- the composition-body
     // patch pass re-emits an op failure that way, and the CXL wrap carries the
     // resolver's code through. The code is already the report header, so a
@@ -1003,11 +1032,18 @@ fn render_plan_diagnostic(
         .strip_prefix(&format!("[{}]", diag.code))
         .map_or_else(|| diag.message.clone(), |rest| rest.trim_start().to_owned());
 
+    let help = with_explain_pointer(&diag.code, &message, diag.help.clone());
+
     let has_labels = !labels.is_empty();
     let wrapped = WrappedPipelineError {
         // With a snippet the header already prints the path; without one the
-        // message is the only place the failing pipeline is named.
-        filename: (!has_labels).then(|| filename.to_owned()),
+        // message is the only place the failing pipeline is named. A caller
+        // that cannot vouch for the file passes `None` rather than have the
+        // report blame a document that is not at fault.
+        filename: (!has_labels)
+            .then_some(filename)
+            .flatten()
+            .map(str::to_owned),
         code: diag.code.clone(),
         severity: miette_severity(diag.severity),
         message,
@@ -1038,17 +1074,34 @@ fn render_pipeline_error(err: &PipelineError, config_path: &std::path::Path) {
     // we still render the raw error via miette's graphical handler
     // so the user sees consistent formatting.
     //
-    // The text a span's line number indexes is the *interpolated* config, not
-    // the bytes on disk: the loader runs `interpolate_env_vars` before parsing,
-    // so a `${VAR}` holding a multi-line value shifts every line after it. The
-    // renderer applies the same transformation rather than re-reading the raw
-    // file, or the underline lands on whatever YAML happens to sit at that line
-    // in the unexpanded text -- silently, because any in-range line resolves.
-    // If interpolation fails the config never parsed, so there are no plan
-    // diagnostics to anchor; fall back to the raw text for the generic path.
-    let source_text = std::fs::read_to_string(config_path)
-        .ok()
-        .map(|raw| clinker_plan::config::interpolate_env_vars(&raw, &[]).unwrap_or(raw));
+    // Quoting is always from the RAW file, never the interpolated text.
+    //
+    // A span's line number indexes the interpolated config, because the loader
+    // substitutes `${VAR}` before parsing. That tempts a renderer into quoting
+    // the interpolated text so the numbers line up — but a `${SFTP_URL}`
+    // holding a credential is resolved there, and miette prints the underlined
+    // line plus one either side, so the secret would reach stderr and any log
+    // capturing it. The raw file carries `${SFTP_URL}` literally, so nothing
+    // sensitive can be printed from it on any path.
+    //
+    // The two texts share line numbering exactly when no substituted value
+    // contained a newline — the ordinary case — so the raw file quotes the
+    // right line there. When a value did span lines the numberings diverge,
+    // and rather than quote what is now the wrong line, the snippet is dropped
+    // and the report renders without one.
+    let source_text = std::fs::read_to_string(config_path).ok();
+    // Interpolated only to ask whether any substituted value carried a
+    // newline; the expanded text is dropped here and never rendered. A
+    // substitution that fails means the config never parsed, so there are no
+    // plan diagnostics to anchor and no snippet to lose.
+    //
+    // The `&[]` mirrors what the loader passes. Should a caller ever supply
+    // extra vars, they have to be threaded here too: a newline inside one
+    // would shift the loader's line numbering without shifting the numbering
+    // this asks about, and the snippet would quote the wrong line again.
+    let anchor_text = source_text.as_deref().filter(|raw| {
+        clinker_plan::config::interpolate_env_vars(raw, &[]).is_ok_and(|i| !i.shifted_lines)
+    });
     let filename = config_path.to_string_lossy().into_owned();
     // Built once and shared: a compile that fails N gates would otherwise
     // clone the whole config text N times.
@@ -1056,19 +1109,58 @@ fn render_pipeline_error(err: &PipelineError, config_path: &std::path::Path) {
         .as_ref()
         .map(|s| std::sync::Arc::new(miette::NamedSource::new(filename.clone(), s.clone())));
 
-    if let PipelineError::PlanDiagnostics(diags) = err {
-        for diag in diags {
-            render_plan_diagnostic(diag, &filename, source.as_ref(), source_text.as_deref());
+    match err {
+        PipelineError::PlanDiagnostics(diags) => {
+            for diag in diags {
+                render_plan_diagnostic(diag, Some(&filename), source.as_ref(), anchor_text);
+            }
+            return;
         }
-        return;
+        // The fault is in a channel/group file, which each message names for
+        // itself. Attributing it to the pipeline file would send the author to
+        // a document with nothing wrong in it, and no anchor here indexes the
+        // pipeline text, so no snippet is drawn either.
+        PipelineError::OverlayDiagnostics(diags) => {
+            for diag in diags {
+                render_plan_diagnostic(diag, None, None, None);
+            }
+            return;
+        }
+        _ => {}
     }
+
+    // A large family of gates reports through `ConfigError::Validation` with
+    // its code at the head of the message rather than as a structured
+    // diagnostic. Rendering those under the placeholder
+    // `clinker::pipeline_error` drops the code out of the header and the
+    // explain pointer off the report, while the pages this PR adds describe
+    // the fuller shape. The code is already in hand, so lift it and give the
+    // message the same treatment a structured diagnostic gets.
+    let validation = match err {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(msg)) => {
+            split_leading_code(msg)
+        }
+        _ => None,
+    };
+    let (code, message, help) = match validation {
+        Some((code, body)) => (
+            code.to_owned(),
+            body.to_owned(),
+            with_explain_pointer(code, body, None),
+        ),
+        None => (
+            String::from("clinker::pipeline_error"),
+            err.to_string(),
+            None,
+        ),
+    };
 
     let wrapped = WrappedPipelineError {
         filename: Some(filename),
-        code: String::from("clinker::pipeline_error"),
+        code,
         severity: miette::Severity::Error,
-        message: err.to_string(),
-        help: None,
+        message,
+        help,
         labels: Vec::new(),
         src: source,
     };
@@ -1106,7 +1198,7 @@ fn abort_on_overlay_errors(
         }
     }
     if !errors.is_empty() {
-        return Err(PipelineError::plan_diagnostics_unanchored(errors));
+        return Err(PipelineError::overlay_diagnostics(errors));
     }
     Ok(())
 }
@@ -2892,7 +2984,8 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let yaml = std::fs::read_to_string(config_path)?;
     let interpolated = clinker_plan::config::interpolate_env_vars(&yaml, &[])
-        .map_err(|e| format!("environment variable interpolation failed: {e}"))?;
+        .map_err(|e| format!("environment variable interpolation failed: {e}"))?
+        .text;
     let mut pipeline_config: clinker_plan::config::PipelineConfig =
         clinker_plan::yaml::from_str(&interpolated)
             .map_err(|e| format!("YAML parse error: {e}"))?;
@@ -3024,6 +3117,36 @@ fn format_overlay_value(v: &serde_json::Value) -> String {
 /// post-compile, returning the config, the compiled plan, and the overlay
 /// result (whose diagnostics carry any `E113`/`E109`). A compile failure (e.g.
 /// a dangling splice anchor) is a hard `Err`.
+/// Why [`compile_effective_plan`] could not produce an effective plan.
+///
+/// Compile-gate diagnostics are carried whole rather than flattened to a
+/// string: `channels resolve` renders one report per diagnostic, with the same
+/// code, help, and explain pointer the identical failure gets under `run`,
+/// while `channels lint` folds them into its per-target failure table. Both
+/// need the parts, and a joined string has already thrown them away.
+enum EffectivePlanError {
+    /// Diagnostics from `config.compile()`.
+    Diagnostics(Vec<clinker_core_types::Diagnostic>),
+    /// A failure before compile — unreadable base file, `${VAR}` with nothing
+    /// behind it, YAML syntax, or a source patch that would not apply. These
+    /// carry no diagnostic code, so there is nothing to preserve.
+    Setup(String),
+}
+
+impl EffectivePlanError {
+    /// One line per underlying failure, for a caller assembling a summary
+    /// table rather than rendering a report.
+    fn lines(&self) -> Vec<String> {
+        match self {
+            Self::Diagnostics(diags) => diags
+                .iter()
+                .map(|d| format!("[{}] {}", d.code, d.message))
+                .collect(),
+            Self::Setup(msg) => msg.lines().map(str::to_owned).collect(),
+        }
+    }
+}
+
 fn compile_effective_plan(
     base_path: &std::path::Path,
     workspace_root: &std::path::Path,
@@ -3034,22 +3157,24 @@ fn compile_effective_plan(
         clinker_plan::plan::CompiledPlan,
         clinker_channel::ChannelOverlayResult,
     ),
-    String,
+    EffectivePlanError,
 > {
+    use EffectivePlanError as E;
     let yaml = std::fs::read_to_string(base_path)
-        .map_err(|e| format!("cannot read {}: {e}", base_path.display()))?;
+        .map_err(|e| E::Setup(format!("cannot read {}: {e}", base_path.display())))?;
     let interpolated = clinker_plan::config::interpolate_env_vars(&yaml, &[])
-        .map_err(|e| format!("environment variable interpolation failed: {e}"))?;
+        .map_err(|e| E::Setup(format!("environment variable interpolation failed: {e}")))?
+        .text;
     let mut config: clinker_plan::config::PipelineConfig =
         clinker_plan::yaml::from_str(&interpolated)
-            .map_err(|e| format!("YAML parse error: {e}"))?;
+            .map_err(|e| E::Setup(format!("YAML parse error: {e}")))?;
 
     // Per-source patches shape the parsed config before compile, so the
     // effective DAG this reports reflects the same schema / multi-value /
     // options changes a `run --channel` would execute.
     if let Some(patches) = res.source_patches() {
         clinker_plan::config::apply_source_patches(&mut config, patches)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| E::Setup(e.to_string()))?;
     }
 
     let base_parent = base_path
@@ -3065,13 +3190,7 @@ fn compile_effective_plan(
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
     ctx.overlay_ops = res.op_stream().to_vec();
 
-    let mut plan = config.compile(&ctx).map_err(|diags| {
-        let messages: Vec<String> = diags
-            .iter()
-            .map(|d| format!("[{}] {}", d.code, d.message))
-            .collect();
-        format!("compilation failed:\n{}", messages.join("\n"))
-    })?;
+    let mut plan = config.compile(&ctx).map_err(E::Diagnostics)?;
     let overlay = res.apply_config_and_vars(&mut plan, &config);
     Ok((config, plan, overlay))
 }
@@ -3206,7 +3325,23 @@ fn run_channels_resolve(args: &ResolveArgs) -> Result<u8, Box<dyn std::error::Er
     )
     .map_err(|e| format!("overlay resolution failed: {e}"))?;
 
-    let (config, plan, overlay) = compile_effective_plan(&args.target, &workspace_root, &res)?;
+    // A compile failure renders here rather than propagating as a message, so
+    // the identical gate reads the same under `channels resolve` as under
+    // `run`: code in the header, help below it, explain pointer attached.
+    let (config, plan, overlay) = match compile_effective_plan(&args.target, &workspace_root, &res)
+    {
+        Ok(triple) => triple,
+        Err(EffectivePlanError::Diagnostics(diags)) => {
+            // Unanchored: an overlay op numbers lines in the overlay file, and
+            // this path always has an overlay applied.
+            render_pipeline_error(
+                &PipelineError::plan_diagnostics_unanchored(diags),
+                &args.target,
+            );
+            return Err(Box::new(AlreadyReported));
+        }
+        Err(e @ EffectivePlanError::Setup(_)) => return Err(e.lines().join("\n").into()),
+    };
 
     // Overlay report (deterministic) followed by the effective DAG for context.
     print!("{}", render_resolved(&plan, &overlay, &res, &target_name));
@@ -3295,12 +3430,8 @@ fn run_channels_lint(args: &LintArgs) -> Result<u8, Box<dyn std::error::Error>> 
                         failures.push((channel.id.clone(), target_name.clone(), errs));
                     }
                 }
-                Err(msg) => {
-                    failures.push((
-                        channel.id.clone(),
-                        target_name.clone(),
-                        msg.lines().map(str::to_string).collect(),
-                    ));
+                Err(e) => {
+                    failures.push((channel.id.clone(), target_name.clone(), e.lines()));
                 }
             }
         }

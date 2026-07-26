@@ -8,20 +8,24 @@ Clinker provides three levels of pre-flight checking so you can catch problems b
 clinker run pipeline.yaml --dry-run
 ```
 
-This checks the configuration document itself:
+This checks the configuration document itself. Among what it catches:
 
 - YAML structure, required fields, and unknown-key rejection
-- Per-node config validation (option values, mutually exclusive settings)
-- Pipeline-level settings such as the memory thresholds and DLQ rates
-- Output destination collisions
+- Per-node config validation — option values and mutually exclusive settings,
+  such as a file source declaring no `path`/`glob`/`regex`/`paths` matcher, or
+  more than one
+- The pipeline-level memory thresholds
+- An output envelope naming a section none of its feeding sources declares
 
 No records are read. No output files are created. The command exits with code 0
 on success or code 1 with a diagnostic on failure.
 
 **`--dry-run` stops before the plan is compiled.** It does *not* type-check CXL,
 bind schemas, check that connected nodes agree on columns, resolve the DAG, or
-run the plan-time gates on source and output config. A pipeline that `--dry-run`
-accepts can still fail the moment a real run starts.
+run the plan-time gates that need the compiled plan — which includes the DLQ
+rate bounds (`E318`) and the check that no two output destinations resolve to
+the same file (`E322`). A pipeline that `--dry-run` accepts can still fail the
+moment a real run starts.
 
 ## Plan compilation
 

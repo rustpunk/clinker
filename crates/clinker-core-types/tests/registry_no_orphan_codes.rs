@@ -10,6 +10,33 @@
 //! `file:line` that emits it. It is the half of the contract that covers sites
 //! no test executes; the `debug_assert!` in the constructors covers the codes
 //! chosen at runtime, which no source scan can resolve.
+//!
+//! # What this scan cannot see
+//!
+//! It matches text, not syntax. Parsing Rust properly would mean a parser
+//! dependency, so instead the gaps are named here and *counted at run time* —
+//! [`every_emitted_diagnostic_code_is_registered`] prints one line per site it
+//! recognized as a code-carrying position but could not resolve to a literal.
+//! Run with `--nocapture` to see them. They are reported rather than failed
+//! because each is a legitimate spelling, not a defect:
+//!
+//! - **A code chosen at run time.** `Diagnostic::error(code, ..)` where `code`
+//!   is a variable, a `match` arm, or a `const`. The constructors'
+//!   `debug_assert!` covers these, but only on a path some debug test executes.
+//! - **An interpolated `[CODE]` prefix.** `format!("[{code}] ..")` carries its
+//!   code the same way a literal `"[E123] .."` does, but the code is not in the
+//!   text. Covered only if that code's literal also appears somewhere the scan
+//!   does recognize. Every string opening `"[{` is reported, because whether
+//!   one is a code prefix or an ordinary `[{}]` list rendering is precisely
+//!   what this scan cannot determine.
+//! - **A raw-string literal.** `r#"E123"#` in a constructor position is not
+//!   matched; the leading `r` is not a quote. (A raw string *message* opening
+//!   `[E123]` is matched, since its quote still precedes the bracket.)
+//! - **Comments and doc comments are not skipped.** A code-shaped literal
+//!   inside one is scanned as though it were code, so a doc example must use a
+//!   registered code or it fails the test.
+//! - **Only `<workspace>/crates` is walked.** A code emitted from a source
+//!   outside that tree is invisible here.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -123,9 +150,16 @@ fn skip_ws(bytes: &[u8], from: usize) -> usize {
     i
 }
 
+/// A diagnostic-carrying position whose code the scan could not read, with why.
+struct Unresolved {
+    file: PathBuf,
+    line: usize,
+    reason: &'static str,
+}
+
 /// Collect every code-shaped literal sitting in a diagnostic-carrying
-/// position in `src`.
-fn sites_in(path: &Path, src: &str) -> Vec<Site> {
+/// position in `src`, along with the positions whose code could not be read.
+fn sites_in(path: &Path, src: &str) -> (Vec<Site>, Vec<Unresolved>) {
     let bytes = src.as_bytes();
     let mut line_starts = vec![0usize];
     line_starts.extend(src.match_indices('\n').map(|(i, _)| i + 1));
@@ -135,6 +169,7 @@ fn sites_in(path: &Path, src: &str) -> Vec<Site> {
     };
 
     let mut out = Vec::new();
+    let mut unresolved = Vec::new();
     let mut push = |offset: usize, code: &str, shape: Shape| {
         out.push(Site {
             code: code.to_owned(),
@@ -143,16 +178,34 @@ fn sites_in(path: &Path, src: &str) -> Vec<Site> {
             shape,
         });
     };
+    let mut blind = |offset: usize, reason: &'static str| {
+        unresolved.push(Unresolved {
+            file: path.to_path_buf(),
+            line: line_of(offset),
+            reason,
+        });
+    };
 
     for marker in ["Diagnostic::error(", "Diagnostic::warning("] {
         for (idx, _) in src.match_indices(marker) {
             let after = skip_ws(bytes, idx + marker.len());
-            if let Some(code) = literal_at(bytes, after)
-                && looks_like_code(code)
-            {
-                push(idx, code, Shape::Constructor);
+            match literal_at(bytes, after) {
+                Some(code) if looks_like_code(code) => push(idx, code, Shape::Constructor),
+                // A literal that is not code-shaped in the one position that
+                // must hold a code. Reported rather than failed: the shape rule
+                // is deliberately narrow, so widening it here would be a guess.
+                Some(_) => blind(idx, "constructor code literal is not code-shaped"),
+                None => blind(idx, "constructor code is not a plain literal"),
             }
         }
+    }
+
+    // `format!("[{code}] ..")` carries its code exactly as a literal
+    // `"[E123] .."` does, but the code is not in the text to be read. Whether
+    // a given one is a code prefix or an ordinary `[{}]` list rendering is
+    // exactly what this scan cannot tell, so it says so rather than deciding.
+    for (idx, _) in src.match_indices("\"[{") {
+        blind(idx, "string opens with an interpolated bracket");
     }
 
     for marker in ["code:", "err_code:"] {
@@ -187,7 +240,7 @@ fn sites_in(path: &Path, src: &str) -> Vec<Site> {
         }
     }
 
-    out
+    (out, unresolved)
 }
 
 #[test]
@@ -201,11 +254,14 @@ fn every_emitted_diagnostic_code_is_registered() {
     );
 
     let mut sites = Vec::new();
+    let mut unresolved = Vec::new();
     for path in &files {
         let Ok(src) = std::fs::read_to_string(path) else {
             continue;
         };
-        sites.extend(sites_in(path, &src));
+        let (found, blind) = sites_in(path, &src);
+        sites.extend(found);
+        unresolved.extend(blind);
     }
 
     // Both recognized shapes must still match real code. If a refactor
@@ -226,6 +282,23 @@ fn every_emitted_diagnostic_code_is_registered() {
         "scan matched no `\"[CODE] ...\"` message prefix; the scanner's \
          prefix pattern has gone stale"
     );
+
+    // The coverage the scan does not provide, named rather than left implicit:
+    // a reader deciding whether this guard protects a given emission site can
+    // see which sites it had to skip. Printed, not failed — every entry is a
+    // legitimate spelling, covered instead by the constructors'
+    // `debug_assert!` (see this file's module doc).
+    println!(
+        "registry scan: {} resolved code literal(s) across {} file(s); \
+         {} code-carrying position(s) unresolved",
+        sites.len(),
+        files.len(),
+        unresolved.len()
+    );
+    for u in &unresolved {
+        let rel = u.file.strip_prefix(&root).unwrap_or(&u.file);
+        println!("  unresolved: {} at {}:{}", u.reason, rel.display(), u.line);
+    }
 
     let mut orphans = String::new();
     for site in &sites {

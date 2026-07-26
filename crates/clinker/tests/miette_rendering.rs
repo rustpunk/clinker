@@ -824,6 +824,279 @@ nodes:
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+const SECRET: &str = "sftp://user:hunter2SECRETTOKEN@files.example.com/in";
+const MULTILINE_SECRET: &str =
+    "-----BEGIN KEY-----\n# MIIBOgIBAAJBAKSECRETLINE\n# -----END KEY-----";
+
+#[test]
+fn test_a_resolved_env_var_never_reaches_the_rendered_snippet() {
+    // The loader substitutes `${VAR}` before parsing, so a span's line number
+    // indexes the interpolated text. Quoting that text to make the numbers
+    // line up would print resolved credentials: miette shows the underlined
+    // line plus one either side, so a `path: "${SFTP_URL}"` on or beside the
+    // offending node lands in stderr and in any CI log capturing it.
+    //
+    // Both shapes are covered because they exercise different halves of the
+    // fix: the single-line value tests that the raw text is what gets quoted,
+    // and the multi-line value tests that the snippet is dropped when the two
+    // texts stop sharing line numbering.
+    let tmp = tempdir_path();
+
+    // (a) A single-line secret sitting on the very line the gate underlines.
+    //     Flow style puts the whole node — including `path:` — on one line.
+    let inline = tmp.join("inline_secret.yaml");
+    std::fs::write(
+        &inline,
+        r#"pipeline:
+  name: inline_secret
+nodes:
+  - { type: source, name: src, config: { name: src, type: json, path: "${LEAK_TEST_URL}", options: { record_path: "$.rows" }, schema: [{ name: amount, type: int }] } }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+    )
+    .expect("write inline fixture");
+
+    // (b) A multi-line value ahead of the offending node, which shifts every
+    //     later line and so breaks the correspondence between the two texts.
+    let shifted = tmp.join("shifted_secret.yaml");
+    std::fs::write(
+        &shifted,
+        r#"pipeline:
+  name: shifted_secret
+# ${LEAK_TEST_PEM}
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: "${LEAK_TEST_URL}"
+      options:
+        record_path: "$.rows"
+      schema:
+        - { name: amount, type: int }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+    )
+    .expect("write shifted fixture");
+
+    for fixture in [&inline, &shifted] {
+        let output = Command::new(clinker_bin())
+            .arg("run")
+            .arg(fixture)
+            .env("LEAK_TEST_URL", SECRET)
+            .env("LEAK_TEST_PEM", MULTILINE_SECRET)
+            .output()
+            .expect("spawn clinker");
+
+        assert!(
+            !output.status.success(),
+            "the record_path gate must fail so a diagnostic is rendered"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Asserted on raw output, deliberately un-flattened: a secret split
+        // across a wrap is still a leaked secret, so each line of a multi-line
+        // value is checked on its own.
+        for needle in [SECRET, "hunter2SECRETTOKEN"] {
+            assert!(
+                !stderr.contains(needle),
+                "a resolved credential reached stderr from {}:\n{stderr}",
+                fixture.display()
+            );
+            assert!(
+                !stdout.contains(needle),
+                "a resolved credential reached stdout"
+            );
+        }
+        for line in MULTILINE_SECRET.lines() {
+            let line = line.trim_start_matches("# ").trim();
+            assert!(
+                !stderr.contains(line),
+                "a resolved multi-line value reached stderr from {}: {line:?}\n{stderr}",
+                fixture.display()
+            );
+        }
+        // The diagnostic still arrives — this is not passing by rendering
+        // nothing at all.
+        assert!(flatten_report(&stderr).contains("E363"), "got:\n{stderr}");
+    }
+
+    // The reference itself is fine to show, and proves the snippet was drawn
+    // from the raw file rather than suppressed in the single-line case.
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&inline)
+        .env("LEAK_TEST_URL", SECRET)
+        .env("LEAK_TEST_PEM", MULTILINE_SECRET)
+        .output()
+        .expect("spawn clinker");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        flatten_report(&stderr).contains("${LEAK_TEST_URL}"),
+        "the raw reference should be quoted in place of its value; got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_a_validation_gate_renders_under_its_own_code() {
+    // A large family of gates reports through `ConfigError::Validation` with
+    // its code at the head of the message rather than as a structured
+    // `Diagnostic`. Those used to render under the placeholder
+    // `clinker::pipeline_error`, so the code never reached the header and the
+    // report carried none of the parts the docs describe -- while the
+    // identical class of failure raised as a `Diagnostic` got all of them.
+    let tmp = tempdir_path();
+    let yaml_path = tmp.join("bad_threshold.yaml");
+    std::fs::write(
+        &yaml_path,
+        r#"pipeline:
+  name: bad_threshold
+  memory:
+    resume_threshold: 0.99
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: amount, type: int }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+    )
+    .expect("write fixture");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&yaml_path)
+        .output()
+        .expect("spawn clinker");
+
+    assert!(!output.status.success(), "the threshold gate must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let flat = flatten_report(&stderr);
+
+    assert!(
+        flat.contains("E324"),
+        "the gate's own code must head the report; got:\n{stderr}"
+    );
+    assert!(
+        !flat.contains("clinker::pipeline_error"),
+        "the placeholder code must not stand in for a code the message carries; \
+         got:\n{stderr}"
+    );
+    // Lifted into the header, so the prefix that carried it is gone from the
+    // message -- stated once per report, as for a structured diagnostic.
+    assert!(
+        !flat.contains("[E324]"),
+        "the code must be stated once, not left embedded in the message too; \
+         got:\n{stderr}"
+    );
+    // This gate spells its own pointer, so exactly one must survive.
+    assert_eq!(
+        flat.matches("clinker explain --code E324").count(),
+        1,
+        "the explain pointer must appear exactly once; got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_an_overlay_error_is_not_blamed_on_the_pipeline_file() {
+    // Overlay errors route through the same renderer as plan diagnostics,
+    // which prefixes a label-less report with `pipeline error in <file>:`. The
+    // offending input is the channel file, so naming the pipeline sent the
+    // author to a document with nothing wrong in it.
+    let tmp = tempdir_path();
+    std::fs::write(tmp.join("in.csv"), "amount\n1\n").expect("write input");
+    std::fs::write(
+        tmp.join("pipe.yaml"),
+        r#"pipeline:
+  name: overlay_attrib
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: amount, type: int }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+    )
+    .expect("write pipeline");
+
+    let tenant = tmp.join("channel").join("acme");
+    std::fs::create_dir_all(&tenant).expect("create tenant dir");
+    std::fs::write(
+        tenant.join("pipe.channel.yaml"),
+        "channel:\n  target: ../../pipe.yaml\nconfig:\n  nosuchnode.nosuchparam: 1\n",
+    )
+    .expect("write overlay");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg("pipe.yaml")
+        .arg("--channel")
+        .arg("acme")
+        .current_dir(&tmp)
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        !output.status.success(),
+        "an overlay key matching no parameter must fail the run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let flat = flatten_report(&stderr);
+
+    assert!(flat.contains("E113"), "got:\n{stderr}");
+    assert!(
+        !flat.contains("pipeline error in"),
+        "the pipeline file is not the offending input and must not be named as \
+         it; got:\n{stderr}"
+    );
+    // The message still identifies what failed and where -- the attribution is
+    // dropped, not the identification.
+    assert!(
+        flat.contains("nosuchnode.nosuchparam"),
+        "the report must still name the offending overlay key; got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// Create an ephemeral per-test temp directory under the system
 /// temp root. Avoids adding a `tempfile` dev-dep.
 fn tempdir_path() -> std::path::PathBuf {

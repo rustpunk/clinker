@@ -32,6 +32,17 @@ pub enum PipelineError {
     /// see [`PipelineError::plan_diagnostics_unanchored`] for why that is not
     /// always so, and how a caller that cannot tell says so.
     PlanDiagnostics(Vec<clinker_core_types::Diagnostic>),
+    /// Plan-time failure raised while applying a channel/group overlay, so the
+    /// offending input is an overlay file rather than the pipeline file.
+    ///
+    /// Distinct from [`PipelineError::PlanDiagnostics`] purely so a renderer
+    /// does not attribute the fault to the pipeline it was handed: these
+    /// diagnostics name their own channel and overlay path in the message, and
+    /// a report headed `pipeline error in <pipeline.yaml>` sends the author to
+    /// a file with nothing wrong in it. They never carry a usable line anchor
+    /// either — an overlay op numbers lines in the overlay file — so a renderer
+    /// draws no snippet for them.
+    OverlayDiagnostics(Vec<clinker_core_types::Diagnostic>),
     Compilation {
         transform_name: String,
         messages: Vec<String>,
@@ -334,19 +345,37 @@ impl PipelineError {
     /// cannot uses this, which drops the anchors and leaves the code, message
     /// and help to render on their own.
     pub fn plan_diagnostics_unanchored(diags: Vec<clinker_core_types::Diagnostic>) -> Self {
-        use clinker_core_types::span::Span;
-        let stripped = diags
-            .into_iter()
-            .map(|mut d| {
-                d.primary.span = Span::SYNTHETIC;
-                for s in &mut d.secondary {
-                    s.span = Span::SYNTHETIC;
-                }
-                d
-            })
-            .collect();
-        Self::PlanDiagnostics(stripped)
+        Self::PlanDiagnostics(strip_anchors(diags))
     }
+
+    /// Diagnostics raised while applying a channel/group overlay.
+    ///
+    /// Anchors are dropped for the same reason
+    /// [`PipelineError::plan_diagnostics_unanchored`] drops them — an overlay
+    /// op numbers lines in the overlay file, not the pipeline — and the
+    /// [`PipelineError::OverlayDiagnostics`] variant additionally tells the
+    /// renderer not to name the pipeline file as the offending input.
+    pub fn overlay_diagnostics(diags: Vec<clinker_core_types::Diagnostic>) -> Self {
+        Self::OverlayDiagnostics(strip_anchors(diags))
+    }
+}
+
+/// Replace every span with [`Span::SYNTHETIC`], so a renderer cannot resolve a
+/// line number against a document the line does not belong to.
+fn strip_anchors(
+    diags: Vec<clinker_core_types::Diagnostic>,
+) -> Vec<clinker_core_types::Diagnostic> {
+    use clinker_core_types::span::Span;
+    diags
+        .into_iter()
+        .map(|mut d| {
+            d.primary.span = Span::SYNTHETIC;
+            for s in &mut d.secondary {
+                s.span = Span::SYNTHETIC;
+            }
+            d
+        })
+        .collect()
 }
 
 impl fmt::Display for PipelineError {
@@ -356,8 +385,15 @@ impl fmt::Display for PipelineError {
             Self::Schema(e) => write!(f, "schema error: {e}"),
             Self::Format(e) => write!(f, "format error: {e}"),
             Self::Eval(e) => write!(f, "evaluation error: {e}"),
-            Self::PlanDiagnostics(diags) => {
-                write!(f, "plan compilation failed:")?;
+            Self::PlanDiagnostics(diags) | Self::OverlayDiagnostics(diags) => {
+                write!(
+                    f,
+                    "{}",
+                    match self {
+                        Self::OverlayDiagnostics(_) => "channel overlay failed:",
+                        _ => "plan compilation failed:",
+                    }
+                )?;
                 for d in diags {
                     // Some messages already open with their own `[CODE]`
                     // prefix -- the composition-body patch pass re-emits an op

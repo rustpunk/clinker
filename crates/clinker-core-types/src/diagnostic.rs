@@ -79,7 +79,7 @@ diagnostic_registry! {
     "E106", Error, "Name collision after composition expansion";
     "E107", Error, "Cycle detected in flat post-expansion graph";
     "E108", Error, "Composition body references enclosing scope (IsolatedFromAbove)";
-    "E109", Error, "Ambiguous column reference (declared vs pass-through in open row)";
+    "E109", Error, "A channel overlay targeting a composition carries `vars:` overrides, which a composition overlay does not support";
     "E110", Error, "An extraction selection names a node the execution-plan DAG does not contain";
     "E111", Error, "Composition body has zero nodes (rejected at bind time)";
     "E112", Error, "Runtime composition recursion depth exceeded";

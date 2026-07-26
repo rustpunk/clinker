@@ -356,7 +356,7 @@ fn resolve_scoped_overrides(
 }
 
 /// Resolve `$source.<src>.<var>` channel overrides. Outer dimension is
-/// the source-node name (must exist in the pipeline; E111 otherwise);
+/// the source-node name (must exist in the pipeline; E118 otherwise);
 /// inner dimension follows the same rules as
 /// [`resolve_scoped_overrides`] for `Source` scope.
 fn resolve_source_overrides(
@@ -405,7 +405,7 @@ fn resolve_source_overrides(
 
 /// Single per-entry validator: reserved-name guard (when
 /// `reserved_scope` is `Some`), type-equality check on override
-/// (E107), default coercion. Push diagnostics on failure; return
+/// (E116), default coercion. Push diagnostics on failure; return
 /// `None` so the caller skips the entry.
 fn validate_and_coerce(
     channel_name: &str,

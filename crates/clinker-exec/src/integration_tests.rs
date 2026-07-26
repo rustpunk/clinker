@@ -61,6 +61,7 @@ mod tests {
                 PipelineError::Config(_)
                 | PipelineError::Schema(_)
                 | PipelineError::PlanDiagnostics(_)
+                | PipelineError::OverlayDiagnostics(_)
                 | PipelineError::Compilation { .. }
                 | PipelineError::Internal { .. }
                 | PipelineError::SortOrderViolation { .. }

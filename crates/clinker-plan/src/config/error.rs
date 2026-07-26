@@ -47,6 +47,26 @@ impl From<crate::yaml::YamlError> for ConfigError {
 static ENV_VAR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}").unwrap());
 
+/// The result of substituting `${VAR}` references into a config document.
+///
+/// Carries whether the substitution changed the document's line count, because
+/// a caller holding both texts cannot otherwise tell whether a line number
+/// taken from one addresses the same line in the other.
+pub struct Interpolation {
+    /// The document with every reference replaced by its value.
+    ///
+    /// Contains whatever the referenced variables held, so it must never be
+    /// shown to a user: a `${SFTP_URL}` carrying a credential appears here in
+    /// the clear. Anything user-facing quotes the raw document instead.
+    pub text: String,
+    /// Whether any substituted value contained a newline.
+    ///
+    /// When false, `text` and the raw document have identical line numbering,
+    /// so a line number resolved against one addresses the same line in the
+    /// other. When true they have diverged and no such correspondence exists.
+    pub shifted_lines: bool,
+}
+
 /// Pre-deserialize environment variable interpolation.
 ///
 /// Replaces `${VAR}` with `env::var("VAR")` and `${VAR:-default}` with
@@ -64,7 +84,7 @@ static ENV_VAR_RE: LazyLock<Regex> =
 pub fn interpolate_env_vars(
     yaml: &str,
     extra_vars: &[(&str, &str)],
-) -> Result<String, ConfigError> {
+) -> Result<Interpolation, ConfigError> {
     // Step 1: Replace $$ with NULL byte placeholder before main regex.
     // NULL bytes do not appear in valid YAML config files.
     debug_assert!(
@@ -76,6 +96,9 @@ pub fn interpolate_env_vars(
     // Step 2: Run regex substitution with extra_vars priority
     let mut result = String::with_capacity(escaped.len());
     let mut last_end = 0;
+    // Tracked across every substitution source -- an override, the
+    // environment, and an inline default can each carry a newline.
+    let mut shifted_lines = false;
 
     for caps in ENV_VAR_RE.captures_iter(&escaped) {
         let full_match = caps.get(0).unwrap();
@@ -104,12 +127,19 @@ pub fn interpolate_env_vars(
             .find(|(k, _)| *k == var_name)
             .map(|(_, v)| *v)
         {
+            shifted_lines |= value.contains('\n');
             result.push_str(value);
         } else {
             match std::env::var(var_name) {
-                Ok(value) => result.push_str(&value),
+                Ok(value) => {
+                    shifted_lines |= value.contains('\n');
+                    result.push_str(&value);
+                }
                 Err(_) => match default_value {
-                    Some(default) => result.push_str(default),
+                    Some(default) => {
+                        shifted_lines |= default.contains('\n');
+                        result.push_str(default);
+                    }
                     None => {
                         return Err(ConfigError::EnvVar {
                             var_name: var_name.to_string(),
@@ -126,7 +156,10 @@ pub fn interpolate_env_vars(
     result.push_str(&escaped[last_end..]);
 
     // Step 3: Restore NULL byte placeholder → $
-    Ok(result.replace('\0', "$"))
+    Ok(Interpolation {
+        text: result.replace('\0', "$"),
+        shifted_lines,
+    })
 }
 
 /// Parse a pipeline config from a YAML string (after interpolation).
@@ -134,7 +167,7 @@ pub fn interpolate_env_vars(
 /// All YAML parsing flows through `crate::yaml::from_str`, the single
 /// chokepoint that owns the DoS-defense [`Budget`].
 pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
-    let interpolated = interpolate_env_vars(yaml, &[])?;
+    let interpolated = interpolate_env_vars(yaml, &[])?.text;
     let config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
     validate_config(&config)?;
     Ok(config)
@@ -167,7 +200,7 @@ fn parse_config_source(
     yaml: &str,
     extra_vars: &[(&str, &str)],
 ) -> Result<PipelineConfig, ConfigError> {
-    let interpolated = interpolate_env_vars(yaml, extra_vars)?;
+    let interpolated = interpolate_env_vars(yaml, extra_vars)?.text;
     let mut config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
     config.source_hash = *blake3::hash(interpolated.as_bytes()).as_bytes();
     // Resolve any external `.schema.yaml` (`SourceSchema::File`) references to
@@ -479,7 +512,7 @@ mod external_schema_tests {
         let p = dir.path().join("pipeline.yaml");
         std::fs::write(&p, pipeline).unwrap();
         let config = parse_config_with_vars(&p, &[]).unwrap();
-        let interpolated = interpolate_env_vars(pipeline, &[]).unwrap();
+        let interpolated = interpolate_env_vars(pipeline, &[]).unwrap().text;
         assert_eq!(
             config.source_hash,
             *blake3::hash(interpolated.as_bytes()).as_bytes(),
