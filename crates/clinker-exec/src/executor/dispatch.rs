@@ -3040,15 +3040,14 @@ pub(crate) fn service_pending_node_buffer_spills(
 
 /// Execute one DAG node by routing it to its arm.
 ///
-/// Reads the node by `node_idx` from `current_dag.graph` and dispatches
-/// on `PlanNode` variant. Each arm reads from and writes to `ctx.node_buffers`
-/// and updates the cumulative counters / timers. Errors short-circuit only
-/// for invariant violations and `ErrorStrategy::FailFast` runtime failures;
-/// per-record DLQ-able errors land in `ctx.dlq_entries` under
-/// `Continue`/`BestEffort`. Output sink errors are collected into
-/// `ctx.output_errors` instead of short-circuiting so sibling outputs still
-/// get their chance to fail (and be reported) — the caller aggregates after
-/// the walk.
+/// Reads the node by `node_idx` from `current_dag.graph` and dispatches on
+/// `PlanNode` variant. Each arm reads from and writes to `ctx.node_buffers`
+/// and updates the cumulative counters / timers. Errors short-circuit only for
+/// invariant violations and `ErrorStrategy::FailFast` runtime failures;
+/// per-record DLQ-able errors land in `ctx.dlq_entries` under `Continue`.
+/// Output sink errors are collected into `ctx.output_errors` instead of
+/// short-circuiting so sibling outputs still get their chance to fail (and be
+/// reported) — the caller aggregates after the walk.
 pub(crate) fn dispatch_plan_node(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,

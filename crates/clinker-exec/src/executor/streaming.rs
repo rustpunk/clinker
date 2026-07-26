@@ -170,8 +170,8 @@ pub(crate) struct StreamingOutputSpec {
     pub(crate) cxl_emit_names: Vec<String>,
     /// The run's error strategy, carried in owned form so the detached
     /// streaming thread can route a `join_values` `on_conflict: error`
-    /// collision to the DLQ under `Continue` / `BestEffort` (and abort under
-    /// `FailFast`) with no borrow back into the config.
+    /// collision to the DLQ under `Continue` (and abort under `FailFast`)
+    /// with no borrow back into the config.
     pub(crate) strategy: ErrorStrategy,
 }
 

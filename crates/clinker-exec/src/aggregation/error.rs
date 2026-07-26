@@ -105,17 +105,16 @@ pub enum HashAggError {
         prev_key_debug: String,
         next_key_debug: String,
     },
-    /// A single input record's buffered contributions alone exceed the
-    /// entire memory budget. Buffer-mode aggregation must hold every raw
+    /// A single input record's buffered contributions alone exceed the entire
+    /// memory budget. Buffer-mode aggregation must hold every raw
     /// contribution resident to recompute `BufferRequired` bindings (`min`,
     /// `max`, `avg`) after a retraction, so a row larger than the whole
     /// budget has no in-budget representation and spilling cannot rescue it —
     /// the next add of the same shape repeats the overflow. Routed by the
-    /// executor dispatch arm by error strategy: `FailFast` surfaces
-    /// `E310 MemoryBudgetExceeded`; `Continue` / `BestEffort` sends the
-    /// offending record to the DLQ. `row_charge` is the record's estimated
-    /// buffered footprint in bytes; `budget` is the configured memory limit
-    /// in bytes.
+    /// executor dispatch arm by error strategy: `FailFast` surfaces `E310
+    /// MemoryBudgetExceeded`; `Continue` sends the offending record to the
+    /// DLQ. `row_charge` is the record's estimated buffered footprint in
+    /// bytes; `budget` is the configured memory limit in bytes.
     #[error(
         "buffered aggregate row footprint ({row_charge} bytes) exceeds the entire memory budget ({budget} bytes)"
     )]

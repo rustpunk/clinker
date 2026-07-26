@@ -54,16 +54,15 @@ pub enum DlqErrorCategory {
     /// driver row — probe-key extraction, residual-filter eval, or the
     /// matched / `on_miss: null_fields` body eval. Distinct from the
     /// upstream-Transform `TypeCoercionFailure` because the failing row
-    /// carries contributing-build lineage: the entry is attributed to
-    /// the contributing input source(s) rather than the synthetic merged
-    /// source, and the failure rewinds each contributing source's
-    /// rollback cursor to the captured pre-fold floor so a downstream
-    /// resume reprocesses both the driver and the matched build row.
-    /// Routed only under `Continue` / `BestEffort`; `FailFast` propagates
-    /// the eval error unchanged. Recovery is uniform across every Combine
-    /// join mode — the inline hash build-probe arm and the IEJoin,
-    /// grace-hash, and sort-merge kernels all route an output-eval failure
-    /// here under `Continue` / `BestEffort`.
+    /// carries contributing-build lineage: the entry is attributed to the
+    /// contributing input source(s) rather than the synthetic merged
+    /// source, and the failure rewinds each contributing source's rollback
+    /// cursor to the captured pre-fold floor so a downstream resume
+    /// reprocesses both the driver and the matched build row. Routed only
+    /// under `Continue`; `FailFast` propagates the eval error unchanged.
+    /// Recovery is uniform across every Combine join mode — the inline
+    /// hash build-probe arm and the IEJoin, grace-hash, and sort-merge
+    /// kernels all route an output-eval failure here under `Continue`.
     CombineOutputRow,
     /// Two Reshape rules wrote the same field on the same correlation-
     /// group row at runtime (a content-dependent collision the
@@ -93,7 +92,7 @@ pub enum DlqErrorCategory {
     /// is dead-lettered (the entry's `triggering_field` names the column and
     /// `triggering_value` carries the offending value) rather than emitting a
     /// corrupted cell. The first `DlqErrorCategory` originating at the sink-write
-    /// stage; routed by the Output dispatch arms under `Continue` / `BestEffort`.
+    /// stage; routed by the Output dispatch arms under `Continue`.
     MultiValueJoinCollision,
 }
 

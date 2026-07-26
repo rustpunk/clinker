@@ -1498,9 +1498,9 @@ enum ProbeRowStep {
     /// The row produced zero or more output records (already pushed) and
     /// the driver loop continues.
     Continue,
-    /// A recoverable per-row eval failure under `Continue` / `BestEffort`.
-    /// The caller routes it through `dispatch_combine_output_error` (cursor
-    /// rewind + DLQ) — inline immediately, or after the streaming join.
+    /// A recoverable per-row eval failure under `Continue`. The caller
+    /// routes it through `dispatch_combine_output_error` (cursor rewind +
+    /// DLQ) — inline immediately, or after the streaming join.
     Deferred(Box<ProbeFailure>),
 }
 

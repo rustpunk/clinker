@@ -491,9 +491,9 @@ pub(crate) struct CombineOutputEvalFailure {
 ///
 /// Returned by the IEJoin, grace-hash, and sort-merge kernels in place of a
 /// bare `Vec<(Record, u64)>`. Under `FailFast` the failures vector is always
-/// empty because those errors propagate immediately; under
-/// `Continue` / `BestEffort` each deferred failure is drained by the
-/// dispatcher into the `combine_output_row` dead-letter path.
+/// empty because those errors propagate immediately; under `Continue` each
+/// deferred failure is drained by the dispatcher into the
+/// `combine_output_row` dead-letter path.
 #[derive(Debug)]
 pub(crate) struct CombineKernelOutput {
     /// Emitted `(record, source-row-order)` pairs, identical in shape to the

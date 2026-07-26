@@ -303,7 +303,7 @@ pub(crate) fn dispatch_aggregation(
         // Finalize into the retained boxed aggregator (rather than
         // consuming it) so the commit phase can drive the same
         // instance. Accumulator finalize errors route to the DLQ under
-        // `Continue` / `BestEffort`; all other engine errors propagate.
+        // `Continue`; all other engine errors propagate.
         let finalize_ctx = ctx.merged_eval_ctx();
         let mut hash_box = match stream.into_retained_hash() {
             Some(b) => b,
@@ -349,7 +349,7 @@ pub(crate) fn dispatch_aggregation(
                         source,
                     });
                 }
-                ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                ErrorStrategy::Continue => {
                     emit_aggregate_finalize_dlq(
                         ctx,
                         name,
@@ -994,8 +994,8 @@ fn finalize_bucket(
 }
 
 /// Route a document-flush finalize result: an `Accumulator` failure goes
-/// to the DLQ under `Continue` / `BestEffort` (mirroring the single-stream
-/// strict arm), `FailFast` and every other engine error propagate.
+/// to the DLQ under `Continue` (mirroring the single-stream strict arm),
+/// `FailFast` and every other engine error propagate.
 ///
 /// `attribution` is the input slice narrowed to the flushing document — a
 /// single record from that document, or the whole batch for the cross-
@@ -1021,7 +1021,7 @@ fn route_document_flush_result(
                 binding,
                 source,
             }),
-            ErrorStrategy::Continue | ErrorStrategy::BestEffort => emit_aggregate_finalize_dlq(
+            ErrorStrategy::Continue => emit_aggregate_finalize_dlq(
                 ctx,
                 name,
                 attribution,
@@ -1046,8 +1046,8 @@ struct StreamingIngestEffects {
     /// liveness match the drain-to-`Vec` path.
     cursor_advances: Vec<(Arc<str>, u64)>,
     /// `(record, row_num, error_message)` for each `add_record` failure
-    /// under `Continue` / `BestEffort`, replayed via the dispatcher's DLQ
-    /// routing after join. `FailFast` surfaces the error eagerly instead.
+    /// under `Continue`, replayed via the dispatcher's DLQ routing after
+    /// join. `FailFast` surfaces the error eagerly instead.
     add_errors: Vec<(Record, u64, String)>,
 }
 
@@ -1277,7 +1277,7 @@ fn run_streaming_aggregate_ingest(
                             // → E310 abort names the stage that overran, matching
                             // the materialized arm's attribution.
                             ErrorStrategy::FailFast => return Err(agg_hash_error_into(name, e)),
-                            ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                            ErrorStrategy::Continue => {
                                 effects.add_errors.push((
                                     record,
                                     rn,
@@ -1358,8 +1358,8 @@ fn run_streaming_aggregate_ingest(
 
     // Replay the per-record side effects the scoped thread accumulated. The
     // cursor advances keep rollback / watermark state consistent; the DLQ
-    // errors route through the same `Continue` / `BestEffort` path the
-    // materialized ingest loop uses.
+    // errors route through the same `Continue` path the materialized ingest
+    // loop uses.
     for (source_name_arc, rn) in std::mem::take(&mut effects.cursor_advances) {
         advance_cursor(ctx, &source_name_arc, rn);
     }
@@ -1858,7 +1858,7 @@ fn run_time_windowed_aggregate(
                                 source,
                             });
                         }
-                        ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                        ErrorStrategy::Continue => {
                             emit_aggregate_finalize_dlq(
                                 ctx,
                                 name,
@@ -1944,7 +1944,7 @@ fn agg_hash_error_into(name: &str, e: crate::aggregation::HashAggError) -> Pipel
 /// Shared per-record `add_record` error handler for every materialized
 /// ingest arm — the strict per-document path, the relaxed-CK path, and
 /// the tumbling/hopping/session windowed arms. `FailFast` surfaces the
-/// error; `Continue` / `BestEffort` routes the failing record to the DLQ.
+/// error; `Continue` routes the failing record to the DLQ.
 fn handle_aggregate_add_error(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
@@ -1963,7 +1963,7 @@ fn handle_aggregate_add_error(
         // Stamp the aggregate node name so an `OversizedRow` → E310 abort
         // names the stage that overran.
         ErrorStrategy::FailFast => Err(agg_hash_error_into(name, e)),
-        ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+        ErrorStrategy::Continue => {
             let stage = Some(clinker_core_types::dlq::stage_aggregate(name));
             let routed = record_error_to_buffer_if_grouped(
                 ctx,
@@ -2046,7 +2046,7 @@ fn finalize_windows(
                         source,
                     });
                 }
-                ErrorStrategy::Continue | ErrorStrategy::BestEffort => {
+                ErrorStrategy::Continue => {
                     emit_aggregate_finalize_dlq(
                         ctx,
                         name,

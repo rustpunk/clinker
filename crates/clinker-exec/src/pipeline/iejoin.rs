@@ -571,8 +571,8 @@ pub(crate) struct IEJoinExec<'a> {
     pub spill_compress: bool,
     /// Error strategy governing output-stage eval failures. Under
     /// `FailFast` a residual / body eval error propagates immediately;
-    /// under `Continue` / `BestEffort` the failing row is deferred to the
-    /// dispatcher via [`BlockBandOutput::output_eval_failures`].
+    /// under `Continue` the failing row is deferred to the dispatcher via
+    /// [`BlockBandOutput::output_eval_failures`].
     pub strategy: clinker_plan::config::ErrorStrategy,
 }
 

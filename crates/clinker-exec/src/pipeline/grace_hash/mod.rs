@@ -223,8 +223,8 @@ pub(crate) struct GraceHashExec<'a> {
     pub consumer_handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
     /// Error strategy governing output-stage eval failures. Under
     /// `FailFast` a residual / body eval error propagates immediately;
-    /// under `Continue` / `BestEffort` the failing row is deferred to the
-    /// dispatcher via [`CombineKernelOutput::output_eval_failures`].
+    /// under `Continue` the failing row is deferred to the dispatcher via
+    /// [`CombineKernelOutput::output_eval_failures`].
     pub strategy: clinker_plan::config::ErrorStrategy,
     /// Exec-time statistics accumulator (Plane B) and the `(node, column)`
     /// the join's build-side sketches are recorded under at completion. The

@@ -132,8 +132,8 @@ first value and the other the last. If the collision is intentional (both values
 belong together), declare the column `multiple: true` to collect them into an
 array in document order; otherwise rename one of the source keys so they no
 longer collide. As with XML, detection is per document at read time, so the run
-aborts under `fail_fast` and dead-letters the document under `continue` /
-`best_effort` with `dlq_granularity: document`.
+aborts under `fail_fast` and dead-letters the document under `continue`
+with `dlq_granularity: document`.
 
 Detection covers two **distinct** source keys that flatten to the same dotted
 name — the nested `{"a": {"b": 1}}` plus literal `{"a.b": 2}` case above. It does

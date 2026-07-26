@@ -911,9 +911,8 @@ struct FanOutContext<'a> {
     projection_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
     collector: &'a mut crate::executor::stage_metrics::StageCollector,
     /// The run's error strategy, so a `join_values` `on_conflict: error`
-    /// collision dead-letters under `Continue` / `BestEffort` but still aborts
-    /// under `FailFast` — the same disposition every other per-record failure
-    /// gets.
+    /// collision dead-letters under `Continue` but still aborts under
+    /// `FailFast` — the same disposition every other per-record failure gets.
     strategy: ErrorStrategy,
     /// Collision DLQ entries gathered during the write. Drained through
     /// [`push_dlq`] by the caller once the full `ctx` borrow is free (the

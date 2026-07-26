@@ -228,16 +228,20 @@ Supported types include `int`, `float`, `string`, `bool`, `date`, and
 
 ## Error handling
 
-Each node can specify an error handling strategy:
+A pipeline picks one error handling strategy, in the top-level
+`error_handling:` block:
 
 | Strategy      | Behavior                                                      |
 |---------------|---------------------------------------------------------------|
 | `fail_fast`   | Stop the pipeline on the first error (default)                |
 | `continue`    | Route error records to a dead-letter queue file and continue  |
-| `best_effort` | Log errors and continue without writing error records         |
 
 When using `continue`, Clinker writes rejected records to a DLQ file alongside
 the output. Each DLQ entry includes the original record, the error category,
 the error message, and the node that rejected it. This makes diagnosing
 production issues straightforward: check the DLQ, fix the data or the
-pipeline, and rerun.
+pipeline, and rerun. A run that dead-letters at least one record exits with
+code 2 rather than 0, so a scheduler can tell a clean run from a partial one.
+
+See [Error Handling & DLQ](../pipelines/error-handling.md) for the DLQ columns,
+the error categories, and the per-source options.
