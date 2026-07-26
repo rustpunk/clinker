@@ -219,6 +219,17 @@ fn flatten_report(stderr: &str) -> String {
         .join(" ")
 }
 
+/// Whether a flattened report quotes a source snippet drawn from `file`.
+///
+/// A snippet header spells `<path>:<line>:<col>]`, so a digit right after the
+/// filename is the giveaway — as distinct from the message prefix, which is
+/// `<path>: <message>`.
+fn quotes_a_snippet_from(flat: &str, file: &str) -> bool {
+    flat.split(&format!("{file}:"))
+        .skip(1)
+        .any(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
 /// Assert the three things a plan-time diagnostic must keep on the way to the
 /// terminal, plus the absence of the transform-compilation misattribution.
 fn assert_plan_diagnostic_intact(stderr: &str) {
@@ -466,15 +477,9 @@ nodes:
     assert!(flat.contains("E203"), "got:\n{stderr}");
     assert!(flat.contains("not_a_column_in_the_body"), "got:\n{stderr}");
     // But nothing from the pipeline file is underlined, because no line of it
-    // is implicated. A snippet header spells `<path>:<line>:<col>]`, so a
-    // digit right after the filename is the giveaway -- as distinct from the
-    // message prefix, which is `<path>: <message>`.
-    let anchored_at_a_line = flat
-        .split("main.yaml:")
-        .skip(1)
-        .any(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    // is implicated.
     assert!(
-        !anchored_at_a_line,
+        !quotes_a_snippet_from(&flat, "main.yaml"),
         "a body-file diagnostic must not anchor a snippet in the pipeline \
          file; got:\n{stderr}"
     );
@@ -1093,6 +1098,94 @@ nodes:
         flat.contains("nosuchnode.nosuchparam"),
         "the report must still name the offending overlay key; got:\n{stderr}"
     );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Write a workspace whose `pipe.yaml` trips E363, plus a channel `acme`
+/// carrying `overlay_body`. Returns the workspace root.
+fn write_channel_workspace(overlay_body: &str) -> std::path::PathBuf {
+    let tmp = tempdir_path();
+    std::fs::write(tmp.join("in.json"), "{\"rows\":[]}\n").expect("write input");
+    std::fs::write(tmp.join("pipe.yaml"), jsonpath_record_path_yaml()).expect("write pipeline");
+    let tenant = tmp.join("channel").join("acme");
+    std::fs::create_dir_all(&tenant).expect("create tenant dir");
+    std::fs::write(
+        tenant.join("pipe.channel.yaml"),
+        format!("channel:\n  target: ../../pipe.yaml\n{overlay_body}"),
+    )
+    .expect("write overlay");
+    tmp
+}
+
+/// Run `clinker run pipe.yaml --channel acme` inside `dir`.
+fn run_channel_in(dir: &std::path::Path) -> std::process::Output {
+    Command::new(clinker_bin())
+        .arg("run")
+        .arg("pipe.yaml")
+        .arg("--channel")
+        .arg("acme")
+        .current_dir(dir)
+        .output()
+        .expect("spawn clinker")
+}
+
+#[test]
+fn test_a_channel_that_rewrites_nothing_keeps_the_source_snippet() {
+    // Suppression is keyed on whether the text being quoted is still the text
+    // that was compiled -- not on whether a channel was selected. A channel
+    // carrying only var overlays contributes no op, no source patch and no
+    // composition `config:` fold, and vars are applied to the compiled plan
+    // afterwards, so `pipe.yaml` is byte-for-byte what the compiler saw. Its
+    // snippet is correct, and dropping it costs the author a source line for
+    // nothing.
+    let tmp = write_channel_workspace(
+        "vars:\n  pipeline:\n    tenant_label: { type: string, default: \"acme\" }\n",
+    );
+
+    let output = run_channel_in(&tmp);
+    assert!(!output.status.success(), "the record_path gate must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let flat = flatten_report(&stderr);
+
+    assert!(flat.contains("E363"), "got:\n{stderr}");
+    assert!(
+        quotes_a_snippet_from(&flat, "pipe.yaml"),
+        "a channel that rewrote nothing must not cost the author their \
+         snippet; got:\n{stderr}"
+    );
+    // Drawn from the raw file, which is also what was compiled here.
+    assert!(
+        flat.contains("record_path"),
+        "the quoted line must be the offending one; got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_a_channel_that_patches_a_source_drops_the_source_snippet() {
+    // The other half of the same rule. A `sources:` patch is applied to the
+    // parsed config before compile, so the compiler is working on a document
+    // `pipe.yaml` no longer describes. Line numbering is untouched, which is
+    // exactly what makes this dangerous: every line still resolves, so a
+    // snippet would quote stale content with nothing to signal it.
+    let tmp =
+        write_channel_workspace("sources:\n  src:\n    schema:\n      amount: { type: float }\n");
+
+    let output = run_channel_in(&tmp);
+    assert!(!output.status.success(), "the record_path gate must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let flat = flatten_report(&stderr);
+
+    assert!(flat.contains("E363"), "got:\n{stderr}");
+    assert!(
+        !quotes_a_snippet_from(&flat, "pipe.yaml"),
+        "a patched config must not be quoted from the unpatched file; \
+         got:\n{stderr}"
+    );
+    // The diagnostic still arrives whole, and still names the pipeline.
+    assert!(flat.contains("pipe.yaml"), "got:\n{stderr}");
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

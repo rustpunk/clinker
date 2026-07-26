@@ -849,13 +849,15 @@ fn line_byte_range(text: &str, line: u32) -> Option<(usize, usize)> {
 /// Whether every plan diagnostic's line anchor is provably a line of the
 /// pipeline file, so a source snippet can be drawn from it.
 ///
-/// A plan-time span is a bare line number with no file identity. The pipeline
-/// file is the only document in play unless the plan binds a composition body
-/// (whose gates number lines in the body file) or a channel/group overlay
-/// spliced nodes in (whose ops number lines in the overlay file). Neither is
-/// possible without a `composition` node or an active overlay, so their
-/// absence is a proof — and their presence sends the whole run down the
-/// unanchored path rather than risk underlining unrelated YAML.
+/// A plan-time span is a bare line number with no file identity, so a snippet
+/// is only correct while the text being quoted is the text that was parsed.
+/// Two things break that. A composition body's gates number lines in the body
+/// file, not the pipeline. And an overlay that rewrites the config — a
+/// structural op, a source patch, a composition `config:` fold — leaves the
+/// compiler working on something the file on disk no longer describes, so a
+/// line resolved against it quotes stale content even where the numbering is
+/// unchanged. Their absence is a proof, and their presence sends the whole run
+/// down the unanchored path rather than risk quoting the wrong YAML.
 ///
 /// Deliberately whole-run rather than per-diagnostic: attributing an
 /// individual span would need file identity the span does not carry. Carrying
@@ -891,15 +893,22 @@ impl std::fmt::Display for AlreadyReported {
 
 impl std::error::Error for AlreadyReported {}
 
-/// Whether an overlay actually put anything into the plan.
+/// Whether an overlay changed the config that was compiled.
 ///
-/// `--channel`/`--group` being passed is not the question — an overlay that
-/// resolved to nothing splices no nodes, so it introduces no second document
-/// and no reason to distrust a line anchor. Keyed on the same emptiness test
-/// the overlay summary uses, so a flag that changed nothing does not silently
-/// cost the user their source snippets.
+/// The rule a snippet has to satisfy is that the text being quoted is the text
+/// that was parsed. `--channel`/`--group` being passed does not decide that,
+/// and neither does whether the overlay resolved to anything: a channel that
+/// contributes only var overlays leaves the pipeline file byte-for-byte what
+/// the compiler saw, so its snippets are correct and dropping them costs the
+/// author a source line for nothing.
+///
+/// What does decide it is whether the overlay rewrote the document — a
+/// structural op, a source patch, or a composition `config:` fold. Any of those
+/// and the compiled config is no longer the file on disk, so a line number
+/// resolved against that file quotes the wrong content. See
+/// [`OverlayResolution::modifies_compiled_config`], which owns the list.
 fn overlay_contributed(overlay: Option<&clinker_channel::OverlayResolution>) -> bool {
-    overlay.is_some_and(|res| !res.is_empty())
+    overlay.is_some_and(clinker_channel::OverlayResolution::modifies_compiled_config)
 }
 
 /// Build the plan-diagnostic error, keeping line anchors only when

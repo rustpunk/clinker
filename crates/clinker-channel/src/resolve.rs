@@ -134,6 +134,33 @@ impl OverlayResolution {
         self.channel.is_none() && self.applied_groups.is_empty() && self.op_stream.is_empty()
     }
 
+    /// Whether this resolution changes the config the compiler actually sees.
+    ///
+    /// Narrower than [`Self::is_empty`], which answers whether an overlay
+    /// resolved to anything at all. A renderer drawing a source snippet needs
+    /// this one instead: a plan diagnostic's line number indexes the document
+    /// that was parsed and compiled, so quoting the pipeline file is only
+    /// correct while that file *is* what was compiled.
+    ///
+    /// Three contributions reach the compiler, all applied before it runs —
+    /// the structural op stream, the per-source patches, and the composition
+    /// `config:` fold. A channel that was selected but contributes none of them
+    /// leaves the pipeline file byte-for-byte what got compiled, so its
+    /// snippets stay correct and the author keeps them.
+    ///
+    /// Var overlays are deliberately absent: they are applied to the compiled
+    /// plan, after every gate that could raise an anchored diagnostic has run,
+    /// and they never rewrite the pipeline text.
+    ///
+    /// A fourth contribution added later belongs in this list too — it lives
+    /// here, beside the accessors that feed the compiler, rather than at the
+    /// call site, so the two cannot drift apart.
+    pub fn modifies_compiled_config(&self) -> bool {
+        !self.op_stream.is_empty()
+            || self.source_patches().is_some_and(|p| !p.is_empty())
+            || !self.effective_config_overrides().is_empty()
+    }
+
     /// The concatenated, layer-tagged structural op stream. Feed this into
     /// `CompileContext::overlay_ops` before compiling so the effective DAG is
     /// what binds and lowers.
