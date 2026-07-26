@@ -129,5 +129,12 @@ The on-disk spill volume Reshape produces is surfaced per stage in `clinker run 
 
 Two current limitations qualify the "identical whether spilled or resident" guarantee above:
 
-- **A single correlation group must fit the memory budget at finalize.** The no-cascade contract requires the *whole* group to be resident when its rules fire, so even though cross-group and ingest-time peaks spill to disk, the finalize reload of one group needs that group to fit. Skew slicing bounds the ingest peak, but a single correlation group larger than `memory.limit` has no in-budget representation. Rather than risk an out-of-memory crash, the run **fails loud** with a diagnostic naming the offending group's size. Raise `memory.limit`, or partition the input so no one correlation group is that large. (A future two-pass finalize could lift this.)
+- **A single correlation group must fit the memory budget at finalize.** The no-cascade contract requires the *whole* group to be resident when its rules fire, so even though cross-group and ingest-time peaks spill to disk, the finalize reload of one group needs that group to fit. Skew slicing bounds the ingest peak, but a single correlation group larger than `memory.limit` has no in-budget representation. Rather than risk an out-of-memory crash, the run **fails loud** with `E310 MemoryBudgetExceeded`, naming the Reshape node, the offending `partition_by` group, and its footprint against the budget:
+
+```
+E310 backfill: arena exceeded budget (128000/8192) [one Reshape correlation
+group [employee_id="employee-00000"] is ~128000 bytes on reload. ...]
+```
+
+Raise `memory.limit` above that group's footprint, or add a finer `partition_by` so no one correlation group is that large. (A future two-pass finalize could lift this.)
 - **Reshape rules cannot reference `$doc` document context.** Because the spill round-trip does not yet preserve [document envelope context](../pipelines/envelope-and-doc-context.md), a `$doc.*` reference in a rule's `when`, `mutate.set`, or `synthesize` expression would resolve to the real envelope for a resident group but to null for a spilled one — output that depends on the memory budget. A pipeline whose Reshape rules reference `$doc` is **rejected at compile time**. Move the `$doc` lookup into an upstream Transform that copies the value into a record column, then reference that column in the Reshape rule.

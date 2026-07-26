@@ -53,8 +53,9 @@
 //! analogue of the single-giant-group finalize failure below.
 //!
 //! A single correlation group whose reloaded footprint exceeds the finalize
-//! budget fails loud with a [`PipelineError`] rather than risking an
-//! out-of-memory crash on reload.
+//! budget fails loud with the same [`PipelineError::MemoryBudgetExceeded`]
+//! diagnostic, naming the offending `partition_by` group, rather than risking
+//! an out-of-memory crash on reload.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,6 +70,7 @@ use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, drain_node_buffer_slot,
     node_buffer_spill_allowed, source_file_arc_of, source_name_arc_of,
 };
+use crate::executor::format_partition_group;
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
@@ -292,7 +294,7 @@ fn run_cull_grouped(
     let mut removed: Vec<(Record, u64)> = Vec::new();
     let group_order = buffer.take_group_order();
     for key in group_order {
-        let mut group = buffer.take_group(name, &key, hard_limit)?;
+        let mut group = buffer.take_group(name, &config.partition_by, &key, hard_limit)?;
         handle.set_bytes(buffer.resident_bytes() as u64);
         if !config.order_by.is_empty() {
             sort_group(&mut group, &config.order_by);
@@ -875,12 +877,13 @@ impl CullGroupBuffer {
     ///
     /// # Errors
     ///
-    /// Returns [`PipelineError::Internal`] when a single correlation group's
-    /// reloaded footprint exceeds `hard_limit`, or when a spill file cannot be
-    /// read back.
+    /// Returns [`PipelineError::MemoryBudgetExceeded`] (E310) when a single
+    /// correlation group's reloaded footprint exceeds `hard_limit`, or
+    /// [`PipelineError::Internal`] when a spill file cannot be read back.
     fn take_group(
         &mut self,
         node_name: &str,
+        partition_by: &[String],
         key: &[GroupByKey],
         hard_limit: u64,
     ) -> Result<Vec<(Record, u64)>, PipelineError> {
@@ -889,7 +892,13 @@ impl CullGroupBuffer {
 
         let group_bytes = (state.resident_bytes + state.spilled_bytes) as u64;
         if hard_limit > 0 && group_bytes > hard_limit {
-            return Err(cull_giant_group_error(node_name, group_bytes, hard_limit));
+            return Err(cull_giant_group_error(
+                node_name,
+                partition_by,
+                key,
+                group_bytes,
+                hard_limit,
+            ));
         }
 
         if state.spilled.is_empty() {
@@ -1049,21 +1058,37 @@ fn cull_predicate_error(node_name: &str, e: crate::aggregation::HashAggError) ->
     }
 }
 
-/// Hard error for a single correlation group that exceeds the finalize memory
-/// budget. The `drop_group_when` decision needs the whole group observable at
-/// once, so a group bigger than the budget has no in-budget representation —
-/// fail loud rather than OOM on reload.
-fn cull_giant_group_error(node_name: &str, group_bytes: u64, hard_limit: u64) -> PipelineError {
-    PipelineError::Internal {
-        op: "cull",
+/// Hard error (E310) for a single correlation group that exceeds the finalize
+/// memory budget. The `drop_group_when` decision needs the whole group
+/// observable at once, so a group bigger than the budget has no in-budget
+/// representation — fail loud rather than OOM on reload.
+///
+/// This is a memory-budget condition, not an invariant violation: the engine
+/// is working exactly as designed and the author's data outgrew a configured
+/// ceiling. So it surfaces through the standard `MemoryBudgetExceeded`
+/// diagnostic every other budget overrun uses — the same surface as the
+/// sibling decision-state overrun below — naming the offending `partition_by`
+/// group so the author can find it in their input.
+fn cull_giant_group_error(
+    node_name: &str,
+    partition_by: &[String],
+    key: &[GroupByKey],
+    group_bytes: u64,
+    hard_limit: u64,
+) -> PipelineError {
+    let group = format_partition_group(partition_by, key);
+    PipelineError::MemoryBudgetExceeded {
         node: node_name.to_string(),
-        detail: format!(
-            "a single Cull correlation group is ~{group_bytes} bytes, which exceeds the memory \
-             budget of {hard_limit} bytes. Cull evaluates its group-level removal predicate \
-             against the whole group at once, so a single group must fit the budget even though \
-             cross-group and ingest-time peaks spill to disk. Raise `memory.limit`, or partition \
-             the input so no one correlation group is this large."
-        ),
+        used: group_bytes,
+        limit: hard_limit,
+        source: BudgetCategory::Arena,
+        detail: Some(format!(
+            "one Cull correlation group {group} is ~{group_bytes} bytes on reload. Cull \
+             evaluates its `drop_group_when` predicate against the whole group at once, so a \
+             single group must fit the budget even though cross-group and ingest-time peaks \
+             spill to disk. Raise `memory.limit` above this group's footprint, or add a finer \
+             `partition_by` so no one correlation group is this large."
+        )),
     }
 }
 
@@ -1138,6 +1163,87 @@ mod tests {
         };
         assert_eq!(empty, canon(&Value::String("".into())));
         assert_eq!(null, canon(&Value::Null));
+    }
+
+    // A single correlation group too large to observe whole at finalize is an
+    // ordinary memory-budget condition — the author's data outgrew a
+    // configured ceiling — not an engine invariant violation. It must carry
+    // the standard E310 surface, the same one the sibling decision-state
+    // overrun uses, so a user reads one memory diagnostic rather than an
+    // "internal error" that implies a broken engine.
+    #[test]
+    fn take_group_rejects_a_group_larger_than_the_hard_limit_with_e310() {
+        let schema: Arc<Schema> = Arc::new(Schema::new(vec!["account".into()]));
+        let spill_root = tempfile::tempdir().unwrap();
+        let arb = arbitrator(512);
+        let handle = ConsumerHandle::new();
+        let key = vec![GroupByKey::Str("g".into())];
+        let partition_by = vec!["account".to_string()];
+
+        // One group, ~5 KiB across 64 records against a 512 B soft limit, so
+        // part of it partition-spills — exercising the reload path the hard
+        // limit gates rather than a purely resident group.
+        let mut buffer = CullGroupBuffer::new(Arc::clone(&schema), true);
+        for row_num in 0..64u64 {
+            let payload = format!("{row_num:063}");
+            buffer.push(
+                key.clone(),
+                record(&schema, Value::String(payload.into())),
+                row_num,
+            );
+            handle.set_bytes(buffer.resident_bytes() as u64);
+            if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
+                buffer
+                    .spill_until_under_budget("cl", &arb, spill_root.path(), &handle)
+                    .unwrap();
+            }
+        }
+        assert!(
+            !buffer.groups[&key].spilled.is_empty(),
+            "the oversized group must have partition-spilled for this to test the reload gate"
+        );
+
+        let err = buffer
+            .take_group("cl", &partition_by, &key, 256)
+            .expect_err("a group exceeding the hard limit must be rejected at finalize");
+
+        match &err {
+            PipelineError::MemoryBudgetExceeded {
+                node,
+                used,
+                limit,
+                source,
+                detail,
+            } => {
+                assert_eq!(node, "cl", "the diagnostic must name the Cull node");
+                assert_eq!(*limit, 256, "the limit must be the hard budget in force");
+                assert!(
+                    *used > *limit,
+                    "the reported footprint ({used}) must be the overrun, above the limit ({limit})"
+                );
+                assert_eq!(*source, BudgetCategory::Arena);
+                let detail = detail.as_deref().expect("the overrun must carry detail");
+                assert!(
+                    detail.contains("Cull correlation group [account=\"g\"]"),
+                    "the detail must name the offending partition_by group: {detail}"
+                );
+                assert!(
+                    detail.contains("drop_group_when"),
+                    "the detail must explain why one group must fit the budget: {detail}"
+                );
+                assert!(
+                    detail.contains("memory.limit") && detail.contains("partition_by"),
+                    "the detail must give the author a remedy: {detail}"
+                );
+            }
+            other => panic!("a giant correlation group must surface E310; got {other:?}"),
+        }
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.starts_with("E310 cl:"),
+            "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
+        );
     }
 
     // The disk-spill cap must abort the spill instead of writing past

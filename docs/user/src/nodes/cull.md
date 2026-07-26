@@ -136,6 +136,13 @@ The on-disk spill volume Cull produces is surfaced per stage in `clinker run --e
 
 ### Limit: a single group must fit the finalize budget
 
-Cull evaluates its group-level predicate against the *whole* group at once, so even though cross-group and ingest-time peaks spill to disk, the finalize reload of one group needs that group to fit the memory budget. Skew slicing bounds the ingest peak, but a single correlation group larger than `memory.limit` has no in-budget representation. Rather than risk an out-of-memory crash, the run **fails loud** with a diagnostic naming the offending group's size. Raise `memory.limit`, or partition the input so no one correlation group is that large.
+Cull evaluates its group-level predicate against the *whole* group at once, so even though cross-group and ingest-time peaks spill to disk, the finalize reload of one group needs that group to fit the memory budget. Skew slicing bounds the ingest peak, but a single correlation group larger than `memory.limit` has no in-budget representation. Rather than risk an out-of-memory crash, the run **fails loud** with `E310 MemoryBudgetExceeded`, naming the Cull node, the offending `partition_by` group, and its footprint against the budget:
 
-There is a second, symmetric bound on the **number** of groups. The per-group removal decision is held in an in-memory aggregate that is `O(distinct groups)` and — unlike the raw records — cannot spill. If a partition key is so high-cardinality that the decision state alone would exceed `memory.limit` (many small groups rather than one giant group), the run likewise **fails loud** with a memory-budget error naming the drop-decision state, rather than growing that state unbounded. Raise `memory.limit`, or coarsen the `partition_by` key so the group count fits the budget.
+```
+E310 drop_big: arena exceeded budget (512000/8192) [one Cull correlation
+group [account="BIG"] is ~512000 bytes on reload. ...]
+```
+
+Raise `memory.limit` above that group's footprint, or add a finer `partition_by` so no one correlation group is that large.
+
+There is a second, symmetric bound on the **number** of groups. The per-group removal decision is held in an in-memory aggregate that is `O(distinct groups)` and — unlike the raw records — cannot spill. If a partition key is so high-cardinality that the decision state alone would exceed `memory.limit` (many small groups rather than one giant group), the run likewise **fails loud** with `E310`, rather than growing that state unbounded. The two cases share the code and are told apart by what the diagnostic names: `Cull drop-decision aggregate state` for this one, a specific `Cull correlation group [...]` for the giant-group case above. Raise `memory.limit`, or coarsen the `partition_by` key so the group count fits the budget.

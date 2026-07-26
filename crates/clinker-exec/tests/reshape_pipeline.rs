@@ -882,20 +882,64 @@ fn reshape_giant_group_exceeds_budget_fails_loud() {
     // finalize to observe the rules. A single group larger than the memory
     // budget therefore has no in-budget representation: skew slicing bounds the
     // ingest peak, but the finalize reload still needs the whole group. Rather
-    // than OOM, the run must fail loud with a clear diagnostic naming the
-    // single-group limitation.
+    // than OOM, the run must fail loud.
+    //
+    // And it must fail loud through the STANDARD memory diagnostic. A group
+    // that outgrew the budget is an expected operational condition with a
+    // documented code, not an invariant violation: surfacing it as an internal
+    // error would tell the author their engine is broken when in fact their
+    // data exceeded a limit they configured.
     let (csv, _) = scd_input(1, 400); // one ~125 KB group
 
     let err = run_reshape_report(&scd_spill_pipeline("8K"), &csv)
         .expect_err("a single group larger than the budget must fail loud, not OOM");
-    let rendered = format!("{err:?}");
+
+    match &err {
+        PipelineError::MemoryBudgetExceeded {
+            node,
+            used,
+            limit,
+            detail,
+            ..
+        } => {
+            assert_eq!(
+                node, "backfill",
+                "the diagnostic must name the Reshape node"
+            );
+            assert!(
+                *used > *limit,
+                "the reported group footprint ({used}) must exceed the budget ({limit})"
+            );
+            let detail = detail.as_deref().expect("the overrun must carry detail");
+            // The offending group is named as the author declared it, so a
+            // 200-group input points at the one group that blew the budget.
+            assert!(
+                detail.contains("Reshape correlation group [employee_id=\"employee-00000\"]"),
+                "the detail must name the offending partition_by group: {detail}"
+            );
+            assert!(
+                detail.contains("no-cascade"),
+                "the detail must explain why one group must fit the budget: {detail}"
+            );
+            assert!(
+                detail.contains("memory.limit") && detail.contains("partition_by"),
+                "the detail must give the author a remedy: {detail}"
+            );
+        }
+        other => panic!(
+            "a giant correlation group is a memory-budget condition and must surface E310, \
+             not an internal error; got {other:?}"
+        ),
+    }
+
+    let rendered = err.to_string();
     assert!(
-        rendered.contains("single Reshape correlation group"),
-        "the diagnostic must name the giant-group limitation: {rendered}"
+        rendered.starts_with("E310 backfill:"),
+        "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
     );
     assert!(
-        rendered.contains("memory budget") && rendered.contains("no-cascade"),
-        "the diagnostic must explain why one group must fit the budget: {rendered}"
+        !rendered.contains("internal error"),
+        "a configured-limit overrun must never read as an engine bug: {rendered}"
     );
 }
 

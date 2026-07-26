@@ -55,11 +55,13 @@ use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, drain_node_buffer_slot, node_buffer_spill_allowed,
     push_dlq, source_file_arc_of, source_name_arc_of, tee_emit_to_region_input_buffers,
 };
+use crate::executor::format_partition_group;
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_core_types::dlq::{DlqErrorCategory, stage_reshape_mutation_conflict};
+use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{
     CopyFrom, RESHAPE_MUTATED_BY_COLUMN, RESHAPE_SYNTHESIZED_BY_COLUMN, RESHAPE_SYNTHETIC_COLUMN,
     ReshapeBody,
@@ -322,7 +324,7 @@ fn run_reshape_grouped(
     let mut out: Vec<(Record, u64)> = Vec::new();
     let group_order = buffer.take_group_order();
     for key in group_order {
-        let mut group = buffer.take_group(name, &key, hard_limit)?;
+        let mut group = buffer.take_group(name, &config.partition_by, &key, hard_limit)?;
         handle.set_bytes(buffer.resident_bytes() as u64);
         if !config.order_by.is_empty() {
             sort_group(&mut group, &config.order_by);
@@ -683,12 +685,13 @@ impl ReshapeGroupBuffer {
     ///
     /// # Errors
     ///
-    /// Returns [`PipelineError::Internal`] when a single correlation group's
-    /// reloaded footprint exceeds `hard_limit`, or when a spill file cannot
-    /// be read back.
+    /// Returns [`PipelineError::MemoryBudgetExceeded`] (E310) when a single
+    /// correlation group's reloaded footprint exceeds `hard_limit`, or
+    /// [`PipelineError::Internal`] when a spill file cannot be read back.
     fn take_group(
         &mut self,
         node_name: &str,
+        partition_by: &[String],
         key: &[GroupByKey],
         hard_limit: u64,
     ) -> Result<Vec<(Record, u64)>, PipelineError> {
@@ -701,6 +704,8 @@ impl ReshapeGroupBuffer {
         if hard_limit > 0 && group_bytes > hard_limit {
             return Err(reshape_giant_group_error(
                 node_name,
+                partition_by,
+                key,
                 group_bytes,
                 hard_limit,
             ));
@@ -794,21 +799,36 @@ fn reshape_spill_error(node_name: &str, e: clinker_plan::SpillError) -> Pipeline
     }
 }
 
-/// Hard error for a single correlation group that exceeds the finalize
+/// Hard error (E310) for a single correlation group that exceeds the finalize
 /// memory budget. The no-cascade contract requires the whole group resident
 /// to observe rules, so a group bigger than the budget has no in-budget
 /// representation — fail loud rather than OOM on reload.
-fn reshape_giant_group_error(node_name: &str, group_bytes: u64, hard_limit: u64) -> PipelineError {
-    PipelineError::Internal {
-        op: "reshape",
+///
+/// This is a memory-budget condition, not an invariant violation: the engine
+/// is working exactly as designed and the author's data outgrew a configured
+/// ceiling. So it surfaces through the standard `MemoryBudgetExceeded`
+/// diagnostic every other budget overrun uses, naming the offending
+/// `partition_by` group so the author can find it in their input.
+fn reshape_giant_group_error(
+    node_name: &str,
+    partition_by: &[String],
+    key: &[GroupByKey],
+    group_bytes: u64,
+    hard_limit: u64,
+) -> PipelineError {
+    let group = format_partition_group(partition_by, key);
+    PipelineError::MemoryBudgetExceeded {
         node: node_name.to_string(),
-        detail: format!(
-            "a single Reshape correlation group is ~{group_bytes} bytes, which exceeds the \
-             memory budget of {hard_limit} bytes. Reshape applies its rules against the whole \
-             group at once (the no-cascade contract), so a single group must fit the budget even \
-             though cross-group and ingest-time peaks spill to disk. Raise `memory.limit`, or \
-             partition the input so no one correlation group is this large."
-        ),
+        used: group_bytes,
+        limit: hard_limit,
+        source: BudgetCategory::Arena,
+        detail: Some(format!(
+            "one Reshape correlation group {group} is ~{group_bytes} bytes on reload. Reshape \
+             applies its rules against the whole group at once (the no-cascade contract), so a \
+             single group must fit the budget even though cross-group and ingest-time peaks \
+             spill to disk. Raise `memory.limit` above this group's footprint, or add a finer \
+             `partition_by` so no one correlation group is this large."
+        )),
     }
 }
 
@@ -1150,6 +1170,12 @@ mod tests {
         vec![GroupByKey::Str("g".into())]
     }
 
+    /// The `partition_by` field list that produced [`single_group_key`], so a
+    /// diagnostic can name the group as the author declared it.
+    fn partition_by() -> Vec<String> {
+        vec!["gid".to_string()]
+    }
+
     /// Accumulate `n` records into one group, spilling whenever the resident
     /// footprint exceeds the arbitrator's soft limit — the same admit-then-
     /// spill cadence the dispatch loop runs. Returns the populated buffer.
@@ -1192,7 +1218,7 @@ mod tests {
             !buffer.groups[&key].spilled.is_empty(),
             "the single oversized group must have partition-spilled"
         );
-        let group = buffer.take_group("rs", &key, 0).unwrap();
+        let group = buffer.take_group("rs", &partition_by(), &key, 0).unwrap();
         let row_nums: Vec<u64> = group.iter().map(|(_, rn)| *rn).collect();
         let expected: Vec<u64> = (0..64).collect();
         assert_eq!(
@@ -1267,12 +1293,49 @@ mod tests {
         let mut buffer = fill_single_group(&schema, &arb, spill_root.path(), 64);
         // A hard limit far below the group's reloaded footprint must fail loud.
         let err = buffer
-            .take_group("rs", &key, 256)
+            .take_group("rs", &partition_by(), &key, 256)
             .expect_err("a group exceeding the hard limit must be rejected at finalize");
-        let detail = format!("{err:?}");
+
+        // A group that outgrew the budget is an ordinary operational limit,
+        // not an engine invariant violation, so it must carry the standard
+        // memory surface — typed, not merely reworded.
+        match &err {
+            PipelineError::MemoryBudgetExceeded {
+                node,
+                used,
+                limit,
+                source,
+                detail,
+            } => {
+                assert_eq!(node, "rs", "the diagnostic must name the Reshape node");
+                assert_eq!(*limit, 256, "the limit must be the hard budget in force");
+                assert!(
+                    *used > *limit,
+                    "the reported footprint ({used}) must be the overrun, above the limit ({limit})"
+                );
+                assert_eq!(*source, BudgetCategory::Arena);
+                let detail = detail.as_deref().expect("the overrun must carry detail");
+                assert!(
+                    detail.contains("Reshape correlation group [gid=\"g\"]"),
+                    "the detail must name the offending partition_by group: {detail}"
+                );
+                assert!(
+                    detail.contains("no-cascade"),
+                    "the detail must explain why one group must fit the budget: {detail}"
+                );
+                assert!(
+                    detail.contains("memory.limit") && detail.contains("partition_by"),
+                    "the detail must give the author a remedy: {detail}"
+                );
+            }
+            other => panic!("a giant correlation group must surface E310; got {other:?}"),
+        }
+
+        // Rendered form: the E310 code and the budget figures reach the user.
+        let rendered = err.to_string();
         assert!(
-            detail.contains("single Reshape correlation group"),
-            "the diagnostic must name the giant-group limitation: {detail}"
+            rendered.starts_with("E310 rs:"),
+            "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
         );
     }
 

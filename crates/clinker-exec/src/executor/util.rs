@@ -1,11 +1,11 @@
 //! Cross-cutting executor utilities: dispatch-order scheduling,
-//! record-schema reshaping, correlation-key copy, and small config/plan
-//! lookups shared across the dispatch arms.
+//! record-schema reshaping, correlation-key copy, group-key diagnostic
+//! rendering, and small config/plan lookups shared across the dispatch arms.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use clinker_record::{Record, Schema, SchemaBuilder};
+use clinker_record::{GroupByKey, Record, Schema, SchemaBuilder};
 use indexmap::IndexMap;
 
 use clinker_plan::config::PipelineConfig;
@@ -365,6 +365,57 @@ pub(crate) fn build_arbitrator_from_config(
         resume_threshold,
         crate::pipeline::memory::build_policy(mem.backpressure),
     )
+}
+
+/// Render a correlation / partition group key for a user-facing diagnostic.
+///
+/// Every operator that groups records — correlation commit, cascading-retract
+/// detection, Reshape, Cull — names the offending group with this one
+/// spelling, so a group key a user learns to read in one diagnostic reads the
+/// same in all of them. Strings are quoted (`"A-1"`) so an empty or
+/// space-padded key stays visible; a `Decimal` round-trips through
+/// [`GroupByKey::to_value`] to keep its exact scale.
+///
+/// Pure and non-blocking; reached only on a diagnostic path, so the
+/// per-part allocation stays off the record hot loop.
+pub(crate) fn format_group_key(key: &[GroupByKey]) -> String {
+    let parts: Vec<String> = key.iter().map(format_group_key_part).collect();
+    format!("[{}]", parts.join(", "))
+}
+
+/// Render one group-key component. The bracketed whole-key and the
+/// `field=value` pair forms both build on this, so a key value renders
+/// identically whichever form the diagnostic uses.
+fn format_group_key_part(k: &GroupByKey) -> String {
+    match k {
+        GroupByKey::Null => "null".to_string(),
+        GroupByKey::Bool(b) => b.to_string(),
+        GroupByKey::Int(i) => i.to_string(),
+        GroupByKey::Float(bits) => f64::from_bits(*bits).to_string(),
+        GroupByKey::Decimal(_) => k.to_value().to_string(),
+        GroupByKey::Str(s) => format!("{s:?}"),
+        GroupByKey::Date(d) => d.to_string(),
+        GroupByKey::DateTime(ts) => ts.to_string(),
+    }
+}
+
+/// Render a group key paired with the `partition_by` fields that produced it,
+/// as `field=value` pairs in declaration order — the shape a pipeline author
+/// can match against their own YAML.
+///
+/// Falls back to the bare key rendering when the field list and the key
+/// disagree on length, so a length mismatch degrades the diagnostic instead
+/// of losing it.
+pub(crate) fn format_partition_group(partition_by: &[String], key: &[GroupByKey]) -> String {
+    if partition_by.len() != key.len() {
+        return format_group_key(key);
+    }
+    let parts: Vec<String> = partition_by
+        .iter()
+        .zip(key)
+        .map(|(field, k)| format!("{field}={}", format_group_key_part(k)))
+        .collect();
+    format!("[{}]", parts.join(", "))
 }
 
 #[cfg(test)]

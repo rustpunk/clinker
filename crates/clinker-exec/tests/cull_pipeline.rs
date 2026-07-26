@@ -566,6 +566,82 @@ fn cull_decision_state_fails_loud_when_group_cardinality_exceeds_budget() {
     }
 }
 
+/// Build one partition group of `rows` records, each carrying a fixed-width
+/// payload in `account` so the single group's buffered footprint is large and
+/// predictable. The inverse shape of [`distinct_group_input`]: tiny group
+/// cardinality, one very large group.
+fn single_giant_group_input(rows: usize) -> String {
+    let mut csv = String::from("account,seq\n");
+    for r in 0..rows {
+        csv.push_str(&format!("BIG,{r}\n"));
+    }
+    csv
+}
+
+#[test]
+fn cull_giant_group_exceeds_budget_fails_loud() {
+    // One correlation group larger than the finalize budget. `drop_group_when`
+    // is evaluated against the whole group at once, so ingest-time spilling
+    // bounds the resident peak but the finalize reload still needs the group
+    // whole — there is no in-budget representation, and the run must fail
+    // loud rather than OOM.
+    //
+    // The failure must arrive as the STANDARD memory diagnostic. Group
+    // cardinality here is 1, so the O(groups) drop-decision state is trivially
+    // small and cannot be what trips: this isolates the single-giant-group
+    // reload gate. An internal error would misreport an ordinary configured-
+    // limit overrun as an engine invariant violation.
+    let csv = single_giant_group_input(2_000);
+    let err = run_cull_result(&count_cull_pipeline("8K"), &csv)
+        .expect_err("a single group larger than the budget must fail loud, not OOM");
+
+    match &err {
+        clinker_plan::error::PipelineError::MemoryBudgetExceeded {
+            node,
+            used,
+            limit,
+            detail,
+            ..
+        } => {
+            assert_eq!(node, "drop_big", "the diagnostic must name the Cull node");
+            assert!(
+                *used > *limit,
+                "the reported group footprint ({used}) must exceed the budget ({limit})"
+            );
+            let detail = detail.as_deref().expect("the overrun must carry detail");
+            // Names the offending group as the author declared it — and is
+            // distinguishable from the sibling decision-state overrun, which
+            // shares the E310 code but reports a different surface.
+            assert!(
+                detail.contains("Cull correlation group [account=\"BIG\"]"),
+                "the detail must name the offending partition_by group: {detail}"
+            );
+            assert!(
+                detail.contains("drop_group_when"),
+                "the detail must explain why one group must fit the budget: {detail}"
+            );
+            assert!(
+                detail.contains("memory.limit") && detail.contains("partition_by"),
+                "the detail must give the author a remedy: {detail}"
+            );
+        }
+        other => panic!(
+            "a giant correlation group is a memory-budget condition and must surface E310, \
+             not an internal error; got {other:?}"
+        ),
+    }
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.starts_with("E310 drop_big:"),
+        "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
+    );
+    assert!(
+        !rendered.contains("internal error"),
+        "a configured-limit overrun must never read as an engine bug: {rendered}"
+    );
+}
+
 #[test]
 fn idempotent_rerun_is_byte_stable() {
     // Re-running Cull over its own main output must be a fixed point: the main
