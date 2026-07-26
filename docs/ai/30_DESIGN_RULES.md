@@ -123,6 +123,11 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
 
 ## Configuration And Format Rules
 
+These rules govern how config is parsed and modeled. What a surface should
+*look like* to the author who types it is a separate question, answered by the
+User-Facing Surface contract in [AGENTS.md](../../AGENTS.md); consult it before
+adding, renaming, or narrowing anything a pipeline author writes by hand.
+
 - YAML parsing must go through `clinker_plan::yaml`. The module states it is
   the single YAML parser chokepoint and the only place that should call
   `serde_saphyr::from_str*` or construct a serde-saphyr budget. It enforces a
