@@ -53,11 +53,11 @@ Current normal dependencies are intentional: `clinker-exec`, `clinker-plan`, `cl
 - HTTP/connect/body failures are hard source errors, not per-row DLQ records.
 - 5xx/transport failures retry only within configured retry limits; 4xx is fatal.
 - Page body reads are capped by `MAX_PAGE_BYTES`.
-- SQL cursor wording in docs/manifests is roadmap language, not implemented behavior in this crate; route changes to the central open-question registry before documenting it as current behavior.
+- No SQL transport exists in this crate: the only implemented transport is REST. Treat any SQL-cursor wording anywhere as roadmap work tracked in issues #225 (Source) / #226 (sink), not as behavior to preserve or extend; route changes to the central open-question registry before documenting it as current behavior.
 
 ## Common mistakes for AI agents to avoid
 
-- Inventing implemented SQL cursor support from broad wording in docs or the manifest.
+- Inventing implemented SQL cursor support from roadmap wording in docs or issues.
 - Making `max_pages` optional for REST.
 - Adding async runtime assumptions.
 - Faking filesystem paths for network sources.

@@ -3,7 +3,7 @@ name = "clinker-net"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Network finite-pull Source readers (REST, SQL cursors) for Clinker"
+description = "Network finite-pull Source readers (REST) for Clinker"
 
 [dependencies]
 clinker-exec = { workspace = true }

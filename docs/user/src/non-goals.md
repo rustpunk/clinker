@@ -107,9 +107,15 @@ SQL is the right surface.
 ## Not a connector marketplace
 
 Clinker ships with a deliberately small set of source and sink types:
-CSV, JSON, XML, fixed-width files in the current release; finite-cursor
-REST and SQL sources on the roadmap. There is no plugin registry, no
-third-party connector store, no SaaS-API catalog.
+CSV, JSON, XML, fixed-width, EDIFACT, X12, HL7 v2, and SWIFT MT files,
+plus a finite-cursor REST source. Writing to a network endpoint is not
+supported: a REST Output sink
+([issue #224](https://github.com/rustpunk/clinker/issues/224)) and
+finite-cursor SQL sources and sinks
+([#225](https://github.com/rustpunk/clinker/issues/225),
+[#226](https://github.com/rustpunk/clinker/issues/226)) are tracked but
+unbuilt. There is no plugin registry, no third-party connector store, no
+SaaS-API catalog.
 
 **Out of scope:**
 

@@ -97,7 +97,7 @@ alias automatically (see [Channels](../pipelines/channels.md)).
 
 A source declaration has two independent layers:
 
-- **Transport** (`transport:`) selects *where* the records come from. The only transport today is `file` — read bytes from the filesystem, resolved through one of the file matchers (`path` / `glob` / `regex` / `paths`). `transport:` is optional and defaults to `file`, so a source that omits it reads from disk exactly as before.
+- **Transport** (`transport:`) selects *where* the records come from. Two transports exist: `file` — read bytes from the filesystem, resolved through one of the file matchers (`path` / `glob` / `regex` / `paths`) — and `rest` — pull records from a paginated HTTP endpoint under a hard page/record cap (see [Network Sources (REST)](../formats/source-network.md)). `transport:` is optional and defaults to `file`, so a source that omits it reads from disk exactly as before.
 - **Format** (`type:`) selects *how* the bytes decode into records: `csv`, `json`, `xml`, `fixed_width`, `edifact`, `x12`, `hl7`, `swift`.
 
 ```yaml

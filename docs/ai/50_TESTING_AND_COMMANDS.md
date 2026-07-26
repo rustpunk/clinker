@@ -57,12 +57,66 @@ Status: **Inferred from CI.**
 ## 4. Full Test Command
 
 ```bash
-ulimit -n 4096 && cargo test --workspace --locked --offline
+# Raise the file-descriptor soft limit to the 65536 floor the spill tests
+# need. Raise-only by construction: the body runs only when the current
+# soft limit is below the floor, and both targets are >= the current soft
+# limit — so an already-sufficient limit is never lowered. `-S` is
+# load-bearing: a bare `ulimit -n N` sets the soft AND the hard limit, and
+# an unprivileged process can never raise a hard limit back.
+if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then
+  ulimit -S -n 65536 2>/dev/null || ulimit -S -n "$(ulimit -Hn)"
+fi
+
+cargo test --workspace --locked --offline
 ```
 
 Status: **Verified outside the sandbox.**
 
-Why the prefix matters: with the default local `ulimit -n` of `1024`, `clinker-exec` spill tests can fail with `Too many open files (os error 24)`. The `clinker-net` REST e2e tests also need permission to bind local sockets; they failed inside the restricted sandbox with `Operation not permitted` and passed outside it.
+Why the fd floor matters: the spill path opens up to `MERGE_FAN_IN` = 64
+readers per active k-way merge pass
+(`crates/clinker-exec/src/pipeline/spill_merge.rs`), and grace-hash holds
+one open probe-spill writer per on-disk partition
+(`crates/clinker-exec/src/pipeline/grace_hash/mod.rs`, `PartitionState::OnDisk`).
+`cargo test` multiplies that by the libtest thread count, which defaults to
+the core count — so the process-wide peak scales with `nproc`, not with any
+single test. Below the floor, spill tests fail with
+`Too many open files (os error 24)`, and *which* tests fail varies run to
+run: the victim is whichever test opens a file while the process is at the
+ceiling.
+
+Measured on a 32-core host (`nproc` = 32), sampling `/proc/<pid>/fd` of the
+`clinker-exec` lib test binary about 16 000 times per run across five runs:
+the peak concurrent descriptor count is **4165–4222**. Any floor at or below
+`4096` is therefore below what the suite actually needs on a host this size.
+The floor of `65536` gives roughly 15x headroom over the measured peak,
+which absorbs higher core counts — demand scales with
+`available_parallelism()`, so a 128-core host lands near ~17 000 and still
+fits.
+
+End-to-end confirmation on the same host, running
+`cargo test -p clinker-exec --lib --locked --offline`:
+
+| soft `ulimit -n` | result |
+|---|---|
+| 4096 | FAILED — 868 passed, 2 failed, both `Too many open files (os error 24)` |
+| 4096 with `-- --test-threads=4` | FAILED — 868 passed, 2 failed |
+| 65536 | ok — 870 passed, 0 failed |
+
+Cutting the thread count does not rescue 4096: a single grace-hash or
+cascaded-merge test can sit near the per-operator bound on its own.
+
+On a host that is already at or above the floor the `if` is a no-op, not a
+failure: it changes nothing and succeeds, so the block is safe to lift into
+a setup script or chain with `&&` without stranding the command after it.
+
+Never write a bare `ulimit -n <n>` before the suite. On a host whose soft
+limit already exceeds `<n>` that command *lowers* the limit into the failing
+range — following the instruction becomes the cause of the failure it was
+meant to prevent.
+
+The `clinker-net` REST e2e tests separately need permission to bind local
+sockets; they fail inside the restricted sandbox with
+`Operation not permitted` and pass outside it.
 
 CI runs:
 
@@ -121,17 +175,18 @@ UPDATE_SCENARIO_GOLDENS=1 cargo test -p clinker --test scenarios -- --nocapture
 re-bless run passes, so without it the input digest to paste back into the
 harness's `GATES` table is never printed.
 
-Status: **Inferred for the exact per-crate commands.** The full workspace test command above covered these packages successfully outside the sandbox with `ulimit -n 4096`.
+Status: **Inferred for the exact per-crate commands.** The full workspace test command above covered these packages successfully outside the sandbox at a soft fd limit of 65536 or higher.
 
 Targeted examples:
 
 ```bash
 cargo test -p cxl --locked --offline
 cargo test -p clinker-exec --lib --locked --offline executor::tests::spill_dir_unavailable_midrun::unarmed_seam_lets_a_real_spilling_run_complete -- --exact
-ulimit -n 4096 && cargo test -p clinker-exec --lib --locked --offline executor::tests::spill_dir_unavailable_midrun::unarmed_seam_lets_a_real_spilling_run_complete -- --exact
 ```
 
-Status: **Verified.** The second command failed at `ulimit -n 1024`; the third passed with `ulimit -n 4096`.
+Status: **Verified.** The second command needs the section 4 fd floor: it
+failed at `ulimit -n 1024` and passes at 65536. Apply the raise-only
+snippet from section 4 first rather than prefixing a fixed `ulimit -n`.
 
 ## 6. Formatting Command
 
@@ -322,10 +377,14 @@ cargo fmt --all --check
 cargo check --workspace --locked --offline
 cargo clippy --workspace --locked --offline -- -D warnings
 cargo clippy --workspace --all-targets --locked --offline -- -D warnings
-ulimit -n 4096 && cargo test --workspace --locked --offline
+cargo test --workspace --locked --offline
 ```
 
-Status: **Verified outside the sandbox for the full test command.** If REST e2e tests are involved, the full test command may need unsandboxed localhost socket access.
+Status: **Verified outside the sandbox for the full test command.** Apply
+the raise-only fd snippet from section 4 before the test command; the
+spill tests need a soft `ulimit -n` of at least the 65536 floor. If REST e2e tests
+are involved, the full test command may need unsandboxed localhost socket
+access.
 
 For sprint-closing / CI parity:
 
@@ -352,7 +411,7 @@ Status: **Inferred from CI for the exact online forms.** Locked/offline variants
 ## 13. Expensive, Flaky, Or Environment-Dependent Commands
 
 - **Environment-dependent:** `cargo test --workspace` needs local socket permission for `clinker-net` REST e2e tests. The restricted sandbox produced `Operation not permitted`; the unsandboxed run passed.
-- **Environment-dependent:** spill-heavy tests may need `ulimit -n 4096`. With `ulimit -n` at `1024`, one `clinker-exec` spill test failed with `Too many open files (os error 24)`.
+- **Environment-dependent:** spill-heavy tests need a soft `ulimit -n` of at least 65536; demand scales with the libtest thread count, which defaults to the core count. At 1024 a `clinker-exec` spill test fails with `Too many open files (os error 24)`; at 4096 on a 32-core host two do, because the measured peak there is 4165-4222 descriptors. Raise the limit with the raise-only snippet in section 4 — a bare `ulimit -n <n>` lowers an already-higher limit into the failing range. CI is unaffected: `.github/workflows/ci.yml` sets no `ulimit`, so every job inherits the runner default.
 - **Expensive:** `cargo test --benches -p clinker-benchmarks` runs the e2e benchmark smoke matrix and took several minutes.
 - **Expensive:** `cargo bench ...` runs real Criterion measurements and should be reserved for performance-sensitive changes.
 - **Expensive:** `cargo test -- --ignored` includes at least one XML generator test that reports generating about 600 MB.
@@ -360,7 +419,8 @@ Status: **Inferred from CI for the exact online forms.** Locked/offline variants
 
 ## 14. Troubleshooting Common Failures
 
-- `Too many open files (os error 24)` in spill tests: check `ulimit -n`. Retry with `ulimit -n 4096 && cargo test ...`.
+- `Too many open files (os error 24)` in spill tests: check `ulimit -Sn`. It must be at least the 65536 floor (see section 4 for the measurement behind it and the headroom it carries); raise it with the raise-only snippet there. Do not prefix a fixed `ulimit -n <n>` — that lowers an already-sufficient limit. If the hard limit (`ulimit -Hn`) is itself below the floor, raise the hard limit at the OS level or cut the parallelism with `cargo test -- --test-threads=<n>`; fewer threads reduces the demand but does not remove it, because a single grace-hash or cascaded-merge test can be near the per-operator bound on its own.
+- A `proptest` failure caused by fd exhaustion writes a regression seed under `crates/clinker-exec/proptest-regressions/` and asks you to commit it. **Do not.** Replayed at a healthy fd limit those seeds pass — they are environment artifacts, not counterexamples, and committing one adds permanent noise implying a bug that does not exist. Delete the file, fix the fd limit, and re-run. The tracked regression files are `pipeline/iejoin.txt`, `pipeline/sort_key.txt`, and `pipeline/sort_merge_join.txt`; anything else appearing after a `Too many open files` run is an artifact.
 - `Operation not permitted` in `crates/clinker-net/tests/rest_executor_e2e.rs`: the test likely cannot bind a local socket in the sandbox. Rerun outside the sandbox or in normal CI.
 - `cargo deny check` cannot acquire `~/.cargo/advisory-dbs/db.lock`: the filesystem sandbox is read-only for that cargo advisory DB path. Rerun with permission to write/read the cargo advisory database.
 - `cargo test --workspace` can run for a long time: the workspace has a large test suite with many integration tests. Use `cargo test -p <package>` or an exact test filter while iterating.
