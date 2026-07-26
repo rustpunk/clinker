@@ -621,8 +621,21 @@ fn cull_giant_group_exceeds_budget_fails_loud() {
                 "the detail must explain why one group must fit the budget: {detail}"
             );
             assert!(
-                detail.contains("memory.limit") && detail.contains("partition_by"),
-                "the detail must give the author a remedy: {detail}"
+                detail.contains("memory.limit") && detail.contains("upstream Transform"),
+                "the detail must give the author a result-preserving remedy: {detail}"
+            );
+            // This pipeline's rule is `count(*) > 100`. Splitting `account`
+            // across a finer key drops each per-group count below the
+            // threshold, so the run would succeed and stop removing accounts
+            // it should remove. The engine must never suggest that.
+            assert!(
+                !detail.contains("add a finer `partition_by`"),
+                "the remediation must not recommend narrowing partition_by: {detail}"
+            );
+            assert!(
+                detail.contains("Narrowing `partition_by`")
+                    && detail.contains("changes which rows are removed"),
+                "the detail must warn that narrowing partition_by changes the result set: {detail}"
             );
         }
         other => panic!(

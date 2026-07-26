@@ -140,9 +140,16 @@ Cull evaluates its group-level predicate against the *whole* group at once, so e
 
 ```
 E310 drop_big: arena exceeded budget (512000/8192) [one Cull correlation
-group [account="BIG"] is ~512000 bytes on reload. ...]
+group [account="BIG"] does not fit; the reported use is that group's reload
+footprint alone. ...]
 ```
 
-Raise `memory.limit` above that group's footprint, or add a finer `partition_by` so no one correlation group is that large.
+Two remedies preserve your results: raise `memory.limit` clear of the reported figure — finalize also holds the run's remaining groups and the per-group decision map, so the group's own size is a floor, not a target — or shrink each record with an upstream Transform that drops columns this node does not read.
 
-There is a second, symmetric bound on the **number** of groups. The per-group removal decision is held in an in-memory aggregate that is `O(distinct groups)` and — unlike the raw records — cannot spill. If a partition key is so high-cardinality that the decision state alone would exceed `memory.limit` (many small groups rather than one giant group), the run likewise **fails loud** with `E310`, rather than growing that state unbounded. The two cases share the code and are told apart by what the diagnostic names: `Cull drop-decision aggregate state` for this one, a specific `Cull correlation group [...]` for the giant-group case above. Raise `memory.limit`, or coarsen the `partition_by` key so the group count fits the budget.
+**Do not narrow `partition_by` to clear this error.** It would make the group smaller and the run succeed, but `partition_by` defines the group `drop_group_when` evaluates over. With a rule like `count(*) > 100`, splitting one account across a finer key drops each resulting group below the threshold, so an account that should have been removed is emitted on the main port instead — the run "works" and quietly returns a different result set. Treat the grouping key as a modelling decision, never as a memory knob.
+
+Note that `clinker explain --code E310` currently describes only the Combine case and suggests a `drive:` hint, which Cull has no equivalent for — see [#1017](https://github.com/rustpunk/clinker/issues/1017). The guidance above is the one to follow for Cull.
+
+There is a second, symmetric bound on the **number** of groups. The per-group removal decision is held in an in-memory aggregate that is `O(distinct groups)` and — unlike the raw records — cannot spill. If a partition key is so high-cardinality that the decision state alone would exceed `memory.limit` (many small groups rather than one giant group), the run likewise **fails loud** with `E310`, rather than growing that state unbounded. Here, coarsening `partition_by` is a legitimate fix only if the coarser key is the grouping you actually meant — the same caveat as above applies. Otherwise, raise `memory.limit`.
+
+Cull raises `E310` from three sites in total, told apart by what the diagnostic names: a specific `Cull correlation group [...]` for the giant-group case above, `Cull drop-decision aggregate state` for the group-count bound, and `Cull cross-region tee admission` when a downstream stage in a different deferred region forces this node's output to be parked in memory.

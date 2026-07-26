@@ -686,8 +686,10 @@ impl ReshapeGroupBuffer {
     /// # Errors
     ///
     /// Returns [`PipelineError::MemoryBudgetExceeded`] (E310) when a single
-    /// correlation group's reloaded footprint exceeds `hard_limit`, or
-    /// [`PipelineError::Internal`] when a spill file cannot be read back.
+    /// correlation group's reloaded footprint exceeds `hard_limit`.
+    ///
+    /// A spill file that cannot be read back currently surfaces through
+    /// [`reshape_spill_error`]; see the classification caveat recorded there.
     fn take_group(
         &mut self,
         node_name: &str,
@@ -791,6 +793,15 @@ fn estimated_input_bytes(record: &Record) -> usize {
 /// Wrap a spill read/write fault from the Reshape group buffer as a hard
 /// pipeline error. Spill faults are I/O failures, not data errors, so they
 /// abort the run rather than route to the DLQ.
+///
+/// The `Internal` classification here is known to be wrong and is not a
+/// contract to build on: a full or unavailable spill volume is host
+/// infrastructure failing, not an engine invariant violated. The aggregate and
+/// grace-hash paths map the same `SpillError` to `PipelineError::Spill`, which
+/// keeps the E321 disk-full diagnostic and exits 4; this path flattens it to a
+/// string and exits 1, so an orchestrator that retries infrastructure faults
+/// treats a full disk here as a bad pipeline. Tracked separately — changing it
+/// moves an exit code, so it is not folded into an unrelated change.
 fn reshape_spill_error(node_name: &str, e: clinker_plan::SpillError) -> PipelineError {
     PipelineError::Internal {
         op: "reshape",
@@ -809,6 +820,17 @@ fn reshape_spill_error(node_name: &str, e: clinker_plan::SpillError) -> Pipeline
 /// ceiling. So it surfaces through the standard `MemoryBudgetExceeded`
 /// diagnostic every other budget overrun uses, naming the offending
 /// `partition_by` group so the author can find it in their input.
+///
+/// The remediation deliberately does NOT suggest a finer `partition_by`.
+/// `partition_by` defines the group the rules evaluate against, so narrowing
+/// it makes the run succeed by silently changing the answer — a suggestion the
+/// engine must never make. The safe levers are a larger budget and a smaller
+/// per-record footprint.
+///
+/// `used` is this one group's reload footprint while `limit` is the run-wide
+/// ceiling, so the two are not directly comparable as a target: finalize also
+/// holds the remaining groups. The wording says "clear of" rather than naming
+/// the group's own size as a sufficient budget.
 fn reshape_giant_group_error(
     node_name: &str,
     partition_by: &[String],
@@ -817,17 +839,29 @@ fn reshape_giant_group_error(
     hard_limit: u64,
 ) -> PipelineError {
     let group = format_partition_group(partition_by, key);
+    // This node folds a blank partition value into the null group, so a
+    // rendered `null` covers both and an author grepping for missing values
+    // alone would not find the group.
+    let blank_note = if key.iter().any(|k| matches!(k, GroupByKey::Null)) {
+        " This node groups blank and missing partition values together, so `null` here covers \
+         empty-string values too."
+    } else {
+        ""
+    };
     PipelineError::MemoryBudgetExceeded {
         node: node_name.to_string(),
         used: group_bytes,
         limit: hard_limit,
         source: BudgetCategory::Arena,
         detail: Some(format!(
-            "one Reshape correlation group {group} is ~{group_bytes} bytes on reload. Reshape \
-             applies its rules against the whole group at once (the no-cascade contract), so a \
-             single group must fit the budget even though cross-group and ingest-time peaks \
-             spill to disk. Raise `memory.limit` above this group's footprint, or add a finer \
-             `partition_by` so no one correlation group is this large."
+            "one Reshape correlation group {group} does not fit; the reported use is that \
+             group's reload footprint alone. Reshape applies its rules against the whole group \
+             at once (the no-cascade contract), so a single group must fit the budget even \
+             though cross-group and ingest-time peaks spill to disk. Raise `memory.limit` clear \
+             of this figure — finalize also holds the run's remaining groups — or shrink each \
+             record with an upstream Transform that drops columns this node does not read. \
+             Narrowing `partition_by` would also shrink the group, but it redefines the group \
+             the rules evaluate against and changes results.{blank_note}"
         )),
     }
 }
@@ -1324,8 +1358,22 @@ mod tests {
                     "the detail must explain why one group must fit the budget: {detail}"
                 );
                 assert!(
-                    detail.contains("memory.limit") && detail.contains("partition_by"),
-                    "the detail must give the author a remedy: {detail}"
+                    detail.contains("memory.limit") && detail.contains("upstream Transform"),
+                    "the detail must give the author a result-preserving remedy: {detail}"
+                );
+                // The engine must never recommend narrowing `partition_by` as a
+                // memory fix. It redefines the group the rules evaluate
+                // against, so it clears the abort by silently changing the
+                // answer — the exact failure class this milestone exists to
+                // remove. The warning must be present and the suggestion absent.
+                assert!(
+                    !detail.contains("add a finer `partition_by`"),
+                    "the remediation must not recommend narrowing partition_by: {detail}"
+                );
+                assert!(
+                    detail.contains("Narrowing `partition_by`")
+                        && detail.contains("changes results"),
+                    "the detail must warn that narrowing partition_by changes results: {detail}"
                 );
             }
             other => panic!("a giant correlation group must surface E310; got {other:?}"),
@@ -1336,6 +1384,55 @@ mod tests {
         assert!(
             rendered.starts_with("E310 rs:"),
             "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
+        );
+    }
+
+    // This node folds a blank partition value into the null group
+    // (`partition_key`), and a blank key is exactly the case most likely to
+    // produce a giant group, since every blank row merges into one. Naming
+    // that group `[gid=null]` alone would send the author hunting for missing
+    // values they do not have, so the diagnostic must say that `null` covers
+    // empty strings too.
+    #[test]
+    fn a_blank_partition_value_group_is_named_unambiguously() {
+        let schema = schema();
+        let spill_root = tempfile::tempdir().unwrap();
+        let arb = arbitrator(512);
+        let handle = ConsumerHandle::new();
+        // A blank `gid` keys to Null through this node's `partition_key`.
+        let key = partition_key(&rec(&schema, "", "x"), &partition_by());
+        assert_eq!(
+            key,
+            vec![GroupByKey::Null],
+            "a blank partition value must key to the null group for this test to be meaningful"
+        );
+
+        let mut buffer = ReshapeGroupBuffer::new(Arc::clone(&schema), true);
+        for row_num in 0..64u64 {
+            let payload = format!("{row_num:063}");
+            buffer.push(key.clone(), rec(&schema, "", &payload), row_num);
+            handle.set_bytes(buffer.resident_bytes() as u64);
+            if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
+                buffer
+                    .spill_until_under_budget("rs", &arb, spill_root.path(), &handle)
+                    .unwrap();
+            }
+        }
+
+        let err = buffer
+            .take_group("rs", &partition_by(), &key, 256)
+            .expect_err("a group exceeding the hard limit must be rejected at finalize");
+        let PipelineError::MemoryBudgetExceeded { detail, .. } = &err else {
+            panic!("a giant correlation group must surface E310; got {err:?}");
+        };
+        let detail = detail.as_deref().expect("the overrun must carry detail");
+        assert!(
+            detail.contains("[gid=null]"),
+            "the group must still be named: {detail}"
+        );
+        assert!(
+            detail.contains("blank and missing"),
+            "a null-keyed group must disclose that blank values are folded in: {detail}"
         );
     }
 

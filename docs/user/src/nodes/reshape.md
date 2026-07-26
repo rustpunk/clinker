@@ -131,10 +131,15 @@ Two current limitations qualify the "identical whether spilled or resident" guar
 
 - **A single correlation group must fit the memory budget at finalize.** The no-cascade contract requires the *whole* group to be resident when its rules fire, so even though cross-group and ingest-time peaks spill to disk, the finalize reload of one group needs that group to fit. Skew slicing bounds the ingest peak, but a single correlation group larger than `memory.limit` has no in-budget representation. Rather than risk an out-of-memory crash, the run **fails loud** with `E310 MemoryBudgetExceeded`, naming the Reshape node, the offending `partition_by` group, and its footprint against the budget:
 
-```
-E310 backfill: arena exceeded budget (128000/8192) [one Reshape correlation
-group [employee_id="employee-00000"] is ~128000 bytes on reload. ...]
-```
+  ```
+  E310 backfill: arena exceeded budget (128000/8192) [one Reshape correlation
+  group [employee_id="employee-00000"] does not fit; the reported use is that
+  group's reload footprint alone. ...]
+  ```
 
-Raise `memory.limit` above that group's footprint, or add a finer `partition_by` so no one correlation group is that large. (A future two-pass finalize could lift this.)
+  Two remedies preserve your results: raise `memory.limit` clear of the reported figure — finalize also holds the run's remaining groups, so the group's own size is a floor, not a target — or shrink each record with an upstream Transform that drops columns this node does not read.
+
+  **Do not narrow `partition_by` to clear this error.** It would make the group smaller and the run succeed, but `partition_by` defines the group the rules evaluate against, so a narrower key changes which records each rule sees and therefore changes your output. Treat the grouping key as a modelling decision, never as a memory knob. (A future two-pass finalize could lift this limit.)
+
+  Note that `clinker explain --code E310` currently describes only the Combine case and suggests a `drive:` hint, which Reshape has no equivalent for — see [#1017](https://github.com/rustpunk/clinker/issues/1017). The guidance above is the one to follow for Reshape.
 - **Reshape rules cannot reference `$doc` document context.** Because the spill round-trip does not yet preserve [document envelope context](../pipelines/envelope-and-doc-context.md), a `$doc.*` reference in a rule's `when`, `mutate.set`, or `synthesize` expression would resolve to the real envelope for a resident group but to null for a spilled one — output that depends on the memory budget. A pipeline whose Reshape rules reference `$doc` is **rejected at compile time**. Move the `$doc` lookup into an upstream Transform that copies the value into a record column, then reference that column in the Reshape rule.

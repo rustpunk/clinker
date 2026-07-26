@@ -878,8 +878,10 @@ impl CullGroupBuffer {
     /// # Errors
     ///
     /// Returns [`PipelineError::MemoryBudgetExceeded`] (E310) when a single
-    /// correlation group's reloaded footprint exceeds `hard_limit`, or
-    /// [`PipelineError::Internal`] when a spill file cannot be read back.
+    /// correlation group's reloaded footprint exceeds `hard_limit`.
+    ///
+    /// A spill file that cannot be read back currently surfaces through
+    /// [`cull_spill_error`]; see the classification caveat recorded there.
     fn take_group(
         &mut self,
         node_name: &str,
@@ -1039,6 +1041,15 @@ fn sort_group(group: &mut [(Record, u64)], order_by: &[SortField]) {
 /// Wrap a spill read/write fault from the Cull group buffer as a hard
 /// pipeline error. Spill faults are I/O failures, not data errors, so they
 /// abort the run rather than route anywhere.
+///
+/// The `Internal` classification here is known to be wrong and is not a
+/// contract to build on: a full or unavailable spill volume is host
+/// infrastructure failing, not an engine invariant violated. The aggregate and
+/// grace-hash paths map the same `SpillError` to `PipelineError::Spill`, which
+/// keeps the E321 disk-full diagnostic and exits 4; this path flattens it to a
+/// string and exits 1, so an orchestrator that retries infrastructure faults
+/// treats a full disk here as a bad pipeline. Tracked separately — changing it
+/// moves an exit code, so it is not folded into an unrelated change.
 fn cull_spill_error(node_name: &str, e: clinker_plan::SpillError) -> PipelineError {
     PipelineError::Internal {
         op: "cull",
@@ -1069,6 +1080,19 @@ fn cull_predicate_error(node_name: &str, e: crate::aggregation::HashAggError) ->
 /// diagnostic every other budget overrun uses — the same surface as the
 /// sibling decision-state overrun below — naming the offending `partition_by`
 /// group so the author can find it in their input.
+///
+/// The remediation deliberately does NOT suggest a finer `partition_by`.
+/// `partition_by` defines the group `drop_group_when` evaluates over, so
+/// narrowing it splits the group and changes what the predicate counts: a
+/// `count(*) > 100` rule that removed an account can silently stop firing once
+/// that account's rows are split, and rows that should have routed to
+/// `removed_to` land on the main port instead. A memory diagnostic must never
+/// recommend a fix that changes the result set.
+///
+/// `used` is this one group's reload footprint while `limit` is the run-wide
+/// ceiling, so the two are not directly comparable as a target: finalize also
+/// holds the remaining groups and the O(groups) decision map. The wording says
+/// "clear of" rather than naming the group's own size as a sufficient budget.
 fn cull_giant_group_error(
     node_name: &str,
     partition_by: &[String],
@@ -1083,11 +1107,14 @@ fn cull_giant_group_error(
         limit: hard_limit,
         source: BudgetCategory::Arena,
         detail: Some(format!(
-            "one Cull correlation group {group} is ~{group_bytes} bytes on reload. Cull \
-             evaluates its `drop_group_when` predicate against the whole group at once, so a \
-             single group must fit the budget even though cross-group and ingest-time peaks \
-             spill to disk. Raise `memory.limit` above this group's footprint, or add a finer \
-             `partition_by` so no one correlation group is this large."
+            "one Cull correlation group {group} does not fit; the reported use is that group's \
+             reload footprint alone. Cull evaluates its `drop_group_when` predicate against the \
+             whole group at once, so a single group must fit the budget even though cross-group \
+             and ingest-time peaks spill to disk. Raise `memory.limit` clear of this figure — \
+             finalize also holds the run's remaining groups and its per-group decision map — or \
+             shrink each record with an upstream Transform that drops columns this node does \
+             not read. Narrowing `partition_by` would also shrink the group, but it changes \
+             what `drop_group_when` counts and changes which rows are removed."
         )),
     }
 }
@@ -1232,8 +1259,22 @@ mod tests {
                     "the detail must explain why one group must fit the budget: {detail}"
                 );
                 assert!(
-                    detail.contains("memory.limit") && detail.contains("partition_by"),
-                    "the detail must give the author a remedy: {detail}"
+                    detail.contains("memory.limit") && detail.contains("upstream Transform"),
+                    "the detail must give the author a result-preserving remedy: {detail}"
+                );
+                // Narrowing `partition_by` splits the group, so a
+                // `count(*) > 100` rule can stop firing and rows that should
+                // have routed to `removed_to` land on the main port instead.
+                // The engine must warn about that, never suggest it.
+                assert!(
+                    !detail.contains("add a finer `partition_by`"),
+                    "the remediation must not recommend narrowing partition_by: {detail}"
+                );
+                assert!(
+                    detail.contains("Narrowing `partition_by`")
+                        && detail.contains("changes which rows are removed"),
+                    "the detail must warn that narrowing partition_by changes the result set: \
+                     {detail}"
                 );
             }
             other => panic!("a giant correlation group must surface E310; got {other:?}"),

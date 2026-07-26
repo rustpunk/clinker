@@ -922,8 +922,19 @@ fn reshape_giant_group_exceeds_budget_fails_loud() {
                 "the detail must explain why one group must fit the budget: {detail}"
             );
             assert!(
-                detail.contains("memory.limit") && detail.contains("partition_by"),
-                "the detail must give the author a remedy: {detail}"
+                detail.contains("memory.limit") && detail.contains("upstream Transform"),
+                "the detail must give the author a result-preserving remedy: {detail}"
+            );
+            // Narrowing `partition_by` redefines the group the rules evaluate
+            // against, so recommending it would clear the abort by changing
+            // the answer. The engine warns about it instead.
+            assert!(
+                !detail.contains("add a finer `partition_by`"),
+                "the remediation must not recommend narrowing partition_by: {detail}"
+            );
+            assert!(
+                detail.contains("Narrowing `partition_by`") && detail.contains("changes results"),
+                "the detail must warn that narrowing partition_by changes results: {detail}"
             );
         }
         other => panic!(

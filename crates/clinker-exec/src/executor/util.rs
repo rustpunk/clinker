@@ -367,17 +367,24 @@ pub(crate) fn build_arbitrator_from_config(
     )
 }
 
-/// Render a correlation / partition group key for a user-facing diagnostic.
+/// Render a correlation / partition group key as a display string.
 ///
 /// Every operator that groups records — correlation commit, cascading-retract
-/// detection, Reshape, Cull — names the offending group with this one
-/// spelling, so a group key a user learns to read in one diagnostic reads the
-/// same in all of them. Strings are quoted (`"A-1"`) so an empty or
-/// space-padded key stays visible; a `Decimal` round-trips through
-/// [`GroupByKey::to_value`] to keep its exact scale.
+/// detection, Reshape, Cull — names a group with this one spelling, so a group
+/// key a user learns to read in one diagnostic reads the same in all of them.
+/// Strings are quoted (`"A-1"`) so an empty or space-padded key stays visible;
+/// a `Decimal` round-trips through [`GroupByKey::to_value`] to keep its exact
+/// scale.
 ///
-/// Pure and non-blocking; reached only on a diagnostic path, so the
-/// per-part allocation stays off the record hot loop.
+/// **This is an output-ordering contract, not only a diagnostic one.**
+/// Correlation commit and cascading-retract detection both sort their group
+/// keys by this string to fix the order groups flush to writers, so the
+/// rendering decides emitted record order. Changing the escaping, the field
+/// order, or adding truncation reorders committed output — such a change needs
+/// the golden fixtures re-read, not just a diagnostic eyeballed.
+///
+/// Pure and non-blocking. Allocates per key part, so it stays off the
+/// per-record hot loop; the sort callers pay it once per group.
 pub(crate) fn format_group_key(key: &[GroupByKey]) -> String {
     let parts: Vec<String> = key.iter().map(format_group_key_part).collect();
     format!("[{}]", parts.join(", "))
