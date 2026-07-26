@@ -62,7 +62,7 @@ pipeline:
     fuzzy_threshold: { type: float, default: 0.85 }   # read as $vars.fuzzy_threshold
 ```
 
-Built-in members of each scope (`$source.file`, `$source.row`,
+Built-in members of each scope (`$source.file`, `$source.name`, `$source.row`,
 `$source.path`, `$source.count`, `$source.batch`,
 `$source.ingestion_timestamp`; `$pipeline.start_time`,
 `$pipeline.name`, `$pipeline.execution_id`, `$pipeline.batch_id`,

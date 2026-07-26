@@ -364,6 +364,85 @@ fn test_plan_time_gate_keeps_code_help_and_span_under_dry_run() {
 }
 
 #[test]
+fn test_dry_run_empty_pipeline_returns_a_diagnostic_instead_of_panicking() {
+    let tmp = tempdir_path();
+    let yaml_path = tmp.join("empty.yaml");
+    std::fs::write(&yaml_path, "pipeline:\n  name: empty\nnodes: []\n").expect("write yaml");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&yaml_path)
+        .arg("--dry-run")
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        !output.status.success(),
+        "an empty pipeline must fail dry-run validation"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("pipeline must declare at least one source node"),
+        "stderr must explain the source requirement; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked at"),
+        "invalid user input must not panic; got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_bare_dry_run_does_not_require_input_or_create_output() {
+    let tmp = tempdir_path();
+    let yaml_path = tmp.join("no_io.yaml");
+    let output_path = tmp.join("result.csv");
+    std::fs::write(
+        &yaml_path,
+        r#"pipeline:
+  name: no_io
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: missing.csv
+      schema:
+        - { name: amount, type: int }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: result.csv
+"#,
+    )
+    .expect("write yaml");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&yaml_path)
+        .arg("--dry-run")
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        output.status.success(),
+        "bare dry-run must stop before runtime source discovery; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output_path.exists(),
+        "bare dry-run must not create the configured output"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn test_plan_diagnostic_without_its_own_pointer_gets_the_explain_hint() {
     // E203 (CXL name resolution) attaches no help of its own, so the renderer
     // is the only thing that can tell the user the code is explainable. A gate

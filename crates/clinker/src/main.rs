@@ -1449,6 +1449,26 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         pipeline_config.pipeline.memory.limit = Some(limit);
     }
 
+    // Every run mode needs a primary source identity. Reject an empty
+    // top-level pipeline through the normal diagnostic path instead of letting
+    // the runtime setup below panic. This is config inspection only: it does
+    // not discover or open the source.
+    let input_path = pipeline_config
+        .source_configs()
+        .next()
+        .map(|source| {
+            if source.transport.is_file() {
+                source.path_str().to_string()
+            } else {
+                format!("<source:{}>", source.name)
+            }
+        })
+        .ok_or_else(|| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                "pipeline must declare at least one source node".to_string(),
+            ))
+        })?;
+
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
@@ -1718,21 +1738,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let mut channel_record_vars: indexmap::IndexMap<String, clinker_record::Value> =
         Default::default();
 
-    // Open readers for ALL sources (primary + lookup references) and
-    // writers for ALL outputs. The first source's identity seeds the DLQ
-    // sidecar's global `_cxl_dlq_source_file` fallback: a file source uses
-    // its path, a pathless network source uses the same `<source:NAME>`
-    // synthetic id the executor stamps per record.
-    let first_source = pipeline_config
-        .source_configs()
-        .next()
-        .expect("pipeline has at least one source");
-    let input_path = if first_source.transport.is_file() {
-        first_source.path_str().to_string()
-    } else {
-        format!("<source:{}>", first_source.name)
-    };
-
     // Build the source reader registry. Each source's matcher
     // (`path` / `glob` / `regex` / `paths`) resolves through the
     // discovery layer; every matched file becomes one `FileSlot` and
@@ -1781,7 +1786,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
 
     if args.dry_run && args.dry_run_n.is_none() {
         // Compile-validation mode (no -n): the plan and any channel/group
-        // overlay are fully checked, but no source discovery or I/O begins.
+        // overlay are fully checked, but runtime source discovery, reader and
+        // writer setup, and record processing do not begin. Compilation may
+        // inspect source metadata for planning estimates.
         tracing::info!(
             "Dry run: plan valid, {} inputs, {} outputs, {} transforms",
             pipeline_config.source_configs().count(),

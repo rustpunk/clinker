@@ -59,7 +59,8 @@ pub struct Interpolation {
     /// shown to a user: a `${SFTP_URL}` carrying a credential appears here in
     /// the clear. Anything user-facing quotes the raw document instead.
     pub text: String,
-    /// Whether any substituted value contained a YAML line break.
+    /// Whether a substituted value introduced a YAML line break or the
+    /// placeholder itself contained one that substitution removed.
     ///
     /// When false, `text` and the raw document have identical line numbering,
     /// so a line number resolved against one addresses the same line in the
@@ -98,6 +99,14 @@ pub fn interpolate_env_vars_with_metadata(
     yaml: &str,
     extra_vars: &[(&str, &str)],
 ) -> Result<Interpolation, ConfigError> {
+    interpolate_env_vars_with_metadata_using(yaml, extra_vars, |name| std::env::var(name))
+}
+
+fn interpolate_env_vars_with_metadata_using(
+    yaml: &str,
+    extra_vars: &[(&str, &str)],
+    mut env_var: impl FnMut(&str) -> Result<String, std::env::VarError>,
+) -> Result<Interpolation, ConfigError> {
     // Step 1: Replace $$ with NULL byte placeholder before main regex.
     // NULL bytes do not appear in valid YAML config files.
     debug_assert!(
@@ -117,6 +126,12 @@ pub fn interpolate_env_vars_with_metadata(
         let full_match = caps.get(0).unwrap();
         let var_name = caps.get(1).unwrap().as_str();
         let default_value = caps.get(2).map(|m| m.as_str());
+
+        // A placeholder can itself span YAML lines when an inline default
+        // contains a lone CR. Replacing that default with a single-line CLI or
+        // environment value removes a line break, which invalidates raw-source
+        // line mapping just as surely as introducing one does.
+        shifted_lines |= contains_yaml_line_break(full_match.as_str());
 
         // Validate env var name: must be UPPERCASE + underscores only
         if !var_name
@@ -143,7 +158,7 @@ pub fn interpolate_env_vars_with_metadata(
             shifted_lines |= contains_yaml_line_break(value);
             result.push_str(value);
         } else {
-            match std::env::var(var_name) {
+            match env_var(var_name) {
                 Ok(value) => {
                     shifted_lines |= contains_yaml_line_break(&value);
                     result.push_str(&value);
@@ -417,6 +432,33 @@ mod interpolation_tests {
         assert!(
             interpolation.shifted_lines,
             "YAML line break in default must invalidate raw line mapping"
+        );
+    }
+
+    #[test]
+    fn metadata_marks_lone_cr_default_removed_by_extra_var_as_a_line_shift() {
+        let yaml = "# ${VALUE:-first\rsecond}\nnodes: []\n";
+        let interpolation =
+            interpolate_env_vars_with_metadata(yaml, &[("VALUE", "replacement")]).unwrap();
+        assert_eq!(interpolation.text, "# replacement\nnodes: []\n");
+        assert!(
+            interpolation.shifted_lines,
+            "removing a YAML line break from a placeholder must invalidate raw line mapping"
+        );
+    }
+
+    #[test]
+    fn metadata_marks_lone_cr_default_removed_by_environment_as_a_line_shift() {
+        let yaml = "# ${VALUE:-first\rsecond}\nnodes: []\n";
+        let interpolation = interpolate_env_vars_with_metadata_using(yaml, &[], |name| {
+            assert_eq!(name, "VALUE");
+            Ok("replacement".to_string())
+        })
+        .unwrap();
+        assert_eq!(interpolation.text, "# replacement\nnodes: []\n");
+        assert!(
+            interpolation.shifted_lines,
+            "an environment override that removes a YAML line break must invalidate raw line mapping"
         );
     }
 }

@@ -94,19 +94,20 @@ The resulting diagram shows:
 - **When tuning parallelism** -- check which strategy the optimizer selected for each node.
 - **In code review** -- generate a DOT diagram and include it in the PR for visual confirmation.
 
-Explain runs instantly because it only parses the YAML and builds the plan -- no data is touched.
+Explain parses the YAML and builds the plan without opening runtime readers or
+processing records. Planning may inspect source metadata or matchers for cost
+estimates, but it does not create pipeline outputs.
 
 ```bash
 clinker run pipeline.yaml --explain       # parse, compile, print the plan
-clinker run pipeline.yaml --dry-run       # parse and validate the config only
+clinker run pipeline.yaml --dry-run       # parse and compile without printing the plan
 ```
 
-`--explain` is the stronger of the two as a pre-flight check. `--dry-run`
-stops after config validation -- it never compiles the plan, so schema
-binding, CXL type checking, and the plan-time gates on source and output
-config are not reached. A pipeline that `--dry-run` accepts can still fail at
-the start of a real run. Use `--explain` when you want everything a run
-checks before it reads data.
+Both commands perform the same compile-time checks: schema binding, CXL type
+checking, DAG wiring, and plan-time source and output gates. `--explain` also
+renders the compiled plan; bare `--dry-run` is the quieter validation form.
+Neither command opens runtime readers, processes records, or creates pipeline
+outputs.
 
 ## Retraction section
 

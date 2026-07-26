@@ -7,10 +7,12 @@ All notable changes to Clinker are tracked here.
 ### Fixed — dry-run now performs the documented compile check
 
 Bare `clinker run --dry-run` now compiles the plan and applies channel/group
-overlays before returning, while still stopping before source discovery or any
-data I/O. This restores the behavior the CLI reference, explain pages, and
-deployment examples already promised: CXL parsing and type checking, schema
-binding, DAG wiring, and plan-time gates all run during a dry-run.
+overlays before returning, while still stopping before runtime source discovery,
+reader and writer setup, or record processing. Compilation may inspect source
+metadata or matchers for planning estimates. This restores the behavior the CLI
+reference, explain pages, and deployment examples already promised: CXL parsing
+and type checking, schema binding, DAG wiring, and plan-time gates all run during
+a dry-run.
 
 ### Changed — compile failures retain structured diagnostics
 
@@ -20,6 +22,12 @@ severity, and spans into `PipelineError::Compilation`. Channel-overlay failures
 use `PipelineError::OverlayDiagnostics` so renderers do not blame the pipeline
 file for an overlay error. Downstream exhaustive matches on `PipelineError`
 must handle both variants.
+
+`clinker_core_types::Diagnostic::error` and `Diagnostic::warning` now enforce
+the compile-time diagnostic registry in debug builds. A code passed to either
+public constructor must be registered with the matching severity; an unknown or
+mismatched code triggers a debug assertion. Downstream code that constructs
+Clinker diagnostics must register its codes before upgrading.
 
 `PlanDiagnostics` also records whether its line-only spans are safe to resolve
 against the pipeline document. Untrusted spans remain in the structured value
