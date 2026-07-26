@@ -1,0 +1,110 @@
+# Supplier product feed (XML with repeated elements) -> CSV + normalised XML.
+#
+# The reason this scenario exists: `<category>` occurs more than once per
+# product, and a `multiple: true` schema column carries every occurrence as one
+# multi-value field — through the pipeline and back out, encoded per sink.
+#
+# The repeats are direct children of <product> rather than sitting in a
+# <categories> container. A container would flatten to the column name
+# `categories.category`, which CXL cannot address (#995) — readable, but not
+# transformable. The write side puts the container back with `wrap_in`.
+#
+# Money travels as integer minor units (`list_price_minor`), not as `24.50`.
+# That is good practice on its own, and currently necessary: the XML reader
+# type-infers element text and ignores the declared column type, so a decimal
+# arrives as a float expansion — see
+# https://github.com/rustpunk/clinker/issues/992. An integer element reads back
+# exactly, and the display amount is derived from it in decimal below.
+pipeline:
+  name: product_feed_normalize
+
+nodes:
+  - type: source
+    name: feed
+    config:
+      name: feed
+      type: xml
+      path: ./data/catalog.xml
+      options:
+        # Selects the repeating record element. Everything above it —
+        # <catalog>'s own attributes — is document context, not record data.
+        record_path: catalog/product
+        # Attributes are named `@name` by default, which is not a usable CXL
+        # identifier. Dropping the prefix gives the record's own `sku`
+        # attribute a plain column name. Note this covers attributes of the
+        # RECORD element only — `<catalog currency="USD">` belongs to the
+        # document, not the record, and is not a column at all.
+        attribute_prefix: ""
+      schema:
+        - { name: sku, type: string }
+        - { name: name, type: string }
+        - { name: brand, type: string }
+        - { name: list_price_minor, type: int }
+        - { name: cost_minor, type: int }
+        # The multi-value column. Every repeated <category> collects into ONE
+        # field on ONE record — the feed is not fanned out into a row per
+        # category. The repeated element is a direct child of <product>: inside
+        # a container it would flatten to `categories.category`, which CXL
+        # cannot address (#995).
+        - { name: category, type: string, multiple: true }
+        - { name: stock_on_hand, type: int }
+
+  - type: transform
+    name: normalize
+    description: Flatten to trade-ready columns and derive margin from minor units
+    input: feed
+    config:
+      cxl: |
+        # Integer minor units convert to an exact decimal amount. Doing the
+        # arithmetic in minor units first and converting once keeps every
+        # intermediate exact.
+        let list_minor = list_price_minor
+        let margin_minor = list_minor - cost_minor
+
+        emit sku = sku
+        emit product_name = name
+        emit brand = brand
+        emit list_price = list_minor.to_decimal() / "100".to_decimal()
+        emit cost = cost_minor.to_decimal() / "100".to_decimal()
+        emit margin = margin_minor.to_decimal() / "100".to_decimal()
+        # Decimal, not integer, division: `margin_minor * 100 / list_minor`
+        # truncates, and every row would print a flat 40 while the true figure
+        # for VF-3051 is 40.02.
+        let pct = margin_minor.to_decimal() * "100".to_decimal() / list_minor.to_decimal()
+        emit margin_pct = pct.round_to(2)
+        emit categories = category
+        emit in_stock = stock_on_hand > 0
+        emit stock_on_hand = stock_on_hand
+
+  - type: output
+    name: catalog_csv
+    description: Flat row per product; the multi-value column joins into one cell
+    input: normalize
+    config:
+      name: catalog_csv
+      type: csv
+      path: ./output/catalog.csv
+      include_unmapped: false
+      # A `multiple:` column has no single-cell form, so CSV joins it with a
+      # delimiter. The default is `;`; naming it here makes the contract
+      # explicit rather than implied.
+      join_values:
+        - { field: categories, delimiter: "|" }
+
+  - type: output
+    name: catalog_xml
+    description: Normalised XML — repeated <category> elements survive the round trip
+    input: normalize
+    config:
+      name: catalog_xml
+      type: xml
+      path: ./output/catalog.xml
+      include_unmapped: false
+      options:
+        root_element: catalog
+        record_element: product
+      # Without an override the items would emit as repeated <categories>
+      # elements named after the column. `repeat_as` names the item and
+      # `wrap_in` restores the container, so the output mirrors the input shape.
+      join_values:
+        - { field: categories, repeat_as: category, wrap_in: categories }

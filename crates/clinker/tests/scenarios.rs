@@ -37,6 +37,12 @@
 //!
 //! Review the resulting diff: a change in *shape* is the signal, a change in
 //! every row usually means the generator moved.
+//!
+//! A golden that a [`KnownBroken`] marker names is **not** re-blessed: the run
+//! is producing the wrong bytes, and that file is the only committed record of
+//! the right ones. Regenerate such a golden deliberately, from whatever variant
+//! of the scenario does behave correctly, and the blessing run says which files
+//! it skipped.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -55,12 +61,35 @@ struct Gate {
     input_digest: &'static str,
     /// Output files, relative to the scenario directory, compared byte-for-byte.
     outputs: &'static [&'static str],
-    /// Expected `total, ok, written, dlq` from the run summary.
+    /// The `total, ok, written, dlq` a **correct** engine produces.
+    ///
+    /// For a parked scenario this is the post-fix expectation, not what the
+    /// engine prints today; [`KnownBroken::current_counters`] carries the
+    /// latter. Pinning the correct value here is what lets the stale-marker
+    /// check fire on the run that fixes the underlying bug.
     counters: Counters,
-    /// Set when the scenario is known not to hold on current `main`. The
-    /// harness then requires the mismatch, so the gate stays honest and the
-    /// test fails loudly once the referenced issue is fixed.
-    known_broken: Option<&'static str>,
+    /// Set when the scenario does not hold on current `main`, naming precisely
+    /// what is wrong so that everything else stays gated.
+    known_broken: Option<KnownBroken>,
+}
+
+/// The specific ways a parked scenario currently deviates from its goldens.
+///
+/// Deliberately narrow. An earlier version of this mechanism carried only an
+/// issue string and tolerated *every* golden mismatch for the gate, which meant
+/// a scenario's still-working outputs silently stopped being checked the moment
+/// it was parked for an unrelated reason. Naming the failing outputs keeps the
+/// rest of the scenario under the gate.
+struct KnownBroken {
+    /// Issue describing why, surfaced in the stale-marker message.
+    issue: &'static str,
+    /// Outputs whose golden is expected NOT to match yet. A mismatch on any
+    /// output not listed here is a real regression and fails the gate.
+    failing_outputs: &'static [&'static str],
+    /// The run summary the engine prints today, when it differs from the
+    /// correct one in [`Gate::counters`]. `None` means the counters are
+    /// already correct and any deviation is a real failure.
+    current_counters: Option<Counters>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -80,7 +109,7 @@ const VOLATILE_DLQ_COLUMNS: usize = 2;
 const GATES: &[Gate] = &[
     Gate {
         id: "01-storefront-orders",
-        input_digest: "56c1401e7ea6",
+        input_digest: "0e3483cfe9a1",
         outputs: &["output/billable_lines.csv"],
         counters: Counters {
             total: 48,
@@ -91,8 +120,40 @@ const GATES: &[Gate] = &[
         known_broken: None,
     },
     Gate {
+        id: "02-product-feed-normalize",
+        input_digest: "250cd16cb79d",
+        outputs: &["output/catalog.csv", "output/catalog.xml"],
+        // The CORRECT summary: 14 records written to each of two sinks. The
+        // engine currently delivers to only one, so it prints 14 — declared
+        // below rather than pinned here, so that the run which fixes #996
+        // reports a stale marker instead of a counter mismatch.
+        counters: Counters {
+            total: 14,
+            ok: 14,
+            written: 28,
+            dlq: 0,
+        },
+        // The goldens state what this pipeline SHOULD write to both sinks. It
+        // currently writes nothing to the first: a node feeding two Outputs
+        // delivers records only to the last-declared one, silently and with
+        // exit 0 (#996). `output/catalog.csv` is committed as the output of the
+        // single-sink variant — the correct answer — and the marker names it as
+        // the one output allowed to differ. `output/catalog.xml` stays fully
+        // gated, so the sink that works today cannot regress unnoticed.
+        known_broken: Some(KnownBroken {
+            issue: "https://github.com/rustpunk/clinker/issues/996",
+            failing_outputs: &["output/catalog.csv"],
+            current_counters: Some(Counters {
+                total: 14,
+                ok: 14,
+                written: 14,
+                dlq: 0,
+            }),
+        }),
+    },
+    Gate {
         id: "03-support-triage",
-        input_digest: "d4c149c9653f",
+        input_digest: "7d6f476f9ca3",
         outputs: &[
             "output/urgent.csv",
             "output/standard.csv",
@@ -116,6 +177,13 @@ fn repo_root() -> PathBuf {
         .and_then(Path::parent)
         .expect("workspace root above crates/clinker")
         .to_path_buf()
+}
+
+/// Whether `rel` is an output the gate's marker declares currently broken.
+fn is_failing_output(gate: &Gate, rel: &str) -> bool {
+    gate.known_broken
+        .as_ref()
+        .is_some_and(|kb| kb.failing_outputs.contains(&rel))
 }
 
 fn updating() -> bool {
@@ -205,8 +273,9 @@ struct Failure {
 }
 
 impl Failure {
-    /// A golden mismatch — the defect class `known_broken` may suppress.
-    fn golden(message: String) -> Self {
+    /// A deviation a `known_broken` marker may declare and tolerate — a golden
+    /// mismatch on a named failing output, or the declared current run summary.
+    fn tolerable(message: String) -> Self {
         Self {
             tolerable: true,
             message,
@@ -307,16 +376,34 @@ fn run_gate(gate: &Gate) -> Vec<Failure> {
     }
 
     // The run summary is written to stdout.
+    // `Gate::counters` is the CORRECT summary. A parked scenario may print a
+    // different one — a sink that receives nothing also writes nothing, so the
+    // written count is part of what the bug gets wrong — and that deviation is
+    // declared rather than baked into the expectation. Anything neither correct
+    // nor the declared-current value is a real failure.
+    let current = gate
+        .known_broken
+        .as_ref()
+        .and_then(|kb| kb.current_counters.as_ref());
     match parse_counters(&stdout) {
-        Some(actual) if actual != gate.counters => failures.push(Failure::fatal(format!(
-            "{}: run summary {:?} does not match the gate's {:?}",
-            gate.id, actual, gate.counters
-        ))),
         None => failures.push(Failure::fatal(format!(
             "{}: could not find a 'Pipeline complete:' summary in stdout:\n{stdout}",
             gate.id
         ))),
-        Some(_) => {}
+        Some(actual) if actual == gate.counters => {}
+        Some(actual) if Some(&actual) == current => {
+            // Expected while parked; tolerable so the stale-marker check can
+            // see that the scenario is still broken in the declared way.
+            failures.push(Failure::tolerable(format!(
+                "{}: run summary is still the known-broken {:?}",
+                gate.id, actual
+            )));
+        }
+        Some(actual) => failures.push(Failure::fatal(format!(
+            "{}: run summary {:?} matches neither the correct {:?} nor the declared \
+             known-broken {:?}",
+            gate.id, actual, gate.counters, current
+        ))),
     }
 
     for rel in gate.outputs {
@@ -335,6 +422,18 @@ fn run_gate(gate: &Gate) -> Vec<Failure> {
         let actual = normalize(rel, &raw);
 
         if updating() {
+            // Never bless an output the marker declares broken: its committed
+            // golden is the only record of the CORRECT answer, and the run that
+            // would overwrite it is producing the wrong one. Re-blessing after
+            // a generator change would otherwise silently replace the expected
+            // output with the engine's current defect.
+            if is_failing_output(gate, rel) {
+                println!(
+                    "{}: keeping {rel} golden — declared known-broken, not re-blessed",
+                    gate.id
+                );
+                continue;
+            }
             std::fs::create_dir_all(golden.parent().expect("expected dir"))
                 .expect("create expected dir");
             std::fs::write(&golden, &actual).expect("write golden");
@@ -343,11 +442,20 @@ fn run_gate(gate: &Gate) -> Vec<Failure> {
 
         match std::fs::read(&golden) {
             Ok(expected) if expected == actual => {}
-            Ok(expected) => failures.push(Failure::golden(format!(
-                "{}: {rel} does not match its golden.\n{}",
-                gate.id,
-                first_difference(&expected, &actual)
-            ))),
+            Ok(expected) => {
+                let msg = format!(
+                    "{}: {rel} does not match its golden.\n{}",
+                    gate.id,
+                    first_difference(&expected, &actual)
+                );
+                // Only the outputs the marker names may deviate. Every other
+                // output stays fully gated while the scenario is parked.
+                failures.push(if is_failing_output(gate, rel) {
+                    Failure::tolerable(msg)
+                } else {
+                    Failure::fatal(msg)
+                });
+            }
             Err(_) => failures.push(Failure::fatal(format!(
                 "{}: no committed golden at {}. Create it with \
                  UPDATE_SCENARIO_GOLDENS=1 and review the result.",
@@ -396,16 +504,22 @@ fn every_scenario_matches_its_golden() {
                 .map(|f| f.message.clone()),
         );
 
-        match gate.known_broken {
-            // A gate marked known-broken must actually be broken *in the way
-            // the marker claims*. If the golden now matches, the marker is
-            // stale and the test says so rather than quietly continuing to skip
-            // a now-working scenario.
-            Some(issue) if !failures.iter().any(|f| f.tolerable) && !updating() => {
+        match gate.known_broken.as_ref() {
+            // A parked gate must still be broken in the way the marker claims.
+            // Only conclude that from a run that actually compared goldens: a
+            // fatal short-circuit (digest drift, wrong exit code, signal)
+            // returns before any comparison, so zero tolerable failures there
+            // means "nothing was checked", not "everything now passes".
+            Some(kb)
+                if !failures.iter().any(|f| f.tolerable)
+                    && !failures.iter().any(|f| !f.tolerable)
+                    && !updating() =>
+            {
                 report.push(format!(
-                    "{}: marked known-broken against {issue}, but its golden now matches. \
-                     Remove `known_broken` and land the golden.",
-                    gate.id
+                    "{}: marked known-broken against {}, but every declared deviation is \
+                     gone — the goldens and run summary now match. Remove `known_broken` \
+                     and let the scenario gate normally.",
+                    gate.id, kb.issue
                 ));
             }
             Some(_) => {}

@@ -75,9 +75,11 @@ that looks like it should control this, but its behaviour is under review in
 [#974](https://github.com/rustpunk/clinker/issues/974) — rename in the transform
 instead, where the reader can see it happen.
 
-**`sort_order` makes the output stable.** Without it, row order depends on how
-the engine schedules the read. With it, this file is reproducible — which is the
-precondition for comparing it against a golden.
+**Row order is stable because the read is.** A single-file source delivers
+records in file order, deterministically, so this output is byte-comparable
+against a committed golden without any sorting step. The Output node does have a
+`sort_order:` key — do not reach for it yet: it is parsed and documented but
+currently has no effect at all ([#950](https://github.com/rustpunk/clinker/issues/950)).
 
 ## Try changing it
 

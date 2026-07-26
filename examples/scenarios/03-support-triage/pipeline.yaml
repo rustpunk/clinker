@@ -85,8 +85,6 @@ nodes:
       type: csv
       path: ./output/urgent.csv
       include_unmapped: false
-      sort_order:
-        - field: ticket_id
 
   - type: output
     name: standard_queue
@@ -96,8 +94,6 @@ nodes:
       type: csv
       path: ./output/standard.csv
       include_unmapped: false
-      sort_order:
-        - field: ticket_id
 
   - type: output
     name: backlog_queue
@@ -107,8 +103,6 @@ nodes:
       type: json
       path: ./output/backlog.json
       include_unmapped: false
-      sort_order:
-        - field: ticket_id
 
 error_handling:
   # Keep going past a bad row rather than aborting the export. Without this the
