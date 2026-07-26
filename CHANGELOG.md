@@ -65,7 +65,7 @@ use compositions at all. Each condition now has its own code and its own page:
 
 | Condition | Was | Now |
 |---|---|---|
-| Channel var override disagrees with the pipeline's declared type, or its default does not match that type | `E107` | `E116` |
+| Channel var declaration changes an existing type, or its default does not match its declared type | `E107` | `E116` |
 | Channel var name shadows a reserved `$pipeline.*` / `$source.*` field | `E110` | `E117` |
 | `vars.source` block keyed by a source the pipeline does not declare | `E111` | `E118` |
 

@@ -357,6 +357,7 @@ pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
     ("E106", include_str!("../../../../docs/explain/E106.md")),
     ("E107", include_str!("../../../../docs/explain/E107.md")),
     ("E108", include_str!("../../../../docs/explain/E108.md")),
+    ("E110", include_str!("../../../../docs/explain/E110.md")),
     ("E115", include_str!("../../../../docs/explain/E115.md")),
     ("E116", include_str!("../../../../docs/explain/E116.md")),
     ("E117", include_str!("../../../../docs/explain/E117.md")),
@@ -680,7 +681,7 @@ mod tests {
         // reader of the overlay condition to a page about composition binding.
         // Each page must describe the overlay condition, not the one it left.
         for (code, marker) in [
-            ("E116", "channel var override"),
+            ("E116", "incompatible with its type contract"),
             ("E117", "shadows a reserved system field"),
             ("E118", "the pipeline does not declare"),
         ] {
@@ -698,6 +699,25 @@ mod tests {
             e107.contains("ycle"),
             "E107 must still describe the composition cycle it always did"
         );
+    }
+
+    #[test]
+    fn test_e110_and_e117_each_explain_only_their_primary_condition() {
+        let e110 = explain_code("E110").expect("E110 has an extraction page");
+        assert_eq!(
+            e110.lines().next(),
+            Some(
+                "# Error E110: an extraction selection names a node absent from the execution-plan DAG"
+            )
+        );
+        assert!(e110.contains("selected node 'clean_oder'"));
+
+        let e117 = explain_code("E117").expect("E117 has a reserved-name page");
+        assert_eq!(
+            e117.lines().next(),
+            Some("# Error E117: a channel var's name shadows a reserved system field")
+        );
+        assert!(e117.contains("$pipeline.execution_id"));
     }
 
     #[test]

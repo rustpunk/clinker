@@ -191,7 +191,7 @@ checked against the pipeline. Each code below tells you what to fix.
 | Code | What it catches                                                        |
 | ---- | ---------------------------------------------------------------------- |
 | E109 | Channel targets a composition but carries `vars:` overrides.           |
-| E116 | Channel var override declares a different type than the pipeline.      |
+| E116 | Channel var changes an existing type, or any default mismatches its declared type. |
 | E117 | Channel var name shadows a reserved system field for that scope.       |
 | E118 | Channel `vars.source.<src>` references an unknown source-node name.    |
 | E164 | An init-phase Transform has a runtime descendant.                      |
@@ -334,7 +334,8 @@ with `--channel acme-prod`; the `channel.target` field is authoritative.
 Override semantics (entry name already declared) require the channel's
 `type` to match the declared type — mismatches produce **E116**. Add
 semantics (entry name not yet declared) extend the registry with a new
-declaration. `$source` overrides are keyed by source-node name; an
+declaration. In both cases, a `default` that does not match the entry's `type`
+also produces **E116**. `$source` overrides are keyed by source-node name; an
 unknown source name produces **E118**. The reserved-name guard
 (**E117**) blocks channels from shadowing system fields like
 `$pipeline.execution_id` or `$source.path`. Channels that target a

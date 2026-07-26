@@ -290,13 +290,14 @@ stale-user-docs sweep.)
   `rg`-based check or review rule.
 - Priority: Medium
 
-### 18. Should diagnostic code pages exist for channel variable overlay errors?
+### 18. Should the remaining E109 and E111 conditions get explain pages?
 
-- Question: Should `E109`, `E110`, and `E111` get dedicated `docs/explain/`
-  pages and lookup coverage?
-- Why it matters: Channel var overlay failures are user-visible diagnostics.
-  Diagnostic-code lookup should be consistent for errors emitted by channel and
-  planning layers.
+- Question: Should `E109` and `E111` get dedicated `docs/explain/` pages and
+  lookup coverage?
+- Why it matters: E109 is a user-visible channel overlay failure and E111 is a
+  composition-body validation failure. E110 now has a dedicated extraction
+  page, and the former channel meanings split to E116-E118 with their own
+  pages; these two older conditions remain without lookup coverage.
 - Files/modules involved:
   `crates/clinker-channel/src/overlay.rs`,
   `docs/user/src/pipelines/channels.md`,

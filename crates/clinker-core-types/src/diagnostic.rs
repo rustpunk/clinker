@@ -92,7 +92,7 @@ diagnostic_registry! {
     // `clinker explain --code` send half its readers to the wrong page. Placed
     // with the rest of the channel/overlay family rather than appended at the
     // end of the registry.
-    "E116", Error, "A channel var override disagrees with the pipeline's declaration — a different type, or a default that does not match the declared type";
+    "E116", Error, "A channel var declaration is type-incompatible: an override changes the pipeline's type, or a default does not match the entry's declared type";
     "E117", Error, "A channel var's name shadows a reserved system field";
     "E118", Error, "A channel `vars.source` block is keyed by a source name the pipeline does not declare";
     "E120", Error, "Channel discovery exceeded the tenant-folder scan budget";
