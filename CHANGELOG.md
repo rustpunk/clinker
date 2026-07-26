@@ -36,9 +36,9 @@ use compositions at all. Each condition now has its own code and its own page:
 
 | Condition | Was | Now |
 |---|---|---|
-| Channel var override disagrees with the pipeline's declared type, or its default does not match that type | `E107` | `E364` |
-| Channel var name shadows a reserved `$pipeline.*` / `$source.*` field | `E110` | `E365` |
-| `vars.source` block keyed by a source the pipeline does not declare | `E111` | `E366` |
+| Channel var override disagrees with the pipeline's declared type, or its default does not match that type | `E107` | `E116` |
+| Channel var name shadows a reserved `$pipeline.*` / `$source.*` field | `E110` | `E117` |
+| `vars.source` block keyed by a source the pipeline does not declare | `E111` | `E118` |
 
 The old codes keep their original meanings — `E107` a cycle in the flat
 post-expansion graph, `E110` an extraction selection naming a node absent from

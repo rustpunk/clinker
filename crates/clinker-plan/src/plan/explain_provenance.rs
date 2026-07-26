@@ -364,6 +364,9 @@ pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
     ("E107", include_str!("../../../../docs/explain/E107.md")),
     ("E108", include_str!("../../../../docs/explain/E108.md")),
     ("E115", include_str!("../../../../docs/explain/E115.md")),
+    ("E116", include_str!("../../../../docs/explain/E116.md")),
+    ("E117", include_str!("../../../../docs/explain/E117.md")),
+    ("E118", include_str!("../../../../docs/explain/E118.md")),
     ("E300", include_str!("../../../../docs/explain/E300.md")),
     ("E301", include_str!("../../../../docs/explain/E301.md")),
     ("E303", include_str!("../../../../docs/explain/E303.md")),
@@ -418,9 +421,6 @@ pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
     ("E361", include_str!("../../../../docs/explain/E361.md")),
     ("E362", include_str!("../../../../docs/explain/E362.md")),
     ("E363", include_str!("../../../../docs/explain/E363.md")),
-    ("E364", include_str!("../../../../docs/explain/E364.md")),
-    ("E365", include_str!("../../../../docs/explain/E365.md")),
-    ("E366", include_str!("../../../../docs/explain/E366.md")),
     ("E323", include_str!("../../../../docs/explain/E323.md")),
     ("E150b", include_str!("../../../../docs/explain/E150b.md")),
     ("E150c", include_str!("../../../../docs/explain/E150c.md")),
@@ -686,9 +686,9 @@ mod tests {
         // reader of the overlay condition to a page about composition binding.
         // Each page must describe the overlay condition, not the one it left.
         for (code, marker) in [
-            ("E364", "channel var override"),
-            ("E365", "shadows a reserved system field"),
-            ("E366", "the pipeline does not declare"),
+            ("E116", "channel var override"),
+            ("E117", "shadows a reserved system field"),
+            ("E118", "the pipeline does not declare"),
         ] {
             let doc = explain_code(code).unwrap_or_else(|| panic!("{code} has no page"));
             assert!(doc.contains(code), "{code} page must name its own code");

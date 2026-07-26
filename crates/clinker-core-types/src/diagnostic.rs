@@ -86,6 +86,14 @@ diagnostic_registry! {
     "E113", Error, "Channel `config`/override key matches no parameter in the compiled plan (unknown key)";
     "E114", Error, "A structural overlay op cannot be applied (missing target, orphaning remove, breaking schema patch)";
     "E115", Error, "Composition body node fails node-scoped config validation (same checks as top-level nodes)";
+    // Split out of E107 / E110 / E111, which each also named an unrelated
+    // composition-binding condition. One code answering two questions makes
+    // `clinker explain --code` send half its readers to the wrong page. Placed
+    // with the rest of the channel/overlay family rather than appended at the
+    // end of the registry.
+    "E116", Error, "A channel var override disagrees with the pipeline's declaration — a different type, or a default that does not match the declared type";
+    "E117", Error, "A channel var's name shadows a reserved system field";
+    "E118", Error, "A channel `vars.source` block is keyed by a source name the pipeline does not declare";
     "E120", Error, "Channel discovery exceeded the tenant-folder scan budget";
     "E121", Error, "Channel manifest failed to parse";
     "E122", Error, "Channel discovery exceeded the group-file scan budget";
@@ -195,13 +203,6 @@ diagnostic_registry! {
     "E361", Error, "`multiple: true` column on a source whose format has no way to produce more than one value";
     "E362", Error, "Malformed `join_values:` output declaration (the write-side mirror of E358)";
     "E363", Error, "A source's `record_path` is not a path in its format's grammar — an XPath descendant step (`//`), a JSONPath root marker (`$.`), a leading `/`, an empty segment, or an XML segment no element can be named";
-    // ── Channel / group overlay declarations ────────────────────────────
-    // Split out of E107 / E110 / E111, which each also named an unrelated
-    // composition-binding condition. One code answering two questions makes
-    // `clinker explain --code` send half its readers to the wrong page.
-    "E364", Error, "A channel var override disagrees with the pipeline's declaration — a different type, or a default that does not match the declared type";
-    "E365", Error, "A channel var's name shadows a reserved system field";
-    "E366", Error, "A channel `vars.source` block is keyed by a source name the pipeline does not declare";
     // ── Path security ───────────────────────────────────────────────────
     "E-SEC-001", Error, "Path security violation (escape, symlink, etc.)";
     // ── Warnings ────────────────────────────────────────────────────────

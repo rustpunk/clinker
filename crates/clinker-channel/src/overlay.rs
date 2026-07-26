@@ -371,7 +371,7 @@ fn resolve_source_overrides(
     for (src_name, inner) in overrides {
         if !declared_sources.iter().any(|n| n == src_name) {
             diagnostics.push(Diagnostic::error(
-                "E366",
+                "E118",
                 format!(
                     "channel {:?}: source {:?} not declared in pipeline (known: {})",
                     channel_name,
@@ -420,7 +420,7 @@ fn validate_and_coerce(
         && reserved_names_for(scope).contains(&var_name)
     {
         diagnostics.push(Diagnostic::error(
-            "E365",
+            "E117",
             format!(
                 "channel {:?}: var ${}.{} shadows reserved system field",
                 channel_name, scope_label, var_name,
@@ -434,7 +434,7 @@ fn validate_and_coerce(
         && declared != decl.var_type
     {
         diagnostics.push(Diagnostic::error(
-            "E364",
+            "E116",
             format!(
                 "channel {:?}: var ${}.{} override type mismatch — declared {:?}, override declared {:?}",
                 channel_name, scope_label, var_name, declared, decl.var_type,
@@ -449,7 +449,7 @@ fn validate_and_coerce(
     let where_label = format!("channel {channel_name:?} vars.{scope_label}");
     if let Err(e) = check_scoped_var_default(&where_label, var_name, decl.var_type, default) {
         diagnostics.push(Diagnostic::error(
-            "E364",
+            "E116",
             format!(
                 "channel {:?}: var ${}.{} default does not match type {:?}: {e}",
                 channel_name, scope_label, var_name, decl.var_type,
