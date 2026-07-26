@@ -26,6 +26,11 @@ pub enum PipelineError {
     ///
     /// `Display` folds each diagnostic to `[CODE] message` plus its help, so a
     /// consumer that only has the `Display` string still gets the code.
+    ///
+    /// A renderer may draw a source snippet from a diagnostic's line anchor
+    /// only if it knows the anchor belongs to the document it is rendering;
+    /// see [`PipelineError::plan_diagnostics_unanchored`] for why that is not
+    /// always so, and how a caller that cannot tell says so.
     PlanDiagnostics(Vec<clinker_core_types::Diagnostic>),
     Compilation {
         transform_name: String,
@@ -310,6 +315,40 @@ pub enum PipelineError {
     Interrupted,
 }
 
+impl PipelineError {
+    /// Plan diagnostics whose line anchors must not be used to draw a source
+    /// snippet.
+    ///
+    /// A plan-time diagnostic's span is a bare line number
+    /// ([`Span::line_only`](clinker_core_types::span::Span::line_only)) with no
+    /// file identity attached. Most come from the pipeline file, but a
+    /// composition body's gates number lines in the *body* file and a
+    /// structural overlay op numbers them in the channel/group file. A
+    /// renderer holding only the pipeline text cannot tell those apart, and
+    /// resolving a body-file line against the pipeline would underline
+    /// unrelated YAML — or, past its end, nothing at all.
+    ///
+    /// So the caller decides. One that can prove every diagnostic came from
+    /// the file being rendered passes them through
+    /// [`PipelineError::PlanDiagnostics`] and keeps the snippet; one that
+    /// cannot uses this, which drops the anchors and leaves the code, message
+    /// and help to render on their own.
+    pub fn plan_diagnostics_unanchored(diags: Vec<clinker_core_types::Diagnostic>) -> Self {
+        use clinker_core_types::span::Span;
+        let stripped = diags
+            .into_iter()
+            .map(|mut d| {
+                d.primary.span = Span::SYNTHETIC;
+                for s in &mut d.secondary {
+                    s.span = Span::SYNTHETIC;
+                }
+                d
+            })
+            .collect();
+        Self::PlanDiagnostics(stripped)
+    }
+}
+
 impl fmt::Display for PipelineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -320,7 +359,15 @@ impl fmt::Display for PipelineError {
             Self::PlanDiagnostics(diags) => {
                 write!(f, "plan compilation failed:")?;
                 for d in diags {
-                    write!(f, "\n  [{}] {}", d.code, d.message)?;
+                    // Some messages already open with their own `[CODE]`
+                    // prefix -- the composition-body patch pass re-emits an op
+                    // failure that way. Prefixing again would print the code
+                    // twice.
+                    if d.message.starts_with(&format!("[{}]", d.code)) {
+                        write!(f, "\n  {}", d.message)?;
+                    } else {
+                        write!(f, "\n  [{}] {}", d.code, d.message)?;
+                    }
                     if let Some(help) = &d.help {
                         write!(f, "\n        help: {help}")?;
                     }
@@ -663,6 +710,56 @@ impl From<crate::runtime_error::SpillError> for PipelineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_core_types::span::Span;
+    use clinker_core_types::{Diagnostic, LabeledSpan};
+
+    fn diag(code: &str, message: &str) -> Diagnostic {
+        Diagnostic::error(
+            code,
+            message,
+            LabeledSpan::primary(Span::line_only(4), String::new()),
+        )
+    }
+
+    #[test]
+    fn plan_diagnostics_display_states_the_code_once() {
+        // The composition-body patch pass re-emits an op failure with its code
+        // already spelled into the message; prefixing again printed it twice.
+        let e = PipelineError::PlanDiagnostics(vec![
+            diag(
+                "E231",
+                "[E231] channel schema patch: unknown column 'ghost'",
+            ),
+            diag("E363", "source 'src': record_path is not a path"),
+        ]);
+        let rendered = e.to_string();
+        assert_eq!(rendered.matches("E231").count(), 1, "{rendered}");
+        assert!(
+            rendered.contains("[E231] channel schema patch"),
+            "{rendered}"
+        );
+        // A message without the prefix still gets one.
+        assert!(rendered.contains("[E363] source 'src'"), "{rendered}");
+    }
+
+    #[test]
+    fn plan_diagnostics_unanchored_drops_every_line_anchor() {
+        // A caller that cannot prove the lines belong to the document being
+        // rendered says so, and the renderer then has nothing to mis-point at.
+        let anchored = diag("E363", "source 'src': record_path is not a path")
+            .with_secondary(LabeledSpan::new(Span::line_only(9), None));
+        assert_eq!(anchored.primary.span.synthetic_line_number(), Some(4));
+
+        let e = PipelineError::plan_diagnostics_unanchored(vec![anchored]);
+        let PipelineError::PlanDiagnostics(diags) = &e else {
+            panic!("expected PlanDiagnostics");
+        };
+        assert_eq!(diags[0].primary.span.synthetic_line_number(), None);
+        assert_eq!(diags[0].secondary[0].span.synthetic_line_number(), None);
+        // The code, message and help are untouched -- only the anchor goes.
+        assert_eq!(diags[0].code, "E363");
+        assert!(e.to_string().contains("record_path is not a path"));
+    }
 
     #[test]
     fn spill_cap_exceeded_renders_e320_distinct_from_oom() {

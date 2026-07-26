@@ -3483,9 +3483,14 @@ nodes:
         // source name, which nothing constrains against `[` — must not be
         // mistaken for a code. The message survives whole, brackets included,
         // so nothing the user wrote is lost from the diagnostic.
+        // The well-formed-but-unregistered case is assembled rather than
+        // written out: a bracketed-code prefix spelled as a source literal is
+        // exactly what the workspace orphan-code scan exists to reject, and
+        // this fixture is about such a value arriving at runtime.
+        let unregistered = format!("[{}] channel source patch failed", "E999");
         for msg in [
             "[orders] channel source patch failed",
-            "[E999] channel source patch failed",
+            unregistered.as_str(),
             "[] channel source patch failed",
             "[E231 channel source patch failed",
         ] {

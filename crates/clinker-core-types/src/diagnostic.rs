@@ -107,6 +107,7 @@ diagnostic_registry! {
     "E164", Error, "Init-phase node has a runtime-phase descendant consuming its records";
     "E171", Error, "Scoped-var reader is not a DAG descendant of the Transform that writes it";
     "E172", Error, "`$source` scoped var read downstream of a Merge/Combine node (the per-source value is ambiguous there)";
+    "E173", Error, "Composition body reads a parent-scope `$pipeline` / `$source` var its `_compose.scoped_vars` schema does not opt into";
     "E174", Error, "Composition `scoped_vars` schema disagrees with the parent pipeline's declaration";
     "E175", Error, "Init-phase node reads a scoped var only a runtime-phase node writes";
     "E15Y", Error, "Aggregate with streaming strategy over relaxed-CK group_by";
@@ -127,6 +128,7 @@ diagnostic_registry! {
     "E219", Error, "`rest` transport declares a file matcher (path/glob/regex/paths)";
     "E220", Error, "`rest` transport declares a non-`json`/`xml` decode format";
     "E221", Error, "REST source read failure (HTTP request / body-read error)";
+    "E222", Error, "An envelope section declares a `json_pointer` that is not a valid RFC 6901 pointer";
     // ── Channel `sources:` patches ──────────────────────────────────────
     "E230", Error, "Channel source patch key is malformed, unaddressable, or targets a source no node declares";
     "E231", Error, "Channel schema patch names a column the source does not declare";
@@ -167,6 +169,7 @@ diagnostic_registry! {
     "E317", Error, "`error_handling.dlq.per_source` key does not name a declared Source";
     "E318", Error, "`error_handling.dlq.*.max_rate` out of `[0.0, 1.0]` or DLQ path collides";
     "E322", Error, "Two output destinations (Output nodes, or an Output node and a DLQ path) resolve to the same file";
+    "E324", Error, "`pipeline.memory.resume_threshold` does not sit below the soft/spill threshold, so the two form no hysteresis band";
     // ── Output splitting, document context, and envelopes ───────────────
     "E323", Error, "`edifact` output combined with byte-limit `split` (an interchange is one indivisible UNB..UNZ envelope)";
     "E338", Error, "`x12` output combined with byte-limit `split` (an interchange is one indivisible ISA..IEA envelope)";
@@ -177,8 +180,13 @@ diagnostic_registry! {
     "E343", Error, "A per-source-file output template (`{source_file}` / `{source_path}`) combined with a source declaring `dlq_granularity: document` (a buffered-and-flushed document is incompatible with per-record file fan-out)";
     "E348", Error, "A `$doc.<section>.<field>` access against a segment/positional source (X12 / EDIFACT / HL7) names a section the format does not synthesize, or a positional element outside the `e`/`f`-prefix pattern or beyond the configured `max_elements` / `max_fields`";
     "E349", Error, "A `$doc.<section>.<field>` access is attributed to a `rest` source (or a `rest` source declares an `envelope:` block) — a REST pull buffers no document, so the access can never resolve";
+    "E344", Error, "A source declares `dlq_granularity: document` together with `error_handling.strategy: fail_fast`, which contradict each other";
+    "E346", Error, "An output's envelope references a section, or requires a `footer_from_doc`, that its feeding sources do not provide";
+    "E347", Error, "`reconstruct_envelope` combined with per-file output splitting, a per-source-file path template, or a document-granularity DLQ source";
     "E353", Error, "Envelope header section references a body column — the header is emitted before the body streams, so it may read only `$vars` / `$source` / `$pipeline` / `$doc`";
     "E354", Error, "Envelope footer section declares an aggregate a streaming footer fold cannot compute";
+    "E355", Error, "A single-document-envelope output can be fed more than one document with no consolidating node on the path, which would silently merge distinct messages into one envelope";
+    "E357", Error, "An envelope section on a segment/positional source names a tier other than the one file-level header segment the reader resolves from its bounded pre-scan";
     "E356", Error, "A plain single-schema CSV / fixed-width source declares an `envelope:` block — a plain flat file carries no header/trailer structure to extract, so the declared sections are inert (a multi-record source declaring `discriminator:` + `records:` is unaffected)";
     // ── Multi-value declarations (fan-out, split, join) ──────────────────
     "E358", Error, "Malformed `split_to_rows:` / `split_values:` source declaration (duplicate, nested, undeclared column, or a format whose reader is never handed it)";

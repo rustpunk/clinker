@@ -31,6 +31,12 @@ enum Shape {
     /// A `code: "E123"` / `err_code: "E123"` struct-field initializer on a
     /// fault or error type whose code is later handed to `Diagnostic::error`.
     CodeField,
+    /// A message that carries its code as a `[E123]` prefix, the convention
+    /// plan-time `ConfigError::Validation` and CXL resolver diagnostics use.
+    /// These reach the user through the same `clinker explain --code` surface
+    /// as a `Diagnostic`, and `split_diagnostic_code` promotes some of them
+    /// into real `Diagnostic`s, so they are held to the same rule.
+    BracketedPrefix,
 }
 
 /// Workspace root, derived from this crate's manifest directory.
@@ -166,6 +172,21 @@ fn sites_in(path: &Path, src: &str) -> Vec<Site> {
         }
     }
 
+    // A string literal opening with `[CODE]`. Matched on the literal's first
+    // bytes rather than anywhere inside it, so a message that merely mentions
+    // a code -- an assertion, or a `See: clinker explain --code E123` pointer
+    // -- is not mistaken for one that carries it.
+    for (idx, _) in src.match_indices("\"[") {
+        let rest = &src[idx + 2..];
+        let Some(close) = rest.find(']') else {
+            continue;
+        };
+        let code = &rest[..close];
+        if looks_like_code(code) {
+            push(idx, code, Shape::BracketedPrefix);
+        }
+    }
+
     out
 }
 
@@ -199,6 +220,11 @@ fn every_emitted_diagnostic_code_is_registered() {
         sites.iter().any(|s| s.shape == Shape::CodeField),
         "scan matched no `code: \"...\"` field initializer; the scanner's \
          field pattern has gone stale"
+    );
+    assert!(
+        sites.iter().any(|s| s.shape == Shape::BracketedPrefix),
+        "scan matched no `\"[CODE] ...\"` message prefix; the scanner's \
+         prefix pattern has gone stale"
     );
 
     let mut orphans = String::new();

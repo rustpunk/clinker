@@ -94,12 +94,19 @@ The resulting diagram shows:
 - **When tuning parallelism** -- check which strategy the optimizer selected for each node.
 - **In code review** -- generate a DOT diagram and include it in the PR for visual confirmation.
 
-Explain runs instantly because it only parses the YAML and builds the plan -- no data is touched. Pair it with `--dry-run` for full config validation:
+Explain runs instantly because it only parses the YAML and builds the plan -- no data is touched.
 
 ```bash
-clinker run pipeline.yaml --explain       # inspect plan
-clinker run pipeline.yaml --dry-run       # validate config
+clinker run pipeline.yaml --explain       # parse, compile, print the plan
+clinker run pipeline.yaml --dry-run       # parse and validate the config only
 ```
+
+`--explain` is the stronger of the two as a pre-flight check. `--dry-run`
+stops after config validation -- it never compiles the plan, so schema
+binding, CXL type checking, and the plan-time gates on source and output
+config are not reached. A pipeline that `--dry-run` accepts can still fail at
+the start of a real run. Use `--explain` when you want everything a run
+checks before it reads data.
 
 ## Retraction section
 
@@ -162,21 +169,23 @@ printed before the run starts, and it carries four things:
 ```
 E363
 
-  × pipeline error in pipeline.yaml: source 'src': `record_path` "$.rows"
-  │ starts with the JSONPath root marker `$.`, which is not part of the
-  │ grammar; `record_path` is a dot-separated path of object keys, descended
-  │ from the document root (for example `data.rows`). Write "rows" instead
+  × source 'src': `record_path` "$.rows" starts with the JSONPath root marker
+  │ `$.`, which is not part of the grammar; `record_path` is a dot-separated
+  │ path of object keys, descended from the document root (for example
+  │ `data.rows`). Write "rows" instead
    ╭─[pipeline.yaml:4:1]
  3 │ nodes:
  4 │   - type: source
-   ·   ────────┬───────
-   ·           ╰── declared here
+   · ────────┬───────
+   ·         ╰── declared here
  5 │     name: src
    ╰────
   help: `record_path` on a `json` source is a dot-separated path of object
         keys descended from the document root: no `$.` JSONPath root marker,
-        no leading `/`, and no empty segments.
-        See: clinker explain --code E363
+        no leading `/`, and no empty segments. It takes precedence over
+        `format:`, so pair it with `format: object` or leave `format:` off.
+        Omit `record_path` entirely and the reader auto-detects the document
+        shape. Run `clinker explain --code E363` for the full grammar.
 ```
 
 - **The code** (`E363`) heads the report. Hand it to
@@ -184,11 +193,25 @@ E363
 - **The message** names the offending input and the rule it broke.
 - **The source line** is quoted from your YAML, with the offending node
   underlined.
-- **The `help:` paragraph** names the fix, and points at the code's explain
-  page when one exists.
+- **The `help:` paragraph** names the fix. When the gate does not already say
+  so, a `See: clinker explain --code <CODE>` line is appended.
 
-The same report is printed under `--explain` and `--dry-run`, because all
-three go through the same compile step.
+Warnings are reported the same way but marked `⚠` rather than `×`, so an
+advisory is distinguishable from the diagnostic that stopped the run.
+
+The same report is printed under `--explain`, which compiles the plan before
+printing it.
+
+Two notes on where the snippet comes from:
+
+- A pipeline that pulls in a composition body or a channel/group overlay is
+  reported without the quoted source line. A plan-time diagnostic carries a
+  line number but not which file it belongs to, and those two features
+  introduce a second file — so rather than risk underlining an unrelated line,
+  the report gives the code, message and help alone.
+- `--dry-run` does **not** print this report: it returns after config
+  validation, before the plan is compiled, so it exits `0` on a pipeline that
+  a real run rejects. Gate CI on `--explain`, not on `--dry-run`.
 
 ## Looking up diagnostic codes
 

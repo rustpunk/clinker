@@ -488,7 +488,7 @@ impl PipelineExecutor {
         let compile_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Compile);
         let validated_plan = config
             .compile(&compile_ctx)
-            .map_err(PipelineError::PlanDiagnostics)?;
+            .map_err(PipelineError::plan_diagnostics_unanchored)?;
         let plan = validated_plan.dag();
         collector.record(compile_timer.finish(0, 0));
 
@@ -1575,7 +1575,7 @@ impl PipelineExecutor {
     ) -> Result<(ExecutionPlanDag, ()), PipelineError> {
         let validated_plan = config
             .compile(&clinker_plan::config::CompileContext::default())
-            .map_err(PipelineError::PlanDiagnostics)?;
+            .map_err(PipelineError::plan_diagnostics_unanchored)?;
         Ok((validated_plan.dag().clone(), ()))
     }
 }

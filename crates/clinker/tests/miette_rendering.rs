@@ -382,6 +382,234 @@ nodes:
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[test]
+fn test_composition_body_diagnostic_does_not_point_into_the_pipeline_file() {
+    // A plan-time span is a bare line number with no file identity, and a
+    // composition body's gates number lines in the *body* file. Resolving one
+    // against the pipeline file underlines unrelated YAML -- here it landed on
+    // the output node -- or, past the file's end, silently nothing. A plan
+    // that binds a body therefore renders without a snippet at all.
+    let tmp = tempdir_path();
+    std::fs::write(
+        tmp.join("body.comp.yaml"),
+        r#"_compose:
+  name: body
+  inputs:
+    b_in:
+      schema:
+        - { name: customer_id, type: string }
+  outputs:
+    b_out: body_proj
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: body_proj
+    input: b_in
+    config:
+      cxl: |
+        emit z = not_a_column_in_the_body
+"#,
+    )
+    .expect("write body");
+    let yaml_path = tmp.join("main.yaml");
+    std::fs::write(
+        &yaml_path,
+        r#"pipeline:
+  name: comp_span
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: customer_id, type: string }
+  - type: composition
+    name: c1
+    input: src
+    use: ./body.comp.yaml
+    inputs:
+      b_in: src
+  - type: output
+    name: out
+    input: c1
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+    )
+    .expect("write main");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&yaml_path)
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        !output.status.success(),
+        "an unresolved identifier in a composition body must fail the run"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let flat = flatten_report(&stderr);
+
+    // The diagnostic still arrives whole.
+    assert!(flat.contains("E203"), "got:\n{stderr}");
+    assert!(flat.contains("not_a_column_in_the_body"), "got:\n{stderr}");
+    // But nothing from the pipeline file is underlined, because no line of it
+    // is implicated. A snippet header spells `<path>:<line>:<col>]`, so a
+    // digit right after the filename is the giveaway -- as distinct from the
+    // message prefix, which is `<path>: <message>`.
+    let anchored_at_a_line = flat
+        .split("main.yaml:")
+        .skip(1)
+        .any(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+    assert!(
+        !anchored_at_a_line,
+        "a body-file diagnostic must not anchor a snippet in the pipeline \
+         file; got:\n{stderr}"
+    );
+    assert!(
+        !flat.contains("declared here"),
+        "no snippet label may be drawn from an unattributable line; \
+         got:\n{stderr}"
+    );
+    // With no snippet header to name it, the message still says which
+    // pipeline failed.
+    assert!(flat.contains("main.yaml"), "got:\n{stderr}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_warning_is_not_painted_as_an_error() {
+    // `compile()` returns warnings alongside errors in its `Err` vector, and
+    // the whole vector is rendered. A W002 advisory styled identically to the
+    // E363 that actually stopped the run leaves the user unable to tell which
+    // is which.
+    let tmp = tempdir_path();
+    let yaml_path = tmp.join("warn_and_error.yaml");
+    std::fs::write(
+        &yaml_path,
+        r#"pipeline:
+  name: warn_and_error
+nodes:
+  - type: source
+    name: Src
+    config:
+      name: Src
+      type: json
+      path: in.json
+      options:
+        record_path: "$.rows"
+      schema:
+        - { name: amount, type: int }
+  - type: output
+    name: src
+    input: Src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+    )
+    .expect("write yaml");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&yaml_path)
+        .output()
+        .expect("spawn clinker");
+
+    assert!(!output.status.success(), "the E363 gate must fail the run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let flat = flatten_report(&stderr);
+
+    // Both diagnostics are present...
+    assert!(flat.contains("W002"), "got:\n{stderr}");
+    assert!(flat.contains("E363"), "got:\n{stderr}");
+    // ...and they are not styled the same. miette marks an error `x` and a
+    // warning with its own glyph, so exactly one report is an error.
+    assert_eq!(
+        flat.matches('\u{d7}').count(),
+        1,
+        "exactly one report -- the error -- may carry the error marker; \
+         got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_two_location_diagnostic_renders_both_locations() {
+    // E164 is unactionable with half of it shown: the node the author has to
+    // change is the runtime consumer, which is the secondary label.
+    let tmp = tempdir_path();
+    let yaml_path = tmp.join("two_location.yaml");
+    std::fs::write(
+        &yaml_path,
+        r#"pipeline:
+  name: two_location
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: amount, type: int }
+  - type: transform
+    name: init_t
+    input: src
+    config:
+      phase: init
+      cxl: |
+        emit doubled = amount * 2
+  - type: transform
+    name: runtime_t
+    input: init_t
+    config:
+      cxl: |
+        emit tripled = doubled + 1
+  - type: output
+    name: out
+    input: runtime_t
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+    )
+    .expect("write yaml");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&yaml_path)
+        .output()
+        .expect("spawn clinker");
+
+    assert!(!output.status.success(), "the E164 gate must fail the run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let flat = flatten_report(&stderr);
+
+    assert!(flat.contains("E164"), "got:\n{stderr}");
+    assert!(
+        flat.contains("init node"),
+        "the primary label must be rendered; got:\n{stderr}"
+    );
+    assert!(
+        flat.contains("runtime consumer"),
+        "the secondary label names the node the author must change, and must \
+         be rendered too; got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 /// Create an ephemeral per-test temp directory under the system
 /// temp root. Avoids adding a `tempfile` dev-dep.
 fn tempdir_path() -> std::path::PathBuf {
