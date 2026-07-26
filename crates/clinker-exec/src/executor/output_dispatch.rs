@@ -18,7 +18,7 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
     CorrelationRecordSlot, ExecutorContext, buffer_key_for_record, drain_node_buffer_slot,
-    push_dlq, push_write_error, sink_collision_dlq_entry, source_file_path_of,
+    mapping_probe, push_dlq, push_write_error, sink_collision_dlq_entry, source_file_path_of,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::structured_output_guard::{
@@ -312,12 +312,20 @@ pub(crate) fn dispatch_output(
     // commit arm emits a `GroupSizeExceeded` trigger.
     if !buffered.is_empty() {
         let max_buf = ctx.correlation_max_group_buffer;
+        // Disjoint field borrows: the probe map and the correlation buffers are
+        // separate fields, so both may be held across the loop.
+        let probe = mapping_probe(&mut ctx.mapping_probes, name, out_cfg);
         let buffers = ctx
             .correlation_buffers
             .as_mut()
             .expect("correlation_buffers is Some — we just checked above");
         for (record, rn, group_key) in buffered.iter() {
-            let projected = project_output_from_record(record, out_cfg, cxl_emit_names_opt);
+            let projected = crate::projection::project_output_probed(
+                record,
+                out_cfg,
+                cxl_emit_names_opt,
+                Some(probe),
+            );
             let entry = buffers.entry(group_key.clone()).or_default();
             entry.total_records += 1;
             if max_buf > 0 && entry.total_records > max_buf {
@@ -363,12 +371,6 @@ pub(crate) fn dispatch_output(
         };
         Arc::clone(projected.schema())
     };
-    // Write-boundary E365, checked here as well as in `build_format_writer`
-    // because this arm establishes its schema BEFORE it looks for a writer —
-    // so a dry-run, or an Output whose writer a sibling already took, still
-    // reports a `mapping:` entry the stream cannot supply instead of silently
-    // reporting what it "would" have written.
-    crate::projection::check_mapping_against_schema(&output_schema, out_cfg, name)?;
 
     // Find and take the writer for this output. Errors from
     // build_format_writer / write_record / flush are captured
@@ -413,6 +415,7 @@ pub(crate) fn dispatch_output(
             strategy,
             dlq_pending: &mut dlq_pending,
             written_rows: &mut written_rows,
+            mapping_probe: mapping_probe(&mut ctx.mapping_probes, name, out_cfg),
         };
         if let Some(per_file) = fan_out_writers {
             emit_fan_out(&mut fan_ctx, &unbuffered, per_file, scan_timer);
@@ -669,8 +672,16 @@ fn dispatch_output_envelope(
             return Ok(());
         }
         let projected = {
+            // Disjoint field borrows: the projection timer and the probe map are
+            // separate context fields, so the stage timing survives the probe.
             let _guard = ctx.projection_timer.guard();
-            project_output_from_record(&record, &out_cfg, cxl_emit_names_opt)
+            let probe = mapping_probe(&mut ctx.mapping_probes, name, &out_cfg);
+            crate::projection::project_output_probed(
+                &record,
+                &out_cfg,
+                cxl_emit_names_opt,
+                Some(probe),
+            )
         };
         {
             let _guard = ctx.write_timer.guard();
@@ -916,6 +927,9 @@ struct FanOutContext<'a> {
     write_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
     projection_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
     collector: &'a mut crate::executor::stage_metrics::StageCollector,
+    /// This Output's `mapping:` resolution evidence, carried in so the per-record
+    /// projections below feed the same probe the rest of the run's arms do.
+    mapping_probe: &'a mut crate::projection::MappingProbe,
     /// The run's error strategy, so a `join_values` `on_conflict: error`
     /// collision dead-letters under `Continue` but still aborts under
     /// `FailFast` — the same disposition every other per-record failure gets.
@@ -955,7 +969,12 @@ fn emit_single_writer(
             for (record, rn) in unbuffered {
                 let projected = {
                     let _guard = fan_ctx.projection_timer.guard();
-                    project_output_from_record(record, fan_ctx.out_cfg, fan_ctx.cxl_emit_names_opt)
+                    crate::projection::project_output_probed(
+                        record,
+                        fan_ctx.out_cfg,
+                        fan_ctx.cxl_emit_names_opt,
+                        Some(fan_ctx.mapping_probe),
+                    )
                 };
                 let write_result = {
                     let _guard = fan_ctx.write_timer.guard();
@@ -1052,7 +1071,12 @@ fn emit_fan_out(
         };
         let projected = {
             let _guard = fan_ctx.projection_timer.guard();
-            project_output_from_record(record, fan_ctx.out_cfg, fan_ctx.cxl_emit_names_opt)
+            crate::projection::project_output_probed(
+                record,
+                fan_ctx.out_cfg,
+                fan_ctx.cxl_emit_names_opt,
+                Some(fan_ctx.mapping_probe),
+            )
         };
         let write_result = {
             let _guard = fan_ctx.write_timer.guard();

@@ -71,9 +71,8 @@ a block matched no incoming field and so renamed nothing at all, and the
 diagnostic says so. It has no behaviour to preserve — swap those pairs back to
 what you originally meant.
 
-`mapping:` is now a column **selection**, not a rename overlay, so an item that
-resolves to nothing removes a column from the file rather than leaving it
-unrenamed. Five silent outcomes are therefore compile errors:
+`mapping:` is now a column **selection**, not a rename overlay. Four silent
+outcomes are therefore compile errors:
 
 - a repeated output name (**E364**);
 - an empty block, `mapping: {}` or `mapping: []` (**E364**) — it declares an
@@ -81,22 +80,70 @@ unrenamed. Five silent outcomes are therefore compile errors:
 - an output name that `include_unmapped: true` would also carry through
   (**E364**) — the file would carry the column twice and readers would resolve
   the passthrough copy, losing the renamed value;
-- `exclude:` naming a column the mapping *produces* (**E364**) — `exclude:`
-  matches incoming names and runs before the rename, so it suppressed nothing;
 - an item naming a column that does not exist at that point in the pipeline
   (**E365**, with the available column list and a `did you mean`).
 
-Where the compiler cannot prove a column absent — inside a composition body, or
-for a column arriving through the `auto_widen` sidecar — **E365** is raised at
-the write boundary instead, once per output, before the first byte is written.
+`exclude:` naming a column the mapping *produces* is deliberately **not** an
+error. `exclude:` matches incoming column names, so it removes the upstream
+column of that name and leaves the mapped one standing — which is exactly the
+fix the collision diagnostic above prescribes.
 
 A `mapping:` item may name an `auto_widen` drift column when the output sets
 `include_unmapped: true`, which is what expands the sidecar to top-level
 columns; under `include_unmapped: false` the sidecar stays packed and the item
-is rejected. Column names in `mapping:` are matched bare — there is no qualified
-`input.column` spelling.
+is rejected. The sidecar waiver is per item, not per block: a name one edit away
+from a column the row *does* declare keeps its **E365** and its `did you mean`,
+because that is a misspelling however the column travels. Column names in
+`mapping:` are matched bare — there is no qualified `input.column` spelling.
 
 Run `clinker explain E364` or `clinker explain E365` for the full pages.
+
+### Changed — every record writes every column an Output's `mapping:` declares
+
+**Breaking change for streams whose records differ in shape.** When a record
+does not carry an item's source column, that column is now written **empty**
+rather than omitted. Previously such a record passed through without the column,
+so the file's shape depended on the data.
+
+The declared column set is the same for every record, in declaration order. That
+follows from what the surface already promises: `mapping:` is the author's
+statement of which columns the file carries and in what order, and a column that
+vanishes on some rows contradicts both. It also makes the output schema a
+function of the config rather than of whichever record happened to arrive first —
+which matters, because most write paths derive the file's header from exactly
+that first record.
+
+Affected: a multi-record-type source, a composition body's open row, and columns
+reaching the sink through the `auto_widen` sidecar. A homogeneous stream, where
+every record carries every mapped column, is unchanged.
+
+If a `mapping:` block relied on the old behaviour to produce a
+per-record-variable column set, remove the items for the columns that vary and
+let `include_unmapped: true` append them instead — that path still follows the
+data.
+
+### Added — end-of-run reporting for an Output's `mapping:` block
+
+Two advisory warnings, printed to standard error when a run finishes. Neither
+changes the exit code: both describe a file that was written and is readable,
+and by the time a stream ends the run's other outputs have already been flushed.
+
+- **W365** — a `mapping:` item whose source column *no record* carried, so the
+  item wrote an empty column in every row. This replaces a write-boundary
+  **E365** that aborted such runs. The abort tested the wrong thing: it checked
+  the established output schema, which on most write paths is derived from the
+  first record, so it killed runs whose first record merely happened to be
+  sparse while staying silent about a column absent from every record after the
+  first. Tracking resolution across the whole stream separates the two cases
+  exactly — a misspelling is carried by no record, an ordinary sparse column is
+  carried by some record and is not reported.
+- **W366** — an upstream column dropped because a `mapping:` output name
+  occupies its place in the header. The mapped value still wins, unchanged; what
+  is new is that the displaced column is named rather than lost in silence.
+  Where the planner can enumerate the columns reaching that output, the same
+  collision remains an **E364** at compile time.
+
+Run `clinker explain W365` or `clinker explain W366` for the full pages.
 
 ### Removed — the `best_effort` error strategy
 

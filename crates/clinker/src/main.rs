@@ -625,12 +625,7 @@ fn main() -> ExitCode {
                         | PipelineError::CombineOutputCapExceeded { .. }
                         | PipelineError::EnvelopeMultiHeaderConflict { .. }
                         | PipelineError::EnvelopeHeaderGrainUnmatched { .. }
-                        | PipelineError::EnvelopeHeaderMultipleForGrain { .. }
-                        // E365 at the write boundary — the pipeline names a
-                        // column its own stream does not carry. A config
-                        // error the author fixes in the YAML, so exit 1 with
-                        // the rest of that class, not the data-quality exit 3.
-                        | PipelineError::OutputMappingColumnMissing { .. } => ExitCode::from(1),
+                        | PipelineError::EnvelopeHeaderMultipleForGrain { .. } => ExitCode::from(1),
                         // Disk-cap exceedance (E320) is a resource-exhaustion
                         // halt — the run filled its configured spill budget.
                         // Group it with the other infrastructure failures
@@ -2388,6 +2383,15 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             "  Total: {} bytes (compare against the --explain estimate)",
             report.cumulative_spill_bytes
         );
+    }
+
+    // Advisory end-of-run findings — today the per-Output `mapping:` report
+    // (W365 / W366). Rendered like the startup storage warnings: to stderr and
+    // the tracing log, leaving stdout for the run summary, and never affecting
+    // the exit code. Each describes a file that was written and is readable.
+    for advisory in &report.advisories {
+        tracing::warn!("{advisory}");
+        eprintln!("{advisory}");
     }
 
     // Exit codes per spec §10.2. An interrupted run takes precedence:

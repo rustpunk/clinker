@@ -154,6 +154,10 @@ pub(crate) struct DispatchOutcome {
     /// walk unwound early. Carried up so the report surfaces the
     /// interrupted state to the CLI.
     pub(crate) interrupted: bool,
+    /// Advisory end-of-run findings, already rendered. Today: the per-Output
+    /// `mapping:` report (W365 / W366). Never fatal — by the time a stream
+    /// ends its sibling Outputs have written.
+    pub(crate) advisories: Vec<String>,
 }
 
 /// Borrowed, read-only inputs threaded through `execute_dag` and
@@ -707,6 +711,7 @@ impl PipelineExecutor {
             per_stage_spill_bytes,
             peak_consumer_usage_bytes,
             interrupted,
+            advisories,
         } = Self::execute_dag(
             &DagExecInputs {
                 config,
@@ -816,6 +821,7 @@ impl PipelineExecutor {
             per_stage_spill_bytes,
             peak_consumer_usage_bytes,
             interrupted,
+            advisories,
         })
     }
 
@@ -1236,6 +1242,7 @@ impl PipelineExecutor {
             rollback_cursors: HashMap::new(),
             combine_input_snapshots: HashMap::new(),
             output_errors: Vec::new(),
+            mapping_probes: BTreeMap::new(),
             ok_source_rows: HashSet::new(),
             records_emitted: 0,
             transform_timer: stage_metrics::CumulativeTimer::new(),
@@ -1537,6 +1544,16 @@ impl PipelineExecutor {
         let per_stage_spill_bytes = ctx.memory_budget.per_stage_spill_bytes();
         let peak_consumer_usage_bytes = ctx.memory_budget.peak_consumer_usage();
         let interrupted = ctx.interrupted;
+        // Per-Output `mapping:` findings, over the WHOLE stream. Drained here
+        // rather than at each arm's close because an Output's records can reach
+        // the projection from several arms and several chunks, and only the
+        // union distinguishes a column no record carried from one some record
+        // did.
+        let advisories: Vec<String> = ctx
+            .mapping_probes
+            .iter()
+            .flat_map(|(output_name, probe)| probe.findings(output_name))
+            .collect();
         Ok(DispatchOutcome {
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
@@ -1549,6 +1566,7 @@ impl PipelineExecutor {
             per_stage_spill_bytes,
             peak_consumer_usage_bytes,
             interrupted,
+            advisories,
         })
     }
 

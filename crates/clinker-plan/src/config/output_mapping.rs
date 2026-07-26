@@ -506,39 +506,12 @@ pub fn output_mapping_faults(
                     ),
                 });
             }
-            // The output side is the subtler half: `exclude: [sold_to]` against
-            // `- sold_to: customer_id` looks like it suppresses the column, but
-            // `exclude:` matches INCOMING names and runs before the rename, so
-            // `sold_to` does not exist yet when it is consulted and the column
-            // is written anyway. Report the name the author actually has to act
-            // on rather than letting the exclusion silently do nothing.
-            let write_clashes: Vec<&str> = mapping
-                .entries()
-                .iter()
-                .filter(|e| !e.is_passthrough())
-                .map(|e| e.output.as_str())
-                .filter(|o| excluded(o))
-                .collect();
-            if !write_clashes.is_empty() {
-                faults.push(NodeFault {
-                    node_index,
-                    code: "E364",
-                    message: format!(
-                        "output '{out_name}': `exclude:` names {listed}, which `mapping:` \
-                         produces as an OUTPUT column name — `exclude:` matches incoming column \
-                         names and runs before the rename, so it would not suppress it and the \
-                         column would be written anyway",
-                        listed = quoted(&write_clashes),
-                    ),
-                    help: format!(
-                        "to drop the column, delete its `mapping:` item instead. To exclude the \
-                         column it is renamed FROM, name the source column in `exclude:` — but \
-                         then the mapping item cannot resolve either, so delete it as well. \
-                         Remove {listed} from `exclude:` to keep writing it.",
-                        listed = quoted(&write_clashes),
-                    ),
-                });
-            }
+            // Only the SOURCE side is a fault. `exclude:` operates on incoming
+            // column names, full stop, and naming one that the mapping also
+            // produces as an output name is not a mistake — it is the documented
+            // resolution for a collision between a mapped column and a
+            // passthrough of the same name, which the collision diagnostic's own
+            // help tells the author to write.
         }
     }
     faults
@@ -746,18 +719,18 @@ mod tests {
             assert!(f[0].0.contains("exclude"), "{}", f[0].0);
         }
 
-        /// The output side of the same clash: `exclude:` matches incoming names
-        /// and runs before the rename, so excluding a produced name suppresses
-        /// nothing and the column is written regardless.
+        /// `exclude:` naming a column the mapping also PRODUCES is not a fault.
+        /// `exclude:` operates on incoming names, so it removes the upstream
+        /// column of that name and leaves the mapped one — which is exactly the
+        /// resolution the collision diagnostic tells the author to write. A gate
+        /// here would reject the fix another diagnostic hands out.
         #[test]
-        fn excluding_a_mapping_output_name_is_rejected() {
+        fn excluding_a_mapping_output_name_is_not_a_fault() {
             let f = faults(&output_with(
                 &block("        - sku\n        - amount: qty\n"),
                 "      exclude: [amount]\n",
             ));
-            assert_eq!(f.len(), 1, "{f:?}");
-            assert!(f[0].0.contains("'amount'"), "{}", f[0].0);
-            assert!(f[0].0.contains("before the rename"), "{}", f[0].0);
+            assert!(f.is_empty(), "{f:?}");
         }
 
         /// A passthrough entry names one column on both sides, so excluding it

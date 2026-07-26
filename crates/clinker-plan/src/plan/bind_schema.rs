@@ -1450,8 +1450,7 @@ fn validate_output_mapping_columns(
     // expansion is gated on `include_unmapped: true`. Under `false` the sidecar
     // stays packed and a mapping naming one of its columns genuinely cannot
     // resolve, so the gate still applies there.
-    let sidecar_may_supply_anything = upstream
-        .has_field(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN)
+    let sidecar_expands = upstream.has_field(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN)
         && output.include_unmapped;
 
     // Suggest only author-facing columns: the engine-stamped namespaces
@@ -1472,39 +1471,50 @@ fn validate_output_mapping_columns(
             .join(", ")
     };
 
-    if !sidecar_may_supply_anything {
-        let mut missing: Vec<&str> = Vec::new();
-        for entry in mapping.entries() {
-            let source = entry.source.as_str();
-            if !is_available(source) && !missing.contains(&source) {
-                missing.push(source);
-            }
+    let mut missing: Vec<&str> = Vec::new();
+    for entry in mapping.entries() {
+        let source = entry.source.as_str();
+        if !is_available(source) && !missing.contains(&source) {
+            missing.push(source);
         }
-        for name in missing {
-            let help = match cxl::resolve::levenshtein::best_match(name, &candidate_refs, 3) {
-                Some(near) => format!(
-                    "did you mean `- <output_name>: {near}`? Columns available at output \
-                     {node_name:?}: {available}"
-                ),
-                None => format!(
-                    "columns available at output {node_name:?}: {available}. If '{name}' reaches \
-                     the sink only through `on_unmapped: auto_widen`, either set \
-                     `include_unmapped: true` on this output so the sidecar is expanded before \
-                     the mapping reads it, or declare the column in the source's `schema:` block"
-                ),
-            };
-            diags.push(
-                Diagnostic::error(
-                    "E365",
-                    format!(
-                        "output {node_name:?}: `mapping:` reads column '{name}', which does not \
-                         exist at this point in the pipeline"
-                    ),
-                    LabeledSpan::primary(span, String::new()),
-                )
-                .with_help(help),
-            );
+    }
+    for name in missing {
+        let near = cxl::resolve::levenshtein::best_match(name, &candidate_refs, 3);
+        // Per-ENTRY waiver, not per-block. Standing the gate down for the whole
+        // block whenever the sidecar is in play would let a plain typo through
+        // under `auto_widen`, which is the default source policy and therefore
+        // the commonest shape there is. A name close enough to a declared column
+        // to have a did-you-mean is a misspelling of that column, not a drift
+        // column that happens to resemble it, so it keeps its diagnostic. A name
+        // resembling nothing declared may genuinely be arriving in the sidecar,
+        // so it is left to the end-of-stream report — which knows, as no
+        // compile-time check can, whether any record actually carried it.
+        if sidecar_expands && near.is_none() {
+            continue;
         }
+        let help = match near {
+            Some(near) => format!(
+                "did you mean `- <output_name>: {near}`? Columns available at output \
+                 {node_name:?}: {available}"
+            ),
+            None => format!(
+                "columns available at output {node_name:?}: {available}. If '{name}' reaches \
+                 the sink only through `on_unmapped: auto_widen`, either set \
+                 `include_unmapped: true` on this output so the sidecar is expanded before \
+                 the mapping reads it, or declare the column in the source's `schema:` block"
+            ),
+        };
+        diags.push(
+            Diagnostic::error(
+                "E365",
+                format!(
+                    "output {node_name:?}: `mapping:` reads column '{name}', which does not \
+                     exist at this point in the pipeline"
+                ),
+                LabeledSpan::primary(span, String::new()),
+            )
+            .with_help(help),
+        );
     }
 
     // Collision gate. Only `include_unmapped: true` appends anything, so only

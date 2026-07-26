@@ -177,6 +177,16 @@ pub struct ExecutionReport {
     /// [`crate::pipeline::shutdown::ShutdownToken`]. The CLI maps this to
     /// the interrupted exit code (130). A clean run leaves it `false`.
     pub interrupted: bool,
+    /// Advisory end-of-run findings, already rendered, in Output declaration
+    /// order. Today: the per-Output `mapping:` report — **W365** for an entry
+    /// whose column no record carried, **W366** for an upstream column a mapped
+    /// output name displaced.
+    ///
+    /// Never fatal. Both describe a file that was written and is readable; by
+    /// the time a stream ends its sibling Outputs have flushed, so aborting
+    /// would leave a half-written run behind for a fault visible in the output
+    /// itself. Empty on a clean run.
+    pub advisories: Vec<String>,
 }
 
 /// Sum per-stage CPU and I/O deltas into run-level totals. Stages with `None`

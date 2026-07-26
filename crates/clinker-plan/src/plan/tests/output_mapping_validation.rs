@@ -155,20 +155,32 @@ fn a_mapping_entry_the_same_output_excludes_is_rejected() {
     assert!(d.message.contains("exclude"), "{}", d.message);
 }
 
-/// `exclude:` matches INCOMING names and runs before the rename, so excluding a
-/// mapping's OUTPUT name suppresses nothing and the column is written anyway.
+/// `exclude:` operates on INCOMING column names, so naming one the mapping also
+/// produces as an output name is not a fault — it removes the upstream column of
+/// that name and leaves the mapped one standing. That is precisely the fix the
+/// collision diagnostic (E364) hands the author, so rejecting it here would make
+/// one diagnostic reject the form another prescribes.
 #[test]
-fn excluding_a_mapping_output_name_is_rejected() {
-    let diags = compile_err(&pipeline(
-        "      exclude: [surname]\n      mapping:\n        - surname: last_name\n",
-    ));
-    let d = only(&diags, "E364");
-    assert!(d.message.contains("'surname'"), "{}", d.message);
-    assert!(
-        d.message.contains("before the rename"),
-        "message must name the ordering that makes the exclusion inert: {}",
-        d.message
+fn excluding_a_mapping_output_name_compiles() {
+    let yaml = pipeline("      exclude: [surname]\n      mapping:\n        - surname: last_name\n");
+    let config = parse_config(&yaml).expect("pipeline parses");
+    config
+        .compile(&CompileContext::default())
+        .expect("`exclude:` naming a produced output name is the documented collision fix");
+}
+
+/// End to end on the collision advice: an upstream column named the same as a
+/// mapped output, resolved by excluding the upstream one, compiles clean.
+#[test]
+fn the_collision_diagnostics_own_advice_compiles() {
+    let yaml = pipeline(
+        "      include_unmapped: true\n      exclude: [department]\n      mapping:\n        \
+         - department: first_name\n",
     );
+    let config = parse_config(&yaml).expect("pipeline parses");
+    config
+        .compile(&CompileContext::default())
+        .expect("excluding the colliding upstream column must resolve the collision");
 }
 
 /// The headline defect: a column name that matches nothing. It used to rename

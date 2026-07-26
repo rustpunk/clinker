@@ -12,6 +12,22 @@ mod tests {
         yaml: &str,
         csv_input: &str,
     ) -> Result<(clinker_record::PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+        let run = run_pipeline_reporting(yaml, csv_input)?;
+        Ok((run.counters, run.dlq, run.output))
+    }
+
+    /// What one in-memory run produced.
+    struct RunOutcome {
+        counters: clinker_record::PipelineCounters,
+        dlq: Vec<DlqEntry>,
+        output: String,
+        /// The run's advisory end-of-stream findings — the `mapping:` report.
+        advisories: Vec<String>,
+    }
+
+    /// [`run_pipeline`] plus the run's advisory findings, for the tests that
+    /// assert on the end-of-run `mapping:` report.
+    fn run_pipeline_reporting(yaml: &str, csv_input: &str) -> Result<RunOutcome, PipelineError> {
         let config = config::parse_config(yaml).unwrap();
         let output_buf = SharedBuffer::new();
 
@@ -41,8 +57,12 @@ mod tests {
         let report =
             PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
 
-        let output = output_buf.as_string();
-        Ok((report.counters, report.dlq_entries, output))
+        Ok(RunOutcome {
+            counters: report.counters,
+            dlq: report.dlq_entries,
+            output: output_buf.as_string(),
+            advisories: report.advisories,
+        })
     }
 
     /// Determine exit code from pipeline result (mirrors main.rs logic).
@@ -77,8 +97,7 @@ mod tests {
                 | PipelineError::CombineOutputCapExceeded { .. }
                 | PipelineError::EnvelopeMultiHeaderConflict { .. }
                 | PipelineError::EnvelopeHeaderGrainUnmatched { .. }
-                | PipelineError::EnvelopeHeaderMultipleForGrain { .. }
-                | PipelineError::OutputMappingColumnMissing { .. },
+                | PipelineError::EnvelopeHeaderMultipleForGrain { .. },
             ) => 1,
             Err(
                 PipelineError::Eval(_)
@@ -477,21 +496,19 @@ nodes:
         );
     }
 
-    /// The write-boundary half of E365, end to end. The plan-time gate stands
-    /// down here on purpose: the source reserves the `auto_widen` sidecar and
-    /// `include_unmapped: true` expands it, so at compile time `nickname` might
-    /// genuinely arrive. It does not — and because `mapping:` SELECTS, a silent
-    /// skip would write a file missing the column the block declared. The run
-    /// must fail instead.
+    /// A mapping entry no record resolves, end to end. The compile gate stands
+    /// down on purpose — the source reserves the `auto_widen` sidecar and
+    /// `include_unmapped: true` expands it, so `goes_by` might genuinely arrive,
+    /// and `goes_by` is not a near-miss of any declared column.
     ///
-    /// This is the same guard that covers a mapping inside a composition body,
-    /// whose rows are open by construction and which the plan gate therefore
-    /// also cannot check: both reach the writer through the one dispatch arm.
+    /// The run completes and writes the declared column, empty; the end-of-run
+    /// report names the entry. Aborting instead would kill a run whose sibling
+    /// Outputs have already flushed, over a fault that is visible in the file.
     #[test]
-    fn a_mapping_column_the_stream_never_supplies_fails_the_run() {
+    fn a_mapping_column_no_record_supplies_writes_empty_and_is_reported() {
         let yaml = r#"
 pipeline:
-  name: mapping_runtime_gate
+  name: mapping_runtime_report
 nodes:
 - type: source
   name: people
@@ -516,18 +533,190 @@ nodes:
     - nickname: goes_by
 "#;
         let csv = "first_name\nAlice\n";
-        let err = run_pipeline(yaml, csv).expect_err("an unresolved mapping entry must fail");
-        let rendered = err.to_string();
-        assert!(rendered.contains("E365"), "{rendered}");
+        let run = run_pipeline_reporting(yaml, csv).expect("the run completes");
+        let advisories = &run.advisories;
+
+        assert_eq!(run.counters.records_written, 1);
+        assert_eq!(
+            run.output, "first_name,nickname\nAlice,\n",
+            "the declared column is written, empty — the file's shape follows the block, \
+             not the data"
+        );
+        assert_eq!(advisories.len(), 1, "{advisories:?}");
+        assert!(advisories[0].contains("W365"), "{}", advisories[0]);
         assert!(
-            rendered.contains("'goes_by'"),
-            "the message names the source column the author must correct: {rendered}"
+            advisories[0].contains("'goes_by'"),
+            "the report names the source column the author must correct: {}",
+            advisories[0]
+        );
+    }
+
+    /// A genuinely heterogeneous stream, and the property the whole redesign
+    /// exists for: the file's column set follows the `mapping:` block, not
+    /// whichever record happened to arrive first.
+    ///
+    /// A JSON source because a CSV file's header fixes every record's column
+    /// set, so it cannot express a record that lacks a column. `goes_by` is
+    /// undeclared, so it reaches the sink through the `auto_widen` sidecar — on
+    /// one record and not the other. A CSV sink because its header IS the
+    /// projected column set, so the assertion reads it directly.
+    ///
+    /// Run twice, once in each record order. Under the previous skip-the-column
+    /// behaviour the sparse-first order lost `nickname` for every record, since
+    /// the header is derived from the first record's projection. The two runs
+    /// must now agree.
+    #[test]
+    fn a_heterogeneous_stream_null_fills_whatever_order_records_arrive_in() {
+        let yaml = r#"
+pipeline:
+  name: mapping_heterogeneous
+nodes:
+- type: source
+  name: people
+  config:
+    name: people
+    type: json
+    path: test.json
+    schema:
+    - { name: first_name, type: string }
+- type: output
+  name: out
+  input: people
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: true
+    mapping:
+    - first_name
+    - nickname: goes_by
+"#;
+
+        let dense_first = run_pipeline_reporting(
+            yaml,
+            r#"[{"first_name":"Alice","goes_by":"Al"},{"first_name":"Bob"}]"#,
+        )
+        .expect("the run completes");
+        assert_eq!(dense_first.counters.records_written, 2);
+        assert_eq!(
+            dense_first.output, "first_name,nickname\nAlice,Al\nBob,\n",
+            "the record without the column still carries it, empty"
         );
         assert!(
-            rendered.contains("'first_name'"),
-            "the message lists the columns that are present: {rendered}"
+            dense_first.advisories.is_empty(),
+            "a column some record carried is sparse, not a typo: {:?}",
+            dense_first.advisories
         );
-        assert_eq!(exit_code(&Err(err)), 1);
+
+        let sparse_first = run_pipeline_reporting(
+            yaml,
+            r#"[{"first_name":"Bob"},{"first_name":"Alice","goes_by":"Al"}]"#,
+        )
+        .expect("the run completes");
+        assert_eq!(
+            sparse_first.output, "first_name,nickname\nBob,\nAlice,Al\n",
+            "the declared column survives a first record that does not carry it"
+        );
+        assert!(
+            sparse_first.advisories.is_empty(),
+            "{:?}",
+            sparse_first.advisories
+        );
+    }
+
+    /// W366 end to end. `sold_to` is not in the source's `schema:`, so it
+    /// reaches the sink through the `auto_widen` sidecar and the plan gate
+    /// cannot see the collision with the mapping's output name. The mapped value
+    /// wins — that is deterministic and documented — and the displaced upstream
+    /// column is named rather than dropped in silence.
+    #[test]
+    fn a_passthrough_a_mapping_output_name_displaced_is_reported() {
+        let yaml = r#"
+pipeline:
+  name: mapping_collision_report
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: test.csv
+    options:
+      has_header: true
+    schema:
+    - { name: order_id, type: string }
+    - { name: customer_id, type: string }
+- type: output
+  name: out
+  input: orders
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: true
+    mapping:
+    - order_id
+    - sold_to: customer_id
+"#;
+        let csv = "order_id,customer_id,sold_to\nA-1,C-9,stale\n";
+        let run = run_pipeline_reporting(yaml, csv).expect("the run completes");
+        let advisories = &run.advisories;
+
+        assert_eq!(
+            run.output, "order_id,sold_to\nA-1,C-9\n",
+            "one `sold_to` column, carrying the MAPPED value"
+        );
+        assert_eq!(advisories.len(), 1, "{advisories:?}");
+        assert!(advisories[0].contains("W366"), "{}", advisories[0]);
+        assert!(
+            advisories[0].contains("'sold_to'"),
+            "the report names the displaced upstream column: {}",
+            advisories[0]
+        );
+    }
+
+    /// The narrower contrast, on the CSV path where every record shares one
+    /// column set: a column present but EMPTY on a record still resolves. An
+    /// empty value is not an absent column, so the report stays quiet.
+    #[test]
+    fn a_column_some_record_supplies_is_not_reported() {
+        let yaml = r#"
+pipeline:
+  name: mapping_sparse
+nodes:
+- type: source
+  name: people
+  config:
+    name: people
+    type: csv
+    path: test.csv
+    options:
+      has_header: true
+    on_unmapped:
+      mode: drop
+    schema:
+    - { name: first_name, type: string }
+    - { name: nickname, type: string }
+- type: output
+  name: out
+  input: people
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: false
+    mapping:
+    - first_name
+    - goes_by: nickname
+"#;
+        let csv = "first_name,nickname\nAlice,Al\nBob,\n";
+        let run = run_pipeline_reporting(yaml, csv).expect("the run completes");
+        assert_eq!(run.output, "first_name,goes_by\nAlice,Al\nBob,\n");
+        assert!(
+            run.advisories.is_empty(),
+            "an empty value is not an absent column: {:?}",
+            run.advisories
+        );
     }
 
     /// Over-rejection guard for the same gate: a mapping every record can

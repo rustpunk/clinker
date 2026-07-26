@@ -81,6 +81,25 @@ pub fn project_output_from_record(
     config: &OutputConfig,
     cxl_emit_names: Option<&[String]>,
 ) -> Record {
+    project_output_probed(input_record, config, cxl_emit_names, None)
+}
+
+/// [`project_output_from_record`] with the per-Output [`MappingProbe`] the
+/// end-of-stream report is built from.
+///
+/// Every per-record projection for one Output must feed the SAME probe, or an
+/// entry that resolved only on the records routed elsewhere reads as never
+/// resolved. Callers with no stream-scoped home for one pass `None`; those are
+/// the ad-hoc and test projections, which produce no report.
+pub fn project_output_probed(
+    input_record: &Record,
+    config: &OutputConfig,
+    cxl_emit_names: Option<&[String]>,
+    mut probe: Option<&mut MappingProbe>,
+) -> Record {
+    if let Some(probe) = probe.as_deref_mut() {
+        probe.note_record();
+    }
     let drop_unmapped =
         !config.include_unmapped && cxl_emit_names.is_some() && config.mapping.is_none();
     let needs_rewrite = config.exclude.is_some()
@@ -180,88 +199,126 @@ pub fn project_output_from_record(
 
     if let Some(ref exclude_list) = config.exclude {
         for name in exclude_list {
-            fields.swap_remove(name.as_str());
+            // Order-preserving. `swap_remove` moves the map's last entry into
+            // the hole, so `a,b,c,d` minus `b` would emit `a,d,c` and break the
+            // relative order the passthrough columns are documented to keep.
+            // `exclude:` lists are author-sized, so the shift is cheap.
+            fields.shift_remove(name.as_str());
         }
     }
 
     // `mapping:` is the ordered declaration of the columns this output
-    // carries: listed columns first, in declaration order, under their
-    // declared names, then — when `include_unmapped` is set — everything
+    // carries: every listed column, in declaration order, under its
+    // declared name, then — when `include_unmapped` is set — everything
     // the block did not claim, in its existing relative order.
     //
-    // Per-record cost: one probe per listed column plus one
-    // `claims_source` probe per surviving column. Every index the loop
-    // consults is resolved once when the config is parsed, and a listed
-    // column's value is MOVED out of `fields` rather than copied — the
-    // slot is left holding a `Null` placeholder that the append loop
-    // below never reaches, because it skips claimed sources. Only a
-    // source feeding two output columns is cloned, and only for the
-    // readers before the last. So this allocates nothing per record
-    // beyond the output record itself; the previous rename pass
-    // allocated a whole second `IndexMap` on every record.
+    // A listed column absent from THIS record is written as `Value::Null`,
+    // not skipped. That is what makes the output schema a function of the
+    // config alone rather than of whichever record happened to arrive
+    // first: `mapping:` states which columns the file carries and in what
+    // order, and a column that vanishes on some rows contradicts both.
+    // Heterogeneous streams — an `auto_widen` sidecar, a multi-record-type
+    // source, a composition body's open row — are exactly the shapes where
+    // a per-record column set would otherwise leak into the file's shape.
+    //
+    // Per-record cost: one lookup per listed column plus one `claims_*`
+    // lookup per surviving column. Every index the loop consults is
+    // resolved once when the config is parsed, and a listed column's value
+    // is MOVED out of `fields` rather than copied — the slot is left
+    // holding a `Null` placeholder that the append loop below never
+    // reaches, because it skips claimed sources. Only a source feeding two
+    // output columns is cloned, and only for the readers before the last.
+    // So this allocates nothing per record beyond the output record itself.
     //
     // The placeholder trick is what keeps the append order intact:
-    // removing the slot outright would need `swap_remove` (which
-    // reorders the passthrough columns) or `shift_remove` (which is
-    // O(n) per listed column).
+    // removing the slot outright would need `swap_remove` (which reorders
+    // the passthrough columns) or a shift per listed column.
     let (names, values): (Vec<Box<str>>, Vec<Value>) = match config.mapping.as_ref() {
         Some(mapping) => {
             let mut names: Vec<Box<str>> = Vec::with_capacity(mapping.entries().len());
             let mut values: Vec<Value> = Vec::with_capacity(mapping.entries().len());
             for (index, entry) in mapping.entries().iter().enumerate() {
-                // A listed column absent from this record is skipped rather
-                // than emitted empty. The plan-time E365 gate rejects a name
-                // the graph cannot supply where it can see the column set, and
-                // the write boundary rejects one it cannot, so what reaches
-                // here is a column that exists in the schema but not on this
-                // row.
-                let Some(slot) = fields.get_mut(entry.source.as_str()) else {
-                    continue;
-                };
-                let value = if mapping.is_last_reader(index) {
-                    std::mem::replace(slot, Value::Null)
-                } else {
-                    slot.clone()
+                let value = match fields.get_mut(entry.source.as_str()) {
+                    Some(slot) => {
+                        if let Some(probe) = probe.as_deref_mut() {
+                            probe.note_resolved(index);
+                        }
+                        if mapping.is_last_reader(index) {
+                            std::mem::replace(slot, Value::Null)
+                        } else {
+                            slot.clone()
+                        }
+                    }
+                    // Absent on this row. The column is still written, empty,
+                    // so the file's shape does not depend on the data. An entry
+                    // that resolves on NO record is a typo rather than a sparse
+                    // column, and the probe's end-of-stream report says so.
+                    None => Value::Null,
                 };
                 names.push(Box::<str>::from(entry.output.as_str()));
                 values.push(value);
             }
             if config.include_unmapped {
                 for (name, value) in fields {
-                    // `claims_output` is the collision guard: a passthrough
-                    // column whose name the block already writes must not be
-                    // appended beside it. `SchemaBuilder` does not dedupe and
-                    // the schema's name index is last-write-wins, so the
-                    // appended column would answer `Record::get` for the
-                    // mapped one and serve its value under the mapped header.
-                    // The plan gate catches this where it can enumerate the
-                    // upstream columns; open rows and sidecar-expanded columns
-                    // reach here unchecked, so this guard is not redundant.
-                    if !mapping.claims_source(name.as_str())
-                        && !mapping.claims_output(name.as_str())
-                    {
-                        names.push(Box::<str>::from(name.as_str()));
-                        values.push(value);
+                    if mapping.claims_source(name.as_str()) {
+                        continue;
                     }
+                    // Collision guard: a passthrough column whose name the block
+                    // already writes must not be appended beside it.
+                    // `SchemaBuilder` does not dedupe and the schema's name
+                    // index is last-write-wins, so the appended column would
+                    // answer `Record::get` for the mapped one and serve its
+                    // value under the mapped header. The mapping is the author's
+                    // explicit statement, so the mapped column wins — but the
+                    // displaced one is recorded, because dropping real upstream
+                    // data silently is the thing this must not do. The plan gate
+                    // catches this where it can enumerate the upstream columns;
+                    // open rows and sidecar-expanded columns reach here
+                    // unchecked, so the guard is not redundant.
+                    if mapping.claims_output(name.as_str()) {
+                        if let Some(probe) = probe.as_deref_mut() {
+                            probe.note_shadowed(name.as_str());
+                        }
+                        continue;
+                    }
+                    names.push(Box::<str>::from(name.as_str()));
+                    values.push(value);
                 }
             } else {
                 // `include_unmapped: false` drops the unlisted USER columns.
                 // The engine-stamped correlation shadows are governed by their
                 // own flag, so a mapping must not silently defeat an explicit
-                // `include_correlation_keys: true` — they are appended after
-                // the declared columns instead. A `$`-prefixed key can only be
-                // in `fields` because that flag admitted it: `$` is a reserved
-                // engine namespace no source column may claim, the `$widened`
-                // slot was removed above, and sidecar expansion (the other
-                // source of extra keys) runs only on the branch above.
-                for (name, value) in fields {
-                    if name.starts_with('$')
-                        && !mapping.claims_source(name.as_str())
-                        && !mapping.claims_output(name.as_str())
-                    {
-                        names.push(Box::<str>::from(name.as_str()));
-                        values.push(value);
+                // `include_correlation_keys: true` — they are appended after the
+                // declared columns instead.
+                //
+                // Selected by FieldMetadata, never by a name prefix: `$` is not
+                // reserved on the input side, so a source column named `$id` or
+                // `$schema` (ordinary in JSON-Schema and MongoDB-shaped
+                // payloads) is a user column and must stay dropped here. The
+                // record's correlation fields sit after its user fields in
+                // schema order, which is the order `fields` was gathered in, so
+                // walking them directly preserves the append order.
+                for (name, _) in input_record.iter_correlation_fields() {
+                    if mapping.claims_source(name) {
+                        continue;
                     }
+                    if mapping.claims_output(name) {
+                        if let Some(probe) = probe.as_deref_mut() {
+                            probe.note_shadowed(name);
+                        }
+                        continue;
+                    }
+                    // `exclude:` may have removed it, and a CK column is present
+                    // in `fields` only when `include_correlation_keys` admitted
+                    // it in the first place. `swap_remove` is safe here where it
+                    // was not above: the append order comes from the record's
+                    // schema walk, not from `fields`, and `fields` is dead after
+                    // this loop.
+                    let Some(value) = fields.swap_remove(name) else {
+                        continue;
+                    };
+                    names.push(Box::<str>::from(name));
+                    values.push(value);
                 }
             }
             (names, values)
@@ -287,70 +344,144 @@ pub fn project_output_from_record(
     out
 }
 
-/// Every `mapping:` output name absent from an established output schema.
+/// Per-Output evidence about how a `mapping:` block resolved over a whole
+/// stream, and the source of its end-of-stream report.
 ///
-/// Empty for a well-formed stream. A name is missing exactly when the entry's
-/// source column was not on the records the schema was derived from, so this
-/// is the write-boundary half of **E365**: the plan-time gate answers the
-/// question wherever it can enumerate the upstream columns, and this answers it
-/// where it cannot — inside a composition body (whose rows are open by
-/// construction, and where an open tail may legitimately supply anything) and
-/// for columns that arrive only through the `auto_widen` sidecar.
+/// Exists because absence is a property of the *stream*, not of the output
+/// schema. Every record now carries every declared column (an unresolved entry
+/// writes `Value::Null`), so the schema can no longer answer "did this entry
+/// ever find its column" — and the schema was the wrong place to ask anyway: it
+/// is derived from the first record on every arm except the buffered CSV union,
+/// and a first-record-derived answer is either too strict (a legitimately sparse
+/// column aborts the run) or too loose (a column absent from every LATER record
+/// goes unreported).
 ///
-/// Checked against the SCHEMA, once per output stream, not per record: whether
-/// a column exists is a property of the stream. Under selection semantics a
-/// mapping entry that resolves to nothing deletes a column from the file, and
-/// with `include_unmapped: false` a wholly unresolvable block writes an empty
-/// header and blank rows — so silence here is data loss, not a no-op.
-pub fn missing_mapping_outputs(
-    schema: &clinker_record::Schema,
-    config: &OutputConfig,
-) -> Vec<String> {
-    let Some(mapping) = config.mapping.as_ref() else {
-        return Vec::new();
-    };
-    let present: std::collections::HashSet<&str> = schema.columns().iter().map(|c| &**c).collect();
-    let mut missing: Vec<String> = Vec::new();
-    for entry in mapping.entries() {
-        if !present.contains(entry.output.as_str()) && !missing.contains(&entry.output) {
-            missing.push(entry.output.clone());
-        }
-    }
-    missing
+/// Asking over the whole stream is precise instead. A typo is supplied by no
+/// record, so it reports; a sparse column in a heterogeneous stream is supplied
+/// by some record, so it does not.
+///
+/// Bounded: three vectors sized by the author's column count, allocated once
+/// per Output. Nothing here grows with input cardinality, and the per-record
+/// path only sets a flag.
+///
+/// Self-describing on purpose: it carries the source names it was built from
+/// rather than re-reading them out of an [`OutputConfig`] at report time. The
+/// report is produced after the dispatch walk, where the only handle left is
+/// the Output's name, and matching that name back to a config is a lookup that
+/// can miss — a miss would report one Output's entries under another's name.
+#[derive(Debug, Clone)]
+pub struct MappingProbe {
+    /// The source column each mapping entry reads, in declaration order, and
+    /// whether that source resolved on some record. Empty for an Output with
+    /// no `mapping:` block.
+    sources: Vec<Box<str>>,
+    resolved: Vec<bool>,
+    /// Passthrough column names the mapping displaced, first-seen order.
+    shadowed: Vec<Box<str>>,
+    /// Records projected through this Output. Zero means the stream was empty,
+    /// which is not evidence of anything.
+    records: u64,
 }
 
-/// Raise the write-boundary **E365** for an established output schema that the
-/// `mapping:` block does not fully cover, or `Ok(())` when it does.
-pub fn check_mapping_against_schema(
-    schema: &clinker_record::Schema,
-    config: &OutputConfig,
-    output_name: &str,
-) -> Result<(), clinker_plan::error::PipelineError> {
-    let missing = missing_mapping_outputs(schema, config);
-    if missing.is_empty() {
-        return Ok(());
-    }
-    let mapping = config
-        .mapping
-        .as_ref()
-        .expect("missing_mapping_outputs only reports names when a mapping is declared");
-    let sources: Vec<String> = missing
-        .iter()
-        .filter_map(|out| {
-            mapping
-                .entries()
+impl MappingProbe {
+    /// A probe sized for `config`'s mapping block. Cheap for an Output with no
+    /// `mapping:` — it allocates nothing and reports nothing.
+    pub fn for_config(config: &OutputConfig) -> Self {
+        let sources: Vec<Box<str>> = config.mapping.as_ref().map_or_else(Vec::new, |m| {
+            m.entries()
                 .iter()
-                .find(|e| &e.output == out)
-                .map(|e| e.source.clone())
-        })
-        .collect();
-    Err(
-        clinker_plan::error::PipelineError::OutputMappingColumnMissing {
-            output: output_name.to_string(),
-            columns: sources,
-            available: schema.columns().iter().map(|c| c.to_string()).collect(),
-        },
-    )
+                .map(|e| Box::<str>::from(e.source.as_str()))
+                .collect()
+        });
+        Self {
+            resolved: vec![false; sources.len()],
+            sources,
+            shadowed: Vec::new(),
+            records: 0,
+        }
+    }
+
+    fn note_record(&mut self) {
+        self.records = self.records.saturating_add(1);
+    }
+
+    fn note_resolved(&mut self, index: usize) {
+        if let Some(slot) = self.resolved.get_mut(index) {
+            *slot = true;
+        }
+    }
+
+    fn note_shadowed(&mut self, column: &str) {
+        if !self.shadowed.iter().any(|c| &**c == column) {
+            self.shadowed.push(Box::from(column));
+        }
+    }
+
+    /// Fold another probe for the same Output into this one. Used where an
+    /// Output's records are projected off the dispatcher's thread — the
+    /// streaming arm accumulates locally and folds back once joined.
+    ///
+    /// Both sides are built from the same Output's block, so their entry
+    /// vectors agree; `zip` stopping at the shorter one is the safe reading of
+    /// a disagreement, not a silent truncation of a real signal.
+    pub fn merge(&mut self, other: &MappingProbe) {
+        self.records = self.records.saturating_add(other.records);
+        for (slot, hit) in self.resolved.iter_mut().zip(other.resolved.iter()) {
+            *slot |= *hit;
+        }
+        for column in &other.shadowed {
+            self.note_shadowed(column);
+        }
+    }
+
+    /// The advisory findings for one Output, empty when the block resolved
+    /// cleanly.
+    ///
+    /// Advisory, never fatal: by the time a stream ends its sibling Outputs have
+    /// written, so aborting here would leave a half-written run behind for a
+    /// fault that is visible in the file itself.
+    pub fn findings(&self, output_name: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        // An empty stream resolves nothing and proves nothing.
+        if self.records == 0 {
+            return out;
+        }
+        // Duplicated source names collapse: two entries reading the same missing
+        // column are one thing for the author to fix.
+        let mut unresolved: Vec<&str> = Vec::new();
+        for (index, source) in self.sources.iter().enumerate() {
+            if !self.resolved[index] && !unresolved.contains(&&**source) {
+                unresolved.push(source);
+            }
+        }
+        if !unresolved.is_empty() {
+            let listed = unresolved
+                .iter()
+                .map(|c| format!("'{c}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(format!(
+                "W365 output '{output_name}': `mapping:` reads column(s) {listed}, which no \
+                 record carried — those output columns are empty in every row. Check the \
+                 spelling, or remove the item if the column is gone from upstream"
+            ));
+        }
+        if !self.shadowed.is_empty() {
+            let listed = self
+                .shadowed
+                .iter()
+                .map(|c| format!("'{c}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(format!(
+                "W366 output '{output_name}': upstream column(s) {listed} were dropped because \
+                 `mapping:` writes an output column of the same name; the mapped value is what \
+                 the file carries. Rename the mapped column, or add the upstream name to this \
+                 output's `exclude:` to state the intent"
+            ));
+        }
+        out
+    }
 }
 
 /// Enforce a declared output-column `scale` at the write boundary: each
@@ -811,6 +942,18 @@ mod tests {
         assert_eq!(out.get("bee"), Some(&Value::Integer(2)));
         assert_eq!(out.get("c"), Some(&Value::Integer(3)));
         assert_eq!(out.get("d"), Some(&Value::Integer(4)));
+
+        // `exclude:` removes from the same map and must preserve order too. A
+        // `swap_remove` here would pull `d` into `b`'s slot and emit `x,d,c`.
+        let mut excluding = fast_path_output_config(false);
+        excluding.include_unmapped = true;
+        excluding.exclude = Some(vec!["b".to_string()]);
+        excluding.mapping = Some(OutputMapping::new(vec![MappingEntry::rename("x", "a")]));
+        let out = project_output_from_record(&input, &excluding, None);
+        let cols: Vec<&str> = out.schema().columns().iter().map(|c| &**c).collect();
+        assert_eq!(cols, vec!["x", "c", "d"]);
+        assert_eq!(out.get("c"), Some(&Value::Integer(3)));
+        assert_eq!(out.get("d"), Some(&Value::Integer(4)));
     }
 
     /// One source column feeding two output columns: the earlier reader copies,
@@ -873,44 +1016,152 @@ mod tests {
         );
     }
 
-    /// The write-boundary half of E365: a mapping entry whose column the stream
-    /// never supplied leaves its output name off the established schema, and
-    /// that is refused rather than written as a file missing a column.
+    fn one_field(name: &str, value: Value) -> Record {
+        Record::new(SchemaBuilder::new().with_field(name).build(), vec![value])
+    }
+
+    /// The core of the redesign: a record missing a mapped source still carries
+    /// the declared column, empty. The output schema is a function of the
+    /// config, not of whichever record arrived first.
     #[test]
-    fn missing_mapping_output_is_reported_against_an_established_schema() {
+    fn an_absent_mapping_source_yields_a_null_column_not_a_missing_one() {
         let mut config = fast_path_output_config(false);
         config.include_unmapped = false;
         config.mapping = Some(OutputMapping::new(vec![
             MappingEntry::passthrough("id"),
-            MappingEntry::rename("given_name", "firstname"),
+            MappingEntry::rename("given_name", "first_name"),
         ]));
-        let established = Schema::new(vec!["id".into()]);
 
-        assert_eq!(
-            missing_mapping_outputs(&established, &config),
-            vec!["given_name".to_string()]
+        // A record carrying both, and a record carrying only `id` — the shape a
+        // heterogeneous stream produces.
+        let full = Record::new(
+            SchemaBuilder::new()
+                .with_field("id")
+                .with_field("first_name")
+                .build(),
+            vec![Value::Integer(1), Value::String("Alice".into())],
         );
-        let err = check_mapping_against_schema(&established, &config, "out")
-            .expect_err("an unresolved entry must be refused");
-        let rendered = err.to_string();
-        assert!(rendered.contains("E365"), "{rendered}");
+        let sparse = one_field("id", Value::Integer(2));
+
+        let a = project_output_from_record(&full, &config, None);
+        let b = project_output_from_record(&sparse, &config, None);
+
+        let cols = |r: &Record| -> Vec<String> {
+            r.schema().columns().iter().map(|c| c.to_string()).collect()
+        };
+        assert_eq!(cols(&a), vec!["id", "given_name"]);
+        assert_eq!(
+            cols(&b),
+            cols(&a),
+            "every record must project the same declared column set, whatever it carries"
+        );
+        assert_eq!(b.get("given_name"), Some(&Value::Null));
+    }
+
+    /// The probe distinguishes a typo from a sparse column. `first_name`
+    /// resolved on one of the two records, so it is not reported; `nickname`
+    /// resolved on neither, so it is.
+    #[test]
+    fn the_probe_reports_only_entries_no_record_resolved() {
+        let mut config = fast_path_output_config(false);
+        config.include_unmapped = false;
+        config.mapping = Some(OutputMapping::new(vec![
+            MappingEntry::passthrough("first_name"),
+            MappingEntry::rename("goes_by", "nickname"),
+        ]));
+
+        let mut probe = MappingProbe::for_config(&config);
+        let with_name = one_field("first_name", Value::String("Alice".into()));
+        let without = one_field("other", Value::Integer(1));
+        project_output_probed(&without, &config, None, Some(&mut probe));
+        project_output_probed(&with_name, &config, None, Some(&mut probe));
+
+        let findings = probe.findings("out");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("W365"), "{}", findings[0]);
         assert!(
-            rendered.contains("'firstname'"),
-            "the message names the SOURCE column the author has to correct: {rendered}"
+            findings[0].contains("'nickname'"),
+            "names the unresolved source column: {}",
+            findings[0]
+        );
+        assert!(
+            !findings[0].contains("'first_name'"),
+            "a column some record carried is sparse, not a typo: {}",
+            findings[0]
         );
     }
 
-    /// Over-rejection guard for the same check: a fully covered schema passes.
+    /// An empty stream resolves nothing and proves nothing — it must not warn.
     #[test]
-    fn a_fully_resolved_mapping_passes_the_write_boundary_check() {
+    fn the_probe_stays_silent_on_an_empty_stream() {
         let mut config = fast_path_output_config(false);
         config.mapping = Some(OutputMapping::new(vec![MappingEntry::rename(
-            "given_name",
-            "first_name",
+            "goes_by", "nickname",
         )]));
-        let established = Schema::new(vec!["given_name".into(), "id".into()]);
-        assert!(missing_mapping_outputs(&established, &config).is_empty());
-        assert!(check_mapping_against_schema(&established, &config, "out").is_ok());
+        let probe = MappingProbe::for_config(&config);
+        assert!(probe.findings("out").is_empty());
+    }
+
+    /// The displaced passthrough is reported rather than dropped in silence.
+    #[test]
+    fn the_probe_reports_a_passthrough_the_mapping_displaced() {
+        let mut config = fast_path_output_config(false);
+        config.include_unmapped = true;
+        config.mapping = Some(OutputMapping::new(vec![MappingEntry::rename(
+            "sold_to", "customer",
+        )]));
+        let input = Record::new(
+            SchemaBuilder::new()
+                .with_field("customer")
+                .with_field("sold_to")
+                .build(),
+            vec![Value::String("right".into()), Value::String("stale".into())],
+        );
+
+        let mut probe = MappingProbe::for_config(&config);
+        let out = project_output_probed(&input, &config, None, Some(&mut probe));
+        assert_eq!(out.get("sold_to"), Some(&Value::String("right".into())));
+
+        let findings = probe.findings("out");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("W366"), "{}", findings[0]);
+        assert!(findings[0].contains("'sold_to'"), "{}", findings[0]);
+    }
+
+    /// A user column named `$id` — ordinary in JSON-Schema and MongoDB-shaped
+    /// payloads — is a user column, not an engine one, so `include_unmapped:
+    /// false` drops it like any other unlisted column. Engine-stamped fields
+    /// are selected by metadata; a `$` prefix proves nothing.
+    #[test]
+    fn a_dollar_prefixed_user_column_is_not_treated_as_engine_stamped() {
+        use clinker_record::FieldMetadata;
+        let schema = SchemaBuilder::new()
+            .with_field("$id")
+            .with_field("name")
+            .with_field_meta("$ck.name", FieldMetadata::source_correlation("name"))
+            .build();
+        let input = Record::new(
+            schema,
+            vec![
+                Value::String("doc-1".into()),
+                Value::String("Alice".into()),
+                Value::String("Alice".into()),
+            ],
+        );
+        let mut config = fast_path_output_config(true);
+        config.include_unmapped = false;
+        config.mapping = Some(OutputMapping::new(vec![MappingEntry::rename(
+            "person", "name",
+        )]));
+
+        let out = project_output_from_record(&input, &config, None);
+        let cols: Vec<&str> = out.schema().columns().iter().map(|c| &**c).collect();
+        assert_eq!(
+            cols,
+            vec!["person", "$ck.name"],
+            "`$id` is a user column and stays dropped; only the metadata-stamped \
+             correlation shadow rides the include_correlation_keys flag"
+        );
     }
 
     /// `include_unmapped: true` expands the sidecar map even when

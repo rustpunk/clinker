@@ -61,13 +61,13 @@ use std::sync::Arc;
 use clinker_record::{DocumentId, Record};
 
 use crate::executor::dispatch::{
-    ExecutorContext, MERGED_SOURCE_FILE, push_dlq, source_file_arc_of, source_name_arc_of,
+    ExecutorContext, MERGED_SOURCE_FILE, mapping_probe, push_dlq, source_file_arc_of,
+    source_name_arc_of,
 };
 use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::stream_event::StreamEvent;
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
 use crate::executor::{DlqEntry, build_format_writer};
-use crate::projection::project_output_from_record;
 use clinker_plan::config::OutputConfig;
 use clinker_plan::error::PipelineError;
 
@@ -486,10 +486,12 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                 self.arbitrator.unregister_consumer(consumer_id);
                 return Ok(());
             }
-            projected.push(project_output_from_record(
+            let probe = mapping_probe(&mut ctx.mapping_probes, &self.output_name, self.out_cfg);
+            projected.push(crate::projection::project_output_probed(
                 &record,
                 self.out_cfg,
                 cxl_emit_names_opt,
+                Some(probe),
             ));
             if ctx.ok_source_rows.insert(row_num) {
                 self.ok_count += 1;
@@ -515,8 +517,15 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
             ctx.output_errors.push(err);
             return;
         }
-        let projected =
-            project_output_from_record(&record, self.out_cfg, self.cxl_emit_names.as_deref());
+        let projected = {
+            let probe = mapping_probe(&mut ctx.mapping_probes, &self.output_name, self.out_cfg);
+            crate::projection::project_output_probed(
+                &record,
+                self.out_cfg,
+                self.cxl_emit_names.as_deref(),
+                Some(probe),
+            )
+        };
         if ctx.ok_source_rows.insert(row_num) {
             self.ok_count += 1;
         }
