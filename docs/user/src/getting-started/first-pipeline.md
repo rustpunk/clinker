@@ -72,19 +72,13 @@ from `employees` through `classify` to `report`.
 Before processing any data, check that the pipeline is well-formed:
 
 ```bash
-clinker run my_first_pipeline.yaml --explain
+clinker run my_first_pipeline.yaml --dry-run
 ```
 
-`--explain` compiles the plan: it parses the YAML, resolves the DAG, and
-type-checks every CXL expression against the declared schemas, then prints the
-execution plan. If there are errors -- a typo in a field name, a type mismatch,
-a missing `input:` reference -- Clinker reports them with the diagnostic's code
-and the offending line, and stops. No data is read.
-
-There is also `--dry-run`, which is a lighter check: it validates the
-configuration document but stops before compiling the plan, so it does not
-catch a CXL type error or a broken `input:` reference. Reach for `--explain`
-when you want to know a pipeline will start.
+Dry-run parses the YAML, resolves the DAG, and type-checks all CXL expressions
+against the declared schemas. If there are errors -- a typo in a field name, a
+type mismatch, a missing `input:` reference -- Clinker reports them with
+source-location diagnostics and stops. No data is read.
 
 ## 4. Preview records
 

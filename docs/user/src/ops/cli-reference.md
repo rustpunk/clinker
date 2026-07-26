@@ -27,7 +27,7 @@ clinker run [OPTIONS] <CONFIG>
 | `--explain [FORMAT]` | `text` | Print the execution plan and exit without processing data. Accepted formats: `text`, `json`, `dot`. See [Explain Plans](explain.md). |
 | `--lineage <PATH>` | -- | Build column lineage and write it as OpenLineage NDJSON, then exit without processing data. Give a file path, or `-` for stdout. See [Column Lineage](lineage.md). |
 | `--lineage-events <PATH>` | -- | Run the pipeline and emit live OpenLineage run events (a `START` at run begin, then a terminal `COMPLETE` / `FAIL` / `ABORT` with real timing and row counts) as NDJSON to a file path, or `-` for stdout. Cannot be combined with `--lineage`, `--explain`, `--dry-run`, or `-n`. See [Live run events](lineage.md#live-run-events). |
-| `--dry-run` | -- | Check the configuration document (YAML structure, required fields, per-node config validation) without reading any data. Stops before the plan is compiled, so it does not type-check CXL, bind schemas, or resolve the DAG -- use `--explain` for that. See [Validation & Dry Run](validation.md). |
+| `--dry-run` | -- | Validate the configuration (YAML structure, CXL syntax, type checking, DAG wiring) without reading any data. |
 | `-n, --dry-run-n <N>` | -- | Process only the first `N` records through the full pipeline. Implies `--dry-run`. |
 | `--dry-run-output <FILE>` | stdout | Redirect dry-run output to a file instead of stdout. Only meaningful with `-n`. |
 | `--rules-path <DIR>` | `./rules/` | Search path for CXL module files referenced by `use` statements. |

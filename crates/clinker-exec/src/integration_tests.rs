@@ -60,7 +60,7 @@ mod tests {
             Err(
                 PipelineError::Config(_)
                 | PipelineError::Schema(_)
-                | PipelineError::PlanDiagnostics(_)
+                | PipelineError::PlanDiagnostics { .. }
                 | PipelineError::OverlayDiagnostics(_)
                 | PipelineError::Compilation { .. }
                 | PipelineError::Internal { .. }

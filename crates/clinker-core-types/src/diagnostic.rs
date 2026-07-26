@@ -15,9 +15,10 @@
 //!   workspace source for code literals in diagnostic-carrying positions and
 //!   fails on any that [`REGISTRY`] does not list.
 //! - [`Diagnostic::error`] and [`Diagnostic::warning`] carry a
-//!   `debug_assert!` on registry membership, which catches codes chosen at
-//!   runtime (match arms, codes lifted back out of an error message) that a
-//!   source scan cannot see.
+//!   `debug_assert!` on registry membership and severity, which catches codes
+//!   chosen at runtime (match arms, codes lifted back out of an error message)
+//!   that a source scan cannot see, as well as an error code emitted as a
+//!   warning or vice versa.
 
 use crate::span::{FileId, Span};
 
@@ -220,7 +221,15 @@ diagnostic_registry! {
 /// The orphan-code test and the constructors' `debug_assert!` both resolve
 /// membership through here, so there is one definition of "registered".
 pub fn is_registered(code: &str) -> bool {
-    REGISTRY.iter().any(|entry| entry.code == code)
+    registered_severity(code).is_some()
+}
+
+/// Registered severity for `code`, or `None` when the code is not listed.
+pub fn registered_severity(code: &str) -> Option<Severity> {
+    REGISTRY
+        .iter()
+        .find(|entry| entry.code == code)
+        .map(|entry| entry.severity)
 }
 
 /// Severity level for a [`Diagnostic`].
@@ -330,10 +339,12 @@ impl Diagnostic {
         primary: LabeledSpan,
     ) -> Self {
         let code = code.into();
-        debug_assert!(
-            is_registered(&code),
-            "diagnostic code {code:?} is not in the registry; add a row to the \
-             `diagnostic_registry!` invocation in clinker-core-types/src/diagnostic.rs"
+        debug_assert_eq!(
+            registered_severity(&code),
+            Some(Severity::Error),
+            "diagnostic code {code:?} is missing from the registry or is not registered as Error; \
+             add or correct its row in the `diagnostic_registry!` invocation in \
+             clinker-core-types/src/diagnostic.rs"
         );
         Self {
             code,
@@ -355,10 +366,12 @@ impl Diagnostic {
         primary: LabeledSpan,
     ) -> Self {
         let code = code.into();
-        debug_assert!(
-            is_registered(&code),
-            "diagnostic code {code:?} is not in the registry; add a row to the \
-             `diagnostic_registry!` invocation in clinker-core-types/src/diagnostic.rs"
+        debug_assert_eq!(
+            registered_severity(&code),
+            Some(Severity::Warning),
+            "diagnostic code {code:?} is missing from the registry or is not registered as Warning; \
+             add or correct its row in the `diagnostic_registry!` invocation in \
+             clinker-core-types/src/diagnostic.rs"
         );
         Self {
             code,
@@ -524,5 +537,34 @@ mod diagnostic_tests {
         // row, which this asserts is currently absent.
         assert!(!is_registered("E302"));
         assert!(!is_registered("E999"));
+    }
+
+    #[test]
+    fn registered_severity_comes_from_the_registry_row() {
+        assert_eq!(registered_severity("E001"), Some(Severity::Error));
+        assert_eq!(registered_severity("W002"), Some(Severity::Warning));
+        assert_eq!(registered_severity("E999"), None);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "not registered as Error")]
+    fn error_constructor_rejects_a_warning_code() {
+        let _ = Diagnostic::error(
+            "W002",
+            "wrong severity",
+            LabeledSpan::primary(Span::SYNTHETIC, ""),
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "not registered as Warning")]
+    fn warning_constructor_rejects_an_error_code() {
+        let _ = Diagnostic::warning(
+            "E001",
+            "wrong severity",
+            LabeledSpan::primary(Span::SYNTHETIC, ""),
+        );
     }
 }

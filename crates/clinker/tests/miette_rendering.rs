@@ -337,6 +337,33 @@ fn test_plan_time_gate_keeps_code_help_and_span_under_explain() {
 }
 
 #[test]
+fn test_plan_time_gate_keeps_code_help_and_span_under_dry_run() {
+    let tmp = tempdir_path();
+    let yaml_path = tmp.join("bad_record_path.yaml");
+    std::fs::write(&yaml_path, jsonpath_record_path_yaml()).expect("write yaml");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&yaml_path)
+        .arg("--dry-run")
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        !output.status.success(),
+        "dry-run must compile and reject the same plan-time gate as a real run; \
+         got status {:?}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_plan_diagnostic_intact(&stderr);
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn test_plan_diagnostic_without_its_own_pointer_gets_the_explain_hint() {
     // E203 (CXL name resolution) attaches no help of its own, so the renderer
     // is the only thing that can tell the user the code is explainable. A gate
@@ -832,6 +859,7 @@ nodes:
 const SECRET: &str = "sftp://user:hunter2SECRETTOKEN@files.example.com/in";
 const MULTILINE_SECRET: &str =
     "-----BEGIN KEY-----\n# MIIBOgIBAAJBAKSECRETLINE\n# -----END KEY-----";
+const CR_SECRET: &str = "CR_FIRST_SECRET\r# CR_SECOND_SECRET";
 
 #[test]
 fn test_a_resolved_env_var_never_reaches_the_rendered_snippet() {
@@ -897,12 +925,43 @@ nodes:
     )
     .expect("write shifted fixture");
 
-    for fixture in [&inline, &shifted] {
+    // (c) A lone-CR value shifts saphyr's YAML line numbering just like LF,
+    //     even though it contains no `\n` byte.
+    let shifted_cr = tmp.join("shifted_cr_secret.yaml");
+    std::fs::write(
+        &shifted_cr,
+        r#"pipeline:
+  name: shifted_cr_secret
+# ${LEAK_TEST_CR}
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: "${LEAK_TEST_URL}"
+      options:
+        record_path: "$.rows"
+      schema:
+        - { name: amount, type: int }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+    )
+    .expect("write lone-CR fixture");
+
+    for fixture in [&inline, &shifted, &shifted_cr] {
         let output = Command::new(clinker_bin())
             .arg("run")
             .arg(fixture)
             .env("LEAK_TEST_URL", SECRET)
             .env("LEAK_TEST_PEM", MULTILINE_SECRET)
+            .env("LEAK_TEST_CR", CR_SECRET)
             .output()
             .expect("spawn clinker");
 
@@ -935,9 +994,25 @@ nodes:
                 fixture.display()
             );
         }
+        for line in CR_SECRET.split('\r') {
+            let line = line.trim_start_matches("# ").trim();
+            assert!(
+                !stderr.contains(line),
+                "a resolved lone-CR value reached stderr from {}: {line:?}\n{stderr}",
+                fixture.display()
+            );
+        }
         // The diagnostic still arrives — this is not passing by rendering
         // nothing at all.
-        assert!(flatten_report(&stderr).contains("E363"), "got:\n{stderr}");
+        let flat = flatten_report(&stderr);
+        assert!(flat.contains("E363"), "got:\n{stderr}");
+        if fixture != &inline {
+            let filename = fixture.file_name().unwrap().to_string_lossy();
+            assert!(
+                !quotes_a_snippet_from(&flat, &filename),
+                "a line-shifting substitution must suppress the raw snippet; got:\n{stderr}"
+            );
+        }
     }
 
     // The reference itself is fine to show, and proves the snippet was drawn

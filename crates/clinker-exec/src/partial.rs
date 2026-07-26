@@ -42,9 +42,7 @@ pub struct PartialPipelineConfig {
 }
 
 pub fn parse_partial_config(yaml: &str) -> Result<PartialPipelineConfig, String> {
-    let interpolated = interpolate_env_vars(yaml, &[])
-        .map_err(|e| e.to_string())?
-        .text;
+    let interpolated = interpolate_env_vars(yaml, &[]).map_err(|e| e.to_string())?;
 
     let tree: serde_json::Value = clinker_plan::yaml::from_str(&interpolated)
         .map_err(|e| format!("YAML syntax error: {e}"))?;

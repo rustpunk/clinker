@@ -339,12 +339,6 @@ fn parse_dotted_path(path: &str) -> Result<(&str, &str), ProvenanceExplainError>
     Ok((node_name, param_name))
 }
 
-/// Look up error/warning code documentation embedded at compile time.
-///
-/// Returns the doc content for any code registered in this function's
-/// match body, or `None` for unknown codes. Every registered code must
-/// have a matching `docs/explain/<code>.md` file; the section-coverage
-/// contract is enforced by `test_explain_docs_all_have_required_sections`.
 /// Every code `clinker explain --code` can answer for, paired with its page.
 ///
 /// One home for the list: [`explain_code`] looks up here and [`explain_codes`]

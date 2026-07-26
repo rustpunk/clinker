@@ -4,6 +4,27 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Fixed — dry-run now performs the documented compile check
+
+Bare `clinker run --dry-run` now compiles the plan and applies channel/group
+overlays before returning, while still stopping before source discovery or any
+data I/O. This restores the behavior the CLI reference, explain pages, and
+deployment examples already promised: CXL parsing and type checking, schema
+binding, DAG wiring, and plan-time gates all run during a dry-run.
+
+### Changed — compile failures retain structured diagnostics
+
+**Rust API change.** Plan compile failures now use
+`PipelineError::PlanDiagnostics` instead of flattening their code, help text,
+severity, and spans into `PipelineError::Compilation`. Channel-overlay failures
+use `PipelineError::OverlayDiagnostics` so renderers do not blame the pipeline
+file for an overlay error. Downstream exhaustive matches on `PipelineError`
+must handle both variants.
+
+`PlanDiagnostics` also records whether its line-only spans are safe to resolve
+against the pipeline document. Untrusted spans remain in the structured value
+for consumers that can attribute them; the CLI simply omits the source snippet.
+
 ### Removed — the `best_effort` error strategy
 
 **Breaking change.** `error_handling.strategy` now accepts exactly `fail_fast`

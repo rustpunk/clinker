@@ -158,7 +158,17 @@ impl OverlayResolution {
     pub fn modifies_compiled_config(&self) -> bool {
         !self.op_stream.is_empty()
             || self.source_patches().is_some_and(|p| !p.is_empty())
-            || !self.effective_config_overrides().is_empty()
+            || self
+                .applied_groups
+                .iter()
+                .any(|applied| !applied.group.config.is_empty() || !applied.group.fixed.is_empty())
+            || self.channel.as_ref().is_some_and(|ctx| {
+                ctx.manifest.as_ref().is_some_and(|manifest| {
+                    !manifest.config.is_empty() || !manifest.fixed.is_empty()
+                }) || ctx.per_target.as_ref().is_some_and(|overlay| {
+                    !overlay.overlay.config.is_empty() || !overlay.overlay.fixed.is_empty()
+                })
+            })
     }
 
     /// The concatenated, layer-tagged structural op stream. Feed this into

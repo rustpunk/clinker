@@ -42,11 +42,6 @@ clinker-case-probe-*.tmp
 # when run from the crate directory; never a source artifact.
 crates/clinker/out.csv
 
-# Pending snapshots insta writes beside the accepted `.snap` when an
-# assertion fails. Transient by design — reviewed, then accepted into the
-# `.snap` or discarded — so it is never a source artifact.
-*.snap.new
-
 # Local review/audit scratch trees written by ad-hoc tooling during code
 # review and auditing; never source artifacts.
 .audit/

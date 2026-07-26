@@ -4489,6 +4489,7 @@ pub const RESERVED_SOURCE_NAMES: &[&str] = &[
     "count",
     "batch",
     "ingestion_timestamp",
+    "name",
 ];
 
 /// Reserved `$record.*` member names. Empty today — issue #44 will add

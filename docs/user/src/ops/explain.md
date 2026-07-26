@@ -204,14 +204,16 @@ printing it.
 
 Two notes on where the snippet comes from:
 
-- A pipeline that pulls in a composition body or a channel/group overlay is
-  reported without the quoted source line. A plan-time diagnostic carries a
-  line number but not which file it belongs to, and those two features
-  introduce a second file — so rather than risk underlining an unrelated line,
-  the report gives the code, message and help alone.
-- `--dry-run` does **not** print this report: it returns after config
-  validation, before the plan is compiled, so it exits `0` on a pipeline that
-  a real run rejects. Gate CI on `--explain`, not on `--dry-run`.
+- A pipeline that pulls in a composition body is reported without the quoted
+  source line. A plan-time diagnostic carries a line number but not which file
+  it belongs to, so rather than risk underlining an unrelated line, the report
+  gives the code, message and help alone.
+- A channel/group overlay suppresses the snippet only when it rewrites the
+  compiled config through structural ops, source patches, or composition
+  `config:` values. A selection that contributes only runtime vars leaves the
+  pipeline document unchanged, so its snippet remains safe and is retained.
+- Bare `--dry-run` compiles the plan and prints the same report without reading
+  source data.
 
 ## Looking up diagnostic codes
 

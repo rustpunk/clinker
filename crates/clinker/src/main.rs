@@ -608,7 +608,7 @@ fn main() -> ExitCode {
                     match &e {
                         PipelineError::Config(_)
                         | PipelineError::Schema(_)
-                        | PipelineError::PlanDiagnostics(_)
+                        | PipelineError::PlanDiagnostics { .. }
                         | PipelineError::OverlayDiagnostics(_)
                         | PipelineError::Compilation { .. }
                         | PipelineError::Internal { .. }
@@ -832,18 +832,32 @@ impl miette::Diagnostic for WrappedPipelineError {
 /// including it would run the underline one column past the line's last
 /// visible character.
 fn line_byte_range(text: &str, line: u32) -> Option<(usize, usize)> {
-    let idx = usize::try_from(line).ok()?.checked_sub(1)?;
-    let start = if idx == 0 {
-        0
-    } else {
-        text.match_indices('\n').nth(idx - 1)?.0 + 1
-    };
-    let rest = &text[start..];
-    let mut len = rest.find('\n').unwrap_or(rest.len());
-    if rest[..len].ends_with('\r') {
-        len -= 1;
+    let target = usize::try_from(line).ok()?.checked_sub(1)?;
+    let bytes = text.as_bytes();
+    let mut current = 0usize;
+    let mut start = 0usize;
+
+    while current < target {
+        let mut i = start;
+        while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
+            i += 1;
+        }
+        if i == bytes.len() {
+            return None;
+        }
+        start = if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+            i + 2
+        } else {
+            i + 1
+        };
+        current += 1;
     }
-    Some((start, len))
+
+    let mut end = start;
+    while end < bytes.len() && bytes[end] != b'\n' && bytes[end] != b'\r' {
+        end += 1;
+    }
+    Some((start, end - start))
 }
 
 /// Whether every plan diagnostic's line anchor is provably a line of the
@@ -918,7 +932,7 @@ fn plan_diagnostics(
     anchors_trusted: bool,
 ) -> PipelineError {
     if anchors_trusted {
-        PipelineError::PlanDiagnostics(diags)
+        PipelineError::plan_diagnostics(diags)
     } else {
         PipelineError::plan_diagnostics_unanchored(diags)
     }
@@ -1094,22 +1108,23 @@ fn render_pipeline_error(err: &PipelineError, config_path: &std::path::Path) {
     // sensitive can be printed from it on any path.
     //
     // The two texts share line numbering exactly when no substituted value
-    // contained a newline — the ordinary case — so the raw file quotes the
+    // contained a YAML line break — the ordinary case — so the raw file quotes the
     // right line there. When a value did span lines the numberings diverge,
     // and rather than quote what is now the wrong line, the snippet is dropped
     // and the report renders without one.
     let source_text = std::fs::read_to_string(config_path).ok();
-    // Interpolated only to ask whether any substituted value carried a
-    // newline; the expanded text is dropped here and never rendered. A
+    // Interpolated only to ask whether any substituted value carried a YAML
+    // line break; the expanded text is dropped here and never rendered. A
     // substitution that fails means the config never parsed, so there are no
     // plan diagnostics to anchor and no snippet to lose.
     //
     // The `&[]` mirrors what the loader passes. Should a caller ever supply
-    // extra vars, they have to be threaded here too: a newline inside one
+    // extra vars, they have to be threaded here too: a line break inside one
     // would shift the loader's line numbering without shifting the numbering
     // this asks about, and the snippet would quote the wrong line again.
     let anchor_text = source_text.as_deref().filter(|raw| {
-        clinker_plan::config::interpolate_env_vars(raw, &[]).is_ok_and(|i| !i.shifted_lines)
+        clinker_plan::config::interpolate_env_vars_with_metadata(raw, &[])
+            .is_ok_and(|i| !i.shifted_lines)
     });
     let filename = config_path.to_string_lossy().into_owned();
     // Built once and shared: a compile that fails N gates would otherwise
@@ -1119,9 +1134,17 @@ fn render_pipeline_error(err: &PipelineError, config_path: &std::path::Path) {
         .map(|s| std::sync::Arc::new(miette::NamedSource::new(filename.clone(), s.clone())));
 
     match err {
-        PipelineError::PlanDiagnostics(diags) => {
-            for diag in diags {
-                render_plan_diagnostic(diag, Some(&filename), source.as_ref(), anchor_text);
+        PipelineError::PlanDiagnostics {
+            diagnostics,
+            anchors_trusted,
+        } => {
+            let (diagnostic_source, diagnostic_text) = if *anchors_trusted {
+                (source.as_ref(), anchor_text)
+            } else {
+                (None, None)
+            };
+            for diag in diagnostics {
+                render_plan_diagnostic(diag, Some(&filename), diagnostic_source, diagnostic_text);
             }
             return;
         }
@@ -1496,7 +1519,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     .map_err(PipelineError::Config)?;
 
     // The resolved-outputs preamble is human-readable text decoration. The
-    // text explain and the config-validation dry run want it; the JSON and
+    // text explain and the compile-validation dry run want it; the JSON and
     // DOT explain formats are machine-consumed, so emitting a non-JSON / non-
     // DOT preamble to stdout would make their output unparseable (the JSON
     // form exists precisely so downstream tooling can read the plan and the
@@ -1672,17 +1695,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         ));
     }
 
-    if args.dry_run && args.dry_run_n.is_none() {
-        // Config-validation-only mode (no -n)
-        tracing::info!(
-            "Dry run: config valid, {} inputs, {} outputs, {} transforms",
-            pipeline_config.source_configs().count(),
-            pipeline_config.output_configs().count(),
-            pipeline_config.transform_node_count(),
-        );
-        return Ok(0);
-    }
-
     // Resolve spool directory (CLI > env > YAML)
     let yaml_spool = pipeline_config
         .pipeline
@@ -1765,6 +1777,18 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             channel_source_vars.entry(src).or_default().extend(inner);
         }
         channel_record_vars.extend(overlay.record_vars);
+    }
+
+    if args.dry_run && args.dry_run_n.is_none() {
+        // Compile-validation mode (no -n): the plan and any channel/group
+        // overlay are fully checked, but no source discovery or I/O begins.
+        tracing::info!(
+            "Dry run: plan valid, {} inputs, {} outputs, {} transforms",
+            pipeline_config.source_configs().count(),
+            pipeline_config.output_configs().count(),
+            pipeline_config.transform_node_count(),
+        );
+        return Ok(0);
     }
 
     // Discovery pre-pass: resolve every File source's matcher to its file set
@@ -2993,8 +3017,7 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let yaml = std::fs::read_to_string(config_path)?;
     let interpolated = clinker_plan::config::interpolate_env_vars(&yaml, &[])
-        .map_err(|e| format!("environment variable interpolation failed: {e}"))?
-        .text;
+        .map_err(|e| format!("environment variable interpolation failed: {e}"))?;
     let mut pipeline_config: clinker_plan::config::PipelineConfig =
         clinker_plan::yaml::from_str(&interpolated)
             .map_err(|e| format!("YAML parse error: {e}"))?;
@@ -3172,8 +3195,7 @@ fn compile_effective_plan(
     let yaml = std::fs::read_to_string(base_path)
         .map_err(|e| E::Setup(format!("cannot read {}: {e}", base_path.display())))?;
     let interpolated = clinker_plan::config::interpolate_env_vars(&yaml, &[])
-        .map_err(|e| E::Setup(format!("environment variable interpolation failed: {e}")))?
-        .text;
+        .map_err(|e| E::Setup(format!("environment variable interpolation failed: {e}")))?;
     let mut config: clinker_plan::config::PipelineConfig =
         clinker_plan::yaml::from_str(&interpolated)
             .map_err(|e| E::Setup(format!("YAML parse error: {e}")))?;
@@ -3915,6 +3937,16 @@ fn diag_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_byte_range_handles_lf_crlf_and_lone_cr() {
+        for text in ["one\ntwo\nthree", "one\r\ntwo\r\nthree", "one\rtwo\rthree"] {
+            assert_eq!(line_byte_range(text, 1), Some((0, 3)));
+            assert_eq!(&text[line_byte_range(text, 2).unwrap().0..][..3], "two");
+            assert_eq!(&text[line_byte_range(text, 3).unwrap().0..][..5], "three");
+            assert_eq!(line_byte_range(text, 4), None);
+        }
+    }
     use clap::Parser;
 
     // ── Plan-diagnostic rendering ───────────────────────────────────────

@@ -477,9 +477,8 @@ sources:
 /// base pipeline's `small.rows` is valid; only the overlay's JSONPath-shaped
 /// value is not.
 ///
-/// Asserted on the diagnostic text rather than its code: the run path renders
-/// compile diagnostics through `PipelineError::Compilation`, which carries only
-/// their messages — the same for every plan-time gate, not this one.
+/// The run path carries the compile diagnostic whole, so both its stable code
+/// and its actionable message are available to assert.
 #[test]
 fn patched_jsonpath_record_path_fails_at_compile() {
     let dir = tempfile::tempdir().expect("tempdir");

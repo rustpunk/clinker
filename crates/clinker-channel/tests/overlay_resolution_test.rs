@@ -715,6 +715,25 @@ fn source_reserved_name_e117() {
     );
 }
 
+#[test]
+fn source_name_builtin_is_reserved_by_e117() {
+    let ws = workspace();
+    write(
+        &ws.path().join("channel/globex/base.channel.yaml"),
+        &per_target_overlay(
+            "vars:\n  source:\n    orders:\n      name:\n        type: string\n        default: shadowed\n",
+        ),
+    );
+
+    let (_res, _plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
+    assert_eq!(
+        errors_with_code(&result.diagnostics, "E117").len(),
+        1,
+        "{:?}",
+        result.diagnostics
+    );
+}
+
 // ── Var overlay: $record ────────────────────────────────────────────────
 
 #[test]

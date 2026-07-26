@@ -59,7 +59,7 @@ pub struct Interpolation {
     /// shown to a user: a `${SFTP_URL}` carrying a credential appears here in
     /// the clear. Anything user-facing quotes the raw document instead.
     pub text: String,
-    /// Whether any substituted value contained a newline.
+    /// Whether any substituted value contained a YAML line break.
     ///
     /// When false, `text` and the raw document have identical line numbering,
     /// so a line number resolved against one addresses the same line in the
@@ -84,6 +84,19 @@ pub struct Interpolation {
 pub fn interpolate_env_vars(
     yaml: &str,
     extra_vars: &[(&str, &str)],
+) -> Result<String, ConfigError> {
+    interpolate_env_vars_with_metadata(yaml, extra_vars).map(|interpolation| interpolation.text)
+}
+
+/// Pre-deserialize environment variable interpolation with line-shift metadata.
+///
+/// This is the metadata-bearing counterpart to [`interpolate_env_vars`]. It
+/// exists for callers that retain the raw document and need to know whether a
+/// source line resolved against the interpolated document can still be mapped
+/// back to it safely.
+pub fn interpolate_env_vars_with_metadata(
+    yaml: &str,
+    extra_vars: &[(&str, &str)],
 ) -> Result<Interpolation, ConfigError> {
     // Step 1: Replace $$ with NULL byte placeholder before main regex.
     // NULL bytes do not appear in valid YAML config files.
@@ -97,7 +110,7 @@ pub fn interpolate_env_vars(
     let mut result = String::with_capacity(escaped.len());
     let mut last_end = 0;
     // Tracked across every substitution source -- an override, the
-    // environment, and an inline default can each carry a newline.
+    // environment, and an inline default can each carry a YAML line break.
     let mut shifted_lines = false;
 
     for caps in ENV_VAR_RE.captures_iter(&escaped) {
@@ -127,17 +140,17 @@ pub fn interpolate_env_vars(
             .find(|(k, _)| *k == var_name)
             .map(|(_, v)| *v)
         {
-            shifted_lines |= value.contains('\n');
+            shifted_lines |= contains_yaml_line_break(value);
             result.push_str(value);
         } else {
             match std::env::var(var_name) {
                 Ok(value) => {
-                    shifted_lines |= value.contains('\n');
+                    shifted_lines |= contains_yaml_line_break(&value);
                     result.push_str(&value);
                 }
                 Err(_) => match default_value {
                     Some(default) => {
-                        shifted_lines |= default.contains('\n');
+                        shifted_lines |= contains_yaml_line_break(default);
                         result.push_str(default);
                     }
                     None => {
@@ -162,12 +175,19 @@ pub fn interpolate_env_vars(
     })
 }
 
+/// YAML recognizes both LF and a lone CR as line breaks. A substitution that
+/// introduces either changes the parser's line numbering relative to the raw
+/// document, even if the number of LF bytes is unchanged.
+fn contains_yaml_line_break(value: &str) -> bool {
+    value.contains('\n') || value.contains('\r')
+}
+
 /// Parse a pipeline config from a YAML string (after interpolation).
 ///
 /// All YAML parsing flows through `crate::yaml::from_str`, the single
 /// chokepoint that owns the DoS-defense [`Budget`].
 pub fn parse_config(yaml: &str) -> Result<PipelineConfig, ConfigError> {
-    let interpolated = interpolate_env_vars(yaml, &[])?.text;
+    let interpolated = interpolate_env_vars(yaml, &[])?;
     let config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
     validate_config(&config)?;
     Ok(config)
@@ -200,7 +220,7 @@ fn parse_config_source(
     yaml: &str,
     extra_vars: &[(&str, &str)],
 ) -> Result<PipelineConfig, ConfigError> {
-    let interpolated = interpolate_env_vars(yaml, extra_vars)?.text;
+    let interpolated = interpolate_env_vars(yaml, extra_vars)?;
     let mut config: PipelineConfig = crate::yaml::from_str(&interpolated)?;
     config.source_hash = *blake3::hash(interpolated.as_bytes()).as_bytes();
     // Resolve any external `.schema.yaml` (`SourceSchema::File`) references to
@@ -365,6 +385,43 @@ pub fn load_config_from_str(yaml: &str) -> Result<PipelineConfig, ConfigError> {
 }
 
 #[cfg(test)]
+mod interpolation_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_interpolation_api_still_returns_the_interpolated_string() {
+        let result: Result<String, ConfigError> =
+            interpolate_env_vars("name: ${NAME}\n", &[("NAME", "orders")]);
+        assert_eq!(result.unwrap(), "name: orders\n");
+    }
+
+    #[test]
+    fn metadata_marks_lf_and_lone_cr_from_extra_vars_as_line_shifts() {
+        for value in ["first\nsecond", "first\rsecond", "first\r\nsecond"] {
+            let interpolation =
+                interpolate_env_vars_with_metadata("# ${VALUE}\nnodes: []\n", &[("VALUE", value)])
+                    .unwrap();
+            assert!(
+                interpolation.shifted_lines,
+                "YAML line break in {value:?} must invalidate raw line mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_marks_lone_cr_from_a_default_as_a_line_shift() {
+        // The interpolation grammar's `.` does not cross LF, but it does
+        // accept CR in a default, and saphyr treats that CR as a line break.
+        let yaml = "# ${MISSING:-first\rsecond}\n";
+        let interpolation = interpolate_env_vars_with_metadata(yaml, &[]).unwrap();
+        assert!(
+            interpolation.shifted_lines,
+            "YAML line break in default must invalidate raw line mapping"
+        );
+    }
+}
+
+#[cfg(test)]
 mod external_schema_tests {
     use super::*;
 
@@ -512,7 +569,7 @@ mod external_schema_tests {
         let p = dir.path().join("pipeline.yaml");
         std::fs::write(&p, pipeline).unwrap();
         let config = parse_config_with_vars(&p, &[]).unwrap();
-        let interpolated = interpolate_env_vars(pipeline, &[]).unwrap().text;
+        let interpolated = interpolate_env_vars(pipeline, &[]).unwrap();
         assert_eq!(
             config.source_hash,
             *blake3::hash(interpolated.as_bytes()).as_bytes(),
