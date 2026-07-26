@@ -1,14 +1,18 @@
 //! Cross-cutting executor utilities: dispatch-order scheduling,
-//! record-schema reshaping, correlation-key copy, and small config/plan
-//! lookups shared across the dispatch arms.
+//! record-schema reshaping, correlation-key copy, group-key diagnostic
+//! rendering, the shared grouped-node budget diagnostic, and small
+//! config/plan lookups shared across the dispatch arms.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
-use clinker_record::{Record, Schema, SchemaBuilder};
+use clinker_record::{GroupByKey, Record, Schema, SchemaBuilder};
 use indexmap::IndexMap;
 
+use clinker_plan::BudgetCategory;
 use clinker_plan::config::PipelineConfig;
+use clinker_plan::error::PipelineError;
 
 /// Resolve a CSV `delimiter` / `quote_char` string to the single ASCII byte
 /// the byte-oriented CSV reader and writer accept.
@@ -367,9 +371,359 @@ pub(crate) fn build_arbitrator_from_config(
     )
 }
 
+/// Render a group key as a bare bracketed value list: `["A-1", 3]`.
+///
+/// One of two group-key spellings in this module. This one drops the field
+/// names; [`format_partition_group`] keeps them (`[account="A-1"]`). Correlation
+/// commit and cascading-retract detection use this form; the Reshape and Cull
+/// budget diagnostics use the named form. They are not interchangeable, and a
+/// change to either does not propagate to the other — only
+/// [`format_group_key_part`], which both call, is shared.
+///
+/// **This form carries an output-ordering contract.** Correlation commit and
+/// cascading-retract detection sort their group keys by this string to fix the
+/// order groups flush to writers, so its rendering decides emitted record
+/// order. See [`format_group_key_part`] for what that constrains.
+///
+/// Pure and non-blocking; allocates per key part. The sort callers deliberately
+/// use `sort_by_key` rather than caching every rendered key: repeated rendering
+/// costs CPU, but retaining one string per group would add uncharged
+/// cardinality-shaped memory to an already memory-sensitive path.
+pub(crate) fn format_group_key(key: &[GroupByKey]) -> String {
+    let parts: Vec<String> = key.iter().map(format_group_key_part).collect();
+    format!("[{}]", parts.join(", "))
+}
+
+/// Render one group-key component. Both whole-key forms build on this, so a
+/// key value renders identically whichever one a caller uses.
+///
+/// **The escaping and formatting decisions here are load-bearing for output
+/// order, not only for diagnostics.** [`format_group_key`] feeds the
+/// correlation-commit and retract-detection sorts, so unquoting a string for
+/// readability, changing numeric formatting, or adding truncation reorders
+/// committed records and diverges the byte-stable goldens. Such a change needs
+/// those fixtures re-read, not just a diagnostic eyeballed.
+///
+/// Rendering fidelity, by variant: `Str` is quoted (so an empty or
+/// space-padded key stays visible) and `Decimal` round-trips through
+/// [`GroupByKey::to_value`] at its exact scale. `Float` is not exact — and
+/// because `value_to_group_key` widens every `Value::Integer` to `f64`, an
+/// integer partition value above 2^53 renders rounded, so the printed name of
+/// such a group is not a literal copy of the author's cell.
+fn format_group_key_part(k: &GroupByKey) -> String {
+    match k {
+        GroupByKey::Null => "null".to_string(),
+        GroupByKey::Bool(b) => b.to_string(),
+        GroupByKey::Int(i) => i.to_string(),
+        GroupByKey::Float(bits) => f64::from_bits(*bits).to_string(),
+        GroupByKey::Decimal(_) => k.to_value().to_string(),
+        GroupByKey::Str(s) => format!("{s:?}"),
+        GroupByKey::Date(d) => d.to_string(),
+        GroupByKey::DateTime(ts) => ts.to_string(),
+    }
+}
+
+/// Maximum raw bytes retained from one author-controlled field name or string
+/// partition value in an error diagnostic.
+const DIAGNOSTIC_GROUP_COMPONENT_BYTES: usize = 64;
+
+/// Maximum bytes devoted to the rendered group name in a diagnostic. The
+/// surrounding E310 explanation is fixed-size; bounding this author-controlled
+/// segment keeps the fail-loud path independent of input cardinality.
+const DIAGNOSTIC_GROUP_TOTAL_BYTES: usize = 1024;
+
+/// Space held back while appending components so the exact omission marker and
+/// closing bracket always fit inside [`DIAGNOSTIC_GROUP_TOTAL_BYTES`].
+const DIAGNOSTIC_GROUP_OMISSION_RESERVE: usize = 64;
+
+/// Return a valid UTF-8 prefix no larger than `max_bytes`, plus the number of
+/// raw input bytes omitted. The byte count makes truncation unambiguous without
+/// hashing or walking the omitted tail.
+fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> (&str, usize) {
+    if value.len() <= max_bytes {
+        return (value, 0);
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&value[..end], value.len() - end)
+}
+
+fn format_diagnostic_field_name(field: &str) -> String {
+    let (prefix, omitted) = bounded_utf8_prefix(field, DIAGNOSTIC_GROUP_COMPONENT_BYTES);
+    if omitted == 0 {
+        return prefix.to_string();
+    }
+    format!("{prefix}...<{omitted} bytes omitted>")
+}
+
+/// Diagnostic-only counterpart to [`format_group_key_part`]. String values are
+/// truncated before formatting, so constructing an E310 after the budget has
+/// already been exceeded cannot allocate a second input-sized string. The
+/// ordering renderer remains exact and unchanged.
+fn format_diagnostic_group_key_part(k: &GroupByKey) -> String {
+    let GroupByKey::Str(value) = k else {
+        return format_group_key_part(k);
+    };
+    let (prefix, omitted) = bounded_utf8_prefix(value, DIAGNOSTIC_GROUP_COMPONENT_BYTES);
+    let mut rendered = format!("{prefix:?}");
+    if omitted > 0 {
+        // Debug formatting always surrounds a string with quotes. Replace the
+        // closing quote with a precise truncation marker inside the value.
+        let closing_quote = rendered.pop();
+        debug_assert_eq!(closing_quote, Some('"'));
+        let _ = write!(rendered, "...<{omitted} bytes omitted>\"");
+    }
+    rendered
+}
+
+fn format_diagnostic_group_key(key: &[GroupByKey]) -> String {
+    let mut rendered = String::with_capacity(DIAGNOSTIC_GROUP_TOTAL_BYTES.min(128));
+    rendered.push('[');
+    for (idx, part) in key.iter().enumerate() {
+        let part = format_diagnostic_group_key_part(part);
+        let separator_len = usize::from(idx > 0) * 2;
+        if rendered.len() + separator_len + part.len() + DIAGNOSTIC_GROUP_OMISSION_RESERVE
+            > DIAGNOSTIC_GROUP_TOTAL_BYTES
+        {
+            if idx > 0 {
+                rendered.push_str(", ");
+            }
+            let omitted = key.len() - idx;
+            let _ = write!(rendered, "... <{omitted} key parts omitted>");
+            break;
+        }
+        if idx > 0 {
+            rendered.push_str(", ");
+        }
+        rendered.push_str(&part);
+    }
+    rendered.push(']');
+    rendered
+}
+
+/// Render a group key paired with the `partition_by` fields that produced it,
+/// as `field=value` pairs in declaration order: `[account="A-1", day=3]`.
+///
+/// The second of this module's two group-key spellings — [`format_group_key`]
+/// renders the same key without field names, and the two do not share a
+/// format, only [`format_group_key_part`]. Used by the Reshape and Cull budget
+/// diagnostics; no caller sorts by this form, so unlike `format_group_key` it
+/// carries no output-ordering contract of its own (the part renderer it shares
+/// still does).
+///
+/// The field names are the author's own, so they match the YAML directly. The
+/// values are rendered, not echoed: see [`format_group_key_part`] for where a
+/// rendered value can differ from the cell it came from.
+///
+/// An empty `partition_by` is the degenerate correlation key: every record
+/// keys to the same empty tuple, so the node holds exactly one group spanning
+/// the whole input. That group renders as `[whole input]` — an empty bracket
+/// pair would name nothing, leaving the author with a diagnostic about a group
+/// they cannot identify.
+///
+/// Falls back to a bounded bare-key rendering when the field list and the key
+/// disagree on length, so a length mismatch degrades the diagnostic instead
+/// of losing it. Both paths cap author-controlled text: this formatter runs
+/// only after the memory ceiling has already been exceeded and must not create
+/// another allocation proportional to a hostile key or field list.
+pub(crate) fn format_partition_group(partition_by: &[String], key: &[GroupByKey]) -> String {
+    if partition_by.is_empty() && key.is_empty() {
+        return "[whole input]".to_string();
+    }
+    if partition_by.len() != key.len() {
+        return format_diagnostic_group_key(key);
+    }
+    let mut rendered = String::with_capacity(DIAGNOSTIC_GROUP_TOTAL_BYTES.min(128));
+    rendered.push('[');
+    for (idx, (field, value)) in partition_by.iter().zip(key).enumerate() {
+        let field = format_diagnostic_field_name(field);
+        let value = format_diagnostic_group_key_part(value);
+        let component_len = field.len() + 1 + value.len();
+        let separator_len = usize::from(idx > 0) * 2;
+        if rendered.len() + separator_len + component_len + DIAGNOSTIC_GROUP_OMISSION_RESERVE
+            > DIAGNOSTIC_GROUP_TOTAL_BYTES
+        {
+            if idx > 0 {
+                rendered.push_str(", ");
+            }
+            let omitted = partition_by.len() - idx;
+            let _ = write!(rendered, "... <{omitted} fields omitted>");
+            break;
+        }
+        if idx > 0 {
+            rendered.push_str(", ");
+        }
+        rendered.push_str(&field);
+        rendered.push('=');
+        rendered.push_str(&value);
+    }
+    rendered.push(']');
+    rendered
+}
+
+/// Which grouped node raised a giant-group `E310`.
+///
+/// Reshape and Cull hold structurally identical per-group buffers and fail the
+/// same way at finalize, so [`giant_group_error`] writes one message for both.
+/// The four things that genuinely differ between them ride on this enum rather
+/// than on two parallel builders — the duplication that arrangement replaces is
+/// exactly what let the two messages drift apart from each other.
+#[derive(Clone, Copy)]
+pub(crate) enum GroupedNodeKind {
+    Reshape,
+    Cull,
+}
+
+impl GroupedNodeKind {
+    /// Node name as the author knows it, used both to name the operator and to
+    /// attribute the write-every-column-through remark to it.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Reshape => "Reshape",
+            Self::Cull => "Cull",
+        }
+    }
+
+    /// Why this node needs the whole group resident at once. Reshape's reason
+    /// is the no-cascade contract (every rule observes one original snapshot);
+    /// Cull's is that `drop_group_when` is an aggregate over the whole group.
+    fn whole_group_clause(self) -> &'static str {
+        match self {
+            Self::Reshape => {
+                "Reshape applies its rules against the whole group at once (the no-cascade \
+                 contract)"
+            }
+            Self::Cull => {
+                "Cull evaluates its `drop_group_when` predicate against the whole group at once"
+            }
+        }
+    }
+
+    /// What else is resident at finalize besides the remaining groups, which is
+    /// why the reported figure is a floor rather than a sufficient budget. Cull
+    /// additionally holds its `O(distinct groups)` decision map.
+    fn co_resident_extra(self) -> &'static str {
+        match self {
+            Self::Reshape => "",
+            Self::Cull => " and its per-group decision map",
+        }
+    }
+
+    /// What re-keying `partition_by` costs. Never offered as a remedy — the
+    /// engine must not recommend a fix that changes the result set — but named
+    /// so an author who reaches for it knows what it does. Reshape's rules
+    /// would evaluate over a different group; Cull's predicate would count
+    /// different rows, routing records to the wrong output port.
+    fn rekey_consequence(self) -> &'static str {
+        match self {
+            Self::Reshape => "redefines the group the rules evaluate against and changes results",
+            Self::Cull => {
+                "changes what `drop_group_when` counts and changes which rows are removed"
+            }
+        }
+    }
+
+    /// What lands in the null group, enumerated because a `null`-keyed group is
+    /// the case most likely to be giant and an author who greps only for blanks
+    /// finds too few rows to explain the size and stops looking.
+    ///
+    /// The two enumerations differ because the keyings differ: Reshape's
+    /// `partition_key` folds every unkeyable value in, while Cull hard-errors
+    /// on a NaN, array, or map partition value rather than folding it.
+    fn null_group_note(self) -> &'static str {
+        match self {
+            Self::Reshape => {
+                " A `null` here is where this node puts every row whose partition value it cannot \
+                 use as a key: a missing column, an explicit null, an empty string, a NaN, or an \
+                 array- or map-valued cell. Any of those may be inflating this group."
+            }
+            Self::Cull => {
+                " A `null` here covers both an explicit null and a row missing the column \
+                 entirely, so either may be inflating this group."
+            }
+        }
+    }
+}
+
+/// Hard error (E310) for a single Reshape or Cull correlation group that
+/// exceeds the finalize memory budget.
+///
+/// This is a memory-budget condition, not an invariant violation: the engine is
+/// working exactly as designed and the author's data outgrew a configured
+/// ceiling. So it surfaces through the standard `MemoryBudgetExceeded`
+/// diagnostic every other budget overrun uses, naming the offending
+/// `partition_by` group so the author can find it in their input.
+///
+/// The remediation deliberately does NOT suggest a finer `partition_by`. That
+/// key defines the group the node's rules evaluate against, so narrowing it
+/// makes the run succeed by silently changing the answer — a suggestion the
+/// engine must never make. It is named only with its consequence attached.
+///
+/// Only one lever here leaves the output untouched: a larger budget. Dropping
+/// columns upstream also shrinks the group, but both nodes write every input
+/// column through, so every dropped column vanishes from what is written. The
+/// text offers it labelled with that consequence rather than as a free win.
+///
+/// `group_bytes` is this one group's reload footprint while `hard_limit` is the
+/// run-wide ceiling, so the two are not directly comparable as a target:
+/// finalize also holds the remaining groups. The wording says "clear of" rather
+/// than naming the group's own size as a sufficient budget.
+pub(crate) fn giant_group_error(
+    kind: GroupedNodeKind,
+    node_name: &str,
+    partition_by: &[String],
+    key: &[GroupByKey],
+    group_bytes: u64,
+    hard_limit: u64,
+) -> PipelineError {
+    let label = kind.label();
+    let group = format_partition_group(partition_by, key);
+    // With no `partition_by` fields there is no key to narrow, so the standard
+    // narrowing warning would advise editing something the author never wrote.
+    // Name the shape they did declare instead.
+    let rekey = if partition_by.is_empty() {
+        format!(
+            "`partition_by` is empty here, so every record forms this one group — there is no \
+             key to narrow. Declaring fields in `partition_by` would split it, but that {}.",
+            kind.rekey_consequence()
+        )
+    } else {
+        format!(
+            "Narrowing `partition_by` shrinks it as well, but it {}.",
+            kind.rekey_consequence()
+        )
+    };
+    let null_note = if key.iter().any(|k| matches!(k, GroupByKey::Null)) {
+        kind.null_group_note()
+    } else {
+        ""
+    };
+    PipelineError::MemoryBudgetExceeded {
+        node: node_name.to_string(),
+        used: group_bytes,
+        limit: hard_limit,
+        source: BudgetCategory::Arena,
+        detail: Some(format!(
+            "one {label} correlation group {group} does not fit; the reported use \
+             ({group_bytes} bytes) is that group's reload footprint alone. {}, so a single group \
+             must fit the budget even though cross-group and ingest-time peaks spill to disk. \
+             Raising `memory.limit` clear of {group_bytes} bytes is the only fix that leaves your \
+             output unchanged — finalize also holds the run's remaining groups{}, so treat that \
+             figure as a floor. Dropping columns this node does not read, in an upstream \
+             Transform, also shrinks the group, but {label} writes every input column through, so \
+             those columns leave the output too. {rekey}{null_note}",
+            kind.whole_group_clause(),
+            kind.co_resident_extra(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_memory_limit;
+    use super::{DIAGNOSTIC_GROUP_TOTAL_BYTES, format_partition_group, parse_memory_limit};
+    use clinker_record::GroupByKey;
 
     const MINIMAL_PIPELINE: &str = r#"
 pipeline:
@@ -458,5 +812,26 @@ nodes:
                 "aggregate spill budget for {limit:?} must equal the arbitrator ceiling"
             );
         }
+    }
+
+    #[test]
+    fn diagnostic_group_bounds_an_oversized_string_key_before_formatting() {
+        let key = vec![GroupByKey::Str("x".repeat(4096).into_boxed_str())];
+        let rendered = format_partition_group(&["account".to_string()], &key);
+
+        assert!(rendered.len() <= DIAGNOSTIC_GROUP_TOTAL_BYTES);
+        assert!(rendered.contains("<4032 bytes omitted>"), "{rendered}");
+        assert!(!rendered.contains(&"x".repeat(128)), "{rendered}");
+    }
+
+    #[test]
+    fn diagnostic_group_bounds_high_cardinality_partition_fields() {
+        let fields: Vec<String> = (0..1000).map(|idx| format!("field_{idx:04}")).collect();
+        let key = vec![GroupByKey::Null; fields.len()];
+        let rendered = format_partition_group(&fields, &key);
+
+        assert!(rendered.len() <= DIAGNOSTIC_GROUP_TOTAL_BYTES);
+        assert!(rendered.contains("fields omitted"), "{rendered}");
+        assert!(rendered.starts_with("[field_0000=null"), "{rendered}");
     }
 }

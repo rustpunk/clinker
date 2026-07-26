@@ -120,6 +120,77 @@ nodes:
       path: out.csv
 "#;
 
+/// Whole-input Reshape: `partition_by: []` is the degenerate correlation key,
+/// so every record keys to the same empty tuple and the node holds exactly one
+/// group. `order_by` therefore sorts the entire input rather than sorting
+/// within per-key groups, which is what makes the grouping observable from the
+/// output alone.
+const WHOLE_INPUT_PIPELINE: &str = r#"
+pipeline:
+  name: reshape_whole_input
+nodes:
+  - type: source
+    name: rows
+    config:
+      name: rows
+      type: csv
+      path: test.csv
+      schema:
+        - { name: id, type: string }
+        - { name: amount, type: int }
+        - { name: label, type: string }
+  - type: reshape
+    name: relabel
+    input: rows
+    config:
+      partition_by: []
+      order_by:
+        - { field: amount, order: asc }
+      rules:
+        - name: flag_large
+          when: "amount > 100"
+          mutate:
+            set:
+              label: "'large'"
+  - type: output
+    name: out
+    input: relabel
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+#[test]
+fn empty_partition_by_groups_the_whole_input() {
+    // `partition_by: []` applies the rules across the entire dataset. It is a
+    // supported configuration, not a malformed one — a bind-time arity rule
+    // would delete the capability, so this pins the runtime behaviour end to
+    // end rather than only the compile.
+    //
+    // Two ids arrive interleaved and out of amount order. Under whole-input
+    // grouping the single group is sorted by `amount` as a unit, so the output
+    // is globally ascending. Were the input keyed by `id` instead, the output
+    // would run group-by-group in first-seen key order (b, then a, then c) —
+    // so the global ordering below is what distinguishes the two shapes.
+    let csv = "id,amount,label\n\
+               b,300,plain\n\
+               a,50,plain\n\
+               c,200,plain\n\
+               a,10,plain\n";
+    let (counters, dlq, output) = run_reshape(WHOLE_INPUT_PIPELINE, csv).unwrap();
+
+    assert!(dlq.is_empty(), "no DLQ entries expected, got {dlq:?}");
+    assert_eq!(counters.ok_count, 4, "all 4 source rows emit clean");
+
+    let data: Vec<&str> = output.lines().skip(1).filter(|l| !l.is_empty()).collect();
+    assert_eq!(
+        data,
+        vec!["a,10,plain", "a,50,plain", "c,200,large", "b,300,large"],
+        "one whole-input group must sort as a unit and relabel every row over 100: {output}"
+    );
+}
+
 #[test]
 fn scd_type2_mutates_trigger_and_synthesizes_row() {
     // Employee A has one long-gap row (1000 - 100 = 900 > 365) and one
@@ -882,20 +953,89 @@ fn reshape_giant_group_exceeds_budget_fails_loud() {
     // finalize to observe the rules. A single group larger than the memory
     // budget therefore has no in-budget representation: skew slicing bounds the
     // ingest peak, but the finalize reload still needs the whole group. Rather
-    // than OOM, the run must fail loud with a clear diagnostic naming the
-    // single-group limitation.
+    // than OOM, the run must fail loud.
+    //
+    // And it must fail loud through the STANDARD memory diagnostic. A group
+    // that outgrew the budget is an expected operational condition with a
+    // documented code, not an invariant violation: surfacing it as an internal
+    // error would tell the author their engine is broken when in fact their
+    // data exceeded a limit they configured.
     let (csv, _) = scd_input(1, 400); // one ~125 KB group
 
     let err = run_reshape_report(&scd_spill_pipeline("8K"), &csv)
         .expect_err("a single group larger than the budget must fail loud, not OOM");
-    let rendered = format!("{err:?}");
+
+    match &err {
+        PipelineError::MemoryBudgetExceeded {
+            node,
+            used,
+            limit,
+            detail,
+            ..
+        } => {
+            assert_eq!(
+                node, "backfill",
+                "the diagnostic must name the Reshape node"
+            );
+            assert!(
+                *used > *limit,
+                "the reported group footprint ({used}) must exceed the budget ({limit})"
+            );
+            let detail = detail.as_deref().expect("the overrun must carry detail");
+            // The offending group is named as the author declared it, so a
+            // 200-group input points at the one group that blew the budget.
+            assert!(
+                detail.contains("Reshape correlation group [employee_id=\"employee-00000\"]"),
+                "the detail must name the offending partition_by group: {detail}"
+            );
+            assert!(
+                detail.contains("no-cascade"),
+                "the detail must explain why one group must fit the budget: {detail}"
+            );
+            assert!(
+                detail.contains("memory.limit")
+                    && detail.contains("only fix that leaves your output unchanged"),
+                "the detail must name raising the budget as the one output-preserving fix: \
+                 {detail}"
+            );
+            // The column-dropping remedy is offered, so it must carry its
+            // consequence: this node writes every input column through, so
+            // dropped columns leave the written output as well.
+            assert!(
+                detail.contains("upstream Transform"),
+                "the detail must offer the column-drop remedy: {detail}"
+            );
+            assert!(
+                detail.contains("leave the output too"),
+                "offering the column-drop remedy requires disclosing that it changes which \
+                 columns are written: {detail}"
+            );
+            // Narrowing `partition_by` redefines the group the rules evaluate
+            // against, so recommending it would clear the abort by changing
+            // the answer. The engine warns about it instead.
+            assert!(
+                !detail.contains("add a finer `partition_by`"),
+                "the remediation must not recommend narrowing partition_by: {detail}"
+            );
+            assert!(
+                detail.contains("Narrowing `partition_by`") && detail.contains("changes results"),
+                "the detail must warn that narrowing partition_by changes results: {detail}"
+            );
+        }
+        other => panic!(
+            "a giant correlation group is a memory-budget condition and must surface E310, \
+             not an internal error; got {other:?}"
+        ),
+    }
+
+    let rendered = err.to_string();
     assert!(
-        rendered.contains("single Reshape correlation group"),
-        "the diagnostic must name the giant-group limitation: {rendered}"
+        rendered.starts_with("E310 backfill:"),
+        "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
     );
     assert!(
-        rendered.contains("memory budget") && rendered.contains("no-cascade"),
-        "the diagnostic must explain why one group must fit the budget: {rendered}"
+        !rendered.contains("internal error"),
+        "a configured-limit overrun must never read as an engine bug: {rendered}"
     );
 }
 

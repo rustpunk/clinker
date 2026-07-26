@@ -14,6 +14,7 @@ use petgraph::graph::NodeIndex;
 
 use super::DlqEvent;
 use crate::executor::dispatch::ExecutorContext;
+use crate::executor::format_group_key;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
 /// One row-and-source pair carrying a relaxed-CK retract trigger.
@@ -366,21 +367,4 @@ fn buffer_key_position_for_column(schema: &Schema, target_col_idx: usize) -> Opt
             })
             .count(),
     )
-}
-
-fn format_group_key(key: &[GroupByKey]) -> String {
-    let parts: Vec<String> = key
-        .iter()
-        .map(|k| match k {
-            GroupByKey::Null => "null".to_string(),
-            GroupByKey::Bool(b) => b.to_string(),
-            GroupByKey::Int(i) => i.to_string(),
-            GroupByKey::Float(bits) => f64::from_bits(*bits).to_string(),
-            GroupByKey::Decimal(_) => k.to_value().to_string(),
-            GroupByKey::Str(s) => format!("{s:?}"),
-            GroupByKey::Date(d) => d.to_string(),
-            GroupByKey::DateTime(ts) => ts.to_string(),
-        })
-        .collect();
-    format!("[{}]", parts.join(", "))
 }

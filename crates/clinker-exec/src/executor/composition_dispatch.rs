@@ -126,14 +126,14 @@ pub(crate) fn dispatch_composition(
     // diagnostic points the user at the user-visible operator,
     // not at the body's internal output port node name.
     //
-    // Boundary admit (post-body): same two-path model as the
-    // pre-body port-records clone in `collect_port_records`.
-    // If `admit_node_buffer` returns `MemoryBudgetExceeded`
-    // here, it surfaces bare with `node = composition_name` —
-    // not wrapped in `CompositionBodyError`. The wrapper at
-    // `execute_composition_body`'s topo walk has already
-    // returned with `Ok` by the time we reach this admit;
-    // only errors from inside that walk get the wrapper.
+    // Boundary admit (post-body): if `admit_node_buffer` returns
+    // `MemoryBudgetExceeded` here, it surfaces bare with `node =
+    // composition_name` — not wrapped in `CompositionBodyError`.
+    // The wrapper at `execute_composition_body`'s topo walk has
+    // already returned with `Ok` by the time we reach this admit;
+    // only errors from inside that walk get the wrapper. The pre-body
+    // port-records clone is not an admit today; #1028 tracks bringing
+    // that duplicate under the pull-mode memory contract.
     let nb = admit_node_buffer(
         ctx,
         &composition_name,
@@ -191,40 +191,28 @@ fn collect_port_records(
                 ),
             });
         };
-        // Compute the heap-clone footprint while the immutable borrow
-        // of `node_buffers` is live, then release it so the charge
-        // path can take `&mut ctx.memory_budget`. The cloned records
-        // are about to be seeded into the body-local `node_buffers`
-        // namespace inside `execute_composition_body`; the body's
-        // port-source Source arm discharges the slot when it claims
-        // the seeded buffer, and the body-exit leak-discharge cleans
-        // up any unconsumed remainder if a body operator errored.
-        //
-        // Boundary admit: the budget exceedance surfaces as a bare
-        // `MemoryBudgetExceeded` with `node = composition_name`
-        // (the user-visible call-site identifier). The body has not
-        // executed yet, so there is no body-internal operator name
-        // to disambiguate via `CompositionBodyError` — only inner
-        // errors that bubble out of `execute_composition_body`'s
-        // topo walk get that wrapper. Detail string discriminates
-        // this site from the generic admit in `admit_node_buffer`.
-        let cloned_with_bytes = ctx.node_buffers.get(&edge.source().into()).map(|nb| {
-            // Composition port seeding clones records only; the
-            // composition body operates inside its own document-
-            // boundary scope and re-emits punctuations at the call-
-            // site level on body exit, so the parent's puncts do not
-            // forward through the body's port-source boundary.
-            let cloned_records: Vec<(Record, u64)> = nb
-                .clone_memory_only()
-                .into_iter()
-                .filter_map(|e| e.into_record())
-                .collect();
-            (cloned_records, nb.estimated_memory_bytes())
-        });
-        let records: Vec<(Record, u64)> = match cloned_with_bytes {
-            Some((cloned, _bytes)) => cloned,
-            None => Vec::new(),
-        };
+        // Clone records while the immutable `node_buffers` borrow is live.
+        // Unlike a normal node-buffer handoff, this duplicate is seeded into
+        // the body-local namespace with `NodeBuffer::memory_from_records`
+        // rather than `admit_node_buffer`. It is therefore not registered
+        // with the pull-mode arbitrator and cannot itself raise E310. #1028
+        // tracks reserving the duplicate before allocation and transferring
+        // that accounting into the body scope without a gap or double count.
+        let records = ctx
+            .node_buffers
+            .get(&edge.source().into())
+            .map(|nb| {
+                // Composition port seeding clones records only; the
+                // composition body operates inside its own document-
+                // boundary scope and re-emits punctuations at the call-
+                // site level on body exit, so the parent's puncts do not
+                // forward through the body's port-source boundary.
+                nb.clone_memory_only()
+                    .into_iter()
+                    .filter_map(|e| e.into_record())
+                    .collect::<Vec<(Record, u64)>>()
+            })
+            .unwrap_or_default();
         // Two parallel edges to the same port (e.g. `inputs: { p: a,
         // p: a }` — currently rejected at parse, but the runtime is
         // defensive) would overwrite; the wiring pass guarantees
@@ -352,17 +340,16 @@ fn execute_composition_body(
     // "in composition '<name>': <inner>" instead of an opaque
     // inner-only message.
     //
-    // Body-interior path of the two-path admission model: the inner
-    // error's `node` field names a body-internal operator (e.g.
-    // `stage_split`) the user never wrote in their YAML, so the
-    // wrapper supplies the user-visible call-site name on top. The
-    // boundary admits in `collect_port_records` (pre-body input
-    // clone) and the parent's Composition arm (post-body output
-    // harvest) stay unwrapped because their `node` is already the
-    // call-site composition name — wrapping them would duplicate
-    // the same identifier in both layers with no information gain.
-    // Consumers that want to catch every composition-involved
-    // budget exceedance must match both shapes.
+    // Body-interior path of the two E310 shapes a composition can
+    // currently emit: the inner error's `node` field names a body-
+    // internal operator (e.g. `stage_split`) the user never wrote in
+    // their YAML, so the wrapper supplies the user-visible call-site
+    // name on top. The other shape is the parent's post-body output
+    // admission, which stays unwrapped because its `node` is already
+    // the call-site composition name. The pre-body input clone is not
+    // admitted and cannot emit E310 (#1028). Consumers that want to
+    // catch every current composition-involved budget exceedance must
+    // match both the bare and wrapped shapes.
     let topo: Vec<NodeIndex> = body_dag.topo_order.clone();
     let mut walk_result: Result<(), PipelineError> = Ok(());
     for node_idx in topo {

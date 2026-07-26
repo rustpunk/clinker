@@ -12,6 +12,10 @@
 //! - `removed_to` is empty.
 //! - `removed_to` collides with the node's own name (the main output port).
 //! - `drop_group_when` references a field absent from the upstream schema.
+//!
+//! One positive path is pinned alongside them: `partition_by: []` is the
+//! degenerate whole-input key and must compile, so no guard here grows into
+//! rejecting a supported configuration.
 
 use crate::config::{CompileContext, parse_config};
 
@@ -81,6 +85,25 @@ nodes:
       path: audit.csv
 "#
     )
+}
+
+// `partition_by: []` is the degenerate correlation key: every record keys to
+// the same empty tuple, so `drop_group_when` decides the whole input as one
+// group — keep everything or remove everything. It is a supported
+// configuration, not a malformed one, so this test pins the compile.
+#[test]
+fn empty_partition_by_groups_the_whole_input() {
+    let yaml = pipeline_with_cull_config(
+        r#"      partition_by: []
+      removed_to: removed
+      rules:
+        - name: drop_errors
+          drop_group_when: "sum(if status == 'error' then 1 else 0) > 0""#,
+    );
+    let config = parse_config(&yaml).expect("parse_config");
+    config
+        .compile(&CompileContext::default())
+        .expect("`partition_by: []` groups the whole input and must compile");
 }
 
 #[test]

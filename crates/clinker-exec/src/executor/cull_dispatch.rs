@@ -53,8 +53,9 @@
 //! analogue of the single-giant-group finalize failure below.
 //!
 //! A single correlation group whose reloaded footprint exceeds the finalize
-//! budget fails loud with a [`PipelineError`] rather than risking an
-//! out-of-memory crash on reload.
+//! budget fails loud with the same [`PipelineError::MemoryBudgetExceeded`]
+//! diagnostic, naming the offending `partition_by` group, rather than risking
+//! an out-of-memory crash on reload.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,6 +70,7 @@ use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, drain_node_buffer_slot,
     node_buffer_spill_allowed, source_file_arc_of, source_name_arc_of,
 };
+use crate::executor::{GroupedNodeKind, giant_group_error};
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
@@ -292,7 +294,7 @@ fn run_cull_grouped(
     let mut removed: Vec<(Record, u64)> = Vec::new();
     let group_order = buffer.take_group_order();
     for key in group_order {
-        let mut group = buffer.take_group(name, &key, hard_limit)?;
+        let mut group = buffer.take_group(name, &config.partition_by, &key, hard_limit)?;
         handle.set_bytes(buffer.resident_bytes() as u64);
         if !config.order_by.is_empty() {
             sort_group(&mut group, &config.order_by);
@@ -875,12 +877,15 @@ impl CullGroupBuffer {
     ///
     /// # Errors
     ///
-    /// Returns [`PipelineError::Internal`] when a single correlation group's
-    /// reloaded footprint exceeds `hard_limit`, or when a spill file cannot be
-    /// read back.
+    /// Returns [`PipelineError::MemoryBudgetExceeded`] (E310) when a single
+    /// correlation group's reloaded footprint exceeds `hard_limit`.
+    ///
+    /// A spill file that cannot be read back currently surfaces through
+    /// [`cull_spill_error`]; see the classification caveat recorded there.
     fn take_group(
         &mut self,
         node_name: &str,
+        partition_by: &[String],
         key: &[GroupByKey],
         hard_limit: u64,
     ) -> Result<Vec<(Record, u64)>, PipelineError> {
@@ -889,7 +894,14 @@ impl CullGroupBuffer {
 
         let group_bytes = (state.resident_bytes + state.spilled_bytes) as u64;
         if hard_limit > 0 && group_bytes > hard_limit {
-            return Err(cull_giant_group_error(node_name, group_bytes, hard_limit));
+            return Err(giant_group_error(
+                GroupedNodeKind::Cull,
+                node_name,
+                partition_by,
+                key,
+                group_bytes,
+                hard_limit,
+            ));
         }
 
         if state.spilled.is_empty() {
@@ -1030,6 +1042,15 @@ fn sort_group(group: &mut [(Record, u64)], order_by: &[SortField]) {
 /// Wrap a spill read/write fault from the Cull group buffer as a hard
 /// pipeline error. Spill faults are I/O failures, not data errors, so they
 /// abort the run rather than route anywhere.
+///
+/// The `Internal` classification here is known to be wrong and is not a
+/// contract to build on: a full or unavailable spill volume is host
+/// infrastructure failing, not an engine invariant violated. The aggregate and
+/// grace-hash paths map the same `SpillError` to `PipelineError::Spill`, which
+/// keeps the E321 disk-full diagnostic and exits 4; this path flattens it to a
+/// string and exits 1, so an orchestrator that retries infrastructure faults
+/// treats a full disk here as a bad pipeline. Tracked in issue #1021 — changing
+/// it moves an exit code, so it is not folded into an unrelated change.
 fn cull_spill_error(node_name: &str, e: clinker_plan::SpillError) -> PipelineError {
     PipelineError::Internal {
         op: "cull",
@@ -1041,29 +1062,21 @@ fn cull_spill_error(node_name: &str, e: clinker_plan::SpillError) -> PipelineErr
 /// Wrap a predicate-aggregate compile or eval fault as a hard pipeline error.
 /// `bind_cull` already typechecked each rule fragment, so a failure here is a
 /// setup-invariant violation that aborts the run.
+///
+/// The blanket `Internal` classification here is known to be wrong and is not a
+/// contract to build on. Typechecking proves the fragment's shape, not that
+/// every row evaluates: a runtime data error in the author's own
+/// `drop_group_when` expression aborts as an engine bug at exit 1 rather than
+/// routing to the DLQ under `strategy: continue`, which is what the same class
+/// of fault does elsewhere. It also flattens `SpillCapExceeded` (E320, exit 4)
+/// into the same bucket. Tracked in issue #1021 with the sibling spill-fault
+/// misclassification — the fix moves user-visible exit codes and DLQ routing,
+/// so the whole family lands under one review rather than riding along here.
 fn cull_predicate_error(node_name: &str, e: crate::aggregation::HashAggError) -> PipelineError {
     PipelineError::Internal {
         op: "cull",
         node: node_name.to_string(),
         detail: format!("drop_group_when predicate evaluation failed: {e}"),
-    }
-}
-
-/// Hard error for a single correlation group that exceeds the finalize memory
-/// budget. The `drop_group_when` decision needs the whole group observable at
-/// once, so a group bigger than the budget has no in-budget representation —
-/// fail loud rather than OOM on reload.
-fn cull_giant_group_error(node_name: &str, group_bytes: u64, hard_limit: u64) -> PipelineError {
-    PipelineError::Internal {
-        op: "cull",
-        node: node_name.to_string(),
-        detail: format!(
-            "a single Cull correlation group is ~{group_bytes} bytes, which exceeds the memory \
-             budget of {hard_limit} bytes. Cull evaluates its group-level removal predicate \
-             against the whole group at once, so a single group must fit the budget even though \
-             cross-group and ingest-time peaks spill to disk. Raise `memory.limit`, or partition \
-             the input so no one correlation group is this large."
-        ),
     }
 }
 
@@ -1138,6 +1151,119 @@ mod tests {
         };
         assert_eq!(empty, canon(&Value::String("".into())));
         assert_eq!(null, canon(&Value::Null));
+    }
+
+    // A single correlation group too large to observe whole at finalize is an
+    // ordinary memory-budget condition — the author's data outgrew a
+    // configured ceiling — not an engine invariant violation. It must carry
+    // the standard E310 surface, the same one the sibling decision-state
+    // overrun uses, so a user reads one memory diagnostic rather than an
+    // "internal error" that implies a broken engine.
+    #[test]
+    fn take_group_rejects_a_group_larger_than_the_hard_limit_with_e310() {
+        let schema: Arc<Schema> = Arc::new(Schema::new(vec!["account".into()]));
+        let spill_root = tempfile::tempdir().unwrap();
+        let arb = arbitrator(512);
+        let handle = ConsumerHandle::new();
+        let key = vec![GroupByKey::Str("g".into())];
+        let partition_by = vec!["account".to_string()];
+
+        // One group, ~5 KiB across 64 records against a 512 B soft limit, so
+        // part of it partition-spills — exercising the reload path the hard
+        // limit gates rather than a purely resident group.
+        let mut buffer = CullGroupBuffer::new(Arc::clone(&schema), true);
+        for row_num in 0..64u64 {
+            let payload = format!("{row_num:063}");
+            buffer.push(
+                key.clone(),
+                record(&schema, Value::String(payload.into())),
+                row_num,
+            );
+            handle.set_bytes(buffer.resident_bytes() as u64);
+            if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
+                buffer
+                    .spill_until_under_budget("cl", &arb, spill_root.path(), &handle)
+                    .unwrap();
+            }
+        }
+        assert!(
+            !buffer.groups[&key].spilled.is_empty(),
+            "the oversized group must have partition-spilled for this to test the reload gate"
+        );
+
+        let err = buffer
+            .take_group("cl", &partition_by, &key, 256)
+            .expect_err("a group exceeding the hard limit must be rejected at finalize");
+
+        match &err {
+            PipelineError::MemoryBudgetExceeded {
+                node,
+                used,
+                limit,
+                source,
+                detail,
+            } => {
+                assert_eq!(node, "cl", "the diagnostic must name the Cull node");
+                assert_eq!(*limit, 256, "the limit must be the hard budget in force");
+                assert!(
+                    *used > *limit,
+                    "the reported footprint ({used}) must be the overrun, above the limit ({limit})"
+                );
+                assert_eq!(*source, BudgetCategory::Arena);
+                let detail = detail.as_deref().expect("the overrun must carry detail");
+                assert!(
+                    detail.contains("Cull correlation group [account=\"g\"]"),
+                    "the detail must name the offending partition_by group: {detail}"
+                );
+                assert!(
+                    detail.contains("drop_group_when"),
+                    "the detail must explain why one group must fit the budget: {detail}"
+                );
+                assert!(
+                    detail.contains("memory.limit")
+                        && detail.contains("only fix that leaves your output unchanged"),
+                    "the detail must name raising the budget as the one output-preserving fix: \
+                     {detail}"
+                );
+                // The column-dropping remedy must be offered AND must carry its
+                // consequence: this node writes every input column through, so
+                // dropped columns leave the written output as well. Asserting
+                // the pair rather than "consequence-if-offered" keeps the check
+                // live — the implication form passes vacuously the moment the
+                // remedy is reworded, which is how the two node messages drifted
+                // apart before.
+                assert!(
+                    detail.contains("upstream Transform"),
+                    "the detail must offer the column-drop remedy: {detail}"
+                );
+                assert!(
+                    detail.contains("leave the output too"),
+                    "offering the column-drop remedy requires disclosing that it changes which \
+                     columns are written: {detail}"
+                );
+                // Narrowing `partition_by` splits the group, so a
+                // `count(*) > 100` rule can stop firing and rows that should
+                // have routed to `removed_to` land on the main port instead.
+                // The engine must warn about that, never suggest it.
+                assert!(
+                    !detail.contains("add a finer `partition_by`"),
+                    "the remediation must not recommend narrowing partition_by: {detail}"
+                );
+                assert!(
+                    detail.contains("Narrowing `partition_by`")
+                        && detail.contains("changes which rows are removed"),
+                    "the detail must warn that narrowing partition_by changes the result set: \
+                     {detail}"
+                );
+            }
+            other => panic!("a giant correlation group must surface E310; got {other:?}"),
+        }
+
+        let rendered = err.to_string();
+        assert!(
+            rendered.starts_with("E310 cl:"),
+            "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
+        );
     }
 
     // The disk-spill cap must abort the spill instead of writing past

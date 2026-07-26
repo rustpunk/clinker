@@ -127,6 +127,90 @@ nodes:
       path: audit.csv
 "#;
 
+/// Whole-input Cull: `partition_by: []` is the degenerate correlation key, so
+/// every record keys to the same empty tuple and `drop_group_when` decides the
+/// entire input at once — keep everything or remove everything.
+const WHOLE_INPUT_CULL_PIPELINE: &str = r#"
+pipeline:
+  name: cull_whole_input
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: test.csv
+      schema:
+        - { name: account, type: string }
+        - { name: amount, type: int }
+        - { name: status, type: string }
+  - type: cull
+    name: drop_bad
+    input: events
+    config:
+      partition_by: []
+      removed_to: removed
+      rules:
+        - name: drop_any_error
+          drop_group_when: "sum(if status == 'error' then 1 else 0) > 0"
+  - type: output
+    name: out
+    input: drop_bad
+    config:
+      name: out
+      type: csv
+      path: out.csv
+  - type: output
+    name: audit
+    input: drop_bad.removed
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#;
+
+#[test]
+fn empty_partition_by_decides_the_whole_input() {
+    // `partition_by: []` applies the removal rule across the entire dataset. It
+    // is a supported configuration, not a malformed one — a bind-time arity
+    // rule would delete the capability, so this pins the runtime behaviour end
+    // to end rather than only the compile.
+    //
+    // The same input under `partition_by: [account]` removes only account A
+    // (see `error_group_routed_to_removed_clean_group_to_main`). Under
+    // whole-input grouping the one error row condemns every record, including
+    // account B's — which is exactly what distinguishes the two shapes.
+    let csv = "account,amount,status\n\
+               A,100,ok\n\
+               A,200,error\n\
+               B,300,ok\n\
+               B,400,ok\n";
+    let out = run_cull(WHOLE_INPUT_CULL_PIPELINE, csv);
+
+    assert_eq!(out.dlq_count, 0, "removed rows are not DLQ entries");
+
+    let main_data: Vec<&str> = out.main.lines().skip(1).filter(|l| !l.is_empty()).collect();
+    assert!(
+        main_data.is_empty(),
+        "one whole-input group carrying an error routes every record away from main: {}",
+        out.main
+    );
+    let removed_data: Vec<&str> = out
+        .removed
+        .lines()
+        .skip(1)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        removed_data,
+        vec!["A,100,ok", "A,200,error", "B,300,ok", "B,400,ok"],
+        "every record of the single whole-input group is removed: {}",
+        out.removed
+    );
+}
+
 #[test]
 fn error_group_routed_to_removed_clean_group_to_main() {
     // Account A has one `error` row → the whole A group is removed. Account B
@@ -564,6 +648,109 @@ fn cull_decision_state_fails_loud_when_group_cardinality_exceeds_budget() {
         }
         other => panic!("expected MemoryBudgetExceeded for the decision state; got {other:?}"),
     }
+}
+
+/// Build one partition group of `rows` records, each carrying a fixed-width
+/// payload in `account` so the single group's buffered footprint is large and
+/// predictable. The inverse shape of [`distinct_group_input`]: tiny group
+/// cardinality, one very large group.
+fn single_giant_group_input(rows: usize) -> String {
+    let mut csv = String::from("account,seq\n");
+    for r in 0..rows {
+        csv.push_str(&format!("BIG,{r}\n"));
+    }
+    csv
+}
+
+#[test]
+fn cull_giant_group_exceeds_budget_fails_loud() {
+    // One correlation group larger than the finalize budget. `drop_group_when`
+    // is evaluated against the whole group at once, so ingest-time spilling
+    // bounds the resident peak but the finalize reload still needs the group
+    // whole — there is no in-budget representation, and the run must fail
+    // loud rather than OOM.
+    //
+    // The failure must arrive as the STANDARD memory diagnostic. Group
+    // cardinality here is 1, so the O(groups) drop-decision state is trivially
+    // small and cannot be what trips: this isolates the single-giant-group
+    // reload gate. An internal error would misreport an ordinary configured-
+    // limit overrun as an engine invariant violation.
+    let csv = single_giant_group_input(2_000);
+    let err = run_cull_result(&count_cull_pipeline("8K"), &csv)
+        .expect_err("a single group larger than the budget must fail loud, not OOM");
+
+    match &err {
+        clinker_plan::error::PipelineError::MemoryBudgetExceeded {
+            node,
+            used,
+            limit,
+            detail,
+            ..
+        } => {
+            assert_eq!(node, "drop_big", "the diagnostic must name the Cull node");
+            assert!(
+                *used > *limit,
+                "the reported group footprint ({used}) must exceed the budget ({limit})"
+            );
+            let detail = detail.as_deref().expect("the overrun must carry detail");
+            // Names the offending group as the author declared it — and is
+            // distinguishable from the sibling decision-state overrun, which
+            // shares the E310 code but reports a different surface.
+            assert!(
+                detail.contains("Cull correlation group [account=\"BIG\"]"),
+                "the detail must name the offending partition_by group: {detail}"
+            );
+            assert!(
+                detail.contains("drop_group_when"),
+                "the detail must explain why one group must fit the budget: {detail}"
+            );
+            assert!(
+                detail.contains("memory.limit")
+                    && detail.contains("only fix that leaves your output unchanged"),
+                "the detail must name raising the budget as the one output-preserving fix: \
+                 {detail}"
+            );
+            // The column-dropping remedy is offered, so it must carry its
+            // consequence: this node writes every input column through, so
+            // dropped columns leave the written output as well.
+            assert!(
+                detail.contains("upstream Transform"),
+                "the detail must offer the column-drop remedy: {detail}"
+            );
+            assert!(
+                detail.contains("leave the output too"),
+                "offering the column-drop remedy requires disclosing that it changes which \
+                 columns are written: {detail}"
+            );
+            // This pipeline's rule is `count(*) > 100`. Splitting `account`
+            // across a finer key drops each per-group count below the
+            // threshold, so the run would succeed and stop removing accounts
+            // it should remove. The engine must never suggest that.
+            assert!(
+                !detail.contains("add a finer `partition_by`"),
+                "the remediation must not recommend narrowing partition_by: {detail}"
+            );
+            assert!(
+                detail.contains("Narrowing `partition_by`")
+                    && detail.contains("changes which rows are removed"),
+                "the detail must warn that narrowing partition_by changes the result set: {detail}"
+            );
+        }
+        other => panic!(
+            "a giant correlation group is a memory-budget condition and must surface E310, \
+             not an internal error; got {other:?}"
+        ),
+    }
+
+    let rendered = err.to_string();
+    assert!(
+        rendered.starts_with("E310 drop_big:"),
+        "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
+    );
+    assert!(
+        !rendered.contains("internal error"),
+        "a configured-limit overrun must never read as an engine bug: {rendered}"
+    );
 }
 
 #[test]

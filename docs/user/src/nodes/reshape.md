@@ -38,6 +38,45 @@ For each `employee_id` group, every row where `plan_start - plan_end > 365` (the
 
 A list of field names. Records sharing the same values for all `partition_by` fields form one group, and every rule observes and acts within a single group. This is the correlation key the operator reasons over.
 
+### Whole-input grouping (`partition_by: []`)
+
+An empty list is the degenerate case of that key: every record shares it, so the entire input forms **one** group and the rules apply across the whole dataset rather than per entity.
+
+```yaml
+- type: reshape
+  name: relabel
+  input: rows
+  config:
+    partition_by: []          # one group: the whole input
+    order_by:
+      - { field: amount, order: asc }
+    rules:
+      - name: flag_large
+        when: "amount > 100"
+        mutate:
+          set:
+            label: "'large'"
+```
+
+`order_by` then sorts the whole input as a unit, and the [no-cascade contract](#no-cascade) applies across every record at once. Two consequences follow from there being only one group:
+
+- The **whole input** must fit `memory.limit` at finalize, since a single group has to be resident when its rules fire (see [Limits](#limits)). Whole-input grouping is for datasets that fit the budget, not for bulk row-at-a-time work — a per-record mutation with no cross-record dependency belongs in a [Transform](transform.md), which streams.
+- A [mutation conflict](#mutation-conflicts) rolls back the whole group, so one conflict rolls back the entire run's records rather than one entity's.
+
+### Values Reshape cannot key
+
+Reshape groups a record under a single **null group** whenever it cannot build a key from the partition value. Today that covers all of:
+
+- the column being absent from the record
+- an explicit null
+- an **empty string** (`""`)
+- a `NaN` float
+- an array- or map-valued cell (a multi-value column)
+
+So `account=""` and `account=null` land in the *same* Reshape group. Note that [Cull](cull.md#values-cull-cannot-key) does **not** fold empty strings — there, `account=""` and `account=null` are two groups. The difference is unintentional and tracked in [#1022](https://github.com/rustpunk/clinker/issues/1022); until it is resolved, do not assume one node's grouping matches the other's for blank values.
+
+If a blank-heavy column is your partition key, expect one large null group. Normalize blanks upstream (a Transform that maps `""` to a real sentinel) when you want them grouped separately.
+
 ## `order_by`
 
 Optional. A list of sort fields (`{ field, order }`, where `order` is `asc` or `desc`) applied within each group before rules run, so order-dependent synthesis is deterministic. Nulls sort last. Arrival order breaks ties.
@@ -129,5 +168,22 @@ The on-disk spill volume Reshape produces is surfaced per stage in `clinker run 
 
 Two current limitations qualify the "identical whether spilled or resident" guarantee above:
 
-- **A single correlation group must fit the memory budget at finalize.** The no-cascade contract requires the *whole* group to be resident when its rules fire, so even though cross-group and ingest-time peaks spill to disk, the finalize reload of one group needs that group to fit. Skew slicing bounds the ingest peak, but a single correlation group larger than `memory.limit` has no in-budget representation. Rather than risk an out-of-memory crash, the run **fails loud** with a diagnostic naming the offending group's size. Raise `memory.limit`, or partition the input so no one correlation group is that large. (A future two-pass finalize could lift this.)
+- **A single correlation group must fit the memory budget at finalize.** The no-cascade contract requires the *whole* group to be resident when its rules fire, so even though cross-group and ingest-time peaks spill to disk, the finalize reload of one group needs that group to fit. Skew slicing bounds the ingest peak, but a single correlation group larger than `memory.limit` has no in-budget representation. Rather than risk an out-of-memory crash, the run **fails loud** with `E310 MemoryBudgetExceeded`, naming the Reshape node, the offending `partition_by` group, and its footprint against the budget:
+
+  ```
+  E310 backfill: arena exceeded budget (128000/8192) [one Reshape correlation
+  group [employee_id="employee-00000"] does not fit; the reported use is that
+  group's reload footprint alone. ...]
+  ```
+
+  **Raising `memory.limit` is the only fix that leaves your output unchanged.** Raise it clear of the reported figure — finalize also holds the run's remaining groups, so that figure is a floor, not a target.
+
+  The other two levers both change what you get, and are worth knowing only so you can weigh them deliberately:
+
+  - *Dropping columns this node does not read*, in an upstream Transform, shrinks each buffered record. But Reshape's output row is the upstream columns plus its `$meta.*` audit columns — it never drops a column itself — so anything you strip upstream is also missing from the written output.
+  - *Narrowing `partition_by`* shrinks the group too, but that key **defines** the group the rules evaluate against, so a narrower key changes which records each rule sees and therefore changes your results. Treat the grouping key as a modelling decision, never as a memory knob.
+
+  (A future two-pass finalize could lift this limit.)
+
+  Run `clinker explain --code E310` for remediation keyed to whichever memory surface overran.
 - **Reshape rules cannot reference `$doc` document context.** Because the spill round-trip does not yet preserve [document envelope context](../pipelines/envelope-and-doc-context.md), a `$doc.*` reference in a rule's `when`, `mutate.set`, or `synthesize` expression would resolve to the real envelope for a resident group but to null for a spilled one — output that depends on the memory budget. A pipeline whose Reshape rules reference `$doc` is **rejected at compile time**. Move the `$doc` lookup into an upstream Transform that copies the value into a record column, then reference that column in the Reshape rule.

@@ -21,7 +21,7 @@ use crate::executor::dispatch::{
     push_write_error, source_name_arc_of,
 };
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
-use crate::executor::{DlqEntry, build_format_writer};
+use crate::executor::{DlqEntry, build_format_writer, format_group_key};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::ExecutionPlanDag;
 
@@ -84,23 +84,6 @@ pub(crate) fn commit_correlation_buffers(
     flush_clean_records_to_writers(ctx, clean_per_output)?;
 
     Ok(())
-}
-
-fn format_group_key(key: &[GroupByKey]) -> String {
-    let parts: Vec<String> = key
-        .iter()
-        .map(|k| match k {
-            GroupByKey::Null => "null".to_string(),
-            GroupByKey::Bool(b) => b.to_string(),
-            GroupByKey::Int(i) => i.to_string(),
-            GroupByKey::Float(bits) => f64::from_bits(*bits).to_string(),
-            GroupByKey::Decimal(_) => k.to_value().to_string(),
-            GroupByKey::Str(s) => format!("{s:?}"),
-            GroupByKey::Date(d) => d.to_string(),
-            GroupByKey::DateTime(ts) => ts.to_string(),
-        })
-        .collect();
-    format!("[{}]", parts.join(", "))
 }
 
 fn commit_one_group(

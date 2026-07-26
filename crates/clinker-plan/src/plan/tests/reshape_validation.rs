@@ -15,6 +15,10 @@
 //! - `mutate.set` targets a column absent from the upstream schema
 //!   (Reshape mutates existing columns, never adds new ones).
 //! - `synthesize` with `copy_from: none` fails to override every column.
+//!
+//! One positive path is pinned alongside them: `partition_by: []` is the
+//! degenerate whole-input key and must compile, so no guard here grows into
+//! rejecting a supported configuration.
 
 use crate::config::{CompileContext, parse_config};
 
@@ -75,6 +79,28 @@ nodes:
       path: out.csv
 "#
     )
+}
+
+// `partition_by: []` is the degenerate correlation key: every record keys to
+// the same empty tuple, so the whole input forms one group and the rules apply
+// across the entire dataset. It is a supported configuration, not a malformed
+// one — a bind-time arity rule here would delete that capability, so this test
+// pins the compile.
+#[test]
+fn empty_partition_by_groups_the_whole_input() {
+    let yaml = pipeline_with_reshape_config(
+        r#"      partition_by: []
+      rules:
+        - name: r
+          when: "amount > 0"
+          mutate:
+            set:
+              label: "'x'""#,
+    );
+    let config = parse_config(&yaml).expect("parse_config");
+    config
+        .compile(&CompileContext::default())
+        .expect("`partition_by: []` groups the whole input and must compile");
 }
 
 #[test]
