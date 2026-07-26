@@ -71,15 +71,114 @@ The CSV, XML, fixed-width, EDIFACT, X12, and HL7 writers can only write flat sca
 
 ### Field mapping
 
-Rename fields at output time without changing upstream CXL:
+`mapping:` declares the columns the file carries -- which columns, under what
+names, in what order -- without changing upstream CXL. It is a sequence, one
+item per output column:
 
 ```yaml
     mapping:
-      "Customer Name": "full_name"
-      "Order Total": "amount"
+      - order_id                  # carried through under its own name
+      - sold_to: customer_id      # written as `sold_to`, read from `customer_id`
+      - contact_email: customer_email
+      - channel
+      - sku
 ```
 
-Keys are output column names; values are the source field names from upstream.
+Two item shapes:
+
+- **A bare column name** emits that column unchanged. This is the common case,
+  and it costs one line naming the column once.
+- **A single-key pair** renames. The **output name is on the left**, the source
+  column on the right -- the same side the bare form names. Reading an item
+  left to right always tells you what appears in the file first.
+
+The renames are the only items carrying a colon, so in a wide output they are
+found by scanning for structure rather than by comparing two names per line.
+
+#### Order and selection
+
+**Declaration order is the output column order.** Listed columns are written
+first, in the order the block declares them, whatever order they arrive in.
+
+**`include_unmapped` governs everything the block does not list.** With
+`include_unmapped: true` (the default) unlisted columns are appended after the
+declared ones, in their existing relative order. With `include_unmapped: false`
+they are dropped, so the block becomes the complete statement of the output:
+
+```yaml
+    include_unmapped: false
+    mapping:
+      - department
+      - surname: last_name
+      - first_name
+```
+
+Given upstream columns `first_name, last_name, department`, that writes exactly
+`department,surname,first_name`.
+
+**Every record carries every declared column.** When a record does not supply an
+item's source column, that column is still written, empty. The file's shape
+follows the block, not the data — so a stream whose records differ in shape (a
+multi-record-type source, a column arriving through `auto_widen`, a composition
+body's open row) still produces one stable column set in declaration order,
+rather than one that depends on which record happened to arrive first.
+
+One upstream column may feed two output columns -- `- sku` and
+`- item_code: sku` -- because names must be unique on the output side, not the
+source side. Declaring the same *output* name twice is rejected (**E364**): a
+file cannot carry two columns under one header.
+
+For the same reason, an output name that `include_unmapped: true` would also
+carry through is rejected. If upstream already has a `sold_to` column, writing
+`- sold_to: customer_id` under `include_unmapped: true` would put two `sold_to`
+columns in the file and readers would resolve the wrong one. Rename the mapped
+column, exclude the upstream one, or set `include_unmapped: false`.
+
+Where the compiler cannot enumerate the upstream columns, the same collision
+reaches the run. The mapped value wins -- the block is your explicit statement
+of what the file carries -- and the displaced upstream column is named in a
+**W366** warning at the end of the run. Applying one of the three fixes above
+silences it.
+
+#### Diagnostics
+
+A `mapping:` item naming a column that does not exist at that point in the
+pipeline is rejected at compile time (**E365**), with the available column list
+and a `did you mean` when the name is a near miss. Nothing is renamed silently.
+
+The compiler cannot always see the column set. Inside a composition body the
+rows are open by construction, and under `on_unmapped: auto_widen` a column can
+reach the sink through the sidecar without being declared anywhere. There an
+item naming an unknown column compiles even when its name resembles a declared
+column: spelling similarity cannot prove that a dynamic field is absent.
+**W365** reports it after the run if no written record supplied it.
+
+What catches the rest is the end of the run: if no record supplied an item's
+source column, that item wrote an empty column in every row, and the run reports
+it as **W365**, naming the column to correct. An item some records supply and
+others do not is a sparse column, not a mistake, and is not reported.
+
+Both **W365** and **W366** are advisory. They print to standard error when the
+run finishes and do not change the exit code -- the file is written and readable
+either way, and by the time a stream ends the run's other outputs have already
+been flushed.
+
+A column absent from the source's `schema:` reaches the sink only through the
+`auto_widen` sidecar, which is expanded to top-level columns only under
+`include_unmapped: true`. A `mapping:` item may name such a column when that
+flag is set; under `include_unmapped: false` it cannot resolve and is rejected
+at compile time.
+
+An empty block -- `mapping: {}` or `mapping: []` -- is rejected (**E364**): it
+declares an output with no columns. To write every upstream column, remove the
+`mapping:` key rather than emptying it.
+
+Writing the block as a YAML map instead of a sequence is rejected (**E364**);
+the message prints your own block already rewritten. Run `clinker explain --code E364`
+for the migration, and read the direction note there before pasting: releases
+before this one documented `output_name: source_field` but *executed* the
+reverse, so the rewrite swaps each pair's two sides to preserve what the
+pipeline was actually writing.
 
 ### Excluding fields
 
@@ -88,6 +187,21 @@ Remove specific fields from output:
 ```yaml
     exclude: [internal_id, _debug_flag, temp_calc]
 ```
+
+`exclude:` matches **incoming** column names, and runs before `mapping:`. Two
+consequences:
+
+- The columns that survive keep their relative order. Upstream `a, b, c, d` with
+  `exclude: [b]` writes `a, c, d`.
+- Naming a column that a `mapping:` item also *produces* is not a conflict --
+  the exclusion removes the upstream column of that name and leaves the mapped
+  one standing. That is the fix for the two-columns-under-one-header collision
+  above: `- sold_to: customer_id` with `exclude: [sold_to]` writes one `sold_to`
+  column, carrying `customer_id`'s value.
+
+Excluding a column a `mapping:` item *reads* is a different matter, and is
+rejected (**E364**): the exclusion removes the column before the item can read
+it, so the item could never resolve.
 
 ### Header control (CSV)
 
@@ -380,12 +494,16 @@ This is automatic — there is no setting to enable it. It applies only to this 
     name: department_reports
     type: csv
     path: "./output/employees.csv"
+    # `include_unmapped: false` makes the mapping the whole output: these four
+    # columns, in this order, and nothing else. Without it every unlisted
+    # upstream column would still be appended after them, and an `exclude:`
+    # would be needed to keep any of them out.
+    include_unmapped: false
     mapping:
-      "Employee ID": "employee_id"
-      "Full Name": "display_name"
-      "Department": "department"
-      "Annual Salary": "salary"
-    exclude: [internal_flags]
+      - "Employee ID": employee_id
+      - "Full Name": display_name
+      - department
+      - "Annual Salary": salary
     include_header: true
     sort_order:
       - { field: "department", order: asc }

@@ -18,7 +18,7 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
     CorrelationRecordSlot, ExecutorContext, buffer_key_for_record, drain_node_buffer_slot,
-    push_dlq, push_write_error, sink_collision_dlq_entry, source_file_path_of,
+    mapping_probe, push_dlq, push_write_error, sink_collision_dlq_entry, source_file_path_of,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::structured_output_guard::{
@@ -317,7 +317,12 @@ pub(crate) fn dispatch_output(
             .as_mut()
             .expect("correlation_buffers is Some — we just checked above");
         for (record, rn, group_key) in buffered.iter() {
-            let projected = project_output_from_record(record, out_cfg, cxl_emit_names_opt);
+            // Do not feed the run-wide mapping probe yet: a dirty correlation
+            // group is rejected wholesale, so its fields did not populate the
+            // delivered file. Clean groups contribute their evidence at the
+            // commit boundary without rebuilding this projection.
+            let projected =
+                crate::projection::project_output_from_record(record, out_cfg, cxl_emit_names_opt);
             let entry = buffers.entry(group_key.clone()).or_default();
             entry.total_records += 1;
             if max_buf > 0 && entry.total_records > max_buf {
@@ -407,6 +412,10 @@ pub(crate) fn dispatch_output(
             strategy,
             dlq_pending: &mut dlq_pending,
             written_rows: &mut written_rows,
+            mapping_probe: out_cfg
+                .mapping
+                .as_ref()
+                .map(|_| mapping_probe(&mut ctx.mapping_probes, name, out_cfg)),
         };
         if let Some(per_file) = fan_out_writers {
             emit_fan_out(&mut fan_ctx, &unbuffered, per_file, scan_timer);
@@ -664,7 +673,22 @@ fn dispatch_output_envelope(
         }
         let projected = {
             let _guard = ctx.projection_timer.guard();
-            project_output_from_record(&record, &out_cfg, cxl_emit_names_opt)
+            match out_cfg.mapping.as_ref() {
+                Some(_) => {
+                    let probe = mapping_probe(&mut ctx.mapping_probes, name, &out_cfg);
+                    crate::projection::project_output_probed(
+                        &record,
+                        &out_cfg,
+                        cxl_emit_names_opt,
+                        Some(probe),
+                    )
+                }
+                None => crate::projection::project_output_from_record(
+                    &record,
+                    &out_cfg,
+                    cxl_emit_names_opt,
+                ),
+            }
         };
         {
             let _guard = ctx.write_timer.guard();
@@ -910,6 +934,9 @@ struct FanOutContext<'a> {
     write_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
     projection_timer: &'a mut crate::executor::stage_metrics::CumulativeTimer,
     collector: &'a mut crate::executor::stage_metrics::StageCollector,
+    /// This Output's `mapping:` resolution evidence, carried in so the per-record
+    /// projections below feed the same probe the rest of the run's arms do.
+    mapping_probe: Option<&'a mut crate::projection::MappingProbe>,
     /// The run's error strategy, so a `join_values` `on_conflict: error`
     /// collision dead-letters under `Continue` but still aborts under
     /// `FailFast` — the same disposition every other per-record failure gets.
@@ -949,13 +976,28 @@ fn emit_single_writer(
             for (record, rn) in unbuffered {
                 let projected = {
                     let _guard = fan_ctx.projection_timer.guard();
-                    project_output_from_record(record, fan_ctx.out_cfg, fan_ctx.cxl_emit_names_opt)
+                    match fan_ctx.mapping_probe.as_deref_mut() {
+                        Some(probe) => crate::projection::project_output_staged(
+                            record,
+                            fan_ctx.out_cfg,
+                            fan_ctx.cxl_emit_names_opt,
+                            probe,
+                        ),
+                        None => crate::projection::project_output_from_record(
+                            record,
+                            fan_ctx.out_cfg,
+                            fan_ctx.cxl_emit_names_opt,
+                        ),
+                    }
                 };
                 let write_result = {
                     let _guard = fan_ctx.write_timer.guard();
                     csv_writer.write_record(&projected)
                 };
                 if let Err(e) = write_result {
+                    if let Some(probe) = fan_ctx.mapping_probe.as_deref_mut() {
+                        probe.discard_staged_record();
+                    }
                     // A `join_values` `on_conflict: error` collision dead-letters
                     // the one offending record and keeps writing the rest (unless
                     // FailFast); any other write error is fatal for this writer.
@@ -968,6 +1010,12 @@ fn emit_single_writer(
                     push_write_error(fan_ctx.output_errors, e);
                     write_failed = true;
                     break;
+                }
+                // Advisories describe the delivered file. A record rejected by
+                // `join_values on_conflict: error` above must not contribute
+                // mapping evidence or hide an all-empty written column.
+                if let Some(probe) = fan_ctx.mapping_probe.as_deref_mut() {
+                    probe.commit_staged_record();
                 }
                 fan_ctx.written_rows.push(*rn);
             }
@@ -1046,13 +1094,28 @@ fn emit_fan_out(
         };
         let projected = {
             let _guard = fan_ctx.projection_timer.guard();
-            project_output_from_record(record, fan_ctx.out_cfg, fan_ctx.cxl_emit_names_opt)
+            match fan_ctx.mapping_probe.as_deref_mut() {
+                Some(probe) => crate::projection::project_output_staged(
+                    record,
+                    fan_ctx.out_cfg,
+                    fan_ctx.cxl_emit_names_opt,
+                    probe,
+                ),
+                None => crate::projection::project_output_from_record(
+                    record,
+                    fan_ctx.out_cfg,
+                    fan_ctx.cxl_emit_names_opt,
+                ),
+            }
         };
         let write_result = {
             let _guard = fan_ctx.write_timer.guard();
             fw.write_record(&projected)
         };
         if let Err(e) = write_result {
+            if let Some(probe) = fan_ctx.mapping_probe.as_deref_mut() {
+                probe.discard_staged_record();
+            }
             if fan_ctx.strategy != ErrorStrategy::FailFast
                 && let Some(entry) = sink_collision_dlq_entry(record, *rn, fan_ctx.name, &e)
             {
@@ -1061,6 +1124,9 @@ fn emit_fan_out(
             }
             push_write_error(fan_ctx.output_errors, e);
             continue;
+        }
+        if let Some(probe) = fan_ctx.mapping_probe.as_deref_mut() {
+            probe.commit_staged_record();
         }
         fan_ctx.written_rows.push(*rn);
     }

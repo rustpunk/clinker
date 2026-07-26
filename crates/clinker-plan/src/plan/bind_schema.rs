@@ -1401,6 +1401,182 @@ pub(crate) fn validate_output_path_collisions(
     }
 }
 
+/// The two schema-dependent `mapping:` gates on an Output node.
+///
+/// **E365** — an entry reads a column the graph does not supply at that point.
+/// The output schema is known at plan time, so a stale or mistyped column name
+/// is answerable here with a span instead of by reading the written file and
+/// noticing a header that is not the one the block declared.
+///
+/// **E364** — an entry's OUTPUT name collides with an upstream column that
+/// `include_unmapped` would append beside it. Two same-named columns on one
+/// schema resolve last-write-wins through `Record::get`, so the writer would
+/// serve the passthrough column's value under the renamed column's header —
+/// the renamed value silently dropped.
+///
+/// Both run only against a **closed** row. An open row is the composition-port
+/// case: the caller's extra columns bind to the row variable and flow through,
+/// so a name missing from `declared` there is not evidence the column is absent
+/// at run time, and an unlisted column set that cannot be enumerated cannot be
+/// checked for collisions either. Reporting either would reject a body that is
+/// correct for every caller. The runtime carries its own guard for both, which
+/// is what covers the open-row and sidecar cases.
+fn validate_output_mapping_columns(
+    node_name: &str,
+    output: &crate::config::OutputConfig,
+    upstream: &Row,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(mapping) = output.mapping.as_ref() else {
+        return;
+    };
+    if !matches!(upstream.tail, cxl::typecheck::RowTail::Closed) {
+        return;
+    }
+    // An Output's upstream row carries only bare names: a Combine publishes its
+    // merged row as `QualifiedField::bare`, so the qualified spelling never
+    // reaches here and matching it would accept a name the record cannot carry.
+    let is_available = |wanted: &str| upstream.fields().any(|(qf, _)| qf.name.as_ref() == wanted);
+    let excluded = |name: &str| {
+        output
+            .exclude
+            .as_ref()
+            .is_some_and(|ex| ex.iter().any(|x| x == name))
+    };
+
+    // A row that reserves the `auto_widen` sidecar can carry columns the
+    // declared set does not name — but only where the sidecar is expanded, and
+    // expansion is gated on `include_unmapped: true`. Under `false` the sidecar
+    // stays packed and a mapping naming one of its columns genuinely cannot
+    // resolve, so the gate still applies there.
+    let sidecar_expands = upstream.has_field(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN)
+        && output.include_unmapped;
+
+    // Suggest only author-facing columns: the engine-stamped namespaces
+    // (`$widened`, `$source.*`, `$ck.*`) are not names a pipeline author types.
+    let candidates: Vec<String> = upstream
+        .fields()
+        .map(|(qf, _)| qf.name.to_string())
+        .filter(|n| !n.starts_with('$'))
+        .collect();
+    let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    let available = if candidate_refs.is_empty() {
+        "(none)".to_string()
+    } else {
+        candidate_refs
+            .iter()
+            .map(|c| format!("'{c}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let mut missing: Vec<(usize, &str)> = Vec::new();
+    for (index, entry) in mapping.entries().iter().enumerate() {
+        let source = entry.source.as_str();
+        if !is_available(source) && !missing.iter().any(|(_, name)| *name == source) {
+            missing.push((index, source));
+        }
+    }
+    for (entry_index, name) in missing {
+        let entry = &mapping.entries()[entry_index];
+        let near = cxl::resolve::levenshtein::best_match(name, &candidate_refs, 3);
+        // Edit distance is useful help only after absence is known. A sidecar
+        // can legitimately carry a drift column whose spelling happens to be
+        // close to a declared column, so similarity cannot turn an unknown
+        // runtime fact into a compile-time error. W365 reports the item after
+        // the run if no delivered record actually carried it.
+        if sidecar_expands {
+            continue;
+        }
+        let help = match near {
+            Some(near) => {
+                let corrected =
+                    crate::config::output_mapping::render_mapping_item(&entry.output, near);
+                format!(
+                    "did you mean `{corrected}`? Columns available at output \
+                     {node_name:?}: {available}"
+                )
+            }
+            None => format!(
+                "columns available at output {node_name:?}: {available}. If '{name}' reaches \
+                 the sink only through `on_unmapped: auto_widen`, either set \
+                 `include_unmapped: true` on this output so the sidecar is expanded before \
+                 the mapping reads it, or declare the column in the source's `schema:` block"
+            ),
+        };
+        diags.push(
+            Diagnostic::error(
+                "E365",
+                format!(
+                    "output {node_name:?}: `mapping:` reads column '{name}', which does not \
+                     exist at this point in the pipeline"
+                ),
+                LabeledSpan::primary(
+                    mapping
+                        .entry_line(entry_index)
+                        .map(Span::line_only)
+                        .unwrap_or(span),
+                    String::new(),
+                ),
+            )
+            .with_help(help),
+        );
+    }
+
+    // Collision gate. Only `include_unmapped: true` appends anything, so only
+    // it can collide. A column some entry READS is consumed by that entry and
+    // never appended; one this output excludes is removed before the append.
+    if !output.include_unmapped {
+        return;
+    }
+    let mut collisions: Vec<(&str, usize)> = Vec::new();
+    for (qf, _) in upstream.fields() {
+        let column = qf.name.as_ref();
+        let mapped_entry = mapping
+            .entries()
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.output == column);
+        if column.starts_with('$')
+            || mapping.claims_source(column)
+            || excluded(column)
+            || mapped_entry.is_none()
+            || collisions.iter().any(|(name, _)| *name == column)
+        {
+            continue;
+        }
+        collisions.push((column, mapped_entry.expect("checked above").0));
+    }
+    for (column, entry_index) in collisions {
+        let source = mapping.entries()[entry_index].source.as_str();
+        diags.push(
+            Diagnostic::error(
+                "E364",
+                format!(
+                    "output {node_name:?}: `mapping:` writes column '{column}', and \
+                     `include_unmapped: true` would also carry the upstream column of that name \
+                     through beside it — the file would carry two '{column}' columns and readers \
+                     would resolve the wrong one"
+                ),
+                LabeledSpan::primary(
+                    mapping
+                        .entry_line(entry_index)
+                        .map(Span::line_only)
+                        .unwrap_or(span),
+                    String::new(),
+                ),
+            )
+            .with_help(format!(
+                "rename the mapped column to a name the upstream does not already use, add \
+                 '{column}' to this output's `exclude:` so only the mapped column is written, \
+                 or set `include_unmapped: false` so the block is the whole output. The \
+                 colliding item reads '{source}'."
+            )),
+        );
+    }
+}
+
 fn synthetic_typed_program(output_row: Row) -> TypedProgram {
     TypedProgram {
         program: cxl::ast::Program {
@@ -2546,9 +2722,10 @@ fn bind_schema_inner(
                     artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
                 }
             }
-            PipelineNode::Output { header, .. } => {
+            PipelineNode::Output { header, config } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let row = upstream.clone();
+                    validate_output_mapping_columns(&name, &config.output, &row, span, diags);
                     schema_by_name.insert(name.clone(), row.clone());
                     artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
                 }
@@ -3079,6 +3256,28 @@ fn bind_composition(
                     ),
                     LabeledSpan::primary(
                         span_for_node(&body_file.nodes[fault.node_index]),
+                        String::new(),
+                    ),
+                )
+                .with_help(fault.help),
+            );
+            has_node_config_violation = true;
+        }
+        for fault in crate::config::output_mapping::output_mapping_faults_spanned(&body_file.nodes)
+        {
+            diags.push(
+                Diagnostic::error(
+                    fault.code,
+                    format!(
+                        "composition node {node_name:?}: body file {}: {}",
+                        resolved_path.display(),
+                        fault.message
+                    ),
+                    LabeledSpan::primary(
+                        fault
+                            .item_line
+                            .map(Span::line_only)
+                            .unwrap_or_else(|| span_for_node(&body_file.nodes[fault.node_index])),
                         String::new(),
                     ),
                 )

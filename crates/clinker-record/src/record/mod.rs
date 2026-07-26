@@ -294,6 +294,33 @@ impl Record {
             .map(|(i, name)| (name.as_ref(), &self.values[i]))
     }
 
+    /// Iterator over the correlation-lattice columns alone (`$ck.<field>`
+    /// source-CK shadows and `$ck.aggregate.<name>` synthetic-CK lineage),
+    /// in schema order.
+    ///
+    /// The complement of [`Record::iter_user_fields`] within
+    /// [`Record::iter_user_and_correlation_fields`]. Selects on
+    /// [`crate::schema::FieldMetadata`], never on a name prefix: `$` is not a
+    /// reserved namespace on the input side, so a source column legitimately
+    /// named `$id` or `$schema` — ordinary in JSON-Schema and MongoDB-shaped
+    /// payloads — carries `FieldMetadata::None` and is a user field, not an
+    /// engine one.
+    pub fn iter_correlation_fields(&self) -> impl Iterator<Item = (&str, &Value)> {
+        use crate::schema::FieldMetadata;
+        self.schema
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| {
+                matches!(
+                    self.schema.field_metadata(*i),
+                    Some(FieldMetadata::SourceCorrelation { .. })
+                        | Some(FieldMetadata::AggregateGroupIndex { .. })
+                )
+            })
+            .map(|(i, name)| (name.as_ref(), &self.values[i]))
+    }
+
     /// Number of schema fields.
     pub fn field_count(&self) -> usize {
         self.schema.column_count()

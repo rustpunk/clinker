@@ -32,6 +32,126 @@ Clinker diagnostics must register its codes before upgrading.
 `PlanDiagnostics` also records whether its line-only spans are safe to resolve
 against the pipeline document. Untrusted spans remain in the structured value
 for consumers that can attribute them; the CLI simply omits the source snippet.
+### Changed — an Output's `mapping:` is an ordered sequence, and its direction is fixed
+
+**Breaking change to a hand-written YAML key.** `mapping:` was a map of column
+name to column name. It is now a sequence, one item per output column:
+
+```yaml
+mapping:
+  - order_id                # carried through under its own name
+  - sold_to: customer_id    # written as `sold_to`, read from `customer_id`
+```
+
+A bare scalar carries a column through unchanged; a single-key pair renames.
+Declaration order is the output column order — which the map form could not
+express at all. Columns the block does not list are appended after it when
+`include_unmapped: true` (the default) and dropped when it is `false`.
+
+**The pair direction is `output_name: source_column` — output on the left.**
+That is the direction the user guide always documented and the plan layer
+always assumed; the executor's rename pass implemented the reverse, so a block
+written to the documentation renamed nothing and the run still exited 0. Both
+halves now agree on the documented direction.
+
+Migration, both mechanical:
+
+- Put `- ` in front of each line. A pair whose two sides are the same column
+  collapses to a bare name.
+- **Swap the two sides of each remaining pair.** The engine looked map entries
+  up by the incoming field name, so the key was the *source* column:
+  `customer_id: sold_to` renamed `customer_id` to `sold_to`, which is now
+  `- sold_to: customer_id`.
+
+A map-valued `mapping:` is rejected at compile time with **E364**, and the
+message prints your own block already converted — lifted, collapsed, and with
+each pair swapped as above. The one block that swap is wrong for is one written
+to follow the *old documentation*, which described the opposite direction: such
+a block matched no incoming field and so renamed nothing at all, and the
+diagnostic says so. It has no behaviour to preserve — swap those pairs back to
+what you originally meant.
+
+`mapping:` is now a column **selection**, not a rename overlay. Four silent
+outcomes are therefore compile errors:
+
+- a repeated output name (**E364**);
+- an empty block, `mapping: {}` or `mapping: []` (**E364**) — it declares an
+  output with no columns; remove the key to write every upstream column;
+- an output name that `include_unmapped: true` would also carry through
+  (**E364**) — the file would carry the column twice and readers would resolve
+  the passthrough copy, losing the renamed value;
+- an item naming a column that does not exist at that point in the pipeline
+  (**E365**, with the available column list and a `did you mean`).
+
+`exclude:` naming a column the mapping *produces* is deliberately **not** an
+error. `exclude:` matches incoming column names, so it removes the upstream
+column of that name and leaves the mapped one standing — which is exactly the
+fix the collision diagnostic above prescribes.
+
+A `mapping:` item may name an `auto_widen` drift column when the output sets
+`include_unmapped: true`, which is what expands the sidecar to top-level
+columns; under `include_unmapped: false` the sidecar stays packed and the item
+is rejected. Similarity to a declared name does not change that waiver: edit
+distance can suggest a spelling only after absence is known, and a real drift
+column may happen to be similar. **W365** reports the item after the run if no
+written record supplied it. Column names in `mapping:` are matched bare — there
+is no qualified `input.column` spelling.
+
+Rust callers must also migrate `OutputConfig.mapping` from
+`Option<IndexMap<String, String>>` to `Option<OutputMapping>` (constructed from
+`Vec<MappingEntry>`). `OutputSpec.mapping` is now a `Vec<MappingEntry>`, and
+`ExecutionReport` struct literals must supply the new `advisories` field.
+
+Run `clinker explain --code E364` or `clinker explain --code E365` for the full
+pages.
+
+### Changed — every record writes every column an Output's `mapping:` declares
+
+**Breaking change for streams whose records differ in shape.** When a record
+does not carry an item's source column, that column is now written **empty**
+rather than omitted. Previously such a record passed through without the column,
+so the file's shape depended on the data.
+
+The declared column set is the same for every record, in declaration order. That
+follows from what the surface already promises: `mapping:` is the author's
+statement of which columns the file carries and in what order, and a column that
+vanishes on some rows contradicts both. It also makes the output schema a
+function of the config rather than of whichever record happened to arrive first —
+which matters, because most write paths derive the file's header from exactly
+that first record.
+
+Affected: a multi-record-type source, a composition body's open row, and columns
+reaching the sink through the `auto_widen` sidecar. A homogeneous stream, where
+every record carries every mapped column, is unchanged.
+
+If a `mapping:` block relied on the old behaviour to produce a
+per-record-variable column set, remove the items for the columns that vary and
+let `include_unmapped: true` append them instead — that path still follows the
+data.
+
+### Added — end-of-run reporting for an Output's `mapping:` block
+
+Two advisory warnings, printed to standard error when a run finishes. Neither
+changes the exit code: both describe a file that was written and is readable,
+and by the time a stream ends the run's other outputs have already been flushed.
+
+- **W365** — a `mapping:` item whose source column *no record* carried, so the
+  item wrote an empty column in every row. This replaces a write-boundary
+  **E365** that aborted such runs. The abort tested the wrong thing: it checked
+  the established output schema, which on most write paths is derived from the
+  first record, so it killed runs whose first record merely happened to be
+  sparse while staying silent about a column absent from every record after the
+  first. Tracking resolution across the whole stream separates the two cases
+  exactly — a misspelling is carried by no record, an ordinary sparse column is
+  carried by some record and is not reported.
+- **W366** — an upstream column dropped because a `mapping:` output name
+  occupies its place in the header. The mapped value still wins, unchanged; what
+  is new is that the displaced column is named rather than lost in silence.
+  Where the planner can enumerate the columns reaching that output, the same
+  collision remains an **E364** at compile time.
+
+Run `clinker explain --code W365` or `clinker explain --code W366` for the full
+pages.
 
 ### Removed — the `best_effort` error strategy
 

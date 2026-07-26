@@ -30,7 +30,10 @@ nodes:
       type: csv
       path: bench://output.csv
       include_unmapped: true
+      # `output_name: source_column` — each pair renames one upstream column.
+      # `out` is not listed, so `include_unmapped: true` appends it after the
+      # three declared columns.
       mapping:
-        output_a: f0
-        output_b: f1
-        output_c: f2
+        - output_a: f0
+        - output_b: f1
+        - output_c: f2

@@ -30,8 +30,10 @@ fn params() -> PipelineRunParams {
 
 /// A JSON source (native arrays) feeding a CSV sink. Row 1's `tags` array holds
 /// a value containing the join delimiter `;`; row 2 is clean.
-const JSON_INPUT: &str =
-    r#"[{"order_id":"1","tags":["a;b","c"]},{"order_id":"2","tags":["x","y"]}]"#;
+const JSON_INPUT: &str = r#"[
+  {"order_id":"1","tags":["a;b","c"],"optional":"rejected-only","displaced":"rejected-only"},
+  {"order_id":"2","tags":["x","y"]}
+]"#;
 
 fn json_reader() -> SourceReaders {
     HashMap::from([(
@@ -70,6 +72,11 @@ nodes:
       name: out
       type: csv
       path: ./out.csv
+      mapping:
+        - order_id
+        - tags
+        - optional_copy: optional
+        - displaced: order_id
 "#;
     let config = clinker_plan::config::parse_config(PIPELINE).expect("pipeline parses");
     let buf = SharedBuffer::new();
@@ -83,9 +90,13 @@ nodes:
 
     // Only the clean record reached the CSV; the colliding record did not.
     let output = String::from_utf8(buf.contents()).expect("utf-8 output");
-    assert_eq!(output, "order_id,tags\n2,x;y\n", "got: {output}");
+    assert_eq!(
+        output, "order_id,tags,optional_copy,displaced\n2,x;y,,2\n",
+        "got: {output}"
+    );
 
     assert_join_collision_entry(&report.dlq_entries);
+    assert_rejected_row_did_not_affect_mapping_advisories(&report.advisories);
     // The colliding record is counted once (as DLQ), not as both written and
     // dead-lettered: one row written/ok (row 2), one row dead-lettered (row 1).
     assert_eq!(report.counters.records_written, 1, "only row 2 was written");
@@ -127,6 +138,11 @@ nodes:
       name: out
       type: csv
       path: ./out.csv
+      mapping:
+        - order_id
+        - tags
+        - optional_copy: optional
+        - displaced: order_id
 "#;
     let config = clinker_plan::config::parse_config(PIPELINE).expect("pipeline parses");
     let buf = SharedBuffer::new();
@@ -139,12 +155,30 @@ nodes:
         .expect("run succeeds — the streaming collision dead-letters, it does not abort");
 
     let output = String::from_utf8(buf.contents()).expect("utf-8 output");
-    assert_eq!(output, "order_id,tags\n2,x;y\n", "got: {output}");
+    assert_eq!(
+        output, "order_id,tags,optional_copy,displaced\n2,x;y,,2\n",
+        "got: {output}"
+    );
 
     assert_join_collision_entry(&report.dlq_entries);
+    assert_rejected_row_did_not_affect_mapping_advisories(&report.advisories);
     assert_eq!(report.counters.records_written, 1, "only row 2 was written");
     assert_eq!(report.counters.ok_count, 1, "only row 2 is ok");
     assert_eq!(report.counters.dlq_count, 1, "row 1 collided");
+}
+
+/// The colliding row is the only one carrying `optional` and the passthrough
+/// `displaced`. Because it was dead-lettered, it neither resolves the empty
+/// mapped column nor creates a displaced-column warning for the written file.
+fn assert_rejected_row_did_not_affect_mapping_advisories(advisories: &[String]) {
+    assert_eq!(advisories.len(), 1, "{advisories:?}");
+    assert!(advisories[0].contains("W365"), "{}", advisories[0]);
+    assert!(advisories[0].contains("'optional'"), "{}", advisories[0]);
+    assert!(
+        !advisories.iter().any(|advisory| advisory.contains("W366")),
+        "a passthrough present only on the rejected row was not displaced in the file: \
+         {advisories:?}"
+    );
 }
 
 /// Exactly one `MultiValueJoinCollision` entry, naming the `tags` field and the

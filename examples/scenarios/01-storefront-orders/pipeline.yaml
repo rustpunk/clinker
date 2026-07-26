@@ -74,7 +74,8 @@ nodes:
       # appear last.
       #
       # Renaming happens in the transform above rather than through the Output
-      # node's `mapping:`, which is under review in #974.
+      # node's `mapping:`. Either works; keeping it in the transform means the
+      # emitted names and the written header are read from one place.
       include_unmapped: false
       # Row order here is the order the reader delivers records, which is
       # deterministic for a single file — that is what makes this output

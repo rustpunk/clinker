@@ -2385,6 +2385,15 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         );
     }
 
+    // Advisory end-of-run findings — today the per-Output `mapping:` report
+    // (W365 / W366). Rendered like the startup storage warnings: to stderr and
+    // the tracing log, leaving stdout for the run summary, and never affecting
+    // the exit code. Each describes a file that was written and is readable.
+    for advisory in &report.advisories {
+        tracing::warn!("{advisory}");
+        eprintln!("{advisory}");
+    }
+
     // Exit codes per spec §10.2. An interrupted run takes precedence:
     // the pipeline drained what it could before unwinding on the
     // shutdown signal, so report the conventional SIGINT status (130)

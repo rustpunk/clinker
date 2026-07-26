@@ -12,6 +12,22 @@ mod tests {
         yaml: &str,
         csv_input: &str,
     ) -> Result<(clinker_record::PipelineCounters, Vec<DlqEntry>, String), PipelineError> {
+        let run = run_pipeline_reporting(yaml, csv_input)?;
+        Ok((run.counters, run.dlq, run.output))
+    }
+
+    /// What one in-memory run produced.
+    struct RunOutcome {
+        counters: clinker_record::PipelineCounters,
+        dlq: Vec<DlqEntry>,
+        output: String,
+        /// The run's advisory end-of-stream findings — the `mapping:` report.
+        advisories: Vec<String>,
+    }
+
+    /// [`run_pipeline`] plus the run's advisory findings, for the tests that
+    /// assert on the end-of-run `mapping:` report.
+    fn run_pipeline_reporting(yaml: &str, csv_input: &str) -> Result<RunOutcome, PipelineError> {
         let config = config::parse_config(yaml).unwrap();
         let output_buf = SharedBuffer::new();
 
@@ -41,8 +57,12 @@ mod tests {
         let report =
             PipelineExecutor::run_with_readers_writers(&config, readers, writers.into(), &params)?;
 
-        let output = output_buf.as_string();
-        Ok((report.counters, report.dlq_entries, output))
+        Ok(RunOutcome {
+            counters: report.counters,
+            dlq: report.dlq_entries,
+            output: output_buf.as_string(),
+            advisories: report.advisories,
+        })
     }
 
     /// Determine exit code from pipeline result (mirrors main.rs logic).
@@ -261,7 +281,7 @@ nodes:
     exclude:
     - internal_id
     mapping:
-      full_name: employee_name
+    - employee_name: full_name
 "#;
         let csv = "first_name,last_name,department,internal_id\n\
                     Alice,Smith,Engineering,12345\n\
@@ -322,6 +342,524 @@ nodes:
 
         let records: Vec<csv::StringRecord> = reader.records().map(|r| r.unwrap()).collect();
         assert_eq!(records.len(), 3);
+    }
+
+    /// The written header line for a `mapping:` block, asserted as a whole
+    /// rather than by `contains`. Column order is the block's declaration
+    /// order, deliberately different from the upstream column order, and the
+    /// one rename is spelled `output_name: source_column`.
+    fn mapping_header(mapping_block: &str, include_unmapped: bool) -> String {
+        let yaml = format!(
+            r#"
+pipeline:
+  name: mapping_header
+nodes:
+- type: source
+  name: employees
+  config:
+    name: employees
+    type: csv
+    path: test.csv
+    options:
+      has_header: true
+    schema:
+    - {{ name: first_name, type: string }}
+    - {{ name: last_name, type: string }}
+    - {{ name: department, type: string }}
+- type: output
+  name: out
+  input: employees
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: {include_unmapped}
+    mapping:
+{mapping_block}
+"#
+        );
+        let csv = "first_name,last_name,department\nAlice,Smith,Engineering\n";
+        let (_, _, output) = run_pipeline(&yaml, csv).expect("pipeline must run");
+        output
+            .lines()
+            .next()
+            .expect("output must carry a header")
+            .to_string()
+    }
+
+    /// Declaration order is the output column order — including when it
+    /// disagrees with the order the columns arrive in.
+    #[test]
+    fn mapping_declaration_order_is_the_output_column_order() {
+        let header = mapping_header(
+            "    - department\n    - surname: last_name\n    - first_name\n",
+            false,
+        );
+        assert_eq!(header, "department,surname,first_name");
+    }
+
+    /// `include_unmapped: false` against a partial mapping: only the listed
+    /// columns are written.
+    #[test]
+    fn mapping_without_include_unmapped_writes_only_the_listed_columns() {
+        let header = mapping_header("    - surname: last_name\n", false);
+        assert_eq!(header, "surname");
+    }
+
+    /// `include_unmapped: true` against the same partial mapping: the listed
+    /// column comes first, then everything the block did not claim, in its
+    /// existing relative order.
+    #[test]
+    fn mapping_with_include_unmapped_appends_the_unlisted_columns() {
+        let header = mapping_header("    - surname: last_name\n", true);
+        assert_eq!(header, "surname,first_name,department");
+    }
+
+    /// One upstream column may feed two output columns. Uniqueness is required
+    /// on the output side, which the map form could not express in this
+    /// direction at all.
+    #[test]
+    fn one_source_column_may_be_written_twice_under_two_names() {
+        let header = mapping_header("    - department\n    - dept: department\n", false);
+        assert_eq!(header, "department,dept");
+    }
+
+    /// The shape the sequence form exists for: a wide output that renames one
+    /// column. Twelve bare scalars and one pair, and the rename is the only
+    /// item carrying a colon.
+    #[test]
+    fn a_wide_mapping_renaming_one_column_writes_the_declared_header() {
+        let columns = [
+            "order_id",
+            "order_date",
+            "customer_id",
+            "channel",
+            "sku",
+            "quantity",
+            "unit_price",
+            "discount_pct",
+            "gross_amount",
+            "line_total",
+            "ship_country",
+            "status",
+        ];
+        let schema: String = columns
+            .iter()
+            .map(|c| format!("    - {{ name: {c}, type: string }}\n"))
+            .collect();
+        // Identity for every column but `customer_id`, which is written as
+        // `sold_to`. Declared in upstream order so the assertion isolates the
+        // rename rather than re-testing reordering.
+        let mapping: String = columns
+            .iter()
+            .map(|c| {
+                if *c == "customer_id" {
+                    "    - sold_to: customer_id\n".to_string()
+                } else {
+                    format!("    - {c}\n")
+                }
+            })
+            .collect();
+        let yaml = format!(
+            r#"
+pipeline:
+  name: wide_mapping
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: test.csv
+    options:
+      has_header: true
+    schema:
+{schema}- type: output
+  name: out
+  input: orders
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: false
+    mapping:
+{mapping}"#
+        );
+        let header_row = columns.join(",");
+        let csv = format!("{header_row}\n{}\n", vec!["x"; columns.len()].join(","));
+
+        let (_, _, output) = run_pipeline(&yaml, &csv).expect("pipeline must run");
+        assert_eq!(
+            output.lines().next().expect("header"),
+            "order_id,order_date,sold_to,channel,sku,quantity,unit_price,discount_pct,\
+             gross_amount,line_total,ship_country,status"
+        );
+    }
+
+    /// A mapping entry no record resolves, end to end. The compile gate stands
+    /// down on purpose — the source reserves the `auto_widen` sidecar and
+    /// `include_unmapped: true` expands it, so `goes_by` might genuinely arrive,
+    /// and `goes_by` is not a near-miss of any declared column.
+    ///
+    /// The run completes and writes the declared column, empty; the end-of-run
+    /// report names the entry. Aborting instead would kill a run whose sibling
+    /// Outputs have already flushed, over a fault that is visible in the file.
+    #[test]
+    fn a_mapping_column_no_record_supplies_writes_empty_and_is_reported() {
+        let yaml = r#"
+pipeline:
+  name: mapping_runtime_report
+nodes:
+- type: source
+  name: people
+  config:
+    name: people
+    type: csv
+    path: test.csv
+    options:
+      has_header: true
+    schema:
+    - { name: first_name, type: string }
+- type: output
+  name: out
+  input: people
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: true
+    mapping:
+    - first_name
+    - nickname: goes_by
+"#;
+        let csv = "first_name\nAlice\n";
+        let run = run_pipeline_reporting(yaml, csv).expect("the run completes");
+        let advisories = &run.advisories;
+
+        assert_eq!(run.counters.records_written, 1);
+        assert_eq!(
+            run.output, "first_name,nickname\nAlice,\n",
+            "the declared column is written, empty — the file's shape follows the block, \
+             not the data"
+        );
+        assert_eq!(advisories.len(), 1, "{advisories:?}");
+        assert!(advisories[0].contains("W365"), "{}", advisories[0]);
+        assert!(
+            advisories[0].contains("'goes_by'"),
+            "the report names the source column the author must correct: {}",
+            advisories[0]
+        );
+    }
+
+    /// A record in a correlation group is not part of the delivered stream
+    /// when any peer in that group fails. Its fields therefore must not count
+    /// as evidence that a mapped column was populated in the written file.
+    #[test]
+    fn a_rejected_correlation_group_cannot_suppress_an_empty_column_report() {
+        let yaml = r#"
+pipeline:
+  name: mapping_correlation_report
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: people
+  config:
+    name: people
+    type: json
+    path: test.json
+    correlation_key: employee_id
+    schema:
+    - { name: employee_id, type: string }
+    - { name: value, type: string }
+- type: transform
+  name: parse_value
+  input: people
+  config:
+    cxl: |
+      emit employee_id = employee_id
+      emit parsed_value = value.to_int()
+- type: output
+  name: out
+  input: parse_value
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: true
+    mapping:
+    - employee_id
+    - optional_copy: optional
+    - displaced: employee_id
+"#;
+        let input = r#"[
+          {"employee_id":"A","value":"100","optional":"present-only-in-rejected-group","displaced":"rejected-only"},
+          {"employee_id":"A","value":"bad"},
+          {"employee_id":"B","value":"200"}
+        ]"#;
+
+        let run = run_pipeline_reporting(yaml, input).expect("the run completes");
+        assert_eq!(run.counters.records_written, 1);
+        assert!(run.output.contains("B,"), "{}", run.output);
+        assert!(!run.output.contains("A,"), "{}", run.output);
+        assert_eq!(run.advisories.len(), 1, "{:?}", run.advisories);
+        assert!(run.advisories[0].contains("W365"), "{}", run.advisories[0]);
+        assert!(
+            run.advisories[0].contains("'optional'"),
+            "the only record carrying `optional` was rejected with its group: {}",
+            run.advisories[0]
+        );
+        assert!(
+            !run.advisories
+                .iter()
+                .any(|warning| warning.contains("W366")),
+            "the only colliding passthrough was rejected with its group: {:?}",
+            run.advisories
+        );
+    }
+
+    /// An oversized correlation group is rejected before commit just like a
+    /// dirty group. Its fields cannot resolve or collide in the written file's
+    /// mapping report.
+    #[test]
+    fn an_overflowed_correlation_group_cannot_affect_mapping_advisories() {
+        let yaml = r#"
+pipeline:
+  name: mapping_correlation_overflow_report
+error_handling:
+  strategy: continue
+  max_group_buffer: 1
+nodes:
+- type: source
+  name: people
+  config:
+    name: people
+    type: json
+    path: test.json
+    correlation_key: employee_id
+    schema:
+    - { name: employee_id, type: string }
+    - { name: value, type: string }
+- type: transform
+  name: passthrough
+  input: people
+  config:
+    cxl: |
+      emit employee_id = employee_id
+      emit value = value
+- type: output
+  name: out
+  input: passthrough
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: true
+    mapping:
+    - employee_id
+    - optional_copy: optional
+    - displaced: employee_id
+"#;
+        let input = r#"[
+          {"employee_id":"A","value":"one","optional":"overflow-only","displaced":"overflow-only"},
+          {"employee_id":"A","value":"two"},
+          {"employee_id":"B","value":"clean"}
+        ]"#;
+
+        let run = run_pipeline_reporting(yaml, input).expect("the run completes");
+        assert_eq!(run.counters.records_written, 1);
+        assert!(run.output.contains("B,"), "{}", run.output);
+        assert!(!run.output.contains("A,"), "{}", run.output);
+        assert_eq!(run.advisories.len(), 1, "{:?}", run.advisories);
+        assert!(run.advisories[0].contains("W365"), "{}", run.advisories[0]);
+        assert!(
+            run.advisories[0].contains("'optional'"),
+            "the only record carrying `optional` was rejected on overflow: {}",
+            run.advisories[0]
+        );
+        assert!(
+            !run.advisories
+                .iter()
+                .any(|warning| warning.contains("W366")),
+            "the only colliding passthrough was rejected on overflow: {:?}",
+            run.advisories
+        );
+    }
+
+    /// A genuinely heterogeneous stream, and the property the whole redesign
+    /// exists for: the file's column set follows the `mapping:` block, not
+    /// whichever record happened to arrive first.
+    ///
+    /// A JSON source because a CSV file's header fixes every record's column
+    /// set, so it cannot express a record that lacks a column. `goes_by` is
+    /// undeclared, so it reaches the sink through the `auto_widen` sidecar — on
+    /// one record and not the other. A CSV sink because its header IS the
+    /// projected column set, so the assertion reads it directly.
+    ///
+    /// Run twice, once in each record order. Under the previous skip-the-column
+    /// behaviour the sparse-first order lost `nickname` for every record, since
+    /// the header is derived from the first record's projection. The two runs
+    /// must now agree.
+    #[test]
+    fn a_heterogeneous_stream_null_fills_whatever_order_records_arrive_in() {
+        let yaml = r#"
+pipeline:
+  name: mapping_heterogeneous
+nodes:
+- type: source
+  name: people
+  config:
+    name: people
+    type: json
+    path: test.json
+    schema:
+    - { name: first_name, type: string }
+- type: output
+  name: out
+  input: people
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: true
+    mapping:
+    - first_name
+    - nickname: goes_by
+"#;
+
+        let dense_first = run_pipeline_reporting(
+            yaml,
+            r#"[{"first_name":"Alice","goes_by":"Al"},{"first_name":"Bob"}]"#,
+        )
+        .expect("the run completes");
+        assert_eq!(dense_first.counters.records_written, 2);
+        assert_eq!(
+            dense_first.output, "first_name,nickname\nAlice,Al\nBob,\n",
+            "the record without the column still carries it, empty"
+        );
+        assert!(
+            dense_first.advisories.is_empty(),
+            "a column some record carried is sparse, not a typo: {:?}",
+            dense_first.advisories
+        );
+
+        let sparse_first = run_pipeline_reporting(
+            yaml,
+            r#"[{"first_name":"Bob"},{"first_name":"Alice","goes_by":"Al"}]"#,
+        )
+        .expect("the run completes");
+        assert_eq!(
+            sparse_first.output, "first_name,nickname\nBob,\nAlice,Al\n",
+            "the declared column survives a first record that does not carry it"
+        );
+        assert!(
+            sparse_first.advisories.is_empty(),
+            "{:?}",
+            sparse_first.advisories
+        );
+    }
+
+    /// W366 end to end. `sold_to` is not in the source's `schema:`, so it
+    /// reaches the sink through the `auto_widen` sidecar and the plan gate
+    /// cannot see the collision with the mapping's output name. The mapped value
+    /// wins — that is deterministic and documented — and the displaced upstream
+    /// column is named rather than dropped in silence.
+    #[test]
+    fn a_passthrough_a_mapping_output_name_displaced_is_reported() {
+        let yaml = r#"
+pipeline:
+  name: mapping_collision_report
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: test.csv
+    options:
+      has_header: true
+    schema:
+    - { name: order_id, type: string }
+    - { name: customer_id, type: string }
+- type: output
+  name: out
+  input: orders
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: true
+    mapping:
+    - order_id
+    - sold_to: customer_id
+"#;
+        let csv = "order_id,customer_id,sold_to\nA-1,C-9,stale\n";
+        let run = run_pipeline_reporting(yaml, csv).expect("the run completes");
+        let advisories = &run.advisories;
+
+        assert_eq!(
+            run.output, "order_id,sold_to\nA-1,C-9\n",
+            "one `sold_to` column, carrying the MAPPED value"
+        );
+        assert_eq!(advisories.len(), 1, "{advisories:?}");
+        assert!(advisories[0].contains("W366"), "{}", advisories[0]);
+        assert!(
+            advisories[0].contains("'sold_to'"),
+            "the report names the displaced upstream column: {}",
+            advisories[0]
+        );
+    }
+
+    /// The narrower contrast, on the CSV path where every record shares one
+    /// column set: a column present but EMPTY on a record still resolves. An
+    /// empty value is not an absent column, so the report stays quiet.
+    #[test]
+    fn a_column_some_record_supplies_is_not_reported() {
+        let yaml = r#"
+pipeline:
+  name: mapping_sparse
+nodes:
+- type: source
+  name: people
+  config:
+    name: people
+    type: csv
+    path: test.csv
+    options:
+      has_header: true
+    on_unmapped:
+      mode: drop
+    schema:
+    - { name: first_name, type: string }
+    - { name: nickname, type: string }
+- type: output
+  name: out
+  input: people
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: false
+    mapping:
+    - first_name
+    - goes_by: nickname
+"#;
+        let csv = "first_name,nickname\nAlice,Al\nBob,\n";
+        let run = run_pipeline_reporting(yaml, csv).expect("the run completes");
+        assert_eq!(run.output, "first_name,goes_by\nAlice,Al\nBob,\n");
+        assert!(
+            run.advisories.is_empty(),
+            "an empty value is not an absent column: {:?}",
+            run.advisories
+        );
+    }
+
+    /// Over-rejection guard for the same gate: a mapping every record can
+    /// satisfy runs clean and writes the declared header.
+    #[test]
+    fn a_mapping_the_stream_satisfies_runs_clean() {
+        let header = mapping_header("    - surname: last_name\n    - first_name\n", false);
+        assert_eq!(header, "surname,first_name");
     }
 
     // ── Phase 8 Task 8.4 exit code gate tests ─────────────────

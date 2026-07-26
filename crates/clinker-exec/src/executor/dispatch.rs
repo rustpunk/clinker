@@ -16,7 +16,7 @@
 //! where `recursive_term.execute(partition, Arc::clone(&task_context))`
 //! re-enters the same execution loop with a different plan.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
 use std::sync::{Arc, LazyLock};
 
@@ -760,6 +760,15 @@ pub(crate) struct ExecutorContext<'a> {
     /// still fail-fast and bypass the rewind path.
     pub(crate) combine_input_snapshots: HashMap<NodeIndex, HashMap<Arc<str>, u64>>,
     pub(crate) output_errors: Vec<PipelineError>,
+    /// Per-Output `mapping:` resolution evidence, keyed by Output node name and
+    /// accumulated across every arm and every chunk. Drained once at the end of
+    /// the run into the report's advisory findings.
+    ///
+    /// Run-scoped rather than arm-scoped because an Output's records can reach
+    /// the projection from several arms and several chunks; only the union over
+    /// the whole stream can distinguish a column no record carried (a typo) from
+    /// one that some record carried (a sparse column in a heterogeneous stream).
+    pub(crate) mapping_probes: BTreeMap<String, crate::projection::MappingProbe>,
     pub(crate) ok_source_rows: HashSet<u64>,
     pub(crate) records_emitted: u64,
     pub(crate) transform_timer: stage_metrics::CumulativeTimer,
@@ -1107,7 +1116,43 @@ pub(crate) struct RetainedAggregatorState {
     pub(crate) consumer_id: crate::pipeline::memory::ConsumerId,
 }
 
+/// The `mapping:` probe for one Output, created on first use and sized from
+/// that Output's block.
+///
+/// Takes the map rather than the whole [`ExecutorContext`] so a per-record
+/// projection can hold the probe alongside a disjoint borrow of another
+/// context field — the correlation buffers, the writer registry, the
+/// projection timer. Looks up before inserting so the steady-state path
+/// allocates nothing: `entry()` would build the owned key on every record.
+pub(crate) fn mapping_probe<'p>(
+    probes: &'p mut BTreeMap<String, crate::projection::MappingProbe>,
+    output_name: &str,
+    out_cfg: &clinker_plan::config::OutputConfig,
+) -> &'p mut crate::projection::MappingProbe {
+    if !probes.contains_key(output_name) {
+        probes.insert(
+            output_name.to_string(),
+            crate::projection::MappingProbe::for_config(out_cfg),
+        );
+    }
+    probes
+        .get_mut(output_name)
+        .expect("inserted above when absent")
+}
+
 impl<'a> ExecutorContext<'a> {
+    /// Fold a probe accumulated off the dispatcher's thread into the run's.
+    pub(crate) fn merge_mapping_probe(
+        &mut self,
+        output_name: &str,
+        out_cfg: &clinker_plan::config::OutputConfig,
+        probe: &crate::projection::MappingProbe,
+    ) {
+        if out_cfg.mapping.is_some() {
+            mapping_probe(&mut self.mapping_probes, output_name, out_cfg).merge(probe);
+        }
+    }
+
     /// Poll the run's shutdown flag at an operator chunk boundary. When
     /// the token has tripped (SIGINT/SIGTERM, or a programmatic
     /// request), record the interruption and return

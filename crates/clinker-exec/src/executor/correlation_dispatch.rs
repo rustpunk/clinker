@@ -381,6 +381,21 @@ fn flush_clean_records_to_writers(
                     };
                     if let Err(e) = flush_result {
                         push_write_error(&mut ctx.output_errors, e);
+                    } else if out_cfg.mapping.is_some() {
+                        // Correlation records were projected before their group
+                        // disposition. Observe only after this clean queue is
+                        // fully written and flushed, so rejected groups, dry
+                        // runs, and failed writers cannot affect advisories.
+                        // Re-walking retained originals here is bounded and
+                        // avoids storing per-record probe state in the group.
+                        let probe = crate::executor::dispatch::mapping_probe(
+                            &mut ctx.mapping_probes,
+                            &output_name,
+                            out_cfg,
+                        );
+                        for slot in &slots {
+                            probe.observe_committed_record(&slot.original_record, out_cfg);
+                        }
                     }
                 }
             }

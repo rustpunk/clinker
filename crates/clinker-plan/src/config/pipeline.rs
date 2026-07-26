@@ -1226,6 +1226,25 @@ impl PipelineConfig {
                 .with_help(fault.help),
             );
         }
+        for fault in crate::config::output_mapping::output_mapping_faults_spanned(&self.nodes) {
+            let primary = fault
+                .item_line
+                .map(Span::line_only)
+                .or_else(|| {
+                    doc_node_line_by_name
+                        .get(self.nodes[fault.node_index].value.name())
+                        .map(|&line| Span::line_only(line))
+                })
+                .unwrap_or(Span::SYNTHETIC);
+            diags.push(
+                Diagnostic::error(
+                    fault.code,
+                    fault.message,
+                    LabeledSpan::primary(primary, String::new()),
+                )
+                .with_help(fault.help),
+            );
+        }
         for (doc_path, ref_nodes) in &doc_path_set.by_node {
             for node_id in ref_nodes {
                 let Some(sources) = node_sources.get(node_id) else {
@@ -1343,7 +1362,11 @@ impl PipelineConfig {
             .iter()
             .map(|o| crate::plan::execution::OutputSpec {
                 name: o.name.clone(),
-                mapping: o.mapping.clone().unwrap_or_default(),
+                mapping: o
+                    .mapping
+                    .as_ref()
+                    .map(|m| m.entries().to_vec())
+                    .unwrap_or_default(),
                 exclude: o.exclude.clone().unwrap_or_default(),
                 include_unmapped: o.include_unmapped,
             })

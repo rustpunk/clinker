@@ -1298,9 +1298,13 @@ fn output_consumed_columns(
     } = &graph[out_idx]
     {
         let cfg = &payload.output;
+        // `entry.source` is the column read from upstream — the right-hand side
+        // of an `output_name: source_column` pair, and the whole of a bare-name
+        // entry. Seeding from the output names instead would prune the columns
+        // the projection actually reads.
         if let Some(mapping) = cfg.mapping.as_ref() {
-            for src_col in mapping.values() {
-                set.insert(src_col.clone());
+            for entry in mapping.entries() {
+                set.insert(entry.source.clone());
             }
         }
         if cfg.include_unmapped {

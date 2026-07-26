@@ -416,6 +416,8 @@ pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
     ("E361", include_str!("../../../../docs/explain/E361.md")),
     ("E362", include_str!("../../../../docs/explain/E362.md")),
     ("E363", include_str!("../../../../docs/explain/E363.md")),
+    ("E364", include_str!("../../../../docs/explain/E364.md")),
+    ("E365", include_str!("../../../../docs/explain/E365.md")),
     ("E323", include_str!("../../../../docs/explain/E323.md")),
     ("E150b", include_str!("../../../../docs/explain/E150b.md")),
     ("E150c", include_str!("../../../../docs/explain/E150c.md")),
@@ -426,6 +428,8 @@ pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
     ("W302", include_str!("../../../../docs/explain/W302.md")),
     ("W305", include_str!("../../../../docs/explain/W305.md")),
     ("W306", include_str!("../../../../docs/explain/W306.md")),
+    ("W365", include_str!("../../../../docs/explain/W365.md")),
+    ("W366", include_str!("../../../../docs/explain/W366.md")),
 ];
 
 /// Look up error/warning code documentation embedded at compile time.

@@ -19,6 +19,7 @@ mod explain_buffer_class;
 mod explain_examples;
 mod explain_polish;
 mod multi_value_validation;
+mod output_mapping_validation;
 mod overlay_compile;
 mod plan_time_window_root;
 mod predicate_support;

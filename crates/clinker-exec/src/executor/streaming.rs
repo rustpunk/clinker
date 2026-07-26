@@ -194,6 +194,19 @@ pub(crate) struct StreamingOutputTaskOutput {
     /// live `ctx`), drained through `push_dlq` in [`Self::fold_into`] once the
     /// thread is joined and the dispatcher's `ctx` is available again.
     pub(crate) dlq_pending: Vec<DlqEntry>,
+    /// This Output's `mapping:` resolution evidence, accumulated on the
+    /// streaming thread and merged into the run-wide map in [`Self::fold_into`].
+    /// Merged rather than replaced: an Output can also receive records through
+    /// the dispatcher's arms, and only the union answers "did any record carry
+    /// this column".
+    pub(crate) mapping_probe: crate::projection::MappingProbe,
+    /// The Output this task wrote, so the fold can key the probe without
+    /// reaching back into the consumer's `spec`.
+    pub(crate) output_name: String,
+    /// This Output's config, so the fold can size a probe entry the dispatcher
+    /// arms never created. Owned for the same reason the rest of
+    /// [`StreamingOutputSpec`] is: the thread outlives the borrow.
+    pub(crate) out_cfg: OutputConfig,
 }
 
 impl StreamingOutputTaskOutput {
@@ -230,6 +243,7 @@ impl StreamingOutputTaskOutput {
         for sm in self.stage_metrics {
             ctx.collector.record(sm);
         }
+        ctx.merge_mapping_probe(&self.output_name, &self.out_cfg, &self.mapping_probe);
     }
 }
 
@@ -356,6 +370,9 @@ struct OutputStreamConsumer {
 impl OutputStreamConsumer {
     fn new(raw_writer: Box<dyn Write + Send>, spec: StreamingOutputSpec) -> Self {
         let structured_guard = StructuredOutputDocumentGuard::new(&spec.out_cfg.format);
+        let mapping_probe = crate::projection::MappingProbe::for_config(&spec.out_cfg);
+        let output_name = spec.output_name.clone();
+        let out_cfg = spec.out_cfg.clone();
         Self {
             spec,
             out: StreamingOutputTaskOutput {
@@ -367,6 +384,9 @@ impl OutputStreamConsumer {
                 errors: Vec::new(),
                 stage_metrics: Vec::new(),
                 dlq_pending: Vec::new(),
+                mapping_probe,
+                output_name,
+                out_cfg,
             },
             scan_timer_slot: Some(stage_metrics::StageTimer::new(
                 stage_metrics::StageName::SchemaScan,
@@ -380,8 +400,6 @@ impl OutputStreamConsumer {
 
 impl StreamingConsumer for OutputStreamConsumer {
     fn on_record(&mut self, record: Record, row_num: u64) -> ControlFlow<()> {
-        use crate::projection::project_output_from_record;
-
         let cxl_emit_names_opt: Option<&[String]> = if self.spec.cxl_emit_names.is_empty() {
             None
         } else {
@@ -411,7 +429,20 @@ impl StreamingConsumer for OutputStreamConsumer {
 
         let projected = {
             let _guard = self.out.projection_timer.guard();
-            project_output_from_record(&record, &self.spec.out_cfg, cxl_emit_names_opt)
+            if self.spec.out_cfg.mapping.is_some() {
+                crate::projection::project_output_staged(
+                    &record,
+                    &self.spec.out_cfg,
+                    cxl_emit_names_opt,
+                    &mut self.out.mapping_probe,
+                )
+            } else {
+                crate::projection::project_output_from_record(
+                    &record,
+                    &self.spec.out_cfg,
+                    cxl_emit_names_opt,
+                )
+            }
         };
 
         // Lazy writer construction: defer until we have the first record's
@@ -433,6 +464,9 @@ impl StreamingConsumer for OutputStreamConsumer {
                     }
                 }
                 Err(e) => {
+                    if self.spec.out_cfg.mapping.is_some() {
+                        self.out.mapping_probe.discard_staged_record();
+                    }
                     self.out.errors.push(e);
                     if let Some(timer) = self.scan_timer_slot.take() {
                         self.out.stage_metrics.push(timer.finish(0, 0));
@@ -451,12 +485,18 @@ impl StreamingConsumer for OutputStreamConsumer {
         };
         match write_result {
             Ok(()) => {
+                if self.spec.out_cfg.mapping.is_some() {
+                    self.out.mapping_probe.commit_staged_record();
+                }
                 self.out.records_written += 1;
                 self.out.records_emitted += 1;
                 self.out.seen_row_nums.insert(row_num);
                 ControlFlow::Continue(())
             }
             Err(e) => {
+                if self.spec.out_cfg.mapping.is_some() {
+                    self.out.mapping_probe.discard_staged_record();
+                }
                 // A `join_values` `on_conflict: error` collision dead-letters the
                 // one offending record and keeps streaming (unless FailFast); the
                 // entry is drained to the DLQ when the thread is joined. Any other

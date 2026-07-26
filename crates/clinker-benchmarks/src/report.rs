@@ -466,6 +466,7 @@ mod tests {
             per_stage_spill_bytes: Default::default(),
             peak_consumer_usage_bytes: 0,
             interrupted: false,
+            advisories: Vec::new(),
         };
         report.counters.total_count = 1000;
         report.counters.ok_count = 995;
@@ -550,6 +551,7 @@ mod tests {
             per_stage_spill_bytes: Default::default(),
             peak_consumer_usage_bytes: 0,
             interrupted: false,
+            advisories: Vec::new(),
         };
         let output = format_summary_table("test/bad", "small", &report);
         assert!(
