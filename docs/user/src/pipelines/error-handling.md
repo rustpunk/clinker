@@ -15,27 +15,28 @@ error_handling:
 
 ## Strategies
 
-The `strategy:` field controls what happens when a record fails:
+`error_handling.strategy` is pipeline-wide -- it is set once at the top level, not per node. It controls what happens when a record fails:
 
-| Strategy | Behavior |
-|----------|----------|
-| `fail_fast` | **Default.** Stop the pipeline on the first error. |
-| `continue` | Route bad records to the DLQ and keep processing good records. |
-| `best_effort` | Continue processing with partial results, even if some stages produce incomplete output. |
+| Strategy | Behavior | Exit code |
+|----------|----------|-----------|
+| `fail_fast` | **Default.** Abort the run on the first record failure. | Non-zero, by the class of the aborting error (`3` for an evaluation failure, `4` for an I/O failure -- see [Exit Codes](../ops/exit-codes.md)) |
+| `continue` | Route the failing record to the DLQ and keep processing. | `2` if any record was dead-lettered, `0` otherwise |
+
+There are exactly two, because the engine makes exactly one decision at each record failure: propagate it and stop, or dead-letter it and carry on.
 
 ### fail_fast
 
-The safest strategy. Any record-level error (type coercion failure, validation error, missing required field) halts the pipeline immediately. Use this when data quality is critical and you prefer to fix issues before reprocessing.
+The safest strategy. Any record-level error (type coercion failure, validation error, missing required field) halts the pipeline immediately, with a non-zero exit and no DLQ file. Use this when data quality is critical and you prefer to fix issues before reprocessing.
+
+Some failures abort the run under **either** strategy, because they are not record-scoped: an unwritable output path, a config or CXL compile error, and the DLQ-rate ceiling ([`dlq.max_rate`](#dlq-configuration), E315/E316) all end the run regardless of the strategy.
 
 ### continue
 
 The production workhorse. Bad records are written to the DLQ file with diagnostic metadata, and the pipeline continues processing remaining records. After the run completes, inspect the DLQ to understand and correct failures.
 
-A pipeline that completes with DLQ entries exits with **code 2** -- this signals "pipeline completed successfully but some records were rejected." It is not a crash or internal error.
+A pipeline that completes with DLQ entries exits with **code 2** -- this signals "pipeline completed successfully but some records were rejected." It is not a crash or internal error. A `continue` run that dead-letters nothing exits `0`, exactly like a clean `fail_fast` run.
 
-### best_effort
-
-The most lenient strategy. Processing continues even with partial results. Use this for exploratory data analysis where completeness is less important than progress.
+> **Migrating from `best_effort`.** The removed `best_effort` spelling was a third name for the `continue` behavior: it wrote the same DLQ entries and produced the same exit code, because the runtime never distinguished the two. Replace it with `strategy: continue`. A pipeline still carrying `best_effort` is rejected at config-validation time with a message naming the replacement.
 
 ## DLQ configuration
 
@@ -93,7 +94,7 @@ The `_cxl_dlq_error_category` column contains one of these values:
 | `document_rejected` | A non-failing record was DLQ'd as collateral because another record in its document failed under a source's `dlq_granularity: document` policy |
 | `late_record` | A record arrived at a time-windowed aggregate after its event-time window had already closed |
 | `expansion_limit_exceeded` | A transform's `emit each` fan-out produced more output records than its `max_expansion` ceiling allows |
-| `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key, residual, or matched / `on_miss: null_fields` body); the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. Routed to the DLQ under `continue` / `best_effort` across every Combine join mode; `fail_fast` propagates the eval error |
+| `combine_output_row` | A Combine output-stage eval failed for one driver row (probe-key, residual, or matched / `on_miss: null_fields` body); the entry carries the contributing-build lineage and rewinds both the driver and matched build source's rollback cursor. Routed to the DLQ under `continue` across every Combine join mode; `fail_fast` propagates the eval error |
 | `structural_validation` | An envelope trailer's declared count did not match the body the reader streamed (X12 `SE`/`GE`/`IEA`, EDIFACT `UNT`/`UNZ`, HL7 `BTS`/`FTS`, a multi-record flat-file trailer), or a multi-record flat file broke a non-count structural rule (an unknown record-type discriminator, a body record after the trailer). The root-cause `trigger: true` entry for a malformed document rejected under a source's `dlq_granularity: document` policy; every already-streamed record of the same file is a `document_rejected` collateral |
 
 ## Advanced options
@@ -153,7 +154,7 @@ nodes:
       dlq_granularity: document   # record (default) | document
 ```
 
-Under `dlq_granularity: document` and the `continue` / `best_effort` strategies, when any record of a document fails:
+Under `dlq_granularity: document` and the `continue` strategy, when any record of a document fails:
 
 - the failing record becomes the **root-cause** DLQ entry (`_cxl_dlq_trigger = true`, carrying its original error category);
 - every other record of the same document becomes a **collateral** entry (`_cxl_dlq_trigger = false`, category `document_rejected`);
@@ -171,7 +172,7 @@ This is the document-shaped analogue of [correlation keys](#correlation-key): us
 
 **Output restriction.** Document-level DLQ flushes each whole document to a single output writer, so it cannot be combined with a [per-source-file output](../nodes/output.md) (a `{source_file}` / `{source_path}` path template over a multi-file source). The two are rejected together at compile time (E343); use a single output path, or set `dlq_granularity: record` if per-file output is the requirement.
 
-**Strategy requirement.** `dlq_granularity: document` requires `error_handling.strategy: continue` (or `best_effort`). It is incompatible with the default `fail_fast`: document-level dead-lettering keeps the run going past a bad document, which contradicts fail-fast's abort-on-first-error. The combination is rejected at compile time (E344) — set `strategy: continue` to dead-letter bad documents, or keep `fail_fast` with the default `dlq_granularity: record`.
+**Strategy requirement.** `dlq_granularity: document` requires `error_handling.strategy: continue`. It is incompatible with the default `fail_fast`: document-level dead-lettering keeps the run going past a bad document, which contradicts fail-fast's abort-on-first-error. The combination is rejected at compile time (E344) — set `strategy: continue` to dead-letter bad documents, or keep `fail_fast` with the default `dlq_granularity: record`.
 
 **Spilling stages.** Document identity survives memory pressure end to end. The per-document buffer identifies each document before buffering and spills under the memory budget, and a blocking stage (Sort, hash Aggregate, grace-hash Combine) between the source and the output preserves each record's document context — including the source file the grain keys on — across its own spill round-trip. A document whose records pass through a spilling stage is therefore still grouped and rejected as one document under memory pressure, exactly as it would be in memory.
 
@@ -212,10 +213,12 @@ The opt-in is the same `dlq_granularity: document` knob that governs per-record 
 | Code | Meaning |
 |------|---------|
 | 0 | Pipeline completed successfully, no errors |
-| 1 | Pipeline failed (internal error, config error, or `fail_fast` triggered) |
+| 1 | Configuration error -- the pipeline never started |
 | 2 | Pipeline completed, but DLQ entries were produced |
+| 3 | Data error halted the run: a `fail_fast` evaluation/accumulator failure, or the DLQ-rate ceiling |
+| 4 | I/O, format, or spill failure |
 
-Exit code 2 is not a failure -- it means the pipeline ran to completion and handled errors according to the configured strategy. Check the DLQ file for details.
+Exit code 2 is not a failure -- it means the pipeline ran to completion and handled errors according to the configured strategy. Check the DLQ file for details. See [Exit Codes & Error Diagnosis](../ops/exit-codes.md) for the full reference and the orchestrator retry policy.
 
 ## Complete example
 

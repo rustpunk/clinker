@@ -39,6 +39,21 @@ Representative code and manifest evidence cited by those docs includes:
 
 ## Entries
 
+### 2026-07-25: `ErrorStrategy` Has Exactly Two Variants
+
+Type: Source-backed fact (issue #951).
+
+Summary: `ErrorStrategy` is `{ FailFast, Continue }`. The former third variant
+`BestEffort` carried no distinct runtime behaviour — every handler was either
+the combined arm `Continue | BestEffort` or an `== FailFast` test — so it was a
+second spelling for `Continue` on a surface that promised a third disposition.
+`ErrorStrategy` now hand-rolls `Deserialize` (the `Serialize` derive stays) so
+`strategy: best_effort` is rejected with a migration message naming
+`strategy: continue`, instead of a bare unknown-variant list. Evidence:
+`crates/clinker-plan/src/config/pipeline.rs` (`ErrorStrategy`,
+`ERROR_STRATEGY_VARIANTS`, `mod error_strategy_tests`);
+`docs/user/src/pipelines/error-handling.md`.
+
 ### 2026-07-25: `record_path` Has One Grammar, Enforced at Both Layers
 
 Type: Source-backed fact (issue #949).

@@ -330,8 +330,8 @@ repeat on purpose: declare the column `multiple: true` to collect every
 occurrence into an array, or add a `split_to_rows` entry to fan each occurrence
 out to its own record. Detection is per document at read time — a plan cannot
 know in advance that a particular document repeats a field. Under the default
-`fail_fast` strategy the run aborts with the diagnostic; under `continue` /
-`best_effort` with `dlq_granularity: document` the offending document is routed
+`fail_fast` strategy the run aborts with the diagnostic; under `continue`
+with `dlq_granularity: document` the offending document is routed
 to the dead-letter queue and the run continues.
 
 ### Delimited text in one element: `split_values`

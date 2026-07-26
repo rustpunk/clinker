@@ -4,6 +4,28 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Removed — the `best_effort` error strategy
+
+**Breaking change.** `error_handling.strategy` now accepts exactly `fail_fast`
+and `continue`. The third spelling, `best_effort`, is gone.
+
+It never had behaviour of its own. The runtime made one decision per record
+failure — propagate it, or dead-letter it and keep going — and `best_effort`
+took the same branch as `continue` at every site, so the two produced identical
+DLQ entries and identical exit codes. The documentation claimed otherwise (that
+`best_effort` continued "without writing error records", and that it was "the
+most lenient strategy"), which made the config surface look like it offered a
+third disposition that the engine could not deliver.
+
+Replace `strategy: best_effort` with `strategy: continue`. A pipeline still
+carrying the old value is rejected at config-validation time with a message
+naming the replacement and pointing at the offending line, rather than a bare
+unknown-value error.
+
+A genuine partial-success mode — one that actually differs from `continue` —
+can be designed on its own merits later; nothing about this removal forecloses
+it.
+
 ### Changed — JSON output expands dotted column names into nested objects
 
 **Behaviour change.** A JSON output previously emitted every column name
