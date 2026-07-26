@@ -15,7 +15,8 @@ use petgraph::graph::NodeIndex;
 use crate::executor::cull_dispatch::reads_predecessor_slot;
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, advance_cursor, drain_node_buffer_slot,
-    node_buffer_spill_allowed, push_dlq, record_error_to_buffer_if_grouped, source_file_arc_of,
+    missing_node_buffer_input_error, node_buffer_spill_allowed, push_dlq,
+    record_error_to_buffer_if_grouped, require_node_buffer_slot, source_file_arc_of,
     source_name_arc_of, stream_linear_producer_emit,
 };
 use crate::executor::schema_check::check_input_schema;
@@ -61,13 +62,57 @@ pub(crate) fn dispatch_route(
     ) = if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
         own_buf.drain_split()?
     } else {
-        match predecessors
-            .iter()
-            .find_map(|p| drain_node_buffer_slot(ctx, *p))
-        {
-            Some(nb) => nb.drain_split()?,
-            None => (Vec::new(), Vec::new()),
-        }
+        let pred_buf = if predecessors.len() == 1 {
+            let pred = predecessors[0];
+            let producer_port = current_dag
+                .graph
+                .find_edge(pred, node_idx)
+                .and_then(|edge| current_dag.graph.edge_weight(edge))
+                .and_then(|edge| edge.producer_port.as_deref());
+            Some(require_node_buffer_slot(
+                ctx,
+                pred,
+                name,
+                current_dag.graph[pred].name(),
+                producer_port,
+            )?)
+        } else {
+            predecessors
+                .iter()
+                .find_map(|p| drain_node_buffer_slot(ctx, *p))
+        };
+        let input_buffer = match pred_buf {
+            Some(buffer) => buffer,
+            None => {
+                let authored_input = ctx
+                    .current_body_node_input_refs
+                    .as_ref()
+                    .and_then(|refs| refs.get(name.as_str()))
+                    .and_then(|refs| refs.first())
+                    .map(String::as_str);
+                let (producer_name, producer_port) = if let Some(&pred) = predecessors.first() {
+                    let producer_port = current_dag
+                        .graph
+                        .find_edge(pred, node_idx)
+                        .and_then(|edge| current_dag.graph.edge_weight(edge))
+                        .and_then(|edge| edge.producer_port.as_deref());
+                    (current_dag.graph[pred].name(), producer_port)
+                } else if let Some(input) = authored_input {
+                    match input.split_once('.') {
+                        Some((producer, port)) => (producer, Some(port)),
+                        None => (input, None),
+                    }
+                } else {
+                    ("composition input", None)
+                };
+                return Err(missing_node_buffer_input_error(
+                    name,
+                    producer_name,
+                    producer_port,
+                ));
+            }
+        };
+        input_buffer.drain_split()?
     };
 
     if let Some(expected) = current_dag.graph[node_idx]

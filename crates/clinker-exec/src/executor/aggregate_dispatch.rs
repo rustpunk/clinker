@@ -18,8 +18,8 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
     ExecutorContext, RetainedAggregatorState, admit_node_buffer, advance_cursor,
-    drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed,
-    project_rows_to_buffer_schema, push_dlq, record_error_to_buffer_if_grouped, source_file_arc_of,
+    finalize_node_rooted_windows, node_buffer_spill_allowed, project_rows_to_buffer_schema,
+    push_dlq, record_error_to_buffer_if_grouped, require_node_buffer_slot, source_file_arc_of,
     source_name_arc_of, stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
@@ -157,15 +157,24 @@ pub(crate) fn dispatch_aggregation(
         return finalize_aggregate_emit(ctx, current_dag, node_idx, name, agg_timer, ingest);
     }
 
+    let producer_port = current_dag
+        .graph
+        .find_edge(pred, node_idx)
+        .and_then(|edge| current_dag.graph.edge_weight(edge))
+        .and_then(|edge| edge.producer_port.as_deref());
+    let input_buffer = require_node_buffer_slot(
+        ctx,
+        pred,
+        name,
+        current_dag.graph[pred].name(),
+        producer_port,
+    )?;
+    // Meter the re-materialized drain so a spill-backed predecessor cannot
+    // re-inflate into RAM past the hard limit uncharged.
     let (input, input_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
-    ) = match drain_node_buffer_slot(ctx, pred) {
-        // Meter the re-materialized drain so a spill-backed predecessor cannot
-        // re-inflate into RAM past the hard limit uncharged.
-        Some(nb) => nb.drain_split_metered(&ctx.memory_budget, name)?,
-        None => (Vec::new(), Vec::new()),
-    };
+    ) = input_buffer.drain_split_metered(&ctx.memory_budget, name)?;
 
     if let Some(expected) = current_dag.graph[node_idx]
         .expected_input_schema_in(current_dag)

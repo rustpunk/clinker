@@ -15,9 +15,9 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, advance_cursor, dispatch_transform_eval_error,
-    drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed,
-    source_file_arc_of, source_name_arc_of, tee_emit_to_region_input_buffers,
-    transform_fused_consume,
+    drain_node_buffer_slot, finalize_node_rooted_windows, missing_node_buffer_input_error,
+    node_buffer_spill_allowed, require_node_buffer_slot, source_file_arc_of, source_name_arc_of,
+    tee_emit_to_region_input_buffers, transform_fused_consume,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{
@@ -74,18 +74,58 @@ pub(crate) fn dispatch_transform(
             .neighbors_directed(node_idx, Direction::Incoming)
             .collect();
         let pred_buf = if predecessors.len() == 1 {
-            drain_node_buffer_slot(ctx, predecessors[0])
+            let pred = predecessors[0];
+            let producer_port = current_dag
+                .graph
+                .find_edge(pred, node_idx)
+                .and_then(|edge| current_dag.graph.edge_weight(edge))
+                .and_then(|edge| edge.producer_port.as_deref());
+            Some(require_node_buffer_slot(
+                ctx,
+                pred,
+                name,
+                current_dag.graph[pred].name(),
+                producer_port,
+            )?)
         } else {
             predecessors
                 .iter()
                 .find_map(|p| drain_node_buffer_slot(ctx, *p))
         };
-        match pred_buf {
-            // Meter the re-materialized drain so a spill-backed input cannot
-            // re-inflate into RAM past the hard limit uncharged.
-            Some(nb) => nb.drain_split_metered(&ctx.memory_budget, name.as_str())?,
-            None => (Vec::new(), Vec::new()),
-        }
+        let input_buffer = match pred_buf {
+            Some(buffer) => buffer,
+            None => {
+                let authored_input = ctx
+                    .current_body_node_input_refs
+                    .as_ref()
+                    .and_then(|refs| refs.get(name.as_str()))
+                    .and_then(|refs| refs.first())
+                    .map(String::as_str);
+                let (producer_name, producer_port) = if let Some(&pred) = predecessors.first() {
+                    let producer_port = current_dag
+                        .graph
+                        .find_edge(pred, node_idx)
+                        .and_then(|edge| current_dag.graph.edge_weight(edge))
+                        .and_then(|edge| edge.producer_port.as_deref());
+                    (current_dag.graph[pred].name(), producer_port)
+                } else if let Some(input) = authored_input {
+                    match input.split_once('.') {
+                        Some((producer, port)) => (producer, Some(port)),
+                        None => (input, None),
+                    }
+                } else {
+                    ("composition input", None)
+                };
+                return Err(missing_node_buffer_input_error(
+                    name,
+                    producer_name,
+                    producer_port,
+                ));
+            }
+        };
+        // Meter the re-materialized drain so a spill-backed input cannot
+        // re-inflate into RAM past the hard limit uncharged.
+        input_buffer.drain_split_metered(&ctx.memory_budget, name.as_str())?
     };
 
     // Read the typed program off the `PlanNode::Transform` payload. Every

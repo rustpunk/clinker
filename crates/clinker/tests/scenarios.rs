@@ -40,9 +40,9 @@
 //!
 //! A golden that a [`KnownBroken`] marker names is **not** re-blessed: the run
 //! is producing the wrong bytes, and that file is the only committed record of
-//! the right ones. Regenerate such a golden deliberately, from whatever variant
-//! of the scenario does behave correctly, and the blessing run says which files
-//! it skipped.
+//! the right ones. A marker may instead pin an exact fail-loud diagnostic; that
+//! run returns before output comparison and cannot overwrite its goldens.
+//! Regenerate either kind deliberately from a variant that behaves correctly.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,6 +90,15 @@ struct KnownBroken {
     /// correct one in [`Gate::counters`]. `None` means the counters are
     /// already correct and any deviation is a real failure.
     current_counters: Option<Counters>,
+    /// Exact fail-loud state while the underlying issue remains unresolved.
+    /// When present, the run must exit with this code and carry every named
+    /// diagnostic fragment. A return to silent success is a regression.
+    current_failure: Option<CurrentFailure>,
+}
+
+struct CurrentFailure {
+    exit_code: i32,
+    stderr_contains: &'static [&'static str],
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -133,21 +142,22 @@ const GATES: &[Gate] = &[
             written: 28,
             dlq: 0,
         },
-        // The goldens state what this pipeline SHOULD write to both sinks. It
-        // currently writes nothing to the first: a node feeding two Outputs
-        // delivers records only to the last-declared one, silently and with
-        // exit 0 (#996). `output/catalog.csv` is committed as the output of the
-        // single-sink variant — the correct answer — and the marker names it as
-        // the one output allowed to differ. `output/catalog.xml` stays fully
-        // gated, so the sink that works today cannot regress unnoticed.
+        // The goldens state what this pipeline SHOULD write to both sinks.
+        // Until #996 is fixed, the executor now stops before publishing either
+        // output instead of silently committing an empty first destination.
+        // The marker pins that fail-loud state so a return to exit-0 partial
+        // output is a regression and a complete fix makes the marker stale.
         known_broken: Some(KnownBroken {
             issue: "https://github.com/rustpunk/clinker/issues/996",
-            failing_outputs: &["output/catalog.csv"],
-            current_counters: Some(Counters {
-                total: 14,
-                ok: 14,
-                written: 14,
-                dlq: 0,
+            failing_outputs: &[],
+            current_counters: None,
+            current_failure: Some(CurrentFailure {
+                exit_code: 1,
+                stderr_contains: &[
+                    "internal error in executor 'catalog_csv'",
+                    "planned input from producer 'normalize' was unavailable",
+                    "instead of treating it as empty",
+                ],
             }),
         }),
     },
@@ -259,22 +269,21 @@ fn find_scenario(id: &str) -> &'static Scenario {
 
 /// One problem found while running a gate.
 ///
-/// `tolerable` distinguishes the two kinds. A golden mismatch is what a
-/// `known_broken` marker is *for* and may be suppressed. Everything else —
-/// generator-digest drift, a wrong exit code, a missing output file, an
-/// unparseable summary — indicates the scenario is not doing what the gate
-/// believes at all, and must surface even on a known-broken scenario. Without
-/// that split, a scenario parked on an issue could silently start crashing, or
-/// its input could drift, and the eventual un-parking would bless goldens
-/// against data nobody reasoned about.
+/// `tolerable` distinguishes a precisely declared current defect from a new
+/// regression. A marker may suppress a named golden/counter mismatch or one
+/// exact fail-loud exit and diagnostic. Everything else — generator drift, an
+/// undeclared exit code, a missing output file, an unparseable summary, or a
+/// changed diagnostic — indicates the scenario is not doing what the gate
+/// believes and must surface. Without that split, a parked scenario could fail
+/// in a new way and hide it behind the original issue.
 struct Failure {
     tolerable: bool,
     message: String,
 }
 
 impl Failure {
-    /// A deviation a `known_broken` marker may declare and tolerate — a golden
-    /// mismatch on a named failing output, or the declared current run summary.
+    /// A deviation a `known_broken` marker declares exactly: a named golden or
+    /// counter mismatch, or a pinned fail-loud exit and diagnostic.
     fn tolerable(message: String) -> Self {
         Self {
             tolerable: true,
@@ -361,6 +370,42 @@ fn run_gate(gate: &Gate) -> Vec<Failure> {
     let expected_exit = if gate.counters.dlq > 0 { 2 } else { 0 };
     match output.status.code() {
         Some(code) if code == expected_exit => {}
+        Some(code)
+            if gate
+                .known_broken
+                .as_ref()
+                .and_then(|known| known.current_failure.as_ref())
+                .is_some_and(|failure| failure.exit_code == code) =>
+        {
+            let failure = gate
+                .known_broken
+                .as_ref()
+                .and_then(|known| known.current_failure.as_ref())
+                .expect("guard established a known failure");
+            let missing: Vec<&str> = failure
+                .stderr_contains
+                .iter()
+                .copied()
+                .filter(|fragment| !stderr.contains(fragment))
+                .collect();
+            if !missing.is_empty() {
+                failures.push(Failure::fatal(format!(
+                    "{}: known-broken exit code {code} carried the wrong diagnostic; missing {:?}.\
+                     \nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    gate.id, missing
+                )));
+            } else {
+                failures.push(Failure::tolerable(format!(
+                    "{}: still stops with the fail-loud diagnostic tracked by {}",
+                    gate.id,
+                    gate.known_broken
+                        .as_ref()
+                        .expect("known failure belongs to a marker")
+                        .issue
+                )));
+            }
+            return failures;
+        }
         Some(code) => {
             failures.push(Failure::fatal(format!(
                 "{}: exit code {code}, expected {expected_exit} ({} DLQ entries).\

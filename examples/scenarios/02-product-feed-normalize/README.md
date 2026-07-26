@@ -7,9 +7,9 @@ through as a single multi-value field.
 This is the multi-value scenario. `<category>` appears more than once per
 product, and one column holds all of them.
 
-> **This scenario currently fails its own gate**, on purpose. See
-> [What is broken](#what-is-broken) below — the committed expected output states
-> what the engine *should* write, and one of the two sinks does not yet get it.
+> **This scenario cannot complete yet.** See [What is broken](#what-is-broken)
+> below. The committed expected output states what both sinks should write; the
+> gate pins the current fail-loud behavior until the fan-out bug is fixed.
 
 ## Run it
 
@@ -19,9 +19,8 @@ cd examples/scenarios/02-product-feed-normalize
 cargo run -p clinker -- run pipeline.yaml
 ```
 
-```
-Pipeline complete: 14 total, 14 ok, 14 written, 0 dlq
-```
+The run currently exits 1 and reports that `catalog_csv` could not obtain the
+planned input from `normalize`. It does not publish a plausible empty result.
 
 ## The input
 
@@ -100,38 +99,33 @@ but untransformable. The write side puts the container back with `wrap_in`.
 
 ## What is broken
 
-`output/catalog.csv` comes out **empty**, and the run still exits 0 reporting
-all 14 records written.
+The run exits 1 before publishing either destination because `normalize` cannot
+yet feed two direct Output consumers correctly.
 
-The cause is not this pipeline. A node feeding two Output nodes delivers records
-to only the last-declared one; every earlier sink gets a zero-byte file, with no
-diagnostic ([#996](https://github.com/rustpunk/clinker/issues/996)). Declaring
-either sink alone produces correct output, and swapping their order moves the
-empty file to the other one.
+The underlying fan-out defect is tracked by
+[#996](https://github.com/rustpunk/clinker/issues/996). Previously, a node
+feeding two Output nodes delivered records to only one and silently committed a
+zero-byte sibling. The executor now detects the missing planned input and stops
+instead of treating it as an empty stream. Declaring either sink alone still
+produces the correct output.
 
-The scenario keeps the two-sink shape rather than working around it, because
-writing one result in two formats is an ordinary thing to want and the corpus is
-meant to state what the engine *should* do. `expected/catalog.csv` is therefore
-the output of the single-sink variant — the correct answer — and the harness
-carries a `known_broken` marker pointing at #996.
+The scenario keeps the two-sink shape rather than working around it because
+writing one result in two formats is ordinary and the corpus is meant to state
+what the engine should do. Both committed goldens come from working single-sink
+variants and remain the correct answer. The harness carries a `known_broken`
+marker pointing at #996.
 
-The marker is narrow by design. It names `output/catalog.csv` as the only
-output allowed to differ and declares the run summary the engine currently
-prints; `output/catalog.xml` stays fully gated, so the sink that works today
-cannot regress unnoticed while the scenario is parked. The gate's `counters`
-record the **correct** summary — 14 records to each of two sinks, so 28 writes
-— which is what makes the run that fixes #996 report a stale marker rather than
-a counter mismatch. A re-bless run refuses to overwrite a golden the marker
-declares broken, since that file is the only record of the right answer;
-regenerate it from the single-sink variant instead.
+The marker requires exit 1 and the exact fail-loud diagnostic naming
+`catalog_csv` and `normalize`. A return to exit-0 partial output is therefore a
+regression. The gate's counters still record the correct result — 14 records to
+each of two sinks, so 28 writes — so a complete #996 fix makes the marker stale
+and restores normal golden comparison.
 
 ## Try changing it
 
-- Delete the **`catalog_xml`** output and rerun. `catalog_csv` is then the only
-  sink, it receives every record, and `output/catalog.csv` matches its golden
-  exactly — the clearest demonstration that #996 is about having two sinks and
-  not about this pipeline. (Deleting `catalog_csv` instead proves nothing: the
-  CSV simply stops being written at all.)
+- Delete either Output and rerun. The remaining sink receives every record and
+  matches its golden, demonstrating that #996 is about direct shared input
+  rather than either format.
 - Remove `multiple: true` from the schema and rerun — the repeated element is
   now an error rather than a collected field.
 - Drop the XML `join_values` override to see the unwrapped, column-named default.

@@ -1649,6 +1649,59 @@ pub(crate) fn drain_node_buffer_slot(
     ctx.node_buffers.remove(&key)
 }
 
+/// Build the cold-path invariant error for a required materialized input that
+/// was not present after every intentional input alternative was exhausted.
+#[cold]
+pub(crate) fn missing_node_buffer_input_error(
+    consumer_name: &str,
+    producer_name: &str,
+    producer_port: Option<&str>,
+) -> PipelineError {
+    let port_detail = producer_port
+        .map(|port| format!(" on port '{port}'"))
+        .unwrap_or_default();
+    PipelineError::Internal {
+        op: "executor",
+        node: consumer_name.to_string(),
+        detail: format!(
+            "planned input from producer '{producer_name}'{port_detail} was unavailable; the run stopped instead of treating it as empty"
+        ),
+    }
+}
+
+/// Drain a required materialized input slot, failing loudly when the slot is
+/// absent. A present empty [`NodeBuffer`] remains a valid zero-row input.
+pub(crate) fn require_node_buffer_slot(
+    ctx: &mut ExecutorContext<'_>,
+    key: impl Into<NodeBufferKey>,
+    consumer_name: &str,
+    producer_name: &str,
+    producer_port: Option<&str>,
+) -> Result<NodeBuffer, PipelineError> {
+    drain_node_buffer_slot(ctx, key)
+        .ok_or_else(|| missing_node_buffer_input_error(consumer_name, producer_name, producer_port))
+}
+
+#[cfg(test)]
+mod required_node_buffer_tests {
+    use super::missing_node_buffer_input_error;
+    use clinker_plan::error::PipelineError;
+
+    #[test]
+    fn missing_input_error_names_consumer_producer_and_port() {
+        let error =
+            missing_node_buffer_input_error("aggregate_orders", "route_orders", Some("matched"));
+
+        let PipelineError::Internal { op, node, detail } = error else {
+            panic!("missing node-buffer input must be an internal executor error");
+        };
+        assert_eq!(op, "executor");
+        assert_eq!(node, "aggregate_orders");
+        assert!(detail.contains("producer 'route_orders' on port 'matched'"));
+        assert!(detail.contains("run stopped instead of treating it as empty"));
+    }
+}
+
 /// Take a predecessor-slot reader's input from `key`, cloning the slot (leaving
 /// it intact) when other predecessor-slot consumers of the SAME
 /// `(producer, port)` slot still need it — so one producer output port fanned

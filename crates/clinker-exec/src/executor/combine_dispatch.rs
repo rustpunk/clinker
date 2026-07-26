@@ -19,8 +19,8 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, advance_cursor, drain_or_clone_shared_input,
-    finalize_node_rooted_windows, node_buffer_spill_allowed, push_dlq,
-    record_error_to_buffer_if_grouped, source_file_arc_of, source_name_arc_of,
+    finalize_node_rooted_windows, missing_node_buffer_input_error, node_buffer_spill_allowed,
+    push_dlq, record_error_to_buffer_if_grouped, source_file_arc_of, source_name_arc_of,
     stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
@@ -308,26 +308,26 @@ pub(crate) fn dispatch_combine(
     ) = if streaming_probe_driver.is_some() {
         (Vec::new(), Vec::new())
     } else {
-        match drain_or_clone_shared_input(
+        let input = drain_or_clone_shared_input(
             ctx,
             current_dag,
             NodeBufferKey::with_port(driver_pred, driver_port.as_deref()),
-        ) {
-            Some(nb) => nb.drain_split()?,
-            None => (Vec::new(), Vec::new()),
-        }
+        )
+        .ok_or_else(|| {
+            missing_node_buffer_input_error(name, driver_upstream, driver_port.as_deref())
+        })?;
+        input.drain_split()?
     };
     let (build_buf, build_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
-    ) = match drain_or_clone_shared_input(
+    ) = drain_or_clone_shared_input(
         ctx,
         current_dag,
         NodeBufferKey::with_port(build_pred, build_port.as_deref()),
-    ) {
-        Some(nb) => nb.drain_split()?,
-        None => (Vec::new(), Vec::new()),
-    };
+    )
+    .ok_or_else(|| missing_node_buffer_input_error(name, build_upstream, build_port.as_deref()))?
+    .drain_split()?;
     // The empty-punctuation common case folds to an empty vector,
     // leaving the no-document path byte-identical to a bare union. For
     // the streaming-probe path the driver's punctuations have not arrived

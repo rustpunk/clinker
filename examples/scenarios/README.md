@@ -52,19 +52,20 @@ multi-record flat files, envelope reconstruction, and the EDI family.
 
 A scenario may be committed with goldens the engine does not yet produce, marked
 `known_broken` in the harness against an issue. The goldens state the correct
-answer; the marker records exactly how the engine disagrees.
+answer; the marker records exactly how the engine disagrees, including a pinned
+fail-loud diagnostic when the safe current behavior is to stop the run.
 
 The marker names the specific outputs allowed to differ and, where relevant, the
 run summary the engine currently prints. Every other output stays fully gated, so
 parking a scenario for one reason cannot silently stop its working parts from
-being checked. A wrong exit code, drifted input digest or missing output always
-fails. The gate's counters record the *correct* summary, so the run that fixes
-the underlying bug reports the marker as stale rather than a counter mismatch.
+being checked. An undeclared exit code, drifted input digest, or unexpected
+diagnostic always fails. The gate's counters record the *correct* summary, so
+the run that fixes the underlying bug reports the marker as stale rather than a
+counter mismatch.
 
-A re-bless run will not overwrite a golden the marker declares broken — that file
-is the only committed record of the right answer. Regenerate it deliberately
-(for #996, by running the scenario with a single sink) rather than from the
-engine's current output.
+A re-bless run will not replace correct goldens from a known failing run. For
+#996, regenerate either output deliberately from its single-sink variant rather
+than from the engine's current fail-loud run.
 
 Currently parked: **02-product-feed-normalize**, against
 [#996](https://github.com/rustpunk/clinker/issues/996).

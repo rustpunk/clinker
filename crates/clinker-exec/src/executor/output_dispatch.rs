@@ -18,7 +18,8 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
     CorrelationRecordSlot, ExecutorContext, buffer_key_for_record, drain_node_buffer_slot,
-    mapping_probe, push_dlq, push_write_error, sink_collision_dlq_entry, source_file_path_of,
+    mapping_probe, missing_node_buffer_input_error, push_dlq, push_write_error,
+    sink_collision_dlq_entry, source_file_path_of,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::structured_output_guard::{
@@ -185,7 +186,7 @@ pub(crate) fn dispatch_output(
                     }
                 }
             }
-            found.unwrap_or_default()
+            found.ok_or_else(|| missing_output_input_error(current_dag, node_idx, name))?
         };
 
     let OutputInputs {
@@ -521,7 +522,7 @@ fn dispatch_output_document_dlq(
     node_idx: NodeIndex,
     name: &str,
 ) -> Result<(), PipelineError> {
-    let events = drain_output_input_events(ctx, current_dag, node_idx)?;
+    let events = drain_output_input_events(ctx, current_dag, node_idx, name)?;
 
     let OutputInputs {
         expected_input_schema,
@@ -561,8 +562,9 @@ fn drain_output_input_events(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
+    name: &str,
 ) -> Result<Vec<crate::executor::stream_event::StreamEvent>, PipelineError> {
-    drain_output_input_event_iter(ctx, current_dag, node_idx).collect()
+    drain_output_input_event_iter(ctx, current_dag, node_idx, name).collect()
 }
 
 /// Execute the `Output` arm under envelope reconstruction
@@ -637,7 +639,7 @@ fn dispatch_output_envelope(
     let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
     let mut any_record = false;
 
-    let events = drain_output_input_event_iter(ctx, current_dag, node_idx);
+    let events = drain_output_input_event_iter(ctx, current_dag, node_idx, name);
     let mut driver = EnvelopeWriterDriver::default();
     let mut structured_guard = StructuredOutputDocumentGuard::new(&out_cfg.format);
 
@@ -885,9 +887,8 @@ fn drain_output_input_event_iter(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
+    name: &str,
 ) -> Box<dyn Iterator<Item = Result<crate::executor::stream_event::StreamEvent, PipelineError>>> {
-    use crate::executor::stream_event::StreamEvent;
-
     if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
         return Box::new(own_buf.drain());
     }
@@ -913,7 +914,35 @@ fn drain_output_input_event_iter(
             return Box::new(cloned.into_iter().map(Ok));
         }
     }
-    Box::new(std::iter::empty::<Result<StreamEvent, PipelineError>>())
+    Box::new(std::iter::once(Err(missing_output_input_error(
+        current_dag,
+        node_idx,
+        name,
+    ))))
+}
+
+/// Build the fail-loud diagnostic only after every valid Output input location
+/// (own slot, predecessor drain, or predecessor clone) has been checked.
+#[cold]
+fn missing_output_input_error(
+    current_dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+    name: &str,
+) -> PipelineError {
+    use petgraph::visit::EdgeRef;
+
+    let incoming = current_dag
+        .graph
+        .edges_directed(node_idx, Direction::Incoming)
+        .next();
+    match incoming {
+        Some(edge) => missing_node_buffer_input_error(
+            name,
+            current_dag.graph[edge.source()].name(),
+            edge.weight().producer_port.as_deref(),
+        ),
+        None => missing_node_buffer_input_error(name, "<missing predecessor>", None),
+    }
 }
 
 /// The Output node's resolved write target plus the run-scoped writer
