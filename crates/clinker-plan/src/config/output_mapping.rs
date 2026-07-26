@@ -277,7 +277,7 @@ impl<'de> Deserialize<'de> for MappingEntry {
                          source column; got `{output}: {source}`. {MAPPING_SHAPE_HELP}"
                     )));
                 }
-                Ok(MappingEntry { output, source })
+                Ok(MappingEntry::rename(output, source))
             }
         }
 
