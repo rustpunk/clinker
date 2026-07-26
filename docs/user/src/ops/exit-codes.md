@@ -45,7 +45,7 @@ Error: CXL type error in node 'transform_1'
    |                ^^^^^^^^^^^^^ cannot add Int and String
 ```
 
-**Action:** Fix the YAML or CXL expression indicated in the diagnostic, then re-run with `--dry-run` to confirm the fix.
+**Action:** Fix the YAML or CXL expression indicated in the diagnostic, then re-run with `--explain` to confirm the fix. Use `--explain` rather than `--dry-run` here: a CXL type error surfaces when the plan is compiled, which bare `--dry-run` returns before reaching.
 
 ### Exit code 2: Partial success (DLQ entries)
 
@@ -189,9 +189,11 @@ exit $EXIT
 ### CI pipeline (GitHub Actions)
 
 ```yaml
-- name: Run ETL pipeline
-  run: clinker run pipeline.yaml --dry-run
-  # Exit code 1 fails the build on config errors
+- name: Compile the plan
+  run: clinker run pipeline.yaml --explain
+  # Exit code 1 fails the build on config, schema or CXL errors.
+  # `--explain` rather than `--dry-run`: the latter returns before the plan is
+  # compiled, so it exits 0 on a pipeline that cannot start.
 
 - name: Smoke test with real data
   run: clinker run pipeline.yaml --dry-run -n 100

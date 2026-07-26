@@ -345,85 +345,116 @@ fn parse_dotted_path(path: &str) -> Result<(&str, &str), ProvenanceExplainError>
 /// match body, or `None` for unknown codes. Every registered code must
 /// have a matching `docs/explain/<code>.md` file; the section-coverage
 /// contract is enforced by `test_explain_docs_all_have_required_sections`.
+/// Every code `clinker explain --code` can answer for, paired with its page.
+///
+/// One home for the list: [`explain_code`] looks up here and [`explain_codes`]
+/// enumerates the same rows, so the CLI cannot advertise a set of valid codes
+/// that has drifted from the set it actually serves. Every entry needs a
+/// matching `docs/explain/<code>.md`; the section-coverage contract is
+/// enforced by `test_explain_docs_all_have_required_sections`.
+pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
+    ("E200", include_str!("../../../../docs/explain/E200.md")),
+    ("E202", include_str!("../../../../docs/explain/E202.md")),
+    ("E203", include_str!("../../../../docs/explain/E203.md")),
+    ("E101", include_str!("../../../../docs/explain/E101.md")),
+    ("E102", include_str!("../../../../docs/explain/E102.md")),
+    ("E103", include_str!("../../../../docs/explain/E103.md")),
+    ("E104", include_str!("../../../../docs/explain/E104.md")),
+    ("E106", include_str!("../../../../docs/explain/E106.md")),
+    ("E107", include_str!("../../../../docs/explain/E107.md")),
+    ("E108", include_str!("../../../../docs/explain/E108.md")),
+    ("E115", include_str!("../../../../docs/explain/E115.md")),
+    ("E300", include_str!("../../../../docs/explain/E300.md")),
+    ("E301", include_str!("../../../../docs/explain/E301.md")),
+    ("E303", include_str!("../../../../docs/explain/E303.md")),
+    ("E304", include_str!("../../../../docs/explain/E304.md")),
+    ("E305", include_str!("../../../../docs/explain/E305.md")),
+    ("E306", include_str!("../../../../docs/explain/E306.md")),
+    ("E307", include_str!("../../../../docs/explain/E307.md")),
+    ("E308", include_str!("../../../../docs/explain/E308.md")),
+    ("E309", include_str!("../../../../docs/explain/E309.md")),
+    ("E310", include_str!("../../../../docs/explain/E310.md")),
+    ("E311", include_str!("../../../../docs/explain/E311.md")),
+    ("E312", include_str!("../../../../docs/explain/E312.md")),
+    ("E313", include_str!("../../../../docs/explain/E313.md")),
+    ("E319", include_str!("../../../../docs/explain/E319.md")),
+    ("E320", include_str!("../../../../docs/explain/E320.md")),
+    ("E321", include_str!("../../../../docs/explain/E321.md")),
+    ("E324", include_str!("../../../../docs/explain/E324.md")),
+    ("E325", include_str!("../../../../docs/explain/E325.md")),
+    ("E326", include_str!("../../../../docs/explain/E326.md")),
+    ("E327", include_str!("../../../../docs/explain/E327.md")),
+    ("E330", include_str!("../../../../docs/explain/E330.md")),
+    ("E331", include_str!("../../../../docs/explain/E331.md")),
+    ("E332", include_str!("../../../../docs/explain/E332.md")),
+    ("E333", include_str!("../../../../docs/explain/E333.md")),
+    ("E334", include_str!("../../../../docs/explain/E334.md")),
+    ("E335", include_str!("../../../../docs/explain/E335.md")),
+    ("E336", include_str!("../../../../docs/explain/E336.md")),
+    ("E337", include_str!("../../../../docs/explain/E337.md")),
+    ("E338", include_str!("../../../../docs/explain/E338.md")),
+    ("E339", include_str!("../../../../docs/explain/E339.md")),
+    ("E340", include_str!("../../../../docs/explain/E340.md")),
+    ("E341", include_str!("../../../../docs/explain/E341.md")),
+    ("E342", include_str!("../../../../docs/explain/E342.md")),
+    ("E343", include_str!("../../../../docs/explain/E343.md")),
+    ("E344", include_str!("../../../../docs/explain/E344.md")),
+    ("E345", include_str!("../../../../docs/explain/E345.md")),
+    ("E346", include_str!("../../../../docs/explain/E346.md")),
+    ("E347", include_str!("../../../../docs/explain/E347.md")),
+    ("E348", include_str!("../../../../docs/explain/E348.md")),
+    ("E349", include_str!("../../../../docs/explain/E349.md")),
+    ("E350", include_str!("../../../../docs/explain/E350.md")),
+    ("E351", include_str!("../../../../docs/explain/E351.md")),
+    ("E352", include_str!("../../../../docs/explain/E352.md")),
+    ("E353", include_str!("../../../../docs/explain/E353.md")),
+    ("E354", include_str!("../../../../docs/explain/E354.md")),
+    ("E355", include_str!("../../../../docs/explain/E355.md")),
+    ("E356", include_str!("../../../../docs/explain/E356.md")),
+    ("E357", include_str!("../../../../docs/explain/E357.md")),
+    ("E358", include_str!("../../../../docs/explain/E358.md")),
+    ("E359", include_str!("../../../../docs/explain/E359.md")),
+    ("E360", include_str!("../../../../docs/explain/E360.md")),
+    ("E361", include_str!("../../../../docs/explain/E361.md")),
+    ("E362", include_str!("../../../../docs/explain/E362.md")),
+    ("E363", include_str!("../../../../docs/explain/E363.md")),
+    ("E364", include_str!("../../../../docs/explain/E364.md")),
+    ("E365", include_str!("../../../../docs/explain/E365.md")),
+    ("E366", include_str!("../../../../docs/explain/E366.md")),
+    ("E323", include_str!("../../../../docs/explain/E323.md")),
+    ("E150b", include_str!("../../../../docs/explain/E150b.md")),
+    ("E150c", include_str!("../../../../docs/explain/E150c.md")),
+    ("E150d", include_str!("../../../../docs/explain/E150d.md")),
+    ("E150e", include_str!("../../../../docs/explain/E150e.md")),
+    ("E15Y", include_str!("../../../../docs/explain/E15Y.md")),
+    ("W101", include_str!("../../../../docs/explain/W101.md")),
+    ("W302", include_str!("../../../../docs/explain/W302.md")),
+    ("W305", include_str!("../../../../docs/explain/W305.md")),
+    ("W306", include_str!("../../../../docs/explain/W306.md")),
+];
+
+/// Look up error/warning code documentation embedded at compile time.
+///
+/// Returns the doc content for any code in [`EXPLAIN_PAGES`], or `None` for
+/// an unknown code.
 pub fn explain_code(code: &str) -> Option<&'static str> {
-    match code {
-        "E200" => Some(include_str!("../../../../docs/explain/E200.md")),
-        "E202" => Some(include_str!("../../../../docs/explain/E202.md")),
-        "E203" => Some(include_str!("../../../../docs/explain/E203.md")),
-        "E101" => Some(include_str!("../../../../docs/explain/E101.md")),
-        "E102" => Some(include_str!("../../../../docs/explain/E102.md")),
-        "E103" => Some(include_str!("../../../../docs/explain/E103.md")),
-        "E104" => Some(include_str!("../../../../docs/explain/E104.md")),
-        "E106" => Some(include_str!("../../../../docs/explain/E106.md")),
-        "E107" => Some(include_str!("../../../../docs/explain/E107.md")),
-        "E108" => Some(include_str!("../../../../docs/explain/E108.md")),
-        "E115" => Some(include_str!("../../../../docs/explain/E115.md")),
-        "E300" => Some(include_str!("../../../../docs/explain/E300.md")),
-        "E301" => Some(include_str!("../../../../docs/explain/E301.md")),
-        "E303" => Some(include_str!("../../../../docs/explain/E303.md")),
-        "E304" => Some(include_str!("../../../../docs/explain/E304.md")),
-        "E305" => Some(include_str!("../../../../docs/explain/E305.md")),
-        "E306" => Some(include_str!("../../../../docs/explain/E306.md")),
-        "E307" => Some(include_str!("../../../../docs/explain/E307.md")),
-        "E308" => Some(include_str!("../../../../docs/explain/E308.md")),
-        "E309" => Some(include_str!("../../../../docs/explain/E309.md")),
-        "E310" => Some(include_str!("../../../../docs/explain/E310.md")),
-        "E311" => Some(include_str!("../../../../docs/explain/E311.md")),
-        "E312" => Some(include_str!("../../../../docs/explain/E312.md")),
-        "E313" => Some(include_str!("../../../../docs/explain/E313.md")),
-        "E319" => Some(include_str!("../../../../docs/explain/E319.md")),
-        "E320" => Some(include_str!("../../../../docs/explain/E320.md")),
-        "E321" => Some(include_str!("../../../../docs/explain/E321.md")),
-        "E324" => Some(include_str!("../../../../docs/explain/E324.md")),
-        "E325" => Some(include_str!("../../../../docs/explain/E325.md")),
-        "E326" => Some(include_str!("../../../../docs/explain/E326.md")),
-        "E327" => Some(include_str!("../../../../docs/explain/E327.md")),
-        "E330" => Some(include_str!("../../../../docs/explain/E330.md")),
-        "E331" => Some(include_str!("../../../../docs/explain/E331.md")),
-        "E332" => Some(include_str!("../../../../docs/explain/E332.md")),
-        "E333" => Some(include_str!("../../../../docs/explain/E333.md")),
-        "E334" => Some(include_str!("../../../../docs/explain/E334.md")),
-        "E335" => Some(include_str!("../../../../docs/explain/E335.md")),
-        "E336" => Some(include_str!("../../../../docs/explain/E336.md")),
-        "E337" => Some(include_str!("../../../../docs/explain/E337.md")),
-        "E338" => Some(include_str!("../../../../docs/explain/E338.md")),
-        "E339" => Some(include_str!("../../../../docs/explain/E339.md")),
-        "E340" => Some(include_str!("../../../../docs/explain/E340.md")),
-        "E341" => Some(include_str!("../../../../docs/explain/E341.md")),
-        "E342" => Some(include_str!("../../../../docs/explain/E342.md")),
-        "E343" => Some(include_str!("../../../../docs/explain/E343.md")),
-        "E344" => Some(include_str!("../../../../docs/explain/E344.md")),
-        "E345" => Some(include_str!("../../../../docs/explain/E345.md")),
-        "E346" => Some(include_str!("../../../../docs/explain/E346.md")),
-        "E347" => Some(include_str!("../../../../docs/explain/E347.md")),
-        "E348" => Some(include_str!("../../../../docs/explain/E348.md")),
-        "E349" => Some(include_str!("../../../../docs/explain/E349.md")),
-        "E350" => Some(include_str!("../../../../docs/explain/E350.md")),
-        "E351" => Some(include_str!("../../../../docs/explain/E351.md")),
-        "E352" => Some(include_str!("../../../../docs/explain/E352.md")),
-        "E353" => Some(include_str!("../../../../docs/explain/E353.md")),
-        "E354" => Some(include_str!("../../../../docs/explain/E354.md")),
-        "E355" => Some(include_str!("../../../../docs/explain/E355.md")),
-        "E356" => Some(include_str!("../../../../docs/explain/E356.md")),
-        "E357" => Some(include_str!("../../../../docs/explain/E357.md")),
-        "E358" => Some(include_str!("../../../../docs/explain/E358.md")),
-        "E359" => Some(include_str!("../../../../docs/explain/E359.md")),
-        "E360" => Some(include_str!("../../../../docs/explain/E360.md")),
-        "E361" => Some(include_str!("../../../../docs/explain/E361.md")),
-        "E362" => Some(include_str!("../../../../docs/explain/E362.md")),
-        "E363" => Some(include_str!("../../../../docs/explain/E363.md")),
-        "E323" => Some(include_str!("../../../../docs/explain/E323.md")),
-        "E150b" => Some(include_str!("../../../../docs/explain/E150b.md")),
-        "E150c" => Some(include_str!("../../../../docs/explain/E150c.md")),
-        "E150d" => Some(include_str!("../../../../docs/explain/E150d.md")),
-        "E150e" => Some(include_str!("../../../../docs/explain/E150e.md")),
-        "E15Y" => Some(include_str!("../../../../docs/explain/E15Y.md")),
-        "W101" => Some(include_str!("../../../../docs/explain/W101.md")),
-        "W302" => Some(include_str!("../../../../docs/explain/W302.md")),
-        "W305" => Some(include_str!("../../../../docs/explain/W305.md")),
-        "W306" => Some(include_str!("../../../../docs/explain/W306.md")),
-        _ => None,
-    }
+    EXPLAIN_PAGES
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, doc)| *doc)
+}
+
+/// Every code [`explain_code`] can answer for, sorted.
+///
+/// The CLI prints this when a user names a code that does not exist, so it is
+/// derived rather than retyped. A hand-maintained list goes stale the first
+/// time a code is added, and then tells a user who mistyped after following an
+/// `explain --code` hint that the valid range stops before the code the hint
+/// named.
+pub fn explain_codes() -> Vec<&'static str> {
+    let mut codes: Vec<&'static str> = EXPLAIN_PAGES.iter().map(|(c, _)| *c).collect();
+    codes.sort_unstable();
+    codes
 }
 
 #[cfg(test)]
@@ -634,16 +665,58 @@ mod tests {
     }
 
     #[test]
+    fn test_explain_codes_enumerates_exactly_what_explain_code_serves() {
+        // The CLI prints this list when a code is not found, so a list that
+        // reports fewer codes than are served tells a user the code they were
+        // just pointed at does not exist.
+        let listed = explain_codes();
+        assert_eq!(listed.len(), EXPLAIN_PAGES.len());
+        for code in &listed {
+            assert!(
+                explain_code(code).is_some(),
+                "{code} is listed as valid but serves no page"
+            );
+        }
+        assert!(listed.windows(2).all(|w| w[0] < w[1]), "must be sorted");
+    }
+
+    #[test]
+    fn test_overlay_conditions_have_their_own_pages() {
+        // Split out of E107 / E110 / E111 so `explain --code` stops sending a
+        // reader of the overlay condition to a page about composition binding.
+        // Each page must describe the overlay condition, not the one it left.
+        for (code, marker) in [
+            ("E364", "channel var override"),
+            ("E365", "shadows a reserved system field"),
+            ("E366", "the pipeline does not declare"),
+        ] {
+            let doc = explain_code(code).unwrap_or_else(|| panic!("{code} has no page"));
+            assert!(doc.contains(code), "{code} page must name its own code");
+            assert!(
+                doc.contains(marker),
+                "{code} page must describe the overlay condition"
+            );
+        }
+        // The code they were split out of keeps its original meaning rather
+        // than being repurposed.
+        let e107 = explain_code("E107").expect("E107 has a page");
+        assert!(
+            e107.contains("ycle"),
+            "E107 must still describe the composition cycle it always did"
+        );
+    }
+
+    #[test]
     fn test_explain_docs_all_have_required_sections() {
-        let codes = [
-            "E200", "E202", "E203", "E101", "E102", "E103", "E104", "E106", "E107", "E108", "E115",
-            "E150b", "E150c", "E150d", "E150e", "E300", "E301", "E303", "E304", "E305", "E306",
-            "E307", "E308", "E309", "E310", "E311", "E312", "E313", "E319", "E320", "E321", "E323",
-            "E324", "E325", "E326", "E327", "E330", "E331", "E332", "E333", "E334", "E335", "E336",
-            "E337", "E338", "E339", "E340", "E341", "E342", "E343", "E344", "E345", "E346", "E347",
-            "E348", "E349", "E350", "E351", "E352", "E353", "E354", "E355", "E356", "E357", "E358",
-            "E359", "E360", "E361", "E362", "E363", "E15Y", "W101", "W302", "W305", "W306",
-        ];
+        // Derived from the page table, not retyped: a hand-listed set silently
+        // stops covering a page the moment one is added, which is how a page
+        // could ship without its sections in the first place.
+        let codes = explain_codes();
+        assert_eq!(
+            codes.len(),
+            EXPLAIN_PAGES.len(),
+            "every page must be covered exactly once"
+        );
         let required_sections = [
             "## What it means",
             "## Example",

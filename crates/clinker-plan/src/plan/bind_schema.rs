@@ -4405,6 +4405,77 @@ fn typecheck_cxl(
     )
 }
 
+/// Turn CXL name-resolution failures into one plan diagnostic, keeping the
+/// resolver's own code and help when it carries them.
+///
+/// A resolver diagnostic may name its own code as a `[CODE]` message prefix —
+/// E173 does, for a composition body reading a parent-scope var its
+/// `_compose.scoped_vars` schema does not opt into. Wrapping every failure as
+/// E203 published two contradicting codes in one report (an E203 header over
+/// an `[E173]` message, with a pointer to the E203 page) and dropped the
+/// resolver's `help`, which for E173 is the line naming the exact field to add.
+///
+/// So the wrap applies only where there is nothing better: when every
+/// diagnostic agrees on one code that code is used, along with the helps they
+/// carry, and otherwise the failures collapse into E203 as before.
+fn resolve_failure_diagnostic(
+    node_name: &str,
+    diags: Vec<cxl::resolve::ResolveDiagnostic>,
+    span: Span,
+) -> Diagnostic {
+    /// The `[CODE]` a resolver message names for itself, if any.
+    fn own_code(message: &str) -> Option<&str> {
+        let rest = message.strip_prefix('[')?;
+        let (code, _) = rest.split_once(']')?;
+        clinker_core_types::diagnostic::is_registered(code).then_some(code)
+    }
+
+    let shared_code = diags
+        .first()
+        .and_then(|d| own_code(&d.message))
+        .filter(|code| diags.iter().all(|d| own_code(&d.message) == Some(*code)))
+        .map(str::to_owned);
+
+    let helps: Vec<String> = diags.iter().filter_map(|d| d.help.clone()).collect();
+
+    match shared_code {
+        Some(code) => {
+            // The code becomes the diagnostic's own, so the prefix that carried
+            // it here is redundant -- leaving it in would state the code twice
+            // to every consumer, not just the one renderer that strips it.
+            let prefix = format!("[{code}]");
+            let joined = diags
+                .iter()
+                .map(|d| {
+                    d.message
+                        .strip_prefix(&prefix)
+                        .map_or(d.message.as_str(), str::trim_start)
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            let diag = Diagnostic::error(code, joined, LabeledSpan::primary(span, String::new()));
+            if helps.is_empty() {
+                diag
+            } else {
+                diag.with_help(helps.join("; "))
+            }
+        }
+        None => {
+            let joined = diags
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+                .join("; ");
+            Diagnostic::error(
+                "E203",
+                format!("CXL name resolution failed in {node_name:?}: {joined}"),
+                LabeledSpan::primary(span, String::new()),
+            )
+        }
+    }
+}
+
 /// Resolve + typecheck an already-parsed CXL `program` against `schema`,
 /// attaching `source` as the typed program's display text.
 ///
@@ -4443,20 +4514,7 @@ fn typecheck_parsed_program(
         &std::collections::HashMap::new(),
         scoped_vars,
     )
-    .map_err(|diags| {
-        Diagnostic::error(
-            "E203",
-            format!(
-                "CXL name resolution failed in {node_name:?}: {}",
-                diags
-                    .into_iter()
-                    .map(|d| d.message)
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-            LabeledSpan::primary(span, String::new()),
-        )
-    })?;
+    .map_err(|diags| resolve_failure_diagnostic(node_name, diags, span))?;
     cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode.clone(), scoped_vars)
         .map(|mut typed| {
             fold_body_config(&mut typed, scoped_vars);

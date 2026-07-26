@@ -678,6 +678,9 @@ fn main() -> ExitCode {
                 .init();
             match run_explain(args) {
                 Ok(()) => ExitCode::SUCCESS,
+                // A plan diagnostic has already been rendered in full; saying
+                // it again in one flat line would bury the report above it.
+                Err(e) if e.is::<AlreadyReported>() => ExitCode::FAILURE,
                 Err(e) => {
                     eprintln!("clinker explain error: {e}");
                     ExitCode::FAILURE
@@ -760,9 +763,15 @@ struct WrappedPipelineError {
 
 impl WrappedPipelineError {
     fn prefixed_message(&self) -> String {
-        match &self.filename {
-            Some(f) => format!("pipeline error in {f}: {}", self.message),
-            None => self.message.clone(),
+        match (&self.filename, self.severity) {
+            // "pipeline error in ..." on a warning contradicts the glyph
+            // miette prints beside it. Name the file without calling the
+            // advisory a failure.
+            (Some(f), miette::Severity::Error) => {
+                format!("pipeline error in {f}: {}", self.message)
+            }
+            (Some(f), _) => format!("in {f}: {}", self.message),
+            (None, _) => self.message.clone(),
         }
     }
 }
@@ -857,6 +866,35 @@ fn plan_line_anchors_trusted(
             .nodes
             .iter()
             .any(|n| matches!(n.value, PipelineNode::Composition { .. }))
+}
+
+/// Marker for a failure whose diagnostic has already been printed by
+/// [`render_pipeline_error`].
+///
+/// `run_explain` returns `Box<dyn Error>` and its caller prints whatever comes
+/// back. Returning this instead of a message keeps the caller from printing a
+/// second, flatter version of a report the user has already been shown.
+#[derive(Debug)]
+struct AlreadyReported;
+
+impl std::fmt::Display for AlreadyReported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never surfaced: the caller checks for this type before printing.
+        f.write_str("plan compilation failed")
+    }
+}
+
+impl std::error::Error for AlreadyReported {}
+
+/// Whether an overlay actually put anything into the plan.
+///
+/// `--channel`/`--group` being passed is not the question — an overlay that
+/// resolved to nothing splices no nodes, so it introduces no second document
+/// and no reason to distrust a line anchor. Keyed on the same emptiness test
+/// the overlay summary uses, so a flag that changed nothing does not silently
+/// cost the user their source snippets.
+fn overlay_contributed(overlay: Option<&clinker_channel::OverlayResolution>) -> bool {
+    overlay.is_some_and(|res| !res.is_empty())
 }
 
 /// Build the plan-diagnostic error, keeping line anchors only when
@@ -956,6 +994,15 @@ fn render_plan_diagnostic(
         });
     }
 
+    // Some messages open with their own `[CODE]` prefix -- the composition-body
+    // patch pass re-emits an op failure that way, and the CXL wrap carries the
+    // resolver's code through. The code is already the report header, so a
+    // prefix here would state it twice.
+    let message = diag
+        .message
+        .strip_prefix(&format!("[{}]", diag.code))
+        .map_or_else(|| diag.message.clone(), |rest| rest.trim_start().to_owned());
+
     let has_labels = !labels.is_empty();
     let wrapped = WrappedPipelineError {
         // With a snippet the header already prints the path; without one the
@@ -963,7 +1010,7 @@ fn render_plan_diagnostic(
         filename: (!has_labels).then(|| filename.to_owned()),
         code: diag.code.clone(),
         severity: miette_severity(diag.severity),
-        message: diag.message.clone(),
+        message,
         help,
         // A label needs its source attached; without one miette renders the
         // message alone, which is what a spanless diagnostic deserves.
@@ -990,7 +1037,18 @@ fn render_pipeline_error(err: &PipelineError, config_path: &std::path::Path) {
     // Best-effort source attach. If the config file is unreadable
     // we still render the raw error via miette's graphical handler
     // so the user sees consistent formatting.
-    let source_text = std::fs::read_to_string(config_path).ok();
+    //
+    // The text a span's line number indexes is the *interpolated* config, not
+    // the bytes on disk: the loader runs `interpolate_env_vars` before parsing,
+    // so a `${VAR}` holding a multi-line value shifts every line after it. The
+    // renderer applies the same transformation rather than re-reading the raw
+    // file, or the underline lands on whatever YAML happens to sit at that line
+    // in the unexpanded text -- silently, because any in-range line resolves.
+    // If interpolation fails the config never parsed, so there are no plan
+    // diagnostics to anchor; fall back to the raw text for the generic path.
+    let source_text = std::fs::read_to_string(config_path)
+        .ok()
+        .map(|raw| clinker_plan::config::interpolate_env_vars(&raw, &[]).unwrap_or(raw));
     let filename = config_path.to_string_lossy().into_owned();
     // Built once and shared: a compile that fails N gates would otherwise
     // clone the whole config text N times.
@@ -1026,6 +1084,15 @@ fn render_pipeline_error(err: &PipelineError, config_path: &std::path::Path) {
 /// renderer gives them the same code / help / source-line treatment as any
 /// other plan-time diagnostic, and printing them here as well would show each
 /// failure twice.
+///
+/// The anchors are dropped unconditionally, which is this path's correct
+/// verdict rather than a blanket precaution: every diagnostic here is produced
+/// while applying the channel/group overlay, so its line -- if it ever carries
+/// one -- numbers the overlay file, never the pipeline. Threading the caller's
+/// [`plan_line_anchors_trusted`] result would anchor them whenever the overlay
+/// resolved to nothing, which is the one case that verdict returns `true` for.
+/// Inert today because every channel diagnostic uses a synthetic span; stated
+/// here so it stays correct when one does not.
 fn abort_on_overlay_errors(
     overlay: &clinker_channel::ChannelOverlayResult,
 ) -> Result<(), PipelineError> {
@@ -1039,7 +1106,7 @@ fn abort_on_overlay_errors(
         }
     }
     if !errors.is_empty() {
-        return Err(PipelineError::PlanDiagnostics(errors));
+        return Err(PipelineError::plan_diagnostics_unanchored(errors));
     }
     Ok(())
 }
@@ -1343,12 +1410,13 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     }
 
     if let Some(format) = args.explain {
-        let mut compiled_plan = pipeline_config.compile(&compile_ctx).map_err(|d| {
-            plan_diagnostics(
-                d,
-                plan_line_anchors_trusted(&pipeline_config, overlay_resolution.is_some()),
-            )
-        })?;
+        let anchors_trusted = plan_line_anchors_trusted(
+            &pipeline_config,
+            overlay_contributed(overlay_resolution.as_ref()),
+        );
+        let mut compiled_plan = pipeline_config
+            .compile(&compile_ctx)
+            .map_err(|d| plan_diagnostics(d, anchors_trusted))?;
         if let Some(res) = &overlay_resolution {
             let overlay = res.apply_config_and_vars(&mut compiled_plan, &pipeline_config);
             abort_on_overlay_errors(&overlay)?;
@@ -1464,12 +1532,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         let cfg = lineage_config
             .as_ref()
             .expect("lineage_config is captured whenever --lineage is set");
-        let mut compiled_plan = cfg.compile(&compile_ctx).map_err(|d| {
-            plan_diagnostics(
-                d,
-                plan_line_anchors_trusted(cfg, overlay_resolution.is_some()),
-            )
-        })?;
+        let anchors_trusted =
+            plan_line_anchors_trusted(cfg, overlay_contributed(overlay_resolution.as_ref()));
+        let mut compiled_plan = cfg
+            .compile(&compile_ctx)
+            .map_err(|d| plan_diagnostics(d, anchors_trusted))?;
         if let Some(res) = &overlay_resolution {
             let overlay = res.apply_config_and_vars(&mut compiled_plan, cfg);
             abort_on_overlay_errors(&overlay)?;
@@ -1578,12 +1645,13 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // The structural overlay op stream (if any) is applied inside `compile`
     // via `compile_ctx.overlay_ops`, so a bad splice anchor or ill-typed op is
     // a compile diagnostic, not a panic — propagate it rather than unwrapping.
-    let mut compiled_plan = pipeline_config.compile(&compile_ctx).map_err(|d| {
-        plan_diagnostics(
-            d,
-            plan_line_anchors_trusted(&pipeline_config, overlay_resolution.is_some()),
-        )
-    })?;
+    let anchors_trusted = plan_line_anchors_trusted(
+        &pipeline_config,
+        overlay_contributed(overlay_resolution.as_ref()),
+    );
+    let mut compiled_plan = pipeline_config
+        .compile(&compile_ctx)
+        .map_err(|d| plan_diagnostics(d, anchors_trusted))?;
     // Channel/group overlay: config/vars clobber over the compiled plan's
     // provenance, resolving the four scoped var registries into the runtime
     // values the executor layers atop Transform-declared defaults at init.
@@ -2801,12 +2869,14 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
             None => {
-                return Err(format!(
-                    "unknown diagnostic code '{code}'. Valid codes: E101-E104, E106-E108, E115, \
-                     E150b-E150e, E15Y, E300/E301/E303-E313/E319/E325/E326/E327, E320/E321/E323, E330-E354, \
-                     W101/W302/W305/W306"
-                )
-                .into());
+                // Derived from the same table `explain_code` answers from --
+                // a retyped range goes stale the first time a code is added,
+                // and then contradicts the `See: clinker explain --code <CODE>`
+                // hint the run path now prints.
+                let valid = clinker_plan::plan::explain_provenance::explain_codes().join(", ");
+                return Err(
+                    format!("unknown diagnostic code '{code}'. Valid codes: {valid}").into(),
+                );
             }
         }
     }
@@ -2881,22 +2951,23 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
         compile_ctx.overlay_ops = res.op_stream().to_vec();
     }
 
+    // Compile failures render through the same path `clinker run` uses, so a
+    // user who hits a gate here gets the code, help and source line rather
+    // than a bare message with no way to reach `clinker explain --code`.
+    let anchors_trusted = plan_line_anchors_trusted(
+        &pipeline_config,
+        overlay_contributed(overlay_resolution.as_ref()),
+    );
     let mut compiled_plan = pipeline_config.compile(&compile_ctx).map_err(|diags| {
-        let messages: Vec<String> = diags.iter().map(|d| d.message.clone()).collect();
-        format!("compilation failed:\n{}", messages.join("\n"))
+        render_pipeline_error(&plan_diagnostics(diags, anchors_trusted), config_path);
+        AlreadyReported
     })?;
 
     if let Some(res) = &overlay_resolution {
-        use clinker_core_types::Severity;
         let overlay = res.apply_config_and_vars(&mut compiled_plan, &pipeline_config);
-        let errors: Vec<String> = overlay
-            .diagnostics
-            .iter()
-            .filter(|d| matches!(d.severity, Severity::Error))
-            .map(|d| format!("[{}] {}", d.code, d.message))
-            .collect();
-        if !errors.is_empty() {
-            return Err(format!("overlay application failed:\n{}", errors.join("\n")).into());
+        if let Err(e) = abort_on_overlay_errors(&overlay) {
+            render_pipeline_error(&e, config_path);
+            return Err(AlreadyReported.into());
         }
     }
 

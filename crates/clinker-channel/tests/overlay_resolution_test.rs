@@ -591,7 +591,7 @@ fn static_var_add() {
 }
 
 #[test]
-fn static_var_type_mismatch_e107() {
+fn static_var_type_mismatch_e364() {
     let ws = workspace();
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
@@ -602,7 +602,7 @@ fn static_var_type_mismatch_e107() {
 
     let (_res, _plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
     assert_eq!(
-        errors_with_code(&result.diagnostics, "E107").len(),
+        errors_with_code(&result.diagnostics, "E364").len(),
         1,
         "{:?}",
         result.diagnostics
@@ -634,7 +634,7 @@ fn pipeline_var_override() {
 }
 
 #[test]
-fn pipeline_reserved_name_e110() {
+fn pipeline_reserved_name_e365() {
     let ws = workspace();
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
@@ -645,7 +645,7 @@ fn pipeline_reserved_name_e110() {
 
     let (_res, _plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
     assert_eq!(
-        errors_with_code(&result.diagnostics, "E110").len(),
+        errors_with_code(&result.diagnostics, "E365").len(),
         1,
         "{:?}",
         result.diagnostics
@@ -678,7 +678,7 @@ fn source_var_override_per_name() {
 }
 
 #[test]
-fn source_unknown_name_e111() {
+fn source_unknown_name_e366() {
     let ws = workspace();
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
@@ -689,7 +689,7 @@ fn source_unknown_name_e111() {
 
     let (_res, _plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
     assert_eq!(
-        errors_with_code(&result.diagnostics, "E111").len(),
+        errors_with_code(&result.diagnostics, "E366").len(),
         1,
         "{:?}",
         result.diagnostics
@@ -697,7 +697,7 @@ fn source_unknown_name_e111() {
 }
 
 #[test]
-fn source_reserved_name_e110() {
+fn source_reserved_name_e365() {
     let ws = workspace();
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
@@ -708,7 +708,7 @@ fn source_reserved_name_e110() {
 
     let (_res, _plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
     assert_eq!(
-        errors_with_code(&result.diagnostics, "E110").len(),
+        errors_with_code(&result.diagnostics, "E365").len(),
         1,
         "{:?}",
         result.diagnostics

@@ -26,6 +26,29 @@ A genuine partial-success mode — one that actually differs from `continue` —
 can be designed on its own merits later; nothing about this removal forecloses
 it.
 
+### Changed — three channel-overlay conditions moved to their own diagnostic codes
+
+**Diagnostic code change.** Three conditions raised while resolving a channel or
+group overlay shared a code with an unrelated composition-binding check. Because
+a failure now prints `See: clinker explain --code <CODE>`, sharing sent readers
+of one condition to a page describing the other — for a pipeline that may not
+use compositions at all. Each condition now has its own code and its own page:
+
+| Condition | Was | Now |
+|---|---|---|
+| Channel var override disagrees with the pipeline's declared type, or its default does not match that type | `E107` | `E364` |
+| Channel var name shadows a reserved `$pipeline.*` / `$source.*` field | `E110` | `E365` |
+| `vars.source` block keyed by a source the pipeline does not declare | `E111` | `E366` |
+
+The old codes keep their original meanings — `E107` a cycle in the flat
+post-expansion graph, `E110` an extraction selection naming a node absent from
+the DAG, `E111` a composition body with zero nodes — and are still emitted for
+those. Only the overlay conditions moved.
+
+Tooling that greps run output or CI logs for `E107`, `E110`, or `E111` to detect
+an overlay misconfiguration needs to match the new codes instead. Nothing in
+pipeline or channel YAML changes.
+
 ### Changed — JSON output expands dotted column names into nested objects
 
 **Behaviour change.** A JSON output previously emitted every column name

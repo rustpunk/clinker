@@ -80,7 +80,7 @@ diagnostic_registry! {
     "E107", Error, "Cycle detected in flat post-expansion graph";
     "E108", Error, "Composition body references enclosing scope (IsolatedFromAbove)";
     "E109", Error, "Ambiguous column reference (declared vs pass-through in open row)";
-    "E110", Error, "Channel var shadows a reserved system field, or an extraction selection names a node the execution-plan DAG does not contain (one code, two unrelated conditions)";
+    "E110", Error, "An extraction selection names a node the execution-plan DAG does not contain";
     "E111", Error, "Composition body has zero nodes (rejected at bind time)";
     "E112", Error, "Runtime composition recursion depth exceeded";
     "E113", Error, "Channel `config`/override key matches no parameter in the compiled plan (unknown key)";
@@ -195,6 +195,13 @@ diagnostic_registry! {
     "E361", Error, "`multiple: true` column on a source whose format has no way to produce more than one value";
     "E362", Error, "Malformed `join_values:` output declaration (the write-side mirror of E358)";
     "E363", Error, "A source's `record_path` is not a path in its format's grammar — an XPath descendant step (`//`), a JSONPath root marker (`$.`), a leading `/`, an empty segment, or an XML segment no element can be named";
+    // ── Channel / group overlay declarations ────────────────────────────
+    // Split out of E107 / E110 / E111, which each also named an unrelated
+    // composition-binding condition. One code answering two questions makes
+    // `clinker explain --code` send half its readers to the wrong page.
+    "E364", Error, "A channel var override disagrees with the pipeline's declaration — a different type, or a default that does not match the declared type";
+    "E365", Error, "A channel var's name shadows a reserved system field";
+    "E366", Error, "A channel `vars.source` block is keyed by a source name the pipeline does not declare";
     // ── Path security ───────────────────────────────────────────────────
     "E-SEC-001", Error, "Path security violation (escape, symlink, etc.)";
     // ── Warnings ────────────────────────────────────────────────────────

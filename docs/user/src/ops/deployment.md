@@ -185,9 +185,11 @@ The batch ID appears in metrics output and log lines, making it easy to correlat
 
 To upgrade Clinker:
 
-1. Validate the new version against your pipelines:
+1. Validate the new version against your pipelines. Use `--explain`, not
+   `--dry-run`: it compiles the plan, so a gate the new version tightened
+   surfaces here rather than on the first production run.
    ```bash
-   /opt/clinker/bin/clinker-new run pipeline.yaml --dry-run
+   /opt/clinker/bin/clinker-new run pipeline.yaml --explain
    ```
 2. Replace the binary:
    ```bash

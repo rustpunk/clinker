@@ -198,16 +198,22 @@ fn strip_ansi(s: &str) -> String {
 ///
 /// miette hard-wraps its message and help paragraphs to the terminal width,
 /// which differs between a developer's terminal and CI. A phrase that sits on
-/// one line in one place arrives split across a newline plus the renderer's
-/// gutter indent in the other. Collapsing every run of whitespace to a single
-/// space makes a `contains` mean "this phrase is present", at any width and on
-/// any platform.
+/// one line in one place arrives split in the other — and not merely across a
+/// newline: each continuation line carries a `│` gutter marker, so the break
+/// lands *inside* the phrase as `node names │ differ only in case`. Dropping
+/// the frame characters and then collapsing every run of whitespace makes a
+/// `contains` mean "this phrase is present", at any width and on any platform.
 ///
-/// This matters as much for the negative assertion below as for the positive
-/// ones: a wrapped occurrence of the transform-compilation heading would
-/// otherwise satisfy `!contains` for the wrong reason.
+/// This matters as much for the negative assertions below as for the positive
+/// ones: a wrapped occurrence of a heading would otherwise satisfy `!contains`
+/// for the wrong reason.
 fn flatten_report(stderr: &str) -> String {
+    // miette's box-drawing frame: the continuation gutter, the snippet border,
+    // and the label leaders. None of it is diagnostic content, and the theme
+    // that selects these characters is platform-dependent.
+    const FRAME: &[char] = &['│', '·', '╭', '╰', '╮', '╯', '─', '┬', '├', '┤'];
     strip_ansi(stderr)
+        .replace(FRAME, " ")
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -605,6 +611,214 @@ nodes:
         flat.contains("runtime consumer"),
         "the secondary label names the node the author must change, and must \
          be rendered too; got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Write a composition body plus a caller that trips a body-file diagnostic,
+/// optionally giving the caller two node names that differ only in case so the
+/// compile also yields a W002 warning.
+fn write_body_and_caller(tmp: &std::path::Path, warn: bool) -> std::path::PathBuf {
+    std::fs::write(
+        tmp.join("body.comp.yaml"),
+        r#"_compose:
+  name: body
+  inputs:
+    b_in:
+      schema:
+        - { name: customer_id, type: string }
+  outputs:
+    b_out: body_proj
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: body_proj
+    input: b_in
+    config:
+      cxl: |
+        emit z = not_a_column_in_the_body
+"#,
+    )
+    .expect("write body");
+    let (source_name, comp_name) = if warn { ("Src", "src") } else { ("src", "c1") };
+    let yaml_path = tmp.join("main.yaml");
+    std::fs::write(
+        &yaml_path,
+        format!(
+            r#"pipeline:
+  name: comp_span
+nodes:
+  - type: source
+    name: {source_name}
+    config:
+      name: {source_name}
+      type: csv
+      path: in.csv
+      schema:
+        - {{ name: customer_id, type: string }}
+  - type: composition
+    name: {comp_name}
+    input: {source_name}
+    use: ./body.comp.yaml
+    inputs:
+      b_in: {source_name}
+  - type: output
+    name: out
+    input: {comp_name}
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+        ),
+    )
+    .expect("write main");
+    yaml_path
+}
+
+#[test]
+fn test_warning_on_the_unanchored_path_is_not_called_an_error() {
+    // With no snippet to carry the filename, the message names it instead --
+    // but "pipeline error in ..." on a warning contradicts the glyph beside
+    // it. `test_warning_is_not_painted_as_an_error` covers only the
+    // snippet-bearing path, where the prefix is absent for other reasons.
+    let tmp = tempdir_path();
+    let yaml_path = write_body_and_caller(&tmp, true);
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&yaml_path)
+        .output()
+        .expect("spawn clinker");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let flat = flatten_report(&stderr);
+
+    assert!(flat.contains("W002"), "got:\n{stderr}");
+    // Assertions are scoped to the W002 report rather than to the whole
+    // stream: the E203 error below it legitimately says "pipeline error in",
+    // and no needle may span the temp path, which miette breaks mid-token at
+    // some widths.
+    let (warning_report, _) = flat
+        .split_once("E203")
+        .expect("the body-file error follows the warning");
+    assert!(
+        warning_report.contains("node names differ only in case"),
+        "got:\n{stderr}"
+    );
+    // The warning still names the file it came from...
+    assert!(
+        warning_report.contains("main.yaml"),
+        "the warning must still name its file; got:\n{stderr}"
+    );
+    // ...without calling itself a pipeline error.
+    assert!(
+        !warning_report.contains("pipeline error"),
+        "a warning must not be prefixed as an error; got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_resolver_diagnostic_keeps_its_own_code_and_help() {
+    // A composition body reading a parent-scope var its `scoped_vars` schema
+    // does not opt into raises E173, which carries the help naming the exact
+    // field to add. Wrapping it as E203 published two contradicting codes and
+    // dropped that help, leaving the reader with a pointer to a page about a
+    // different failure.
+    let tmp = tempdir_path();
+    std::fs::write(
+        tmp.join("scoped.comp.yaml"),
+        r#"_compose:
+  name: scoped
+  inputs:
+    s_in:
+      schema:
+        - { name: customer_id, type: string }
+  outputs:
+    s_out: s_proj
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: s_proj
+    input: s_in
+    config:
+      cxl: |
+        emit z = $pipeline.batch_label
+"#,
+    )
+    .expect("write body");
+    let yaml_path = tmp.join("main.yaml");
+    std::fs::write(
+        &yaml_path,
+        r#"pipeline:
+  name: scoped_var
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - { name: customer_id, type: string }
+  - type: transform
+    name: tag
+    input: src
+    config:
+      declares:
+        - { name: batch_label, scope: pipeline, type: string }
+      cxl: |
+        emit $pipeline.batch_label = "spring"
+  - type: composition
+    name: c1
+    input: tag
+    use: ./scoped.comp.yaml
+    inputs:
+      s_in: tag
+  - type: output
+    name: out
+    input: c1
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#,
+    )
+    .expect("write main");
+
+    let output = Command::new(clinker_bin())
+        .arg("run")
+        .arg(&yaml_path)
+        .output()
+        .expect("spawn clinker");
+
+    assert!(!output.status.success(), "the scoped-var gate must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let flat = flatten_report(&stderr);
+
+    assert!(
+        flat.contains("E173"),
+        "the resolver's own code must head the report; got:\n{stderr}"
+    );
+    assert!(
+        !flat.contains("E203"),
+        "the wrapping code must not appear alongside it; got:\n{stderr}"
+    );
+    // The code is the header, so the message must not repeat it.
+    assert!(
+        !flat.contains("[E173]"),
+        "the code must be stated once, not embedded in the message too; \
+         got:\n{stderr}"
+    );
+    assert!(
+        flat.contains("_compose.scoped_vars.pipeline"),
+        "the resolver's help names the field to add and must survive; \
+         got:\n{stderr}"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
