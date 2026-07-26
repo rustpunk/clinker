@@ -61,6 +61,17 @@ bench, socket, and file-descriptor caveats.
 - Never push to main directly; push only feature branches created for an explicitly requested task.
 - If a term, architecture rule, or behavior is unclear, record it in [docs/ai/80_OPEN_QUESTIONS.md](docs/ai/80_OPEN_QUESTIONS.md) instead of guessing.
 
+## User-Facing Surface
+
+Anything a pipeline author writes by hand — a YAML key, a CXL construct, a CLI flag, an option value — is a user interface. Changing it is a design decision, not an implementation detail.
+
+- Ground surface decisions in patterns config authors have already met and that demonstrably work in tools of this shape, rather than in a spelling that only makes sense from inside the engine. Where an established convention exists, follow it; where this project departs from one, say so in the PR and give the reason.
+- One concept, one spelling. A second syntax for something the surface already expresses is a defect, not a convenience.
+- The common case is the short case; the general form stays reachable without rewriting the simple one.
+- Engine vocabulary stays out of author vocabulary — internal identifiers and namespaced machinery are not things a user should have to type.
+- Errors are part of the surface: a diagnostic names the offending input, the rule it broke, and a corrected form the author can paste.
+- User documentation ships in the same PR as the surface change.
+
 ## Rust Conventions
 
 - Prefer existing local patterns over new abstractions.
