@@ -47,14 +47,30 @@ rather than silently dropping data.
 
 ## Writing XML
 
-The XML writer expands dotted field names to nested elements and applies
-the same `attribute_prefix` convention in reverse: a field whose final
-path segment carries the prefix is emitted as an XML **attribute** of its
-enclosing element instead of a child element. A top-level `@id` attaches
-to the record element's start tag; a nested `Address.@type` attaches to
-the `<Address>` element. Records read from an XML source therefore
-round-trip — `<Record id="7"><name>A</name></Record>` reads and writes
-back unchanged, and the writer never emits an `@`-named element.
+The XML writer expands dotted field names to nested elements, by the same rule
+the [JSON writer](json.md#writing-json) expands them into nested objects —
+grouping, ordering, absent-child pruning, and the `\.` escape for a literal dot
+are all specified once on [Field Paths](../cxl/field-paths.md). What is specific
+to XML is layered on top of that decoding, not instead of it.
+
+The `attribute_prefix` convention applies in reverse: a field whose final path
+segment carries the prefix is emitted as an XML **attribute** of its enclosing
+element instead of a child element. A top-level `@id` attaches to the record
+element's start tag; a nested `Address.@type` attaches to the `<Address>`
+element. Records read from an XML source therefore round-trip —
+`<Record id="7"><name>A</name></Record>` reads and writes back unchanged, and
+the writer never emits an `@`-named element.
+
+Each decoded segment must also be a well-formed XML `Name`, so a segment that
+begins with a digit or contains a space is rejected. A literal dot survives —
+`.` is a legal XML name character, so a column declared `a\.b` emits the single
+element `<a.b>` rather than nesting.
+
+Two column names that cannot both be expanded — a column `a` holding a value
+alongside a column `a.b` needing `a` to be a container — are refused before any
+byte of the record is written, naming both columns. Earlier versions emitted two
+sibling `<a>` elements for that column set, which this reader then refused on
+the way back in.
 
 ```yaml
 - type: output

@@ -1,6 +1,13 @@
 //! JSON writer supporting array mode, NDJSON mode, pretty-printing,
 //! and null omission. Implements `FormatWriter`.
 //!
+//! Dotted column names expand back into nested objects on the way out —
+//! `Address.City` and `Address.State` become one `"Address"` object with two
+//! keys — so a document read from nested JSON writes back with its shape
+//! intact. The names are decoded with the shared record-space grammar in
+//! [`clinker_record::field_path`], the same grammar the XML writer expands
+//! elements with, so one column set produces the same tree in both formats.
+//!
 //! Under `reconstruct_envelope` the whole-stream array framing is REPLACED by
 //! per-document object framing: each enveloped document becomes one JSON
 //! object `{ "<header>": {...}, "body": [ ... ], "<footer>": {...} }`, with the
@@ -13,6 +20,7 @@
 use std::io::Write;
 use std::sync::Arc;
 
+use clinker_record::field_path::{self, FieldPathError};
 use clinker_record::{DocumentContext, Record, Schema, Value};
 
 use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
@@ -59,16 +67,21 @@ impl Default for JsonWriterConfig {
 
 pub struct JsonWriter<W: Write> {
     writer: W,
-    /// Schema held for the writer's lifetime. Post-rip the writer emits
-    /// records via `Record::iter_all_fields` (schema-positional) so the
-    /// field is not read per-record, but keeping the `Arc` pins the
-    /// schema against unintended drop by factory callers.
+    /// Schema held for the writer's lifetime. The writer emits records against
+    /// the plan built from `Record::schema`, so the field is not read
+    /// per-record, but keeping the `Arc` pins the schema against unintended
+    /// drop by factory callers.
     _schema: Arc<Schema>,
     config: JsonWriterConfig,
     records_written: u64,
     /// Per-document envelope framer + state machine, present only when
     /// `config.envelope` is. Drives the per-document-object reframe.
     envelope: Option<EnvelopeState>,
+    /// Precompiled name→object-tree expansion, rebuilt only when the schema
+    /// identity changes. Holds one `String` per distinct path segment plus one
+    /// column index per leaf — bounded by the schema's column names, never by
+    /// record count.
+    plan_cache: Option<PlanCache>,
     /// Reusable serialization buffer. Each record is serialized straight into
     /// this `Vec` (via a borrowing `serde::Serialize` impl, no intermediate
     /// `serde_json::Value` tree) and then written to the sink; the allocation
@@ -108,16 +121,38 @@ impl<W: Write> JsonWriter<W> {
             config,
             records_written: 0,
             envelope,
+            plan_cache: None,
             scratch: Vec::new(),
         }
     }
 
-    /// Serialize a record as a JSON object into the reusable `scratch` buffer
-    /// in schema-column order. `preserve_nulls: false` omits keys with Null
-    /// values. Engine-stamped columns are stripped from the default output;
-    /// callers opt in via `include_engine_stamped`. Keys borrow the schema's
-    /// column names and values borrow the record's [`Value`]s, so no
-    /// intermediate `serde_json::Value` tree is built.
+    /// Ensure `plan_cache` holds an expansion plan for this record's schema,
+    /// rebuilding only when the schema identity changes (`Arc::ptr_eq`), so a
+    /// single-schema stream builds it once. Name decoding and collision
+    /// detection happen here, before any byte of the record is written, so an
+    /// unexpandable column set fails `write_record` cleanly.
+    fn ensure_plan(&mut self, record: &Record) -> Result<(), FormatError> {
+        let current = self
+            .plan_cache
+            .as_ref()
+            .is_some_and(|c| Arc::ptr_eq(&c.schema, record.schema()));
+        if !current {
+            self.plan_cache = Some(build_plan_cache(
+                record.schema(),
+                self.config.include_engine_stamped,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Serialize a record as a JSON object into the reusable `scratch` buffer,
+    /// walking the expansion plan so dotted column names emit as nested
+    /// objects. `preserve_nulls: false` omits null leaves, and an object whose
+    /// every descendant is omitted emits no key at all. Engine-stamped columns
+    /// are stripped from the default output; callers opt in via
+    /// `include_engine_stamped`. Keys borrow the plan's segment names and
+    /// values borrow the record's [`Value`]s, so no intermediate
+    /// `serde_json::Value` tree is built.
     ///
     /// The buffer is cleared first, and the sink is written only by the caller
     /// on success, so a mid-record error (non-finite float) leaves no partial
@@ -125,20 +160,30 @@ impl<W: Write> JsonWriter<W> {
     ///
     /// # Errors
     ///
-    /// Returns [`FormatError::Json`] when a field holds a non-finite float
-    /// (NaN or an infinity), which JSON cannot represent.
+    /// Returns [`FormatError::FieldPath`] when the schema's column names cannot
+    /// be expanded, and [`FormatError::Json`] when a field holds a non-finite
+    /// float (NaN or an infinity), which JSON cannot represent.
     fn serialize_record(&mut self, record: &Record) -> Result<(), FormatError> {
         use serde::Serialize as _;
-        self.scratch.clear();
-        let obj = RecordObjectSer {
-            record,
-            preserve_nulls: self.config.preserve_nulls,
-            include_engine_stamped: self.config.include_engine_stamped,
+        self.ensure_plan(record)?;
+        // Disjoint field borrows: serializing reads the plan (`plan_cache`)
+        // while writing into `scratch`.
+        let Self {
+            plan_cache,
+            scratch,
+            config,
+            ..
+        } = self;
+        scratch.clear();
+        let obj = PlanBodySer {
+            body: &plan_cache.as_ref().expect("plan built above").root,
+            values: record.values(),
+            preserve_nulls: config.preserve_nulls,
         };
-        let result = if self.config.pretty {
-            obj.serialize(&mut serde_json::Serializer::pretty(&mut self.scratch))
+        let result = if config.pretty {
+            obj.serialize(&mut serde_json::Serializer::pretty(&mut *scratch))
         } else {
-            obj.serialize(&mut serde_json::Serializer::new(&mut self.scratch))
+            obj.serialize(&mut serde_json::Serializer::new(&mut *scratch))
         };
         result.map_err(|e| FormatError::Json(e.to_string()))
     }
@@ -155,27 +200,41 @@ impl<W: Write> JsonWriter<W> {
     }
 
     /// Build a JSON object from an envelope section's ordered fields, plus an
-    /// optional trailing computed-count entry. `null` is always emitted for a
-    /// section (envelope sections are small typed metadata, not body records),
-    /// so the round-trip stays faithful regardless of `preserve_nulls`.
+    /// optional trailing computed-count entry. Section field names expand into
+    /// nested objects by the same rule body records use, and the count entry
+    /// rides that expansion too — matching the XML writer, which passes the
+    /// count through the same field tree its section fields go through.
+    /// `null` is always emitted for a section (envelope sections are small
+    /// typed metadata, not body records), so the round-trip stays faithful
+    /// regardless of `preserve_nulls`.
+    ///
+    /// Unlike the body path this materializes an owned `serde_json::Map`: a
+    /// section is bounded `$doc` metadata already held in memory under
+    /// `max_index_bytes`, not a streamed record.
     ///
     /// # Errors
     ///
-    /// Returns [`FormatError::Json`] when a section field holds a non-finite
-    /// float (NaN or an infinity), which JSON cannot represent.
+    /// Returns [`FormatError::FieldPath`] when the section's field names cannot
+    /// be expanded, and [`FormatError::Json`] when a section field holds a
+    /// non-finite float (NaN or an infinity), which JSON cannot represent.
     fn section_object(
         fields: &indexmap::IndexMap<Box<str>, Value>,
         count: Option<(&str, i64)>,
     ) -> Result<serde_json::Value, FormatError> {
         use serde_json::{Map, Value as Jv};
-        let mut obj = Map::new();
+        let names = fields
+            .keys()
+            .map(|k| k.as_ref())
+            .chain(count.map(|(field, _)| field));
+        field_path::check_expandable(names).map_err(field_path_error)?;
+        let mut root = Map::new();
         for (name, value) in fields {
-            obj.insert(name.to_string(), clinker_to_json(value)?);
+            insert_section_field(&mut root, name, clinker_to_json(value)?)?;
         }
         if let Some((field, n)) = count {
-            obj.insert(field.to_string(), Jv::Number(n.into()));
+            insert_section_field(&mut root, field, Jv::Number(n.into()))?;
         }
-        Ok(Jv::Object(obj))
+        Ok(Jv::Object(root))
     }
 
     /// Append one body record to the currently-open document object's `body`
@@ -430,42 +489,175 @@ pub(crate) fn clinker_to_json(val: &Value) -> Result<serde_json::Value, FormatEr
     })
 }
 
-/// Borrows a record and serializes its fields as a JSON object directly to the
-/// target serializer, with no intermediate `serde_json::Value` tree. Keys
-/// borrow the schema's column names; values borrow the record's [`Value`]s via
-/// [`ValueSer`]. Mirrors the field selection of the (removed) `record_to_json`:
-/// honors `preserve_nulls` (skips null fields when false) and
-/// `include_engine_stamped` (whether `$`-namespaced correlation columns
-/// appear).
-struct RecordObjectSer<'a> {
-    record: &'a Record,
-    preserve_nulls: bool,
-    include_engine_stamped: bool,
+/// Wrap a field-name grammar failure as this writer's error.
+fn field_path_error(source: FieldPathError) -> FormatError {
+    FormatError::field_path("JSON", source)
 }
 
-impl serde::Serialize for RecordObjectSer<'_> {
+// ── Column name → nested object expansion ────────────────────────────
+
+/// The expansion plan plus the schema identity it was built for.
+struct PlanCache {
+    schema: Arc<Schema>,
+    root: PlanBody,
+}
+
+/// One object's contents: the ordered keys it emits. Key order is
+/// first-insertion order, so columns sharing a prefix group at the position
+/// where that prefix first appeared even when the schema interleaves them.
+type PlanBody = Vec<PlanNode>;
+
+enum PlanNode {
+    /// A key holding a column's value, addressed by its schema position.
+    Leaf { name: String, field: usize },
+    /// A key holding a nested object.
+    Branch { name: String, body: PlanBody },
+}
+
+/// Build the expansion plan for a schema: decode every emitted column name and
+/// place its index at the leaf its path addresses.
+///
+/// The whole column set is checked before the first placement, so a set that
+/// cannot be expanded is refused as a set rather than discovered halfway
+/// through building a tree.
+///
+/// # Errors
+///
+/// Returns [`FormatError::FieldPath`] for a malformed escape, a name past the
+/// depth cap, or two columns that would occupy the same place in the tree.
+fn build_plan_cache(
+    schema: &Arc<Schema>,
+    include_engine_stamped: bool,
+) -> Result<PlanCache, FormatError> {
+    let emitted: Vec<(usize, &str)> = (0..schema.column_count())
+        .filter(|&i| include_engine_stamped || !schema.is_engine_stamped(i))
+        .map(|i| (i, schema.columns()[i].as_ref()))
+        .collect();
+    field_path::check_expandable(emitted.iter().map(|&(_, name)| name))
+        .map_err(field_path_error)?;
+
+    let mut root = PlanBody::default();
+    for &(field, name) in &emitted {
+        let path = field_path::decode(name).map_err(field_path_error)?;
+        let (leaf, branches) = path
+            .split_last()
+            .expect("decoding yields at least one segment");
+        let mut body = &mut root;
+        for segment in branches {
+            // Descend into the branch this segment already opened, so a shared
+            // prefix groups at the position where it first appeared.
+            let at = body
+                .iter()
+                .position(|n| matches!(n, PlanNode::Branch { name, .. } if *name == **segment))
+                .unwrap_or_else(|| {
+                    body.push(PlanNode::Branch {
+                        name: segment.to_string(),
+                        body: PlanBody::default(),
+                    });
+                    body.len() - 1
+                });
+            body = match &mut body[at] {
+                PlanNode::Branch { body, .. } => body,
+                PlanNode::Leaf { .. } => {
+                    unreachable!("check_expandable rejects a column nesting under a value column")
+                }
+            };
+        }
+        body.push(PlanNode::Leaf {
+            name: leaf.to_string(),
+            field,
+        });
+    }
+    Ok(PlanCache {
+        schema: Arc::clone(schema),
+        root,
+    })
+}
+
+/// Place one already-materialized section value at the path its field name
+/// addresses, creating intermediate objects as it descends.
+fn insert_section_field(
+    root: &mut serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    value: serde_json::Value,
+) -> Result<(), FormatError> {
+    let path = field_path::decode(name).map_err(field_path_error)?;
+    let (leaf, branches) = path
+        .split_last()
+        .expect("decoding yields at least one segment");
+    let mut object = root;
+    for segment in branches {
+        object = object
+            .entry(segment.as_ref())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+            .expect("check_expandable rejects a field nesting under a value field");
+    }
+    object.insert(leaf.to_string(), value);
+    Ok(())
+}
+
+/// Borrows one object's plan and the record's values, serializing the object
+/// directly to the target serializer with no intermediate `serde_json::Value`
+/// tree. Keys borrow the plan's segment names; values borrow the record's
+/// [`Value`]s via [`ValueSer`]. Nested objects recurse through this same impl,
+/// bounded by [`clinker_record::field_path::MAX_FIELD_PATH_DEPTH`].
+struct PlanBodySer<'a> {
+    body: &'a PlanBody,
+    values: &'a [Value],
+    preserve_nulls: bool,
+}
+
+impl serde::Serialize for PlanBodySer<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         // `None` length hint: serde_json ignores it, and the exact post-null-
-        // skip entry count would need a second pass over the fields.
+        // skip entry count would need a second pass over the plan.
         let mut map = serializer.serialize_map(None)?;
-        if self.include_engine_stamped {
-            for (col, val) in self.record.iter_all_fields() {
-                if !self.preserve_nulls && val.is_null() {
-                    continue;
+        for node in self.body {
+            match node {
+                PlanNode::Leaf { name, field } => {
+                    let value = &self.values[*field];
+                    if !self.preserve_nulls && value.is_null() {
+                        continue;
+                    }
+                    map.serialize_entry(name.as_str(), &ValueSer(value))?;
                 }
-                map.serialize_entry(col, &ValueSer(val))?;
-            }
-        } else {
-            for (col, val) in self.record.iter_user_fields() {
-                if !self.preserve_nulls && val.is_null() {
-                    continue;
+                PlanNode::Branch { name, body } => {
+                    // An object whose every descendant is omitted emits no key
+                    // at all rather than an empty object, so it reads back as
+                    // the absent column it stands for. Under `preserve_nulls`
+                    // every leaf emits, so no subtree can be empty.
+                    if !self.preserve_nulls && !has_present_leaf(body, self.values) {
+                        continue;
+                    }
+                    map.serialize_entry(
+                        name.as_str(),
+                        &PlanBodySer {
+                            body,
+                            values: self.values,
+                            preserve_nulls: self.preserve_nulls,
+                        },
+                    )?;
                 }
-                map.serialize_entry(col, &ValueSer(val))?;
             }
         }
         map.end()
     }
+}
+
+/// Whether any leaf under `body` holds a non-null value. Only meaningful under
+/// `preserve_nulls: false`, the one mode in which a subtree can go unemitted.
+///
+/// Re-walks the subtree rather than caching per-record presence flags: the walk
+/// is bounded by the plan, which is already retained, while a presence buffer
+/// would be per-record state proportional to record width. It short-circuits on
+/// the first present leaf, so the cost is paid only by sparse records.
+fn has_present_leaf(body: &PlanBody, values: &[Value]) -> bool {
+    body.iter().any(|node| match node {
+        PlanNode::Leaf { field, .. } => !values[*field].is_null(),
+        PlanNode::Branch { body, .. } => has_present_leaf(body, values),
+    })
 }
 
 /// Borrows a clinker [`Value`] and serializes it directly, mirroring
@@ -523,6 +715,7 @@ mod tests {
     use super::*;
     use crate::json::reader::{JsonReader, JsonReaderConfig};
     use crate::traits::FormatReader;
+    use clinker_record::schema::{FieldMetadata, SchemaBuilder};
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -553,6 +746,47 @@ mod tests {
         String::from_utf8(buf).unwrap()
     }
 
+    /// Build a record over a schema of plain columns, one value per column.
+    fn record_of(schema: &Arc<Schema>, values: Vec<Value>) -> Record {
+        Record::new(Arc::clone(schema), values)
+    }
+
+    fn schema_of(columns: &[&str]) -> Arc<Schema> {
+        columns.iter().copied().collect::<SchemaBuilder>().build()
+    }
+
+    /// Write one record as a single NDJSON line, so assertions can pin the
+    /// exact bytes rather than a reparsed tree.
+    fn write_one_line(
+        config: JsonWriterConfig,
+        schema: &Arc<Schema>,
+        values: Vec<Value>,
+    ) -> String {
+        let config = JsonWriterConfig {
+            format: JsonOutputMode::Ndjson,
+            ..config
+        };
+        write_records(config, &[record_of(schema, values)], schema)
+            .trim_end()
+            .to_string()
+    }
+
+    /// Write one record and return the writer error plus everything that
+    /// reached the sink, so a rejection can be checked to have emitted nothing.
+    fn write_one_expecting_error(
+        config: JsonWriterConfig,
+        schema: &Arc<Schema>,
+        values: Vec<Value>,
+    ) -> (FormatError, Vec<u8>) {
+        let mut buf = Vec::new();
+        let mut w = JsonWriter::new(&mut buf, Arc::clone(schema), config);
+        let err = w
+            .write_record(&record_of(schema, values))
+            .expect_err("expected the record to be refused");
+        drop(w);
+        (err, buf)
+    }
+
     #[test]
     fn test_json_write_array_mode() {
         let schema = test_schema();
@@ -562,12 +796,14 @@ mod tests {
             make_record(&schema, "Carol", 35, true),
         ];
         let output = write_records(JsonWriterConfig::default(), &records, &schema);
-        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-        let arr = parsed.as_array().unwrap();
-        assert_eq!(arr.len(), 3);
-        assert_eq!(arr[0]["name"], "Alice");
-        assert_eq!(arr[1]["age"], 25);
-        assert_eq!(arr[2]["active"], true);
+        // Exact bytes: a flat schema must emit exactly what it did before
+        // dotted names started expanding.
+        assert_eq!(
+            output,
+            "[\n{\"name\":\"Alice\",\"age\":30,\"active\":true},\n\
+             {\"name\":\"Bob\",\"age\":25,\"active\":false},\n\
+             {\"name\":\"Carol\",\"age\":35,\"active\":true}\n]\n"
+        );
     }
 
     #[test]
@@ -977,6 +1213,320 @@ mod tests {
             ),
             other => panic!("expected FormatError::Json, got {other:?}"),
         }
+    }
+
+    // ── Dotted column name → nested object expansion ─────────────────
+
+    #[test]
+    fn dotted_columns_expand_into_one_nested_object() {
+        let schema = schema_of(&["Address.City", "Address.State", "name"]);
+        let out = write_one_line(
+            JsonWriterConfig::default(),
+            &schema,
+            vec![
+                Value::String("Boston".into()),
+                Value::String("MA".into()),
+                Value::String("Ada".into()),
+            ],
+        );
+        assert_eq!(
+            out,
+            r#"{"Address":{"City":"Boston","State":"MA"},"name":"Ada"}"#
+        );
+    }
+
+    #[test]
+    fn a_shared_prefix_groups_at_its_first_occurrence() {
+        // Interleaved in the schema, grouped in the output, hoisted to where
+        // the prefix first appeared — the same shape the XML writer produces.
+        let schema = schema_of(&["A.x", "n", "A.y"]);
+        let out = write_one_line(
+            JsonWriterConfig::default(),
+            &schema,
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+        );
+        assert_eq!(out, r#"{"A":{"x":1,"y":3},"n":2}"#);
+    }
+
+    #[test]
+    fn expansion_nests_to_arbitrary_depth() {
+        let schema = schema_of(&["a.b.c", "a.b.d", "a.e"]);
+        let out = write_one_line(
+            JsonWriterConfig::default(),
+            &schema,
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+        );
+        assert_eq!(out, r#"{"a":{"b":{"c":1,"d":2},"e":3}}"#);
+    }
+
+    #[test]
+    fn an_object_with_no_emitted_children_emits_no_key() {
+        let schema = schema_of(&["a.b", "a.c", "d"]);
+        let config = JsonWriterConfig {
+            preserve_nulls: false,
+            ..Default::default()
+        };
+        // Every descendant null: the parent key is absent, not `{}` — so it
+        // reads back as the absent column it stands for.
+        let all_null = write_one_line(
+            config.clone(),
+            &schema,
+            vec![Value::Null, Value::Null, Value::Integer(9)],
+        );
+        assert_eq!(all_null, r#"{"d":9}"#);
+        // One descendant present: the parent appears with only that child.
+        let one_present = write_one_line(
+            config,
+            &schema,
+            vec![Value::Null, Value::Integer(7), Value::Integer(9)],
+        );
+        assert_eq!(one_present, r#"{"a":{"c":7},"d":9}"#);
+    }
+
+    #[test]
+    fn preserved_nulls_keep_the_nested_object() {
+        let schema = schema_of(&["a.b"]);
+        let config = JsonWriterConfig {
+            preserve_nulls: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            write_one_line(config, &schema, vec![Value::Null]),
+            r#"{"a":{"b":null}}"#
+        );
+    }
+
+    #[test]
+    fn pretty_mode_indents_the_nested_object() {
+        let schema = schema_of(&["Address.City", "name"]);
+        let config = JsonWriterConfig {
+            pretty: true,
+            ..Default::default()
+        };
+        let out = write_one_line(
+            config,
+            &schema,
+            vec![Value::String("Boston".into()), Value::String("Ada".into())],
+        );
+        assert_eq!(
+            out,
+            "{\n  \"Address\": {\n    \"City\": \"Boston\"\n  },\n  \"name\": \"Ada\"\n}"
+        );
+    }
+
+    #[test]
+    fn a_structured_value_nests_below_the_expanded_leaf() {
+        // Expansion adds structure above the leaf; the value model supplies
+        // structure below it. The two never interact.
+        let schema = schema_of(&["Items.Item", "meta.tags"]);
+        let out = write_one_line(
+            JsonWriterConfig::default(),
+            &schema,
+            vec![
+                Value::Array(vec![Value::Integer(1), Value::Integer(2)]),
+                Value::Map(Box::new(
+                    [("k".into(), Value::String("v".into()))]
+                        .into_iter()
+                        .collect(),
+                )),
+            ],
+        );
+        assert_eq!(out, r#"{"Items":{"Item":[1,2]},"meta":{"tags":{"k":"v"}}}"#);
+    }
+
+    #[test]
+    fn a_column_that_is_also_a_container_is_refused_before_any_byte() {
+        for columns in [
+            // A value column and a container of the same name, either order.
+            ["a", "a.b"],
+            ["a.b", "a"],
+            // The same clash one level deeper.
+            ["a.b", "a.b.c"],
+            ["a.b.c", "a.b"],
+            // Two distinct spellings addressing the identical path.
+            ["a[b", "a\\[b"],
+        ] {
+            let schema = schema_of(&columns);
+            let (err, buf) = write_one_expecting_error(
+                JsonWriterConfig::default(),
+                &schema,
+                vec![Value::Integer(1); columns.len()],
+            );
+            let FormatError::FieldPath { format, .. } = &err else {
+                panic!("expected a field-path error for {columns:?}, got {err:?}");
+            };
+            assert_eq!(*format, "JSON");
+            let msg = err.to_string();
+            for column in columns {
+                assert!(msg.contains(column), "{msg} should name {column}");
+            }
+            assert!(
+                buf.is_empty(),
+                "a refused column set must emit no bytes, got: {:?}",
+                String::from_utf8_lossy(&buf)
+            );
+        }
+    }
+
+    #[test]
+    fn an_escaped_separator_keeps_the_dot_in_the_key() {
+        // The replacement for the literal dotted key unconditional expansion
+        // takes away: declare the column with the separator escaped.
+        let schema = schema_of(&["a\\.b", "a"]);
+        let out = write_one_line(
+            JsonWriterConfig::default(),
+            &schema,
+            vec![Value::Integer(1), Value::Integer(2)],
+        );
+        assert_eq!(out, r#"{"a.b":1,"a":2}"#);
+
+        // An escaped and an unescaped separator address different paths, so
+        // the two coexist rather than colliding.
+        let schema = schema_of(&["a.b", "a\\.b"]);
+        let out = write_one_line(
+            JsonWriterConfig::default(),
+            &schema,
+            vec![Value::Integer(1), Value::Integer(2)],
+        );
+        assert_eq!(out, r#"{"a":{"b":1},"a.b":2}"#);
+    }
+
+    #[test]
+    fn a_malformed_escape_is_refused_before_any_byte() {
+        let schema = schema_of(&["C:\\temp"]);
+        let (err, buf) = write_one_expecting_error(
+            JsonWriterConfig::default(),
+            &schema,
+            vec![Value::Integer(1)],
+        );
+        assert!(
+            matches!(
+                err,
+                FormatError::FieldPath {
+                    source: clinker_record::field_path::FieldPathError::UnknownEscape { .. },
+                    ..
+                }
+            ),
+            "got {err:?}"
+        );
+        // The message must carry the spelling that fixes it.
+        assert!(err.to_string().contains("C:\\\\temp"), "{err}");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn engine_stamped_columns_expand_by_the_same_rule() {
+        // The rule is a function of the column-name string alone, with no
+        // carve-out for engine-stamped namespaces.
+        let schema = SchemaBuilder::new()
+            .with_field("amount")
+            .with_field_meta(
+                "$ck.customer_id",
+                FieldMetadata::source_correlation("customer_id"),
+            )
+            .build();
+        let values = vec![Value::Integer(5), Value::String("C-1".into())];
+
+        let stripped = write_one_line(JsonWriterConfig::default(), &schema, values.clone());
+        assert_eq!(stripped, r#"{"amount":5}"#);
+
+        let config = JsonWriterConfig {
+            include_engine_stamped: true,
+            ..Default::default()
+        };
+        let included = write_one_line(config, &schema, values);
+        assert_eq!(included, r#"{"amount":5,"$ck":{"customer_id":"C-1"}}"#);
+    }
+
+    #[test]
+    fn a_new_schema_identity_rebuilds_the_plan() {
+        let flat = schema_of(&["a"]);
+        let nested = schema_of(&["a.b"]);
+        let config = JsonWriterConfig {
+            format: JsonOutputMode::Ndjson,
+            ..Default::default()
+        };
+        let mut buf = Vec::new();
+        {
+            let mut w = JsonWriter::new(&mut buf, Arc::clone(&flat), config);
+            w.write_record(&record_of(&flat, vec![Value::Integer(1)]))
+                .unwrap();
+            w.write_record(&record_of(&nested, vec![Value::Integer(2)]))
+                .unwrap();
+            w.write_record(&record_of(&flat, vec![Value::Integer(3)]))
+                .unwrap();
+            w.flush().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(out.trim_end(), "{\"a\":1}\n{\"a\":{\"b\":2}}\n{\"a\":3}");
+    }
+
+    #[test]
+    fn a_nested_schema_reuses_the_scratch_buffer_without_bleed() {
+        // The nested walk writes into the same retained buffer every record;
+        // a wide schema with a long value would surface any stale tail.
+        let columns: Vec<String> = (0..40).map(|i| format!("g{}.c{i}", i % 4)).collect();
+        let schema = schema_of(&columns.iter().map(String::as_str).collect::<Vec<_>>());
+        let long = "x".repeat(500);
+        let mk = |seed: i64, tail: &str| {
+            let mut values: Vec<Value> = (0..40).map(|i| Value::Integer(seed + i)).collect();
+            values[17] = Value::String(format!("{long}-{tail}").into());
+            record_of(&schema, values)
+        };
+        let config = JsonWriterConfig {
+            format: JsonOutputMode::Ndjson,
+            ..Default::default()
+        };
+        let written = write_records(config, &[mk(0, "first"), mk(100, "second")], &schema);
+        let lines: Vec<&str> = written.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 2);
+        for (line, (seed, tail)) in lines.iter().zip([(0, "first"), (100, "second")]) {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(v["g0"]["c0"], seed);
+            assert_eq!(v["g3"]["c39"], seed + 39);
+            assert_eq!(v["g1"]["c17"], format!("{long}-{tail}"));
+        }
+    }
+
+    #[test]
+    fn envelope_section_fields_expand_too() {
+        let schema = schema_of(&["amount"]);
+        let config = JsonWriterConfig {
+            format: JsonOutputMode::Ndjson,
+            envelope: Some(crate::envelope_writer::OutputEnvelopeSpec {
+                header_from_doc: Some("Head".into()),
+                footer_from_doc: Some("Foot".into()),
+                footer_record_count_field: Some("totals.count".into()),
+            }),
+            ..Default::default()
+        };
+        let doc = doc_with_sections(&[
+            (
+                "Head",
+                &[
+                    ("batch.id", Value::String("B-1".into())),
+                    ("batch.source", Value::String("ftp".into())),
+                ],
+            ),
+            ("Foot", &[("totals.checksum", Value::String("S".into()))]),
+        ]);
+        let mut buf = Vec::new();
+        {
+            let mut w = JsonWriter::new(&mut buf, Arc::clone(&schema), config);
+            w.begin_document(&doc).unwrap();
+            w.write_record(&record_of(&schema, vec![Value::Integer(1)]))
+                .unwrap();
+            w.end_document(&doc).unwrap();
+            w.flush().unwrap();
+        }
+        let out = String::from_utf8(buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(out.trim_end()).unwrap();
+        assert_eq!(parsed["header"]["batch"]["id"], "B-1");
+        assert_eq!(parsed["header"]["batch"]["source"], "ftp");
+        // The computed count rides the same expansion, joining the section
+        // field that shares its prefix.
+        assert_eq!(parsed["footer"]["totals"]["checksum"], "S");
+        assert_eq!(parsed["footer"]["totals"]["count"], 1);
     }
 
     #[test]

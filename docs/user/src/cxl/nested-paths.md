@@ -101,6 +101,7 @@ The first chain reads a string out of nested structure and uppercases it. The se
 
 ## See also
 
+- [Field Paths](field-paths.md) -- the other surface for the same idea: how a flat column-name string spells a path, with a backslash escape instead of brackets.
 - [Closures](closures.md) -- closures over arrays of maps typically use bracket-index on the `it` binding.
 - [Array Methods](builtins-array.md) -- traversal builtins that consume nested arrays.
 - [Map Methods](builtins-map.md) -- builders and accessors for map values.

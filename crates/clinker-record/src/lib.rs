@@ -3,6 +3,7 @@ pub mod coercion;
 pub mod counters;
 pub mod decimal_serde;
 pub mod document_context;
+pub mod field_path;
 pub mod field_str;
 pub mod group_key;
 pub mod minimal;

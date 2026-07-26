@@ -257,11 +257,7 @@ impl Record {
             .columns()
             .iter()
             .enumerate()
-            .filter(|(i, _)| {
-                self.schema
-                    .field_metadata(*i)
-                    .is_none_or(|m| !m.is_engine_stamped())
-            })
+            .filter(|(i, _)| !self.schema.is_engine_stamped(*i))
             .map(|(i, name)| (name.as_ref(), &self.values[i]))
     }
 

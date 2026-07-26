@@ -66,6 +66,7 @@
 - [Aggregate Functions](cxl/aggregates.md)
 - [Closures](cxl/closures.md)
 - [Nested Paths](cxl/nested-paths.md)
+- [Field Paths](cxl/field-paths.md)
 - [Emit Each](cxl/emit-each.md)
 - [System Variables](cxl/system-variables.md)
 - [Null Handling](cxl/nulls.md)

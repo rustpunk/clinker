@@ -214,6 +214,20 @@ pub enum FormatError {
         format: &'static str,
         field: String,
     },
+    /// A writer that expands dotted column names into nested output (JSON
+    /// objects, XML elements) was handed a column set it cannot expand: a
+    /// malformed escape in one name, a name nesting past the depth cap, or
+    /// two names that would occupy the same place in the tree.
+    ///
+    /// Raised when the writer builds its plan for a schema, before any byte of
+    /// the first record is written, so a rejected column set leaves no partial
+    /// output. The grammar and the remedies live in
+    /// [`clinker_record::field_path`]; the inner error carries the offending
+    /// names and the escaped spelling that resolves a clash.
+    FieldPath {
+        format: &'static str,
+        source: clinker_record::field_path::FieldPathError,
+    },
 }
 
 impl fmt::Display for FormatError {
@@ -302,6 +316,11 @@ impl fmt::Display for FormatError {
                  fan each occurrence out to its own record. (In JSON this also fires when two \
                  distinct keys flatten to the same dotted name — rename one to disambiguate.)"
             ),
+            Self::FieldPath { format, source } => write!(
+                f,
+                "{format} writer cannot expand this output's column names into nested output: \
+                 {source}"
+            ),
         }
     }
 }
@@ -323,6 +342,16 @@ impl FormatError {
             format: "EDIFACT",
             message: message.into(),
         }
+    }
+
+    /// Build a [`FormatError::FieldPath`] for a writer that could not expand
+    /// its output's column names into nested output. `format` names the writer
+    /// for the diagnostic; the grammar failure itself is format-independent.
+    pub fn field_path(
+        format: &'static str,
+        source: clinker_record::field_path::FieldPathError,
+    ) -> Self {
+        Self::FieldPath { format, source }
     }
 
     /// Build a [`FormatError::StructuralCount`] for an HL7 batch/file
@@ -399,6 +428,7 @@ impl std::error::Error for FormatError {
         match self {
             Self::Io(e) => Some(e),
             Self::Csv(e) => Some(e),
+            Self::FieldPath { source, .. } => Some(source),
             _ => None,
         }
     }
