@@ -52,10 +52,19 @@ multi-record flat files, envelope reconstruction, and the EDI family.
 
 A scenario may be committed with goldens the engine does not yet produce, marked
 `known_broken` in the harness against an issue. The goldens state the correct
-answer; the marker records that the engine disagrees. Only a *golden mismatch*
-is tolerated — a wrong exit code, drifted input, missing output or unexpected
-counters still fail the gate, so a parked scenario cannot rot. When the issue is
-fixed the harness reports the marker as stale and asks for it to be removed.
+answer; the marker records exactly how the engine disagrees.
+
+The marker names the specific outputs allowed to differ and, where relevant, the
+run summary the engine currently prints. Every other output stays fully gated, so
+parking a scenario for one reason cannot silently stop its working parts from
+being checked. A wrong exit code, drifted input digest or missing output always
+fails. The gate's counters record the *correct* summary, so the run that fixes
+the underlying bug reports the marker as stale rather than a counter mismatch.
+
+A re-bless run will not overwrite a golden the marker declares broken — that file
+is the only committed record of the right answer. Regenerate it deliberately
+(for #996, by running the scenario with a single sink) rather than from the
+engine's current output.
 
 Currently parked: **02-product-feed-normalize**, against
 [#996](https://github.com/rustpunk/clinker/issues/996).
@@ -111,7 +120,9 @@ runs. Every scenario follows these rules, and new ones should too:
 
 - Generated data is seeded, never wall-clock derived. Dates are offsets from a
   fixed epoch; money is integer cents, never a float.
-- Every output declares an explicit `sort_order`.
+- Row order comes from the reader, which is deterministic per file. The
+  Output node's `sort_order:` key is deliberately unused: it is parsed and
+  documented but currently inert ([#950](https://github.com/rustpunk/clinker/issues/950)).
 - `merge` uses `concat`; an unseeded `interleave` is non-deterministic by design.
 - No `now()` or `$pipeline.start_time` in a compared column.
 - The harness pins `--batch-id`, whose default is a fresh UUID per run.

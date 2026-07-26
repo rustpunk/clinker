@@ -83,7 +83,9 @@ emit list_price = list_minor.to_decimal() / "100".to_decimal()
 ```
 
 Deriving once from an exact integer keeps every intermediate exact — `24.50`,
-`14.70`, margin `9.80`. This is good practice regardless, and here it is also
+`14.70`, margin `9.80`. `margin_pct` divides in decimal for the same reason:
+integer division would print a flat `40` on every row, hiding that VF-3051's
+true margin is `40.02`. This is good practice regardless, and here it is also
 necessary: the XML reader type-infers element text and ignores the declared
 column type, so `24.50` in a `decimal` column arrives as a float expansion
 ([#992](https://github.com/rustpunk/clinker/issues/992)).
@@ -111,16 +113,31 @@ The scenario keeps the two-sink shape rather than working around it, because
 writing one result in two formats is an ordinary thing to want and the corpus is
 meant to state what the engine *should* do. `expected/catalog.csv` is therefore
 the output of the single-sink variant — the correct answer — and the harness
-carries a `known_broken` marker pointing at #996. Everything that is not a
-golden mismatch still fails the gate, so this scenario cannot quietly rot while
-parked, and the moment #996 is fixed the harness reports the marker as stale.
+carries a `known_broken` marker pointing at #996.
+
+The marker is narrow by design. It names `output/catalog.csv` as the only
+output allowed to differ and declares the run summary the engine currently
+prints; `output/catalog.xml` stays fully gated, so the sink that works today
+cannot regress unnoticed while the scenario is parked. The gate's `counters`
+record the **correct** summary — 14 records to each of two sinks, so 28 writes
+— which is what makes the run that fixes #996 report a stale marker rather than
+a counter mismatch. A re-bless run refuses to overwrite a golden the marker
+declares broken, since that file is the only record of the right answer;
+regenerate it from the single-sink variant instead.
 
 ## Try changing it
 
-- Delete the `catalog_csv` output and rerun. The CSV problem disappears, which
-  is the clearest demonstration of #996.
+- Delete the **`catalog_xml`** output and rerun. `catalog_csv` is then the only
+  sink, it receives every record, and `output/catalog.csv` matches its golden
+  exactly — the clearest demonstration that #996 is about having two sinks and
+  not about this pipeline. (Deleting `catalog_csv` instead proves nothing: the
+  CSV simply stops being written at all.)
 - Remove `multiple: true` from the schema and rerun — the repeated element is
   now an error rather than a collected field.
 - Drop the XML `join_values` override to see the unwrapped, column-named default.
-- Add `on_conflict` to the CSV `join_values` entry and give a category a `|` in
-  it, to see delimiter-collision handling rather than a corrupted cell.
+- Give a category a `|` in it and rerun. The run **aborts** with exit 4 naming
+  the offending value and the delimiter: `on_conflict` defaults to `error`, so a
+  value that collides with the join delimiter refuses the record rather than
+  silently producing a cell that would parse back as two categories. Set
+  `on_conflict` explicitly to choose a different policy — the default is the
+  safe one, not the lenient one.

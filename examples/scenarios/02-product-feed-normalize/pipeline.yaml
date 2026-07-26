@@ -1,10 +1,13 @@
-# Supplier product feed (nested XML) -> flat CSV + normalised XML.
+# Supplier product feed (XML with repeated elements) -> CSV + normalised XML.
 #
-# The reason this scenario exists: `<categories>` holds a *repeated*
-# `<category>` element, and a `multiple: true` schema column carries all of them
-# as one multi-value field — through the pipeline and back out as repeated
-# elements. Everything else here is the ordinary work of flattening a nested
-# document into something a downstream system can consume.
+# The reason this scenario exists: `<category>` occurs more than once per
+# product, and a `multiple: true` schema column carries every occurrence as one
+# multi-value field — through the pipeline and back out, encoded per sink.
+#
+# The repeats are direct children of <product> rather than sitting in a
+# <categories> container. A container would flatten to the column name
+# `categories.category`, which CXL cannot address (#995) — readable, but not
+# transformable. The write side puts the container back with `wrap_in`.
 #
 # Money travels as integer minor units (`list_price_minor`), not as `24.50`.
 # That is good practice on its own, and currently necessary: the XML reader
@@ -27,8 +30,10 @@ nodes:
         # <catalog>'s own attributes — is document context, not record data.
         record_path: catalog/product
         # Attributes are named `@name` by default, which is not a usable CXL
-        # identifier. This feed has no element that collides with an attribute
-        # name, so dropping the prefix gives plain `sku` / `currency`.
+        # identifier. Dropping the prefix gives the record's own `sku`
+        # attribute a plain column name. Note this covers attributes of the
+        # RECORD element only — `<catalog currency="USD">` belongs to the
+        # document, not the record, and is not a column at all.
         attribute_prefix: ""
       schema:
         - { name: sku, type: string }
@@ -62,7 +67,11 @@ nodes:
         emit list_price = list_minor.to_decimal() / "100".to_decimal()
         emit cost = cost_minor.to_decimal() / "100".to_decimal()
         emit margin = margin_minor.to_decimal() / "100".to_decimal()
-        emit margin_pct = (margin_minor * 100 / list_minor)
+        # Decimal, not integer, division: `margin_minor * 100 / list_minor`
+        # truncates, and every row would print a flat 40 while the true figure
+        # for VF-3051 is 40.02.
+        let pct = margin_minor.to_decimal() * "100".to_decimal() / list_minor.to_decimal()
+        emit margin_pct = pct.round_to(2)
         emit categories = category
         emit in_stock = stock_on_hand > 0
         emit stock_on_hand = stock_on_hand
@@ -81,8 +90,6 @@ nodes:
       # explicit rather than implied.
       join_values:
         - { field: categories, delimiter: "|" }
-      sort_order:
-        - field: sku
 
   - type: output
     name: catalog_xml
@@ -101,5 +108,3 @@ nodes:
       # `wrap_in` restores the container, so the output mirrors the input shape.
       join_values:
         - { field: categories, repeat_as: category, wrap_in: categories }
-      sort_order:
-        - field: sku

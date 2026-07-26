@@ -76,8 +76,8 @@ nodes:
       # Renaming happens in the transform above rather than through the Output
       # node's `mapping:`, which is under review in #974.
       include_unmapped: false
-      # An explicit order makes the output byte-stable regardless of how the
-      # engine schedules the read, which is what lets this file be compared
-      # byte-for-byte against a committed golden.
-      sort_order:
-        - field: order_id
+      # Row order here is the order the reader delivers records, which is
+      # deterministic for a single file — that is what makes this output
+      # byte-comparable against a committed golden. The Output node has a
+      # `sort_order:` key, but it is currently inert (#950), so declaring it
+      # would imply a guarantee the engine does not yet provide.
