@@ -154,6 +154,42 @@ The `[WON]` marker names the layer whose value survives; shadowed layers show
 what they proposed. An unknown source, column, or attribute is rejected with a
 hint listing the valid names at that level.
 
+## Reading a plan-time failure
+
+A pipeline that fails a plan-time check never reads any input. The failure is
+printed before the run starts, and it carries four things:
+
+```
+E363
+
+  × pipeline error in pipeline.yaml: source 'src': `record_path` "$.rows"
+  │ starts with the JSONPath root marker `$.`, which is not part of the
+  │ grammar; `record_path` is a dot-separated path of object keys, descended
+  │ from the document root (for example `data.rows`). Write "rows" instead
+   ╭─[pipeline.yaml:4:1]
+ 3 │ nodes:
+ 4 │   - type: source
+   ·   ────────┬───────
+   ·           ╰── declared here
+ 5 │     name: src
+   ╰────
+  help: `record_path` on a `json` source is a dot-separated path of object
+        keys descended from the document root: no `$.` JSONPath root marker,
+        no leading `/`, and no empty segments.
+        See: clinker explain --code E363
+```
+
+- **The code** (`E363`) heads the report. Hand it to
+  `clinker explain --code` for the worked example.
+- **The message** names the offending input and the rule it broke.
+- **The source line** is quoted from your YAML, with the offending node
+  underlined.
+- **The `help:` paragraph** names the fix, and points at the code's explain
+  page when one exists.
+
+The same report is printed under `--explain` and `--dry-run`, because all
+three go through the same compile step.
+
 ## Looking up diagnostic codes
 
 `clinker explain --code <CODE>` prints the documentation for any registered error or warning code, including retraction-specific codes:

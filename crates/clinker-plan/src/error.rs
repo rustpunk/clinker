@@ -15,6 +15,18 @@ pub enum PipelineError {
     Schema(crate::schema::SchemaError),
     Format(clinker_format::FormatError),
     Eval(cxl::eval::EvalError),
+    /// Plan-time compile failure, carrying the diagnostics whole.
+    ///
+    /// Every plan-time gate produces a [`Diagnostic`](clinker_core_types::Diagnostic)
+    /// with a code, a source span, and (usually) a help paragraph naming the
+    /// fix. Callers that flatten those into `Compilation`'s `Vec<String>` drop
+    /// all three, leaving the user with a bare sentence and no code to hand to
+    /// `clinker explain --code`. Carry them intact so the renderer can put the
+    /// code, the help, and the offending YAML line back on screen.
+    ///
+    /// `Display` folds each diagnostic to `[CODE] message` plus its help, so a
+    /// consumer that only has the `Display` string still gets the code.
+    PlanDiagnostics(Vec<clinker_core_types::Diagnostic>),
     Compilation {
         transform_name: String,
         messages: Vec<String>,
@@ -305,6 +317,16 @@ impl fmt::Display for PipelineError {
             Self::Schema(e) => write!(f, "schema error: {e}"),
             Self::Format(e) => write!(f, "format error: {e}"),
             Self::Eval(e) => write!(f, "evaluation error: {e}"),
+            Self::PlanDiagnostics(diags) => {
+                write!(f, "plan compilation failed:")?;
+                for d in diags {
+                    write!(f, "\n  [{}] {}", d.code, d.message)?;
+                    if let Some(help) = &d.help {
+                        write!(f, "\n        help: {help}")?;
+                    }
+                }
+                Ok(())
+            }
             Self::Compilation {
                 transform_name,
                 messages,

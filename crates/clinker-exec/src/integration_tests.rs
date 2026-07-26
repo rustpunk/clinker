@@ -60,6 +60,7 @@ mod tests {
             Err(
                 PipelineError::Config(_)
                 | PipelineError::Schema(_)
+                | PipelineError::PlanDiagnostics(_)
                 | PipelineError::Compilation { .. }
                 | PipelineError::Internal { .. }
                 | PipelineError::SortOrderViolation { .. }

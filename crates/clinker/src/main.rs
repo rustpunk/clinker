@@ -608,6 +608,7 @@ fn main() -> ExitCode {
                     match &e {
                         PipelineError::Config(_)
                         | PipelineError::Schema(_)
+                        | PipelineError::PlanDiagnostics(_)
                         | PipelineError::Compilation { .. }
                         | PipelineError::Internal { .. }
                         | PipelineError::SortOrderViolation { .. }
@@ -735,6 +736,133 @@ fn main() -> ExitCode {
     }
 }
 
+/// Hand-rolled `Error + Diagnostic` wrapper so we can attach a
+/// `NamedSource` without pulling in a new `thiserror` dependency
+/// in the binary crate.
+///
+/// Carries the pieces miette renders separately: the stable diagnostic code
+/// in the header, the help paragraph under the snippet, and a label pointing
+/// into the attached source. A `PipelineError` with no structured diagnostic
+/// behind it fills in the generic `clinker::pipeline_error` code and no
+/// label, which is how every error rendered before plan diagnostics were
+/// carried whole.
+struct WrappedPipelineError {
+    filename: String,
+    code: String,
+    message: String,
+    help: Option<String>,
+    label: Option<miette::LabeledSpan>,
+    src: Option<miette::NamedSource<String>>,
+}
+
+impl std::fmt::Debug for WrappedPipelineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.filename, self.message)
+    }
+}
+
+impl std::fmt::Display for WrappedPipelineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "pipeline error in {}: {}", self.filename, self.message)
+    }
+}
+
+impl std::error::Error for WrappedPipelineError {}
+
+impl miette::Diagnostic for WrappedPipelineError {
+    fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        Some(Box::new(&self.code))
+    }
+    fn severity(&self) -> Option<miette::Severity> {
+        Some(miette::Severity::Error)
+    }
+    fn help<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
+        self.help
+            .as_ref()
+            .map(|h| Box::new(h) as Box<dyn std::fmt::Display + 'a>)
+    }
+    fn labels(&self) -> Option<Box<dyn Iterator<Item = miette::LabeledSpan> + '_>> {
+        let label = self.label.clone()?;
+        Some(Box::new(std::iter::once(label)))
+    }
+    fn source_code(&self) -> Option<&dyn miette::SourceCode> {
+        self.src.as_ref().map(|s| s as &dyn miette::SourceCode)
+    }
+}
+
+/// Byte range of 1-based `line` in `text`, excluding the line terminator.
+///
+/// Plan-time diagnostics anchor to a YAML line rather than a byte range:
+/// serde-saphyr loses node-header byte offsets through the tagged-enum +
+/// flatten shape the `nodes:` taxonomy uses, so the compile path stamps
+/// `Span::line_only`. That is enough to point miette's snippet at the
+/// offending node.
+fn line_byte_range(text: &str, line: u32) -> Option<(usize, usize)> {
+    let idx = usize::try_from(line).ok()?.checked_sub(1)?;
+    let start = if idx == 0 {
+        0
+    } else {
+        text.match_indices('\n').nth(idx - 1)?.0 + 1
+    };
+    let len = text[start..].find('\n').unwrap_or(text.len() - start);
+    Some((start, len))
+}
+
+/// Render one plan-time diagnostic with its code, help, and source line.
+///
+/// The `See: clinker explain --code <CODE>` pointer is appended only when an
+/// explain page exists, matching the wording the storage-validation and
+/// staging-copy errors already use, so a user meets one phrasing across every
+/// coded failure.
+fn render_plan_diagnostic(
+    diag: &clinker_core_types::Diagnostic,
+    filename: &str,
+    source_text: Option<&String>,
+) {
+    let label = diag
+        .primary
+        .span
+        .synthetic_line_number()
+        .zip(source_text)
+        .and_then(|(line, text)| line_byte_range(text, line))
+        .map(|(start, len)| {
+            let text = match diag.primary.label.as_deref() {
+                Some(l) if !l.is_empty() => l.to_owned(),
+                _ => "declared here".to_owned(),
+            };
+            miette::LabeledSpan::new(Some(text), start, len)
+        });
+
+    let mut help = diag.help.clone();
+    let pointer = format!("clinker explain --code {}", diag.code);
+    // Some gates already point at their explain page in the help they attach;
+    // appending a second pointer would say the same thing twice.
+    let already_pointed = help.as_deref().is_some_and(|h| h.contains(&pointer));
+    if !already_pointed
+        && clinker_plan::plan::explain_provenance::explain_code(&diag.code).is_some()
+    {
+        help = Some(match help {
+            Some(h) => format!("{h}\nSee: {pointer}"),
+            None => format!("See: {pointer}"),
+        });
+    }
+
+    let wrapped = WrappedPipelineError {
+        filename: filename.to_owned(),
+        code: diag.code.clone(),
+        message: diag.message.clone(),
+        help,
+        // A label needs its source attached; without one miette renders the
+        // message alone, which is what a spanless diagnostic deserves.
+        src: label
+            .is_some()
+            .then(|| source_text.map(|s| miette::NamedSource::new(filename, s.clone())))
+            .flatten(),
+        label,
+    };
+    eprintln!("{:?}", miette::Report::new(wrapped));
+}
+
 /// Renders a `PipelineError` via miette with the YAML source attached
 /// as a `NamedSource`, falling back to plain-text output when the
 /// config file is unreadable.
@@ -744,89 +872,60 @@ fn main() -> ExitCode {
 /// attached `NamedSource` header. The regression test
 /// `test_diagnostic_renders_via_miette_in_cli` asserts that stderr
 /// contains the config filename when a bad YAML is passed.
+///
+/// A `PlanDiagnostics` error renders one report per diagnostic so each keeps
+/// its own code, help paragraph, and source line; everything else renders as
+/// one report under the generic `clinker::pipeline_error` code.
 fn render_pipeline_error(err: &PipelineError, config_path: &std::path::Path) {
-    use miette::{Diagnostic, NamedSource, Report, Severity};
-    use std::fmt;
-
     // Best-effort source attach. If the config file is unreadable
     // we still render the raw error via miette's graphical handler
     // so the user sees consistent formatting.
     let source_text = std::fs::read_to_string(config_path).ok();
     let filename = config_path.to_string_lossy().into_owned();
 
-    /// Hand-rolled `Error + Diagnostic` wrapper so we can attach a
-    /// `NamedSource` without pulling in a new `thiserror` dependency
-    /// in the binary crate.
-    struct WrappedPipelineError {
-        filename: String,
-        message: String,
-        src: Option<NamedSource<String>>,
-    }
-
-    impl fmt::Debug for WrappedPipelineError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "{}: {}", self.filename, self.message)
+    if let PipelineError::PlanDiagnostics(diags) = err {
+        for diag in diags {
+            render_plan_diagnostic(diag, &filename, source_text.as_ref());
         }
-    }
-
-    impl fmt::Display for WrappedPipelineError {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "pipeline error in {}: {}", self.filename, self.message)
-        }
-    }
-
-    impl std::error::Error for WrappedPipelineError {}
-
-    impl Diagnostic for WrappedPipelineError {
-        fn code<'a>(&'a self) -> Option<Box<dyn fmt::Display + 'a>> {
-            Some(Box::new("clinker::pipeline_error"))
-        }
-        fn severity(&self) -> Option<Severity> {
-            Some(Severity::Error)
-        }
-        fn source_code(&self) -> Option<&dyn miette::SourceCode> {
-            self.src.as_ref().map(|s| s as &dyn miette::SourceCode)
-        }
+        return;
     }
 
     let wrapped = WrappedPipelineError {
         filename: filename.clone(),
+        code: String::from("clinker::pipeline_error"),
         message: err.to_string(),
+        help: None,
+        label: None,
         src: source_text
             .as_ref()
-            .map(|s| NamedSource::new(filename.clone(), s.clone())),
+            .map(|s| miette::NamedSource::new(filename.clone(), s.clone())),
     };
 
-    let report = Report::new(wrapped);
-    eprintln!("{report:?}");
+    eprintln!("{:?}", miette::Report::new(wrapped));
 }
 
-/// Print every diagnostic from a channel-overlay result and convert
-/// any error-severity entry into a `PipelineError::Compilation` so
-/// the run aborts before executor init.
+/// Print every non-error diagnostic from a channel-overlay result and turn
+/// any error-severity entry into a `PipelineError::PlanDiagnostics` so the
+/// run aborts before executor init.
+///
+/// Errors are handed on whole rather than printed here: the top-level
+/// renderer gives them the same code / help / source-line treatment as any
+/// other plan-time diagnostic, and printing them here as well would show each
+/// failure twice.
 fn abort_on_overlay_errors(
     overlay: &clinker_channel::ChannelOverlayResult,
 ) -> Result<(), PipelineError> {
     use clinker_core_types::Severity;
-    let mut had_error = false;
-    let mut messages: Vec<String> = Vec::new();
+    let mut errors: Vec<clinker_core_types::Diagnostic> = Vec::new();
     for d in &overlay.diagnostics {
-        let severity_label = match d.severity {
-            Severity::Error => "error",
-            Severity::Warning => "warning",
-            Severity::Note => "note",
-        };
-        eprintln!("{}: [{}] {}", severity_label, d.code, d.message);
-        if matches!(d.severity, Severity::Error) {
-            had_error = true;
-            messages.push(format!("[{}] {}", d.code, d.message));
+        match d.severity {
+            Severity::Error => errors.push(d.clone()),
+            Severity::Warning => eprintln!("warning: [{}] {}", d.code, d.message),
+            Severity::Note => eprintln!("note: [{}] {}", d.code, d.message),
         }
     }
-    if had_error {
-        return Err(PipelineError::Compilation {
-            transform_name: String::from("<channel overlay>"),
-            messages,
-        });
+    if !errors.is_empty() {
+        return Err(PipelineError::PlanDiagnostics(errors));
     }
     Ok(())
 }
@@ -1130,13 +1229,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     }
 
     if let Some(format) = args.explain {
-        let mut compiled_plan =
-            pipeline_config
-                .compile(&compile_ctx)
-                .map_err(|diags| PipelineError::Compilation {
-                    transform_name: String::new(),
-                    messages: diags.iter().map(|d| d.message.clone()).collect(),
-                })?;
+        let mut compiled_plan = pipeline_config
+            .compile(&compile_ctx)
+            .map_err(PipelineError::PlanDiagnostics)?;
         if let Some(res) = &overlay_resolution {
             let overlay = res.apply_config_and_vars(&mut compiled_plan, &pipeline_config);
             abort_on_overlay_errors(&overlay)?;
@@ -1252,12 +1347,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         let cfg = lineage_config
             .as_ref()
             .expect("lineage_config is captured whenever --lineage is set");
-        let mut compiled_plan =
-            cfg.compile(&compile_ctx)
-                .map_err(|diags| PipelineError::Compilation {
-                    transform_name: String::new(),
-                    messages: diags.iter().map(|d| d.message.clone()).collect(),
-                })?;
+        let mut compiled_plan = cfg
+            .compile(&compile_ctx)
+            .map_err(PipelineError::PlanDiagnostics)?;
         if let Some(res) = &overlay_resolution {
             let overlay = res.apply_config_and_vars(&mut compiled_plan, cfg);
             abort_on_overlay_errors(&overlay)?;
@@ -1366,13 +1458,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // The structural overlay op stream (if any) is applied inside `compile`
     // via `compile_ctx.overlay_ops`, so a bad splice anchor or ill-typed op is
     // a compile diagnostic, not a panic — propagate it rather than unwrapping.
-    let mut compiled_plan =
-        pipeline_config
-            .compile(&compile_ctx)
-            .map_err(|diags| PipelineError::Compilation {
-                transform_name: String::new(),
-                messages: diags.iter().map(|d| d.message.clone()).collect(),
-            })?;
+    let mut compiled_plan = pipeline_config
+        .compile(&compile_ctx)
+        .map_err(PipelineError::PlanDiagnostics)?;
     // Channel/group overlay: config/vars clobber over the compiled plan's
     // provenance, resolving the four scoped var registries into the runtime
     // values the executor layers atop Transform-declared defaults at init.
