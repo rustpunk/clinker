@@ -486,13 +486,24 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                 self.arbitrator.unregister_consumer(consumer_id);
                 return Ok(());
             }
-            let probe = mapping_probe(&mut ctx.mapping_probes, &self.output_name, self.out_cfg);
-            projected.push(crate::projection::project_output_probed(
-                &record,
-                self.out_cfg,
-                cxl_emit_names_opt,
-                Some(probe),
-            ));
+            let record = match self.out_cfg.mapping.as_ref() {
+                Some(_) => {
+                    let probe =
+                        mapping_probe(&mut ctx.mapping_probes, &self.output_name, self.out_cfg);
+                    crate::projection::project_output_probed(
+                        &record,
+                        self.out_cfg,
+                        cxl_emit_names_opt,
+                        Some(probe),
+                    )
+                }
+                None => crate::projection::project_output_from_record(
+                    &record,
+                    self.out_cfg,
+                    cxl_emit_names_opt,
+                ),
+            };
+            projected.push(record);
             if ctx.ok_source_rows.insert(row_num) {
                 self.ok_count += 1;
             }
@@ -518,13 +529,23 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
             return;
         }
         let projected = {
-            let probe = mapping_probe(&mut ctx.mapping_probes, &self.output_name, self.out_cfg);
-            crate::projection::project_output_probed(
-                &record,
-                self.out_cfg,
-                self.cxl_emit_names.as_deref(),
-                Some(probe),
-            )
+            match self.out_cfg.mapping.as_ref() {
+                Some(_) => {
+                    let probe =
+                        mapping_probe(&mut ctx.mapping_probes, &self.output_name, self.out_cfg);
+                    crate::projection::project_output_probed(
+                        &record,
+                        self.out_cfg,
+                        self.cxl_emit_names.as_deref(),
+                        Some(probe),
+                    )
+                }
+                None => crate::projection::project_output_from_record(
+                    &record,
+                    self.out_cfg,
+                    self.cxl_emit_names.as_deref(),
+                ),
+            }
         };
         if ctx.ok_source_rows.insert(row_num) {
             self.ok_count += 1;

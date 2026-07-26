@@ -134,12 +134,21 @@ fn an_empty_mapping_is_rejected() {
 /// it: two columns cannot share one CSV header.
 #[test]
 fn duplicate_output_name_is_rejected() {
-    let diags = compile_err(&pipeline(
-        "      mapping:\n        - department\n        - department: last_name\n",
-    ));
+    let yaml = pipeline("      mapping:\n        - department\n        - department: last_name\n");
+    let duplicate_line = yaml
+        .lines()
+        .position(|line| line.contains("- department: last_name"))
+        .map(|index| index as u32 + 1)
+        .expect("duplicate item line");
+    let diags = compile_err(&yaml);
     let d = only(&diags, "E364");
     assert!(d.message.contains("'department'"), "{}", d.message);
     assert!(d.message.contains("more than once"), "{}", d.message);
+    assert_eq!(
+        d.primary.span.synthetic_line_number(),
+        Some(duplicate_line),
+        "the duplicate item, not the Output node, is highlighted"
+    );
 }
 
 /// `exclude:` runs before `mapping:` reads the column, so the entry could only
@@ -187,9 +196,13 @@ fn the_collision_diagnostics_own_advice_compiles() {
 /// nothing and exit 0.
 #[test]
 fn unknown_source_column_is_rejected_with_a_suggestion() {
-    let diags = compile_err(&pipeline(
-        "      mapping:\n        - given_name: firstname\n",
-    ));
+    let yaml = pipeline("      mapping:\n        - given_name: firstname\n");
+    let item_line = yaml
+        .lines()
+        .position(|line| line.contains("- given_name: firstname"))
+        .map(|index| index as u32 + 1)
+        .expect("mapping item line");
+    let diags = compile_err(&yaml);
     let d = only(&diags, "E365");
     assert!(
         d.message.contains("'firstname'"),
@@ -204,6 +217,11 @@ fn unknown_source_column_is_rejected_with_a_suggestion() {
     assert!(
         help.contains("'department'"),
         "help must list the columns that are available: {help}"
+    );
+    assert_eq!(
+        d.primary.span.synthetic_line_number(),
+        Some(item_line),
+        "the unmatched item, not the Output node, is highlighted"
     );
 }
 
@@ -328,6 +346,40 @@ nodes:
     config
         .compile(&CompileContext::default())
         .expect("a sidecar-reserving row may supply an undeclared column");
+}
+
+/// Similarity is not proof of absence: a real drift column may differ from a
+/// declared column only by punctuation. The runtime W365 report, which sees
+/// delivered records, owns the unresolved case.
+#[test]
+fn auto_widen_near_match_still_suppresses_e365() {
+    let yaml = r#"
+pipeline:
+  name: output_mapping_widen_near_match
+nodes:
+  - type: source
+    name: people
+    config:
+      name: people
+      type: csv
+      path: ./people.csv
+      schema:
+        - { name: first_name, type: string }
+  - type: output
+    name: out
+    input: people
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+      mapping:
+        - nickname: firstname
+"#;
+    let config = parse_config(yaml).expect("pipeline parses");
+    config
+        .compile(&CompileContext::default())
+        .expect("a similarly named sidecar column may be real drift");
 }
 
 /// The relaxation is conditioned on expansion actually happening. Under

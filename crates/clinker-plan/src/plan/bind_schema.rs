@@ -1471,25 +1471,21 @@ fn validate_output_mapping_columns(
             .join(", ")
     };
 
-    let mut missing: Vec<&str> = Vec::new();
-    for entry in mapping.entries() {
+    let mut missing: Vec<(usize, &str)> = Vec::new();
+    for (index, entry) in mapping.entries().iter().enumerate() {
         let source = entry.source.as_str();
-        if !is_available(source) && !missing.contains(&source) {
-            missing.push(source);
+        if !is_available(source) && !missing.iter().any(|(_, name)| *name == source) {
+            missing.push((index, source));
         }
     }
-    for name in missing {
+    for (entry_index, name) in missing {
         let near = cxl::resolve::levenshtein::best_match(name, &candidate_refs, 3);
-        // Per-ENTRY waiver, not per-block. Standing the gate down for the whole
-        // block whenever the sidecar is in play would let a plain typo through
-        // under `auto_widen`, which is the default source policy and therefore
-        // the commonest shape there is. A name close enough to a declared column
-        // to have a did-you-mean is a misspelling of that column, not a drift
-        // column that happens to resemble it, so it keeps its diagnostic. A name
-        // resembling nothing declared may genuinely be arriving in the sidecar,
-        // so it is left to the end-of-stream report — which knows, as no
-        // compile-time check can, whether any record actually carried it.
-        if sidecar_expands && near.is_none() {
+        // Edit distance is useful help only after absence is known. A sidecar
+        // can legitimately carry a drift column whose spelling happens to be
+        // close to a declared column, so similarity cannot turn an unknown
+        // runtime fact into a compile-time error. W365 reports the item after
+        // the run if no delivered record actually carried it.
+        if sidecar_expands {
             continue;
         }
         let help = match near {
@@ -1511,7 +1507,13 @@ fn validate_output_mapping_columns(
                     "output {node_name:?}: `mapping:` reads column '{name}', which does not \
                      exist at this point in the pipeline"
                 ),
-                LabeledSpan::primary(span, String::new()),
+                LabeledSpan::primary(
+                    mapping
+                        .entry_line(entry_index)
+                        .map(Span::line_only)
+                        .unwrap_or(span),
+                    String::new(),
+                ),
             )
             .with_help(help),
         );
@@ -1523,26 +1525,26 @@ fn validate_output_mapping_columns(
     if !output.include_unmapped {
         return;
     }
-    let mut collisions: Vec<&str> = Vec::new();
+    let mut collisions: Vec<(&str, usize)> = Vec::new();
     for (qf, _) in upstream.fields() {
         let column = qf.name.as_ref();
+        let mapped_entry = mapping
+            .entries()
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.output == column);
         if column.starts_with('$')
             || mapping.claims_source(column)
             || excluded(column)
-            || !mapping.claims_output(column)
-            || collisions.contains(&column)
+            || mapped_entry.is_none()
+            || collisions.iter().any(|(name, _)| *name == column)
         {
             continue;
         }
-        collisions.push(column);
+        collisions.push((column, mapped_entry.expect("checked above").0));
     }
-    for column in collisions {
-        let source = mapping
-            .entries()
-            .iter()
-            .find(|e| e.output == column)
-            .map(|e| e.source.as_str())
-            .unwrap_or(column);
+    for (column, entry_index) in collisions {
+        let source = mapping.entries()[entry_index].source.as_str();
         diags.push(
             Diagnostic::error(
                 "E364",
@@ -1552,7 +1554,13 @@ fn validate_output_mapping_columns(
                      through beside it — the file would carry two '{column}' columns and readers \
                      would resolve the wrong one"
                 ),
-                LabeledSpan::primary(span, String::new()),
+                LabeledSpan::primary(
+                    mapping
+                        .entry_line(entry_index)
+                        .map(Span::line_only)
+                        .unwrap_or(span),
+                    String::new(),
+                ),
             )
             .with_help(format!(
                 "rename the mapped column to a name the upstream does not already use, add \
@@ -3230,9 +3238,6 @@ fn bind_composition(
             ))
             .chain(crate::config::record_path::record_path_faults(
                 &body_file.nodes,
-            ))
-            .chain(crate::config::output_mapping::output_mapping_faults(
-                &body_file.nodes,
             ));
         let mut has_node_config_violation = false;
         for fault in faults {
@@ -3246,6 +3251,28 @@ fn bind_composition(
                     ),
                     LabeledSpan::primary(
                         span_for_node(&body_file.nodes[fault.node_index]),
+                        String::new(),
+                    ),
+                )
+                .with_help(fault.help),
+            );
+            has_node_config_violation = true;
+        }
+        for fault in crate::config::output_mapping::output_mapping_faults_spanned(&body_file.nodes)
+        {
+            diags.push(
+                Diagnostic::error(
+                    fault.code,
+                    format!(
+                        "composition node {node_name:?}: body file {}: {}",
+                        resolved_path.display(),
+                        fault.message
+                    ),
+                    LabeledSpan::primary(
+                        fault
+                            .item_line
+                            .map(Span::line_only)
+                            .unwrap_or_else(|| span_for_node(&body_file.nodes[fault.node_index])),
                         String::new(),
                     ),
                 )

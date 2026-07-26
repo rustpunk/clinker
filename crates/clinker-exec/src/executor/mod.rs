@@ -1549,11 +1549,7 @@ impl PipelineExecutor {
         // the projection from several arms and several chunks, and only the
         // union distinguishes a column no record carried from one some record
         // did.
-        let advisories: Vec<String> = ctx
-            .mapping_probes
-            .iter()
-            .flat_map(|(output_name, probe)| probe.findings(output_name))
-            .collect();
+        let advisories = collect_mapping_advisories(ctx.output_configs, &ctx.mapping_probes);
         Ok(DispatchOutcome {
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
@@ -1596,6 +1592,24 @@ impl PipelineExecutor {
             .map_err(PipelineError::plan_diagnostics_unanchored)?;
         Ok((validated_plan.dag().clone(), ()))
     }
+}
+
+/// Render mapping findings in the same order the Outputs appear in the
+/// pipeline. The probe registry is keyed for lookup, not presentation; walking
+/// it directly would sort advisories by output name.
+fn collect_mapping_advisories(
+    output_configs: &[clinker_plan::config::OutputConfig],
+    mapping_probes: &BTreeMap<String, crate::projection::MappingProbe>,
+) -> Vec<String> {
+    output_configs
+        .iter()
+        .filter_map(|output| {
+            mapping_probes
+                .get(&output.name)
+                .map(|probe| (output.name.as_str(), probe))
+        })
+        .flat_map(|(output_name, probe)| probe.findings(output_name))
+        .collect()
 }
 
 /// Project the per-source finalized ingest counts into the report-facing map:
@@ -1651,6 +1665,62 @@ mod tests {
     //! in-crate symbols.
 
     use super::*;
+
+    #[test]
+    fn mapping_advisories_follow_output_declaration_order() {
+        let config = clinker_plan::config::parse_config(
+            r#"
+pipeline:
+  name: advisory_order
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: json
+      path: input.json
+      schema:
+        - { name: id, type: string }
+  - type: output
+    name: z_out
+    input: source
+    config:
+      name: z_out
+      type: csv
+      path: z.csv
+      mapping:
+        - z_missing
+  - type: output
+    name: a_out
+    input: source
+    config:
+      name: a_out
+      type: csv
+      path: a.csv
+      mapping:
+        - a_missing
+"#,
+        )
+        .expect("pipeline parses");
+        let outputs: Vec<_> = config.output_configs().cloned().collect();
+        let record = clinker_record::Record::new(
+            clinker_record::SchemaBuilder::new()
+                .with_field("id")
+                .build(),
+            vec![clinker_record::Value::String("1".into())],
+        );
+        let mut probes = BTreeMap::new();
+        for output in &outputs {
+            let mut probe = crate::projection::MappingProbe::for_config(output);
+            probe.observe_committed_record(&record, output);
+            probes.insert(output.name.clone(), probe);
+        }
+
+        let advisories = collect_mapping_advisories(&outputs, &probes);
+        assert_eq!(advisories.len(), 2, "{advisories:?}");
+        assert!(advisories[0].contains("z_out"), "{}", advisories[0]);
+        assert!(advisories[1].contains("a_out"), "{}", advisories[1]);
+    }
 
     mod aggregation;
     mod combine_consumer_lifecycle;

@@ -75,9 +75,14 @@ impl MappingEntry {
 /// Construct from an entry list with [`OutputMapping::new`]; every derived
 /// index is computed once there and kept in step with `entries` because all
 /// fields are private.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct OutputMapping {
     entries: Vec<MappingEntry>,
+    /// One-based source line for each authored sequence item. Programmatic
+    /// construction uses `0` (unknown). Kept parallel to `entries` so plan
+    /// diagnostics can point at the offending item without putting parser
+    /// metadata on the public [`MappingEntry`] API or the runtime plan.
+    entry_lines: Vec<u32>,
     /// Every source column some entry reads. Lets the projection pass answer
     /// "has this column already been placed?" in O(1) per column with no
     /// per-record allocation, which is what keeps the unlisted-column append
@@ -117,8 +122,9 @@ impl OutputMapping {
     /// claimed-output, and last-reader indexes.
     ///
     /// Accepts duplicate output names and an empty list: rejecting either is a
-    /// plan-time diagnostic (**E364**) that carries the offending node's span,
-    /// and a `Deserialize` impl has no span to attach.
+    /// plan-time diagnostic (**E364**). Programmatic construction has no source
+    /// line to attach; YAML deserialization records sequence-item lines
+    /// separately without changing this API.
     pub fn new(entries: Vec<MappingEntry>) -> Self {
         let claimed: HashSet<Box<str>> = entries
             .iter()
@@ -136,6 +142,7 @@ impl OutputMapping {
             last_reader[i] = seen.insert(entry.source.as_str());
         }
         Self {
+            entry_lines: vec![0; entries.len()],
             entries,
             claimed,
             claimed_outputs,
@@ -163,6 +170,15 @@ impl OutputMapping {
         &self.entries
     }
 
+    /// One-based YAML line for the entry at `index`, when the mapping came
+    /// from source text and the parser retained the item location.
+    pub(crate) fn entry_line(&self, index: usize) -> Option<u32> {
+        self.entry_lines
+            .get(index)
+            .copied()
+            .filter(|line| *line > 0)
+    }
+
     /// True when some entry reads `column` from upstream, so the projection
     /// pass has already placed it and must not append it a second time.
     pub fn claims_source(&self, column: &str) -> bool {
@@ -185,16 +201,39 @@ impl OutputMapping {
     /// Drives the **E364** plan-time gate; a writer cannot emit two columns
     /// under one header.
     pub fn duplicate_output_names(&self) -> Vec<&str> {
+        self.duplicate_output_entries()
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect()
+    }
+
+    /// Repeated output names paired with the first offending entry index.
+    pub(crate) fn duplicate_output_entries(&self) -> Vec<(usize, &str)> {
         let mut seen: HashSet<&str> = HashSet::with_capacity(self.entries.len());
-        let mut dups: Vec<&str> = Vec::new();
-        for entry in &self.entries {
-            if !seen.insert(entry.output.as_str()) && !dups.contains(&entry.output.as_str()) {
-                dups.push(entry.output.as_str());
+        let mut dups: Vec<(usize, &str)> = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            if !seen.insert(entry.output.as_str())
+                && !dups.iter().any(|(_, name)| *name == entry.output)
+            {
+                dups.push((index, entry.output.as_str()));
             }
         }
         dups
     }
 }
+
+impl PartialEq for OutputMapping {
+    fn eq(&self, other: &Self) -> bool {
+        // Source locations are parser metadata, not part of the authored
+        // mapping value. A parsed block and the equivalent programmatically
+        // constructed block compare equal.
+        self.entries == other.entries
+            && self.legacy_map == other.legacy_map
+            && self.map_form == other.map_form
+    }
+}
+
+impl Eq for OutputMapping {}
 
 impl Serialize for OutputMapping {
     /// Round-trips to the authored shape: a bare scalar per passthrough entry,
@@ -231,6 +270,140 @@ const MAPPING_SHAPE_HELP: &str = "`mapping:` is a sequence, one item per output 
      `output_name: source_column` pair to rename it:\n  \
      mapping:\n    - order_id\n    - sold_to: customer_id";
 
+/// A mapping entry plus its YAML line when the active deserializer supports
+/// serde-saphyr's `__yaml_spanned` protocol. Other serde formats fall back to
+/// an ordinary unspanned entry, preserving `OutputMapping`'s format-neutral
+/// `Deserialize` implementation.
+struct LocatedMappingEntry {
+    value: MappingEntry,
+    line: u32,
+}
+
+impl<'de> Deserialize<'de> for LocatedMappingEntry {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct LocatedVisitor;
+
+        impl<'de> Visitor<'de> for LocatedVisitor {
+            type Value = LocatedMappingEntry;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a mapping entry with optional source location")
+            }
+
+            fn visit_newtype_struct<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                struct EntryOrSpanVisitor;
+
+                impl<'de> Visitor<'de> for EntryOrSpanVisitor {
+                    type Value = LocatedMappingEntry;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("a mapping entry or serde-saphyr spanned entry")
+                    }
+
+                    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                        if value.is_empty() {
+                            return Err(de::Error::custom(format!(
+                                "a `mapping:` item may not be an empty column name. \
+                                 {MAPPING_SHAPE_HELP}"
+                            )));
+                        }
+                        Ok(LocatedMappingEntry {
+                            value: MappingEntry::passthrough(value),
+                            line: 0,
+                        })
+                    }
+
+                    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+                        if value.is_empty() {
+                            return Err(de::Error::custom(format!(
+                                "a `mapping:` item may not be an empty column name. \
+                                 {MAPPING_SHAPE_HELP}"
+                            )));
+                        }
+                        Ok(LocatedMappingEntry {
+                            value: MappingEntry::passthrough(value),
+                            line: 0,
+                        })
+                    }
+
+                    fn visit_map<A: MapAccess<'de>>(
+                        self,
+                        mut map: A,
+                    ) -> Result<Self::Value, A::Error> {
+                        let Some(first_key) = map.next_key::<String>()? else {
+                            return Err(de::Error::custom(
+                                "an empty `mapping:` item names no column",
+                            ));
+                        };
+                        if first_key != "value" {
+                            let source = map.next_value::<String>()?;
+                            if map.next_key::<de::IgnoredAny>()?.is_some() {
+                                return Err(de::Error::custom(
+                                    "a `mapping:` rename item carries exactly one pair",
+                                ));
+                            }
+                            if first_key.is_empty() || source.is_empty() {
+                                return Err(de::Error::custom(format!(
+                                    "a `mapping:` rename item needs a non-empty output name and \
+                                     source column. {MAPPING_SHAPE_HELP}"
+                                )));
+                            }
+                            return Ok(LocatedMappingEntry {
+                                value: MappingEntry::rename(first_key, source),
+                                line: 0,
+                            });
+                        }
+
+                        // serde-saphyr's internal wrapper yields the fixed map
+                        // `{value, referenced, defined}` in this order. A plain
+                        // serde format may instead be deserializing the valid
+                        // rename `{value: source}`; no second key distinguishes
+                        // that case without relying on the concrete format.
+                        let value = map.next_value::<MappingEntry>()?;
+                        let Some(second_key) = map.next_key::<String>()? else {
+                            return Ok(LocatedMappingEntry {
+                                value: MappingEntry::rename("value", value.source),
+                                line: 0,
+                            });
+                        };
+                        if second_key != "referenced" {
+                            return Err(de::Error::custom(format!(
+                                "unexpected spanned mapping field `{second_key}`"
+                            )));
+                        }
+                        let referenced = map.next_value::<crate::yaml::Location>()?;
+                        let defined_key = map.next_key::<String>()?.ok_or_else(|| {
+                            de::Error::custom("spanned mapping entry is missing `defined`")
+                        })?;
+                        if defined_key != "defined" {
+                            return Err(de::Error::custom(format!(
+                                "unexpected spanned mapping field `{defined_key}`"
+                            )));
+                        }
+                        let _defined = map.next_value::<crate::yaml::Location>()?;
+                        if map.next_key::<de::IgnoredAny>()?.is_some() {
+                            return Err(de::Error::custom(
+                                "spanned mapping entry carries an unexpected field",
+                            ));
+                        }
+                        Ok(LocatedMappingEntry {
+                            value,
+                            line: referenced.line() as u32,
+                        })
+                    }
+                }
+
+                deserializer.deserialize_any(EntryOrSpanVisitor)
+            }
+        }
+
+        deserializer.deserialize_newtype_struct("__yaml_spanned", LocatedVisitor)
+    }
+}
+
 impl<'de> Deserialize<'de> for OutputMapping {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct MappingVisitor;
@@ -246,10 +419,14 @@ impl<'de> Deserialize<'de> for OutputMapping {
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
                 let mut entries = Vec::with_capacity(seq.size_hint().unwrap_or(0));
-                while let Some(entry) = seq.next_element::<MappingEntry>()? {
-                    entries.push(entry);
+                let mut entry_lines = Vec::with_capacity(entries.capacity());
+                while let Some(entry) = seq.next_element::<LocatedMappingEntry>()? {
+                    entry_lines.push(entry.line);
+                    entries.push(entry.value);
                 }
-                Ok(OutputMapping::new(entries))
+                let mut mapping = OutputMapping::new(entries);
+                mapping.entry_lines = entry_lines;
+                Ok(mapping)
             }
 
             /// Capture the superseded map form rather than failing here, so the
@@ -345,8 +522,8 @@ fn quoted(names: &[&str]) -> String {
         .join(", ")
 }
 
-/// Every Output whose `mapping:` block is malformed or contradicts itself
-/// (**E364**).
+/// Detailed finding for an Output whose `mapping:` block is malformed or
+/// contradicts itself (**E364**), including an internal item-line anchor.
 ///
 /// Four faults, all decidable from the Output node alone — no upstream schema
 /// needed, which is why they live here rather than in the bind walk:
@@ -360,18 +537,45 @@ fn quoted(names: &[&str]) -> String {
 /// * a repeated output name. A YAML map gave key uniqueness for free; a
 ///   sequence has to enforce it, and a writer cannot emit two columns under one
 ///   header.
-/// * a column this same output's `exclude:` removes, named on either side of an
-///   entry. `exclude:` runs against the incoming column names before `mapping:`
-///   reads them, so the entry could only ever produce nothing (source side) or
-///   the exclusion could never take effect (output side).
+/// * a source column this same output's `exclude:` removes. `exclude:` runs
+///   against incoming column names before `mapping:` reads them, so the entry
+///   could only ever produce nothing. An output-side name is allowed because
+///   excluding the incoming namesake is how authors resolve a passthrough
+///   collision.
 ///
 /// Takes a node LIST rather than the pipeline, for the same reason the
 /// multi-value gates do: a composition body's nodes need the identical check
 /// and never appear in the call-site pipeline's `nodes:`.
+pub(crate) struct OutputMappingFault {
+    pub(crate) node_index: usize,
+    /// One-based YAML line for the precise offending mapping item. `None` for
+    /// block-level faults and programmatically constructed configurations.
+    pub(crate) item_line: Option<u32>,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
+    pub(crate) help: String,
+}
+
+/// Every Output whose `mapping:` block is malformed or contradicts itself
+/// (**E364**), in the shared node-fault form used by public validation helpers.
 pub fn output_mapping_faults(
     nodes: &[crate::yaml::Spanned<crate::config::pipeline_node::PipelineNode>],
 ) -> Vec<crate::config::multi_value::NodeFault> {
-    use crate::config::multi_value::NodeFault;
+    output_mapping_faults_spanned(nodes)
+        .into_iter()
+        .map(|fault| crate::config::multi_value::NodeFault {
+            node_index: fault.node_index,
+            code: fault.code,
+            message: fault.message,
+            help: fault.help,
+        })
+        .collect()
+}
+
+/// Internal item-spanned form used when constructing plan diagnostics.
+pub(crate) fn output_mapping_faults_spanned(
+    nodes: &[crate::yaml::Spanned<crate::config::pipeline_node::PipelineNode>],
+) -> Vec<OutputMappingFault> {
     use crate::config::pipeline_node::PipelineNode;
 
     let mut faults = Vec::new();
@@ -430,8 +634,9 @@ pub fn output_mapping_faults(
                      direction and therefore renamed nothing — swap them back."
                 )
             };
-            faults.push(NodeFault {
+            faults.push(OutputMappingFault {
                 node_index,
+                item_line: None,
                 code: "E364",
                 message: format!(
                     "output '{out_name}': `mapping:` is a sequence of output columns, not a map \
@@ -445,8 +650,9 @@ pub fn output_mapping_faults(
         }
 
         if mapping.entries().is_empty() {
-            faults.push(NodeFault {
+            faults.push(OutputMappingFault {
                 node_index,
+                item_line: None,
                 code: "E364",
                 message: format!(
                     "output '{out_name}': `mapping:` declares no columns, so it states that the \
@@ -461,10 +667,12 @@ pub fn output_mapping_faults(
             continue;
         }
 
-        let dups = mapping.duplicate_output_names();
+        let duplicate_entries = mapping.duplicate_output_entries();
+        let dups: Vec<&str> = duplicate_entries.iter().map(|(_, name)| *name).collect();
         if !dups.is_empty() {
-            faults.push(NodeFault {
+            faults.push(OutputMappingFault {
                 node_index,
+                item_line: mapping.entry_line(duplicate_entries[0].0),
                 code: "E364",
                 message: format!(
                     "output '{out_name}': `mapping:` declares the output column(s) {listed} \
@@ -482,27 +690,31 @@ pub fn output_mapping_faults(
 
         if let Some(exclude) = output.exclude.as_ref() {
             let excluded = |n: &str| exclude.iter().any(|x| x == n);
-            let read_clashes: Vec<&str> = mapping
+            let read_clashes: Vec<(usize, &str)> = mapping
                 .entries()
                 .iter()
-                .map(|e| e.source.as_str())
-                .filter(|s| excluded(s))
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    excluded(&entry.source).then_some((index, entry.source.as_str()))
+                })
                 .collect();
             if !read_clashes.is_empty() {
-                faults.push(NodeFault {
+                let listed_names: Vec<&str> = read_clashes.iter().map(|(_, name)| *name).collect();
+                faults.push(OutputMappingFault {
                     node_index,
+                    item_line: mapping.entry_line(read_clashes[0].0),
                     code: "E364",
                     message: format!(
                         "output '{out_name}': `mapping:` reads the column(s) {listed}, which this \
                          output's own `exclude:` removes first — the entries can never produce a \
                          column",
-                        listed = quoted(&read_clashes),
+                        listed = quoted(&listed_names),
                     ),
                     help: format!(
                         "drop {listed} from `exclude:` if the mapping should write it, or drop \
                          the mapping item if the column should not be written. `exclude:` names \
                          incoming columns and runs before `mapping:` reads them",
-                        listed = quoted(&read_clashes),
+                        listed = quoted(&listed_names),
                     ),
                 });
             }
@@ -559,6 +771,25 @@ mod tests {
         assert!(m.entries()[0].is_passthrough());
         assert!(!m.entries()[1].is_passthrough());
         assert!(m.entries()[2].is_passthrough());
+    }
+
+    #[test]
+    fn serde_json_deserialization_remains_unspanned_and_format_neutral() {
+        let mapping: OutputMapping = serde_json::from_str(
+            r#"["order_id", {"sold_to": "customer_id"}, {"value": "source_value"}]"#,
+        )
+        .expect("JSON deserialization");
+        assert_eq!(
+            mapping.entries(),
+            &[
+                MappingEntry::passthrough("order_id"),
+                MappingEntry::rename("sold_to", "customer_id"),
+                MappingEntry::rename("value", "source_value"),
+            ]
+        );
+        assert_eq!(mapping.entry_line(0), None);
+        assert_eq!(mapping.entry_line(1), None);
+        assert_eq!(mapping.entry_line(2), None);
     }
 
     /// The superseded map form parses into the capture slot and declares no

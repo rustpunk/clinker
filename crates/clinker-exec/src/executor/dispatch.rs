@@ -1148,7 +1148,9 @@ impl<'a> ExecutorContext<'a> {
         out_cfg: &clinker_plan::config::OutputConfig,
         probe: &crate::projection::MappingProbe,
     ) {
-        mapping_probe(&mut self.mapping_probes, output_name, out_cfg).merge(probe);
+        if out_cfg.mapping.is_some() {
+            mapping_probe(&mut self.mapping_probes, output_name, out_cfg).merge(probe);
+        }
     }
 
     /// Poll the run's shutdown flag at an operator chunk boundary. When

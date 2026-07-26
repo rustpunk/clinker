@@ -149,9 +149,9 @@ and a `did you mean` when the name is a near miss. Nothing is renamed silently.
 The compiler cannot always see the column set. Inside a composition body the
 rows are open by construction, and under `on_unmapped: auto_widen` a column can
 reach the sink through the sidecar without being declared anywhere. There an
-item naming an unknown column compiles, unless the name is a near miss of a
-column that *is* declared -- a misspelling of a known column keeps its **E365**
-and its `did you mean` even under `auto_widen`.
+item naming an unknown column compiles even when its name resembles a declared
+column: spelling similarity cannot prove that a dynamic field is absent.
+**W365** reports it after the run if no written record supplied it.
 
 What catches the rest is the end of the run: if no record supplied an item's
 source column, that item wrote an empty column in every row, and the run reports
@@ -174,7 +174,7 @@ declares an output with no columns. To write every upstream column, remove the
 `mapping:` key rather than emptying it.
 
 Writing the block as a YAML map instead of a sequence is rejected (**E364**);
-the message prints your own block already rewritten. Run `clinker explain E364`
+the message prints your own block already rewritten. Run `clinker explain --code E364`
 for the migration, and read the direction note there before pasting: releases
 before this one documented `output_name: source_field` but *executed* the
 reverse, so the rewrite swaps each pair's two sides to preserve what the

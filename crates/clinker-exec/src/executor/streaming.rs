@@ -429,12 +429,20 @@ impl StreamingConsumer for OutputStreamConsumer {
 
         let projected = {
             let _guard = self.out.projection_timer.guard();
-            crate::projection::project_output_probed(
-                &record,
-                &self.spec.out_cfg,
-                cxl_emit_names_opt,
-                Some(&mut self.out.mapping_probe),
-            )
+            if self.spec.out_cfg.mapping.is_some() {
+                crate::projection::project_output_staged(
+                    &record,
+                    &self.spec.out_cfg,
+                    cxl_emit_names_opt,
+                    &mut self.out.mapping_probe,
+                )
+            } else {
+                crate::projection::project_output_from_record(
+                    &record,
+                    &self.spec.out_cfg,
+                    cxl_emit_names_opt,
+                )
+            }
         };
 
         // Lazy writer construction: defer until we have the first record's
@@ -456,6 +464,9 @@ impl StreamingConsumer for OutputStreamConsumer {
                     }
                 }
                 Err(e) => {
+                    if self.spec.out_cfg.mapping.is_some() {
+                        self.out.mapping_probe.discard_staged_record();
+                    }
                     self.out.errors.push(e);
                     if let Some(timer) = self.scan_timer_slot.take() {
                         self.out.stage_metrics.push(timer.finish(0, 0));
@@ -474,12 +485,18 @@ impl StreamingConsumer for OutputStreamConsumer {
         };
         match write_result {
             Ok(()) => {
+                if self.spec.out_cfg.mapping.is_some() {
+                    self.out.mapping_probe.commit_staged_record();
+                }
                 self.out.records_written += 1;
                 self.out.records_emitted += 1;
                 self.out.seen_row_nums.insert(row_num);
                 ControlFlow::Continue(())
             }
             Err(e) => {
+                if self.spec.out_cfg.mapping.is_some() {
+                    self.out.mapping_probe.discard_staged_record();
+                }
                 // A `join_values` `on_conflict: error` collision dead-letters the
                 // one offending record and keeps streaming (unless FailFast); the
                 // entry is drained to the DLQ when the thread is joined. Any other

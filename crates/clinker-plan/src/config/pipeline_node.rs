@@ -1536,10 +1536,43 @@ pub struct CombineBody {
 }
 
 /// Output variant body. Wraps the existing sink config.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OutputBody {
     #[serde(flatten)]
     pub output: crate::config::OutputConfig,
+}
+
+impl<'de> Deserialize<'de> for OutputBody {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct OutputBodyVisitor;
+
+        impl<'de> Visitor<'de> for OutputBodyVisitor {
+            type Value = OutputBody;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an output configuration")
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                // `#[serde(flatten)]` buffers through ContentDeserializer and
+                // loses nested item locations. Delegate the native map stream
+                // directly so `OutputMapping` can retain each sequence item's
+                // span for E364/E365.
+                let output = crate::config::OutputConfig::deserialize(
+                    de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(OutputBody { output })
+            }
+        }
+
+        deserializer.deserialize_map(OutputBodyVisitor)
+    }
 }
 
 /// Engine-stamped audit column set `true` on every record a Reshape

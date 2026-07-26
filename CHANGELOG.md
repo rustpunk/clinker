@@ -91,12 +91,19 @@ fix the collision diagnostic above prescribes.
 A `mapping:` item may name an `auto_widen` drift column when the output sets
 `include_unmapped: true`, which is what expands the sidecar to top-level
 columns; under `include_unmapped: false` the sidecar stays packed and the item
-is rejected. The sidecar waiver is per item, not per block: a name one edit away
-from a column the row *does* declare keeps its **E365** and its `did you mean`,
-because that is a misspelling however the column travels. Column names in
-`mapping:` are matched bare — there is no qualified `input.column` spelling.
+is rejected. Similarity to a declared name does not change that waiver: edit
+distance can suggest a spelling only after absence is known, and a real drift
+column may happen to be similar. **W365** reports the item after the run if no
+written record supplied it. Column names in `mapping:` are matched bare — there
+is no qualified `input.column` spelling.
 
-Run `clinker explain E364` or `clinker explain E365` for the full pages.
+Rust callers must also migrate `OutputConfig.mapping` from
+`Option<IndexMap<String, String>>` to `Option<OutputMapping>` (constructed from
+`Vec<MappingEntry>`). `OutputSpec.mapping` is now a `Vec<MappingEntry>`, and
+`ExecutionReport` struct literals must supply the new `advisories` field.
+
+Run `clinker explain --code E364` or `clinker explain --code E365` for the full
+pages.
 
 ### Changed — every record writes every column an Output's `mapping:` declares
 
@@ -143,7 +150,8 @@ and by the time a stream ends the run's other outputs have already been flushed.
   Where the planner can enumerate the columns reaching that output, the same
   collision remains an **E364** at compile time.
 
-Run `clinker explain W365` or `clinker explain W366` for the full pages.
+Run `clinker explain --code W365` or `clinker explain --code W366` for the full
+pages.
 
 ### Removed — the `best_effort` error strategy
 

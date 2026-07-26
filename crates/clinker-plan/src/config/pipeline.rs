@@ -1212,13 +1212,29 @@ impl PipelineConfig {
             .into_iter()
             .chain(crate::config::multi_value::output_node_faults(&self.nodes))
             .chain(crate::config::record_path::record_path_faults(&self.nodes))
-            .chain(crate::config::output_mapping::output_mapping_faults(
-                &self.nodes,
-            ))
         {
             let primary = doc_node_line_by_name
                 .get(self.nodes[fault.node_index].value.name())
                 .map(|&line| Span::line_only(line))
+                .unwrap_or(Span::SYNTHETIC);
+            diags.push(
+                Diagnostic::error(
+                    fault.code,
+                    fault.message,
+                    LabeledSpan::primary(primary, String::new()),
+                )
+                .with_help(fault.help),
+            );
+        }
+        for fault in crate::config::output_mapping::output_mapping_faults_spanned(&self.nodes) {
+            let primary = fault
+                .item_line
+                .map(Span::line_only)
+                .or_else(|| {
+                    doc_node_line_by_name
+                        .get(self.nodes[fault.node_index].value.name())
+                        .map(|&line| Span::line_only(line))
+                })
                 .unwrap_or(Span::SYNTHETIC);
             diags.push(
                 Diagnostic::error(

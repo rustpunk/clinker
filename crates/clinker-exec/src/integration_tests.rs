@@ -551,6 +551,141 @@ nodes:
         );
     }
 
+    /// A record in a correlation group is not part of the delivered stream
+    /// when any peer in that group fails. Its fields therefore must not count
+    /// as evidence that a mapped column was populated in the written file.
+    #[test]
+    fn a_rejected_correlation_group_cannot_suppress_an_empty_column_report() {
+        let yaml = r#"
+pipeline:
+  name: mapping_correlation_report
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: people
+  config:
+    name: people
+    type: json
+    path: test.json
+    correlation_key: employee_id
+    schema:
+    - { name: employee_id, type: string }
+    - { name: value, type: string }
+- type: transform
+  name: parse_value
+  input: people
+  config:
+    cxl: |
+      emit employee_id = employee_id
+      emit parsed_value = value.to_int()
+- type: output
+  name: out
+  input: parse_value
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: true
+    mapping:
+    - employee_id
+    - optional_copy: optional
+    - displaced: employee_id
+"#;
+        let input = r#"[
+          {"employee_id":"A","value":"100","optional":"present-only-in-rejected-group","displaced":"rejected-only"},
+          {"employee_id":"A","value":"bad"},
+          {"employee_id":"B","value":"200"}
+        ]"#;
+
+        let run = run_pipeline_reporting(yaml, input).expect("the run completes");
+        assert_eq!(run.counters.records_written, 1);
+        assert!(run.output.contains("B,"), "{}", run.output);
+        assert!(!run.output.contains("A,"), "{}", run.output);
+        assert_eq!(run.advisories.len(), 1, "{:?}", run.advisories);
+        assert!(run.advisories[0].contains("W365"), "{}", run.advisories[0]);
+        assert!(
+            run.advisories[0].contains("'optional'"),
+            "the only record carrying `optional` was rejected with its group: {}",
+            run.advisories[0]
+        );
+        assert!(
+            !run.advisories
+                .iter()
+                .any(|warning| warning.contains("W366")),
+            "the only colliding passthrough was rejected with its group: {:?}",
+            run.advisories
+        );
+    }
+
+    /// An oversized correlation group is rejected before commit just like a
+    /// dirty group. Its fields cannot resolve or collide in the written file's
+    /// mapping report.
+    #[test]
+    fn an_overflowed_correlation_group_cannot_affect_mapping_advisories() {
+        let yaml = r#"
+pipeline:
+  name: mapping_correlation_overflow_report
+error_handling:
+  strategy: continue
+  max_group_buffer: 1
+nodes:
+- type: source
+  name: people
+  config:
+    name: people
+    type: json
+    path: test.json
+    correlation_key: employee_id
+    schema:
+    - { name: employee_id, type: string }
+    - { name: value, type: string }
+- type: transform
+  name: passthrough
+  input: people
+  config:
+    cxl: |
+      emit employee_id = employee_id
+      emit value = value
+- type: output
+  name: out
+  input: passthrough
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: true
+    mapping:
+    - employee_id
+    - optional_copy: optional
+    - displaced: employee_id
+"#;
+        let input = r#"[
+          {"employee_id":"A","value":"one","optional":"overflow-only","displaced":"overflow-only"},
+          {"employee_id":"A","value":"two"},
+          {"employee_id":"B","value":"clean"}
+        ]"#;
+
+        let run = run_pipeline_reporting(yaml, input).expect("the run completes");
+        assert_eq!(run.counters.records_written, 1);
+        assert!(run.output.contains("B,"), "{}", run.output);
+        assert!(!run.output.contains("A,"), "{}", run.output);
+        assert_eq!(run.advisories.len(), 1, "{:?}", run.advisories);
+        assert!(run.advisories[0].contains("W365"), "{}", run.advisories[0]);
+        assert!(
+            run.advisories[0].contains("'optional'"),
+            "the only record carrying `optional` was rejected on overflow: {}",
+            run.advisories[0]
+        );
+        assert!(
+            !run.advisories
+                .iter()
+                .any(|warning| warning.contains("W366")),
+            "the only colliding passthrough was rejected on overflow: {:?}",
+            run.advisories
+        );
+    }
+
     /// A genuinely heterogeneous stream, and the property the whole redesign
     /// exists for: the file's column set follows the `mapping:` block, not
     /// whichever record happened to arrive first.

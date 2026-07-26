@@ -344,6 +344,24 @@ pub fn project_output_probed(
     out
 }
 
+/// Project one record while staging its mapping evidence until the caller
+/// knows whether the writer accepted it.
+///
+/// The scratch flags live on `probe` and are reused for every record, so this
+/// adds no record-rate allocation and does not repeat the mapping lookups the
+/// projection already performs. Call exactly one of
+/// [`MappingProbe::commit_staged_record`] or
+/// [`MappingProbe::discard_staged_record`] before staging another record.
+pub(crate) fn project_output_staged(
+    input_record: &Record,
+    config: &OutputConfig,
+    cxl_emit_names: Option<&[String]>,
+    probe: &mut MappingProbe,
+) -> Record {
+    probe.begin_staged_record();
+    project_output_probed(input_record, config, cxl_emit_names, Some(probe))
+}
+
 /// Per-Output evidence about how a `mapping:` block resolved over a whole
 /// stream, and the source of its end-of-stream report.
 ///
@@ -360,9 +378,9 @@ pub fn project_output_probed(
 /// record, so it reports; a sparse column in a heterogeneous stream is supplied
 /// by some record, so it does not.
 ///
-/// Bounded: three vectors sized by the author's column count, allocated once
+/// Bounded: fixed vectors sized by the author's column count, allocated once
 /// per Output. Nothing here grows with input cardinality, and the per-record
-/// path only sets a flag.
+/// path only clears and sets reusable flags.
 ///
 /// Self-describing on purpose: it carries the source names it was built from
 /// rather than re-reading them out of an [`OutputConfig`] at report time. The
@@ -375,45 +393,151 @@ pub struct MappingProbe {
     /// whether that source resolved on some record. Empty for an Output with
     /// no `mapping:` block.
     sources: Vec<Box<str>>,
+    outputs: Vec<Box<str>>,
     resolved: Vec<bool>,
-    /// Passthrough column names the mapping displaced, first-seen order.
-    shadowed: Vec<Box<str>>,
+    /// Whether each mapping output name displaced an upstream passthrough.
+    /// Parallel to `outputs`; findings preserve mapping declaration order.
+    shadowed: Vec<bool>,
     /// Records projected through this Output. Zero means the stream was empty,
     /// which is not evidence of anything.
     records: u64,
+    /// Fixed per-Output scratch used when projection precedes a fallible write.
+    /// These vectors are allocated with the probe, then cleared and reused for
+    /// every record; they never grow with input cardinality.
+    staged_resolved: Vec<bool>,
+    staged_shadowed: Vec<bool>,
+    staging: bool,
 }
 
 impl MappingProbe {
     /// A probe sized for `config`'s mapping block. Cheap for an Output with no
     /// `mapping:` — it allocates nothing and reports nothing.
     pub fn for_config(config: &OutputConfig) -> Self {
-        let sources: Vec<Box<str>> = config.mapping.as_ref().map_or_else(Vec::new, |m| {
-            m.entries()
-                .iter()
-                .map(|e| Box::<str>::from(e.source.as_str()))
-                .collect()
-        });
+        let (sources, outputs): (Vec<Box<str>>, Vec<Box<str>>) =
+            config.mapping.as_ref().map_or_else(
+                || (Vec::new(), Vec::new()),
+                |m| {
+                    m.entries()
+                        .iter()
+                        .map(|e| {
+                            (
+                                Box::<str>::from(e.source.as_str()),
+                                Box::<str>::from(e.output.as_str()),
+                            )
+                        })
+                        .unzip()
+                },
+            );
         Self {
             resolved: vec![false; sources.len()],
+            shadowed: vec![false; outputs.len()],
+            staged_resolved: vec![false; sources.len()],
+            staged_shadowed: vec![false; outputs.len()],
             sources,
-            shadowed: Vec::new(),
+            outputs,
             records: 0,
+            staging: false,
         }
     }
 
     fn note_record(&mut self) {
-        self.records = self.records.saturating_add(1);
+        if !self.staging {
+            self.records = self.records.saturating_add(1);
+        }
     }
 
     fn note_resolved(&mut self, index: usize) {
-        if let Some(slot) = self.resolved.get_mut(index) {
+        let slots = if self.staging {
+            &mut self.staged_resolved
+        } else {
+            &mut self.resolved
+        };
+        if let Some(slot) = slots.get_mut(index) {
             *slot = true;
         }
     }
 
     fn note_shadowed(&mut self, column: &str) {
-        if !self.shadowed.iter().any(|c| &**c == column) {
-            self.shadowed.push(Box::from(column));
+        let Some(index) = self.outputs.iter().position(|name| &**name == column) else {
+            return;
+        };
+        let slots = if self.staging {
+            &mut self.staged_shadowed
+        } else {
+            &mut self.shadowed
+        };
+        if let Some(slot) = slots.get_mut(index) {
+            *slot = true;
+        }
+    }
+
+    fn begin_staged_record(&mut self) {
+        debug_assert!(
+            !self.staging,
+            "previous mapping observation was not finished"
+        );
+        self.staged_resolved.fill(false);
+        self.staged_shadowed.fill(false);
+        self.staging = true;
+    }
+
+    /// Commit the evidence staged by [`project_output_staged`] after a
+    /// successful write.
+    pub(crate) fn commit_staged_record(&mut self) {
+        debug_assert!(self.staging, "no mapping observation is staged");
+        if !self.staging {
+            return;
+        }
+        self.records = self.records.saturating_add(1);
+        for (resolved, staged) in self.resolved.iter_mut().zip(&self.staged_resolved) {
+            *resolved |= *staged;
+        }
+        for (shadowed, staged) in self.shadowed.iter_mut().zip(&self.staged_shadowed) {
+            *shadowed |= *staged;
+        }
+        self.staging = false;
+    }
+
+    /// Drop the evidence staged by [`project_output_staged`] after a rejected
+    /// or dead-lettered write.
+    pub(crate) fn discard_staged_record(&mut self) {
+        debug_assert!(self.staging, "no mapping observation is staged");
+        self.staging = false;
+    }
+
+    /// Observe one record without rebuilding its projected output.
+    ///
+    /// The correlation-buffer path projects before it knows whether the group
+    /// will commit. It calls this only for clean groups at commit time so a
+    /// record later rejected to the DLQ cannot make an all-empty written
+    /// column look populated. The checks mirror the gather/exclude/mapping
+    /// visibility rules in [`project_output_probed`] and allocate no
+    /// per-record state.
+    pub(crate) fn observe_committed_record(&mut self, record: &Record, config: &OutputConfig) {
+        self.note_record();
+        let Some(mapping) = config.mapping.as_ref() else {
+            return;
+        };
+
+        for (index, entry) in mapping.entries().iter().enumerate() {
+            if projection_field_is_present(record, config, &entry.source) {
+                self.note_resolved(index);
+            }
+        }
+
+        for entry in mapping.entries() {
+            let name = entry.output.as_str();
+            if mapping.claims_source(name) {
+                continue;
+            }
+            let would_be_appended = if config.include_unmapped {
+                projection_field_is_present(record, config, name)
+            } else {
+                correlation_field_is_present(record, config, name)
+            };
+            if would_be_appended {
+                self.note_shadowed(name);
+            }
         }
     }
 
@@ -429,8 +553,8 @@ impl MappingProbe {
         for (slot, hit) in self.resolved.iter_mut().zip(other.resolved.iter()) {
             *slot |= *hit;
         }
-        for column in &other.shadowed {
-            self.note_shadowed(column);
+        for (slot, hit) in self.shadowed.iter_mut().zip(other.shadowed.iter()) {
+            *slot |= *hit;
         }
     }
 
@@ -466,9 +590,14 @@ impl MappingProbe {
                  spelling, or remove the item if the column is gone from upstream"
             ));
         }
-        if !self.shadowed.is_empty() {
-            let listed = self
-                .shadowed
+        let shadowed: Vec<&str> = self
+            .outputs
+            .iter()
+            .zip(&self.shadowed)
+            .filter_map(|(name, hit)| hit.then_some(&**name))
+            .collect();
+        if !shadowed.is_empty() {
+            let listed = shadowed
                 .iter()
                 .map(|c| format!("'{c}'"))
                 .collect::<Vec<_>>()
@@ -482,6 +611,61 @@ impl MappingProbe {
         }
         out
     }
+}
+
+/// Whether `name` is present in the temporary field map built by the output
+/// projection after its visibility and `exclude:` rules run.
+fn projection_field_is_present(record: &Record, config: &OutputConfig, name: &str) -> bool {
+    if config
+        .exclude
+        .as_ref()
+        .is_some_and(|excluded| excluded.iter().any(|column| column == name))
+    {
+        return false;
+    }
+
+    if let Some(index) = record.schema().index(name) {
+        use clinker_record::FieldMetadata;
+        match record.schema().field_metadata(index) {
+            None => return true,
+            Some(
+                FieldMetadata::SourceCorrelation { .. } | FieldMetadata::AggregateGroupIndex { .. },
+            ) => return config.include_correlation_keys,
+            Some(_) => {}
+        }
+    }
+
+    if config.include_unmapped
+        && let Some(Value::Map(sidecar)) =
+            record.get(clinker_plan::config::pipeline_node::WIDENED_SIDECAR_COLUMN)
+    {
+        return sidecar.contains_key(name);
+    }
+
+    false
+}
+
+/// Under `include_unmapped: false`, only correlation columns can be appended
+/// after the declared mapping, and only when the author explicitly opts in.
+fn correlation_field_is_present(record: &Record, config: &OutputConfig, name: &str) -> bool {
+    if !config.include_correlation_keys
+        || config
+            .exclude
+            .as_ref()
+            .is_some_and(|excluded| excluded.iter().any(|column| column == name))
+    {
+        return false;
+    }
+    let Some(index) = record.schema().index(name) else {
+        return false;
+    };
+    matches!(
+        record.schema().field_metadata(index),
+        Some(
+            clinker_record::FieldMetadata::SourceCorrelation { .. }
+                | clinker_record::FieldMetadata::AggregateGroupIndex { .. }
+        )
+    )
 }
 
 /// Enforce a declared output-column `scale` at the write boundary: each
