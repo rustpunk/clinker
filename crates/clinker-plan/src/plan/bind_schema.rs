@@ -1401,23 +1401,26 @@ pub(crate) fn validate_output_path_collisions(
     }
 }
 
-/// **E365** — an Output's `mapping:` reads a column the graph does not supply
-/// at that point.
+/// The two schema-dependent `mapping:` gates on an Output node.
 ///
+/// **E365** — an entry reads a column the graph does not supply at that point.
 /// The output schema is known at plan time, so a stale or mistyped column name
 /// is answerable here with a span instead of by reading the written file and
 /// noticing a header that is not the one the block declared.
 ///
-/// Runs only against a **closed** row. An open row is the composition-port
-/// case: the caller's extra columns bind to the row variable and flow through,
-/// so a name missing from `declared` there is not evidence the column is
-/// absent at run time. Reporting it would reject a body that is correct for
-/// every caller.
+/// **E364** — an entry's OUTPUT name collides with an upstream column that
+/// `include_unmapped` would append beside it. Two same-named columns on one
+/// schema resolve last-write-wins through `Record::get`, so the writer would
+/// serve the passthrough column's value under the renamed column's header —
+/// the renamed value silently dropped.
 ///
-/// A column that reaches the sink only through the `auto_widen` sidecar is
-/// undeclared by construction and so is reported. That matches the rest of the
-/// surface — CXL cannot name an undeclared column either — and the help says
-/// how to make it nameable.
+/// Both run only against a **closed** row. An open row is the composition-port
+/// case: the caller's extra columns bind to the row variable and flow through,
+/// so a name missing from `declared` there is not evidence the column is absent
+/// at run time, and an unlisted column set that cannot be enumerated cannot be
+/// checked for collisions either. Reporting either would reject a body that is
+/// correct for every caller. The runtime carries its own guard for both, which
+/// is what covers the open-row and sidecar cases.
 fn validate_output_mapping_columns(
     node_name: &str,
     output: &crate::config::OutputConfig,
@@ -1431,30 +1434,31 @@ fn validate_output_mapping_columns(
     if !matches!(upstream.tail, cxl::typecheck::RowTail::Closed) {
         return;
     }
-    // Match on the bare name, and also accept the `qualifier.name` spelling a
-    // combine merged row carries — `has_field` answers `false` for a name two
-    // combine inputs both declare, and an ambiguous column is present, not
-    // missing.
-    let is_available = |wanted: &str| {
-        upstream
-            .fields()
-            .any(|(qf, _)| qf.name.as_ref() == wanted || qf.to_string() == wanted)
+    // An Output's upstream row carries only bare names: a Combine publishes its
+    // merged row as `QualifiedField::bare`, so the qualified spelling never
+    // reaches here and matching it would accept a name the record cannot carry.
+    let is_available = |wanted: &str| upstream.fields().any(|(qf, _)| qf.name.as_ref() == wanted);
+    let excluded = |name: &str| {
+        output
+            .exclude
+            .as_ref()
+            .is_some_and(|ex| ex.iter().any(|x| x == name))
     };
-    let mut missing: Vec<&str> = Vec::new();
-    for entry in mapping.entries() {
-        let source = entry.source.as_str();
-        if !is_available(source) && !missing.contains(&source) {
-            missing.push(source);
-        }
-    }
-    if missing.is_empty() {
-        return;
-    }
+
+    // A row that reserves the `auto_widen` sidecar can carry columns the
+    // declared set does not name — but only where the sidecar is expanded, and
+    // expansion is gated on `include_unmapped: true`. Under `false` the sidecar
+    // stays packed and a mapping naming one of its columns genuinely cannot
+    // resolve, so the gate still applies there.
+    let sidecar_may_supply_anything = upstream
+        .has_field(crate::config::pipeline_node::WIDENED_SIDECAR_COLUMN)
+        && output.include_unmapped;
+
     // Suggest only author-facing columns: the engine-stamped namespaces
     // (`$widened`, `$source.*`, `$ck.*`) are not names a pipeline author types.
     let candidates: Vec<String> = upstream
         .fields()
-        .map(|(qf, _)| qf.to_string())
+        .map(|(qf, _)| qf.name.to_string())
         .filter(|n| !n.starts_with('$'))
         .collect();
     let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
@@ -1467,28 +1471,85 @@ fn validate_output_mapping_columns(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    for name in missing {
-        let help = match cxl::resolve::levenshtein::best_match(name, &candidate_refs, 3) {
-            Some(near) => format!(
-                "did you mean `- <output_name>: {near}`? Columns available at output \
-                 {node_name:?}: {available}"
-            ),
-            None => format!(
-                "columns available at output {node_name:?}: {available}. If '{name}' reaches \
-                 the sink only through `on_unmapped: auto_widen`, declare it in the source's \
-                 `schema:` block so the rest of the pipeline can name it too"
-            ),
-        };
+
+    if !sidecar_may_supply_anything {
+        let mut missing: Vec<&str> = Vec::new();
+        for entry in mapping.entries() {
+            let source = entry.source.as_str();
+            if !is_available(source) && !missing.contains(&source) {
+                missing.push(source);
+            }
+        }
+        for name in missing {
+            let help = match cxl::resolve::levenshtein::best_match(name, &candidate_refs, 3) {
+                Some(near) => format!(
+                    "did you mean `- <output_name>: {near}`? Columns available at output \
+                     {node_name:?}: {available}"
+                ),
+                None => format!(
+                    "columns available at output {node_name:?}: {available}. If '{name}' reaches \
+                     the sink only through `on_unmapped: auto_widen`, either set \
+                     `include_unmapped: true` on this output so the sidecar is expanded before \
+                     the mapping reads it, or declare the column in the source's `schema:` block"
+                ),
+            };
+            diags.push(
+                Diagnostic::error(
+                    "E365",
+                    format!(
+                        "output {node_name:?}: `mapping:` reads column '{name}', which does not \
+                         exist at this point in the pipeline"
+                    ),
+                    LabeledSpan::primary(span, String::new()),
+                )
+                .with_help(help),
+            );
+        }
+    }
+
+    // Collision gate. Only `include_unmapped: true` appends anything, so only
+    // it can collide. A column some entry READS is consumed by that entry and
+    // never appended; one this output excludes is removed before the append.
+    if !output.include_unmapped {
+        return;
+    }
+    let mut collisions: Vec<&str> = Vec::new();
+    for (qf, _) in upstream.fields() {
+        let column = qf.name.as_ref();
+        if column.starts_with('$')
+            || mapping.claims_source(column)
+            || excluded(column)
+            || !mapping.claims_output(column)
+            || collisions.contains(&column)
+        {
+            continue;
+        }
+        collisions.push(column);
+    }
+    for column in collisions {
+        let source = mapping
+            .entries()
+            .iter()
+            .find(|e| e.output == column)
+            .map(|e| e.source.as_str())
+            .unwrap_or(column);
         diags.push(
             Diagnostic::error(
-                "E365",
+                "E364",
                 format!(
-                    "output {node_name:?}: `mapping:` reads column '{name}', which does not \
-                     exist at this point in the pipeline"
+                    "output {node_name:?}: `mapping:` writes column '{column}', and \
+                     `include_unmapped: true` would also carry the upstream column of that name \
+                     through beside it — the file would carry two '{column}' columns and readers \
+                     would resolve the wrong one"
                 ),
                 LabeledSpan::primary(span, String::new()),
             )
-            .with_help(help),
+            .with_help(format!(
+                "rename the mapped column to a name the upstream does not already use, add \
+                 '{column}' to this output's `exclude:` so only the mapped column is written, \
+                 or set `include_unmapped: false` so the block is the whole output. The \
+                 colliding item reads '{source}'."
+            )),
         );
     }
 }

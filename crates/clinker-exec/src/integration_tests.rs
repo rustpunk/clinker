@@ -77,7 +77,8 @@ mod tests {
                 | PipelineError::CombineOutputCapExceeded { .. }
                 | PipelineError::EnvelopeMultiHeaderConflict { .. }
                 | PipelineError::EnvelopeHeaderGrainUnmatched { .. }
-                | PipelineError::EnvelopeHeaderMultipleForGrain { .. },
+                | PipelineError::EnvelopeHeaderMultipleForGrain { .. }
+                | PipelineError::OutputMappingColumnMissing { .. },
             ) => 1,
             Err(
                 PipelineError::Eval(_)
@@ -474,6 +475,67 @@ nodes:
             "order_id,order_date,sold_to,channel,sku,quantity,unit_price,discount_pct,\
              gross_amount,line_total,ship_country,status"
         );
+    }
+
+    /// The write-boundary half of E365, end to end. The plan-time gate stands
+    /// down here on purpose: the source reserves the `auto_widen` sidecar and
+    /// `include_unmapped: true` expands it, so at compile time `nickname` might
+    /// genuinely arrive. It does not — and because `mapping:` SELECTS, a silent
+    /// skip would write a file missing the column the block declared. The run
+    /// must fail instead.
+    ///
+    /// This is the same guard that covers a mapping inside a composition body,
+    /// whose rows are open by construction and which the plan gate therefore
+    /// also cannot check: both reach the writer through the one dispatch arm.
+    #[test]
+    fn a_mapping_column_the_stream_never_supplies_fails_the_run() {
+        let yaml = r#"
+pipeline:
+  name: mapping_runtime_gate
+nodes:
+- type: source
+  name: people
+  config:
+    name: people
+    type: csv
+    path: test.csv
+    options:
+      has_header: true
+    schema:
+    - { name: first_name, type: string }
+- type: output
+  name: out
+  input: people
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: true
+    mapping:
+    - first_name
+    - nickname: goes_by
+"#;
+        let csv = "first_name\nAlice\n";
+        let err = run_pipeline(yaml, csv).expect_err("an unresolved mapping entry must fail");
+        let rendered = err.to_string();
+        assert!(rendered.contains("E365"), "{rendered}");
+        assert!(
+            rendered.contains("'goes_by'"),
+            "the message names the source column the author must correct: {rendered}"
+        );
+        assert!(
+            rendered.contains("'first_name'"),
+            "the message lists the columns that are present: {rendered}"
+        );
+        assert_eq!(exit_code(&Err(err)), 1);
+    }
+
+    /// Over-rejection guard for the same gate: a mapping every record can
+    /// satisfy runs clean and writes the declared header.
+    #[test]
+    fn a_mapping_the_stream_satisfies_runs_clean() {
+        let header = mapping_header("    - surname: last_name\n    - first_name\n", false);
+        assert_eq!(header, "surname,first_name");
     }
 
     // ── Phase 8 Task 8.4 exit code gate tests ─────────────────

@@ -625,7 +625,12 @@ fn main() -> ExitCode {
                         | PipelineError::CombineOutputCapExceeded { .. }
                         | PipelineError::EnvelopeMultiHeaderConflict { .. }
                         | PipelineError::EnvelopeHeaderGrainUnmatched { .. }
-                        | PipelineError::EnvelopeHeaderMultipleForGrain { .. } => ExitCode::from(1),
+                        | PipelineError::EnvelopeHeaderMultipleForGrain { .. }
+                        // E365 at the write boundary — the pipeline names a
+                        // column its own stream does not carry. A config
+                        // error the author fixes in the YAML, so exit 1 with
+                        // the rest of that class, not the data-quality exit 3.
+                        | PipelineError::OutputMappingColumnMissing { .. } => ExitCode::from(1),
                         // Disk-cap exceedance (E320) is a resource-exhaustion
                         // halt — the run filled its configured spill budget.
                         // Group it with the other infrastructure failures

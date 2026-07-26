@@ -425,6 +425,15 @@ pub(crate) fn build_format_writer(
     raw_writer: Box<dyn Write + Send>,
     schema: Arc<Schema>,
 ) -> Result<Box<dyn FormatWriter>, PipelineError> {
+    // Write-boundary E365. Every arm that opens a writer — records-only,
+    // fan-out, envelope, document-DLQ, streaming, correlation — passes through
+    // here with the schema it established from the stream's own records, so
+    // this is the one place that sees every established output schema. A
+    // `mapping:` entry whose column the stream never supplied would otherwise
+    // drop that column from the file silently; under selection semantics that
+    // is data loss, so it is refused before the first byte.
+    crate::projection::check_mapping_against_schema(&schema, output, &output.name)?;
+
     // Extract field definitions for fixed-width output (requires explicit schema).
     let field_defs = if matches!(output.format, OutputFormat::FixedWidth(_)) {
         Some(extract_output_field_defs(output)?)

@@ -72,8 +72,8 @@ impl MappingEntry {
 
 /// An Output node's ordered `mapping:` declaration.
 ///
-/// Construct from an entry list with [`OutputMapping::new`]; the claimed-source
-/// index is derived once there and kept in step with `entries` because both
+/// Construct from an entry list with [`OutputMapping::new`]; every derived
+/// index is computed once there and kept in step with `entries` because all
 /// fields are private.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutputMapping {
@@ -83,6 +83,19 @@ pub struct OutputMapping {
     /// per-record allocation, which is what keeps the unlisted-column append
     /// off the record-rate allocation path.
     claimed: HashSet<Box<str>>,
+    /// Every name some entry writes. The unlisted-column append consults it so
+    /// a passthrough column cannot land under a name the block already
+    /// declared — two same-named columns on one schema resolve last-write-wins
+    /// through `Record::get`, which would serve the passthrough's value under
+    /// the renamed column's header.
+    claimed_outputs: HashSet<Box<str>>,
+    /// Per entry, whether it is the LAST one reading its source column. The
+    /// projection pass moves the value out of the gathered field map for a last
+    /// reader and clones only for the rare source feeding two output columns,
+    /// so the common path copies no `Value` per record.
+    ///
+    /// Parallel to `entries`; indexed by entry position.
+    last_reader: Vec<bool>,
     /// Capture slot for the superseded map form, read by the **E364** gate and
     /// by nothing else — the same device the retired `array_paths:` key uses.
     ///
@@ -92,31 +105,57 @@ pub struct OutputMapping {
     /// and the author's own pairs echoed back in the sequence form, rather than
     /// a bare YAML type error.
     legacy_map: Vec<(String, String)>,
+    /// Whether the block was written as a YAML map. Tracked separately from
+    /// `legacy_map` being non-empty so an EMPTY map (`mapping: {}`) is still
+    /// recognised as the superseded form rather than slipping through as a
+    /// well-formed block that happens to declare nothing.
+    map_form: bool,
 }
 
 impl OutputMapping {
-    /// Build from an ordered entry list, deriving the claimed-source index.
+    /// Build from an ordered entry list, deriving the claimed-source,
+    /// claimed-output, and last-reader indexes.
     ///
-    /// Accepts duplicate output names: rejecting them is a plan-time
-    /// diagnostic (**E364**) that carries the offending node's span, and a
-    /// `Deserialize` impl has no span to attach.
+    /// Accepts duplicate output names and an empty list: rejecting either is a
+    /// plan-time diagnostic (**E364**) that carries the offending node's span,
+    /// and a `Deserialize` impl has no span to attach.
     pub fn new(entries: Vec<MappingEntry>) -> Self {
-        let claimed = entries
+        let claimed: HashSet<Box<str>> = entries
             .iter()
             .map(|e| Box::<str>::from(e.source.as_str()))
             .collect();
+        let claimed_outputs: HashSet<Box<str>> = entries
+            .iter()
+            .map(|e| Box::<str>::from(e.output.as_str()))
+            .collect();
+        // Walk backwards so the FIRST time a source is seen from the end is its
+        // last reader in declaration order.
+        let mut seen: HashSet<&str> = HashSet::with_capacity(entries.len());
+        let mut last_reader = vec![false; entries.len()];
+        for (i, entry) in entries.iter().enumerate().rev() {
+            last_reader[i] = seen.insert(entry.source.as_str());
+        }
         Self {
             entries,
             claimed,
+            claimed_outputs,
+            last_reader,
             legacy_map: Vec::new(),
+            map_form: false,
         }
     }
 
     /// The superseded map form's pairs, when the block was written as a map.
-    /// Empty for every well-formed block. Drives the **E364** migration
-    /// diagnostic.
+    /// Empty for every well-formed block, and also for an empty map — use
+    /// [`OutputMapping::is_map_form`] to detect the shape itself.
     pub fn legacy_map_form(&self) -> &[(String, String)] {
         &self.legacy_map
+    }
+
+    /// Whether the block was written as a YAML map rather than a sequence.
+    /// True for `mapping: {}` as well as for a populated map.
+    pub fn is_map_form(&self) -> bool {
+        self.map_form
     }
 
     /// The declared entries, in declaration order — which is output order.
@@ -128,6 +167,18 @@ impl OutputMapping {
     /// pass has already placed it and must not append it a second time.
     pub fn claims_source(&self, column: &str) -> bool {
         self.claimed.contains(column)
+    }
+
+    /// True when some entry writes `column`, so an unlisted upstream column of
+    /// that name must not be appended alongside it.
+    pub fn claims_output(&self, column: &str) -> bool {
+        self.claimed_outputs.contains(column)
+    }
+
+    /// Whether the entry at `index` is the last one reading its source column,
+    /// and may therefore take the value rather than copy it.
+    pub fn is_last_reader(&self, index: usize) -> bool {
+        self.last_reader.get(index).copied().unwrap_or(true)
     }
 
     /// Output names that appear more than once, in first-duplicate order.
@@ -211,9 +262,9 @@ impl<'de> Deserialize<'de> for OutputMapping {
                     legacy_map.push(pair);
                 }
                 Ok(OutputMapping {
-                    entries: Vec::new(),
-                    claimed: HashSet::new(),
+                    map_form: true,
                     legacy_map,
+                    ..OutputMapping::new(Vec::new())
                 })
             }
         }
@@ -285,21 +336,34 @@ impl<'de> Deserialize<'de> for MappingEntry {
     }
 }
 
+/// Render a `'a', 'b'` list for a diagnostic.
+fn quoted(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|n| format!("'{n}'"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Every Output whose `mapping:` block is malformed or contradicts itself
 /// (**E364**).
 ///
-/// Three faults, all decidable from the Output node alone — no upstream schema
+/// Four faults, all decidable from the Output node alone — no upstream schema
 /// needed, which is why they live here rather than in the bind walk:
 ///
 /// * the superseded map form. `mapping:` was a YAML map of column name to
-///   column name; it is a sequence now. The rejection echoes the author's own
-///   pairs back in the sequence form so the fix is a paste.
+///   column name; it is a sequence now. The rejection rewrites the author's own
+///   pairs into the sequence form so the fix is a paste.
+/// * a block that declares no columns — an empty sequence or an empty map.
+///   Under `include_unmapped: false` that is a file with no columns at all, so
+///   it is malformed rather than a valid request for an empty file.
 /// * a repeated output name. A YAML map gave key uniqueness for free; a
 ///   sequence has to enforce it, and a writer cannot emit two columns under one
 ///   header.
-/// * a listed column this same output's `exclude:` removes. `exclude:` runs
-///   against the incoming column names before `mapping:` reads them, so the
-///   entry could only ever produce nothing.
+/// * a column this same output's `exclude:` removes, named on either side of an
+///   entry. `exclude:` runs against the incoming column names before `mapping:`
+///   reads them, so the entry could only ever produce nothing (source side) or
+///   the exclusion could never take effect (output side).
 ///
 /// Takes a node LIST rather than the pipeline, for the same reason the
 /// multi-value gates do: a composition body's nodes need the identical check
@@ -325,24 +389,47 @@ pub fn output_mapping_faults(
         };
         let out_name = header.name.as_str();
 
-        let legacy = mapping.legacy_map_form();
-        if !legacy.is_empty() {
-            // Echo the author's own pairs, unswapped. Under the contract the
-            // key is already the output name, so a block written against the
-            // documented direction lifts straight into the sequence; a block
-            // written against the old executor behaviour needs the sides
-            // swapped, which is why the help states the direction outright.
+        // Keyed off the SHAPE, not off the capture having content, so an empty
+        // map (`mapping: {}`) is recognised as the superseded form too instead
+        // of reading as a well-formed block that happens to declare nothing.
+        if mapping.is_map_form() {
+            let legacy = mapping.legacy_map_form();
+            // The pairs are SWAPPED into the new direction. The old executor
+            // looked entries up by the incoming field name, so the map's key
+            // was the SOURCE column — every block that actually renamed
+            // anything was source-on-left, and lifting it verbatim would invert
+            // it. The help names the one block this is wrong for: one written
+            // to the old documentation, which renamed nothing at all.
             let rewritten = legacy
                 .iter()
                 .map(|(k, v)| {
                     if k == v {
                         format!("    - {k}")
                     } else {
-                        format!("    - {k}: {v}")
+                        format!("    - {v}: {k}")
                     }
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
+            let help = if legacy.is_empty() {
+                "each item is a bare column name (carried through under its own name) or a \
+                 single `output_name: source_column` pair — the OUTPUT name is on the left, \
+                 and declaration order is the output column order. This block also names no \
+                 column at all; list the columns the file should carry:\n  mapping:\n    \
+                 - order_id\n    - sold_to: customer_id"
+                    .to_string()
+            } else {
+                format!(
+                    "each item is a bare column name (carried through under its own name) or a \
+                     single `output_name: source_column` pair — the OUTPUT name is on the left, \
+                     and declaration order is the output column order. Rewrite the block as:\n  \
+                     mapping:\n{rewritten}\n\nThe two sides of each pair are SWAPPED above, \
+                     deliberately: the engine read the map's key as the SOURCE column, so this \
+                     preserves what the pipeline actually wrote. If instead the block was \
+                     written to follow the old documentation — which described the opposite \
+                     direction and therefore renamed nothing — swap them back."
+                )
+            };
             faults.push(NodeFault {
                 node_index,
                 code: "E364",
@@ -350,31 +437,39 @@ pub fn output_mapping_faults(
                     "output '{out_name}': `mapping:` is a sequence of output columns, not a map \
                      of column name to column name"
                 ),
-                help: format!(
-                    "each item is a bare column name (carried through under its own name) or a \
-                     single `output_name: source_column` pair — the OUTPUT name is on the left, \
-                     and declaration order is the output column order. Rewrite the block as:\n  \
-                     mapping:\n{rewritten}"
-                ),
+                help,
             });
             // Every other check reads `entries`, which a captured map form
             // leaves empty; there is nothing further to say about this block.
             continue;
         }
 
+        if mapping.entries().is_empty() {
+            faults.push(NodeFault {
+                node_index,
+                code: "E364",
+                message: format!(
+                    "output '{out_name}': `mapping:` declares no columns, so it states that the \
+                     file carries none"
+                ),
+                help: "list the columns the file should carry, one item each — a bare column \
+                       name to carry it through, or an `output_name: source_column` pair to \
+                       rename it. To write every upstream column, remove the `mapping:` block \
+                       entirely rather than leaving it empty."
+                    .to_string(),
+            });
+            continue;
+        }
+
         let dups = mapping.duplicate_output_names();
         if !dups.is_empty() {
-            let listed = dups
-                .iter()
-                .map(|d| format!("'{d}'"))
-                .collect::<Vec<_>>()
-                .join(", ");
             faults.push(NodeFault {
                 node_index,
                 code: "E364",
                 message: format!(
                     "output '{out_name}': `mapping:` declares the output column(s) {listed} \
-                     more than once; a written file cannot carry two columns under one name"
+                     more than once; a written file cannot carry two columns under one name",
+                    listed = quoted(&dups),
                 ),
                 help: format!(
                     "keep one item per output column and delete the rest. To write one upstream \
@@ -386,30 +481,61 @@ pub fn output_mapping_faults(
         }
 
         if let Some(exclude) = output.exclude.as_ref() {
-            let clashes: Vec<&str> = mapping
+            let excluded = |n: &str| exclude.iter().any(|x| x == n);
+            let read_clashes: Vec<&str> = mapping
                 .entries()
                 .iter()
-                .filter(|e| exclude.iter().any(|x| x == &e.source))
                 .map(|e| e.source.as_str())
+                .filter(|s| excluded(s))
                 .collect();
-            if !clashes.is_empty() {
-                let listed = clashes
-                    .iter()
-                    .map(|c| format!("'{c}'"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
+            if !read_clashes.is_empty() {
                 faults.push(NodeFault {
                     node_index,
                     code: "E364",
                     message: format!(
                         "output '{out_name}': `mapping:` reads the column(s) {listed}, which this \
                          output's own `exclude:` removes first — the entries can never produce a \
-                         column"
+                         column",
+                        listed = quoted(&read_clashes),
                     ),
                     help: format!(
                         "drop {listed} from `exclude:` if the mapping should write it, or drop \
                          the mapping item if the column should not be written. `exclude:` names \
-                         incoming columns and runs before `mapping:` reads them"
+                         incoming columns and runs before `mapping:` reads them",
+                        listed = quoted(&read_clashes),
+                    ),
+                });
+            }
+            // The output side is the subtler half: `exclude: [sold_to]` against
+            // `- sold_to: customer_id` looks like it suppresses the column, but
+            // `exclude:` matches INCOMING names and runs before the rename, so
+            // `sold_to` does not exist yet when it is consulted and the column
+            // is written anyway. Report the name the author actually has to act
+            // on rather than letting the exclusion silently do nothing.
+            let write_clashes: Vec<&str> = mapping
+                .entries()
+                .iter()
+                .filter(|e| !e.is_passthrough())
+                .map(|e| e.output.as_str())
+                .filter(|o| excluded(o))
+                .collect();
+            if !write_clashes.is_empty() {
+                faults.push(NodeFault {
+                    node_index,
+                    code: "E364",
+                    message: format!(
+                        "output '{out_name}': `exclude:` names {listed}, which `mapping:` \
+                         produces as an OUTPUT column name — `exclude:` matches incoming column \
+                         names and runs before the rename, so it would not suppress it and the \
+                         column would be written anyway",
+                        listed = quoted(&write_clashes),
+                    ),
+                    help: format!(
+                        "to drop the column, delete its `mapping:` item instead. To exclude the \
+                         column it is renamed FROM, name the source column in `exclude:` — but \
+                         then the mapping item cannot resolve either, so delete it as well. \
+                         Remove {listed} from `exclude:` to keep writing it.",
+                        listed = quoted(&write_clashes),
                     ),
                 });
             }
@@ -532,24 +658,38 @@ mod tests {
                 .collect()
         }
 
-        fn output_with(mapping_block: &str, extra: &str) -> String {
+        /// `mapping_value` is spliced in directly after `mapping:`, so a caller
+        /// can write an inline `{}` / `[]` as well as an indented block.
+        fn output_with(mapping_value: &str, extra: &str) -> String {
             format!(
                 "  - type: source\n    name: src\n    config:\n      name: src\n      \
                  type: csv\n      path: in.csv\n      schema:\n        - {{ name: sku, \
                  type: string }}\n        - {{ name: qty, type: int }}\n  - type: output\n    \
                  name: out\n    input: src\n    config:\n      name: out\n      type: csv\n      \
-                 path: out.csv\n{extra}      mapping:\n{mapping_block}"
+                 path: out.csv\n{extra}      mapping:{mapping_value}"
             )
+        }
+
+        /// An indented block value, the ordinary shape.
+        fn block(lines: &str) -> String {
+            format!("\n{lines}")
         }
 
         #[test]
         fn map_form_is_rejected_with_the_sequence_form_spelled_out() {
-            let f = faults(&output_with("        sku: sku\n        item: qty\n", ""));
+            let f = faults(&output_with(
+                &block("        sku: sku\n        item: qty\n"),
+                "",
+            ));
             assert_eq!(f.len(), 1, "{f:?}");
             assert!(f[0].0.contains("not a map"), "{}", f[0].0);
+            // `item: qty` meant "rename the source column `item` to `qty`" — the
+            // engine looked entries up by the incoming field name. The sequence
+            // spelling of that is `- qty: item`; emitting `- item: qty` would
+            // hand back a block that inverts the rename.
             assert!(
-                f[0].1.contains("- sku\n") && f[0].1.contains("- item: qty"),
-                "help must echo the author's pairs in the sequence form, identity entries \
+                f[0].1.contains("- sku\n") && f[0].1.contains("- qty: item"),
+                "help must rewrite the pairs into the new direction, identity entries \
                  collapsed to a bare name: {}",
                 f[0].1
             );
@@ -560,9 +700,36 @@ mod tests {
             );
         }
 
+        /// An empty map is still the superseded shape — the gate keys off the
+        /// form, not off the capture having content, so it cannot slip through
+        /// as a well-formed block that happens to declare nothing.
+        #[test]
+        fn an_empty_map_is_rejected_as_the_map_form() {
+            let f = faults(&output_with(" {}\n", ""));
+            assert_eq!(f.len(), 1, "{f:?}");
+            assert!(f[0].0.contains("not a map"), "{}", f[0].0);
+            assert!(
+                f[0].1.contains("names no column"),
+                "help must also say the block declares nothing: {}",
+                f[0].1
+            );
+        }
+
+        /// An empty sequence declares no columns, which under
+        /// `include_unmapped: false` is a file with no columns at all.
+        #[test]
+        fn an_empty_sequence_is_rejected() {
+            let f = faults(&output_with(" []\n", ""));
+            assert_eq!(f.len(), 1, "{f:?}");
+            assert!(f[0].0.contains("declares no columns"), "{}", f[0].0);
+        }
+
         #[test]
         fn duplicate_output_name_is_rejected() {
-            let f = faults(&output_with("        - sku\n        - sku: qty\n", ""));
+            let f = faults(&output_with(
+                &block("        - sku\n        - sku: qty\n"),
+                "",
+            ));
             assert_eq!(f.len(), 1, "{f:?}");
             assert!(f[0].0.contains("'sku'"), "{}", f[0].0);
             assert!(f[0].0.contains("more than once"), "{}", f[0].0);
@@ -571,7 +738,7 @@ mod tests {
         #[test]
         fn a_mapping_item_excluded_by_the_same_output_is_rejected() {
             let f = faults(&output_with(
-                "        - sku\n        - amount: qty\n",
+                &block("        - sku\n        - amount: qty\n"),
                 "      exclude: [qty]\n",
             ));
             assert_eq!(f.len(), 1, "{f:?}");
@@ -579,9 +746,38 @@ mod tests {
             assert!(f[0].0.contains("exclude"), "{}", f[0].0);
         }
 
+        /// The output side of the same clash: `exclude:` matches incoming names
+        /// and runs before the rename, so excluding a produced name suppresses
+        /// nothing and the column is written regardless.
+        #[test]
+        fn excluding_a_mapping_output_name_is_rejected() {
+            let f = faults(&output_with(
+                &block("        - sku\n        - amount: qty\n"),
+                "      exclude: [amount]\n",
+            ));
+            assert_eq!(f.len(), 1, "{f:?}");
+            assert!(f[0].0.contains("'amount'"), "{}", f[0].0);
+            assert!(f[0].0.contains("before the rename"), "{}", f[0].0);
+        }
+
+        /// A passthrough entry names one column on both sides, so excluding it
+        /// is the source-side clash and must be reported once, not twice.
+        #[test]
+        fn excluding_a_passthrough_entry_reports_the_source_side_only() {
+            let f = faults(&output_with(
+                &block("        - sku\n        - amount: qty\n"),
+                "      exclude: [sku]\n",
+            ));
+            assert_eq!(f.len(), 1, "{f:?}");
+            assert!(f[0].0.contains("removes first"), "{}", f[0].0);
+        }
+
         #[test]
         fn a_well_formed_sequence_produces_no_fault() {
-            let f = faults(&output_with("        - sku\n        - amount: qty\n", ""));
+            let f = faults(&output_with(
+                &block("        - sku\n        - amount: qty\n"),
+                "",
+            ));
             assert!(f.is_empty(), "{f:?}");
         }
     }

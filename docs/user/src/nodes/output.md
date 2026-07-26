@@ -121,18 +121,40 @@ One upstream column may feed two output columns -- `- sku` and
 source side. Declaring the same *output* name twice is rejected (**E364**): a
 file cannot carry two columns under one header.
 
+For the same reason, an output name that `include_unmapped: true` would also
+carry through is rejected. If upstream already has a `sold_to` column, writing
+`- sold_to: customer_id` under `include_unmapped: true` would put two `sold_to`
+columns in the file and readers would resolve the wrong one. Rename the mapped
+column, exclude the upstream one, or set `include_unmapped: false`.
+
 #### Diagnostics
 
 A `mapping:` item naming a column that does not exist at that point in the
 pipeline is rejected at compile time (**E365**), with the available column list
 and a `did you mean` when the name is a near miss. Nothing is renamed silently.
 
+Because `mapping:` *selects*, an item that resolves to nothing removes a column
+from the file rather than leaving it unrenamed -- so where the compiler cannot
+prove the column absent, the check runs again at the write boundary, once per
+output, before the first byte. That covers a mapping inside a composition body
+and a column arriving through the `auto_widen` sidecar. Both surface as
+**E365**.
+
+A column absent from the source's `schema:` reaches the sink only through the
+`auto_widen` sidecar, which is expanded to top-level columns only under
+`include_unmapped: true`. A `mapping:` item may name such a column when that
+flag is set; under `include_unmapped: false` it cannot resolve and is rejected.
+
+An empty block -- `mapping: {}` or `mapping: []` -- is rejected (**E364**): it
+declares an output with no columns. To write every upstream column, remove the
+`mapping:` key rather than emptying it.
+
 Writing the block as a YAML map instead of a sequence is rejected (**E364**);
 the message prints your own block already rewritten. Run `clinker explain E364`
-for the migration, including the direction change -- releases before this one
-documented `output_name: source_field` but implemented the reverse, so a block
-written against the old *behaviour* needs its two sides swapped as well as
-lifted into a sequence.
+for the migration, and read the direction note there before pasting: releases
+before this one documented `output_name: source_field` but *executed* the
+reverse, so the rewrite swaps each pair's two sides to preserve what the
+pipeline was actually writing.
 
 ### Excluding fields
 
@@ -433,12 +455,16 @@ This is automatic — there is no setting to enable it. It applies only to this 
     name: department_reports
     type: csv
     path: "./output/employees.csv"
+    # `include_unmapped: false` makes the mapping the whole output: these four
+    # columns, in this order, and nothing else. Without it every unlisted
+    # upstream column would still be appended after them, and an `exclude:`
+    # would be needed to keep any of them out.
+    include_unmapped: false
     mapping:
       - "Employee ID": employee_id
       - "Full Name": display_name
       - department
       - "Annual Salary": salary
-    exclude: [internal_flags]
     include_header: true
     sort_order:
       - { field: "department", order: asc }

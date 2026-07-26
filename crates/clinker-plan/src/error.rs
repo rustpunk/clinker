@@ -324,6 +324,26 @@ pub enum PipelineError {
         observed_count: u64,
         total_count: u64,
     },
+    /// E365 (write-boundary surface) — an Output's `mapping:` declared a
+    /// column the stream does not supply, so the established output schema is
+    /// missing the column that entry would have written.
+    ///
+    /// The compile-time half of E365 answers this wherever the planner can
+    /// enumerate the upstream column set. This is the half for where it
+    /// cannot: inside a composition body, whose rows are open by construction
+    /// and whose open tail may legitimately supply anything, and for columns
+    /// that reach the sink only through the `auto_widen` sidecar. Raised once
+    /// per output stream at schema establishment, never per record.
+    ///
+    /// Always aborts. `mapping:` selects, so an unresolved entry deletes a
+    /// column from the written file rather than leaving it unrenamed.
+    OutputMappingColumnMissing {
+        output: String,
+        /// The source columns the unresolved entries read.
+        columns: Vec<String>,
+        /// The column names the established output schema does carry.
+        available: Vec<String>,
+    },
     /// A chunk-boundary shutdown poll tripped (SIGINT/SIGTERM or a
     /// programmatic shutdown request from the execution layer).
     /// The dispatch unwinds so the executor can drop senders, join worker
@@ -635,6 +655,34 @@ impl fmt::Display for PipelineError {
                      max_rate {max_rate:.4} ({observed_count}/{total_count} records)"
                 ),
             },
+            Self::OutputMappingColumnMissing {
+                output,
+                columns,
+                available,
+            } => {
+                let missing = columns
+                    .iter()
+                    .map(|c| format!("'{c}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let have = if available.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    available
+                        .iter()
+                        .map(|c| format!("'{c}'"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                write!(
+                    f,
+                    "E365 output '{output}': `mapping:` reads column(s) {missing}, which the \
+                     records reaching this output do not carry, so the declared column(s) were \
+                     not written. Columns actually present: {have}. `mapping:` selects the \
+                     output columns, so an entry that resolves to nothing drops a column from \
+                     the file — correct the column name, or remove the item"
+                )
+            }
             Self::Interrupted => write!(f, "pipeline interrupted by shutdown signal"),
         }
     }

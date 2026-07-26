@@ -58,16 +58,45 @@ Migration, both mechanical:
 
 - Put `- ` in front of each line. A pair whose two sides are the same column
   collapses to a bare name.
-- If your block was written against the old *behaviour* (source column on the
-  left), swap the two sides. A block written against the old *documentation*
-  lifts unchanged.
+- **Swap the two sides of each remaining pair.** The engine looked map entries
+  up by the incoming field name, so the key was the *source* column:
+  `customer_id: sold_to` renamed `customer_id` to `sold_to`, which is now
+  `- sold_to: customer_id`.
 
 A map-valued `mapping:` is rejected at compile time with **E364**, and the
-message prints your own block already rewritten. Two silent failure modes are
-now compile errors as well: a repeated output name (**E364**), and an item
-naming a column that does not exist at that point in the pipeline (**E365**,
-with the available column list and a `did you mean`). Run `clinker explain E364`
-or `clinker explain E365` for the full pages.
+message prints your own block already converted — lifted, collapsed, and with
+each pair swapped as above. The one block that swap is wrong for is one written
+to follow the *old documentation*, which described the opposite direction: such
+a block matched no incoming field and so renamed nothing at all, and the
+diagnostic says so. It has no behaviour to preserve — swap those pairs back to
+what you originally meant.
+
+`mapping:` is now a column **selection**, not a rename overlay, so an item that
+resolves to nothing removes a column from the file rather than leaving it
+unrenamed. Five silent outcomes are therefore compile errors:
+
+- a repeated output name (**E364**);
+- an empty block, `mapping: {}` or `mapping: []` (**E364**) — it declares an
+  output with no columns; remove the key to write every upstream column;
+- an output name that `include_unmapped: true` would also carry through
+  (**E364**) — the file would carry the column twice and readers would resolve
+  the passthrough copy, losing the renamed value;
+- `exclude:` naming a column the mapping *produces* (**E364**) — `exclude:`
+  matches incoming names and runs before the rename, so it suppressed nothing;
+- an item naming a column that does not exist at that point in the pipeline
+  (**E365**, with the available column list and a `did you mean`).
+
+Where the compiler cannot prove a column absent — inside a composition body, or
+for a column arriving through the `auto_widen` sidecar — **E365** is raised at
+the write boundary instead, once per output, before the first byte is written.
+
+A `mapping:` item may name an `auto_widen` drift column when the output sets
+`include_unmapped: true`, which is what expands the sidecar to top-level
+columns; under `include_unmapped: false` the sidecar stays packed and the item
+is rejected. Column names in `mapping:` are matched bare — there is no qualified
+`input.column` spelling.
+
+Run `clinker explain E364` or `clinker explain E365` for the full pages.
 
 ### Removed — the `best_effort` error strategy
 

@@ -363,6 +363,12 @@ pub(crate) fn dispatch_output(
         };
         Arc::clone(projected.schema())
     };
+    // Write-boundary E365, checked here as well as in `build_format_writer`
+    // because this arm establishes its schema BEFORE it looks for a writer —
+    // so a dry-run, or an Output whose writer a sibling already took, still
+    // reports a `mapping:` entry the stream cannot supply instead of silently
+    // reporting what it "would" have written.
+    crate::projection::check_mapping_against_schema(&output_schema, out_cfg, name)?;
 
     // Find and take the writer for this output. Errors from
     // build_format_writer / write_record / flush are captured

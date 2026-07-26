@@ -14,6 +14,13 @@ use crate::config::{CompileContext, parse_config};
 
 /// A source declaring `first_name` / `last_name` / `department`, feeding one
 /// CSV output whose `config:` carries the spliced-in lines.
+///
+/// `on_unmapped: drop` is deliberate. The engine-wide default is `auto_widen`,
+/// which reserves the `$widened` sidecar and — under `include_unmapped: true` —
+/// can legitimately supply a column the declared schema does not name, so E365
+/// stands down there (see [`auto_widen_under_include_unmapped_suppresses_e365`]).
+/// These fixtures want the gate live, so they use a source policy that cannot
+/// carry an undeclared column.
 fn pipeline(output_extra: &str) -> String {
     format!(
         r#"
@@ -26,6 +33,8 @@ nodes:
       name: people
       type: csv
       path: ./people.csv
+      on_unmapped:
+        mode: drop
       schema:
         - {{ name: first_name, type: string }}
         - {{ name: last_name, type: string }}
@@ -73,16 +82,52 @@ fn map_form_is_rejected_with_the_authors_own_block_rewritten() {
         d.message
     );
     let help = d.help.as_deref().unwrap_or_default();
+    // The pairs come back SWAPPED. The engine looked map entries up by the
+    // incoming field name, so `surname: last_name` renamed the SOURCE column
+    // `surname` to `last_name`; the sequence form spells that
+    // `- last_name: surname`. Emitting `- surname: last_name` would hand the
+    // author a block that inverts the rename their pipeline was performing.
     assert!(
-        help.contains("- first_name\n") && help.contains("- surname: last_name"),
-        "help must echo the block in the sequence form, identity entries collapsed \
-         to a bare name: {help}"
+        help.contains("- first_name\n") && help.contains("- last_name: surname"),
+        "help must rewrite the block into the sequence form with each pair swapped \
+         into the new direction, identity entries collapsed to a bare name: {help}"
+    );
+    assert!(
+        !help.contains("- surname: last_name"),
+        "the unswapped pair would invert the rename the pipeline was performing: {help}"
     );
     assert!(
         help.contains("OUTPUT name is on the left"),
         "help must state the pair direction, since the map form was documented one way \
          round and implemented the other: {help}"
     );
+    assert!(
+        help.contains("SWAPPED") && help.contains("old documentation"),
+        "help must say the swap is deliberate and name the one block it is wrong for — \
+         one written to the old documentation, which renamed nothing: {help}"
+    );
+}
+
+/// An empty block passes every content-based check — no legacy pairs, no
+/// duplicates, no exclude clash — but under `include_unmapped: false` it states
+/// that the file carries no columns at all, which is a header line and one blank
+/// row per record. Both spellings are rejected.
+#[test]
+fn an_empty_mapping_is_rejected() {
+    for block in ["      mapping: {}\n", "      mapping: []\n"] {
+        let diags = compile_err(&pipeline(block));
+        let d = only(&diags, "E364");
+        assert!(
+            d.message.contains("mapping:"),
+            "message must name the block: {}",
+            d.message
+        );
+        let help = d.help.as_deref().unwrap_or_default();
+        assert!(
+            help.contains("remove the `mapping:` block") || help.contains("list the columns"),
+            "help must say what to write instead: {help}"
+        );
+    }
 }
 
 /// A YAML map gave output-name uniqueness for free. The sequence has to enforce
@@ -108,6 +153,22 @@ fn a_mapping_entry_the_same_output_excludes_is_rejected() {
     let d = only(&diags, "E364");
     assert!(d.message.contains("'last_name'"), "{}", d.message);
     assert!(d.message.contains("exclude"), "{}", d.message);
+}
+
+/// `exclude:` matches INCOMING names and runs before the rename, so excluding a
+/// mapping's OUTPUT name suppresses nothing and the column is written anyway.
+#[test]
+fn excluding_a_mapping_output_name_is_rejected() {
+    let diags = compile_err(&pipeline(
+        "      exclude: [surname]\n      mapping:\n        - surname: last_name\n",
+    ));
+    let d = only(&diags, "E364");
+    assert!(d.message.contains("'surname'"), "{}", d.message);
+    assert!(
+        d.message.contains("before the rename"),
+        "message must name the ordering that makes the exclusion inert: {}",
+        d.message
+    );
 }
 
 /// The headline defect: a column name that matches nothing. It used to rename
@@ -183,4 +244,114 @@ fn one_source_column_feeding_two_output_columns_compiles() {
     config
         .compile(&CompileContext::default())
         .expect("two output columns may read one source column");
+}
+
+/// A renamed column landing on a name `include_unmapped` also carries through
+/// would put two same-named columns on one schema. The schema's name index is
+/// last-write-wins, so the passthrough column would answer for the renamed one
+/// and serve its value under the renamed header — the rename silently lost.
+#[test]
+fn an_output_name_colliding_with_a_passthrough_column_is_rejected() {
+    let diags = compile_err(&pipeline(
+        "      include_unmapped: true\n      mapping:\n        - department: first_name\n",
+    ));
+    let d = only(&diags, "E364");
+    assert!(d.message.contains("'department'"), "{}", d.message);
+    assert!(
+        d.message.contains("two"),
+        "message must say the file would carry the column twice: {}",
+        d.message
+    );
+    let help = d.help.as_deref().unwrap_or_default();
+    assert!(
+        help.contains("exclude:") && help.contains("include_unmapped: false"),
+        "help must offer both ways out: {help}"
+    );
+}
+
+/// The same collision is fine under `include_unmapped: false` — nothing is
+/// appended, so nothing can collide.
+#[test]
+fn an_output_name_matching_an_unlisted_column_is_fine_when_nothing_is_appended() {
+    let yaml = pipeline(
+        "      include_unmapped: false\n      mapping:\n        - department: first_name\n",
+    );
+    let config = parse_config(&yaml).expect("pipeline parses");
+    config
+        .compile(&CompileContext::default())
+        .expect("with no passthrough columns there is nothing to collide with");
+}
+
+/// An `auto_widen` source can carry a column its declared schema does not name,
+/// and `include_unmapped: true` expands the sidecar into the field map BEFORE
+/// the mapping reads it — so the column is genuinely reachable and E365 must
+/// stand down. Rejecting it would break a pipeline that worked, and the only
+/// remedy the diagnostic could offer (declare the column) defeats auto-widen.
+#[test]
+fn auto_widen_under_include_unmapped_suppresses_e365() {
+    let yaml = r#"
+pipeline:
+  name: output_mapping_widen
+nodes:
+  - type: source
+    name: people
+    config:
+      name: people
+      type: csv
+      path: ./people.csv
+      schema:
+        - { name: first_name, type: string }
+  - type: output
+    name: out
+    input: people
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+      mapping:
+        - nickname: drifted_column
+"#;
+    let config = parse_config(yaml).expect("pipeline parses");
+    config
+        .compile(&CompileContext::default())
+        .expect("a sidecar-reserving row may supply an undeclared column");
+}
+
+/// The relaxation is conditioned on expansion actually happening. Under
+/// `include_unmapped: false` the sidecar stays packed, so the same mapping
+/// cannot resolve and E365 still applies.
+#[test]
+fn auto_widen_without_include_unmapped_still_fires_e365() {
+    let yaml = r#"
+pipeline:
+  name: output_mapping_widen_packed
+nodes:
+  - type: source
+    name: people
+    config:
+      name: people
+      type: csv
+      path: ./people.csv
+      schema:
+        - { name: first_name, type: string }
+  - type: output
+    name: out
+    input: people
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: false
+      mapping:
+        - nickname: drifted_column
+"#;
+    let diags = compile_err(yaml);
+    let d = only(&diags, "E365");
+    assert!(d.message.contains("'drifted_column'"), "{}", d.message);
+    let help = d.help.as_deref().unwrap_or_default();
+    assert!(
+        help.contains("include_unmapped: true"),
+        "help must name the flag that would make the sidecar column reachable: {help}"
+    );
 }
