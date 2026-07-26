@@ -9,6 +9,7 @@ pub mod fs_type;
 pub mod multi_value;
 pub mod node_header;
 pub mod output;
+pub mod output_mapping;
 pub mod patch;
 pub mod path_template;
 pub mod pipeline;
@@ -41,6 +42,7 @@ pub use format::*;
 pub use fs_type::{FsKind, case_sensitive_dir, classify, collision_key, same_device};
 pub use node_header::{MergeHeader, NodeHeader, NodeInput, SourceHeader};
 pub use output::*;
+pub use output_mapping::{MappingEntry, OutputMapping};
 pub use patch::{
     BodySourcePatchMap, ColumnPatch, DiscriminatorPatch, EnvelopeFieldOp, NestedSectionOp,
     RecordTypeAdd, RecordTypeOp, RecordTypePatch, SchemaColumnOp, SourceConfigPatch, SplitFieldOp,

@@ -261,7 +261,7 @@ nodes:
     exclude:
     - internal_id
     mapping:
-      full_name: employee_name
+    - employee_name: full_name
 "#;
         let csv = "first_name,last_name,department,internal_id\n\
                     Alice,Smith,Engineering,12345\n\
@@ -322,6 +322,158 @@ nodes:
 
         let records: Vec<csv::StringRecord> = reader.records().map(|r| r.unwrap()).collect();
         assert_eq!(records.len(), 3);
+    }
+
+    /// The written header line for a `mapping:` block, asserted as a whole
+    /// rather than by `contains`. Column order is the block's declaration
+    /// order, deliberately different from the upstream column order, and the
+    /// one rename is spelled `output_name: source_column`.
+    fn mapping_header(mapping_block: &str, include_unmapped: bool) -> String {
+        let yaml = format!(
+            r#"
+pipeline:
+  name: mapping_header
+nodes:
+- type: source
+  name: employees
+  config:
+    name: employees
+    type: csv
+    path: test.csv
+    options:
+      has_header: true
+    schema:
+    - {{ name: first_name, type: string }}
+    - {{ name: last_name, type: string }}
+    - {{ name: department, type: string }}
+- type: output
+  name: out
+  input: employees
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: {include_unmapped}
+    mapping:
+{mapping_block}
+"#
+        );
+        let csv = "first_name,last_name,department\nAlice,Smith,Engineering\n";
+        let (_, _, output) = run_pipeline(&yaml, csv).expect("pipeline must run");
+        output
+            .lines()
+            .next()
+            .expect("output must carry a header")
+            .to_string()
+    }
+
+    /// Declaration order is the output column order — including when it
+    /// disagrees with the order the columns arrive in.
+    #[test]
+    fn mapping_declaration_order_is_the_output_column_order() {
+        let header = mapping_header(
+            "    - department\n    - surname: last_name\n    - first_name\n",
+            false,
+        );
+        assert_eq!(header, "department,surname,first_name");
+    }
+
+    /// `include_unmapped: false` against a partial mapping: only the listed
+    /// columns are written.
+    #[test]
+    fn mapping_without_include_unmapped_writes_only_the_listed_columns() {
+        let header = mapping_header("    - surname: last_name\n", false);
+        assert_eq!(header, "surname");
+    }
+
+    /// `include_unmapped: true` against the same partial mapping: the listed
+    /// column comes first, then everything the block did not claim, in its
+    /// existing relative order.
+    #[test]
+    fn mapping_with_include_unmapped_appends_the_unlisted_columns() {
+        let header = mapping_header("    - surname: last_name\n", true);
+        assert_eq!(header, "surname,first_name,department");
+    }
+
+    /// One upstream column may feed two output columns. Uniqueness is required
+    /// on the output side, which the map form could not express in this
+    /// direction at all.
+    #[test]
+    fn one_source_column_may_be_written_twice_under_two_names() {
+        let header = mapping_header("    - department\n    - dept: department\n", false);
+        assert_eq!(header, "department,dept");
+    }
+
+    /// The shape the sequence form exists for: a wide output that renames one
+    /// column. Twelve bare scalars and one pair, and the rename is the only
+    /// item carrying a colon.
+    #[test]
+    fn a_wide_mapping_renaming_one_column_writes_the_declared_header() {
+        let columns = [
+            "order_id",
+            "order_date",
+            "customer_id",
+            "channel",
+            "sku",
+            "quantity",
+            "unit_price",
+            "discount_pct",
+            "gross_amount",
+            "line_total",
+            "ship_country",
+            "status",
+        ];
+        let schema: String = columns
+            .iter()
+            .map(|c| format!("    - {{ name: {c}, type: string }}\n"))
+            .collect();
+        // Identity for every column but `customer_id`, which is written as
+        // `sold_to`. Declared in upstream order so the assertion isolates the
+        // rename rather than re-testing reordering.
+        let mapping: String = columns
+            .iter()
+            .map(|c| {
+                if *c == "customer_id" {
+                    "    - sold_to: customer_id\n".to_string()
+                } else {
+                    format!("    - {c}\n")
+                }
+            })
+            .collect();
+        let yaml = format!(
+            r#"
+pipeline:
+  name: wide_mapping
+nodes:
+- type: source
+  name: orders
+  config:
+    name: orders
+    type: csv
+    path: test.csv
+    options:
+      has_header: true
+    schema:
+{schema}- type: output
+  name: out
+  input: orders
+  config:
+    name: out
+    type: csv
+    path: output.csv
+    include_unmapped: false
+    mapping:
+{mapping}"#
+        );
+        let header_row = columns.join(",");
+        let csv = format!("{header_row}\n{}\n", vec!["x"; columns.len()].join(","));
+
+        let (_, _, output) = run_pipeline(&yaml, &csv).expect("pipeline must run");
+        assert_eq!(
+            output.lines().next().expect("header"),
+            "order_id,order_date,sold_to,channel,sku,quantity,unit_price,discount_pct,\
+             gross_amount,line_total,ship_country,status"
+        );
     }
 
     // ── Phase 8 Task 8.4 exit code gate tests ─────────────────

@@ -1401,6 +1401,98 @@ pub(crate) fn validate_output_path_collisions(
     }
 }
 
+/// **E365** — an Output's `mapping:` reads a column the graph does not supply
+/// at that point.
+///
+/// The output schema is known at plan time, so a stale or mistyped column name
+/// is answerable here with a span instead of by reading the written file and
+/// noticing a header that is not the one the block declared.
+///
+/// Runs only against a **closed** row. An open row is the composition-port
+/// case: the caller's extra columns bind to the row variable and flow through,
+/// so a name missing from `declared` there is not evidence the column is
+/// absent at run time. Reporting it would reject a body that is correct for
+/// every caller.
+///
+/// A column that reaches the sink only through the `auto_widen` sidecar is
+/// undeclared by construction and so is reported. That matches the rest of the
+/// surface — CXL cannot name an undeclared column either — and the help says
+/// how to make it nameable.
+fn validate_output_mapping_columns(
+    node_name: &str,
+    output: &crate::config::OutputConfig,
+    upstream: &Row,
+    span: Span,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let Some(mapping) = output.mapping.as_ref() else {
+        return;
+    };
+    if !matches!(upstream.tail, cxl::typecheck::RowTail::Closed) {
+        return;
+    }
+    // Match on the bare name, and also accept the `qualifier.name` spelling a
+    // combine merged row carries — `has_field` answers `false` for a name two
+    // combine inputs both declare, and an ambiguous column is present, not
+    // missing.
+    let is_available = |wanted: &str| {
+        upstream
+            .fields()
+            .any(|(qf, _)| qf.name.as_ref() == wanted || qf.to_string() == wanted)
+    };
+    let mut missing: Vec<&str> = Vec::new();
+    for entry in mapping.entries() {
+        let source = entry.source.as_str();
+        if !is_available(source) && !missing.contains(&source) {
+            missing.push(source);
+        }
+    }
+    if missing.is_empty() {
+        return;
+    }
+    // Suggest only author-facing columns: the engine-stamped namespaces
+    // (`$widened`, `$source.*`, `$ck.*`) are not names a pipeline author types.
+    let candidates: Vec<String> = upstream
+        .fields()
+        .map(|(qf, _)| qf.to_string())
+        .filter(|n| !n.starts_with('$'))
+        .collect();
+    let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    let available = if candidate_refs.is_empty() {
+        "(none)".to_string()
+    } else {
+        candidate_refs
+            .iter()
+            .map(|c| format!("'{c}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    for name in missing {
+        let help = match cxl::resolve::levenshtein::best_match(name, &candidate_refs, 3) {
+            Some(near) => format!(
+                "did you mean `- <output_name>: {near}`? Columns available at output \
+                 {node_name:?}: {available}"
+            ),
+            None => format!(
+                "columns available at output {node_name:?}: {available}. If '{name}' reaches \
+                 the sink only through `on_unmapped: auto_widen`, declare it in the source's \
+                 `schema:` block so the rest of the pipeline can name it too"
+            ),
+        };
+        diags.push(
+            Diagnostic::error(
+                "E365",
+                format!(
+                    "output {node_name:?}: `mapping:` reads column '{name}', which does not \
+                     exist at this point in the pipeline"
+                ),
+                LabeledSpan::primary(span, String::new()),
+            )
+            .with_help(help),
+        );
+    }
+}
+
 fn synthetic_typed_program(output_row: Row) -> TypedProgram {
     TypedProgram {
         program: cxl::ast::Program {
@@ -2546,9 +2638,10 @@ fn bind_schema_inner(
                     artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
                 }
             }
-            PipelineNode::Output { header, .. } => {
+            PipelineNode::Output { header, config } => {
                 if let Some(upstream) = upstream_schema(&header.input.value, schema_by_name) {
                     let row = upstream.clone();
+                    validate_output_mapping_columns(&name, &config.output, &row, span, diags);
                     schema_by_name.insert(name.clone(), row.clone());
                     artifacts.typed_insert(node_id, Arc::new(synthetic_typed_program(row)));
                 }
@@ -3065,6 +3158,9 @@ fn bind_composition(
                 &body_file.nodes,
             ))
             .chain(crate::config::record_path::record_path_faults(
+                &body_file.nodes,
+            ))
+            .chain(crate::config::output_mapping::output_mapping_faults(
                 &body_file.nodes,
             ));
         let mut has_node_config_violation = false;

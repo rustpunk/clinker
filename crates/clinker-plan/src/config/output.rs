@@ -3,7 +3,6 @@
 use super::*;
 use clinker_format::JoinValues;
 use clinker_record::schema_def::LineSeparator;
-use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 /// Output destination configuration.
@@ -21,8 +20,14 @@ pub struct OutputConfig {
     pub include_unmapped: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include_header: Option<bool>,
+    /// Ordered declaration of the columns this output writes: which columns,
+    /// under which names, in which order. Each item is a bare column name
+    /// (carried through unchanged) or a single `output_name: source_column`
+    /// pair. Declaration order is output column order; columns the block does
+    /// not list are appended after it when `include_unmapped` is `true` and
+    /// dropped when it is `false`. See [`OutputMapping`].
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub mapping: Option<IndexMap<String, String>>,
+    pub mapping: Option<OutputMapping>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exclude: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]

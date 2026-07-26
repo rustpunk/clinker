@@ -28,7 +28,9 @@ pub fn apply_aliases(emitted: &mut IndexMap<String, Value>, aliases: &HashMap<St
 ///    add all input record fields not already emitted (the path that
 ///    surfaces `OnUnmapped::AutoWiden`-discovered columns at the sink).
 /// 2. **Exclude**: Remove any field in `exclude` list (by current name).
-/// 3. **Mapping**: Rename surviving fields per `mapping` table.
+/// 3. **Mapping**: Emit the columns `mapping` lists, in declaration
+///    order, under their declared output names; append whatever the
+///    block did not list when `include_unmapped` is set.
 pub fn project_output(
     input_record: &Record,
     emitted: &IndexMap<String, Value>,
@@ -68,12 +70,19 @@ pub fn project_output_with_meta(
 /// Output projection semantic. When `cxl_emit_names` is `None` (caller
 /// has no upstream PlanNode handle), all upstream columns survive — the
 /// permissive fallback used by tests and ad-hoc projections.
+///
+/// A declared `mapping:` overrides the `cxl_emit_names` restriction for
+/// the columns it lists: the block is the author's own statement of
+/// which columns the file carries, so a listed column is emitted whether
+/// or not the upstream transform named it in an `emit`. `include_unmapped`
+/// still governs everything the block does not list.
 pub fn project_output_from_record(
     input_record: &Record,
     config: &OutputConfig,
     cxl_emit_names: Option<&[String]>,
 ) -> Record {
-    let drop_unmapped = !config.include_unmapped && cxl_emit_names.is_some();
+    let drop_unmapped =
+        !config.include_unmapped && cxl_emit_names.is_some() && config.mapping.is_none();
     let needs_rewrite = config.exclude.is_some()
         || config.mapping.is_some()
         || config.include_unmapped
@@ -175,21 +184,68 @@ pub fn project_output_from_record(
         }
     }
 
-    if let Some(ref mapping) = config.mapping {
-        let mut renamed = IndexMap::with_capacity(fields.len());
-        for (name, value) in fields {
-            let output_name = mapping.get(&name).cloned().unwrap_or(name);
-            renamed.insert(output_name, value);
+    // `mapping:` is the ordered declaration of the columns this output
+    // carries: listed columns first, in declaration order, under their
+    // declared names, then — when `include_unmapped` is set — everything
+    // the block did not claim, in its existing relative order.
+    //
+    // Per-record cost: one probe per listed column plus one
+    // `claims_source` probe per surviving column. The claimed-source set
+    // is resolved once when the config is parsed, so nothing here
+    // allocates per record beyond the output record itself; the previous
+    // rename pass allocated a whole second `IndexMap` on every record.
+    let (names, values): (Vec<Box<str>>, Vec<Value>) = match config.mapping.as_ref() {
+        Some(mapping) => {
+            let mut names: Vec<Box<str>> = Vec::with_capacity(mapping.entries().len());
+            let mut values: Vec<Value> = Vec::with_capacity(mapping.entries().len());
+            for entry in mapping.entries() {
+                // A listed column absent from this record is skipped rather
+                // than emitted empty. The plan-time E365 gate rejects a name
+                // the graph cannot supply, so what reaches here is a column
+                // that exists in the schema but not on this row.
+                if let Some(value) = fields.get(entry.source.as_str()) {
+                    names.push(Box::<str>::from(entry.output.as_str()));
+                    values.push(value.clone());
+                }
+            }
+            if config.include_unmapped {
+                for (name, value) in fields {
+                    if !mapping.claims_source(name.as_str()) {
+                        names.push(Box::<str>::from(name.as_str()));
+                        values.push(value);
+                    }
+                }
+            } else {
+                // `include_unmapped: false` drops the unlisted USER columns.
+                // The engine-stamped correlation shadows are governed by their
+                // own flag, so a mapping must not silently defeat an explicit
+                // `include_correlation_keys: true` — they are appended after
+                // the declared columns instead. A `$`-prefixed key can only be
+                // in `fields` because that flag admitted it: `$` is a reserved
+                // engine namespace no source column may claim, the `$widened`
+                // slot was removed above, and sidecar expansion (the other
+                // source of extra keys) runs only on the branch above.
+                for (name, value) in fields {
+                    if name.starts_with('$') && !mapping.claims_source(name.as_str()) {
+                        names.push(Box::<str>::from(name.as_str()));
+                        values.push(value);
+                    }
+                }
+            }
+            (names, values)
         }
-        fields = renamed;
-    }
+        None => {
+            let mut names: Vec<Box<str>> = Vec::with_capacity(fields.len());
+            let mut values: Vec<Value> = Vec::with_capacity(fields.len());
+            for (name, value) in fields {
+                names.push(Box::<str>::from(name.as_str()));
+                values.push(value);
+            }
+            (names, values)
+        }
+    };
 
-    let schema = fields
-        .keys()
-        .map(|k| Box::<str>::from(k.as_str()))
-        .collect::<SchemaBuilder>()
-        .build();
-    let values: Vec<Value> = fields.into_values().collect();
+    let schema = names.into_iter().collect::<SchemaBuilder>().build();
     let mut out = Record::new(schema, values);
     // Same document's row after the rename/exclude rewrite — carry the
     // envelope context forward so document-reconstructing writers still
@@ -259,6 +315,7 @@ fn round_declared_output_decimals(record: &mut Record, config: &OutputConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clinker_plan::config::{MappingEntry, OutputMapping};
     use clinker_record::Schema;
 
     fn make_input() -> Record {
@@ -361,13 +418,14 @@ mod tests {
         assert!(result.get("first_name").is_some());
     }
 
+    /// The direction contract: the pair is `output_name: source_column`, so
+    /// `given_name: first_name` reads `first_name` and writes `given_name`.
     #[test]
     fn test_mapping_renames() {
         let input = make_input();
         let emitted = IndexMap::new();
 
-        let mut mapping = IndexMap::new();
-        mapping.insert("first_name".to_string(), "given_name".to_string());
+        let mapping = OutputMapping::new(vec![MappingEntry::rename("given_name", "first_name")]);
 
         let config = OutputConfig {
             name: "out".into(),
@@ -512,19 +570,19 @@ mod tests {
             "sidecar payload must not be expanded — that is the include_unmapped flag"
         );
 
-        // Slow path: same flags, but force rewrite via mapping.
+        // Slow path: same flags, but force the rewrite with an `exclude:` of a
+        // column this record does not carry. A `mapping:` would force it too,
+        // but a mapping under `include_unmapped: false` emits only what it
+        // lists, which would conflate this test with the selection semantic it
+        // is not about.
         let config_slow = OutputConfig {
             name: "out".into(),
             format: clinker_plan::config::OutputFormat::Csv(None),
             path: "/tmp/out.csv".into(),
             include_unmapped: false,
             include_header: None,
-            mapping: Some({
-                let mut m = IndexMap::new();
-                m.insert("name".into(), "person".into());
-                m
-            }),
-            exclude: None,
+            mapping: None,
+            exclude: Some(vec!["not_on_this_record".to_string()]),
             sort_order: None,
             preserve_nulls: None,
             include_correlation_keys: true,
@@ -547,13 +605,37 @@ mod tests {
             .collect();
         assert_eq!(
             cols_slow,
-            vec!["id", "person", "$ck.id"],
+            vec!["id", "name", "$ck.id"],
             "slow path: include_correlation_keys must surface $ck.* but never $widened"
         );
         assert!(
             result_slow.get("$widened").is_none(),
             "slow path: $widened must not appear on the output schema"
         );
+
+        // A `mapping:` under `include_unmapped: false` selects the USER
+        // columns; it must not silently defeat an explicit
+        // `include_correlation_keys: true`. The shadows are appended after the
+        // declared columns, and `$widened` still never appears.
+        let mut config_mapped = config_slow.clone();
+        config_mapped.exclude = None;
+        config_mapped.mapping = Some(OutputMapping::new(vec![MappingEntry::rename(
+            "person", "name",
+        )]));
+        let result_mapped = project_output_from_record(&input, &config_mapped, None);
+        let cols_mapped: Vec<&str> = result_mapped
+            .schema()
+            .columns()
+            .iter()
+            .map(|c| &**c)
+            .collect();
+        assert_eq!(
+            cols_mapped,
+            vec!["person", "$ck.id"],
+            "a mapping selects the user columns; include_correlation_keys still governs \
+             the correlation shadows"
+        );
+        assert!(result_mapped.get("$widened").is_none());
     }
 
     /// `include_unmapped: true` expands the sidecar map even when
@@ -854,13 +936,13 @@ mod tests {
             .checked_div(Decimal::from(3))
             .expect("4 / 3");
         let input = one_field_record("raw_avg", Value::Decimal(quotient));
-        let mut mapping = IndexMap::new();
-        mapping.insert("raw_avg".to_string(), "average".to_string());
         let mut config = scale_config(Some(SourceSchema::Columns(vec![decimal_col(
             "average",
             Some(2),
         )])));
-        config.mapping = Some(mapping);
+        config.mapping = Some(OutputMapping::new(vec![MappingEntry::rename(
+            "average", "raw_avg",
+        )]));
         let out = project_output_from_record(&input, &config, None);
         assert!(out.get("raw_avg").is_none(), "field was renamed");
         assert_eq!(

@@ -260,8 +260,8 @@ nodes:
       path: out.csv
       include_unmapped: false
       mapping:
-        out_dept: dept_keep
-        out_total: running_total
+        - out_dept: dept_keep
+        - out_total: running_total
 "#;
     let plan = compile(yaml);
     let agg_idx = node_idx_for(&plan, "agg");

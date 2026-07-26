@@ -204,6 +204,8 @@ diagnostic_registry! {
     "E361", Error, "`multiple: true` column on a source whose format has no way to produce more than one value";
     "E362", Error, "Malformed `join_values:` output declaration (the write-side mirror of E358)";
     "E363", Error, "A source's `record_path` is not a path in its format's grammar — an XPath descendant step (`//`), a JSONPath root marker (`$.`), a leading `/`, an empty segment, or an XML segment no element can be named";
+    "E364", Error, "An Output `mapping:` block uses the superseded map form or declares a projection that cannot produce unique, meaningful columns";
+    "E365", Error, "An Output `mapping:` item reads a column the pipeline does not carry at that point in the graph";
     // ── Path security ───────────────────────────────────────────────────
     "E-SEC-001", Error, "Path security violation (escape, symlink, etc.)";
     // ── Warnings ────────────────────────────────────────────────────────
