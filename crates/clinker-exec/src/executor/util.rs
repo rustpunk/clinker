@@ -1,6 +1,7 @@
 //! Cross-cutting executor utilities: dispatch-order scheduling,
 //! record-schema reshaping, correlation-key copy, group-key diagnostic
-//! rendering, and small config/plan lookups shared across the dispatch arms.
+//! rendering, the shared grouped-node budget diagnostic, and small
+//! config/plan lookups shared across the dispatch arms.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -8,7 +9,9 @@ use std::sync::Arc;
 use clinker_record::{GroupByKey, Record, Schema, SchemaBuilder};
 use indexmap::IndexMap;
 
+use clinker_plan::BudgetCategory;
 use clinker_plan::config::PipelineConfig;
+use clinker_plan::error::PipelineError;
 
 /// Resolve a CSV `delimiter` / `quote_char` string to the single ASCII byte
 /// the byte-oriented CSV reader and writer accept.
@@ -432,10 +435,19 @@ fn format_group_key_part(k: &GroupByKey) -> String {
 /// values are rendered, not echoed: see [`format_group_key_part`] for where a
 /// rendered value can differ from the cell it came from.
 ///
+/// An empty `partition_by` is the degenerate correlation key: every record
+/// keys to the same empty tuple, so the node holds exactly one group spanning
+/// the whole input. That group renders as `[whole input]` — an empty bracket
+/// pair would name nothing, leaving the author with a diagnostic about a group
+/// they cannot identify.
+///
 /// Falls back to the bare key rendering when the field list and the key
 /// disagree on length, so a length mismatch degrades the diagnostic instead
 /// of losing it.
 pub(crate) fn format_partition_group(partition_by: &[String], key: &[GroupByKey]) -> String {
+    if partition_by.is_empty() && key.is_empty() {
+        return "[whole input]".to_string();
+    }
     if partition_by.len() != key.len() {
         return format_group_key(key);
     }
@@ -445,6 +457,163 @@ pub(crate) fn format_partition_group(partition_by: &[String], key: &[GroupByKey]
         .map(|(field, k)| format!("{field}={}", format_group_key_part(k)))
         .collect();
     format!("[{}]", parts.join(", "))
+}
+
+/// Which grouped node raised a giant-group `E310`.
+///
+/// Reshape and Cull hold structurally identical per-group buffers and fail the
+/// same way at finalize, so [`giant_group_error`] writes one message for both.
+/// The four things that genuinely differ between them ride on this enum rather
+/// than on two parallel builders — the duplication that arrangement replaces is
+/// exactly what let the two messages drift apart from each other.
+#[derive(Clone, Copy)]
+pub(crate) enum GroupedNodeKind {
+    Reshape,
+    Cull,
+}
+
+impl GroupedNodeKind {
+    /// Node name as the author knows it, used both to name the operator and to
+    /// attribute the write-every-column-through remark to it.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Reshape => "Reshape",
+            Self::Cull => "Cull",
+        }
+    }
+
+    /// Why this node needs the whole group resident at once. Reshape's reason
+    /// is the no-cascade contract (every rule observes one original snapshot);
+    /// Cull's is that `drop_group_when` is an aggregate over the whole group.
+    fn whole_group_clause(self) -> &'static str {
+        match self {
+            Self::Reshape => {
+                "Reshape applies its rules against the whole group at once (the no-cascade \
+                 contract)"
+            }
+            Self::Cull => {
+                "Cull evaluates its `drop_group_when` predicate against the whole group at once"
+            }
+        }
+    }
+
+    /// What else is resident at finalize besides the remaining groups, which is
+    /// why the reported figure is a floor rather than a sufficient budget. Cull
+    /// additionally holds its `O(distinct groups)` decision map.
+    fn co_resident_extra(self) -> &'static str {
+        match self {
+            Self::Reshape => "",
+            Self::Cull => " and its per-group decision map",
+        }
+    }
+
+    /// What re-keying `partition_by` costs. Never offered as a remedy — the
+    /// engine must not recommend a fix that changes the result set — but named
+    /// so an author who reaches for it knows what it does. Reshape's rules
+    /// would evaluate over a different group; Cull's predicate would count
+    /// different rows, routing records to the wrong output port.
+    fn rekey_consequence(self) -> &'static str {
+        match self {
+            Self::Reshape => "redefines the group the rules evaluate against and changes results",
+            Self::Cull => {
+                "changes what `drop_group_when` counts and changes which rows are removed"
+            }
+        }
+    }
+
+    /// What lands in the null group, enumerated because a `null`-keyed group is
+    /// the case most likely to be giant and an author who greps only for blanks
+    /// finds too few rows to explain the size and stops looking.
+    ///
+    /// The two enumerations differ because the keyings differ: Reshape's
+    /// `partition_key` folds every unkeyable value in, while Cull hard-errors
+    /// on a NaN, array, or map partition value rather than folding it.
+    fn null_group_note(self) -> &'static str {
+        match self {
+            Self::Reshape => {
+                " A `null` here is where this node puts every row whose partition value it cannot \
+                 use as a key: a missing column, an explicit null, an empty string, a NaN, or an \
+                 array- or map-valued cell. Any of those may be inflating this group."
+            }
+            Self::Cull => {
+                " A `null` here covers both an explicit null and a row missing the column \
+                 entirely, so either may be inflating this group."
+            }
+        }
+    }
+}
+
+/// Hard error (E310) for a single Reshape or Cull correlation group that
+/// exceeds the finalize memory budget.
+///
+/// This is a memory-budget condition, not an invariant violation: the engine is
+/// working exactly as designed and the author's data outgrew a configured
+/// ceiling. So it surfaces through the standard `MemoryBudgetExceeded`
+/// diagnostic every other budget overrun uses, naming the offending
+/// `partition_by` group so the author can find it in their input.
+///
+/// The remediation deliberately does NOT suggest a finer `partition_by`. That
+/// key defines the group the node's rules evaluate against, so narrowing it
+/// makes the run succeed by silently changing the answer — a suggestion the
+/// engine must never make. It is named only with its consequence attached.
+///
+/// Only one lever here leaves the output untouched: a larger budget. Dropping
+/// columns upstream also shrinks the group, but both nodes write every input
+/// column through, so every dropped column vanishes from what is written. The
+/// text offers it labelled with that consequence rather than as a free win.
+///
+/// `group_bytes` is this one group's reload footprint while `hard_limit` is the
+/// run-wide ceiling, so the two are not directly comparable as a target:
+/// finalize also holds the remaining groups. The wording says "clear of" rather
+/// than naming the group's own size as a sufficient budget.
+pub(crate) fn giant_group_error(
+    kind: GroupedNodeKind,
+    node_name: &str,
+    partition_by: &[String],
+    key: &[GroupByKey],
+    group_bytes: u64,
+    hard_limit: u64,
+) -> PipelineError {
+    let label = kind.label();
+    let group = format_partition_group(partition_by, key);
+    // With no `partition_by` fields there is no key to narrow, so the standard
+    // narrowing warning would advise editing something the author never wrote.
+    // Name the shape they did declare instead.
+    let rekey = if partition_by.is_empty() {
+        format!(
+            "`partition_by` is empty here, so every record forms this one group — there is no \
+             key to narrow. Declaring fields in `partition_by` would split it, but that {}.",
+            kind.rekey_consequence()
+        )
+    } else {
+        format!(
+            "Narrowing `partition_by` shrinks it as well, but it {}.",
+            kind.rekey_consequence()
+        )
+    };
+    let null_note = if key.iter().any(|k| matches!(k, GroupByKey::Null)) {
+        kind.null_group_note()
+    } else {
+        ""
+    };
+    PipelineError::MemoryBudgetExceeded {
+        node: node_name.to_string(),
+        used: group_bytes,
+        limit: hard_limit,
+        source: BudgetCategory::Arena,
+        detail: Some(format!(
+            "one {label} correlation group {group} does not fit; the reported use \
+             ({group_bytes} bytes) is that group's reload footprint alone. {}, so a single group \
+             must fit the budget even though cross-group and ingest-time peaks spill to disk. \
+             Raising `memory.limit` clear of {group_bytes} bytes is the only fix that leaves your \
+             output unchanged — finalize also holds the run's remaining groups{}, so treat that \
+             figure as a floor. Dropping columns this node does not read, in an upstream \
+             Transform, also shrinks the group, but {label} writes every input column through, so \
+             those columns leave the output too. {rekey}{null_note}",
+            kind.whole_group_clause(),
+            kind.co_resident_extra(),
+        )),
+    }
 }
 
 #[cfg(test)]

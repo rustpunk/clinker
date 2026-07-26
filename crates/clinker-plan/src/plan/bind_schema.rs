@@ -1441,7 +1441,7 @@ struct ReshapeNodeBinding<'a> {
 ///
 /// Validation enforced here (structural checks use code E200; a rule
 /// expression's own CXL compilation uses E202/E203/E200 by failure class):
-/// - every `partition_by` field exists upstream;
+/// - every `partition_by` and `order_by` field exists upstream;
 /// - each rule's `when` predicate and every `set` / `overrides` value
 ///   expression typechecks against the upstream row;
 /// - `set` targets must already exist upstream (Reshape mutates, it does
@@ -1449,7 +1449,12 @@ struct ReshapeNodeBinding<'a> {
 ///   an engine-stamped `$`-namespaced column — group identity must
 ///   survive Reshape;
 /// - `copy_from: none` requires every upstream column to appear in
-///   `overrides`, so a synthesized row is never silently all-null.
+///   `overrides`, so a synthesized row is never silently all-null;
+/// - no rule fragment references `$doc` document context, which the
+///   per-group spill round-trip cannot preserve.
+///
+/// `partition_by` carries no arity rule: an empty list is the degenerate
+/// key every record shares, which groups the whole input at once.
 fn bind_reshape(
     node: &ReshapeNodeBinding<'_>,
     diags: &mut Vec<Diagnostic>,
@@ -1465,24 +1470,6 @@ fn bind_reshape(
         id,
     } = node;
     let mut ok = true;
-
-    // An empty `partition_by` has no correlation key, so every record forms
-    // one group. Rules would then observe the whole input as a single group,
-    // and a budget overrun could only name that group as `[]`.
-    if config.partition_by.is_empty() {
-        diags.push(
-            Diagnostic::error(
-                "E200",
-                format!("reshape {name:?}: partition_by must name at least one field"),
-                LabeledSpan::primary(span, String::new()),
-            )
-            .with_help(
-                "name the column that identifies one correlation group, for example \
-                 `partition_by: [employee_id]`",
-            ),
-        );
-        ok = false;
-    }
 
     // `partition_by` fields must exist upstream.
     for pk in &config.partition_by {
@@ -1819,6 +1806,9 @@ struct CullNodeBinding<'a> {
 /// - `removed_to` is non-empty and is not the node's own name (the main
 ///   output port), so the two output ports are distinguishable.
 ///
+/// `partition_by` carries no arity rule: an empty list is the degenerate
+/// key every record shares, which groups the whole input at once.
+///
 /// Cull does not widen: both the main and `removed_to` output ports carry
 /// the unchanged upstream row, so the bound output schema equals upstream.
 fn bind_cull(
@@ -1836,24 +1826,6 @@ fn bind_cull(
         id,
     } = node;
     let mut ok = true;
-
-    // An empty `partition_by` has no correlation key, so every record forms
-    // one group. `drop_group_when` would then decide the whole input at once,
-    // and a budget overrun could only name that group as `[]`.
-    if config.partition_by.is_empty() {
-        diags.push(
-            Diagnostic::error(
-                "E200",
-                format!("cull {name:?}: partition_by must name at least one field"),
-                LabeledSpan::primary(span, String::new()),
-            )
-            .with_help(
-                "name the column that identifies one correlation group, for example \
-                 `partition_by: [account]`",
-            ),
-        );
-        ok = false;
-    }
 
     // `partition_by` fields must exist upstream.
     for pk in &config.partition_by {

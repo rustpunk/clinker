@@ -419,6 +419,20 @@ impl fmt::Display for PipelineError {
                 ),
                 None => write!(f, "E310 {node}: {source} exceeded budget ({used}/{limit})"),
             },
+            // A zero ceiling is unsatisfiable for a different reason than a
+            // sub-baseline one, and its baseline figure may be unmeasured, so
+            // it carries its own wording rather than a comparison that could
+            // render as "0 bytes is below ... (0 bytes)".
+            Self::UnsatisfiableMemoryBudget { limit: 0, .. } => write!(
+                f,
+                "E312 memory.limit is 0 bytes, which leaves no budget for any pipeline \
+                 state — this process holds resident memory before the first record is \
+                 read, and none of it is clinker's to spill. A zero ceiling is not the \
+                 strictest budget but the absence of one, so it is rejected rather than \
+                 run. Set a real ceiling — memory: {{ limit: \"512M\" }} — or omit \
+                 memory.limit to take that same 512 MiB default. \
+                 See: clinker explain --code E312"
+            ),
             Self::UnsatisfiableMemoryBudget {
                 limit,
                 baseline_rss,

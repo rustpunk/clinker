@@ -127,6 +127,90 @@ nodes:
       path: audit.csv
 "#;
 
+/// Whole-input Cull: `partition_by: []` is the degenerate correlation key, so
+/// every record keys to the same empty tuple and `drop_group_when` decides the
+/// entire input at once — keep everything or remove everything.
+const WHOLE_INPUT_CULL_PIPELINE: &str = r#"
+pipeline:
+  name: cull_whole_input
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: test.csv
+      schema:
+        - { name: account, type: string }
+        - { name: amount, type: int }
+        - { name: status, type: string }
+  - type: cull
+    name: drop_bad
+    input: events
+    config:
+      partition_by: []
+      removed_to: removed
+      rules:
+        - name: drop_any_error
+          drop_group_when: "sum(if status == 'error' then 1 else 0) > 0"
+  - type: output
+    name: out
+    input: drop_bad
+    config:
+      name: out
+      type: csv
+      path: out.csv
+  - type: output
+    name: audit
+    input: drop_bad.removed
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#;
+
+#[test]
+fn empty_partition_by_decides_the_whole_input() {
+    // `partition_by: []` applies the removal rule across the entire dataset. It
+    // is a supported configuration, not a malformed one — a bind-time arity
+    // rule would delete the capability, so this pins the runtime behaviour end
+    // to end rather than only the compile.
+    //
+    // The same input under `partition_by: [account]` removes only account A
+    // (see `error_group_routed_to_removed_clean_group_to_main`). Under
+    // whole-input grouping the one error row condemns every record, including
+    // account B's — which is exactly what distinguishes the two shapes.
+    let csv = "account,amount,status\n\
+               A,100,ok\n\
+               A,200,error\n\
+               B,300,ok\n\
+               B,400,ok\n";
+    let out = run_cull(WHOLE_INPUT_CULL_PIPELINE, csv);
+
+    assert_eq!(out.dlq_count, 0, "removed rows are not DLQ entries");
+
+    let main_data: Vec<&str> = out.main.lines().skip(1).filter(|l| !l.is_empty()).collect();
+    assert!(
+        main_data.is_empty(),
+        "one whole-input group carrying an error routes every record away from main: {}",
+        out.main
+    );
+    let removed_data: Vec<&str> = out
+        .removed
+        .lines()
+        .skip(1)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(
+        removed_data,
+        vec!["A,100,ok", "A,200,error", "B,300,ok", "B,400,ok"],
+        "every record of the single whole-input group is removed: {}",
+        out.removed
+    );
+}
+
 #[test]
 fn error_group_routed_to_removed_clean_group_to_main() {
     // Account A has one `error` row → the whole A group is removed. Account B
@@ -630,7 +714,11 @@ fn cull_giant_group_exceeds_budget_fails_loud() {
             // consequence: this node writes every input column through, so
             // dropped columns leave the written output as well.
             assert!(
-                !detail.contains("upstream Transform") || detail.contains("leave the output too"),
+                detail.contains("upstream Transform"),
+                "the detail must offer the column-drop remedy: {detail}"
+            );
+            assert!(
+                detail.contains("leave the output too"),
                 "offering the column-drop remedy requires disclosing that it changes which \
                  columns are written: {detail}"
             );

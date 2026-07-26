@@ -60,8 +60,8 @@ pub(crate) use transform::{
 };
 use util::scheduled_pass_order;
 pub(crate) use util::{
-    build_arbitrator_from_config, copy_build_ck_columns, format_group_key, format_partition_group,
-    parse_memory_limit, record_with_emitted_fields, widen_record_to_schema,
+    GroupedNodeKind, build_arbitrator_from_config, copy_build_ck_columns, format_group_key,
+    giant_group_error, parse_memory_limit, record_with_emitted_fields, widen_record_to_schema,
 };
 
 use std::collections::{BTreeMap, HashMap, HashSet};

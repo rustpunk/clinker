@@ -55,13 +55,12 @@ use crate::executor::dispatch::{
     ExecutorContext, admit_node_buffer, drain_node_buffer_slot, node_buffer_spill_allowed,
     push_dlq, source_file_arc_of, source_name_arc_of, tee_emit_to_region_input_buffers,
 };
-use crate::executor::format_partition_group;
+use crate::executor::{GroupedNodeKind, giant_group_error};
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_core_types::dlq::{DlqErrorCategory, stage_reshape_mutation_conflict};
-use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{
     CopyFrom, RESHAPE_MUTATED_BY_COLUMN, RESHAPE_SYNTHESIZED_BY_COLUMN, RESHAPE_SYNTHETIC_COLUMN,
     ReshapeBody,
@@ -704,7 +703,8 @@ impl ReshapeGroupBuffer {
         // cannot be observed whole, so refuse it rather than OOM on reload.
         let group_bytes = (state.resident_bytes + state.spilled_bytes) as u64;
         if hard_limit > 0 && group_bytes > hard_limit {
-            return Err(reshape_giant_group_error(
+            return Err(giant_group_error(
+                GroupedNodeKind::Reshape,
                 node_name,
                 partition_by,
                 key,
@@ -807,72 +807,6 @@ fn reshape_spill_error(node_name: &str, e: clinker_plan::SpillError) -> Pipeline
         op: "reshape",
         node: node_name.to_string(),
         detail: format!("group-buffer spill failed: {e}"),
-    }
-}
-
-/// Hard error (E310) for a single correlation group that exceeds the finalize
-/// memory budget. The no-cascade contract requires the whole group resident
-/// to observe rules, so a group bigger than the budget has no in-budget
-/// representation — fail loud rather than OOM on reload.
-///
-/// This is a memory-budget condition, not an invariant violation: the engine
-/// is working exactly as designed and the author's data outgrew a configured
-/// ceiling. So it surfaces through the standard `MemoryBudgetExceeded`
-/// diagnostic every other budget overrun uses, naming the offending
-/// `partition_by` group so the author can find it in their input.
-///
-/// The remediation deliberately does NOT suggest a finer `partition_by`.
-/// `partition_by` defines the group the rules evaluate against, so narrowing
-/// it makes the run succeed by silently changing the answer — a suggestion the
-/// engine must never make.
-///
-/// Only one lever here leaves the output untouched: a larger budget. Dropping
-/// columns upstream also shrinks the group, but this node's bound output row is
-/// the upstream columns plus the `$meta.*` audit columns, so every dropped
-/// column vanishes from what is written. The text offers it labelled with that
-/// consequence rather than as a free win.
-///
-/// `used` is this one group's reload footprint while `limit` is the run-wide
-/// ceiling, so the two are not directly comparable as a target: finalize also
-/// holds the remaining groups. The wording says "clear of" rather than naming
-/// the group's own size as a sufficient budget.
-fn reshape_giant_group_error(
-    node_name: &str,
-    partition_by: &[String],
-    key: &[GroupByKey],
-    group_bytes: u64,
-    hard_limit: u64,
-) -> PipelineError {
-    let group = format_partition_group(partition_by, key);
-    // `partition_key` routes every value it cannot key into the null group, so
-    // a rendered `null` is not only "missing data" — an author who greps for
-    // blanks alone can find far too few rows to explain the size and stop
-    // looking. Enumerate what actually lands there.
-    let null_note = if key.iter().any(|k| matches!(k, GroupByKey::Null)) {
-        " A `null` here is where this node puts every row whose partition value it cannot use as \
-         a key: a missing column, an explicit null, an empty string, a NaN, or an array- or \
-         map-valued cell. Any of those may be inflating this group."
-    } else {
-        ""
-    };
-    PipelineError::MemoryBudgetExceeded {
-        node: node_name.to_string(),
-        used: group_bytes,
-        limit: hard_limit,
-        source: BudgetCategory::Arena,
-        detail: Some(format!(
-            "one Reshape correlation group {group} does not fit; the reported use \
-             ({group_bytes} bytes) is that group's reload footprint alone. Reshape applies its \
-             rules against the whole group at once (the no-cascade contract), so a single group \
-             must fit the budget even though cross-group and ingest-time peaks spill to disk. \
-             Raising `memory.limit` clear of {group_bytes} bytes is the only fix that leaves \
-             your output unchanged — finalize also holds the run's remaining groups, so treat \
-             that figure as a floor. Dropping columns this node does not read, in an upstream \
-             Transform, also shrinks the group, but Reshape writes every input column through, \
-             so those columns leave the output too. Narrowing `partition_by` shrinks it as \
-             well, but it redefines the group the rules evaluate against and changes \
-             results.{null_note}"
-        )),
     }
 }
 
@@ -1182,6 +1116,7 @@ fn reshape_eval_error(
 mod tests {
     use super::*;
     use crate::pipeline::memory::NoOpPolicy;
+    use clinker_plan::BudgetCategory;
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec!["gid".into(), "payload".into()]))
@@ -1373,13 +1308,19 @@ mod tests {
                     "the detail must name raising the budget as the one output-preserving fix: \
                      {detail}"
                 );
-                // The column-dropping remedy is offered, so it must carry its
+                // The column-dropping remedy must be offered AND must carry its
                 // consequence: this node writes every input column through, so
-                // dropped columns leave the written output as well. A test that
-                // certified it as free would pin a false guarantee.
+                // dropped columns leave the written output as well. Asserting
+                // the pair rather than "consequence-if-offered" keeps the check
+                // live — the implication form passes vacuously the moment the
+                // remedy is reworded, which is how the two node messages drifted
+                // apart before.
                 assert!(
-                    !detail.contains("upstream Transform")
-                        || detail.contains("leave the output too"),
+                    detail.contains("upstream Transform"),
+                    "the detail must offer the column-drop remedy: {detail}"
+                );
+                assert!(
+                    detail.contains("leave the output too"),
                     "offering the column-drop remedy requires disclosing that it changes which \
                      columns are written: {detail}"
                 );
@@ -1406,6 +1347,60 @@ mod tests {
         assert!(
             rendered.starts_with("E310 rs:"),
             "the rendered diagnostic must lead with the E310 code and the node: {rendered}"
+        );
+    }
+
+    // `partition_by: []` is the degenerate correlation key: every record keys
+    // to the same empty tuple, so the node holds one group spanning the whole
+    // input. Naming that group `[]` would print an empty bracket pair — a
+    // diagnostic about a group the author cannot identify — and the standard
+    // remediation would tell them to narrow a key they never declared.
+    #[test]
+    fn a_whole_input_group_names_itself_and_offers_no_key_to_narrow() {
+        let schema = schema();
+        let mut buffer = ReshapeGroupBuffer::new(Arc::clone(&schema), true);
+        // Every record keys to the empty tuple, so all 8 land in one group.
+        for row_num in 0..8u64 {
+            let payload = format!("{row_num:063}");
+            buffer.push(Vec::new(), rec(&schema, "any", &payload), row_num);
+        }
+        assert_eq!(
+            buffer.groups.len(),
+            1,
+            "an empty partition key must yield exactly one whole-input group"
+        );
+
+        let err = buffer
+            .take_group("rs", &[], &[], 64)
+            .expect_err("a group exceeding the hard limit must be rejected at finalize");
+        let PipelineError::MemoryBudgetExceeded { detail, .. } = &err else {
+            panic!("a giant correlation group must surface E310; got {err:?}");
+        };
+        let detail = detail.as_deref().expect("the overrun must carry detail");
+        assert!(
+            detail.contains("correlation group [whole input]"),
+            "the whole-input group must be named readably, not as an empty bracket pair: {detail}"
+        );
+        assert!(
+            !detail.contains("[]"),
+            "the empty bracket pair names nothing and must not reach the author: {detail}"
+        );
+        // With no declared fields there is nothing to narrow, so the standard
+        // narrowing warning would send the author editing a key they never
+        // wrote. The result-changing consequence still has to be stated.
+        assert!(
+            !detail.contains("Narrowing `partition_by`"),
+            "with no partition key declared there is nothing to narrow: {detail}"
+        );
+        assert!(
+            detail.contains("`partition_by` is empty here")
+                && detail.contains("there is no key to narrow"),
+            "the detail must say the group covers the whole input and offers no key: {detail}"
+        );
+        assert!(
+            detail.contains("Declaring fields in `partition_by`")
+                && detail.contains("changes results"),
+            "splitting the whole-input group changes results, and the detail must say so: {detail}"
         );
     }
 

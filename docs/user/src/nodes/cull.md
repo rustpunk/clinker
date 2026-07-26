@@ -30,6 +30,26 @@ For each `employee_id` group, if the group holds more than three rows the **whol
 
 A list of field names. Records sharing the same values for all `partition_by` fields form one group, and the removal predicate observes one whole group at a time. This is the correlation key the operator reasons over. `partition_by` must cover every visible correlation-key field so group identity is preserved on both output ports.
 
+### Whole-input grouping (`partition_by: []`)
+
+An empty list is the degenerate case of that key: every record shares it, so the entire input forms **one** group and `drop_group_when` decides the whole dataset at once — every record is kept, or every record is routed to `removed_to`.
+
+```yaml
+- type: cull
+  name: drop_bad
+  input: events
+  config:
+    partition_by: []          # one group: the whole input
+    removed_to: removed
+    rules:
+      - name: drop_any_error
+        drop_group_when: "sum(if status == 'error' then 1 else 0) > 0"
+```
+
+That pipeline routes **all** records to `removed` if any single record has `status: error`. Keyed by `[account]` the same rule would remove only the offending account's records — so reach for whole-input grouping when the decision genuinely concerns the batch (an all-or-nothing gate on a delivery), not when you meant a per-entity rule.
+
+The whole input must then fit `memory.limit` at finalize, since a single group has to be resident when its predicate runs (see [the limit below](#limit-a-single-group-must-fit-the-finalize-budget)). The sibling group-count bound does not apply: one group is as few as the decision state can be.
+
 ### Values Cull cannot key
 
 Cull groups a record under a single **null group** in two cases: the column is absent from the record, or its value is an explicit null.

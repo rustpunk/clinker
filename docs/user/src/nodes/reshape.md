@@ -38,6 +38,31 @@ For each `employee_id` group, every row where `plan_start - plan_end > 365` (the
 
 A list of field names. Records sharing the same values for all `partition_by` fields form one group, and every rule observes and acts within a single group. This is the correlation key the operator reasons over.
 
+### Whole-input grouping (`partition_by: []`)
+
+An empty list is the degenerate case of that key: every record shares it, so the entire input forms **one** group and the rules apply across the whole dataset rather than per entity.
+
+```yaml
+- type: reshape
+  name: relabel
+  input: rows
+  config:
+    partition_by: []          # one group: the whole input
+    order_by:
+      - { field: amount, order: asc }
+    rules:
+      - name: flag_large
+        when: "amount > 100"
+        mutate:
+          set:
+            label: "'large'"
+```
+
+`order_by` then sorts the whole input as a unit, and the [no-cascade contract](#no-cascade) applies across every record at once. Two consequences follow from there being only one group:
+
+- The **whole input** must fit `memory.limit` at finalize, since a single group has to be resident when its rules fire (see [Limits](#limits)). Whole-input grouping is for datasets that fit the budget, not for bulk row-at-a-time work — a per-record mutation with no cross-record dependency belongs in a [Transform](transform.md), which streams.
+- A [mutation conflict](#mutation-conflicts) rolls back the whole group, so one conflict rolls back the entire run's records rather than one entity's.
+
 ### Values Reshape cannot key
 
 Reshape groups a record under a single **null group** whenever it cannot build a key from the partition value. Today that covers all of:

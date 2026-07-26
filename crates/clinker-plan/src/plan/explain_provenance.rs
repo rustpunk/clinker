@@ -497,6 +497,43 @@ mod tests {
         assert!(rv.provenance.iter().find(|l| l.won).unwrap().kind == LayerKind::ChannelPerTarget);
     }
 
+    // The explain pages are `include_str!`-compiled into the binary, so prose
+    // that describes behaviour ships frozen at build time. Where a page quotes
+    // a diagnostic verbatim, pin the quote against the live `Display` output —
+    // otherwise the shipped page keeps asserting a message the engine stopped
+    // emitting, and the reader trusts it over what is on their terminal.
+    #[test]
+    fn test_explain_code_e312_quotes_the_live_zero_budget_message() {
+        // The page hard-wraps its quoted block, so compare on whitespace-
+        // collapsed text: a reflow of the page must not fail this, only a
+        // reworded diagnostic.
+        let unwrap_ws = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+        let doc = unwrap_ws(explain_code("E312").unwrap());
+        let rendered = crate::error::PipelineError::UnsatisfiableMemoryBudget {
+            limit: 0,
+            baseline_rss: 0,
+        }
+        .to_string();
+        for clause in [
+            "memory.limit is 0 bytes",
+            "not the strictest budget but the absence of one",
+            "clinker explain --code E312",
+        ] {
+            assert!(
+                rendered.contains(clause),
+                "the zero-budget diagnostic must carry {clause:?}: {rendered}"
+            );
+            assert!(
+                doc.contains(clause),
+                "the E312 page quotes the zero-budget diagnostic and must track it; \
+                 {clause:?} is missing from the page"
+            );
+        }
+        // The zero case is rejected without a baseline reading, so neither the
+        // message nor the page may present it as a baseline comparison.
+        assert!(!rendered.contains("is below this process's"));
+    }
+
     #[test]
     fn test_explain_code_e319() {
         let doc = explain_code("E319").unwrap();

@@ -70,7 +70,7 @@ use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, drain_node_buffer_slot,
     node_buffer_spill_allowed, source_file_arc_of, source_name_arc_of,
 };
-use crate::executor::format_partition_group;
+use crate::executor::{GroupedNodeKind, giant_group_error};
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
 };
@@ -894,7 +894,8 @@ impl CullGroupBuffer {
 
         let group_bytes = (state.resident_bytes + state.spilled_bytes) as u64;
         if hard_limit > 0 && group_bytes > hard_limit {
-            return Err(cull_giant_group_error(
+            return Err(giant_group_error(
+                GroupedNodeKind::Cull,
                 node_name,
                 partition_by,
                 key,
@@ -1079,74 +1080,6 @@ fn cull_predicate_error(node_name: &str, e: crate::aggregation::HashAggError) ->
     }
 }
 
-/// Hard error (E310) for a single correlation group that exceeds the finalize
-/// memory budget. The `drop_group_when` decision needs the whole group
-/// observable at once, so a group bigger than the budget has no in-budget
-/// representation — fail loud rather than OOM on reload.
-///
-/// This is a memory-budget condition, not an invariant violation: the engine
-/// is working exactly as designed and the author's data outgrew a configured
-/// ceiling. So it surfaces through the standard `MemoryBudgetExceeded`
-/// diagnostic every other budget overrun uses — the same surface as the
-/// sibling decision-state overrun below — naming the offending `partition_by`
-/// group so the author can find it in their input.
-///
-/// The remediation deliberately does NOT suggest a finer `partition_by`.
-/// `partition_by` defines the group `drop_group_when` evaluates over, so
-/// narrowing it splits the group and changes what the predicate counts: a
-/// `count(*) > 100` rule that removed an account can silently stop firing once
-/// that account's rows are split, and rows that should have routed to
-/// `removed_to` land on the main port instead. A memory diagnostic must never
-/// recommend a fix that changes the result set.
-///
-/// Only one lever here leaves the output untouched: a larger budget. Dropping
-/// columns upstream also shrinks the group, but Cull's bound output row equals
-/// its upstream row — it filters rows, never columns — so every dropped column
-/// vanishes from both the main and `removed_to` ports. The text offers it
-/// labelled with that consequence rather than as a free win.
-///
-/// `used` is this one group's reload footprint while `limit` is the run-wide
-/// ceiling, so the two are not directly comparable as a target: finalize also
-/// holds the remaining groups and the O(groups) decision map. The wording says
-/// "clear of" rather than naming the group's own size as a sufficient budget.
-fn cull_giant_group_error(
-    node_name: &str,
-    partition_by: &[String],
-    key: &[GroupByKey],
-    group_bytes: u64,
-    hard_limit: u64,
-) -> PipelineError {
-    let group = format_partition_group(partition_by, key);
-    // `partition_key` routes only two shapes into the null group here — Cull
-    // hard-errors on a NaN, array, or map partition value rather than folding
-    // it in, so this enumeration is deliberately shorter than Reshape's.
-    let null_note = if key.iter().any(|k| matches!(k, GroupByKey::Null)) {
-        " A `null` here covers both an explicit null and a row missing the column entirely, so \
-         either may be inflating this group."
-    } else {
-        ""
-    };
-    PipelineError::MemoryBudgetExceeded {
-        node: node_name.to_string(),
-        used: group_bytes,
-        limit: hard_limit,
-        source: BudgetCategory::Arena,
-        detail: Some(format!(
-            "one Cull correlation group {group} does not fit; the reported use ({group_bytes} \
-             bytes) is that group's reload footprint alone. Cull evaluates its `drop_group_when` \
-             predicate against the whole group at once, so a single group must fit the budget \
-             even though cross-group and ingest-time peaks spill to disk. Raising `memory.limit` \
-             clear of {group_bytes} bytes is the only fix that leaves your output unchanged — \
-             finalize also holds the run's remaining groups and its per-group decision map, so \
-             treat that figure as a floor. Dropping columns this node does not read, in an \
-             upstream Transform, also shrinks the group, but Cull writes every input column \
-             through, so those columns leave the output too. Narrowing `partition_by` shrinks it \
-             as well, but it changes what `drop_group_when` counts and changes which rows are \
-             removed.{null_note}"
-        )),
-    }
-}
-
 /// Hard error (E310) for the Cull drop-decision aggregate outgrowing the
 /// memory budget. The decision aggregate and the per-group decision map it
 /// feeds are both O(distinct groups) and run in-memory: the raw-record buffer
@@ -1292,13 +1225,19 @@ mod tests {
                     "the detail must name raising the budget as the one output-preserving fix: \
                      {detail}"
                 );
-                // The column-dropping remedy is offered, so it must carry its
+                // The column-dropping remedy must be offered AND must carry its
                 // consequence: this node writes every input column through, so
-                // dropped columns leave the written output as well. A test that
-                // certified it as free would pin a false guarantee.
+                // dropped columns leave the written output as well. Asserting
+                // the pair rather than "consequence-if-offered" keeps the check
+                // live — the implication form passes vacuously the moment the
+                // remedy is reworded, which is how the two node messages drifted
+                // apart before.
                 assert!(
-                    !detail.contains("upstream Transform")
-                        || detail.contains("leave the output too"),
+                    detail.contains("upstream Transform"),
+                    "the detail must offer the column-drop remedy: {detail}"
+                );
+                assert!(
+                    detail.contains("leave the output too"),
                     "offering the column-drop remedy requires disclosing that it changes which \
                      columns are written: {detail}"
                 );

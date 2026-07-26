@@ -15,6 +15,10 @@
 //! - `mutate.set` targets a column absent from the upstream schema
 //!   (Reshape mutates existing columns, never adds new ones).
 //! - `synthesize` with `copy_from: none` fails to override every column.
+//!
+//! One positive path is pinned alongside them: `partition_by: []` is the
+//! degenerate whole-input key and must compile, so no guard here grows into
+//! rejecting a supported configuration.
 
 use crate::config::{CompileContext, parse_config};
 
@@ -77,13 +81,13 @@ nodes:
     )
 }
 
-// An empty `partition_by` has no correlation key, so every record would form
-// one group and the rules would observe the whole input at once. Nothing
-// downstream can describe that group either — a budget overrun could only name
-// it as `[]`. Reject it at bind time rather than running a shape no author
-// meant to ask for.
+// `partition_by: []` is the degenerate correlation key: every record keys to
+// the same empty tuple, so the whole input forms one group and the rules apply
+// across the entire dataset. It is a supported configuration, not a malformed
+// one — a bind-time arity rule here would delete that capability, so this test
+// pins the compile.
 #[test]
-fn empty_partition_by_rejected() {
+fn empty_partition_by_groups_the_whole_input() {
     let yaml = pipeline_with_reshape_config(
         r#"      partition_by: []
       rules:
@@ -93,8 +97,10 @@ fn empty_partition_by_rejected() {
             set:
               label: "'x'""#,
     );
-    let diags = compile_diagnostics(&yaml);
-    assert_e200_contains(&diags, &["partition_by", "at least one field"]);
+    let config = parse_config(&yaml).expect("parse_config");
+    config
+        .compile(&CompileContext::default())
+        .expect("`partition_by: []` groups the whole input and must compile");
 }
 
 #[test]
