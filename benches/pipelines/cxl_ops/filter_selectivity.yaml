@@ -2,12 +2,37 @@ pipeline:
   name: bench-filter-selectivity
 
 nodes:
+  # Keep each selectivity path independent until source fan-out is safe (#908).
   - type: source
-    name: source
+    name: source_90pct
     config:
-      name: source
+      name: source_90pct
       type: csv
-      path: bench://input.csv
+      path: bench://input_90.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+
+  - type: source
+    name: source_50pct
+    config:
+      name: source_50pct
+      type: csv
+      path: bench://input_50.csv
+      options:
+        has_header: true
+      schema:
+        - { name: f0, type: int }
+        - { name: f1, type: string }
+
+  - type: source
+    name: source_10pct
+    config:
+      name: source_10pct
+      type: csv
+      path: bench://input_10.csv
       options:
         has_header: true
       schema:
@@ -16,7 +41,7 @@ nodes:
 
   - type: transform
     name: filter_90pct
-    input: source
+    input: source_90pct
     config:
       cxl: |
         filter f0 > 100000
@@ -24,7 +49,7 @@ nodes:
 
   - type: transform
     name: filter_50pct
-    input: source
+    input: source_50pct
     config:
       cxl: |
         filter f0 > 500000
@@ -32,7 +57,7 @@ nodes:
 
   - type: transform
     name: filter_10pct
-    input: source
+    input: source_10pct
     config:
       cxl: |
         filter f0 > 900000
