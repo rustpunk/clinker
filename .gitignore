@@ -13,6 +13,13 @@ docs/**/book/
 !docs/ai/
 !docs/ai/**
 target/
+# Isolated build target used when a checkout must not share the workspace
+# `target/` — concurrent builds in sibling checkouts otherwise race on the
+# shared directory and can link a stale rlib. Deliberately unanchored so it
+# matches at any depth: inside a linked worktree this directory is top-level
+# relative to that worktree's root, so an anchored pattern would miss it and
+# leave a multi-GB build tree untracked-but-committable.
+target-verify/
 bench-data/
 examples/pipelines/output/
 examples/pipelines/retract-demo/output/
