@@ -170,31 +170,99 @@ nodes:
 "#
 }
 
+/// Remove SGR colour escapes. miette emits them on Linux and macOS and may
+/// omit them elsewhere; either way they sit between the characters a needle
+/// spans, so they are stripped rather than matched around.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('\u{1b}') {
+        out.push_str(&rest[..i]);
+        // CSI: `ESC [` then parameter bytes, terminated by an ASCII letter.
+        let after = &rest[i + 1..];
+        let after = after.strip_prefix('[').unwrap_or(after);
+        match after.find(|c: char| c.is_ascii_alphabetic()) {
+            Some(end) => rest = &after[end + 1..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Flatten a rendered report so an assertion tests the diagnostic rather than
+/// the terminal it was rendered into.
+///
+/// miette hard-wraps its message and help paragraphs to the terminal width,
+/// which differs between a developer's terminal and CI. A phrase that sits on
+/// one line in one place arrives split across a newline plus the renderer's
+/// gutter indent in the other. Collapsing every run of whitespace to a single
+/// space makes a `contains` mean "this phrase is present", at any width and on
+/// any platform.
+///
+/// This matters as much for the negative assertion below as for the positive
+/// ones: a wrapped occurrence of the transform-compilation heading would
+/// otherwise satisfy `!contains` for the wrong reason.
+fn flatten_report(stderr: &str) -> String {
+    strip_ansi(stderr)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Assert the three things a plan-time diagnostic must keep on the way to the
 /// terminal, plus the absence of the transform-compilation misattribution.
-fn assert_plan_diagnostic_intact(stderr: &str, filename: &str) {
+fn assert_plan_diagnostic_intact(stderr: &str) {
+    let flat = flatten_report(stderr);
+
     // 1. The code, so `clinker explain --code E363` is reachable from the
     //    error the user is looking at.
     assert!(
-        stderr.contains("E363"),
+        flat.contains("E363"),
         "stderr must carry the diagnostic code; got:\n{stderr}"
     );
+
     // 2. The help paragraph naming the fix. Every gate attaches one; none of
-    //    it used to reach the terminal.
+    //    it used to reach the terminal. The needle is deliberately a phrase
+    //    that appears only in the help and not in the message -- the message
+    //    also describes the grammar, so a needle common to both would pass
+    //    even with the help dropped again.
     assert!(
-        stderr.contains("dot-separated path of object keys"),
-        "stderr must carry the diagnostic's help text; got:\n{stderr}"
+        flat.contains("help: `record_path` on a `json` source"),
+        "stderr must render the help as help; got:\n{stderr}"
     );
+    assert!(
+        flat.contains("no empty segments. It takes precedence over `format:`"),
+        "stderr must carry the whole help paragraph, not a prefix of it; \
+         got:\n{stderr}"
+    );
+
     // 3. The source line. The gate fires on the `- type: source` node, which
-    //    is line 4 of the fixture, so miette's snippet header must name it.
+    //    is line 4 of the fixture, so miette's snippet must be anchored there
+    //    and must quote that line.
+    //
+    //    Anchored on the header's trailing `:<line>:<col>]` rather than on the
+    //    file path: the path is a long temp directory that differs per run and
+    //    per platform (and, on Windows, in separator), while this token is
+    //    short, ASCII, and unique in the report. The quoted line is checked by
+    //    its YAML content for the same reason -- the gutter's box-drawing
+    //    characters are theme-dependent.
     assert!(
-        stderr.contains(&format!("{filename}:4:")),
-        "stderr must point at the offending YAML line; got:\n{stderr}"
+        flat.contains(":4:1]"),
+        "stderr must anchor the snippet at line 4, column 1; got:\n{stderr}"
     );
-    // The failure is in a source's config, not a CXL transform — and there is
+    assert!(
+        flat.contains("- type: source"),
+        "stderr must quote the offending YAML line; got:\n{stderr}"
+    );
+
+    // The failure is in a source's config, not a CXL transform -- and there is
     // no transform in this pipeline at all.
     assert!(
-        !stderr.contains("CXL compilation failed for transform"),
+        !flat.contains("CXL compilation failed for transform"),
         "a source-config gate must not be labelled a transform compilation \
          failure; got:\n{stderr}"
     );
@@ -220,7 +288,7 @@ fn test_plan_time_gate_keeps_code_help_and_span_on_the_run_path() {
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_plan_diagnostic_intact(&stderr, "bad_record_path.yaml");
+    assert_plan_diagnostic_intact(&stderr);
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -246,7 +314,7 @@ fn test_plan_time_gate_keeps_code_help_and_span_under_explain() {
     );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_plan_diagnostic_intact(&stderr, "bad_record_path.yaml");
+    assert_plan_diagnostic_intact(&stderr);
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -295,13 +363,18 @@ nodes:
         .expect("spawn clinker");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // Flattened for the same reason as `assert_plan_diagnostic_intact`: the
+    // pointer is short enough to survive today's width, but it sits in a help
+    // paragraph miette wraps, so matching raw stderr would make this test a
+    // function of the terminal.
+    let flat = flatten_report(&stderr);
     assert!(
-        stderr.contains("See: clinker explain --code E203"),
+        flat.contains("See: clinker explain --code E203"),
         "a diagnostic with no help of its own must still be told where its \
          explain page is; got:\n{stderr}"
     );
     assert_eq!(
-        stderr.matches("clinker explain --code E203").count(),
+        flat.matches("clinker explain --code E203").count(),
         1,
         "the explain pointer must appear exactly once; got:\n{stderr}"
     );
