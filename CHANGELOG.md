@@ -32,6 +32,42 @@ Clinker diagnostics must register its codes before upgrading.
 `PlanDiagnostics` also records whether its line-only spans are safe to resolve
 against the pipeline document. Untrusted spans remain in the structured value
 for consumers that can attribute them; the CLI simply omits the source snippet.
+### Changed — an Output's `mapping:` is an ordered sequence, and its direction is fixed
+
+**Breaking change to a hand-written YAML key.** `mapping:` was a map of column
+name to column name. It is now a sequence, one item per output column:
+
+```yaml
+mapping:
+  - order_id                # carried through under its own name
+  - sold_to: customer_id    # written as `sold_to`, read from `customer_id`
+```
+
+A bare scalar carries a column through unchanged; a single-key pair renames.
+Declaration order is the output column order — which the map form could not
+express at all. Columns the block does not list are appended after it when
+`include_unmapped: true` (the default) and dropped when it is `false`.
+
+**The pair direction is `output_name: source_column` — output on the left.**
+That is the direction the user guide always documented and the plan layer
+always assumed; the executor's rename pass implemented the reverse, so a block
+written to the documentation renamed nothing and the run still exited 0. Both
+halves now agree on the documented direction.
+
+Migration, both mechanical:
+
+- Put `- ` in front of each line. A pair whose two sides are the same column
+  collapses to a bare name.
+- If your block was written against the old *behaviour* (source column on the
+  left), swap the two sides. A block written against the old *documentation*
+  lifts unchanged.
+
+A map-valued `mapping:` is rejected at compile time with **E364**, and the
+message prints your own block already rewritten. Two silent failure modes are
+now compile errors as well: a repeated output name (**E364**), and an item
+naming a column that does not exist at that point in the pipeline (**E365**,
+with the available column list and a `did you mean`). Run `clinker explain E364`
+or `clinker explain E365` for the full pages.
 
 ### Removed — the `best_effort` error strategy
 

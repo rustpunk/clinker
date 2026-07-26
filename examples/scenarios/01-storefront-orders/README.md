@@ -70,10 +70,10 @@ rides along.
 
 **Column order.** Emitted columns that exist in the source schema come first in
 schema order; derived columns follow in emit order, which is why
-`gross_amount` and `line_total` are last. The Output node has a `mapping:` key
-that looks like it should control this, but its behaviour is under review in
-[#974](https://github.com/rustpunk/clinker/issues/974) — rename in the transform
-instead, where the reader can see it happen.
+`gross_amount` and `line_total` are last. The Output node's `mapping:` key can
+state the order explicitly instead — it declares the output columns, their
+names, and their order in one sequence. This scenario renames in the transform
+so the emitted names and the written header are read from one place.
 
 **Row order is stable because the read is.** A single-file source delivers
 records in file order, deterministically, so this output is byte-comparable

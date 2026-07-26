@@ -71,15 +71,68 @@ The CSV, XML, fixed-width, EDIFACT, X12, and HL7 writers can only write flat sca
 
 ### Field mapping
 
-Rename fields at output time without changing upstream CXL:
+`mapping:` declares the columns the file carries -- which columns, under what
+names, in what order -- without changing upstream CXL. It is a sequence, one
+item per output column:
 
 ```yaml
     mapping:
-      "Customer Name": "full_name"
-      "Order Total": "amount"
+      - order_id                  # carried through under its own name
+      - sold_to: customer_id      # written as `sold_to`, read from `customer_id`
+      - contact_email: customer_email
+      - channel
+      - sku
 ```
 
-Keys are output column names; values are the source field names from upstream.
+Two item shapes:
+
+- **A bare column name** emits that column unchanged. This is the common case,
+  and it costs one line naming the column once.
+- **A single-key pair** renames. The **output name is on the left**, the source
+  column on the right -- the same side the bare form names. Reading an item
+  left to right always tells you what appears in the file first.
+
+The renames are the only items carrying a colon, so in a wide output they are
+found by scanning for structure rather than by comparing two names per line.
+
+#### Order and selection
+
+**Declaration order is the output column order.** Listed columns are written
+first, in the order the block declares them, whatever order they arrive in.
+
+**`include_unmapped` governs everything the block does not list.** With
+`include_unmapped: true` (the default) unlisted columns are appended after the
+declared ones, in their existing relative order. With `include_unmapped: false`
+they are dropped, so the block becomes the complete statement of the output:
+
+```yaml
+    include_unmapped: false
+    mapping:
+      - department
+      - surname: last_name
+      - first_name
+```
+
+Given upstream columns `first_name, last_name, department`, that writes exactly
+`department,surname,first_name`.
+
+One upstream column may feed two output columns -- `- sku` and
+`- item_code: sku` -- because names must be unique on the output side, not the
+source side. Declaring the same *output* name twice is rejected (**E364**): a
+file cannot carry two columns under one header.
+
+#### Diagnostics
+
+A `mapping:` item naming a column that does not exist at that point in the
+pipeline is rejected at compile time (**E365**), with the available column list
+and a `did you mean` when the name is a near miss. Nothing is renamed silently.
+
+Writing the block as a YAML map instead of a sequence is rejected (**E364**);
+the message prints your own block already rewritten. Run `clinker explain E364`
+for the migration, including the direction change -- releases before this one
+documented `output_name: source_field` but implemented the reverse, so a block
+written against the old *behaviour* needs its two sides swapped as well as
+lifted into a sequence.
 
 ### Excluding fields
 
@@ -381,10 +434,10 @@ This is automatic — there is no setting to enable it. It applies only to this 
     type: csv
     path: "./output/employees.csv"
     mapping:
-      "Employee ID": "employee_id"
-      "Full Name": "display_name"
-      "Department": "department"
-      "Annual Salary": "salary"
+      - "Employee ID": employee_id
+      - "Full Name": display_name
+      - department
+      - "Annual Salary": salary
     exclude: [internal_flags]
     include_header: true
     sort_order:
