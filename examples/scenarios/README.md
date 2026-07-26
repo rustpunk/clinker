@@ -42,10 +42,23 @@ cargo run -p clinker-scenarios -- gen --force                 # ignore the cache
 | Scenario | Formats | Introduces |
 |---|---|---|
 | [01-storefront-orders](01-storefront-orders/) | csv → csv | typed source schema, exact decimal money, `filter`, projection |
+| [02-product-feed-normalize](02-product-feed-normalize/) | xml → csv, xml | repeated elements as a `multiple:` column, per-sink encoding, minor-unit money |
 | [03-support-triage](03-support-triage/) | csv → csv, json | strict conversion, dead-letter queue, exclusive routing to three sinks |
 
 More scenarios are landing in sequence — combine and aggregate, windowing,
 multi-record flat files, envelope reconstruction, and the EDI family.
+
+## Scenarios that currently fail
+
+A scenario may be committed with goldens the engine does not yet produce, marked
+`known_broken` in the harness against an issue. The goldens state the correct
+answer; the marker records that the engine disagrees. Only a *golden mismatch*
+is tolerated — a wrong exit code, drifted input, missing output or unexpected
+counters still fail the gate, so a parked scenario cannot rot. When the issue is
+fixed the harness reports the marker as stale and asks for it to be removed.
+
+Currently parked: **02-product-feed-normalize**, against
+[#996](https://github.com/rustpunk/clinker/issues/996).
 
 ## Layout
 

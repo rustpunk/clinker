@@ -1,0 +1,15 @@
+sku,brand,stock_on_hand,product_name,list_price,cost,margin,margin_pct,categories,in_stock
+HL-1001,Kestrel,380,Insulated Flask 750ml,24.50,14.70,9.80,40,drinkware|grocery,true
+HL-1001-R2,Kestrel,470,Insulated Flask 750ml (Refill),24.50,14.70,9.80,40,gift,true
+HL-1002,Kestrel,358,Trail Mug Enamel,11.95,7.17,4.78,40,gift|grocery|clearance,true
+NT-2010,Northgate,403,Merino Base Layer,68,40.80,27.20,40,apparel|seasonal,true
+NT-2011,Northgate,181,Wool Blend Socks 3pk,22,13.20,8.80,40,drinkware|clearance|seasonal,true
+NT-2011-R2,Northgate,283,Wool Blend Socks 3pk (Refill),22,13.20,8.80,40,grocery|seasonal,true
+VF-3050,Verity,292,Cold Brew Concentrate 1L,16.50,9.90,6.60,40,seasonal|outdoor|grocery,true
+VF-3051,Verity,4,Single Origin Beans 500g,18.99,11.39,7.60,40,clearance|drinkware,true
+FC-4100,Fenmoor,275,Bearing Assembly M8,9.40,5.64,3.76,40,gift,true
+FC-4100-R2,Fenmoor,372,Bearing Assembly M8 (Refill),9.40,5.64,3.76,40,clearance|gift|grocery,true
+FC-4101,Fenmoor,468,Drive Belt 1200mm,31.20,18.72,12.48,40,seasonal|apparel|outdoor,true
+SP-5000,Saltmarsh,296,Sea Salt Flakes 250g,7.20,4.32,2.88,40,outdoor,true
+SP-5001,Saltmarsh,422,Smoked Paprika 90g,5.45,3.27,2.18,40,clearance|apparel|outdoor,true
+SP-5001-R2,Saltmarsh,411,Smoked Paprika 90g (Refill),5.45,3.27,2.18,40,industrial,true

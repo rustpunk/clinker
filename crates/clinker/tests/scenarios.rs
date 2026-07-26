@@ -80,7 +80,7 @@ const VOLATILE_DLQ_COLUMNS: usize = 2;
 const GATES: &[Gate] = &[
     Gate {
         id: "01-storefront-orders",
-        input_digest: "56c1401e7ea6",
+        input_digest: "0e3483cfe9a1",
         outputs: &["output/billable_lines.csv"],
         counters: Counters {
             total: 48,
@@ -91,8 +91,29 @@ const GATES: &[Gate] = &[
         known_broken: None,
     },
     Gate {
+        id: "02-product-feed-normalize",
+        input_digest: "250cd16cb79d",
+        outputs: &["output/catalog.csv", "output/catalog.xml"],
+        counters: Counters {
+            total: 14,
+            ok: 14,
+            written: 14,
+            dlq: 0,
+        },
+        // The goldens state what this pipeline SHOULD write to both sinks. It
+        // currently writes nothing to the first: a node feeding two Outputs
+        // delivers records only to the last-declared one, silently and with
+        // exit 0 (#996). `output/catalog.csv` is therefore committed as the
+        // output of the single-sink variant — the correct answer — and this
+        // marker records that the engine does not yet produce it. Everything
+        // that is not a golden mismatch still fails this gate, so the scenario
+        // cannot rot while parked, and the harness reports a stale marker the
+        // moment #996 lands.
+        known_broken: Some("https://github.com/rustpunk/clinker/issues/996"),
+    },
+    Gate {
         id: "03-support-triage",
-        input_digest: "d4c149c9653f",
+        input_digest: "7d6f476f9ca3",
         outputs: &[
             "output/urgent.csv",
             "output/standard.csv",

@@ -113,12 +113,18 @@ pub fn storefront_orders() -> GeneratedData {
     }])
 }
 
-/// Scenario 02 — a supplier product feed as nested XML.
+/// Scenario 02 — a supplier product feed as XML with repeated elements.
 ///
-/// Each `<product>` carries a nested `<pricing>` block and a `<categories>`
-/// block holding **one or more** `<category>` elements. Those repeats are the
-/// point: they exercise a `multiple: true` column end to end, read as one
-/// multi-value field and written back out as repeated elements.
+/// Each `<product>` carries **one or more** `<category>` elements. Those repeats
+/// are the point: they exercise a `multiple: true` column end to end, read as
+/// one multi-value field and written back out as repeated elements.
+///
+/// The repeated element is a *direct* child of the record element rather than
+/// sitting inside a `<categories>` container, and money is a flat
+/// `<list_price_minor>` rather than a nested `<pricing>` block. Both are
+/// deliberate: a nested element flattens to a dotted column name that CXL
+/// cannot currently address (#995), so a wrapped repeat would be readable but
+/// untransformable. The write side reintroduces the container via `wrap_in`.
 pub fn product_feed() -> GeneratedData {
     let mut rng = fastrand::Rng::with_seed(SEED_PRODUCT_FEED);
     let mut out = String::new();
@@ -158,15 +164,24 @@ pub fn product_feed() -> GeneratedData {
             out.push_str(&format!("  <product sku=\"{}\">\n", xml_escape(&vsku)));
             xml_leaf(&mut out, 2, "name", &vname);
             xml_leaf(&mut out, 2, "brand", brand);
-            out.push_str("    <pricing>\n");
-            xml_leaf(&mut out, 3, "list_price", &money(*price_cents));
-            xml_leaf(&mut out, 3, "cost", &money(price_cents * 6 / 10));
-            out.push_str("    </pricing>\n");
-            out.push_str("    <categories>\n");
+            // Money travels as integer minor units, which is both good practice
+            // and currently necessary: the XML reader type-infers element text
+            // and ignores the declared column type, so `24.50` in a `decimal`
+            // column arrives as a float expansion (#992). An integer element
+            // reads back exactly, and the scenario derives the display amount
+            // from it in decimal.
+            xml_leaf(&mut out, 2, "list_price_minor", &price_cents.to_string());
+            xml_leaf(
+                &mut out,
+                2,
+                "cost_minor",
+                &(price_cents * 6 / 10).to_string(),
+            );
+            // Repeated directly under <product>: a container would flatten to a
+            // dotted column name CXL cannot address (#995).
             for c in &chosen {
-                xml_leaf(&mut out, 3, "category", c);
+                xml_leaf(&mut out, 2, "category", c);
             }
-            out.push_str("    </categories>\n");
             xml_leaf(
                 &mut out,
                 2,
@@ -308,16 +323,50 @@ mod tests {
         }
     }
 
+    /// The `<category>` values of each `<product>` block, in document order.
+    ///
+    /// Splits on the record element rather than a container: the repeats are
+    /// direct children of `<product>`, so there is no wrapper to key on. A
+    /// helper shared by the tests below keeps them from silently going vacuous
+    /// if the feed's shape changes again — an empty result fails
+    /// `product_feed_emits_categories_at_all`.
+    fn categories_per_product(xml: &str) -> Vec<Vec<&str>> {
+        xml.split("<product ")
+            .skip(1)
+            .map(|block| {
+                let block = block.split("</product>").next().unwrap_or(block);
+                block
+                    .lines()
+                    .filter_map(|l| l.trim().strip_prefix("<category>"))
+                    .filter_map(|l| l.strip_suffix("</category>"))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn product_feed_emits_categories_at_all() {
+        // Guards the two tests below from passing vacuously: if the feed's
+        // shape changes so the parser matches nothing, they would otherwise
+        // both succeed on an empty set.
+        let xml = String::from_utf8(product_feed().files()[0].bytes.clone()).unwrap();
+        let per_product = categories_per_product(&xml);
+        assert!(!per_product.is_empty(), "no <product> blocks parsed");
+        assert!(
+            per_product.iter().all(|c| !c.is_empty()),
+            "every product must carry at least one category"
+        );
+    }
+
     #[test]
     fn product_feed_has_products_with_more_than_one_category() {
         // The repeated <category> elements are the whole reason this scenario
         // exists; a generator that emitted exactly one per product would leave
         // the multi-value path unexercised.
         let xml = String::from_utf8(product_feed().files()[0].bytes.clone()).unwrap();
-        let multi = xml
-            .split("<categories>")
-            .skip(1)
-            .filter(|block| block.matches("<category>").count() > 1)
+        let multi = categories_per_product(&xml)
+            .iter()
+            .filter(|c| c.len() > 1)
             .count();
         assert!(multi > 0, "no product carries repeated <category> elements");
     }
@@ -325,13 +374,7 @@ mod tests {
     #[test]
     fn product_feed_never_repeats_a_category_within_one_product() {
         let xml = String::from_utf8(product_feed().files()[0].bytes.clone()).unwrap();
-        for block in xml.split("<categories>").skip(1) {
-            let block = block.split("</categories>").next().unwrap();
-            let mut cats: Vec<&str> = block
-                .lines()
-                .filter_map(|l| l.trim().strip_prefix("<category>"))
-                .filter_map(|l| l.strip_suffix("</category>"))
-                .collect();
+        for mut cats in categories_per_product(&xml) {
             let before = cats.len();
             cats.sort_unstable();
             cats.dedup();
