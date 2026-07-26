@@ -381,9 +381,13 @@ fn test_dry_run_empty_pipeline_returns_a_diagnostic_instead_of_panicking() {
         "an empty pipeline must fail dry-run validation"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let normalized_stderr = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
+    let diagnostic_words = stderr
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     assert!(
-        normalized_stderr.contains("pipeline must declare at least one source node"),
+        diagnostic_words.contains("pipeline must declare at least one source node"),
         "stderr must explain the source requirement; got:\n{stderr}"
     );
     assert!(
