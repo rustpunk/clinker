@@ -2,6 +2,13 @@
 //! to nested elements, attribute-prefixed fields emitted as XML attributes,
 //! null handling, and proper escaping.
 //!
+//! Column names are decoded with the shared record-space grammar in
+//! [`clinker_record::field_path`] — the same grammar the JSON writer expands
+//! objects with — so one column set produces the same tree in both formats.
+//! What stays XML-specific is everything below the decode: attribute
+//! classification against `attribute_prefix`, repeated-element naming, and
+//! rejecting a segment that is not a well-formed XML `Name`.
+//!
 //! Under `reconstruct_envelope`, each document is wrapped in a `<Document>`
 //! element inside the root: `begin_document` opens `<Document>` and emits the
 //! header section as a `<header>` element; the body `<Record>` elements stream
@@ -17,6 +24,7 @@ use quick_xml::events::attributes::Attribute;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::name::QName;
 
+use clinker_record::field_path::{self, FieldPathError};
 use clinker_record::{DocumentContext, Record, Schema, Value};
 
 use crate::envelope_writer::{EnvelopeFramer, OutputEnvelopeSpec};
@@ -375,6 +383,14 @@ impl<W: Write + Send> FormatWriter for XmlWriter<W> {
 
 // ── Field tree for dotted name → nested element expansion ────────────
 
+/// Wrap a field-name grammar failure as this writer's error.
+fn field_path_error(source: FieldPathError) -> FormatError {
+    FormatError::FieldPath {
+        format: "XML",
+        source,
+    }
+}
+
 /// One element's content: the attributes attached to its start tag plus its
 /// child nodes. The whole body is materialized before the element's start
 /// tag is emitted, because attributes have to be known at that point.
@@ -412,14 +428,16 @@ fn build_field_tree(
     preserve_nulls: bool,
     attribute_prefix: &str,
 ) -> Result<ElementBody, FormatError> {
+    field_path::check_expandable(fields.iter().map(|&(name, _)| name)).map_err(field_path_error)?;
     let mut root = ElementBody::default();
 
     for &(name, val) in fields {
-        if val.is_null() && (!preserve_nulls || is_attribute_path(name, attribute_prefix)) {
+        let path = field_path::decode(name).map_err(field_path_error)?;
+        if val.is_null() && (!preserve_nulls || is_attribute_path(&path, attribute_prefix)) {
             continue;
         }
         let text = value_to_text(name, val)?;
-        insert_field(&mut root, name, name, &text, attribute_prefix)?;
+        insert_field(&mut root, name, &path, &text, attribute_prefix)?;
     }
 
     Ok(root)
@@ -478,11 +496,10 @@ fn escape_attribute_value(raw: &str) -> String {
 
 /// True when the path's final segment is attribute-classified — i.e. a
 /// non-empty prefix marks it as an attribute of its enclosing element.
-fn is_attribute_path(path: &str, attribute_prefix: &str) -> bool {
+fn is_attribute_path(path: &[Cow<'_, str>], attribute_prefix: &str) -> bool {
     !attribute_prefix.is_empty()
         && path
-            .rsplit('.')
-            .next()
+            .last()
             .is_some_and(|segment| segment.starts_with(attribute_prefix))
 }
 
@@ -553,30 +570,32 @@ fn check_xml_name(name: &str, context: &str) -> Result<(), FormatError> {
     }
 }
 
-/// Insert a dotted field name into the tree, creating branches as needed.
+/// Insert a decoded field path into the tree, creating branches as needed.
 /// An attribute-prefixed segment must be the path's final segment (an
 /// attribute is a leaf — nothing can nest under it); `field` is the full
 /// original field name, carried for error messages.
 fn insert_field(
     body: &mut ElementBody,
     field: &str,
-    path: &str,
+    path: &[Cow<'_, str>],
     text: &str,
     attribute_prefix: &str,
 ) -> Result<(), FormatError> {
-    if let Some((first, rest)) = path.split_once('.') {
-        if !attribute_prefix.is_empty() && first.starts_with(attribute_prefix) {
+    let (segment, rest) = path
+        .split_first()
+        .expect("a decoded field path has at least one segment");
+    if !rest.is_empty() {
+        if !attribute_prefix.is_empty() && segment.starts_with(attribute_prefix) {
             return Err(FormatError::Xml(format!(
-                "field '{field}': attribute-prefixed segment '{first}' \
+                "field '{field}': attribute-prefixed segment '{segment}' \
                  cannot have fields nested under it — an XML attribute is a leaf"
             )));
         }
-        check_xml_name(first, &format!("field '{field}': element"))?;
-        // Find or create a branch for `first`
-        let branch = body
-            .children
-            .iter_mut()
-            .find(|n| matches!(n, FieldNode::Branch { name, .. } if name == first));
+        check_xml_name(segment, &format!("field '{field}': element"))?;
+        // Find or create a branch for `segment`
+        let branch = body.children.iter_mut().find(
+            |n| matches!(n, FieldNode::Branch { name, .. } if name.as_str() == segment.as_ref()),
+        );
         if let Some(FieldNode::Branch {
             body: branch_body, ..
         }) = branch
@@ -586,13 +605,13 @@ fn insert_field(
             let mut branch_body = ElementBody::default();
             insert_field(&mut branch_body, field, rest, text, attribute_prefix)?;
             body.children.push(FieldNode::Branch {
-                name: first.to_string(),
+                name: segment.to_string(),
                 body: branch_body,
             });
             Ok(())
         }
-    } else if !attribute_prefix.is_empty() && path.starts_with(attribute_prefix) {
-        let attr_name = &path[attribute_prefix.len()..];
+    } else if !attribute_prefix.is_empty() && segment.starts_with(attribute_prefix) {
+        let attr_name = &segment[attribute_prefix.len()..];
         if attr_name.is_empty() {
             return Err(FormatError::Xml(format!(
                 "field '{field}': attribute prefix '{attribute_prefix}' \
@@ -608,9 +627,9 @@ fn insert_field(
         body.attrs.push((attr_name.to_string(), text.to_string()));
         Ok(())
     } else {
-        check_xml_name(path, &format!("field '{field}': element"))?;
+        check_xml_name(segment, &format!("field '{field}': element"))?;
         body.children.push(FieldNode::Leaf {
-            name: path.to_string(),
+            name: segment.to_string(),
             text: text.to_string(),
         });
         Ok(())
@@ -755,14 +774,16 @@ fn build_plan_cache(record: &Record, config: &XmlWriterConfig) -> Result<PlanCac
     } else {
         record.iter_user_fields().map(|(name, _)| name).collect()
     };
+    field_path::check_expandable(names.iter().copied()).map_err(field_path_error)?;
     let mut root = PlanBody::default();
     let mut field_is_attr = vec![false; names.len()];
     for (i, name) in names.iter().enumerate() {
+        let path = field_path::decode(name).map_err(field_path_error)?;
         plan_insert_field(
             &mut root,
             i,
             name,
-            name,
+            &path,
             &config.attribute_prefix,
             &config.join_values,
             &mut field_is_attr,
@@ -775,7 +796,7 @@ fn build_plan_cache(record: &Record, config: &XmlWriterConfig) -> Result<PlanCac
     })
 }
 
-/// Insert a dotted field name into the plan, creating branches as needed —
+/// Insert a decoded field path into the plan, creating branches as needed —
 /// the plan-time twin of [`insert_field`], storing the field index in place of
 /// a rendered value. Attribute-prefixed segments must be terminal, and
 /// attribute names are validated here (once) rather than per record.
@@ -783,23 +804,25 @@ fn plan_insert_field(
     body: &mut PlanBody,
     field_index: usize,
     field: &str,
-    path: &str,
+    path: &[Cow<'_, str>],
     attribute_prefix: &str,
     join_values: &[JoinValues],
     field_is_attr: &mut [bool],
 ) -> Result<(), FormatError> {
-    if let Some((first, rest)) = path.split_once('.') {
-        if !attribute_prefix.is_empty() && first.starts_with(attribute_prefix) {
+    let (segment, rest) = path
+        .split_first()
+        .expect("a decoded field path has at least one segment");
+    if !rest.is_empty() {
+        if !attribute_prefix.is_empty() && segment.starts_with(attribute_prefix) {
             return Err(FormatError::Xml(format!(
-                "field '{field}': attribute-prefixed segment '{first}' \
+                "field '{field}': attribute-prefixed segment '{segment}' \
                  cannot have fields nested under it — an XML attribute is a leaf"
             )));
         }
-        check_xml_name(first, &format!("field '{field}': element"))?;
-        let branch = body
-            .children
-            .iter_mut()
-            .find(|n| matches!(n, PlanNode::Branch { name, .. } if name == first));
+        check_xml_name(segment, &format!("field '{field}': element"))?;
+        let branch = body.children.iter_mut().find(
+            |n| matches!(n, PlanNode::Branch { name, .. } if name.as_str() == segment.as_ref()),
+        );
         if let Some(PlanNode::Branch {
             body: branch_body, ..
         }) = branch
@@ -825,13 +848,13 @@ fn plan_insert_field(
                 field_is_attr,
             )?;
             body.children.push(PlanNode::Branch {
-                name: first.to_string(),
+                name: segment.to_string(),
                 body: branch_body,
             });
             Ok(())
         }
-    } else if !attribute_prefix.is_empty() && path.starts_with(attribute_prefix) {
-        let attr_name = &path[attribute_prefix.len()..];
+    } else if !attribute_prefix.is_empty() && segment.starts_with(attribute_prefix) {
+        let attr_name = &segment[attribute_prefix.len()..];
         if attr_name.is_empty() {
             return Err(FormatError::Xml(format!(
                 "field '{field}': attribute prefix '{attribute_prefix}' \
@@ -851,10 +874,10 @@ fn plan_insert_field(
         });
         Ok(())
     } else {
-        check_xml_name(path, &format!("field '{field}': element"))?;
-        let repeat = build_repeat_spec(field, path, join_values)?;
+        check_xml_name(segment, &format!("field '{field}': element"))?;
+        let repeat = build_repeat_spec(field, segment, join_values)?;
         body.children.push(PlanNode::Leaf {
-            name: path.to_string(),
+            name: segment.to_string(),
             field: field_index,
             repeat,
         });
@@ -1242,6 +1265,58 @@ mod tests {
         assert!(
             output.contains("<Address><City>NYC</City></Address>"),
             "Dotted field should expand to nested elements: {output}"
+        );
+    }
+
+    #[test]
+    fn an_escaped_separator_stays_inside_one_element_name() {
+        // `.` is a legal XML NameChar, so an escaped separator produces one
+        // element rather than a nesting level. This is the replacement for the
+        // literal dotted name that unconditional expansion takes away.
+        let schema = Arc::new(Schema::new(vec![r"a\.b".into()]));
+        let record = Record::new(Arc::clone(&schema), vec![Value::String("v".into())]);
+        let output = write_records(XmlWriterConfig::default(), &[record], &schema);
+        assert!(output.contains("<a.b>v</a.b>"), "{output}");
+
+        // The reader flattens `<a.b>` back to the column `a.b` — unescaped, so
+        // the name it hands back would nest on a second write. Closing that is
+        // the read side's half of the grammar, tracked by
+        // https://github.com/rustpunk/clinker/issues/920; pinned here so the
+        // flip is deliberate.
+        let mut reader = XmlReader::from_reader(
+            std::io::Cursor::new(output.into_bytes()),
+            XmlReaderConfig {
+                record_path: Some("Root/Record".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let _s = reader.schema().unwrap();
+        let back = reader.next_record().unwrap().unwrap();
+        assert_eq!(back.get("a.b"), Some(&Value::String("v".into())));
+    }
+
+    #[test]
+    fn a_column_that_is_also_a_container_is_refused() {
+        // Previously emitted two sibling `<a>` elements, which this crate's own
+        // reader then refused on the way back in.
+        let schema = Arc::new(Schema::new(vec!["a".into(), "a.b".into()]));
+        let record = Record::new(
+            Arc::clone(&schema),
+            vec![Value::Integer(1), Value::Integer(2)],
+        );
+        let mut buf = Vec::new();
+        let mut w = XmlWriter::new(&mut buf, Arc::clone(&schema), XmlWriterConfig::default());
+        let err = w.write_record(&record).unwrap_err();
+        assert!(
+            matches!(err, FormatError::FieldPath { format: "XML", .. }),
+            "{err:?}"
+        );
+        drop(w);
+        assert!(
+            buf.is_empty(),
+            "a refused column set emits no bytes, got: {:?}",
+            String::from_utf8_lossy(&buf)
         );
     }
 

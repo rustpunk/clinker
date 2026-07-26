@@ -4,6 +4,40 @@ All notable changes to Clinker are tracked here.
 
 ## Unreleased
 
+### Changed — JSON output expands dotted column names into nested objects
+
+**Behaviour change.** A JSON output previously emitted every column name
+verbatim, so a column named `customer.name` became the literal key
+`"customer.name"`. It now expands into `{"customer": {"name": …}}`, matching
+what the XML writer has always done with the same column set — so a pipeline
+that reads nested JSON and writes JSON reproduces its input shape. This applies
+unconditionally; there is no option to keep the old output, because a per-output
+flag would mean the same column name meant different things at different
+outputs.
+
+Any pipeline whose output schema carries a dotted column name emits a different
+JSON shape than before. This includes columns produced by the JSON and XML
+readers' flattening, and — under `include_correlation_keys: true` — the
+engine-stamped `$ck.<field>` columns, which now nest under a `"$ck"` object.
+
+- To emit a key that genuinely contains a `.`, escape the separator in the
+  column name: a column declared `a\.b` writes the single key `"a.b"`. The full
+  grammar, including the reserved `[`, is documented at
+  `docs/user/src/cxl/field-paths.md`.
+- Two column names that cannot both be expanded — a column `a` holding a value
+  alongside a column `a.b` needing `a` to be a container, or two spellings of
+  the same path — are now refused before any byte is written, naming both
+  columns, on the JSON **and** XML writers. The XML writer previously emitted
+  two sibling elements for that column set, which its own reader then rejected
+  on the way back in.
+- A column name carrying a malformed escape (a `\` not part of `\.`, `\[`, or
+  `\\`, as in a column literally named `C:\temp`) is likewise refused, with the
+  corrected spelling in the message.
+
+Known gap: the readers still join flattened path segments without escaping them,
+so a source key that literally contains a `.` arrives as an unescaped column
+name and writes back nested. Tracked separately.
+
 ### Added — scoped variables and the `state` node
 
 - Three-scope variable system: `pipeline`, `source`, and `record`.

@@ -75,7 +75,7 @@ Returns a new map with `key` set to `value`. If the key was already present, its
 
 For `profile = {"name":"Alice","address":{"city":"LA"}}`, `profile.set("address.city", "NYC")` is `{"name":"Alice","address":{"city":"NYC"}}` -- the sibling `name` and any other `address` keys are preserved.
 
-> **Known limitation.** Because `.` and `[` are path syntax, `set` cannot target a key whose name *literally* contains a `.` or `[` (for example a JSON field literally named `"a.b"`). To write such a key, build it with [`merge`](#mergeother-map---map) and a map literal; to remove it, use [`remove_field`](#remove_fieldkey-string---map), which matches the exact key string.
+> **Known limitation.** Because `.` and `[` are path syntax, `set` cannot yet target a key whose name *literally* contains a `.` or `[` (for example a JSON field literally named `"a.b"`). Column names solve this with a backslash escape — `a\.b` is one segment named `a.b`, per [Field Paths](field-paths.md) — and the decided direction is for `set` / `unset` keys to read that same grammar, since both are flat strings addressing a path. Until they do: to write such a key, build it with [`merge`](#mergeother-map---map) and a map literal; to remove it, use [`remove_field`](#remove_fieldkey-string---map), which matches the exact key string.
 
 ### remove_field(key: String) -> Map
 

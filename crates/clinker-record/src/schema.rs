@@ -242,6 +242,17 @@ impl Schema {
     pub fn field_metadata_by_name(&self, name: &str) -> Option<&FieldMetadata> {
         self.index(name).and_then(|i| self.field_metadata(i))
     }
+
+    /// Whether column `idx` is engine-stamped rather than user-declared — the
+    /// predicate that decides what the default writer surface emits.
+    ///
+    /// The by-index form exists for callers that must keep the column's schema
+    /// position (a writer precompiling a plan against `Record::values`), which
+    /// the field iterators do not hand back.
+    pub fn is_engine_stamped(&self, idx: usize) -> bool {
+        self.field_metadata(idx)
+            .is_some_and(FieldMetadata::is_engine_stamped)
+    }
 }
 
 /// Fluent builder for `Arc<Schema>` construction.

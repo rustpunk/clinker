@@ -3,6 +3,7 @@ pub mod coercion;
 pub mod counters;
 pub mod decimal_serde;
 pub mod document_context;
+pub mod field_path;
 pub mod field_str;
 pub mod group_key;
 pub mod minimal;
@@ -26,6 +27,7 @@ pub use document_context::{
     DocumentContext, DocumentGrain, DocumentId, EnvelopeRecord, synthetic_document_context,
     synthetic_document_context_ref,
 };
+pub use field_path::{FieldPathError, MAX_FIELD_PATH_DEPTH};
 pub use field_str::FieldStr;
 pub use group_key::{GroupByKey, GroupKeyError, value_to_group_key};
 pub use minimal::MinimalRecord;

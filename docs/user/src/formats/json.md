@@ -138,3 +138,85 @@ JSON output fails with a JSON error naming the value, rather than silently
 substituting `null` — a substituted `null` would be indistinguishable from
 a genuine source null on read-back. Filter such records or replace the
 value in a transform before the JSON output.
+
+## Writing JSON
+
+A JSON output writes one object per record, in schema-column order, either as a
+single array (`format: array`, the default) or one object per line
+(`format: ndjson`).
+
+```yaml
+- type: output
+  name: enriched
+  input: processed
+  config:
+    name: enriched
+    type: json
+    path: "./output/enriched.json"
+    options:
+      format: ndjson     # array | ndjson
+      pretty: false      # indent the emitted objects
+```
+
+### Dotted column names become nested objects
+
+A column name containing a `.` expands back into nesting, the same way the
+[XML writer](xml.md#writing-xml) expands one into nested elements. Columns
+`Address.City` and `Address.State` write as one object:
+
+```json
+{"Address":{"City":"Boston","State":"MA"},"name":"Ada"}
+```
+
+This is what makes a JSON-in / JSON-out pipeline reproduce its input shape: the
+reader flattened `{"Address":{"City":…}}` into the column `Address.City`, and
+the writer puts it back. It applies to every JSON output, with no option to turn
+it off — a flag would mean the same column name meant different things at
+different outputs.
+
+Three points follow from the rule, all shared with the XML writer and specified
+in full on [Field Paths](../cxl/field-paths.md):
+
+- **Grouping.** Columns sharing a prefix collect into one object, positioned
+  where that prefix first appeared, even when the schema interleaves them.
+- **Absent children.** Under `preserve_nulls: false` a null column emits no key,
+  and an object whose every descendant is absent emits no key at all rather than
+  an empty `{}` — so it reads back as the absent column it stands for.
+- **Values are untouched.** A column holding a map or an array still serializes
+  as that map or array. Expansion adds structure above the value, never inside
+  it.
+
+### Keeping a literal `.` in a key
+
+To emit a key that genuinely contains a `.`, escape the separator in the column
+name. The column `a\.b` writes the single key `"a.b"`:
+
+```yaml
+      schema:
+        - { name: "a\\.b", type: string }   # emits {"a.b": …}
+        - { name: "a.b",   type: string }   # emits {"a": {"b": …}}
+```
+
+A `[` in a column name is currently literal but reserved; write `\[` if you want
+it to stay literal indefinitely. See
+[Field Paths](../cxl/field-paths.md#writing-a-literal-bracket) for why.
+
+Note that this is a **write-side** escape. A source key that literally contains
+a `.` still arrives from the reader as an unescaped column name (the
+[Flattened-name collisions](#flattened-name-collisions) section above covers
+what the reader does), so `{"a.b": 1}` read and written back comes out as
+`{"a": {"b": 1}}`. Closing that is tracked by
+[issue 920](https://github.com/rustpunk/clinker/issues/920).
+
+### Column names that cannot both be written
+
+Two columns can describe places that cannot both exist in one object — a column
+`a` holding a value alongside a column `a.b` that needs `a` to be an object.
+Rather than keep one and drop the other, the writer refuses the whole column set
+before emitting a byte, naming both columns and, where escaping would resolve
+it, the escaped spelling to use. [Field Paths](../cxl/field-paths.md#when-two-names-clash)
+lists every clashing shape.
+
+A column name carrying a malformed escape — a `\` that is not part of `\.`,
+`\[`, or `\\`, as in a column literally named `C:\temp` — is refused the same
+way, with the corrected spelling (`C:\\temp`) in the message.
