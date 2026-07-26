@@ -437,7 +437,7 @@ nodes:
         emit x = $doc.Head.blob
   - type: output
     name: out
-    input: docs
+    input: tag
     config:
       name: out
       type: json

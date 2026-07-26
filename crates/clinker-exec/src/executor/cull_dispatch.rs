@@ -67,8 +67,8 @@ use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 
 use crate::executor::dispatch::{
-    ExecutorContext, NodeBufferKey, admit_node_buffer, drain_node_buffer_slot,
-    node_buffer_spill_allowed, source_file_arc_of, source_name_arc_of,
+    ExecutorContext, NodeBufferKey, admit_node_buffer, node_buffer_spill_allowed,
+    require_node_buffer_slot, source_file_arc_of, source_name_arc_of,
 };
 use crate::executor::{GroupedNodeKind, giant_group_error};
 use crate::pipeline::memory::{
@@ -167,13 +167,22 @@ pub(crate) fn dispatch_cull(
     };
 
     let pred = single_predecessor(current_dag, node_idx, "cull", name)?;
+    let producer_port = current_dag
+        .graph
+        .find_edge(pred, node_idx)
+        .and_then(|edge| current_dag.graph.edge_weight(edge))
+        .and_then(|edge| edge.producer_port.as_deref());
+    let input_buffer = require_node_buffer_slot(
+        ctx,
+        pred,
+        name,
+        current_dag.graph[pred].name(),
+        producer_port,
+    )?;
     let (input, input_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
-    ) = match drain_node_buffer_slot(ctx, pred) {
-        Some(nb) => nb.drain_split()?,
-        None => (Vec::new(), Vec::new()),
-    };
+    ) = input_buffer.drain_split()?;
 
     if input.is_empty() {
         // Empty-input fast path returns BEFORE any consumer registers, so

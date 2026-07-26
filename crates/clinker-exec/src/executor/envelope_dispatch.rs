@@ -59,7 +59,7 @@ use petgraph::graph::NodeIndex;
 
 use crate::aggregation::{AggregateEvalScope, eval_expr_in_agg_scope};
 use crate::executor::dispatch::{
-    ExecutorContext, admit_node_buffer, drain_node_buffer_slot, node_buffer_spill_allowed,
+    ExecutorContext, admit_node_buffer, node_buffer_spill_allowed, require_node_buffer_slot,
 };
 use crate::executor::envelope::distinct_body_headers;
 use crate::executor::node_buffer::DrainedEvents;
@@ -132,10 +132,19 @@ pub(crate) fn dispatch_envelope(
         Some(header_pred) => body_predecessor_excluding(current_dag, node_idx, name, header_pred)?,
         None => single_predecessor(current_dag, node_idx, "envelope", name)?,
     };
-    let (mut records, puncts) = match drain_node_buffer_slot(ctx, body_pred) {
-        Some(nb) => nb.drain_split()?,
-        None => (Vec::new(), Vec::new()),
-    };
+    let body_port = current_dag
+        .graph
+        .edges_connecting(body_pred, node_idx)
+        .next()
+        .and_then(|edge| edge.weight().producer_port.as_deref());
+    let (mut records, puncts) = require_node_buffer_slot(
+        ctx,
+        body_pred,
+        name,
+        current_dag.graph[body_pred].name(),
+        body_port,
+    )?
+    .drain_split()?;
 
     // Drain the wired header stream and replace each body grain's ambient
     // envelope with its grain-matched header record. This runs BEFORE the
@@ -146,10 +155,19 @@ pub(crate) fn dispatch_envelope(
         // body's punctuations drive output framing, and the header is a
         // 1-row-per-grain metadata stream whose document boundaries are not part
         // of the framed body.
-        let (header_records, _header_puncts) = match drain_node_buffer_slot(ctx, header_pred) {
-            Some(nb) => nb.drain_split()?,
-            None => (Vec::new(), Vec::new()),
-        };
+        let header_port = current_dag
+            .graph
+            .edges_connecting(header_pred, node_idx)
+            .next()
+            .and_then(|edge| edge.weight().producer_port.as_deref());
+        let (header_records, _header_puncts) = require_node_buffer_slot(
+            ctx,
+            header_pred,
+            name,
+            current_dag.graph[header_pred].name(),
+            header_port,
+        )?
+        .drain_split()?;
         replace_headers_by_grain(name, &mut records, &header_records)?;
     }
 

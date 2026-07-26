@@ -17,7 +17,8 @@ use petgraph::graph::NodeIndex;
 use crate::executor::dispatch::{
     ExecutorContext, FusedMergeOutput, MergeStreamHandoff, NodeBufferKey, admit_node_buffer,
     drain_or_clone_shared_input, finalize_node_rooted_windows, merge_fused_interleave,
-    node_buffer_spill_allowed, stream_linear_producer_emit, tee_emit_to_region_input_buffers,
+    missing_node_buffer_input_error, node_buffer_spill_allowed, stream_linear_producer_emit,
+    tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
 use clinker_plan::error::PipelineError;
@@ -228,19 +229,21 @@ pub(crate) fn dispatch_merge(
             clinker_plan::config::MergeMode::Concat => {
                 for (src, port) in &ordered_inputs {
                     let upstream_name = current_dag.graph[*src].name().to_string();
-                    if let Some(buf) = drain_or_clone_shared_input(
+                    let buf = drain_or_clone_shared_input(
                         ctx,
                         current_dag,
                         NodeBufferKey::with_port(*src, port.as_deref()),
-                    ) {
-                        for event in buf.drain() {
-                            match event? {
-                                crate::executor::stream_event::StreamEvent::Record(record, rn) => {
-                                    emit(&mut merged, &upstream_name, record, rn)?;
-                                }
-                                crate::executor::stream_event::StreamEvent::Punctuation(p) => {
-                                    all_puncts.push(p);
-                                }
+                    )
+                    .ok_or_else(|| {
+                        missing_node_buffer_input_error(name, &upstream_name, port.as_deref())
+                    })?;
+                    for event in buf.drain() {
+                        match event? {
+                            crate::executor::stream_event::StreamEvent::Record(record, rn) => {
+                                emit(&mut merged, &upstream_name, record, rn)?;
+                            }
+                            crate::executor::stream_event::StreamEvent::Punctuation(p) => {
+                                all_puncts.push(p);
                             }
                         }
                     }
@@ -261,18 +264,22 @@ pub(crate) fn dispatch_merge(
                     .iter()
                     .map(
                         |(src, port)| -> Result<VecDeque<(Record, u64)>, PipelineError> {
-                            match drain_or_clone_shared_input(
+                            let upstream_name = current_dag.graph[*src].name();
+                            let nb = drain_or_clone_shared_input(
                                 ctx,
                                 current_dag,
                                 NodeBufferKey::with_port(*src, port.as_deref()),
-                            ) {
-                                Some(nb) => {
-                                    let (records, puncts) = nb.drain_split()?;
-                                    all_puncts.extend(puncts);
-                                    Ok(VecDeque::from(records))
-                                }
-                                None => Ok(VecDeque::new()),
-                            }
+                            )
+                            .ok_or_else(|| {
+                                missing_node_buffer_input_error(
+                                    name,
+                                    upstream_name,
+                                    port.as_deref(),
+                                )
+                            })?;
+                            let (records, puncts) = nb.drain_split()?;
+                            all_puncts.extend(puncts);
+                            Ok(VecDeque::from(records))
                         },
                     )
                     .collect::<Result<Vec<_>, _>>()?;

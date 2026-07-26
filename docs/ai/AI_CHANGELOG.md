@@ -39,6 +39,20 @@ Representative code and manifest evidence cited by those docs includes:
 
 ## Entries
 
+### 2026-07-26: A Missing Planned Node Buffer Is Not Empty Input
+
+Type: Source-backed fact (issue #1029).
+
+Summary: Required materialized-input reads use one checked retrieval boundary.
+After certified streaming/fused and explicit alternate-slot paths are excluded,
+an absent planned slot returns `PipelineError::Internal` naming the consumer
+and producer/port; it is never converted to an empty collection. A real zero-
+row stage remains represented by an occupied `NodeBuffer::Memory(Vec::new())`.
+The guard is allocation-free on the successful path and deliberately does not
+change fan-out reader counts, slot addressing, clone reservation, or spill
+eligibility. Evidence: `crates/clinker-exec/src/executor/dispatch.rs` and the
+dispatcher integration tests.
+
 ### 2026-07-25: `ErrorStrategy` Has Exactly Two Variants
 
 Type: Source-backed fact (issue #951).

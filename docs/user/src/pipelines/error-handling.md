@@ -30,6 +30,15 @@ The safest strategy. Any record-level error (type coercion failure, validation e
 
 Some failures abort the run under **either** strategy, because they are not record-scoped: an unwritable output path, a config or CXL compile error, and the DLQ-rate ceiling ([`dlq.max_rate`](#dlq-configuration), E315/E316) all end the run regardless of the strategy.
 
+An executor invariant failure also aborts under either strategy with exit code
+`1`. In particular, if a planned materialized input is unavailable when its
+consumer runs, Clinker stops instead of treating that input as a legitimate
+zero-row result. The message names the consuming node and planned producer
+(including the producer port when applicable) and says the input was not
+treated as empty. A source or stage that really emits zero rows remains valid;
+it carries an explicit empty buffer and completes normally. Report any missing-
+input internal error as an engine defect rather than routing it to the DLQ.
+
 ### continue
 
 The production workhorse. Bad records are written to the DLQ file with diagnostic metadata, and the pipeline continues processing remaining records. After the run completes, inspect the DLQ to understand and correct failures.

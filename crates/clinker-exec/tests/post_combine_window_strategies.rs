@@ -79,7 +79,7 @@ nodes:
       group_by: [department]
 - type: output
   name: out
-  input: enriched
+  input: running
   config:
     name: out
     path: out.csv
@@ -136,12 +136,9 @@ ENG,5000
     PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
         .expect("pipeline must run");
     let _output = buf.as_string();
-    // The Output node above is wired to the combine `enriched`, so the
-    // running window's emit columns aren't projected to the writer in
-    // this fixture — the load-bearing assertion is that compile + run
-    // succeeds against a HashBuildProbe combine feeding a downstream
-    // window. Value-level assertion lives below where the Output node
-    // sees the windowed transform.
+    // The load-bearing assertion is that compile + run succeeds against a
+    // HashBuildProbe combine feeding a downstream window. Value-level
+    // assertion lives below with a larger fixture.
 }
 
 /// HashBuildProbe combine feeding a windowed Transform whose output

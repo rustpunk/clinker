@@ -18,7 +18,8 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, dispatch_plan_node, drain_node_buffer_slot,
-    finalize_node_rooted_windows, node_buffer_spill_allowed, tee_emit_to_region_input_buffers,
+    finalize_node_rooted_windows, missing_node_buffer_input_error, node_buffer_spill_allowed,
+    require_node_buffer_slot, tee_emit_to_region_input_buffers,
 };
 use crate::executor::node_buffer::NodeBuffer;
 use crate::executor::schema_check::check_input_schema;
@@ -198,21 +199,22 @@ fn collect_port_records(
         // with the pull-mode arbitrator and cannot itself raise E310. #1028
         // tracks reserving the duplicate before allocation and transferring
         // that accounting into the body scope without a gap or double count.
-        let records = ctx
-            .node_buffers
-            .get(&edge.source().into())
-            .map(|nb| {
-                // Composition port seeding clones records only; the
-                // composition body operates inside its own document-
-                // boundary scope and re-emits punctuations at the call-
-                // site level on body exit, so the parent's puncts do not
-                // forward through the body's port-source boundary.
-                nb.clone_memory_only()
-                    .into_iter()
-                    .filter_map(|e| e.into_record())
-                    .collect::<Vec<(Record, u64)>>()
-            })
-            .unwrap_or_default();
+        let input_buffer = ctx.node_buffers.get(&edge.source().into()).ok_or_else(|| {
+            missing_node_buffer_input_error(
+                composition_name,
+                parent_dag.graph[edge.source()].name(),
+                edge.weight().producer_port.as_deref(),
+            )
+        })?;
+        // Composition port seeding clones records only; the composition body
+        // operates inside its own document-boundary scope and re-emits
+        // punctuations at the call-site level on body exit, so the parent's
+        // punctuations do not forward through the body's port-source boundary.
+        let records = input_buffer
+            .clone_memory_only()
+            .into_iter()
+            .filter_map(|event| event.into_record())
+            .collect::<Vec<(Record, u64)>>();
         // Two parallel edges to the same port (e.g. `inputs: { p: a,
         // p: a }` — currently rejected at parse, but the runtime is
         // defensive) would overwrite; the wiring pass guarantees
@@ -363,9 +365,9 @@ fn execute_composition_body(
     }
 
     // Harvest output before restoring parent buffers. When the output
-    // port aliases a deferred-region producer (a relaxed-CK Aggregate
-    // sitting at the body's terminal port), the producer's forward
-    // emit is NOT a final stream — the commit-pass body→parent
+    // port participates in a deferred region (for example a Transform
+    // downstream of a relaxed-CK Aggregate), its forward emit is NOT a final
+    // stream — the commit-pass body→parent
     // harvest path re-emits the post-recompute narrow rows into the
     // parent's `node_buffers[composition_idx]`. Returning the forward
     // emit here would double-feed the parent's continuation: once
@@ -380,17 +382,21 @@ fn execute_composition_body(
             // pipeline scope; they re-emit when the parent's call
             // site re-introduces document context. The body harvest
             // takes records only.
-            let drained: Vec<(Record, u64)> = match drain_node_buffer_slot(ctx, idx) {
-                Some(nb) => {
-                    let (records, _puncts) = nb.drain_split()?;
-                    records
-                }
-                None => Vec::new(),
-            };
-            if body_dag.deferred_region_at_producer(idx).is_some() {
+            if body_dag.deferred_region_at(idx).is_some() {
+                // A deferred body terminal is harvested by the commit pass. Its
+                // forward slot is optional and is drained only as cleanup.
+                drain_node_buffer_slot(ctx, idx);
                 Vec::new()
             } else {
-                drained
+                let (records, _puncts) = require_node_buffer_slot(
+                    ctx,
+                    idx,
+                    composition_name,
+                    body_dag.graph[idx].name(),
+                    None,
+                )?
+                .drain_split()?;
+                records
             }
         }
         _ => Vec::new(),
