@@ -69,9 +69,12 @@ nodes:
         stderr.contains("prepared"),
         "diagnostic must name producer prepared; got:\n{stderr}"
     );
-    let normalized_stderr = stderr.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        normalized_stderr.contains("run stopped instead of treating it as empty"),
+        stderr.contains("run stopped instead of"),
         "diagnostic must explain its fail-closed disposition; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("treating it as empty"),
+        "diagnostic must explain that the missing input was not treated as empty; got:\n{stderr}"
     );
 }
