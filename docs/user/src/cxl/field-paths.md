@@ -33,16 +33,19 @@ Reading a name left to right:
 | `\.` | A literal `.` inside the current segment. |
 | `\\` | A literal `\`. |
 | `\[` | A literal `[`. |
-| Anything else | A literal character of the current segment. |
+| `\` before anything else | **An error.** `\]`, `\t`, and a name ending in `\` are all rejected. |
+| Any other character | A literal character of the current segment — including a bare `[`, and `]`, `@`, `$`, `/`, and whitespace. |
 
 So `Address.City` is two segments, and `a\.b` is one segment named `a.b`.
 
 Three consequences worth stating outright:
 
-- **A lone `\` is an error, never a literal.** `C:\temp` is rejected, because
-  silently treating `\t` as the two characters `\` and `t` would make the
-  encoding ambiguous, and silently *dropping* the `\` would rename the column
-  without saying so. Write `C:\\temp`.
+- **An unrecognized escape is an error, never a literal.** A `\` must be
+  followed by `.`, `[`, or `\` — nothing else, and not the end of the name.
+  `C:\temp` is rejected, because silently treating `\t` as the two characters
+  `\` and `t` would make the encoding ambiguous, and silently *dropping* the
+  `\` would rename the column without saying so. Write `C:\\temp`. The same
+  applies to `\]`, which is covered below.
 - **Empty segments are real.** `a..b` is three segments — `a`, the empty name,
   and `b`. An empty key is a value a document can genuinely carry, so the
   grammar does not reject it.
@@ -59,6 +62,25 @@ nonetheless **reserved**: bracket indexing may later be given meaning inside a
 flat name, matching the `[n]` form CXL expressions already use. Writing `\[`
 means "a literal `[`" today and will keep meaning exactly that. A bare `[` is
 not guaranteed to.
+
+So the column `a[0]` future-proofs as `a\[0]` — escaping only the opening
+bracket:
+
+| Spelling | Result |
+|----------|--------|
+| `a\[0]` | One segment named `a[0]`. Correct, and stable across the reserved-`[` change. |
+| `a\[0\]` | **Rejected** — `\]` is not an escape. |
+| `a[0]` | One segment named `a[0]` today, but a bare `[` is the form that is not guaranteed to keep that meaning. |
+
+**Only the opening bracket is ever escaped.** `]` is never escaped and never
+needs to be: it would carry meaning only as the close of an unescaped `[`, so a
+literal `]` standing on its own is already unambiguous. Escaping it would add
+noise without removing any ambiguity.
+
+Writing `\]` is an error rather than a silently-accepted no-op, for the same
+reason `C:\temp` is: an escape that quietly meant nothing would let two
+different names decode to the same path, and one of them would be dropped. The
+error names the offending escape and the rule.
 
 If a column name of yours contains `[`, escaping it now costs nothing and makes
 it future-proof.
