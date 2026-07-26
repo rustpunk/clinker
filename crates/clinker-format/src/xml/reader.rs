@@ -44,6 +44,7 @@ use crate::doc_index::DocArenaIndex;
 use crate::envelope::{EnvelopeConfig, EnvelopeExtract, coerce_section_fields};
 use crate::error::FormatError;
 use crate::multi_value::{SplitToRows, SplitToRowsMode, SplitValues, split_text_value};
+use crate::record_path::{RecordPath, RecordPathSyntax};
 use crate::source::{ReopenableSource, SourceIdentity};
 use crate::traits::FormatReader;
 use crate::xml::streaming::{SectionTarget, extract_sections};
@@ -230,11 +231,12 @@ impl XmlReader {
         let source = source.into_reopenable().map_err(FormatError::Io)?;
         let (parser, body_identity) = Self::open_body(&source)?;
 
-        let path_segments: Vec<String> = config
-            .record_path
-            .as_deref()
-            .map(|p| p.split('/').map(String::from).collect())
-            .unwrap_or_default();
+        let path_segments = match config.record_path.as_deref() {
+            Some(raw) => RecordPath::parse(RecordPathSyntax::Xml, raw)
+                .map_err(|e| FormatError::Xml(e.to_string()))?
+                .into_segments(),
+            None => Vec::new(),
+        };
 
         Ok(XmlReader {
             source,
@@ -1320,6 +1322,59 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    /// A catalogue the rejected paths below all *look* like they would match,
+    /// so a test that reads zero records is reading zero from a real document.
+    const CATALOG: &str = r#"<catalog>
+        <product><product_id>1</product_id><name>A</name></product>
+        <product><product_id>2</product_id><name>B</name></product>
+    </catalog>"#;
+
+    #[test]
+    fn xpath_shaped_record_path_fails_at_construction() {
+        // Every form here used to build a segment list containing an empty
+        // string, which no element name equals: the reader ran to EOF and the
+        // pipeline reported success over zero records.
+        for raw in ["//product", "/catalog/product", "catalog//product", ""] {
+            let Err(err) = XmlReader::from_reader(
+                Cursor::new(CATALOG.as_bytes().to_vec()),
+                default_config_with_path(raw),
+            ) else {
+                panic!("{raw:?}: must be rejected at construction");
+            };
+            let msg = match err {
+                FormatError::Xml(m) => m,
+                other => panic!("{raw:?}: expected FormatError::Xml, got {other:?}"),
+            };
+            assert!(msg.contains("record_path"), "{raw:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn jsonpath_shaped_record_path_on_an_xml_source_fails_at_construction() {
+        let Err(err) = XmlReader::from_reader(
+            Cursor::new(CATALOG.as_bytes().to_vec()),
+            default_config_with_path("$.product"),
+        ) else {
+            panic!("must be rejected at construction");
+        };
+        match err {
+            FormatError::Xml(m) => assert!(m.contains("JSONPath"), "{m}"),
+            other => panic!("expected FormatError::Xml, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_corrected_record_path_still_streams_every_record() {
+        // The positive twin of the rejections above: the XML-name segment rule
+        // must not over-reject a path that matches.
+        let mut reader = reader_from_str(CATALOG, default_config_with_path("catalog/product"));
+        let first = reader.next_record().expect("record").expect("first");
+        assert_eq!(first.get("product_id"), Some(&Value::Integer(1)));
+        let second = reader.next_record().expect("record").expect("second");
+        assert_eq!(second.get("product_id"), Some(&Value::Integer(2)));
+        assert!(reader.next_record().expect("eof").is_none());
     }
 
     fn envelope_config(sections: &[SectionSpec]) -> EnvelopeConfig {

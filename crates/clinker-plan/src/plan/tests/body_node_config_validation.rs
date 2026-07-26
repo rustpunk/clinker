@@ -18,7 +18,8 @@
 //! resolved to its inline columns relative to the composition file's own
 //! directory (so a body Output's declared-decimal `scale` reaches the write
 //! boundary and a body Source's file schema resolves from the right base);
-//! and the multi-value gates (E358 / E359 / E360 / E361) run over body nodes,
+//! and the per-source config gates — the multi-value family (E358 / E359 /
+//! E360 / E361) and the `record_path` grammar (E363) — run over body nodes,
 //! which the call-site pipeline's own `nodes:` walk never sees.
 
 use std::path::PathBuf;
@@ -527,6 +528,35 @@ fn body_source_unproducible_multi_value_column_rejected_with_e361() {
     assert!(
         diag.message.contains("'sku'") && diag.message.contains("mv_body.comp.yaml"),
         "the diagnostic must name the column and the body file: {:?}",
+        diag.message
+    );
+}
+
+/// A JSONPath-shaped `record_path` on a body source. Without the body walk the
+/// grammar gate would exist for top-level sources only, and a body source would
+/// keep failing obscurely from inside the reader — or, for the XPath-shaped
+/// forms, reading zero records with no error at all.
+#[test]
+fn body_source_jsonpath_record_path_rejected_with_e363() {
+    let diags = compile_body_source(
+        r#"  - type: source
+    name: body_src
+    config:
+      name: body_src
+      type: json
+      path: body_src.json
+      options:
+        record_path: "$.data"
+      schema:
+        - { name: sku, type: string }"#,
+    );
+    let diag = diags
+        .iter()
+        .find(|d| d.code == "E363")
+        .unwrap_or_else(|| panic!("expected an E363 for the body source; got: {diags:?}"));
+    assert!(
+        diag.message.contains("JSONPath") && diag.message.contains("mv_body.comp.yaml"),
+        "the diagnostic must name the grammar and the body file: {:?}",
         diag.message
     );
 }

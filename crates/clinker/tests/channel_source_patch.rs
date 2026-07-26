@@ -472,6 +472,72 @@ sources:
     assert!(stderr.contains("E231"), "stderr:\n{stderr}");
 }
 
+/// A channel `options:` patch is applied before validation, so a patched
+/// `record_path` is subject to the same grammar gate a hand-written one is. The
+/// base pipeline's `small.rows` is valid; only the overlay's JSONPath-shaped
+/// value is not.
+///
+/// Asserted on the diagnostic text rather than its code: the run path renders
+/// compile diagnostics through `PipelineError::Compilation`, which carries only
+/// their messages — the same for every plan-time gate, not this one.
+#[test]
+fn patched_jsonpath_record_path_fails_at_compile() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let p = dir.path();
+    write(
+        p,
+        "in.json",
+        "{ \"small\": { \"rows\": [ {\"id\":\"1\"} ] } }\n",
+    );
+    write(
+        p,
+        "pipe.yaml",
+        "\
+pipeline:
+  name: json_record_path_patch
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: json
+      path: in.json
+      options:
+        record_path: small.rows
+      schema:
+        - { name: id, type: string }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+",
+    );
+    // The unpatched pipeline runs, so the failure below is the patch's.
+    assert!(run_in(p, &[]).status.success(), "base json run failed");
+
+    write_channel(
+        p,
+        "badpath",
+        "\
+sources:
+  src:
+    options:
+      record_path: \"$.rows\"
+",
+    );
+    let out = run_in(p, &["--channel", "badpath"]);
+    assert!(
+        !out.status.success(),
+        "a patched JSONPath-shaped record_path must fail at compile"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("JSONPath"), "stderr:\n{stderr}");
+    assert!(stderr.contains("record_path"), "stderr:\n{stderr}");
+}
+
 /// Pipeline whose output path carries the `{pipeline_hash}` token, so the
 /// effective pipeline identity is observable as the output filename.
 const HASH_PIPELINE: &str = "\

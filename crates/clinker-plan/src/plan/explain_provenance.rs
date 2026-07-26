@@ -411,6 +411,7 @@ pub fn explain_code(code: &str) -> Option<&'static str> {
         "E360" => Some(include_str!("../../../../docs/explain/E360.md")),
         "E361" => Some(include_str!("../../../../docs/explain/E361.md")),
         "E362" => Some(include_str!("../../../../docs/explain/E362.md")),
+        "E363" => Some(include_str!("../../../../docs/explain/E363.md")),
         "E323" => Some(include_str!("../../../../docs/explain/E323.md")),
         "E150b" => Some(include_str!("../../../../docs/explain/E150b.md")),
         "E150c" => Some(include_str!("../../../../docs/explain/E150c.md")),
@@ -617,6 +618,17 @@ mod tests {
     }
 
     #[test]
+    fn test_explain_code_e363_record_path_syntax() {
+        let doc = explain_code("E363").unwrap();
+        assert!(doc.contains("E363"));
+        assert!(doc.contains("record_path"));
+        // Both grammars an author is likely to reach for must be named, so the
+        // page answers "why was mine rejected" for either.
+        assert!(doc.contains("XPath"));
+        assert!(doc.contains("JSONPath"));
+    }
+
+    #[test]
     fn test_explain_code_unknown() {
         assert!(explain_code("E999").is_none());
     }
@@ -630,7 +642,7 @@ mod tests {
             "E324", "E325", "E326", "E327", "E330", "E331", "E332", "E333", "E334", "E335", "E336",
             "E337", "E338", "E339", "E340", "E341", "E342", "E343", "E344", "E345", "E346", "E347",
             "E348", "E349", "E350", "E351", "E352", "E353", "E354", "E355", "E356", "E357", "E358",
-            "E359", "E360", "E361", "E362", "E15Y", "W101", "W302", "W305", "W306",
+            "E359", "E360", "E361", "E362", "E363", "E15Y", "W101", "W302", "W305", "W306",
         ];
         let required_sections = [
             "## What it means",

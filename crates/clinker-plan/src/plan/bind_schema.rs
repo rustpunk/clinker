@@ -3037,25 +3037,29 @@ fn bind_composition(
         }
     }
 
-    // 7e. The multi-value gates (E358 / E359 / E360 / E361), which the
-    // call-site pipeline runs over its OWN `nodes:` — a list that never
-    // contains a body's nodes. Without this pass a body source declaring the
-    // retired `array_paths:`, a `multiple: true` column its format cannot
-    // produce, or a malformed `split_to_rows` block reaches the executor
-    // ungated and emits one record per document where the author asked for one
-    // per element. The XML reader's construction-time nesting/duplicate
-    // rejection used to catch part of that for body sources and was replaced by
-    // the plan-time gate, so running the gate here is what keeps the
-    // replacement whole. Runs after 7d so an external `.schema.yaml` is already
-    // folded inline and the gates see its columns. Collect every finding, then
-    // abandon the body, mirroring the passes above.
+    // 7e. The multi-value gates (E358 / E359 / E360 / E361) and the E363
+    // `record_path` grammar gate, which the call-site pipeline runs over its
+    // OWN `nodes:` — a list that never contains a body's nodes. Without this
+    // pass a body source declaring the retired `array_paths:`, a `multiple:
+    // true` column its format cannot produce, a malformed `split_to_rows`
+    // block, or an XPath-shaped `record_path` reaches the executor ungated and
+    // emits one record per document — or none at all — where the author asked
+    // for one per element. The XML reader's construction-time
+    // nesting/duplicate rejection used to catch part of that for body sources
+    // and was replaced by the plan-time gate, so running the gate here is what
+    // keeps the replacement whole. Runs after 7d so an external `.schema.yaml`
+    // is already folded inline and the gates see its columns. Collect every
+    // finding, then abandon the body, mirroring the passes above.
     {
         let faults = crate::config::multi_value::source_node_faults(&body_file.nodes)
             .into_iter()
             .chain(crate::config::multi_value::output_node_faults(
                 &body_file.nodes,
+            ))
+            .chain(crate::config::record_path::record_path_faults(
+                &body_file.nodes,
             ));
-        let mut has_multi_value_violation = false;
+        let mut has_node_config_violation = false;
         for fault in faults {
             diags.push(
                 Diagnostic::error(
@@ -3072,9 +3076,9 @@ fn bind_composition(
                 )
                 .with_help(fault.help),
             );
-            has_multi_value_violation = true;
+            has_node_config_violation = true;
         }
-        if has_multi_value_violation {
+        if has_node_config_violation {
             return;
         }
     }
