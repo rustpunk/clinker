@@ -13,7 +13,7 @@
 //!
 //! A CXL body's own compilation surfaces one of three codes by failure
 //! class: E202 (parse), E203 (name resolution), E200 (type check). Other
-//! errors surface as E201 (missing source schema) and E102–E109 / W101
+//! errors surface as E201 (missing source schema) and E102–E108 / W101
 //! (composition binding).
 
 use std::collections::{HashMap, HashSet};
@@ -4405,6 +4405,77 @@ fn typecheck_cxl(
     )
 }
 
+/// Turn CXL name-resolution failures into one plan diagnostic, keeping the
+/// resolver's own code and help when it carries them.
+///
+/// A resolver diagnostic may name its own code as a `[CODE]` message prefix —
+/// E173 does, for a composition body reading a parent-scope var its
+/// `_compose.scoped_vars` schema does not opt into. Wrapping every failure as
+/// E203 published two contradicting codes in one report (an E203 header over
+/// an `[E173]` message, with a pointer to the E203 page) and dropped the
+/// resolver's `help`, which for E173 is the line naming the exact field to add.
+///
+/// A code heads the report only when every failure names it. A mixed batch
+/// stays E203, and each sub-failure that named a code has it restated after
+/// the message rather than bracketed in front of it: the bracketed form is how
+/// a code announces itself as *the* code of a report, so leaving one there
+/// under an E203 header reproduced the same contradiction one layer down.
+///
+/// `context` names the failing node and is kept on both paths — a pipeline
+/// with more than one composition body is otherwise unactionable, since a
+/// lifted diagnostic carries no span that would identify which body to edit.
+fn resolve_failure_diagnostic(
+    context: &str,
+    diags: Vec<cxl::resolve::ResolveDiagnostic>,
+    span: Span,
+) -> Diagnostic {
+    /// Split a resolver message into the registered `[CODE]` it names for
+    /// itself, if any, and the message body without that prefix.
+    fn split_own_code(message: &str) -> (Option<&str>, &str) {
+        let Some((code, body)) = message
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once(']'))
+        else {
+            return (None, message);
+        };
+        if clinker_core_types::diagnostic::is_registered(code) {
+            (Some(code), body.trim_start())
+        } else {
+            (None, message)
+        }
+    }
+
+    let split: Vec<(Option<&str>, &str)> =
+        diags.iter().map(|d| split_own_code(&d.message)).collect();
+    let shared_code = split
+        .first()
+        .and_then(|(code, _)| *code)
+        .filter(|code| split.iter().all(|(c, _)| *c == Some(*code)));
+
+    let joined = split
+        .iter()
+        .map(|(code, body)| match code {
+            // Restated only where it is not already the report's own code,
+            // which would say it twice.
+            Some(c) if shared_code.is_none() => format!("{body} ({c})"),
+            _ => (*body).to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    let helps: Vec<String> = diags.iter().filter_map(|d| d.help.clone()).collect();
+    let diag = Diagnostic::error(
+        shared_code.unwrap_or("E203"),
+        format!("{context}: {joined}"),
+        LabeledSpan::primary(span, String::new()),
+    );
+    if helps.is_empty() {
+        diag
+    } else {
+        diag.with_help(helps.join("; "))
+    }
+}
+
 /// Resolve + typecheck an already-parsed CXL `program` against `schema`,
 /// attaching `source` as the typed program's display text.
 ///
@@ -4444,17 +4515,10 @@ fn typecheck_parsed_program(
         scoped_vars,
     )
     .map_err(|diags| {
-        Diagnostic::error(
-            "E203",
-            format!(
-                "CXL name resolution failed in {node_name:?}: {}",
-                diags
-                    .into_iter()
-                    .map(|d| d.message)
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ),
-            LabeledSpan::primary(span, String::new()),
+        resolve_failure_diagnostic(
+            &format!("CXL name resolution failed in {node_name:?}"),
+            diags,
+            span,
         )
     })?;
     cxl::typecheck::pass::type_check_with_mode_and_vars(resolved, schema, mode.clone(), scoped_vars)
@@ -5600,7 +5664,8 @@ fn walk_expr_for_qualified_refs(
 /// Wraps the source as `"filter {where_src}"` so the CXL parser
 /// produces a `Statement::Filter`. Routes diagnostics by category:
 /// - Parse failures → E202
-/// - Name-resolution failures → E203
+/// - Name-resolution failures → the resolver's own code when every failure
+///   names the same one, else E203; see [`resolve_failure_diagnostic`]
 /// - Typecheck "filter predicate must be type Bool" → E303
 /// - Other typecheck errors → E200
 fn typecheck_combine_where(
@@ -5639,15 +5704,10 @@ fn typecheck_combine_where(
     ) {
         Ok(r) => r,
         Err(rd) => {
-            let msg = rd
-                .into_iter()
-                .map(|d| d.message)
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(vec![Diagnostic::error(
-                "E203",
-                format!("combine {combine_name:?} where-clause name resolution: {msg}"),
-                LabeledSpan::primary(span, String::new()),
+            return Err(vec![resolve_failure_diagnostic(
+                &format!("combine {combine_name:?} where-clause name resolution"),
+                rd,
+                span,
             )]);
         }
     };

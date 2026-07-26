@@ -47,6 +47,27 @@ impl From<crate::yaml::YamlError> for ConfigError {
 static ENV_VAR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-(.*?))?\}").unwrap());
 
+/// The result of substituting `${VAR}` references into a config document.
+///
+/// Carries whether the substitution changed the document's line count, because
+/// a caller holding both texts cannot otherwise tell whether a line number
+/// taken from one addresses the same line in the other.
+pub struct Interpolation {
+    /// The document with every reference replaced by its value.
+    ///
+    /// Contains whatever the referenced variables held, so it must never be
+    /// shown to a user: a `${SFTP_URL}` carrying a credential appears here in
+    /// the clear. Anything user-facing quotes the raw document instead.
+    pub text: String,
+    /// Whether a substituted value introduced a YAML line break or the
+    /// placeholder itself contained one that substitution removed.
+    ///
+    /// When false, `text` and the raw document have identical line numbering,
+    /// so a line number resolved against one addresses the same line in the
+    /// other. When true they have diverged and no such correspondence exists.
+    pub shifted_lines: bool,
+}
+
 /// Pre-deserialize environment variable interpolation.
 ///
 /// Replaces `${VAR}` with `env::var("VAR")` and `${VAR:-default}` with
@@ -65,6 +86,27 @@ pub fn interpolate_env_vars(
     yaml: &str,
     extra_vars: &[(&str, &str)],
 ) -> Result<String, ConfigError> {
+    interpolate_env_vars_with_metadata(yaml, extra_vars).map(|interpolation| interpolation.text)
+}
+
+/// Pre-deserialize environment variable interpolation with line-shift metadata.
+///
+/// This is the metadata-bearing counterpart to [`interpolate_env_vars`]. It
+/// exists for callers that retain the raw document and need to know whether a
+/// source line resolved against the interpolated document can still be mapped
+/// back to it safely.
+pub fn interpolate_env_vars_with_metadata(
+    yaml: &str,
+    extra_vars: &[(&str, &str)],
+) -> Result<Interpolation, ConfigError> {
+    interpolate_env_vars_with_metadata_using(yaml, extra_vars, |name| std::env::var(name))
+}
+
+fn interpolate_env_vars_with_metadata_using(
+    yaml: &str,
+    extra_vars: &[(&str, &str)],
+    mut env_var: impl FnMut(&str) -> Result<String, std::env::VarError>,
+) -> Result<Interpolation, ConfigError> {
     // Step 1: Replace $$ with NULL byte placeholder before main regex.
     // NULL bytes do not appear in valid YAML config files.
     debug_assert!(
@@ -76,11 +118,20 @@ pub fn interpolate_env_vars(
     // Step 2: Run regex substitution with extra_vars priority
     let mut result = String::with_capacity(escaped.len());
     let mut last_end = 0;
+    // Tracked across every substitution source -- an override, the
+    // environment, and an inline default can each carry a YAML line break.
+    let mut shifted_lines = false;
 
     for caps in ENV_VAR_RE.captures_iter(&escaped) {
         let full_match = caps.get(0).unwrap();
         let var_name = caps.get(1).unwrap().as_str();
         let default_value = caps.get(2).map(|m| m.as_str());
+
+        // A placeholder can itself span YAML lines when an inline default
+        // contains a lone CR. Replacing that default with a single-line CLI or
+        // environment value removes a line break, which invalidates raw-source
+        // line mapping just as surely as introducing one does.
+        shifted_lines |= contains_yaml_line_break(full_match.as_str());
 
         // Validate env var name: must be UPPERCASE + underscores only
         if !var_name
@@ -104,12 +155,19 @@ pub fn interpolate_env_vars(
             .find(|(k, _)| *k == var_name)
             .map(|(_, v)| *v)
         {
+            shifted_lines |= contains_yaml_line_break(value);
             result.push_str(value);
         } else {
-            match std::env::var(var_name) {
-                Ok(value) => result.push_str(&value),
+            match env_var(var_name) {
+                Ok(value) => {
+                    shifted_lines |= contains_yaml_line_break(&value);
+                    result.push_str(&value);
+                }
                 Err(_) => match default_value {
-                    Some(default) => result.push_str(default),
+                    Some(default) => {
+                        shifted_lines |= contains_yaml_line_break(default);
+                        result.push_str(default);
+                    }
                     None => {
                         return Err(ConfigError::EnvVar {
                             var_name: var_name.to_string(),
@@ -126,7 +184,17 @@ pub fn interpolate_env_vars(
     result.push_str(&escaped[last_end..]);
 
     // Step 3: Restore NULL byte placeholder → $
-    Ok(result.replace('\0', "$"))
+    Ok(Interpolation {
+        text: result.replace('\0', "$"),
+        shifted_lines,
+    })
+}
+
+/// YAML recognizes both LF and a lone CR as line breaks. A substitution that
+/// introduces either changes the parser's line numbering relative to the raw
+/// document, even if the number of LF bytes is unchanged.
+fn contains_yaml_line_break(value: &str) -> bool {
+    value.contains('\n') || value.contains('\r')
 }
 
 /// Parse a pipeline config from a YAML string (after interpolation).
@@ -329,6 +397,70 @@ pub fn load_config_from_str(yaml: &str) -> Result<PipelineConfig, ConfigError> {
     let config = parse_config_source(yaml, &[])?;
     validate_config(&config)?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod interpolation_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_interpolation_api_still_returns_the_interpolated_string() {
+        let result: Result<String, ConfigError> =
+            interpolate_env_vars("name: ${NAME}\n", &[("NAME", "orders")]);
+        assert_eq!(result.unwrap(), "name: orders\n");
+    }
+
+    #[test]
+    fn metadata_marks_lf_and_lone_cr_from_extra_vars_as_line_shifts() {
+        for value in ["first\nsecond", "first\rsecond", "first\r\nsecond"] {
+            let interpolation =
+                interpolate_env_vars_with_metadata("# ${VALUE}\nnodes: []\n", &[("VALUE", value)])
+                    .unwrap();
+            assert!(
+                interpolation.shifted_lines,
+                "YAML line break in {value:?} must invalidate raw line mapping"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_marks_lone_cr_from_a_default_as_a_line_shift() {
+        // The interpolation grammar's `.` does not cross LF, but it does
+        // accept CR in a default, and saphyr treats that CR as a line break.
+        let yaml = "# ${MISSING:-first\rsecond}\n";
+        let interpolation = interpolate_env_vars_with_metadata(yaml, &[]).unwrap();
+        assert!(
+            interpolation.shifted_lines,
+            "YAML line break in default must invalidate raw line mapping"
+        );
+    }
+
+    #[test]
+    fn metadata_marks_lone_cr_default_removed_by_extra_var_as_a_line_shift() {
+        let yaml = "# ${VALUE:-first\rsecond}\nnodes: []\n";
+        let interpolation =
+            interpolate_env_vars_with_metadata(yaml, &[("VALUE", "replacement")]).unwrap();
+        assert_eq!(interpolation.text, "# replacement\nnodes: []\n");
+        assert!(
+            interpolation.shifted_lines,
+            "removing a YAML line break from a placeholder must invalidate raw line mapping"
+        );
+    }
+
+    #[test]
+    fn metadata_marks_lone_cr_default_removed_by_environment_as_a_line_shift() {
+        let yaml = "# ${VALUE:-first\rsecond}\nnodes: []\n";
+        let interpolation = interpolate_env_vars_with_metadata_using(yaml, &[], |name| {
+            assert_eq!(name, "VALUE");
+            Ok("replacement".to_string())
+        })
+        .unwrap();
+        assert_eq!(interpolation.text, "# replacement\nnodes: []\n");
+        assert!(
+            interpolation.shifted_lines,
+            "an environment override that removes a YAML line break must invalidate raw line mapping"
+        );
+    }
 }
 
 #[cfg(test)]

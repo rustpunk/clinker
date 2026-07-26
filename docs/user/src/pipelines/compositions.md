@@ -27,7 +27,7 @@ finally falling back to a filename match. A `use:` that resolves to no
 exist — fails compilation with a spanned `E103` diagnostic naming the
 composition node. The whole run aborts loudly; it does not silently drop
 the composition and write an empty output. The same holds for the other
-composition-binding errors (`E102`–`E109`): an ill-bound call site fails
+composition-binding errors (`E102`–`E108`): an ill-bound call site fails
 compile rather than producing a run that writes zero records. Run
 `clinker explain --code E103` for details.
 

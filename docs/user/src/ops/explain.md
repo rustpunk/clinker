@@ -94,12 +94,20 @@ The resulting diagram shows:
 - **When tuning parallelism** -- check which strategy the optimizer selected for each node.
 - **In code review** -- generate a DOT diagram and include it in the PR for visual confirmation.
 
-Explain runs instantly because it only parses the YAML and builds the plan -- no data is touched. Pair it with `--dry-run` for full config validation:
+Explain parses the YAML and builds the plan without opening runtime readers or
+processing records. Planning may inspect source metadata or matchers for cost
+estimates, but it does not create pipeline outputs.
 
 ```bash
-clinker run pipeline.yaml --explain       # inspect plan
-clinker run pipeline.yaml --dry-run       # validate config
+clinker run pipeline.yaml --explain       # parse, compile, print the plan
+clinker run pipeline.yaml --dry-run       # parse and compile without printing the plan
 ```
+
+Both commands perform the same compile-time checks: schema binding, CXL type
+checking, DAG wiring, and plan-time source and output gates. `--explain` also
+renders the compiled plan; bare `--dry-run` is the quieter validation form.
+Neither command opens runtime readers, processes records, or creates pipeline
+outputs.
 
 ## Retraction section
 
@@ -154,12 +162,71 @@ The `[WON]` marker names the layer whose value survives; shadowed layers show
 what they proposed. An unknown source, column, or attribute is rejected with a
 hint listing the valid names at that level.
 
+## Reading a plan-time failure
+
+A pipeline that fails a plan-time check never reads any input. The failure is
+printed before the run starts, and it carries four things:
+
+```
+E363
+
+  × source 'src': `record_path` "$.rows" starts with the JSONPath root marker
+  │ `$.`, which is not part of the grammar; `record_path` is a dot-separated
+  │ path of object keys, descended from the document root (for example
+  │ `data.rows`). Write "rows" instead
+   ╭─[pipeline.yaml:4:1]
+ 3 │ nodes:
+ 4 │   - type: source
+   · ────────┬───────
+   ·         ╰── declared here
+ 5 │     name: src
+   ╰────
+  help: `record_path` on a `json` source is a dot-separated path of object
+        keys descended from the document root: no `$.` JSONPath root marker,
+        no leading `/`, and no empty segments. It takes precedence over
+        `format:`, so pair it with `format: object` or leave `format:` off.
+        Omit `record_path` entirely and the reader auto-detects the document
+        shape. Run `clinker explain --code E363` for the full grammar.
+```
+
+- **The code** (`E363`) heads the report. Where a page exists for it, hand it
+  to `clinker explain --code` for the worked example.
+- **The message** names the offending input and the rule it broke.
+- **The source line** is quoted from your YAML, with the offending node
+  underlined.
+- **The `help:` paragraph** names the fix. When the gate does not already say
+  so, a `See: clinker explain --code <CODE>` line is appended.
+
+Warnings are reported the same way but marked `⚠` rather than `×`, so an
+advisory is distinguishable from the diagnostic that stopped the run.
+
+The same report is printed under `--explain`, which compiles the plan before
+printing it.
+
+Two notes on where the snippet comes from:
+
+- A pipeline that pulls in a composition body is reported without the quoted
+  source line. A plan-time diagnostic carries a line number but not which file
+  it belongs to, so rather than risk underlining an unrelated line, the report
+  gives the code, message and help alone.
+- A channel/group overlay suppresses the snippet only when it rewrites the
+  compiled config through structural ops, source patches, or composition
+  `config:` values. A selection that contributes only runtime vars leaves the
+  pipeline document unchanged, so its snippet remains safe and is retained.
+- Bare `--dry-run` compiles the plan and prints the same report without reading
+  source data.
+
 ## Looking up diagnostic codes
 
-`clinker explain --code <CODE>` prints the documentation for any registered error or warning code, including retraction-specific codes:
+`clinker explain --code <CODE>` prints the documentation page for a code that
+has one, including retraction-specific codes:
 
 ```bash
 clinker explain --code E15Y   # retraction-mode aggregate incompatible with strategy: streaming
 ```
 
-The full set of codes is enumerated in the error returned when an unknown code is passed.
+Not every code that can head a report has a page yet — pages are written per
+condition, and the code set is larger. **The report itself tells you which:** the
+`See: clinker explain --code <CODE>` line is appended only when that code has a
+page, so a report carrying it is a code this command can answer for. Passing a
+code with no page reports it as unknown and lists every code that does have one.

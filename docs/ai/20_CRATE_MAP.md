@@ -77,7 +77,7 @@ Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clink
 - Important public modules: `diagnostic`, `dlq`, `graph`, `span`.
 - Internal dependencies: none.
 - Architecturally important external dependencies: `miette`, `petgraph`, `serde-saphyr`.
-- Known tests/examples/benches: unit tests in `diagnostic.rs`, `dlq.rs`, `graph.rs`, and `span.rs`; no integration tests or benches listed by Cargo metadata.
+- Known tests/examples/benches: unit tests in `diagnostic.rs`, `dlq.rs`, `graph.rs`, and `span.rs`; one integration test, `tests/registry_no_orphan_codes.rs`, which scans the workspace's Rust sources for diagnostic code literals and fails on any the registry does not list; no benches listed by Cargo metadata.
 - Confidence: High.
 - Evidence: `crates/clinker-core-types/src/lib.rs` explicitly describes the crate as leaf vocabulary and re-exports `Diagnostic`, `NameGraph`, `Span`, and `DlqErrorCategory`; `crates/clinker-core-types/Cargo.toml`.
 

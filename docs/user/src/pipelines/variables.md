@@ -62,7 +62,7 @@ pipeline:
     fuzzy_threshold: { type: float, default: 0.85 }   # read as $vars.fuzzy_threshold
 ```
 
-Built-in members of each scope (`$source.file`, `$source.row`,
+Built-in members of each scope (`$source.file`, `$source.name`, `$source.row`,
 `$source.path`, `$source.count`, `$source.batch`,
 `$source.ingestion_timestamp`; `$pipeline.start_time`,
 `$pipeline.name`, `$pipeline.execution_id`, `$pipeline.batch_id`,
@@ -190,10 +190,10 @@ checked against the pipeline. Each code below tells you what to fix.
 
 | Code | What it catches                                                        |
 | ---- | ---------------------------------------------------------------------- |
-| E107 | Channel var override declares a different type than the pipeline.      |
 | E109 | Channel targets a composition but carries `vars:` overrides.           |
-| E110 | Channel var name shadows a reserved system field for that scope.       |
-| E111 | Channel `vars.source.<src>` references an unknown source-node name.    |
+| E116 | Channel var changes an existing type, or any default mismatches its declared type. |
+| E117 | Channel var name shadows a reserved system field for that scope.       |
+| E118 | Channel `vars.source.<src>` references an unknown source-node name.    |
 | E164 | An init-phase Transform has a runtime descendant.                      |
 | E171 | A reader is not a transitive DAG descendant of its writer.             |
 | E172 | Bare `$source.<custom>` read downstream of a Merge or Combine.         |
@@ -332,11 +332,12 @@ The overlay lives in the tenant's folder (`channel/acme-prod/`) and is applied
 with `--channel acme-prod`; the `channel.target` field is authoritative.
 
 Override semantics (entry name already declared) require the channel's
-`type` to match the declared type — mismatches produce **E107**. Add
+`type` to match the declared type — mismatches produce **E116**. Add
 semantics (entry name not yet declared) extend the registry with a new
-declaration. `$source` overrides are keyed by source-node name; an
-unknown source name produces **E111**. The reserved-name guard
-(**E110**) blocks channels from shadowing system fields like
+declaration. In both cases, a `default` that does not match the entry's `type`
+also produces **E116**. `$source` overrides are keyed by source-node name; an
+unknown source name produces **E118**. The reserved-name guard
+(**E117**) blocks channels from shadowing system fields like
 `$pipeline.execution_id` or `$source.path`. Channels that target a
 `.comp.yaml` may not carry `vars:` (**E109** if they do).
 

@@ -619,7 +619,7 @@ impl PipelineConfig {
     ///
     /// On error, returns the accumulated diagnostics from the topology
     /// pre-pass plus any per-variant lowering errors. Composition binding
-    /// errors (E102–E109) are fatal: an unresolvable `use:` or an
+    /// errors (E102–E108) are fatal: an unresolvable `use:` or an
     /// ill-bound call site fails compile rather than dropping the
     /// composition node and letting the run write zero records with no
     /// diagnostic.
@@ -777,7 +777,7 @@ impl PipelineConfig {
         // (E317/E318) make per-variant lowering meaningless, so stop here
         // rather than lowering a plan that cannot run. Every other
         // error-severity diagnostic — composition-binding errors
-        // (E102–E109) included — is caught by the post-lowering gate,
+        // (E102–E108) included — is caught by the post-lowering gate,
         // which lets lowering accumulate the full diagnostic set first.
         let has_cxl_errors = diags.iter().any(|d| {
             matches!(d.severity, clinker_core_types::Severity::Error)
@@ -1973,7 +1973,7 @@ impl PipelineConfig {
         // executor inherits the parent's WindowRuntime via
         // `Arc::clone` at recursion entry. The pass only short-
         // circuits on errors it itself emits (E003 / E150d at body
-        // root). Any E102-E109 from bind_composition are already in
+        // root). Any E102-E108 from bind_composition are already in
         // `diags` and are caught by the post-lowering gate below; this
         // pass only needs to surface the window-rooting errors it adds.
         let pre_pass_diag_count = diags.len();
@@ -2353,7 +2353,7 @@ impl PipelineConfig {
         ));
 
         // Any error-severity diagnostic accumulated through binding and
-        // lowering is fatal, composition-binding errors (E102–E109)
+        // lowering is fatal, composition-binding errors (E102–E108)
         // included. An unresolvable `use:` or an ill-bound call site drops
         // the composition node from the lowered DAG above; letting compile
         // still succeed there produced a run that wrote zero records with
@@ -4033,7 +4033,7 @@ pub(crate) fn lower_node_to_plan_node(
         }
         PipelineNode::Composition { .. } => {
             // Look up the body assigned by bind_composition. If binding
-            // failed (E102–E109), there's no entry — omit the node from
+            // failed (E102–E108), there's no entry — omit the node from
             // this partial DAG. The binding errors are already in `diags`
             // and the post-lowering gate turns them into a compile
             // failure, so the omission is never observed by a run.
@@ -4489,6 +4489,7 @@ pub const RESERVED_SOURCE_NAMES: &[&str] = &[
     "count",
     "batch",
     "ingestion_timestamp",
+    "name",
 ];
 
 /// Reserved `$record.*` member names. Empty today — issue #44 will add

@@ -3,99 +3,234 @@
 //! # Diagnostic code registry
 //!
 //! Every `Diagnostic::error` / `Diagnostic::warning` call site in the
-//! workspace MUST use one of the codes listed here. Adding a new code
-//! requires a new entry in this block. No orphan literals.
+//! workspace MUST use one of the codes in [`REGISTRY`]. Adding a new code
+//! requires a new row in the `diagnostic_registry!` invocation below. No
+//! orphan literals.
 //!
-//! | Code        | Severity | Meaning                                              |
-//! |-------------|----------|------------------------------------------------------|
-//! | `E000`      | error    | serde-saphyr parse error (from `from_serde_saphyr_error`) |
-//! | `E001`      | error    | Duplicate node name (exact match)                    |
-//! | `E002`      | error    | Self-referential node input                          |
-//! | `E003`      | error    | Cycle detected between nodes                         |
-//! | `E004`      | error    | Node input references undeclared producer (unified pass; payload `InputRefUndeclared`) |
-//! | `E010`      | error    | Dotted-name check (`.` reserved for branch refs)     |
-//! | `E011`      | error    | Log directive sanity (`every` must be valid)         |
-//! | `E101`      | error    | Composition signature parse error (malformed `.comp.yaml`) |
-//! | `E102`      | error    | Composition body references undeclared port          |
-//! | `E103`      | error    | Call site or channel binds undeclared input/config/resource |
-//! | `E104`      | error    | Call site or channel missing required input/config   |
-//! | `E106`      | error    | Name collision after composition expansion           |
-//! | `E107`      | error    | Cycle detected in flat post-expansion graph          |
-//! | `E108`      | error    | Composition body references enclosing scope (IsolatedFromAbove) |
-//! | `E109`      | error    | Ambiguous column reference (declared vs pass-through in open row) |
-//! | `E111`      | error    | Composition body has zero nodes (rejected at bind time) |
-//! | `E112`      | error    | Runtime composition recursion depth exceeded |
-//! | `E113`      | error    | Channel `config`/override key matches no parameter in the compiled plan (unknown key) |
-//! | `E115`      | error    | Composition body node fails node-scoped config validation (same checks as top-level nodes) |
-//! | `E200`      | error    | CXL type error (compile-time typecheck failure)      |
-//! | `E201`      | error    | Source declaration missing required `schema:` field  |
-//! | `E202`      | error    | CXL parse error (compile-time CXL syntax failure)    |
-//! | `E203`      | error    | CXL name-resolution error (unresolved field / variable / module reference) |
-//! | `E210`      | error    | Source declares more than one of `{path,glob,regex,paths}` |
-//! | `E211`      | error    | Source declares none of `{path,glob,regex,paths}`    |
-//! | `E212`      | error    | Invalid glob pattern in source matcher               |
-//! | `E213`      | error    | Invalid regex pattern in source matcher              |
-//! | `E214`      | error    | Invalid duration string for `modified_after`/`_before` |
-//! | `E215`      | error    | Invalid byte size for `min_size`/`max_size`          |
-//! | `E216`      | error    | Source matched zero files (with `on_no_match: error`) |
-//! | `E217`      | error    | Schema mismatch across multi-file source's files     |
-//! | `E218`      | error    | `files.take_first` and `files.take_last` both set    |
-//! | `E219`      | error    | `rest` transport declares a file matcher (path/glob/regex/paths) |
-//! | `E220`      | error    | `rest` transport declares a non-`json`/`xml` decode format |
-//! | `E221`      | error    | REST source read failure (HTTP request / body-read error) |
-//! | `E15Y`      | error    | Aggregate with streaming strategy over relaxed-CK group_by |
-//! | `E-SEC-001` | error    | Path security violation (escape, symlink, etc.)      |
-//! | `W002`      | warning  | Node names differ only in case                       |
-//! | `W100`      | warning  | Aggregate lowering deferred (stub)                   |
-//! | `W101`      | warning  | Pass-through column shadowed by composition body column |
-//! | `W102`      | warning  | Composition signature validation (required+default contradiction, suspicious port) |
+//! The registry is data, not prose: [`REGISTRY`] is the single home for the
+//! code list and its rendered documentation table is generated from those
+//! same rows, so the two cannot drift. Two checks enforce the contract:
 //!
-//! Combine node diagnostics:
-//!
-//! | Code        | Severity | Meaning                                              |
-//! |-------------|----------|------------------------------------------------------|
-//! | `E300`      | error    | Combine input count is out of bounds (must be 2..=8) |
-//! | `E301`      | error    | Combine input qualifier collides with reserved namespace |
-//! | `E303`      | error    | Combine where-clause is not boolean                  |
-//! | `E304`      | error    | Field not in combine merged row                      |
-//! | `E305`      | error    | Combine where-clause has no cross-input comparisons OR forms a disconnected join graph |
-//! | `E306`      | error    | Combine drive hint references unknown input          |
-//! | `E307`      | error    | Combine input references undeclared upstream         |
-//! | `E308`      | error    | Combine cxl body references unknown field            |
-//! | `E309`      | error    | Combine output schema is empty                       |
-//! | `E310`      | error    | Memory-budget surface exceeded the configured hard limit |
-//! | `E311`      | error    | Combine `match: collect` has a non-empty `cxl:` body |
-//! | `E313`      | error    | Combine `where:` has neither an equality nor a range conjunct |
-//! | `E327`      | error    | Combine range conjunct operands don't reduce to a supported range axis (ambiguous `numeric`, or non-orderable) |
-//! | `E314`      | error    | Schema mismatch at operator entry (column list divergence) |
-//! | `E319`      | error    | Combine `on_miss: error` had no matching build row   |
-//! | `E325`      | error    | Combine output exceeded the opt-in `max_output_rows` cap |
-//! | `W302`      | warning  | Pure-equi combine with all small inputs — consider InMemoryHash |
-//! | `W305`      | warning  | Combine where-clause has no equality conjuncts       |
-//! | `W306`      | warning  | Combine planner cannot determine optimal driving input |
-//!
-//! DLQ threshold + per-source routing diagnostics:
-//!
-//! | Code        | Severity | Meaning                                              |
-//! |-------------|----------|------------------------------------------------------|
-//! | `E315`      | error    | Pipeline-wide DLQ rate exceeded `error_handling.dlq.max_rate` |
-//! | `E316`      | error    | Per-source DLQ rate exceeded `error_handling.dlq.per_source.<name>.max_rate` |
-//! | `E317`      | error    | `error_handling.dlq.per_source` key does not name a declared Source |
-//! | `E318`      | error    | `error_handling.dlq.*.max_rate` out of `[0.0, 1.0]` or DLQ path collides |
-//! | `E322`      | error    | Two output destinations (Output nodes, or an Output node and a DLQ path) resolve to the same file |
-//! | `E323`      | error    | `edifact` output combined with byte-limit `split` (an interchange is one indivisible UNB..UNZ envelope) |
-//! | `E338`      | error    | `x12` output combined with byte-limit `split` (an interchange is one indivisible ISA..IEA envelope) |
-//! | `E339`      | error    | `hl7` output combined with byte-limit `split` (a batch/file envelope is one indivisible FHS..FTS structure) |
-//! | `E340`      | error    | A `$doc.<section>.<field>` access is indexed by a non-literal expression, so its declared document path cannot be resolved at compile time |
-//! | `E341`      | error    | A `$doc.<section>.<field>` access names an envelope section or field a feeding closed-schema source (XML / JSON) does not declare |
-//! | `E342`      | error    | `swift` output combined with byte-limit `split` (a SWIFT MT message is one indivisible brace-balanced `{1:..}..{5:..}` envelope) |
-//! | `E343`      | error    | A per-source-file output template (`{source_file}` / `{source_path}`) combined with a source declaring `dlq_granularity: document` (a buffered-and-flushed document is incompatible with per-record file fan-out) |
-//! | `E348`      | error    | A `$doc.<section>.<field>` access against a segment/positional source (X12 / EDIFACT / HL7) names a section the format does not synthesize, or a positional element outside the `e`/`f`-prefix pattern or beyond the configured `max_elements` / `max_fields` |
-//! | `E349`      | error    | A `$doc.<section>.<field>` access is attributed to a `rest` source (or a `rest` source declares an `envelope:` block) — a REST pull buffers no document, so the access can never resolve |
-//! | `E356`      | error    | A plain single-schema CSV / fixed-width source declares an `envelope:` block — a plain flat file carries no header/trailer structure to extract, so the declared sections are inert (a multi-record source declaring `discriminator:` + `records:` is unaffected) |
-//! | `E363`      | error    | A source's `record_path` is not a path in its format's grammar — an XPath descendant step (`//`), a JSONPath root marker (`$.`), a leading `/`, an empty segment, or an XML segment no element can be named |
+//! - `crates/clinker-core-types/tests/registry_no_orphan_codes.rs` scans the
+//!   workspace source for code literals in diagnostic-carrying positions and
+//!   fails on any that [`REGISTRY`] does not list.
+//! - [`Diagnostic::error`] and [`Diagnostic::warning`] carry a
+//!   `debug_assert!` on registry membership and severity, which catches codes
+//!   chosen at runtime (match arms, codes lifted back out of an error message)
+//!   that a source scan cannot see, as well as an error code emitted as a
+//!   warning or vice versa.
 
 use crate::span::{FileId, Span};
+
+/// One row of the diagnostic-code registry.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct RegistryEntry {
+    /// The code literal as it appears in `Diagnostic::code` and in
+    /// `clinker explain --code <CODE>`.
+    pub code: &'static str,
+    /// Severity the emitting site uses for this code.
+    pub severity: Severity,
+    /// One-line statement of the condition the code reports.
+    pub meaning: &'static str,
+}
+
+/// Declare the diagnostic-code registry once, as data, and render its
+/// documentation table from the same rows.
+///
+/// Each row is `"CODE", Severity, "meaning";`. The expansion produces the
+/// [`REGISTRY`] slice and the Markdown table in its rustdoc, so a row added
+/// here shows up in both without a second edit.
+macro_rules! diagnostic_registry {
+    ($($code:literal, $severity:ident, $meaning:literal;)+) => {
+        /// Every diagnostic code the workspace may emit, with its severity
+        /// and the condition it reports.
+        ///
+        /// Ordered by code family rather than alphabetically: topology and
+        /// naming (`E0xx`), composition and channel binding (`E1xx`), CXL and
+        /// source declaration (`E2xx`), combine / DLQ / envelope / multi-value
+        /// (`E3xx`), then the non-numeric codes.
+        ///
+        /// | Code | Severity | Meaning |
+        /// |------|----------|---------|
+        $(#[doc = concat!("| `", $code, "` | ", stringify!($severity), " | ", $meaning, " |")])+
+        pub const REGISTRY: &[RegistryEntry] = &[
+            $(RegistryEntry {
+                code: $code,
+                severity: Severity::$severity,
+                meaning: $meaning,
+            },)+
+        ];
+    };
+}
+
+diagnostic_registry! {
+    // ── Topology, naming, and node-level config ─────────────────────────
+    "E000", Error, "serde-saphyr parse error (from `from_serde_saphyr_error`)";
+    "E001", Error, "Duplicate node name (exact match)";
+    "E002", Error, "Self-referential node input";
+    "E003", Error, "Cycle detected between nodes";
+    "E004", Error, "Node input references undeclared producer (unified pass; payload `InputRefUndeclared`)";
+    "E010", Error, "Dotted-name check (`.` reserved for branch refs)";
+    "E011", Error, "Log directive sanity (`every` must be valid)";
+    // ── Composition binding and the channel/group overlay ───────────────
+    "E101", Error, "Composition signature parse error (malformed `.comp.yaml`)";
+    "E102", Error, "Composition body references undeclared port";
+    "E103", Error, "Call site or channel binds undeclared input/config/resource";
+    "E104", Error, "Call site or channel missing required input/config";
+    "E106", Error, "Name collision after composition expansion";
+    "E107", Error, "Cycle detected in flat post-expansion graph";
+    "E108", Error, "Composition body references enclosing scope (IsolatedFromAbove)";
+    "E109", Error, "A channel overlay targeting a composition carries `vars:` overrides, which a composition overlay does not support";
+    "E110", Error, "An extraction selection names a node the execution-plan DAG does not contain";
+    "E111", Error, "Composition body has zero nodes (rejected at bind time)";
+    "E112", Error, "Runtime composition recursion depth exceeded";
+    "E113", Error, "Channel `config`/override key matches no parameter in the compiled plan (unknown key)";
+    "E114", Error, "A structural overlay op cannot be applied (missing target, orphaning remove, breaking schema patch)";
+    "E115", Error, "Composition body node fails node-scoped config validation (same checks as top-level nodes)";
+    // Split out of E107 / E110 / E111, which each also named an unrelated
+    // composition-binding condition. One code answering two questions makes
+    // `clinker explain --code` send half its readers to the wrong page. Placed
+    // with the rest of the channel/overlay family rather than appended at the
+    // end of the registry.
+    "E116", Error, "A channel var declaration is type-incompatible: an override changes the pipeline's type, or a default does not match the entry's declared type";
+    "E117", Error, "A channel var's name shadows a reserved system field";
+    "E118", Error, "A channel `vars.source` block is keyed by a source name the pipeline does not declare";
+    "E120", Error, "Channel discovery exceeded the tenant-folder scan budget";
+    "E121", Error, "Channel manifest failed to parse";
+    "E122", Error, "Channel discovery exceeded the group-file scan budget";
+    "E123", Error, "Group file failed to parse";
+    // ── Windows, watermarks, phases, and scoped vars ────────────────────
+    "E150", Error, "Analytic window on a transform fed by a `correlation_key:` source (per-group arena construction is unsupported)";
+    "E150b", Error, "Node-rooted window references a field its rooted upstream operator does not emit";
+    "E150c", Error, "Cross-source window references a source whose ingestion tier is downstream of the window-bearing transform";
+    "E150d", Error, "Windowed transform is rooted at a Merge node, which concatenates streams without a single producer identity";
+    "E150e", Error, "Windowed transform references an array-typed field; the window builtin has no array support";
+    "E152", Error, "Composition node has an untagged (portless) incoming edge";
+    "E153", Error, "Source declares a `correlation_key` field its `schema:` block does not contain";
+    "E154", Error, "Source declares a `watermark.column` its `schema:` block does not contain";
+    "E155", Error, "Source declares a `watermark.column` whose type is not event-time-coercible";
+    "E156", Error, "Aggregate declares `time_window:` while an upstream-reachable source declares no `watermark.column`";
+    "E157", Error, "Source declares an external schema file that failed to load";
+    "E158", Error, "Source column declares the non-concrete type `numeric` (inference-only)";
+    "E159", Error, "Source declares a `generated` schema on a format with no engine-generated positional column model";
+    "E164", Error, "Init-phase node has a runtime-phase descendant consuming its records";
+    "E171", Error, "Scoped-var reader is not a DAG descendant of the Transform that writes it";
+    "E172", Error, "`$source` scoped var read downstream of a Merge/Combine node (the per-source value is ambiguous there)";
+    "E173", Error, "Composition body reads a parent-scope `$pipeline` / `$source` var its `_compose.scoped_vars` schema does not opt into";
+    "E174", Error, "Composition `scoped_vars` schema disagrees with the parent pipeline's declaration";
+    "E175", Error, "Init-phase node reads a scoped var only a runtime-phase node writes";
+    "E15Y", Error, "Aggregate with streaming strategy over relaxed-CK group_by";
+    // ── CXL compilation and source declaration ──────────────────────────
+    "E200", Error, "CXL type error (compile-time typecheck failure)";
+    "E201", Error, "Source declaration missing required `schema:` field";
+    "E202", Error, "CXL parse error (compile-time CXL syntax failure)";
+    "E203", Error, "CXL name-resolution error (unresolved field / variable / module reference)";
+    "E210", Error, "Source declares more than one of `{path,glob,regex,paths}`";
+    "E211", Error, "Source declares none of `{path,glob,regex,paths}`";
+    "E212", Error, "Invalid glob pattern in source matcher";
+    "E213", Error, "Invalid regex pattern in source matcher";
+    "E214", Error, "Invalid duration string for `modified_after`/`_before`";
+    "E215", Error, "Invalid byte size for `min_size`/`max_size`";
+    "E216", Error, "Source matched zero files (with `on_no_match: error`)";
+    "E217", Error, "Schema mismatch across multi-file source's files";
+    "E218", Error, "`files.take_first` and `files.take_last` both set";
+    "E219", Error, "`rest` transport declares a file matcher (path/glob/regex/paths)";
+    "E220", Error, "`rest` transport declares a non-`json`/`xml` decode format";
+    "E221", Error, "REST source read failure (HTTP request / body-read error)";
+    "E222", Error, "An envelope section declares a `json_pointer` that is not a valid RFC 6901 pointer";
+    // ── Channel `sources:` patches ──────────────────────────────────────
+    "E230", Error, "Channel source patch key is malformed, unaddressable, or targets a source no node declares";
+    "E231", Error, "Channel schema patch names a column the source does not declare";
+    "E232", Error, "Channel schema patch adds a column that already exists";
+    "E233", Error, "Channel schema patch renames a column onto an existing column name";
+    "E234", Error, "Channel envelope-section patch removes a field the section does not declare";
+    "E235", Error, "Channel options patch is rejected by the source format's option struct";
+    "E236", Error, "Channel schema patch adds a column without the required `type`";
+    "E237", Error, "Channel schema column ops applied to a schema with no flat column list (multi-record / generated / file)";
+    "E238", Error, "Channel patch uses a format-specific section op on a source of the wrong format";
+    "E239", Error, "Channel patch removes a declaration the source does not carry";
+    "E240", Error, "Channel patch names an invalid target, or creates a declaration without the fields that requires";
+    "E241", Error, "Channel `records` / `discriminator` ops applied to a schema that is not multi-record";
+    "E242", Error, "Channel records patch names an unknown record type";
+    "E243", Error, "Channel records patch adds a record type that already exists";
+    "E244", Error, "Merged discriminator is not exactly one of byte-range or field";
+    "E245", Error, "Two record types share a discriminator tag after the patch";
+    // ── Combine ─────────────────────────────────────────────────────────
+    "E300", Error, "Combine input count is out of bounds (must be 2..=8)";
+    "E301", Error, "Combine input qualifier collides with reserved namespace";
+    "E303", Error, "Combine where-clause is not boolean";
+    "E304", Error, "Field not in combine merged row";
+    "E305", Error, "Combine where-clause has no cross-input comparisons OR forms a disconnected join graph";
+    "E306", Error, "Combine drive hint references unknown input";
+    "E307", Error, "Combine input references undeclared upstream";
+    "E308", Error, "Combine cxl body references unknown field";
+    "E309", Error, "Combine output schema is empty";
+    "E310", Error, "Memory-budget surface exceeded the configured hard limit";
+    "E311", Error, "Combine `match: collect` has a non-empty `cxl:` body";
+    "E313", Error, "Combine `where:` has neither an equality nor a range conjunct";
+    "E314", Error, "Schema mismatch at operator entry (column list divergence)";
+    "E319", Error, "Combine `on_miss: error` had no matching build row";
+    "E325", Error, "Combine output exceeded the opt-in `max_output_rows` cap";
+    "E327", Error, "Combine range conjunct operands don't reduce to a supported range axis (ambiguous `numeric`, or non-orderable)";
+    // ── DLQ thresholds and per-source routing ───────────────────────────
+    "E315", Error, "Pipeline-wide DLQ rate exceeded `error_handling.dlq.max_rate`";
+    "E316", Error, "Per-source DLQ rate exceeded `error_handling.dlq.per_source.<name>.max_rate`";
+    "E317", Error, "`error_handling.dlq.per_source` key does not name a declared Source";
+    "E318", Error, "`error_handling.dlq.*.max_rate` out of `[0.0, 1.0]` or DLQ path collides";
+    "E322", Error, "Two output destinations (Output nodes, or an Output node and a DLQ path) resolve to the same file";
+    "E324", Error, "`pipeline.memory.resume_threshold` does not sit below the soft/spill threshold, so the two form no hysteresis band";
+    // ── Output splitting, document context, and envelopes ───────────────
+    "E323", Error, "`edifact` output combined with byte-limit `split` (an interchange is one indivisible UNB..UNZ envelope)";
+    "E338", Error, "`x12` output combined with byte-limit `split` (an interchange is one indivisible ISA..IEA envelope)";
+    "E339", Error, "`hl7` output combined with byte-limit `split` (a batch/file envelope is one indivisible FHS..FTS structure)";
+    "E340", Error, "A `$doc.<section>.<field>` access is indexed by a non-literal expression, so its declared document path cannot be resolved at compile time";
+    "E341", Error, "A `$doc.<section>.<field>` access names an envelope section or field a feeding closed-schema source (XML / JSON) does not declare";
+    "E342", Error, "`swift` output combined with byte-limit `split` (a SWIFT MT message is one indivisible brace-balanced `{1:..}..{5:..}` envelope)";
+    "E343", Error, "A per-source-file output template (`{source_file}` / `{source_path}`) combined with a source declaring `dlq_granularity: document` (a buffered-and-flushed document is incompatible with per-record file fan-out)";
+    "E348", Error, "A `$doc.<section>.<field>` access against a segment/positional source (X12 / EDIFACT / HL7) names a section the format does not synthesize, or a positional element outside the `e`/`f`-prefix pattern or beyond the configured `max_elements` / `max_fields`";
+    "E349", Error, "A `$doc.<section>.<field>` access is attributed to a `rest` source (or a `rest` source declares an `envelope:` block) — a REST pull buffers no document, so the access can never resolve";
+    "E344", Error, "A source declares `dlq_granularity: document` together with `error_handling.strategy: fail_fast`, which contradict each other";
+    "E346", Error, "An output's envelope references a section, or requires a `footer_from_doc`, that its feeding sources do not provide";
+    "E347", Error, "`reconstruct_envelope` combined with per-file output splitting, a per-source-file path template, or a document-granularity DLQ source";
+    "E353", Error, "Envelope header section references a body column — the header is emitted before the body streams, so it may read only `$vars` / `$source` / `$pipeline` / `$doc`";
+    "E354", Error, "Envelope footer section declares an aggregate a streaming footer fold cannot compute";
+    "E355", Error, "A single-document-envelope output can be fed more than one document with no consolidating node on the path, which would silently merge distinct messages into one envelope";
+    "E357", Error, "An envelope section on a segment/positional source names a tier other than the one file-level header segment the reader resolves from its bounded pre-scan";
+    "E356", Error, "A plain single-schema CSV / fixed-width source declares an `envelope:` block — a plain flat file carries no header/trailer structure to extract, so the declared sections are inert (a multi-record source declaring `discriminator:` + `records:` is unaffected)";
+    // ── Multi-value declarations (fan-out, split, join) ──────────────────
+    "E358", Error, "Malformed `split_to_rows:` / `split_values:` source declaration (duplicate, nested, undeclared column, or a format whose reader is never handed it)";
+    "E359", Error, "A `multiple:` column reaches an output whose format has no encoding for a field holding more than one value";
+    "E360", Error, "Source declares the removed `array_paths:` key, which the multi-value declarations replaced";
+    "E361", Error, "`multiple: true` column on a source whose format has no way to produce more than one value";
+    "E362", Error, "Malformed `join_values:` output declaration (the write-side mirror of E358)";
+    "E363", Error, "A source's `record_path` is not a path in its format's grammar — an XPath descendant step (`//`), a JSONPath root marker (`$.`), a leading `/`, an empty segment, or an XML segment no element can be named";
+    // ── Path security ───────────────────────────────────────────────────
+    "E-SEC-001", Error, "Path security violation (escape, symlink, etc.)";
+    // ── Warnings ────────────────────────────────────────────────────────
+    "W002", Warning, "Node names differ only in case";
+    "W100", Warning, "Aggregate lowering deferred (stub)";
+    "W101", Warning, "Pass-through column shadowed by composition body column";
+    "W102", Warning, "Composition signature validation (required+default contradiction, suspicious port)";
+    "W302", Warning, "Pure-equi combine with all small inputs — consider InMemoryHash";
+    "W305", Warning, "Combine where-clause has no equality conjuncts";
+    "W306", Warning, "Combine planner cannot determine optimal driving input";
+}
+
+/// Whether `code` is listed in [`REGISTRY`].
+///
+/// The orphan-code test and the constructors' `debug_assert!` both resolve
+/// membership through here, so there is one definition of "registered".
+pub fn is_registered(code: &str) -> bool {
+    registered_severity(code).is_some()
+}
+
+/// Registered severity for `code`, or `None` when the code is not listed.
+pub fn registered_severity(code: &str) -> Option<Severity> {
+    REGISTRY
+        .iter()
+        .find(|entry| entry.code == code)
+        .map(|entry| entry.severity)
+}
 
 /// Severity level for a [`Diagnostic`].
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -189,13 +324,30 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
+    /// Build an error-severity diagnostic.
+    ///
+    /// `code` must appear in [`REGISTRY`]. Debug builds assert this, so a
+    /// code chosen at runtime — a match arm, or one lifted back out of an
+    /// error message — is caught the first time a test exercises the path,
+    /// where the source scan in
+    /// `tests/registry_no_orphan_codes.rs` cannot see it. `#[track_caller]`
+    /// puts the emission site in the panic message.
+    #[track_caller]
     pub fn error(
         code: impl Into<String>,
         message: impl Into<String>,
         primary: LabeledSpan,
     ) -> Self {
+        let code = code.into();
+        debug_assert_eq!(
+            registered_severity(&code),
+            Some(Severity::Error),
+            "diagnostic code {code:?} is missing from the registry or is not registered as Error; \
+             add or correct its row in the `diagnostic_registry!` invocation in \
+             clinker-core-types/src/diagnostic.rs"
+        );
         Self {
-            code: code.into(),
+            code,
             severity: Severity::Error,
             message: message.into(),
             primary,
@@ -205,13 +357,24 @@ impl Diagnostic {
         }
     }
 
+    /// Build a warning-severity diagnostic. `code` must appear in
+    /// [`REGISTRY`]; see [`Diagnostic::error`] for how that is enforced.
+    #[track_caller]
     pub fn warning(
         code: impl Into<String>,
         message: impl Into<String>,
         primary: LabeledSpan,
     ) -> Self {
+        let code = code.into();
+        debug_assert_eq!(
+            registered_severity(&code),
+            Some(Severity::Warning),
+            "diagnostic code {code:?} is missing from the registry or is not registered as Warning; \
+             add or correct its row in the `diagnostic_registry!` invocation in \
+             clinker-core-types/src/diagnostic.rs"
+        );
         Self {
-            code: code.into(),
+            code,
             severity: Severity::Warning,
             message: message.into(),
             primary,
@@ -307,47 +470,101 @@ mod diagnostic_tests {
     }
 
     #[test]
-    fn test_error_registry_e101_through_e108_documented() {
-        let source = include_str!("diagnostic.rs");
-        for code in [
-            "E101", "E102", "E103", "E104", "E106", "E107", "E108", "E109", "E111", "E112", "E113",
-            "E115",
-        ] {
-            let pattern = format!("`{code}`");
+    fn test_registry_codes_are_unique() {
+        let mut seen: Vec<&str> = Vec::with_capacity(REGISTRY.len());
+        for entry in REGISTRY {
             assert!(
-                source.contains(&pattern),
-                "diagnostic registry missing entry for {code}"
+                !seen.contains(&entry.code),
+                "diagnostic registry lists {} more than once",
+                entry.code
             );
+            seen.push(entry.code);
         }
-        // Also verify W101 is registered
-        assert!(
-            source.contains("`W101`"),
-            "diagnostic registry missing entry for W101"
-        );
     }
 
     #[test]
-    fn test_error_registry_combine_codes_documented() {
-        let source = include_str!("diagnostic.rs");
+    fn test_registry_codes_match_the_documented_shape() {
+        // The orphan-code scanner recognizes literals by shape, so a code
+        // outside the shape would be invisible to it. Keeping the registry
+        // inside the shape keeps the scanner's coverage honest.
+        for entry in REGISTRY {
+            let ok = if let Some(rest) = entry.code.strip_prefix("E-SEC-") {
+                !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+            } else {
+                let rest = match entry.code.as_bytes().first() {
+                    Some(b'E') | Some(b'W') => &entry.code[1..],
+                    _ => "",
+                };
+                let digits = rest.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+                digits.len() >= 2
+                    && digits.bytes().all(|b| b.is_ascii_digit())
+                    && rest.len() - digits.len() <= 1
+            };
+            assert!(
+                ok,
+                "registry code {:?} is outside the recognized shape (`E123`, `E123a`, or \
+                 `E-SEC-001`); the orphan-code scanner would not see it",
+                entry.code
+            );
+        }
+    }
+
+    #[test]
+    fn test_registry_meanings_are_non_empty_and_table_safe() {
+        for entry in REGISTRY {
+            assert!(
+                !entry.meaning.is_empty(),
+                "registry entry {} has no meaning text",
+                entry.code
+            );
+            // The rustdoc table is generated from these strings; a literal
+            // pipe would split the row into extra columns.
+            assert!(
+                !entry.meaning.contains('|'),
+                "registry meaning for {} contains a `|`, which breaks the generated table",
+                entry.code
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_registered_rejects_an_unlisted_code() {
+        assert!(is_registered("E001"));
+        assert!(is_registered("W306"));
+        assert!(is_registered("E-SEC-001"));
         // E302 was dropped earlier: structurally unreachable with
-        // `QualifiedField`-keyed merged rows. Re-adding it requires an
-        // explicit entry both here and in the registry table above.
-        for code in [
-            "E300", "E301", "E303", "E304", "E305", "E306", "E307", "E308", "E309", "E310", "E311",
-            "E313", "E314", "E315", "E316", "E317", "E318", "E319", "E322", "E325", "E327",
-        ] {
-            let pattern = format!("`{code}`");
-            assert!(
-                source.contains(&pattern),
-                "diagnostic registry missing entry for {code}"
-            );
-        }
-        for code in ["W302", "W305", "W306"] {
-            let pattern = format!("`{code}`");
-            assert!(
-                source.contains(&pattern),
-                "diagnostic registry missing entry for {code}"
-            );
-        }
+        // `QualifiedField`-keyed merged rows. Re-adding it needs a registry
+        // row, which this asserts is currently absent.
+        assert!(!is_registered("E302"));
+        assert!(!is_registered("E999"));
+    }
+
+    #[test]
+    fn registered_severity_comes_from_the_registry_row() {
+        assert_eq!(registered_severity("E001"), Some(Severity::Error));
+        assert_eq!(registered_severity("W002"), Some(Severity::Warning));
+        assert_eq!(registered_severity("E999"), None);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "not registered as Error")]
+    fn error_constructor_rejects_a_warning_code() {
+        let _ = Diagnostic::error(
+            "W002",
+            "wrong severity",
+            LabeledSpan::primary(Span::SYNTHETIC, ""),
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "not registered as Warning")]
+    fn warning_constructor_rejects_an_error_code() {
+        let _ = Diagnostic::warning(
+            "E001",
+            "wrong severity",
+            LabeledSpan::primary(Span::SYNTHETIC, ""),
+        );
     }
 }

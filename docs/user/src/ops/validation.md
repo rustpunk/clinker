@@ -2,7 +2,7 @@
 
 Clinker provides two levels of pre-flight validation so you can catch problems before committing to a full run.
 
-## Config-only validation
+## Compile validation
 
 ```bash
 clinker run pipeline.yaml --dry-run
@@ -14,9 +14,13 @@ This validates everything that can be checked without reading data:
 - CXL syntax and compile-time type checking
 - Schema compatibility between connected nodes
 - DAG wiring (no cycles, no dangling inputs, no missing nodes)
-- File path resolution (existence checks for inputs)
+- Plan-time source and output configuration gates
 
-No records are read. No output files are created. The command exits with code 0 on success or code 1 with a diagnostic message on failure.
+No records are read and no output files are created. Bare `--dry-run` does not
+perform runtime source discovery or require an input file to be readable.
+Planning may still inspect available file metadata or evaluate matchers for
+cost estimates. The command exits with code 0 on success or code 1 with a
+diagnostic message on failure.
 
 **Use this after every YAML edit.** It runs in milliseconds and catches the majority of configuration mistakes.
 
@@ -28,7 +32,7 @@ clinker run pipeline.yaml --dry-run -n 10
 
 This reads the first 10 records from each source and processes them through the full pipeline -- transforms, aggregations, routing, and output formatting. Results are printed to stdout.
 
-The record preview exercises the runtime evaluation path, catching issues that config-only validation cannot:
+The record preview exercises the runtime evaluation path, catching issues that compile validation cannot:
 
 - CXL expressions that are syntactically valid but fail at runtime (e.g., calling a string method on an integer)
 - Data format mismatches between the declared schema and actual file contents
@@ -71,7 +75,7 @@ The typical full pre-flight sequence is:
 
 ```bash
 clinker run pipeline.yaml --explain          # inspect the DAG
-clinker run pipeline.yaml --dry-run          # validate config
+clinker run pipeline.yaml --dry-run          # validate the compiled plan
 clinker run pipeline.yaml --dry-run -n 10    # preview with data
 clinker run pipeline.yaml --force            # run for real
 ```

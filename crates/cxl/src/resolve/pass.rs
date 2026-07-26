@@ -67,6 +67,8 @@ const PIPELINE_MEMBERS: &[&str] = &[
     "total_count",
     "ok_count",
     "dlq_count",
+    "filtered_count",
+    "distinct_count",
 ];
 
 /// The known source.* member names — per-record / per-source provenance.
@@ -993,6 +995,20 @@ mod tests {
             has_pipeline,
             "Expected PipelineMember binding for pipeline.start_time"
         );
+    }
+
+    #[test]
+    fn test_resolve_pipeline_filter_counters() {
+        for member in ["filtered_count", "distinct_count"] {
+            let resolved = resolve_ok(&format!("emit n = $pipeline.{member}"), &[]);
+            assert!(
+                resolved
+                    .bindings
+                    .iter()
+                    .any(|b| matches!(b, Some(ResolvedBinding::PipelineMember))),
+                "expected builtin binding for $pipeline.{member}"
+            );
+        }
     }
 
     #[test]

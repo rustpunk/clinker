@@ -2,4 +2,5 @@
 source: crates/clinker-exec/tests/state_node_diagnostics.rs
 expression: render_diags(&diags)
 ---
-E203: CXL name resolution failed in "read_var": [E173] composition body references parent-scope variable '$pipeline.cutoff' which is not opted into the body's `_compose.scoped_vars.pipeline` schema
+E173: CXL name resolution failed in "read_var": composition body references parent-scope variable '$pipeline.cutoff' which is not opted into the body's `_compose.scoped_vars.pipeline` schema
+  help: add `cutoff: { type: <type> }` to `_compose.scoped_vars.pipeline` in this composition's `.comp.yaml`, OR remove the read
