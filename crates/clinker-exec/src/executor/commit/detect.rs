@@ -74,7 +74,7 @@ pub(crate) fn detect_retract_scope(
         .filter(|(_, g)| !g.error_rows.is_empty() || g.overflowed)
         .map(|(k, _)| k.clone())
         .collect();
-    trigger_keys.sort_by_cached_key(|k| format_group_key(k));
+    trigger_keys.sort_by_key(|k| format_group_key(k));
     scope.trigger_group_keys = trigger_keys.clone();
 
     // Aggregate-name → NodeIndex map, built once per detect call so

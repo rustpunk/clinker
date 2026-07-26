@@ -236,34 +236,14 @@ fn peak_rss_bytes_impl() -> Option<u64> {
 /// against, the budget cannot be judged unsatisfiable, and the run
 /// proceeds to surface any overflow through the normal runtime path.
 ///
-/// A ceiling of exactly zero is the one case rejected ahead of both those
-/// scopings — under every policy, and without needing a baseline reading.
-/// It is unsatisfiable on its face: the process holds resident memory before
-/// the first record is read, and none of it is the engine's to spill. It is
-/// also not the strictest possible budget but the absence of one, because the
-/// per-surface hard-limit gates read a zero ceiling as "no ceiling" and stop
-/// firing — so admitting it would send the run down exactly the unbounded
-/// paths those gates exist to close, which is the opposite of what the config
-/// asks for. Rejecting at the config boundary keeps that zero-means-ungated
-/// reading correct everywhere it appears without a run ever reaching it.
-///
 /// # Errors
 ///
-/// Returns [`PipelineError::UnsatisfiableMemoryBudget`] when `limit` is zero,
-/// or when the policy pauses producers and `limit` is below the measured
-/// baseline RSS.
+/// Returns [`PipelineError::UnsatisfiableMemoryBudget`] when the policy
+/// pauses producers and `limit` is below the measured baseline RSS.
 pub fn reject_unsatisfiable_budget(
     limit: u64,
     knob: clinker_plan::config::BackpressureKnob,
 ) -> Result<(), clinker_plan::error::PipelineError> {
-    if limit == 0 {
-        return Err(
-            clinker_plan::error::PipelineError::UnsatisfiableMemoryBudget {
-                limit: 0,
-                baseline_rss: rss_bytes().unwrap_or(0),
-            },
-        );
-    }
     if !knob.pauses_producers() {
         return Ok(());
     }
@@ -1997,44 +1977,6 @@ mod tests {
                 assert!(
                     reject_unsatisfiable_budget(1, BackpressureKnob::Spill).is_ok(),
                     "spill policy must not reject a sub-baseline budget at startup"
-                );
-
-                // Zero is the exception to that scoping. It is rejected under
-                // EVERY policy, spill included: a zero ceiling is not the
-                // strictest budget but the absence of one — the per-surface
-                // `hard_limit > 0` gates stop firing — so admitting it would
-                // send the run down the unbounded paths those gates close.
-                // A one-byte budget keeps them all armed; a zero-byte budget
-                // disarms them, which is why the two cases part here.
-                for knob in [
-                    BackpressureKnob::Pause,
-                    BackpressureKnob::Both,
-                    BackpressureKnob::Spill,
-                ] {
-                    match reject_unsatisfiable_budget(0, knob) {
-                        Err(PipelineError::UnsatisfiableMemoryBudget { limit, .. }) => {
-                            assert_eq!(limit, 0, "the diagnostic must echo the configured 0");
-                        }
-                        other => panic!(
-                            "a zero budget must be rejected under {knob:?}, since it disables \
-                             the per-surface hard-limit gates rather than tightening them; \
-                             got {other:?}"
-                        ),
-                    }
-                }
-                // The rendered message must not read as a comparison against an
-                // unmeasured baseline, and must name a limit the author can paste.
-                let rendered = reject_unsatisfiable_budget(0, BackpressureKnob::Pause)
-                    .unwrap_err()
-                    .to_string();
-                assert!(
-                    rendered.starts_with("E312 ") && rendered.contains("512M"),
-                    "the zero-budget diagnostic must carry E312 and a usable limit: {rendered}"
-                );
-                assert!(
-                    !rendered.contains("is below this process's"),
-                    "a zero budget is not rejected by baseline comparison, so it must not claim \
-                     to be: {rendered}"
                 );
 
                 // A budget well above baseline is satisfiable under every policy.

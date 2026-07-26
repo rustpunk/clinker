@@ -4,6 +4,7 @@
 //! config/plan lookups shared across the dispatch arms.
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use clinker_record::{GroupByKey, Record, Schema, SchemaBuilder};
@@ -384,9 +385,10 @@ pub(crate) fn build_arbitrator_from_config(
 /// order groups flush to writers, so its rendering decides emitted record
 /// order. See [`format_group_key_part`] for what that constrains.
 ///
-/// Pure and non-blocking; allocates per key part. The sort callers pass it to
-/// `sort_by_cached_key`, which renders each key once rather than once per
-/// comparison.
+/// Pure and non-blocking; allocates per key part. The sort callers deliberately
+/// use `sort_by_key` rather than caching every rendered key: repeated rendering
+/// costs CPU, but retaining one string per group would add uncharged
+/// cardinality-shaped memory to an already memory-sensitive path.
 pub(crate) fn format_group_key(key: &[GroupByKey]) -> String {
     let parts: Vec<String> = key.iter().map(format_group_key_part).collect();
     format!("[{}]", parts.join(", "))
@@ -421,6 +423,86 @@ fn format_group_key_part(k: &GroupByKey) -> String {
     }
 }
 
+/// Maximum raw bytes retained from one author-controlled field name or string
+/// partition value in an error diagnostic.
+const DIAGNOSTIC_GROUP_COMPONENT_BYTES: usize = 64;
+
+/// Maximum bytes devoted to the rendered group name in a diagnostic. The
+/// surrounding E310 explanation is fixed-size; bounding this author-controlled
+/// segment keeps the fail-loud path independent of input cardinality.
+const DIAGNOSTIC_GROUP_TOTAL_BYTES: usize = 1024;
+
+/// Space held back while appending components so the exact omission marker and
+/// closing bracket always fit inside [`DIAGNOSTIC_GROUP_TOTAL_BYTES`].
+const DIAGNOSTIC_GROUP_OMISSION_RESERVE: usize = 64;
+
+/// Return a valid UTF-8 prefix no larger than `max_bytes`, plus the number of
+/// raw input bytes omitted. The byte count makes truncation unambiguous without
+/// hashing or walking the omitted tail.
+fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> (&str, usize) {
+    if value.len() <= max_bytes {
+        return (value, 0);
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&value[..end], value.len() - end)
+}
+
+fn format_diagnostic_field_name(field: &str) -> String {
+    let (prefix, omitted) = bounded_utf8_prefix(field, DIAGNOSTIC_GROUP_COMPONENT_BYTES);
+    if omitted == 0 {
+        return prefix.to_string();
+    }
+    format!("{prefix}...<{omitted} bytes omitted>")
+}
+
+/// Diagnostic-only counterpart to [`format_group_key_part`]. String values are
+/// truncated before formatting, so constructing an E310 after the budget has
+/// already been exceeded cannot allocate a second input-sized string. The
+/// ordering renderer remains exact and unchanged.
+fn format_diagnostic_group_key_part(k: &GroupByKey) -> String {
+    let GroupByKey::Str(value) = k else {
+        return format_group_key_part(k);
+    };
+    let (prefix, omitted) = bounded_utf8_prefix(value, DIAGNOSTIC_GROUP_COMPONENT_BYTES);
+    let mut rendered = format!("{prefix:?}");
+    if omitted > 0 {
+        // Debug formatting always surrounds a string with quotes. Replace the
+        // closing quote with a precise truncation marker inside the value.
+        let closing_quote = rendered.pop();
+        debug_assert_eq!(closing_quote, Some('"'));
+        let _ = write!(rendered, "...<{omitted} bytes omitted>\"");
+    }
+    rendered
+}
+
+fn format_diagnostic_group_key(key: &[GroupByKey]) -> String {
+    let mut rendered = String::with_capacity(DIAGNOSTIC_GROUP_TOTAL_BYTES.min(128));
+    rendered.push('[');
+    for (idx, part) in key.iter().enumerate() {
+        let part = format_diagnostic_group_key_part(part);
+        let separator_len = usize::from(idx > 0) * 2;
+        if rendered.len() + separator_len + part.len() + DIAGNOSTIC_GROUP_OMISSION_RESERVE
+            > DIAGNOSTIC_GROUP_TOTAL_BYTES
+        {
+            if idx > 0 {
+                rendered.push_str(", ");
+            }
+            let omitted = key.len() - idx;
+            let _ = write!(rendered, "... <{omitted} key parts omitted>");
+            break;
+        }
+        if idx > 0 {
+            rendered.push_str(", ");
+        }
+        rendered.push_str(&part);
+    }
+    rendered.push(']');
+    rendered
+}
+
 /// Render a group key paired with the `partition_by` fields that produced it,
 /// as `field=value` pairs in declaration order: `[account="A-1", day=3]`.
 ///
@@ -441,22 +523,44 @@ fn format_group_key_part(k: &GroupByKey) -> String {
 /// pair would name nothing, leaving the author with a diagnostic about a group
 /// they cannot identify.
 ///
-/// Falls back to the bare key rendering when the field list and the key
+/// Falls back to a bounded bare-key rendering when the field list and the key
 /// disagree on length, so a length mismatch degrades the diagnostic instead
-/// of losing it.
+/// of losing it. Both paths cap author-controlled text: this formatter runs
+/// only after the memory ceiling has already been exceeded and must not create
+/// another allocation proportional to a hostile key or field list.
 pub(crate) fn format_partition_group(partition_by: &[String], key: &[GroupByKey]) -> String {
     if partition_by.is_empty() && key.is_empty() {
         return "[whole input]".to_string();
     }
     if partition_by.len() != key.len() {
-        return format_group_key(key);
+        return format_diagnostic_group_key(key);
     }
-    let parts: Vec<String> = partition_by
-        .iter()
-        .zip(key)
-        .map(|(field, k)| format!("{field}={}", format_group_key_part(k)))
-        .collect();
-    format!("[{}]", parts.join(", "))
+    let mut rendered = String::with_capacity(DIAGNOSTIC_GROUP_TOTAL_BYTES.min(128));
+    rendered.push('[');
+    for (idx, (field, value)) in partition_by.iter().zip(key).enumerate() {
+        let field = format_diagnostic_field_name(field);
+        let value = format_diagnostic_group_key_part(value);
+        let component_len = field.len() + 1 + value.len();
+        let separator_len = usize::from(idx > 0) * 2;
+        if rendered.len() + separator_len + component_len + DIAGNOSTIC_GROUP_OMISSION_RESERVE
+            > DIAGNOSTIC_GROUP_TOTAL_BYTES
+        {
+            if idx > 0 {
+                rendered.push_str(", ");
+            }
+            let omitted = partition_by.len() - idx;
+            let _ = write!(rendered, "... <{omitted} fields omitted>");
+            break;
+        }
+        if idx > 0 {
+            rendered.push_str(", ");
+        }
+        rendered.push_str(&field);
+        rendered.push('=');
+        rendered.push_str(&value);
+    }
+    rendered.push(']');
+    rendered
 }
 
 /// Which grouped node raised a giant-group `E310`.
@@ -618,7 +722,8 @@ pub(crate) fn giant_group_error(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_memory_limit;
+    use super::{DIAGNOSTIC_GROUP_TOTAL_BYTES, format_partition_group, parse_memory_limit};
+    use clinker_record::GroupByKey;
 
     const MINIMAL_PIPELINE: &str = r#"
 pipeline:
@@ -707,5 +812,26 @@ nodes:
                 "aggregate spill budget for {limit:?} must equal the arbitrator ceiling"
             );
         }
+    }
+
+    #[test]
+    fn diagnostic_group_bounds_an_oversized_string_key_before_formatting() {
+        let key = vec![GroupByKey::Str("x".repeat(4096).into_boxed_str())];
+        let rendered = format_partition_group(&["account".to_string()], &key);
+
+        assert!(rendered.len() <= DIAGNOSTIC_GROUP_TOTAL_BYTES);
+        assert!(rendered.contains("<4032 bytes omitted>"), "{rendered}");
+        assert!(!rendered.contains(&"x".repeat(128)), "{rendered}");
+    }
+
+    #[test]
+    fn diagnostic_group_bounds_high_cardinality_partition_fields() {
+        let fields: Vec<String> = (0..1000).map(|idx| format!("field_{idx:04}")).collect();
+        let key = vec![GroupByKey::Null; fields.len()];
+        let rendered = format_partition_group(&fields, &key);
+
+        assert!(rendered.len() <= DIAGNOSTIC_GROUP_TOTAL_BYTES);
+        assert!(rendered.contains("fields omitted"), "{rendered}");
+        assert!(rendered.starts_with("[field_0000=null"), "{rendered}");
     }
 }

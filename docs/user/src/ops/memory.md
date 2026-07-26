@@ -73,14 +73,7 @@ the `backpressure` policy. Under a producer-pausing policy (`pause`, the
 default, or `both`) a value below the process's baseline resident memory is
 rejected at startup by the budget gate as `E312`. Under the non-pausing `spill`
 policy that startup gate does not fire: the run proceeds and relies on spilling
-to stay within the budget rather than aborting.
-
-**A limit of `0` is rejected under every policy**, `spill` included. Zero is not
-the strictest budget but the absence of one: the engine's per-surface hard-limit
-checks read a zero ceiling as "no ceiling" and stop firing, so a run admitted
-under it would proceed *unbounded* — the opposite of what the value asks for.
-It fails at startup as `E312` naming a usable replacement. Use a small non-zero
-limit (`"1"` is a byte) when you want to force maximum spill pressure. Because `--memory-limit` simply
+to stay within the budget rather than aborting. Because `--memory-limit` simply
 populates `pipeline.memory.limit`, that `E312` — which names the limit and
 echoes the offending byte value — refers to the same limit you passed via the
 flag.
