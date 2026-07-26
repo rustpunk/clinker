@@ -619,8 +619,8 @@ pub(crate) struct SortMergeExec<'a> {
     pub consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
     /// Error strategy governing output-stage eval failures. Under
     /// `FailFast` a residual / body eval error propagates immediately;
-    /// under `Continue` / `BestEffort` the failing row is deferred to the
-    /// dispatcher via [`SortMergeOutput::output_eval_failures`].
+    /// under `Continue` the failing row is deferred to the dispatcher via
+    /// [`SortMergeOutput::output_eval_failures`].
     pub strategy: clinker_plan::config::ErrorStrategy,
 }
 

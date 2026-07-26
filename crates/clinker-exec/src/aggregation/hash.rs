@@ -787,8 +787,8 @@ impl HashAggregator {
         // cannot be salvaged by spilling — the very next add of the same
         // shape would repeat the overflow. Surface a typed error the
         // dispatch arm routes by error strategy (FailFast aborts with E310;
-        // Continue/BestEffort routes the offending record to the DLQ)
-        // rather than admitting an unaffordable contribution.
+        // Continue routes the offending record to the DLQ) rather than
+        // admitting an unaffordable contribution.
         if self.memory_budget > 0 && row_charge > self.memory_budget {
             return Err(HashAggError::OversizedRow {
                 row_charge,

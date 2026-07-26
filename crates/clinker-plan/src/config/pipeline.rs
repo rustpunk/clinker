@@ -4371,12 +4371,46 @@ impl Default for ErrorHandlingConfig {
 }
 
 /// Error handling strategy variants.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Two dispositions, and the runtime distinguishes exactly these two: abort
+/// the run on the first record failure, or dead-letter the failing record and
+/// keep going.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorStrategy {
     FailFast,
     Continue,
-    BestEffort,
+}
+
+/// The strategy spellings a pipeline may write, in the order the diagnostic
+/// lists them.
+const ERROR_STRATEGY_VARIANTS: &[&str] = &["fail_fast", "continue"];
+
+/// Hand-written so a pipeline still writing the removed `best_effort` gets a
+/// migration diagnostic naming its replacement rather than a bare
+/// unknown-variant list. `every_listed_strategy_parses` keeps the accepted
+/// spellings and [`ERROR_STRATEGY_VARIANTS`] from drifting apart.
+impl<'de> Deserialize<'de> for ErrorStrategy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.as_str() {
+            "fail_fast" => Ok(Self::FailFast),
+            "continue" => Ok(Self::Continue),
+            "best_effort" => Err(serde::de::Error::custom(
+                "`error_handling.strategy: best_effort` is not a strategy: it was \
+                 removed because it behaved identically to `continue` — both routed \
+                 the failing record to the dead-letter queue and kept the run going. \
+                 Write `strategy: continue` instead",
+            )),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                ERROR_STRATEGY_VARIANTS,
+            )),
+        }
+    }
 }
 
 fn default_strategy() -> ErrorStrategy {
@@ -4827,7 +4861,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             "[E344] source '{source}': `dlq_granularity: document` cannot be combined \
              with `error_handling.strategy: fail_fast` — document-level dead-lettering \
              keeps the run going past a bad document, which contradicts fail-fast's \
-             abort-on-first-error. Use `strategy: continue` (or `best_effort`) with \
+             abort-on-first-error. Use `strategy: continue` with \
              `dlq_granularity: document`, or set `dlq_granularity: record` to keep \
              fail-fast"
         )));
@@ -5728,6 +5762,102 @@ nodes:
         assert!(
             msg.contains("resume_treshold") || msg.contains("unknown field"),
             "rejection must flag the unknown field: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod error_strategy_tests {
+    use super::ErrorStrategy;
+    use crate::config::parse_config;
+
+    /// Minimal pipeline whose `error_handling.strategy` is caller-supplied.
+    fn strategy_pipeline(strategy: &str) -> String {
+        format!(
+            r#"
+pipeline:
+  name: error_strategy
+error_handling:
+  strategy: {strategy}
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: in.csv
+      schema:
+        - {{ name: a, type: string }}
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+        )
+    }
+
+    #[test]
+    fn both_strategies_parse() {
+        let fail_fast = parse_config(&strategy_pipeline("fail_fast")).expect("fail_fast is valid");
+        assert_eq!(fail_fast.error_handling.strategy, ErrorStrategy::FailFast);
+        let cont = parse_config(&strategy_pipeline("continue")).expect("continue is valid");
+        assert_eq!(cont.error_handling.strategy, ErrorStrategy::Continue);
+    }
+
+    /// The unknown-variant diagnostic lists [`ERROR_STRATEGY_VARIANTS`], so a
+    /// spelling that drifted out of the deserializer's match would advertise a
+    /// value the parser rejects.
+    #[test]
+    fn every_listed_strategy_parses() {
+        for spelling in super::ERROR_STRATEGY_VARIANTS {
+            parse_config(&strategy_pipeline(spelling))
+                .unwrap_or_else(|e| panic!("advertised strategy {spelling:?} must parse: {e}"));
+        }
+    }
+
+    #[test]
+    fn omitted_strategy_defaults_to_fail_fast() {
+        let yaml =
+            strategy_pipeline("fail_fast").replace("error_handling:\n  strategy: fail_fast\n", "");
+        let cfg = parse_config(&yaml).expect("an omitted error_handling block is valid");
+        assert_eq!(cfg.error_handling.strategy, ErrorStrategy::FailFast);
+    }
+
+    /// `best_effort` was runtime-identical to `continue` and is gone. A
+    /// pipeline still carrying it must be told what to write instead — a bare
+    /// unknown-variant list would name `continue` without saying it is the
+    /// replacement.
+    #[test]
+    fn removed_best_effort_rejected_with_a_migration_diagnostic() {
+        let err = parse_config(&strategy_pipeline("best_effort"))
+            .expect_err("`best_effort` is no longer a strategy");
+        let msg = err.to_string();
+        for expected in [
+            // the offending input
+            "best_effort",
+            // the rule it broke
+            "is not a strategy",
+            // the corrected form the author can paste
+            "strategy: continue",
+        ] {
+            assert!(
+                msg.contains(expected),
+                "the best_effort rejection must contain {expected:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrelated_unknown_strategy_lists_the_two_real_ones() {
+        let err =
+            parse_config(&strategy_pipeline("lenient")).expect_err("`lenient` is not a strategy");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("lenient") && msg.contains("fail_fast") && msg.contains("continue"),
+            "an unknown strategy must name the input and both accepted spellings: {msg}"
         );
     }
 }

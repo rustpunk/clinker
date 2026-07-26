@@ -71,9 +71,9 @@ use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 /// drift (`PipelineError::Compilation` from `check_input_schema`),
 /// memory-budget overruns from `tee_emit_to_region_input_buffers`,
 /// downstream Combine/Aggregate engine errors. `FailFast` strategy
-/// short-circuits the walk; `Continue` / `BestEffort` route per-record
-/// failures to `ctx.dlq_entries` (which the dispatcher captures into
-/// the returned [`DlqEvent`] vec).
+/// short-circuits the walk; `Continue` routes per-record failures to
+/// `ctx.dlq_entries` (which the dispatcher captures into the returned
+/// [`DlqEvent`] vec).
 pub(crate) fn dispatch_deferred_subdag(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,

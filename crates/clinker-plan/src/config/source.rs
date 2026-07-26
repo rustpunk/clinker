@@ -72,7 +72,7 @@ pub struct SourceConfig {
     pub envelope: Option<clinker_format::EnvelopeConfig>,
 
     /// Granularity at which a record failure dead-letters under the
-    /// `continue` / `best_effort` error strategies: `record` (the default)
+    /// `continue` error strategy: `record` (the default)
     /// DLQs only the failing record and streams its siblings, while
     /// `document` dead-letters the entire document any record of which
     /// fails. Per-source because only a document-aware source carries an
@@ -139,7 +139,7 @@ pub struct SourceConfig {
     pub notes: Option<serde_json::Value>,
 }
 
-/// Per-source dead-letter granularity under `continue` / `best_effort`.
+/// Per-source dead-letter granularity under `continue`.
 ///
 /// Selects whether a record failure dead-letters just the failing record
 /// or the whole document it belongs to. `Document` is incompatible with
