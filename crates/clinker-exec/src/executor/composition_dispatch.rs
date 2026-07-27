@@ -9,7 +9,7 @@
 //! port-collection and body-walk helpers (`collect_port_records`,
 //! `execute_composition_body`) move with it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use clinker_record::Record;
 use indexmap::IndexMap;
@@ -17,13 +17,13 @@ use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
-    ExecutorContext, NodeBufferKey, admit_node_buffer, dispatch_plan_node, drain_node_buffer_slot,
-    finalize_node_rooted_windows, missing_node_buffer_input_error, node_buffer_spill_allowed,
-    require_node_buffer_slot, tee_emit_to_region_input_buffers,
+    ExecutorContext, NodeBufferKey, NodeBufferReaderLedger, admit_node_buffer, dispatch_plan_node,
+    drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed,
+    planned_materialized_reader_counts, require_node_buffer_input,
+    require_node_buffer_input_transferred, tee_emit_to_region_input_buffers,
+    validate_completed_node_buffer_scope,
 };
-use crate::executor::node_buffer::{
-    NodeBuffer, TransientNodeBufferReservation, clone_node_buffer_reserved,
-};
+use crate::executor::node_buffer::{NodeBuffer, TransientNodeBufferReservation};
 use crate::executor::schema_check::check_input_schema;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -87,7 +87,11 @@ pub(crate) fn dispatch_composition(
         // by their producer's buffer until `collect_port_records`
         // claims them below.
         if let Some(&first_pred) = predecessors.first()
-            && let Some(records) = ctx.node_buffers.get(&first_pred.into())
+            && let Some(edge) = current_dag.graph.find_edge(first_pred, node_idx)
+            && let Some(records) = ctx.node_buffers.get(&NodeBufferKey::with_port(
+                first_pred,
+                current_dag.graph[edge].producer_port.as_deref(),
+            ))
         {
             for (record, _) in records.peek_mem_records() {
                 check_input_schema(
@@ -137,15 +141,15 @@ pub(crate) fn dispatch_composition(
     // only errors from inside that walk get the wrapper. The pre-body
     // port-records clone is separately preflighted under the call-site name
     // before entering the body, so its E310 also remains bare.
-    let nb = admit_node_buffer(
+    admit_node_buffer(
         ctx,
+        current_dag,
         &composition_name,
         node_idx,
         output_records,
         Vec::new(),
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
-    ctx.node_buffers.insert(node_idx.into(), nb);
 
     Ok(())
 }
@@ -168,7 +172,31 @@ pub(crate) fn dispatch_composition(
 /// fan-out from a single producer to multiple ports is a normal case.
 struct ReservedPortRecords {
     records: Vec<(Record, u64)>,
-    reservation: TransientNodeBufferReservation,
+    reservation: Option<TransientNodeBufferReservation>,
+}
+
+/// Discard forward-pass slots owned by deferred body regions.
+///
+/// Their commit-time replay is seeded from retained aggregate/continuation
+/// state, not from these narrow forward emits. Leaving them in the transient
+/// body namespace would both retain memory until scope teardown and violate
+/// the successful-scope ledger invariant.
+fn discard_deferred_body_residue(ctx: &mut ExecutorContext<'_>, body_dag: &ExecutionPlanDag) {
+    let mut deferred_nodes = HashSet::new();
+    for region in body_dag.deferred_regions.values() {
+        deferred_nodes.insert(region.producer);
+        deferred_nodes.extend(region.members.iter().copied());
+        deferred_nodes.extend(region.outputs.iter().copied());
+    }
+    let stale_keys: Vec<NodeBufferKey> = ctx
+        .node_buffers
+        .keys()
+        .filter(|key| deferred_nodes.contains(&key.node))
+        .cloned()
+        .collect();
+    for key in stale_keys {
+        drain_node_buffer_slot(ctx, key);
+    }
 }
 
 fn collect_port_records(
@@ -199,21 +227,18 @@ fn collect_port_records(
                 ),
             });
         };
-        let input_buffer = ctx.node_buffers.get(&edge.source().into()).ok_or_else(|| {
-            missing_node_buffer_input_error(
-                composition_name,
-                parent_dag.graph[edge.source()].name(),
-                edge.weight().producer_port.as_deref(),
-            )
-        })?;
-        // Composition port seeding clones records only; the composition body
-        // operates inside its own document-boundary scope and re-emits
-        // punctuations at the call-site level on body exit, so the parent's
-        // punctuations do not forward through the body's port-source boundary.
-        let reserved =
-            clone_node_buffer_reserved(input_buffer, &ctx.memory_budget, composition_name)?;
-        let (cloned, reservation) = reserved.into_parts();
-        let (records, _puncts) = cloned.drain_split()?;
+        let producer_port = edge.weight().producer_port.as_deref();
+        let input = require_node_buffer_input_transferred(
+            ctx,
+            NodeBufferKey::with_port(edge.source(), producer_port),
+            composition_name,
+            parent_dag.graph[edge.source()].name(),
+            producer_port,
+        )?;
+        // Composition port seeding takes records only; the body operates in
+        // its own document-boundary scope and re-emits at the call site.
+        let (input, reservation) = input.into_parts();
+        let (records, _puncts) = input.drain_split()?;
         // Two parallel edges to the same port (e.g. `inputs: { p: a,
         // p: a }` — currently rejected at parse, but the runtime is
         // defensive) would overwrite; the wiring pass guarantees
@@ -296,12 +321,43 @@ fn execute_composition_body(
     // second charge for the same allocation.
     let mut body_buffers: HashMap<NodeBufferKey, NodeBuffer> = HashMap::new();
     let mut body_consumer_ids = HashMap::new();
-    for (slot_key, input) in resolved_inputs {
-        body_buffers.insert(
-            slot_key.clone(),
-            NodeBuffer::memory_from_records(input.records),
-        );
-        body_consumer_ids.insert(slot_key, input.reservation.into_registration());
+    let mut body_readers = NodeBufferReaderLedger::default();
+    let seed_result = (|| {
+        for (slot_key, input) in resolved_inputs {
+            let Some(reservation) = input.reservation else {
+                return Err(PipelineError::Internal {
+                    op: "executor",
+                    node: composition_name.to_string(),
+                    detail: format!(
+                        "composition body seed {slot_key:?} had no transferred memory registration"
+                    ),
+                });
+            };
+            if body_buffers.contains_key(&slot_key) || body_consumer_ids.contains_key(&slot_key) {
+                return Err(PipelineError::Internal {
+                    op: "executor",
+                    node: composition_name.to_string(),
+                    detail: format!(
+                        "composition body seed {slot_key:?} was published more than once"
+                    ),
+                });
+            }
+            body_readers.publish(slot_key.clone(), 1, composition_name)?;
+            body_buffers.insert(
+                slot_key.clone(),
+                NodeBuffer::memory_from_records(input.records),
+            );
+            body_consumer_ids.insert(slot_key, reservation.into_registration());
+        }
+        Ok::<(), PipelineError>(())
+    })();
+    if let Err(error) = seed_result {
+        drop(body_buffers);
+        for (_, (id, handle)) in body_consumer_ids {
+            handle.set_bytes(0);
+            ctx.memory_budget.unregister_consumer(id);
+        }
+        return Err(error);
     }
 
     // Pick the body's terminal output node. The bind-time alias
@@ -321,10 +377,13 @@ fn execute_composition_body(
     let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
     let saved_consumer_ids =
         std::mem::replace(&mut ctx.node_buffer_consumer_ids, body_consumer_ids);
-    // Shared-input drain counts key by the body-local `NodeBufferKey` space, so
-    // swap to a fresh map alongside `node_buffers` — a pending parent fanout
-    // count must not collide with a body slot of the same index/port.
-    let saved_shared_drains = std::mem::take(&mut ctx.shared_input_drains);
+    // Remaining-reader counts key by the body-local `NodeBufferKey` space, so
+    // swap to a fresh ledger alongside `node_buffers`.
+    let saved_readers = std::mem::replace(&mut ctx.node_buffer_readers, body_readers);
+    let saved_planned_readers = std::mem::replace(
+        &mut ctx.planned_node_buffer_readers,
+        planned_materialized_reader_counts(&body_dag),
+    );
     let saved_combine = std::mem::take(&mut ctx.source_records);
     // Window-arena consumer ids key by slot index, which the body
     // re-uses from zero alongside its window-runtime overlay. Swap to a
@@ -393,19 +452,22 @@ fn execute_composition_body(
                     drain_node_buffer_slot(ctx, idx);
                     Vec::new()
                 } else {
-                    let (records, _puncts) = require_node_buffer_slot(
+                    let input = require_node_buffer_input(
                         ctx,
                         idx,
                         composition_name,
                         body_dag.graph[idx].name(),
                         None,
-                    )?
-                    .drain_split()?;
+                    )?;
+                    let (input, _reservation) = input.into_parts();
+                    let (records, _puncts) = input.drain_split()?;
                     records
                 }
             }
             None => Vec::new(),
         };
+        discard_deferred_body_residue(ctx, &body_dag);
+        validate_completed_node_buffer_scope(ctx, composition_name)?;
         Ok(output_records)
     })();
 
@@ -422,7 +484,8 @@ fn execute_composition_body(
     }
     ctx.node_buffers = saved_buffers;
     ctx.node_buffer_consumer_ids = saved_consumer_ids;
-    ctx.shared_input_drains = saved_shared_drains;
+    ctx.node_buffer_readers = saved_readers;
+    ctx.planned_node_buffer_readers = saved_planned_readers;
     ctx.source_records = saved_combine;
     ctx.current_body_node_input_refs = saved_body_refs;
     // Unregister body-local window-arena consumers and restore the

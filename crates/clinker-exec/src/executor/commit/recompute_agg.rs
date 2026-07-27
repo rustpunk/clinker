@@ -164,6 +164,11 @@ pub(crate) fn emit_post_recompute(
     // that mutable borrow, so this finalize context stays inline.
     let merged_source_count =
         ctx.source_count_by_name(&crate::executor::dispatch::MERGED_SOURCE_NAME);
+    // A recompute replaces the forward-pass (or prior replay) producer slot;
+    // that value is stale state, not another logical read. Discard it before
+    // finalization so the old allocation does not overlap the new emit and the
+    // atomic publisher sees an unoccupied slot/count/registration triple.
+    drain_node_buffer_slot(ctx, agg_idx);
     let retained = ctx
         .relaxed_aggregator_states
         .get_mut(&agg_idx)
@@ -226,13 +231,12 @@ pub(crate) fn emit_post_recompute(
             "node-rooted window rebuild during commit-pass recompute: {e}"
         )));
     }
-    // The forward-pass Aggregate arm registered a NodeBufferConsumer
-    // for this slot; the re-admit below unregisters it before the
-    // new wrapper lands so the arbitrator's registry holds exactly
-    // one entry per live slot.
+    // The stale slot was discarded before finalize; publish the replacement
+    // through the ordinary atomic slot/count/registration boundary.
     let agg_name = current_dag.graph[agg_idx].name().to_string();
-    let nb = admit_node_buffer(
+    admit_node_buffer(
         ctx,
+        current_dag,
         &agg_name,
         agg_idx,
         projected,
@@ -249,6 +253,5 @@ pub(crate) fn emit_post_recompute(
         // aggregate output.
         HashAggError::Spill(format!("post-recompute node-buffer admission: {e}"))
     })?;
-    ctx.node_buffers.insert(agg_idx.into(), nb);
     Ok(emitted)
 }

@@ -133,11 +133,13 @@ probe-side stream their result straight to the writer (see
 The remaining boundaries -- multi-branch Route fan-out, output that forks
 to several consumers, Composition bodies, diamond DAGs -- materialize
 records into per-stage buffers that charge against the same budget
-envelope. When a buffer would push cumulative usage past the soft
-threshold (80% of the limit), the engine spills the buffer to disk; when
-it would exceed the hard limit, the engine fails fast with a structured
-`E310 MemoryBudgetExceeded` diagnostic that names the offending
-producer.
+envelope. Single-consumer buffers can spill past the soft threshold. A
+buffer shared by several readers remains memory-only: readers run
+sequentially, with one original plus at most one charged temporary copy,
+and the final reader takes the original regardless of declaration or dispatch
+order. If that overlap would exceed the hard limit, the engine fails before
+cloning with a structured `E310 MemoryBudgetExceeded` diagnostic that names
+the consumer needing the copy.
 
 Use `clinker run --explain` to see which nodes will materialize
 (`buffer: materialized`) versus which will stream (`buffer: streaming`)

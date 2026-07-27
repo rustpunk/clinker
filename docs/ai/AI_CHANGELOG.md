@@ -39,6 +39,22 @@ Representative code and manifest evidence cited by those docs includes:
 
 ## Entries
 
+### 2026-07-27: Materialized Slots Declare Their Readers at Publication
+
+Type: Source-backed fact (issues #996 and #1033).
+
+Summary: Each materialized `NodeBufferKey` generation is published with an
+authoritative remaining-reader count. All logical slot readers use one O(1)
+boundary: the single-reader path removes the original directly, earlier shared
+readers receive one reservation-backed clone at a time, and the final reader
+takes the original independent of node declaration or dispatch order. The same
+ledger follows node-buffer state through Composition and deferred scopes;
+successful scope completion rejects slot/count/registration residue. Both
+ordinary and event-aware Output paths use this ownership rule, so several
+Outputs reading one producer are a complete broadcast rather than a partial or
+order-dependent write. Evidence: `crates/clinker-exec/src/executor/dispatch.rs`,
+the direct fan-out and composition executor regressions, and Scenario 02.
+
 ### 2026-07-26: A Missing Planned Node Buffer Is Not Empty Input
 
 Type: Source-backed fact (issue #1029).

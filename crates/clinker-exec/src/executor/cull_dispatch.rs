@@ -67,7 +67,8 @@ use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 
 use crate::executor::dispatch::{
-    ExecutorContext, NodeBufferKey, admit_node_buffer, node_buffer_spill_allowed,
+    ExecutorContext, NodeBufferKey, admit_node_buffer, admit_node_buffer_with_readers,
+    crosses_into_deferred_consumer, node_buffer_spill_allowed,
     require_single_input_node_buffer_slot, source_file_arc_of, source_name_arc_of,
 };
 use crate::executor::{GroupedNodeKind, giant_group_error};
@@ -180,6 +181,7 @@ pub(crate) fn dispatch_cull(
         current_dag.graph[pred].name(),
         producer_port,
     )?;
+    let (input_buffer, _input_reservation) = input_buffer.into_parts();
     let (input, input_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
@@ -510,7 +512,6 @@ fn emit_ports(
     let removed_port = config.removed_to.as_str();
     let is_removed_port = |port: Option<&str>| matches!(port, Some(p) if p == removed_port);
 
-    let cull_region_producer = current_dag.deferred_region_at(node_idx).map(|r| r.producer);
     let active_body = ctx.window_runtime.active_stack.last().copied();
 
     // Predecessor-slot readers (Merge / Combine) drain by incoming edge, so one
@@ -544,13 +545,7 @@ fn emit_ports(
         // so the commit-time deferred dispatcher receives exactly them.
         // In-region and non-deferred edges skip the tee; their `node_buffers`
         // slot already covers them.
-        let succ_region_producer = current_dag.deferred_region_at(succ).map(|r| r.producer);
-        let crosses = match (cull_region_producer, succ_region_producer) {
-            (None, Some(_)) => true,
-            (Some(p), Some(t)) if p != t => true,
-            _ => false,
-        };
-        if crosses {
+        if crosses_into_deferred_consumer(current_dag, node_idx, succ) {
             let row_bytes_each: u64 = records
                 .first()
                 .map(|(rec, _)| {
@@ -576,6 +571,7 @@ fn emit_ports(
                     .or_default()
                     .push((record.clone(), *rn));
             }
+            continue;
         }
         if reads_predecessor_slot(&current_dag.graph[succ]) {
             if !pred_ports.contains(&port) {
@@ -584,15 +580,15 @@ fn emit_ports(
         } else {
             // Own-slot reader: its port-selected records go into its own slot.
             let records = records.clone();
-            let nb = admit_node_buffer(
+            admit_node_buffer_with_readers(
                 ctx,
                 name,
                 succ,
                 records,
                 input_puncts.clone(),
                 node_buffer_spill_allowed(current_dag, succ),
+                1,
             )?;
-            ctx.node_buffers.insert(succ.into(), nb);
         }
     }
     let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
@@ -603,26 +599,31 @@ fn emit_ports(
             kept.clone()
         };
         let key = NodeBufferKey::with_port(node_idx, port.as_deref());
-        let nb = admit_node_buffer(
+        admit_node_buffer(
             ctx,
+            current_dag,
             name,
             key.clone(),
             records,
             input_puncts.clone(),
             spill_allowed,
         )?;
-        ctx.node_buffers.insert(key, nb);
     }
     Ok(())
 }
 
-/// Whether `node` drains its *predecessor's* `node_buffers` slot rather than
-/// checking its own slot first. Merge and Combine read each predecessor slot
-/// directly; every other consumer (Transform / Output / Reshape / Cull / Sort
-/// / Aggregation) checks its own slot first, so a producer writes into the
-/// consumer's slot for those.
+/// Whether `node` must address each incoming predecessor slot directly rather
+/// than receiving one successor-local slot from Route/Cull. Multi-input nodes
+/// need the exact producer/port identity for every input; the remaining
+/// single-input consumers can use their own successor-local slot.
 pub(crate) fn reads_predecessor_slot(node: &PlanNode) -> bool {
-    matches!(node, PlanNode::Merge { .. } | PlanNode::Combine { .. })
+    matches!(
+        node,
+        PlanNode::Merge { .. }
+            | PlanNode::Combine { .. }
+            | PlanNode::Composition { .. }
+            | PlanNode::Envelope { .. }
+    )
 }
 
 // ---------------------------------------------------------------------

@@ -204,6 +204,7 @@ pub(crate) fn dispatch_reshape(
         current_dag.graph[pred].name(),
         producer_port,
     )?;
+    let (input_buffer, _input_reservation) = input_buffer.into_parts();
     let (input, input_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
@@ -214,15 +215,15 @@ pub(crate) fn dispatch_reshape(
         // there is nothing to deregister: a `ConsumerId` left registered on
         // an early return inflates the run's peak for every downstream stage.
         tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &[])?;
-        let nb = admit_node_buffer(
+        admit_node_buffer(
             ctx,
+            current_dag,
             name,
             node_idx,
             Vec::new(),
             input_puncts,
             node_buffer_spill_allowed(current_dag, node_idx),
         )?;
-        ctx.node_buffers.insert(node_idx.into(), nb);
         return Ok(());
     }
 
@@ -343,15 +344,15 @@ fn run_reshape_grouped(
     }
 
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &out)?;
-    let nb = admit_node_buffer(
+    admit_node_buffer(
         ctx,
+        current_dag,
         name,
         node_idx,
         out,
         input_puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
-    ctx.node_buffers.insert(node_idx.into(), nb);
     Ok(())
 }
 

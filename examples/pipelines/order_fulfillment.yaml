@@ -81,6 +81,8 @@ nodes:
     input: product_lookup
     config:
       cxl: |
+        # `_route` is an ordinary audit column. Both direct Output nodes below
+        # receive every row; use a Route node to partition destinations.
         emit _route = if priority_level == "urgent" or priority_level == "high" or line_total >= $vars.high_value_threshold then "priority_report" else "fulfilled_orders"
         emit handling_fee = if priority_level == "urgent" then $vars.express_surcharge else 0.0
         emit region = $vars.region

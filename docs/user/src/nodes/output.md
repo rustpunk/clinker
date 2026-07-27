@@ -18,6 +18,17 @@ The `type:` field selects the output format: `csv`, `json`, `xml`, `fixed_width`
 
 Structured single-writer outputs (`edifact`, `x12`, `hl7`, and `swift`) accept one concrete document grain per output file. A multi-file source or multi-input merge feeding one of these outputs is rejected instead of being silently written as one merged envelope. To write multiple structured documents, consolidate them deliberately with an Envelope node first or route each document to a separate output path.
 
+## Direct broadcast to several outputs
+
+Several Output nodes may name the same input. This is a broadcast: every
+Output receives every upstream record, regardless of node declaration order.
+The run report counts one write per sink, so five input records feeding a CSV
+and a JSON Output produce `records_written: 10`.
+
+Use a [Route](route.md) node when outputs should receive different subsets.
+Writing a field such as `_route` does not select a destination; it is an
+ordinary output column unless a Route condition explicitly reads it.
+
 ## Field control
 
 Output nodes can either pass every upstream field through to the writer or restrict output to the fields the upstream transform explicitly emitted. Several options control which fields appear and how they are named.

@@ -132,34 +132,13 @@ const GATES: &[Gate] = &[
         id: "02-product-feed-normalize",
         input_digest: "250cd16cb79d",
         outputs: &["output/catalog.csv", "output/catalog.xml"],
-        // The CORRECT summary: 14 records written to each of two sinks. The
-        // engine currently delivers to only one, so it prints 14 — declared
-        // below rather than pinned here, so that the run which fixes #996
-        // reports a stale marker instead of a counter mismatch.
         counters: Counters {
             total: 14,
             ok: 14,
             written: 28,
             dlq: 0,
         },
-        // The goldens state what this pipeline SHOULD write to both sinks.
-        // Until #996 is fixed, the executor now stops before publishing either
-        // output instead of silently committing an empty first destination.
-        // The marker pins that fail-loud state so a return to exit-0 partial
-        // output is a regression and a complete fix makes the marker stale.
-        known_broken: Some(KnownBroken {
-            issue: "https://github.com/rustpunk/clinker/issues/996",
-            failing_outputs: &[],
-            current_counters: None,
-            current_failure: Some(CurrentFailure {
-                exit_code: 1,
-                stderr_contains: &[
-                    "internal error in executor 'catalog_csv'",
-                    "planned input from producer 'normalize' was unavailable",
-                    "instead of treating it as empty",
-                ],
-            }),
-        }),
+        known_broken: None,
     },
     Gate {
         id: "03-support-triage",

@@ -269,6 +269,11 @@ overrides:
         then "priority_report" else "fulfilled_orders"
 ```
 
+Here `_route` is an ordinary audit field; it does not select an Output. Direct
+Outputs sharing `route_priority` each receive every record. To partition rows
+by destination, add a [Route node](../nodes/route.md) with conditions that read
+the field (or express the conditions directly on the Route).
+
 Any other field path is a hard error, never a silent no-op.
 
 ### `patch_schema` — shape a source's columns

@@ -70,7 +70,7 @@ fn canonicalization_overlap_rejection_arbitrator(
     u64,
 ) {
     let arbitrator = quiet_arbitrator();
-    let pinned_bytes = HARD_LIMIT - 3 * row_bytes + 1;
+    let pinned_bytes = HARD_LIMIT - 2 * row_bytes + 1;
     let id = arbitrator.register_consumer(Arc::new(PinnedUsage(pinned_bytes)));
     (arbitrator, id, pinned_bytes)
 }
@@ -191,6 +191,10 @@ nodes:
       type: csv
       path: src.csv
       schema: [ { name: id, type: string } ]
+  - type: output
+    name: sibling
+    input: src
+    config: { name: sibling, type: csv, path: sibling.csv }
   - type: composition
     name: passthrough_call
     input: src
@@ -210,7 +214,7 @@ fn composition_clone_rejects_before_allocation_and_restores_baseline() {
     let (result, _) = run(
         COMPOSITION_PASSTHROUGH,
         &[("src", "id\n123\n")],
-        &["out"],
+        &["out", "sibling"],
         Arc::clone(&arbitrator),
     );
 
@@ -295,6 +299,63 @@ fn shared_transform_clone_rejects_before_allocation_and_restores_baseline() {
             assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
         }
         other => panic!("expected shared-Transform E310 NodeBuffer; got {other:?}"),
+    }
+    assert_eq!(arbitrator.consumer_count(), 1);
+    assert_eq!(arbitrator.sum_consumer_usage(), baseline_usage);
+    arbitrator.unregister_consumer(baseline_id);
+}
+
+const SHARED_OUTPUT_PREDECESSOR: &str = r#"
+pipeline:
+  name: transient_clone_shared_output_predecessor_gate
+nodes:
+  - type: source
+    name: src
+    config: { name: src, type: csv, path: src.csv, schema: [ { name: id, type: string } ] }
+  - type: transform
+    name: prepared
+    input: src
+    config:
+      cxl: |
+        emit marker = "ready"
+  - type: output
+    name: alpha
+    input: prepared
+    config: { name: alpha, type: csv, path: alpha.csv }
+  - type: output
+    name: beta
+    input: prepared
+    config: { name: beta, type: csv, path: beta.csv }
+"#;
+
+#[test]
+fn shared_output_clone_rejects_before_allocation_and_restores_baseline() {
+    let row_bytes = row_bytes_for_node(SHARED_OUTPUT_PREDECESSOR, "prepared");
+    let (arbitrator, baseline_id, baseline_usage) = clone_rejection_arbitrator(row_bytes);
+    let (result, _) = run(
+        SHARED_OUTPUT_PREDECESSOR,
+        &[("src", "id\n123\n")],
+        &["alpha", "beta"],
+        Arc::clone(&arbitrator),
+    );
+
+    match result.expect_err("the first shared Output clone must cross the hard limit") {
+        PipelineError::MemoryBudgetExceeded {
+            node,
+            used,
+            limit,
+            source,
+            ..
+        } => {
+            assert!(
+                node == "alpha" || node == "beta",
+                "unexpected clone site {node}"
+            );
+            assert_eq!(used, HARD_LIMIT + 1);
+            assert_eq!(limit, HARD_LIMIT);
+            assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
+        }
+        other => panic!("expected shared-Output E310 NodeBuffer; got {other:?}"),
     }
     assert_eq!(arbitrator.consumer_count(), 1);
     assert_eq!(arbitrator.sum_consumer_usage(), baseline_usage);
