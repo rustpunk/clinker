@@ -324,6 +324,125 @@ nodes:
     group.finish();
 }
 
+// ── Direct materialized fan-out ───────────────────────────────────
+
+fn direct_fan_out_yaml(reader_count: usize) -> String {
+    let mut yaml = String::from(
+        r#"
+pipeline:
+  name: bench_direct_fan_out
+error_handling:
+  strategy: continue
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: id, type: string }
+"#,
+    );
+    for reader in 1..=reader_count {
+        yaml.push_str(&format!(
+            r#"
+- type: output
+  name: out_{reader}
+  input: src
+  config:
+    name: out_{reader}
+    path: out_{reader}.csv
+    type: csv
+"#,
+        ));
+    }
+    yaml
+}
+
+fn bench_e2e_direct_fan_out(c: &mut Criterion) {
+    let mut group = c.benchmark_group("e2e_direct_fan_out");
+    let params = test_params();
+
+    for reader_count in 1..=3 {
+        let config = parse_config(&direct_fan_out_yaml(reader_count)).unwrap();
+        let plan = clinker_plan::config::PipelineConfig::compile(
+            &config,
+            &clinker_plan::config::CompileContext::default(),
+        )
+        .expect("compile direct fan-out benchmark");
+
+        for count in [SMALL, MEDIUM] {
+            let csv_bytes = CsvPayload::generate(
+                count,
+                &clinker_bench_support::FieldKind::default_layout(5),
+                16,
+                42,
+            );
+
+            group.throughput(Throughput::Elements(count as u64));
+            let peak_consumer_usage_bytes = {
+                let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+                    "src".to_string(),
+                    clinker_exec::executor::single_file_reader(
+                        "test.csv",
+                        Box::new(Cursor::new(csv_bytes.clone())),
+                    ),
+                )]);
+                let mut writers: HashMap<String, Box<dyn Write + Send>> =
+                    HashMap::with_capacity(reader_count);
+                for reader in 1..=reader_count {
+                    writers.insert(
+                        format!("out_{reader}"),
+                        Box::new(BenchBuffer::new()) as Box<dyn Write + Send>,
+                    );
+                }
+                PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+                    .expect("direct fan-out benchmark preflight")
+                    .peak_consumer_usage_bytes
+            };
+            eprintln!(
+                "e2e_direct_fan_out/{reader_count}_readers/{count}: \
+                 peak_consumer_usage_bytes={peak_consumer_usage_bytes}"
+            );
+            group.bench_with_input(
+                BenchmarkId::new(format!("{reader_count}_readers"), count),
+                &count,
+                |b, _| {
+                    b.iter(|| {
+                        let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+                            "src".to_string(),
+                            clinker_exec::executor::single_file_reader(
+                                "test.csv",
+                                Box::new(Cursor::new(csv_bytes.clone())),
+                            ),
+                        )]);
+                        let mut output_buffers = Vec::with_capacity(reader_count);
+                        let mut writers: HashMap<String, Box<dyn Write + Send>> =
+                            HashMap::with_capacity(reader_count);
+                        for reader in 1..=reader_count {
+                            let buffer = BenchBuffer::new();
+                            writers.insert(
+                                format!("out_{reader}"),
+                                Box::new(buffer.clone()) as Box<dyn Write + Send>,
+                            );
+                            output_buffers.push(buffer);
+                        }
+                        let report = PipelineExecutor::run_plan_with_readers_writers(
+                            &plan, readers, writers, &params,
+                        )
+                        .unwrap();
+                        black_box(report.peak_consumer_usage_bytes);
+                        black_box(&output_buffers);
+                        black_box(report);
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 // ── Pipeline with sort ─────────────────────────────────────────────
 
 fn bench_e2e_with_sort(c: &mut Criterion) {
@@ -417,6 +536,7 @@ criterion_group!(
     bench_e2e_streaming,
     bench_e2e_two_pass,
     bench_e2e_multi_output,
+    bench_e2e_direct_fan_out,
     bench_e2e_with_sort,
 );
 criterion_main!(benches);
