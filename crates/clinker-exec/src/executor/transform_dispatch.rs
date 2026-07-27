@@ -108,13 +108,14 @@ pub(crate) fn dispatch_transform(
         &producer_name,
         producer_port.as_deref(),
     )?;
-    let (input_buffer, _input_reservation) = input_buffer.into_parts();
-    // Meter the re-materialized drain so a spill-backed input cannot
-    // re-inflate into RAM past the hard limit uncharged.
+    let (input_buffer, _input_reservation) =
+        input_buffer.into_materialized_parts(&ctx.memory_budget, name)?;
+    // The caller-explicit materialization reservation above covers the full
+    // collected vector, including spill-backed reloads.
     let (input_records, input_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
-    ) = input_buffer.drain_split_metered(&ctx.memory_budget, name.as_str())?;
+    ) = input_buffer.drain_split()?;
 
     // Read the typed program off the `PlanNode::Transform` payload. Every
     // lowered Transform carries a `Some(payload)` with a typechecked program;

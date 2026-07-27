@@ -135,8 +135,8 @@ pub(crate) fn dispatch_merge(
     let mut nonfused_sender: Option<
         crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
     > = None;
-    // Shared-input clone reservations belong to the complete Merge arm, not
-    // only the input-conversion block: cloned records remain live through
+    // Shared-input materialization reservations belong to the complete Merge
+    // arm, not only the input-conversion block: collected records remain live through
     // boundary reconciliation, window finalization, and output admission.
     let mut input_reservations = Vec::new();
     let FusedMergeOutput {
@@ -241,7 +241,8 @@ pub(crate) fn dispatch_merge(
                         &upstream_name,
                         port.as_deref(),
                     )?;
-                    let (buf, reservation) = buf.into_parts();
+                    let (buf, reservation) =
+                        buf.into_materialized_parts(&ctx.memory_budget, name)?;
                     if let Some(reservation) = reservation {
                         input_reservations.push(reservation);
                     }
@@ -280,7 +281,8 @@ pub(crate) fn dispatch_merge(
                                 upstream_name,
                                 port.as_deref(),
                             )?;
-                            let (nb, reservation) = nb.into_parts();
+                            let (nb, reservation) =
+                                nb.into_materialized_parts(&ctx.memory_budget, name)?;
                             if let Some(reservation) = reservation {
                                 input_reservations.push(reservation);
                             }

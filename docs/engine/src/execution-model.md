@@ -34,29 +34,37 @@ failure. `Transform` and `Output` also recognize successor-local slots through
 their existing specialized input paths. `Merge` and `Combine` remain
 predecessor-slot readers because they select among multiple incoming edges.
 
-### Shared-buffer clones and composition scope
+### Shared-buffer scans and composition scope
 
 Every published materialized slot carries a remaining-reader count keyed by
 its exact `(producer, producer_port)` `NodeBufferKey`. The producer declares
 that count when it publishes the slot; readers never rediscover ownership from
 node kind, node index, or dispatch order. The common one-reader path removes
 the slot and its registration directly with O(1) bookkeeping. With several
-readers, each earlier reader receives a clone while the original stays live for
-the final reader. This applies uniformly to materialized Transform, Aggregate,
+readers, each earlier reader opens a sequential scan over shared immutable
+backing while the original stays live for the final reader. This applies
+uniformly to materialized Transform, Aggregate,
 Sort, Reshape, Route, Cull, Envelope, Composition, Merge, Combine, and Output
 inputs, including successor-local Route/Cull slots and both Output event paths.
 
-The duplicate is not an untracked local vector: allocation goes through one
-reserved-clone boundary that registers its estimated bytes before the clone
-and returns the clone together with a must-retain reservation. The consumer
-holds that reservation through its complete synchronous operation; unwinding
-an error releases it automatically. Clone failure is transactional: the reader
-count changes only after reservation and cloning succeed. The final reader
-drains the original slot and its ordinary node-buffer registration. Successful
-scope completion rejects any residual slot, registration, or positive reader
-count as an internal invariant failure.
+`Memory`, `Spilled`, and `Mixed` all support repeatable scans. A memory scan
+clones one event at a time; a spill scan opens one chunk at a time, preserving
+record and punctuation order with O(1) file descriptors per active scan. A
+consumer that collects the scan into a resident vector first registers the
+estimated materialized bytes and holds that reservation through its complete
+synchronous operation; unwinding an error releases it automatically. The
+reader count changes only after the scan is acquired successfully. The final
+reader drains the authoritative slot and its ordinary node-buffer
+registration. Successful scope completion rejects any residual slot,
+registration, or positive reader count as an internal invariant failure.
 
-A composition input uses the same clone boundary, then transfers the live
+An adopted `MergeSpilled` run set cannot be scanned repeatedly because its
+merger consumes and unlinks the runs. Its first shared acquisition therefore
+folds it exactly once into an ordinary spill file. Replacement disk bytes are
+charged before the input runs are released; an overlap beyond the spill quota
+returns E320 and cleans up every file and registration from the failed fold.
+
+A composition input uses the same scan/materialization boundary, then transfers the live
 consumer id and byte handle into the body-local node-buffer registry. Body
 Source canonicalization briefly needs the seeded events and its prospective
 output together, so it extends that same reservation before allocating the

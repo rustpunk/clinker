@@ -1207,18 +1207,26 @@ impl MemoryArbitrator {
         if n == 0 {
             return;
         }
+        let released = {
+            let mut per_stage = self
+                .per_stage_spill_bytes
+                .lock()
+                .expect("per_stage_spill_bytes mutex poisoned");
+            let Some(entry) = per_stage.get_mut(node) else {
+                return;
+            };
+            let released = n.min(*entry);
+            *entry -= released;
+            released
+        };
+        if released == 0 {
+            return;
+        }
         let _ =
             self.cumulative_spill_bytes
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    Some(cur.saturating_sub(n))
+                    Some(cur.saturating_sub(released))
                 });
-        let mut per_stage = self
-            .per_stage_spill_bytes
-            .lock()
-            .expect("per_stage_spill_bytes mutex poisoned");
-        if let Some(entry) = per_stage.get_mut(node) {
-            *entry = entry.saturating_sub(n);
-        }
     }
 
     /// Register a consumer with the arbitrator. Returns a fresh
@@ -1246,8 +1254,8 @@ impl MemoryArbitrator {
     /// The ArcSwap registry moves from one complete snapshot to another, so a
     /// concurrent reader observes either the old wrapper or the replacement —
     /// never a missing id and never both wrappers. Used when a composition's
-    /// transient clone becomes an ordinary spill-aware body node-buffer slot
-    /// without an unregister/register accounting gap.
+    /// transient scan materialization becomes an ordinary spill-aware body
+    /// node-buffer slot without an unregister/register accounting gap.
     pub(crate) fn replace_consumer(
         &self,
         id: ConsumerId,
@@ -1304,6 +1312,18 @@ impl MemoryArbitrator {
     /// reads `current_usage()` via `sum_consumer_usage`.
     pub fn consumer_count(&self) -> usize {
         self.consumers.load().len()
+    }
+
+    /// Number of registered producer-side consumers that can be paused.
+    /// Test-only lifecycle probe used to distinguish Source registrations
+    /// from synchronous materialization reservations.
+    #[cfg(test)]
+    pub(crate) fn backpressureable_consumer_count(&self) -> usize {
+        self.consumers
+            .load()
+            .iter()
+            .filter(|(_, consumer)| consumer.can_back_pressure())
+            .count()
     }
 
     /// Sum of `current_usage()` across every registered consumer.
@@ -2387,9 +2407,11 @@ mod tests {
             Some(&0),
             "an over-release floors the stage entry at zero"
         );
-        // The pipeline-wide counter also floors at zero on the over-release; the
-        // guard is the floor, not per-stage bookkeeping of other nodes.
-        assert_eq!(arbitrator.cumulative_spill_bytes(), 0);
+        assert_eq!(
+            arbitrator.cumulative_spill_bytes(),
+            300,
+            "an over-release for one stage cannot consume another stage's live charge"
+        );
     }
 
     #[test]

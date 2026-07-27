@@ -558,7 +558,7 @@ nodes:
 #[test]
 fn route_branch_fanned_to_two_merges_reaches_both() {
     // A single Route branch (`splitter.big`) feeds TWO Merge consumers. They
-    // share one `(splitter, "big")` slot; the first to drain must clone it so
+    // share one `(splitter, "big")` slot; the first opens a sequential scan so
     // the second still sees the records, rather than draining it empty. Both
     // merges must therefore carry the big-branch row plus their own input.
     let a = "k,v\nx,15\n";

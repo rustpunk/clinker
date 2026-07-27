@@ -824,10 +824,8 @@ fn peel_mem_tail(buffer: NodeBuffer) -> SpilledRemainder {
             spills,
             pending_puncts,
         } => (mem, spills, pending_puncts),
-        NodeBuffer::MergeSpilled { .. } => {
-            unreachable!(
-                "document DLQ buckets are only ever Memory/Spilled/Mixed, never MergeSpilled"
-            )
+        NodeBuffer::MergeSpilled { .. } | NodeBuffer::ReReadable(_) => {
+            unreachable!("document DLQ buckets are only ever mutable Memory/Spilled/Mixed buffers")
         }
     };
     let mut mem_records: Vec<(Record, u64)> = Vec::with_capacity(mem_events.len());

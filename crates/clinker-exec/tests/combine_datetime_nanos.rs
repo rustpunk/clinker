@@ -32,6 +32,10 @@ use clinker_plan::config::{CompileContext, PipelineConfig};
 /// Tight budget: small enough that the block-band external-sort threshold binds
 /// and the sides spill; the hash aggregate's group-count threshold also trips.
 const TIGHT_LIMIT: &str = "1M";
+/// The join's exact spill-backed output scan is just under 2 MiB. This limit
+/// admits that final materialization while keeping the much wider input axes
+/// over the block-band spill threshold.
+const JOIN_TIGHT_LIMIT: &str = "2M";
 /// Roomy budget: far above the working set, so nothing spills — the resident
 /// half of every across-budget pair.
 const ROOMY_LIMIT: &str = "512M";
@@ -275,10 +279,17 @@ fn datetime_single_inequality_matches_oracle_across_strategies_and_budgets() {
     let bld_sort = sort_order_block("threshold");
 
     // IEJoin (no sort_order) at both budgets.
-    let iejoin_tight = run(JOIN_YAML, TIGHT_LIMIT, "", "", &inputs, "out");
+    let iejoin_tight = run(JOIN_YAML, JOIN_TIGHT_LIMIT, "", "", &inputs, "out");
     let iejoin_roomy = run(JOIN_YAML, ROOMY_LIMIT, "", "", &inputs, "out");
     // SortMerge (both sources presorted on the range axis) at both budgets.
-    let sortmerge_tight = run(JOIN_YAML, TIGHT_LIMIT, &drv_sort, &bld_sort, &inputs, "out");
+    let sortmerge_tight = run(
+        JOIN_YAML,
+        JOIN_TIGHT_LIMIT,
+        &drv_sort,
+        &bld_sort,
+        &inputs,
+        "out",
+    );
     let sortmerge_roomy = run(JOIN_YAML, ROOMY_LIMIT, &drv_sort, &bld_sort, &inputs, "out");
 
     for (label, r) in [

@@ -615,7 +615,7 @@ fn block_band_first_skip_does_not_retry_higher_index_build() {
 /// Tight budget: the block-band external-sort threshold (`soft / 4`) binds and
 /// the sides spill. Under `backpressure: spill` a sub-baseline-RSS limit is not
 /// rejected at startup but completes by spilling.
-const TIGHT_LIMIT: &str = "1M";
+const TIGHT_LIMIT: &str = "3M";
 /// Roomy budget: everything stays resident, so no block-band spill occurs.
 const ROOMY_LIMIT: &str = "512M";
 

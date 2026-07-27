@@ -97,7 +97,8 @@ pub(crate) fn dispatch_route(
         &producer_name,
         producer_port.as_deref(),
     )?;
-    let (input_buffer, _input_reservation) = input_buffer.into_parts();
+    let (input_buffer, _input_reservation) =
+        input_buffer.into_materialized_parts(&ctx.memory_budget, name)?;
     let (input_records, input_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,

@@ -227,7 +227,7 @@ mod pure_range {
     /// so a sub-baseline-RSS limit is not rejected at startup (the `pause`
     /// policy would reject it) but instead completes by spilling — making the
     /// forced-spill layout independent of the host's baseline RSS.
-    const TIGHT_LIMIT: &str = "1M";
+    const TIGHT_LIMIT: &str = "3M";
     /// Roomy budget: far above the working set, so every side stays resident and
     /// no block-band spill occurs — the resident half of the across-budget pair.
     const ROOMY_LIMIT: &str = "512M";

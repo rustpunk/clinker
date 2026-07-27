@@ -537,27 +537,27 @@ impl ExecutionPlanDag {
 
             // Buffer-edge pseudo-nodes: one entry per `node_buffers` slot
             // between non-fused stages. The runtime keys `ctx.node_buffers`
-            // by the producer's `NodeIndex`, so the slot number printed
-            // here is that index — stable and identical to the slot the
-            // executor admits into. Every slot registers a
+            // by the exact `(producer NodeIndex, producer_port)` pair. The
+            // stable producer index is the compact slot number printed here,
+            // and a named producer port is printed beside it. Every slot registers a
             // `NodeBufferConsumer` (priority 0, the cheapest spill victim);
             // its `can_back_pressure` is a constant `false` — a
             // materialized node buffer has no pauseable producer — so the
             // producer-variant suffix is informational context only; it
             // does not flip the flag.
-            let materialized_edges: Vec<(NodeIndex, NodeIndex)> = self
+            let materialized_edges: Vec<(NodeIndex, NodeIndex, Option<String>)> = self
                 .topo_order
                 .iter()
                 .filter(|&&idx| buffer_classes.get(&idx) == Some(&BufferClass::Materialized))
                 .flat_map(|&producer| {
-                    self.graph
-                        .edges(producer)
-                        .map(move |edge| (producer, edge.target()))
+                    self.graph.edges(producer).map(move |edge| {
+                        (producer, edge.target(), edge.weight().producer_port.clone())
+                    })
                 })
                 .collect();
             if !materialized_edges.is_empty() {
                 out.push_str("=== Buffer Edges ===\n\n");
-                for (producer, target) in materialized_edges {
+                for (producer, target, producer_port) in materialized_edges {
                     let producer_node = &self.graph[producer];
                     let target_node = &self.graph[target];
                     out.push_str(&format!(
@@ -565,10 +565,16 @@ impl ExecutionPlanDag {
                         producer_node.id_slug(),
                         target_node.id_slug()
                     ));
-                    out.push_str(&format!(
-                        "  buffer: node_buffer (slot={})\n",
-                        producer.index()
-                    ));
+                    match producer_port {
+                        Some(port) => out.push_str(&format!(
+                            "  buffer: node_buffer (slot={}, port={port})\n",
+                            producer.index()
+                        )),
+                        None => out.push_str(&format!(
+                            "  buffer: node_buffer (slot={})\n",
+                            producer.index()
+                        )),
+                    }
                     // A node_buffer slot holds the producer's materialized
                     // output, so its predicted peak is the producer's own
                     // predicted volume; it frees that whole buffer once the

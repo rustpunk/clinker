@@ -173,14 +173,14 @@ fn memory_budget_overflow_on_deferred_buffer_raises_e310() {
     // Force the per-arena budget to a very small value so the deferred
     // region producer's narrow projection trips memory accounting on
     // the first record. `backpressure: spill` keeps the bare `Priority`
-    // policy: the 500-byte budget is below the process baseline RSS, which
+    // policy: the 1 KiB budget is below the process baseline RSS, which
     // the default `pause` policy would reject at startup (E312), but the
     // spill policy never pauses a producer and so reaches the per-record
     // admission charge that this test asserts trips on the first record.
     let yaml = r#"
 pipeline:
   name: deferred_budget_overflow
-  memory: { limit: "500", backpressure: spill }
+  memory: { limit: "1K", backpressure: spill }
 error_handling:
   strategy: continue
 nodes:

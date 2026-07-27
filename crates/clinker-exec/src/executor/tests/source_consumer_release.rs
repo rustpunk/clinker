@@ -297,16 +297,13 @@ impl std::io::Write for GateWriter {
     }
 }
 
-/// The release must happen AT the Source arm's receiver disconnect, not
-/// merely by end of run: a downstream stage dispatched after the drain
-/// makes its spill / abort decisions against `sum_consumer_usage`, so a
-/// charge that lingers until the teardown sweep would still distort
-/// them. The gated writer freezes the run inside the Output turn —
-/// strictly after the Source turn completed — and the registry must
-/// already be empty at that point (the Output arm unregistered its
-/// input slot when it drained it).
+/// The source ingest registration must be replaced when its receiver
+/// disconnects, while the final materialized reader keeps the slot's
+/// exact charge registered through its synchronous Output turn. The
+/// gated writer freezes the run after the Source turn completed and
+/// proves that only the transferred node-buffer registration remains.
 #[test]
-fn source_charge_is_released_before_the_downstream_output_writes() {
+fn source_charge_is_replaced_by_output_input_registration_before_write() {
     let yaml = r#"
 pipeline:
   name: source_consumer_midrun
@@ -369,17 +366,20 @@ nodes:
         drop(guard);
     }
 
-    // Frozen inside the Output turn: the Source arm has drained its
-    // receiver to disconnect and the Output arm has unregistered its
-    // input slot, so the only registration that could remain is a
-    // leaked source ingest consumer.
+    // Frozen inside the Output turn: the Source receiver is disconnected,
+    // while the final reader still owns the transferred materialization
+    // registration until the synchronous write completes.
     assert_eq!(
         arb.consumer_count(),
-        0,
-        "the source's registration must be gone the moment its receiver drains, \
-         not at end-of-run teardown"
+        1,
+        "the Output turn must retain exactly one transferred node-buffer registration"
     );
-    assert_eq!(arb.sum_consumer_usage(), 0);
+    assert_eq!(
+        arb.backpressureable_consumer_count(),
+        0,
+        "the Source registration must be gone once its receiver disconnects"
+    );
+    assert!(arb.sum_consumer_usage() > 0);
 
     {
         let (flag, cv) = &*release;
@@ -391,6 +391,8 @@ nodes:
         .expect("run thread must not panic")
         .expect("pipeline must run");
     assert_eq!(arb.consumer_count(), 0);
+    assert_eq!(arb.backpressureable_consumer_count(), 0);
+    assert_eq!(arb.sum_consumer_usage(), 0);
 }
 
 /// A shutdown token tripped before the walk starts means no dispatch arm

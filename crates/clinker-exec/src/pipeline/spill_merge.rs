@@ -128,6 +128,77 @@ impl OwnedMergeBudget {
             compress: self.compress,
         }
     }
+
+    /// Fold adopted payload-ordered runs into one ordinary, re-readable spill
+    /// file. The replacement is charged before the input runs are released so
+    /// the disk cap observes the true overlap. On every error, charges for
+    /// files unlinked by the failed fold are released before returning.
+    pub(crate) fn fold_payload_ordered_runs(
+        &self,
+        runs: Vec<SpillFile<(u64, u64, u64)>>,
+        expected_rows: u64,
+        context: &'static str,
+    ) -> Result<(SpillFile<u64>, u64), PipelineError> {
+        let Some(first) = runs.first() else {
+            return Err(PipelineError::Internal {
+                op: "spill merge",
+                node: self.node.to_string(),
+                detail: "cannot fold an empty payload-ordered run set".to_string(),
+            });
+        };
+        let schema = Arc::clone(first.schema());
+        let spill_dir = first.path().parent().map(Path::to_path_buf);
+        let mut merger = SortedRunMerger::new_payload_ordered(runs, context, self.as_borrowed())?;
+        let input_bytes = merger.spill_bytes();
+
+        let folded = (|| {
+            let mut writer = SpillWriter::<u64>::new(schema, spill_dir.as_deref(), self.compress)
+                .map_err(PipelineError::from)?;
+            let mut row_count = 0u64;
+            for item in &mut merger {
+                let (record, (order, _, _)) = item?;
+                writer
+                    .write_pair(&record, &order)
+                    .map_err(PipelineError::from)?;
+                row_count = row_count.saturating_add(1);
+            }
+            let (file, written) = writer.finish_with_bytes().map_err(PipelineError::from)?;
+            Ok::<_, PipelineError>((file, written, row_count))
+        })();
+
+        let (file, written, row_count) = match folded {
+            Ok(folded) => folded,
+            Err(error) => {
+                self.budget.release_spill_bytes(&self.node, input_bytes);
+                return Err(error);
+            }
+        };
+
+        if row_count != expected_rows {
+            self.budget.release_spill_bytes(&self.node, input_bytes);
+            return Err(PipelineError::Internal {
+                op: "spill merge",
+                node: self.node.to_string(),
+                detail: format!(
+                    "shared MergeSpilled fold produced {row_count} rows; expected {expected_rows}"
+                ),
+            });
+        }
+
+        if written > 0 && self.budget.record_spill_bytes(&self.node, written) {
+            let total = self.budget.cumulative_spill_bytes();
+            self.budget.release_spill_bytes(&self.node, written);
+            self.budget.release_spill_bytes(&self.node, input_bytes);
+            return Err(PipelineError::spill_cap_exceeded(
+                self.node.as_ref(),
+                self.budget.max_spill_bytes(),
+                written,
+                total,
+            ));
+        }
+        self.budget.release_spill_bytes(&self.node, input_bytes);
+        Ok((file, row_count))
+    }
 }
 
 /// How [`SortedRunMerger`] orders runs against each other, mirroring the
@@ -244,6 +315,12 @@ pub(crate) struct SortedRunMerger<P: Ord> {
     done: bool,
 }
 
+impl<P: Ord> SortedRunMerger<P> {
+    fn spill_bytes(&self) -> u64 {
+        self._files.iter().map(SpillFile::bytes).sum()
+    }
+}
+
 impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
     /// Field-ordered merge: runs are ordered by [`compare_records_by_fields`]
     /// over `sort_by`, matching a field-ordered
@@ -299,21 +376,31 @@ impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
         // scale with the total run count.
         let files = reduce_to_fan_in(files, &ordering, context, &budget, fan_in)?;
 
-        let mut readers: Vec<SpillReader<P>> = files
-            .iter()
-            .map(|f| f.reader())
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| {
-                PipelineError::Io(std::io::Error::other(format!(
-                    "{context}: spill run open failed during k-way merge: {e}"
-                )))
-            })?;
+        let live_bytes: u64 = files.iter().map(SpillFile::bytes).sum();
+        let opened = (|| {
+            let mut readers: Vec<SpillReader<P>> = files
+                .iter()
+                .map(|f| f.reader())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    PipelineError::Io(std::io::Error::other(format!(
+                        "{context}: spill run open failed during k-way merge: {e}"
+                    )))
+                })?;
 
-        let mut initial: Vec<Option<Run<P>>> = Vec::with_capacity(readers.len());
-        for reader in &mut readers {
-            initial.push(next_run(reader, &ordering, context)?);
-        }
-        let tree = LoserTree::new(initial);
+            let mut initial: Vec<Option<Run<P>>> = Vec::with_capacity(readers.len());
+            for reader in &mut readers {
+                initial.push(next_run(reader, &ordering, context)?);
+            }
+            Ok::<_, PipelineError>((readers, LoserTree::new(initial)))
+        })();
+        let (readers, tree) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                budget.budget.release_spill_bytes(budget.node, live_bytes);
+                return Err(error);
+            }
+        };
 
         Ok(Self {
             _files: files,
@@ -376,7 +463,21 @@ fn reduce_to_fan_in<P: Serialize + DeserializeOwned + Ord>(
                 // copy. It only ever occurs as the final group, so the
                 // increasing-interval order is preserved.
                 1 => next.push(group.into_iter().next().expect("group.len() == 1")),
-                _ => next.push(merge_group(group, ordering, context, budget)?),
+                _ => match merge_group(group, ordering, context, budget) {
+                    Ok(file) => next.push(file),
+                    Err(error) => {
+                        let remaining: Vec<SpillFile<P>> = iter.collect();
+                        let cleanup_bytes = next
+                            .iter()
+                            .chain(remaining.iter())
+                            .map(SpillFile::bytes)
+                            .sum();
+                        budget
+                            .budget
+                            .release_spill_bytes(budget.node, cleanup_bytes);
+                        return Err(error);
+                    }
+                },
             }
         }
         runs = next;
@@ -421,26 +522,49 @@ fn merge_group<P: Serialize + DeserializeOwned + Ord>(
     // Intermediate-run write faults keep their structured `SpillError`, so an
     // `ENOSPC` mid-cascade still surfaces as `DiskFull` (E321) and a vanished
     // spill dir as `DirUnavailable`, rather than flattening into a generic `Io`.
-    let mut writer = SpillWriter::<P>::new(schema, spill_dir.as_deref(), budget.compress)
-        .map_err(PipelineError::from)?;
-    let merger = SortedRunMerger::open(group, ordering.clone(), context, *budget, fan_in)?;
-    for item in merger {
-        let (record, payload) = item?;
-        writer
-            .write_pair(&record, &payload)
-            .map_err(PipelineError::from)?;
+    let mut writer = match SpillWriter::<P>::new(schema, spill_dir.as_deref(), budget.compress) {
+        Ok(writer) => writer,
+        Err(error) => {
+            budget.budget.release_spill_bytes(budget.node, input_bytes);
+            return Err(PipelineError::from(error));
+        }
+    };
+    // An open failure releases the group's charge inside `open`, alongside the
+    // files it consumed. Once this succeeds, this function owns that cleanup.
+    let mut merger = SortedRunMerger::open(group, ordering.clone(), context, *budget, fan_in)?;
+    for item in &mut merger {
+        let (record, payload) = match item {
+            Ok(item) => item,
+            Err(error) => {
+                budget.budget.release_spill_bytes(budget.node, input_bytes);
+                return Err(error);
+            }
+        };
+        if let Err(error) = writer.write_pair(&record, &payload) {
+            budget.budget.release_spill_bytes(budget.node, input_bytes);
+            return Err(PipelineError::from(error));
+        }
     }
-    let (file, written) = writer.finish_with_bytes().map_err(PipelineError::from)?;
+    let (file, written) = match writer.finish_with_bytes() {
+        Ok(finished) => finished,
+        Err(error) => {
+            budget.budget.release_spill_bytes(budget.node, input_bytes);
+            return Err(PipelineError::from(error));
+        }
+    };
     // The consumed inputs are still charged at this point (the merger dropped at
     // the end of the drain loop, but nothing has released their bytes yet), so
     // the cap check sees inputs + this output — the cascade's true concurrent
     // peak. On overflow the inputs stay counted in the E320 figure.
     if written > 0 && budget.budget.record_spill_bytes(budget.node, written) {
+        let total = budget.budget.cumulative_spill_bytes();
+        budget.budget.release_spill_bytes(budget.node, written);
+        budget.budget.release_spill_bytes(budget.node, input_bytes);
         return Err(PipelineError::spill_cap_exceeded(
             budget.node,
             budget.budget.max_spill_bytes(),
             written,
-            budget.budget.cumulative_spill_bytes(),
+            total,
         ));
     }
     budget.budget.release_spill_bytes(budget.node, input_bytes);

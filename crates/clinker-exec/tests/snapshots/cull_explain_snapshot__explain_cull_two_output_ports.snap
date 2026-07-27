@@ -55,7 +55,7 @@ edge source.events -> cull.drop_bad:
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: source)
 
 edge cull.drop_bad -> output.audit:
-  buffer: node_buffer (slot=1)
+  buffer: node_buffer (slot=1, port=removed)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: cull)
 
 edge cull.drop_bad -> output.kept:

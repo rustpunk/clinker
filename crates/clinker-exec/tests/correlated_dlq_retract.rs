@@ -1193,8 +1193,8 @@ O5,ENG,200
 /// A single record's buffer-mode contribution that exceeds the entire
 /// memory budget must surface as a typed error or DLQ outcome, never a
 /// panic. The aggregate runs in buffer-mode (a `BufferRequired` binding
-/// like `min`) with a memory.limit so small that any single row's
-/// per-binding charge breaches it. The admission guard returns a typed
+/// like `min`) with a string contribution larger than the calibrated
+/// memory.limit. The admission guard returns a typed
 /// `OversizedRow`, which the dispatch arm routes by error strategy: under
 /// `continue` the offending records go to the DLQ; a 100%-DLQ run can
 /// additionally trip the DLQ-rate ceiling (E315), which is itself a typed
@@ -1206,15 +1206,14 @@ O5,ENG,200
 /// architecturally-correct shapes, and neither is a crash.
 #[test]
 fn oversized_buffer_row_surfaces_typed_error_or_dlq_never_panics() {
-    // `backpressure: spill` keeps the bare `Priority` policy: the 1-byte
-    // budget is below the process baseline RSS, which the default `pause`
-    // policy rejects at startup (E312), but this test needs the run to
-    // reach the per-row admission guard, which only the non-pausing spill
-    // policy does under a sub-baseline budget.
+    // The 1 KiB budget admits correlation sorting's fixed-width scan while
+    // each 2 KiB payload still exceeds the Aggregate's per-row admission
+    // limit. `backpressure: spill` keeps the non-pausing policy so a
+    // sub-baseline test budget reaches that guard.
     let yaml = r#"
 pipeline:
   name: degrade_fallback
-  memory: { limit: "1", backpressure: spill }
+  memory: { limit: "1K", backpressure: spill }
 error_handling:
   strategy: continue
 nodes:
@@ -1229,6 +1228,7 @@ nodes:
       - { name: order_id, type: string }
       - { name: department, type: string }
       - { name: amount, type: int }
+      - { name: payload, type: string }
 - type: aggregate
   name: dept_stats
   input: src
@@ -1236,7 +1236,7 @@ nodes:
     group_by: [department]
     cxl: 'emit department = department
 
-      emit lo = min(amount)
+      emit lo = min(payload)
 
       '
 - type: output
@@ -1248,11 +1248,12 @@ nodes:
     type: csv
     include_unmapped: true
 "#;
-    let csv = "order_id,department,amount\nO1,HR,10\nO2,HR,20\nO3,ENG,100\n";
+    let large = "x".repeat(2048);
+    let csv = format!("order_id,department,amount,payload\nO1,HR,10,{large}\nO2,HR,20,{large}\n");
 
     // Direct call: a panic in the admission path would unwind through this
     // frame and fail the test, which is exactly the regression this guards.
-    match run_pipeline(yaml, csv) {
+    match run_pipeline(yaml, &csv) {
         Ok((counters, _dlq, output)) => {
             // Clean run. Under `continue` the oversized rows route to the
             // DLQ; a run that instead absorbed the pressure (spill) still
@@ -1264,11 +1265,14 @@ nodes:
                  expected either DLQ-routed oversized rows or successful processing"
             );
         }
-        Err(_e) => {
+        Err(PipelineError::DlqRateExceeded { .. }) => {
             // Typed error is the architecturally-correct hard-abort shape:
             // the admission guard's `OversizedRow` maps to E310 under
             // FailFast, and a 100%-DLQ run can trip E315 even under
             // `continue`. Both are typed `PipelineError`s, not a crash.
+        }
+        Err(other) => {
+            panic!("the calibrated run must reach Aggregate oversized-row handling; got {other:?}")
         }
     }
 }
@@ -1280,14 +1284,15 @@ nodes:
 /// stage" promise the memory docs make against the rendered diagnostic.
 #[test]
 fn oversized_buffer_row_failfast_names_the_aggregate_stage() {
-    // Same sub-baseline budget + non-pausing `spill` policy as the lenient
-    // test above so the run reaches the per-row admission guard; `fail_fast`
-    // (the default, so no `error_handling` block) turns the guard's
-    // `OversizedRow` into an E310 abort instead of a DLQ route.
+    // The 1 KiB budget admits the fixed-width materializations introduced
+    // by correlation sorting, while one 2 KiB string contribution still
+    // exceeds the Aggregate's entire row budget. `fail_fast` (the default,
+    // so no `error_handling` block) turns that `OversizedRow` into an E310
+    // abort instead of a DLQ route.
     let yaml = r#"
 pipeline:
   name: oversized_failfast
-  memory: { limit: "1", backpressure: spill }
+  memory: { limit: "1K", backpressure: spill }
 nodes:
 - type: source
   name: src
@@ -1300,6 +1305,7 @@ nodes:
       - { name: order_id, type: string }
       - { name: department, type: string }
       - { name: amount, type: int }
+      - { name: payload, type: string }
 - type: aggregate
   name: dept_stats
   input: src
@@ -1307,7 +1313,7 @@ nodes:
     group_by: [department]
     cxl: 'emit department = department
 
-      emit lo = min(amount)
+      emit lo = min(payload)
 
       '
 - type: output
@@ -1319,9 +1325,10 @@ nodes:
     type: csv
     include_unmapped: true
 "#;
-    let csv = "order_id,department,amount\nO1,HR,10\nO2,HR,20\n";
+    let large = "x".repeat(2048);
+    let csv = format!("order_id,department,amount,payload\nO1,HR,10,{large}\nO2,HR,20,{large}\n");
 
-    match run_pipeline(yaml, csv) {
+    match run_pipeline(yaml, &csv) {
         Err(PipelineError::MemoryBudgetExceeded { node, .. }) => {
             assert_eq!(
                 node, "dept_stats",

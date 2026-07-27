@@ -474,9 +474,7 @@ pub(crate) fn sink_collision_dlq_entry(
     })
 }
 
-use crate::executor::node_buffer::{
-    NodeBuffer, TransientNodeBufferReservation, clone_node_buffer_reserved,
-};
+use crate::executor::node_buffer::{NodeBuffer, TransientNodeBufferReservation};
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, evaluate_single_transform, stage_metrics};
 use clinker_plan::BudgetCategory;
@@ -724,11 +722,10 @@ pub(crate) struct ExecutorContext<'a> {
     /// Per-slot consumer registration for `node_buffers`. `admit_node_buffer`
     /// registers a `NodeBufferConsumer` with the pipeline-scoped arbitrator
     /// and stores both the returned `ConsumerId` (used to `unregister_consumer`
-    /// at the slot's drain site) and a clone of the `Arc<ConsumerHandle>`
+    /// after the slot's final reader) and a clone of the `Arc<ConsumerHandle>`
     /// (used by partial-discharge sites to drive `handle.sub_bytes`). Keyed
-    /// by the slot's `NodeIndex`; body-scope swaps replace this map alongside
-    /// `node_buffers` so a body walk does not pollute the parent scope's
-    /// registry.
+    /// by exact `NodeBufferKey`; body-scope swaps replace this map alongside
+    /// `node_buffers` so a body walk does not pollute the parent scope's registry.
     pub(crate) node_buffer_consumer_ids: HashMap<
         NodeBufferKey,
         (
@@ -1396,9 +1393,8 @@ impl<'a> ExecutorContext<'a> {
     /// `ConsumerHandle` are installed once per streaming spec; this clones
     /// the handle into a charge handle the producer arm drives per flushed
     /// batch. `spill_allowed` is computed by the caller via
-    /// [`node_buffer_spill_allowed`] so a future multi-consumer streaming
-    /// topology cannot spill a batch into a slot whose consumer would hit
-    /// `NodeBuffer::clone_memory_only`.
+    /// [`node_buffer_spill_allowed`], keeping the streaming and materialized
+    /// spill classifications on the same compiled-plan boundary.
     pub(crate) fn streaming_charge_handle(
         &self,
         node_idx: NodeIndex,
@@ -1715,42 +1711,17 @@ pub(crate) fn estimate_node_buffer_bytes(rows: &[(Record, u64)]) -> u64 {
         .saturating_mul(rows.len() as u64)
 }
 
-/// Predicate: does the topology at `slot_key` permit a soft-threshold
-/// spill at admission time?
+/// Predicate: does this materialized slot permit a soft-threshold spill at
+/// admission time?
 ///
-/// Returns `false` when the slot will be cloned by a downstream
-/// consumer rather than drained — multi-consumer fan-out
-/// (`Output` arms with more than one Output sharing a producer) and
-/// composition input-port edges both reach
-/// `NodeBuffer::clone_memory_only`, which panics on `Spilled`/`Mixed`
-/// because spill chunks cannot be cheap-cloned for parallel readers.
-/// Lifting that constraint requires sharing `Arc<SpillFile<u64>>` across
-/// readers and is tracked as a sibling sub-issue of #108 (back-pressure
-/// for fan-out spilling). Until that lands, producer-side spill is
-/// gated to slots with a single drain consumer.
-///
-/// Route's per-successor admission already pre-forks into per-branch
-/// slots keyed by the successor's `NodeIndex`; each such slot has
-/// exactly one outgoing consumer (the successor itself drives one
-/// chain), so this predicate returns `true` and spill applies — the
-/// canonical Route-fan-out scenario the issue body calls out.
+/// Every materialized slot is eligible. Fan-out readers use sequential
+/// re-readable cursors over immutable memory/spill backing, and producer-port
+/// identity remains part of [`NodeBufferKey`], so neither multiple outgoing
+/// edges nor port-scoped edges require a memory-only clone.
 pub(crate) fn node_buffer_spill_allowed(
-    current_dag: &ExecutionPlanDag,
-    slot_key: NodeIndex,
+    _current_dag: &ExecutionPlanDag,
+    _slot_key: NodeIndex,
 ) -> bool {
-    let mut outgoing = 0usize;
-    for edge in current_dag
-        .graph
-        .edges_directed(slot_key, Direction::Outgoing)
-    {
-        outgoing += 1;
-        if outgoing > 1 {
-            return false;
-        }
-        if edge.weight().port.is_some() {
-            return false;
-        }
-    }
     true
 }
 
@@ -1773,15 +1744,14 @@ pub(crate) fn node_buffer_spill_allowed(
 /// 4. Otherwise rows stay in memory as `NodeBuffer::Memory(rows)`.
 ///
 /// `spill_allowed` should be computed via [`node_buffer_spill_allowed`]
-/// for the slot's `NodeIndex` so multi-consumer fan-out and
-/// composition input-port slots stay memory-bound (their consumers
-/// reach `NodeBuffer::clone_memory_only`, which panics on spill
-/// variants).
+/// for the slot's `NodeIndex`; all materialized slots currently qualify.
 /// Discard a `node_buffers` slot and all paired accounting state.
 ///
 /// This is a cleanup/replacement primitive, not a logical read: semantic
-/// consumers must use [`require_node_buffer_input`] so shared slots clone or
-/// transfer according to their producer-declared reader count.
+/// consumers must use [`require_node_buffer_input`] so shared slots scan or
+/// transfer according to their producer-declared reader count. Replacement
+/// callers recover the ordinary owned representation when every synchronous
+/// shared scan has completed, avoiding a clone from otherwise-stale backing.
 pub(crate) fn drain_node_buffer_slot(
     ctx: &mut ExecutorContext<'_>,
     key: impl Into<NodeBufferKey>,
@@ -1791,7 +1761,9 @@ pub(crate) fn drain_node_buffer_slot(
     if let Some((id, _)) = ctx.node_buffer_consumer_ids.remove(&key) {
         ctx.memory_budget.unregister_consumer(id);
     }
-    ctx.node_buffers.remove(&key)
+    ctx.node_buffers
+        .remove(&key)
+        .map(NodeBuffer::into_authoritative)
 }
 
 /// Build the cold-path invariant error for a required materialized input that
@@ -1814,19 +1786,44 @@ pub(crate) fn missing_node_buffer_input_error(
     }
 }
 
-/// One materialized slot read plus the optional reservation for an earlier
-/// fan-out reader's transient clone. The guard must remain live through the
-/// consumer's complete synchronous operation.
-#[must_use = "a materialized input clone must retain its transient reservation"]
+/// One materialized slot read plus the optional reservation for its resident
+/// scan materialization. The guard must remain live through the consumer's
+/// complete synchronous operation.
+#[must_use = "a materialized input must retain its scan reservation"]
 pub(crate) struct NodeBufferInput {
     buffer: NodeBuffer,
     reservation: Option<TransientNodeBufferReservation>,
 }
 
 impl NodeBufferInput {
-    /// Split the input from its optional clone/transfer lifetime guard.
+    /// Split the input from its optional materialization/transfer lifetime guard.
     pub(crate) fn into_parts(self) -> (NodeBuffer, Option<TransientNodeBufferReservation>) {
         (self.buffer, self.reservation)
+    }
+
+    /// Prepare a consumer that will collect the sequential scan into a full
+    /// resident vector. A standalone reservation covers the materialized
+    /// footprint when ownership was not transferred; a transferred
+    /// registration charges only the representation overlap.
+    pub(crate) fn into_materialized_parts(
+        self,
+        budget: &Arc<crate::pipeline::memory::MemoryArbitrator>,
+        node: &str,
+    ) -> Result<(NodeBuffer, Option<TransientNodeBufferReservation>), PipelineError> {
+        let materialized_bytes = self.buffer.estimated_materialized_bytes();
+        let overlap_bytes = self.buffer.transferred_materialization_overlap_bytes();
+        let reservation = match self.reservation {
+            Some(reservation) => {
+                reservation.reserve_additional(overlap_bytes, node)?;
+                reservation
+            }
+            None => crate::executor::node_buffer::reserve_node_buffer_materialization(
+                materialized_bytes,
+                budget,
+                node,
+            )?,
+        };
+        Ok((self.buffer, Some(reservation)))
     }
 }
 
@@ -1873,9 +1870,9 @@ pub(crate) fn validate_completed_node_buffer_scope(
 /// Read one published materialized slot according to its producer-declared
 /// remaining-reader count.
 ///
-/// Earlier readers receive a reservation-backed clone and decrement only
-/// after that clone succeeds. The last reader removes the original slot and
-/// unregisters its ordinary node-buffer consumer. A present empty buffer is a
+/// Earlier readers receive a sequential scan and decrement only after that
+/// scan is acquired. The last reader removes the authoritative slot and
+/// transfers its ordinary node-buffer registration. A present empty buffer is a
 /// valid zero-row input; missing, zero, or inconsistent ledger state fails as
 /// an internal executor invariant instead of becoming an empty stream.
 pub(crate) fn require_node_buffer_input(
@@ -1922,7 +1919,7 @@ fn require_node_buffer_input_inner(
     consumer_name: &str,
     producer_name: &str,
     producer_port: Option<&str>,
-    transfer_last_registration: bool,
+    _transfer_last_registration: bool,
 ) -> Result<NodeBufferInput, PipelineError> {
     let Some(remaining) = ctx.node_buffer_readers.remaining_for_slot(
         &key,
@@ -1937,41 +1934,28 @@ fn require_node_buffer_input_inner(
             producer_port,
         ));
     };
-    let Some(buffer) = ctx.node_buffers.get(&key) else {
-        return Err(node_buffer_reader_mismatch_error(
-            consumer_name,
-            &key,
-            "slot disappeared after reader-ledger validation",
-        ));
-    };
-
     if remaining > 1 {
-        let reserved = clone_node_buffer_reserved(buffer, &ctx.memory_budget, consumer_name)?;
-        let (buffer, reservation) = reserved.into_parts();
-        ctx.node_buffer_readers
-            .complete_clone(&key, consumer_name)?;
-        return Ok(NodeBufferInput {
-            buffer,
-            reservation: Some(reservation),
-        });
-    }
-
-    ctx.node_buffer_readers.complete_last(&key, consumer_name)?;
-    if !transfer_last_registration {
-        let error_key = key.clone();
-        let buffer = drain_node_buffer_slot(ctx, key).ok_or_else(|| {
+        let buffer = ctx.node_buffers.get_mut(&key).ok_or_else(|| {
             node_buffer_reader_mismatch_error(
                 consumer_name,
-                &error_key,
-                "last-reader slot disappeared during synchronous removal",
+                &key,
+                "slot disappeared after reader-ledger validation",
             )
         })?;
+        let buffer = buffer.reread()?;
+        ctx.node_buffer_readers
+            .complete_clone(&key, consumer_name)?;
         return Ok(NodeBufferInput {
             buffer,
             reservation: None,
         });
     }
 
+    ctx.node_buffer_readers.complete_last(&key, consumer_name)?;
+    // The authoritative last reader takes the slot's existing registration as
+    // a RAII guard for the complete synchronous read. This preserves the
+    // original resident charge while a consuming drain moves memory out, and
+    // gives spill-backed materialization a handle to charge its overlap.
     let buffer = ctx.node_buffers.remove(&key).ok_or_else(|| {
         node_buffer_reader_mismatch_error(
             consumer_name,
@@ -1979,6 +1963,7 @@ fn require_node_buffer_input_inner(
             "last-reader slot disappeared during synchronous transfer",
         )
     })?;
+    let buffer = buffer.into_authoritative();
     let reservation = ctx
         .node_buffer_consumer_ids
         .remove(&key)
@@ -2139,7 +2124,7 @@ mod required_node_buffer_tests {
 
         ledger
             .complete_clone(&key, "first")
-            .expect("first reserved clone completes");
+            .expect("first shared scan completes");
         assert_eq!(
             ledger
                 .remaining_for_slot(&key, true, true, "second")
@@ -2148,7 +2133,7 @@ mod required_node_buffer_tests {
         );
         ledger
             .complete_clone(&key, "second")
-            .expect("second reserved clone completes");
+            .expect("second shared scan completes");
         assert_eq!(
             ledger
                 .remaining_for_slot(&key, true, true, "last")
@@ -2271,7 +2256,7 @@ pub(crate) fn admit_node_buffer_with_readers(
 }
 
 /// Admit a composition port Source's canonicalized rows while transferring
-/// the clone reservation already registered for the seeded body slot.
+/// the materialization reservation already registered for the seeded body slot.
 ///
 /// The registration keeps the same id and handle. Only its consumer wrapper
 /// changes atomically from the transient, non-reclaimable form to the ordinary
@@ -2409,7 +2394,10 @@ fn admit_node_buffer_inner(
     spill_allowed: bool,
     transferred_reservation: Option<TransientNodeBufferReservation>,
 ) -> Result<NodeBuffer, PipelineError> {
-    let bytes = estimate_node_buffer_bytes(&rows);
+    let bytes = transferred_reservation
+        .as_ref()
+        .map(TransientNodeBufferReservation::bytes)
+        .unwrap_or_else(|| estimate_node_buffer_bytes(&rows));
     // Register a NodeBufferConsumer with the pipeline-scoped
     // arbitrator for every slot admission. The handle's `bytes`
     // counter seeds to the admitted byte estimate so the consumer's
@@ -2429,7 +2417,6 @@ fn admit_node_buffer_inner(
     // unregisters first so the arbitrator's registry holds exactly
     // one wrapper per live slot.
     let (consumer_id, handle) = if let Some(reservation) = transferred_reservation {
-        reservation.set_bytes(bytes);
         let (consumer_id, handle) = reservation.into_registration();
         let replacement = Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
             handle.clone(),
@@ -2473,28 +2460,10 @@ fn admit_node_buffer_inner(
     // dispatch order moves: finishing a chain's blocking consumer before
     // charging the next chain's source keeps fewer slots live at once.
     ctx.memory_budget.sample_peak_consumer_usage();
-    if !spill_allowed {
-        // A non-spillable slot (multi-consumer fan-out / composition
-        // input-port edge) cannot be evicted: its consumer clones the
-        // resident rows via `NodeBuffer::clone_memory_only`, which panics on
-        // a spill-backed variant, and the rows are already fully
-        // materialized, non-back-pressureable, and drained synchronously.
-        // Admitting one while already over the hard limit would blow the
-        // budget with no recourse — no spill, no pause, no block — so
-        // hard-gate it here, mirroring the route cross-region tee admission
-        // precedent (`route_dispatch`). A spillable over-budget slot must
-        // still spill rather than abort, so only this arm gates.
-        if ctx.memory_budget.should_abort() {
-            return Err(PipelineError::MemoryBudgetExceeded {
-                node: node_name.to_string(),
-                used: ctx.memory_budget.peak_rss().unwrap_or(0),
-                limit: ctx.memory_budget.hard_limit(),
-                source: clinker_plan::BudgetCategory::Arena,
-                detail: Some("non-spillable node-buffer admission".to_string()),
-            });
-        }
-        return Ok(NodeBuffer::memory_from_records_and_puncts(rows, puncts));
-    }
+    debug_assert!(
+        spill_allowed,
+        "every published materialized node-buffer slot must be spill-eligible"
+    );
     if !ctx.memory_budget.should_spill() {
         return Ok(NodeBuffer::memory_from_records_and_puncts(rows, puncts));
     }
@@ -3672,20 +3641,12 @@ pub(crate) fn transform_fused_consume(
 /// `try_spill`, which only flips the slot's [`ConsumerHandle`] spill-request
 /// flag — it performs no I/O. This sweep is the missing servicing half: it
 /// reads each live slot's flag via `take_spill_request` and, for a resident
-/// `NodeBuffer::Memory` slot whose topology permits spilling
-/// (single drain consumer — [`node_buffer_spill_allowed`]), flushes it to
+/// resident `NodeBuffer::Memory` slot whose compiled classification permits
+/// spilling ([`node_buffer_spill_allowed`]), flushes it to
 /// disk through [`NodeBuffer::spill_resident_memory`], discharges the slot's
 /// in-memory charge, and records the file against the arbitrator's disk
 /// quota (surfacing the `SpillCapExceeded` (E320) disk-cap error on an
 /// over-quota total, exactly as the admission and streaming spill paths do).
-///
-/// Non-spillable slots (multi-consumer fan-out / composition input-port
-/// edges, whose consumer would reach `NodeBuffer::clone_memory_only` and
-/// panic on a spill-backed variant) are deliberately skipped: their
-/// over-budget case is caught by the hard-limit admission gate in
-/// [`admit_node_buffer`], not by spilling. Clearing the flag on such a slot
-/// is harmless — a still-pressured arbitrator simply re-elects and re-flags
-/// it on its next poll.
 ///
 /// Thin `ExecutorContext` adapter over [`service_pending_node_buffer_spills`],
 /// which holds the testable core (the full context is impractical to build
@@ -3750,13 +3711,14 @@ pub(crate) fn service_pending_node_buffer_spills(
     sweep: &NodeBufferSpillSweep<'_>,
 ) -> Result<(), PipelineError> {
     // Phase 1: collect the slots whose consumer flagged a spill request and
-    // that are eligible to spill (resident `Memory` + single-drain
-    // topology). `take_spill_request` read-and-clears the flag for every
-    // flagged slot, spillable or not, so a non-spillable flag does not spin.
+    // that are eligible to spill (resident `Memory` or re-readable resident
+    // memory). `take_spill_request` read-and-clears every observed flag.
     let mut to_spill: Vec<NodeBufferKey> = Vec::new();
     for (key, (_id, handle)) in sweep.consumer_ids {
         if handle.take_spill_request()
-            && matches!(node_buffers.get(key), Some(NodeBuffer::Memory(_)))
+            && node_buffers
+                .get(key)
+                .is_some_and(NodeBuffer::is_resident_memory)
             && (sweep.is_spill_allowed)(key.node)
         {
             to_spill.push(key.clone());

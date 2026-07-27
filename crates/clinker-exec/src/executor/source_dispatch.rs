@@ -126,8 +126,8 @@ pub(crate) fn dispatch_source(
         };
         let prospective_bytes = source_schema
             .as_ref()
-            .map(|schema| seeded.estimated_memory_bytes_for_columns(schema.column_count()))
-            .unwrap_or_else(|| seeded.estimated_memory_bytes());
+            .map(|schema| seeded.estimated_materialized_bytes_for_columns(schema.column_count()))
+            .unwrap_or_else(|| seeded.estimated_materialized_bytes());
         reservation.reserve_additional(prospective_bytes, name)?;
         let mut out_records: Vec<(Record, u64)> = Vec::with_capacity(seeded.len_hint());
         let mut out_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();

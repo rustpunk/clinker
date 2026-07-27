@@ -1,10 +1,10 @@
-//! End-to-end accounting checks for transient node-buffer clones.
+//! End-to-end accounting checks for transient node-buffer materializations.
 //!
 //! These use the crate-private arbitrator-injection entry point so the
 //! reservation gate and registry cleanup can be observed without relying on
-//! process RSS. A fixed consumer near a 100 GiB hard limit makes clone
+//! process RSS. A fixed consumer near a 100 GiB hard limit makes reservation
 //! rejection deterministic: the producer slot fits, while one additional
-//! clone exceeds the limit by exactly one byte.
+//! resident scan materialization exceeds the limit by exactly one byte.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -49,7 +49,7 @@ fn quiet_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
     ))
 }
 
-fn clone_rejection_arbitrator(
+fn materialization_rejection_arbitrator(
     row_bytes: u64,
 ) -> (
     Arc<crate::pipeline::memory::MemoryArbitrator>,
@@ -57,7 +57,10 @@ fn clone_rejection_arbitrator(
     u64,
 ) {
     let arbitrator = quiet_arbitrator();
-    let pinned_bytes = HARD_LIMIT - 2 * row_bytes + 1;
+    // The published slot itself is spill-eligible and discharges its resident
+    // charge. Keep one scan materialization just one byte over the remaining
+    // headroom so rejection occurs before the consumer allocates its Vec.
+    let pinned_bytes = HARD_LIMIT - row_bytes + 1;
     let id = arbitrator.register_consumer(Arc::new(PinnedUsage(pinned_bytes)));
     (arbitrator, id, pinned_bytes)
 }
@@ -208,9 +211,9 @@ nodes:
 "#;
 
 #[test]
-fn composition_clone_rejects_before_allocation_and_restores_baseline() {
+fn composition_materialization_rejects_before_allocation_and_restores_baseline() {
     let row_bytes = row_bytes_for_node(COMPOSITION_PASSTHROUGH, "src");
-    let (arbitrator, baseline_id, baseline_usage) = clone_rejection_arbitrator(row_bytes);
+    let (arbitrator, baseline_id, baseline_usage) = materialization_rejection_arbitrator(row_bytes);
     let (result, _) = run(
         COMPOSITION_PASSTHROUGH,
         &[("src", "id\n123\n")],
@@ -218,7 +221,7 @@ fn composition_clone_rejects_before_allocation_and_restores_baseline() {
         Arc::clone(&arbitrator),
     );
 
-    match result.expect_err("the composition input clone must cross the hard limit") {
+    match result.expect_err("the composition input materialization must cross the hard limit") {
         PipelineError::MemoryBudgetExceeded {
             node,
             used,
@@ -275,9 +278,9 @@ nodes:
 "#;
 
 #[test]
-fn shared_transform_clone_rejects_before_allocation_and_restores_baseline() {
+fn shared_transform_materialization_rejects_before_allocation_and_restores_baseline() {
     let row_bytes = row_bytes_for_node(SHARED_PREDECESSOR, "shared");
-    let (arbitrator, baseline_id, baseline_usage) = clone_rejection_arbitrator(row_bytes);
+    let (arbitrator, baseline_id, baseline_usage) = materialization_rejection_arbitrator(row_bytes);
     let (result, _) = run(
         SHARED_PREDECESSOR,
         &[("a", "k,v\nx,15\n"), ("b", "k,v\n"), ("c", "k,v\n")],
@@ -285,7 +288,8 @@ fn shared_transform_clone_rejects_before_allocation_and_restores_baseline() {
         Arc::clone(&arbitrator),
     );
 
-    match result.expect_err("the first shared Transform clone must cross the hard limit") {
+    match result.expect_err("the first shared Transform materialization must cross the hard limit")
+    {
         PipelineError::MemoryBudgetExceeded {
             node,
             used,
@@ -293,7 +297,10 @@ fn shared_transform_clone_rejects_before_allocation_and_restores_baseline() {
             source,
             ..
         } => {
-            assert!(node == "m1" || node == "m2", "unexpected clone site {node}");
+            assert!(
+                node == "m1" || node == "m2",
+                "unexpected materialization site {node}"
+            );
             assert_eq!(used, HARD_LIMIT + 1);
             assert_eq!(limit, HARD_LIMIT);
             assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
@@ -329,9 +336,9 @@ nodes:
 "#;
 
 #[test]
-fn shared_output_clone_rejects_before_allocation_and_restores_baseline() {
+fn shared_output_materialization_rejects_before_allocation_and_restores_baseline() {
     let row_bytes = row_bytes_for_node(SHARED_OUTPUT_PREDECESSOR, "prepared");
-    let (arbitrator, baseline_id, baseline_usage) = clone_rejection_arbitrator(row_bytes);
+    let (arbitrator, baseline_id, baseline_usage) = materialization_rejection_arbitrator(row_bytes);
     let (result, _) = run(
         SHARED_OUTPUT_PREDECESSOR,
         &[("src", "id\n123\n")],
@@ -339,7 +346,7 @@ fn shared_output_clone_rejects_before_allocation_and_restores_baseline() {
         Arc::clone(&arbitrator),
     );
 
-    match result.expect_err("the first shared Output clone must cross the hard limit") {
+    match result.expect_err("the first shared Output materialization must cross the hard limit") {
         PipelineError::MemoryBudgetExceeded {
             node,
             used,
@@ -349,7 +356,7 @@ fn shared_output_clone_rejects_before_allocation_and_restores_baseline() {
         } => {
             assert!(
                 node == "alpha" || node == "beta",
-                "unexpected clone site {node}"
+                "unexpected materialization site {node}"
             );
             assert_eq!(used, HARD_LIMIT + 1);
             assert_eq!(limit, HARD_LIMIT);

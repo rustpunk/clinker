@@ -71,6 +71,7 @@ use crate::executor::dispatch::{
     crosses_into_deferred_consumer, node_buffer_spill_allowed,
     require_single_input_node_buffer_slot, source_file_arc_of, source_name_arc_of,
 };
+use crate::executor::node_buffer::record_byte_cost;
 use crate::executor::{GroupedNodeKind, giant_group_error};
 use crate::pipeline::memory::{
     ConsumerHandle, ConsumerSpillError, MemoryArbitrator, MemoryConsumer,
@@ -181,7 +182,8 @@ pub(crate) fn dispatch_cull(
         current_dag.graph[pred].name(),
         producer_port,
     )?;
-    let (input_buffer, _input_reservation) = input_buffer.into_parts();
+    let (input_buffer, _input_reservation) =
+        input_buffer.into_materialized_parts(&ctx.memory_budget, name)?;
     let (input, input_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
@@ -361,10 +363,11 @@ fn run_cull_grouped(
 /// run fully in memory (`budget: 0`, `spill_dir: None`) — the raw-record
 /// dispatch buffer carries the spill burden, this state does not. Because Cull
 /// cannot back-pressure or spill this state, the aggregate's live footprint is
-/// read against the run's hard limit on every admission, and the decision
-/// map's estimated footprint is checked before it is built; either overflowing
-/// the budget returns [`PipelineError::MemoryBudgetExceeded`] rather than
-/// growing the state uncounted toward an out-of-memory crash.
+/// added to the run's existing charged memory on every admission, and the
+/// decision map's projected footprint is checked the same way before it is
+/// built. Either combined allocation overflowing the budget returns
+/// [`PipelineError::MemoryBudgetExceeded`] rather than growing the state
+/// uncounted toward an out-of-memory crash.
 fn compute_drop_decisions(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
@@ -373,7 +376,7 @@ fn compute_drop_decisions(
     typed: &Arc<cxl::typecheck::TypedProgram>,
     input: &[(Record, u64)],
 ) -> Result<HashMap<Vec<GroupByKey>, bool>, PipelineError> {
-    use crate::aggregation::{AggregateStream, AggregatorConfig, SortRow};
+    use crate::aggregation::{AggregatorConfig, HashAggregator, SortRow};
 
     let evaluator = ProgramEvaluator::new(Arc::clone(typed), false);
 
@@ -397,38 +400,36 @@ fn compute_drop_decisions(
         .build();
 
     let handle = ConsumerHandle::new();
-    let mut stream = AggregateStream::for_node(
-        clinker_plan::plan::types::AggregateStrategy::Hash,
-        AggregatorConfig {
-            compiled: Arc::clone(compiled),
-            evaluator,
-            output_schema: Arc::clone(&drop_output_schema),
-            spill_schema,
-            // In-memory only: the raw-record buffer carries the spill burden,
-            // and the aggregate state is O(groups) — never spilled. The handle
-            // mirrors that live O(groups) footprint so the ingest loop below
-            // can gate it against the hard limit; the aggregate can neither
-            // spill (`spill_dir: None`) nor back-pressure, so an unbounded group
-            // cardinality must fail loud rather than grow the state uncounted.
-            memory_budget: 0,
-            spill_dir: None,
-            spill_compress: false,
-            transform_name: format!("cull:{name}"),
-            consumer_handle: Arc::clone(&handle),
-            // The predicate aggregate runs in-memory (`budget: 0`,
-            // `spill_dir: None`) so it never spills, but `AggregatorConfig`
-            // requires an arbitrator; the run's shared one is the natural fit.
-            arbitrator: Arc::clone(&ctx.memory_budget),
-        },
-    )?;
+    let mut stream = HashAggregator::new(AggregatorConfig {
+        compiled: Arc::clone(compiled),
+        evaluator,
+        output_schema: Arc::clone(&drop_output_schema),
+        spill_schema,
+        // In-memory only: the raw-record buffer carries the spill burden,
+        // and the aggregate state is O(groups) — never spilled. The ingest
+        // loop below reads the hash aggregate's fixed per-group estimate
+        // as well as its variable heap before every admission; it can neither
+        // spill (`spill_dir: None`) nor back-pressure, so an unbounded group
+        // cardinality must fail loud rather than grow the state uncounted.
+        memory_budget: 0,
+        spill_dir: None,
+        spill_compress: false,
+        transform_name: format!("cull:{name}"),
+        consumer_handle: Arc::clone(&handle),
+        // The predicate aggregate runs in-memory (`budget: 0`,
+        // `spill_dir: None`) so it never spills, but `AggregatorConfig`
+        // requires an arbitrator; the run's shared one is the natural fit.
+        arbitrator: Arc::clone(&ctx.memory_budget),
+    });
 
     // The decision aggregate cannot spill (`budget: 0`, `spill_dir: None`) or
     // back-pressure, so its O(groups) accumulator state is arbitrator-invisible
-    // and grows unchecked with the group cardinality. Gate the live footprint
-    // the aggregate mirrors into `handle` against the run's hard limit on every
-    // admission and fail loud once it would carry the state past the ceiling. A
-    // `hard_limit` of 0 means "no limit" (matching the finalize giant-group
-    // gate in `take_group`), so the read is skipped.
+    // and grows with the group cardinality. Gate its fixed hash/key/accumulator
+    // footprint plus variable value heap against the run's hard limit on every
+    // admission and fail loud once it and the already charged input would carry
+    // the scope past the ceiling. A `hard_limit` of 0 means "no limit"
+    // (matching the finalize giant-group gate in `take_group`), so the read is
+    // skipped.
     let hard_limit = ctx.memory_budget.hard_limit();
     let mut emitted: Vec<SortRow> = Vec::new();
     for (record, row_num) in input {
@@ -437,11 +438,12 @@ fn compute_drop_decisions(
         let eval_ctx =
             ctx.eval_ctx_for_record(&source_file, &source_name, *row_num, record.doc_ctx());
         stream
-            .add_record(record, *row_num, &eval_ctx, &mut emitted)
+            .add_record(record, *row_num, &eval_ctx)
             .map_err(|e| cull_predicate_error(name, e))?;
-        let live = handle.bytes();
-        if hard_limit > 0 && live > hard_limit {
-            return Err(cull_decision_budget_error(name, live, hard_limit));
+        let live = stream.estimated_memory_bytes();
+        let projected = ctx.memory_budget.sum_consumer_usage().saturating_add(live);
+        if hard_limit > 0 && projected > hard_limit {
+            return Err(cull_decision_budget_error(name, projected, hard_limit));
         }
     }
     let finalize_ctx = ctx.merged_eval_ctx();
@@ -459,17 +461,21 @@ fn compute_drop_decisions(
     // The decisions map is a second O(groups) structure — one entry per
     // emitted group, each a `Vec<GroupByKey>` key plus a bool in a hash slot.
     // The ingest gate above bounds the aggregate's own state; estimate this
-    // derived map's resident footprint and fail loud before allocating it so a
-    // group cardinality that would overflow the budget aborts cleanly here too.
+    // derived map's resident footprint and fail loud before allocating it when
+    // the map, finalized aggregate state, and already charged input would
+    // overflow the budget together.
     let per_entry = std::mem::size_of::<(Vec<GroupByKey>, bool)>()
         + config.partition_by.len() * std::mem::size_of::<GroupByKey>();
     let decisions_bytes = (emitted.len() as u64).saturating_mul(per_entry as u64);
-    if hard_limit > 0 && decisions_bytes > hard_limit {
-        return Err(cull_decision_budget_error(
-            name,
-            decisions_bytes,
-            hard_limit,
-        ));
+    let emitted_bytes =
+        record_byte_cost(drop_output_schema.column_count()).saturating_mul(emitted.len() as u64);
+    let projected = ctx
+        .memory_budget
+        .sum_consumer_usage()
+        .saturating_add(emitted_bytes)
+        .saturating_add(decisions_bytes);
+    if hard_limit > 0 && projected > hard_limit {
+        return Err(cull_decision_budget_error(name, projected, hard_limit));
     }
     let mut decisions: HashMap<Vec<GroupByKey>, bool> = HashMap::with_capacity(emitted.len());
     for (record, _) in emitted {
@@ -1095,10 +1101,11 @@ fn cull_predicate_error(node_name: &str, e: crate::aggregation::HashAggError) ->
 /// memory budget. The decision aggregate and the per-group decision map it
 /// feeds are both O(distinct groups) and run in-memory: the raw-record buffer
 /// carries the spill burden, this state does not, and Cull cannot
-/// back-pressure. So a group cardinality whose decision state alone exceeds the
-/// budget has no in-budget representation — fail loud rather than grow it
-/// uncounted toward an out-of-memory crash. `used` is the offending live or
-/// estimated footprint; `hard_limit` is the configured ceiling.
+/// back-pressure. So a group cardinality whose decision state plus the other
+/// live charged memory exceeds the budget has no in-budget representation —
+/// fail loud rather than grow it uncounted toward an out-of-memory crash.
+/// `used` is the offending live or estimated footprint; `hard_limit` is the
+/// configured ceiling.
 fn cull_decision_budget_error(node_name: &str, used: u64, hard_limit: u64) -> PipelineError {
     PipelineError::MemoryBudgetExceeded {
         node: node_name.to_string(),

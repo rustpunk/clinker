@@ -145,6 +145,9 @@ pub struct HashAggregator {
     /// leaves 40% for `value_heap_bytes` growth (Collect accumulators,
     /// meta tracker observations). `usize::MAX` when budget is 0.
     max_groups: usize,
+    /// Conservative fixed footprint of one live group, shared by the spill
+    /// threshold and callers that must budget an in-memory-only aggregate.
+    estimated_bytes_per_group: usize,
     /// Counter for periodic RSS backstop polling. Checked every 4096
     /// records to limit /proc/self/statm read overhead.
     records_since_rss_check: u32,
@@ -308,6 +311,7 @@ impl HashAggregator {
             transform_name,
             rows_seen: 0,
             max_groups,
+            estimated_bytes_per_group: estimated,
             records_since_rss_check: 0,
             lineage,
             buffered_groups: hashbrown::HashMap::new(),
@@ -399,6 +403,20 @@ impl HashAggregator {
     /// by the spill trigger and by tests verifying memory accounting.
     pub fn value_heap_bytes(&self) -> usize {
         self.value_heap_bytes
+    }
+
+    /// Conservative resident footprint of the live in-memory group state.
+    ///
+    /// Unlike [`Self::value_heap_bytes`], this includes the fixed hash-table,
+    /// key, and accumulator-row cost for aggregates such as `count(*)` whose
+    /// accumulator contributes no variable heap bytes. Spill-backed groups are
+    /// excluded because they are no longer resident.
+    pub(crate) fn estimated_memory_bytes(&self) -> u64 {
+        let groups = self.groups.len().saturating_add(self.buffered_groups.len());
+        let bytes = groups
+            .saturating_mul(self.estimated_bytes_per_group)
+            .saturating_add(self.value_heap_bytes);
+        u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 
     /// Pre-computed maximum group count before spill fires.
@@ -1646,6 +1664,66 @@ mod spill_trigger_tests {
             agg.max_groups() > 0 && agg.max_groups() < usize::MAX,
             "max_groups should be a finite positive value, got {}",
             agg.max_groups(),
+        );
+    }
+
+    #[test]
+    fn estimated_memory_includes_fixed_state_for_count_groups() {
+        let input = make_schema(&["k"]);
+        let mut agg = build_test_aggregator(
+            &[("k", Type::String)],
+            &["k"],
+            "emit k = k\nemit n = count(*)",
+            0,
+            None,
+        );
+        let stable = StableEvalContext::test_default();
+        let file: Arc<str> = Arc::from("t.csv");
+
+        for (row, key) in ["a", "b", "c"].into_iter().enumerate() {
+            let record = make_record(&input, vec![Value::String(key.into())]);
+            agg.add_record(&record, row as u64, &ctx_for(&stable, &file, row as u64))
+                .expect("count group admission");
+        }
+
+        assert_eq!(agg.groups.len(), 3);
+        assert_eq!(
+            agg.value_heap_bytes(),
+            0,
+            "count(*) has no variable accumulator heap"
+        );
+        assert_eq!(
+            agg.estimated_memory_bytes(),
+            (agg.groups.len() * agg.estimated_bytes_per_group) as u64,
+            "fixed hash, key, and accumulator state must remain budget-visible"
+        );
+
+        let mut collect = build_test_aggregator(
+            &[("k", Type::String), ("v", Type::String)],
+            &["k"],
+            "emit k = k\nemit vals = collect(v)",
+            0,
+            None,
+        );
+        let collect_schema = make_schema(&["k", "v"]);
+        for row in 0..2 {
+            let record = make_record(
+                &collect_schema,
+                vec![
+                    Value::String("one-group".into()),
+                    Value::String(format!("payload-{row}").into()),
+                ],
+            );
+            collect
+                .add_record(&record, row, &ctx_for(&stable, &file, row))
+                .expect("collect admission");
+        }
+        assert!(collect.value_heap_bytes() > 0);
+        assert_eq!(
+            collect.estimated_memory_bytes(),
+            (collect.groups.len() * collect.estimated_bytes_per_group + collect.value_heap_bytes())
+                as u64,
+            "variable accumulator heap must be included exactly once"
         );
     }
 

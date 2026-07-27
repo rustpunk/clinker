@@ -146,7 +146,8 @@ pub(crate) fn dispatch_envelope(
         current_dag.graph[body_pred].name(),
         body_port,
     )?;
-    let (body_input, _body_reservation) = body_input.into_parts();
+    let (body_input, _body_reservation) =
+        body_input.into_materialized_parts(&ctx.memory_budget, name)?;
     let (mut records, puncts) = body_input.drain_split()?;
 
     // Drain the wired header stream and replace each body grain's ambient
@@ -170,7 +171,8 @@ pub(crate) fn dispatch_envelope(
             current_dag.graph[header_pred].name(),
             header_port,
         )?;
-        let (header_input, _header_reservation) = header_input.into_parts();
+        let (header_input, _header_reservation) =
+            header_input.into_materialized_parts(&ctx.memory_budget, name)?;
         let (header_records, _header_puncts) = header_input.drain_split()?;
         replace_headers_by_grain(name, &mut records, &header_records)?;
     }

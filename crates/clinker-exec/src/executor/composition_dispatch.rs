@@ -17,13 +17,15 @@ use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
-    ExecutorContext, NodeBufferKey, NodeBufferReaderLedger, admit_node_buffer, dispatch_plan_node,
-    drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed,
-    planned_materialized_reader_counts, require_node_buffer_input,
-    require_node_buffer_input_transferred, tee_emit_to_region_input_buffers,
-    validate_completed_node_buffer_scope,
+    ExecutorContext, NodeBufferKey, NodeBufferReaderLedger, admit_node_buffer,
+    admit_node_buffer_transferred, dispatch_plan_node, drain_node_buffer_slot,
+    finalize_node_rooted_windows, node_buffer_spill_allowed, planned_materialized_reader_counts,
+    require_node_buffer_input, require_node_buffer_input_transferred,
+    tee_emit_to_region_input_buffers, validate_completed_node_buffer_scope,
 };
-use crate::executor::node_buffer::{NodeBuffer, TransientNodeBufferReservation};
+use crate::executor::node_buffer::{
+    NodeBuffer, TransientNodeBufferReservation, reserve_node_buffer_materialization,
+};
 use crate::executor::schema_check::check_input_schema;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -121,13 +123,13 @@ pub(crate) fn dispatch_composition(
     // bounded by MAX_COMPOSITION_DEPTH (compile-time) plus the
     // E112 runtime cap, so the recursion cannot overflow the
     // stack.
-    let output_records = execute_composition_body(ctx, body, port_records, &composition_name)?;
+    let output = execute_composition_body(ctx, body, port_records, &composition_name)?;
     // Materialize node-rooted window runtimes for any IndexSpec
     // rooted at this composition's call-site NodeIndex. The
     // body executor returned with `active_stack` already
     // popped, so the install lands on `top` (parent scope).
-    finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
-    tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
+    finalize_node_rooted_windows(ctx, current_dag, node_idx, &output.records)?;
+    tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output.records)?;
     // Attribution rule: the body harvest's bytes are charged
     // under the parent composition's name so a budget-exceeded
     // diagnostic points the user at the user-visible operator,
@@ -141,15 +143,26 @@ pub(crate) fn dispatch_composition(
     // only errors from inside that walk get the wrapper. The pre-body
     // port-records clone is separately preflighted under the call-site name
     // before entering the body, so its E310 also remains bare.
-    admit_node_buffer(
-        ctx,
-        current_dag,
-        &composition_name,
-        node_idx,
-        output_records,
-        Vec::new(),
-        node_buffer_spill_allowed(current_dag, node_idx),
-    )?;
+    match output.reservation {
+        Some(reservation) => admit_node_buffer_transferred(
+            ctx,
+            current_dag,
+            &composition_name,
+            node_idx,
+            output.records,
+            Vec::new(),
+            reservation,
+        )?,
+        None => admit_node_buffer(
+            ctx,
+            current_dag,
+            &composition_name,
+            node_idx,
+            output.records,
+            Vec::new(),
+            node_buffer_spill_allowed(current_dag, node_idx),
+        )?,
+    }
 
     Ok(())
 }
@@ -238,7 +251,23 @@ fn collect_port_records(
         // Composition port seeding takes records only; the body operates in
         // its own document-boundary scope and re-emits at the call site.
         let (input, reservation) = input.into_parts();
+        let materialized_bytes = input.estimated_materialized_bytes();
+        let transferred_overlap_bytes = input.transferred_materialization_overlap_bytes();
+        let reservation = match reservation {
+            Some(reservation) => {
+                reservation.reserve_additional(transferred_overlap_bytes, composition_name)?;
+                reservation
+            }
+            None => reserve_node_buffer_materialization(
+                materialized_bytes,
+                &ctx.memory_budget,
+                composition_name,
+            )?,
+        };
         let (records, _puncts) = input.drain_split()?;
+        reservation.set_bytes(crate::executor::dispatch::estimate_node_buffer_bytes(
+            &records,
+        ));
         // Two parallel edges to the same port (e.g. `inputs: { p: a,
         // p: a }` — currently rejected at parse, but the runtime is
         // defensive) would overwrite; the wiring pass guarantees
@@ -247,7 +276,7 @@ fn collect_port_records(
             port_name.clone(),
             ReservedPortRecords {
                 records,
-                reservation,
+                reservation: Some(reservation),
             },
         );
     }
@@ -268,7 +297,7 @@ fn execute_composition_body(
     body_id: clinker_plan::plan::composition_body::CompositionBodyId,
     port_records: IndexMap<String, ReservedPortRecords>,
     composition_name: &str,
-) -> Result<Vec<(clinker_record::Record, u64)>, PipelineError> {
+) -> Result<ReservedPortRecords, PipelineError> {
     use clinker_plan::plan::index::PlanIndexRoot;
 
     // Resolve body and pre-compute everything that needs the
@@ -315,7 +344,7 @@ fn execute_composition_body(
         resolved_inputs.push((NodeBufferKey::from(*body_idx), input));
     }
 
-    // Seed body-scope buffers and transfer each clone reservation's existing
+    // Seed body-scope buffers and transfer each materialization reservation's existing
     // consumer id/handle into the body-local registry. The wrapper stays
     // continuously registered: there is no unregister/register gap and no
     // second charge for the same allocation.
@@ -422,10 +451,10 @@ fn execute_composition_body(
     //
     // Body-interior E310 errors name a body-internal operator (for example
     // `stage_split`), so the wrapper supplies the user-visible call-site name.
-    // The pre-body reserved-clone gate and the parent's post-body output
+    // The pre-body materialization gate and the parent's post-body output
     // admission already name the call-site and remain bare.
     let topo: Vec<NodeIndex> = body_dag.topo_order.clone();
-    let walk_and_harvest: Result<Vec<(Record, u64)>, PipelineError> = (|| {
+    let walk_and_harvest: Result<ReservedPortRecords, PipelineError> = (|| {
         for node_idx in topo {
             if let Err(inner) = dispatch_plan_node(ctx, &body_dag, node_idx) {
                 return Err(PipelineError::compose_body_error(
@@ -439,7 +468,7 @@ fn execute_composition_body(
         // participates in a deferred region, the commit pass is the sole
         // source of parent records, so the optional forward slot is cleanup
         // only.
-        let output_records = match output_idx {
+        let output = match output_idx {
             Some(idx) => {
                 // Composition body output harvest — punctuations on the
                 // body's output port belong to the composition's parent
@@ -450,7 +479,10 @@ fn execute_composition_body(
                     // A deferred body terminal is harvested by the commit pass. Its
                     // forward slot is optional and is drained only as cleanup.
                     drain_node_buffer_slot(ctx, idx);
-                    Vec::new()
+                    ReservedPortRecords {
+                        records: Vec::new(),
+                        reservation: None,
+                    }
                 } else {
                     let input = require_node_buffer_input(
                         ctx,
@@ -459,16 +491,23 @@ fn execute_composition_body(
                         body_dag.graph[idx].name(),
                         None,
                     )?;
-                    let (input, _reservation) = input.into_parts();
+                    let (input, reservation) =
+                        input.into_materialized_parts(&ctx.memory_budget, composition_name)?;
                     let (records, _puncts) = input.drain_split()?;
-                    records
+                    ReservedPortRecords {
+                        records,
+                        reservation,
+                    }
                 }
             }
-            None => Vec::new(),
+            None => ReservedPortRecords {
+                records: Vec::new(),
+                reservation: None,
+            },
         };
         discard_deferred_body_residue(ctx, &body_dag);
         validate_completed_node_buffer_scope(ctx, composition_name)?;
-        Ok(output_records)
+        Ok(output)
     })();
 
     // One restoration path for body dispatch, output harvest, and success.

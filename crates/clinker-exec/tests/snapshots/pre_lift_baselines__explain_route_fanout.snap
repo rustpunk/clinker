@@ -68,11 +68,11 @@ edge transform.classify -> route.classify_route:
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: transform)
 
 edge route.classify_route -> output.low:
-  buffer: node_buffer (slot=2)
+  buffer: node_buffer (slot=2, port=low)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: route)
 
 edge route.classify_route -> output.high:
-  buffer: node_buffer (slot=2)
+  buffer: node_buffer (slot=2, port=high)
   arbitration: spill_priority=0, can_back_pressure=false, predicted_peak=0B, predicted_freed=0B (producer: route)
 
 Route 'classify_route' (mode: exclusive):
