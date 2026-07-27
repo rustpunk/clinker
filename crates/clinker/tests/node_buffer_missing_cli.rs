@@ -1,4 +1,4 @@
-//! CLI regression for missing required materialized node-buffer inputs (#1029).
+//! CLI regression for direct multi-Output materialized fan-out (#996).
 
 use std::process::Command;
 
@@ -7,7 +7,7 @@ fn clinker_bin() -> &'static str {
 }
 
 #[test]
-fn missing_planned_input_exits_nonzero_with_actionable_diagnostic() {
+fn shared_output_input_writes_both_outputs() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("input.csv"), "id\n1\n2\n").expect("write source fixture");
 
@@ -38,6 +38,7 @@ nodes:
       name: alpha
       type: csv
       path: alpha.csv
+      include_unmapped: true
   - type: output
     name: beta
     input: prepared
@@ -45,6 +46,7 @@ nodes:
       name: beta
       type: csv
       path: beta.csv
+      include_unmapped: true
 "#;
     std::fs::write(&pipeline_path, pipeline).expect("write pipeline fixture");
 
@@ -56,25 +58,13 @@ nodes:
         .expect("spawn clinker");
 
     assert!(
-        !output.status.success(),
-        "a missing planned input must produce a nonzero exit; stderr: {}",
+        output.status.success(),
+        "direct Output fan-out must succeed; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("alpha"),
-        "diagnostic must name consuming node alpha; got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("prepared"),
-        "diagnostic must name producer prepared; got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("run stopped instead of"),
-        "diagnostic must explain its fail-closed disposition; got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("treating it as empty"),
-        "diagnostic must explain that the missing input was not treated as empty; got:\n{stderr}"
-    );
+    let expected = "id,marker\n1,ready\n2,ready\n";
+    let alpha = std::fs::read_to_string(dir.path().join("alpha.csv")).expect("read alpha output");
+    let beta = std::fs::read_to_string(dir.path().join("beta.csv")).expect("read beta output");
+    assert_eq!(alpha, expected, "alpha must receive the complete input");
+    assert_eq!(beta, expected, "beta must receive the complete input");
 }
