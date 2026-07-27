@@ -144,18 +144,36 @@ fn run(
     Result<ExecutionReport, PipelineError>,
     HashMap<String, SharedBuffer>,
 ) {
+    run_with_params(
+        yaml,
+        source_csv,
+        output_names,
+        arbitrator,
+        &PipelineRunParams {
+            execution_id: "transient-node-buffer-reservation".to_string(),
+            batch_id: "batch-0".to_string(),
+            ..Default::default()
+        },
+    )
+}
+
+fn run_with_params(
+    yaml: &str,
+    source_csv: &[(&str, &str)],
+    output_names: &[&str],
+    arbitrator: Arc<crate::pipeline::memory::MemoryArbitrator>,
+    params: &PipelineRunParams,
+) -> (
+    Result<ExecutionReport, PipelineError>,
+    HashMap<String, SharedBuffer>,
+) {
     let config = clinker_plan::config::parse_config(yaml).expect("parse pipeline YAML");
     let (writers, buffers) = writers(output_names);
-    let params = PipelineRunParams {
-        execution_id: "transient-node-buffer-reservation".to_string(),
-        batch_id: "batch-0".to_string(),
-        ..Default::default()
-    };
     let result = PipelineExecutor::run_with_readers_writers_with_arbitrator(
         &config,
         readers(source_csv),
         writers.into(),
-        &params,
+        params,
         fixture_compile_context(),
         arbitrator,
     );
@@ -360,6 +378,117 @@ fn direct_source_composition_transfer_restores_colliding_parent_registration() {
         0,
         "body transfer and parent restoration must leave no registration"
     );
+    assert_eq!(arbitrator.sum_consumer_usage(), 0);
+}
+
+const DIRECT_SOURCE_FUSION_NAME_COLLISION: &str = r#"
+pipeline:
+  name: direct_source_fusion_name_collision
+nodes:
+  - type: source
+    name: body_feed
+    config: { name: body_feed, type: csv, path: body-feed.csv, schema: [ { name: id, type: int } ] }
+  - type: composition
+    name: body_call
+    input: body_feed
+    use: ../compositions/source_boundary_collision.comp.yaml
+    inputs:
+      collision: body_feed
+  - type: output
+    name: body_out
+    input: body_call
+    config: { name: body_out, type: csv, path: body-out.csv, include_unmapped: false }
+  - type: source
+    name: collision
+    config: { name: collision, type: csv, path: collision.csv, schema: [ { name: id, type: int } ] }
+  - type: transform
+    name: top_transform
+    input: collision
+    config:
+      declares:
+        - { name: boundary, scope: record, type: string }
+      cxl: |
+        emit id = id
+        emit origin = "top-transform"
+        emit $record.boundary = $record.boundary
+  - type: output
+    name: top_out
+    input: top_transform
+    config: { name: top_out, type: csv, path: top-out.csv, include_unmapped: false }
+"#;
+
+#[test]
+fn direct_source_composition_seed_precedes_fused_name_and_releases_registration() {
+    let config = clinker_plan::config::parse_config(DIRECT_SOURCE_FUSION_NAME_COLLISION)
+        .expect("parse pipeline YAML");
+    let compiled = config
+        .compile(&fixture_compile_context())
+        .expect("compile pipeline");
+    let dag = compiled.dag();
+    let parent_source_idx = dag
+        .graph
+        .node_indices()
+        .find(|idx| dag.graph[*idx].name() == "body_feed")
+        .expect("parent Source exists");
+    let body_id = dag
+        .graph
+        .node_indices()
+        .find_map(|idx| match &dag.graph[idx] {
+            clinker_plan::plan::execution::PlanNode::Composition { name, body, .. }
+                if name == "body_call" =>
+            {
+                Some(*body)
+            }
+            _ => None,
+        })
+        .expect("composition body id exists");
+    let body = compiled
+        .composition_bodies()
+        .get(&body_id)
+        .expect("bound composition body exists");
+    let body_port_source_idx = *body
+        .port_name_to_node_idx
+        .get("collision")
+        .expect("body input port Source exists");
+    assert_eq!(
+        parent_source_idx, body_port_source_idx,
+        "this regression must exercise colliding parent/body NodeIndex spaces"
+    );
+
+    let merge_fused =
+        clinker_plan::plan::execution::compute_merge_interleave_fused_sources(dag, &config);
+    let init_phase = clinker_plan::plan::execution::compute_init_phase_node_set(dag);
+    let (transform_sources, _) = clinker_plan::plan::execution::compute_transform_fused_sources(
+        dag,
+        &merge_fused,
+        &init_phase,
+    );
+    assert!(transform_sources.contains("collision"));
+
+    let arbitrator = quiet_arbitrator();
+    let mut params = PipelineRunParams {
+        execution_id: "direct-source-fusion-name-collision".to_string(),
+        batch_id: "batch-0".to_string(),
+        ..Default::default()
+    };
+    params
+        .record_vars
+        .insert("boundary".to_string(), clinker_record::Value::from("body"));
+    let (result, outputs) = run_with_params(
+        DIRECT_SOURCE_FUSION_NAME_COLLISION,
+        &[("body_feed", "id\n7\n"), ("collision", "id\n9\n")],
+        &["body_out", "top_out"],
+        Arc::clone(&arbitrator),
+        &params,
+    );
+    result.expect("direct Source-to-Composition collision pipeline must run");
+
+    assert_eq!(outputs["body_out"].as_string(), "id,boundary\n7,body\n");
+    assert_eq!(
+        outputs["top_out"].as_string(),
+        "id,origin\n9,top-transform\n"
+    );
+    assert_eq!(arbitrator.consumer_count(), 0);
     assert_eq!(arbitrator.sum_consumer_usage(), 0);
 }
 

@@ -40,16 +40,16 @@ pub(crate) fn dispatch_source(
     };
     // Three input paths feed a Source's emit:
     //
-    // 1. Source name in `ctx.fused_sources` — a downstream
-    //    `Merge.interleave` arm has taken ownership of this
-    //    Source's crossbeam `Receiver` and is consuming records
-    //    directly via `crossbeam_channel::Select`. This arm
-    //    returns cleanly without emitting; the fused Merge
-    //    populates the merge node's buffer.
-    // 2. Records already seeded into `ctx.node_buffers[node_idx]`
+    // 1. Records already seeded into `ctx.node_buffers[node_idx]`
     //    by the body executor at composition entry —
     //    composition input ports surface as synthetic Source
     //    nodes owning the records the parent scope harvested.
+    // 2. Source name in `ctx.fused_sources` with no seeded own
+    //    slot — a downstream top-level `Merge.interleave` or
+    //    Transform arm has taken ownership of this Source's
+    //    crossbeam `Receiver` and consumes it directly. This arm
+    //    returns cleanly without emitting; the fused consumer
+    //    owns the Source boundary work and downstream emission.
     // 3. The live crossbeam `Receiver` in `source_records[name]`,
     //    consumed via `recv` per record until the paired ingest
     //    thread drops its sender. Per record: canonicalize onto
@@ -65,7 +65,9 @@ pub(crate) fn dispatch_source(
     // `Arc<Schema>` so every downstream operator hits the
     // `Arc::ptr_eq` fast path on the first record. Structural
     // equality holds by construction.
-    if ctx.fused_sources.contains(name.as_str()) {
+    let source_slot_key = NodeBufferKey::from(node_idx);
+    let has_seeded_own_slot = ctx.node_buffers.contains_key(&source_slot_key);
+    if !has_seeded_own_slot && ctx.fused_sources.contains(name.as_str()) {
         return Ok(());
     }
     let source_schema = current_dag.graph[node_idx].stored_output_schema().cloned();
@@ -80,7 +82,6 @@ pub(crate) fn dispatch_source(
         }
     };
 
-    let source_slot_key = NodeBufferKey::from(node_idx);
     let (records, source_puncts, transferred_reservation): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,

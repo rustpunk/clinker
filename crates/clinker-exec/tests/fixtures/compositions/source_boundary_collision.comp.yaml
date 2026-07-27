@@ -1,0 +1,26 @@
+# A body input port intentionally shares its name with a top-level Source in
+# the regression pipelines. The body Source boundary must seed the declared
+# record variable after its Aggregate input creates a fresh Record.
+_compose:
+  name: source_boundary_collision
+  inputs:
+    collision:
+      schema:
+        - { name: id, type: int }
+  outputs:
+    out: expose_boundary
+  config_schema: {}
+  scoped_vars:
+    record:
+      boundary: { type: string }
+
+nodes:
+  - type: transform
+    name: expose_boundary
+    input: collision
+    config:
+      declares:
+        - { name: boundary, scope: record, type: string }
+      cxl: |
+        emit id = id
+        emit boundary = $record.boundary

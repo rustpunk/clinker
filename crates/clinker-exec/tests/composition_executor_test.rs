@@ -15,6 +15,12 @@ use std::sync::{Arc, Mutex};
 
 use clinker_exec::executor::{PipelineExecutor, PipelineRunParams};
 use clinker_plan::config::{CompileContext, parse_config};
+use clinker_plan::plan::CompiledPlan;
+use clinker_plan::plan::execution::{
+    compute_init_phase_node_set, compute_merge_interleave_fused_sources,
+    compute_transform_fused_sources,
+};
+use clinker_record::Value;
 
 #[derive(Clone, Default)]
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
@@ -84,6 +90,245 @@ fn run_with_composition(
         PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &test_params())
             .expect("pipeline run");
     (report, buf.as_string())
+}
+
+fn run_source_collision_pipeline(
+    yaml: &str,
+    inputs: &[(&str, &str, &str)],
+) -> (CompiledPlan, HashMap<String, String>) {
+    let config = parse_config(yaml).expect("parse source-collision pipeline");
+    let root = fixture_workspace_root();
+    let ctx = CompileContext::with_pipeline_dir(&root, PathBuf::from("pipelines"));
+    let plan = config
+        .compile(&ctx)
+        .expect("compile source-collision pipeline");
+
+    let readers: clinker_exec::executor::SourceReaders = inputs
+        .iter()
+        .map(|(source, file, csv)| {
+            (
+                (*source).to_string(),
+                clinker_exec::executor::single_file_reader(
+                    *file,
+                    Box::new(Cursor::new(csv.as_bytes().to_vec())),
+                ),
+            )
+        })
+        .collect();
+    let buffers: HashMap<String, SharedBuffer> = config
+        .output_configs()
+        .map(|output| (output.name.clone(), SharedBuffer::new()))
+        .collect();
+    let writers: HashMap<String, Box<dyn Write + Send>> = buffers
+        .iter()
+        .map(|(name, buffer)| {
+            (
+                name.clone(),
+                Box::new(buffer.clone()) as Box<dyn Write + Send>,
+            )
+        })
+        .collect();
+    let mut params = test_params();
+    params
+        .record_vars
+        .insert("boundary".to_string(), Value::from("body"));
+
+    PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .expect("run source-collision pipeline");
+    let outputs = buffers
+        .into_iter()
+        .map(|(name, buffer)| (name, buffer.as_string()))
+        .collect();
+    (plan, outputs)
+}
+
+#[test]
+fn composition_port_seed_wins_over_same_named_fused_transform_source() {
+    let yaml = r#"
+pipeline:
+  name: composition_source_collision_transform
+nodes:
+  - type: source
+    name: body_feed
+    config:
+      name: body_feed
+      type: csv
+      path: body-transform.csv
+      schema:
+        - { name: id, type: int }
+  - type: aggregate
+    name: body_group
+    input: body_feed
+    config:
+      group_by: [id]
+      strategy: hash
+      cxl: |
+        emit id = max(id)
+  - type: composition
+    name: body_call
+    input: body_group
+    use: ../compositions/source_boundary_collision.comp.yaml
+    inputs:
+      collision: body_group
+  - type: output
+    name: body_out
+    input: body_call
+    config:
+      name: body_out
+      type: csv
+      path: body-out.csv
+      include_unmapped: false
+  - type: source
+    name: collision
+    config:
+      name: collision
+      type: csv
+      path: collision-transform.csv
+      schema:
+        - { name: id, type: int }
+  - type: transform
+    name: top_transform
+    input: collision
+    config:
+      declares:
+        - { name: boundary, scope: record, type: string }
+      cxl: |
+        emit id = id
+        emit origin = "top-transform"
+        emit $record.boundary = $record.boundary
+  - type: output
+    name: top_out
+    input: top_transform
+    config:
+      name: top_out
+      type: csv
+      path: top-out.csv
+      include_unmapped: false
+"#;
+    let (plan, outputs) = run_source_collision_pipeline(
+        yaml,
+        &[
+            ("body_feed", "body-transform.csv", "id\n7\n"),
+            ("collision", "collision-transform.csv", "id\n9\n"),
+        ],
+    );
+
+    let dag = plan.dag();
+    let merge_fused = compute_merge_interleave_fused_sources(dag, plan.config());
+    let init_phase = compute_init_phase_node_set(dag);
+    let (transform_sources, fused_transforms) =
+        compute_transform_fused_sources(dag, &merge_fused, &init_phase);
+    let top_transform = dag
+        .graph
+        .node_indices()
+        .find(|idx| dag.graph[*idx].name() == "top_transform")
+        .expect("top Transform present");
+    assert!(transform_sources.contains("collision"));
+    assert!(fused_transforms.contains(&top_transform));
+    assert_eq!(outputs["body_out"], "id,boundary\n7,body\n");
+    assert_eq!(outputs["top_out"], "id,origin\n9,top-transform\n");
+}
+
+#[test]
+fn composition_port_seed_wins_over_same_named_fused_merge_source() {
+    let yaml = r#"
+pipeline:
+  name: composition_source_collision_merge
+nodes:
+  - type: source
+    name: body_feed
+    config:
+      name: body_feed
+      type: csv
+      path: body-merge.csv
+      schema:
+        - { name: id, type: int }
+  - type: aggregate
+    name: body_group
+    input: body_feed
+    config:
+      group_by: [id]
+      strategy: hash
+      cxl: |
+        emit id = max(id)
+  - type: composition
+    name: body_call
+    input: body_group
+    use: ../compositions/source_boundary_collision.comp.yaml
+    inputs:
+      collision: body_group
+  - type: output
+    name: body_out
+    input: body_call
+    config:
+      name: body_out
+      type: csv
+      path: body-out.csv
+      include_unmapped: false
+  - type: source
+    name: collision
+    config:
+      name: collision
+      type: csv
+      path: collision-merge.csv
+      schema:
+        - { name: id, type: int }
+        - { name: origin, type: string }
+  - type: source
+    name: peer
+    config:
+      name: peer
+      type: csv
+      path: peer-merge.csv
+      schema:
+        - { name: id, type: int }
+        - { name: origin, type: string }
+  - type: merge
+    name: top_merge
+    inputs: [collision, peer]
+    config:
+      mode: interleave
+  - type: transform
+    name: top_passthrough
+    input: top_merge
+    config:
+      declares:
+        - { name: boundary, scope: record, type: string }
+      cxl: |
+        emit id = id
+        emit origin = origin
+        emit $record.boundary = $record.boundary
+  - type: output
+    name: top_out
+    input: top_passthrough
+    config:
+      name: top_out
+      type: csv
+      path: top-out.csv
+      include_unmapped: true
+"#;
+    let (plan, outputs) = run_source_collision_pipeline(
+        yaml,
+        &[
+            ("body_feed", "body-merge.csv", "id\n7\n"),
+            (
+                "collision",
+                "collision-merge.csv",
+                "id,origin\n11,collision\n",
+            ),
+            ("peer", "peer-merge.csv", "id,origin\n12,peer\n"),
+        ],
+    );
+
+    let fused = compute_merge_interleave_fused_sources(plan.dag(), plan.config());
+    assert!(fused.contains("collision"));
+    assert!(fused.contains("peer"));
+    assert_eq!(outputs["body_out"], "id,boundary\n7,body\n");
+    let top_output = &outputs["top_out"];
+    let mut top_rows: Vec<&str> = top_output.lines().skip(1).collect();
+    top_rows.sort_unstable();
+    assert_eq!(top_output.lines().next(), Some("id,origin"));
+    assert_eq!(top_rows, vec!["11,collision", "12,peer"]);
 }
 
 #[test]
