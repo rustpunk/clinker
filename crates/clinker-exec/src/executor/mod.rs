@@ -1222,7 +1222,8 @@ impl PipelineExecutor {
 
             node_buffers: HashMap::new(),
             node_buffer_consumer_ids: HashMap::new(),
-            shared_input_drains: HashMap::new(),
+            node_buffer_readers: dispatch::NodeBufferReaderLedger::default(),
+            planned_node_buffer_readers: dispatch::planned_materialized_reader_counts(plan),
             window_arena_consumer_ids: HashMap::new(),
             source_records,
             source_consumers,
@@ -1304,11 +1305,10 @@ impl PipelineExecutor {
         // the init-phase Transforms themselves). Pass 2 dispatches every
         // other node — the runtime DAG. Init-phase Transforms are
         // E164-validated as terminal, so Pass 2 never references their
-        // output edge. The dispatcher's `remaining_consumers` heuristic
-        // counts neighbors based on graph structure (pass-independent), so
-        // a Source feeding both an init branch and a runtime branch
-        // correctly clones its buffer for Pass 1's first consumer and
-        // removes it for Pass 2's last consumer.
+        // output edge. Producer publication uses the DAG scope's precomputed,
+        // pass-independent reader counts, so a Source feeding both an init
+        // branch and a runtime branch gives Pass 1 a reserved clone and
+        // transfers the original generation to Pass 2's final reader.
         //
         // The dispatch sequences are resolved up front (before the loop)
         // so each `scheduled_pass_order` call borrows `plan` only for its
@@ -1357,7 +1357,7 @@ impl PipelineExecutor {
             )
         };
 
-        let walk_result: Result<(), PipelineError> = (|| {
+        let mut walk_result: Result<(), PipelineError> = (|| {
             for node_idx in dispatch_sequence {
                 ctx.check_shutdown()?;
                 dispatch::dispatch_plan_node(&mut ctx, plan, node_idx)?;
@@ -1416,14 +1416,22 @@ impl PipelineExecutor {
             ctx.memory_budget.unregister_consumer(id);
         }
 
+        if walk_result.is_ok()
+            && let Err(error) =
+                dispatch::validate_completed_node_buffer_scope(&ctx, &ctx.config.pipeline.name)
+        {
+            walk_result = Err(error);
+        }
+
         // The walk is finished (success, interruption, or error), so no
         // top-scope node buffer can be consumed again. Drop every residual
         // allocation while its pull-mode wrapper is still registered, then
         // unregister the matching ids before propagating `walk_result`.
-        // Composition inputs deliberately clone and leave their parent slots
-        // intact for possible siblings, so this sweep is their normal terminal
-        // cleanup as well as the early-error backstop.
+        // Successful reads consume every declared reader and leave no slot;
+        // this sweep is the early-error/interruption backstop for partially
+        // consumed fan-out and composition inputs.
         drop(std::mem::take(&mut ctx.node_buffers));
+        ctx.node_buffer_readers = dispatch::NodeBufferReaderLedger::default();
         for (_, (id, handle)) in std::mem::take(&mut ctx.node_buffer_consumer_ids) {
             handle.set_bytes(0);
             ctx.memory_budget.unregister_consumer(id);

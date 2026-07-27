@@ -14,9 +14,9 @@ use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
-    ExecutorContext, admit_node_buffer, advance_cursor, dispatch_transform_eval_error,
-    drain_node_buffer_slot, finalize_node_rooted_windows, missing_node_buffer_input_error,
-    node_buffer_spill_allowed, require_node_buffer_slot, source_file_arc_of, source_name_arc_of,
+    ExecutorContext, NodeBufferKey, admit_node_buffer, advance_cursor,
+    dispatch_transform_eval_error, finalize_node_rooted_windows, node_buffer_spill_allowed,
+    require_node_buffer_input, source_file_arc_of, source_name_arc_of,
     tee_emit_to_region_input_buffers, transform_fused_consume,
 };
 use crate::executor::schema_check::check_input_schema;
@@ -63,70 +63,58 @@ pub(crate) fn dispatch_transform(
     // Records flow into per-record evaluation; punctuations are
     // preserved verbatim and forwarded onto the output buffer
     // alongside the transformed records (Preserving behavior).
-    let (input_records, input_puncts): (
-        Vec<(Record, u64)>,
-        Vec<crate::executor::stream_event::Punctuation>,
-    ) = if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
-        own_buf.drain_split_metered(&ctx.memory_budget, name.as_str())?
-    } else {
-        let predecessors: Vec<NodeIndex> = current_dag
-            .graph
-            .neighbors_directed(node_idx, Direction::Incoming)
-            .collect();
-        let pred_buf = if predecessors.len() == 1 {
-            let pred = predecessors[0];
-            let producer_port = current_dag
+    let predecessors: Vec<NodeIndex> = current_dag
+        .graph
+        .neighbors_directed(node_idx, Direction::Incoming)
+        .collect();
+    let authored_input = ctx
+        .current_body_node_input_refs
+        .as_ref()
+        .and_then(|refs| refs.get(name.as_str()))
+        .and_then(|refs| refs.first())
+        .map(String::as_str);
+    let own_key = NodeBufferKey::from(node_idx);
+    let (input_key, producer_name, producer_port): (NodeBufferKey, String, Option<String>) =
+        if ctx.node_buffers.contains_key(&own_key) {
+            let (producer, port) = authored_input
+                .and_then(|input| input.split_once('.'))
+                .map_or(
+                    (authored_input.unwrap_or("composition input"), None),
+                    |(p, port)| (p, Some(port)),
+                );
+            (own_key, producer.to_string(), port.map(str::to_string))
+        } else if let Some(&pred) = predecessors.first() {
+            let port = current_dag
                 .graph
                 .find_edge(pred, node_idx)
                 .and_then(|edge| current_dag.graph.edge_weight(edge))
                 .and_then(|edge| edge.producer_port.as_deref());
-            Some(require_node_buffer_slot(
-                ctx,
-                pred,
-                name,
-                current_dag.graph[pred].name(),
-                producer_port,
-            )?)
+            (
+                NodeBufferKey::with_port(pred, port),
+                current_dag.graph[pred].name().to_string(),
+                port.map(str::to_string),
+            )
         } else {
-            predecessors
-                .iter()
-                .find_map(|p| drain_node_buffer_slot(ctx, *p))
+            (
+                own_key,
+                authored_input.unwrap_or("composition input").to_string(),
+                None,
+            )
         };
-        let input_buffer = match pred_buf {
-            Some(buffer) => buffer,
-            None => {
-                let authored_input = ctx
-                    .current_body_node_input_refs
-                    .as_ref()
-                    .and_then(|refs| refs.get(name.as_str()))
-                    .and_then(|refs| refs.first())
-                    .map(String::as_str);
-                let (producer_name, producer_port) = if let Some(&pred) = predecessors.first() {
-                    let producer_port = current_dag
-                        .graph
-                        .find_edge(pred, node_idx)
-                        .and_then(|edge| current_dag.graph.edge_weight(edge))
-                        .and_then(|edge| edge.producer_port.as_deref());
-                    (current_dag.graph[pred].name(), producer_port)
-                } else if let Some(input) = authored_input {
-                    match input.split_once('.') {
-                        Some((producer, port)) => (producer, Some(port)),
-                        None => (input, None),
-                    }
-                } else {
-                    ("composition input", None)
-                };
-                return Err(missing_node_buffer_input_error(
-                    name,
-                    producer_name,
-                    producer_port,
-                ));
-            }
-        };
-        // Meter the re-materialized drain so a spill-backed input cannot
-        // re-inflate into RAM past the hard limit uncharged.
-        input_buffer.drain_split_metered(&ctx.memory_budget, name.as_str())?
-    };
+    let input_buffer = require_node_buffer_input(
+        ctx,
+        input_key,
+        name,
+        &producer_name,
+        producer_port.as_deref(),
+    )?;
+    let (input_buffer, _input_reservation) = input_buffer.into_parts();
+    // Meter the re-materialized drain so a spill-backed input cannot
+    // re-inflate into RAM past the hard limit uncharged.
+    let (input_records, input_puncts): (
+        Vec<(Record, u64)>,
+        Vec<crate::executor::stream_event::Punctuation>,
+    ) = input_buffer.drain_split_metered(&ctx.memory_budget, name.as_str())?;
 
     // Read the typed program off the `PlanNode::Transform` payload. Every
     // lowered Transform carries a `Some(payload)` with a typechecked program;
@@ -136,15 +124,15 @@ pub(crate) fn dispatch_transform(
         Some(p) => p,
         None => {
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &input_records)?;
-            let nb = admit_node_buffer(
+            admit_node_buffer(
                 ctx,
+                current_dag,
                 name.as_str(),
                 node_idx,
                 input_records,
                 input_puncts,
                 node_buffer_spill_allowed(current_dag, node_idx),
             )?;
-            ctx.node_buffers.insert(node_idx.into(), nb);
             return Ok(());
         }
     };
@@ -317,15 +305,15 @@ pub(crate) fn dispatch_transform(
     // matching runtime; otherwise the helper is a no-op.
     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-    let nb = admit_node_buffer(
+    admit_node_buffer(
         ctx,
+        current_dag,
         name,
         node_idx,
         output_records,
         input_puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
-    ctx.node_buffers.insert(node_idx.into(), nb);
 
     Ok(())
 }

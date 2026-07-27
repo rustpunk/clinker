@@ -16,9 +16,8 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
     ExecutorContext, FusedMergeOutput, MergeStreamHandoff, NodeBufferKey, admit_node_buffer,
-    drain_or_clone_shared_input, finalize_node_rooted_windows, merge_fused_interleave,
-    missing_node_buffer_input_error, node_buffer_spill_allowed, stream_linear_producer_emit,
-    tee_emit_to_region_input_buffers,
+    finalize_node_rooted_windows, merge_fused_interleave, node_buffer_spill_allowed,
+    require_node_buffer_input, stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
 use clinker_plan::error::PipelineError;
@@ -121,6 +120,7 @@ pub(crate) fn dispatch_merge(
     // `stream_linear_producer_emit` below, skipping the
     // materialized `admit_node_buffer` slot.
     let streaming_sender = ctx.take_streaming_sender(node_idx);
+    let fused_streaming_handoff = fused_mode && streaming_sender.is_some();
     // The per-batch charge handle for the streaming slot, shared by
     // both fused and non-fused streaming paths. `None` when this
     // Merge is materialized (no streaming sender installed).
@@ -233,15 +233,13 @@ pub(crate) fn dispatch_merge(
             clinker_plan::config::MergeMode::Concat => {
                 for (src, port) in &ordered_inputs {
                     let upstream_name = current_dag.graph[*src].name().to_string();
-                    let buf = drain_or_clone_shared_input(
+                    let buf = require_node_buffer_input(
                         ctx,
-                        current_dag,
                         NodeBufferKey::with_port(*src, port.as_deref()),
                         name,
-                    )?
-                    .ok_or_else(|| {
-                        missing_node_buffer_input_error(name, &upstream_name, port.as_deref())
-                    })?;
+                        &upstream_name,
+                        port.as_deref(),
+                    )?;
                     let (buf, reservation) = buf.into_parts();
                     if let Some(reservation) = reservation {
                         input_reservations.push(reservation);
@@ -274,19 +272,13 @@ pub(crate) fn dispatch_merge(
                     .map(
                         |(src, port)| -> Result<VecDeque<(Record, u64)>, PipelineError> {
                             let upstream_name = current_dag.graph[*src].name();
-                            let nb = drain_or_clone_shared_input(
+                            let nb = require_node_buffer_input(
                                 ctx,
-                                current_dag,
                                 NodeBufferKey::with_port(*src, port.as_deref()),
                                 name,
-                            )?
-                            .ok_or_else(|| {
-                                missing_node_buffer_input_error(
-                                    name,
-                                    upstream_name,
-                                    port.as_deref(),
-                                )
-                            })?;
+                                upstream_name,
+                                port.as_deref(),
+                            )?;
                             let (nb, reservation) = nb.into_parts();
                             if let Some(reservation) = reservation {
                                 input_reservations.push(reservation);
@@ -349,6 +341,15 @@ pub(crate) fn dispatch_merge(
         crate::executor::stream_event::reconcile_document_boundaries(all_puncts)
     };
 
+    // The fused interleave arm already sent every event directly to the
+    // downstream writer and consumed/dropped its sender. Its returned record
+    // vector is intentionally empty, so publishing it as a materialized Merge
+    // slot would create an unread ledger entry after the streaming Output's
+    // own dispatch turn no-ops.
+    if fused_streaming_handoff {
+        return Ok(());
+    }
+
     // Non-fused streaming path: the predecessors' slots are
     // already drained into the full `merged` Vec, so this does not
     // shrink the Merge's own working set; what it saves is the
@@ -387,15 +388,15 @@ pub(crate) fn dispatch_merge(
     // nothing because no spec roots at a Merge NodeIndex.
     finalize_node_rooted_windows(ctx, current_dag, node_idx, &merged)?;
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &merged)?;
-    let nb = admit_node_buffer(
+    admit_node_buffer(
         ctx,
+        current_dag,
         name,
         node_idx,
         merged,
         deduped_puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
-    ctx.node_buffers.insert(node_idx.into(), nb);
 
     Ok(())
 }

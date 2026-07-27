@@ -81,6 +81,11 @@ fn relaxed_aggregate_seeds_a_deferred_region_with_downstream_members() {
         .node_indices()
         .find(|&i| matches!(&plan.graph[i], PlanNode::Aggregation { .. }))
         .expect("Aggregate node must be present");
+    let source_idx = plan
+        .graph
+        .node_indices()
+        .find(|&i| matches!(&plan.graph[i], PlanNode::Source { name, .. } if name == "src"))
+        .expect("Source 'src' must be present");
     let transform_idx = plan
         .graph
         .node_indices()
@@ -118,6 +123,14 @@ fn relaxed_aggregate_seeds_a_deferred_region_with_downstream_members() {
     assert!(
         !plan.is_deferred_consumer(agg_idx),
         "Aggregate (the producer) must NOT be flagged as deferred consumer"
+    );
+    assert!(
+        !crate::executor::dispatch::crosses_into_deferred_consumer(&plan, source_idx, agg_idx,),
+        "the live forward edge into a region producer must not be parked"
+    );
+    assert!(
+        !crate::executor::dispatch::crosses_into_deferred_consumer(&plan, agg_idx, transform_idx,),
+        "an edge from the region producer to its own member uses the canonical producer slot"
     );
 
     // The buffer_schema is the column-pruned union the deferred
@@ -266,6 +279,25 @@ nodes:
     let lookup_csv = "department,budget\nHR,100\nENG,500\n";
 
     let config = clinker_plan::config::parse_config(yaml).expect("parse");
+    let plan = config
+        .compile(&clinker_plan::config::CompileContext::default())
+        .expect("compile")
+        .dag()
+        .clone();
+    let lookup_idx = plan
+        .graph
+        .node_indices()
+        .find(|&i| plan.graph[i].name() == "dept_lookup")
+        .expect("lookup Source must be present");
+    let combine_idx = plan
+        .graph
+        .node_indices()
+        .find(|&i| plan.graph[i].name() == "enriched")
+        .expect("deferred Combine must be present");
+    assert!(
+        crate::executor::dispatch::crosses_into_deferred_consumer(&plan, lookup_idx, combine_idx,),
+        "an external build edge into a forward-skipped deferred Combine must be parked"
+    );
     let readers: crate::executor::SourceReaders = HashMap::from([
         (
             "orders".to_string(),

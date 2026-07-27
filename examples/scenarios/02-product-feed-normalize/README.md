@@ -7,10 +7,6 @@ through as a single multi-value field.
 This is the multi-value scenario. `<category>` appears more than once per
 product, and one column holds all of them.
 
-> **This scenario cannot complete yet.** See [What is broken](#what-is-broken)
-> below. The committed expected output states what both sinks should write; the
-> gate pins the current fail-loud behavior until the fan-out bug is fixed.
-
 ## Run it
 
 ```bash
@@ -19,8 +15,9 @@ cd examples/scenarios/02-product-feed-normalize
 cargo run -p clinker -- run pipeline.yaml
 ```
 
-The run currently exits 1 and reports that `catalog_csv` could not obtain the
-planned input from `normalize`. It does not publish a plausible empty result.
+The run writes all 14 products to both destinations. Its summary reports 14
+records read and 28 writes because each record is broadcast to two Output
+nodes.
 
 ## The input
 
@@ -97,35 +94,21 @@ a dotted column name (`categories.category`) that CXL cannot address
 ([#995](https://github.com/rustpunk/clinker/issues/995)) — it would be readable
 but untransformable. The write side puts the container back with `wrap_in`.
 
-## What is broken
+## Direct multi-output broadcast
 
-The run exits 1 before publishing either destination because `normalize` cannot
-yet feed two direct Output consumers correctly.
+Both Output nodes read the same `normalize` result. Direct multi-output edges
+are broadcast, not partitioned: `catalog.csv` and `catalog.xml` each receive all
+14 records and encode the repeated category field in their own format. The
+scenario gate compares both files with committed goldens and requires
+`records_written = 28`.
 
-The underlying fan-out defect is tracked by
-[#996](https://github.com/rustpunk/clinker/issues/996). Previously, a node
-feeding two Output nodes delivered records to only one and silently committed a
-zero-byte sibling. The executor now detects the missing planned input and stops
-instead of treating it as an empty stream. Declaring either sink alone still
-produces the correct output.
-
-The scenario keeps the two-sink shape rather than working around it because
-writing one result in two formats is ordinary and the corpus is meant to state
-what the engine should do. Both committed goldens come from working single-sink
-variants and remain the correct answer. The harness carries a `known_broken`
-marker pointing at #996.
-
-The marker requires exit 1 and the exact fail-loud diagnostic naming
-`catalog_csv` and `normalize`. A return to exit-0 partial output is therefore a
-regression. The gate's counters still record the correct result — 14 records to
-each of two sinks, so 28 writes — so a complete #996 fix makes the marker stale
-and restores normal golden comparison.
+Use a [Route](../../../docs/user/src/nodes/route.md) node when destinations
+should receive different subsets instead.
 
 ## Try changing it
 
-- Delete either Output and rerun. The remaining sink receives every record and
-  matches its golden, demonstrating that #996 is about direct shared input
-  rather than either format.
+- Delete either Output and rerun. The remaining sink still receives every
+  record, while the summary drops from 28 writes to 14.
 - Remove `multiple: true` from the schema and rerun — the repeated element is
   now an error rather than a collected field.
 - Drop the XML `join_values` override to see the unwrapped, column-named default.

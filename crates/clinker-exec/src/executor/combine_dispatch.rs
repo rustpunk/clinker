@@ -18,10 +18,10 @@ use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
-    ExecutorContext, NodeBufferKey, admit_node_buffer, advance_cursor, drain_or_clone_shared_input,
-    finalize_node_rooted_windows, missing_node_buffer_input_error, node_buffer_spill_allowed,
-    push_dlq, record_error_to_buffer_if_grouped, source_file_arc_of, source_name_arc_of,
-    stream_linear_producer_emit, tee_emit_to_region_input_buffers,
+    ExecutorContext, NodeBufferKey, admit_node_buffer, advance_cursor, declare_node_buffer_readers,
+    drain_node_buffer_slot, finalize_node_rooted_windows, node_buffer_spill_allowed, push_dlq,
+    record_error_to_buffer_if_grouped, require_node_buffer_input, source_file_arc_of,
+    source_name_arc_of, stream_linear_producer_emit, tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, NullStorage, stage_metrics, widen_record_to_schema};
@@ -309,26 +309,24 @@ pub(crate) fn dispatch_combine(
     ) = if streaming_probe_driver.is_some() {
         (Vec::new(), Vec::new(), None)
     } else {
-        let input = drain_or_clone_shared_input(
+        let input = require_node_buffer_input(
             ctx,
-            current_dag,
             NodeBufferKey::with_port(driver_pred, driver_port.as_deref()),
             name,
-        )?
-        .ok_or_else(|| {
-            missing_node_buffer_input_error(name, driver_upstream, driver_port.as_deref())
-        })?;
+            driver_upstream,
+            driver_port.as_deref(),
+        )?;
         let (input, reservation) = input.into_parts();
         let (records, puncts) = input.drain_split()?;
         (records, puncts, reservation)
     };
-    let build_input = drain_or_clone_shared_input(
+    let build_input = require_node_buffer_input(
         ctx,
-        current_dag,
         NodeBufferKey::with_port(build_pred, build_port.as_deref()),
         name,
-    )?
-    .ok_or_else(|| missing_node_buffer_input_error(name, build_upstream, build_port.as_deref()))?;
+        build_upstream,
+        build_port.as_deref(),
+    )?;
     let (build_input, _build_clone_reservation) = build_input.into_parts();
     let (build_buf, build_puncts): (
         Vec<(Record, u64)>,
@@ -580,7 +578,7 @@ pub(crate) fn dispatch_combine(
                 // downstream drains. Both pure-range and equi+range combines
                 // return the same block-band handle, so the output axis is
                 // bounded either way.
-                let nb = match drain_block_band_output(
+                match drain_block_band_output(
                     ctx,
                     current_dag,
                     node_idx,
@@ -600,14 +598,11 @@ pub(crate) fn dispatch_combine(
                         ctx.combine_input_snapshots.remove(&node_idx);
                         return Ok(());
                     }
-                    BlockBandDrain::Buffered(nb) => {
-                        let probe_records_out = nb.len_hint() as u64;
+                    BlockBandDrain::Buffered(probe_records_out) => {
                         ctx.collector
                             .record(probe_timer.finish(probe_records_in, probe_records_out));
-                        nb
                     }
-                };
-                ctx.node_buffers.insert(node_idx.into(), nb);
+                }
                 // Combine arm clean-exit: drop the per-fold cursor
                 // snapshot. Every emitted record has cleared into
                 // `node_buffers` without rewind, so the snapshot is
@@ -739,15 +734,15 @@ pub(crate) fn dispatch_combine(
                     .record(probe_timer.finish(probe_records_in, probe_records_out));
                 finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-                let nb = admit_node_buffer(
+                admit_node_buffer(
                     ctx,
+                    current_dag,
                     name,
                     node_idx,
                     output_records,
                     combined_puncts,
                     node_buffer_spill_allowed(current_dag, node_idx),
                 )?;
-                ctx.node_buffers.insert(node_idx.into(), nb);
                 // Combine arm clean-exit: drop the per-fold cursor
                 // snapshot. Mirrors the inline arm's post-emit
                 // clear so non-inline strategies do not leak
@@ -884,11 +879,9 @@ pub(crate) fn dispatch_combine(
                         ctx.combine_input_snapshots.remove(&node_idx);
                         return Ok(());
                     }
-                    BlockBandDrain::Buffered(nb) => {
-                        let probe_records_out = nb.len_hint() as u64;
+                    BlockBandDrain::Buffered(probe_records_out) => {
                         ctx.collector
                             .record(probe_timer.finish(probe_records_in, probe_records_out));
-                        ctx.node_buffers.insert(node_idx.into(), nb);
                     }
                 }
                 // Combine arm clean-exit: drop the per-fold cursor snapshot.
@@ -1162,15 +1155,15 @@ pub(crate) fn dispatch_combine(
 
         finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
         tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-        let nb = admit_node_buffer(
+        admit_node_buffer(
             ctx,
+            current_dag,
             name,
             node_idx,
             output_records,
             combined_puncts,
             node_buffer_spill_allowed(current_dag, node_idx),
         )?;
-        ctx.node_buffers.insert(node_idx.into(), nb);
         // Drop the per-fold cursor snapshot: every emitted record
         // has cleared into `node_buffers` without rewind, so the
         // snapshot is no longer needed. The rewind path on a
@@ -1963,9 +1956,9 @@ enum BlockBandDrain {
     /// over the back-pressure sink; no `node_buffers` slot was admitted.
     /// Carries the emitted row count for the probe-stage timer.
     Streamed(u64),
-    /// The output was admitted to a `node_buffers` slot (resident or spilled);
-    /// the caller inserts it and reads its length.
-    Buffered(crate::executor::node_buffer::NodeBuffer),
+    /// The output was admitted to a `node_buffers` slot (resident or spilled).
+    /// Carries the emitted row count for the probe-stage timer.
+    Buffered(u64),
 }
 
 /// Resolve the spill-compression mode for a k-way merge over `files`: the
@@ -2083,7 +2076,7 @@ fn drain_block_band_output(
         return Ok(BlockBandDrain::Streamed(count));
     }
 
-    let buffered = match sorted {
+    match sorted {
         SortedOutput::InMemory(pairs) => {
             // The result fit the buffer's byte threshold, so it is already
             // bounded. Strip the sort payload back to `(record, order)` and admit
@@ -2095,7 +2088,15 @@ fn drain_block_band_output(
                 .collect();
             finalize_node_rooted_windows(ctx, current_dag, node_idx, &rows)?;
             tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &rows)?;
-            admit_node_buffer(ctx, combine_name, node_idx, rows, puncts, spill_allowed)?
+            admit_node_buffer(
+                ctx,
+                current_dag,
+                combine_name,
+                node_idx,
+                rows,
+                puncts,
+                spill_allowed,
+            )?;
         }
         SortedOutput::Spilled(files) => {
             if spill_allowed && !needs_materialization {
@@ -2106,12 +2107,13 @@ fn drain_block_band_output(
                 // never re-serialized to a second chunk.
                 adopt_spilled_runs_into_node_buffer(
                     ctx,
+                    current_dag,
                     node_idx,
                     combine_name,
                     files,
                     row_count,
                     puncts,
-                )?
+                )?;
             } else {
                 // A window root, a cross-region tee, or a non-spillable slot needs
                 // the whole slice; those surfaces are O(N) regardless, so
@@ -2133,11 +2135,19 @@ fn drain_block_band_output(
                 }
                 finalize_node_rooted_windows(ctx, current_dag, node_idx, &rows)?;
                 tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &rows)?;
-                admit_node_buffer(ctx, combine_name, node_idx, rows, puncts, spill_allowed)?
+                admit_node_buffer(
+                    ctx,
+                    current_dag,
+                    combine_name,
+                    node_idx,
+                    rows,
+                    puncts,
+                    spill_allowed,
+                )?;
             }
         }
-    };
-    Ok(BlockBandDrain::Buffered(buffered))
+    }
+    Ok(BlockBandDrain::Buffered(row_count))
 }
 
 /// Stream a block-band combine's payload-sorted output rows straight to a
@@ -2251,19 +2261,26 @@ fn node_tees_to_deferred_region(current_dag: &ExecutionPlanDag, node_idx: NodeIn
 /// unregisters through the same path.
 fn adopt_spilled_runs_into_node_buffer(
     ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     combine_name: &str,
     files: Vec<crate::pipeline::spill::SpillFile<(RecordOrder, u64, u64)>>,
     row_count: u64,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
-) -> Result<crate::executor::node_buffer::NodeBuffer, PipelineError> {
+) -> Result<(), PipelineError> {
     use crate::executor::node_buffer::{NodeBuffer, NodeBufferConsumer};
+    if ctx.node_buffers.contains_key(&node_idx.into())
+        || ctx.node_buffer_consumer_ids.contains_key(&node_idx.into())
+    {
+        return Err(PipelineError::Internal {
+            op: "executor",
+            node: combine_name.to_string(),
+            detail: "block-band output slot was republished without discarding its previous value"
+                .to_string(),
+        });
+    }
     // Register the slot's node-buffer consumer at zero resident bytes so its
     // later drain unregisters through the same path `admit_node_buffer` sets up.
-    // A prior registration at this slot is replaced first.
-    if let Some((prev_id, _)) = ctx.node_buffer_consumer_ids.remove(&node_idx.into()) {
-        ctx.memory_budget.unregister_consumer(prev_id);
-    }
     let handle = crate::pipeline::memory::ConsumerHandle::new();
     handle.set_bytes(0);
     let consumer_id = ctx
@@ -2272,6 +2289,13 @@ fn adopt_spilled_runs_into_node_buffer(
     ctx.node_buffer_consumer_ids
         .insert(node_idx.into(), (consumer_id, handle));
     ctx.memory_budget.sample_peak_consumer_usage();
+    if let Err(error) = declare_node_buffer_readers(ctx, current_dag, combine_name, node_idx) {
+        if let Some((id, handle)) = ctx.node_buffer_consumer_ids.remove(&node_idx.into()) {
+            handle.set_bytes(0);
+            ctx.memory_budget.unregister_consumer(id);
+        }
+        return Err(error);
+    }
     // Park a charging context on the slot so that if this adopted run set is too
     // fragmented, the drain's k-way merge folds it down under the disk quota
     // (E320), charging the intermediate runs to this combine node — matching the
@@ -2282,12 +2306,16 @@ fn adopt_spilled_runs_into_node_buffer(
         Arc::from(combine_name),
         merge_compress,
     );
-    Ok(NodeBuffer::merge_spilled(
-        files,
-        row_count,
-        puncts,
-        merge_budget,
-    ))
+    let buffer = NodeBuffer::merge_spilled(files, row_count, puncts, merge_budget);
+    if ctx.node_buffers.insert(node_idx.into(), buffer).is_some() {
+        drain_node_buffer_slot(ctx, node_idx);
+        return Err(PipelineError::Internal {
+            op: "executor",
+            node: combine_name.to_string(),
+            detail: "block-band output slot changed during synchronous spill adoption".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn dispatch_combine_output_error(

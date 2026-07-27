@@ -59,7 +59,8 @@ use petgraph::graph::NodeIndex;
 
 use crate::aggregation::{AggregateEvalScope, eval_expr_in_agg_scope};
 use crate::executor::dispatch::{
-    ExecutorContext, admit_node_buffer, node_buffer_spill_allowed, require_node_buffer_slot,
+    ExecutorContext, NodeBufferKey, admit_node_buffer, node_buffer_spill_allowed,
+    require_node_buffer_input, single_input_node_buffer_key,
 };
 use crate::executor::envelope::distinct_body_headers;
 use crate::executor::node_buffer::DrainedEvents;
@@ -137,14 +138,16 @@ pub(crate) fn dispatch_envelope(
         .edges_connecting(body_pred, node_idx)
         .next()
         .and_then(|edge| edge.weight().producer_port.as_deref());
-    let (mut records, puncts) = require_node_buffer_slot(
+    let body_key = single_input_node_buffer_key(&ctx.node_buffers, node_idx, body_pred, body_port);
+    let body_input = require_node_buffer_input(
         ctx,
-        body_pred,
+        body_key,
         name,
         current_dag.graph[body_pred].name(),
         body_port,
-    )?
-    .drain_split()?;
+    )?;
+    let (body_input, _body_reservation) = body_input.into_parts();
+    let (mut records, puncts) = body_input.drain_split()?;
 
     // Drain the wired header stream and replace each body grain's ambient
     // envelope with its grain-matched header record. This runs BEFORE the
@@ -160,14 +163,15 @@ pub(crate) fn dispatch_envelope(
             .edges_connecting(header_pred, node_idx)
             .next()
             .and_then(|edge| edge.weight().producer_port.as_deref());
-        let (header_records, _header_puncts) = require_node_buffer_slot(
+        let header_input = require_node_buffer_input(
             ctx,
-            header_pred,
+            NodeBufferKey::with_port(header_pred, header_port),
             name,
             current_dag.graph[header_pred].name(),
             header_port,
-        )?
-        .drain_split()?;
+        )?;
+        let (header_input, _header_reservation) = header_input.into_parts();
+        let (header_records, _header_puncts) = header_input.drain_split()?;
         replace_headers_by_grain(name, &mut records, &header_records)?;
     }
 
@@ -199,15 +203,15 @@ pub(crate) fn dispatch_envelope(
         synthesize_sections(ctx, name, synthesis, &mut records, &mut puncts)?;
     }
 
-    let nb = admit_node_buffer(
+    admit_node_buffer(
         ctx,
+        current_dag,
         name,
         node_idx,
         records,
         puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
-    ctx.node_buffers.insert(node_idx.into(), nb);
     Ok(())
 }
 

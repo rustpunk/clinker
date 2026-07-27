@@ -44,7 +44,10 @@ use petgraph::visit::{EdgeRef, Topo};
 use super::DlqEvent;
 use super::detect::RetractScope;
 use crate::executor::dispatch::{
-    ExecutorContext, NodeBufferKey, admit_node_buffer, dispatch_plan_node, drain_node_buffer_slot,
+    ExecutorContext, NodeBufferKey, admit_node_buffer, admit_node_buffer_with_readers,
+    dispatch_plan_node, drain_node_buffer_slot, node_buffer_spill_allowed,
+    planned_materialized_reader_counts, require_node_buffer_input,
+    validate_completed_node_buffer_scope,
 };
 use crate::executor::node_buffer::NodeBuffer;
 use clinker_plan::error::PipelineError;
@@ -357,15 +360,15 @@ fn seed_cross_region_inputs_for(
         let slot_key = NodeBufferKey::with_port(source_idx, producer_port);
         drain_node_buffer_slot(ctx, slot_key.clone());
         let source_name = current_dag.graph[source_idx].name();
-        let nb = admit_node_buffer(
+        admit_node_buffer_with_readers(
             ctx,
             source_name,
             slot_key.clone(),
             parked,
             Vec::new(),
             false,
+            1,
         )?;
-        ctx.node_buffers.insert(slot_key, nb);
     }
 
     Ok(())
@@ -423,10 +426,14 @@ fn recurse_into_body(
     let body_buffers: HashMap<NodeBufferKey, NodeBuffer> = HashMap::new();
     let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
     let saved_consumer_ids = std::mem::take(&mut ctx.node_buffer_consumer_ids);
-    // Shared-input drain counts key by the body-local `NodeBufferKey` space;
+    // Remaining-reader counts key by the body-local `NodeBufferKey` space;
     // swap alongside `node_buffers` so a body fanout does not collide with a
     // parent count.
-    let saved_shared_drains = std::mem::take(&mut ctx.shared_input_drains);
+    let saved_readers = std::mem::take(&mut ctx.node_buffer_readers);
+    let saved_planned_readers = std::mem::replace(
+        &mut ctx.planned_node_buffer_readers,
+        planned_materialized_reader_counts(&body_dag),
+    );
     // Window-arena consumer ids are keyed by slot index, which the body
     // re-uses from zero just like its window-runtime overlay. Swap to a
     // fresh map so a body slot-0 arena registration does not clobber the
@@ -522,14 +529,20 @@ fn recurse_into_body(
         // body covered without an extra code path.
         let mut harvested: Vec<(Record, u64)> = Vec::new();
         for body_out_idx in bound_body.output_port_to_node_idx.values() {
-            if let Some(nb) = drain_node_buffer_slot(ctx, *body_out_idx) {
-                // Commit-pass body harvest: composition body output
-                // punctuations re-emit at the parent's call site;
-                // here we take records only.
-                let (records, _puncts) = nb.drain_split()?;
-                harvested.extend(records);
-            }
+            let input = require_node_buffer_input(
+                ctx,
+                *body_out_idx,
+                parent_dag.graph[composition_idx].name(),
+                body_dag.graph[*body_out_idx].name(),
+                None,
+            )?;
+            let (input, _reservation) = input.into_parts();
+            // Commit-pass body harvest: composition body output punctuations
+            // re-emit at the parent's call site; here we take records only.
+            let (records, _puncts) = input.drain_split()?;
+            harvested.extend(records);
         }
+        validate_completed_node_buffer_scope(ctx, parent_dag.graph[composition_idx].name())?;
         Ok::<Vec<(Record, u64)>, PipelineError>(harvested)
     })();
 
@@ -560,32 +573,38 @@ fn recurse_into_body(
     ctx.source_records = saved_combine;
     ctx.node_buffers = saved_buffers;
     ctx.node_buffer_consumer_ids = saved_consumer_ids;
-    ctx.shared_input_drains = saved_shared_drains;
+    ctx.node_buffer_readers = saved_readers;
+    ctx.planned_node_buffer_readers = saved_planned_readers;
     ctx.window_arena_consumer_ids = saved_arena_ids;
 
     let harvested = walk_and_harvest?;
 
-    if !harvested.is_empty() {
-        // Append harvested rows onto the parent composition's slot.
-        // Pull-mode attribution: the slot's registered
-        // `NodeBufferConsumer` carries the live byte count via its
-        // shared handle; the arbitrator's `should_abort` poll guards
-        // the per-pipeline hard limit at the parent dispatcher's
-        // batch boundaries.
-        let slot = ctx
-            .node_buffers
-            .entry(composition_idx.into())
-            .or_insert_with(|| NodeBuffer::Memory(Vec::new()));
-        for (record, rn) in harvested {
-            slot.push(record, rn);
-        }
-    }
-
-    if let Some(continuation) = parent_dag
+    let continuation = parent_dag
         .parent_continuations
         .get(&composition_idx)
-        .cloned()
-    {
+        .cloned();
+    if !harvested.is_empty() || continuation.is_some() {
+        // Republish the commit-pass harvest through the ordinary slot boundary.
+        // Any stale forward-pass value is replacement state, not a logical
+        // read; discard its count/registration before combining the rows.
+        let mut rows = match drain_node_buffer_slot(ctx, composition_idx) {
+            Some(slot) => slot.drain_split()?.0,
+            None => Vec::new(),
+        };
+        rows.extend(harvested);
+        let composition_name = parent_dag.graph[composition_idx].name();
+        admit_node_buffer(
+            ctx,
+            parent_dag,
+            composition_name,
+            composition_idx,
+            rows,
+            Vec::new(),
+            node_buffer_spill_allowed(parent_dag, composition_idx),
+        )?;
+    }
+
+    if let Some(continuation) = continuation {
         dispatch_continuation(ctx, parent_dag, &continuation, events)?;
     }
 

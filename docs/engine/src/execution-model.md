@@ -36,15 +36,25 @@ predecessor-slot readers because they select among multiple incoming edges.
 
 ### Shared-buffer clones and composition scope
 
-When a predecessor feeds several consumers, the earlier `Output`, `Merge`, or
-`Combine` readers clone its resident events and leave the original slot for the
-last reader. The duplicate is not an untracked local vector: allocation goes
-through one reserved-clone boundary that registers its estimated bytes before
-the clone and returns the clone together with a must-retain reservation. The
-consumer holds that reservation through its complete synchronous read, write,
-join, or output-admission phase; unwinding an error releases it automatically.
-The final reader drains the original slot and its ordinary node-buffer
-registration.
+Every published materialized slot carries a remaining-reader count keyed by
+its exact `(producer, producer_port)` `NodeBufferKey`. The producer declares
+that count when it publishes the slot; readers never rediscover ownership from
+node kind, node index, or dispatch order. The common one-reader path removes
+the slot and its registration directly with O(1) bookkeeping. With several
+readers, each earlier reader receives a clone while the original stays live for
+the final reader. This applies uniformly to materialized Transform, Aggregate,
+Sort, Reshape, Route, Cull, Envelope, Composition, Merge, Combine, and Output
+inputs, including successor-local Route/Cull slots and both Output event paths.
+
+The duplicate is not an untracked local vector: allocation goes through one
+reserved-clone boundary that registers its estimated bytes before the clone
+and returns the clone together with a must-retain reservation. The consumer
+holds that reservation through its complete synchronous operation; unwinding
+an error releases it automatically. Clone failure is transactional: the reader
+count changes only after reservation and cloning succeed. The final reader
+drains the original slot and its ordinary node-buffer registration. Successful
+scope completion rejects any residual slot, registration, or positive reader
+count as an internal invariant failure.
 
 A composition input uses the same clone boundary, then transfers the live
 consumer id and byte handle into the body-local node-buffer registry. Body
@@ -53,8 +63,8 @@ output together, so it extends that same reservation before allocating the
 output and reduces it to the canonicalized footprint as soon as the seed
 allocation drops. Slot admission then atomically replaces the transient
 consumer wrapper with the ordinary spill-aware wrapper under the same id.
-Body execution swaps the parent `node_buffers`, node-buffer registrations, shared
-drain counts, source-record table, body references, and window state as one
+Body execution swaps the parent `node_buffers`, node-buffer registrations,
+reader ledger, source-record table, body references, and window state as one
 scope. Body dispatch and output harvest are captured before a single cleanup
 path unregisters body residue and restores every parent map, so a successful
 body, a dispatch error, and a harvest error have the same ownership lifecycle.

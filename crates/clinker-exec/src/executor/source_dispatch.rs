@@ -17,7 +17,8 @@ use crate::executor::dispatch::{
     ExecutorContext, MERGED_SOURCE_FILE, NodeBufferKey, admit_node_buffer,
     admit_node_buffer_transferred, build_engine_stamped_tail, canonicalize_to_source_schema,
     estimate_node_buffer_bytes, finalize_node_rooted_windows, node_buffer_spill_allowed,
-    seed_source_vars_for_record, source_file_arc_of, tee_emit_to_region_input_buffers,
+    require_node_buffer_input_transferred, seed_source_vars_for_record, source_file_arc_of,
+    tee_emit_to_region_input_buffers,
 };
 use crate::executor::node_buffer::TransientNodeBufferReservation;
 use clinker_plan::error::PipelineError;
@@ -86,7 +87,15 @@ pub(crate) fn dispatch_source(
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
         Option<TransientNodeBufferReservation>,
-    ) = if let Some(seeded) = ctx.node_buffers.remove(&source_slot_key) {
+    ) = if has_seeded_own_slot {
+        let seeded = require_node_buffer_input_transferred(
+            ctx,
+            source_slot_key.clone(),
+            name,
+            "composition input",
+            None,
+        )?;
+        let (seeded, reservation) = seeded.into_parts();
         // Body-context port source — records were seeded by
         // `execute_composition_body` from parent-scope
         // output. The seeded records still carry the parent
@@ -107,9 +116,7 @@ pub(crate) fn dispatch_source(
         // handle to the actual canonicalized footprint; admission later
         // atomically changes only the wrapper while retaining this id and
         // handle.
-        let Some((consumer_id, consumer_handle)) =
-            ctx.node_buffer_consumer_ids.remove(&source_slot_key)
-        else {
+        let Some(reservation) = reservation else {
             return Err(PipelineError::Internal {
                 op: "executor",
                 node: name.clone(),
@@ -117,11 +124,6 @@ pub(crate) fn dispatch_source(
                     .to_string(),
             });
         };
-        let reservation = TransientNodeBufferReservation::from_registration(
-            Arc::clone(&ctx.memory_budget),
-            consumer_id,
-            consumer_handle,
-        );
         let prospective_bytes = source_schema
             .as_ref()
             .map(|schema| seeded.estimated_memory_bytes_for_columns(schema.column_count()))
@@ -257,20 +259,27 @@ pub(crate) fn dispatch_source(
     finalize_node_rooted_windows(ctx, current_dag, node_idx, &records)?;
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &records)?;
     let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-    let nb = if let Some(reservation) = transferred_reservation {
+    if let Some(reservation) = transferred_reservation {
         admit_node_buffer_transferred(
             ctx,
+            current_dag,
+            name,
+            node_idx,
+            records,
+            source_puncts,
+            reservation,
+        )?;
+    } else {
+        admit_node_buffer(
+            ctx,
+            current_dag,
             name,
             node_idx,
             records,
             source_puncts,
             spill_allowed,
-            reservation,
-        )?
-    } else {
-        admit_node_buffer(ctx, name, node_idx, records, source_puncts, spill_allowed)?
-    };
-    ctx.node_buffers.insert(node_idx.into(), nb);
+        )?;
+    }
 
     Ok(())
 }

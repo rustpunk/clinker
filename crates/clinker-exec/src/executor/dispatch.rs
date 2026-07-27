@@ -522,6 +522,137 @@ impl From<NodeIndex> for NodeBufferKey {
     }
 }
 
+/// Remaining materialized readers for each published node-buffer slot.
+///
+/// Counts are declared when the producer publishes the slot, rather than
+/// inferred when a consumer happens to run. That makes the last-reader choice
+/// independent of the memory-arbitrated dispatch order and keeps each output
+/// port's ownership separate.
+#[derive(Default)]
+pub(crate) struct NodeBufferReaderLedger {
+    remaining: HashMap<NodeBufferKey, usize>,
+}
+
+impl NodeBufferReaderLedger {
+    pub(crate) fn publish(
+        &mut self,
+        key: NodeBufferKey,
+        readers: usize,
+        producer_name: &str,
+    ) -> Result<(), PipelineError> {
+        if readers == 0 {
+            return Err(PipelineError::Internal {
+                op: "executor",
+                node: producer_name.to_string(),
+                detail: format!("node-buffer slot {key:?} was published with zero readers"),
+            });
+        }
+        match self.remaining.entry(key.clone()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(readers);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(PipelineError::Internal {
+                    op: "executor",
+                    node: producer_name.to_string(),
+                    detail: format!(
+                        "node-buffer slot {key:?} was published while an earlier reader count was still live"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn remaining_for_slot(
+        &self,
+        key: &NodeBufferKey,
+        slot_exists: bool,
+        registration_exists: bool,
+        consumer_name: &str,
+    ) -> Result<Option<usize>, PipelineError> {
+        let remaining = self.remaining.get(key).copied();
+        match (remaining, slot_exists, registration_exists) {
+            (None, false, false) => Ok(None),
+            (None, _, _) => Err(node_buffer_reader_mismatch_error(
+                consumer_name,
+                key,
+                "slot or memory registration exists without a remaining-reader count",
+            )),
+            (Some(0), _, _) => Err(node_buffer_reader_mismatch_error(
+                consumer_name,
+                key,
+                "zero remaining readers were retained",
+            )),
+            (Some(_), false, _) => Err(node_buffer_reader_mismatch_error(
+                consumer_name,
+                key,
+                "positive remaining-reader count exists without its slot",
+            )),
+            (Some(_), true, false) => Err(node_buffer_reader_mismatch_error(
+                consumer_name,
+                key,
+                "published slot exists without its memory registration",
+            )),
+            (Some(remaining), true, true) => Ok(Some(remaining)),
+        }
+    }
+
+    fn complete_clone(
+        &mut self,
+        key: &NodeBufferKey,
+        consumer_name: &str,
+    ) -> Result<(), PipelineError> {
+        let Some(remaining) = self.remaining.get_mut(key) else {
+            return Err(node_buffer_reader_mismatch_error(
+                consumer_name,
+                key,
+                "reader count disappeared before clone completion",
+            ));
+        };
+        if *remaining <= 1 {
+            return Err(node_buffer_reader_mismatch_error(
+                consumer_name,
+                key,
+                "clone completion did not have more than one remaining reader",
+            ));
+        }
+        *remaining -= 1;
+        Ok(())
+    }
+
+    fn complete_last(
+        &mut self,
+        key: &NodeBufferKey,
+        consumer_name: &str,
+    ) -> Result<(), PipelineError> {
+        match self.remaining.get(key).copied() {
+            Some(1) => {
+                self.remaining.remove(key);
+                Ok(())
+            }
+            Some(remaining) => Err(node_buffer_reader_mismatch_error(
+                consumer_name,
+                key,
+                &format!("last-reader completion still had {remaining} readers"),
+            )),
+            None => Err(node_buffer_reader_mismatch_error(
+                consumer_name,
+                key,
+                "reader count disappeared before last-reader completion",
+            )),
+        }
+    }
+
+    fn discard(&mut self, key: &NodeBufferKey) {
+        self.remaining.remove(key);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining.is_empty()
+    }
+}
+
 /// Mutable per-walk and borrowed plan-time state passed to
 /// [`dispatch_plan_node`].
 ///
@@ -605,12 +736,15 @@ pub(crate) struct ExecutorContext<'a> {
             std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
         ),
     >,
-    /// Count of consumers that have already drained a shared predecessor-slot
-    /// (a producer output port fanned out to more than one Merge/Combine).
-    /// `drain_or_clone_shared_input` clones the slot for every consumer except
-    /// the last, which removes it — the count makes "who is last" independent
-    /// of the memory-arbitrated dispatch order.
-    pub(crate) shared_input_drains: HashMap<NodeBufferKey, usize>,
+    /// Producer-declared remaining readers for every materialized slot. Body
+    /// scopes swap this ledger alongside `node_buffers` so equal local
+    /// `NodeIndex` values cannot collide across scopes.
+    pub(crate) node_buffer_readers: NodeBufferReaderLedger,
+    /// Immutable reader cardinality for each producer-owned slot in the
+    /// current DAG scope. Built once in one edge pass, then consulted in O(1)
+    /// at publication so wide multi-port fan-out does not rescan the graph per
+    /// port. Body scopes replace it alongside the mutable slot ledger.
+    pub(crate) planned_node_buffer_readers: HashMap<NodeBufferKey, usize>,
     /// Per-slot consumer registration for window-runtime arenas.
     /// `finalize_node_rooted_windows` registers an `ArenaConsumer` with
     /// the pipeline-scoped arbitrator after each arena builds and stores
@@ -1521,9 +1655,6 @@ pub(crate) fn tee_emit_to_region_input_buffers(
     emit_rows: &[(Record, u64)],
 ) -> Result<(), PipelineError> {
     use petgraph::visit::EdgeRef;
-    let producer_region_producer = current_dag
-        .deferred_region_at(producer_idx)
-        .map(|r| r.producer);
     let active_body = ctx.window_runtime.active_stack.last().copied();
     let mut crossing_edges: Vec<petgraph::graph::EdgeIndex> = Vec::new();
     for edge_ref in current_dag
@@ -1531,20 +1662,7 @@ pub(crate) fn tee_emit_to_region_input_buffers(
         .edges_directed(producer_idx, petgraph::Direction::Outgoing)
     {
         let target = edge_ref.target();
-        let target_region_producer = current_dag.deferred_region_at(target).map(|r| r.producer);
-        let crosses = match (producer_region_producer, target_region_producer) {
-            // Non-deferred source feeding a deferred consumer: park
-            // narrow rows so the commit-time dispatcher can re-feed
-            // the deferred member without losing the upstream emit.
-            (None, Some(_)) => true,
-            // Distinct deferred regions abutting at this edge.
-            (Some(p), Some(t)) if p != t => true,
-            // Same region (internal edge) or both non-deferred: no
-            // cross-region tee needed; node_buffers carries the
-            // payload already.
-            _ => false,
-        };
-        if crosses {
+        if crosses_into_deferred_consumer(current_dag, producer_idx, target) {
             crossing_edges.push(edge_ref.id());
         }
     }
@@ -1560,6 +1678,30 @@ pub(crate) fn tee_emit_to_region_input_buffers(
         }
     }
     Ok(())
+}
+
+/// Whether an edge must be parked for commit-time deferred dispatch.
+///
+/// Region producers still execute on the forward pass, even though
+/// [`ExecutionPlanDag::deferred_region_at`] reports that they participate in a
+/// region. Only members and outputs skipped by the forward dispatcher consume
+/// a parked generation.
+pub(crate) fn crosses_into_deferred_consumer(
+    current_dag: &ExecutionPlanDag,
+    producer: NodeIndex,
+    target: NodeIndex,
+) -> bool {
+    if !current_dag.is_deferred_consumer(target) {
+        return false;
+    }
+    let producer_region = current_dag
+        .deferred_region_at(producer)
+        .map(|region| region.producer);
+    let target_region = current_dag
+        .deferred_region_at(target)
+        .map(|region| region.producer);
+    matches!((producer_region, target_region), (None, Some(_)))
+        || matches!((producer_region, target_region), (Some(source), Some(target)) if source != target)
 }
 
 /// Per-row heuristic byte cost. Returns `0` for an empty slice. The
@@ -1635,17 +1777,17 @@ pub(crate) fn node_buffer_spill_allowed(
 /// composition input-port slots stay memory-bound (their consumers
 /// reach `NodeBuffer::clone_memory_only`, which panics on spill
 /// variants).
-/// Remove a `node_buffers` slot and unregister its paired
-/// `NodeBufferConsumer` from the pipeline-scoped arbitrator. Mirrors
-/// `HashMap::remove` shape — returns the buffer if the slot was
-/// occupied, `None` otherwise. Every drain site that previously
-/// called `ctx.node_buffers.remove(&idx)` routes through this helper
-/// so the arbitrator's registry stays aligned with the live slot map.
+/// Discard a `node_buffers` slot and all paired accounting state.
+///
+/// This is a cleanup/replacement primitive, not a logical read: semantic
+/// consumers must use [`require_node_buffer_input`] so shared slots clone or
+/// transfer according to their producer-declared reader count.
 pub(crate) fn drain_node_buffer_slot(
     ctx: &mut ExecutorContext<'_>,
     key: impl Into<NodeBufferKey>,
 ) -> Option<NodeBuffer> {
     let key = key.into();
+    ctx.node_buffer_readers.discard(&key);
     if let Some((id, _)) = ctx.node_buffer_consumer_ids.remove(&key) {
         ctx.memory_budget.unregister_consumer(id);
     }
@@ -1672,17 +1814,185 @@ pub(crate) fn missing_node_buffer_input_error(
     }
 }
 
-/// Drain a required materialized input slot, failing loudly when the slot is
-/// absent. A present empty [`NodeBuffer`] remains a valid zero-row input.
-pub(crate) fn require_node_buffer_slot(
+/// One materialized slot read plus the optional reservation for an earlier
+/// fan-out reader's transient clone. The guard must remain live through the
+/// consumer's complete synchronous operation.
+#[must_use = "a materialized input clone must retain its transient reservation"]
+pub(crate) struct NodeBufferInput {
+    buffer: NodeBuffer,
+    reservation: Option<TransientNodeBufferReservation>,
+}
+
+impl NodeBufferInput {
+    /// Split the input from its optional clone/transfer lifetime guard.
+    pub(crate) fn into_parts(self) -> (NodeBuffer, Option<TransientNodeBufferReservation>) {
+        (self.buffer, self.reservation)
+    }
+}
+
+#[cold]
+fn node_buffer_reader_mismatch_error(
+    consumer_name: &str,
+    key: &NodeBufferKey,
+    detail: &str,
+) -> PipelineError {
+    PipelineError::Internal {
+        op: "executor",
+        node: consumer_name.to_string(),
+        detail: format!("node-buffer reader ledger mismatch for slot {key:?}: {detail}"),
+    }
+}
+
+/// Verify that a successfully completed dispatch scope consumed every
+/// published slot and released every paired registration. Error and interrupt
+/// unwinds skip this check and use cleanup-only discard so the original cause
+/// remains authoritative.
+pub(crate) fn validate_completed_node_buffer_scope(
+    ctx: &ExecutorContext<'_>,
+    scope_name: &str,
+) -> Result<(), PipelineError> {
+    if ctx.node_buffers.is_empty()
+        && ctx.node_buffer_readers.is_empty()
+        && ctx.node_buffer_consumer_ids.is_empty()
+    {
+        return Ok(());
+    }
+
+    Err(PipelineError::Internal {
+        op: "executor",
+        node: scope_name.to_string(),
+        detail: format!(
+            "completed node-buffer scope retained {} slot(s), {} reader-count entry/entries, and {} memory registration(s)",
+            ctx.node_buffers.len(),
+            ctx.node_buffer_readers.remaining.len(),
+            ctx.node_buffer_consumer_ids.len(),
+        ),
+    })
+}
+
+/// Read one published materialized slot according to its producer-declared
+/// remaining-reader count.
+///
+/// Earlier readers receive a reservation-backed clone and decrement only
+/// after that clone succeeds. The last reader removes the original slot and
+/// unregisters its ordinary node-buffer consumer. A present empty buffer is a
+/// valid zero-row input; missing, zero, or inconsistent ledger state fails as
+/// an internal executor invariant instead of becoming an empty stream.
+pub(crate) fn require_node_buffer_input(
     ctx: &mut ExecutorContext<'_>,
     key: impl Into<NodeBufferKey>,
     consumer_name: &str,
     producer_name: &str,
     producer_port: Option<&str>,
-) -> Result<NodeBuffer, PipelineError> {
-    drain_node_buffer_slot(ctx, key)
-        .ok_or_else(|| missing_node_buffer_input_error(consumer_name, producer_name, producer_port))
+) -> Result<NodeBufferInput, PipelineError> {
+    require_node_buffer_input_inner(
+        ctx,
+        key.into(),
+        consumer_name,
+        producer_name,
+        producer_port,
+        false,
+    )
+}
+
+/// Composition-boundary variant of [`require_node_buffer_input`]. On the last
+/// reader, ownership of the original slot's existing registration moves into
+/// the returned RAII guard instead of being unregistered. This keeps the
+/// allocation continuously charged while it is re-seeded into a body scope.
+pub(crate) fn require_node_buffer_input_transferred(
+    ctx: &mut ExecutorContext<'_>,
+    key: impl Into<NodeBufferKey>,
+    consumer_name: &str,
+    producer_name: &str,
+    producer_port: Option<&str>,
+) -> Result<NodeBufferInput, PipelineError> {
+    require_node_buffer_input_inner(
+        ctx,
+        key.into(),
+        consumer_name,
+        producer_name,
+        producer_port,
+        true,
+    )
+}
+
+fn require_node_buffer_input_inner(
+    ctx: &mut ExecutorContext<'_>,
+    key: NodeBufferKey,
+    consumer_name: &str,
+    producer_name: &str,
+    producer_port: Option<&str>,
+    transfer_last_registration: bool,
+) -> Result<NodeBufferInput, PipelineError> {
+    let Some(remaining) = ctx.node_buffer_readers.remaining_for_slot(
+        &key,
+        ctx.node_buffers.contains_key(&key),
+        ctx.node_buffer_consumer_ids.contains_key(&key),
+        consumer_name,
+    )?
+    else {
+        return Err(missing_node_buffer_input_error(
+            consumer_name,
+            producer_name,
+            producer_port,
+        ));
+    };
+    let Some(buffer) = ctx.node_buffers.get(&key) else {
+        return Err(node_buffer_reader_mismatch_error(
+            consumer_name,
+            &key,
+            "slot disappeared after reader-ledger validation",
+        ));
+    };
+
+    if remaining > 1 {
+        let reserved = clone_node_buffer_reserved(buffer, &ctx.memory_budget, consumer_name)?;
+        let (buffer, reservation) = reserved.into_parts();
+        ctx.node_buffer_readers
+            .complete_clone(&key, consumer_name)?;
+        return Ok(NodeBufferInput {
+            buffer,
+            reservation: Some(reservation),
+        });
+    }
+
+    ctx.node_buffer_readers.complete_last(&key, consumer_name)?;
+    if !transfer_last_registration {
+        let error_key = key.clone();
+        let buffer = drain_node_buffer_slot(ctx, key).ok_or_else(|| {
+            node_buffer_reader_mismatch_error(
+                consumer_name,
+                &error_key,
+                "last-reader slot disappeared during synchronous removal",
+            )
+        })?;
+        return Ok(NodeBufferInput {
+            buffer,
+            reservation: None,
+        });
+    }
+
+    let buffer = ctx.node_buffers.remove(&key).ok_or_else(|| {
+        node_buffer_reader_mismatch_error(
+            consumer_name,
+            &key,
+            "last-reader slot disappeared during synchronous transfer",
+        )
+    })?;
+    let reservation = ctx
+        .node_buffer_consumer_ids
+        .remove(&key)
+        .map(|(id, handle)| {
+            TransientNodeBufferReservation::from_registration(
+                Arc::clone(&ctx.memory_budget),
+                id,
+                handle,
+            )
+        });
+    Ok(NodeBufferInput {
+        buffer,
+        reservation,
+    })
 }
 
 /// Drain a single-input consumer's materialized input using the executor's
@@ -1700,10 +2010,10 @@ pub(crate) fn require_single_input_node_buffer_slot(
     consumer_name: &str,
     producer_name: &str,
     producer_port: Option<&str>,
-) -> Result<NodeBuffer, PipelineError> {
+) -> Result<NodeBufferInput, PipelineError> {
     let key =
         single_input_node_buffer_key(&ctx.node_buffers, consumer_idx, producer_idx, producer_port);
-    require_node_buffer_slot(ctx, key, consumer_name, producer_name, producer_port)
+    require_node_buffer_input(ctx, key, consumer_name, producer_name, producer_port)
 }
 
 /// Resolve the materialized slot key for a single-input consumer without
@@ -1725,8 +2035,17 @@ pub(crate) fn single_input_node_buffer_key(
 
 #[cfg(test)]
 mod required_node_buffer_tests {
-    use super::missing_node_buffer_input_error;
+    use super::{NodeBufferKey, NodeBufferReaderLedger, missing_node_buffer_input_error};
     use clinker_plan::error::PipelineError;
+    use petgraph::graph::NodeIndex;
+
+    fn internal_detail(error: PipelineError) -> String {
+        let PipelineError::Internal { op, detail, .. } = error else {
+            panic!("reader-ledger invariants must use the typed internal error");
+        };
+        assert_eq!(op, "executor");
+        detail
+    }
 
     #[test]
     fn missing_input_error_names_consumer_producer_and_port() {
@@ -1741,108 +2060,214 @@ mod required_node_buffer_tests {
         assert!(detail.contains("producer 'route_orders' on port 'matched'"));
         assert!(detail.contains("run stopped instead of treating it as empty"));
     }
-}
 
-/// One shared-predecessor input plus the optional reservation for a transient
-/// duplicate. Consumers retain the guard through their complete synchronous
-/// Merge/Combine operation, not only through conversion into record vectors.
-#[must_use = "a cloned shared input must retain its transient reservation"]
-pub(crate) struct SharedNodeBufferInput {
-    buffer: NodeBuffer,
-    reservation: Option<TransientNodeBufferReservation>,
-}
+    #[test]
+    fn reader_ledger_rejects_slot_count_and_registration_mismatches() {
+        let key = NodeBufferKey::from(NodeIndex::new(7));
+        let mut ledger = NodeBufferReaderLedger::default();
 
-impl SharedNodeBufferInput {
-    fn drained(buffer: NodeBuffer) -> Self {
-        Self {
-            buffer,
-            reservation: None,
-        }
+        let detail = internal_detail(
+            ledger
+                .remaining_for_slot(&key, true, true, "consumer")
+                .expect_err("a slot without its count must fail"),
+        );
+        assert!(detail.contains("without a remaining-reader count"));
+
+        ledger
+            .publish(key.clone(), 2, "producer")
+            .expect("first publication is valid");
+        let detail = internal_detail(
+            ledger
+                .remaining_for_slot(&key, false, true, "consumer")
+                .expect_err("a count without its slot must fail"),
+        );
+        assert!(detail.contains("without its slot"));
+
+        let detail = internal_detail(
+            ledger
+                .remaining_for_slot(&key, true, false, "consumer")
+                .expect_err("a slot without its registration must fail"),
+        );
+        assert!(detail.contains("without its memory registration"));
     }
 
-    /// Split the input into its buffer and optional clone-lifetime guard.
-    pub(crate) fn into_parts(self) -> (NodeBuffer, Option<TransientNodeBufferReservation>) {
-        (self.buffer, self.reservation)
-    }
-}
+    #[test]
+    fn reader_ledger_keeps_ports_and_publications_exact() {
+        let main = NodeBufferKey::with_port(NodeIndex::new(4), Some("main"));
+        let removed = NodeBufferKey::with_port(NodeIndex::new(4), Some("removed"));
+        let mut ledger = NodeBufferReaderLedger::default();
+        ledger
+            .publish(main.clone(), 3, "producer")
+            .expect("main port publication");
+        ledger
+            .publish(removed.clone(), 1, "producer")
+            .expect("removed port publication");
 
-/// Take a predecessor-slot reader's input from `key`, cloning the slot (leaving
-/// it intact) when other predecessor-slot consumers of the same
-/// `(producer, port)` slot still need it — so one producer output port fanned
-/// out to several Merge/Combine consumers reaches all of them, not just the
-/// first to drain. The last consumer removes the slot; every earlier consumer
-/// receives a reserved clone. Counting drains rather than comparing
-/// `NodeIndex` keeps this correct under memory-arbitrated dispatch order.
-///
-/// A fanned port has more than one outgoing edge on its producer, so
-/// [`node_buffer_spill_allowed`] keeps the slot resident. The clone preserves
-/// the full `StreamEvent` vector, including punctuations, and its returned guard
-/// keeps the duplicate charge live through the consuming Merge/Combine arm.
-pub(crate) fn drain_or_clone_shared_input(
-    ctx: &mut ExecutorContext<'_>,
-    current_dag: &ExecutionPlanDag,
-    key: NodeBufferKey,
-    consumer_name: &str,
-) -> Result<Option<SharedNodeBufferInput>, PipelineError> {
-    use petgraph::visit::EdgeRef;
-    let port = key.producer_port.as_deref();
-    let total_consumers = current_dag
-        .graph
-        .edges_directed(key.node, Direction::Outgoing)
-        .filter(|e| {
-            e.weight().producer_port.as_deref() == port
-                && crate::executor::cull_dispatch::reads_predecessor_slot(
-                    &current_dag.graph[e.target()],
-                )
-        })
-        .count();
-    // Single consumer (the overwhelming common case): plain drain, no counting.
-    // This also covers the two paths that count a consumer but skip its drain —
-    // a streaming-probe driver (its producer is certified single-outgoing-edge,
-    // so `total_consumers == 1`) and a fused-Source Merge (streams live channels,
-    // materializes no `(source, None)` slot) — so neither can stall the counter.
-    if total_consumers <= 1 {
-        return Ok(drain_node_buffer_slot(ctx, key).map(SharedNodeBufferInput::drained));
+        assert_eq!(
+            ledger
+                .remaining_for_slot(&main, true, true, "consumer")
+                .expect("main ledger state"),
+            Some(3)
+        );
+        assert_eq!(
+            ledger
+                .remaining_for_slot(&removed, true, true, "consumer")
+                .expect("removed ledger state"),
+            Some(1)
+        );
+        let detail = internal_detail(
+            ledger
+                .publish(main.clone(), 4, "producer")
+                .expect_err("a live slot cannot be republished"),
+        );
+        assert!(detail.contains("earlier reader count was still live"));
+        assert_eq!(
+            ledger
+                .remaining_for_slot(&main, true, true, "consumer")
+                .expect("duplicate rejection preserves original count"),
+            Some(3)
+        );
     }
-    let drained = ctx.shared_input_drains.entry(key.clone()).or_insert(0);
-    *drained += 1;
-    if *drained >= total_consumers {
-        ctx.shared_input_drains.remove(&key);
-        Ok(drain_node_buffer_slot(ctx, key).map(SharedNodeBufferInput::drained))
-    } else {
-        // The original slot keeps its own registered charge until the last
-        // consumer removes it. Register the duplicate before allocating it and
-        // return the must-use guard with the cloned buffer so this consumer's
-        // complete synchronous operation stays charged as well.
-        let Some(buffer) = ctx.node_buffers.get(&key) else {
-            return Ok(None);
-        };
-        let reserved = clone_node_buffer_reserved(buffer, &ctx.memory_budget, consumer_name)?;
-        let (buffer, reservation) = reserved.into_parts();
-        Ok(Some(SharedNodeBufferInput {
-            buffer,
-            reservation: Some(reservation),
-        }))
+
+    #[test]
+    fn reader_ledger_decrements_clones_then_removes_the_last_reader() {
+        let key = NodeBufferKey::from(NodeIndex::new(9));
+        let mut ledger = NodeBufferReaderLedger::default();
+        ledger
+            .publish(key.clone(), 3, "producer")
+            .expect("three-reader publication");
+
+        ledger
+            .complete_clone(&key, "first")
+            .expect("first reserved clone completes");
+        assert_eq!(
+            ledger
+                .remaining_for_slot(&key, true, true, "second")
+                .expect("second reader sees the live slot"),
+            Some(2)
+        );
+        ledger
+            .complete_clone(&key, "second")
+            .expect("second reserved clone completes");
+        assert_eq!(
+            ledger
+                .remaining_for_slot(&key, true, true, "last")
+                .expect("last reader sees the original"),
+            Some(1)
+        );
+        ledger
+            .complete_last(&key, "last")
+            .expect("last reader removes the generation");
+        assert_eq!(
+            ledger
+                .remaining_for_slot(&key, false, false, "after")
+                .expect("completed generation has no residue"),
+            None
+        );
     }
 }
 
 pub(crate) fn admit_node_buffer(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_name: &str,
+    key: impl Into<NodeBufferKey>,
+    rows: Vec<(Record, u64)>,
+    puncts: Vec<crate::executor::stream_event::Punctuation>,
+    spill_allowed: bool,
+) -> Result<(), PipelineError> {
+    let slot_key = key.into();
+    let mut readers = planned_materialized_reader_count(ctx, current_dag, &slot_key)?;
+    // A composition body's terminal output is harvested by the scope driver,
+    // not represented by an outgoing graph edge. Count that synthetic reader
+    // at publication so body slots still obey the same strict ledger contract.
+    if readers == 0 && ctx.current_body_node_input_refs.is_some() {
+        readers = 1;
+    }
+    admit_node_buffer_with_readers(
+        ctx,
+        node_name,
+        slot_key,
+        rows,
+        puncts,
+        spill_allowed,
+        readers,
+    )
+}
+
+/// Declare the structural readers for a producer slot that was materialized by
+/// a specialized admission path (for example, adopted spill runs).
+pub(crate) fn declare_node_buffer_readers(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    node_name: &str,
+    key: impl Into<NodeBufferKey>,
+) -> Result<(), PipelineError> {
+    let key = key.into();
+    let readers = planned_materialized_reader_count(ctx, current_dag, &key)?;
+    ctx.node_buffer_readers.publish(key, readers, node_name)
+}
+
+/// Admit a slot whose reader set is established by a scope-local publication
+/// rather than by all outgoing edges in the DAG. Route/Cull successor-local
+/// slots and commit-time single-edge re-seeds use this path with one reader.
+pub(crate) fn admit_node_buffer_with_readers(
     ctx: &mut ExecutorContext<'_>,
     node_name: &str,
     key: impl Into<NodeBufferKey>,
     rows: Vec<(Record, u64)>,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
     spill_allowed: bool,
-) -> Result<NodeBuffer, PipelineError> {
-    admit_node_buffer_inner(
+    readers: usize,
+) -> Result<(), PipelineError> {
+    let slot_key = key.into();
+    if readers == 0 {
+        return Ok(());
+    }
+    if ctx.node_buffers.contains_key(&slot_key)
+        || ctx.node_buffer_consumer_ids.contains_key(&slot_key)
+    {
+        return Err(PipelineError::Internal {
+            op: "executor",
+            node: node_name.to_string(),
+            detail: format!(
+                "node-buffer slot {slot_key:?} was republished without first discarding the previous slot"
+            ),
+        });
+    }
+    ctx.node_buffer_readers
+        .publish(slot_key.clone(), readers, node_name)?;
+    match admit_node_buffer_inner(
         ctx,
         node_name,
-        key.into(),
+        slot_key.clone(),
         rows,
         puncts,
         spill_allowed,
         None,
-    )
+    ) {
+        Ok(buffer) => {
+            if ctx.node_buffers.insert(slot_key.clone(), buffer).is_some() {
+                ctx.node_buffer_readers.discard(&slot_key);
+                return Err(PipelineError::Internal {
+                    op: "executor",
+                    node: node_name.to_string(),
+                    detail: format!(
+                        "node-buffer slot {slot_key:?} changed during synchronous publication"
+                    ),
+                });
+            }
+            Ok(())
+        }
+        Err(error) => {
+            ctx.node_buffer_readers.discard(&slot_key);
+            if let Some((id, handle)) = ctx.node_buffer_consumer_ids.remove(&slot_key) {
+                handle.set_bytes(0);
+                ctx.memory_budget.unregister_consumer(id);
+            }
+            Err(error)
+        }
+    }
 }
 
 /// Admit a composition port Source's canonicalized rows while transferring
@@ -1854,22 +2279,125 @@ pub(crate) fn admit_node_buffer(
 /// gap or a duplicate charge.
 pub(crate) fn admit_node_buffer_transferred(
     ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
     node_name: &str,
     key: impl Into<NodeBufferKey>,
     rows: Vec<(Record, u64)>,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
-    spill_allowed: bool,
     reservation: TransientNodeBufferReservation,
-) -> Result<NodeBuffer, PipelineError> {
-    admit_node_buffer_inner(
+) -> Result<(), PipelineError> {
+    let slot_key = key.into();
+    let spill_allowed = node_buffer_spill_allowed(current_dag, slot_key.node);
+    let mut readers = planned_materialized_reader_count(ctx, current_dag, &slot_key)?;
+    if readers == 0 && ctx.current_body_node_input_refs.is_some() {
+        readers = 1;
+    }
+    if readers == 0 {
+        return Ok(());
+    }
+    if ctx.node_buffers.contains_key(&slot_key)
+        || ctx.node_buffer_consumer_ids.contains_key(&slot_key)
+    {
+        return Err(PipelineError::Internal {
+            op: "executor",
+            node: node_name.to_string(),
+            detail: format!(
+                "node-buffer slot {slot_key:?} was republished without first discarding the previous slot"
+            ),
+        });
+    }
+    ctx.node_buffer_readers
+        .publish(slot_key.clone(), readers, node_name)?;
+    match admit_node_buffer_inner(
         ctx,
         node_name,
-        key.into(),
+        slot_key.clone(),
         rows,
         puncts,
         spill_allowed,
         Some(reservation),
-    )
+    ) {
+        Ok(buffer) => {
+            if ctx.node_buffers.insert(slot_key.clone(), buffer).is_some() {
+                ctx.node_buffer_readers.discard(&slot_key);
+                return Err(PipelineError::Internal {
+                    op: "executor",
+                    node: node_name.to_string(),
+                    detail: format!(
+                        "node-buffer slot {slot_key:?} changed during synchronous publication"
+                    ),
+                });
+            }
+            Ok(())
+        }
+        Err(error) => {
+            ctx.node_buffer_readers.discard(&slot_key);
+            if let Some((id, handle)) = ctx.node_buffer_consumer_ids.remove(&slot_key) {
+                handle.set_bytes(0);
+                ctx.memory_budget.unregister_consumer(id);
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Build the exact structural reader cardinality for every producer-owned
+/// materialized slot in one O(V + E) pass per DAG scope.
+///
+/// Cross-region edges consume the separately parked/re-seeded generation, not
+/// the producer's forward slot. Route and Cull also pre-fork simple
+/// single-input consumers into successor-local slots, so only their
+/// multi-input predecessor-slot readers contribute here.
+pub(crate) fn planned_materialized_reader_counts(
+    current_dag: &ExecutionPlanDag,
+) -> HashMap<NodeBufferKey, usize> {
+    use petgraph::visit::EdgeRef;
+
+    let mut counts = HashMap::new();
+    for producer in current_dag.graph.node_indices() {
+        let producer_preforks = matches!(
+            current_dag.graph[producer],
+            PlanNode::Route { .. } | PlanNode::Cull { .. }
+        );
+        for edge in current_dag
+            .graph
+            .edges_directed(producer, Direction::Outgoing)
+        {
+            let target = edge.target();
+            if crosses_into_deferred_consumer(current_dag, producer, target)
+                || (producer_preforks
+                    && !crate::executor::cull_dispatch::reads_predecessor_slot(
+                        &current_dag.graph[target],
+                    ))
+            {
+                continue;
+            }
+            let key = NodeBufferKey::with_port(producer, edge.weight().producer_port.as_deref());
+            *counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Read the precomputed publication cardinality in O(1), while failing loudly
+/// if a slot key belongs to a different DAG scope.
+fn planned_materialized_reader_count(
+    ctx: &ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    key: &NodeBufferKey,
+) -> Result<usize, PipelineError> {
+    if current_dag.graph.node_weight(key.node).is_none() {
+        return Err(PipelineError::Internal {
+            op: "executor",
+            node: format!("node-{}", key.node.index()),
+            detail: format!("node-buffer slot {key:?} does not belong to the current DAG scope"),
+        });
+    }
+    Ok(ctx
+        .planned_node_buffer_readers
+        .get(key)
+        .copied()
+        .unwrap_or(0))
 }
 
 fn admit_node_buffer_inner(
@@ -1881,12 +2409,6 @@ fn admit_node_buffer_inner(
     spill_allowed: bool,
     transferred_reservation: Option<TransientNodeBufferReservation>,
 ) -> Result<NodeBuffer, PipelineError> {
-    if rows.is_empty() && puncts.is_empty() {
-        // An empty canonicalized composition seed owns no resident buffer.
-        // Dropping the still-RAII reservation releases its registration.
-        drop(transferred_reservation);
-        return Ok(NodeBuffer::Memory(Vec::new()));
-    }
     let bytes = estimate_node_buffer_bytes(&rows);
     // Register a NodeBufferConsumer with the pipeline-scoped
     // arbitrator for every slot admission. The handle's `bytes`
@@ -3130,15 +3652,15 @@ pub(crate) fn transform_fused_consume(
 
     finalize_node_rooted_windows(ctx, current_dag, node_idx, &output_records)?;
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &output_records)?;
-    let nb = admit_node_buffer(
+    admit_node_buffer(
         ctx,
+        current_dag,
         name,
         node_idx,
         output_records,
         forwarded_puncts,
         node_buffer_spill_allowed(current_dag, node_idx),
     )?;
-    ctx.node_buffers.insert(node_idx.into(), nb);
     Ok(())
 }
 

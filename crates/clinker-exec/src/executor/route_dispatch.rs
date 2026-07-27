@@ -14,9 +14,9 @@ use petgraph::graph::NodeIndex;
 
 use crate::executor::cull_dispatch::reads_predecessor_slot;
 use crate::executor::dispatch::{
-    ExecutorContext, NodeBufferKey, admit_node_buffer, advance_cursor, drain_node_buffer_slot,
-    missing_node_buffer_input_error, node_buffer_spill_allowed, push_dlq,
-    record_error_to_buffer_if_grouped, require_node_buffer_slot, source_file_arc_of,
+    ExecutorContext, NodeBufferKey, admit_node_buffer, admit_node_buffer_with_readers,
+    advance_cursor, crosses_into_deferred_consumer, node_buffer_spill_allowed, push_dlq,
+    record_error_to_buffer_if_grouped, require_node_buffer_input, source_file_arc_of,
     source_name_arc_of, stream_linear_producer_emit,
 };
 use crate::executor::schema_check::check_input_schema;
@@ -56,64 +56,52 @@ pub(crate) fn dispatch_route(
         .graph
         .neighbors_directed(node_idx, Direction::Incoming)
         .collect();
-    let (input_records, input_puncts): (
-        Vec<(Record, u64)>,
-        Vec<crate::executor::stream_event::Punctuation>,
-    ) = if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
-        own_buf.drain_split()?
-    } else {
-        let pred_buf = if predecessors.len() == 1 {
-            let pred = predecessors[0];
-            let producer_port = current_dag
+    let authored_input = ctx
+        .current_body_node_input_refs
+        .as_ref()
+        .and_then(|refs| refs.get(name.as_str()))
+        .and_then(|refs| refs.first())
+        .map(String::as_str);
+    let own_key = NodeBufferKey::from(node_idx);
+    let (input_key, producer_name, producer_port): (NodeBufferKey, String, Option<String>) =
+        if ctx.node_buffers.contains_key(&own_key) {
+            let (producer, port) = authored_input
+                .and_then(|input| input.split_once('.'))
+                .map_or(
+                    (authored_input.unwrap_or("composition input"), None),
+                    |(p, port)| (p, Some(port)),
+                );
+            (own_key, producer.to_string(), port.map(str::to_string))
+        } else if let Some(&pred) = predecessors.first() {
+            let port = current_dag
                 .graph
                 .find_edge(pred, node_idx)
                 .and_then(|edge| current_dag.graph.edge_weight(edge))
                 .and_then(|edge| edge.producer_port.as_deref());
-            Some(require_node_buffer_slot(
-                ctx,
-                pred,
-                name,
-                current_dag.graph[pred].name(),
-                producer_port,
-            )?)
+            (
+                NodeBufferKey::with_port(pred, port),
+                current_dag.graph[pred].name().to_string(),
+                port.map(str::to_string),
+            )
         } else {
-            predecessors
-                .iter()
-                .find_map(|p| drain_node_buffer_slot(ctx, *p))
+            (
+                own_key,
+                authored_input.unwrap_or("composition input").to_string(),
+                None,
+            )
         };
-        let input_buffer = match pred_buf {
-            Some(buffer) => buffer,
-            None => {
-                let authored_input = ctx
-                    .current_body_node_input_refs
-                    .as_ref()
-                    .and_then(|refs| refs.get(name.as_str()))
-                    .and_then(|refs| refs.first())
-                    .map(String::as_str);
-                let (producer_name, producer_port) = if let Some(&pred) = predecessors.first() {
-                    let producer_port = current_dag
-                        .graph
-                        .find_edge(pred, node_idx)
-                        .and_then(|edge| current_dag.graph.edge_weight(edge))
-                        .and_then(|edge| edge.producer_port.as_deref());
-                    (current_dag.graph[pred].name(), producer_port)
-                } else if let Some(input) = authored_input {
-                    match input.split_once('.') {
-                        Some((producer, port)) => (producer, Some(port)),
-                        None => (input, None),
-                    }
-                } else {
-                    ("composition input", None)
-                };
-                return Err(missing_node_buffer_input_error(
-                    name,
-                    producer_name,
-                    producer_port,
-                ));
-            }
-        };
-        input_buffer.drain_split()?
-    };
+    let input_buffer = require_node_buffer_input(
+        ctx,
+        input_key,
+        name,
+        &producer_name,
+        producer_port.as_deref(),
+    )?;
+    let (input_buffer, _input_reservation) = input_buffer.into_parts();
+    let (input_records, input_puncts): (
+        Vec<(Record, u64)>,
+        Vec<crate::executor::stream_event::Punctuation>,
+    ) = input_buffer.drain_split()?;
 
     if let Some(expected) = current_dag.graph[node_idx]
         .expected_input_schema_in(current_dag)
@@ -288,7 +276,6 @@ pub(crate) fn dispatch_route(
     // assignment selected. Internal-region edges and edges between two
     // non-deferred operators skip the tee — the `node_buffers` entry already
     // covers them.
-    let route_region_producer = current_dag.deferred_region_at(node_idx).map(|r| r.producer);
     let active_body = ctx.window_runtime.active_stack.last().copied();
     // Collect outgoing (branch, successor, edge) triples before the mutable
     // admissions below so the immutable graph borrow does not overlap them.
@@ -311,13 +298,7 @@ pub(crate) fn dispatch_route(
         // admit below (a predecessor-slot reader re-reads it in the second loop
         // instead), so a non-crossing Merge/Combine branch costs no clone here.
         let records: &[(Record, u64)] = branch_records.get(&branch).map_or(&[], |v| v.as_slice());
-        let succ_region_producer = current_dag.deferred_region_at(succ_idx).map(|r| r.producer);
-        let crosses = match (route_region_producer, succ_region_producer) {
-            (None, Some(_)) => true,
-            (Some(p), Some(t)) if p != t => true,
-            _ => false,
-        };
-        if crosses {
+        if crosses_into_deferred_consumer(current_dag, node_idx, succ_idx) {
             let row_bytes_each: u64 = records
                 .first()
                 .map(|(rec, _)| {
@@ -340,6 +321,7 @@ pub(crate) fn dispatch_route(
                     .or_default()
                     .push((record.clone(), *rn));
             }
+            continue;
         }
         // Route broadcasts punctuations to every branch — each downstream
         // subgraph needs the same document-boundary signal to drive its own
@@ -349,30 +331,30 @@ pub(crate) fn dispatch_route(
                 pred_branches.push(branch);
             }
         } else {
-            let nb = admit_node_buffer(
+            admit_node_buffer_with_readers(
                 ctx,
                 name,
                 succ_idx,
                 records.to_vec(),
                 input_puncts.clone(),
                 node_buffer_spill_allowed(current_dag, succ_idx),
+                1,
             )?;
-            ctx.node_buffers.insert(succ_idx.into(), nb);
         }
     }
     let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
     for branch in pred_branches {
         let records = branch_records.get(&branch).cloned().unwrap_or_default();
         let key = NodeBufferKey::with_port(node_idx, Some(branch.as_str()));
-        let nb = admit_node_buffer(
+        admit_node_buffer(
             ctx,
+            current_dag,
             name,
             key.clone(),
             records,
             input_puncts.clone(),
             spill_allowed,
         )?;
-        ctx.node_buffers.insert(key, nb);
     }
 
     Ok(())

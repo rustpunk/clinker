@@ -17,13 +17,11 @@ use petgraph::Direction;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
-    CorrelationRecordSlot, ExecutorContext, buffer_key_for_record, drain_node_buffer_slot,
-    mapping_probe, missing_node_buffer_input_error, push_dlq, push_write_error,
-    sink_collision_dlq_entry, source_file_path_of,
+    CorrelationRecordSlot, ExecutorContext, buffer_key_for_record, mapping_probe,
+    missing_node_buffer_input_error, push_dlq, push_write_error, require_node_buffer_input,
+    single_input_node_buffer_key, sink_collision_dlq_entry, source_file_path_of,
 };
-use crate::executor::node_buffer::{
-    NodeBuffer, TransientNodeBufferReservation, clone_node_buffer_reserved,
-};
+use crate::executor::node_buffer::TransientNodeBufferReservation;
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::structured_output_guard::{
     StructuredOutputDocumentGuard, structured_output_format,
@@ -57,28 +55,6 @@ struct OutputInputs {
     expected_input_schema: Option<Arc<clinker_record::Schema>>,
     upstream_name: String,
     cxl_emit_names: Vec<String>,
-}
-
-/// Records materialized from a multi-consumer Output clone together with the
-/// reservation that must remain live through the complete write phase.
-#[must_use = "an Output clone's reservation must remain live while its records are used"]
-struct ReservedOutputRecords {
-    records: Vec<(Record, u64)>,
-    reservation: TransientNodeBufferReservation,
-}
-
-fn clone_output_records_reserved(
-    input: &NodeBuffer,
-    memory_budget: &Arc<crate::pipeline::memory::MemoryArbitrator>,
-    output_name: &str,
-) -> Result<ReservedOutputRecords, PipelineError> {
-    let reserved = clone_node_buffer_reserved(input, memory_budget, output_name)?;
-    let (cloned, reservation) = reserved.into_parts();
-    let (records, _puncts) = cloned.drain_split()?;
-    Ok(ReservedOutputRecords {
-        records,
-        reservation,
-    })
 }
 
 /// Derive the [`OutputInputs`] for `node_idx` from the plan. Shared by the
@@ -158,59 +134,25 @@ pub(crate) fn dispatch_output(
     // for non-streaming outputs. Streaming Outputs (#72) take
     // the early-return path above and forward puncts through
     // the streaming channel separately.
-    let mut input_clone_reservation: Option<TransientNodeBufferReservation> = None;
-    let input_records: Vec<(Record, u64)> =
-        if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
-            let (records, _puncts) = own_buf.drain_split()?;
-            records
-        } else {
-            let predecessors: Vec<NodeIndex> = current_dag
-                .graph
-                .neighbors_directed(node_idx, Direction::Incoming)
-                .collect();
-            let mut found: Option<Vec<(Record, u64)>> = None;
-            for &p in &predecessors {
-                // When multiple outputs share a predecessor,
-                // clone the buffer for all but the last
-                // consumer to avoid starving siblings.
-                let remaining_consumers = current_dag
-                    .graph
-                    .neighbors_directed(p, Direction::Outgoing)
-                    .filter(|&succ| succ > node_idx)
-                    .count();
-                if remaining_consumers == 0 {
-                    if let Some(nb) = drain_node_buffer_slot(ctx, p) {
-                        let (records, _puncts) = nb.drain_split()?;
-                        found = Some(records);
-                        break;
-                    }
-                } else {
-                    // Multi-consumer fanout: keep the producer's
-                    // buffer alive for remaining siblings via a
-                    // heap clone. The clone is preflighted and registered
-                    // before allocation, and its reservation stays live
-                    // through the complete Output write. The producer slot's
-                    // registered consumer keeps reporting the original buffer
-                    // until the last consumer drains it.
-                    //
-                    // Output is terminal — it writes to disk and
-                    // has no downstream node_buffer to receive
-                    // forwarded punctuations. The fan-out clone
-                    // path takes records only; sibling consumers
-                    // that need the document boundary read it from
-                    // the non-cloned (last-consumer) drain through
-                    // their own arm.
-                    if let Some(input_buffer) = ctx.node_buffers.get(&p.into()) {
-                        let reserved =
-                            clone_output_records_reserved(input_buffer, &ctx.memory_budget, name)?;
-                        input_clone_reservation = Some(reserved.reservation);
-                        found = Some(reserved.records);
-                        break;
-                    }
-                }
-            }
-            found.ok_or_else(|| missing_output_input_error(current_dag, node_idx, name))?
-        };
+    use petgraph::visit::EdgeRef;
+    let edge = current_dag
+        .graph
+        .edges_directed(node_idx, Direction::Incoming)
+        .next()
+        .ok_or_else(|| missing_output_input_error(current_dag, node_idx, name))?;
+    let producer = edge.source();
+    let producer_port = edge.weight().producer_port.as_deref();
+    let input_key =
+        single_input_node_buffer_key(&ctx.node_buffers, node_idx, producer, producer_port);
+    let input = require_node_buffer_input(
+        ctx,
+        input_key,
+        name,
+        current_dag.graph[producer].name(),
+        producer_port,
+    )?;
+    let (input, input_clone_reservation) = input.into_parts();
+    let (input_records, _input_puncts) = input.drain_split()?;
 
     let OutputInputs {
         expected_input_schema,
@@ -912,11 +854,11 @@ impl EnvelopeWriterDriver {
 /// preserving record/boundary ordering — the envelope-reconstruction analog
 /// of [`drain_output_input_events`], but yielding an iterator rather than a
 /// `Vec` so a spilled predecessor buffer streams from disk one event at a
-/// time instead of materializing. Mirrors the predecessor-selection logic of
-/// the per-record path (own slot first, then the last-consumer predecessor
-/// drain, then a memory clone for multi-consumer fan-out). Multi-consumer
-/// fan-out slots are never spilled, so the in-memory clone branch never hides
-/// a spilled buffer.
+/// time instead of materializing. Mirrors the per-record path's own-slot-first
+/// selection, then lets the producer-declared reader ledger choose a reserved
+/// clone or transfer the original predecessor generation to its final reader.
+/// Shared fan-out slots are never spilled, so the clone path never hides a
+/// spilled buffer.
 #[must_use = "a cloned Output input must retain its transient reservation"]
 struct OutputInputEventIter {
     events:
@@ -925,17 +867,6 @@ struct OutputInputEventIter {
 }
 
 impl OutputInputEventIter {
-    fn drained(
-        events: Box<
-            dyn Iterator<Item = Result<crate::executor::stream_event::StreamEvent, PipelineError>>,
-        >,
-    ) -> Self {
-        Self {
-            events,
-            reservation: None,
-        }
-    }
-
     fn into_parts(
         self,
     ) -> (
@@ -960,33 +891,28 @@ fn drain_output_input_event_iter(
     node_idx: NodeIndex,
     name: &str,
 ) -> Result<OutputInputEventIter, PipelineError> {
-    if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
-        return Ok(OutputInputEventIter::drained(Box::new(own_buf.drain())));
-    }
-    let predecessors: Vec<NodeIndex> = current_dag
+    use petgraph::visit::EdgeRef;
+    let edge = current_dag
         .graph
-        .neighbors_directed(node_idx, Direction::Incoming)
-        .collect();
-    for p in predecessors {
-        let remaining_consumers = current_dag
-            .graph
-            .neighbors_directed(p, Direction::Outgoing)
-            .filter(|&succ| succ > node_idx)
-            .count();
-        if remaining_consumers == 0 {
-            if let Some(nb) = drain_node_buffer_slot(ctx, p) {
-                return Ok(OutputInputEventIter::drained(Box::new(nb.drain())));
-            }
-        } else if let Some(input_buffer) = ctx.node_buffers.get(&p.into()) {
-            let reserved = clone_node_buffer_reserved(input_buffer, &ctx.memory_budget, name)?;
-            let (cloned, reservation) = reserved.into_parts();
-            return Ok(OutputInputEventIter {
-                events: Box::new(cloned.drain()),
-                reservation: Some(reservation),
-            });
-        }
-    }
-    Err(missing_output_input_error(current_dag, node_idx, name))
+        .edges_directed(node_idx, Direction::Incoming)
+        .next()
+        .ok_or_else(|| missing_output_input_error(current_dag, node_idx, name))?;
+    let producer = edge.source();
+    let producer_port = edge.weight().producer_port.as_deref();
+    let input_key =
+        single_input_node_buffer_key(&ctx.node_buffers, node_idx, producer, producer_port);
+    let input = require_node_buffer_input(
+        ctx,
+        input_key,
+        name,
+        current_dag.graph[producer].name(),
+        producer_port,
+    )?;
+    let (input, reservation) = input.into_parts();
+    Ok(OutputInputEventIter {
+        events: Box::new(input.drain()),
+        reservation,
+    })
 }
 
 /// Build the fail-loud diagnostic only after every valid Output input location
@@ -1244,6 +1170,7 @@ fn emit_fan_out(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::node_buffer::{NodeBuffer, clone_node_buffer_reserved};
     use clinker_format::FormatWriter;
     use clinker_format::error::FormatError;
     use clinker_record::{DocumentContext, DocumentId, FieldResolver, Schema, Value};
@@ -1294,7 +1221,7 @@ mod tests {
         ));
         let baseline_id = budget.register_consumer(Arc::new(FixedUsage(baseline_usage)));
 
-        match clone_output_records_reserved(&input, &budget, "ordinary_out") {
+        match clone_node_buffer_reserved(&input, &budget, "ordinary_out") {
             Err(PipelineError::MemoryBudgetExceeded {
                 node,
                 used,

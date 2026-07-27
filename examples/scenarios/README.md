@@ -63,12 +63,9 @@ diagnostic always fails. The gate's counters record the *correct* summary, so
 the run that fixes the underlying bug reports the marker as stale rather than a
 counter mismatch.
 
-A re-bless run will not replace correct goldens from a known failing run. For
-#996, regenerate either output deliberately from its single-sink variant rather
-than from the engine's current fail-loud run.
+A re-bless run will not replace correct goldens from a known failing run.
 
-Currently parked: **02-product-feed-normalize**, against
-[#996](https://github.com/rustpunk/clinker/issues/996).
+No scenarios are currently parked.
 
 ## Layout
 

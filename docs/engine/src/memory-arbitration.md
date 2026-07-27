@@ -50,7 +50,20 @@ When a buffer crosses the soft threshold (80 % of the limit) the arbitrator runs
 
 Spill fires at the producer side of the first slot whose downstream topology permits it — single-consumer, port-less. For a Source feeding a Route, that's the Source's own slot, not the Route's per-branch slots, because the Source has the one outgoing edge that satisfies the topology rule. Per-branch slots can still spill independently when their own row-distribution drives them past the soft threshold, but the canonical case lands at the producer.
 
-Multi-consumer readers (`Output`, `Merge`, and `Combine`) and composition input ports sometimes need a second in-memory copy while the producer's slot remains live for another consumer. The executor estimates the duplicate with the same `NodeBuffer::estimated_memory_bytes` formula used by the resident slot, adds it to current pressure, and checks the nonzero hard limit **before allocating the clone**. A projected overflow returns `E310 MemoryBudgetExceeded` with the `NodeBuffer` category and the consuming node's name. If it fits, the executor registers a non-reclaimable, non-back-pressureable transient consumer before cloning and retains that reservation until the duplicate's full synchronous use ends. This closes the interval in which both the producer slot and its duplicate are resident; it does not make a shared memory-only slot spillable.
+Every materialized slot declares an O(1) remaining-reader count when it is
+published. The single-reader path removes the original directly without a
+clone. For several readers, dispatch is sequential: an earlier reader may need
+one second in-memory copy while the original remains live, but the executor
+never pre-forks one copy per reader. It estimates that duplicate with the same
+`NodeBuffer::estimated_memory_bytes` formula used by the resident slot, adds it
+to current pressure, and checks the nonzero hard limit **before allocating the
+clone**. A projected overflow returns `E310 MemoryBudgetExceeded` with the
+`NodeBuffer` category and the consuming node's name. If it fits, the executor
+registers a non-reclaimable, non-back-pressureable transient consumer before
+cloning and retains that reservation until the reader's full synchronous use
+ends. Peak fan-out residency is therefore one original plus at most one
+transient clone. This closes the overlap interval; it does not make a shared
+memory-only slot spillable.
 
 Use `clinker run --explain` to predict which stages will dominate the budget before runtime — each node carries a `buffer: streaming | materialized` annotation. Materialized nodes charge `pipeline.memory.limit` as one full-stage slot and spill the whole stage; streaming nodes charge per in-flight batch and, on a single-consumer edge, spill those batches one at a time. Both classes count against the limit and can spill — the annotation tells you the *granularity* (whole-stage vs. per-batch), not whether a stage is exempt from the budget.
 

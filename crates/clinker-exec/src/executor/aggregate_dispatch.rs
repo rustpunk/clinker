@@ -171,6 +171,7 @@ pub(crate) fn dispatch_aggregation(
         current_dag.graph[pred].name(),
         producer_port,
     )?;
+    let (input_buffer, _input_reservation) = input_buffer.into_parts();
     // Meter the re-materialized drain so a spill-backed predecessor cannot
     // re-inflate into RAM past the hard limit uncharged.
     let (input, input_puncts): (
@@ -457,15 +458,15 @@ fn finalize_aggregate_emit(
         let projected = project_rows_to_buffer_schema(out_rows, &buffer_schema);
         finalize_node_rooted_windows(ctx, current_dag, node_idx, &projected)?;
         tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &projected)?;
-        let nb = admit_node_buffer(
+        admit_node_buffer(
             ctx,
+            current_dag,
             name,
             node_idx,
             projected,
             input_puncts,
             node_buffer_spill_allowed(current_dag, node_idx),
         )?;
-        ctx.node_buffers.insert(node_idx.into(), nb);
     } else {
         // Streaming-Output handoff: a streaming-strategy
         // aggregate (the planner certified pre-sorted input)
@@ -510,15 +511,15 @@ fn finalize_aggregate_emit(
         // `out_rows` here, not from the source stream.
         finalize_node_rooted_windows(ctx, current_dag, node_idx, &out_rows)?;
         tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &out_rows)?;
-        let nb = admit_node_buffer(
+        admit_node_buffer(
             ctx,
+            current_dag,
             name,
             node_idx,
             out_rows,
             input_puncts,
             node_buffer_spill_allowed(current_dag, node_idx),
         )?;
-        ctx.node_buffers.insert(node_idx.into(), nb);
     }
 
     Ok(())
