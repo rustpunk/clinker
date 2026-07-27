@@ -34,9 +34,29 @@ nodes:
         medium: "priority == \"medium\""
       default: low
 
+  - type: aggregate
+    name: agg_high
+    input: split.high
+    config:
+      group_by: [priority]
+      strategy: hash
+      cxl: |
+        emit total = sum(value)
+        emit n = count(*)
+
+  - type: aggregate
+    name: agg_low
+    input: split.low
+    config:
+      group_by: [priority]
+      strategy: hash
+      cxl: |
+        emit total = sum(value)
+        emit n = count(*)
+
   - type: output
     name: high_out
-    input: split.high
+    input: agg_high
     config:
       name: high_out
       type: csv
@@ -54,7 +74,7 @@ nodes:
 
   - type: output
     name: low_out
-    input: split.low
+    input: agg_low
     config:
       name: low_out
       type: csv

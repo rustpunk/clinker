@@ -314,6 +314,18 @@ mod tests {
         assert!(!report.stages.is_empty());
     }
 
+    /// Runner executes Route branches that feed Aggregate consumers.
+    #[test]
+    fn test_runner_route_fanout_writes_records() {
+        let runner = test_runner();
+        let path = pipelines_dir().join("realistic/route_fanout.yaml");
+        let report = runner.run(&path, Scale::Small).unwrap();
+        assert!(
+            report.counters.records_written > 0,
+            "Route successor slots must reach Aggregate consumers"
+        );
+    }
+
     /// Runner executes a nested JSON pipeline.
     #[test]
     fn test_runner_nested_json() {

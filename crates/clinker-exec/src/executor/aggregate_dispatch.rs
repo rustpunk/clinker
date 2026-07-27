@@ -19,8 +19,9 @@ use petgraph::graph::NodeIndex;
 use crate::executor::dispatch::{
     ExecutorContext, RetainedAggregatorState, admit_node_buffer, advance_cursor,
     finalize_node_rooted_windows, node_buffer_spill_allowed, project_rows_to_buffer_schema,
-    push_dlq, record_error_to_buffer_if_grouped, require_node_buffer_slot, source_file_arc_of,
-    source_name_arc_of, stream_linear_producer_emit, tee_emit_to_region_input_buffers,
+    push_dlq, record_error_to_buffer_if_grouped, require_single_input_node_buffer_slot,
+    source_file_arc_of, source_name_arc_of, stream_linear_producer_emit,
+    tee_emit_to_region_input_buffers,
 };
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, parse_memory_limit, stage_metrics};
@@ -162,8 +163,9 @@ pub(crate) fn dispatch_aggregation(
         .find_edge(pred, node_idx)
         .and_then(|edge| current_dag.graph.edge_weight(edge))
         .and_then(|edge| edge.producer_port.as_deref());
-    let input_buffer = require_node_buffer_slot(
+    let input_buffer = require_single_input_node_buffer_slot(
         ctx,
+        node_idx,
         pred,
         name,
         current_dag.graph[pred].name(),
