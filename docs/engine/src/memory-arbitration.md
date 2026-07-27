@@ -6,9 +6,9 @@ This page is the engine-internals reference for how Clinker tracks, attributes, 
 
 ## How it works
 
-Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, the Reshape per-group input buffer, `node_buffers` slots and their transient fan-out clones, and window-runtime arenas) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; the arbitrator queries `current_usage()` per consumer at every policy poll. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash with on-disk partitions, for instance, reports only its in-memory portion, and the Reshape buffer reports the live bytes of the groups still resident in memory.
+Clinker tracks memory in two layers. RSS (resident set size) is sampled at chunk boundaries and supplies the primary spill / abort signal. Alongside RSS, every memory-touching operator (Source ingest channels, Aggregate hash maps, sort buffers, grace-hash partitions, sort-merge accumulators, IEJoin arrays, inline-Combine hash tables, the Reshape per-group input buffer, `node_buffers` slots and their transient scan materializations, and window-runtime arenas) registers a `MemoryConsumer` wrapper with the pipeline-scoped arbitrator. Each operator owns its live byte counter and updates it on every admit / spill transition; the arbitrator queries `current_usage()` per consumer at every policy poll. This pull-mode attribution lets the policy distinguish *reclaimable* bytes (what an operator can give up right now) from currently-held bytes — a grace-hash with on-disk partitions, for instance, reports only its in-memory portion, and the Reshape buffer reports the live bytes of the groups still resident in memory.
 
-Registrations are scoped to the state they mirror, not to the run: each wrapper is unregistered when the state it attributes drains. A Source's ingest-channel consumer is released the moment its receiver disconnects (whichever arm consumed it — the Source arm, a fused `Merge.interleave`, or a fused Transform); a Combine branch's consumer is released when the branch exits — the IEJoin, grace-hash, and sort-merge branches route their clean return and every internal `?` early-return through a single unregister, and the inline-hash branch unregisters at its clean exit; and a `node_buffers` slot's consumer leaves the registry when the slot drains. A transient clone carries an RAII reservation for its complete synchronous use, so normal completion and every error return unregister it. Composition input seeding transfers that same registration into the body-local node-buffer registry without an unregister/register gap or a second charge. While the body Source canonicalizes its seed, the same byte handle first reserves the prospective output in addition to the still-live seed, then drops back to the output estimate when the seed allocation is gone; admission atomically swaps the wrapper under the existing consumer id. Later stages therefore never see charged bytes from state that has already moved downstream, and the registry the policy polls contains live contributors only.
+Registrations are scoped to the state they mirror, not to the run: each wrapper is unregistered when the state it attributes drains. A Source's ingest-channel consumer is released the moment its receiver disconnects (whichever arm consumed it — the Source arm, a fused `Merge.interleave`, or a fused Transform); a Combine branch's consumer is released when the branch exits — the IEJoin, grace-hash, and sort-merge branches route their clean return and every internal `?` early-return through a single unregister, and the inline-hash branch unregisters at its clean exit; and a `node_buffers` slot's consumer leaves the registry after its final planned reader. A consumer that collects a sequential scan into a resident vector carries an RAII materialization reservation for its complete synchronous use, so normal completion and every error return unregister it. Composition input seeding transfers that same registration into the body-local node-buffer registry without an unregister/register gap or a second charge. While the body Source canonicalizes its seed, the same byte handle first reserves the prospective output in addition to the still-live seed, then drops back to the output estimate when the seed allocation is gone; admission atomically swaps the wrapper under the existing consumer id. Later stages therefore never see charged bytes from state that has already moved downstream, and the registry the policy polls contains live contributors only.
 
 Window-runtime arenas (the columnar backing store that analytic-window evaluation reads from) are attributed but not independently spillable: an arena is immutable once built and is freed only indirectly, when the operator that consumes its windows drains to disk. Its wrapper reports the arena's bytes so the arbitrator's attribution is complete, but ranks last among spill victims so a policy never elects an arena while any consumer that can actually pause or spill remains.
 
@@ -27,7 +27,7 @@ Each registered consumer carries two parameters the active policy reads: a **spi
 | inline-hash Combine | 30 | false |
 | Source ingest | N/A | true |
 | streaming Aggregate | N/A | false |
-| transient `node_buffers` clone | last | false |
+| transient scan materialization | last | false |
 | window arena | last | false |
 
 Lower priority is spilled first, so `node_buffers` slots (priority 0) are the cheapest victim class — spilling an inter-stage buffer to disk costs one LZ4 + postcard round-trip and frees the most reclaimable bytes per call. The blocking operators climb from there: a grace-hash Combine (10) is preferred over Reshape (15), which is preferred over a sort buffer (20), which is preferred over a hash Aggregate or inline-hash Combine (30). Reshape sits between grace-hash and sort because its spill round-trip re-runs synthesis on reload — costlier to evict than grace partitions, cheaper than an external-sort merge — and it spills the raw per-group input records rather than post-processed output.
@@ -48,22 +48,32 @@ A stage runs streaming — no charged per-stage `node_buffers` slot — when it 
 
 When a buffer crosses the soft threshold (80 % of the limit) the arbitrator runs the active policy. Under the default `pause`, the producer feeding the buffer is paused at its inbound channel; under `spill` or when no consumer can be paused, the slot spills to disk using the same LZ4 + postcard frame format as grace-hash sort partitions. When RSS crosses the hard limit, the engine fails fast with `E310 MemoryBudgetExceeded { node }` naming the operator whose hot loop polled the abort gate. The `explain --code E310` diagnostic covers the full diagnostic model, including the composition-involved two-shape error model.
 
-Spill fires at the producer side of the first slot whose downstream topology permits it — single-consumer, port-less. For a Source feeding a Route, that's the Source's own slot, not the Route's per-branch slots, because the Source has the one outgoing edge that satisfies the topology rule. Per-branch slots can still spill independently when their own row-distribution drives them past the soft threshold, but the canonical case lands at the producer.
+Every materialized slot is spill-eligible, including slots with several consumers and slots keyed by a producer output port. Pressure can therefore spill whichever live priority-0 slot the policy elects; exact `(producer, producer_port)` keys keep independently spilled Route/Cull branches isolated.
 
 Every materialized slot declares an O(1) remaining-reader count when it is
-published. The single-reader path removes the original directly without a
-clone. For several readers, dispatch is sequential: an earlier reader may need
-one second in-memory copy while the original remains live, but the executor
-never pre-forks one copy per reader. It estimates that duplicate with the same
-`NodeBuffer::estimated_memory_bytes` formula used by the resident slot, adds it
-to current pressure, and checks the nonzero hard limit **before allocating the
-clone**. A projected overflow returns `E310 MemoryBudgetExceeded` with the
-`NodeBuffer` category and the consuming node's name. If it fits, the executor
-registers a non-reclaimable, non-back-pressureable transient consumer before
-cloning and retains that reservation until the reader's full synchronous use
-ends. Peak fan-out residency is therefore one original plus at most one
-transient clone. This closes the overlap interval; it does not make a shared
-memory-only slot spillable.
+published. The single-reader path removes the authoritative slot directly.
+For several readers, dispatch remains sequential: each earlier reader borrows
+the same immutable backing and opens a fresh cursor, while the ledger retains
+the slot through its final reader. `Memory` backing clones one event at a time;
+`Spilled` and `Mixed` backing opens at most one spill file for the active scan,
+so file-descriptor use is O(1) per active scan rather than O(number of
+readers). No N-way copy or N-way cursor set is created.
+
+A consumer that needs a full resident vector reserves that materialization
+before collecting the cursor. A projected overlap beyond the nonzero hard
+limit returns `E310 MemoryBudgetExceeded` with the `NodeBuffer` category and
+the consuming node's name. A consumer that stays lazy, such as an Output
+writer on the envelope-reconstruction path, reads directly from the cursor
+without a full duplicate. The final reader reclaims the authoritative backing
+and its existing registration.
+
+`MergeSpilled` is the one destructive spill form: its k-way merger consumes
+and unlinks input runs. On the first shared read, the executor folds those runs
+once into one ordinary re-readable spill file. It charges the replacement file
+before releasing the input-run charges, so the real disk-overlap peak is
+enforced; exceeding `max_spill_bytes` returns `E320 SpillCapExceeded` and
+removes both replacement and input registrations/files. Later readers reopen
+the folded file and do not repeat the fold.
 
 Use `clinker run --explain` to predict which stages will dominate the budget before runtime — each node carries a `buffer: streaming | materialized` annotation. Materialized nodes charge `pipeline.memory.limit` as one full-stage slot and spill the whole stage; streaming nodes charge per in-flight batch and, on a single-consumer edge, spill those batches one at a time. Both classes count against the limit and can spill — the annotation tells you the *granularity* (whole-stage vs. per-batch), not whether a stage is exempt from the budget.
 
@@ -89,7 +99,7 @@ The Source advertises `can_back_pressure=true` and `spill_priority=N/A`: when me
 
 The three `predicted_*` values are the scheduler's inputs (see [Scheduling](#scheduling) below). `predicted_peak` is the live volume a node is expected to hold at its peak — seeded at a file-backed Source from its `path:` file's on-disk size and propagated forward. `predicted_freed` is what the node returns to the budget the instant it finishes draining: a blocking Aggregate holds its whole accumulated input (`predicted_peak=1K`) and frees it on drain (`predicted_freed=1K`), while a streaming Source carries the volume through but frees nothing the instant it drains (`predicted_freed=0B`). `predicted_subtree_reclaim` is the largest reclaim the node's downstream chain eventually unlocks: the Source frees nothing itself, but launching it is the only way to reach the point where its downstream Aggregate can drain, so it inherits that Aggregate's reclaim (`predicted_subtree_reclaim=1K`). Propagation of the subtree value stops at a convergence node — the Combine two independent chains feed — so each feeding chain keeps the distinct reclaim it owns up to the join rather than the shared post-join total. All three render `0B` when no file-size seed reached the node — a multi-file (`glob`/`regex`/`paths`) or absent/unreadable Source, or any node downstream of one. The bytes are formatted in the same binary-prefix units as `memory.limit` (`1K`, `64M`, `2G`), and the same three values appear in `--explain --format json` under `node_properties.<name>.predicted_peak_bytes`, `predicted_freed_bytes_on_complete`, and `predicted_subtree_reclaim_bytes`.
 
-A **`=== Buffer Edges ===`** section follows, listing the `node_buffers` slot between each pair of non-fused stages. Every slot is a priority-0, non-back-pressureable `NodeBufferConsumer` — the cheapest victim class — and the `slot=` number is the stable index the executor admits into. The slot carries the producer's predicted volume (it holds the producer's materialized output and frees that whole buffer once the consumer drains it):
+A **`=== Buffer Edges ===`** section follows, listing the `node_buffers` slot between each pair of non-fused stages. Every slot is a priority-0, non-back-pressureable `NodeBufferConsumer` — the cheapest victim class — and the `slot=` number is the stable producer index the executor admits into. For a multi-output producer, `port=` completes the exact runtime slot identity. The slot carries the producer's predicted volume (it holds the producer's materialized output and frees that whole buffer once the consumer drains it):
 
 ```text
 === Buffer Edges ===

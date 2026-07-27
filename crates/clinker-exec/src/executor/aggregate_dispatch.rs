@@ -171,13 +171,14 @@ pub(crate) fn dispatch_aggregation(
         current_dag.graph[pred].name(),
         producer_port,
     )?;
-    let (input_buffer, _input_reservation) = input_buffer.into_parts();
-    // Meter the re-materialized drain so a spill-backed predecessor cannot
-    // re-inflate into RAM past the hard limit uncharged.
+    let (input_buffer, _input_reservation) =
+        input_buffer.into_materialized_parts(&ctx.memory_budget, name)?;
+    // The caller-explicit materialization reservation above covers the full
+    // collected vector, including spill-backed reloads.
     let (input, input_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
-    ) = input_buffer.drain_split_metered(&ctx.memory_budget, name)?;
+    ) = input_buffer.drain_split()?;
 
     if let Some(expected) = current_dag.graph[node_idx]
         .expected_input_schema_in(current_dag)

@@ -18,9 +18,10 @@
 //! admission a body performs is already enveloped by the call-site
 //! arbitrator and wrapped under the call-site name.
 //!
-//! The arbitrator is seeded above the soft limit (spill active) with a
-//! one-byte disk quota so the first body admission overflows; the
-//! assertion destructures both the wrapper and the inner typed variant.
+//! The arbitrator is seeded above the soft limit (spill active) with enough
+//! disk quota for the parent Source slot but not both that slot and the body
+//! port Source. The assertion destructures both the wrapper and the inner
+//! typed variant.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -30,6 +31,7 @@ use std::sync::Arc;
 
 const HARD_LIMIT: u64 = 100 * 1024 * 1024 * 1024;
 const SPILL_FRAC: f64 = 0.80;
+const PORT_SPILL_CAP: u64 = 512;
 
 fn spill_tripped_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
     let arb = crate::pipeline::memory::MemoryArbitrator::with_policy(
@@ -39,14 +41,14 @@ fn spill_tripped_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> 
         Box::new(crate::pipeline::memory::Priority),
     );
     arb.set_peak_rss_for_test(90 * 1024 * 1024 * 1024);
-    arb.set_max_spill_bytes(1);
+    arb.set_max_spill_bytes(PORT_SPILL_CAP);
     Arc::new(arb)
 }
 
-/// Seeded above the *hard* limit (`should_abort` true) with a generous disk
-/// quota so the disk-cap (E320) path cannot fire first — isolating the
-/// non-spillable hard-budget admission gate.
-fn abort_seeded_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
+/// Seeded above the hard limit with unlimited disk quota. Every materialized
+/// slot on this port path is spill-eligible, so the finite pipeline completes
+/// through spill instead of taking the legacy non-spillable E310 gate.
+fn forced_spill_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
     let arb = crate::pipeline::memory::MemoryArbitrator::with_policy(
         HARD_LIMIT,
         SPILL_FRAC,
@@ -149,7 +151,7 @@ fn port_admission_overshoot_is_wrapped_naming_the_port_source() {
         ctx,
         spill_tripped_arbitrator(),
     )
-    .expect_err("one-byte spill quota must abort the body's port-source admission");
+    .expect_err("the cumulative spill quota must abort the body's port-source admission");
 
     match err {
         PipelineError::CompositionBodyError {
@@ -171,7 +173,7 @@ fn port_admission_overshoot_is_wrapped_naming_the_port_source() {
                         node, "data",
                         "the boundary overflow must name the body's port-source node",
                     );
-                    assert_eq!(cap, 1, "reported cap must equal the one-byte quota");
+                    assert_eq!(cap, PORT_SPILL_CAP, "reported cap must equal the quota");
                     assert!(attempted > 0, "the overflowing flush must report its size");
                     assert!(
                         current > cap,
@@ -185,23 +187,13 @@ fn port_admission_overshoot_is_wrapped_naming_the_port_source() {
     }
 }
 
-/// The producer feeding a composition input port is non-spillable by
-/// construction — the port edge routes its records through
-/// `NodeBuffer::clone_memory_only` into the body, which panics on a
-/// spill-backed variant — so it is exactly the fan-out case's sibling under
-/// the `!spill_allowed` hard-budget gate. Over the hard limit its admission
-/// aborts with the memory-budget E310 (Arena), foreclosing an unaffordable
-/// resident slot that can neither spill nor pause.
-///
-/// The abort names the top-level `src` and is *not* wrapped in
-/// `CompositionBodyError`: because the port feeder is itself non-spillable, it
-/// trips the gate on its own admission — before the composition body ever
-/// executes — so there is no body-interior operator to attribute or wrap. (A
-/// *spillable* body-interior slot that overflows the disk cap inside the body
-/// walk is the wrapped case, covered by
-/// `port_admission_overshoot_is_wrapped_naming_the_port_source`.)
+/// A composition input port is spill-eligible. Even when the seeded pressure
+/// is above the hard limit, every finite slot spills and each body/parent
+/// boundary opens a fresh sequential scan over immutable backing. The run
+/// therefore completes exactly instead of taking the removed non-spillable
+/// Arena gate.
 #[test]
-fn nonspillable_port_feeder_over_hard_limit_aborts_as_arena() {
+fn port_feeder_over_hard_limit_completes_through_spill() {
     let workspace = tempfile::tempdir().expect("tempdir");
     let comp_dir = workspace.path().join("compositions");
     std::fs::create_dir_all(&comp_dir).expect("mkdir compositions");
@@ -230,38 +222,28 @@ fn nonspillable_port_feeder_over_hard_limit_aborts_as_arena() {
         Box::new(out.clone()) as Box<dyn std::io::Write + Send>,
     )]);
     let params = PipelineRunParams {
-        execution_id: "composition-port-nonspillable-abort".to_string(),
+        execution_id: "composition-port-forced-spill".to_string(),
         batch_id: "batch-0".to_string(),
         ..Default::default()
     };
-    let err = PipelineExecutor::run_with_readers_writers_with_arbitrator(
+    let report = PipelineExecutor::run_with_readers_writers_with_arbitrator(
         &config,
         readers,
         writers.into(),
         &params,
         ctx,
-        abort_seeded_arbitrator(),
+        forced_spill_arbitrator(),
     )
-    .expect_err("a non-spillable port-feeder admission over the hard limit must abort");
+    .expect("a finite composition port path must complete through spill");
 
-    match err {
-        PipelineError::MemoryBudgetExceeded {
-            node,
-            source,
-            limit,
-            ..
-        } => {
-            assert_eq!(
-                node, "src",
-                "the port-feeding producer is the first non-spillable admission",
-            );
-            assert_eq!(
-                source,
-                clinker_plan::BudgetCategory::Arena,
-                "a non-spillable node-buffer admission aborts under the Arena tag",
-            );
-            assert_eq!(limit, HARD_LIMIT, "the reported limit is the hard budget");
-        }
-        other => panic!("expected MemoryBudgetExceeded {{ Arena }} naming `src`; got: {other:?}"),
+    assert!(
+        report.cumulative_spill_bytes > 0,
+        "the run must exercise spill"
+    );
+    let rendered = out.as_string();
+    let rows: Vec<&str> = rendered.lines().skip(1).collect();
+    assert_eq!(rows.len(), 30);
+    for i in 0..30 {
+        assert!(rows.contains(&format!("id_{i}").as_str()));
     }
 }

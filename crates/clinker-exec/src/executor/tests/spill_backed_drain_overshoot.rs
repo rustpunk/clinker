@@ -1,16 +1,14 @@
-//! Hard-limit overshoot coverage for the re-materialized-drain gate on
-//! `node_buffers`, surfacing the reserved `BudgetCategory::NodeBuffer`
-//! (E310) tag.
+//! Hard-limit overshoot coverage for reserving a spilled node-buffer scan's
+//! resident materialization, surfacing the reserved
+//! `BudgetCategory::NodeBuffer` (E310) tag.
 //!
 //! A blocking consumer that drains a *spilled* predecessor slot streams the
-//! records back off disk into a fresh `Vec`. That slot's admission charge
-//! was discharged when its consumer unregistered it, so absent a gate the
-//! bytes landing back in RAM are invisible to the budget — a slot that
-//! spilled precisely because it outgrew the budget could re-inflate past the
-//! hard limit with no abort. `NodeBuffer::drain_split_metered` (wired into
-//! the single-consumer Transform and Aggregate drain sites) compares the
-//! growing vector's footprint against the hard limit and aborts with the
-//! typed `MemoryBudgetExceeded { source: NodeBuffer }`.
+//! records back off disk into a fresh `Vec`. Before allocating that vector,
+//! `NodeBufferInput::into_materialized_parts` reserves its full estimated
+//! footprint alongside the immutable spill backing. A slot that spilled
+//! precisely because it outgrew the budget therefore cannot re-inflate past
+//! the hard limit uncharged; the reservation fails with typed
+//! `MemoryBudgetExceeded { source: NodeBuffer }`.
 //!
 //! The hard limit is a small 64 KiB budget: the ~1,500-record re-materialized
 //! input alone exceeds it, so the abort fires on the re-materialized
@@ -23,11 +21,10 @@
 //! stream off the Source receiver instead). The aggregate case is a
 //! relaxed-CK (value-buffering) aggregate: a `correlation_key` source feeding
 //! a `min` binding grouped on a non-key column. That shape is excluded from
-//! the streaming-ingest channel a strict aggregate would take, so the
-//! aggregate drains its predecessor's spilled slot through
-//! `drain_split_metered` and is itself the first stage to re-materialize a
-//! spilled buffer. The assertions destructure the typed variant — no
-//! substring matching.
+//! the streaming-ingest channel a strict aggregate would take, so its
+//! planner-inserted correlation sort is the first stage to reserve and
+//! materialize the spilled buffer. The assertions destructure the typed
+//! variant — no substring matching.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -58,7 +55,7 @@ fn abort_seeded_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
     Arc::new(arb)
 }
 
-/// >1024 rows so the metered drain reaches its first per-batch poll.
+/// Enough rows for the full materialization estimate to exceed 64 KiB.
 fn transform_csv() -> String {
     let mut csv = String::from("id,amount\n");
     for i in 0..1500 {
@@ -204,8 +201,8 @@ fn spilled_aggregate_input_metered_drain_aborts_as_node_buffer() {
     match run(AGGREGATE_CHAIN_YAML, aggregate_csv()) {
         PipelineError::MemoryBudgetExceeded { node, source, .. } => {
             assert_eq!(
-                node, "rollup",
-                "the aggregate draining the spilled predecessor is the aborting stage",
+                node, "__correlation_sort_events",
+                "the correlation sort is the first stage materializing the spilled predecessor",
             );
             assert_eq!(
                 source,

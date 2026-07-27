@@ -1307,8 +1307,8 @@ impl PipelineExecutor {
         // E164-validated as terminal, so Pass 2 never references their
         // output edge. Producer publication uses the DAG scope's precomputed,
         // pass-independent reader counts, so a Source feeding both an init
-        // branch and a runtime branch gives Pass 1 a reserved clone and
-        // transfers the original generation to Pass 2's final reader.
+        // branch and a runtime branch gives Pass 1 a reserved shared scan and
+        // transfers the authoritative generation to Pass 2's final reader.
         //
         // The dispatch sequences are resolved up front (before the loop)
         // so each `scheduled_pass_order` call borrows `plan` only for its

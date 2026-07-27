@@ -489,6 +489,7 @@ nodes:
       schema:
         - {{ name: account, type: string }}
         - {{ name: seq, type: int }}
+        - {{ name: payload, type: string }}
   - type: cull
     name: drop_big
     input: events
@@ -520,38 +521,38 @@ nodes:
 /// plus one "big" account with `big_rows` rows that trips the `count(*) > 100`
 /// removal predicate.
 fn count_input(small_groups: usize, big_rows: usize) -> String {
-    let mut csv = String::from("account,seq\n");
+    let mut csv = String::from("account,seq,payload\n");
     for g in 0..small_groups {
         for r in 0..3 {
-            csv.push_str(&format!("small-{g:05},{r}\n"));
+            csv.push_str(&format!("small-{g:05},{r},x\n"));
         }
     }
     for r in 0..big_rows {
-        csv.push_str(&format!("BIG,{r}\n"));
+        csv.push_str(&format!("BIG,{r},x\n"));
     }
     csv
 }
 
 #[test]
 fn cull_spills_under_memory_pressure() {
-    // Many small groups plus one big group (150 rows, ~38 KB) that trips the
-    // `count(*) > 100` removal predicate. A 96K budget (≈77K soft) sits below
-    // the total raw-record footprint, so the cross-group resident peak trips
-    // the soft threshold and evicts small groups to disk, yet every single
-    // group — including the big one — still fits the finalize reload under the
-    // 96K hard limit (so this is the spill success path, not the fail-loud
+    // Many small groups plus one big group (150 rows) that trips the
+    // `count(*) > 100` removal predicate. A 512 KiB budget admits the exact
+    // 306,000-byte spill-backed input scan while leaving little enough
+    // headroom that the cross-group resident peak evicts small groups to disk.
+    // Every single group — including the big one — still fits the finalize
+    // reload (so this is the spill success path, not the fail-loud
     // single-giant-group case). The output must be byte-identical to the same
     // input run with an ample budget (spill is a memory strategy, never a data
     // transform) AND the run must report on-disk spill volume.
     let csv = count_input(200, 150);
 
-    let spilled = run_cull(&count_cull_pipeline("96K"), &csv);
+    let spilled = run_cull(&count_cull_pipeline("512K"), &csv);
     let in_memory = run_cull(&count_cull_pipeline("512M"), &csv);
 
     assert_eq!(spilled.dlq_count, 0, "spilling run produces no DLQ entries");
     assert!(
         spilled.cumulative_spill_bytes > 0,
-        "the 4K budget must force the disk spill path"
+        "the calibrated budget must force the disk spill path"
     );
     assert_eq!(
         in_memory.cumulative_spill_bytes, 0,
@@ -605,27 +606,70 @@ fn cull_spills_under_memory_pressure() {
 /// each) and spills freely under a sub-baseline `spill` budget, isolating the
 /// O(groups) drop-decision aggregate as the state under test.
 fn distinct_group_input(groups: usize) -> String {
-    let mut csv = String::from("account,seq\n");
+    let mut csv = String::from("account\n");
     for g in 0..groups {
-        csv.push_str(&format!("acct-{g:06},0\n"));
+        csv.push_str(&format!("acct-{g:06}\n"));
     }
     csv
 }
 
+/// One-column variant makes the input's exact scan charge deterministic while
+/// isolating the additional O(groups) decision state built beside it.
+fn decision_state_cull_pipeline(memory_limit: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: cull_decision_state
+  memory: {{ limit: "{memory_limit}", backpressure: spill }}
+error_handling:
+  strategy: continue
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: test.csv
+      schema:
+        - {{ name: account, type: string }}
+  - type: cull
+    name: drop_big
+    input: events
+    config:
+      partition_by: [account]
+      removed_to: removed
+      rules:
+        - name: drop_large_groups
+          drop_group_when: "count(*) > 100"
+  - type: output
+    name: out
+    input: drop_big
+    config:
+      name: out
+      type: csv
+      path: out.csv
+  - type: output
+    name: audit
+    input: drop_big.removed
+    config:
+      name: audit
+      type: csv
+      path: audit.csv
+"#
+    )
+}
+
 #[test]
 fn cull_decision_state_fails_loud_when_group_cardinality_exceeds_budget() {
-    // 20_000 single-row groups. The raw-record buffer is one tiny row per group
-    // and spills freely under the sub-baseline `spill` budget, but the
-    // per-group drop-decision aggregate is O(distinct groups), runs in-memory,
-    // and can neither spill nor back-pressure. A budget far below that decision
-    // state's footprint must surface a typed memory-budget error naming the
-    // drop-decision state — not an OOM crash, and not a silently-truncated
-    // result. (`count(*) > 100` never fires for one-row groups, so no group is
-    // removed; the failure is purely the unbounded decision state, decoupled
-    // from the raw-buffer spill path exercised by
-    // `cull_spills_under_memory_pressure`.)
+    // 20_000 single-row groups. A 5 MiB limit admits the input's exact
+    // 4,320,000-byte scan materialization, but not that input plus the
+    // additional O(distinct groups) drop-decision aggregate. The decision
+    // state runs in-memory and can neither spill nor back-pressure, so the
+    // combined overrun must surface a typed memory-budget error naming that
+    // state — not an OOM crash or truncated result. (`count(*) > 100` never
+    // fires for one-row groups.)
     let csv = distinct_group_input(20_000);
-    let err = run_cull_result(&count_cull_pipeline("32K"), &csv)
+    let err = run_cull_result(&decision_state_cull_pipeline("5M"), &csv)
         .expect_err("an O(groups) decision state above the budget must fail loud");
     match &err {
         clinker_plan::error::PipelineError::MemoryBudgetExceeded {
@@ -655,9 +699,10 @@ fn cull_decision_state_fails_loud_when_group_cardinality_exceeds_budget() {
 /// predictable. The inverse shape of [`distinct_group_input`]: tiny group
 /// cardinality, one very large group.
 fn single_giant_group_input(rows: usize) -> String {
-    let mut csv = String::from("account,seq\n");
+    let payload = "x".repeat(1024);
+    let mut csv = String::from("account,seq,payload\n");
     for r in 0..rows {
-        csv.push_str(&format!("BIG,{r}\n"));
+        csv.push_str(&format!("BIG,{r},{payload}\n"));
     }
     csv
 }
@@ -676,7 +721,10 @@ fn cull_giant_group_exceeds_budget_fails_loud() {
     // reload gate. An internal error would misreport an ordinary configured-
     // limit overrun as an engine invariant violation.
     let csv = single_giant_group_input(2_000);
-    let err = run_cull_result(&count_cull_pipeline("8K"), &csv)
+    // 1 MiB admits the input's exact 816,000-byte fixed-width scan, but the
+    // Cull buffer's heap-aware accounting includes the repeated 1 KiB payload
+    // and rejects the complete group on reload.
+    let err = run_cull_result(&count_cull_pipeline("1M"), &csv)
         .expect_err("a single group larger than the budget must fail loud, not OOM");
 
     match &err {

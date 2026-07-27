@@ -37,13 +37,15 @@ use clinker_plan::error::PipelineError;
 use crate::executor::spill_purge;
 use crate::executor::{PipelineExecutor, PipelineRunParams, SourceReaders, single_file_reader};
 
-// A 1 KiB memory budget forces the HashAggregator's dual-threshold spill: with
-// many distinct keys the group count crosses the budget-derived `max_groups`
-// well before EOF, so `add_record` calls `spill()` mid-run — the open this test
-// intercepts. `backpressure: spill` is required: the budget is below the
-// process baseline RSS, which the default `pause` policy rejects at startup
-// (E312); the spill policy never pauses a producer and so spills mid-run as
-// this test intends rather than being rejected.
+// A 640 KiB memory budget forces the HashAggregator's dual-threshold spill:
+// with many distinct keys the group count crosses the budget-derived
+// `max_groups` well before EOF, so `add_record` calls `spill()` mid-run — the
+// open this test intercepts. The limit still admits the output's exact 608,000
+// byte materialization reservation after the spilled aggregate completes.
+// `backpressure: spill` is required: the budget can remain below the process
+// baseline RSS, which the default `pause` policy rejects at startup (E312);
+// the spill policy never pauses a producer and so spills mid-run as this test
+// intends rather than being rejected.
 //
 // A fused passthrough Transform sits between the Source and the Aggregate so
 // the Aggregate streaming-ingests its input per record (a fused
@@ -56,7 +58,7 @@ use crate::executor::{PipelineExecutor, PipelineRunParams, SourceReaders, single
 const PIPELINE_YAML: &str = r#"
 pipeline:
   name: spill_dir_unavailable_midrun
-  memory: { limit: "1024", backpressure: spill }
+  memory: { limit: "655360", backpressure: spill }
 nodes:
   - type: source
     name: events

@@ -44,10 +44,10 @@ use petgraph::visit::{EdgeRef, Topo};
 use super::DlqEvent;
 use super::detect::RetractScope;
 use crate::executor::dispatch::{
-    ExecutorContext, NodeBufferKey, admit_node_buffer, admit_node_buffer_with_readers,
-    dispatch_plan_node, drain_node_buffer_slot, node_buffer_spill_allowed,
-    planned_materialized_reader_counts, require_node_buffer_input,
-    validate_completed_node_buffer_scope,
+    ExecutorContext, NodeBufferKey, admit_node_buffer, admit_node_buffer_transferred,
+    admit_node_buffer_with_readers, dispatch_plan_node, drain_node_buffer_slot,
+    estimate_node_buffer_bytes, node_buffer_spill_allowed, planned_materialized_reader_counts,
+    require_node_buffer_input, validate_completed_node_buffer_scope,
 };
 use crate::executor::node_buffer::NodeBuffer;
 use clinker_plan::error::PipelineError;
@@ -354,8 +354,9 @@ fn seed_cross_region_inputs_for(
         // consumer; `admit_node_buffer` then re-registers the re-seeded slot so
         // its bytes are attributed and bound-checked like every other slot (a
         // raw insert would leave the replayed records off the arbitrator's
-        // books). The slot is non-spillable — the consumer edge carries a
-        // producer port — so `spill_allowed` is false.
+        // books). Producer-port identity lives in `slot_key`; it does not
+        // restrict spilling because every reader reopens the exact immutable
+        // port-scoped backing for its own sequential scan.
         let producer_port = current_dag.graph[edge_id].producer_port.as_deref();
         let slot_key = NodeBufferKey::with_port(source_idx, producer_port);
         drain_node_buffer_slot(ctx, slot_key.clone());
@@ -366,7 +367,7 @@ fn seed_cross_region_inputs_for(
             slot_key.clone(),
             parked,
             Vec::new(),
-            false,
+            node_buffer_spill_allowed(current_dag, source_idx),
             1,
         )?;
     }
@@ -476,7 +477,11 @@ fn recurse_into_body(
     // unwrapped via `?`. A `Drop`-guard would extend the `&mut ctx`
     // borrow through the recursive dispatch calls, which the borrow
     // checker rejects.
-    let walk_and_harvest: Result<Vec<(Record, u64)>, PipelineError> = (|| {
+    type CommitHarvest = (
+        Vec<(Record, u64)>,
+        Vec<crate::executor::node_buffer::TransientNodeBufferReservation>,
+    );
+    let walk_and_harvest: Result<CommitHarvest, PipelineError> = (|| {
         let body_scope = super::detect::detect_retract_scope(ctx, &body_dag);
         let body_initial_rows: Vec<(u64, std::sync::Arc<str>)> = body_scope
             .seen_source_rows
@@ -528,6 +533,7 @@ fn recurse_into_body(
         // port, but draining the full set keeps a future multi-port
         // body covered without an extra code path.
         let mut harvested: Vec<(Record, u64)> = Vec::new();
+        let mut harvest_reservations = Vec::new();
         for body_out_idx in bound_body.output_port_to_node_idx.values() {
             let input = require_node_buffer_input(
                 ctx,
@@ -536,14 +542,23 @@ fn recurse_into_body(
                 body_dag.graph[*body_out_idx].name(),
                 None,
             )?;
-            let (input, _reservation) = input.into_parts();
+            let (input, reservation) = input.into_materialized_parts(
+                &ctx.memory_budget,
+                parent_dag.graph[composition_idx].name(),
+            )?;
             // Commit-pass body harvest: composition body output punctuations
             // re-emit at the parent's call site; here we take records only.
             let (records, _puncts) = input.drain_split()?;
+            if let Some(reservation) = reservation.as_ref() {
+                reservation.set_bytes(estimate_node_buffer_bytes(&records));
+            }
             harvested.extend(records);
+            if let Some(reservation) = reservation {
+                harvest_reservations.push(reservation);
+            }
         }
         validate_completed_node_buffer_scope(ctx, parent_dag.graph[composition_idx].name())?;
-        Ok::<Vec<(Record, u64)>, PipelineError>(harvested)
+        Ok((harvested, harvest_reservations))
     })();
 
     // Unregister every body-local NodeBufferConsumer so the
@@ -577,7 +592,7 @@ fn recurse_into_body(
     ctx.planned_node_buffer_readers = saved_planned_readers;
     ctx.window_arena_consumer_ids = saved_arena_ids;
 
-    let harvested = walk_and_harvest?;
+    let (harvested, mut harvest_reservations) = walk_and_harvest?;
 
     let continuation = parent_dag
         .parent_continuations
@@ -588,20 +603,47 @@ fn recurse_into_body(
         // Any stale forward-pass value is replacement state, not a logical
         // read; discard its count/registration before combining the rows.
         let mut rows = match drain_node_buffer_slot(ctx, composition_idx) {
-            Some(slot) => slot.drain_split()?.0,
+            Some(slot) => {
+                let reservation =
+                    crate::executor::node_buffer::reserve_node_buffer_materialization(
+                        slot.replacement_materialization_bytes_after_unregister(),
+                        &ctx.memory_budget,
+                        parent_dag.graph[composition_idx].name(),
+                    )?;
+                let rows = slot.drain_split()?.0;
+                reservation.set_bytes(estimate_node_buffer_bytes(&rows));
+                harvest_reservations.push(reservation);
+                rows
+            }
             None => Vec::new(),
         };
         rows.extend(harvested);
         let composition_name = parent_dag.graph[composition_idx].name();
-        admit_node_buffer(
-            ctx,
-            parent_dag,
-            composition_name,
-            composition_idx,
-            rows,
-            Vec::new(),
-            node_buffer_spill_allowed(parent_dag, composition_idx),
-        )?;
+        if let Some(primary) = harvest_reservations.pop() {
+            // Consolidate already-charged harvested vectors into one live
+            // registration, then transfer that exact registration into the
+            // parent slot without a second admission charge.
+            primary.absorb_charges(harvest_reservations);
+            admit_node_buffer_transferred(
+                ctx,
+                parent_dag,
+                composition_name,
+                composition_idx,
+                rows,
+                Vec::new(),
+                primary,
+            )?;
+        } else {
+            admit_node_buffer(
+                ctx,
+                parent_dag,
+                composition_name,
+                composition_idx,
+                rows,
+                Vec::new(),
+                node_buffer_spill_allowed(parent_dag, composition_idx),
+            )?;
+        }
     }
 
     if let Some(continuation) = continuation {

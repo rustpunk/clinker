@@ -316,7 +316,7 @@ pub(crate) fn dispatch_combine(
             driver_upstream,
             driver_port.as_deref(),
         )?;
-        let (input, reservation) = input.into_parts();
+        let (input, reservation) = input.into_materialized_parts(&ctx.memory_budget, name)?;
         let (records, puncts) = input.drain_split()?;
         (records, puncts, reservation)
     };
@@ -327,7 +327,8 @@ pub(crate) fn dispatch_combine(
         build_upstream,
         build_port.as_deref(),
     )?;
-    let (build_input, _build_clone_reservation) = build_input.into_parts();
+    let (build_input, _build_clone_reservation) =
+        build_input.into_materialized_parts(&ctx.memory_budget, name)?;
     let (build_buf, build_puncts): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
@@ -2003,10 +2004,9 @@ fn merge_compress_for<P>(
 ///   the slot if RSS pressure warrants. Spilled output streams straight from the
 ///   k-way run merge into a single node-buffer spill chunk, never
 ///   re-materializing the full result — so a blocking downstream stays bounded.
-///   When a downstream window is rooted on this node, a deferred region abuts
-///   one of its out-edges, or the slot cannot spill (multi-consumer fan-out /
-///   composition input port), the spilled result is materialized once — those
-///   surfaces hold the whole set regardless — and admitted in memory.
+///   When a downstream window is rooted on this node or a deferred region
+///   abuts one of its out-edges, the spilled result is materialized once —
+///   those surfaces hold the whole set regardless — and admitted in memory.
 fn drain_block_band_output(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
@@ -2018,7 +2018,7 @@ fn drain_block_band_output(
 ) -> Result<BlockBandDrain, PipelineError> {
     use crate::pipeline::sort_buffer::SortedOutput;
     let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
-    // A window root, a cross-region tee, or a non-spillable slot needs the whole
+    // A window root or cross-region tee needs the whole
     // slice materialized; the traversal that decides this is walked once and
     // reused by both the streaming guard and the spilled-buffer branch.
     let needs_materialization = block_band_output_needs_materialization(current_dag, node_idx);
@@ -2115,7 +2115,7 @@ fn drain_block_band_output(
                     puncts,
                 )?;
             } else {
-                // A window root, a cross-region tee, or a non-spillable slot needs
+                // A window root or cross-region tee needs
                 // the whole slice; those surfaces are O(N) regardless, so
                 // re-materialize the sorted stream once and admit it in memory.
                 let merge_compress = merge_compress_for(ctx, &files, ctx.batch_size);

@@ -225,7 +225,10 @@ fn streaming_arm_soft_spills_under_one_megabyte_budget() {
         return;
     }
 
-    const ROWS: usize = 4_000;
+    // The materialized Source → Route edge is 280 bytes per row. Keep its
+    // exact 980,000-byte admission below 1 MiB while retaining enough
+    // 128-row batches to exercise repeated streaming spills.
+    const ROWS: usize = 3_500;
     let yaml = r#"
 pipeline:
   name: streaming_route_soft_spill

@@ -79,6 +79,16 @@ nodes:
         text.contains("removed → drop_bad.removed"),
         "the removed side-output port must be rendered: {text}"
     );
+    assert!(
+        text.contains("edge cull.drop_bad -> output.kept:\n  buffer: node_buffer (slot=1)"),
+        "the unnamed main slot must retain its exact producer identity: {text}"
+    );
+    assert!(
+        text.contains(
+            "edge cull.drop_bad -> output.audit:\n  buffer: node_buffer (slot=1, port=removed)"
+        ),
+        "the removed slot must carry its exact producer-port identity: {text}"
+    );
 
     insta::assert_snapshot!("explain_cull_two_output_ports", text);
 }

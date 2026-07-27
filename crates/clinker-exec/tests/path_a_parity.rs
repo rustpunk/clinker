@@ -372,7 +372,7 @@ fn test_canonical_dag_shape_baselines() {
 /// user's Merge is first-class; downstream consumers reference it by
 /// name.
 ///
-/// Scope: compile-only. The executor's fan-out-by-clone is exercised
+/// Scope: compile-only. The executor's shared sequential-scan fan-out is exercised
 /// end-to-end by other tests that share a Transform predecessor across
 /// multiple Outputs; a shared-Merge runtime assertion would require
 /// CSV writers to derive their output schema from the Merge's union

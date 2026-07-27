@@ -158,17 +158,17 @@ fn flagged_resident_memory_slot_spills_and_discharges_via_sweep() {
 }
 
 #[test]
-fn flagged_non_spillable_slot_is_skipped_by_sweep() {
+fn flagged_rereadable_memory_slot_spills_and_discharges_resident_bytes() {
     let arb = MemoryArbitrator::with_policy(64 * 1024 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
     let spill_dir = tempfile::tempdir().expect("temp dir");
     let s = schema();
     let idx = NodeIndex::new(0);
 
-    // A fan-out / composition-port slot: its consumer would reach
-    // `clone_memory_only`, which panics on a spill-backed variant, so the
-    // sweep must never spill it even when the arbitrator flags it.
     let mut node_buffers: HashMap<NodeBufferKey, NodeBuffer> = HashMap::new();
-    node_buffers.insert(idx.into(), memory_slot(&s, &[(1, "a", 1), (2, "b", 2)]));
+    let mut slot = memory_slot(&s, &[(1, "a", 1), (2, "b", 2)]);
+    drop(slot.reread().expect("first fan-out cursor completes"));
+    assert!(slot.is_resident_memory());
+    node_buffers.insert(idx.into(), slot);
 
     let handle = ConsumerHandle::new();
     handle.set_bytes(record_byte_cost(2) * 2);
@@ -187,26 +187,34 @@ fn flagged_non_spillable_slot_is_skipped_by_sweep() {
             spill_root: spill_dir.path(),
             spill_compress: clinker_plan::config::CompressMode::On,
             batch_size: 2048,
-            is_spill_allowed: &|_idx| false,
+            is_spill_allowed: &|_idx| true,
             node_name: &|_idx| "fanout".to_string(),
         },
     )
-    .expect("sweep skips non-spillable slots without error");
+    .expect("sweep spills re-readable resident slot");
 
     assert!(
-        matches!(node_buffers.get(&idx.into()), Some(NodeBuffer::Memory(_))),
-        "a non-spillable slot must stay resident (spilling it would later panic)"
+        !node_buffers
+            .get(&idx.into())
+            .expect("slot remains published")
+            .is_resident_memory(),
+        "the immutable fan-out backing transitions to a re-readable spill"
     );
-    assert!(handle.bytes() > 0, "its charge is untouched");
     assert_eq!(
-        arb.cumulative_spill_bytes(),
+        handle.bytes(),
         0,
-        "nothing is recorded against the disk quota for a skipped slot"
+        "resident bytes are discharged after spill"
     );
-    // The flag was consumed so a still-pressured arbitrator's re-election is
-    // what re-flags it, rather than the same stale flag spinning every sweep.
+    assert!(arb.cumulative_spill_bytes() > 0);
     assert!(
         !handle.take_spill_request(),
-        "the spill-request flag is cleared even when the slot is not spilled"
+        "the spill-request flag is consumed by the successful sweep"
+    );
+
+    let slot = node_buffers.remove(&idx.into()).expect("spilled slot");
+    let (records, _) = slot.drain_split().expect("re-readable spill drains");
+    assert_eq!(
+        records.iter().map(|(_, rn)| *rn).collect::<Vec<_>>(),
+        vec![1, 2]
     );
 }

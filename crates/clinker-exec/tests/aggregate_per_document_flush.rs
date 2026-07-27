@@ -97,12 +97,68 @@ nodes:
     )
 }
 
+/// Streaming-ingest variant used by the forced-spill regression. The long
+/// per-group `min(payload)` state deterministically crosses Aggregate's value-
+/// heap threshold without requiring an impossible sub-materialization hard
+/// limit; the terminal projection removes the helper column again.
+fn count_by_category_spill_yaml(memory_limit: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: per_doc_agg_spill
+  memory: {{ limit: "{memory_limit}", backpressure: spill }}
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      glob: ./*.csv
+      files:
+        on_no_match: skip
+      schema:
+        - {{ name: category, type: string }}
+        - {{ name: payload, type: string }}
+  - type: transform
+    name: passthrough
+    input: events
+    config:
+      cxl: |
+        emit category = category
+        emit payload = payload
+  - type: aggregate
+    name: by_category
+    input: passthrough
+    config:
+      group_by:
+        - category
+      cxl: |
+        emit category = category
+        emit n = count(*)
+        emit sample = min(payload)
+  - type: output
+    name: out
+    input: by_category
+    config:
+      name: out
+      type: csv
+      path: out.csv
+      include_unmapped: true
+      exclude: [sample]
+"#
+    )
+}
+
 /// Run the count-by-category pipeline over a set of in-memory CSV files,
 /// each fed as a distinct `FileSlot` (hence a distinct document). Returns
 /// the sorted body lines (`category,n`) and the run's ok/dlq counts.
-fn run_multi_file(memory_limit: &str, files: &[(&str, &str)]) -> (Vec<String>, u64, u64) {
+fn run_multi_file(memory_limit: &str, files: &[(&str, &str)]) -> (Vec<String>, u64, u64, u64) {
     let yaml = count_by_category_yaml(memory_limit);
-    let config = parse_config(&yaml).expect("parse per-document aggregate pipeline");
+    run_multi_file_yaml(&yaml, files)
+}
+
+fn run_multi_file_yaml(yaml: &str, files: &[(&str, &str)]) -> (Vec<String>, u64, u64, u64) {
+    let config = parse_config(yaml).expect("parse per-document aggregate pipeline");
     let plan = config
         .compile(&CompileContext::default())
         .expect("compile per-document aggregate pipeline");
@@ -141,7 +197,12 @@ fn run_multi_file(memory_limit: &str, files: &[(&str, &str)]) -> (Vec<String>, u
     let output = buf.as_string();
     let mut body: Vec<String> = output.lines().skip(1).map(|s| s.to_string()).collect();
     body.sort();
-    (body, report.counters.ok_count, report.counters.dlq_count)
+    (
+        body,
+        report.counters.ok_count,
+        report.counters.dlq_count,
+        report.cumulative_spill_bytes,
+    )
 }
 
 #[test]
@@ -151,7 +212,7 @@ fn multi_document_emits_one_group_set_per_document() {
     // aggregation must emit x=2 and y=1 for document A and a SEPARATE x=3
     // for document B — a single cross-document aggregate would instead
     // collapse to x=5, y=1.
-    let (body, ok, dlq) = run_multi_file(
+    let (body, ok, dlq, _spill_bytes) = run_multi_file(
         "512M",
         &[
             ("a.csv", "category\nx\nx\ny\n"),
@@ -174,7 +235,7 @@ fn three_documents_each_flush_independently() {
     // category key recurs in every document with a different count, so a
     // correct run yields three distinct rows for it rather than one
     // summed row.
-    let (body, ok, dlq) = run_multi_file(
+    let (body, ok, dlq, _spill_bytes) = run_multi_file(
         "512M",
         &[
             ("d1.csv", "category\na\na\n"),
@@ -201,7 +262,8 @@ fn single_document_emits_one_aggregate_unchanged() {
     // One file = one document: the dominant path must accumulate every row
     // and emit a single aggregate per group, byte-identical to the
     // pre-per-document behavior. x=2, y=1 — never split.
-    let (body, ok, dlq) = run_multi_file("512M", &[("only.csv", "category\nx\nx\ny\n")]);
+    let (body, ok, dlq, _spill_bytes) =
+        run_multi_file("512M", &[("only.csv", "category\nx\nx\ny\n")]);
     assert_eq!(dlq, 0);
     assert_eq!(body, vec!["x,2".to_string(), "y,1".to_string()]);
     assert_eq!(ok, 2, "single document emits one aggregate per group");
@@ -209,36 +271,42 @@ fn single_document_emits_one_aggregate_unchanged() {
 
 #[test]
 fn spilling_strategy_flushes_per_document_across_boundary() {
-    // A 1 KB budget clamps the in-memory group cap so the aggregator
-    // spills to disk; the per-document flush must still split groups by
-    // document across the spill round-trip. Many distinct keys per
-    // document force spill within each document's bucket.
-    let mut doc_a = String::from("category\n");
+    // A fused passthrough avoids a full-input scan reservation. The 96 KiB
+    // budget admits the terminal materialization, while 100 groups carrying
+    // 1 KiB `min(payload)` values cross Aggregate's value-heap threshold and
+    // force a real spill in each document.
+    let payload = "p".repeat(1024);
+    let mut doc_a = String::from("category,payload\n");
     for i in 0..200 {
-        doc_a.push_str(&format!("a{}\n", i % 50));
+        doc_a.push_str(&format!("a{},{payload}\n", i % 100));
     }
-    let mut doc_b = String::from("category\n");
+    let mut doc_b = String::from("category,payload\n");
     for i in 0..200 {
-        doc_b.push_str(&format!("b{}\n", i % 50));
+        doc_b.push_str(&format!("b{},{payload}\n", i % 100));
     }
-    let (body, ok, dlq) = run_multi_file(
-        "1K",
+    let yaml = count_by_category_spill_yaml("96K");
+    let (body, ok, dlq, spill_bytes) = run_multi_file_yaml(
+        &yaml,
         &[("a.csv", doc_a.as_str()), ("b.csv", doc_b.as_str())],
     );
     assert_eq!(dlq, 0, "spilling run produces no DLQ entries");
-    // 50 distinct `a*` keys (each count 4) from document A, 50 distinct
-    // `b*` keys (each count 4) from document B — 100 groups total, every
+    assert!(
+        spill_bytes > 0,
+        "the calibrated budget must force a real spill"
+    );
+    // 100 distinct `a*` keys (each count 2) from document A, 100 distinct
+    // `b*` keys (each count 2) from document B — 200 groups total, every
     // key namespaced to its own document.
-    assert_eq!(ok, 100, "50 groups per document, kept per-document");
-    assert_eq!(body.len(), 100);
+    assert_eq!(ok, 200, "100 groups per document, kept per-document");
+    assert_eq!(body.len(), 200);
     let a_groups = body.iter().filter(|r| r.starts_with("a")).count();
     let b_groups = body.iter().filter(|r| r.starts_with("b")).count();
-    assert_eq!(a_groups, 50, "document A contributes 50 groups");
-    assert_eq!(b_groups, 50, "document B contributes 50 groups");
+    assert_eq!(a_groups, 100, "document A contributes 100 groups");
+    assert_eq!(b_groups, 100, "document B contributes 100 groups");
     for row in &body {
         assert!(
-            row.ends_with(",4"),
-            "every key appears 4 times within its document: {row}"
+            row.ends_with(",2"),
+            "every key appears twice within its document: {row}"
         );
     }
 }

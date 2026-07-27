@@ -483,8 +483,9 @@ fn real_run_logs_per_stage_actual_spill() {
     // (#176 AC#3).
     let tmp = tempdir_path();
     let pipeline = tmp.join("pipeline.yaml");
-    // Inline a 1 MiB memory budget so the aggregate's group table spills.
-    // `backpressure: spill` is required: 1 MiB is below the binary's
+    // Inline an 8 MiB memory budget: it admits the exact 7.6 MB terminal
+    // materialization while the aggregate's 50,000-group table still spills.
+    // `backpressure: spill` is required: 8 MiB is below the binary's
     // baseline RSS, which the default `pause` policy rejects at startup
     // (E312); the spill policy never pauses a producer and so spills as
     // this test intends rather than being rejected.
@@ -499,7 +500,7 @@ fn real_run_logs_per_stage_actual_spill() {
     let yaml = AGG_PIPELINE_YAML
         .replace(
             "pipeline:\n  name: storage_obs\n",
-            "pipeline:\n  name: storage_obs\n  memory: { limit: \"1M\", backpressure: spill }\n",
+            "pipeline:\n  name: storage_obs\n  memory: { limit: \"8M\", backpressure: spill }\n",
         )
         .replace(
             "  - type: aggregate\n    name: dept_totals\n    input: orders\n",
@@ -507,7 +508,7 @@ fn real_run_logs_per_stage_actual_spill() {
         );
     std::fs::write(&pipeline, &yaml).expect("write pipeline yaml");
     // Every row a distinct department: 50_000 groups dwarf the budget-derived
-    // group-count cap (max_groups = 60% of the 1 MiB budget / est-bytes-per-group
+    // group-count cap (max_groups = 60% of the 8 MiB budget / est-bytes-per-group
     // ≈ a few thousand), so the group table crosses the cap and spills before
     // EOF. That cap is derived from the configured budget, not process RSS, so
     // the spill fires deterministically on every host — unlike the prior
@@ -537,7 +538,7 @@ fn real_run_logs_per_stage_actual_spill() {
     // per-stage actuals section must be present on every host.
     assert!(
         stdout.contains("=== Spill Volume (actual, per stage) ==="),
-        "the high-cardinality aggregate must spill its group table under the 1 MiB \
+        "the high-cardinality aggregate must spill its group table under the 8 MiB \
          budget, so the per-stage actual-spill section must be printed; got:\n{stdout}"
     );
     assert!(

@@ -234,8 +234,8 @@ where
 ///
 /// On a soft-threshold trip (`MemoryArbitrator::should_spill_self()`,
 /// which observes RSS without driving the pausing arbitration round) —
-/// and only when `spill_allowed` certifies the slot has a single drain
-/// consumer — the flushed batch's records round-trip through a
+/// and when `spill_allowed` matches the compiled buffer classification — the
+/// flushed batch's records round-trip through a
 /// `SpillFile<u64>` on disk instead of being held in the producer's
 /// working set: each maximal run of consecutive records is written out,
 /// re-read, and forwarded to the writer one at a time, relieving the
@@ -244,10 +244,7 @@ where
 /// interleaving the producer emitted survives the spill round-trip
 /// byte-for-byte in arrival order — a `DocumentOpen` that frames a run
 /// still precedes that run's records, and a `DocumentClose` still trails
-/// them, exactly as on the in-memory path. `spill_allowed` is `false` for
-/// any slot whose consumer would reach `NodeBuffer::clone_memory_only`
-/// (multi-consumer fan-out / composition input-port edge), because that
-/// method panics on spill-backed variants.
+/// them, exactly as on the in-memory path.
 ///
 /// One `StreamingChargeHandle` lives per producer slot for the slot's
 /// whole lifetime; the wrapper it pairs with is unregistered when the

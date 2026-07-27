@@ -151,7 +151,8 @@ pub(crate) fn dispatch_output(
         current_dag.graph[producer].name(),
         producer_port,
     )?;
-    let (input, input_clone_reservation) = input.into_parts();
+    let (input, input_materialization_reservation) =
+        input.into_materialized_parts(&ctx.memory_budget, name)?;
     let (input_records, _input_puncts) = input.drain_split()?;
 
     let OutputInputs {
@@ -424,7 +425,7 @@ pub(crate) fn dispatch_output(
     }
 
     // The duplicate records have completed their synchronous Output use.
-    drop(input_clone_reservation);
+    drop(input_materialization_reservation);
     Ok(())
 }
 
@@ -538,7 +539,7 @@ fn drain_output_input_events(
     ),
     PipelineError,
 > {
-    let input = drain_output_input_event_iter(ctx, current_dag, node_idx, name)?;
+    let input = drain_output_input_event_iter(ctx, current_dag, node_idx, name, true)?;
     let (events, reservation) = input.into_parts();
     Ok((events.collect::<Result<Vec<_>, _>>()?, reservation))
 }
@@ -615,7 +616,7 @@ fn dispatch_output_envelope(
     let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
     let mut any_record = false;
 
-    let events = drain_output_input_event_iter(ctx, current_dag, node_idx, name)?;
+    let events = drain_output_input_event_iter(ctx, current_dag, node_idx, name, false)?;
     let mut driver = EnvelopeWriterDriver::default();
     let mut structured_guard = StructuredOutputDocumentGuard::new(&out_cfg.format);
 
@@ -855,11 +856,10 @@ impl EnvelopeWriterDriver {
 /// of [`drain_output_input_events`], but yielding an iterator rather than a
 /// `Vec` so a spilled predecessor buffer streams from disk one event at a
 /// time instead of materializing. Mirrors the per-record path's own-slot-first
-/// selection, then lets the producer-declared reader ledger choose a reserved
-/// clone or transfer the original predecessor generation to its final reader.
-/// Shared fan-out slots are never spilled, so the clone path never hides a
-/// spilled buffer.
-#[must_use = "a cloned Output input must retain its transient reservation"]
+/// selection, then lets the producer-declared reader ledger choose a shared
+/// sequential scan or transfer the authoritative predecessor generation to
+/// its final reader. A spill-backed scan opens one chunk at a time.
+#[must_use = "an Output input must retain its scan reservation"]
 struct OutputInputEventIter {
     events:
         Box<dyn Iterator<Item = Result<crate::executor::stream_event::StreamEvent, PipelineError>>>,
@@ -890,6 +890,7 @@ fn drain_output_input_event_iter(
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     name: &str,
+    materializes: bool,
 ) -> Result<OutputInputEventIter, PipelineError> {
     use petgraph::visit::EdgeRef;
     let edge = current_dag
@@ -908,7 +909,11 @@ fn drain_output_input_event_iter(
         current_dag.graph[producer].name(),
         producer_port,
     )?;
-    let (input, reservation) = input.into_parts();
+    let (input, reservation) = if materializes {
+        input.into_materialized_parts(&ctx.memory_budget, name)?
+    } else {
+        input.into_parts()
+    };
     Ok(OutputInputEventIter {
         events: Box::new(input.drain()),
         reservation,
@@ -916,7 +921,7 @@ fn drain_output_input_event_iter(
 }
 
 /// Build the fail-loud diagnostic only after every valid Output input location
-/// (own slot, predecessor drain, or predecessor clone) has been checked.
+/// (own slot, predecessor drain, or predecessor shared scan) has been checked.
 #[cold]
 fn missing_output_input_error(
     current_dag: &ExecutionPlanDag,
@@ -1170,7 +1175,7 @@ fn emit_fan_out(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::node_buffer::{NodeBuffer, clone_node_buffer_reserved};
+    use crate::executor::node_buffer::{NodeBuffer, reserve_node_buffer_materialization};
     use clinker_format::FormatWriter;
     use clinker_format::error::FormatError;
     use clinker_record::{DocumentContext, DocumentId, FieldResolver, Schema, Value};
@@ -1208,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_output_clone_preflight_returns_node_buffer_e310_at_baseline() {
+    fn ordinary_output_materialization_preflight_returns_node_buffer_e310_at_baseline() {
         let input = output_clone_fixture();
         let clone_bytes = input.estimated_memory_bytes();
         let hard_limit = 100 * 1024 * 1024 * 1024;
@@ -1221,7 +1226,7 @@ mod tests {
         ));
         let baseline_id = budget.register_consumer(Arc::new(FixedUsage(baseline_usage)));
 
-        match clone_node_buffer_reserved(&input, &budget, "ordinary_out") {
+        match reserve_node_buffer_materialization(clone_bytes, &budget, "ordinary_out") {
             Err(PipelineError::MemoryBudgetExceeded {
                 node,
                 used,
@@ -1234,7 +1239,7 @@ mod tests {
                 assert_eq!(limit, hard_limit);
                 assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
             }
-            Ok(_) => panic!("Output clone must be rejected before allocation"),
+            Ok(_) => panic!("Output materialization must be rejected before allocation"),
             Err(other) => panic!("expected Output E310 NodeBuffer; got {other:?}"),
         }
         assert_eq!(budget.consumer_count(), 1);
@@ -1243,8 +1248,8 @@ mod tests {
     }
 
     #[test]
-    fn envelope_output_iterator_holds_clone_charge_through_iteration() {
-        let input = output_clone_fixture();
+    fn envelope_output_iterator_holds_materialization_charge_through_iteration() {
+        let mut input = output_clone_fixture();
         let clone_bytes = input.estimated_memory_bytes();
         let budget = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
             100 * 1024 * 1024 * 1024,
@@ -1252,11 +1257,11 @@ mod tests {
             0.70,
             Box::new(crate::pipeline::memory::NoOpPolicy),
         ));
-        let reserved = clone_node_buffer_reserved(&input, &budget, "envelope_out")
-            .expect("roomy Output clone");
-        let (cloned, reservation) = reserved.into_parts();
+        let reservation = reserve_node_buffer_materialization(clone_bytes, &budget, "envelope_out")
+            .expect("roomy Output materialization");
+        let reread = input.reread().expect("re-readable Output input");
         let mut events = OutputInputEventIter {
-            events: Box::new(cloned.drain()),
+            events: Box::new(reread.drain()),
             reservation: Some(reservation),
         };
 

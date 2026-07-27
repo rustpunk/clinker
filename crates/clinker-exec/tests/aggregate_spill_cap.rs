@@ -54,9 +54,14 @@ nodes:
         on_no_match: skip
       schema:
         - {{ name: category, type: string }}
+  - type: transform
+    name: passthrough
+    input: events
+    config:
+      cxl: "emit category = category"
   - type: aggregate
     name: {AGG_NODE}
-    input: events
+    input: passthrough
     config:
       group_by:
         - category
@@ -124,10 +129,12 @@ fn run(
 
 #[test]
 fn aggregate_spill_charges_per_stage_disk_accounting() {
-    // Clamped budget, unlimited disk cap: the aggregate spills and the run
-    // completes. Its spilled bytes must be attributed to the aggregate node
-    // and roll into the pipeline-wide cumulative total.
-    let report = run("1K", "fail_fast", None).expect("run completes under an unlimited disk cap");
+    // A fused passthrough streams the input into Aggregate, isolating its group
+    // table from an unrelated full-input scan reservation. The 48 KiB budget
+    // admits the 200-row terminal materialization while the 200-key table still
+    // crosses its deterministic spill threshold. The run completes, and its
+    // spilled bytes are attributed to the aggregate node.
+    let report = run("48K", "fail_fast", None).expect("run completes under an unlimited disk cap");
     assert!(
         report.cumulative_spill_bytes > 0,
         "the clamped budget must force the aggregate to spill; \

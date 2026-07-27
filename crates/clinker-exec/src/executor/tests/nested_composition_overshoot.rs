@@ -17,9 +17,9 @@
 //! `tests/fixtures/compositions/issue_123_nested_hard_fail.comp.yaml`,
 //! whose schema-widening Transform and two-branch fan-out mirror the
 //! top-level diamond inside a body. The arbitrator is seeded above the
-//! soft limit (spill active) with a one-byte disk quota so the body's
-//! first admission overflows deterministically — independent of the
-//! test process's real RSS, which pull-mode would otherwise race.
+//! soft limit (spill active) with enough disk quota for the parent Source
+//! slot but not the cumulative body admission, so the body interior
+//! overflows deterministically — independent of the test process's real RSS.
 
 use super::*;
 use clinker_bench_support::io::SharedBuffer;
@@ -29,6 +29,7 @@ use std::sync::Arc;
 
 const HARD_LIMIT: u64 = 100 * 1024 * 1024 * 1024;
 const SPILL_FRAC: f64 = 0.80;
+const BODY_SPILL_CAP: u64 = 600;
 
 fn spill_tripped_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
     let arb = crate::pipeline::memory::MemoryArbitrator::with_policy(
@@ -38,7 +39,7 @@ fn spill_tripped_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> 
         Box::new(crate::pipeline::memory::Priority),
     );
     arb.set_peak_rss_for_test(90 * 1024 * 1024 * 1024);
-    arb.set_max_spill_bytes(1);
+    arb.set_max_spill_bytes(BODY_SPILL_CAP);
     Arc::new(arb)
 }
 
@@ -118,7 +119,7 @@ fn body_interior_overshoot_is_wrapped_under_the_call_site() {
         ctx,
         spill_tripped_arbitrator(),
     )
-    .expect_err("one-byte spill quota must abort a body-interior admission");
+    .expect_err("the cumulative spill quota must abort a body-interior admission");
 
     match err {
         PipelineError::CompositionBodyError {
@@ -140,7 +141,10 @@ fn body_interior_overshoot_is_wrapped_under_the_call_site() {
                         !node.is_empty(),
                         "the inner error must name the body-internal node that overflowed",
                     );
-                    assert_eq!(cap, 1, "reported cap must equal the one-byte quota");
+                    assert_eq!(
+                        cap, BODY_SPILL_CAP,
+                        "reported cap must equal the configured quota"
+                    );
                     assert!(attempted > 0, "the overflowing flush must report its size");
                     assert!(
                         current > cap,

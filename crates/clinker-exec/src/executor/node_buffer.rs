@@ -19,6 +19,7 @@
 //! as a spill victim under sustained pressure is flushed by the
 //! dispatcher's per-node sweep through [`NodeBuffer::spill_resident_memory`].
 
+use std::sync::Arc;
 use std::vec::IntoIter as VecIntoIter;
 
 use clinker_record::{Record, Value};
@@ -103,6 +104,66 @@ pub(crate) enum NodeBuffer {
         /// intermediate runs charge this node's disk quota through here.
         merge_budget: OwnedMergeBudget,
     },
+    /// Immutable backing shared by sequential fan-out readers. Each reader
+    /// gets its own cursor; memory events clone one at a time and spill files
+    /// open one fresh sequential `SpillReader` at a time. The outer `Arc`
+    /// keeps the slot's files alive until the authoritative reader ledger
+    /// releases the final reader without pre-forking copies.
+    ReReadable(Arc<ReReadableNodeBuffer>),
+}
+
+pub(crate) enum ReReadableNodeBuffer {
+    Memory(Vec<StreamEvent>),
+    Spilled {
+        chunks: Vec<(SpillFile<u64>, u64)>,
+        pending_puncts: Vec<Punctuation>,
+    },
+    Mixed {
+        mem: Vec<StreamEvent>,
+        spills: Vec<(SpillFile<u64>, u64)>,
+        pending_puncts: Vec<Punctuation>,
+    },
+}
+
+impl ReReadableNodeBuffer {
+    fn len_hint(&self) -> usize {
+        match self {
+            Self::Memory(events) => events.iter().filter(|event| event.is_record()).count(),
+            Self::Spilled { chunks, .. } => chunks.iter().map(|(_, count)| *count as usize).sum(),
+            Self::Mixed { mem, spills, .. } => {
+                mem.iter().filter(|event| event.is_record()).count()
+                    + spills
+                        .iter()
+                        .map(|(_, count)| *count as usize)
+                        .sum::<usize>()
+            }
+        }
+    }
+
+    fn memory_events(&self) -> &[StreamEvent] {
+        match self {
+            Self::Memory(events) => events,
+            Self::Mixed { mem, .. } => mem,
+            Self::Spilled { .. } => &[],
+        }
+    }
+
+    fn spill_chunks(&self) -> &[(SpillFile<u64>, u64)] {
+        match self {
+            Self::Memory(_) => &[],
+            Self::Spilled { chunks, .. } => chunks,
+            Self::Mixed { spills, .. } => spills,
+        }
+    }
+
+    fn pending_puncts(&self) -> &[Punctuation] {
+        match self {
+            Self::Memory(_) => &[],
+            Self::Spilled { pending_puncts, .. } | Self::Mixed { pending_puncts, .. } => {
+                pending_puncts
+            }
+        }
+    }
 }
 
 impl NodeBuffer {
@@ -142,6 +203,90 @@ impl NodeBuffer {
         }
     }
 
+    /// Return a new sequential cursor while retaining this slot for later
+    /// readers. The first call atomically converts the slot to immutable
+    /// re-readable backing; subsequent calls only clone the backing `Arc`.
+    ///
+    /// `MergeSpilled` is the one non-repeatable representation. Its first
+    /// shared read folds the destructive k-way merge into one ordinary spill,
+    /// charging the replacement before releasing the adopted runs. A failed
+    /// fold leaves no partially published re-readable slot.
+    pub(crate) fn reread(&mut self) -> Result<Self, PipelineError> {
+        if let Self::ReReadable(backing) = self {
+            return Ok(Self::ReReadable(Arc::clone(backing)));
+        }
+
+        let original = std::mem::replace(self, Self::Memory(Vec::new()));
+        let backing = match original {
+            Self::Memory(events) => ReReadableNodeBuffer::Memory(events),
+            Self::Spilled {
+                chunks,
+                pending_puncts,
+            } => ReReadableNodeBuffer::Spilled {
+                chunks,
+                pending_puncts,
+            },
+            Self::Mixed {
+                mem,
+                spills,
+                pending_puncts,
+            } => ReReadableNodeBuffer::Mixed {
+                mem,
+                spills,
+                pending_puncts,
+            },
+            Self::MergeSpilled {
+                runs,
+                row_count,
+                pending_puncts,
+                merge_budget,
+            } => {
+                let (file, folded_count) = merge_budget.fold_payload_ordered_runs(
+                    runs,
+                    row_count,
+                    "combine shared node-buffer fold",
+                )?;
+                ReReadableNodeBuffer::Spilled {
+                    chunks: vec![(file, folded_count)],
+                    pending_puncts,
+                }
+            }
+            Self::ReReadable(_) => unreachable!("handled before representation replacement"),
+        };
+        let backing = Arc::new(backing);
+        *self = Self::ReReadable(Arc::clone(&backing));
+        Ok(Self::ReReadable(backing))
+    }
+
+    /// Recover the ordinary owned representation for the authoritative last
+    /// reader when no earlier cursor remains live. A still-shared Arc remains
+    /// re-readable defensively; synchronous dispatch normally unwraps here.
+    pub(crate) fn into_authoritative(self) -> Self {
+        let Self::ReReadable(backing) = self else {
+            return self;
+        };
+        match Arc::try_unwrap(backing) {
+            Ok(ReReadableNodeBuffer::Memory(events)) => Self::Memory(events),
+            Ok(ReReadableNodeBuffer::Spilled {
+                chunks,
+                pending_puncts,
+            }) => Self::Spilled {
+                chunks,
+                pending_puncts,
+            },
+            Ok(ReReadableNodeBuffer::Mixed {
+                mem,
+                spills,
+                pending_puncts,
+            }) => Self::Mixed {
+                mem,
+                spills,
+                pending_puncts,
+            },
+            Err(backing) => Self::ReReadable(backing),
+        }
+    }
+
     /// Total record count across memory and recorded spill chunks.
     /// Punctuations do not count toward the record total — they are
     /// O(1) per document, not per record.
@@ -159,6 +304,7 @@ impl NodeBuffer {
                     + spills.iter().map(|(_, c)| *c as usize).sum::<usize>()
             }
             Self::MergeSpilled { row_count, .. } => *row_count as usize,
+            Self::ReReadable(backing) => backing.len_hint(),
         }
     }
 
@@ -203,6 +349,9 @@ impl NodeBuffer {
                  are never push_event-ed, and the (u64, u64, u64) runs are format-\
                  incompatible with Mixed's SpillFile<u64>, so promotion is impossible"
             ),
+            Self::ReReadable(_) => panic!(
+                "push_event on a re-readable node buffer: published fan-out slots are immutable"
+            ),
         }
     }
 
@@ -221,6 +370,7 @@ impl NodeBuffer {
             Self::Memory(v) => v.as_slice(),
             Self::Mixed { mem, .. } => mem.as_slice(),
             Self::Spilled { .. } | Self::MergeSpilled { .. } => &[],
+            Self::ReReadable(backing) => backing.memory_events(),
         };
         mem_slice
             .iter()
@@ -231,47 +381,43 @@ impl NodeBuffer {
             .collect()
     }
 
-    /// Deep-clone the in-memory events for a multi-consumer fan-out site.
-    ///
-    /// # Panics
-    ///
-    /// Panics on `Spilled` and `Mixed`. Spill chunks cannot be
-    /// cheap-cloned; the only legitimate multi-consumer access for a
-    /// spilled buffer is to drain it. The producer-side admission
-    /// helper `dispatch::node_buffer_spill_allowed` returns `false`
-    /// for any slot whose outgoing topology will route through this
-    /// method (multi-consumer fan-out or a composition input-port
-    /// edge), so a `Spilled`/`Mixed` slot never reaches a caller of
-    /// this method. Lifting that constraint requires sharing
-    /// `Arc<SpillFile<u64>>` across readers and is a separate
-    /// follow-up under #108.
-    fn clone_memory_only(&self) -> Vec<StreamEvent> {
-        match self {
-            Self::Memory(v) => v.clone(),
-            Self::Spilled { .. } | Self::Mixed { .. } | Self::MergeSpilled { .. } => {
-                panic!(
-                    "NodeBuffer::clone_memory_only called on a spill-backed \
-                     variant; spilled rows cannot be cloned for multi-consumer \
-                     fanout. Drain through NodeBuffer::drain instead.",
-                );
-            }
-        }
-    }
-
-    /// Column count of the slot's first resident record, or `0` when the
-    /// slot holds no in-memory record. Cheap — stops at the first record
-    /// without allocating — so the spill sweep can resolve the on-disk
-    /// compression mode against the slot's schema width before consuming
-    /// the buffer.
+    /// Column count of the slot's first resident or spill-backed record, or
+    /// `0` when the slot holds no records. Cheap — stops at the first record
+    /// or reads the first spill chunk's schema without opening it — so spill
+    /// and materialization accounting can resolve the slot's row width before
+    /// consuming the buffer.
     pub(crate) fn first_record_column_count(&self) -> usize {
         let mem_slice = match self {
             Self::Memory(v) => v.as_slice(),
             Self::Mixed { mem, .. } => mem.as_slice(),
-            Self::Spilled { .. } => &[],
+            Self::Spilled { chunks, .. } => {
+                return chunks
+                    .first()
+                    .map(|(file, _)| file.schema().column_count())
+                    .unwrap_or(0);
+            }
             // Records live on disk; read the width off the adopted run's schema
             // without opening it.
             Self::MergeSpilled { runs, .. } => {
                 return runs.first().map(|f| f.schema().column_count()).unwrap_or(0);
+            }
+            Self::ReReadable(backing) => {
+                if let Some(columns) =
+                    backing
+                        .memory_events()
+                        .iter()
+                        .find_map(|event| match event {
+                            StreamEvent::Record(record, _) => Some(record.schema().column_count()),
+                            StreamEvent::Punctuation(_) => None,
+                        })
+                {
+                    return columns;
+                }
+                return backing
+                    .spill_chunks()
+                    .first()
+                    .map(|(file, _)| file.schema().column_count())
+                    .unwrap_or(0);
             }
         };
         mem_slice
@@ -297,6 +443,7 @@ impl NodeBuffer {
             Self::Memory(events) => events.as_slice(),
             Self::Mixed { mem, .. } => mem.as_slice(),
             Self::Spilled { .. } | Self::MergeSpilled { .. } => return 0,
+            Self::ReReadable(backing) => backing.memory_events(),
         };
         let mut column_count = None;
         let mut record_count = 0u64;
@@ -311,21 +458,58 @@ impl NodeBuffer {
             .unwrap_or(0)
     }
 
-    /// Estimate this slot's resident record count at a caller-supplied schema
-    /// width without allocating a temporary records vector. Composition port
-    /// Sources use this to reserve their prospective canonicalized output,
-    /// whose body schema can be wider than the parent records being replaced.
-    pub(crate) fn estimated_memory_bytes_for_columns(&self, column_count: usize) -> u64 {
-        let events = match self {
-            Self::Memory(events) => events.as_slice(),
-            Self::Mixed { mem, .. } => mem.as_slice(),
-            Self::Spilled { .. } | Self::MergeSpilled { .. } => return 0,
-        };
-        let record_count = events
-            .iter()
-            .filter(|event| matches!(event, StreamEvent::Record(_, _)))
-            .count() as u64;
-        record_byte_cost(column_count).saturating_mul(record_count)
+    /// Estimated bytes for collecting every row in one sequential scan at a
+    /// caller-supplied schema width. This counts spill-backed rows as well as
+    /// the resident tail.
+    pub(crate) fn estimated_materialized_bytes_for_columns(&self, column_count: usize) -> u64 {
+        record_byte_cost(column_count).saturating_mul(self.len_hint() as u64)
+    }
+
+    /// Estimated resident bytes if one sequential scan is collected into a
+    /// records vector. Unlike [`Self::estimated_memory_bytes`], this includes
+    /// rows currently on disk and is used to reserve a composition port's
+    /// unavoidable body-seed materialization before opening the scan.
+    pub(crate) fn estimated_materialized_bytes(&self) -> u64 {
+        record_byte_cost(self.first_record_column_count()).saturating_mul(self.len_hint() as u64)
+    }
+
+    /// Bytes to reserve when a replacement path has already unregistered the
+    /// authoritative slot and will collect one complete scan. An owned buffer
+    /// transfers or streams its existing storage into that collection. A
+    /// still-shared re-readable buffer must additionally keep its resident
+    /// backing alive while the scan clones rows from it.
+    pub(crate) fn replacement_materialization_bytes_after_unregister(&self) -> u64 {
+        let scan_bytes = self.estimated_materialized_bytes();
+        if matches!(self, Self::ReReadable(_)) {
+            scan_bytes.saturating_add(self.estimated_memory_bytes())
+        } else {
+            scan_bytes
+        }
+    }
+
+    /// Additional bytes that overlap this slot's transferred registration
+    /// while a consuming scan builds its replacement records vector.
+    pub(crate) fn transferred_materialization_overlap_bytes(&self) -> u64 {
+        match self {
+            // The consuming drain moves resident events out of the sole owner.
+            Self::Memory(_) => 0,
+            // Disk rows have no resident charge, so the replacement is wholly
+            // additional until the representation transition completes.
+            Self::Spilled { .. } | Self::MergeSpilled { .. } => self.estimated_materialized_bytes(),
+            // Only the disk-backed portion is absent from the existing
+            // resident-tail charge.
+            Self::Mixed { .. } => self
+                .estimated_materialized_bytes()
+                .saturating_sub(self.estimated_memory_bytes()),
+            // A re-readable cursor clones resident events while the immutable
+            // backing remains alive for sibling readers.
+            Self::ReReadable(_) => self.estimated_materialized_bytes(),
+        }
+    }
+
+    pub(crate) fn is_resident_memory(&self) -> bool {
+        matches!(self, Self::Memory(_))
+            || matches!(self, Self::ReReadable(backing) if matches!(backing.as_ref(), ReReadableNodeBuffer::Memory(_)))
     }
 
     /// Consume the buffer and partition its events into a records
@@ -348,99 +532,6 @@ impl NodeBuffer {
         for event in self.drain() {
             match event? {
                 StreamEvent::Record(r, rn) => records.push((r, rn)),
-                StreamEvent::Punctuation(p) => puncts.push(p),
-            }
-        }
-        Ok((records, puncts))
-    }
-
-    /// Like [`Self::drain_split`], but aborts when the growing re-materialized
-    /// record vector alone exceeds the entire memory budget, so a spill-backed
-    /// slot cannot re-inflate a working set larger than the budget uncharged.
-    ///
-    /// [`Self::drain_split`] streams a `Spilled`/`Mixed` slot's records off
-    /// disk straight into a `Vec` with no arbitrator charge and no hard-limit
-    /// poll — the slot's admission charge was discharged when its consumer
-    /// unregistered it, so the bytes landing back in memory here are
-    /// invisible to the budget. A slot that spilled precisely because it
-    /// outgrew the budget would then re-materialize a Vec larger than the
-    /// whole budget with no gate. Every ~1024 records this estimates the
-    /// resident footprint, adds every other registered consumer's charged
-    /// bytes, and when that joint total exceeds the hard limit surfaces a
-    /// typed `MemoryBudgetExceeded` (E310, tagged `BudgetCategory::NodeBuffer`)
-    /// naming the draining stage.
-    ///
-    /// The gate sums this vector's footprint with
-    /// [`MemoryArbitrator::sum_consumer_usage`] rather than testing the vector
-    /// alone: a live consumer already charged near the limit and this growing
-    /// vector can jointly breach the budget while each stays under it
-    /// individually. That charged-byte sum is RSS-independent, deliberately
-    /// not [`MemoryArbitrator::should_abort`]: `should_abort` also polls
-    /// whole-process RSS, which for any budget below the process baseline (the
-    /// very condition that made the upstream slot spill) is always over — it
-    /// would abort every legitimate spill round-trip whose finite working set
-    /// still fits the budget. Gating on the charged-byte sum keeps the
-    /// "spillable stages complete" guarantee for the common case, catches the
-    /// genuinely unaffordable one, and holds identically on targets where
-    /// `rss_bytes()` returns `None`.
-    ///
-    /// Wired into the single-consumer Transform and Aggregate drain sites,
-    /// whose owned buffer has no separate budget gate of its own. Sort,
-    /// Combine, Cull, and Reshape keep [`Self::drain_split`] because they gate
-    /// their own re-materialized working set downstream.
-    pub(crate) fn drain_split_metered(
-        self,
-        budget: &crate::pipeline::memory::MemoryArbitrator,
-        node: &str,
-    ) -> Result<DrainedEvents, PipelineError> {
-        // Only a spill-backed slot re-inflates uncharged; a pure `Memory`
-        // slot's bytes were never off the budget, so skip the per-batch poll
-        // and reuse the plain drain for it.
-        if matches!(self, Self::Memory(_)) {
-            return self.drain_split();
-        }
-        let hard = budget.hard_limit();
-        let mut records: Vec<(Record, u64)> = Vec::with_capacity(self.len_hint());
-        let mut puncts: Vec<Punctuation> = Vec::new();
-        let mut since_check: usize = 0;
-        for event in self.drain() {
-            match event? {
-                StreamEvent::Record(r, rn) => {
-                    records.push((r, rn));
-                    since_check += 1;
-                    if since_check >= 1024 {
-                        since_check = 0;
-                        let cols = records
-                            .last()
-                            .map(|(r, _)| r.schema().column_count())
-                            .unwrap_or(0);
-                        let bytes = record_byte_cost(cols).saturating_mul(records.len() as u64);
-                        // Gate on the re-materialized footprint PLUS every other
-                        // registered consumer's charged bytes, not this vector
-                        // alone: during a drain a consumer already charged near
-                        // the limit and this growing vector can jointly breach
-                        // the budget while each stays under it individually.
-                        // Summing registered consumers is RSS-independent, so it
-                        // holds where `rss_bytes()` returns `None` and does not
-                        // false-positive on the sub-baseline budgets that made
-                        // the upstream slot spill in the first place.
-                        // `hard == 0` means "unlimited" (no configured budget),
-                        // so never abort in that case.
-                        let combined = bytes.saturating_add(budget.sum_consumer_usage());
-                        if hard > 0 && combined > hard {
-                            return Err(PipelineError::MemoryBudgetExceeded {
-                                node: node.to_string(),
-                                used: combined,
-                                limit: hard,
-                                source: clinker_plan::BudgetCategory::NodeBuffer,
-                                detail: Some(format!(
-                                    "re-materializing spilled node buffer for `{node}` \
-                                     exceeded the memory budget"
-                                )),
-                            });
-                        }
-                    }
-                }
                 StreamEvent::Punctuation(p) => puncts.push(p),
             }
         }
@@ -493,8 +584,17 @@ impl NodeBuffer {
         spill_dir: Option<&std::path::Path>,
         compress: bool,
     ) -> Result<(Self, u64), PipelineError> {
-        let Self::Memory(events) = self else {
-            return Ok((self, 0));
+        let events = match self {
+            Self::Memory(events) => events,
+            Self::ReReadable(backing) => match Arc::try_unwrap(backing) {
+                Ok(ReReadableNodeBuffer::Memory(events)) => events,
+                Ok(other) => return Ok((Self::ReReadable(Arc::new(other)), 0)),
+                // Dispatch is synchronous, so a completed earlier cursor has
+                // dropped before the next spill sweep. If a cursor is still
+                // live, retain the shared resident slot and retry later.
+                Err(backing) => return Ok((Self::ReReadable(backing), 0)),
+            },
+            other => return Ok((other, 0)),
         };
         let mut records: Vec<(Record, u64)> = Vec::with_capacity(events.len());
         let mut puncts: Vec<Punctuation> = Vec::new();
@@ -569,6 +669,15 @@ impl NodeBuffer {
                     merge_budget,
                 };
             }
+            Self::ReReadable(backing) => {
+                return NodeBufferDrain::ReReadable {
+                    current: None,
+                    backing,
+                    memory_index: 0,
+                    spill_index: 0,
+                    punctuation_index: 0,
+                };
+            }
         };
         NodeBufferDrain::Chunked {
             mem: mem.into_iter(),
@@ -579,35 +688,14 @@ impl NodeBuffer {
     }
 }
 
-/// One duplicate `NodeBuffer::Memory` allocation paired with the transient
-/// pull-mode reservation that keeps its bytes visible to arbitration.
-///
-/// Callers must retain the reservation for the complete synchronous lifetime
-/// of the duplicate. Composition entry may instead transfer the reservation's
-/// existing registration into its body-local node-buffer registry.
-#[must_use = "the transient reservation must stay alive with the cloned node buffer"]
-pub(crate) struct ReservedNodeBufferClone {
-    buffer: NodeBuffer,
-    reservation: TransientNodeBufferReservation,
-}
-
-impl ReservedNodeBufferClone {
-    /// Split the duplicate from its lifetime guard. The guard remains
-    /// must-use so converting the buffer into records cannot silently end the
-    /// reservation while those records are still live.
-    pub(crate) fn into_parts(self) -> (NodeBuffer, TransientNodeBufferReservation) {
-        (self.buffer, self.reservation)
-    }
-}
-
-/// RAII ownership of one transient clone's existing arbitrator registration.
+/// RAII ownership of one materialized scan's arbitrator registration.
 ///
 /// The registration is removed on every ordinary drop path, including `?`
 /// propagation and early returns. Composition body entry consumes the guard
 /// with [`Self::into_registration`] and installs the same id and handle in the
 /// body-local node-buffer map, avoiding an unregister/register gap or double
 /// charge.
-#[must_use = "dropping the reservation releases the clone's memory charge"]
+#[must_use = "dropping the reservation releases the materialization charge"]
 pub(crate) struct TransientNodeBufferReservation {
     budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
     consumer_id: crate::pipeline::memory::ConsumerId,
@@ -632,16 +720,24 @@ impl TransientNodeBufferReservation {
     }
 
     /// Reserve an additional temporary allocation while keeping the same
-    /// consumer registered. Composition port canonicalization uses this for
-    /// the interval where the seeded event vector and its canonicalized output
-    /// vector coexist.
+    /// consumer registered. Materializing a sequential scan uses this for the
+    /// interval where the immutable backing and its resident output vector
+    /// coexist.
     pub(crate) fn reserve_additional(
         &self,
         additional_bytes: u64,
         node: &str,
     ) -> Result<(), PipelineError> {
-        let current_pressure = self.budget.current_pressure();
-        let projected_pressure = current_pressure.saturating_add(additional_bytes);
+        if additional_bytes == 0 {
+            return Ok(());
+        }
+        // This preflight accounts the pipeline-owned allocations represented by
+        // consumer handles. Adding an allocation estimate to process RSS would
+        // double-count tracked state already present in RSS and make a small,
+        // intentionally spill-heavy budget fail solely on the host process's
+        // fixed baseline.
+        let charged_pressure = self.budget.sum_consumer_usage();
+        let projected_pressure = charged_pressure.saturating_add(additional_bytes);
         let hard_limit = self.budget.hard_limit();
         if hard_limit != 0 && projected_pressure > hard_limit {
             return Err(PipelineError::MemoryBudgetExceeded {
@@ -650,7 +746,7 @@ impl TransientNodeBufferReservation {
                 limit: hard_limit,
                 source: clinker_plan::BudgetCategory::NodeBuffer,
                 detail: Some(format!(
-                    "composition port canonicalization projected {projected_pressure} bytes from current pressure {current_pressure} plus {additional_bytes} temporary bytes"
+                    "node-buffer materialization overlap projected {projected_pressure} bytes from charged pressure {charged_pressure} plus {additional_bytes} temporary bytes"
                 )),
             });
         }
@@ -663,6 +759,33 @@ impl TransientNodeBufferReservation {
     /// transition has completed.
     pub(crate) fn set_bytes(&self, bytes: u64) {
         self.handle.set_bytes(bytes);
+    }
+
+    /// Current bytes held by this reservation.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    /// Move already-charged sibling reservations onto this registration.
+    ///
+    /// No allocation happens here. The sibling handles are zeroed before this
+    /// handle grows, so the arbitrator never observes a transient duplicate
+    /// charge while several harvested vectors become one node-buffer slot.
+    pub(crate) fn absorb_charges(&self, others: Vec<Self>) {
+        let charged_before = self.budget.sum_consumer_usage();
+        let mut combined = self.bytes();
+        for other in &others {
+            debug_assert!(std::sync::Arc::ptr_eq(&self.budget, &other.budget));
+            combined = combined.saturating_add(other.bytes());
+            other.set_bytes(0);
+        }
+        drop(others);
+        self.set_bytes(combined);
+        debug_assert_eq!(
+            self.budget.sum_consumer_usage(),
+            charged_before,
+            "reservation charge consolidation must preserve total usage"
+        );
     }
 
     /// Transfer ownership of the live registration to a node-buffer registry.
@@ -686,22 +809,21 @@ impl Drop for TransientNodeBufferReservation {
     }
 }
 
-/// Register the estimated duplicate footprint before cloning a resident node
-/// buffer, returning the clone with a must-use lifetime reservation.
-///
-/// The preflight uses current process/consumer pressure plus
-/// [`NodeBuffer::estimated_memory_bytes`]. A projected hard-limit breach
-/// returns typed E310 with [`clinker_plan::BudgetCategory::NodeBuffer`] before
-/// the full event vector is allocated. A zero hard limit retains the existing
-/// unlimited-budget convention.
-pub(crate) fn clone_node_buffer_reserved(
-    buffer: &NodeBuffer,
+/// Reserve a transient materialization before a sequential reader collects its
+/// events into a new resident vector. This retains the reservation mechanism
+/// used by composition canonicalization without coupling fan-out access to a
+/// memory-only buffer clone.
+pub(crate) fn reserve_node_buffer_materialization(
+    reserved_bytes: u64,
     budget: &std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
     node: &str,
-) -> Result<ReservedNodeBufferClone, PipelineError> {
-    let reserved_bytes = buffer.estimated_memory_bytes();
-    let current_pressure = budget.current_pressure();
-    let projected_pressure = current_pressure.saturating_add(reserved_bytes);
+) -> Result<TransientNodeBufferReservation, PipelineError> {
+    // Use the exact pipeline-owned charge ledger for an allocation preflight.
+    // RSS remains the asynchronous spill/abort signal; adding this estimate to
+    // RSS here would double-count charged state and include the process's fixed
+    // baseline, which a spill-backed scan cannot reclaim.
+    let charged_pressure = budget.sum_consumer_usage();
+    let projected_pressure = charged_pressure.saturating_add(reserved_bytes);
     let hard_limit = budget.hard_limit();
     if hard_limit != 0 && projected_pressure > hard_limit {
         return Err(PipelineError::MemoryBudgetExceeded {
@@ -710,7 +832,7 @@ pub(crate) fn clone_node_buffer_reserved(
             limit: hard_limit,
             source: clinker_plan::BudgetCategory::NodeBuffer,
             detail: Some(format!(
-                "transient node-buffer clone projected {projected_pressure} bytes from current pressure {current_pressure} plus {reserved_bytes} reserved bytes"
+                "transient node-buffer materialization projected {projected_pressure} bytes from charged pressure {charged_pressure} plus {reserved_bytes} reserved bytes"
             )),
         });
     }
@@ -728,19 +850,13 @@ pub(crate) fn clone_node_buffer_reserved(
         owns_registration: true,
     };
 
-    // Registration deliberately precedes allocation. If the spill-variant
-    // invariant panics, unwinding drops `reservation` and unregisters it.
-    let cloned = NodeBuffer::Memory(buffer.clone_memory_only());
-    Ok(ReservedNodeBufferClone {
-        buffer: cloned,
-        reservation,
-    })
+    Ok(reservation)
 }
 
-/// Arbitrator wrapper for a transient duplicate. Unlike a resident
+/// Arbitrator wrapper for a transient materialization. Unlike a resident
 /// `NodeBufferConsumer`, this allocation has no dispatcher-owned slot that can
 /// service a spill request, so it advertises neither reclamation nor
-/// back-pressure. Its owner releases the charge only when the clone is dropped
+/// back-pressure. Its owner releases the charge only when the materialization is dropped
 /// or transfers it into a composition body slot.
 struct TransientNodeBufferConsumer {
     handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
@@ -814,6 +930,15 @@ pub(crate) enum NodeBufferDrain {
         /// Charging context lent to the merge open so a fragmented adopted-run
         /// set folds down under the disk quota (E320) at drain.
         merge_budget: OwnedMergeBudget,
+    },
+    ReReadable {
+        // Drops before `backing`, closing the active handle before the final
+        // Arc can unlink its TempPaths on Windows.
+        current: Option<Box<SpillReader<u64>>>,
+        backing: Arc<ReReadableNodeBuffer>,
+        memory_index: usize,
+        spill_index: usize,
+        punctuation_index: usize,
     },
 }
 
@@ -909,6 +1034,42 @@ impl Iterator for NodeBufferDrain {
                     .next()
                     .map(|p| Ok(StreamEvent::punctuation(p)))
             }
+            Self::ReReadable {
+                backing,
+                memory_index,
+                spill_index,
+                current,
+                punctuation_index,
+            } => {
+                if let Some(event) = backing.memory_events().get(*memory_index) {
+                    *memory_index += 1;
+                    return Some(Ok(event.clone()));
+                }
+                loop {
+                    if let Some(reader) = current.as_mut() {
+                        match reader.next() {
+                            Some(Ok((record, row_number))) => {
+                                return Some(Ok(StreamEvent::record(record, row_number)));
+                            }
+                            Some(Err(error)) => return Some(Err(PipelineError::from(error))),
+                            None => *current = None,
+                        }
+                    }
+                    let chunks = backing.spill_chunks();
+                    if let Some((file, _)) = chunks.get(*spill_index) {
+                        *spill_index += 1;
+                        match file.reader() {
+                            Ok(reader) => *current = Some(Box::new(reader)),
+                            Err(error) => return Some(Err(PipelineError::from(error))),
+                        }
+                        continue;
+                    }
+                    let puncts = backing.pending_puncts();
+                    let punctuation = puncts.get(*punctuation_index)?.clone();
+                    *punctuation_index += 1;
+                    return Some(Ok(StreamEvent::punctuation(punctuation)));
+                }
+            }
         }
     }
 }
@@ -920,12 +1081,10 @@ impl Iterator for NodeBufferDrain {
 /// spill-request flag but performs no I/O itself; the dispatcher's
 /// per-node sweep `dispatch::service_node_buffer_spill_requests` reads
 /// the flag via `take_spill_request` at the next `dispatch_plan_node`
-/// turn and, for a resident `Memory` slot with a single drain consumer,
-/// spills it through `NodeBuffer::spill_resident_memory` (postcard,
-/// optionally LZ4-framed, via `SpillWriter<u64>`). A non-spillable slot
-/// (fan-out / composition input-port edge, whose consumer would reach
-/// `clone_memory_only`) is skipped by that sweep and hard-gated at
-/// admission instead.
+/// turn and, for any resident `Memory` slot, spills it through
+/// `NodeBuffer::spill_resident_memory` (postcard, optionally LZ4-framed, via
+/// `SpillWriter<u64>`). Shared and producer-port slots remain readable because
+/// each consumer opens its own sequential cursor over immutable backing.
 ///
 /// `spill_priority = 0`: cheapest victim. Inter-stage buffers are
 /// already row-oriented and write straight through `SpillWriter<u64>`;
@@ -1171,6 +1330,129 @@ mod tests {
         );
     }
 
+    fn scan_shape(buffer: NodeBuffer) -> Vec<Option<u64>> {
+        buffer
+            .drain()
+            .map(|event| match event.expect("re-readable scan event") {
+                StreamEvent::Record(_, row_number) => Some(row_number),
+                StreamEvent::Punctuation(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn memory_supports_repeatable_sequential_scans() {
+        let s = schema();
+        let ctx = synthetic_document_context();
+        let mut buffer = NodeBuffer::Memory(vec![
+            rec_event(&s, 1, "a", 1),
+            StreamEvent::punctuation(Punctuation::document_close(ctx)),
+            rec_event(&s, 2, "b", 2),
+        ]);
+
+        let first = buffer.reread().expect("first memory scan");
+        let second = buffer.reread().expect("second memory scan");
+
+        assert_eq!(scan_shape(first), vec![Some(1), None, Some(2)]);
+        assert_eq!(scan_shape(second), vec![Some(1), None, Some(2)]);
+    }
+
+    #[test]
+    fn replacement_reserves_live_rereadable_memory_backing_and_scan() {
+        let s = schema();
+        let mut slot = NodeBuffer::Memory(vec![rec_event(&s, 1, "a", 1), rec_event(&s, 2, "b", 2)]);
+        let live_reader = slot.reread().expect("shared reader");
+        let scan_bytes = slot.estimated_materialized_bytes();
+        let backing_bytes = slot.estimated_memory_bytes();
+
+        let still_shared = slot.into_authoritative();
+        assert!(matches!(still_shared, NodeBuffer::ReReadable(_)));
+        assert_eq!(
+            still_shared.replacement_materialization_bytes_after_unregister(),
+            scan_bytes + backing_bytes
+        );
+
+        drop(live_reader);
+        let authoritative = still_shared.into_authoritative();
+        assert!(matches!(authoritative, NodeBuffer::Memory(_)));
+        assert_eq!(
+            authoritative.replacement_materialization_bytes_after_unregister(),
+            scan_bytes
+        );
+    }
+
+    #[test]
+    fn spilled_supports_repeatable_sequential_scans() {
+        let s = schema();
+        let ctx = synthetic_document_context();
+        let mut buffer = NodeBuffer::Spilled {
+            chunks: vec![
+                spill_chunk(vec![(rec(&s, 1, "a"), 1), (rec(&s, 2, "b"), 2)]),
+                spill_chunk(vec![(rec(&s, 3, "c"), 3)]),
+            ],
+            pending_puncts: vec![Punctuation::document_close(ctx)],
+        };
+
+        let first = buffer.reread().expect("first spilled scan");
+        let second = buffer.reread().expect("second spilled scan");
+
+        assert_eq!(scan_shape(first), vec![Some(1), Some(2), Some(3), None]);
+        assert_eq!(scan_shape(second), vec![Some(1), Some(2), Some(3), None]);
+    }
+
+    #[test]
+    fn spilled_reread_holds_only_one_active_chunk_reader() {
+        let s = schema();
+        let chunks = (0..32)
+            .map(|i| spill_chunk(vec![(rec(&s, i, "v"), i as u64)]))
+            .collect();
+        let mut buffer = NodeBuffer::Spilled {
+            chunks,
+            pending_puncts: Vec::new(),
+        };
+        let scan = buffer.reread().expect("spilled scan");
+        let mut drain = scan.drain();
+        let mut rows = 0;
+        let mut max_active_readers = 0;
+        while let Some(event) = drain.next() {
+            assert!(event.expect("spill row").is_record());
+            rows += 1;
+            let active_readers = match &drain {
+                NodeBufferDrain::ReReadable { current, .. } => usize::from(current.is_some()),
+                _ => panic!("reread must use the re-readable drain"),
+            };
+            max_active_readers = max_active_readers.max(active_readers);
+        }
+
+        assert_eq!(rows, 32);
+        assert_eq!(
+            max_active_readers, 1,
+            "a sequential scan opens one spill chunk at a time"
+        );
+    }
+
+    #[test]
+    fn mixed_supports_repeatable_sequential_scans_without_order_drift() {
+        let s = schema();
+        let ctx = synthetic_document_context();
+        let mut buffer = NodeBuffer::Mixed {
+            mem: vec![rec_event(&s, 3, "tail", 3)],
+            spills: vec![spill_chunk(vec![
+                (rec(&s, 1, "a"), 1),
+                (rec(&s, 2, "b"), 2),
+            ])],
+            pending_puncts: vec![Punctuation::document_close(ctx)],
+        };
+
+        let first = buffer.reread().expect("first mixed scan");
+        let second = buffer.reread().expect("second mixed scan");
+
+        // Preserve NodeBuffer's established declaration order exactly: the
+        // resident Mixed tail precedes its spill chunks, then punctuation.
+        assert_eq!(scan_shape(first), vec![Some(3), Some(1), Some(2), None]);
+        assert_eq!(scan_shape(second), vec![Some(3), Some(1), Some(2), None]);
+    }
+
     #[test]
     fn empty_variants_have_zero_len_hint() {
         let s = schema();
@@ -1214,7 +1496,7 @@ mod tests {
         ]);
         assert_eq!(mem.estimated_memory_bytes(), (row_bytes_each * 3) as u64);
         assert_eq!(
-            mem.estimated_memory_bytes_for_columns(s.column_count() + 2),
+            mem.estimated_materialized_bytes_for_columns(s.column_count() + 2),
             record_byte_cost(s.column_count() + 2) * 3
         );
 
@@ -1225,9 +1507,75 @@ mod tests {
             pending_puncts: Vec::new(),
         };
         assert_eq!(spilled.estimated_memory_bytes(), 0);
+        assert_eq!(
+            spilled.estimated_materialized_bytes(),
+            record_byte_cost(s.column_count())
+        );
+        let exact_budget = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            spilled.estimated_materialized_bytes(),
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ));
+        let reservation = reserve_node_buffer_materialization(
+            spilled.estimated_materialized_bytes(),
+            &exact_budget,
+            "sole_spill_reader",
+        )
+        .expect("the complete schema-width reservation fits at the exact boundary");
+        assert_eq!(
+            exact_budget.sum_consumer_usage(),
+            record_byte_cost(s.column_count())
+        );
+        drop(reservation);
+        assert_eq!(exact_budget.consumer_count(), 0);
+        assert_eq!(
+            spilled.estimated_materialized_bytes_for_columns(s.column_count() + 2),
+            record_byte_cost(s.column_count() + 2)
+        );
 
         // Empty mem reports zero.
         assert_eq!(NodeBuffer::Memory(Vec::new()).estimated_memory_bytes(), 0);
+    }
+
+    #[test]
+    fn authoritative_reread_spill_preserves_materialized_row_width() {
+        let s = schema();
+        let mut slot = NodeBuffer::Spilled {
+            chunks: vec![spill_chunk(vec![
+                (rec(&s, 1, "a"), 1),
+                (rec(&s, 2, "b"), 2),
+            ])],
+            pending_puncts: Vec::new(),
+        };
+
+        let earlier_reader = slot.reread().expect("first shared reader");
+        drop(earlier_reader);
+        let authoritative = slot.into_authoritative();
+
+        assert!(matches!(authoritative, NodeBuffer::Spilled { .. }));
+        assert_eq!(
+            authoritative.estimated_materialized_bytes(),
+            record_byte_cost(s.column_count()) * 2
+        );
+        let hard_limit = authoritative
+            .estimated_materialized_bytes()
+            .saturating_sub(1);
+        let budget = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            hard_limit,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ));
+        assert!(matches!(
+            reserve_node_buffer_materialization(
+                authoritative.estimated_materialized_bytes(),
+                &budget,
+                "last_reader",
+            ),
+            Err(PipelineError::MemoryBudgetExceeded { .. })
+        ));
+        assert_eq!(budget.consumer_count(), 0);
     }
 
     fn roomy_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
@@ -1240,7 +1588,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_clone_rejects_projected_hard_limit_before_registration() {
+    fn materialization_reservation_rejects_projected_hard_limit_before_registration() {
         let s = schema();
         let buffer = NodeBuffer::Memory(vec![rec_event(&s, 1, "a", 1)]);
         let reserved_bytes = buffer.estimated_memory_bytes();
@@ -1252,12 +1600,11 @@ mod tests {
             0.70,
             Box::new(crate::pipeline::memory::NoOpPolicy),
         ));
-        // A fixed registered footprint near 100 GiB dominates real process
-        // RSS, making both current-pressure reads exact even under a parallel
-        // allocator. The clone alone crosses the limit by one byte.
+        // A fixed registered footprint makes the charged-pressure projection
+        // exact. The requested materialization crosses the limit by one byte.
         let baseline_id = budget.register_consumer(Arc::new(FixedUsageConsumer(baseline_usage)));
 
-        match clone_node_buffer_reserved(&buffer, &budget, "clone_site") {
+        match reserve_node_buffer_materialization(reserved_bytes, &budget, "clone_site") {
             Err(PipelineError::MemoryBudgetExceeded {
                 node,
                 used,
@@ -1270,7 +1617,7 @@ mod tests {
                 assert_eq!(limit, hard_limit);
                 assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
             }
-            Ok(_) => panic!("expected pre-allocation E310 NodeBuffer; clone succeeded"),
+            Ok(_) => panic!("expected pre-allocation E310 NodeBuffer; reservation succeeded"),
             Err(other) => panic!("expected pre-allocation E310 NodeBuffer; got {other:?}"),
         }
         assert_eq!(budget.consumer_count(), 1);
@@ -1280,37 +1627,52 @@ mod tests {
     }
 
     #[test]
-    fn reserved_clone_guard_covers_allocation_until_drop() {
+    fn materialization_reservation_covers_allocation_until_drop() {
         let s = schema();
         let buffer = NodeBuffer::Memory(vec![rec_event(&s, 1, "a", 1), rec_event(&s, 2, "b", 2)]);
         let reserved_bytes = buffer.estimated_memory_bytes();
         let budget = roomy_arbitrator();
 
-        let reserved =
-            clone_node_buffer_reserved(&buffer, &budget, "clone_site").expect("clone fits");
+        let reservation =
+            reserve_node_buffer_materialization(reserved_bytes, &budget, "clone_site")
+                .expect("reservation fits");
         assert_eq!(budget.consumer_count(), 1);
         assert_eq!(budget.sum_consumer_usage(), reserved_bytes);
-        let (cloned, reservation) = reserved.into_parts();
-        drop(cloned);
-        assert_eq!(
-            budget.sum_consumer_usage(),
-            reserved_bytes,
-            "the charge follows the guard, not an intermediate buffer conversion"
-        );
         drop(reservation);
         assert_eq!(budget.consumer_count(), 0);
         assert_eq!(budget.sum_consumer_usage(), 0);
     }
 
     #[test]
-    fn reserved_clone_error_unwind_returns_registry_to_baseline() {
-        fn fail_after_clone(
-            buffer: &NodeBuffer,
+    fn materialization_reservation_uses_pipeline_charges_not_process_baseline() {
+        let s = schema();
+        let buffer = NodeBuffer::Memory(vec![rec_event(&s, 1, "a", 1)]);
+        let reserved_bytes = buffer.estimated_memory_bytes();
+        let budget = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            reserved_bytes + 1,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ));
+
+        let reservation =
+            reserve_node_buffer_materialization(reserved_bytes, &budget, "spill_backed_consumer")
+                .expect("an empty charge ledger has room for the materialized scan");
+        assert_eq!(budget.sum_consumer_usage(), reserved_bytes);
+        drop(reservation);
+        assert_eq!(budget.sum_consumer_usage(), 0);
+    }
+
+    #[test]
+    fn materialization_reservation_error_unwind_returns_registry_to_baseline() {
+        fn fail_after_reservation(
+            reserved_bytes: u64,
             budget: &Arc<crate::pipeline::memory::MemoryArbitrator>,
         ) -> Result<(), PipelineError> {
-            let _reserved = clone_node_buffer_reserved(buffer, budget, "clone_site")?;
+            let _reservation =
+                reserve_node_buffer_materialization(reserved_bytes, budget, "clone_site")?;
             Err(PipelineError::Internal {
-                op: "reserved_clone_test",
+                op: "reserved_materialization_test",
                 node: "clone_site".to_string(),
                 detail: "failure after allocation".to_string(),
             })
@@ -1322,21 +1684,21 @@ mod tests {
         let baseline_count = budget.consumer_count();
         let baseline_usage = budget.sum_consumer_usage();
 
-        assert!(fail_after_clone(&buffer, &budget).is_err());
+        assert!(fail_after_reservation(buffer.estimated_memory_bytes(), &budget).is_err());
         assert_eq!(budget.consumer_count(), baseline_count);
         assert_eq!(budget.sum_consumer_usage(), baseline_usage);
     }
 
     #[test]
-    fn reserved_clone_transfer_keeps_one_continuous_charge() {
+    fn materialization_reservation_transfer_keeps_one_continuous_charge() {
         let s = schema();
         let buffer = NodeBuffer::Memory(vec![rec_event(&s, 1, "a", 1)]);
         let reserved_bytes = buffer.estimated_memory_bytes();
         let budget = roomy_arbitrator();
 
-        let reserved =
-            clone_node_buffer_reserved(&buffer, &budget, "composition").expect("clone fits");
-        let (cloned, reservation) = reserved.into_parts();
+        let reservation =
+            reserve_node_buffer_materialization(reserved_bytes, &budget, "composition")
+                .expect("reservation fits");
         let (consumer_id, handle) = reservation.into_registration();
         assert_eq!(
             budget.consumer_count(),
@@ -1345,7 +1707,6 @@ mod tests {
         );
         assert_eq!(budget.sum_consumer_usage(), reserved_bytes);
 
-        drop(cloned);
         handle.set_bytes(0);
         budget.unregister_consumer(consumer_id);
         assert_eq!(budget.consumer_count(), 0);
@@ -1353,7 +1714,29 @@ mod tests {
     }
 
     #[test]
-    fn reserved_clone_preserves_zero_limit_as_unlimited() {
+    fn materialization_reservation_consolidation_preserves_exact_charge() {
+        let budget = roomy_arbitrator();
+        let primary = reserve_node_buffer_materialization(111, &budget, "composition")
+            .expect("primary reservation fits");
+        let second = reserve_node_buffer_materialization(222, &budget, "composition")
+            .expect("second reservation fits");
+        let third = reserve_node_buffer_materialization(333, &budget, "composition")
+            .expect("third reservation fits");
+        let charged_before = budget.sum_consumer_usage();
+        assert_eq!(charged_before, 666);
+
+        primary.absorb_charges(vec![second, third]);
+
+        assert_eq!(primary.bytes(), 666);
+        assert_eq!(budget.consumer_count(), 1);
+        assert_eq!(budget.sum_consumer_usage(), charged_before);
+        drop(primary);
+        assert_eq!(budget.consumer_count(), 0);
+        assert_eq!(budget.sum_consumer_usage(), 0);
+    }
+
+    #[test]
+    fn materialization_reservation_preserves_zero_limit_as_unlimited() {
         let s = schema();
         let buffer = NodeBuffer::Memory(vec![rec_event(&s, 1, "a", 1)]);
         let budget = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
@@ -1363,9 +1746,42 @@ mod tests {
             Box::new(crate::pipeline::memory::NoOpPolicy),
         ));
 
-        let reserved = clone_node_buffer_reserved(&buffer, &budget, "clone_site")
-            .expect("zero hard limit is unlimited");
-        drop(reserved);
+        let reservation = reserve_node_buffer_materialization(
+            buffer.estimated_memory_bytes(),
+            &budget,
+            "clone_site",
+        )
+        .expect("zero hard limit is unlimited");
+        drop(reservation);
+        assert_eq!(budget.consumer_count(), 0);
+    }
+
+    #[test]
+    fn zero_byte_authoritative_memory_transition_does_not_false_abort() {
+        let s = schema();
+        let buffer = NodeBuffer::Memory(vec![rec_event(&s, 1, "a", 1)]);
+        assert_eq!(buffer.transferred_materialization_overlap_bytes(), 0);
+        let hard = 100 * 1024 * 1024 * 1024;
+        let budget = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            hard,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ));
+        let reservation = reserve_node_buffer_materialization(
+            buffer.estimated_memory_bytes(),
+            &budget,
+            "plain_memory",
+        )
+        .expect("initial slot charge fits");
+        let baseline = budget.register_consumer(Arc::new(FixedUsageConsumer(hard)));
+
+        reservation
+            .reserve_additional(0, "plain_memory")
+            .expect("a zero-overlap ownership move is a true no-op");
+
+        budget.unregister_consumer(baseline);
+        drop(reservation);
         assert_eq!(budget.consumer_count(), 0);
     }
 
@@ -1449,74 +1865,9 @@ mod tests {
         assert_eq!(file_bytes, 0);
     }
 
-    #[test]
-    fn drain_split_metered_aborts_when_rematerialization_exceeds_budget() {
-        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
-        let s = schema();
-        // >1024 records so the per-batch poll fires at least once. Spilled to
-        // disk, so the metered drain re-materializes them off disk uncharged
-        // absent the gate.
-        let rows: Vec<(Record, u64)> = (0..1100).map(|i| (rec(&s, i, "v"), i as u64)).collect();
-        let nb = NodeBuffer::Spilled {
-            chunks: vec![spill_chunk(rows)],
-            pending_puncts: Vec::new(),
-        };
-        // A 1-byte hard limit: the growing re-materialized vector crosses it
-        // at the first 1024-record poll.
-        let arb = MemoryArbitrator::with_policy(1, 0.80, 0.70, Box::new(NoOpPolicy));
-        match nb.drain_split_metered(&arb, "spilled_stage") {
-            Err(PipelineError::MemoryBudgetExceeded { node, source, .. }) => {
-                assert_eq!(node, "spilled_stage", "the error names the draining stage");
-                assert_eq!(
-                    source,
-                    clinker_plan::BudgetCategory::NodeBuffer,
-                    "the re-materialized node-buffer drain is tagged NodeBuffer"
-                );
-            }
-            other => panic!("expected E310 NodeBuffer; got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn drain_split_metered_matches_drain_split_under_ample_budget() {
-        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
-        let s = schema();
-        let ctx = synthetic_document_context();
-        // >1024 rows so the metered poll fires but a 100 GiB limit keeps it
-        // from aborting; the output must match the plain drain exactly.
-        let rows: Vec<(Record, u64)> = (0..1100).map(|i| (rec(&s, i, "v"), i as u64)).collect();
-        let make = || NodeBuffer::Spilled {
-            chunks: vec![spill_chunk(rows.clone())],
-            pending_puncts: vec![Punctuation::document_close(Arc::clone(&ctx))],
-        };
-        let arb = MemoryArbitrator::with_policy(
-            100 * 1024 * 1024 * 1024,
-            0.80,
-            0.70,
-            Box::new(NoOpPolicy),
-        );
-        let (metered_recs, metered_puncts) = make()
-            .drain_split_metered(&arb, "stage")
-            .expect("ample-budget metered drain");
-        let (plain_recs, plain_puncts) = make().drain_split().expect("plain drain");
-        let metered_rns: Vec<u64> = metered_recs.iter().map(|(_, rn)| *rn).collect();
-        let plain_rns: Vec<u64> = plain_recs.iter().map(|(_, rn)| *rn).collect();
-        assert_eq!(
-            metered_rns, plain_rns,
-            "metered drain yields the same records in the same order as the plain drain"
-        );
-        assert_eq!(
-            metered_puncts.len(),
-            plain_puncts.len(),
-            "metered drain preserves the trailing punctuations"
-        );
-    }
-
     /// A registered consumer that reports a fixed charged footprint, so a
     /// test can stage `sum_consumer_usage()` at a chosen value without
-    /// standing up a real spilling operator. `try_spill` is unreachable here:
-    /// `drain_split_metered` only reads `hard_limit()` and
-    /// `sum_consumer_usage()`, never selects a victim.
+    /// standing up a real spilling operator.
     struct FixedUsageConsumer(u64);
 
     impl crate::pipeline::memory::MemoryConsumer for FixedUsageConsumer {
@@ -1535,91 +1886,6 @@ mod tests {
         fn can_back_pressure(&self) -> bool {
             false
         }
-    }
-
-    #[test]
-    fn drain_split_metered_aborts_on_joint_consumer_plus_rematerialization_overshoot() {
-        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
-        let s = schema();
-        // >1024 records so exactly one per-batch poll fires, at 1024 accumulated
-        // records; the re-materialized footprint at that poll is deterministic.
-        let rows: Vec<(Record, u64)> = (0..1100).map(|i| (rec(&s, i, "v"), i as u64)).collect();
-        let nb = NodeBuffer::Spilled {
-            chunks: vec![spill_chunk(rows)],
-            pending_puncts: Vec::new(),
-        };
-
-        // Footprint the metered drain estimates at its first (and only) poll.
-        let poll_footprint = record_byte_cost(s.column_count()) * 1024;
-        // A consumer already charged exactly one footprint, and a hard limit
-        // halfway between one footprint and two. The re-materialized vector
-        // alone stays under the limit and the consumer alone stays under it,
-        // but their sum (two footprints) breaches it — the joint-overshoot the
-        // sum-aware gate exists to catch, invisible to a bytes-only test.
-        let hard = poll_footprint + poll_footprint / 2;
-        let arb = MemoryArbitrator::with_policy(hard, 0.80, 0.70, Box::new(NoOpPolicy));
-        arb.register_consumer(Arc::new(FixedUsageConsumer(poll_footprint)));
-
-        match nb.drain_split_metered(&arb, "joint_stage") {
-            Err(PipelineError::MemoryBudgetExceeded {
-                node,
-                source,
-                used,
-                limit,
-                ..
-            }) => {
-                assert_eq!(node, "joint_stage", "the error names the draining stage");
-                assert_eq!(
-                    source,
-                    clinker_plan::BudgetCategory::NodeBuffer,
-                    "a re-materialized node-buffer drain is tagged NodeBuffer"
-                );
-                assert_eq!(limit, hard, "the reported limit is the hard budget");
-                assert_eq!(
-                    used,
-                    poll_footprint * 2,
-                    "used is the re-materialized footprint PLUS the charged consumer, \
-                     not either side alone"
-                );
-                assert!(
-                    poll_footprint < hard,
-                    "precondition: the re-materialized footprint alone is under the limit"
-                );
-            }
-            other => panic!(
-                "a joint consumer + re-materialization overshoot must abort E310 NodeBuffer; \
-                 got: {other:?}"
-            ),
-        }
-    }
-
-    #[test]
-    fn drain_split_metered_completes_when_joint_footprint_fits() {
-        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
-        let s = schema();
-        let rows: Vec<(Record, u64)> = (0..1100).map(|i| (rec(&s, i, "v"), i as u64)).collect();
-        let nb = NodeBuffer::Spilled {
-            chunks: vec![spill_chunk(rows)],
-            pending_puncts: Vec::new(),
-        };
-
-        let poll_footprint = record_byte_cost(s.column_count()) * 1024;
-        // The same charged consumer, but a budget generous enough that the
-        // joint footprint (two footprints) still fits: each side individually
-        // under AND their sum under → the drain completes and yields every
-        // record. Guards against the gate over-firing on a legitimate drain.
-        let hard = poll_footprint * 3;
-        let arb = MemoryArbitrator::with_policy(hard, 0.80, 0.70, Box::new(NoOpPolicy));
-        arb.register_consumer(Arc::new(FixedUsageConsumer(poll_footprint)));
-
-        let (recs, _puncts) = nb
-            .drain_split_metered(&arb, "joint_stage")
-            .expect("a joint footprint under the budget must complete");
-        assert_eq!(
-            recs.len(),
-            1100,
-            "every re-materialized record drains through when the joint footprint fits"
-        );
     }
 
     #[test]
@@ -1778,5 +2044,136 @@ mod tests {
 
         // (d) The trailing punctuation drains after the merged records.
         assert_eq!(puncts.len(), 1);
+    }
+
+    fn shared_merge_spilled_fixture(
+        arb: &Arc<crate::pipeline::memory::MemoryArbitrator>,
+    ) -> (NodeBuffer, Vec<std::path::PathBuf>) {
+        use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
+
+        let s = schema();
+        let mut buffer: SortBuffer<(u64, u64, u64)> =
+            SortBuffer::new_payload_ordered(1, None, true, Arc::clone(&s));
+        for (record_id, payload) in [(1, (3, 1, 0)), (2, (1, 2, 0))] {
+            buffer.push(rec(&s, record_id, "x"), payload);
+        }
+        let first_bytes = buffer.sort_and_spill().expect("first merge run");
+        arb.record_spill_bytes("banded", first_bytes);
+        for (record_id, payload) in [(3, (2, 3, 0)), (4, (4, 4, 0))] {
+            buffer.push(rec(&s, record_id, "x"), payload);
+        }
+        let second_bytes = buffer.sort_and_spill().expect("second merge run");
+        arb.record_spill_bytes("banded", second_bytes);
+        let (output, residue) = buffer.finish().expect("finish merge runs");
+        arb.record_spill_bytes("banded", residue);
+        let SortedOutput::Spilled(files) = output else {
+            panic!("forced merge fixture must spill");
+        };
+        let paths = files.iter().map(|file| file.path().to_path_buf()).collect();
+        (
+            NodeBuffer::merge_spilled(
+                files,
+                4,
+                Vec::new(),
+                crate::pipeline::spill_merge::OwnedMergeBudget::new(
+                    Arc::clone(arb),
+                    Arc::from("banded"),
+                    true,
+                ),
+            ),
+            paths,
+        )
+    }
+
+    #[test]
+    fn shared_merge_spilled_folds_once_then_repeats_sequentially() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            u64::MAX,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        ));
+        let (mut buffer, original_paths) = shared_merge_spilled_fixture(&arb);
+
+        let first = buffer.reread().expect("first reader folds merge runs");
+        let after_first = arb.cumulative_spill_bytes();
+        let second = buffer.reread().expect("second reader reuses folded spill");
+
+        assert_eq!(
+            arb.cumulative_spill_bytes(),
+            after_first,
+            "the second cursor must not fold or charge another replacement"
+        );
+        assert_eq!(scan_shape(first), vec![Some(1), Some(2), Some(3), Some(4)]);
+        assert_eq!(scan_shape(second), vec![Some(1), Some(2), Some(3), Some(4)]);
+        assert!(
+            original_paths.iter().all(|path| !path.exists()),
+            "the successful fold unlinks every destructive input run"
+        );
+    }
+
+    #[test]
+    fn shared_merge_spilled_e320_cleans_its_files_and_preserves_other_stage_charge() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            u64::MAX,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        ));
+        arb.record_spill_bytes("other", 777);
+        let (mut buffer, original_paths) = shared_merge_spilled_fixture(&arb);
+        let input_bytes = arb.cumulative_spill_bytes() - 777;
+        arb.set_max_spill_bytes(input_bytes + 777);
+
+        match buffer.reread() {
+            Err(PipelineError::SpillCapExceeded { node, .. }) => assert_eq!(node, "banded"),
+            Ok(_) => panic!("replacement overlap must exceed the exact input-only cap"),
+            Err(other) => panic!("expected E320 replacement-overlap failure; got {other:?}"),
+        }
+        assert_eq!(
+            arb.cumulative_spill_bytes(),
+            777,
+            "failed-fold cleanup releases only the banded stage's removed files"
+        );
+        assert!(
+            original_paths.iter().all(|path| !path.exists()),
+            "failed-fold cleanup unlinks every consumed input run"
+        );
+    }
+
+    #[test]
+    fn shared_merge_spilled_decode_error_is_preserved_and_cleans_inputs() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        let arb = Arc::new(MemoryArbitrator::with_policy(
+            u64::MAX,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        ));
+        arb.record_spill_bytes("other", 777);
+        let (mut buffer, original_paths) = shared_merge_spilled_fixture(&arb);
+        std::fs::write(&original_paths[0], b"corrupt spill run").expect("corrupt one adopted run");
+
+        let error = match buffer.reread() {
+            Ok(_) => panic!("the corrupt adopted run must fail the shared fold"),
+            Err(error) => error,
+        };
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("spill run open failed")
+                || rendered.contains("spill run decode failed"),
+            "cleanup must preserve the original run-read failure: {rendered}"
+        );
+        assert_eq!(
+            arb.cumulative_spill_bytes(),
+            777,
+            "error cleanup must not release another stage's live spill charge"
+        );
+        assert!(
+            original_paths.iter().all(|path| !path.exists()),
+            "error cleanup unlinks every adopted input run"
+        );
     }
 }

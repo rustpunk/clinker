@@ -1318,7 +1318,7 @@ fn upstream_spill_still_rejects_whole_document() {
     let yaml = r#"
 pipeline:
   name: doc_dlq_spill
-  memory: { limit: "1M", backpressure: spill }
+  memory: { limit: "2M", backpressure: spill }
 error_handling:
   strategy: continue
 nodes:
@@ -1397,7 +1397,7 @@ nodes:
         .sum();
     assert!(
         upstream_spilled > 0,
-        "an upstream inter-stage buffer must spill under the 1 MiB budget so \
+        "an upstream inter-stage buffer must spill under the 2 MiB budget so \
          the Output reloads records from disk; per-stage spill = {:?}",
         report.per_stage_spill_bytes
     );

@@ -183,6 +183,73 @@ fn explain_arbitration_semantics_are_not_inverted() {
     );
 }
 
+/// A shared producer cannot use the single-consumer streaming shortcut. Its
+/// explain class and both outgoing edge pseudo-nodes must therefore describe
+/// the same materialized, priority-0 spill surface the runtime reader ledger
+/// owns and re-scans.
+#[test]
+fn explain_reports_shared_fanout_as_materialized_spillable_edges() {
+    let yaml = r#"
+pipeline:
+  name: shared_fanout_explain
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: events.csv
+      schema: [ { name: id, type: string } ]
+  - type: transform
+    name: shared
+    input: events
+    config: { cxl: "emit id = id" }
+  - type: transform
+    name: left
+    input: shared
+    config: { cxl: "emit id = id" }
+  - type: transform
+    name: right
+    input: shared
+    config: { cxl: "emit id = id" }
+  - type: output
+    name: left_out
+    input: left
+    config: { name: left_out, type: csv, path: left.csv }
+  - type: output
+    name: right_out
+    input: right
+    config: { name: right_out, type: csv, path: right.csv }
+"#;
+    let text = render_explain(yaml);
+
+    let shared_start = text
+        .find("transform.shared:\n")
+        .expect("shared Physical Properties stanza");
+    assert!(
+        text[shared_start..]
+            .lines()
+            .take(8)
+            .any(|line| line == "  buffer: materialized"),
+        "the shared producer must be materialized in explain output:\n{text}"
+    );
+    for target in ["transform.left", "transform.right"] {
+        let edge = format!("edge transform.shared -> {target}:");
+        let start = text
+            .find(&edge)
+            .unwrap_or_else(|| panic!("missing shared edge `{edge}`:\n{text}"));
+        let stanza = &text[start..];
+        assert!(
+            stanza.starts_with(&format!("{edge}\n  buffer: node_buffer (slot="))
+                && stanza
+                    .lines()
+                    .take(3)
+                    .any(|line| { line.contains("spill_priority=0, can_back_pressure=false") }),
+            "shared edge `{edge}` must be a priority-0 materialized slot:\n{stanza}"
+        );
+    }
+}
+
 /// Pin the full explain text for a pipeline whose Source reads a sized
 /// (1 KiB) input file, so the `predicted_peak` / `predicted_freed`
 /// annotations render NON-ZERO values rather than only the `0B` unknown

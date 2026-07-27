@@ -44,7 +44,7 @@ use std::sync::Arc;
 /// A tight hard limit far below process RSS, but above the local footprint of a
 /// single block-pair (two 16 KiB-floored blocks plus kernel aux). A non-empty
 /// join completes under it because the pre-output gate is strictly local.
-const TIGHT_LIMIT: u64 = 128 * 1024;
+const TIGHT_LIMIT: u64 = 320 * 1024;
 /// Below a single block-pair's local footprint (two 16 KiB block floors plus
 /// aux), so the first surviving pair trips the local pre-output abort.
 const ABORT_LIMIT: u64 = 8 * 1024;
@@ -328,7 +328,7 @@ fn block_band_completes_non_empty_with_spill_under_tight_budget() {
     // band i, so there are 400 matches — well under the 10K output poll. Each
     // input record carries a 200-byte pad column (not emitted), so each side is
     // ~140 KB: it exceeds the ~51 KB sort-spill threshold (multi-run sort spill)
-    // and slices into many 16 KB blocks. Under the 128 KB budget a single
+    // and slices into many 16 KB blocks. Under the 320 KiB budget a single
     // block-pair's local footprint (~two 16 KB blocks + kernel aux) fits, so the
     // run COMPLETES — the input that previously had no spill path now finishes,
     // and does so on this RSS-present host precisely because the per-pair gate
@@ -353,7 +353,7 @@ fn block_band_completes_non_empty_with_spill_under_tight_budget() {
     );
     assert!(
         spilled_bytes(&arb) > 0,
-        "the ~140 KB sides must spill sort runs and blocks under the 128 KB budget; \
+        "the ~140 KB sides must spill sort runs and blocks under the 320 KiB budget; \
          per_stage_spill_bytes[banded] was {}",
         spilled_bytes(&arb)
     );
@@ -423,14 +423,13 @@ fn block_band_completes_while_fully_pruned_and_spilling() {
 
 #[test]
 fn block_band_pre_output_local_abort_under_undersized_budget() {
-    // 500 orders × 500 overlapping bands under a budget below a single
-    // block-pair's local footprint: every order matches its band, so a pair
-    // survives the prune and reaches the pre-output charge. Two 16 KB-floored
-    // blocks plus the kernel's sort arrays exceed the 8 KB budget, so the LOCAL
+    // One matching order/band pair keeps the spill-backed input scans below the
+    // 8 KB budget, then reaches the pre-output charge. The two 16 KB-floored
+    // blocks plus the kernel's sort arrays exceed that budget, so the LOCAL
     // gate trips — proving the demoted abort still fires when a lone block-pair
-    // genuinely cannot fit, independent of process RSS.
+    // genuinely cannot fit, independent of process RSS or input materialization.
     let arb = no_op_arbitrator(ABORT_LIMIT);
-    let (result, output) = run_pipeline(orders_csv(500, 0), bands_csv(500, 0, 0), &arb);
+    let (result, output) = run_pipeline(orders_csv(1, 0), bands_csv(1, 0, 0), &arb);
     let err = result.expect_err("a block-pair over the undersized budget must abort");
     assert_pre_output_abort(err, ABORT_LIMIT);
 
