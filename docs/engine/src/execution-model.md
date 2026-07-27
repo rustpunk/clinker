@@ -25,6 +25,15 @@ allocation, clone, or per-record bookkeeping. Optional lookup remains limited
 to body seeding, own-slot-versus-predecessor selection, and cleanup paths where
 absence has defined control-flow meaning.
 
+`Aggregate`, `Reshape`, `Cull`, and planner-synthesized `Sort` use one address
+rule: first check their own `(consumer, None)` slot, which is where a `Route`
+branch or `Cull` port publishes its selected records, then require the incoming
+`(producer, producer_port)` slot. A present empty own slot is still
+authoritative; only the absence of both valid addresses is an invariant
+failure. `Transform` and `Output` also recognize successor-local slots through
+their existing specialized input paths. `Merge` and `Combine` remain
+predecessor-slot readers because they select among multiple incoming edges.
+
 This distinction is what makes Clinker a bounded-memory executor: a pipeline's peak memory is set by its largest live blocking-or-non-fused-streaming stage plus one batch per fused streaming stage, not by the cumulative size of every stage at once. A streaming stage's output is never separately buffered between dispatch arms, so it is never charged twice: the arbitrator counts each in-flight batch once when the producer flushes it and discharges that charge as the consumer drains it. If RSS still crosses the soft threshold while a single-consumer streaming stage holds batches in flight, the engine spills those batches' records to disk one batch at a time — the streaming handoff is the per-batch counterpart of a blocking stage's full-stage spill, not an exemption from spilling.
 
 ## Which stages stream

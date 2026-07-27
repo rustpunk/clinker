@@ -10,8 +10,8 @@ use clinker_record::Record;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
-    ExecutorContext, admit_node_buffer, node_buffer_spill_allowed, require_node_buffer_slot,
-    tee_emit_to_region_input_buffers,
+    ExecutorContext, admit_node_buffer, node_buffer_spill_allowed,
+    require_single_input_node_buffer_slot, tee_emit_to_region_input_buffers,
 };
 use crate::executor::{parse_memory_limit, stage_metrics};
 use crate::pipeline::spill_merge::merge_sorted_runs;
@@ -49,8 +49,9 @@ pub(crate) fn dispatch_sort(
         .find_edge(pred, node_idx)
         .and_then(|edge| current_dag.graph.edge_weight(edge))
         .and_then(|edge| edge.producer_port.as_deref());
-    let input_buffer = require_node_buffer_slot(
+    let input_buffer = require_single_input_node_buffer_slot(
         ctx,
+        node_idx,
         pred,
         name,
         current_dag.graph[pred].name(),
@@ -201,12 +202,35 @@ fn charge_enforcer_spill(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
+    use crate::executor::dispatch::{NodeBufferKey, single_input_node_buffer_key};
+    use crate::executor::node_buffer::NodeBuffer;
     use crate::pipeline::sort_buffer::SortBuffer;
     use clinker_plan::config::{SortField, SortOrder};
     use clinker_record::{Schema, Value};
     use rust_decimal::Decimal;
+
+    #[test]
+    fn sort_prefers_its_successor_local_slot() {
+        let producer_idx = NodeIndex::new(1);
+        let sort_idx = NodeIndex::new(2);
+        let mut buffers = HashMap::new();
+        buffers.insert(
+            NodeBufferKey::with_port(producer_idx, Some("selected")),
+            NodeBuffer::Memory(Vec::new()),
+        );
+        buffers.insert(
+            NodeBufferKey::from(sort_idx),
+            NodeBuffer::Memory(Vec::new()),
+        );
+
+        let selected =
+            single_input_node_buffer_key(&buffers, sort_idx, producer_idx, Some("selected"));
+
+        assert_eq!(selected, NodeBufferKey::from(sort_idx));
+    }
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec!["k".into(), "id".into()]))

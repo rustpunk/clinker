@@ -1,9 +1,10 @@
 //! End-to-end regressions for required materialized node-buffer inputs (#1029).
 //!
-//! The DAGs below are valid but expose the addressing/reader-count gaps tracked
-//! by #908, #996, and #1013. This safety landing does not make those shapes
-//! execute correctly; it guarantees that a missing planned slot aborts instead
-//! of becoming a successful empty stream.
+//! The DAGs below cover the addressing/reader-count gaps tracked by #908,
+//! #996, and #1013. Route/Cull successor-local slots now execute through the
+//! uniform own-slot-first lookup. The remaining #908 and #996 shapes stay here
+//! to guarantee that a missing planned slot aborts instead of becoming a
+//! successful empty stream.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -131,6 +132,17 @@ fn assert_missing_input(
         detail.contains("run stopped instead of treating it as empty"),
         "the error must explain the fail-closed disposition: {detail}"
     );
+}
+
+fn assert_csv_rows(buffer: &SharedBuffer, expected_header: &str, expected_rows: &[&str]) {
+    let output = buffer.as_string();
+    let mut lines = output.lines();
+    assert_eq!(lines.next(), Some(expected_header));
+    let mut actual: Vec<&str> = lines.collect();
+    let mut expected = expected_rows.to_vec();
+    actual.sort_unstable();
+    expected.sort_unstable();
+    assert_eq!(actual, expected);
 }
 
 fn route_pipeline(name: &str, selected_consumer: &str) -> String {
@@ -360,7 +372,7 @@ fn first_of_two_direct_outputs_fails_loudly_in_beta_alpha_order() {
 }
 
 #[test]
-fn route_to_aggregate_names_the_route_branch_when_it_stops() {
+fn route_to_aggregate_delivers_the_selected_branch() {
     let yaml = route_pipeline(
         "route_to_aggregate_missing_input",
         r#"  - type: aggregate
@@ -381,16 +393,19 @@ fn route_to_aggregate_names_the_route_branch_when_it_stops() {
 "#,
     );
 
-    assert_missing_input(
-        run_pipeline(&yaml, CSV).0,
-        "summarize",
-        "split",
-        Some("keep"),
+    let (result, buffers) = run_pipeline(&yaml, CSV);
+    let report = result.expect("Route successor slot must feed Aggregate");
+    assert_eq!(report.counters.records_written, 3);
+    assert_csv_rows(&buffers["out"], "dept,n", &["eng,1", "sales,1"]);
+    assert_csv_rows(
+        &buffers["dropped"],
+        "id,dept,amount,status,label",
+        &["2,eng,200,bad,two"],
     );
 }
 
 #[test]
-fn route_to_reshape_names_the_route_branch_when_it_stops() {
+fn route_to_reshape_delivers_the_selected_branch() {
     let yaml = route_pipeline(
         "route_to_reshape_missing_input",
         r#"  - type: reshape
@@ -414,11 +429,23 @@ fn route_to_reshape_names_the_route_branch_when_it_stops() {
 "#,
     );
 
-    assert_missing_input(run_pipeline(&yaml, CSV).0, "relabel", "split", Some("keep"));
+    let (result, buffers) = run_pipeline(&yaml, CSV);
+    let report = result.expect("Route successor slot must feed Reshape");
+    assert_eq!(report.counters.records_written, 3);
+    assert_csv_rows(
+        &buffers["out"],
+        "id,dept,amount,status,label",
+        &["1,eng,100,keep,reshaped", "3,sales,50,keep,reshaped"],
+    );
+    assert_csv_rows(
+        &buffers["dropped"],
+        "id,dept,amount,status,label",
+        &["2,eng,200,bad,two"],
+    );
 }
 
 #[test]
-fn route_to_cull_names_the_route_branch_when_it_stops() {
+fn route_to_cull_delivers_the_selected_branch() {
     let yaml = route_pipeline(
         "route_to_cull_missing_input",
         r#"  - type: cull
@@ -447,16 +474,24 @@ fn route_to_cull_names_the_route_branch_when_it_stops() {
 "#,
     );
 
-    assert_missing_input(
-        run_pipeline(&yaml, CSV).0,
-        "filter_kept",
-        "split",
-        Some("keep"),
+    let (result, buffers) = run_pipeline(&yaml, CSV);
+    let report = result.expect("Route successor slot must feed Cull");
+    assert_eq!(report.counters.records_written, 3);
+    assert_csv_rows(
+        &buffers["out"],
+        "id,dept,amount,status,label",
+        &["1,eng,100,keep,one", "3,sales,50,keep,three"],
+    );
+    assert!(buffers["filtered"].as_string().is_empty());
+    assert_csv_rows(
+        &buffers["dropped"],
+        "id,dept,amount,status,label",
+        &["2,eng,200,bad,two"],
     );
 }
 
 #[test]
-fn cull_to_aggregate_stops_instead_of_treating_main_as_empty() {
+fn cull_to_aggregate_delivers_main_and_removed_ports() {
     let yaml = cull_pipeline(
         "cull_to_aggregate_missing_input",
         r#"  - type: aggregate
@@ -477,11 +512,19 @@ fn cull_to_aggregate_stops_instead_of_treating_main_as_empty() {
 "#,
     );
 
-    assert_missing_input(run_pipeline(&yaml, CSV).0, "summarize", "gate", None);
+    let (result, buffers) = run_pipeline(&yaml, CSV);
+    let report = result.expect("Cull successor slot must feed Aggregate");
+    assert_eq!(report.counters.records_written, 3);
+    assert_csv_rows(&buffers["out"], "dept,n", &["eng,1", "sales,1"]);
+    assert_csv_rows(
+        &buffers["removed"],
+        "id,dept,amount,status,label",
+        &["2,eng,200,bad,two"],
+    );
 }
 
 #[test]
-fn cull_to_reshape_stops_instead_of_treating_main_as_empty() {
+fn cull_to_reshape_delivers_main_and_removed_ports() {
     let yaml = cull_pipeline(
         "cull_to_reshape_missing_input",
         r#"  - type: reshape
@@ -505,7 +548,19 @@ fn cull_to_reshape_stops_instead_of_treating_main_as_empty() {
 "#,
     );
 
-    assert_missing_input(run_pipeline(&yaml, CSV).0, "relabel", "gate", None);
+    let (result, buffers) = run_pipeline(&yaml, CSV);
+    let report = result.expect("Cull successor slot must feed Reshape");
+    assert_eq!(report.counters.records_written, 3);
+    assert_csv_rows(
+        &buffers["out"],
+        "id,dept,amount,status,label",
+        &["1,eng,100,keep,reshaped", "3,sales,50,keep,reshaped"],
+    );
+    assert_csv_rows(
+        &buffers["removed"],
+        "id,dept,amount,status,label",
+        &["2,eng,200,bad,two"],
+    );
 }
 
 #[test]

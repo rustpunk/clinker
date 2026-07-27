@@ -68,7 +68,7 @@ use petgraph::visit::EdgeRef;
 
 use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, node_buffer_spill_allowed,
-    require_node_buffer_slot, source_file_arc_of, source_name_arc_of,
+    require_single_input_node_buffer_slot, source_file_arc_of, source_name_arc_of,
 };
 use crate::executor::{GroupedNodeKind, giant_group_error};
 use crate::pipeline::memory::{
@@ -172,8 +172,9 @@ pub(crate) fn dispatch_cull(
         .find_edge(pred, node_idx)
         .and_then(|edge| current_dag.graph.edge_weight(edge))
         .and_then(|edge| edge.producer_port.as_deref());
-    let input_buffer = require_node_buffer_slot(
+    let input_buffer = require_single_input_node_buffer_slot(
         ctx,
+        node_idx,
         pred,
         name,
         current_dag.graph[pred].name(),
@@ -483,15 +484,15 @@ fn compute_drop_decisions(
 /// `None`) draws kept rows.
 ///
 /// Where the records land depends on how the successor reads its input. A
-/// single-output consumer (Transform / Output / Reshape / Cull) checks its own
-/// `node_buffers` slot first, so its port-selected records go into the
-/// successor's own slot (`(succ, None)`). A multi-input consumer (Merge /
-/// Combine) reads its *predecessor's* slot directly, keyed by the incoming
-/// edge's producer port, so each distinct producer port lands in this Cull's
-/// own `(node_idx, Some(port))` slot — the `main` and `removed_to` ports stay
-/// separate, which a Combine build side depends on. Both ports broadcast
-/// `input_puncts` so each downstream subgraph drives its own per-document
-/// accumulators.
+/// single-output consumer (Transform / Output / Reshape / Cull / Sort /
+/// Aggregation) checks its own `node_buffers` slot first, so its port-selected
+/// records go into the successor's own slot (`(succ, None)`). A multi-input
+/// consumer (Merge / Combine) reads its *predecessor's* slot directly, keyed by
+/// the incoming edge's producer port, so each distinct producer port lands in
+/// this Cull's own `(node_idx, Some(port))` slot — the `main` and `removed_to`
+/// ports stay separate, which a Combine build side depends on. Both ports
+/// broadcast `input_puncts` so each downstream subgraph drives its own
+/// per-document accumulators.
 #[allow(clippy::too_many_arguments)]
 fn emit_ports(
     ctx: &mut ExecutorContext<'_>,

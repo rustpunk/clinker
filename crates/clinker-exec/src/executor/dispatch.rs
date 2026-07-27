@@ -1682,6 +1682,44 @@ pub(crate) fn require_node_buffer_slot(
         .ok_or_else(|| missing_node_buffer_input_error(consumer_name, producer_name, producer_port))
 }
 
+/// Drain a single-input consumer's materialized input using the executor's
+/// uniform slot-addressing rule.
+///
+/// Route and Cull publish directly into a single-input successor's own
+/// `(consumer, None)` slot. Other producers publish into their own
+/// `(producer, producer_port)` slot. Prefer the successor-local slot when it
+/// exists, including when it is explicitly empty, then require the incoming
+/// predecessor slot so absence still fails closed.
+pub(crate) fn require_single_input_node_buffer_slot(
+    ctx: &mut ExecutorContext<'_>,
+    consumer_idx: NodeIndex,
+    producer_idx: NodeIndex,
+    consumer_name: &str,
+    producer_name: &str,
+    producer_port: Option<&str>,
+) -> Result<NodeBuffer, PipelineError> {
+    let key =
+        single_input_node_buffer_key(&ctx.node_buffers, consumer_idx, producer_idx, producer_port);
+    require_node_buffer_slot(ctx, key, consumer_name, producer_name, producer_port)
+}
+
+/// Resolve the materialized slot key for a single-input consumer without
+/// changing either slot. Kept separate from the draining helper so the
+/// successor-local precedence can be tested for planner-synthesized nodes.
+pub(crate) fn single_input_node_buffer_key(
+    node_buffers: &HashMap<NodeBufferKey, NodeBuffer>,
+    consumer_idx: NodeIndex,
+    producer_idx: NodeIndex,
+    producer_port: Option<&str>,
+) -> NodeBufferKey {
+    let own_key = NodeBufferKey::from(consumer_idx);
+    if node_buffers.contains_key(&own_key) {
+        own_key
+    } else {
+        NodeBufferKey::with_port(producer_idx, producer_port)
+    }
+}
+
 #[cfg(test)]
 mod required_node_buffer_tests {
     use super::missing_node_buffer_input_error;
