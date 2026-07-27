@@ -34,6 +34,34 @@ failure. `Transform` and `Output` also recognize successor-local slots through
 their existing specialized input paths. `Merge` and `Combine` remain
 predecessor-slot readers because they select among multiple incoming edges.
 
+### Shared-buffer clones and composition scope
+
+When a predecessor feeds several consumers, the earlier `Output`, `Merge`, or
+`Combine` readers clone its resident events and leave the original slot for the
+last reader. The duplicate is not an untracked local vector: allocation goes
+through one reserved-clone boundary that registers its estimated bytes before
+the clone and returns the clone together with a must-retain reservation. The
+consumer holds that reservation through its complete synchronous read, write,
+join, or output-admission phase; unwinding an error releases it automatically.
+The final reader drains the original slot and its ordinary node-buffer
+registration.
+
+A composition input uses the same clone boundary, then transfers the live
+consumer id and byte handle into the body-local node-buffer registry. Body
+Source canonicalization briefly needs the seeded events and its prospective
+output together, so it extends that same reservation before allocating the
+output and reduces it to the canonicalized footprint as soon as the seed
+allocation drops. Slot admission then atomically replaces the transient
+consumer wrapper with the ordinary spill-aware wrapper under the same id.
+Body execution swaps the parent `node_buffers`, node-buffer registrations, shared
+drain counts, source-record table, body references, and window state as one
+scope. Body dispatch and output harvest are captured before a single cleanup
+path unregisters body residue and restores every parent map, so a successful
+body, a dispatch error, and a harvest error have the same ownership lifecycle.
+The transfer keeps one continuous registration and charges both allocations
+only for their real overlap: there is no unregistered interval and no second
+consumer charge for the same bytes.
+
 This distinction is what makes Clinker a bounded-memory executor: a pipeline's peak memory is set by its largest live blocking-or-non-fused-streaming stage plus one batch per fused streaming stage, not by the cumulative size of every stage at once. A streaming stage's output is never separately buffered between dispatch arms, so it is never charged twice: the arbitrator counts each in-flight batch once when the producer flushes it and discharges that charge as the consumer drains it. If RSS still crosses the soft threshold while a single-consumer streaming stage holds batches in flight, the engine spills those batches' records to disk one batch at a time — the streaming handoff is the per-batch counterpart of a blocking stage's full-stage spill, not an exemption from spilling.
 
 ## Which stages stream

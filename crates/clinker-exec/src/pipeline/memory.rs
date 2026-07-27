@@ -1241,6 +1241,38 @@ impl MemoryArbitrator {
         id
     }
 
+    /// Atomically replace the wrapper stored under an existing consumer id.
+    ///
+    /// The ArcSwap registry moves from one complete snapshot to another, so a
+    /// concurrent reader observes either the old wrapper or the replacement —
+    /// never a missing id and never both wrappers. Used when a composition's
+    /// transient clone becomes an ordinary spill-aware body node-buffer slot
+    /// without an unregister/register accounting gap.
+    pub(crate) fn replace_consumer(
+        &self,
+        id: ConsumerId,
+        consumer: Arc<dyn MemoryConsumer>,
+    ) -> Option<Arc<dyn MemoryConsumer>> {
+        let mut replaced = None;
+        self.consumers.rcu(|current| {
+            // ArcSwap may retry the closure after a concurrent writer wins the
+            // compare-and-swap. Do not carry a match from an abandoned
+            // snapshot into the final result.
+            replaced = None;
+            let mut next = Vec::with_capacity(current.len());
+            for (current_id, current_consumer) in current.iter() {
+                if *current_id == id {
+                    replaced = Some(Arc::clone(current_consumer));
+                    next.push((*current_id, Arc::clone(&consumer)));
+                } else {
+                    next.push((*current_id, Arc::clone(current_consumer)));
+                }
+            }
+            next
+        });
+        replaced
+    }
+
     /// Remove a previously-registered consumer from the policy
     /// registry. Returns the consumer if `id` was registered, `None`
     /// otherwise. Operators call this at teardown when their state has
@@ -2535,6 +2567,36 @@ mod tests {
         // Second unregister with the same id returns None — stale ids
         // are not silently re-bound to a later registration.
         assert!(arbitrator.unregister_consumer(id).is_none());
+    }
+
+    #[test]
+    fn replace_consumer_preserves_registry_cardinality_and_updates_usage() {
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
+        let id = arbitrator.register_consumer(Arc::new(MockConsumer::new(100, 40, 0)));
+        assert_eq!(arbitrator.consumer_count(), 1);
+        assert_eq!(arbitrator.sum_consumer_usage(), 100);
+
+        let replaced = arbitrator.replace_consumer(id, Arc::new(MockConsumer::new(250, 0, 0)));
+        assert!(replaced.is_some());
+        assert_eq!(arbitrator.consumer_count(), 1);
+        assert_eq!(arbitrator.sum_consumer_usage(), 250);
+        assert!(arbitrator.unregister_consumer(id).is_some());
+        assert_eq!(arbitrator.consumer_count(), 0);
+    }
+
+    #[test]
+    fn replace_consumer_missing_id_leaves_registry_unchanged() {
+        let arbitrator = MemoryArbitrator::with_policy(u64::MAX, 0.80, 0.70, Box::new(NoOpPolicy));
+        let id = arbitrator.register_consumer(Arc::new(MockConsumer::new(100, 40, 0)));
+        let missing = ConsumerId(id.0 + 1);
+
+        assert!(
+            arbitrator
+                .replace_consumer(missing, Arc::new(MockConsumer::new(250, 0, 0)))
+                .is_none()
+        );
+        assert_eq!(arbitrator.consumer_count(), 1);
+        assert_eq!(arbitrator.sum_consumer_usage(), 100);
     }
 
     #[test]

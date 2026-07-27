@@ -474,7 +474,9 @@ pub(crate) fn sink_collision_dlq_entry(
     })
 }
 
-use crate::executor::node_buffer::NodeBuffer;
+use crate::executor::node_buffer::{
+    NodeBuffer, TransientNodeBufferReservation, clone_node_buffer_reserved,
+};
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::{DlqEntry, evaluate_single_transform, stage_metrics};
 use clinker_plan::BudgetCategory;
@@ -1562,7 +1564,7 @@ pub(crate) fn tee_emit_to_region_input_buffers(
 /// Per-row heuristic byte cost. Returns `0` for an empty slice. The
 /// formula matches `NodeBuffer::estimated_memory_bytes` so the
 /// admission surfaces agree on the same per-row size.
-fn estimate_node_buffer_bytes(rows: &[(Record, u64)]) -> u64 {
+pub(crate) fn estimate_node_buffer_bytes(rows: &[(Record, u64)]) -> u64 {
     let Some((first, _)) = rows.first() else {
         return 0;
     };
@@ -1740,26 +1742,47 @@ mod required_node_buffer_tests {
     }
 }
 
+/// One shared-predecessor input plus the optional reservation for a transient
+/// duplicate. Consumers retain the guard through their complete synchronous
+/// Merge/Combine operation, not only through conversion into record vectors.
+#[must_use = "a cloned shared input must retain its transient reservation"]
+pub(crate) struct SharedNodeBufferInput {
+    buffer: NodeBuffer,
+    reservation: Option<TransientNodeBufferReservation>,
+}
+
+impl SharedNodeBufferInput {
+    fn drained(buffer: NodeBuffer) -> Self {
+        Self {
+            buffer,
+            reservation: None,
+        }
+    }
+
+    /// Split the input into its buffer and optional clone-lifetime guard.
+    pub(crate) fn into_parts(self) -> (NodeBuffer, Option<TransientNodeBufferReservation>) {
+        (self.buffer, self.reservation)
+    }
+}
+
 /// Take a predecessor-slot reader's input from `key`, cloning the slot (leaving
-/// it intact) when other predecessor-slot consumers of the SAME
+/// it intact) when other predecessor-slot consumers of the same
 /// `(producer, port)` slot still need it — so one producer output port fanned
 /// out to several Merge/Combine consumers reaches all of them, not just the
-/// first to drain. The last consumer to drain (the one after which the tracked
-/// drain count reaches the total number of such consumers) removes the slot;
-/// every earlier one clones. Counting drains rather than comparing `NodeIndex`
-/// keeps this correct under the memory-arbitrated dispatch order, which is not
-/// `NodeIndex`-monotonic.
+/// first to drain. The last consumer removes the slot; every earlier consumer
+/// receives a reserved clone. Counting drains rather than comparing
+/// `NodeIndex` keeps this correct under memory-arbitrated dispatch order.
 ///
 /// A fanned port has more than one outgoing edge on its producer, so
-/// [`node_buffer_spill_allowed`] keeps the slot unspilled; the clone therefore
-/// never reaches `clone_memory_only`'s spill panic. The clone preserves
-/// punctuations (it copies the full `StreamEvent` vector), which the Output
-/// fan-out path does not need but a multi-input consumer does.
+/// [`node_buffer_spill_allowed`] keeps the slot resident. The clone preserves
+/// the full `StreamEvent` vector, including punctuations, and its returned guard
+/// keeps the duplicate charge live through the consuming Merge/Combine arm.
 pub(crate) fn drain_or_clone_shared_input(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     key: NodeBufferKey,
-) -> Option<NodeBuffer> {
+    consumer_name: &str,
+) -> Result<Option<SharedNodeBufferInput>, PipelineError> {
     use petgraph::visit::EdgeRef;
     let port = key.producer_port.as_deref();
     let total_consumers = current_dag
@@ -1778,21 +1801,27 @@ pub(crate) fn drain_or_clone_shared_input(
     // so `total_consumers == 1`) and a fused-Source Merge (streams live channels,
     // materializes no `(source, None)` slot) — so neither can stall the counter.
     if total_consumers <= 1 {
-        return drain_node_buffer_slot(ctx, key);
+        return Ok(drain_node_buffer_slot(ctx, key).map(SharedNodeBufferInput::drained));
     }
     let drained = ctx.shared_input_drains.entry(key.clone()).or_insert(0);
     *drained += 1;
     if *drained >= total_consumers {
         ctx.shared_input_drains.remove(&key);
-        drain_node_buffer_slot(ctx, key)
+        Ok(drain_node_buffer_slot(ctx, key).map(SharedNodeBufferInput::drained))
     } else {
-        // The clone is a transient owned buffer drained immediately by this
-        // consumer; the original slot keeps its registered charge until the last
-        // consumer removes it, so the shared data stays accounted once. The
-        // clone is deliberately not admitted (at most one exists at a time).
-        ctx.node_buffers
-            .get(&key)
-            .map(|nb| NodeBuffer::Memory(nb.clone_memory_only()))
+        // The original slot keeps its own registered charge until the last
+        // consumer removes it. Register the duplicate before allocating it and
+        // return the must-use guard with the cloned buffer so this consumer's
+        // complete synchronous operation stays charged as well.
+        let Some(buffer) = ctx.node_buffers.get(&key) else {
+            return Ok(None);
+        };
+        let reserved = clone_node_buffer_reserved(buffer, &ctx.memory_budget, consumer_name)?;
+        let (buffer, reservation) = reserved.into_parts();
+        Ok(Some(SharedNodeBufferInput {
+            buffer,
+            reservation: Some(reservation),
+        }))
     }
 }
 
@@ -1804,8 +1833,57 @@ pub(crate) fn admit_node_buffer(
     puncts: Vec<crate::executor::stream_event::Punctuation>,
     spill_allowed: bool,
 ) -> Result<NodeBuffer, PipelineError> {
-    let slot_key = key.into();
+    admit_node_buffer_inner(
+        ctx,
+        node_name,
+        key.into(),
+        rows,
+        puncts,
+        spill_allowed,
+        None,
+    )
+}
+
+/// Admit a composition port Source's canonicalized rows while transferring
+/// the clone reservation already registered for the seeded body slot.
+///
+/// The registration keeps the same id and handle. Only its consumer wrapper
+/// changes atomically from the transient, non-reclaimable form to the ordinary
+/// spill-aware node-buffer form, so policy readers never observe an accounting
+/// gap or a duplicate charge.
+pub(crate) fn admit_node_buffer_transferred(
+    ctx: &mut ExecutorContext<'_>,
+    node_name: &str,
+    key: impl Into<NodeBufferKey>,
+    rows: Vec<(Record, u64)>,
+    puncts: Vec<crate::executor::stream_event::Punctuation>,
+    spill_allowed: bool,
+    reservation: TransientNodeBufferReservation,
+) -> Result<NodeBuffer, PipelineError> {
+    admit_node_buffer_inner(
+        ctx,
+        node_name,
+        key.into(),
+        rows,
+        puncts,
+        spill_allowed,
+        Some(reservation),
+    )
+}
+
+fn admit_node_buffer_inner(
+    ctx: &mut ExecutorContext<'_>,
+    node_name: &str,
+    slot_key: NodeBufferKey,
+    rows: Vec<(Record, u64)>,
+    puncts: Vec<crate::executor::stream_event::Punctuation>,
+    spill_allowed: bool,
+    transferred_reservation: Option<TransientNodeBufferReservation>,
+) -> Result<NodeBuffer, PipelineError> {
     if rows.is_empty() && puncts.is_empty() {
+        // An empty canonicalized composition seed owns no resident buffer.
+        // Dropping the still-RAII reservation releases its registration.
+        drop(transferred_reservation);
         return Ok(NodeBuffer::Memory(Vec::new()));
     }
     let bytes = estimate_node_buffer_bytes(&rows);
@@ -1827,14 +1905,42 @@ pub(crate) fn admit_node_buffer(
     // discharge — e.g. the post-recompute aggregate emit path)
     // unregisters first so the arbitrator's registry holds exactly
     // one wrapper per live slot.
-    if let Some((prev_id, _)) = ctx.node_buffer_consumer_ids.remove(&slot_key) {
-        ctx.memory_budget.unregister_consumer(prev_id);
-    }
-    let handle = crate::pipeline::memory::ConsumerHandle::new();
-    handle.set_bytes(bytes);
-    let consumer_id = ctx.memory_budget.register_consumer(Arc::new(
-        crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
-    ));
+    let (consumer_id, handle) = if let Some(reservation) = transferred_reservation {
+        reservation.set_bytes(bytes);
+        let (consumer_id, handle) = reservation.into_registration();
+        let replacement = Arc::new(crate::executor::node_buffer::NodeBufferConsumer::new(
+            handle.clone(),
+        ));
+        if ctx
+            .memory_budget
+            .replace_consumer(consumer_id, replacement)
+            .is_none()
+        {
+            // The RAII owner was consumed above, so explicitly zero and remove
+            // the id on this invariant failure. `unregister_consumer` is safe
+            // even when the missing-id result reflects a concurrently removed
+            // final snapshot.
+            handle.set_bytes(0);
+            ctx.memory_budget.unregister_consumer(consumer_id);
+            return Err(PipelineError::Internal {
+                op: "executor",
+                node: node_name.to_string(),
+                detail: "composition port node-buffer reservation was not registered during ownership transfer"
+                    .to_string(),
+            });
+        }
+        (consumer_id, handle)
+    } else {
+        if let Some((prev_id, _)) = ctx.node_buffer_consumer_ids.remove(&slot_key) {
+            ctx.memory_budget.unregister_consumer(prev_id);
+        }
+        let handle = crate::pipeline::memory::ConsumerHandle::new();
+        handle.set_bytes(bytes);
+        let consumer_id = ctx.memory_budget.register_consumer(Arc::new(
+            crate::executor::node_buffer::NodeBufferConsumer::new(handle.clone()),
+        ));
+        (consumer_id, handle)
+    };
     ctx.node_buffer_consumer_ids
         .insert(slot_key, (consumer_id, handle.clone()));
     // Raise the run's high-water mark now that this slot's charge has

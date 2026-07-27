@@ -21,6 +21,9 @@ use crate::executor::dispatch::{
     mapping_probe, missing_node_buffer_input_error, push_dlq, push_write_error,
     sink_collision_dlq_entry, source_file_path_of,
 };
+use crate::executor::node_buffer::{
+    NodeBuffer, TransientNodeBufferReservation, clone_node_buffer_reserved,
+};
 use crate::executor::schema_check::check_input_schema;
 use crate::executor::structured_output_guard::{
     StructuredOutputDocumentGuard, structured_output_format,
@@ -54,6 +57,28 @@ struct OutputInputs {
     expected_input_schema: Option<Arc<clinker_record::Schema>>,
     upstream_name: String,
     cxl_emit_names: Vec<String>,
+}
+
+/// Records materialized from a multi-consumer Output clone together with the
+/// reservation that must remain live through the complete write phase.
+#[must_use = "an Output clone's reservation must remain live while its records are used"]
+struct ReservedOutputRecords {
+    records: Vec<(Record, u64)>,
+    reservation: TransientNodeBufferReservation,
+}
+
+fn clone_output_records_reserved(
+    input: &NodeBuffer,
+    memory_budget: &Arc<crate::pipeline::memory::MemoryArbitrator>,
+    output_name: &str,
+) -> Result<ReservedOutputRecords, PipelineError> {
+    let reserved = clone_node_buffer_reserved(input, memory_budget, output_name)?;
+    let (cloned, reservation) = reserved.into_parts();
+    let (records, _puncts) = cloned.drain_split()?;
+    Ok(ReservedOutputRecords {
+        records,
+        reservation,
+    })
 }
 
 /// Derive the [`OutputInputs`] for `node_idx` from the plan. Shared by the
@@ -133,6 +158,7 @@ pub(crate) fn dispatch_output(
     // for non-streaming outputs. Streaming Outputs (#72) take
     // the early-return path above and forward puncts through
     // the streaming channel separately.
+    let mut input_clone_reservation: Option<TransientNodeBufferReservation> = None;
     let input_records: Vec<(Record, u64)> =
         if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
             let (records, _puncts) = own_buf.drain_split()?;
@@ -161,11 +187,11 @@ pub(crate) fn dispatch_output(
                 } else {
                     // Multi-consumer fanout: keep the producer's
                     // buffer alive for remaining siblings via a
-                    // heap clone. The clone's footprint flows
-                    // through pull-mode attribution at the
-                    // arbitrator's next poll; the producer slot's
-                    // registered consumer keeps reporting the live
-                    // buffer until the last consumer drains it.
+                    // heap clone. The clone is preflighted and registered
+                    // before allocation, and its reservation stays live
+                    // through the complete Output write. The producer slot's
+                    // registered consumer keeps reporting the original buffer
+                    // until the last consumer drains it.
                     //
                     // Output is terminal — it writes to disk and
                     // has no downstream node_buffer to receive
@@ -174,14 +200,11 @@ pub(crate) fn dispatch_output(
                     // that need the document boundary read it from
                     // the non-cloned (last-consumer) drain through
                     // their own arm.
-                    let cloned = ctx.node_buffers.get(&p.into()).map(|nb| {
-                        nb.clone_memory_only()
-                            .into_iter()
-                            .filter_map(|e| e.into_record())
-                            .collect::<Vec<(Record, u64)>>()
-                    });
-                    if let Some(cloned) = cloned {
-                        found = Some(cloned);
+                    if let Some(input_buffer) = ctx.node_buffers.get(&p.into()) {
+                        let reserved =
+                            clone_output_records_reserved(input_buffer, &ctx.memory_budget, name)?;
+                        input_clone_reservation = Some(reserved.reservation);
+                        found = Some(reserved.records);
                         break;
                     }
                 }
@@ -458,6 +481,8 @@ pub(crate) fn dispatch_output(
         push_dlq(ctx, entry)?;
     }
 
+    // The duplicate records have completed their synchronous Output use.
+    drop(input_clone_reservation);
     Ok(())
 }
 
@@ -522,7 +547,8 @@ fn dispatch_output_document_dlq(
     node_idx: NodeIndex,
     name: &str,
 ) -> Result<(), PipelineError> {
-    let events = drain_output_input_events(ctx, current_dag, node_idx, name)?;
+    let (events, _input_clone_reservation) =
+        drain_output_input_events(ctx, current_dag, node_idx, name)?;
 
     let OutputInputs {
         expected_input_schema,
@@ -563,8 +589,16 @@ fn drain_output_input_events(
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     name: &str,
-) -> Result<Vec<crate::executor::stream_event::StreamEvent>, PipelineError> {
-    drain_output_input_event_iter(ctx, current_dag, node_idx, name).collect()
+) -> Result<
+    (
+        Vec<crate::executor::stream_event::StreamEvent>,
+        Option<TransientNodeBufferReservation>,
+    ),
+    PipelineError,
+> {
+    let input = drain_output_input_event_iter(ctx, current_dag, node_idx, name)?;
+    let (events, reservation) = input.into_parts();
+    Ok((events.collect::<Result<Vec<_>, _>>()?, reservation))
 }
 
 /// Execute the `Output` arm under envelope reconstruction
@@ -639,7 +673,7 @@ fn dispatch_output_envelope(
     let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
     let mut any_record = false;
 
-    let events = drain_output_input_event_iter(ctx, current_dag, node_idx, name);
+    let events = drain_output_input_event_iter(ctx, current_dag, node_idx, name)?;
     let mut driver = EnvelopeWriterDriver::default();
     let mut structured_guard = StructuredOutputDocumentGuard::new(&out_cfg.format);
 
@@ -883,14 +917,51 @@ impl EnvelopeWriterDriver {
 /// drain, then a memory clone for multi-consumer fan-out). Multi-consumer
 /// fan-out slots are never spilled, so the in-memory clone branch never hides
 /// a spilled buffer.
+#[must_use = "a cloned Output input must retain its transient reservation"]
+struct OutputInputEventIter {
+    events:
+        Box<dyn Iterator<Item = Result<crate::executor::stream_event::StreamEvent, PipelineError>>>,
+    reservation: Option<TransientNodeBufferReservation>,
+}
+
+impl OutputInputEventIter {
+    fn drained(
+        events: Box<
+            dyn Iterator<Item = Result<crate::executor::stream_event::StreamEvent, PipelineError>>,
+        >,
+    ) -> Self {
+        Self {
+            events,
+            reservation: None,
+        }
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        Box<dyn Iterator<Item = Result<crate::executor::stream_event::StreamEvent, PipelineError>>>,
+        Option<TransientNodeBufferReservation>,
+    ) {
+        (self.events, self.reservation)
+    }
+}
+
+impl Iterator for OutputInputEventIter {
+    type Item = Result<crate::executor::stream_event::StreamEvent, PipelineError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.events.next()
+    }
+}
+
 fn drain_output_input_event_iter(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     name: &str,
-) -> Box<dyn Iterator<Item = Result<crate::executor::stream_event::StreamEvent, PipelineError>>> {
+) -> Result<OutputInputEventIter, PipelineError> {
     if let Some(own_buf) = drain_node_buffer_slot(ctx, node_idx) {
-        return Box::new(own_buf.drain());
+        return Ok(OutputInputEventIter::drained(Box::new(own_buf.drain())));
     }
     let predecessors: Vec<NodeIndex> = current_dag
         .graph
@@ -904,21 +975,18 @@ fn drain_output_input_event_iter(
             .count();
         if remaining_consumers == 0 {
             if let Some(nb) = drain_node_buffer_slot(ctx, p) {
-                return Box::new(nb.drain());
+                return Ok(OutputInputEventIter::drained(Box::new(nb.drain())));
             }
-        } else if let Some(cloned) = ctx
-            .node_buffers
-            .get(&p.into())
-            .map(|nb| nb.clone_memory_only())
-        {
-            return Box::new(cloned.into_iter().map(Ok));
+        } else if let Some(input_buffer) = ctx.node_buffers.get(&p.into()) {
+            let reserved = clone_node_buffer_reserved(input_buffer, &ctx.memory_budget, name)?;
+            let (cloned, reservation) = reserved.into_parts();
+            return Ok(OutputInputEventIter {
+                events: Box::new(cloned.drain()),
+                reservation: Some(reservation),
+            });
         }
     }
-    Box::new(std::iter::once(Err(missing_output_input_error(
-        current_dag,
-        node_idx,
-        name,
-    ))))
+    Err(missing_output_input_error(current_dag, node_idx, name))
 }
 
 /// Build the fail-loud diagnostic only after every valid Output input location
@@ -1180,6 +1248,102 @@ mod tests {
     use clinker_format::error::FormatError;
     use clinker_record::{DocumentContext, DocumentId, FieldResolver, Schema, Value};
     use std::sync::Mutex;
+
+    struct FixedUsage(u64);
+
+    impl crate::pipeline::memory::MemoryConsumer for FixedUsage {
+        fn current_usage(&self) -> u64 {
+            self.0
+        }
+
+        fn spill_priority(&self) -> i32 {
+            i32::MAX
+        }
+
+        fn try_spill(
+            &self,
+            target_bytes: u64,
+        ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+            Err(crate::pipeline::memory::ConsumerSpillError::BelowTarget {
+                target: target_bytes,
+                freed: 0,
+            })
+        }
+
+        fn can_back_pressure(&self) -> bool {
+            false
+        }
+    }
+
+    fn output_clone_fixture() -> NodeBuffer {
+        let schema = Arc::new(Schema::new(vec!["id".into()]));
+        NodeBuffer::memory_from_records(vec![(Record::new(schema, vec![Value::Integer(1)]), 1)])
+    }
+
+    #[test]
+    fn ordinary_output_clone_preflight_returns_node_buffer_e310_at_baseline() {
+        let input = output_clone_fixture();
+        let clone_bytes = input.estimated_memory_bytes();
+        let hard_limit = 100 * 1024 * 1024 * 1024;
+        let baseline_usage = hard_limit - clone_bytes + 1;
+        let budget = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            hard_limit,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ));
+        let baseline_id = budget.register_consumer(Arc::new(FixedUsage(baseline_usage)));
+
+        match clone_output_records_reserved(&input, &budget, "ordinary_out") {
+            Err(PipelineError::MemoryBudgetExceeded {
+                node,
+                used,
+                limit,
+                source,
+                ..
+            }) => {
+                assert_eq!(node, "ordinary_out");
+                assert_eq!(used, hard_limit + 1);
+                assert_eq!(limit, hard_limit);
+                assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
+            }
+            Ok(_) => panic!("Output clone must be rejected before allocation"),
+            Err(other) => panic!("expected Output E310 NodeBuffer; got {other:?}"),
+        }
+        assert_eq!(budget.consumer_count(), 1);
+        assert_eq!(budget.sum_consumer_usage(), baseline_usage);
+        budget.unregister_consumer(baseline_id);
+    }
+
+    #[test]
+    fn envelope_output_iterator_holds_clone_charge_through_iteration() {
+        let input = output_clone_fixture();
+        let clone_bytes = input.estimated_memory_bytes();
+        let budget = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            100 * 1024 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ));
+        let reserved = clone_node_buffer_reserved(&input, &budget, "envelope_out")
+            .expect("roomy Output clone");
+        let (cloned, reservation) = reserved.into_parts();
+        let mut events = OutputInputEventIter {
+            events: Box::new(cloned.drain()),
+            reservation: Some(reservation),
+        };
+
+        assert_eq!(budget.sum_consumer_usage(), clone_bytes);
+        assert!(events.next().expect("one event").is_ok());
+        assert_eq!(
+            budget.sum_consumer_usage(),
+            clone_bytes,
+            "the lazy envelope iterator owns the reservation until it drops"
+        );
+        drop(events);
+        assert_eq!(budget.consumer_count(), 0);
+        assert_eq!(budget.sum_consumer_usage(), 0);
+    }
 
     /// A [`FormatWriter`] that records every hook invocation as an ordered
     /// string log, so a test can assert the exact boundary sequence the

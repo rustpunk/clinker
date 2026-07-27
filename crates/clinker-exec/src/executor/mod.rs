@@ -1416,6 +1416,19 @@ impl PipelineExecutor {
             ctx.memory_budget.unregister_consumer(id);
         }
 
+        // The walk is finished (success, interruption, or error), so no
+        // top-scope node buffer can be consumed again. Drop every residual
+        // allocation while its pull-mode wrapper is still registered, then
+        // unregister the matching ids before propagating `walk_result`.
+        // Composition inputs deliberately clone and leave their parent slots
+        // intact for possible siblings, so this sweep is their normal terminal
+        // cleanup as well as the early-error backstop.
+        drop(std::mem::take(&mut ctx.node_buffers));
+        for (_, (id, handle)) in std::mem::take(&mut ctx.node_buffer_consumer_ids) {
+            handle.set_bytes(0);
+            ctx.memory_budget.unregister_consumer(id);
+        }
+
         // A tripped shutdown token unwinds the walk via
         // `PipelineError::Interrupted`; that is a graceful early stop, not
         // a failure, so swallow it here (the interruption is recorded in
@@ -1737,4 +1750,5 @@ nodes:
     mod source_pause_liveness;
     mod spill_backed_drain_overshoot;
     mod spill_dir_unavailable_midrun;
+    mod transient_node_buffer_reservations;
 }

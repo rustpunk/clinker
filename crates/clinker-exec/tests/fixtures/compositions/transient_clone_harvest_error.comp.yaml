@@ -1,0 +1,18 @@
+_compose:
+  name: transient_clone_harvest_error
+  inputs:
+    inp:
+      schema:
+        - { name: a, type: int }
+  outputs:
+    out: splitter.big
+  config_schema: {}
+
+nodes:
+  - type: route
+    name: splitter
+    input: inp
+    config:
+      conditions:
+        big: "a >= 0"
+      default: small
