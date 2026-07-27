@@ -90,6 +90,65 @@ nodes:
     )
 }
 
+fn shared_source_two_interleaves_yaml() -> &'static str {
+    r#"
+pipeline:
+  name: shared_source_two_interleaves
+nodes:
+  - type: source
+    name: shared
+    config:
+      name: shared
+      type: csv
+      path: shared.csv
+      schema:
+        - { name: id, type: int }
+        - { name: tag, type: string }
+  - type: source
+    name: left_only
+    config:
+      name: left_only
+      type: csv
+      path: left.csv
+      schema:
+        - { name: id, type: int }
+        - { name: tag, type: string }
+  - type: source
+    name: right_only
+    config:
+      name: right_only
+      type: csv
+      path: right.csv
+      schema:
+        - { name: id, type: int }
+        - { name: tag, type: string }
+  - type: merge
+    name: left_merge
+    inputs: [shared, left_only]
+    config:
+      mode: interleave
+  - type: merge
+    name: right_merge
+    inputs: [shared, right_only]
+    config:
+      mode: interleave
+  - type: output
+    name: left_out
+    input: left_merge
+    config:
+      name: left_out
+      type: csv
+      path: left_out.csv
+  - type: output
+    name: right_out
+    input: right_merge
+    config:
+      name: right_out
+      type: csv
+      path: right_out.csv
+"#
+}
+
 /// CSV body for `src_a`: ids 1..=count with a stable `a-N` tag.
 fn src_a_csv(count: u32) -> String {
     let mut s = String::from("id,tag\n");
@@ -174,6 +233,18 @@ fn assert_per_source_fifo(body: &[String]) {
 #[test]
 fn interleave_preserves_per_source_fifo() {
     let yaml = pipeline_yaml("mode: interleave");
+    let config = parse_config(&yaml).expect("parse exclusive interleave");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile exclusive interleave");
+    assert_eq!(
+        clinker_plan::plan::execution::compute_merge_interleave_fused_sources(plan.dag(), &config),
+        ["src_a".to_string(), "src_b".to_string()]
+            .into_iter()
+            .collect(),
+        "the exclusive control topology must retain live receiver fusion"
+    );
+
     let body = run_pipeline(&yaml, 3, 3);
     assert_eq!(body.len(), 6, "expected 6 records, got {body:?}");
     assert_per_source_fifo(&body);
@@ -507,6 +578,70 @@ fn tagged_csv(prefix: char, count: u32) -> String {
         s.push_str(&format!("{i},{prefix}-{i}\n"));
     }
     s
+}
+
+/// A Source shared by two all-Source, unseeded interleave Merges must stay
+/// materialized. Each Merge consumes its own sequential read of the shared
+/// slot, so both outputs receive the complete shared multiset plus their
+/// exclusive predecessor without rereading the source transport.
+#[test]
+fn shared_source_reaches_both_interleave_merges_completely() {
+    let yaml = shared_source_two_interleaves_yaml();
+    let config = parse_config(yaml).expect("parse shared-source interleaves");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile shared-source interleaves");
+    assert!(
+        clinker_plan::plan::execution::compute_merge_interleave_fused_sources(plan.dag(), &config)
+            .is_empty(),
+        "both interleaves must use materialized Source slots"
+    );
+
+    let readers: SourceReaders = HashMap::from([
+        (
+            "shared".to_string(),
+            SourceInput::Files(vec![slot("shared", &tagged_csv('s', 3))]),
+        ),
+        (
+            "left_only".to_string(),
+            SourceInput::Files(vec![slot("left", &tagged_csv('l', 2))]),
+        ),
+        (
+            "right_only".to_string(),
+            SourceInput::Files(vec![slot("right", &tagged_csv('r', 2))]),
+        ),
+    ]);
+    let left = SharedBuffer::new();
+    let right = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
+        ("left_out".to_string(), writer(&left)),
+        ("right_out".to_string(), writer(&right)),
+    ]);
+
+    let report =
+        PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &run_params())
+            .expect("shared-source interleaves execute through materialized slots");
+    assert_eq!(report.counters.dlq_count, 0);
+
+    let sorted_tags = |output: String| {
+        let mut tags: Vec<String> = output
+            .lines()
+            .skip(1)
+            .map(|row| tag_of(row).to_string())
+            .collect();
+        tags.sort();
+        tags
+    };
+    assert_eq!(
+        sorted_tags(left.as_string()),
+        ["l-1", "l-2", "s-1", "s-2", "s-3"],
+        "left Merge must receive every shared and left-only row"
+    );
+    assert_eq!(
+        sorted_tags(right.as_string()),
+        ["r-1", "r-2", "s-1", "s-2", "s-3"],
+        "right Merge must receive every shared and right-only row"
+    );
 }
 
 /// Generalized per-source FIFO check for an arbitrary set of tag

@@ -801,9 +801,9 @@ pub(crate) struct ExecutorContext<'a> {
     /// is present and no seeded own slot exists — a composition body may use
     /// the same bare name for an input-port Source, and that body-local seed
     /// takes precedence without touching the top-level fused receiver. Empty
-    /// for pipelines whose Merge predecessors are not all Sources, or whose
-    /// Merge mode is concat (concat keeps today's declaration-order drain
-    /// through the Source arms).
+    /// for pipelines whose Merge predecessors are not all exclusively owned
+    /// Sources, or whose Merge mode is concat (concat keeps today's
+    /// declaration-order drain through the Source arms).
     pub(crate) fused_sources: HashSet<String>,
 
     /// Transforms whose sole upstream is a `PlanNode::Source` and that

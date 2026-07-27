@@ -1,16 +1,16 @@
 # Merge & Back-pressure
 
-Merge concatenates upstream branches that share a schema into a single stream. For the engine, the interesting surface is not the YAML — it is where Merge *fuses* into the Source ingest loop, where the seeded-interleave path deliberately opts out of that fused channel topology, and how back-pressure propagates (or fails to) through the bounded `mpsc` channels behind each mode. This page covers those mechanics.
+Merge concatenates upstream branches that share a schema into a single stream. For the engine, the interesting surface is not the YAML — it is where Merge *fuses* into the Source ingest loop, where the seeded-interleave path deliberately opts out of that fused channel topology, and how back-pressure propagates (or fails to) through the bounded crossbeam channels behind each mode. This page covers those mechanics.
 
 *User-facing view: the User Guide's "Merge Nodes" page.*
 
 ## Fusion of `interleave` over Sources
 
-When every direct predecessor of an **unseeded** `interleave` Merge is a `Source` node, the executor **fuses** the Merge into the source ingest loop. The predecessor channels are polled directly and Merge consumption proceeds at live ingest rate, with no intermediate buffering tier between the Source readers and the Merge arm.
+When every direct predecessor of an **unseeded** `interleave` Merge is an exclusively owned `Source` node, the executor **fuses** the Merge into the source ingest loop. Exclusive ownership means that each Source has exactly one outgoing edge and that edge targets this Merge. The predecessor channels are polled directly and Merge consumption proceeds at live ingest rate, with no intermediate buffering tier between the Source readers and the Merge arm.
 
-This fused live-channel path is what makes end-to-end back-pressure possible across the Merge boundary (see [Back-pressure semantics](#back-pressure-semantics) below). It is also the same predicate the streaming-output path checks before it engages — see [Streaming Output Writes](output-internals.md).
+This fused live-channel path is what makes end-to-end back-pressure possible across the Source-to-Merge boundary (see [Back-pressure semantics](#back-pressure-semantics) below). The separate Merge-to-Output streaming predicate can avoid materializing the Merge's own output whether or not its inputs are fused. Only when both boundaries qualify does back-pressure extend from the writer through the Merge to the Source readers; see [Streaming Output Writes](output-internals.md).
 
-When the predecessors are not *all* Sources (e.g. `Transform → Merge`), fusion does not apply: the Merge consumes pre-buffered predecessor outputs in round-robin order, and live back-pressure across the Merge boundary itself is unavailable in that shape (though the upstream operator's own bounded buffer still throttles *its* predecessors).
+When the predecessors are not *all* Sources (e.g. `Transform → Merge`) or any predecessor Source also feeds another consumer, fusion does not apply. Eligibility is atomic: one shared Source sends every predecessor of that Merge through the materialized path rather than partially claiming the otherwise-exclusive receivers. The Merge consumes pre-buffered predecessor outputs in round-robin order, and live back-pressure across the Merge boundary itself is unavailable in that shape (though the upstream operator's own bounded buffer still throttles *its* predecessors).
 
 ## Seeded interleave
 
@@ -38,24 +38,24 @@ How a slow consumer or a slow upstream reader propagates back through the DAG de
 
 ### `concat`
 
-Each Source ingest task pushes into its own **bounded `mpsc` channel, capacity 1024 records per Source**. Peer sources produce *concurrently* up to that capacity — the dispatch arm consumes from `inputs[0]`'s channel before turning to `inputs[1]`'s.
+Each Source ingest thread pushes into its own **bounded crossbeam channel, capacity 1024 events per Source**. Peer sources produce *concurrently* up to that capacity — the dispatch arm consumes from `inputs[0]`'s channel before turning to `inputs[1]`'s.
 
 Consequences:
 
 - **Memory.** A non-leading input can hold up to one channel's worth of buffered records (1024) before its producer blocks. Multi-input `concat` over `N` Sources may carry up to `(N − 1) × 1024` records in flight even while only one input is being drained.
 - **Latency.** A record produced by `inputs[1]` while `inputs[0]` is still draining will not reach output until `inputs[0]` finishes, regardless of how fast it was produced.
-- **Producer-side back-pressure.** When a non-leading input's channel fills, its reader blocks at **`blocking_send`**, propagating pressure back to the upstream file/network reader. The upstream is throttled even though it is not the currently-consumed input.
+- **Producer-side back-pressure.** When a non-leading input's channel fills, its reader blocks at **`Sender::send`**, propagating pressure back to the upstream file/network reader. The upstream is throttled even though it is not the currently-consumed input.
 
 `concat` is the right choice when downstream consumers depend on declaration-ordered records (snapshot tests asserting byte-identical output) or when inputs represent ordered time partitions that must remain contiguous.
 
 ### `interleave` (unseeded)
 
-Fused with Source predecessors, the Merge arm **polls every predecessor's channel concurrently**. Live back-pressure flows end-to-end:
+Fused with exclusively owned Source predecessors, the Merge arm **polls every predecessor's channel concurrently**. Live back-pressure flows end-to-end:
 
 - A slow downstream operator delays Merge consumption → the predecessor channels fill → the Source reader tasks block.
 - A fast input does not wait on a slow peer — the Merge schedules whichever channel has a ready record.
 
-When predecessors are not all Sources, fusion does not apply: the Merge consumes pre-buffered predecessor outputs in round-robin order, and live back-pressure across the Merge boundary itself is unavailable, though each upstream operator's own bounded buffer still throttles its predecessors.
+When predecessors are not all Sources or any Source has another outgoing edge, fusion does not apply: the Merge consumes pre-buffered predecessor outputs in round-robin order, and live back-pressure across the Merge boundary itself is unavailable, though each upstream operator's own bounded buffer still throttles its predecessors.
 
 Unseeded `interleave` is the right choice when end-to-end latency matters and the downstream consumer is order-insensitive (an aggregator grouping on a key, or a writer that does not assert on row sequencing).
 

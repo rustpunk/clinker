@@ -180,3 +180,84 @@ fn buffer_class_marks_route_materialized_and_sinks_streaming() {
     assert_eq!(buffer_class_for(block, "output.out_high"), "streaming");
     assert_eq!(buffer_class_for(block, "output.out_low"), "streaming");
 }
+
+fn shared_source_interleaves_yaml() -> &'static str {
+    r#"
+pipeline:
+  name: shared-source-interleaves
+nodes:
+  - type: source
+    name: shared
+    config:
+      name: shared
+      type: csv
+      path: shared.csv
+      schema:
+        - { name: id, type: int }
+
+  - type: source
+    name: left_only
+    config:
+      name: left_only
+      type: csv
+      path: left.csv
+      schema:
+        - { name: id, type: int }
+
+  - type: source
+    name: right_only
+    config:
+      name: right_only
+      type: csv
+      path: right.csv
+      schema:
+        - { name: id, type: int }
+
+  - type: merge
+    name: left_merge
+    inputs: [shared, left_only]
+    config:
+      mode: interleave
+
+  - type: merge
+    name: right_merge
+    inputs: [shared, right_only]
+    config:
+      mode: interleave
+
+  - type: output
+    name: left_out
+    input: left_merge
+    config:
+      name: left_out
+      type: csv
+      path: left_out.csv
+
+  - type: output
+    name: right_out
+    input: right_merge
+    config:
+      name: right_out
+      type: csv
+      path: right_out.csv
+"#
+}
+
+/// Sharing one Source makes both all-Source interleave Merges ineligible for
+/// receiver fusion. Classification is atomic per Merge, so their otherwise-
+/// exclusive Source predecessors materialize as well. Each Merge can still
+/// stream its own output to its sole Output consumer after reading the
+/// predecessor slots.
+#[test]
+fn buffer_class_marks_shared_source_interleaves_materialized_atomically() {
+    let config = parse_fixture(shared_source_interleaves_yaml());
+    let dag = compile(&config);
+    let text = dag.explain_text(&config);
+    let block = physical_properties_block(&text);
+
+    assert_eq!(buffer_class_for(block, "source.shared"), "materialized");
+    assert_eq!(buffer_class_for(block, "source.left_only"), "materialized");
+    assert_eq!(buffer_class_for(block, "source.right_only"), "materialized");
+    assert_eq!(buffer_class_for(block, "merge.left_merge"), "streaming");
+    assert_eq!(buffer_class_for(block, "merge.right_merge"), "streaming");
+}
