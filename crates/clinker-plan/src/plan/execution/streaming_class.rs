@@ -10,6 +10,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use petgraph::visit::EdgeRef;
+
 use crate::config::PipelineConfig;
 use crate::plan::execution::{ExecutionPlanDag, PlanNode};
 
@@ -30,18 +32,21 @@ fn has_single_outgoing(plan: &ExecutionPlanDag, idx: petgraph::graph::NodeIndex)
 
 /// Identify Source-node names whose receivers are claimed by a
 /// downstream `Merge.mode: interleave` whose every direct predecessor
-/// is a `PlanNode::Source`. The Merge arm consumes those receivers
-/// via `crossbeam_channel::Select` so a slow Source no longer blocks
-/// peer Sources' channels from filling. Per-Source dispatch arms whose
-/// name is in this set return cleanly without touching
+/// is an exclusively-owned `PlanNode::Source`: each Source has exactly
+/// one outgoing edge, and it targets that Merge. The Merge arm consumes
+/// those receivers via `crossbeam_channel::Select` so a slow Source no
+/// longer blocks peer Sources' channels from filling. Per-Source dispatch
+/// arms whose name is in this set return cleanly without touching
 /// `ctx.source_records`.
 ///
 /// Only triggers when ALL predecessors are Sources. Mixed
-/// predecessors (Source + Transform + ...) keep today's per-arm
-/// drain path — the Merge arm reads from `node_buffers` for those.
-/// Concat-mode Merges keep the per-Source drain too: concat drains
-/// predecessors in declaration order, which the per-arm path
-/// already delivers.
+/// predecessors (Source + Transform + ...) and Merges with any shared
+/// Source keep today's per-arm drain path — the Merge arm reads from
+/// `node_buffers` for those. Eligibility is atomic per Merge: if one
+/// predecessor is shared, none of that Merge's otherwise-exclusive
+/// Source receivers are claimed. Concat-mode Merges keep the per-Source
+/// drain too: concat drains predecessors in declaration order, which the
+/// per-arm path already delivers.
 pub fn compute_merge_interleave_fused_sources(
     plan: &ExecutionPlanDag,
     config: &PipelineConfig,
@@ -90,11 +95,24 @@ pub fn compute_merge_interleave_fused_sources(
         if !matches!(mode, crate::config::MergeMode::Interleave) || seed.is_some() {
             continue;
         }
-        for pred in predecessors {
-            if let PlanNode::Source { name, .. } = &plan.graph[pred] {
-                fused.insert(name.clone());
-            }
+        let owns_sources_exclusively = predecessors.iter().all(|pred| {
+            let mut outgoing = plan
+                .graph
+                .edges_directed(*pred, petgraph::Direction::Outgoing);
+            matches!(outgoing.next(), Some(edge) if edge.target() == node_idx)
+                && outgoing.next().is_none()
+        });
+        if !owns_sources_exclusively {
+            continue;
         }
+        fused.extend(
+            predecessors
+                .iter()
+                .filter_map(|pred| match &plan.graph[*pred] {
+                    PlanNode::Source { name, .. } => Some(name.clone()),
+                    _ => None,
+                }),
+        );
     }
     fused
 }
@@ -856,6 +874,201 @@ nodes:
     type: csv
     path: out.csv
 "#;
+
+    const EXCLUSIVE_SOURCE_INTERLEAVE: &str = r#"
+pipeline:
+  name: exclusive_source_interleave
+nodes:
+- type: source
+  name: src_a
+  config:
+    name: src_a
+    type: csv
+    path: a.csv
+    schema:
+      - { name: id, type: int }
+- type: source
+  name: src_b
+  config:
+    name: src_b
+    type: csv
+    path: b.csv
+    schema:
+      - { name: id, type: int }
+- type: merge
+  name: merged
+  inputs: [src_a, src_b]
+  config:
+    mode: interleave
+- type: output
+  name: out
+  input: merged
+  config:
+    name: out
+    type: csv
+    path: out.csv
+"#;
+
+    const SHARED_SOURCE_INTERLEAVE: &str = r#"
+pipeline:
+  name: shared_source_interleave
+nodes:
+- type: source
+  name: shared
+  config:
+    name: shared
+    type: csv
+    path: shared.csv
+    schema:
+      - { name: id, type: int }
+- type: source
+  name: exclusive
+  config:
+    name: exclusive
+    type: csv
+    path: exclusive.csv
+    schema:
+      - { name: id, type: int }
+- type: merge
+  name: merged
+  inputs: [shared, exclusive]
+  config:
+    mode: interleave
+- type: output
+  name: merged_out
+  input: merged
+  config:
+    name: merged_out
+    type: csv
+    path: merged.csv
+- type: output
+  name: sibling_out
+  input: shared
+  config:
+    name: sibling_out
+    type: csv
+    path: sibling.csv
+"#;
+
+    const TWO_INTERLEAVES_SHARING_SOURCE: &str = r#"
+pipeline:
+  name: two_interleaves_sharing_source
+nodes:
+- type: source
+  name: shared
+  config:
+    name: shared
+    type: csv
+    path: shared.csv
+    schema:
+      - { name: id, type: int }
+- type: source
+  name: left_only
+  config:
+    name: left_only
+    type: csv
+    path: left.csv
+    schema:
+      - { name: id, type: int }
+- type: source
+  name: right_only
+  config:
+    name: right_only
+    type: csv
+    path: right.csv
+    schema:
+      - { name: id, type: int }
+- type: merge
+  name: left_merge
+  inputs: [shared, left_only]
+  config:
+    mode: interleave
+- type: merge
+  name: right_merge
+  inputs: [shared, right_only]
+  config:
+    mode: interleave
+- type: output
+  name: left_out
+  input: left_merge
+  config:
+    name: left_out
+    type: csv
+    path: left.csv
+- type: output
+  name: right_out
+  input: right_merge
+  config:
+    name: right_out
+    type: csv
+    path: right.csv
+"#;
+
+    fn merge_fused_sources(yaml: &str) -> HashSet<String> {
+        let config = parse_config(yaml).expect("parse pipeline YAML");
+        let plan = config
+            .compile(&CompileContext::default())
+            .expect("compile pipeline");
+        compute_merge_interleave_fused_sources(plan.dag(), &config)
+    }
+
+    #[test]
+    fn exclusive_source_interleave_claims_every_source_receiver() {
+        assert_eq!(
+            merge_fused_sources(EXCLUSIVE_SOURCE_INTERLEAVE),
+            HashSet::from(["src_a".to_string(), "src_b".to_string()])
+        );
+    }
+
+    #[test]
+    fn shared_predecessor_rejects_merge_fusion_atomically() {
+        let fused = merge_fused_sources(SHARED_SOURCE_INTERLEAVE);
+        assert!(
+            fused.is_empty(),
+            "a shared predecessor must also leave the otherwise-exclusive predecessor unclaimed: \
+             {fused:?}"
+        );
+    }
+
+    #[test]
+    fn interleave_merges_sharing_source_claim_no_receivers() {
+        let fused = merge_fused_sources(TWO_INTERLEAVES_SHARING_SOURCE);
+        assert!(
+            fused.is_empty(),
+            "neither Merge may partially claim receiver ownership: {fused:?}"
+        );
+    }
+
+    #[test]
+    fn parallel_source_edges_reject_merge_fusion_atomically() {
+        let config = parse_config(EXCLUSIVE_SOURCE_INTERLEAVE).expect("parse pipeline YAML");
+        let compiled = config
+            .compile(&CompileContext::default())
+            .expect("compile pipeline");
+        let mut dag = compiled.dag().clone();
+        let source = find_node(
+            &dag,
+            "src_a Source",
+            |node| matches!(node, PlanNode::Source { name, .. } if name == "src_a"),
+        );
+        let merge = find_node(
+            &dag,
+            "merged Merge",
+            |node| matches!(node, PlanNode::Merge { name, .. } if name == "merged"),
+        );
+        let edge_idx = dag
+            .graph
+            .find_edge(source, merge)
+            .expect("source -> Merge edge");
+        let duplicate = dag.graph[edge_idx].clone();
+        dag.graph.add_edge(source, merge, duplicate);
+
+        let fused = compute_merge_interleave_fused_sources(&dag, &config);
+        assert!(
+            fused.is_empty(),
+            "parallel edges must also leave the other predecessor unclaimed: {fused:?}"
+        );
+    }
 
     /// Compile `yaml`, then run the exact fused-set + init-phase setup that
     /// [`classify_stream_nodes`] uses at runtime, invoking the closure with

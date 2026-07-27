@@ -1044,7 +1044,7 @@ impl PipelineExecutor {
             .collect();
 
         // Identify Merge.interleave nodes whose predecessors are all
-        // Sources. Those Source receivers move out of
+        // exclusively owned Sources. Those Source receivers move out of
         // `ctx.source_records` and into the fused Merge arm's
         // `crossbeam_channel::Select` so a slow upstream Source no longer
         // blocks peer Sources' channels from filling — back-pressure

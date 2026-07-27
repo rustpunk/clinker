@@ -2,9 +2,9 @@
 //!
 //! Holds the streamwise-concatenation body lifted out of
 //! [`crate::executor::dispatch::dispatch_plan_node`]: declaration-order
-//! concat, round-robin interleave, and the fused all-Source interleave fast
-//! path that takes ownership of the parked source receivers and runs a fair
-//! `crossbeam_channel::Select` for end-to-end back-pressure. The
+//! concat, round-robin interleave, and the fused exclusively-owned all-Source
+//! interleave fast path that takes ownership of the parked source receivers
+//! and runs a fair `crossbeam_channel::Select` for end-to-end back-pressure. The
 //! dispatcher's `Merge` arm is a single delegating call into
 //! [`dispatch_merge`].
 
@@ -25,8 +25,9 @@ use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, matches_upstream
 
 /// Execute the `Merge` arm for `node_idx`: concatenate predecessor buffers
 /// in declaration order (Concat), round-robin across them (Interleave), or —
-/// when every predecessor is a Source under `mode: interleave` — drive the
-/// fused `crossbeam_channel::Select` path. Streaming concatenation; emits
+/// when every predecessor is an exclusively owned Source under
+/// `mode: interleave` — drive the fused `crossbeam_channel::Select` path.
+/// Streaming concatenation; emits
 /// every record onto the canonical merge output schema for `Arc::ptr_eq`.
 pub(crate) fn dispatch_merge(
     ctx: &mut ExecutorContext<'_>,
@@ -46,8 +47,8 @@ pub(crate) fn dispatch_merge(
     };
     // Two architectural modes for a Merge arm:
     //
-    // 1. **Fused** — every direct predecessor is a Source and
-    //    `mode: interleave`. The pre-pass at executor entry
+    // 1. **Fused** — every direct predecessor is a Source owned only by
+    //    this `mode: interleave` Merge. The pre-pass at executor entry
     //    marked each predecessor's source name in
     //    `ctx.fused_sources`, the Source dispatch arms
     //    returned cleanly without consuming, and the receivers
@@ -57,8 +58,8 @@ pub(crate) fn dispatch_merge(
     //    no longer blocks peers — back-pressure flows
     //    end-to-end.
     //
-    // 2. **Non-fused** — concat mode, or a mix of Source and
-    //    non-Source predecessors. Predecessor arms have
+    // 2. **Non-fused** — concat mode, a mix of Source and non-Source
+    //    predecessors, or any shared Source. Predecessor arms have
     //    already populated `ctx.node_buffers`; this arm
     //    consumes those buffers in declaration order (Concat)
     //    or round-robins across them (Interleave).
