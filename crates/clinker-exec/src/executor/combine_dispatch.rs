@@ -302,32 +302,38 @@ pub(crate) fn dispatch_combine(
     // below), so this drains nothing and the driver records (and their
     // punctuations) arrive on the channel instead, to be reconciled with the
     // retained `build_puncts` after the probe joins.
-    let (driver_buf, driver_puncts): (
+    let (driver_buf, driver_puncts, _driver_clone_reservation): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
+        Option<crate::executor::node_buffer::TransientNodeBufferReservation>,
     ) = if streaming_probe_driver.is_some() {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), None)
     } else {
         let input = drain_or_clone_shared_input(
             ctx,
             current_dag,
             NodeBufferKey::with_port(driver_pred, driver_port.as_deref()),
-        )
+            name,
+        )?
         .ok_or_else(|| {
             missing_node_buffer_input_error(name, driver_upstream, driver_port.as_deref())
         })?;
-        input.drain_split()?
+        let (input, reservation) = input.into_parts();
+        let (records, puncts) = input.drain_split()?;
+        (records, puncts, reservation)
     };
-    let (build_buf, build_puncts): (
-        Vec<(Record, u64)>,
-        Vec<crate::executor::stream_event::Punctuation>,
-    ) = drain_or_clone_shared_input(
+    let build_input = drain_or_clone_shared_input(
         ctx,
         current_dag,
         NodeBufferKey::with_port(build_pred, build_port.as_deref()),
-    )
-    .ok_or_else(|| missing_node_buffer_input_error(name, build_upstream, build_port.as_deref()))?
-    .drain_split()?;
+        name,
+    )?
+    .ok_or_else(|| missing_node_buffer_input_error(name, build_upstream, build_port.as_deref()))?;
+    let (build_input, _build_clone_reservation) = build_input.into_parts();
+    let (build_buf, build_puncts): (
+        Vec<(Record, u64)>,
+        Vec<crate::executor::stream_event::Punctuation>,
+    ) = build_input.drain_split()?;
     // The empty-punctuation common case folds to an empty vector,
     // leaving the no-document path byte-identical to a bare union. For
     // the streaming-probe path the driver's punctuations have not arrived

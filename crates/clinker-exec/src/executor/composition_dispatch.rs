@@ -21,7 +21,9 @@ use crate::executor::dispatch::{
     finalize_node_rooted_windows, missing_node_buffer_input_error, node_buffer_spill_allowed,
     require_node_buffer_slot, tee_emit_to_region_input_buffers,
 };
-use crate::executor::node_buffer::NodeBuffer;
+use crate::executor::node_buffer::{
+    NodeBuffer, TransientNodeBufferReservation, clone_node_buffer_reserved,
+};
 use crate::executor::schema_check::check_input_schema;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
@@ -133,8 +135,8 @@ pub(crate) fn dispatch_composition(
     // The wrapper at `execute_composition_body`'s topo walk has
     // already returned with `Ok` by the time we reach this admit;
     // only errors from inside that walk get the wrapper. The pre-body
-    // port-records clone is not an admit today; #1028 tracks bringing
-    // that duplicate under the pull-mode memory contract.
+    // port-records clone is separately preflighted under the call-site name
+    // before entering the body, so its E310 also remains bare.
     let nb = admit_node_buffer(
         ctx,
         &composition_name,
@@ -164,13 +166,18 @@ pub(crate) fn dispatch_composition(
 /// Cloning rather than removing keeps the parent producer's buffer
 /// intact for any sibling consumer the parent walk has not yet reached;
 /// fan-out from a single producer to multiple ports is a normal case.
+struct ReservedPortRecords {
+    records: Vec<(Record, u64)>,
+    reservation: TransientNodeBufferReservation,
+}
+
 fn collect_port_records(
     ctx: &mut ExecutorContext<'_>,
     parent_dag: &ExecutionPlanDag,
     composition_node_idx: NodeIndex,
     composition_name: &str,
-) -> Result<IndexMap<String, Vec<(clinker_record::Record, u64)>>, PipelineError> {
-    let mut result: IndexMap<String, Vec<(clinker_record::Record, u64)>> = IndexMap::new();
+) -> Result<IndexMap<String, ReservedPortRecords>, PipelineError> {
+    let mut result: IndexMap<String, ReservedPortRecords> = IndexMap::new();
     use petgraph::visit::EdgeRef;
     for edge in parent_dag
         .graph
@@ -192,13 +199,6 @@ fn collect_port_records(
                 ),
             });
         };
-        // Clone records while the immutable `node_buffers` borrow is live.
-        // Unlike a normal node-buffer handoff, this duplicate is seeded into
-        // the body-local namespace with `NodeBuffer::memory_from_records`
-        // rather than `admit_node_buffer`. It is therefore not registered
-        // with the pull-mode arbitrator and cannot itself raise E310. #1028
-        // tracks reserving the duplicate before allocation and transferring
-        // that accounting into the body scope without a gap or double count.
         let input_buffer = ctx.node_buffers.get(&edge.source().into()).ok_or_else(|| {
             missing_node_buffer_input_error(
                 composition_name,
@@ -210,16 +210,21 @@ fn collect_port_records(
         // operates inside its own document-boundary scope and re-emits
         // punctuations at the call-site level on body exit, so the parent's
         // punctuations do not forward through the body's port-source boundary.
-        let records = input_buffer
-            .clone_memory_only()
-            .into_iter()
-            .filter_map(|event| event.into_record())
-            .collect::<Vec<(Record, u64)>>();
+        let reserved =
+            clone_node_buffer_reserved(input_buffer, &ctx.memory_budget, composition_name)?;
+        let (cloned, reservation) = reserved.into_parts();
+        let (records, _puncts) = cloned.drain_split()?;
         // Two parallel edges to the same port (e.g. `inputs: { p: a,
         // p: a }` — currently rejected at parse, but the runtime is
         // defensive) would overwrite; the wiring pass guarantees
         // unique port names per consumer.
-        result.insert(port_name.clone(), records);
+        result.insert(
+            port_name.clone(),
+            ReservedPortRecords {
+                records,
+                reservation,
+            },
+        );
     }
     Ok(result)
 }
@@ -231,12 +236,12 @@ fn collect_port_records(
 /// top-level walker uses. The body's `node_buffers` namespace
 /// is swapped in via `mem::replace` so body NodeIndices index a
 /// fresh space; the parent buffers are restored after the walk.
-/// The depth-counter guard increments via RAII so `?`-bubbled
-/// errors can't leak the counter.
+/// Dispatch and output harvest are captured into one result so the single
+/// restoration path runs before success or any error is propagated.
 fn execute_composition_body(
     ctx: &mut ExecutorContext<'_>,
     body_id: clinker_plan::plan::composition_body::CompositionBodyId,
-    port_records: IndexMap<String, Vec<(clinker_record::Record, u64)>>,
+    port_records: IndexMap<String, ReservedPortRecords>,
     composition_name: &str,
 ) -> Result<Vec<(clinker_record::Record, u64)>, PipelineError> {
     use clinker_plan::plan::index::PlanIndexRoot;
@@ -273,14 +278,30 @@ fn execute_composition_body(
         }
     }
 
-    // Seed body-scope buffers from parent records keyed by port.
-    let mut body_buffers: HashMap<NodeBufferKey, NodeBuffer> = HashMap::new();
-    for (port_name, records) in port_records {
+    // Resolve every body-local slot before transferring any reservation out of
+    // its RAII guard. If port resolution fails, all still-owned guards drop and
+    // unregister normally; after this pass the transfer loop is infallible.
+    let mut resolved_inputs = Vec::with_capacity(port_records.len());
+    for (port_name, input) in port_records {
         let body_idx = bound_body
             .port_name_to_node_idx
             .get(port_name.as_str())
             .ok_or_else(|| PipelineError::compose_unknown_port(composition_name, &port_name))?;
-        body_buffers.insert((*body_idx).into(), NodeBuffer::memory_from_records(records));
+        resolved_inputs.push((NodeBufferKey::from(*body_idx), input));
+    }
+
+    // Seed body-scope buffers and transfer each clone reservation's existing
+    // consumer id/handle into the body-local registry. The wrapper stays
+    // continuously registered: there is no unregister/register gap and no
+    // second charge for the same allocation.
+    let mut body_buffers: HashMap<NodeBufferKey, NodeBuffer> = HashMap::new();
+    let mut body_consumer_ids = HashMap::new();
+    for (slot_key, input) in resolved_inputs {
+        body_buffers.insert(
+            slot_key.clone(),
+            NodeBuffer::memory_from_records(input.records),
+        );
+        body_consumer_ids.insert(slot_key, input.reservation.into_registration());
     }
 
     // Pick the body's terminal output node. The bind-time alias
@@ -298,6 +319,8 @@ fn execute_composition_body(
     // not top-level sources. Any non-port-seeded body Source surfaces
     // as the defense-in-depth `Internal` error from the Source arm.
     let saved_buffers = std::mem::replace(&mut ctx.node_buffers, body_buffers);
+    let saved_consumer_ids =
+        std::mem::replace(&mut ctx.node_buffer_consumer_ids, body_consumer_ids);
     // Shared-input drain counts key by the body-local `NodeBufferKey` space, so
     // swap to a fresh map alongside `node_buffers` — a pending parent fanout
     // count must not collide with a body slot of the same index/port.
@@ -327,13 +350,9 @@ fn execute_composition_body(
     ctx.window_runtime.bodies.insert(body_id, body_window_vec);
     ctx.window_runtime.active_stack.push(body_id);
 
-    // Increment depth before recursing. Every exit path below
-    // decrements before returning so the counter stays in sync —
-    // including the `walk_result?` early-return at the end. The
-    // dispatcher loop already collects errors into `walk_result`
-    // rather than `?`-bubbling, so the only `?`-bubble that escapes
-    // this function is on `walk_result?` itself, which fires AFTER
-    // the decrement.
+    // Increment depth before recursing. The walk and output harvest execute
+    // inside one captured Result; parent-scope restoration below runs before
+    // that Result is propagated on every success/error path.
     ctx.recursion_depth += 1;
 
     // Walk the body's topo through the same dispatcher the top-level
@@ -342,71 +361,67 @@ fn execute_composition_body(
     // "in composition '<name>': <inner>" instead of an opaque
     // inner-only message.
     //
-    // Body-interior path of the two E310 shapes a composition can
-    // currently emit: the inner error's `node` field names a body-
-    // internal operator (e.g. `stage_split`) the user never wrote in
-    // their YAML, so the wrapper supplies the user-visible call-site
-    // name on top. The other shape is the parent's post-body output
-    // admission, which stays unwrapped because its `node` is already
-    // the call-site composition name. The pre-body input clone is not
-    // admitted and cannot emit E310 (#1028). Consumers that want to
-    // catch every current composition-involved budget exceedance must
-    // match both the bare and wrapped shapes.
+    // Body-interior E310 errors name a body-internal operator (for example
+    // `stage_split`), so the wrapper supplies the user-visible call-site name.
+    // The pre-body reserved-clone gate and the parent's post-body output
+    // admission already name the call-site and remain bare.
     let topo: Vec<NodeIndex> = body_dag.topo_order.clone();
-    let mut walk_result: Result<(), PipelineError> = Ok(());
-    for node_idx in topo {
-        if let Err(inner) = dispatch_plan_node(ctx, &body_dag, node_idx) {
-            walk_result = Err(PipelineError::compose_body_error(
-                composition_name.to_string(),
-                Box::new(inner),
-            ));
-            break;
-        }
-    }
-
-    // Harvest output before restoring parent buffers. When the output
-    // port participates in a deferred region (for example a Transform
-    // downstream of a relaxed-CK Aggregate), its forward emit is NOT a final
-    // stream — the commit-pass body→parent
-    // harvest path re-emits the post-recompute narrow rows into the
-    // parent's `node_buffers[composition_idx]`. Returning the forward
-    // emit here would double-feed the parent's continuation: once
-    // through the parent Composition arm's `node_buffers.insert`, then
-    // again when `recurse_into_body` extends the slot with the
-    // commit-pass harvest. Drop the forward emit so the commit pass
-    // is the single source of records for that slot.
-    let output_records: Vec<(Record, u64)> = match (&walk_result, output_idx) {
-        (Ok(()), Some(idx)) => {
-            // Composition body output harvest — punctuations on the
-            // body's output port belong to the composition's parent
-            // pipeline scope; they re-emit when the parent's call
-            // site re-introduces document context. The body harvest
-            // takes records only.
-            if body_dag.deferred_region_at(idx).is_some() {
-                // A deferred body terminal is harvested by the commit pass. Its
-                // forward slot is optional and is drained only as cleanup.
-                drain_node_buffer_slot(ctx, idx);
-                Vec::new()
-            } else {
-                let (records, _puncts) = require_node_buffer_slot(
-                    ctx,
-                    idx,
-                    composition_name,
-                    body_dag.graph[idx].name(),
-                    None,
-                )?
-                .drain_split()?;
-                records
+    let walk_and_harvest: Result<Vec<(Record, u64)>, PipelineError> = (|| {
+        for node_idx in topo {
+            if let Err(inner) = dispatch_plan_node(ctx, &body_dag, node_idx) {
+                return Err(PipelineError::compose_body_error(
+                    composition_name.to_string(),
+                    Box::new(inner),
+                ));
             }
         }
-        _ => Vec::new(),
-    };
 
-    // Decrement depth and restore parent scope. `saturating_sub`
-    // is defensive over the invariant; the inc/dec pairs are kept in
-    // sync by hand on every exit path through this function.
+        // Harvest output before restoring parent buffers. When the output port
+        // participates in a deferred region, the commit pass is the sole
+        // source of parent records, so the optional forward slot is cleanup
+        // only.
+        let output_records = match output_idx {
+            Some(idx) => {
+                // Composition body output harvest — punctuations on the
+                // body's output port belong to the composition's parent
+                // pipeline scope; they re-emit when the parent's call
+                // site re-introduces document context. The body harvest
+                // takes records only.
+                if body_dag.deferred_region_at(idx).is_some() {
+                    // A deferred body terminal is harvested by the commit pass. Its
+                    // forward slot is optional and is drained only as cleanup.
+                    drain_node_buffer_slot(ctx, idx);
+                    Vec::new()
+                } else {
+                    let (records, _puncts) = require_node_buffer_slot(
+                        ctx,
+                        idx,
+                        composition_name,
+                        body_dag.graph[idx].name(),
+                        None,
+                    )?
+                    .drain_split()?;
+                    records
+                }
+            }
+            None => Vec::new(),
+        };
+        Ok(output_records)
+    })();
+
+    // One restoration path for body dispatch, output harvest, and success.
+    // Drop body-local buffers while their wrappers remain registered, then
+    // unregister every residual body registration before restoring the parent
+    // maps. Slots already drained by body operators removed their own entries,
+    // so this sweep covers only early-return residue.
     ctx.recursion_depth = ctx.recursion_depth.saturating_sub(1);
+    drop(std::mem::take(&mut ctx.node_buffers));
+    for (_, (id, handle)) in std::mem::take(&mut ctx.node_buffer_consumer_ids) {
+        handle.set_bytes(0);
+        ctx.memory_budget.unregister_consumer(id);
+    }
     ctx.node_buffers = saved_buffers;
+    ctx.node_buffer_consumer_ids = saved_consumer_ids;
     ctx.shared_input_drains = saved_shared_drains;
     ctx.source_records = saved_combine;
     ctx.current_body_node_input_refs = saved_body_refs;
@@ -425,6 +440,5 @@ fn execute_composition_body(
     ctx.window_runtime.active_stack.pop();
     ctx.window_runtime.bodies.remove(&body_id);
 
-    walk_result?;
-    Ok(output_records)
+    walk_and_harvest
 }

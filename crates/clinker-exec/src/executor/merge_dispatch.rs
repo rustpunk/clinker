@@ -134,6 +134,10 @@ pub(crate) fn dispatch_merge(
     let mut nonfused_sender: Option<
         crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
     > = None;
+    // Shared-input clone reservations belong to the complete Merge arm, not
+    // only the input-conversion block: cloned records remain live through
+    // boundary reconciliation, window finalization, and output admission.
+    let mut input_reservations = Vec::new();
     let FusedMergeOutput {
         records: merged,
         puncts: fused_deduped_puncts,
@@ -233,10 +237,15 @@ pub(crate) fn dispatch_merge(
                         ctx,
                         current_dag,
                         NodeBufferKey::with_port(*src, port.as_deref()),
-                    )
+                        name,
+                    )?
                     .ok_or_else(|| {
                         missing_node_buffer_input_error(name, &upstream_name, port.as_deref())
                     })?;
+                    let (buf, reservation) = buf.into_parts();
+                    if let Some(reservation) = reservation {
+                        input_reservations.push(reservation);
+                    }
                     for event in buf.drain() {
                         match event? {
                             crate::executor::stream_event::StreamEvent::Record(record, rn) => {
@@ -269,7 +278,8 @@ pub(crate) fn dispatch_merge(
                                 ctx,
                                 current_dag,
                                 NodeBufferKey::with_port(*src, port.as_deref()),
-                            )
+                                name,
+                            )?
                             .ok_or_else(|| {
                                 missing_node_buffer_input_error(
                                     name,
@@ -277,6 +287,10 @@ pub(crate) fn dispatch_merge(
                                     port.as_deref(),
                                 )
                             })?;
+                            let (nb, reservation) = nb.into_parts();
+                            if let Some(reservation) = reservation {
+                                input_reservations.push(reservation);
+                            }
                             let (records, puncts) = nb.drain_split()?;
                             all_puncts.extend(puncts);
                             Ok(VecDeque::from(records))

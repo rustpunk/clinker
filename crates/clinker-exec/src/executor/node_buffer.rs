@@ -245,7 +245,7 @@ impl NodeBuffer {
     /// this method. Lifting that constraint requires sharing
     /// `Arc<SpillFile<u64>>` across readers and is a separate
     /// follow-up under #108.
-    pub(crate) fn clone_memory_only(&self) -> Vec<StreamEvent> {
+    fn clone_memory_only(&self) -> Vec<StreamEvent> {
         match self {
             Self::Memory(v) => v.clone(),
             Self::Spilled { .. } | Self::Mixed { .. } | Self::MergeSpilled { .. } => {
@@ -293,11 +293,39 @@ impl NodeBuffer {
     /// accounted via `MemoryArbitrator::cumulative_spill_bytes` (the disk
     /// quota), not this counter, so a `Spilled` slot reports `0` here.
     pub(crate) fn estimated_memory_bytes(&self) -> u64 {
-        let mem_records = self.peek_mem_records();
-        let Some((first, _)) = mem_records.first() else {
-            return 0;
+        let events = match self {
+            Self::Memory(events) => events.as_slice(),
+            Self::Mixed { mem, .. } => mem.as_slice(),
+            Self::Spilled { .. } | Self::MergeSpilled { .. } => return 0,
         };
-        record_byte_cost(first.schema().column_count()).saturating_mul(mem_records.len() as u64)
+        let mut column_count = None;
+        let mut record_count = 0u64;
+        for event in events {
+            if let StreamEvent::Record(record, _) = event {
+                column_count.get_or_insert_with(|| record.schema().column_count());
+                record_count = record_count.saturating_add(1);
+            }
+        }
+        column_count
+            .map(|columns| record_byte_cost(columns).saturating_mul(record_count))
+            .unwrap_or(0)
+    }
+
+    /// Estimate this slot's resident record count at a caller-supplied schema
+    /// width without allocating a temporary records vector. Composition port
+    /// Sources use this to reserve their prospective canonicalized output,
+    /// whose body schema can be wider than the parent records being replaced.
+    pub(crate) fn estimated_memory_bytes_for_columns(&self, column_count: usize) -> u64 {
+        let events = match self {
+            Self::Memory(events) => events.as_slice(),
+            Self::Mixed { mem, .. } => mem.as_slice(),
+            Self::Spilled { .. } | Self::MergeSpilled { .. } => return 0,
+        };
+        let record_count = events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::Record(_, _)))
+            .count() as u64;
+        record_byte_cost(column_count).saturating_mul(record_count)
     }
 
     /// Consume the buffer and partition its events into a records
@@ -548,6 +576,203 @@ impl NodeBuffer {
             current: None,
             pending_puncts: pending_puncts.into_iter(),
         }
+    }
+}
+
+/// One duplicate `NodeBuffer::Memory` allocation paired with the transient
+/// pull-mode reservation that keeps its bytes visible to arbitration.
+///
+/// Callers must retain the reservation for the complete synchronous lifetime
+/// of the duplicate. Composition entry may instead transfer the reservation's
+/// existing registration into its body-local node-buffer registry.
+#[must_use = "the transient reservation must stay alive with the cloned node buffer"]
+pub(crate) struct ReservedNodeBufferClone {
+    buffer: NodeBuffer,
+    reservation: TransientNodeBufferReservation,
+}
+
+impl ReservedNodeBufferClone {
+    /// Split the duplicate from its lifetime guard. The guard remains
+    /// must-use so converting the buffer into records cannot silently end the
+    /// reservation while those records are still live.
+    pub(crate) fn into_parts(self) -> (NodeBuffer, TransientNodeBufferReservation) {
+        (self.buffer, self.reservation)
+    }
+}
+
+/// RAII ownership of one transient clone's existing arbitrator registration.
+///
+/// The registration is removed on every ordinary drop path, including `?`
+/// propagation and early returns. Composition body entry consumes the guard
+/// with [`Self::into_registration`] and installs the same id and handle in the
+/// body-local node-buffer map, avoiding an unregister/register gap or double
+/// charge.
+#[must_use = "dropping the reservation releases the clone's memory charge"]
+pub(crate) struct TransientNodeBufferReservation {
+    budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
+    consumer_id: crate::pipeline::memory::ConsumerId,
+    handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+    owns_registration: bool,
+}
+
+impl TransientNodeBufferReservation {
+    /// Reconstitute RAII ownership after a body Source removes a seeded slot
+    /// and its registration from the body-local maps without unregistering.
+    pub(crate) fn from_registration(
+        budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
+        id: crate::pipeline::memory::ConsumerId,
+        handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+    ) -> Self {
+        Self {
+            budget,
+            consumer_id: id,
+            handle,
+            owns_registration: true,
+        }
+    }
+
+    /// Reserve an additional temporary allocation while keeping the same
+    /// consumer registered. Composition port canonicalization uses this for
+    /// the interval where the seeded event vector and its canonicalized output
+    /// vector coexist.
+    pub(crate) fn reserve_additional(
+        &self,
+        additional_bytes: u64,
+        node: &str,
+    ) -> Result<(), PipelineError> {
+        let current_pressure = self.budget.current_pressure();
+        let projected_pressure = current_pressure.saturating_add(additional_bytes);
+        let hard_limit = self.budget.hard_limit();
+        if hard_limit != 0 && projected_pressure > hard_limit {
+            return Err(PipelineError::MemoryBudgetExceeded {
+                node: node.to_string(),
+                used: projected_pressure,
+                limit: hard_limit,
+                source: clinker_plan::BudgetCategory::NodeBuffer,
+                detail: Some(format!(
+                    "composition port canonicalization projected {projected_pressure} bytes from current pressure {current_pressure} plus {additional_bytes} temporary bytes"
+                )),
+            });
+        }
+        self.handle.add_bytes(additional_bytes);
+        self.budget.sample_peak_consumer_usage();
+        Ok(())
+    }
+
+    /// Replace the reservation's reported bytes after a representation
+    /// transition has completed.
+    pub(crate) fn set_bytes(&self, bytes: u64) {
+        self.handle.set_bytes(bytes);
+    }
+
+    /// Transfer ownership of the live registration to a node-buffer registry.
+    pub(crate) fn into_registration(
+        mut self,
+    ) -> (
+        crate::pipeline::memory::ConsumerId,
+        std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+    ) {
+        self.owns_registration = false;
+        (self.consumer_id, self.handle.clone())
+    }
+}
+
+impl Drop for TransientNodeBufferReservation {
+    fn drop(&mut self) {
+        if self.owns_registration {
+            self.handle.set_bytes(0);
+            self.budget.unregister_consumer(self.consumer_id);
+        }
+    }
+}
+
+/// Register the estimated duplicate footprint before cloning a resident node
+/// buffer, returning the clone with a must-use lifetime reservation.
+///
+/// The preflight uses current process/consumer pressure plus
+/// [`NodeBuffer::estimated_memory_bytes`]. A projected hard-limit breach
+/// returns typed E310 with [`clinker_plan::BudgetCategory::NodeBuffer`] before
+/// the full event vector is allocated. A zero hard limit retains the existing
+/// unlimited-budget convention.
+pub(crate) fn clone_node_buffer_reserved(
+    buffer: &NodeBuffer,
+    budget: &std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
+    node: &str,
+) -> Result<ReservedNodeBufferClone, PipelineError> {
+    let reserved_bytes = buffer.estimated_memory_bytes();
+    let current_pressure = budget.current_pressure();
+    let projected_pressure = current_pressure.saturating_add(reserved_bytes);
+    let hard_limit = budget.hard_limit();
+    if hard_limit != 0 && projected_pressure > hard_limit {
+        return Err(PipelineError::MemoryBudgetExceeded {
+            node: node.to_string(),
+            used: projected_pressure,
+            limit: hard_limit,
+            source: clinker_plan::BudgetCategory::NodeBuffer,
+            detail: Some(format!(
+                "transient node-buffer clone projected {projected_pressure} bytes from current pressure {current_pressure} plus {reserved_bytes} reserved bytes"
+            )),
+        });
+    }
+
+    let handle = crate::pipeline::memory::ConsumerHandle::new();
+    handle.set_bytes(reserved_bytes);
+    let consumer_id = budget.register_consumer(std::sync::Arc::new(
+        TransientNodeBufferConsumer::new(handle.clone()),
+    ));
+    budget.sample_peak_consumer_usage();
+    let reservation = TransientNodeBufferReservation {
+        budget: std::sync::Arc::clone(budget),
+        consumer_id,
+        handle,
+        owns_registration: true,
+    };
+
+    // Registration deliberately precedes allocation. If the spill-variant
+    // invariant panics, unwinding drops `reservation` and unregisters it.
+    let cloned = NodeBuffer::Memory(buffer.clone_memory_only());
+    Ok(ReservedNodeBufferClone {
+        buffer: cloned,
+        reservation,
+    })
+}
+
+/// Arbitrator wrapper for a transient duplicate. Unlike a resident
+/// `NodeBufferConsumer`, this allocation has no dispatcher-owned slot that can
+/// service a spill request, so it advertises neither reclamation nor
+/// back-pressure. Its owner releases the charge only when the clone is dropped
+/// or transfers it into a composition body slot.
+struct TransientNodeBufferConsumer {
+    handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>,
+}
+
+impl TransientNodeBufferConsumer {
+    fn new(handle: std::sync::Arc<crate::pipeline::memory::ConsumerHandle>) -> Self {
+        Self { handle }
+    }
+}
+
+impl crate::pipeline::memory::MemoryConsumer for TransientNodeBufferConsumer {
+    fn current_usage(&self) -> u64 {
+        self.handle.bytes()
+    }
+
+    fn spill_priority(&self) -> i32 {
+        i32::MAX
+    }
+
+    fn try_spill(
+        &self,
+        target_bytes: u64,
+    ) -> Result<u64, crate::pipeline::memory::ConsumerSpillError> {
+        Err(crate::pipeline::memory::ConsumerSpillError::BelowTarget {
+            target: target_bytes,
+            freed: 0,
+        })
+    }
+
+    fn can_back_pressure(&self) -> bool {
+        false
     }
 }
 
@@ -988,6 +1213,10 @@ mod tests {
             rec_event(&s, 3, "c", 3),
         ]);
         assert_eq!(mem.estimated_memory_bytes(), (row_bytes_each * 3) as u64);
+        assert_eq!(
+            mem.estimated_memory_bytes_for_columns(s.column_count() + 2),
+            record_byte_cost(s.column_count() + 2) * 3
+        );
 
         // Spilled: zero bytes here — the disk surface tracks them
         // separately through `MemoryArbitrator::cumulative_spill_bytes`.
@@ -999,6 +1228,145 @@ mod tests {
 
         // Empty mem reports zero.
         assert_eq!(NodeBuffer::Memory(Vec::new()).estimated_memory_bytes(), 0);
+    }
+
+    fn roomy_arbitrator() -> Arc<crate::pipeline::memory::MemoryArbitrator> {
+        Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            100 * 1024 * 1024 * 1024,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ))
+    }
+
+    #[test]
+    fn reserved_clone_rejects_projected_hard_limit_before_registration() {
+        let s = schema();
+        let buffer = NodeBuffer::Memory(vec![rec_event(&s, 1, "a", 1)]);
+        let reserved_bytes = buffer.estimated_memory_bytes();
+        let hard_limit = 100 * 1024 * 1024 * 1024;
+        let baseline_usage = hard_limit - reserved_bytes + 1;
+        let budget = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            hard_limit,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ));
+        // A fixed registered footprint near 100 GiB dominates real process
+        // RSS, making both current-pressure reads exact even under a parallel
+        // allocator. The clone alone crosses the limit by one byte.
+        let baseline_id = budget.register_consumer(Arc::new(FixedUsageConsumer(baseline_usage)));
+
+        match clone_node_buffer_reserved(&buffer, &budget, "clone_site") {
+            Err(PipelineError::MemoryBudgetExceeded {
+                node,
+                used,
+                limit,
+                source,
+                ..
+            }) => {
+                assert_eq!(node, "clone_site");
+                assert_eq!(used, hard_limit + 1);
+                assert_eq!(limit, hard_limit);
+                assert_eq!(source, clinker_plan::BudgetCategory::NodeBuffer);
+            }
+            Ok(_) => panic!("expected pre-allocation E310 NodeBuffer; clone succeeded"),
+            Err(other) => panic!("expected pre-allocation E310 NodeBuffer; got {other:?}"),
+        }
+        assert_eq!(budget.consumer_count(), 1);
+        assert_eq!(budget.sum_consumer_usage(), baseline_usage);
+        budget.unregister_consumer(baseline_id);
+        assert_eq!(budget.consumer_count(), 0);
+    }
+
+    #[test]
+    fn reserved_clone_guard_covers_allocation_until_drop() {
+        let s = schema();
+        let buffer = NodeBuffer::Memory(vec![rec_event(&s, 1, "a", 1), rec_event(&s, 2, "b", 2)]);
+        let reserved_bytes = buffer.estimated_memory_bytes();
+        let budget = roomy_arbitrator();
+
+        let reserved =
+            clone_node_buffer_reserved(&buffer, &budget, "clone_site").expect("clone fits");
+        assert_eq!(budget.consumer_count(), 1);
+        assert_eq!(budget.sum_consumer_usage(), reserved_bytes);
+        let (cloned, reservation) = reserved.into_parts();
+        drop(cloned);
+        assert_eq!(
+            budget.sum_consumer_usage(),
+            reserved_bytes,
+            "the charge follows the guard, not an intermediate buffer conversion"
+        );
+        drop(reservation);
+        assert_eq!(budget.consumer_count(), 0);
+        assert_eq!(budget.sum_consumer_usage(), 0);
+    }
+
+    #[test]
+    fn reserved_clone_error_unwind_returns_registry_to_baseline() {
+        fn fail_after_clone(
+            buffer: &NodeBuffer,
+            budget: &Arc<crate::pipeline::memory::MemoryArbitrator>,
+        ) -> Result<(), PipelineError> {
+            let _reserved = clone_node_buffer_reserved(buffer, budget, "clone_site")?;
+            Err(PipelineError::Internal {
+                op: "reserved_clone_test",
+                node: "clone_site".to_string(),
+                detail: "failure after allocation".to_string(),
+            })
+        }
+
+        let s = schema();
+        let buffer = NodeBuffer::Memory(vec![rec_event(&s, 1, "a", 1)]);
+        let budget = roomy_arbitrator();
+        let baseline_count = budget.consumer_count();
+        let baseline_usage = budget.sum_consumer_usage();
+
+        assert!(fail_after_clone(&buffer, &budget).is_err());
+        assert_eq!(budget.consumer_count(), baseline_count);
+        assert_eq!(budget.sum_consumer_usage(), baseline_usage);
+    }
+
+    #[test]
+    fn reserved_clone_transfer_keeps_one_continuous_charge() {
+        let s = schema();
+        let buffer = NodeBuffer::Memory(vec![rec_event(&s, 1, "a", 1)]);
+        let reserved_bytes = buffer.estimated_memory_bytes();
+        let budget = roomy_arbitrator();
+
+        let reserved =
+            clone_node_buffer_reserved(&buffer, &budget, "composition").expect("clone fits");
+        let (cloned, reservation) = reserved.into_parts();
+        let (consumer_id, handle) = reservation.into_registration();
+        assert_eq!(
+            budget.consumer_count(),
+            1,
+            "transfer must not register twice"
+        );
+        assert_eq!(budget.sum_consumer_usage(), reserved_bytes);
+
+        drop(cloned);
+        handle.set_bytes(0);
+        budget.unregister_consumer(consumer_id);
+        assert_eq!(budget.consumer_count(), 0);
+        assert_eq!(budget.sum_consumer_usage(), 0);
+    }
+
+    #[test]
+    fn reserved_clone_preserves_zero_limit_as_unlimited() {
+        let s = schema();
+        let buffer = NodeBuffer::Memory(vec![rec_event(&s, 1, "a", 1)]);
+        let budget = Arc::new(crate::pipeline::memory::MemoryArbitrator::with_policy(
+            0,
+            0.80,
+            0.70,
+            Box::new(crate::pipeline::memory::NoOpPolicy),
+        ));
+
+        let reserved = clone_node_buffer_reserved(&buffer, &budget, "clone_site")
+            .expect("zero hard limit is unlimited");
+        drop(reserved);
+        assert_eq!(budget.consumer_count(), 0);
     }
 
     #[test]

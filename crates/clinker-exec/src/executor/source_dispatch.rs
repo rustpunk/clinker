@@ -14,11 +14,12 @@ use clinker_record::Record;
 use petgraph::graph::NodeIndex;
 
 use crate::executor::dispatch::{
-    ExecutorContext, MERGED_SOURCE_FILE, admit_node_buffer, build_engine_stamped_tail,
-    canonicalize_to_source_schema, drain_node_buffer_slot, finalize_node_rooted_windows,
-    node_buffer_spill_allowed, seed_source_vars_for_record, source_file_arc_of,
-    tee_emit_to_region_input_buffers,
+    ExecutorContext, MERGED_SOURCE_FILE, NodeBufferKey, admit_node_buffer,
+    admit_node_buffer_transferred, build_engine_stamped_tail, canonicalize_to_source_schema,
+    estimate_node_buffer_bytes, finalize_node_rooted_windows, node_buffer_spill_allowed,
+    seed_source_vars_for_record, source_file_arc_of, tee_emit_to_region_input_buffers,
 };
+use crate::executor::node_buffer::TransientNodeBufferReservation;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
 
@@ -79,10 +80,12 @@ pub(crate) fn dispatch_source(
         }
     };
 
-    let (records, source_puncts): (
+    let source_slot_key = NodeBufferKey::from(node_idx);
+    let (records, source_puncts, transferred_reservation): (
         Vec<(Record, u64)>,
         Vec<crate::executor::stream_event::Punctuation>,
-    ) = if let Some(seeded) = drain_node_buffer_slot(ctx, node_idx) {
+        Option<TransientNodeBufferReservation>,
+    ) = if let Some(seeded) = ctx.node_buffers.remove(&source_slot_key) {
         // Body-context port source — records were seeded by
         // `execute_composition_body` from parent-scope
         // output. The seeded records still carry the parent
@@ -94,6 +97,35 @@ pub(crate) fn dispatch_source(
         // Punctuations on the seeded port forward through to
         // the Source's output buffer so downstream operators
         // see the original document boundaries.
+        //
+        // Remove the body-local registration from the slot map without
+        // unregistering it, then resume RAII ownership locally. The seeded
+        // event vector and canonicalized records vector overlap during this
+        // loop, so reserve the prospective canonicalized footprint before
+        // allocating the output. Once the old vector drops, reduce the same
+        // handle to the actual canonicalized footprint; admission later
+        // atomically changes only the wrapper while retaining this id and
+        // handle.
+        let Some((consumer_id, consumer_handle)) =
+            ctx.node_buffer_consumer_ids.remove(&source_slot_key)
+        else {
+            return Err(PipelineError::Internal {
+                op: "executor",
+                node: name.clone(),
+                detail: "composition port Source had a seeded node buffer without its memory reservation"
+                    .to_string(),
+            });
+        };
+        let reservation = TransientNodeBufferReservation::from_registration(
+            Arc::clone(&ctx.memory_budget),
+            consumer_id,
+            consumer_handle,
+        );
+        let prospective_bytes = source_schema
+            .as_ref()
+            .map(|schema| seeded.estimated_memory_bytes_for_columns(schema.column_count()))
+            .unwrap_or_else(|| seeded.estimated_memory_bytes());
+        reservation.reserve_additional(prospective_bytes, name)?;
         let mut out_records: Vec<(Record, u64)> = Vec::with_capacity(seeded.len_hint());
         let mut out_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
         let has_record_seed = !ctx.record_var_seed.is_empty();
@@ -112,7 +144,8 @@ pub(crate) fn dispatch_source(
                 }
             }
         }
-        (out_records, out_puncts)
+        reservation.set_bytes(estimate_node_buffer_bytes(&out_records));
+        (out_records, out_puncts, Some(reservation))
     } else if let Some(rx) = ctx.source_records.remove(name.as_str()) {
         // Live channel: consume per record so back-pressure
         // engages — a slow upstream Source no longer blocks
@@ -194,7 +227,7 @@ pub(crate) fn dispatch_source(
                 "source consumer ended with all partitions in WatermarkStatus::Idle"
             );
         }
-        (drained, drained_puncts)
+        (drained, drained_puncts, None)
     } else {
         // Defense-in-depth: a Source reaching this arm with
         // neither a body-port seed, nor an entry in
@@ -222,14 +255,20 @@ pub(crate) fn dispatch_source(
     // now anchors here.
     finalize_node_rooted_windows(ctx, current_dag, node_idx, &records)?;
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &records)?;
-    let nb = admit_node_buffer(
-        ctx,
-        name,
-        node_idx,
-        records,
-        source_puncts,
-        node_buffer_spill_allowed(current_dag, node_idx),
-    )?;
+    let spill_allowed = node_buffer_spill_allowed(current_dag, node_idx);
+    let nb = if let Some(reservation) = transferred_reservation {
+        admit_node_buffer_transferred(
+            ctx,
+            name,
+            node_idx,
+            records,
+            source_puncts,
+            spill_allowed,
+            reservation,
+        )?
+    } else {
+        admit_node_buffer(ctx, name, node_idx, records, source_puncts, spill_allowed)?
+    };
     ctx.node_buffers.insert(node_idx.into(), nb);
 
     Ok(())

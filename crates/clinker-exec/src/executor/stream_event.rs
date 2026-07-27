@@ -200,17 +200,6 @@ impl StreamEvent {
     pub fn is_record(&self) -> bool {
         matches!(self, Self::Record(..))
     }
-
-    /// Consume into the `(Record, u64)` pair if this event is a record,
-    /// otherwise discard the punctuation and return `None`. Used by the
-    /// Output fan-out clone path and composition port seeding, which
-    /// take records only.
-    pub fn into_record(self) -> Option<(Record, u64)> {
-        match self {
-            Self::Record(r, rn) => Some((r, rn)),
-            Self::Punctuation(_) => None,
-        }
-    }
 }
 
 /// Fold a fan-in's document-boundary punctuations down to one downstream
@@ -362,17 +351,6 @@ mod tests {
         };
         assert_eq!(p.kind(), PunctuationKind::DocumentOpen);
         assert_eq!(p.doc_id(), ctx.id());
-    }
-
-    #[test]
-    fn into_record_discards_punctuation() {
-        let ctx = synthetic_document_context();
-        let p_event = StreamEvent::punctuation(Punctuation::document_close(ctx));
-        assert!(p_event.into_record().is_none());
-
-        let r_event = StreamEvent::record(rec(5), 7);
-        let (_, rn) = r_event.into_record().unwrap();
-        assert_eq!(rn, 7);
     }
 
     fn kinds_for(puncts: &[Punctuation], id: DocumentId) -> Vec<PunctuationKind> {
