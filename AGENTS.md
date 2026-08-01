@@ -83,9 +83,17 @@ Anything a pipeline author writes by hand — a YAML key, a CXL construct, a CLI
 
 ## Dependencies And Approval
 
+Approval is gated on the capability, not on the manifest diff. It covers development, test, benchmark, CI, and release tooling as well as the shipped runtime: being "only tooling" changes which manifest an edge belongs in and how it is verified, never whether approval is needed.
+
 - Do not add dependencies, native toolchain requirements, async runtimes, C build steps, OpenSSL/native-tls, or cargo-deny exceptions without approval.
 - Keep benchmark/test helpers out of default runtime paths.
 - If a command needs network, writes outside the workspace, or needs elevated permissions, ask for approval through the tool flow and explain why.
+- When a task needs a capability an established crate already provides, raise it for approval. Review covers architectural fit and the crate's maintenance status, so asking is the cheap path; work done to avoid the conversation is not a saving.
+- Do not substitute any of these to keep the manifest unchanged: hand-rolling the capability (parsers, lexers, tokenizers, serializers, encoders, date/time arithmetic, cryptography); implementing it outside Rust; vendoring or copying third-party source into the tree; or shelling out to an undeclared external binary.
+- Hand-rolling what a vetted crate provides is a dependency decision taken without review. Raise it rather than growing it, and treat an implementation that needs repeated adversarial repair as evidence the decision was wrong rather than as a reason to keep patching.
+- Adding a non-Rust language to the build, test, or release path is an approval-gated architectural decision in its own right. Committed tooling is Rust; the only committed non-Rust sources are the vendored mdBook theme assets under `docs/theme/`.
+- Not asking is not approval. The absence of a request is not evidence that a dependency was considered and rejected.
+- If approval is refused or deferred, reduce scope or record the gap in [docs/ai/80_OPEN_QUESTIONS.md](docs/ai/80_OPEN_QUESTIONS.md); do not ship a hand-rolled substitute instead.
 
 ## Documentation Rules
 

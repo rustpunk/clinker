@@ -177,6 +177,20 @@ adding, renaming, or narrowing anything a pipeline author writes by hand.
 - Network transport currently uses blocking `ureq` over rustls. Adding async
   clients or a Tokio-driven runtime would be an architecture change, not a
   local connector tweak.
+- The dependency gate is scoped to the capability, not to the manifest diff, and
+  it covers development, test, benchmark, and release tooling as well as runtime
+  crates. Hand-rolling a capability an established crate provides — a parser,
+  lexer, serializer, or encoder — is a dependency decision taken without review,
+  as is implementing it in another language, vendoring third-party source, or
+  calling an undeclared external binary. `AGENTS.md` carries the normative rule.
+- Adding a non-Rust language to the build, test, or release path is an
+  architectural decision requiring approval. The committed tree is Rust plus
+  documentation assets: `git ls-files` matches no `.py`, `.sh`, or `.rb`
+  sources, and the only committed JavaScript is the vendored mdBook theme under
+  `docs/theme/`.
+- Repeated adversarial repair of a hand-written substitute is evidence that the
+  dependency decision was wrong, not a reason to keep patching. Reopen the
+  approval question instead of growing the substitute.
 
 ## Documentation Rules
 
