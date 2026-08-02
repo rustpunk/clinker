@@ -37,6 +37,7 @@ impl TestServer {
         let thread_stop = Arc::clone(&stop);
         let handle = thread::spawn(move || {
             let mut responses = responses.into_iter();
+            let mut completed_connections = Vec::new();
             while !thread_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
@@ -54,6 +55,10 @@ impl TestServer {
                         stream
                             .shutdown(Shutdown::Write)
                             .expect("finish test response");
+                        // Keep the read half alive until fixture teardown so
+                        // closing the handle cannot race the peer's receipt of
+                        // the final response bytes.
+                        completed_connections.push(stream);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
