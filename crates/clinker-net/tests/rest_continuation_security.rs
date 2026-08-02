@@ -55,6 +55,19 @@ impl TestServer {
             while !thread_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Accepted sockets inherit nonblocking mode on BSD-family
+                        // systems but not on Linux. Normalize the stream before
+                        // applying the request read timeout below.
+                        if let Err(error) = stream.set_nonblocking(false) {
+                            let message =
+                                format!("test server could not restore blocking mode: {error}");
+                            eprintln!("{message}");
+                            thread_errors
+                                .lock()
+                                .expect("server error lock")
+                                .push(message);
+                            continue;
+                        }
                         let path = match read_request(&mut stream) {
                             Ok(Some(path)) => path,
                             Ok(None) => {
