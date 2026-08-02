@@ -749,7 +749,7 @@ mod platform {
 mod platform {
     use std::ffi::OsStr;
     use std::fs::File;
-    use std::mem::{MaybeUninit, offset_of, size_of};
+    use std::mem::{MaybeUninit, size_of};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::path::{Component, Path, PathBuf};
@@ -757,7 +757,8 @@ mod platform {
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
         FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-        FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE_IF, FILE_RENAME_INFORMATION,
+        FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         ERROR_INVALID_NAME, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE,
@@ -766,10 +767,10 @@ mod platform {
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_RENAME_INFO,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo, FileRenameInfo,
-        FlushFileBuffers, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-        GetVolumeInformationByHandleW, OPEN_EXISTING, SetFileInformationByHandle,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo, FlushFileBuffers,
+        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
+        OPEN_EXISTING,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -910,15 +911,17 @@ mod platform {
             .map_err(|source| ContainmentError::io("sync-promotion-source", source_path, source))?;
 
             let destination_wide: Vec<u16> = destination_leaf.encode_wide().collect();
-            let bytes = offset_of!(FILE_RENAME_INFO, FileName)
-                + (destination_wide.len() + 1) * size_of::<u16>();
+            // The native contract requires the full fixed structure size plus
+            // the complete FileName byte length. This is intentionally not an
+            // offset calculation: the structure has trailing alignment on
+            // x64, and omitting it yields STATUS_INVALID_PARAMETER.
+            let bytes = size_of::<FILE_RENAME_INFORMATION>()
+                + destination_wide.len() * size_of::<u16>();
             let mut storage = vec![0_u64; bytes.div_ceil(size_of::<u64>())];
-            let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-            // SAFETY: `storage` is aligned for `FILE_RENAME_INFO`, sized for
-            // its header plus the complete UTF-16 leaf and a trailing NUL,
-            // and remains alive for the duration of the OS call. The zeroed
-            // storage supplies the terminator while `FileNameLength` excludes
-            // it, as required by `FILE_RENAME_INFO`.
+            let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+            // SAFETY: `storage` is aligned for `FILE_RENAME_INFORMATION`, sized for
+            // its full fixed structure plus the complete UTF-16 leaf, and
+            // remains alive for the duration of the OS call.
             unsafe {
                 (*info).Anonymous.ReplaceIfExists = disposition == PromotionDisposition::Replace;
                 (*info).RootDirectory = self.handle.as_raw_handle() as HANDLE;
@@ -929,21 +932,26 @@ mod platform {
                     destination_wide.len(),
                 );
             }
-            // SAFETY: the source handle carries DELETE access and `info`
-            // describes a destination leaf relative to the retained parent.
-            let renamed = unsafe {
-                SetFileInformationByHandle(
+            let mut status_block = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+            // SAFETY: the source handle carries DELETE access, `info`
+            // describes a destination leaf relative to the retained parent,
+            // and every pointer remains valid for the synchronous call.
+            let status = unsafe {
+                NtSetInformationFile(
                     source_handle.as_raw_handle() as HANDLE,
-                    FileRenameInfo,
-                    info.cast(),
+                    &mut status_block,
+                    info.cast_const().cast(),
                     bytes as u32,
+                    FileRenameInformation,
                 )
             };
-            if renamed == 0 {
+            if status != STATUS_SUCCESS {
                 return Err(ContainmentError::io(
                     "atomic-promotion",
                     destination_path,
-                    std::io::Error::last_os_error(),
+                    std::io::Error::from_raw_os_error(unsafe {
+                        RtlNtStatusToDosError(status) as i32
+                    }),
                 ));
             }
             if fail_after_rename {
@@ -1038,7 +1046,7 @@ mod platform {
             MaximumLength: byte_length,
             Buffer: wide.as_ptr().cast_mut(),
         };
-        let mut attributes = OBJECT_ATTRIBUTES {
+        let attributes = OBJECT_ATTRIBUTES {
             Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
             RootDirectory: parent.as_raw_handle() as HANDLE,
             ObjectName: &mut name,
@@ -1054,7 +1062,7 @@ mod platform {
             NtCreateFile(
                 &mut handle,
                 access,
-                &mut attributes,
+                &attributes,
                 &mut status_block,
                 std::ptr::null(),
                 FILE_ATTRIBUTE_NORMAL,

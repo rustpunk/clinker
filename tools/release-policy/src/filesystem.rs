@@ -952,6 +952,14 @@ fn semantic_test(profile: &str, mount_root: &Path, log_path: &Path) -> Result<St
         environment,
         Duration::from_secs(900),
     )?;
+    require_semantic_success(log_path, &result)
+}
+
+fn require_semantic_success(log_path: &Path, result: &ChildResult) -> Result<String, GateError> {
+    // A failed qualification is evidence too. Persist the bounded child
+    // observation before interpreting its exit status so CI artifacts retain
+    // the exact test failure, timeout, and truncation state.
+    write_child_observation(log_path, result)?;
     if result.termination != Termination::Exited(Some(0))
         || result.stdout_truncated
         || result.stderr_truncated
@@ -960,20 +968,15 @@ fn semantic_test(profile: &str, mount_root: &Path, log_path: &Path) -> Result<St
             "remote semantic test failed, timed out, or exceeded its output bound",
         ));
     }
-    let mut output = result.stdout;
-    output.extend(result.stderr);
-    let text = String::from_utf8(output.clone())
+    let mut output = result.stdout.clone();
+    output.extend_from_slice(&result.stderr);
+    let text = String::from_utf8(output)
         .map_err(|_| missing("remote semantic test output is not UTF-8"))?;
     if !text.contains("remote_filesystem_matrix_semantics") || !text.contains("test result: ok") {
         return Err(missing(
             "remote semantic test filter selected no passing test",
         ));
     }
-    if let Some(parent) = log_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| GateError::io("create semantic test log directory", &error))?;
-    }
-    write_observation(log_path, &output)?;
     Ok(log_path
         .file_name()
         .and_then(OsStr::to_str)
@@ -1941,7 +1944,15 @@ fn missing(detail: impl Into<String>) -> GateError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Termination, classify_mountpoint_termination};
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
+
+    use tempfile::tempdir;
+
+    use super::{
+        ChildResult, Termination, classify_mountpoint_termination, require_semantic_success,
+    };
 
     #[test]
     fn util_linux_mountpoint_exit_contract_distinguishes_absent_mounts() {
@@ -1949,5 +1960,27 @@ mod tests {
         assert!(!classify_mountpoint_termination(Termination::Exited(Some(32))).unwrap());
         assert!(classify_mountpoint_termination(Termination::Exited(Some(1))).is_err());
         assert!(classify_mountpoint_termination(Termination::TimedOut).is_err());
+    }
+
+    #[test]
+    fn failed_semantic_test_persists_bounded_child_evidence() {
+        let directory = tempdir().expect("temporary evidence directory");
+        let log = directory.path().join("semantic-test.txt");
+        let result = ChildResult {
+            program: PathBuf::from("cargo"),
+            arguments: vec![OsString::from("test")],
+            termination: Termination::Exited(Some(101)),
+            stdout: b"running remote_filesystem_matrix_semantics\n".to_vec(),
+            stderr: b"test failed: concrete semantic error\n".to_vec(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+
+        require_semantic_success(&log, &result).expect_err("failed child must fail qualification");
+
+        let evidence = fs::read_to_string(log).expect("failed child evidence");
+        assert!(evidence.contains("termination=Exited(Some(101))"));
+        assert!(evidence.contains("running remote_filesystem_matrix_semantics"));
+        assert!(evidence.contains("test failed: concrete semantic error"));
     }
 }
