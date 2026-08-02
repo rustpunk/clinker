@@ -915,8 +915,8 @@ mod platform {
             // the complete FileName byte length. This is intentionally not an
             // offset calculation: the structure has trailing alignment on
             // x64, and omitting it yields STATUS_INVALID_PARAMETER.
-            let bytes = size_of::<FILE_RENAME_INFORMATION>()
-                + destination_wide.len() * size_of::<u16>();
+            let bytes =
+                size_of::<FILE_RENAME_INFORMATION>() + destination_wide.len() * size_of::<u16>();
             let mut storage = vec![0_u64; bytes.div_ceil(size_of::<u64>())];
             let info = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
             // SAFETY: `storage` is aligned for `FILE_RENAME_INFORMATION`, sized for
