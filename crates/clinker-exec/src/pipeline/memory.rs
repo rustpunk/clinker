@@ -1734,33 +1734,36 @@ mod tests {
     }
 
     /// A 64 MiB touched allocation must never lower this process's reported
-    /// memory on any first-class target. Gated to the supported targets for
-    /// the same reason as [`test_rss_bytes_returns_some`].
+    /// memory on any first-class target. The samples run in an isolated child
+    /// because RSS is process-global and sibling tests can free more memory
+    /// than this probe commits between its two reads.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     #[test]
     fn test_rss_bytes_increases_after_alloc() {
-        let before = rss_bytes().expect("rss_bytes() must be readable on a first-class target");
-        // Allocate 64 MiB and touch every page so the pages are resident.
-        // A delta-threshold assertion (`after >= before + N`) flakes under a
-        // loaded harness: a concurrent test thread can free more than the
-        // probe allocates between the two samples, so the resident set can
-        // momentarily dip. Asserting `after >= before` keeps the real
-        // coverage (a large touched allocation never lowers this process's
-        // RSS) without depending on a fixed delta surviving harness churn;
-        // the absolute-value coverage that `rss_bytes` reads a positive
-        // figure lives in `test_rss_bytes_returns_some`.
-        let mut big_vec: Vec<u8> = vec![0u8; 64 * 1024 * 1024];
-        let page = 4096;
-        let mut i = 0;
-        while i < big_vec.len() {
-            big_vec[i] = 1;
-            i += page;
-        }
-        std::hint::black_box(&big_vec);
-        let after = rss_bytes().expect("rss_bytes() must be readable on a first-class target");
-        assert!(
-            after >= before,
-            "a 64 MiB touched allocation must not lower process RSS, got before={before} after={after}"
+        run_isolated(
+            "pipeline::memory::tests::test_rss_bytes_increases_after_alloc",
+            || {
+                let before =
+                    rss_bytes().expect("rss_bytes() must be readable on a first-class target");
+                // Allocate 64 MiB and touch every page so the pages are resident.
+                // A delta threshold is intentionally avoided because platform
+                // allocators and resident-set accounting need not expose every
+                // committed byte immediately.
+                let mut big_vec: Vec<u8> = vec![0u8; 64 * 1024 * 1024];
+                let page = 4096;
+                let mut i = 0;
+                while i < big_vec.len() {
+                    big_vec[i] = 1;
+                    i += page;
+                }
+                std::hint::black_box(&big_vec);
+                let after =
+                    rss_bytes().expect("rss_bytes() must be readable on a first-class target");
+                assert!(
+                    after >= before,
+                    "a 64 MiB touched allocation must not lower process RSS, got before={before} after={after}"
+                );
+            },
         );
     }
 

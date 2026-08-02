@@ -1,7 +1,7 @@
 //! Fail-closed continuation and redirect security contracts for REST sources.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -51,6 +51,9 @@ impl TestServer {
                             .write_all(response.as_bytes())
                             .expect("write test response");
                         stream.flush().expect("flush test response");
+                        stream
+                            .shutdown(Shutdown::Write)
+                            .expect("finish test response");
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
