@@ -1,6 +1,6 @@
 //! Fail-closed continuation and redirect security contracts for REST sources.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,6 +25,7 @@ fn network_test_guard() -> std::sync::MutexGuard<'static, ()> {
 struct TestServer {
     url: String,
     requests: Arc<Mutex<Vec<String>>>,
+    errors: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -44,6 +45,8 @@ impl TestServer {
         let responses = make_responses(&url);
         let requests = Arc::new(Mutex::new(Vec::new()));
         let thread_requests = Arc::clone(&requests);
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let thread_errors = Arc::clone(&errors);
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let handle = thread::spawn(move || {
@@ -52,17 +55,44 @@ impl TestServer {
             while !thread_stop.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let Some(path) = read_request(&mut stream) else {
-                            continue;
+                        let path = match read_request(&mut stream) {
+                            Ok(Some(path)) => path,
+                            Ok(None) => {
+                                let message = "test server connection closed before a request line"
+                                    .to_owned();
+                                eprintln!("{message}");
+                                thread_errors
+                                    .lock()
+                                    .expect("server error lock")
+                                    .push(message);
+                                continue;
+                            }
+                            Err(error) => {
+                                let message = format!("test server request read failed: {error}");
+                                eprintln!("{message}");
+                                thread_errors
+                                    .lock()
+                                    .expect("server error lock")
+                                    .push(message);
+                                continue;
+                            }
                         };
                         thread_requests.lock().expect("request lock").push(path);
                         let response = responses.next().unwrap_or_else(|| {
                             response(500, "Internal Server Error", &[], r#"{"unexpected":true}"#)
                         });
-                        stream
+                        if let Err(error) = stream
                             .write_all(response.as_bytes())
-                            .expect("write test response");
-                        stream.flush().expect("flush test response");
+                            .and_then(|()| stream.flush())
+                        {
+                            let message = format!("test server response write failed: {error}");
+                            eprintln!("{message}");
+                            thread_errors
+                                .lock()
+                                .expect("server error lock")
+                                .push(message);
+                            continue;
+                        }
                         // Content-Length frames the response. Keep the socket
                         // alive until fixture teardown so a server-initiated
                         // close cannot race delivery of the final bytes.
@@ -78,6 +108,7 @@ impl TestServer {
         Self {
             url,
             requests,
+            errors,
             stop,
             handle: Some(handle),
         }
@@ -94,24 +125,32 @@ impl Drop for TestServer {
         if let Some(handle) = self.handle.take() {
             handle.join().expect("join test server");
         }
+        if !thread::panicking() {
+            let errors = self.errors.lock().expect("server error lock");
+            assert!(
+                errors.is_empty(),
+                "test server transport failures: {}",
+                errors.join("; ")
+            );
+        }
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<String> {
-    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    let mut reader = BufReader::new(stream.try_clone().ok()?);
+fn read_request(stream: &mut TcpStream) -> io::Result<Option<String>> {
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut reader = BufReader::new(&mut *stream);
     let mut request_line = String::new();
-    if reader.read_line(&mut request_line).ok()? == 0 {
-        return None;
+    if reader.read_line(&mut request_line)? == 0 {
+        return Ok(None);
     }
     loop {
         let mut line = String::new();
-        let read = reader.read_line(&mut line).ok()?;
+        let read = reader.read_line(&mut line)?;
         if read == 0 || line == "\r\n" || line == "\n" {
             break;
         }
     }
-    request_line.split_whitespace().nth(1).map(str::to_owned)
+    Ok(request_line.split_whitespace().nth(1).map(str::to_owned))
 }
 
 fn response(status: u16, reason: &str, headers: &[(&str, &str)], body: &str) -> String {
