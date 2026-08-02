@@ -1,0 +1,814 @@
+{
+  "schema": "clinker.rejected-record-set-fixtures/v1",
+  "cases": [
+    {
+      "name": "missing-publication-approval",
+      "expected_error": "missing",
+      "mutations": [
+        {
+          "target": "records",
+          "action": "remove-record",
+          "decision_id": "publication-approval"
+        }
+      ]
+    },
+    {
+      "name": "duplicate-semantic-decision",
+      "expected_error": "duplicate",
+      "mutations": [
+        {
+          "target": "records",
+          "action": "append-record-copy",
+          "decision_id": "semantic-identity"
+        }
+      ]
+    },
+    {
+      "name": "candidate-wrong-producer-task",
+      "expected_error": "candidate-verification",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-candidate",
+          "action": "set",
+          "path": ["control_id"],
+          "value": "candidate-authorization"
+        }
+      ]
+    },
+    {
+      "name": "nonaccepted-record",
+      "expected_error": "accepted",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "semantic-identity",
+          "action": "set",
+          "path": ["status"],
+          "value": "incomplete"
+        }
+      ]
+    },
+    {
+      "name": "semantic-noncompleting-selection",
+      "expected_error": "completion-eligible",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "semantic-identity",
+          "action": "set",
+          "path": ["selection"],
+          "value": "defer-shared-primitive"
+        }
+      ]
+    },
+    {
+      "name": "candidate-missing-source-sha",
+      "expected_error": "missing required fields",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-candidate",
+          "action": "delete",
+          "path": ["source_sha"]
+        }
+      ]
+    },
+    {
+      "name": "legacy-workflow-sha",
+      "expected_error": "unknown fields",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-candidate",
+          "action": "set",
+          "path": ["workflow_sha"],
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    },
+    {
+      "name": "native-platform-matrix-incomplete",
+      "expected_error": "platform_matrix",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "native-filesystem",
+          "action": "delete",
+          "path": ["platform_matrix", "windows"]
+        }
+      ]
+    },
+    {
+      "name": "remote-support-policy-drift",
+      "expected_error": "support_matrix.policy",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "remote-share",
+          "action": "set",
+          "path": ["support_matrix", "policy"],
+          "value": "no-positive-remote-support"
+        }
+      ]
+    },
+    {
+      "name": "release-rules-generic-admin-bypass",
+      "expected_error": "admin bypass",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-rules",
+          "action": "set",
+          "path": ["ruleset", "main_rule", "generic_admin_bypass"],
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "release-rules-check-not-app-bound",
+      "expected_error": "app_ref",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-rules",
+          "action": "delete",
+          "path": ["ruleset", "main_rule", "required_status_checks", 0, "app_ref"]
+        }
+      ]
+    },
+    {
+      "name": "release-rules-tag-update-allowed",
+      "expected_error": "tag update",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-rules",
+          "action": "set",
+          "path": ["ruleset", "tag_rule", "update_allowed"],
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "release-rules-actions-pin-weakened",
+      "expected_error": "SHA pinning",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-rules",
+          "action": "set",
+          "path": ["ruleset", "actions_policy", "full_sha_pinning_required"],
+          "value": false
+        }
+      ]
+    },
+    {
+      "name": "release-rules-immutable-release-weakened",
+      "expected_error": "immutable releases",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-rules",
+          "action": "set",
+          "path": ["ruleset", "release_policy", "immutable_releases_required"],
+          "value": false
+        }
+      ]
+    },
+    {
+      "name": "unsafe-absolute-evidence-ref",
+      "expected_error": "evidence",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-rules",
+          "action": "set",
+          "path": ["evidence_refs", 0],
+          "value": "/var/tmp/release-evidence.json"
+        }
+      ]
+    },
+    {
+      "name": "unsafe-parent-evidence-ref",
+      "expected_error": "evidence",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-rules",
+          "action": "set",
+          "path": ["evidence_refs", 0],
+          "value": "../release-evidence.json"
+        }
+      ]
+    },
+    {
+      "name": "recorded-at-without-timezone",
+      "expected_error": "recorded_at",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-rules",
+          "action": "set",
+          "path": ["recorded_at"],
+          "value": "2026-07-29T15:10:00"
+        }
+      ]
+    },
+    {
+      "name": "impossible-calendar-timestamp",
+      "expected_error": "recorded_at",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-rules",
+          "action": "set",
+          "path": ["recorded_at"],
+          "value": "2026-02-30T15:10:00Z"
+        }
+      ]
+    },
+    {
+      "name": "authorization-digest-mismatch",
+      "expected_error": "digest mismatch",
+      "mutations": [
+        {
+          "target": "authorization",
+          "action": "set",
+          "path": ["candidate_authorization_sha256"],
+          "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      ]
+    },
+    {
+      "name": "authorization-absent",
+      "expected_error": "authorization",
+      "mutations": [
+        {
+          "target": "bundle",
+          "action": "delete",
+          "path": ["authorization"]
+        }
+      ]
+    },
+    {
+      "name": "authorization-nonauthorized",
+      "expected_error": "authorized",
+      "mutations": [
+        {
+          "target": "bundle",
+          "action": "replace-authorization",
+          "fixture": "rejected"
+        }
+      ]
+    },
+    {
+      "name": "authorization-creator-materialized-field",
+      "expected_error": "unknown fields",
+      "mutations": [
+        {
+          "target": "authorization",
+          "action": "set",
+          "path": ["creator_materialized_authorization"],
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "authorization-proposal-drift-with-valid-digest",
+      "expected_error": "must exactly match candidate authorization",
+      "mutations": [
+        {
+          "target": "authorization",
+          "action": "set",
+          "path": ["authorization", "source_sha"],
+          "value": "9999999999999999999999999999999999999999"
+        },
+        {
+          "target": "authorization",
+          "action": "set",
+          "path": ["authorization", "publish_workflow_ref_resolved_sha"],
+          "value": "9999999999999999999999999999999999999999"
+        },
+        {
+          "target": "authorization",
+          "action": "set",
+          "path": ["authorization", "publish_workflow_sha"],
+          "value": "9999999999999999999999999999999999999999"
+        },
+        {
+          "target": "authorization",
+          "action": "rehash-authorization"
+        }
+      ]
+    },
+    {
+      "name": "authorization-top-level-selection-drift",
+      "expected_error": "selection",
+      "mutations": [
+        {
+          "target": "authorization",
+          "action": "set",
+          "path": ["selection"],
+          "value": "stop-without-completion"
+        }
+      ]
+    },
+    {
+      "name": "authorization-unsafe-evidence-ref",
+      "expected_error": "evidence",
+      "mutations": [
+        {
+          "target": "authorization",
+          "action": "set",
+          "path": ["evidence_refs", 0],
+          "value": "file:///var/tmp/release-evidence.json"
+        }
+      ]
+    },
+    {
+      "name": "candidate-authorization-digest-drift",
+      "expected_error": "candidate_authorization_sha256",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-candidate",
+          "action": "set",
+          "path": ["candidate_authorization_sha256"],
+          "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      ]
+    },
+    {
+      "name": "candidate-evidence-authorization-digest-drift",
+      "expected_error": "authorization digest",
+      "mutations": [
+        {
+          "target": "candidate_evidence",
+          "action": "set",
+          "path": ["candidate_authorization_sha256"],
+          "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      ]
+    },
+    {
+      "name": "approval-authorization-digest-drift",
+      "expected_error": "candidate_authorization_sha256",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "publication-approval",
+          "action": "set",
+          "path": ["candidate_authorization_sha256"],
+          "value": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      ]
+    },
+    {
+      "name": "candidate-tag-created-before-authorization",
+      "expected_error": "time order",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-candidate",
+          "action": "set",
+          "path": ["candidate_tag_created_at"],
+          "value": "2026-07-29T15:00:00Z"
+        }
+      ]
+    },
+    {
+      "name": "candidate-pre-tag-acceptance",
+      "expected_error": "missing required fields",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-candidate",
+          "action": "delete",
+          "path": ["candidate_tag_created_at"]
+        }
+      ]
+    },
+    {
+      "name": "candidate-finalized-recorded-drift",
+      "expected_error": "finalized_at",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-candidate",
+          "action": "set",
+          "path": ["finalized_at"],
+          "value": "2026-07-29T15:09:59Z"
+        }
+      ]
+    },
+    {
+      "name": "candidate-creation-readback-evidence-reused",
+      "expected_error": "distinct",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-candidate",
+          "action": "set",
+          "path": ["candidate_tag_readback_ref"],
+          "value": "https://api.github.com/repos/rustpunk/clinker/git/refs/tags/v3.0.0"
+        }
+      ]
+    },
+    {
+      "name": "candidate-unsafe-readback-evidence",
+      "expected_error": "candidate_tag_readback_ref",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-candidate",
+          "action": "set",
+          "path": ["candidate_tag_readback_ref"],
+          "value": "file:///var/tmp/tag-readback.json"
+        }
+      ]
+    },
+    {
+      "name": "raw-sha-publish-workflow-ref",
+      "expected_error": "publish_workflow_ref",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-candidate",
+          "action": "set",
+          "path": ["publish_workflow_ref"],
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ]
+    },
+    {
+      "name": "publish-workflow-resolution-drift",
+      "expected_error": "resolved SHA",
+      "mutations": [
+        {
+          "target": "candidate_evidence",
+          "action": "set",
+          "path": ["publish_workflow_ref_resolved_sha"],
+          "value": "ffffffffffffffffffffffffffffffffffffffff"
+        }
+      ]
+    },
+    {
+      "name": "candidate-evidence-build-identity-drift",
+      "expected_error": "build_workflow_sha",
+      "mutations": [
+        {
+          "target": "candidate_evidence",
+          "action": "set",
+          "path": ["build_workflow_sha"],
+          "value": "ffffffffffffffffffffffffffffffffffffffff"
+        }
+      ]
+    },
+    {
+      "name": "missing-archive-target",
+      "expected_error": "archive_digests",
+      "mutations": [
+        {
+          "target": "candidate_evidence",
+          "action": "delete",
+          "path": ["archive_digests", "aarch64-apple-darwin"]
+        }
+      ]
+    },
+    {
+      "name": "extra-archive-target",
+      "expected_error": "archive_digests",
+      "mutations": [
+        {
+          "target": "candidate_evidence",
+          "action": "set",
+          "path": ["archive_digests", "aarch64-unknown-linux-gnu"],
+          "value": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    {
+      "name": "publication-path-reordered",
+      "expected_error": "required_path",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "publication-policy",
+          "action": "set",
+          "path": ["publication_policy", "required_path"],
+          "value": ["release-candidate", "publication-approval", "candidate-readback", "public-release-readback"]
+        }
+      ]
+    },
+    {
+      "name": "environment-mode-selection-drift",
+      "expected_error": "approval_mode",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "approval_mode"],
+          "value": "single-maintainer-inspect-then-approve"
+        }
+      ]
+    },
+    {
+      "name": "environment-approval-mode-absent",
+      "expected_error": "missing required fields",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "delete",
+          "path": ["environment_policy", "approval_mode"]
+        }
+      ]
+    },
+    {
+      "name": "automated-environment-approval",
+      "expected_error": "automated_approval",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "automated_approval"],
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "environment-generic-admin-bypass",
+      "expected_error": "admin bypass",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "generic_admin_bypass"],
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "environment-branch-deployment-allowed",
+      "expected_error": "branch deployments",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "deployment_restriction", "branches_allowed"],
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "environment-redispatch-allowed",
+      "expected_error": "redispatch",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "concurrency", "redispatch_allowed"],
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "environment-final-reread-weakened",
+      "expected_error": "draft reread",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "draft_policy", "exact_final_reread_required"],
+          "value": false
+        }
+      ]
+    },
+    {
+      "name": "environment-partial-reconciliation-weakened",
+      "expected_error": "byte-identical",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "draft_policy", "byte_identical_partial_reconciliation_only"],
+          "value": false
+        }
+      ]
+    },
+    {
+      "name": "environment-mismatch-repair-in-place",
+      "expected_error": "new version",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "draft_policy", "mismatch_recovery"],
+          "value": "repair-in-place"
+        }
+      ]
+    },
+    {
+      "name": "two-person-actor-contract-weakened",
+      "expected_error": "actor rule",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "approval_contract", "actor_rule"],
+          "value": "configured-maintainer"
+        }
+      ]
+    },
+    {
+      "name": "two-person-maintainer-cardinality",
+      "expected_error": "two maintainers",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "maintainer_actor_refs"],
+          "value": ["maintainer:release"]
+        }
+      ]
+    },
+    {
+      "name": "environment-order-contract-weakened",
+      "expected_error": "order",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "ordering_contract", "strictly_increasing"],
+          "value": false
+        }
+      ]
+    },
+    {
+      "name": "environment-inspection-required-field-absent",
+      "expected_error": "inspection required fields",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "inspection_contract", "required_fields"],
+          "value": ["run_id", "job_id", "environment", "candidate_tag"]
+        }
+      ]
+    },
+    {
+      "name": "environment-timestamp-order-drift",
+      "expected_error": "timestamp order",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "ordering_contract", "timestamp_order"],
+          "value": ["inspection_started_at", "approved_at", "inspection_completed_at"]
+        }
+      ]
+    },
+    {
+      "name": "environment-exact-run-contract-weakened",
+      "expected_error": "exact run",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "approval_contract", "exact_run_candidate_required"],
+          "value": false
+        }
+      ]
+    },
+    {
+      "name": "approval-actor-drift",
+      "expected_error": "approval actor",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "publication-approval",
+          "action": "set",
+          "path": ["approver_role_ref"],
+          "value": "maintainer:other"
+        }
+      ]
+    },
+    {
+      "name": "single-maintainer-inspector-drift",
+      "base": "single-maintainer",
+      "expected_error": "actor rule",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "set",
+          "path": ["environment_policy", "inspection_contract", "actor_rule"],
+          "value": "any-actor"
+        }
+      ]
+    },
+    {
+      "name": "single-maintainer-rationale-absent",
+      "base": "single-maintainer",
+      "expected_error": "missing required fields",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "release-environment",
+          "action": "delete",
+          "path": ["environment_policy", "two_person_unavailable_reason"]
+        }
+      ]
+    },
+    {
+      "name": "single-maintainer-approver-drift",
+      "base": "single-maintainer",
+      "expected_error": "approval actor",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "publication-approval",
+          "action": "set",
+          "path": ["approver_role_ref"],
+          "value": "maintainer:other"
+        }
+      ]
+    },
+    {
+      "name": "approval-self-digest-field",
+      "expected_error": "unknown fields",
+      "mutations": [
+        {
+          "target": "record",
+          "decision_id": "publication-approval",
+          "action": "set",
+          "path": ["canonical_record_sha256"],
+          "value": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ]
+    },
+    {
+      "name": "candidate-evidence-claims-tag-mutation",
+      "expected_error": "without tag mutation",
+      "mutations": [
+        {
+          "target": "candidate_evidence",
+          "action": "set",
+          "path": ["tag_mutation_performed"],
+          "value": true
+        }
+      ]
+    },
+    {
+      "name": "nonhex-source-sha",
+      "expected_error": "source_sha",
+      "mutations": [
+        {
+          "target": "candidate_evidence",
+          "action": "set",
+          "path": ["source_sha"],
+          "value": "gggggggggggggggggggggggggggggggggggggggg"
+        }
+      ]
+    },
+    {
+      "name": "short-checksum-digest",
+      "expected_error": "checksum_sha256",
+      "mutations": [
+        {
+          "target": "candidate_evidence",
+          "action": "set",
+          "path": ["checksum_sha256"],
+          "value": "cccccccc"
+        }
+      ]
+    },
+    {
+      "name": "candidate-version-tag-drift",
+      "expected_error": "candidate_version",
+      "mutations": [
+        {
+          "target": "candidate_evidence",
+          "action": "set",
+          "path": ["candidate_version"],
+          "value": "3.0.1"
+        }
+      ]
+    }
+  ]
+}

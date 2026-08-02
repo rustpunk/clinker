@@ -1,0 +1,417 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "clinker.release-evidence/v1",
+  "title": "Clinker release evidence",
+  "description": "Normative schema for candidate and revisioned publication evidence produced and validated by the locked clinker-release-policy Rust CLI. Publication evidence alone never completes a release.",
+  "oneOf": [
+    { "$ref": "#/$defs/candidate" },
+    { "$ref": "#/$defs/publication" }
+  ],
+  "$defs": {
+    "sha40": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nonEmpty": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "archiveDigests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc"
+      ],
+      "properties": {
+        "x86_64-unknown-linux-gnu": { "$ref": "#/$defs/sha256" },
+        "x86_64-apple-darwin": { "$ref": "#/$defs/sha256" },
+        "aarch64-apple-darwin": { "$ref": "#/$defs/sha256" },
+        "x86_64-pc-windows-msvc": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "archive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["target", "archive_name", "sha256"],
+      "properties": {
+        "target": {
+          "enum": [
+            "x86_64-unknown-linux-gnu",
+            "x86_64-apple-darwin",
+            "aarch64-apple-darwin",
+            "x86_64-pc-windows-msvc"
+          ]
+        },
+        "archive_name": { "$ref": "#/$defs/nonEmpty" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "attestation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "archive_name",
+        "subject_sha256",
+        "repository",
+        "workflow",
+        "ref",
+        "source_sha",
+        "runner_environment"
+      ],
+      "properties": {
+        "archive_name": { "$ref": "#/$defs/nonEmpty" },
+        "subject_sha256": { "$ref": "#/$defs/sha256" },
+        "repository": { "const": "rustpunk/clinker" },
+        "workflow": { "const": ".github/workflows/release.yml" },
+        "ref": { "$ref": "#/$defs/nonEmpty" },
+        "source_sha": { "$ref": "#/$defs/sha40" },
+        "runner_environment": { "const": "github-hosted" }
+      }
+    },
+    "candidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema",
+        "kind",
+        "state",
+        "revision",
+        "release_status",
+        "completion_eligible",
+        "immutable_authority_sha256",
+        "candidate_authorization_sha256",
+        "candidate_tag",
+        "candidate_version",
+        "source_sha",
+        "build_workflow_sha",
+        "publish_workflow_ref",
+        "publish_workflow_ref_resolved_sha",
+        "publish_workflow_sha",
+        "candidate_release_id",
+        "checksum_sha256",
+        "archive_digests",
+        "ci_run_ref",
+        "changelog_ref",
+        "inventory_ref",
+        "authorized_release_maintainer_ref",
+        "build_workflow_path",
+        "build_run_id",
+        "build_head_sha",
+        "publish_workflow_path",
+        "archives",
+        "attestations",
+        "tag_mutation_performed",
+        "tag_readback_ref",
+        "release_trigger_event_ref"
+      ],
+      "properties": {
+        "schema": { "const": "clinker.candidate-evidence/v1" },
+        "kind": { "const": "candidate" },
+        "state": { "const": "candidate-verified" },
+        "revision": { "const": 0 },
+        "release_status": { "const": "incomplete" },
+        "completion_eligible": { "const": false },
+        "immutable_authority_sha256": { "$ref": "#/$defs/sha256" },
+        "candidate_authorization_sha256": { "$ref": "#/$defs/sha256" },
+        "candidate_tag": { "type": "string", "pattern": "^v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$" },
+        "candidate_version": { "$ref": "#/$defs/nonEmpty" },
+        "source_sha": { "$ref": "#/$defs/sha40" },
+        "build_workflow_sha": { "$ref": "#/$defs/sha40" },
+        "publish_workflow_ref": { "$ref": "#/$defs/nonEmpty" },
+        "publish_workflow_ref_resolved_sha": { "$ref": "#/$defs/sha40" },
+        "publish_workflow_sha": { "$ref": "#/$defs/sha40" },
+        "candidate_release_id": { "$ref": "#/$defs/nonEmpty" },
+        "checksum_sha256": { "$ref": "#/$defs/sha256" },
+        "archive_digests": { "$ref": "#/$defs/archiveDigests" },
+        "ci_run_ref": { "$ref": "#/$defs/nonEmpty" },
+        "changelog_ref": { "$ref": "#/$defs/nonEmpty" },
+        "inventory_ref": { "const": "release/inventory.toml" },
+        "authorized_release_maintainer_ref": { "$ref": "#/$defs/nonEmpty" },
+        "build_workflow_path": { "const": ".github/workflows/release.yml" },
+        "build_run_id": { "$ref": "#/$defs/nonEmpty" },
+        "build_head_sha": { "$ref": "#/$defs/sha40" },
+        "publish_workflow_path": { "const": ".github/workflows/publish-release.yml" },
+        "archives": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/archive" }
+        },
+        "attestations": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": { "$ref": "#/$defs/attestation" }
+        },
+        "tag_mutation_performed": { "const": false },
+        "tag_readback_ref": { "$ref": "#/$defs/nonEmpty" },
+        "release_trigger_event_ref": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "dispatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dispatch_id",
+        "workflow",
+        "workflow_sha",
+        "source_sha",
+        "run_id",
+        "run_attempt",
+        "run_url",
+        "job_id",
+        "job_name",
+        "environment",
+        "trigger_actor_ref",
+        "dispatched_at"
+      ],
+      "properties": {
+        "dispatch_id": { "$ref": "#/$defs/nonEmpty" },
+        "workflow": { "const": "publish-release.yml" },
+        "workflow_sha": { "$ref": "#/$defs/sha40" },
+        "source_sha": { "$ref": "#/$defs/sha40" },
+        "run_id": { "$ref": "#/$defs/nonEmpty" },
+        "run_attempt": { "const": 1 },
+        "run_url": { "$ref": "#/$defs/nonEmpty" },
+        "job_id": { "$ref": "#/$defs/nonEmpty" },
+        "job_name": { "$ref": "#/$defs/nonEmpty" },
+        "environment": { "const": "release" },
+        "trigger_actor_ref": { "$ref": "#/$defs/nonEmpty" },
+        "dispatched_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "inspectionNotStarted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status"],
+      "properties": { "status": { "const": "not-started" } }
+    },
+    "inspectionInProgress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "inspector_actor_ref", "started_at", "evidence_ref"],
+      "properties": {
+        "status": { "const": "in-progress" },
+        "inspector_actor_ref": { "$ref": "#/$defs/nonEmpty" },
+        "started_at": { "$ref": "#/$defs/timestamp" },
+        "evidence_ref": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "inspectionCompleted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "inspector_actor_ref", "started_at", "completed_at", "evidence_ref"],
+      "properties": {
+        "status": { "const": "completed" },
+        "inspector_actor_ref": { "$ref": "#/$defs/nonEmpty" },
+        "started_at": { "$ref": "#/$defs/timestamp" },
+        "completed_at": { "$ref": "#/$defs/timestamp" },
+        "evidence_ref": { "$ref": "#/$defs/nonEmpty" }
+      }
+    },
+    "approval": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["approval_mode", "approver_actor_ref", "approved_at", "approval_receipt_ref", "approval_kind", "automated_approval"],
+          "properties": {
+            "approval_mode": { "const": "two-person-non-self" },
+            "approver_actor_ref": { "$ref": "#/$defs/nonEmpty" },
+            "approved_at": { "$ref": "#/$defs/timestamp" },
+            "approval_receipt_ref": { "$ref": "#/$defs/nonEmpty" },
+            "approval_kind": { "const": "manual" },
+            "automated_approval": { "const": false }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["approval_mode", "configured_maintainer_actor_ref", "two_person_unavailable_reason", "approver_actor_ref", "approved_at", "approval_receipt_ref", "approval_kind", "automated_approval"],
+          "properties": {
+            "approval_mode": { "const": "single-maintainer-inspect-then-approve" },
+            "configured_maintainer_actor_ref": { "$ref": "#/$defs/nonEmpty" },
+            "two_person_unavailable_reason": { "$ref": "#/$defs/nonEmpty" },
+            "approver_actor_ref": { "$ref": "#/$defs/nonEmpty" },
+            "approved_at": { "$ref": "#/$defs/timestamp" },
+            "approval_receipt_ref": { "$ref": "#/$defs/nonEmpty" },
+            "approval_kind": { "const": "manual" },
+            "automated_approval": { "const": false }
+          }
+        }
+      ]
+    },
+    "protectedJob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "job_id", "status", "wait_mode", "completed_at"],
+      "properties": {
+        "run_id": { "$ref": "#/$defs/nonEmpty" },
+        "job_id": { "$ref": "#/$defs/nonEmpty" },
+        "status": { "const": "success" },
+        "wait_mode": { "const": "read-only" },
+        "completed_at": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "publicVerification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "release_url", "verified_at", "immutable_release", "asset_count", "assets_match", "attestations_match"],
+      "properties": {
+        "status": { "const": "verified" },
+        "release_url": { "$ref": "#/$defs/nonEmpty" },
+        "verified_at": { "$ref": "#/$defs/timestamp" },
+        "immutable_release": { "const": true },
+        "asset_count": { "const": 4 },
+        "assets_match": { "const": true },
+        "attestations_match": { "const": true }
+      }
+    },
+    "publicationBase": {
+      "type": "object",
+      "required": ["schema", "kind", "state", "revision", "release_status", "completion_eligible", "immutable_authority_sha256", "repository", "candidate", "candidate_sha256", "candidate_authorization_sha256", "candidate_authorization_blob_sha", "candidate_decision_blob_sha", "candidate_evidence_blob_sha", "approval_record_blob_sha", "approval_record_sha256", "dispatch", "inspection", "asset_identities"],
+      "properties": {
+        "schema": { "const": "clinker.publication-evidence/v1" },
+        "kind": { "const": "publication" },
+        "state": { "$ref": "#/$defs/nonEmpty" },
+        "revision": { "type": "integer", "minimum": 0, "maximum": 4 },
+        "release_status": { "const": "incomplete" },
+        "completion_eligible": { "const": false },
+        "immutable_authority_sha256": { "$ref": "#/$defs/sha256" },
+        "repository": { "const": "rustpunk/clinker" },
+        "candidate": { "$ref": "#/$defs/candidate" },
+        "candidate_sha256": { "$ref": "#/$defs/sha256" },
+        "candidate_authorization_sha256": { "$ref": "#/$defs/sha256" },
+        "candidate_authorization_blob_sha": { "$ref": "#/$defs/sha40" },
+        "candidate_decision_blob_sha": { "$ref": "#/$defs/sha40" },
+        "candidate_evidence_blob_sha": { "$ref": "#/$defs/sha40" },
+        "approval_record_blob_sha": { "$ref": "#/$defs/sha40" },
+        "approval_record_sha256": { "$ref": "#/$defs/sha256" },
+        "dispatch": { "$ref": "#/$defs/dispatch" },
+        "inspection": {},
+        "asset_identities": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["checksum_sha256", "archive_digests"],
+          "properties": {
+            "checksum_sha256": { "$ref": "#/$defs/sha256" },
+            "archive_digests": { "$ref": "#/$defs/archiveDigests" }
+          }
+        },
+        "approval": { "$ref": "#/$defs/approval" },
+        "protected_job": { "$ref": "#/$defs/protectedJob" },
+        "public_verification": { "$ref": "#/$defs/publicVerification" }
+      }
+    },
+    "publication": {
+      "oneOf": [
+        {
+          "allOf": [
+            { "$ref": "#/$defs/publicationBase" },
+            {
+              "properties": {
+                "state": { "const": "awaiting-approval" },
+                "revision": { "const": 0 },
+                "inspection": { "$ref": "#/$defs/inspectionNotStarted" }
+              },
+              "not": {
+                "anyOf": [
+                  { "required": ["approval"] },
+                  { "required": ["protected_job"] },
+                  { "required": ["public_verification"] }
+                ]
+              }
+            }
+          ],
+          "unevaluatedProperties": false
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/publicationBase" },
+            {
+              "properties": {
+                "state": { "const": "inspection-started" },
+                "revision": { "const": 1 },
+                "inspection": { "$ref": "#/$defs/inspectionInProgress" }
+              },
+              "not": {
+                "anyOf": [
+                  { "required": ["approval"] },
+                  { "required": ["protected_job"] },
+                  { "required": ["public_verification"] }
+                ]
+              }
+            }
+          ],
+          "unevaluatedProperties": false
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/publicationBase" },
+            {
+              "properties": {
+                "state": { "const": "inspection-completed" },
+                "revision": { "const": 2 },
+                "inspection": { "$ref": "#/$defs/inspectionCompleted" }
+              },
+              "not": {
+                "anyOf": [
+                  { "required": ["approval"] },
+                  { "required": ["protected_job"] },
+                  { "required": ["public_verification"] }
+                ]
+              }
+            }
+          ],
+          "unevaluatedProperties": false
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/publicationBase" },
+            {
+              "required": ["approval"],
+              "properties": {
+                "state": { "const": "approved" },
+                "revision": { "const": 3 },
+                "inspection": { "$ref": "#/$defs/inspectionCompleted" }
+              },
+              "not": {
+                "anyOf": [
+                  { "required": ["protected_job"] },
+                  { "required": ["public_verification"] }
+                ]
+              }
+            }
+          ],
+          "unevaluatedProperties": false
+        },
+        {
+          "allOf": [
+            { "$ref": "#/$defs/publicationBase" },
+            {
+              "required": ["approval", "protected_job", "public_verification"],
+              "properties": {
+                "state": { "const": "public-verified" },
+                "revision": { "const": 4 },
+                "inspection": { "$ref": "#/$defs/inspectionCompleted" }
+              }
+            }
+          ],
+          "unevaluatedProperties": false
+        }
+      ]
+    }
+  }
+}

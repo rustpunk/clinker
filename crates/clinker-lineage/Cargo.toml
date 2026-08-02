@@ -6,6 +6,7 @@ license.workspace = true
 description = "OpenLineage column-level lineage emission from compiled Clinker plans"
 
 [dependencies]
+clinker-core-types = { workspace = true }
 clinker-plan = { workspace = true }
 clinker-record = { workspace = true }
 cxl = { workspace = true }
@@ -14,4 +15,3 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-clinker-core-types = { workspace = true }

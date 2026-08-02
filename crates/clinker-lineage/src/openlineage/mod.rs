@@ -9,8 +9,9 @@ mod ndjson;
 
 pub use event::{Dataset, DatasetFacets, EventType, Job, JobFacets, Run, RunEvent, RunFacets};
 pub use facet::{
-    ColumnLineageDatasetFacet, ErrorMessageRunFacet, FieldLineage, InputField, PipelineJobFacet,
-    RunStatsFacet, Transformation, TransformationSubtype, TransformationType,
+    ClinkerFailureRunFacet, ColumnLineageDatasetFacet, ErrorMessageRunFacet, FieldLineage,
+    InputField, PipelineJobFacet, RunStatsFacet, Transformation, TransformationSubtype,
+    TransformationType,
 };
 pub use ndjson::write_ndjson;
 
@@ -38,6 +39,10 @@ pub const CLINKER_PIPELINE_FACET_SCHEMA_URL: &str =
 /// a `FAIL` run event to convey the failure message.
 pub const ERROR_MESSAGE_FACET_SCHEMA_URL: &str =
     "https://openlineage.io/spec/facets/1-0-0/ErrorMessageRunFacet.json";
+
+/// Schema URL for the clinker-owned sanitized failure-classification facet.
+pub const CLINKER_FAILURE_FACET_SCHEMA_URL: &str =
+    "https://github.com/rustpunk/clinker/spec/facets/v1/ClinkerFailureRunFacet.json";
 
 /// Schema URL for the clinker-specific run-statistics run facet (the facet-level
 /// `_schemaURL`). OpenLineage has no standard run-level record-count facet, so —

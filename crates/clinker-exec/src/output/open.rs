@@ -4,12 +4,14 @@
 //! both the non-split sink path (`clinker::main`) and the split file
 //! factory (`executor::build_format_writer`).
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use clinker_plan::config::{ConfigError, IfExistsPolicy};
 use clinker_plan::error::PipelineError;
-use clinker_plan::security::check_overwrite;
+use clinker_plan::security::{check_overwrite, validate_path};
+
+use super::containment::{ContainmentError, OpenDisposition, OutputContainment};
 
 /// Open the next valid output sink given the active collision policy.
 ///
@@ -34,37 +36,35 @@ where
 
     match policy {
         IfExistsPolicy::Overwrite => {
-            let f = File::create(&bare).map_err(PipelineError::Io)?;
+            let f = contained_open(&bare, OpenDisposition::Truncate)?;
             Ok((bare, f))
         }
         IfExistsPolicy::Error => {
             if cli_force {
-                let f = File::create(&bare).map_err(PipelineError::Io)?;
+                let f = contained_open(&bare, OpenDisposition::Truncate)?;
                 return Ok((bare, f));
             }
-            check_overwrite(&bare).map_err(|d| {
-                PipelineError::Config(ConfigError::Validation(format!(
-                    "{}: {}",
-                    d.code, d.message
-                )))
-            })?;
-            let f = File::create(&bare).map_err(PipelineError::Io)?;
-            Ok((bare, f))
+            match contained_open(&bare, OpenDisposition::CreateNew) {
+                Ok(file) => Ok((bare, file)),
+                Err(error) if is_already_exists(&error) => Err(existing_output_error(&bare)),
+                Err(error) => Err(error),
+            }
         }
         IfExistsPolicy::UniqueSuffix => {
-            match create_new(&bare) {
+            match contained_open(&bare, OpenDisposition::CreateNew) {
                 Ok(f) => return Ok((bare, f)),
-                Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => {
-                    return Err(PipelineError::Io(e));
+                Err(e) if !is_already_exists(&e) => {
+                    return Err(e);
                 }
                 Err(_) => {}
             }
+
             for n in 1u64..=u64::MAX {
                 let candidate = path_for_n(Some(n)).map_err(PipelineError::Config)?;
-                match create_new(&candidate) {
+                match contained_open(&candidate, OpenDisposition::CreateNew) {
                     Ok(f) => return Ok((candidate, f)),
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(e) => return Err(PipelineError::Io(e)),
+                    Err(e) if is_already_exists(&e) => continue,
+                    Err(e) => return Err(e),
                 }
             }
             Err(PipelineError::Io(std::io::Error::other(
@@ -90,8 +90,51 @@ pub fn append_suffix_before_ext(path: &Path, suffix: &str) -> PathBuf {
     }
 }
 
-fn create_new(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new().write(true).create_new(true).open(path)
+fn contained_open(path: &Path, disposition: OpenDisposition) -> Result<File, PipelineError> {
+    let base = std::env::current_dir().map_err(PipelineError::Io)?;
+    let validated = validate_path(path, &base, path.is_absolute()).map_err(|diagnostic| {
+        PipelineError::Config(ConfigError::Validation(format!(
+            "{}: {}",
+            diagnostic.code, diagnostic.message
+        )))
+    })?;
+    OutputContainment::for_profile(validated, "detected-filesystem")
+        .and_then(|boundary| boundary.open(disposition))
+        .map_err(containment_error)
+}
+
+fn containment_error(error: ContainmentError) -> PipelineError {
+    match error {
+        ContainmentError::Io {
+            operation,
+            path,
+            source,
+        } => {
+            let kind = source.kind();
+            PipelineError::Io(std::io::Error::new(
+                kind,
+                format!(
+                    "output containment {operation} failed for {}: {source}",
+                    path.display()
+                ),
+            ))
+        }
+        other => PipelineError::Config(ConfigError::Validation(other.to_string())),
+    }
+}
+
+fn is_already_exists(error: &PipelineError) -> bool {
+    matches!(error, PipelineError::Io(source) if source.kind() == std::io::ErrorKind::AlreadyExists)
+}
+
+fn existing_output_error(path: &Path) -> PipelineError {
+    let detail = match check_overwrite(path) {
+        Err(diagnostic) => diagnostic.message,
+        Ok(()) => format!(
+            "output file already exists: {path:?} — use --force or set if_exists: overwrite"
+        ),
+    };
+    PipelineError::Config(ConfigError::Validation(format!("E-SEC-001: {detail}")))
 }
 
 #[cfg(test)]
@@ -125,7 +168,10 @@ mod tests {
         let target = dir.path().join("out.csv");
         touch(&target);
         let result = open_output(IfExistsPolicy::Error, false, |_| Ok(target.clone()));
-        assert!(result.is_err());
+        let error = result.expect_err("existing output must be rejected");
+        let rendered = error.to_string();
+        assert!(rendered.contains("E-SEC-001"));
+        assert!(rendered.contains("use --force or set if_exists: overwrite"));
     }
 
     #[test]

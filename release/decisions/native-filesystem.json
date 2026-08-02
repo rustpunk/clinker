@@ -1,0 +1,31 @@
+{
+  "schema": "clinker.decision/v1",
+  "decision_id": "native-filesystem",
+  "control_id": "local-filesystem-safety",
+  "status": "accepted",
+  "selection": "existing-crates-features",
+  "approver_role_ref": "maintainer:architecture",
+  "evidence_refs": [
+    "docs/engine/src/output-internals.md",
+    "crates/clinker-exec/src/output/containment.rs",
+    "Cargo.lock",
+    "crates/clinker-plan/Cargo.toml",
+    "crates/clinker-exec/Cargo.toml",
+    "crates/clinker-channel/Cargo.toml"
+  ],
+  "recorded_at": "2026-07-29T21:05:17Z",
+  "platform_matrix": {
+    "linux": {
+      "primitive": "nix 0.31.2 with default-features=false and feature fs: openat2 with RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS, or retained-directory-fd openat with O_DIRECTORY|O_NOFOLLOW plus fstatat(AT_SYMLINK_NOFOLLOW); renameat2/renameat for same-filesystem promotion; fsync for file and directory durability; libc 0.2.183 only where the reviewed nix binding is unavailable; std::fs file/OwnedFd handles; fs4 1.1.0 sync FileExt advisory locks",
+      "unavailable_behavior": "policy_required"
+    },
+    "macos": {
+      "primitive": "nix 0.31.2 with default-features=false and feature fs: retained-directory-fd openat with O_DIRECTORY|O_NOFOLLOW plus fstatat(AT_SYMLINK_NOFOLLOW); renameat for same-filesystem promotion; fsync for file and directory durability; libc 0.2.183 only where the reviewed nix binding is unavailable; std::fs file/OwnedFd handles; fs4 1.1.0 sync FileExt advisory locks",
+      "unavailable_behavior": "policy_required"
+    },
+    "windows": {
+      "primitive": "windows-sys 0.61.2 with the reviewed WDK Foundation/FileSystem and Win32 Foundation/Security/Storage/FileSystem/IO features: CreateFileW for the trusted volume root, handle-relative NtCreateFile traversal and leaf opens, GetFileInformationByHandleEx(FileAttributeTagInfo), GetFinalPathNameByHandleW, and CloseHandle; GetVolumeInformationByHandleW plus SetFileInformationByHandle(FileRenameInfo/FileRenameInfoEx) for same-volume publication; FlushFileBuffers for durability; std::fs file/OwnedHandle handles; fs4 1.1.0 sync FileExt advisory locks",
+      "unavailable_behavior": "policy_required"
+    }
+  }
+}

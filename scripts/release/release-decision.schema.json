@@ -1,0 +1,917 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "clinker.decision/v1",
+  "title": "Clinker release decision record",
+  "description": "Normative schema for the eight fail-closed release decisions validated by the locked clinker-release-policy Rust CLI, including exact nested shapes, safe evidence references, time ordering, completion selections, and cross-artifact identity.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "decision_id",
+    "control_id",
+    "status",
+    "selection",
+    "approver_role_ref",
+    "evidence_refs",
+    "recorded_at"
+  ],
+  "properties": {
+    "schema": {
+      "const": "clinker.decision/v1"
+    },
+    "decision_id": {
+      "type": "string"
+    },
+    "control_id": {
+      "type": "string"
+    },
+    "status": {
+      "enum": ["accepted", "rejected", "stopped", "incomplete"]
+    },
+    "selection": {
+      "type": "string",
+      "minLength": 1
+    },
+    "approver_role_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "evidence_refs": {
+      "$ref": "#/$defs/evidenceRefs"
+    },
+    "recorded_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "semantic_identity": {
+      "type": "object"
+    },
+    "platform_matrix": {
+      "type": "object"
+    },
+    "support_matrix": {
+      "type": "object"
+    },
+    "ruleset": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/strictRuleset"
+        },
+        {
+          "$ref": "#/$defs/blockingPolicy"
+        }
+      ]
+    },
+    "environment_policy": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/activeEnvironmentPolicy"
+        },
+        {
+          "$ref": "#/$defs/blockingPolicy"
+        }
+      ]
+    },
+    "publication_policy": {
+      "type": "object"
+    },
+    "candidate_tag": {
+      "$ref": "#/$defs/tag"
+    },
+    "candidate_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source_sha": {
+      "$ref": "#/$defs/sha"
+    },
+    "build_workflow_sha": {
+      "$ref": "#/$defs/sha"
+    },
+    "publish_workflow_ref": {
+      "$ref": "#/$defs/tag"
+    },
+    "publish_workflow_ref_resolved_sha": {
+      "$ref": "#/$defs/sha"
+    },
+    "publish_workflow_sha": {
+      "$ref": "#/$defs/sha"
+    },
+    "candidate_release_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "checksum_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "archive_digests": {
+      "$ref": "#/$defs/archiveDigests"
+    },
+    "ci_run_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "changelog_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "inventory_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "authorized_release_maintainer_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "candidate_authorization_schema": {
+      "const": "clinker.release-candidate-authorization/v1"
+    },
+    "candidate_authorization_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "candidate_authorization_sha256": {
+      "$ref": "#/$defs/digest"
+    },
+    "candidate_tag_creation_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "candidate_tag_readback_ref": {
+      "type": "string",
+      "minLength": 1
+    },
+    "approved_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "authorization_recorded_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "candidate_tag_created_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "finalized_at": {
+      "$ref": "#/$defs/timestamp"
+    },
+    "candidate_evidence_ref": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/semanticIdentityDecision"
+    },
+    {
+      "$ref": "#/$defs/nativeFilesystemDecision"
+    },
+    {
+      "$ref": "#/$defs/remoteShareDecision"
+    },
+    {
+      "$ref": "#/$defs/releaseRulesDecision"
+    },
+    {
+      "$ref": "#/$defs/releaseEnvironmentDecision"
+    },
+    {
+      "$ref": "#/$defs/publicationPolicyDecision"
+    },
+    {
+      "$ref": "#/$defs/releaseCandidateDecision"
+    },
+    {
+      "$ref": "#/$defs/publicationApprovalDecision"
+    }
+  ],
+  "$defs": {
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{40}$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F]{64}$"
+    },
+    "tag": {
+      "type": "string",
+      "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "evidenceRefs": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "archiveDigests": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "x86_64-unknown-linux-gnu",
+        "x86_64-pc-windows-msvc",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin"
+      ],
+      "properties": {
+        "x86_64-unknown-linux-gnu": {
+          "$ref": "#/$defs/digest"
+        },
+        "x86_64-pc-windows-msvc": {
+          "$ref": "#/$defs/digest"
+        },
+        "x86_64-apple-darwin": {
+          "$ref": "#/$defs/digest"
+        },
+        "aarch64-apple-darwin": {
+          "$ref": "#/$defs/digest"
+        }
+      }
+    },
+    "blockingPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["blocking_reason"],
+      "properties": {
+        "blocking_reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "actorRefs": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "appBoundCheck": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["context", "app_ref"],
+      "properties": {
+        "context": {
+          "type": "string",
+          "minLength": 1
+        },
+        "app_ref": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "strictRuleset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["main_rule", "tag_rule", "actions_policy", "release_policy"],
+      "properties": {
+        "main_rule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "branch",
+            "enforcement",
+            "required_status_checks",
+            "strict_status_checks",
+            "required_approving_review_count",
+            "codeowner_review_required",
+            "latest_push_approval_required",
+            "conversation_resolution_required",
+            "linear_history_required",
+            "allowed_merge_methods",
+            "update_branch_enabled",
+            "bypass_actor_refs",
+            "generic_admin_bypass"
+          ],
+          "properties": {
+            "branch": {
+              "const": "main"
+            },
+            "enforcement": {
+              "const": "active"
+            },
+            "required_status_checks": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/appBoundCheck"
+              }
+            },
+            "strict_status_checks": {
+              "const": true
+            },
+            "required_approving_review_count": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "codeowner_review_required": {
+              "const": true
+            },
+            "latest_push_approval_required": {
+              "const": true
+            },
+            "conversation_resolution_required": {
+              "const": true
+            },
+            "linear_history_required": {
+              "const": true
+            },
+            "allowed_merge_methods": {
+              "const": ["squash"]
+            },
+            "update_branch_enabled": {
+              "const": true
+            },
+            "bypass_actor_refs": {
+              "$ref": "#/$defs/actorRefs"
+            },
+            "generic_admin_bypass": {
+              "const": false
+            }
+          }
+        },
+        "tag_rule": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tag_pattern",
+            "enforcement",
+            "creation_actor_refs",
+            "update_allowed",
+            "deletion_allowed",
+            "generic_admin_bypass"
+          ],
+          "properties": {
+            "tag_pattern": {
+              "const": "v<semver>"
+            },
+            "enforcement": {
+              "const": "active"
+            },
+            "creation_actor_refs": {
+              "$ref": "#/$defs/actorRefs"
+            },
+            "update_allowed": {
+              "const": false
+            },
+            "deletion_allowed": {
+              "const": false
+            },
+            "generic_admin_bypass": {
+              "const": false
+            }
+          }
+        },
+        "actions_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "full_sha_pinning_required",
+            "workflow_codeowner_review_required"
+          ],
+          "properties": {
+            "full_sha_pinning_required": {
+              "const": true
+            },
+            "workflow_codeowner_review_required": {
+              "const": true
+            }
+          }
+        },
+        "release_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["immutable_releases_required", "mismatch_recovery"],
+          "properties": {
+            "immutable_releases_required": {
+              "const": true
+            },
+            "mismatch_recovery": {
+              "const": "new-version-only"
+            }
+          }
+        }
+      }
+    },
+    "inspectionContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required_fields", "exact_run_candidate_required", "actor_rule"],
+      "properties": {
+        "required_fields": {
+          "const": [
+            "run_id",
+            "job_id",
+            "environment",
+            "candidate_tag",
+            "inspector_actor_ref",
+            "inspection_started_at",
+            "inspection_completed_at",
+            "inspection_evidence_ref"
+          ]
+        },
+        "exact_run_candidate_required": {
+          "const": true
+        },
+        "actor_rule": {
+          "const": "eligible-maintainer"
+        }
+      }
+    },
+    "approvalContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["required_fields", "exact_run_candidate_required", "actor_rule"],
+      "properties": {
+        "required_fields": {
+          "const": [
+            "run_id",
+            "job_id",
+            "environment",
+            "candidate_tag",
+            "approver_actor_ref",
+            "approved_at",
+            "approval_receipt_ref",
+            "approval_kind",
+            "automated_approval"
+          ]
+        },
+        "exact_run_candidate_required": {
+          "const": true
+        },
+        "actor_rule": {
+          "enum": [
+            "eligible-maintainer-distinct-from-trigger",
+            "configured-maintainer"
+          ]
+        }
+      }
+    },
+    "activeEnvironmentPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approval_mode",
+        "environment",
+        "workflow",
+        "job",
+        "approval_kind",
+        "automated_approval",
+        "generic_admin_bypass",
+        "prevent_self_review",
+        "maintainer_actor_refs",
+        "trigger_actor_ref",
+        "deployment_restriction",
+        "concurrency",
+        "inspection_contract",
+        "approval_contract",
+        "ordering_contract",
+        "draft_policy"
+      ],
+      "properties": {
+        "approval_mode": {
+          "enum": [
+            "two-person-non-self",
+            "single-maintainer-inspect-then-approve"
+          ]
+        },
+        "environment": {
+          "const": "release"
+        },
+        "workflow": {
+          "const": ".github/workflows/publish-release.yml"
+        },
+        "job": {
+          "const": "publish-approved-release"
+        },
+        "approval_kind": {
+          "const": "manual"
+        },
+        "automated_approval": {
+          "const": false
+        },
+        "generic_admin_bypass": {
+          "const": false
+        },
+        "prevent_self_review": {
+          "type": "boolean"
+        },
+        "maintainer_actor_refs": {
+          "$ref": "#/$defs/actorRefs"
+        },
+        "trigger_actor_ref": {
+          "type": "string",
+          "minLength": 1
+        },
+        "deployment_restriction": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ref_type", "tag_pattern", "branches_allowed"],
+          "properties": {
+            "ref_type": {
+              "const": "tag"
+            },
+            "tag_pattern": {
+              "const": "v<semver>"
+            },
+            "branches_allowed": {
+              "const": false
+            }
+          }
+        },
+        "concurrency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["scope", "max_in_progress", "redispatch_allowed"],
+          "properties": {
+            "scope": {
+              "const": "candidate-tag"
+            },
+            "max_in_progress": {
+              "const": 1
+            },
+            "redispatch_allowed": {
+              "const": false
+            }
+          }
+        },
+        "inspection_contract": {
+          "$ref": "#/$defs/inspectionContract"
+        },
+        "approval_contract": {
+          "$ref": "#/$defs/approvalContract"
+        },
+        "ordering_contract": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "shared_identity_fields",
+            "timestamp_order",
+            "strictly_increasing"
+          ],
+          "properties": {
+            "shared_identity_fields": {
+              "const": ["run_id", "job_id", "environment", "candidate_tag"]
+            },
+            "timestamp_order": {
+              "const": [
+                "inspection_started_at",
+                "inspection_completed_at",
+                "approved_at"
+              ]
+            },
+            "strictly_increasing": {
+              "const": true
+            }
+          }
+        },
+        "draft_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "exact_final_reread_required",
+            "byte_identical_partial_reconciliation_only",
+            "already_published_exact_match_behavior",
+            "mismatch_recovery"
+          ],
+          "properties": {
+            "exact_final_reread_required": {
+              "const": true
+            },
+            "byte_identical_partial_reconciliation_only": {
+              "const": true
+            },
+            "already_published_exact_match_behavior": {
+              "const": "verification-only"
+            },
+            "mismatch_recovery": {
+              "const": "new-version-only"
+            }
+          }
+        },
+        "two_person_unavailable_reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "approval_mode": {
+                "const": "two-person-non-self"
+              }
+            },
+            "required": ["approval_mode"]
+          },
+          "then": {
+            "properties": {
+              "prevent_self_review": {
+                "const": true
+              },
+              "maintainer_actor_refs": {
+                "minItems": 2
+              },
+              "approval_contract": {
+                "properties": {
+                  "actor_rule": {
+                    "const": "eligible-maintainer-distinct-from-trigger"
+                  }
+                }
+              }
+            },
+            "not": {
+              "required": ["two_person_unavailable_reason"]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "approval_mode": {
+                "const": "single-maintainer-inspect-then-approve"
+              }
+            },
+            "required": ["approval_mode"]
+          },
+          "then": {
+            "required": ["two_person_unavailable_reason"],
+            "properties": {
+              "prevent_self_review": {
+                "const": false
+              },
+              "maintainer_actor_refs": {
+                "minItems": 1,
+                "maxItems": 1
+              },
+              "approval_contract": {
+                "properties": {
+                  "actor_rule": {
+                    "const": "configured-maintainer"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "semanticIdentityDecision": {
+      "properties": {
+        "decision_id": {
+          "const": "semantic-identity"
+        },
+        "control_id": {
+          "const": "identity-binding"
+        },
+        "selection": {
+          "enum": ["shared-primitive-now", "defer-shared-primitive"]
+        }
+      },
+      "required": ["semantic_identity"]
+    },
+    "nativeFilesystemDecision": {
+      "properties": {
+        "decision_id": {
+          "const": "native-filesystem"
+        },
+        "control_id": {
+          "const": "local-filesystem-safety"
+        },
+        "selection": {
+          "enum": ["existing-crates-features", "direct-platform-api"]
+        }
+      },
+      "required": ["platform_matrix"]
+    },
+    "remoteShareDecision": {
+      "properties": {
+        "decision_id": {
+          "const": "remote-share"
+        },
+        "control_id": {
+          "const": "remote-filesystem-safety"
+        },
+        "selection": {
+          "enum": ["evidenced-matrix", "no-positive-remote-support"]
+        }
+      },
+      "required": ["support_matrix"]
+    },
+    "releaseRulesDecision": {
+      "properties": {
+        "decision_id": {
+          "const": "release-rules"
+        },
+        "control_id": {
+          "const": "release-configuration"
+        },
+        "selection": {
+          "enum": ["strict-ruleset", "stop-incomplete"]
+        }
+      },
+      "required": ["ruleset"],
+      "oneOf": [
+        {
+          "properties": {
+            "status": {
+              "const": "accepted"
+            },
+            "selection": {
+              "const": "strict-ruleset"
+            },
+            "ruleset": {
+              "$ref": "#/$defs/strictRuleset"
+            }
+          }
+        },
+        {
+          "properties": {
+            "status": {
+              "enum": ["rejected", "stopped", "incomplete"]
+            },
+            "selection": {
+              "const": "stop-incomplete"
+            },
+            "ruleset": {
+              "$ref": "#/$defs/blockingPolicy"
+            }
+          }
+        }
+      ]
+    },
+    "releaseEnvironmentDecision": {
+      "properties": {
+        "decision_id": {
+          "const": "release-environment"
+        },
+        "control_id": {
+          "const": "release-environment"
+        },
+        "selection": {
+          "enum": [
+            "two-person-non-self",
+            "single-maintainer-inspect-then-approve",
+            "stop-incomplete"
+          ]
+        }
+      },
+      "required": ["environment_policy"],
+      "oneOf": [
+        {
+          "properties": {
+            "status": {
+              "const": "accepted"
+            },
+            "selection": {
+              "const": "two-person-non-self"
+            },
+            "environment_policy": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/activeEnvironmentPolicy"
+                },
+                {
+                  "properties": {
+                    "approval_mode": {
+                      "const": "two-person-non-self"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "status": {
+              "const": "accepted"
+            },
+            "selection": {
+              "const": "single-maintainer-inspect-then-approve"
+            },
+            "environment_policy": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/activeEnvironmentPolicy"
+                },
+                {
+                  "properties": {
+                    "approval_mode": {
+                      "const": "single-maintainer-inspect-then-approve"
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "status": {
+              "enum": ["rejected", "stopped", "incomplete"]
+            },
+            "selection": {
+              "const": "stop-incomplete"
+            },
+            "environment_policy": {
+              "$ref": "#/$defs/blockingPolicy"
+            }
+          }
+        }
+      ]
+    },
+    "publicationPolicyDecision": {
+      "properties": {
+        "decision_id": {
+          "const": "publication-policy"
+        },
+        "control_id": {
+          "const": "publication-policy"
+        },
+        "selection": {
+          "enum": ["live-gate-required", "stop-incomplete"]
+        }
+      },
+      "required": ["publication_policy"]
+    },
+    "releaseCandidateDecision": {
+      "properties": {
+        "decision_id": {
+          "const": "release-candidate"
+        },
+        "control_id": {
+          "const": "candidate-verification"
+        },
+        "selection": {
+          "enum": ["approve-exact-candidate", "stop-without-completion"]
+        }
+      },
+      "required": [
+        "candidate_tag",
+        "candidate_version",
+        "source_sha",
+        "build_workflow_sha",
+        "publish_workflow_ref",
+        "publish_workflow_ref_resolved_sha",
+        "publish_workflow_sha",
+        "candidate_release_id",
+        "checksum_sha256",
+        "archive_digests",
+        "ci_run_ref",
+        "changelog_ref",
+        "inventory_ref",
+        "authorized_release_maintainer_ref",
+        "candidate_authorization_schema",
+        "candidate_authorization_ref",
+        "candidate_authorization_sha256",
+        "candidate_tag_creation_ref",
+        "candidate_tag_readback_ref",
+        "approved_at",
+        "authorization_recorded_at",
+        "candidate_tag_created_at",
+        "finalized_at"
+      ]
+    },
+    "publicationApprovalDecision": {
+      "properties": {
+        "decision_id": {
+          "const": "publication-approval"
+        },
+        "control_id": {
+          "const": "publication-approval"
+        },
+        "selection": {
+          "enum": ["approve-exact-candidate", "stop-without-completion"]
+        }
+      },
+      "required": [
+        "candidate_tag",
+        "candidate_version",
+        "source_sha",
+        "build_workflow_sha",
+        "publish_workflow_ref",
+        "publish_workflow_ref_resolved_sha",
+        "publish_workflow_sha",
+        "candidate_release_id",
+        "checksum_sha256",
+        "archive_digests",
+        "ci_run_ref",
+        "changelog_ref",
+        "inventory_ref",
+        "authorized_release_maintainer_ref",
+        "candidate_authorization_sha256",
+        "candidate_evidence_ref"
+      ]
+    }
+  }
+}

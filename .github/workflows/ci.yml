@@ -19,11 +19,87 @@ env:
   # pressure source on the multi-build check job below.
   CARGO_INCREMENTAL: "0"
 
+permissions: {}
+
 jobs:
+  dependency-policy:
+    name: Dependency policy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.91"
+          components: clippy, rustfmt
+
+      - name: Fetch locked boundary dependencies
+        run: cargo fetch --manifest-path tools/dependency-policy/Cargo.toml --locked
+
+      - name: Format the detached boundary tool
+        run: cargo fmt --manifest-path tools/dependency-policy/Cargo.toml --all -- --check
+
+      - name: Lint the detached boundary tool
+        run: >-
+          cargo clippy --manifest-path tools/dependency-policy/Cargo.toml
+          --all-targets --locked --offline -- -D warnings
+
+      - name: Exercise the boundary regression suite
+        run: cargo test --manifest-path tools/dependency-policy/Cargo.toml --locked --offline
+
+      - name: Enforce the final repository boundary
+        run: >-
+          cargo run --manifest-path tools/dependency-policy/Cargo.toml
+          --locked --offline -- --scope final --root .
+
+  release-policy:
+    name: Release policy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.91"
+          components: clippy, rustfmt
+
+      - name: Fetch locked policy dependencies
+        run: |
+          cargo fetch --manifest-path tools/dependency-policy/Cargo.toml --locked
+          cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked
+
+      - name: Format the detached policy gate
+        run: cargo fmt --manifest-path tools/release-policy/Cargo.toml --all -- --check
+
+      - name: Lint the detached policy gate
+        run: >-
+          cargo clippy --manifest-path tools/release-policy/Cargo.toml
+          --all-targets --locked --offline -- -D warnings
+
+      - name: Exercise the detached policy gate
+        run: cargo test --manifest-path tools/release-policy/Cargo.toml --locked --offline
+
+      - name: Verify repository workflow trust
+        run: >-
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml
+          --locked --offline -- workflow verify
+
   check:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Reclaim ~25-30 GB of preinstalled SDKs the Rust build never touches.
       # This job compiles the whole workspace several times over (two clippy
@@ -34,12 +110,15 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: "1.91"
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Check AI documentation
+        run: bash scripts/check-ai-docs.sh
 
       - run: cargo fmt --all --check
       # Two clippy passes. The first omits --all-targets on purpose: with
@@ -98,22 +177,34 @@ jobs:
   # modules — including the de-gated RSS-validity assertions — actually run.
   test-windows:
     runs-on: windows-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: "1.91"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo test --workspace
 
   test-macos:
     runs-on: macos-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check AI documentation portability
+        run: |
+          bash scripts/check-ai-docs.sh --self-test
+          bash scripts/check-ai-docs.sh
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: "1.91"
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo test --workspace
 
   # Type-check the non-Linux targets from the ubuntu host. `--all-targets`
@@ -125,15 +216,19 @@ jobs:
   # lacks, so their non-Linux coverage comes from the native runners above.
   cross-platform:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: "1.91"
           targets: x86_64-pc-windows-msvc, aarch64-apple-darwin
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - run: >-
           cargo check --all-targets --target x86_64-pc-windows-msvc
@@ -144,8 +239,72 @@ jobs:
           -p clinker-exec -p clinker-plan -p clinker-schema
           -p clinker-channel -p cxl-cli -p clinker-lineage
 
+  # Positive remote-publication evidence is limited to these disposable,
+  # self-provisioned Linux loopback profiles. A missing package, mount,
+  # observation, semantic result, or teardown fails its cell and leaves the
+  # uploaded evidence explicitly ineligible for a support claim.
+  filesystem-matrix:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        profile:
+          - linux-nfsv4.1-loopback-ci
+          - linux-smb3.1.1-loopback-ci
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.91"
+
+      - name: Fetch locked policy dependencies
+        run: cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked
+
+      - name: Validate filesystem matrix contract
+        run: >-
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml
+          --locked --offline -- filesystem self-test
+
+      - name: Provision and exercise exact remote profile
+        env:
+          EVIDENCE_PATH: ${{ runner.temp }}/filesystem-${{ matrix.profile }}.json
+        run: >-
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml
+          --locked --offline -- filesystem provision-and-run
+          --profile "${{ matrix.profile }}"
+          --evidence "${EVIDENCE_PATH}"
+
+      - name: Unconditionally teardown exact remote profile
+        if: always()
+        env:
+          EVIDENCE_PATH: ${{ runner.temp }}/filesystem-${{ matrix.profile }}.json
+        run: >-
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml
+          --locked --offline -- filesystem teardown
+          --profile "${{ matrix.profile }}"
+          --evidence "${EVIDENCE_PATH}"
+
+      - name: Upload profile evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: filesystem-${{ matrix.profile }}-evidence
+          path: ${{ runner.temp }}/filesystem-${{ matrix.profile }}*
+          if-no-files-found: error
+          retention-days: 14
+
   deny:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1

@@ -4,6 +4,80 @@ Output nodes are the terminal sinks of a pipeline. When the planner certifies a 
 
 *User-facing view: the User Guide's "Output Nodes" page.*
 
+## Use-time filesystem containment
+
+Plan-time path validation produces a `ValidatedPath`, but that proof alone is
+not durable: an ancestor can be replaced after validation and before the
+operating system opens the output. Output creation therefore passes through a
+second, use-time boundary in `clinker-exec`:
+
+1. Resolve the runtime policy before opening the leaf. Normal output opens use
+   the filesystem observed from the retained parent handle; explicit profile
+   names exist only for the qualification harness and must match that
+   observation.
+2. Walk the destination ancestors without following symbolic links or reparse
+   points and retain the destination-parent handle.
+3. Create the final leaf relative to that handle with owner-only Unix mode and
+   no-follow semantics. A replaced ancestor or linked leaf returns
+   `security_policy`.
+4. Open a promotion source through an independently anchored parent, compare
+   filesystem/volume identity, synchronize the complete source, and rename it
+   relative to the two handles.
+5. Synchronize the destination directory after rename. Cross-filesystem
+   promotion is refused; it never degrades to copying through a visible final
+   path.
+
+Linux uses the locked `nix` filesystem bindings for `openat`, `renameat` /
+`renameat2`, `fstatfs`, and directory synchronization. macOS uses the matching
+`libc` `openat`, `fstat`, `fstatfs`, and `renameat` primitives. Windows opens
+the drive root with reparse-point-aware `CreateFileW`, then walks every
+descendant and opens every leaf relative to the retained handle with
+`NtCreateFile`. It inspects each handle, compares volume identity, and promotes
+relative to the retained destination handle with `SetFileInformationByHandle`.
+The logical `ValidatedPath` remains required at the public containment boundary
+on every platform.
+
+### Remote filesystem qualification
+
+Normal CLI output is admitted from the filesystem type observed through the
+retained parent handle, including NFS and SMB shares. The profile strings below
+are qualification labels, not pipeline settings and not runtime admission
+tokens:
+
+- `linux-nfsv4.1-loopback-ci`: a disposable GitHub-hosted `ubuntu-24.04` VM,
+  Linux kernel NFS client/server, NFSv4.1 over TCP, a hard mount, and remote
+  locking without a local-only lock mode.
+- `linux-smb3.1.1-loopback-ci`: the same runner class, Linux kernel CIFS client,
+  Samba server, SMB3.1.1, `cache=strict`, remote byte-range locking without
+  `nobrl`, and strict synchronization without `nostrictsync`. The loopback
+  client disables only client-side permission checks with `noperm`; Samba still
+  authorizes I/O as the configured guest identity.
+
+The dedicated CI matrix provisions each server and mount inside its runner,
+executes confinement, lock exclusion, synchronized promotion/visibility,
+cancellation, cross-filesystem refusal, and cleanup-liveness checks, and tears
+the environment down on every exit. Its per-profile artifact records the
+runner image and kernel, exact client/server package versions, effective mount
+options, negotiated protocol observations, lock behavior, synchronization and
+failure-injection results, and teardown status.
+
+A profile is support-eligible only when that exact cell writes `status: passed`,
+`support_eligible: true`, and successful teardown evidence. Missing packages or
+administrative capability, mount/provision failure, incomplete observations, a
+semantic failure, or cleanup failure leaves `status: incomplete` and cannot be
+interpreted as support. These loopback results do not certify a corporate
+share, vendor NAS device, Windows/macOS client, clustered server, or different
+server/mount configuration. They prove the implementation against controlled
+representatives. Operators of other shares must validate their server and mount
+semantics; runtime detection does not turn CI evidence into a vendor support
+claim.
+
+Executor spill should remain on local storage for predictable bounded-memory
+performance. Local working data is distinct from destination quarantine:
+completed bytes still need to be streamed into a destination-local hidden file,
+synchronized there, and promoted on that same share. A local working copy
+reduces random network I/O; it cannot make a cross-filesystem rename atomic.
+
 ## Streaming vs. buffered
 
 When a single Output sits directly downstream of an eligible linear producer, a bounded crossbeam channel connects the producer arm to the writer thread, and `Writer::write_record` fires **per record** as the producer emits. For a `Merge.interleave` whose direct predecessors are exclusively owned Sources, this combines with Source-to-Merge receiver fusion to form an end-to-end live path. Each Source must have exactly one outgoing edge, targeting that Merge; sharing any predecessor rejects receiver fusion for the whole Merge.

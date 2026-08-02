@@ -14,7 +14,10 @@
 //!
 //! Finiteness is a HARD reader property: the REST transport caps its pull
 //! with an explicit `max_pages`/`max_records` ceiling so an unbounded
-//! endpoint cannot silently violate the finite-inputs pillar.
+//! endpoint cannot silently violate the finite-inputs pillar. Server-directed
+//! continuations and redirects are resolved against the effective response URL
+//! and admitted under exact normalized-origin policy before another request is
+//! constructed; an offered continuation beyond the page bound fails closed.
 
 mod rest;
 

@@ -22,16 +22,17 @@ on:
         required: true
         default: "7"
 
-permissions:
-  issues: write
-  pull-requests: read
+permissions: {}
 
 jobs:
   remind:
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: read
     steps:
       - name: Comment on stale Agent Running / PR Open items
-        uses: actions/github-script@v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           github-token: ${{ secrets.PROJECT_TOKEN || github.token }}
           script: |

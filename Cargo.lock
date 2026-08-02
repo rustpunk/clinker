@@ -547,6 +547,7 @@ dependencies = [
  "libc",
  "lz4_flex",
  "miette",
+ "nix",
  "num_cpus",
  "petgraph",
  "postcard",
@@ -602,6 +603,7 @@ name = "clinker-net"
 version = "0.1.0"
 dependencies = [
  "clinker-bench-support",
+ "clinker-core-types",
  "clinker-exec",
  "clinker-format",
  "clinker-plan",

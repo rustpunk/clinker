@@ -1,0 +1,490 @@
+{
+  "schema": "clinker.accepted-record-set-fixture/v1",
+  "records": [
+    {
+      "schema": "clinker.decision/v1",
+      "decision_id": "semantic-identity",
+      "control_id": "identity-binding",
+      "status": "accepted",
+      "selection": "shared-primitive-now",
+      "approver_role_ref": "maintainer:release",
+      "evidence_refs": [
+        "target/release-policy/decision-evidence.json"
+      ],
+      "recorded_at": "2026-07-29T15:10:00Z",
+      "semantic_identity": {
+        "owner_crate": "clinker-plan",
+        "pipeline_hash_substitution_forbidden": true
+      }
+    },
+    {
+      "schema": "clinker.decision/v1",
+      "decision_id": "native-filesystem",
+      "control_id": "local-filesystem-safety",
+      "status": "accepted",
+      "selection": "existing-crates-features",
+      "approver_role_ref": "maintainer:release",
+      "evidence_refs": [
+        "target/release-policy/decision-evidence.json"
+      ],
+      "recorded_at": "2026-07-29T15:10:00Z",
+      "platform_matrix": {
+        "linux": {
+          "primitive": "openat2",
+          "unavailable_behavior": "policy_required"
+        },
+        "macos": {
+          "primitive": "openat-no-follow",
+          "unavailable_behavior": "policy_required"
+        },
+        "windows": {
+          "primitive": "nt-create-file",
+          "unavailable_behavior": "policy_required"
+        }
+      }
+    },
+    {
+      "schema": "clinker.decision/v1",
+      "decision_id": "remote-share",
+      "control_id": "remote-filesystem-safety",
+      "status": "accepted",
+      "selection": "evidenced-matrix",
+      "approver_role_ref": "maintainer:release",
+      "evidence_refs": [
+        "target/release-policy/decision-evidence.json"
+      ],
+      "recorded_at": "2026-07-29T15:10:00Z",
+      "support_matrix": {
+        "policy": "evidenced-matrix",
+        "combinations": [
+          "linux:nfs",
+          "windows:smb"
+        ],
+        "unlisted_behavior": "policy_required"
+      }
+    },
+    {
+      "schema": "clinker.decision/v1",
+      "decision_id": "release-rules",
+      "control_id": "release-configuration",
+      "status": "accepted",
+      "selection": "strict-ruleset",
+      "approver_role_ref": "maintainer:release",
+      "evidence_refs": [
+        "target/release-policy/decision-evidence.json"
+      ],
+      "recorded_at": "2026-07-29T15:10:00Z",
+      "ruleset": {
+        "main_rule": {
+          "branch": "main",
+          "enforcement": "active",
+          "required_status_checks": [
+            {
+              "context": "CI",
+              "app_ref": "app:github-actions"
+            },
+            {
+              "context": "Security",
+              "app_ref": "app:github-actions"
+            }
+          ],
+          "strict_status_checks": true,
+          "required_approving_review_count": 1,
+          "codeowner_review_required": true,
+          "latest_push_approval_required": true,
+          "conversation_resolution_required": true,
+          "linear_history_required": true,
+          "allowed_merge_methods": [
+            "squash"
+          ],
+          "update_branch_enabled": true,
+          "bypass_actor_refs": [
+            "team:release-maintainers"
+          ],
+          "generic_admin_bypass": false
+        },
+        "tag_rule": {
+          "tag_pattern": "v<semver>",
+          "enforcement": "active",
+          "creation_actor_refs": [
+            "team:release-maintainers"
+          ],
+          "update_allowed": false,
+          "deletion_allowed": false,
+          "generic_admin_bypass": false
+        },
+        "actions_policy": {
+          "full_sha_pinning_required": true,
+          "workflow_codeowner_review_required": true
+        },
+        "release_policy": {
+          "immutable_releases_required": true,
+          "mismatch_recovery": "new-version-only"
+        }
+      }
+    },
+    {
+      "schema": "clinker.decision/v1",
+      "decision_id": "release-environment",
+      "control_id": "release-environment",
+      "status": "accepted",
+      "selection": "two-person-non-self",
+      "approver_role_ref": "maintainer:release",
+      "evidence_refs": [
+        "target/release-policy/decision-evidence.json"
+      ],
+      "recorded_at": "2026-07-29T15:10:00Z",
+      "environment_policy": {
+        "approval_mode": "two-person-non-self",
+        "environment": "release",
+        "workflow": ".github/workflows/publish-release.yml",
+        "job": "publish-approved-release",
+        "approval_kind": "manual",
+        "automated_approval": false,
+        "generic_admin_bypass": false,
+        "prevent_self_review": true,
+        "maintainer_actor_refs": [
+          "maintainer:release",
+          "maintainer:inspector"
+        ],
+        "trigger_actor_ref": "maintainer:trigger",
+        "deployment_restriction": {
+          "ref_type": "tag",
+          "tag_pattern": "v<semver>",
+          "branches_allowed": false
+        },
+        "concurrency": {
+          "scope": "candidate-tag",
+          "max_in_progress": 1,
+          "redispatch_allowed": false
+        },
+        "inspection_contract": {
+          "required_fields": [
+            "run_id",
+            "job_id",
+            "environment",
+            "candidate_tag",
+            "inspector_actor_ref",
+            "inspection_started_at",
+            "inspection_completed_at",
+            "inspection_evidence_ref"
+          ],
+          "exact_run_candidate_required": true,
+          "actor_rule": "eligible-maintainer"
+        },
+        "approval_contract": {
+          "required_fields": [
+            "run_id",
+            "job_id",
+            "environment",
+            "candidate_tag",
+            "approver_actor_ref",
+            "approved_at",
+            "approval_receipt_ref",
+            "approval_kind",
+            "automated_approval"
+          ],
+          "exact_run_candidate_required": true,
+          "actor_rule": "eligible-maintainer-distinct-from-trigger"
+        },
+        "ordering_contract": {
+          "shared_identity_fields": [
+            "run_id",
+            "job_id",
+            "environment",
+            "candidate_tag"
+          ],
+          "timestamp_order": [
+            "inspection_started_at",
+            "inspection_completed_at",
+            "approved_at"
+          ],
+          "strictly_increasing": true
+        },
+        "draft_policy": {
+          "exact_final_reread_required": true,
+          "byte_identical_partial_reconciliation_only": true,
+          "already_published_exact_match_behavior": "verification-only",
+          "mismatch_recovery": "new-version-only"
+        }
+      }
+    },
+    {
+      "schema": "clinker.decision/v1",
+      "decision_id": "publication-policy",
+      "control_id": "publication-policy",
+      "status": "accepted",
+      "selection": "live-gate-required",
+      "approver_role_ref": "maintainer:release",
+      "evidence_refs": [
+        "target/release-policy/decision-evidence.json"
+      ],
+      "recorded_at": "2026-07-29T15:10:00Z",
+      "publication_policy": {
+        "required_path": [
+          "release-candidate",
+          "candidate-readback",
+          "publication-approval",
+          "public-release-readback"
+        ],
+        "immutable_publication": true,
+        "repair_in_place_forbidden": true
+      }
+    },
+    {
+      "schema": "clinker.decision/v1",
+      "decision_id": "release-candidate",
+      "control_id": "candidate-verification",
+      "status": "accepted",
+      "selection": "approve-exact-candidate",
+      "approver_role_ref": "maintainer:release",
+      "evidence_refs": [
+        "target/release-policy/decision-evidence.json"
+      ],
+      "recorded_at": "2026-07-29T15:10:00Z",
+      "candidate_tag": "v3.0.0",
+      "candidate_version": "3.0.0",
+      "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "build_workflow_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "publish_workflow_ref": "v3.0.0",
+      "publish_workflow_ref_resolved_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "publish_workflow_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "candidate_release_id": "release-300",
+      "checksum_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "archive_digests": {
+        "aarch64-apple-darwin": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "x86_64-apple-darwin": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "x86_64-pc-windows-msvc": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "x86_64-unknown-linux-gnu": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "ci_run_ref": "https://github.com/rustpunk/clinker/actions/runs/300",
+      "changelog_ref": "CHANGELOG.md#300",
+      "inventory_ref": "release/inventory.toml",
+      "authorized_release_maintainer_ref": "maintainer:release",
+      "candidate_authorization_schema": "clinker.release-candidate-authorization/v1",
+      "candidate_authorization_ref": "release/decisions/release-candidate-authorization.json",
+      "candidate_authorization_sha256": "f235dd6285bcdca002d0736e2b3d6e0494ad3f6d8ca3a6fbdbf947ea0ec88aa5",
+      "candidate_tag_creation_ref": "https://api.github.com/repos/rustpunk/clinker/git/refs/tags/v3.0.0",
+      "candidate_tag_readback_ref": "https://api.github.com/repos/rustpunk/clinker/git/ref/tags/v3.0.0",
+      "approved_at": "2026-07-29T15:01:00Z",
+      "authorization_recorded_at": "2026-07-29T15:02:00Z",
+      "candidate_tag_created_at": "2026-07-29T15:03:00Z",
+      "finalized_at": "2026-07-29T15:10:00Z"
+    },
+    {
+      "schema": "clinker.decision/v1",
+      "decision_id": "publication-approval",
+      "control_id": "publication-approval",
+      "status": "accepted",
+      "selection": "approve-exact-candidate",
+      "approver_role_ref": "maintainer:release",
+      "evidence_refs": [
+        "target/release-policy/decision-evidence.json"
+      ],
+      "recorded_at": "2026-07-29T15:10:00Z",
+      "candidate_tag": "v3.0.0",
+      "candidate_version": "3.0.0",
+      "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "build_workflow_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "publish_workflow_ref": "v3.0.0",
+      "publish_workflow_ref_resolved_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "publish_workflow_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "candidate_release_id": "release-300",
+      "checksum_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "archive_digests": {
+        "aarch64-apple-darwin": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "x86_64-apple-darwin": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "x86_64-pc-windows-msvc": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "x86_64-unknown-linux-gnu": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "ci_run_ref": "https://github.com/rustpunk/clinker/actions/runs/300",
+      "changelog_ref": "CHANGELOG.md#300",
+      "inventory_ref": "release/inventory.toml",
+      "authorized_release_maintainer_ref": "maintainer:release",
+      "candidate_authorization_sha256": "f235dd6285bcdca002d0736e2b3d6e0494ad3f6d8ca3a6fbdbf947ea0ec88aa5",
+      "candidate_evidence_ref": "target/release-policy/candidate-evidence.json"
+    }
+  ],
+  "single_maintainer_environment_record": {
+    "schema": "clinker.decision/v1",
+    "decision_id": "release-environment",
+    "control_id": "release-environment",
+    "status": "accepted",
+    "selection": "single-maintainer-inspect-then-approve",
+    "approver_role_ref": "maintainer:release",
+    "evidence_refs": [
+      "target/release-policy/decision-evidence.json"
+    ],
+    "recorded_at": "2026-07-29T15:10:00Z",
+    "environment_policy": {
+      "approval_mode": "single-maintainer-inspect-then-approve",
+      "environment": "release",
+      "workflow": ".github/workflows/publish-release.yml",
+      "job": "publish-approved-release",
+      "approval_kind": "manual",
+      "automated_approval": false,
+      "generic_admin_bypass": false,
+      "prevent_self_review": false,
+      "maintainer_actor_refs": [
+        "maintainer:release"
+      ],
+      "trigger_actor_ref": "maintainer:trigger",
+      "deployment_restriction": {
+        "ref_type": "tag",
+        "tag_pattern": "v<semver>",
+        "branches_allowed": false
+      },
+      "concurrency": {
+        "scope": "candidate-tag",
+        "max_in_progress": 1,
+        "redispatch_allowed": false
+      },
+      "inspection_contract": {
+        "required_fields": [
+          "run_id",
+          "job_id",
+          "environment",
+          "candidate_tag",
+          "inspector_actor_ref",
+          "inspection_started_at",
+          "inspection_completed_at",
+          "inspection_evidence_ref"
+        ],
+        "exact_run_candidate_required": true,
+        "actor_rule": "eligible-maintainer"
+      },
+      "approval_contract": {
+        "required_fields": [
+          "run_id",
+          "job_id",
+          "environment",
+          "candidate_tag",
+          "approver_actor_ref",
+          "approved_at",
+          "approval_receipt_ref",
+          "approval_kind",
+          "automated_approval"
+        ],
+        "exact_run_candidate_required": true,
+        "actor_rule": "configured-maintainer"
+      },
+      "ordering_contract": {
+        "shared_identity_fields": [
+          "run_id",
+          "job_id",
+          "environment",
+          "candidate_tag"
+        ],
+        "timestamp_order": [
+          "inspection_started_at",
+          "inspection_completed_at",
+          "approved_at"
+        ],
+        "strictly_increasing": true
+      },
+      "draft_policy": {
+        "exact_final_reread_required": true,
+        "byte_identical_partial_reconciliation_only": true,
+        "already_published_exact_match_behavior": "verification-only",
+        "mismatch_recovery": "new-version-only"
+      },
+      "two_person_unavailable_reason": "Only one release maintainer is configured."
+    }
+  },
+  "candidate_evidence": {
+    "schema": "clinker.candidate-evidence/v1",
+    "kind": "candidate",
+    "state": "candidate-verified",
+    "revision": 0,
+    "release_status": "incomplete",
+    "completion_eligible": false,
+    "immutable_authority_sha256": "f235dd6285bcdca002d0736e2b3d6e0494ad3f6d8ca3a6fbdbf947ea0ec88aa5",
+    "candidate_authorization_sha256": "f235dd6285bcdca002d0736e2b3d6e0494ad3f6d8ca3a6fbdbf947ea0ec88aa5",
+    "tag_mutation_performed": false,
+    "tag_readback_ref": "https://api.github.com/repos/rustpunk/clinker/git/ref/tags/v3.0.0",
+    "release_trigger_event_ref": "https://github.com/rustpunk/clinker/actions/runs/300",
+    "candidate_tag": "v3.0.0",
+    "candidate_version": "3.0.0",
+    "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "build_workflow_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "publish_workflow_ref": "v3.0.0",
+    "publish_workflow_ref_resolved_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "publish_workflow_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "candidate_release_id": "release-300",
+    "checksum_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "archive_digests": {
+      "aarch64-apple-darwin": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "x86_64-apple-darwin": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "x86_64-pc-windows-msvc": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "x86_64-unknown-linux-gnu": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "ci_run_ref": "https://github.com/rustpunk/clinker/actions/runs/300",
+    "changelog_ref": "CHANGELOG.md#300",
+    "inventory_ref": "release/inventory.toml",
+    "authorized_release_maintainer_ref": "maintainer:release",
+    "build_workflow_path": ".github/workflows/release.yml",
+    "build_run_id": "300",
+    "build_head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "publish_workflow_path": ".github/workflows/publish-release.yml",
+    "archives": [
+      {
+        "target": "aarch64-apple-darwin",
+        "archive_name": "clinker-v3.0.0-aarch64-apple-darwin.tar.gz",
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      {
+        "target": "x86_64-apple-darwin",
+        "archive_name": "clinker-v3.0.0-x86_64-apple-darwin.tar.gz",
+        "sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      },
+      {
+        "target": "x86_64-pc-windows-msvc",
+        "archive_name": "clinker-v3.0.0-x86_64-pc-windows-msvc.zip",
+        "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      },
+      {
+        "target": "x86_64-unknown-linux-gnu",
+        "archive_name": "clinker-v3.0.0-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ],
+    "attestations": [
+      {
+        "archive_name": "clinker-v3.0.0-aarch64-apple-darwin.tar.gz",
+        "subject_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "repository": "rustpunk/clinker",
+        "workflow": ".github/workflows/release.yml",
+        "ref": "refs/tags/v3.0.0",
+        "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "runner_environment": "github-hosted"
+      },
+      {
+        "archive_name": "clinker-v3.0.0-x86_64-apple-darwin.tar.gz",
+        "subject_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "repository": "rustpunk/clinker",
+        "workflow": ".github/workflows/release.yml",
+        "ref": "refs/tags/v3.0.0",
+        "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "runner_environment": "github-hosted"
+      },
+      {
+        "archive_name": "clinker-v3.0.0-x86_64-pc-windows-msvc.zip",
+        "subject_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "repository": "rustpunk/clinker",
+        "workflow": ".github/workflows/release.yml",
+        "ref": "refs/tags/v3.0.0",
+        "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "runner_environment": "github-hosted"
+      },
+      {
+        "archive_name": "clinker-v3.0.0-x86_64-unknown-linux-gnu.tar.gz",
+        "subject_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "repository": "rustpunk/clinker",
+        "workflow": ".github/workflows/release.yml",
+        "ref": "refs/tags/v3.0.0",
+        "source_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "runner_environment": "github-hosted"
+      }
+    ]
+  }
+}

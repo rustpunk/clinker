@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use clinker_core_types::FailureClassification;
 use serde::{Deserialize, Serialize};
 
 /// Column-level lineage for one dataset.
@@ -166,6 +167,44 @@ impl ErrorMessageRunFacet {
     }
 }
 
+/// Clinker-owned sanitized failure classification carried by a failed run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClinkerFailureRunFacet {
+    /// URI of the software that produced this facet.
+    #[serde(rename = "_producer")]
+    pub producer: String,
+    /// Immutable schema URL for the v1 facet contract.
+    #[serde(rename = "_schemaURL")]
+    pub schema_url: String,
+    /// Stable namespaced failure code.
+    pub code: String,
+    /// Stable broad failure category.
+    pub category: String,
+    /// Stable retry advice.
+    #[serde(rename = "retryAdvice")]
+    pub retry_advice: String,
+    /// Bounded, sanitized human-readable message.
+    pub message: String,
+}
+
+impl ClinkerFailureRunFacet {
+    /// API classification: supported integration API.
+    ///
+    /// Convert an approved shared failure classification into the lineage wire
+    /// contract. Only stable accessors cross the boundary; the core type is not
+    /// serialized or re-exported.
+    pub fn from_classification(classification: &FailureClassification) -> Self {
+        Self {
+            producer: super::PRODUCER.to_string(),
+            schema_url: super::CLINKER_FAILURE_FACET_SCHEMA_URL.to_string(),
+            code: classification.code().to_string(),
+            category: classification.category().as_str().to_string(),
+            retry_advice: classification.retry_advice().as_str().to_string(),
+            message: classification.message().to_string(),
+        }
+    }
+}
+
 /// A clinker-specific run facet carrying whole-run record counts and timing.
 ///
 /// OpenLineage defines no standard run-level record-count facet, so — like
@@ -246,6 +285,25 @@ mod tests {
         assert_eq!(
             serde_json::to_value(TransformationType::Indirect).unwrap(),
             "INDIRECT"
+        );
+    }
+
+    #[test]
+    fn shared_failure_adapts_only_stable_sanitized_accessors() {
+        let classification = FailureClassification::new(
+            "observability.delivery.failed",
+            "temporary collector failure",
+        )
+        .expect("registered failure code");
+
+        let facet = ClinkerFailureRunFacet::from_classification(&classification);
+        assert_eq!(facet.code, "observability.delivery.failed");
+        assert_eq!(facet.category, "observability");
+        assert_eq!(facet.retry_advice, "retry_with_backoff");
+        assert_eq!(facet.message, "temporary collector failure");
+        assert_eq!(
+            facet.schema_url,
+            super::super::CLINKER_FAILURE_FACET_SCHEMA_URL
         );
     }
 }

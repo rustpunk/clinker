@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["tools/dependency-policy", "tools/release-policy"]
 members = [
     "crates/clinker-record",
     "crates/cxl",

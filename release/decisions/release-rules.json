@@ -1,0 +1,82 @@
+{
+  "schema": "clinker.decision/v1",
+  "decision_id": "release-rules",
+  "control_id": "release-configuration",
+  "status": "accepted",
+  "selection": "strict-ruleset",
+  "approver_role_ref": "user:rustpunk",
+  "evidence_refs": [
+    ".github/workflows/ci.yml",
+    ".github/CODEOWNERS",
+    "scripts/release/fixtures/release-decisions/accepted-record-set.json"
+  ],
+  "recorded_at": "2026-07-31T05:18:35Z",
+  "ruleset": {
+    "main_rule": {
+      "branch": "main",
+      "enforcement": "active",
+      "required_status_checks": [
+        {
+          "context": "check",
+          "app_ref": "app:github-actions"
+        },
+        {
+          "context": "test-windows",
+          "app_ref": "app:github-actions"
+        },
+        {
+          "context": "test-macos",
+          "app_ref": "app:github-actions"
+        },
+        {
+          "context": "cross-platform",
+          "app_ref": "app:github-actions"
+        },
+        {
+          "context": "filesystem-matrix (linux-nfsv4.1-loopback-ci)",
+          "app_ref": "app:github-actions"
+        },
+        {
+          "context": "filesystem-matrix (linux-smb3.1.1-loopback-ci)",
+          "app_ref": "app:github-actions"
+        },
+        {
+          "context": "deny",
+          "app_ref": "app:github-actions"
+        }
+      ],
+      "strict_status_checks": true,
+      "required_approving_review_count": 1,
+      "codeowner_review_required": true,
+      "latest_push_approval_required": true,
+      "conversation_resolution_required": true,
+      "linear_history_required": true,
+      "allowed_merge_methods": [
+        "squash"
+      ],
+      "update_branch_enabled": true,
+      "bypass_actor_refs": [
+        "user:rustpunk"
+      ],
+      "generic_admin_bypass": false
+    },
+    "tag_rule": {
+      "tag_pattern": "v<semver>",
+      "enforcement": "active",
+      "creation_actor_refs": [
+        "user:rustpunk"
+      ],
+      "update_allowed": false,
+      "deletion_allowed": false,
+      "generic_admin_bypass": false
+    },
+    "actions_policy": {
+      "full_sha_pinning_required": true,
+      "workflow_codeowner_review_required": true
+    },
+    "release_policy": {
+      "immutable_releases_required": true,
+      "mismatch_recovery": "new-version-only"
+    }
+  }
+}

@@ -1,0 +1,420 @@
+//! Fail-closed continuation and redirect security contracts for REST sources.
+
+use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use clinker_exec::source::RecordSource;
+use clinker_net::build_rest_source;
+use clinker_plan::config::{SourceTransport, parse_config};
+
+struct TestServer {
+    url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl TestServer {
+    fn spawn(responses: Vec<String>) -> Self {
+        Self::spawn_with(|_| responses)
+    }
+
+    fn spawn_with(make_responses: impl FnOnce(&str) -> Vec<String>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        listener
+            .set_nonblocking(true)
+            .expect("set test server nonblocking");
+        let addr = listener.local_addr().expect("test server address");
+        let url = format!("http://{addr}");
+        let responses = make_responses(&url);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let thread_requests = Arc::clone(&requests);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            let mut responses = responses.into_iter();
+            while !thread_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let Some(path) = read_request(&mut stream) else {
+                            continue;
+                        };
+                        thread_requests.lock().expect("request lock").push(path);
+                        let response = responses.next().unwrap_or_else(|| {
+                            response(500, "Internal Server Error", &[], r#"{"unexpected":true}"#)
+                        });
+                        stream
+                            .write_all(response.as_bytes())
+                            .expect("write test response");
+                        stream.flush().expect("flush test response");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("accept test request: {error}"),
+                }
+            }
+        });
+        Self {
+            url,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn paths(&self) -> Vec<String> {
+        self.requests.lock().expect("request lock").clone()
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("join test server");
+        }
+    }
+}
+
+fn read_request(stream: &mut TcpStream) -> Option<String> {
+    stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    let mut reader = BufReader::new(stream.try_clone().ok()?);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).ok()? == 0 {
+        return None;
+    }
+    loop {
+        let mut line = String::new();
+        let read = reader.read_line(&mut line).ok()?;
+        if read == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+    }
+    request_line.split_whitespace().nth(1).map(str::to_owned)
+}
+
+fn response(status: u16, reason: &str, headers: &[(&str, &str)], body: &str) -> String {
+    let headers = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
+    format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}",
+        body.len()
+    )
+}
+
+fn ok(headers: &[(&str, &str)], id: i64) -> String {
+    response(200, "OK", headers, &format!(r#"[{{"id":{id}}}]"#))
+}
+
+fn reader(url: &str, max_pages: u32) -> Box<dyn RecordSource> {
+    reader_with_retries(url, max_pages, 0)
+}
+
+fn reader_with_retries(url: &str, max_pages: u32, retries: u32) -> Box<dyn RecordSource> {
+    let url = serde_json::to_string(url).expect("quote URL");
+    let yaml = format!(
+        r#"
+pipeline:
+  name: rest_continuation_security
+nodes:
+  - type: source
+    name: api
+    config:
+      name: api
+      type: json
+      options:
+        format: array
+      transport:
+        kind: rest
+        url: {url}
+        max_pages: {max_pages}
+        retries: {retries}
+        timeout_secs: 2
+        pagination:
+          strategy: link_header
+      schema:
+        - {{ name: id, type: int }}
+  - type: output
+    name: out
+    input: api
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    );
+    let config = parse_config(&yaml).expect("parse REST security pipeline");
+    let body = config.source_bodies().next().expect("REST source body");
+    let SourceTransport::Rest(cfg) = body.source.transport.clone() else {
+        panic!("expected REST transport")
+    };
+    build_rest_source(
+        cfg,
+        &body.source,
+        body.schema.as_columns().expect("single-record schema"),
+        body.on_unmapped.clone(),
+    )
+    .expect("build REST source")
+}
+
+fn drain_ids(reader: &mut dyn RecordSource) -> Result<Vec<i64>, String> {
+    let mut ids = Vec::new();
+    loop {
+        match reader.next_record() {
+            Ok(Some(record)) => {
+                let Some(clinker_record::Value::Integer(id)) = record.get("id") else {
+                    panic!("record id must be an integer")
+                };
+                ids.push(*id);
+            }
+            Ok(None) => return Ok(ids),
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+fn assert_classification(error: &str, code: &str, category: &str, retry: &str) {
+    assert!(error.contains(code), "missing failure code {code}: {error}");
+    assert!(
+        error.contains(category),
+        "missing failure category {category}: {error}"
+    );
+    assert!(
+        error.contains(retry),
+        "missing retry advice {retry}: {error}"
+    );
+}
+
+#[test]
+fn request_failures_keep_safe_status_and_target_context() {
+    let server = TestServer::spawn(vec![response(
+        401,
+        "Unauthorized",
+        &[],
+        r#"{"error":"vendor detail must not be reflected"}"#,
+    )]);
+    let configured = format!("{}/items?api_key=do-not-render", server.url);
+    let mut source = reader_with_retries(&configured, 1, 3);
+
+    let error = source
+        .next_record()
+        .expect_err("HTTP rejection must fail the source")
+        .to_string();
+
+    assert!(error.contains("class=http_status_401"), "{error}");
+    assert!(error.contains("attempt=1"), "{error}");
+    assert!(error.contains("page=1"), "{error}");
+    assert!(error.contains("/items"), "{error}");
+    assert!(
+        !error.contains("api_key"),
+        "query names must be redacted: {error}"
+    );
+    assert!(
+        !error.contains("do-not-render"),
+        "query values must be redacted: {error}"
+    );
+    assert!(
+        !error.contains("vendor detail"),
+        "response bodies must not enter diagnostics: {error}"
+    );
+    assert_eq!(server.paths(), ["/items?api_key=do-not-render"]);
+}
+
+#[test]
+fn absolute_relative_and_query_only_links_resolve_against_effective_url() {
+    let server = TestServer::spawn_with(|url| {
+        let absolute = format!("{url}/items?page=2");
+        vec![
+            ok(
+                &[
+                    ("Link", &format!("<{absolute}>; rel=\"alternate next\"")),
+                    ("Link", "</unrelated>; rel=prev"),
+                ],
+                1,
+            ),
+            ok(&[("Link", "<next/page>; rel=\"next alternate\"")], 2),
+            ok(&[("Link", "<?page=4>; rel=next")], 3),
+            ok(&[], 4),
+        ]
+    });
+    let mut reader = reader(&format!("{}/items", server.url), 10);
+    let ids = drain_ids(reader.as_mut()).expect("valid continuation chain");
+    assert_eq!(ids, vec![1, 2, 3, 4]);
+    assert_eq!(
+        server.paths(),
+        ["/items", "/items?page=2", "/next/page", "/next/page?page=4"]
+    );
+}
+
+#[test]
+fn malformed_link_metadata_fails_closed() {
+    let server = TestServer::spawn(vec![ok(&[("Link", "</next; rel=next")], 1)]);
+    let mut reader = reader(&format!("{}/start", server.url), 10);
+    let error = drain_ids(reader.as_mut()).expect_err("malformed Link must fail");
+    assert_classification(
+        &error,
+        "rest.protocol.malformed_continuation",
+        "source_protocol",
+        "policy_required",
+    );
+}
+
+#[test]
+fn multiple_next_targets_fail_as_conflicting() {
+    let server = TestServer::spawn(vec![ok(
+        &[
+            ("Link", "</next-a>; rel=next"),
+            ("Link", "</next-b>; rel=\"next alternate\""),
+        ],
+        1,
+    )]);
+    let mut reader = reader(&format!("{}/start", server.url), 10);
+    let error = drain_ids(reader.as_mut()).expect_err("ambiguous next links must fail");
+    assert_classification(
+        &error,
+        "rest.protocol.conflicting_continuation",
+        "source_protocol",
+        "policy_required",
+    );
+}
+
+#[test]
+fn cross_origin_link_is_rejected_before_foreign_connect() {
+    let foreign = TcpListener::bind("127.0.0.1:0").expect("bind foreign listener");
+    foreign.set_nonblocking(true).expect("foreign nonblocking");
+    let foreign_url = format!("http://{}", foreign.local_addr().expect("foreign address"));
+    let server = TestServer::spawn(vec![ok(
+        &[("Link", &format!("<{foreign_url}/next>; rel=next"))],
+        1,
+    )]);
+    let mut reader = reader(&format!("{}/start", server.url), 10);
+    let error = drain_ids(reader.as_mut()).expect_err("foreign link must fail");
+    assert_classification(
+        &error,
+        "rest.security.cross_origin",
+        "security_policy",
+        "do_not_retry",
+    );
+    assert!(
+        matches!(foreign.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "foreign origin must not receive a connection"
+    );
+}
+
+#[test]
+fn same_origin_get_redirect_is_followed_manually() {
+    let server = TestServer::spawn(vec![
+        response(302, "Found", &[("Location", "/final")], ""),
+        ok(&[], 7),
+    ]);
+    let mut reader = reader(&format!("{}/start", server.url), 10);
+    assert_eq!(
+        drain_ids(reader.as_mut()).expect("same-origin redirect"),
+        vec![7]
+    );
+    assert_eq!(server.paths(), ["/start", "/final"]);
+}
+
+#[test]
+fn cross_origin_redirect_is_rejected_before_foreign_connect() {
+    let foreign = TcpListener::bind("127.0.0.1:0").expect("bind foreign listener");
+    foreign.set_nonblocking(true).expect("foreign nonblocking");
+    let foreign_url = format!("http://{}", foreign.local_addr().expect("foreign address"));
+    let server = TestServer::spawn(vec![response(
+        302,
+        "Found",
+        &[("Location", &format!("{foreign_url}/final"))],
+        "",
+    )]);
+    let mut reader = reader(&format!("{}/start", server.url), 10);
+    let error = drain_ids(reader.as_mut()).expect_err("foreign redirect must fail");
+    assert_classification(
+        &error,
+        "rest.security.cross_origin",
+        "security_policy",
+        "do_not_retry",
+    );
+    assert!(
+        matches!(foreign.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "foreign origin must not receive a connection"
+    );
+}
+
+#[test]
+fn continuation_cycle_fails_before_repeating_request() {
+    let server = TestServer::spawn(vec![ok(&[("Link", "</start>; rel=next")], 1)]);
+    let mut reader = reader(&format!("{}/start", server.url), 10);
+    let error = drain_ids(reader.as_mut()).expect_err("cycle must fail");
+    assert_classification(
+        &error,
+        "rest.protocol.unsupported_continuation",
+        "source_protocol",
+        "policy_required",
+    );
+    assert_eq!(server.paths(), ["/start"]);
+}
+
+#[test]
+fn offered_continuation_beyond_page_bound_fails_instead_of_truncating() {
+    let server = TestServer::spawn(vec![ok(&[("Link", "</next>; rel=next")], 1)]);
+    let mut reader = reader(&format!("{}/start", server.url), 1);
+    let error = drain_ids(reader.as_mut()).expect_err("page-bound exhaustion must fail");
+    assert_classification(
+        &error,
+        "rest.protocol.page_limit_reached",
+        "source_protocol",
+        "policy_required",
+    );
+    assert_eq!(server.paths(), ["/start"]);
+}
+
+#[test]
+fn redirect_cycle_fails_with_bounded_requests() {
+    let server = TestServer::spawn(vec![response(302, "Found", &[("Location", "/start")], "")]);
+    let mut reader = reader(&format!("{}/start", server.url), 10);
+    let started = Instant::now();
+    let error = drain_ids(reader.as_mut()).expect_err("redirect cycle must fail");
+    assert_classification(
+        &error,
+        "rest.protocol.unsupported_continuation",
+        "source_protocol",
+        "policy_required",
+    );
+    assert_eq!(server.paths(), ["/start"]);
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn redirect_limit_fails_before_an_unbounded_request_chain() {
+    let responses = (0..11)
+        .map(|index| {
+            response(
+                302,
+                "Found",
+                &[("Location", &format!("/hop{}", index + 1))],
+                "",
+            )
+        })
+        .collect();
+    let server = TestServer::spawn(responses);
+    let mut reader = reader(&format!("{}/hop0", server.url), 10);
+    let error = drain_ids(reader.as_mut()).expect_err("redirect limit must fail");
+    assert_classification(
+        &error,
+        "rest.protocol.unsupported_continuation",
+        "source_protocol",
+        "policy_required",
+    );
+    assert_eq!(
+        server.paths().len(),
+        11,
+        "one initial request plus ten admitted redirects is the hard request bound"
+    );
+}

@@ -6,6 +6,7 @@ license.workspace = true
 description = "Network finite-pull Source readers (REST) for Clinker"
 
 [dependencies]
+clinker-core-types = { workspace = true }
 clinker-exec = { workspace = true }
 clinker-plan = { workspace = true }
 clinker-format = { workspace = true }

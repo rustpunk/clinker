@@ -1,0 +1,24 @@
+{
+  "schema": "clinker.decision/v1",
+  "decision_id": "publication-policy",
+  "control_id": "publication-policy",
+  "status": "accepted",
+  "selection": "live-gate-required",
+  "approver_role_ref": "user:rustpunk",
+  "evidence_refs": [
+    ".github/workflows/release.yml",
+    ".github/workflows/publish-release.yml",
+    "tools/release-policy/src/publication.rs"
+  ],
+  "recorded_at": "2026-07-31T05:18:35Z",
+  "publication_policy": {
+    "required_path": [
+      "release-candidate",
+      "candidate-readback",
+      "publication-approval",
+      "public-release-readback"
+    ],
+    "immutable_publication": true,
+    "repair_in_place_forbidden": true
+  }
+}

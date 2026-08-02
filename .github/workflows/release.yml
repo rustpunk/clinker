@@ -1,104 +1,181 @@
-name: Release
+name: Release candidate draft
 
 on:
   push:
     tags: ["v*"]
 
-permissions:
-  contents: write
+permissions: {}
 
 env:
+  CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: release-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  dependency-policy:
+    name: Verify dependency policy
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the candidate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.91"
+
+      - name: Test and enforce the locked Rust boundary tool
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --manifest-path tools/dependency-policy/Cargo.toml --locked
+          cargo run --manifest-path tools/dependency-policy/Cargo.toml --locked --offline -- --scope final --root .
+
   build:
+    name: Build ${{ matrix.target }}
+    needs: dependency-policy
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            archive: tar.gz
+            os: ubuntu-24.04
           - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            archive: zip
+            os: windows-2025
           - target: aarch64-apple-darwin
-            os: macos-latest
-            archive: tar.gz
-          - target: x86_64-apple-darwin
             os: macos-15
-            archive: tar.gz
-    runs-on: ${{ matrix.os }}
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@master
+      - name: Check out the candidate source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          toolchain: "1.91"
-          targets: ${{ matrix.target }}
+          persist-credentials: false
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build CLI tools
-        run: cargo build --release --target ${{ matrix.target }} -p clinker -p cxl-cli
-
-      - name: Package (Unix)
-        if: matrix.archive == 'tar.gz'
+      - name: Install the repository toolchain target
         shell: bash
         run: |
-          tag="${GITHUB_REF_NAME}"
-          target="${{ matrix.target }}"
-          staging="artifacts"
-          mkdir -p "$staging"
+          set -euo pipefail
+          test -f rust-toolchain.toml
+          rustup show active-toolchain
+          rustup target add "${{ matrix.target }}"
 
-          # CLI binaries from cargo build
-          for bin in clinker cxl-cli; do
-            src="target/${target}/release/${bin}"
-            if [ -f "$src" ]; then
-              archive="${bin}-${tag}-${target}.tar.gz"
-              tar czf "${staging}/${archive}" -C "target/${target}/release" "${bin}"
-              echo "Packaged ${archive}"
-            fi
-          done
-
-      - name: Package (Windows)
-        if: matrix.archive == 'zip'
-        shell: pwsh
+      - name: Build the locked target bundle with the Rust gate
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          BUILD_SOURCE_SHA: ${{ github.sha }}
+        shell: bash
         run: |
-          $tag = $env:GITHUB_REF_NAME
-          $target = "${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+            inventory check --print-json
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+            release build-bundle \
+            --target "$BUILD_TARGET" \
+            --source-sha "$BUILD_SOURCE_SHA" \
+            --output-dir artifacts
 
-          # CLI binaries from cargo build
-          foreach ($bin in @("clinker", "cxl-cli")) {
-            $src = "target\${target}\release\${bin}.exe"
-            if (Test-Path $src) {
-              $archive = "artifacts\${bin}-${tag}-${target}.zip"
-              Compress-Archive -Path $src -DestinationPath $archive
-              Write-Host "Packaged ${archive}"
-            }
-          }
+      - name: Attest the exact archive subject
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload the target bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.target }}
           path: artifacts/*
+          if-no-files-found: error
+          retention-days: 7
 
-  release:
+  assemble-draft:
+    name: Assemble and reread private draft
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
+      - name: Check out verification code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      - name: Download the exact target set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
           path: artifacts
           merge-multiple: true
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
+      - name: Verify and assemble the exact target set with the Rust gate
+        env:
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+            release verify assemble \
+            --asset-dir artifacts \
+            --repository "$RELEASE_REPOSITORY" \
+            --workflow .github/workflows/release.yml \
+            --ref "$RELEASE_REF" \
+            --source-sha "$RELEASE_SOURCE_SHA"
+
+      - name: Stage and freshly verify the private draft with the Rust gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_CANDIDATE_TAG: ${{ github.ref_name }}
+          RELEASE_SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+            release stage-candidate-draft \
+            --repo "$RELEASE_REPOSITORY" \
+            --candidate-tag "$RELEASE_CANDIDATE_TAG" \
+            --source-sha "$RELEASE_SOURCE_SHA" \
+            --asset-dir artifacts \
+            --deadline-seconds 600
+
+      - name: Produce artifact-derived non-completing candidate evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+            release verify \
+            --repo "$RELEASE_REPOSITORY" \
+            --decision-dir release/decisions \
+            --authorization-record release/decisions/release-candidate-authorization.json \
+            --authorization-schema scripts/release/release-candidate-authorization.schema.json \
+            --decision-record release/decisions/release-candidate.json \
+            --decision-schema scripts/release/release-decision.schema.json \
+            --require-private \
+            --fresh-download \
+            --evidence-kind candidate \
+            --evidence-schema scripts/release/release-evidence.schema.json \
+            --evidence-manifest target/release-policy/candidate-evidence.json
+
+      - name: Upload the immutable candidate evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          files: artifacts/*
-          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
-          generate_release_notes: true
+          name: release-candidate-evidence
+          path: target/release-policy/candidate-evidence.json
+          if-no-files-found: error
+          retention-days: 7

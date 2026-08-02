@@ -57,6 +57,17 @@ the whole point of the memory budget. If `df -T /tmp` reports a `tmpfs`
 filesystem, point `storage.spill.dir` at a path on a real block device so
 spilling moves pressure off RAM and onto disk.
 
+### Prefer local spill for network-share pipelines
+
+When sources and outputs live on NFS or SMB, point `storage.spill.dir` at a
+real local disk if possible. Spill workloads include repeated reads, writes,
+merges, and synchronization; running them on the share usually multiplies
+latency and network I/O without improving the durability of the final output.
+Likewise, optional source staging can copy matched share inputs to local disk
+before execution. Output commit remains destination-local: Clinker writes and
+flushes a hidden file on the output share, then promotes it on that same
+filesystem so the final rename does not cross devices.
+
 ### Inspecting the resolved spill root
 
 `clinker run --explain` prints the resolved spill root and where it came from,

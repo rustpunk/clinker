@@ -18,6 +18,30 @@ The `type:` field selects the output format: `csv`, `json`, `xml`, `fixed_width`
 
 Structured single-writer outputs (`edifact`, `x12`, `hl7`, and `swift`) accept one concrete document grain per output file. A multi-file source or multi-input merge feeding one of these outputs is rejected instead of being silently written as one merged envelope. To write multiple structured documents, consolidate them deliberately with an Envelope node first or route each document to a separate output path.
 
+## Local and network-share destinations
+
+An output path may be on a local filesystem or a mounted NFS/SMB share.
+Clinker detects the filesystem behind the actual destination and applies its
+contained-create and same-filesystem promotion rules there; users do not label
+their production paths with a CI profile. The committed filesystem matrix
+qualifies Clinker's semantics against specific loopback NFSv4.1 and SMB3.1.1
+mounts, but it cannot certify every vendor appliance, mount option, outage
+mode, or corporate network. Qualify representative production mounts before
+depending on atomic promotion during an outage or failover.
+
+Clinker creates Unix output files with owner-only mode `0600`. This prevents a
+new file from accidentally inheriting broad access in a shared drop zone. If a
+different service account or group must consume the result, arrange that access
+explicitly with the destination's ACL/ownership policy; Clinker does not
+currently expose an output-mode setting.
+
+For performance, keep spill files and optional staged input copies on a local
+disk when one is available. Blocking operators can create substantial random
+I/O, and performing that work directly on a network share adds latency and
+network traffic. The final output is still written as a hidden file on the
+destination filesystem and promoted there, so the completed file never relies
+on a cross-filesystem rename from local storage.
+
 ## Direct broadcast to several outputs
 
 Several Output nodes may name the same input. This is a broadcast: every

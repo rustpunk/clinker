@@ -1,0 +1,117 @@
+name: Publish approved release
+
+run-name: publish-${{ inputs.candidate_tag }}-${{ inputs.dispatch_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        required: true
+        type: string
+      candidate_authorization_blob_sha:
+        required: true
+        type: string
+      candidate_authorization_sha256:
+        required: true
+        type: string
+      candidate_decision_blob_sha:
+        required: true
+        type: string
+      candidate_evidence_blob_sha:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+      build_workflow_sha:
+        required: true
+        type: string
+      publish_workflow_ref:
+        required: true
+        type: string
+      publish_workflow_sha:
+        required: true
+        type: string
+      candidate_release_id:
+        required: true
+        type: string
+      approval_payload_blob_sha:
+        required: true
+        type: string
+      approval_record_sha256:
+        required: true
+        type: string
+      approval_mode:
+        required: true
+        type: choice
+        options:
+          - two-person-non-self
+          - single-maintainer-inspect-then-approve
+      dispatch_id:
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: publish-release-${{ inputs.candidate_tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish-approved-release:
+    name: publish-approved-release
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the protected candidate revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.publish_workflow_ref }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: "1.91"
+
+      - name: Verify immutable authority and publish once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_REPOSITORY: ${{ github.repository }}
+          PUBLISH_CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          PUBLISH_AUTHORIZATION_BLOB_SHA: ${{ inputs.candidate_authorization_blob_sha }}
+          PUBLISH_AUTHORIZATION_SHA256: ${{ inputs.candidate_authorization_sha256 }}
+          PUBLISH_DECISION_BLOB_SHA: ${{ inputs.candidate_decision_blob_sha }}
+          PUBLISH_CANDIDATE_BLOB_SHA: ${{ inputs.candidate_evidence_blob_sha }}
+          PUBLISH_SOURCE_SHA: ${{ inputs.source_sha }}
+          PUBLISH_BUILD_WORKFLOW_SHA: ${{ inputs.build_workflow_sha }}
+          PUBLISH_WORKFLOW_REF: ${{ inputs.publish_workflow_ref }}
+          PUBLISH_WORKFLOW_SHA: ${{ inputs.publish_workflow_sha }}
+          PUBLISH_RELEASE_ID: ${{ inputs.candidate_release_id }}
+          PUBLISH_APPROVAL_BLOB_SHA: ${{ inputs.approval_payload_blob_sha }}
+          PUBLISH_APPROVAL_SHA256: ${{ inputs.approval_record_sha256 }}
+          PUBLISH_APPROVAL_MODE: ${{ inputs.approval_mode }}
+        run: |
+          cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+            publication protected-publish \
+            --repo "$PUBLISH_REPOSITORY" \
+            --candidate-tag "$PUBLISH_CANDIDATE_TAG" \
+            --candidate-authorization-blob-sha "$PUBLISH_AUTHORIZATION_BLOB_SHA" \
+            --candidate-authorization-sha256 "$PUBLISH_AUTHORIZATION_SHA256" \
+            --candidate-decision-blob-sha "$PUBLISH_DECISION_BLOB_SHA" \
+            --candidate-evidence-blob-sha "$PUBLISH_CANDIDATE_BLOB_SHA" \
+            --source-sha "$PUBLISH_SOURCE_SHA" \
+            --build-workflow-sha "$PUBLISH_BUILD_WORKFLOW_SHA" \
+            --publish-workflow-ref "$PUBLISH_WORKFLOW_REF" \
+            --publish-workflow-sha "$PUBLISH_WORKFLOW_SHA" \
+            --candidate-release-id "$PUBLISH_RELEASE_ID" \
+            --approval-payload-blob-sha "$PUBLISH_APPROVAL_BLOB_SHA" \
+            --approval-record-sha256 "$PUBLISH_APPROVAL_SHA256" \
+            --approval-mode "$PUBLISH_APPROVAL_MODE" \
+            --authorization-schema scripts/release/release-candidate-authorization.schema.json \
+            --decision-schema scripts/release/release-decision.schema.json \
+            --evidence-schema scripts/release/release-evidence.schema.json \
+            --decision-dir release/decisions \
+            --deadline-seconds 600

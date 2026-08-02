@@ -1,0 +1,10 @@
+/.github/dependabot.yml @rustpunk
+/.github/workflows/** @rustpunk
+/scripts/release/** @rustpunk
+/release/** @rustpunk
+/rust-toolchain.toml @rustpunk
+/tools/dependency-policy/** @rustpunk
+/tools/release-policy/** @rustpunk
+/Cargo.toml @rustpunk
+/Cargo.lock @rustpunk
+/LICENSE @rustpunk
