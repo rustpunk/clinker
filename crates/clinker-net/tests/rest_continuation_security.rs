@@ -11,6 +11,17 @@ use clinker_exec::source::RecordSource;
 use clinker_net::build_rest_source;
 use clinker_plan::config::{SourceTransport, parse_config};
 
+// Each case opens real loopback sockets. Keep the cases sequential so the
+// transport assertions measure product behavior rather than host socket
+// teardown scheduling.
+static NETWORK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn network_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    NETWORK_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 struct TestServer {
     url: String,
     requests: Arc<Mutex<Vec<String>>>,
@@ -202,6 +213,7 @@ fn assert_classification(error: &str, code: &str, category: &str, retry: &str) {
 
 #[test]
 fn request_failures_keep_safe_status_and_target_context() {
+    let _guard = network_test_guard();
     let server = TestServer::spawn(vec![response(
         401,
         "Unauthorized",
@@ -237,6 +249,7 @@ fn request_failures_keep_safe_status_and_target_context() {
 
 #[test]
 fn absolute_relative_and_query_only_links_resolve_against_effective_url() {
+    let _guard = network_test_guard();
     let server = TestServer::spawn_with(|url| {
         let absolute = format!("{url}/items?page=2");
         vec![
@@ -263,6 +276,7 @@ fn absolute_relative_and_query_only_links_resolve_against_effective_url() {
 
 #[test]
 fn malformed_link_metadata_fails_closed() {
+    let _guard = network_test_guard();
     let server = TestServer::spawn(vec![ok(&[("Link", "</next; rel=next")], 1)]);
     let mut reader = reader(&format!("{}/start", server.url), 10);
     let error = drain_ids(reader.as_mut()).expect_err("malformed Link must fail");
@@ -276,6 +290,7 @@ fn malformed_link_metadata_fails_closed() {
 
 #[test]
 fn multiple_next_targets_fail_as_conflicting() {
+    let _guard = network_test_guard();
     let server = TestServer::spawn(vec![ok(
         &[
             ("Link", "</next-a>; rel=next"),
@@ -295,6 +310,7 @@ fn multiple_next_targets_fail_as_conflicting() {
 
 #[test]
 fn cross_origin_link_is_rejected_before_foreign_connect() {
+    let _guard = network_test_guard();
     let foreign = TcpListener::bind("127.0.0.1:0").expect("bind foreign listener");
     foreign.set_nonblocking(true).expect("foreign nonblocking");
     let foreign_url = format!("http://{}", foreign.local_addr().expect("foreign address"));
@@ -318,6 +334,7 @@ fn cross_origin_link_is_rejected_before_foreign_connect() {
 
 #[test]
 fn same_origin_get_redirect_is_followed_manually() {
+    let _guard = network_test_guard();
     let server = TestServer::spawn(vec![
         response(302, "Found", &[("Location", "/final")], ""),
         ok(&[], 7),
@@ -332,6 +349,7 @@ fn same_origin_get_redirect_is_followed_manually() {
 
 #[test]
 fn cross_origin_redirect_is_rejected_before_foreign_connect() {
+    let _guard = network_test_guard();
     let foreign = TcpListener::bind("127.0.0.1:0").expect("bind foreign listener");
     foreign.set_nonblocking(true).expect("foreign nonblocking");
     let foreign_url = format!("http://{}", foreign.local_addr().expect("foreign address"));
@@ -357,6 +375,7 @@ fn cross_origin_redirect_is_rejected_before_foreign_connect() {
 
 #[test]
 fn continuation_cycle_fails_before_repeating_request() {
+    let _guard = network_test_guard();
     let server = TestServer::spawn(vec![ok(&[("Link", "</start>; rel=next")], 1)]);
     let mut reader = reader(&format!("{}/start", server.url), 10);
     let error = drain_ids(reader.as_mut()).expect_err("cycle must fail");
@@ -371,6 +390,7 @@ fn continuation_cycle_fails_before_repeating_request() {
 
 #[test]
 fn offered_continuation_beyond_page_bound_fails_instead_of_truncating() {
+    let _guard = network_test_guard();
     let server = TestServer::spawn(vec![ok(&[("Link", "</next>; rel=next")], 1)]);
     let mut reader = reader(&format!("{}/start", server.url), 1);
     let error = drain_ids(reader.as_mut()).expect_err("page-bound exhaustion must fail");
@@ -385,6 +405,7 @@ fn offered_continuation_beyond_page_bound_fails_instead_of_truncating() {
 
 #[test]
 fn redirect_cycle_fails_with_bounded_requests() {
+    let _guard = network_test_guard();
     let server = TestServer::spawn(vec![response(302, "Found", &[("Location", "/start")], "")]);
     let mut reader = reader(&format!("{}/start", server.url), 10);
     let started = Instant::now();
@@ -401,6 +422,7 @@ fn redirect_cycle_fails_with_bounded_requests() {
 
 #[test]
 fn redirect_limit_fails_before_an_unbounded_request_chain() {
+    let _guard = network_test_guard();
     let responses = (0..11)
         .map(|index| {
             response(
