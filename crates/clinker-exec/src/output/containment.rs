@@ -251,8 +251,9 @@ mod platform {
 
     use super::{ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition};
 
-    const CIFS_MAGIC_NUMBER: i64 = 0xff53_4d42_u32 as i64;
-    const SMB_SUPER_MAGIC: i64 = 0x517b;
+    const CIFS_SUPER_MAGIC: u32 = 0xff53_4d42;
+    const SMB2_SUPER_MAGIC: u32 = 0xfe53_4d42;
+    const SMB_SUPER_MAGIC: u32 = 0x517b;
 
     #[derive(Debug)]
     pub(super) struct DirectoryAnchor {
@@ -304,14 +305,11 @@ mod platform {
         ) -> Result<(), ContainmentError> {
             let stat =
                 fstatfs(&self.file).map_err(|error| nix_io("probe-filesystem", path, error))?;
-            let magic = stat.filesystem_type().0 as i64;
-            let observed = if magic == NFS_SUPER_MAGIC.0 {
-                ObservedFilesystem::Nfs
-            } else if magic == CIFS_MAGIC_NUMBER || magic == SMB_SUPER_MAGIC {
-                ObservedFilesystem::Smb
-            } else {
-                ObservedFilesystem::Local
-            };
+            // Linux filesystem magic values are a 32-bit UAPI even where the
+            // statfs field is machine-word-sized. Normalize before comparing
+            // so high-bit CIFS/SMB2 identities work on every architecture.
+            let magic = stat.filesystem_type().0 as u32;
+            let observed = observed_filesystem(magic);
             let supported = matches!(
                 (profile, observed),
                 (FilesystemProfile::Detected, _)
@@ -418,11 +416,21 @@ mod platform {
         }
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ObservedFilesystem {
         Local,
         Nfs,
         Smb,
+    }
+
+    fn observed_filesystem(magic: u32) -> ObservedFilesystem {
+        if magic == NFS_SUPER_MAGIC.0 as u32 {
+            ObservedFilesystem::Nfs
+        } else if matches!(magic, CIFS_SUPER_MAGIC | SMB2_SUPER_MAGIC | SMB_SUPER_MAGIC) {
+            ObservedFilesystem::Smb
+        } else {
+            ObservedFilesystem::Local
+        }
     }
 
     fn profile_name(profile: FilesystemProfile) -> &'static str {
@@ -460,6 +468,26 @@ mod platform {
             path,
             std::io::Error::from_raw_os_error(error as i32),
         )
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{
+            CIFS_SUPER_MAGIC, NFS_SUPER_MAGIC, ObservedFilesystem, SMB_SUPER_MAGIC,
+            SMB2_SUPER_MAGIC, observed_filesystem,
+        };
+
+        #[test]
+        fn linux_remote_filesystem_magic_classification_covers_supported_protocol_families() {
+            assert_eq!(
+                observed_filesystem(NFS_SUPER_MAGIC.0 as u32),
+                ObservedFilesystem::Nfs
+            );
+            for magic in [CIFS_SUPER_MAGIC, SMB2_SUPER_MAGIC, SMB_SUPER_MAGIC] {
+                assert_eq!(observed_filesystem(magic), ObservedFilesystem::Smb);
+            }
+            assert_eq!(observed_filesystem(0xef53), ObservedFilesystem::Local);
+        }
     }
 }
 
@@ -787,12 +815,18 @@ mod platform {
         pub(super) fn open(path: &Path) -> Result<Self, ContainmentError> {
             let mut current_path = PathBuf::new();
             let mut current = None;
-            for component in path.components() {
+            let component_count = path.components().count();
+            for (index, component) in path.components().enumerate() {
+                let access = if index + 1 == component_count {
+                    FILE_GENERIC_READ | FILE_GENERIC_WRITE
+                } else {
+                    FILE_GENERIC_READ
+                };
                 match component {
                     Component::Prefix(prefix) => current_path.push(prefix.as_os_str()),
                     Component::RootDir => {
                         current_path.push(Path::new(r"\"));
-                        current = Some(open_directory(&current_path)?);
+                        current = Some(open_directory(&current_path, access)?);
                     }
                     Component::Normal(name) => {
                         current_path.push(name);
@@ -803,7 +837,7 @@ mod platform {
                                 "destination must have an absolute directory root",
                             )
                         })?;
-                        current = Some(open_directory_at(parent, name, &current_path)?);
+                        current = Some(open_directory_at(parent, name, &current_path, access)?);
                     }
                     _ => {
                         return Err(ContainmentError::security(
@@ -973,10 +1007,10 @@ mod platform {
         }
     }
 
-    fn open_directory(path: &Path) -> Result<OwnedHandle, ContainmentError> {
+    fn open_directory(path: &Path, access: u32) -> Result<OwnedHandle, ContainmentError> {
         let handle = open_file(
             path,
-            FILE_GENERIC_READ,
+            access,
             OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
         )
@@ -1003,11 +1037,12 @@ mod platform {
         parent: &OwnedHandle,
         leaf: &OsStr,
         path: &Path,
+        access: u32,
     ) -> Result<OwnedHandle, ContainmentError> {
         let handle = open_file_at(
             parent,
             leaf,
-            FILE_GENERIC_READ,
+            access,
             FILE_OPEN,
             FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
         )
