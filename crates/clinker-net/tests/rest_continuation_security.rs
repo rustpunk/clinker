@@ -186,6 +186,20 @@ fn reader(url: &str, max_pages: u32) -> Box<dyn RecordSource> {
 }
 
 fn reader_with_retries(url: &str, max_pages: u32, retries: u32) -> Box<dyn RecordSource> {
+    reader_with_pagination(
+        url,
+        max_pages,
+        retries,
+        "        pagination:\n          strategy: link_header",
+    )
+}
+
+fn reader_with_pagination(
+    url: &str,
+    max_pages: u32,
+    retries: u32,
+    pagination: &str,
+) -> Box<dyn RecordSource> {
     let url = serde_json::to_string(url).expect("quote URL");
     let yaml = format!(
         r#"
@@ -205,8 +219,7 @@ nodes:
         max_pages: {max_pages}
         retries: {retries}
         timeout_secs: 2
-        pagination:
-          strategy: link_header
+{pagination}
       schema:
         - {{ name: id, type: int }}
   - type: output
@@ -321,6 +334,82 @@ fn absolute_relative_and_query_only_links_resolve_against_effective_url() {
         server.paths(),
         ["/items", "/items?page=2", "/next/page", "/next/page?page=4"]
     );
+}
+
+#[test]
+fn next_relation_tokens_are_case_insensitive_across_complete_pulls() {
+    let _guard = network_test_guard();
+    let server = TestServer::spawn(vec![
+        ok(&[("Link", "</two>; rel=\"Next\"")], 1),
+        ok(&[("Link", "</three>; rel=\"NEXT\"")], 2),
+        ok(&[("Link", "</four>; rel=\"alternate nExT\"")], 3),
+        ok(&[], 4),
+    ]);
+    let mut reader = reader(&format!("{}/one", server.url), 10);
+
+    assert_eq!(
+        drain_ids(reader.as_mut()).expect("case-insensitive continuation chain"),
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(server.paths(), ["/one", "/two", "/three", "/four"]);
+}
+
+#[test]
+fn unrelated_pagination_strategies_ignore_link_metadata() {
+    let _guard = network_test_guard();
+    let cases = [
+        ("", "none"),
+        (
+            "        pagination:\n          strategy: offset\n          limit: 2",
+            "offset",
+        ),
+        (
+            "        pagination:\n          strategy: cursor_token\n          cursor_param: cursor\n          next_token_pointer: /next",
+            "cursor_token",
+        ),
+    ];
+    let link_headers = [
+        vec![("Link", "</next; rel=next")],
+        vec![
+            ("Link", "</next-a>; rel=next"),
+            ("Link", "</next-b>; rel=next"),
+        ],
+        vec![("Link", "<http://example.invalid/next>; rel=next")],
+    ];
+
+    for (pagination, strategy) in cases {
+        for headers in &link_headers {
+            let server = TestServer::spawn(vec![ok(headers, 1)]);
+            let mut reader = reader_with_pagination(&server.url, 1, 0, pagination);
+            assert_eq!(
+                drain_ids(reader.as_mut()).unwrap_or_else(|error| panic!(
+                    "{strategy} rejected an unrelated Link: {error}"
+                )),
+                vec![1],
+                "strategy={strategy} headers={headers:?}"
+            );
+            let expected_path = if strategy == "offset" {
+                "/?offset=0&limit=2"
+            } else {
+                "/"
+            };
+            assert_eq!(server.paths(), [expected_path]);
+        }
+    }
+}
+
+#[test]
+fn transient_body_timeout_retries_the_whole_page() {
+    let _guard = network_test_guard();
+    let truncated = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 64\r\nConnection: keep-alive\r\n\r\n[".to_owned();
+    let server = TestServer::spawn(vec![truncated, ok(&[], 9)]);
+    let mut reader = reader_with_retries(&format!("{}/start", server.url), 1, 1);
+
+    assert_eq!(
+        drain_ids(reader.as_mut()).expect("transient body timeout should retry"),
+        vec![9]
+    );
+    assert_eq!(server.paths(), ["/start", "/start"]);
 }
 
 #[test]

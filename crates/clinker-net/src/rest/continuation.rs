@@ -350,10 +350,11 @@ fn parse_link_field(field: &str) -> Result<Vec<String>, ContinuationError> {
                 }
             }
         }
-        if rel
-            .as_deref()
-            .is_some_and(|relations| relations.split_ascii_whitespace().any(|rel| rel == "next"))
-        {
+        if rel.as_deref().is_some_and(|relations| {
+            relations
+                .split_ascii_whitespace()
+                .any(|rel| rel.eq_ignore_ascii_case("next"))
+        }) {
             next_targets.push(target.to_owned());
         }
     }

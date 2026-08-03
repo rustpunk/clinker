@@ -95,7 +95,9 @@ an offered continuation beyond that bound is an error.
   ```
 
 - **`link_header`** — the reader follows the URL in the response's RFC
-  5988 `Link: <…>; rel="next"` header until no such link is present.
+  8288 `Link: <…>; rel="next"` header until no such link is present. Registered
+  relation tokens are case-insensitive, so `next`, `Next`, and `NEXT` have the
+  same meaning.
 
   ```yaml
   pagination:
@@ -110,6 +112,11 @@ the original normalized origin is allowed. Cross-origin targets, HTTPS-to-HTTP
 downgrades, malformed or conflicting `rel="next"` metadata, redirect or
 continuation cycles, and traversal beyond the configured bounds fail before a
 foreign or repeated request is sent.
+
+`Link` continuation metadata is parsed and authorized only when
+`pagination.strategy` is `link_header`. Other strategies ignore it because
+their continuation authority comes from the configured offset, cursor, or
+single-request contract.
 
 ### Authentication
 
@@ -149,7 +156,7 @@ certificate verification as a workaround.
 |----------------|---------|----------------------------------------------------------------------|
 | `max_pages`    | —       | **Required.** Hard ceiling on pages fetched, regardless of the server. |
 | `max_records`  | none    | Optional hard ceiling on records emitted.                            |
-| `retries`      | `3`     | Bounded retries on a transient failure (5xx, connect/timeout error). A 4xx is fatal — retrying cannot help. |
+| `retries`      | `3`     | Bounded retries on a transient failure (5xx, connect/timeout error, or a transient body-delivery timeout/reset). A 4xx is fatal — retrying cannot help. |
 | `timeout_secs` | `30`    | Per-request timeout. Bounds in-flight time so an interrupt lands within the shutdown window. |
 
 Request diagnostics report a failure class, attempt number, page number, HTTP
@@ -157,6 +164,10 @@ status when available, and the query-free target path. Authorization headers,
 request bodies, response bodies, and URL query values are never included. A
 proxy or vendor error therefore remains actionable without copying credentials
 or signed query parameters into logs.
+
+A retryable body-delivery failure discards the partial body and retries the
+whole page within the same bounded retry budget. Body-size violations,
+protocol errors, and TLS failures remain fatal.
 
 A partial-page decode failure routes that page's offending rows to the
 DLQ per-row, exactly like a file source; it does not abort the pull.

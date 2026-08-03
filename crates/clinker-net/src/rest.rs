@@ -464,21 +464,31 @@ impl RestRecordSource {
                         RequestFailure::HttpStatus(status),
                     ));
                 }
-                let next_link =
+                let next_link = if matches!(self.next, NextPage::LinkHeader { .. }) {
                     continuation::next_link(response.headers(), &url, &self.admitted_origin)
-                        .map_err(continuation_format_error)?;
-                let body = response
+                        .map_err(continuation_format_error)?
+                } else {
+                    None
+                };
+                let body = match response
                     .body_mut()
                     .with_config()
                     .limit(MAX_PAGE_BYTES)
                     .read_to_vec()
-                    .map_err(|error| {
-                        self.sanitized_request_failure(
+                {
+                    Ok(body) => body,
+                    Err(error) => {
+                        let failure = RequestFailure::from_transport(&error);
+                        if failure.retryable_body_read() {
+                            break failure;
+                        }
+                        return Err(self.sanitized_request_failure(
                             &url,
                             attempt.saturating_add(1),
-                            RequestFailure::from_transport(&error),
-                        )
-                    })?;
+                            failure,
+                        ));
+                    }
+                };
                 return Ok(PageResponse { body, next_link });
             };
             if attempt < self.cfg.retries {
@@ -537,6 +547,23 @@ impl RequestFailure {
             Self::Io(kind) => format!("io_{kind:?}").to_ascii_lowercase(),
             Self::Transport => "transport".to_owned(),
         }
+    }
+
+    fn retryable_body_read(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout
+                | Self::Connection
+                | Self::Io(
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::WouldBlock
+                )
+        )
     }
 }
 
