@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -13,10 +13,11 @@ use crate::bundle::{self, AssemblyRequest};
 use crate::canonical;
 use crate::child::{self, ChildSpec, Termination};
 use crate::cli::github::{
-    DownloadedAsset, GitHubTransport, MAX_RELEASE_ASSET_BYTES, Method, Request as GitHubRequest,
+    DownloadedAsset, GitHubTransport, MAX_RELEASE_ASSET_BYTES, MAX_RELEASE_ASSET_SET_BYTES, Method,
+    Request as GitHubRequest,
 };
 use crate::decision::{self, DecisionRequest};
-use crate::digest::sha256_hex;
+use crate::digest::{sha256_hex, sha256_reader_bounded};
 use crate::error::GateError;
 use crate::evidence::{self, EvidenceKind};
 use crate::inventory;
@@ -243,21 +244,28 @@ pub fn stage_candidate_draft(
 
     let existing = remote_asset_map(release, "candidate release")?;
     reject_remote_asset_drift(&existing, &expected)?;
+    let mut downloaded_bytes = 0_u64;
     for (name, local) in &expected {
-        if let Some(asset_id) = existing.get(name) {
-            let asset = download_release_asset(&request.repository, asset_id, deadline, transport)?;
-            if !asset.matches_bytes(local) {
+        if let Some(remote) = existing.get(name) {
+            if remote.length != local.length {
+                return Err(policy(format!(
+                    "existing candidate asset size differs from local authority: {name}"
+                )));
+            }
+            let asset =
+                download_release_asset(&request.repository, &remote.id, deadline, transport)?;
+            add_downloaded_bytes(&mut downloaded_bytes, asset.length())?;
+            if !asset.matches_identity(local.length, &local.sha256) {
                 return Err(policy(format!(
                     "existing candidate asset differs from local authority: {name}"
                 )));
             }
         }
     }
-    for (name, bytes) in &expected {
+    for (name, local) in &expected {
         if existing.contains_key(name) {
             continue;
         }
-        let path = request.asset_dir.join(name);
         let uploaded = transport.send(
             &GitHubRequest::new(
                 Method::Post,
@@ -268,7 +276,7 @@ pub fn stage_candidate_draft(
                 deadline,
             )
             .header("Content-Type", "application/octet-stream")
-            .input_file(path),
+            .input_file(local.path.clone()),
         )?;
         if !uploaded.body.is_null() {
             let uploaded = release_object(&uploaded.body, "uploaded candidate asset")?;
@@ -277,7 +285,6 @@ pub fn stage_candidate_draft(
                     "uploaded candidate asset name differs from inventory",
                 ));
             }
-            let _ = bytes;
         }
     }
 
@@ -297,12 +304,14 @@ pub fn stage_candidate_draft(
             "staged candidate asset inventory is incomplete or contains extras",
         ));
     }
-    for (name, asset_id) in final_assets {
-        let asset = download_release_asset(&request.repository, &asset_id, deadline, transport)?;
-        if expected
-            .get(&name)
-            .is_none_or(|expected| !asset.matches_bytes(expected))
-        {
+    let mut downloaded_bytes = 0_u64;
+    for (name, remote) in final_assets {
+        let asset = download_release_asset(&request.repository, &remote.id, deadline, transport)?;
+        add_downloaded_bytes(&mut downloaded_bytes, asset.length())?;
+        if expected.get(&name).is_none_or(|expected| {
+            remote.length != expected.length
+                || !asset.matches_identity(expected.length, &expected.sha256)
+        }) {
             return Err(policy(format!(
                 "fresh staged candidate asset differs from local authority: {name}"
             )));
@@ -378,7 +387,7 @@ fn stage_deadline(seconds: u64) -> Result<Duration, GateError> {
 fn local_release_assets(
     inventory: &inventory::ReleaseInventory,
     directory: &Path,
-) -> Result<BTreeMap<String, Vec<u8>>, GateError> {
+) -> Result<BTreeMap<String, LocalReleaseAsset>, GateError> {
     require_complete_asset_set(inventory, directory)?;
     let mut assets = BTreeMap::new();
     let mut names = BTreeSet::from(["SHA256SUMS".to_owned()]);
@@ -387,6 +396,7 @@ fn local_release_assets(
         names.insert(format!("{}.sha256", target.archive_name));
         names.insert(format!("{}.intoto.jsonl", target.archive_name));
     }
+    let mut aggregate = 0_u64;
     for name in names {
         if !name
             .bytes()
@@ -404,12 +414,46 @@ fn local_release_assets(
                 "local release assets must be regular non-symlink files",
             ));
         }
+        if metadata.len() > MAX_RELEASE_ASSET_BYTES {
+            return Err(policy(format!(
+                "local release asset exceeds the {MAX_RELEASE_ASSET_BYTES}-byte limit: {name}"
+            )));
+        }
+        aggregate = aggregate
+            .checked_add(metadata.len())
+            .ok_or_else(|| policy("local release asset sizes overflowed"))?;
+        if aggregate > MAX_RELEASE_ASSET_SET_BYTES {
+            return Err(policy(format!(
+                "local release asset set exceeds the {MAX_RELEASE_ASSET_SET_BYTES}-byte limit"
+            )));
+        }
+        let (length, sha256) = sha256_reader_bounded(
+            File::open(&path).map_err(|error| GateError::io("open local release asset", &error))?,
+            MAX_RELEASE_ASSET_BYTES,
+        )
+        .map_err(|error| GateError::io("hash local release asset", &error))?;
+        if length != metadata.len() {
+            return Err(policy(format!(
+                "local release asset changed while it was admitted: {name}"
+            )));
+        }
         assets.insert(
             name,
-            read_bounded(&path, "read local release asset", MAX_INPUT_BYTES * 1024)?,
+            LocalReleaseAsset {
+                path,
+                length,
+                sha256,
+            },
         );
     }
     Ok(assets)
+}
+
+#[derive(Debug)]
+struct LocalReleaseAsset {
+    path: PathBuf,
+    length: u64,
+    sha256: String,
 }
 
 fn find_candidate_release(
@@ -540,26 +584,61 @@ fn metadata_value(metadata: &str) -> Result<Map<String, Value>, GateError> {
 fn remote_asset_map(
     release: &Map<String, Value>,
     label: &str,
-) -> Result<BTreeMap<String, String>, GateError> {
+) -> Result<BTreeMap<String, RemoteReleaseAsset>, GateError> {
     let assets = release
         .get("assets")
         .and_then(Value::as_array)
         .ok_or_else(|| policy(format!("{label}.assets must be an array")))?;
     let mut observed = BTreeMap::new();
+    let mut aggregate = 0_u64;
     for asset in assets {
         let asset = release_object(asset, "candidate release asset")?;
         let name = string_field(asset, "name", "candidate release asset")?.to_owned();
         let id = value_id(asset, "id", "candidate release asset")?;
-        if observed.insert(name, id).is_some() {
+        let length = asset
+            .get("size")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| policy("candidate release asset size must be an integer"))?;
+        if length > MAX_RELEASE_ASSET_BYTES {
+            return Err(policy("candidate release asset exceeds its byte limit"));
+        }
+        aggregate = aggregate
+            .checked_add(length)
+            .ok_or_else(|| policy("candidate release asset sizes overflowed"))?;
+        if aggregate > MAX_RELEASE_ASSET_SET_BYTES {
+            return Err(policy("candidate release asset set exceeds its byte limit"));
+        }
+        if observed
+            .insert(name, RemoteReleaseAsset { id, length })
+            .is_some()
+        {
             return Err(policy("candidate release contains duplicate asset names"));
         }
     }
     Ok(observed)
 }
 
+#[derive(Debug)]
+struct RemoteReleaseAsset {
+    id: String,
+    length: u64,
+}
+
+fn add_downloaded_bytes(total: &mut u64, length: u64) -> Result<(), GateError> {
+    *total = total
+        .checked_add(length)
+        .ok_or_else(|| policy("downloaded release asset sizes overflowed"))?;
+    if *total > MAX_RELEASE_ASSET_SET_BYTES {
+        return Err(policy(
+            "downloaded release asset set exceeds its byte limit",
+        ));
+    }
+    Ok(())
+}
+
 fn reject_remote_asset_drift(
-    remote: &BTreeMap<String, String>,
-    expected: &BTreeMap<String, Vec<u8>>,
+    remote: &BTreeMap<String, RemoteReleaseAsset>,
+    expected: &BTreeMap<String, LocalReleaseAsset>,
 ) -> Result<(), GateError> {
     if remote.keys().any(|name| !expected.contains_key(name)) {
         return Err(policy(
@@ -1040,13 +1119,18 @@ fn verify_authorized_digests(
         .ok_or_else(|| policy("candidate archive digest authority is absent"))?;
     let mut observed = Map::new();
     for target in &inventory.targets {
+        let path = directory.join(&target.archive_name);
         observed.insert(
             target.target.clone(),
-            Value::String(sha256_hex(&read_bounded(
-                &directory.join(&target.archive_name),
-                "read candidate archive",
-                MAX_INPUT_BYTES * 1024,
-            )?)),
+            Value::String(
+                sha256_reader_bounded(
+                    File::open(&path)
+                        .map_err(|error| GateError::io("open candidate archive", &error))?,
+                    MAX_RELEASE_ASSET_BYTES,
+                )
+                .map_err(|error| GateError::io("hash candidate archive", &error))?
+                .1,
+            ),
         );
     }
     if &observed != expected {
@@ -1172,6 +1256,11 @@ fn candidate_value(
     });
     candidate.insert("archives".to_owned(), Value::Array(archives));
     candidate.insert("attestations".to_owned(), Value::Array(attestations));
+    let assets = local_release_assets(inventory, directory)?
+        .into_iter()
+        .map(|(name, asset)| json!({"name": name, "length": asset.length, "sha256": asset.sha256}))
+        .collect();
+    candidate.insert("assets".to_owned(), Value::Array(assets));
     candidate.insert("tag_mutation_performed".to_owned(), Value::Bool(false));
     candidate.insert(
         "tag_readback_ref".to_owned(),

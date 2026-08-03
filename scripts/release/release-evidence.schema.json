@@ -58,6 +58,24 @@
         "sha256": { "$ref": "#/$defs/sha256" }
       }
     },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "length", "sha256"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "^[0-9A-Za-z._-]+$"
+        },
+        "length": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 536870912
+        },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
     "attestation": {
       "type": "object",
       "additionalProperties": false,
@@ -112,6 +130,7 @@
         "publish_workflow_path",
         "archives",
         "attestations",
+        "assets",
         "tag_mutation_performed",
         "tag_readback_ref",
         "release_trigger_event_ref"
@@ -154,6 +173,12 @@
           "minItems": 4,
           "maxItems": 4,
           "items": { "$ref": "#/$defs/attestation" }
+        },
+        "assets": {
+          "type": "array",
+          "minItems": 13,
+          "maxItems": 13,
+          "items": { "$ref": "#/$defs/asset" }
         },
         "tag_mutation_performed": { "const": false },
         "tag_readback_ref": { "$ref": "#/$defs/nonEmpty" },

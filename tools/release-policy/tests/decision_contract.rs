@@ -153,11 +153,11 @@ fn decision_validate_accepts_authorization_and_candidate_evidence_shape() {
         "authorization.json",
         &authorizations["authorized"],
     );
-    let candidate_evidence = write_json(
-        &directory,
-        "candidate-evidence.json",
-        &accepted["candidate_evidence"],
-    );
+    let mut evidence = accepted["candidate_evidence"].clone();
+    evidence["assets"] = Value::Array(governed_assets(
+        evidence["archives"].as_array().expect("candidate archives"),
+    ));
+    let candidate_evidence = write_json(&directory, "candidate-evidence.json", &evidence);
     let candidate = write_json(&directory, "candidate.json", &accepted["records"][6]);
 
     let output = gate(&[
@@ -285,6 +285,34 @@ fn canonical(value: &Value) -> clinker_release_policy::canonical::CanonicalValue
         .expect("test value must be canonical JSON")
 }
 
+fn governed_assets(archives: &[Value]) -> Vec<Value> {
+    let mut assets = vec![json!({
+        "name": "SHA256SUMS",
+        "length": 1,
+        "sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    })];
+    for archive in archives {
+        let name = archive["archive_name"].as_str().expect("archive name");
+        assets.push(json!({
+            "name": name,
+            "length": 1,
+            "sha256": archive["sha256"],
+        }));
+        assets.push(json!({
+            "name": format!("{name}.sha256"),
+            "length": 1,
+            "sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        }));
+        assets.push(json!({
+            "name": format!("{name}.intoto.jsonl"),
+            "length": 1,
+            "sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        }));
+    }
+    assets.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    assets
+}
+
 fn valid_candidate() -> Value {
     let authorizations = fixture(AUTHORIZATION_FIXTURE);
     let authorization = &authorizations["authorized"];
@@ -328,6 +356,7 @@ fn valid_candidate() -> Value {
             })
         })
         .collect::<Vec<_>>();
+    let assets = governed_assets(&archives);
 
     json!({
         "schema": "clinker.candidate-evidence/v1",
@@ -358,6 +387,7 @@ fn valid_candidate() -> Value {
         "publish_workflow_path": ".github/workflows/publish-release.yml",
         "archives": archives,
         "attestations": attestations,
+        "assets": assets,
         "tag_mutation_performed": false,
         "tag_readback_ref": format!(
             "https://github.com/rustpunk/clinker/git/ref/tags/{}",

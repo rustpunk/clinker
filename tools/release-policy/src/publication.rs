@@ -15,7 +15,9 @@ use crate::error::GateError;
 use crate::evidence::{self, EvidenceExpectation, EvidenceWrite};
 use crate::limits::{MAX_INPUT_BYTES, MAX_SCHEMA_BYTES, read_bounded};
 
-use super::github::{GitHubTransport, MAX_RELEASE_ASSET_BYTES, Method, Request};
+use super::github::{
+    GitHubTransport, MAX_RELEASE_ASSET_BYTES, MAX_RELEASE_ASSET_SET_BYTES, Method, Request,
+};
 
 const REPOSITORY: &str = "rustpunk/clinker";
 const EVIDENCE_SCHEMA_ID: &str = "clinker.release-evidence/v1";
@@ -520,32 +522,41 @@ fn verify_release_assets(
     let assets = field(release, "assets", "release readback")?
         .as_array()
         .ok_or_else(|| policy("release assets must be an array"))?;
-    let archives = field(candidate, "archives", "candidate evidence")?
-        .as_array()
-        .ok_or_else(|| policy("candidate archives must be an array"))?;
-    if assets.len() != 4 || archives.len() != 4 {
-        return Err(policy(
-            "release must contain exactly four authorized assets",
-        ));
+    let expected = candidate_asset_manifest(candidate)?;
+    if assets.len() != expected.len() {
+        return Err(policy("release asset inventory differs from candidate"));
     }
-    let expected = archives
-        .iter()
-        .map(|archive| {
-            let archive = object(archive, "candidate archive")?;
-            Ok((
-                string_field(archive, "archive_name", "candidate archive")?.to_owned(),
-                string_field(archive, "sha256", "candidate archive")?.to_owned(),
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, GateError>>()?;
-    let mut observed = BTreeMap::new();
+    let mut remote = BTreeMap::new();
+    let mut aggregate = 0_u64;
     for asset in assets {
         let asset = object(asset, "release asset")?;
-        let name = string_field(asset, "name", "release asset")?;
+        let name = string_field(asset, "name", "release asset")?.to_owned();
         let id = value_id_or_string(asset, "id", "release asset")?;
-        if observed.contains_key(name) {
-            return Err(policy("release asset names must be unique"));
+        let length = u64_field(asset, "size", "release asset")?;
+        if length > MAX_RELEASE_ASSET_BYTES {
+            return Err(policy("release asset exceeds its byte limit"));
         }
+        aggregate = aggregate
+            .checked_add(length)
+            .ok_or_else(|| policy("release asset sizes overflowed"))?;
+        if aggregate > MAX_RELEASE_ASSET_SET_BYTES {
+            return Err(policy("release asset set exceeds its byte limit"));
+        }
+        if expected
+            .get(&name)
+            .is_none_or(|identity| identity.length != length)
+            || remote.insert(name, id).is_some()
+        {
+            return Err(policy(
+                "release asset names and sizes differ from candidate",
+            ));
+        }
+    }
+    if remote.keys().collect::<BTreeSet<_>>() != expected.keys().collect::<BTreeSet<_>>() {
+        return Err(policy("release asset inventory differs from candidate"));
+    }
+    let mut observed = BTreeMap::new();
+    for (name, id) in remote {
         let asset = transport.download(
             &Request::new(
                 Method::Get,
@@ -556,7 +567,13 @@ fn verify_release_assets(
             .raw(),
             MAX_RELEASE_ASSET_BYTES,
         )?;
-        observed.insert(name.to_owned(), asset.sha256().to_owned());
+        observed.insert(
+            name,
+            AssetIdentity {
+                length: asset.length(),
+                sha256: asset.sha256().to_owned(),
+            },
+        );
     }
     if observed != expected {
         return Err(policy(
@@ -564,6 +581,71 @@ fn verify_release_assets(
         ));
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AssetIdentity {
+    length: u64,
+    sha256: String,
+}
+
+fn candidate_asset_manifest(
+    candidate: &Map<String, Value>,
+) -> Result<BTreeMap<String, AssetIdentity>, GateError> {
+    let assets = field(candidate, "assets", "candidate evidence")?
+        .as_array()
+        .ok_or_else(|| policy("candidate assets must be an array"))?;
+    if assets.len() != 13 {
+        return Err(policy("candidate must contain exactly 13 governed assets"));
+    }
+    let mut manifest = BTreeMap::new();
+    let mut aggregate = 0_u64;
+    for asset in assets {
+        let asset = object(asset, "candidate asset")?;
+        exact_keys(asset, &["name", "length", "sha256"], "candidate asset")?;
+        let name = string_field(asset, "name", "candidate asset")?.to_owned();
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(policy("candidate asset name is not a safe identifier"));
+        }
+        let length = u64_field(asset, "length", "candidate asset")?;
+        if length > MAX_RELEASE_ASSET_BYTES {
+            return Err(policy("candidate asset exceeds its byte limit"));
+        }
+        aggregate = aggregate
+            .checked_add(length)
+            .ok_or_else(|| policy("candidate asset sizes overflowed"))?;
+        if aggregate > MAX_RELEASE_ASSET_SET_BYTES {
+            return Err(policy("candidate asset set exceeds its byte limit"));
+        }
+        let sha256 = string_field(asset, "sha256", "candidate asset")?.to_owned();
+        validate_hex(&sha256, 64, "candidate asset digest")?;
+        if manifest
+            .insert(name, AssetIdentity { length, sha256 })
+            .is_some()
+        {
+            return Err(policy("candidate asset names must be unique"));
+        }
+    }
+    let archives = field(candidate, "archives", "candidate evidence")?
+        .as_array()
+        .ok_or_else(|| policy("candidate archives must be an array"))?;
+    let mut governed_names = BTreeSet::from(["SHA256SUMS".to_owned()]);
+    for archive in archives {
+        let archive = object(archive, "candidate archive")?;
+        let name = string_field(archive, "archive_name", "candidate archive")?;
+        governed_names.insert(name.to_owned());
+        governed_names.insert(format!("{name}.sha256"));
+        governed_names.insert(format!("{name}.intoto.jsonl"));
+    }
+    if manifest.keys().cloned().collect::<BTreeSet<_>>() != governed_names {
+        return Err(policy(
+            "candidate asset inventory differs from the governed release set",
+        ));
+    }
+    Ok(manifest)
 }
 
 fn require_immutable_public(
@@ -1432,24 +1514,12 @@ fn validate_public_release(
     let assets = field(release, "assets", "public release")?
         .as_array()
         .ok_or_else(|| policy("public release assets must be an array"))?;
-    let archives = field(candidate, "archives", "candidate evidence")?
-        .as_array()
-        .ok_or_else(|| policy("candidate archives must be an array"))?;
-    if assets.len() != 4 || archives.len() != 4 {
+    let expected = candidate_asset_manifest(candidate)?;
+    if assets.len() != expected.len() {
         return Err(policy(
-            "public release must contain the exact four authorized assets",
+            "public release asset inventory differs from candidate",
         ));
     }
-    let expected = archives
-        .iter()
-        .map(|archive| {
-            let archive = object(archive, "candidate archive")?;
-            Ok((
-                string_field(archive, "archive_name", "candidate archive")?.to_owned(),
-                string_field(archive, "sha256", "candidate archive")?.to_owned(),
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>, GateError>>()?;
     let observed = assets
         .iter()
         .map(|asset| {
@@ -1459,7 +1529,10 @@ fn validate_public_release(
             }
             Ok((
                 string_field(asset, "name", "public asset")?.to_owned(),
-                string_field(asset, "sha256", "public asset")?.to_owned(),
+                AssetIdentity {
+                    length: u64_field(asset, "length", "public asset")?,
+                    sha256: string_field(asset, "sha256", "public asset")?.to_owned(),
+                },
             ))
         })
         .collect::<Result<BTreeMap<_, _>, GateError>>()?;
@@ -1504,6 +1577,7 @@ fn validate_candidate(value: &Value) -> Result<(), GateError> {
             "publish_workflow_path",
             "archives",
             "attestations",
+            "assets",
             "tag_mutation_performed",
             "tag_readback_ref",
             "release_trigger_event_ref",
@@ -1555,6 +1629,7 @@ fn validate_candidate(value: &Value) -> Result<(), GateError> {
         .as_array()
         .filter(|values| values.len() == 4)
         .ok_or_else(|| policy("candidate must contain four attestations"))?;
+    candidate_asset_manifest(object)?;
     let _ = (archives, attestations);
     Ok(())
 }

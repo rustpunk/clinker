@@ -3,13 +3,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
 use crate::child::{self, ChildSpec, Termination};
+use crate::cli::github::MAX_RELEASE_ASSET_BYTES;
 use crate::digest::sha256_hex;
 use crate::error::GateError;
 use crate::inventory::{BinarySpec, ReleaseInventory, TargetSpec};
@@ -56,6 +57,12 @@ struct ArchiveEntry {
     mode: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerifiedEntry {
+    bytes: Vec<u8>,
+    mode: u32,
+}
+
 /// Build one deterministic suite archive plus checksum and SLSA statement.
 pub fn build(
     repo_root: &Path,
@@ -94,6 +101,14 @@ pub fn build(
         });
     }
     entries.sort_by(|left, right| left.name.cmp(&right.name));
+    let payload_bytes = entries.iter().try_fold(0_u64, |total, entry| {
+        total
+            .checked_add(entry.bytes.len() as u64)
+            .ok_or_else(|| policy("release archive payload sizes overflowed"))
+    })?;
+    if payload_bytes > MAX_RELEASE_ASSET_BYTES.saturating_sub(4 * 1024 * 1024) {
+        return Err(policy("release archive payload exceeds its byte limit"));
+    }
     let manifest = release_manifest(inventory, target, &request.source_sha, &entries)?;
     entries.push(ArchiveEntry {
         name: "release-manifest.json".to_owned(),
@@ -116,6 +131,10 @@ pub fn build(
     } else {
         zip_archive(&target.root_name, &entries)?
     };
+    if archive.len() as u64 > MAX_RELEASE_ASSET_BYTES {
+        return Err(policy("release archive exceeds its byte limit"));
+    }
+    smoke_packaged_archive(inventory, target, &archive)?;
     let digest = sha256_hex(&archive);
     let sidecar = format!("{digest}  {}\n", target.archive_name).into_bytes();
     let provenance =
@@ -252,9 +271,23 @@ fn read_binary(
     let name = format!("{}{}", binary.name, target.binary_suffix);
     let path = binary_dir.join(&name);
     let bytes = read_regular(&path, "read release binary")?;
+    smoke_binary(&path, &name, &binary.smoke_args, version)?;
+    Ok(ArchiveEntry {
+        name,
+        bytes,
+        mode: 0o755,
+    })
+}
+
+fn smoke_binary(
+    path: &Path,
+    name: &str,
+    arguments: &[String],
+    version: &str,
+) -> Result<(), GateError> {
     let result = child::run(ChildSpec {
-        program: path,
-        arguments: binary.smoke_args.iter().map(OsString::from).collect(),
+        program: path.to_path_buf(),
+        arguments: arguments.iter().map(OsString::from).collect(),
         environment: BTreeMap::new(),
         timeout: Duration::from_secs(15),
         output_limit: 16 * 1024,
@@ -272,11 +305,62 @@ fn read_binary(
             "{name} smoke check did not report version {version}"
         )));
     }
-    Ok(ArchiveEntry {
-        name,
-        bytes,
-        mode: 0o755,
-    })
+    Ok(())
+}
+
+fn smoke_packaged_archive(
+    inventory: &ReleaseInventory,
+    target: &TargetSpec,
+    archive: &[u8],
+) -> Result<(), GateError> {
+    if !native_target(&target.target) {
+        return Ok(());
+    }
+    let entries = if target.archive_format == "tar.gz" {
+        read_tar(&gunzip_store(archive)?)?
+    } else {
+        read_zip(archive)?
+    };
+    let temporary = tempfile::tempdir()
+        .map_err(|error| GateError::io("create packaged smoke directory", &error))?;
+    for binary in &inventory.binaries {
+        let name = format!("{}{}", binary.name, target.binary_suffix);
+        let member_name = format!("{}/{name}", target.root_name);
+        let member = entries
+            .get(&member_name)
+            .ok_or_else(|| policy(format!("packaged binary is absent: {name}")))?;
+        if member.mode != 0o755 {
+            return Err(policy(format!("packaged binary is not executable: {name}")));
+        }
+        let path = temporary.path().join(&name);
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| GateError::io("create packaged smoke binary", &error))?;
+        file.write_all(&member.bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|error| GateError::io("write packaged smoke binary", &error))?;
+        drop(file);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+                .map_err(|error| GateError::io("make packaged smoke binary executable", &error))?;
+        }
+        smoke_binary(&path, &name, &binary.smoke_args, &inventory.version)?;
+    }
+    Ok(())
+}
+
+fn native_target(target: &str) -> bool {
+    match target {
+        "x86_64-unknown-linux-gnu" => cfg!(all(target_os = "linux", target_arch = "x86_64")),
+        "x86_64-pc-windows-msvc" => cfg!(all(target_os = "windows", target_arch = "x86_64")),
+        "aarch64-apple-darwin" => cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        "x86_64-apple-darwin" => cfg!(all(target_os = "macos", target_arch = "x86_64")),
+        _ => false,
+    }
 }
 
 fn release_manifest(
@@ -474,9 +558,10 @@ fn verify_archive(
     }
     let manifest_name = format!("{}/release-manifest.json", target.root_name);
     let manifest: Value = serde_json::from_slice(
-        entries
+        &entries
             .get(&manifest_name)
-            .ok_or_else(|| policy("release manifest is absent"))?,
+            .ok_or_else(|| policy("release manifest is absent"))?
+            .bytes,
     )
     .map_err(|_| policy("release manifest is malformed"))?;
     let object = exact_object(
@@ -509,14 +594,14 @@ fn verify_archive(
             )));
         }
         let member_name = format!("{}/{name}", target.root_name);
-        let bytes = entries.get(&member_name).ok_or_else(|| {
+        let member = entries.get(&member_name).ok_or_else(|| {
             policy(format!(
                 "release manifest names missing archive member: {name}"
             ))
         })?;
         expect_value(
             entry.get("sha256"),
-            &sha256_hex(bytes),
+            &sha256_hex(&member.bytes),
             "release manifest digest",
         )?;
         let expected_mode = if name == format!("clinker{}", target.binary_suffix)
@@ -527,6 +612,14 @@ fn verify_archive(
             "0644"
         };
         expect_value(entry.get("mode"), expected_mode, "release manifest mode")?;
+        let expected_mode = if expected_mode == "0755" {
+            0o755
+        } else {
+            0o644
+        };
+        if member.mode != expected_mode {
+            return Err(policy("archive member mode differs from release manifest"));
+        }
     }
     let expected_names = target
         .members
@@ -572,29 +665,78 @@ fn tar_archive(root: &str, entries: &[ArchiveEntry]) -> Result<Vec<u8>, GateErro
     Ok(output)
 }
 
-fn read_tar(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, GateError> {
+fn read_tar(bytes: &[u8]) -> Result<BTreeMap<String, VerifiedEntry>, GateError> {
+    if bytes.len() < 1024 || !bytes.len().is_multiple_of(512) {
+        return Err(policy("tar archive length or terminator is invalid"));
+    }
     let mut offset = 0_usize;
     let mut entries = BTreeMap::new();
     while offset + 512 <= bytes.len() {
         let header = &bytes[offset..offset + 512];
         if header.iter().all(|byte| *byte == 0) {
-            break;
+            if offset + 1024 != bytes.len() || bytes[offset..].iter().any(|byte| *byte != 0) {
+                return Err(policy(
+                    "tar archive has invalid terminator or trailing bytes",
+                ));
+            }
+            return Ok(entries);
+        }
+        let stored_checksum = parse_octal(&header[148..156])?;
+        let observed_checksum = header
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| {
+                if (148..156).contains(&index) {
+                    usize::from(b' ')
+                } else {
+                    usize::from(*byte)
+                }
+            })
+            .sum::<usize>();
+        if stored_checksum != observed_checksum
+            || &header[257..263] != b"ustar\0"
+            || &header[263..265] != b"00"
+            || header[156] != b'0'
+            || parse_octal(&header[108..116])? != 0
+            || parse_octal(&header[116..124])? != 0
+            || parse_octal(&header[136..148])? != 0
+        {
+            return Err(policy("tar member header differs from the strict format"));
         }
         let name = nul_string(&header[..100])?;
         safe_member(&name)?;
+        let mode = parse_octal(&header[100..108])? as u32;
+        if !matches!(mode, 0o644 | 0o755) {
+            return Err(policy("tar member mode is not governed"));
+        }
         let size = parse_octal(&header[124..136])?;
         let start = offset + 512;
         let end = start
             .checked_add(size)
             .ok_or_else(|| policy("tar member size overflow"))?;
-        if end > bytes.len() || entries.insert(name, bytes[start..end].to_vec()).is_some() {
+        let next = end
+            .checked_add(511)
+            .map(|value| value / 512 * 512)
+            .ok_or_else(|| policy("tar member padding overflow"))?;
+        if next > bytes.len()
+            || bytes[end..next].iter().any(|byte| *byte != 0)
+            || entries
+                .insert(
+                    name,
+                    VerifiedEntry {
+                        bytes: bytes[start..end].to_vec(),
+                        mode,
+                    },
+                )
+                .is_some()
+        {
             return Err(policy(
-                "tar archive is truncated or contains duplicate members",
+                "tar archive is truncated, malformed, or contains duplicate members",
             ));
         }
-        offset = end.next_multiple_of(512);
+        offset = next;
     }
-    Ok(entries)
+    Err(policy("tar archive is missing its exact terminator"))
 }
 
 fn gzip_store(input: &[u8]) -> Vec<u8> {
@@ -652,7 +794,8 @@ fn gunzip_store(bytes: &[u8]) -> Result<Vec<u8>, GateError> {
         }
     }
     let trailer = &bytes[bytes.len() - 8..];
-    if u32::from_le_bytes(trailer[..4].try_into().unwrap_or([0; 4])) != crc32(&output)
+    if offset != bytes.len() - 8
+        || u32::from_le_bytes(trailer[..4].try_into().unwrap_or([0; 4])) != crc32(&output)
         || u32::from_le_bytes(trailer[4..].try_into().unwrap_or([0; 4])) != output.len() as u32
     {
         return Err(policy("release tar.gz checksum does not match"));
@@ -714,15 +857,29 @@ fn zip_archive(root: &str, entries: &[ArchiveEntry]) -> Result<Vec<u8>, GateErro
     Ok(output)
 }
 
-fn read_zip(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, GateError> {
+fn read_zip(bytes: &[u8]) -> Result<BTreeMap<String, VerifiedEntry>, GateError> {
+    #[derive(Debug)]
+    struct LocalEntry {
+        name: String,
+        bytes: Vec<u8>,
+        crc: u32,
+        offset: u32,
+    }
+
     let mut offset = 0_usize;
-    let mut entries = BTreeMap::new();
+    let mut locals = Vec::new();
+    let mut names = BTreeSet::new();
     while offset + 4 <= bytes.len() && bytes[offset..offset + 4] == 0x0403_4b50_u32.to_le_bytes() {
         if offset + 30 > bytes.len() {
             return Err(policy("zip local header is truncated"));
         }
-        if le16(bytes, offset + 8)? != 0 {
-            return Err(policy("zip entry uses an unsupported compression method"));
+        if le16(bytes, offset + 4)? != 20
+            || le16(bytes, offset + 6)? != 0
+            || le16(bytes, offset + 8)? != 0
+            || le16(bytes, offset + 10)? != 0
+            || le16(bytes, offset + 12)? != 0
+        {
+            return Err(policy("zip local header differs from the strict format"));
         }
         let crc = le32(bytes, offset + 14)?;
         let compressed = le32(bytes, offset + 18)? as usize;
@@ -733,7 +890,13 @@ fn read_zip(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, GateError> {
             return Err(policy("zip stored entry length does not match"));
         }
         let name_start = offset + 30;
-        let data_start = name_start + name_len + extra_len;
+        if extra_len != 0 {
+            return Err(policy("zip local entry extras are forbidden"));
+        }
+        let data_start = name_start
+            .checked_add(name_len)
+            .and_then(|value| value.checked_add(extra_len))
+            .ok_or_else(|| policy("zip local name length overflow"))?;
         let data_end = data_start
             .checked_add(uncompressed)
             .ok_or_else(|| policy("zip entry length overflow"))?;
@@ -745,12 +908,87 @@ fn read_zip(bytes: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, GateError> {
             .to_owned();
         safe_member(&name)?;
         let data = bytes[data_start..data_end].to_vec();
-        if crc32(&data) != crc || entries.insert(name, data).is_some() {
+        if crc32(&data) != crc || !names.insert(name.clone()) {
             return Err(policy("zip entry checksum failed or member is duplicated"));
         }
+        locals.push(LocalEntry {
+            name,
+            bytes: data,
+            crc,
+            offset: offset as u32,
+        });
         offset = data_end;
     }
-    if offset + 4 > bytes.len() || bytes[offset..offset + 4] != 0x0201_4b50_u32.to_le_bytes() {
+    let central_offset = offset;
+    let mut entries = BTreeMap::new();
+    let mut central_count = 0_usize;
+    while offset + 4 <= bytes.len() && bytes[offset..offset + 4] == 0x0201_4b50_u32.to_le_bytes() {
+        if offset + 46 > bytes.len() {
+            return Err(policy("zip central directory entry is truncated"));
+        }
+        if le16(bytes, offset + 4)? != 0x0314
+            || le16(bytes, offset + 6)? != 20
+            || le16(bytes, offset + 8)? != 0
+            || le16(bytes, offset + 10)? != 0
+            || le16(bytes, offset + 12)? != 0
+            || le16(bytes, offset + 14)? != 0
+            || le16(bytes, offset + 30)? != 0
+            || le16(bytes, offset + 32)? != 0
+            || le16(bytes, offset + 34)? != 0
+            || le16(bytes, offset + 36)? != 0
+        {
+            return Err(policy(
+                "zip central directory differs from the strict format",
+            ));
+        }
+        let crc = le32(bytes, offset + 16)?;
+        let compressed = le32(bytes, offset + 20)?;
+        let uncompressed = le32(bytes, offset + 24)?;
+        let name_len = le16(bytes, offset + 28)? as usize;
+        let external = le32(bytes, offset + 38)?;
+        let local_offset = le32(bytes, offset + 42)?;
+        let end = offset
+            .checked_add(46)
+            .and_then(|value| value.checked_add(name_len))
+            .ok_or_else(|| policy("zip central name length overflow"))?;
+        if end > bytes.len() || compressed != uncompressed {
+            return Err(policy("zip central directory entry is malformed"));
+        }
+        let name = std::str::from_utf8(&bytes[offset + 46..end])
+            .map_err(|_| policy("zip central member name is not UTF-8"))?;
+        let local = locals
+            .get(central_count)
+            .ok_or_else(|| policy("zip central directory contains an extra entry"))?;
+        let mode = external >> 16;
+        if name != local.name
+            || local_offset != local.offset
+            || crc != local.crc
+            || uncompressed as usize != local.bytes.len()
+            || !matches!(mode, 0o100644 | 0o100755)
+        {
+            return Err(policy("zip central directory disagrees with local entry"));
+        }
+        entries.insert(
+            name.to_owned(),
+            VerifiedEntry {
+                bytes: local.bytes.clone(),
+                mode: mode & 0o777,
+            },
+        );
+        central_count += 1;
+        offset = end;
+    }
+    if central_count != locals.len()
+        || offset + 22 != bytes.len()
+        || bytes[offset..offset + 4] != 0x0605_4b50_u32.to_le_bytes()
+        || le16(bytes, offset + 4)? != 0
+        || le16(bytes, offset + 6)? != 0
+        || le16(bytes, offset + 8)? as usize != central_count
+        || le16(bytes, offset + 10)? as usize != central_count
+        || le32(bytes, offset + 12)? as usize != offset - central_offset
+        || le32(bytes, offset + 16)? as usize != central_offset
+        || le16(bytes, offset + 20)? != 0
+    {
         return Err(policy("zip central directory is missing"));
     }
     Ok(entries)
@@ -863,7 +1101,21 @@ fn read_regular(path: &Path, operation: &'static str) -> Result<Vec<u8>, GateErr
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(policy("release input must be a regular non-symlink file"));
     }
-    fs::read(path).map_err(|error| GateError::io(operation, &error))
+    if metadata.len() > MAX_RELEASE_ASSET_BYTES {
+        return Err(policy("release input exceeds its byte limit"));
+    }
+    let file = File::open(path).map_err(|error| GateError::io(operation, &error))?;
+    let mut bytes = Vec::new();
+    file.take(MAX_RELEASE_ASSET_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| GateError::io(operation, &error))?;
+    if bytes.len() as u64 > MAX_RELEASE_ASSET_BYTES {
+        return Err(policy("release input exceeds its byte limit"));
+    }
+    if bytes.len() as u64 != metadata.len() {
+        return Err(policy("release input changed while it was admitted"));
+    }
+    Ok(bytes)
 }
 
 fn admit_output_directory(path: &Path) -> Result<(), GateError> {
@@ -957,4 +1209,81 @@ fn validate_sha40(value: &str, label: &str) -> Result<(), GateError> {
 
 fn policy(detail: impl Into<String>) -> GateError {
     GateError::policy("release.invalid", detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entries() -> Vec<ArchiveEntry> {
+        vec![
+            ArchiveEntry {
+                name: "clinker".to_owned(),
+                bytes: b"binary".to_vec(),
+                mode: 0o755,
+            },
+            ArchiveEntry {
+                name: "README.md".to_owned(),
+                bytes: b"readme".to_vec(),
+                mode: 0o644,
+            },
+        ]
+    }
+
+    fn rewrite_tar_checksum(bytes: &mut [u8]) {
+        bytes[148..156].fill(b' ');
+        let checksum = bytes[..512].iter().map(|byte| u64::from(*byte)).sum();
+        write_checksum(&mut bytes[148..156], checksum);
+    }
+
+    #[test]
+    fn strict_tar_rejects_header_mode_terminator_and_trailing_drift() {
+        let archive = tar_archive("root", &entries()).unwrap();
+        assert!(read_tar(&archive).is_ok());
+
+        let mut checksum = archive.clone();
+        checksum[0] ^= 1;
+        assert!(read_tar(&checksum).is_err());
+
+        let mut mode = archive.clone();
+        write_octal(&mut mode[100..108], 0o777);
+        rewrite_tar_checksum(&mut mode);
+        assert!(read_tar(&mode).is_err());
+
+        let mut trailing = archive;
+        trailing.extend([0_u8; 512]);
+        assert!(read_tar(&trailing).is_err());
+    }
+
+    #[test]
+    fn strict_gzip_rejects_bytes_between_deflate_and_trailer() {
+        let mut archive = gzip_store(&tar_archive("root", &entries()).unwrap());
+        let trailer = archive.split_off(archive.len() - 8);
+        archive.push(0);
+        archive.extend(trailer);
+        assert!(gunzip_store(&archive).is_err());
+    }
+
+    #[test]
+    fn strict_zip_rejects_central_offset_mode_and_trailing_drift() {
+        let archive = zip_archive("root", &entries()).unwrap();
+        assert!(read_zip(&archive).is_ok());
+        let central = archive
+            .windows(4)
+            .position(|window| window == 0x0201_4b50_u32.to_le_bytes())
+            .unwrap();
+
+        let mut offset = archive.clone();
+        offset[central + 42..central + 46].copy_from_slice(&1_u32.to_le_bytes());
+        assert!(read_zip(&offset).is_err());
+
+        let mut mode = archive.clone();
+        mode[central + 38..central + 42]
+            .copy_from_slice(((0o100777_u32) << 16).to_le_bytes().as_slice());
+        assert!(read_zip(&mode).is_err());
+
+        let mut trailing = archive;
+        trailing.push(0);
+        assert!(read_zip(&trailing).is_err());
+    }
 }

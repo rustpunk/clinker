@@ -1181,6 +1181,7 @@ fn validate_candidate_evidence(value: &CanonicalValue) -> Result<(), GateError> 
         "publish_workflow_path",
         "archives",
         "attestations",
+        "assets",
         "tag_mutation_performed",
         "tag_readback_ref",
         "release_trigger_event_ref",
@@ -1279,6 +1280,44 @@ fn validate_candidate_release_entries(
             "candidate archives and attestations must each contain exactly four entries",
         ));
     }
+    let assets = required(evidence, "assets", "candidate evidence")?
+        .as_array()
+        .ok_or_else(|| policy("candidate evidence.assets must be an array"))?;
+    if assets.len() != 13 {
+        return Err(policy(
+            "candidate assets must contain exactly 13 governed entries",
+        ));
+    }
+    let mut asset_names = BTreeSet::new();
+    let mut aggregate = 0_u64;
+    for (index, asset) in assets.iter().enumerate() {
+        let label = format!("candidate evidence.assets[{index}]");
+        let asset = object(asset, &label)?;
+        exact_keys(asset, &["name", "length", "sha256"], &label)?;
+        let name = nonempty_string(asset, "name", &label)?;
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || !asset_names.insert(name)
+        {
+            return Err(policy(
+                "candidate asset names must be unique safe identifiers",
+            ));
+        }
+        let length = required(asset, "length", &label)?
+            .as_u64()
+            .ok_or_else(|| policy("candidate asset length must be an integer"))?;
+        if length > 512 * 1024 * 1024 {
+            return Err(policy("candidate asset exceeds its byte limit"));
+        }
+        aggregate = aggregate
+            .checked_add(length)
+            .ok_or_else(|| policy("candidate asset sizes overflowed"))?;
+        if aggregate > 1024 * 1024 * 1024 {
+            return Err(policy("candidate asset set exceeds its byte limit"));
+        }
+        digest64(required(asset, "sha256", &label)?, "candidate asset sha256")?;
+    }
     let digests = object(
         required(evidence, "archive_digests", "candidate evidence")?,
         "candidate evidence.archive_digests",
@@ -1316,6 +1355,17 @@ fn validate_candidate_release_entries(
             ));
         }
         digest64(required(archive, "sha256", &label)?, "archive sha256")?;
+    }
+    let mut governed_asset_names = BTreeSet::from(["SHA256SUMS".to_owned()]);
+    for archive_name in &archive_names {
+        governed_asset_names.insert(archive_name.clone());
+        governed_asset_names.insert(format!("{archive_name}.sha256"));
+        governed_asset_names.insert(format!("{archive_name}.intoto.jsonl"));
+    }
+    if asset_names != governed_asset_names {
+        return Err(policy(
+            "candidate assets must cover the governed checksum, archives, checksum sidecars, and provenance statements exactly",
+        ));
     }
     let mut attested_names = BTreeSet::new();
     for (index, attestation) in attestations.iter().enumerate() {

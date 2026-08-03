@@ -488,12 +488,14 @@ fn draft_release(
     body: &str,
     draft: bool,
     target_commitish: &str,
-    names: impl IntoIterator<Item = String>,
+    names: impl IntoIterator<Item = (String, u64)>,
 ) -> Value {
     let assets = names
         .into_iter()
         .enumerate()
-        .map(|(index, name)| json!({"id": format!("draft-asset-{index}"), "name": name}))
+        .map(|(index, (name, size))| {
+            json!({"id": format!("draft-asset-{index}"), "name": name, "size": size})
+        })
         .collect::<Vec<_>>();
     json!({
         "id": "release-700",
@@ -508,11 +510,11 @@ fn draft_release(
 
 fn draft_asset_downloads(
     assets: &BTreeMap<String, Vec<u8>>,
-    names: impl IntoIterator<Item = String>,
+    names: impl IntoIterator<Item = (String, u64)>,
 ) -> Vec<FakeResponse> {
     names
         .into_iter()
-        .map(|name| FakeResponse::Raw(assets.get(&name).expect("fixture asset").clone()))
+        .map(|(name, _)| FakeResponse::Raw(assets.get(&name).expect("fixture asset").clone()))
         .collect()
 }
 
@@ -521,7 +523,10 @@ fn hidden_draft_worker_creates_retries_and_reconciles_exact_private_assets() {
     let fixture = DraftFixture::new();
     let request = fixture.request();
     let assets = fixture.asset_bytes();
-    let names = assets.keys().cloned().collect::<Vec<_>>();
+    let names = assets
+        .iter()
+        .map(|(name, bytes)| (name.clone(), bytes.len() as u64))
+        .collect::<Vec<_>>();
     let metadata = draft_metadata("release-700");
     let complete = draft_release(&metadata, true, DRAFT_SOURCE_SHA, names.clone());
 
@@ -639,7 +644,10 @@ fn hidden_draft_worker_fails_closed_on_remote_drift_and_ambiguity() {
     let fixture = DraftFixture::new();
     let request = fixture.request();
     let assets = fixture.asset_bytes();
-    let names = assets.keys().cloned().collect::<Vec<_>>();
+    let names = assets
+        .iter()
+        .map(|(name, bytes)| (name.clone(), bytes.len() as u64))
+        .collect::<Vec<_>>();
     let metadata = draft_metadata("release-700");
     let exact = draft_release(&metadata, true, DRAFT_SOURCE_SHA, names.clone());
 
@@ -659,7 +667,7 @@ fn hidden_draft_worker_fails_closed_on_remote_drift_and_ambiguity() {
     duplicate["assets"]
         .as_array_mut()
         .unwrap()
-        .push(json!({"id": "duplicate", "name": first_name}));
+        .push(json!({"id": "duplicate", "name": first_name.0, "size": first_name.1}));
     let mut cases = vec![
         ("duplicate asset", json!([duplicate])),
         (
@@ -668,7 +676,7 @@ fn hidden_draft_worker_fails_closed_on_remote_drift_and_ambiguity() {
                 &metadata,
                 true,
                 DRAFT_SOURCE_SHA,
-                ["starter.txt".to_owned()],
+                [("starter.txt".to_owned(), 0)],
             )]),
         ),
         (
@@ -804,7 +812,7 @@ impl StateFixture {
         )
         .expect("decision JSON");
         let mut authorization = authorization_fixture["authorized"].clone();
-        let asset_bytes = [
+        let archive_bytes = [
             "aarch64-apple-darwin",
             "x86_64-apple-darwin",
             "x86_64-pc-windows-msvc",
@@ -816,7 +824,7 @@ impl StateFixture {
             (target.to_owned(), bytes)
         })
         .collect::<Vec<_>>();
-        let digests = asset_bytes
+        let digests = archive_bytes
             .iter()
             .map(|(target, bytes)| (target.clone(), Value::String(digest::sha256_hex(bytes))))
             .collect::<Map<_, _>>();
@@ -851,7 +859,7 @@ impl StateFixture {
         let identity = authorization["authorization"]
             .as_object()
             .expect("authorization identity");
-        let archives = asset_bytes
+        let archives = archive_bytes
             .iter()
             .map(|(target, _)| {
                 let extension = if target == "x86_64-pc-windows-msvc" {
@@ -877,6 +885,30 @@ impl StateFixture {
                     "ref": "refs/tags/v3.0.0",
                     "source_sha": identity["source_sha"],
                     "runner_environment": "github-hosted",
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut asset_bytes = vec![("SHA256SUMS".to_owned(), b"fixture checksums\n".to_vec())];
+        for (archive, (_, bytes)) in archives.iter().zip(&archive_bytes) {
+            let name = archive["archive_name"].as_str().unwrap().to_owned();
+            asset_bytes.push((name.clone(), bytes.clone()));
+            asset_bytes.push((
+                format!("{name}.sha256"),
+                format!("{}  {name}\n", archive["sha256"].as_str().unwrap()).into_bytes(),
+            ));
+            asset_bytes.push((
+                format!("{name}.intoto.jsonl"),
+                format!("fixture attestation for {name}\n").into_bytes(),
+            ));
+        }
+        asset_bytes.sort_by(|left, right| left.0.cmp(&right.0));
+        let asset_manifest = asset_bytes
+            .iter()
+            .map(|(name, bytes)| {
+                json!({
+                    "name": name,
+                    "length": bytes.len(),
+                    "sha256": digest::sha256_hex(bytes),
                 })
             })
             .collect::<Vec<_>>();
@@ -909,6 +941,7 @@ impl StateFixture {
             "publish_workflow_path": ".github/workflows/publish-release.yml",
             "archives": archives,
             "attestations": attestations,
+            "assets": asset_manifest,
             "tag_mutation_performed": false,
             "tag_readback_ref": "https://api.github.com/repos/rustpunk/clinker/git/ref/tags/v3.0.0",
             "release_trigger_event_ref": identity["ci_run_ref"],
@@ -1194,7 +1227,7 @@ fn successful_job() -> Value {
 }
 
 fn public_release(fixture: &StateFixture, complete: bool) -> Value {
-    let archives = fixture.candidate_value["archives"].as_array().unwrap();
+    let archives = fixture.candidate_value["assets"].as_array().unwrap();
     let limit = if complete {
         archives.len()
     } else {
@@ -1204,7 +1237,8 @@ fn public_release(fixture: &StateFixture, complete: bool) -> Value {
         .iter()
         .map(|archive| {
             json!({
-                "name": archive["archive_name"],
+                "name": archive["name"],
+                "length": archive["length"],
                 "sha256": archive["sha256"],
                 "uploaded": true
             })
@@ -1284,6 +1318,28 @@ fn protected_worker_rejects_drift_partial_mutation_and_ambiguous_timeout() {
     let mut transport = RecordingTransport::new(blob_drift);
     assert!(publication::protected_publish(&request, &mut transport).is_err());
     assert_eq!(transport.requests.len(), 1);
+
+    let exact_release = worker_release(&fixture, true, false);
+    let mut missing = exact_release.clone();
+    missing["assets"].as_array_mut().unwrap().pop();
+    let mut extra = exact_release.clone();
+    extra["assets"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id": "extra", "name": "starter.txt", "size": 0}));
+    let mut renamed = exact_release.clone();
+    renamed["assets"][0]["name"] = json!("renamed.txt");
+    let mut duplicate = exact_release.clone();
+    duplicate["assets"][1]["name"] = duplicate["assets"][0]["name"].clone();
+    for release in [missing, extra, renamed, duplicate] {
+        let mut responses = protected_worker_prefix(&fixture);
+        responses.push(FakeResponse::Json(release));
+        let mut transport = RecordingTransport::new(responses);
+        assert!(publication::protected_publish(&request, &mut transport).is_err());
+        assert!(transport.requests.iter().all(|request| {
+            request.method != clinker_release_policy::cli::github::Method::Patch
+        }));
+    }
 
     let mut asset_drift = protected_worker_prefix(&fixture);
     asset_drift.push(FakeResponse::Json(worker_release(&fixture, true, false)));
@@ -1391,13 +1447,13 @@ fn protected_worker_replay(fixture: &StateFixture) -> Vec<FakeResponse> {
 }
 
 fn worker_release(fixture: &StateFixture, draft: bool, immutable: bool) -> Value {
-    let assets = fixture.candidate_value["archives"]
+    let assets = fixture.candidate_value["assets"]
         .as_array()
         .unwrap()
         .iter()
         .enumerate()
-        .map(|(index, archive)| {
-            json!({"id": format!("asset-{index}"), "name": archive["archive_name"]})
+        .map(|(index, asset)| {
+            json!({"id": format!("asset-{index}"), "name": asset["name"], "size": asset["length"]})
         })
         .collect::<Vec<_>>();
     json!({
@@ -1616,6 +1672,18 @@ fn candidate_validator_rejects_metadata_and_release_entry_drift() {
     let mut duplicate_attestation = fixture.candidate_value.clone();
     duplicate_attestation["attestations"][1] = duplicate_attestation["attestations"][0].clone();
     assert!(validate_decision_candidate(&fixture, &duplicate_attestation).is_err());
+
+    let mut missing_asset = fixture.candidate_value.clone();
+    missing_asset["assets"].as_array_mut().unwrap().pop();
+    assert!(validate_decision_candidate(&fixture, &missing_asset).is_err());
+
+    let mut duplicate_asset = fixture.candidate_value.clone();
+    duplicate_asset["assets"][1]["name"] = duplicate_asset["assets"][0]["name"].clone();
+    assert!(validate_decision_candidate(&fixture, &duplicate_asset).is_err());
+
+    let mut oversized_asset = fixture.candidate_value.clone();
+    oversized_asset["assets"][0]["length"] = json!(512_u64 * 1024 * 1024 + 1);
+    assert!(validate_decision_candidate(&fixture, &oversized_asset).is_err());
 }
 
 fn validate_decision_candidate(fixture: &StateFixture, candidate: &Value) -> Result<(), GateError> {

@@ -42,3 +42,34 @@ pub fn sha256_reader(mut reader: impl Read) -> io::Result<String> {
     }
     Ok(format!("{:x}", hasher.finalize()))
 }
+
+/// Hash a byte stream while enforcing the maximum admitted byte count.
+///
+/// The returned length is derived from bytes actually read rather than file
+/// metadata, so a concurrent mutation cannot bypass a pre-read size check.
+///
+/// # Errors
+///
+/// Returns an I/O error if the stream cannot be read or exceeds `byte_limit`.
+pub fn sha256_reader_bounded(mut reader: impl Read, byte_limit: u64) -> io::Result<(u64, String)> {
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut length = 0_u64;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        length = length
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("SHA-256 input length overflowed"))?;
+        if length > byte_limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SHA-256 input exceeded its byte limit",
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok((length, format!("{:x}", hasher.finalize())))
+}

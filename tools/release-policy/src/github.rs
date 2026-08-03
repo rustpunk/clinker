@@ -16,6 +16,8 @@ use crate::limits::DEFAULT_CHILD_OUTPUT_BYTES;
 
 /// Maximum admitted size of one freshly downloaded release archive.
 pub const MAX_RELEASE_ASSET_BYTES: u64 = 512 * 1024 * 1024;
+/// Maximum aggregate bytes admitted for one governed release asset set.
+pub const MAX_RELEASE_ASSET_SET_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Supported GitHub API verbs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,11 +133,10 @@ impl DownloadedAsset {
         &self.sha256
     }
 
-    /// Compare the completed download with in-memory authority without loading
-    /// the downloaded file back into memory.
+    /// Compare the completed download with a precomputed bounded identity.
     #[must_use]
-    pub fn matches_bytes(&self, expected: &[u8]) -> bool {
-        self.length == expected.len() as u64 && self.sha256 == digest::sha256_hex(expected)
+    pub fn matches_identity(&self, length: u64, sha256: &str) -> bool {
+        self.length == length && self.sha256 == sha256
     }
 
     fn from_bytes(bytes: &[u8], byte_limit: u64) -> Result<Self, GateError> {
