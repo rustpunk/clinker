@@ -54,6 +54,30 @@ fn write_workflow(root: &Path, name: &str, contents: &str) {
         .expect("workflow fixture must be written");
 }
 
+fn release_workflow() -> String {
+    fs::read_to_string(repository_root().join(".github/workflows/release.yml"))
+        .expect("release workflow must be readable")
+}
+
+fn named_step(source: &str, name: &str) -> String {
+    let marker = format!("      - name: {name}\n");
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("release workflow step is absent: {name}"));
+    let end = source[start + marker.len()..]
+        .find("\n      - name: ")
+        .map_or(source.len(), |relative| start + marker.len() + relative + 1);
+    source[start..end].to_owned()
+}
+
+fn assert_release_workflow_rejected(root: &Path, source: &str, scenario: &str) {
+    write_workflow(root, "release.yml", source);
+    let output = gate(root);
+    assert_eq!(output.status.code(), Some(1), "scenario: {scenario}");
+    assert!(output.stdout.is_empty(), "scenario: {scenario}");
+    assert!(!output.stderr.is_empty(), "scenario: {scenario}");
+}
+
 #[test]
 fn exact_workflow_verify_argv_accepts_the_governed_repository() {
     let output = gate(&repository_root());
@@ -63,6 +87,49 @@ fn exact_workflow_verify_argv_accepts_the_governed_repository() {
         b"Release workflow trust verification passed\n"
     );
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn release_workflow_requires_every_build_stage_in_order() {
+    let root = fixture();
+    let source = release_workflow();
+    let names = [
+        "Fetch the locked workspace dependencies",
+        "Fetch the locked release policy dependencies",
+        "Build the governed target executables",
+        "Validate the repository release inventory",
+        "Build the locked target bundle with the Rust gate",
+        "Attest the exact archive subject",
+        "Upload the target bundle",
+    ];
+    let blocks = names
+        .iter()
+        .map(|name| named_step(&source, name))
+        .collect::<Vec<_>>();
+
+    for (name, block) in names.iter().zip(&blocks) {
+        let without_step = source.replacen(block, "", 1);
+        assert_ne!(without_step, source, "scenario fixture must change: {name}");
+        assert_release_workflow_rejected(root.path(), &without_step, name);
+    }
+
+    for (index, pair) in blocks.windows(2).enumerate() {
+        let adjacent = format!("{}{}", pair[0], pair[1]);
+        let reversed = format!("{}{}", pair[1], pair[0]);
+        let reordered = source.replacen(&adjacent, &reversed, 1);
+        assert_ne!(
+            reordered,
+            source,
+            "adjacent release steps must be discoverable: {} then {}",
+            names[index],
+            names[index + 1]
+        );
+        assert_release_workflow_rejected(
+            root.path(),
+            &reordered,
+            &format!("{} after {}", names[index], names[index + 1]),
+        );
+    }
 }
 
 #[test]

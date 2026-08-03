@@ -71,20 +71,38 @@ jobs:
           rustup show active-toolchain
           rustup target add "${{ matrix.target }}"
 
+      - name: Fetch the locked workspace dependencies
+        shell: bash
+        run: cargo fetch --locked
+
+      - name: Fetch the locked release policy dependencies
+        shell: bash
+        run: cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked
+
+      - name: Build the governed target executables
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: >-
+          cargo build --locked --offline --release --target "$BUILD_TARGET"
+          -p clinker -p cxl-cli
+
+      - name: Validate the repository release inventory
+        shell: bash
+        run: >-
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml
+          --locked --offline -- inventory check --print-json
+
       - name: Build the locked target bundle with the Rust gate
         env:
           BUILD_TARGET: ${{ matrix.target }}
           BUILD_SOURCE_SHA: ${{ github.sha }}
         shell: bash
-        run: |
-          cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked
-          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
-            inventory check --print-json
-          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
-            release build-bundle \
-            --target "$BUILD_TARGET" \
-            --source-sha "$BUILD_SOURCE_SHA" \
-            --output-dir artifacts
+        run: >-
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml
+          --locked --offline -- release build-bundle
+          --target "$BUILD_TARGET" --source-sha "$BUILD_SOURCE_SHA"
+          --output-dir artifacts
 
       - name: Attest the exact archive subject
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1

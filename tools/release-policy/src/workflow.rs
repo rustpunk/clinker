@@ -522,8 +522,7 @@ fn validate_release(workflow: &Workflow) -> Result<(), GateError> {
         .jobs
         .get("assemble-draft")
         .ok_or_else(|| policy("release assembly job is absent"))?;
-    require_action(build, "actions/attest-build-provenance")?;
-    require_action(build, "actions/upload-artifact")?;
+    require_release_build_sequence(build)?;
     require_action(assemble, "actions/download-artifact")?;
     if workflow
         .env
@@ -536,6 +535,127 @@ fn validate_release(workflow: &Workflow) -> Result<(), GateError> {
         ));
     }
     Ok(())
+}
+
+fn require_release_build_sequence(build: &Job) -> Result<(), GateError> {
+    let steps = build
+        .steps
+        .as_deref()
+        .ok_or_else(|| policy("release build steps are absent"))?;
+    let requirements = [
+        ReleaseBuildRequirement::Command(
+            &["cargo", "fetch", "--locked"],
+            "locked workspace dependency fetch",
+        ),
+        ReleaseBuildRequirement::Command(
+            &[
+                "cargo",
+                "fetch",
+                "--manifest-path",
+                "tools/release-policy/Cargo.toml",
+                "--locked",
+            ],
+            "locked release policy dependency fetch",
+        ),
+        ReleaseBuildRequirement::Command(
+            &[
+                "cargo",
+                "build",
+                "--locked",
+                "--offline",
+                "--release",
+                "--target",
+                "\"$BUILD_TARGET\"",
+                "-p",
+                "clinker",
+                "-p",
+                "cxl-cli",
+            ],
+            "governed target executable build",
+        ),
+        ReleaseBuildRequirement::Command(
+            &[
+                "cargo",
+                "run",
+                "--quiet",
+                "--manifest-path",
+                "tools/release-policy/Cargo.toml",
+                "--locked",
+                "--offline",
+                "--",
+                "inventory",
+                "check",
+                "--print-json",
+            ],
+            "live release inventory validation",
+        ),
+        ReleaseBuildRequirement::Command(
+            &[
+                "cargo",
+                "run",
+                "--quiet",
+                "--manifest-path",
+                "tools/release-policy/Cargo.toml",
+                "--locked",
+                "--offline",
+                "--",
+                "release",
+                "build-bundle",
+                "--target",
+                "\"$BUILD_TARGET\"",
+                "--source-sha",
+                "\"$BUILD_SOURCE_SHA\"",
+                "--output-dir",
+                "artifacts",
+            ],
+            "target bundle construction",
+        ),
+        ReleaseBuildRequirement::Action("actions/attest-build-provenance", "archive attestation"),
+        ReleaseBuildRequirement::Action("actions/upload-artifact", "target bundle upload"),
+    ];
+
+    let mut next_index = 0;
+    for requirement in requirements {
+        let Some(relative_index) = steps[next_index..]
+            .iter()
+            .position(|step| requirement.matches(step))
+        else {
+            return Err(policy(format!(
+                "release build is missing the ordered {} step",
+                requirement.description()
+            )));
+        };
+        next_index += relative_index + 1;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ReleaseBuildRequirement<'a> {
+    Command(&'a [&'a str], &'a str),
+    Action(&'a str, &'a str),
+}
+
+impl<'a> ReleaseBuildRequirement<'a> {
+    fn matches(self, step: &Step) -> bool {
+        match self {
+            Self::Command(expected, _) => step
+                .run
+                .as_deref()
+                .is_some_and(|run| exact_command(run, expected)),
+            Self::Action(action, _) => step
+                .uses
+                .as_deref()
+                .and_then(|uses| uses.split_once('@'))
+                .is_some_and(|(name, _)| name == action),
+        }
+    }
+
+    const fn description(self) -> &'a str {
+        match self {
+            Self::Command(_, description) | Self::Action(_, description) => description,
+        }
+    }
 }
 
 fn validate_publication(workflow: &Workflow) -> Result<(), GateError> {

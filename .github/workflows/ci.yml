@@ -87,6 +87,11 @@ jobs:
       - name: Exercise the detached policy gate
         run: cargo test --manifest-path tools/release-policy/Cargo.toml --locked --offline
 
+      - name: Validate the live release inventory
+        run: >-
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml
+          --locked --offline -- inventory check --print-json
+
       - name: Verify repository workflow trust
         run: >-
           cargo run --quiet --manifest-path tools/release-policy/Cargo.toml
