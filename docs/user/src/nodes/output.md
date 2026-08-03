@@ -44,21 +44,49 @@ on a cross-filesystem rename from local storage.
 
 This commit lifecycle applies to single-file, per-source-file fan-out, and
 `split:` outputs. Clinker does not open or truncate an existing final while a
-replacement is running. A failed run leaves every previous final unchanged and
-keeps destination-local hidden partials for operator inspection. After a
-successful run, each complete hidden file is synchronized and atomically
-promoted through the destination directory handle retained at admission.
+replacement is running. Before publication, Clinker synchronizes and validates
+the complete output set. For replacements it then moves each previous final to
+a hidden destination-local backup, promotes the new files, and removes the
+backups only after every promotion succeeds. A detected promotion or directory-
+sync failure rolls the whole set back and keeps the newly written bytes in
+hidden partials for inspection. If rollback itself fails, the error says so;
+Clinker does not report that the previous set was restored.
+
+Publication is transactional recovery across a finite set, not one atomic
+filesystem operation for the set. Each individual rename is atomic, but a
+reader may briefly observe a mixture while the commit or rollback walks several
+destinations. A process or machine crash in that window can leave `.partial`,
+`.backup`, or `.reservation` siblings. Those names are recovery evidence; do
+not treat them as completed output or delete them while another run is live.
 
 `if_exists: error` uses a no-replace promotion. `if_exists: overwrite` and
 `clinker run --force` replace only at successful promotion. `if_exists:
 unique_suffix` uses hidden sibling reservations so concurrent runs choose
-distinct final names without exposing zero-byte placeholders.
+distinct final names without exposing zero-byte placeholders. A reservation
+holds an operating-system lock and records its owner process. A later run
+reclaims it only after a short creation grace period and only when the lock is
+acquirable, proving that no live publisher owns it. If cleanup fails after a
+successful publication, the error names both the visible final and the stale
+reservation or backup; it does not call the publication itself unsuccessful.
 
 Rendered fan-out paths are validated as new output paths. Directory traversal,
 an absolute result produced from a relative template, symbolic-link/reparse
 ancestors, and cross-filesystem promotion fail before a final is touched. Create
 the intended destination directories ahead of the run; Clinker does not follow
 rendered paths while creating missing fan-out parents.
+
+`{source_file}` and `{source_path}` create one output route per discovered
+source file. Two source files that render to the same destination are rejected
+before any output is staged, with both source paths in the diagnostic. Escape a
+token as `{{source_file}}` or `{{source_path}}` when the braces are intended as
+literal filename text. When fan-out is combined with `split:`, every source has
+its own segment sequence: each starts at sequence 1 and rolls over
+independently.
+
+With `write_meta: true`, Clinker writes a `.meta.json` sidecar for every actual
+committed final. A split output therefore gets one sidecar per segment, and a
+fan-out output gets one per rendered destination; no sidecar is written for the
+unrendered base template.
 
 ## Direct broadcast to several outputs
 

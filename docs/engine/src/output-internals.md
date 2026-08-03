@@ -21,26 +21,48 @@ second, use-time boundary in `clinker-exec`:
    owner-only Unix mode and no-follow semantics. The final leaf is not opened
    or truncated during staging. No-replace policies claim a hidden sibling
    reservation so concurrent runs select distinct names without exposing an
-   empty final.
+   empty final. The reservation carries the owner PID and an exclusive `fs4`
+   lock. An existing reservation is reclaimed only after a creation-grace
+   interval and a successful non-blocking exclusive lock, which distinguishes a
+   dead owner from a live or newly starting publisher.
 4. Retain the boundary in a run-scoped publication ledger while single,
-   per-source-file fan-out, and split writers produce their bytes. Synchronize
-   the complete quarantine leaf and rename it to the final leaf relative to the
-   same retained parent handle only after the executor succeeds.
-5. Synchronize the destination directory after rename. Cross-filesystem
+   per-source-file fan-out, and split writers produce their bytes. After the
+   executor succeeds, preflight every quarantine and destination before the
+   first mutation. Move replaceable previous finals to unique destination-local
+   backups, then promote every quarantine through the retained handles.
+5. If any promotion or post-rename directory synchronization fails, walk the
+   changed entries in reverse: move newly visible finals back to their
+   quarantine names and restore every backup. A deterministic second-promotion
+   fault test proves that both previous finals return and both new quarantines
+   remain inspectable. Rollback failure is combined with the publication error,
+   never hidden.
+6. After every promotion succeeds, remove backups and reservations and record
+   the exact committed final paths used by metadata sidecars. Cleanup failure
+   is a distinct post-publication state naming the visible final and stale
+   artifact. Cross-filesystem
    promotion is refused; it never degrades to copying through a visible final
    path.
 
 Linux uses the locked `nix` filesystem bindings for `openat`, `renameat` /
 `renameat2`, `fstatfs`, and directory synchronization. macOS uses the matching
-`libc` `openat`, `fstat`, `fstatfs`, and `renameat` primitives. Windows opens
+`libc` `openat`, `fstat`, `fstatfs`, `renameat`, and `renameatx_np(RENAME_EXCL)`
+primitives. Windows opens
 the drive root with reparse-point-aware `CreateFileW`, then walks every
 descendant and opens every leaf relative to the retained handle with
 `NtCreateFile`. It inspects each handle, compares volume identity, and promotes
-relative to the retained destination handle with `SetFileInformationByHandle`.
+relative to the retained destination handle with `NtSetInformationFile`.
 The logical `ValidatedPath` remains required at the public containment boundary
 on every platform. A promotion that made the destination visible but could not
-synchronize its parent is still a failed run and reports the visible-but-
-unsynchronized state; it is never reduced to a warning.
+synchronize its parent enters the explicit visible-but-unsynchronized state;
+the ledger attempts rollback and never reduces that condition to a warning.
+
+The set protocol is recoverable, not globally atomic: individual renames are
+atomic, while a multi-file commit has an observation window in which old and new
+entries can coexist. An uncatchable process or machine failure may leave hidden
+`.partial`, `.backup`, and `.reservation` entries. The names preserve both sides
+for operator recovery; reservation liveness is established by the lock plus
+grace rule rather than by silently deleting a file that might belong to a live
+run.
 
 ### Remote filesystem qualification
 
