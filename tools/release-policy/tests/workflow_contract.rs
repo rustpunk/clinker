@@ -59,6 +59,11 @@ fn release_workflow() -> String {
         .expect("release workflow must be readable")
 }
 
+fn ci_workflow() -> String {
+    fs::read_to_string(repository_root().join(".github/workflows/ci.yml"))
+        .expect("CI workflow must be readable")
+}
+
 fn named_step(source: &str, name: &str) -> String {
     let marker = format!("      - name: {name}\n");
     let start = source
@@ -188,6 +193,57 @@ fn release_workflow_rejects_unmodeled_mutation_and_environment_drift() {
     for (scenario, mutated) in scenarios {
         assert_ne!(mutated, source, "scenario fixture must change: {scenario}");
         assert_release_workflow_rejected(root.path(), &mutated, scenario);
+    }
+}
+
+#[test]
+fn policy_jobs_reject_no_op_command_substitutions() {
+    let root = fixture();
+    let ci = ci_workflow();
+    let release = release_workflow();
+    let scenarios = [
+        (
+            "CI dependency policy no-op",
+            "ci.yml",
+            ci.replacen(
+                "cargo test --manifest-path tools/dependency-policy/Cargo.toml --locked --offline",
+                "true",
+                1,
+            ),
+        ),
+        (
+            "CI release policy no-op",
+            "ci.yml",
+            ci.replacen(
+                "cargo test --manifest-path tools/release-policy/Cargo.toml --locked --offline",
+                "true",
+                1,
+            ),
+        ),
+        (
+            "release dependency policy no-op",
+            "release.yml",
+            release.replacen(
+                "cargo test --manifest-path tools/dependency-policy/Cargo.toml --locked",
+                "true",
+                1,
+            ),
+        ),
+    ];
+
+    for (scenario, name, mutated) in scenarios {
+        let original = if name == "ci.yml" { &ci } else { &release };
+        assert_ne!(
+            &mutated, original,
+            "scenario fixture must change: {scenario}"
+        );
+        write_workflow(root.path(), name, &mutated);
+        let output = gate(root.path());
+        assert_eq!(output.status.code(), Some(1), "scenario: {scenario}");
+        assert!(output.stdout.is_empty(), "scenario: {scenario}");
+        assert!(!output.stderr.is_empty(), "scenario: {scenario}");
+        fs::remove_file(root.path().join(".github/workflows").join(name))
+            .expect("negative fixture cleanup");
     }
 }
 

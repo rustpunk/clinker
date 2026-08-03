@@ -175,6 +175,7 @@ fn verify_file(path: &Path) -> Result<(), GateError> {
     validate_permissions(name, &workflow.jobs)?;
 
     if name == "ci.yml" {
+        validate_ci_policy_jobs(&workflow.jobs)?;
         validate_filesystem_job(&workflow.jobs)?;
     } else if name == "release.yml" {
         validate_release(&workflow)?;
@@ -469,6 +470,171 @@ fn validate_filesystem_job(jobs: &BTreeMap<String, Job>) -> Result<(), GateError
     Ok(())
 }
 
+fn validate_ci_policy_jobs(jobs: &BTreeMap<String, Job>) -> Result<(), GateError> {
+    let dependency = jobs
+        .get("dependency-policy")
+        .ok_or_else(|| policy("CI dependency-policy job is absent"))?;
+    require_ci_policy_job(dependency, "Dependency policy", "ubuntu-latest", 7)?;
+    let steps = dependency
+        .steps
+        .as_deref()
+        .expect("validated step inventory");
+    require_unnamed_action_step(
+        &steps[0],
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        &["persist-credentials", "false"],
+    )?;
+    require_unnamed_action_step(
+        &steps[1],
+        "dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9",
+        &["toolchain", "1.91", "components", "clippy, rustfmt"],
+    )?;
+    require_plain_command_step(
+        &steps[2],
+        "Fetch locked boundary dependencies",
+        "cargo fetch --manifest-path tools/dependency-policy/Cargo.toml --locked",
+    )?;
+    require_plain_command_step(
+        &steps[3],
+        "Format the detached boundary tool",
+        "cargo fmt --manifest-path tools/dependency-policy/Cargo.toml --all -- --check",
+    )?;
+    require_plain_command_step(
+        &steps[4],
+        "Lint the detached boundary tool",
+        "cargo clippy --manifest-path tools/dependency-policy/Cargo.toml --all-targets --locked --offline -- -D warnings",
+    )?;
+    require_plain_command_step(
+        &steps[5],
+        "Exercise the boundary regression suite",
+        "cargo test --manifest-path tools/dependency-policy/Cargo.toml --locked --offline",
+    )?;
+    require_plain_command_step(
+        &steps[6],
+        "Enforce the final repository boundary",
+        "cargo run --manifest-path tools/dependency-policy/Cargo.toml --locked --offline -- --scope final --root .",
+    )?;
+
+    let release = jobs
+        .get("release-policy")
+        .ok_or_else(|| policy("CI release-policy job is absent"))?;
+    require_ci_policy_job(release, "Release policy", "ubuntu-24.04", 8)?;
+    let steps = release.steps.as_deref().expect("validated step inventory");
+    require_unnamed_action_step(
+        &steps[0],
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        &["persist-credentials", "false"],
+    )?;
+    require_unnamed_action_step(
+        &steps[1],
+        "dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9",
+        &["toolchain", "1.91", "components", "clippy, rustfmt"],
+    )?;
+    require_plain_command_step(
+        &steps[2],
+        "Fetch locked policy dependencies",
+        "cargo fetch --manifest-path tools/dependency-policy/Cargo.toml --locked cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked",
+    )?;
+    require_plain_command_step(
+        &steps[3],
+        "Format the detached policy gate",
+        "cargo fmt --manifest-path tools/release-policy/Cargo.toml --all -- --check",
+    )?;
+    require_plain_command_step(
+        &steps[4],
+        "Lint the detached policy gate",
+        "cargo clippy --manifest-path tools/release-policy/Cargo.toml --all-targets --locked --offline -- -D warnings",
+    )?;
+    require_plain_command_step(
+        &steps[5],
+        "Exercise the detached policy gate",
+        "cargo test --manifest-path tools/release-policy/Cargo.toml --locked --offline",
+    )?;
+    require_plain_command_step(
+        &steps[6],
+        "Validate the live release inventory",
+        "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- inventory check --print-json",
+    )?;
+    require_plain_command_step(
+        &steps[7],
+        "Verify repository workflow trust",
+        "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- workflow verify",
+    )
+}
+
+fn require_ci_policy_job(
+    job: &Job,
+    name: &str,
+    runner: &str,
+    step_count: usize,
+) -> Result<(), GateError> {
+    if job.name.as_deref() != Some(name)
+        || job.runs_on.as_ref().and_then(Value::as_str) != Some(runner)
+        || job.needs.is_some()
+        || job.condition.is_some()
+        || job.timeout_minutes.is_some()
+        || job.strategy.is_some()
+        || job.environment.is_some()
+        || job.uses.is_some()
+        || job.with.is_some()
+        || job.env.is_some()
+        || job
+            .steps
+            .as_ref()
+            .is_none_or(|steps| steps.len() != step_count)
+    {
+        return Err(policy(format!(
+            "CI policy job {name:?} differs from reviewed policy"
+        )));
+    }
+    Ok(())
+}
+
+fn require_unnamed_action_step(
+    step: &Step,
+    action: &str,
+    arguments: &[&str],
+) -> Result<(), GateError> {
+    if step.name.is_some()
+        || step.id.is_some()
+        || step.condition.is_some()
+        || step.uses.as_deref() != Some(action)
+        || !exact_value_map(step.with.as_ref(), arguments)
+        || step.run.is_some()
+        || step.shell.is_some()
+        || step.env.is_some()
+        || step.continue_on_error.is_some()
+        || step.timeout_minutes.is_some()
+        || step.working_directory.is_some()
+    {
+        return Err(policy("CI policy action step differs from reviewed policy"));
+    }
+    Ok(())
+}
+
+fn require_plain_command_step(step: &Step, name: &str, command: &str) -> Result<(), GateError> {
+    if step.name.as_deref() != Some(name)
+        || step.id.is_some()
+        || step.condition.is_some()
+        || step.uses.is_some()
+        || step.with.is_some()
+        || step
+            .run
+            .as_deref()
+            .is_none_or(|run| !exact_script(run, command))
+        || step.shell.is_some()
+        || step.env.is_some()
+        || step.continue_on_error.is_some()
+        || step.timeout_minutes.is_some()
+        || step.working_directory.is_some()
+    {
+        return Err(policy(format!(
+            "CI policy command step {name:?} differs from reviewed policy"
+        )));
+    }
+    Ok(())
+}
+
 fn require_evidence_path(step: &Step) -> Result<(), GateError> {
     if step
         .env
@@ -514,6 +680,10 @@ fn require_direct_command(run: &str, operation: &str) -> Result<(), GateError> {
 }
 
 fn validate_release(workflow: &Workflow) -> Result<(), GateError> {
+    let dependency = workflow
+        .jobs
+        .get("dependency-policy")
+        .ok_or_else(|| policy("release dependency-policy job is absent"))?;
     let build = workflow
         .jobs
         .get("build")
@@ -522,6 +692,7 @@ fn validate_release(workflow: &Workflow) -> Result<(), GateError> {
         .jobs
         .get("assemble-draft")
         .ok_or_else(|| policy("release assembly job is absent"))?;
+    require_exact_release_dependency(dependency)?;
     require_exact_release_build(build)?;
     require_exact_release_assembly(assemble)?;
     if workflow
@@ -535,6 +706,43 @@ fn validate_release(workflow: &Workflow) -> Result<(), GateError> {
         ));
     }
     Ok(())
+}
+
+fn require_exact_release_dependency(job: &Job) -> Result<(), GateError> {
+    if job.name.as_deref() != Some("Verify dependency policy")
+        || job.runs_on.as_ref().and_then(Value::as_str) != Some("ubuntu-24.04")
+        || job.needs.is_some()
+        || job.condition.is_some()
+        || job.timeout_minutes.is_some()
+        || job.strategy.is_some()
+        || job.environment.is_some()
+        || job.uses.is_some()
+        || job.with.is_some()
+        || job.env.is_some()
+        || job.steps.as_ref().is_none_or(|steps| steps.len() != 3)
+    {
+        return Err(policy(
+            "release dependency-policy job shape differs from reviewed policy",
+        ));
+    }
+    let steps = job.steps.as_deref().expect("validated step inventory");
+    require_action_step(
+        &steps[0],
+        "Check out the candidate source",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        &["persist-credentials", "false"],
+    )?;
+    require_unnamed_action_step(
+        &steps[1],
+        "dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9",
+        &["toolchain", "1.91"],
+    )?;
+    require_command_step(
+        &steps[2],
+        "Test and enforce the locked Rust boundary tool",
+        "set -euo pipefail cargo test --manifest-path tools/dependency-policy/Cargo.toml --locked cargo run --manifest-path tools/dependency-policy/Cargo.toml --locked --offline -- --scope final --root .",
+        &[],
+    )
 }
 
 fn require_exact_release_build(build: &Job) -> Result<(), GateError> {
