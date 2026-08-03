@@ -1430,6 +1430,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let mut pipeline_config =
         clinker_plan::config::load_config_with_vars_and_patches(&args.config, &[], source_patches)
             .map_err(PipelineError::Config)?;
+    apply_cli_force_policy(&mut pipeline_config, args.force);
 
     // A `--memory-limit` flag overrides the pipeline's `memory.limit`, matching
     // the documented CLI-wins precedence. The flag is validated at the boundary,
@@ -2040,7 +2041,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 let (_final_path, file) = output_staging.stage_output(
                     output.name.clone(),
                     output.if_exists,
-                    args.force,
+                    false,
                     path_for_n,
                 )?;
                 per_file.insert(file_arc, Box::new(file));
@@ -2072,7 +2073,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         let (final_path, handle) = output_staging.stage_output(
             output.name.clone(),
             output.if_exists,
-            args.force,
+            false,
             path_for_n,
         )?;
         let writer: Box<dyn std::io::Write + Send> = Box::new(handle);
@@ -2464,6 +2465,19 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     }
 
     Ok(exit_code)
+}
+
+fn apply_cli_force_policy(config: &mut clinker_plan::config::PipelineConfig, force: bool) {
+    if !force {
+        return;
+    }
+    for node in &mut config.nodes {
+        if let clinker_plan::config::PipelineNode::Output { config: body, .. } = &mut node.value
+            && body.output.if_exists == clinker_plan::config::IfExistsPolicy::Error
+        {
+            body.output.if_exists = clinker_plan::config::IfExistsPolicy::Overwrite;
+        }
+    }
 }
 
 /// Whether the named Output is flagged for per-source-file fan-out by

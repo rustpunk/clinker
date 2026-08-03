@@ -267,6 +267,117 @@ nodes:
 }
 
 #[test]
+fn force_replaces_existing_split_segments_after_success() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("input.csv"), "id\n1\n2\n").expect("write input");
+    std::fs::write(dir.path().join("result_0001.csv"), "previous\n")
+        .expect("write previous segment");
+    let pipeline_path = dir.path().join("pipeline.yaml");
+    std::fs::write(
+        &pipeline_path,
+        r#"pipeline:
+  name: force_split_success
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+- type: output
+  name: out
+  input: src
+  config:
+    name: out
+    path: result.csv
+    type: csv
+    if_exists: error
+    split:
+      max_records: 1
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&pipeline_path)
+        .arg("--force")
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        output.status.success(),
+        "forced split run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let first =
+        std::fs::read_to_string(dir.path().join("result_0001.csv")).expect("read first segment");
+    assert!(first.contains('1'), "first segment: {first:?}");
+    assert!(
+        std::fs::read_to_string(dir.path().join("result_0002.csv"))
+            .expect("read second segment")
+            .contains('2')
+    );
+}
+
+#[test]
+fn failed_force_split_run_preserves_existing_segment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("input.csv"), "id,group\n1,A\n2,A\n").expect("write input");
+    std::fs::write(dir.path().join("result_0001.csv"), "previous\n")
+        .expect("write previous segment");
+    let pipeline_path = dir.path().join("pipeline.yaml");
+    std::fs::write(
+        &pipeline_path,
+        r#"pipeline:
+  name: force_split_failure
+error_handling:
+  strategy: fail_fast
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+      - { name: group, type: string }
+- type: output
+  name: out
+  input: src
+  config:
+    name: out
+    path: result.csv
+    type: csv
+    if_exists: error
+    split:
+      max_records: 1
+      group_key: group
+      oversize_group: error
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&pipeline_path)
+        .arg("--force")
+        .output()
+        .expect("spawn clinker");
+
+    assert!(!output.status.success(), "forced split failure must fail");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("result_0001.csv")).expect("read previous segment"),
+        "previous\n"
+    );
+}
+
+#[test]
 fn fan_out_outputs_publish_only_after_success() {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("input-a.csv"), "id\n1\n").expect("write input a");
