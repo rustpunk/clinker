@@ -499,6 +499,226 @@ nodes:
 }
 
 #[test]
+fn split_fan_out_keeps_an_independent_segment_sequence_per_source() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("input-a.csv"), "id\n1\n2\n").expect("write input a");
+    std::fs::write(dir.path().join("input-b.csv"), "id\n3\n4\n").expect("write input b");
+    let pipeline_path = dir.path().join("pipeline.yaml");
+    std::fs::write(
+        &pipeline_path,
+        r#"pipeline:
+  name: split_fan_out
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    glob: input-*.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+- type: output
+  name: out
+  input: src
+  config:
+    name: out
+    path: result_{source_file}.csv
+    type: csv
+    split:
+      max_records: 1
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&pipeline_path)
+        .output()
+        .expect("spawn clinker");
+    assert!(
+        output.status.success(),
+        "split fan-out run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for (name, expected) in [
+        ("result_input-a_0001.csv", '1'),
+        ("result_input-a_0002.csv", '2'),
+        ("result_input-b_0001.csv", '3'),
+        ("result_input-b_0002.csv", '4'),
+    ] {
+        let body = std::fs::read_to_string(dir.path().join(name)).expect("read split fan-out");
+        assert!(body.contains(expected), "{name}: {body:?}");
+    }
+}
+
+#[test]
+fn duplicate_rendered_fan_out_destinations_fail_before_staging() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("east")).expect("create east");
+    std::fs::create_dir_all(dir.path().join("west")).expect("create west");
+    std::fs::write(dir.path().join("east/orders.csv"), "id\n1\n").expect("write east");
+    std::fs::write(dir.path().join("west/orders.csv"), "id\n2\n").expect("write west");
+    let pipeline_path = dir.path().join("pipeline.yaml");
+    std::fs::write(
+        &pipeline_path,
+        r#"pipeline:
+  name: duplicate_fan_out_destination
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    paths: [east/orders.csv, west/orders.csv]
+    type: csv
+    schema:
+      - { name: id, type: int }
+- type: output
+  name: out
+  input: src
+  config:
+    name: out
+    path: result_{source_file}.csv
+    type: csv
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&pipeline_path)
+        .output()
+        .expect("spawn clinker");
+    assert!(!output.status.success(), "duplicate fan-out must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("east/orders.csv"), "stderr: {stderr}");
+    assert!(stderr.contains("west/orders.csv"), "stderr: {stderr}");
+    assert!(!dir.path().join("result_orders.csv").exists());
+    assert!(
+        std::fs::read_dir(dir.path())
+            .expect("read root")
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().starts_with(".clinker-")),
+        "collision must be rejected before any output is staged"
+    );
+}
+
+#[test]
+fn escaped_per_record_tokens_remain_literal_in_cli_paths() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("input-a.csv"), "id\n1\n").expect("write input a");
+    std::fs::write(dir.path().join("input-b.csv"), "id\n2\n").expect("write input b");
+    let pipeline_path = dir.path().join("pipeline.yaml");
+    std::fs::write(
+        &pipeline_path,
+        r#"pipeline:
+  name: escaped_per_record_tokens
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    glob: input-*.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+- type: output
+  name: fan
+  input: src
+  config:
+    name: fan
+    path: literal-{{source_file}}-{source_file}.csv
+    type: csv
+- type: output
+  name: merged
+  input: src
+  config:
+    name: merged
+    path: literal-{{source_path}}.csv
+    type: csv
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&pipeline_path)
+        .output()
+        .expect("spawn clinker");
+    assert!(
+        output.status.success(),
+        "escaped-token run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        dir.path()
+            .join("literal-{source_file}-input-a.csv")
+            .exists()
+    );
+    assert!(
+        dir.path()
+            .join("literal-{source_file}-input-b.csv")
+            .exists()
+    );
+    assert!(dir.path().join("literal-{source_path}.csv").exists());
+}
+
+#[test]
+fn split_sidecars_name_each_committed_segment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("input.csv"), "id\n1\n2\n").expect("write input");
+    let pipeline_path = dir.path().join("pipeline.yaml");
+    std::fs::write(
+        &pipeline_path,
+        r#"pipeline:
+  name: split_sidecars
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+- type: output
+  name: out
+  input: src
+  config:
+    name: out
+    path: result.csv
+    type: csv
+    write_meta: true
+    split:
+      max_records: 1
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&pipeline_path)
+        .output()
+        .expect("spawn clinker");
+    assert!(
+        output.status.success(),
+        "split sidecar run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    for name in ["result_0001.csv", "result_0002.csv"] {
+        let sidecar_path = dir.path().join(format!("{name}.meta.json"));
+        let sidecar: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sidecar_path).expect("read segment sidecar"))
+                .expect("parse segment sidecar");
+        assert_eq!(sidecar["resolved_path"], name);
+    }
+    assert!(!dir.path().join("result.csv.meta.json").exists());
+}
+
+#[test]
 fn fan_out_rejects_a_linked_destination_parent() {
     let dir = tempfile::tempdir().expect("tempdir");
     let outside = tempfile::tempdir().expect("outside tempdir");

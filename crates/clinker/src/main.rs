@@ -1965,8 +1965,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
         std::collections::HashMap::new();
     let output_staging = clinker_exec::output::staging::OutputStagingRegistry::default();
-    let mut resolved_output_paths: std::collections::HashMap<String, std::path::PathBuf> =
-        std::collections::HashMap::new();
     let mut fan_out_destinations: std::collections::HashMap<
         String,
         Vec<(std::sync::Arc<str>, std::path::PathBuf, std::path::PathBuf)>,
@@ -2050,7 +2048,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     resolved_path.to_string_lossy().into_owned(),
                 );
                 if output.split.is_some() {
-                    resolved_output_paths.insert(output.name.clone(), resolved_path.clone());
                     per_file.insert(file_arc, Box::new(std::io::sink()));
                     continue;
                 }
@@ -2072,13 +2069,12 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                         }
                     })
                 };
-                let (final_path, file) = output_staging.stage_output(
+                let (_final_path, file) = output_staging.stage_output(
                     output.name.clone(),
                     output.if_exists,
                     false,
                     path_for_n,
                 )?;
-                resolved_output_paths.insert(output.name.clone(), final_path);
                 per_file.insert(file_arc, Box::new(file));
             }
             fan_out_writers.insert(output.name.clone(), per_file);
@@ -2089,7 +2085,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         // shared ledger inside `build_format_writer`.
         if output.split.is_some() {
             writers.insert(output.name.clone(), Box::new(std::io::sink()));
-            resolved_output_paths.insert(output.name.clone(), output.path.clone().into());
             continue;
         }
         let bare =
@@ -2113,7 +2108,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     }
                 })
             };
-        let (final_path, handle) = output_staging.stage_output(
+        let (_final_path, handle) = output_staging.stage_output(
             output.name.clone(),
             output.if_exists,
             false,
@@ -2121,7 +2116,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         )?;
         let writer: Box<dyn std::io::Write + Send> = Box::new(handle);
         writers.insert(output.name.clone(), writer);
-        resolved_output_paths.insert(output.name.clone(), final_path);
     }
 
     let registry = clinker_exec::executor::WriterRegistry {
@@ -2367,34 +2361,33 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             .max(0) as u64;
         let hash_full = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
         let hash_short = hash_full[..8.min(hash_full.len())].to_string();
-        let target = resolved_output_paths
-            .get(&output.name)
-            .cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from(&output.path));
-        let sidecar = clinker_exec::output::sidecar::OutputSidecar {
-            pipeline_path: args.config.to_string_lossy().into_owned(),
-            pipeline_hash: hash_full,
-            pipeline_hash_short: hash_short,
-            channel: None,
-            clinker_version: env!("CARGO_PKG_VERSION").to_string(),
-            run_started_at: report.started_at.to_rfc3339(),
-            run_finished_at: report.finished_at.to_rfc3339(),
-            elapsed_total_ms: elapsed_ms,
-            execution_id: Some(execution_id.clone()),
-            batch_id: Some(batch_id.clone()),
-            output_name: output.name.clone(),
-            resolved_path: target.to_string_lossy().into_owned(),
-            record_count: 0,
-            bytes_written: 0,
-            dlq_counts,
-            route_counts: std::collections::BTreeMap::new(),
-            node_timings_ms: std::collections::BTreeMap::new(),
-        };
-        if let Err(e) = clinker_exec::output::sidecar::write_sidecar(&target, &sidecar) {
-            tracing::warn!(
-                "failed to write provenance sidecar for output {:?}: {e:?}",
-                output.name
-            );
+        for target in output_staging.committed_paths(&output.name) {
+            let sidecar = clinker_exec::output::sidecar::OutputSidecar {
+                pipeline_path: args.config.to_string_lossy().into_owned(),
+                pipeline_hash: hash_full.clone(),
+                pipeline_hash_short: hash_short.clone(),
+                channel: None,
+                clinker_version: env!("CARGO_PKG_VERSION").to_string(),
+                run_started_at: report.started_at.to_rfc3339(),
+                run_finished_at: report.finished_at.to_rfc3339(),
+                elapsed_total_ms: elapsed_ms,
+                execution_id: Some(execution_id.clone()),
+                batch_id: Some(batch_id.clone()),
+                output_name: output.name.clone(),
+                resolved_path: target.to_string_lossy().into_owned(),
+                record_count: 0,
+                bytes_written: 0,
+                dlq_counts: dlq_counts.clone(),
+                route_counts: std::collections::BTreeMap::new(),
+                node_timings_ms: std::collections::BTreeMap::new(),
+            };
+            if let Err(e) = clinker_exec::output::sidecar::write_sidecar(&target, &sidecar) {
+                tracing::warn!(
+                    "failed to write provenance sidecar for output {:?} at {}: {e:?}",
+                    output.name,
+                    target.display(),
+                );
+            }
         }
     }
 

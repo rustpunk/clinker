@@ -36,6 +36,7 @@ pub struct PartialOutput {
 #[derive(Clone, Debug, Default)]
 pub struct OutputStagingRegistry {
     pending: Arc<Mutex<Vec<PendingOutput>>>,
+    committed: Arc<Mutex<Vec<(String, PathBuf)>>>,
 }
 
 impl OutputStagingRegistry {
@@ -83,6 +84,18 @@ impl OutputStagingRegistry {
             .collect()
     }
 
+    /// Final paths successfully committed for one authored output name.
+    #[must_use]
+    pub fn committed_paths(&self, name: &str) -> Vec<PathBuf> {
+        self.committed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .filter(|(entry_name, _)| entry_name == name)
+            .map(|(_, path)| path.clone())
+            .collect()
+    }
+
     /// Publish every staged file after successful pipeline execution.
     ///
     /// # Errors
@@ -98,6 +111,7 @@ impl OutputStagingRegistry {
             std::mem::take(&mut *guard)
         };
         let mut remaining = pending.into_iter();
+        let mut committed = Vec::new();
         while let Some(pending) = remaining.next() {
             if let Err(error) = pending.staged.commit() {
                 let mut guard = self
@@ -107,7 +121,12 @@ impl OutputStagingRegistry {
                 guard.extend(remaining);
                 return Err(containment_error(error));
             }
+            committed.push((pending.name, pending.final_path));
         }
+        self.committed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .extend(committed);
         Ok(())
     }
 
