@@ -762,7 +762,7 @@ impl PipelineExecutor {
             }
         }
         if auto_commit_staged {
-            output_staging.commit_all()?;
+            output_staging.commit_all_if_complete(interrupted)?;
         }
         collector.record(reader_timer.finish(total_ingested, total_ingested));
 

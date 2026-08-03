@@ -2198,10 +2198,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         }
     };
 
-    // Synchronization failure is a failed run even when the destination is
-    // already visible; the containment diagnostic states that exact condition.
-    output_staging.commit_all()?;
-
     let counters = &report.counters;
     let dlq_entries = &report.dlq_entries;
 
@@ -2212,11 +2208,17 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Per-source `path:` overrides partition entries into separate
     // sidecar files; entries from sources without an override fall
     // through to `dlq_config.path` (the pipeline-wide sink).
-    if !dlq_entries.is_empty()
-        && let Some(ref dlq_config) = pipeline_config.error_handling.dlq
-    {
-        let buckets = clinker_exec::dlq::partition_dlq_entries(dlq_entries, dlq_config);
-        if !buckets.is_empty() {
+    let publication_preparation = (|| -> Result<(), PipelineError> {
+        if report.interrupted {
+            return Ok(());
+        }
+        if !dlq_entries.is_empty()
+            && let Some(ref dlq_config) = pipeline_config.error_handling.dlq
+        {
+            let buckets = clinker_exec::dlq::partition_dlq_entries(dlq_entries, dlq_config);
+            if buckets.is_empty() {
+                return Ok(());
+            }
             // DLQ user-row columns come from the source's authored
             // `schema:` declaration, not from re-reading the input file.
             // The authored schema is the runtime schema for every
@@ -2246,12 +2248,20 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 if !target_dir.exists() {
                     std::fs::create_dir_all(&target_dir)?;
                 }
-                let dlq_temp = tempfile::NamedTempFile::new_in(&target_dir)?;
-                let dlq_temp_handle = dlq_temp.reopen()?;
+                let bare = target_path.clone();
+                let (_final_path, dlq_handle) = output_staging.stage_output(
+                    "dead-letter output",
+                    clinker_plan::config::IfExistsPolicy::Overwrite,
+                    false,
+                    move |n| {
+                        debug_assert!(n.is_none());
+                        Ok(bare.clone())
+                    },
+                )?;
                 let owned: Vec<clinker_exec::executor::DlqEntry> =
                     bucket_entries.iter().map(|e| (*e).clone()).collect();
                 clinker_exec::dlq::write_dlq(
-                    dlq_temp_handle,
+                    dlq_handle,
                     &owned,
                     &input_schema,
                     &input_path,
@@ -2259,25 +2269,45 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     include_source_row,
                 )
                 .map_err(PipelineError::Format)?;
-                dlq_temp.persist(target_path).map_err(|e| {
-                    tracing::error!(
-                        final_path = %target_path.display(),
-                        "failed to atomically rename DLQ output into place; temp file preserved",
-                    );
-                    PipelineError::Io(std::io::Error::other(format!(
-                        "atomic DLQ rename failed for {}: {}",
-                        target_path.display(),
-                        e.error
-                    )))
-                })?;
             }
         }
+        Ok(())
+    })();
+    if let Err(error) = publication_preparation {
+        source_stager.cleanup(false);
+        for pending in output_staging.partials() {
+            tracing::warn!(
+                output = %pending.name,
+                final_path = %pending.final_path.display(),
+                partial_path = %pending.partial_path.display(),
+                "publication preparation failed; hidden output preserved",
+            );
+        }
+        return Err(error);
+    }
+
+    if report.interrupted {
+        for pending in output_staging.partials() {
+            tracing::warn!(
+                output = %pending.name,
+                final_path = %pending.final_path.display(),
+                partial_path = %pending.partial_path.display(),
+                "pipeline was interrupted; hidden output was not published",
+            );
+        }
+    } else {
+        // Synchronization failure is a failed run even when a destination is
+        // already visible; the containment diagnostic states that exact condition.
+        output_staging.commit_all_if_complete(report.interrupted)?;
     }
 
     // Provenance sidecars for outputs that opted in via `write_meta`.
     // Per-output record/byte/route counts are not yet surfaced from the
     // executor; identity, timing, and DLQ-by-category come through.
-    for output in pipeline_config.output_configs() {
+    for output in pipeline_config
+        .output_configs()
+        .filter(|_| !report.interrupted)
+    {
         if !output.write_meta {
             continue;
         }

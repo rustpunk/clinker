@@ -110,4 +110,57 @@ impl OutputStagingRegistry {
         }
         Ok(())
     }
+
+    /// Publish the ledger only for a complete, non-interrupted execution.
+    ///
+    /// Returns `false` without consuming any entry when shutdown interrupted
+    /// the run, leaving every quarantine path available for inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same publication failures as [`Self::commit_all`].
+    pub fn commit_all_if_complete(&self, interrupted: bool) -> Result<bool, PipelineError> {
+        if interrupted {
+            return Ok(false);
+        }
+        self.commit_all()?;
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use clinker_plan::config::IfExistsPolicy;
+
+    use super::OutputStagingRegistry;
+
+    #[test]
+    fn interrupted_execution_keeps_existing_final_and_quarantine() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let final_path = root.path().join("result.csv");
+        std::fs::write(&final_path, b"previous\n").expect("previous final");
+        let registry = OutputStagingRegistry::default();
+        let bare = final_path.clone();
+        let (_, mut file) = registry
+            .stage_output("out", IfExistsPolicy::Overwrite, false, move |_| {
+                Ok(bare.clone())
+            })
+            .expect("stage replacement");
+        file.write_all(b"new\n").expect("write quarantine");
+        drop(file);
+
+        assert!(!registry.commit_all_if_complete(true).expect("skip commit"));
+        assert_eq!(
+            std::fs::read(&final_path).expect("read existing final"),
+            b"previous\n"
+        );
+        let partials = registry.partials();
+        assert_eq!(partials.len(), 1);
+        assert_eq!(
+            std::fs::read(&partials[0].partial_path).expect("read quarantine"),
+            b"new\n"
+        );
+    }
 }

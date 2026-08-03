@@ -620,6 +620,78 @@ nodes:
 }
 
 #[test]
+fn dlq_directory_preparation_failure_preserves_primary_final() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("input.csv"), "id,amount\n1,0\n").expect("write input");
+    std::fs::write(dir.path().join("out.csv"), "previous primary\n")
+        .expect("write previous primary");
+    std::fs::write(dir.path().join("blocked"), "not a directory\n").expect("write blocking file");
+    let pipeline_path = dir.path().join("pipeline.yaml");
+    std::fs::write(
+        &pipeline_path,
+        r#"pipeline:
+  name: dlq_preparation_failure
+error_handling:
+  strategy: continue
+  dlq:
+    path: blocked/dlq.csv
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+      - { name: amount, type: int }
+- type: transform
+  name: fail_one
+  input: src
+  config:
+    cxl: |
+      emit id = id
+      emit value = 1 / amount
+- type: output
+  name: out
+  input: fail_one
+  config:
+    name: out
+    path: out.csv
+    type: csv
+    if_exists: overwrite
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&pipeline_path)
+        .output()
+        .expect("spawn clinker");
+
+    assert!(
+        !output.status.success(),
+        "DLQ preparation failure must fail"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("out.csv")).expect("read previous primary"),
+        "previous primary\n"
+    );
+    assert!(
+        std::fs::read_dir(dir.path())
+            .expect("read output directory")
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".clinker-out.csv-")),
+        "primary quarantine must remain inspectable"
+    );
+}
+
+#[test]
 fn unique_suffix_concurrent_runs_each_get_distinct_outputs() {
     // Spawn multiple `clinker run` processes simultaneously against the
     // same output directory with `if_exists: unique_suffix`. Each must
