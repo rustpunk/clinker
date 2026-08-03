@@ -408,6 +408,8 @@ fn normal_leaf(path: &Path) -> Result<OsString, ContainmentError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
+    use std::io::Write;
     use std::path::Path;
 
     use clinker_plan::security::validate_path;
@@ -437,6 +439,43 @@ mod tests {
             std::fs::read(destination_path).expect("visible final remains inspectable"),
             b"complete artifact"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_no_replace_publishes_only_to_a_free_destination() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let destination = validate_path(Path::new("result.bin"), root.path(), false)
+            .expect("destination fixture should validate");
+        let boundary = OutputContainment::for_profile(destination, "local-filesystem")
+            .expect("local destination should be supported");
+        let (staged, mut file) = boundary
+            .stage(PromotionDisposition::NoReplace)
+            .expect("free destination should stage");
+        file.write_all(b"complete artifact")
+            .expect("write staged artifact");
+        drop(file);
+
+        staged
+            .commit()
+            .expect("no-replace promotion should succeed");
+        assert_eq!(
+            std::fs::read(root.path().join("result.bin")).expect("published destination"),
+            b"complete artifact"
+        );
+
+        let destination = validate_path(Path::new("result.bin"), root.path(), false)
+            .expect("destination fixture should validate");
+        let boundary = OutputContainment::for_profile(destination, "local-filesystem")
+            .expect("local destination should be supported");
+        let error = boundary
+            .stage(PromotionDisposition::NoReplace)
+            .expect_err("existing destination must collide");
+        assert!(matches!(
+            error,
+            ContainmentError::Io { ref source, .. }
+                if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
     }
 }
 
@@ -913,12 +952,6 @@ mod platform {
             destination_path: &Path,
             fail_after_rename: bool,
         ) -> Result<(), ContainmentError> {
-            if disposition == PromotionDisposition::NoReplace {
-                return Err(ContainmentError::PolicyRequired {
-                    profile: "macos-atomic-no-replace".to_owned(),
-                    detail: "the approved macOS renameat primitive does not provide atomic no-replace promotion",
-                });
-            }
             let source_leaf = c_string(source_leaf, source_path)?;
             let destination_leaf = c_string(destination_leaf, destination_path)?;
             // SAFETY: the source leaf is opened relative to a retained parent;
@@ -949,12 +982,21 @@ mod platform {
             // SAFETY: both names are single NUL-terminated components and both
             // descriptors are retained directory handles on the same device.
             let result = unsafe {
-                libc::renameat(
-                    source_parent.file.as_raw_fd(),
-                    source_leaf.as_ptr(),
-                    self.file.as_raw_fd(),
-                    destination_leaf.as_ptr(),
-                )
+                match disposition {
+                    PromotionDisposition::Replace => libc::renameat(
+                        source_parent.file.as_raw_fd(),
+                        source_leaf.as_ptr(),
+                        self.file.as_raw_fd(),
+                        destination_leaf.as_ptr(),
+                    ),
+                    PromotionDisposition::NoReplace => libc::renameatx_np(
+                        source_parent.file.as_raw_fd(),
+                        source_leaf.as_ptr(),
+                        self.file.as_raw_fd(),
+                        destination_leaf.as_ptr(),
+                        libc::RENAME_EXCL,
+                    ),
+                }
             };
             if result != 0 {
                 return Err(ContainmentError::io(
