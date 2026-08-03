@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::error::GateError;
 
@@ -522,8 +522,8 @@ fn validate_release(workflow: &Workflow) -> Result<(), GateError> {
         .jobs
         .get("assemble-draft")
         .ok_or_else(|| policy("release assembly job is absent"))?;
-    require_release_build_sequence(build)?;
-    require_action(assemble, "actions/download-artifact")?;
+    require_exact_release_build(build)?;
+    require_exact_release_assembly(assemble)?;
     if workflow
         .env
         .as_ref()
@@ -537,124 +537,305 @@ fn validate_release(workflow: &Workflow) -> Result<(), GateError> {
     Ok(())
 }
 
-fn require_release_build_sequence(build: &Job) -> Result<(), GateError> {
+fn require_exact_release_build(build: &Job) -> Result<(), GateError> {
+    if build.name.as_deref() != Some("Build ${{ matrix.target }}")
+        || build.runs_on.as_ref().and_then(Value::as_str) != Some("${{ matrix.os }}")
+        || build.needs.as_ref().and_then(Value::as_str) != Some("dependency-policy")
+        || build.condition.is_some()
+        || build.timeout_minutes.is_some()
+        || build.environment.is_some()
+        || build.uses.is_some()
+        || build.with.is_some()
+        || build.env.is_some()
+    {
+        return Err(policy(
+            "release build job shape differs from reviewed policy",
+        ));
+    }
+    let strategy = build
+        .strategy
+        .as_ref()
+        .ok_or_else(|| policy("release build strategy is absent"))?;
+    if strategy.fail_fast != Some(false)
+        || strategy.max_parallel.is_some()
+        || strategy.matrix
+            != json!({
+                "include": [
+                    {"target": "x86_64-unknown-linux-gnu", "os": "ubuntu-24.04"},
+                    {"target": "x86_64-pc-windows-msvc", "os": "windows-2025"},
+                    {"target": "aarch64-apple-darwin", "os": "macos-15"},
+                    {"target": "x86_64-apple-darwin", "os": "macos-15-intel"}
+                ]
+            })
+    {
+        return Err(policy(
+            "release build runner matrix differs from reviewed policy",
+        ));
+    }
     let steps = build
         .steps
         .as_deref()
         .ok_or_else(|| policy("release build steps are absent"))?;
-    let requirements = [
-        ReleaseBuildRequirement::Command(
-            &["cargo", "fetch", "--locked"],
-            "locked workspace dependency fetch",
-        ),
-        ReleaseBuildRequirement::Command(
-            &[
-                "cargo",
-                "fetch",
-                "--manifest-path",
-                "tools/release-policy/Cargo.toml",
-                "--locked",
-            ],
-            "locked release policy dependency fetch",
-        ),
-        ReleaseBuildRequirement::Command(
-            &[
-                "cargo",
-                "build",
-                "--locked",
-                "--offline",
-                "--release",
-                "--target",
-                "\"$BUILD_TARGET\"",
-                "-p",
-                "clinker",
-                "-p",
-                "cxl-cli",
-            ],
-            "governed target executable build",
-        ),
-        ReleaseBuildRequirement::Command(
-            &[
-                "cargo",
-                "run",
-                "--quiet",
-                "--manifest-path",
-                "tools/release-policy/Cargo.toml",
-                "--locked",
-                "--offline",
-                "--",
-                "inventory",
-                "check",
-                "--print-json",
-            ],
-            "live release inventory validation",
-        ),
-        ReleaseBuildRequirement::Command(
-            &[
-                "cargo",
-                "run",
-                "--quiet",
-                "--manifest-path",
-                "tools/release-policy/Cargo.toml",
-                "--locked",
-                "--offline",
-                "--",
-                "release",
-                "build-bundle",
-                "--target",
-                "\"$BUILD_TARGET\"",
-                "--source-sha",
-                "\"$BUILD_SOURCE_SHA\"",
-                "--output-dir",
-                "artifacts",
-            ],
-            "target bundle construction",
-        ),
-        ReleaseBuildRequirement::Action("actions/attest-build-provenance", "archive attestation"),
-        ReleaseBuildRequirement::Action("actions/upload-artifact", "target bundle upload"),
-    ];
+    if steps.len() != 9 {
+        return Err(policy(
+            "release build step inventory differs from reviewed policy",
+        ));
+    }
+    require_action_step(
+        &steps[0],
+        "Check out the candidate source",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        &["persist-credentials", "false"],
+    )?;
+    require_command_step(
+        &steps[1],
+        "Install the repository toolchain target",
+        "set -euo pipefail test -f rust-toolchain.toml rustup show active-toolchain rustup target add \"${{ matrix.target }}\"",
+        &[],
+    )?;
+    require_command_step(
+        &steps[2],
+        "Fetch the locked workspace dependencies",
+        "cargo fetch --locked",
+        &[],
+    )?;
+    require_command_step(
+        &steps[3],
+        "Fetch the locked release policy dependencies",
+        "cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked",
+        &[],
+    )?;
+    require_command_step(
+        &steps[4],
+        "Build the governed target executables",
+        "cargo build --locked --offline --release --target \"$BUILD_TARGET\" -p clinker -p cxl-cli",
+        &["BUILD_TARGET", "${{ matrix.target }}"],
+    )?;
+    require_command_step(
+        &steps[5],
+        "Validate the repository release inventory",
+        "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- inventory check --print-json",
+        &[],
+    )?;
+    require_command_step(
+        &steps[6],
+        "Build the locked target bundle with the Rust gate",
+        "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release build-bundle --target \"$BUILD_TARGET\" --source-sha \"$BUILD_SOURCE_SHA\" --output-dir artifacts",
+        &[
+            "BUILD_TARGET",
+            "${{ matrix.target }}",
+            "BUILD_SOURCE_SHA",
+            "${{ github.sha }}",
+        ],
+    )?;
+    require_action_step(
+        &steps[7],
+        "Attest the exact archive subject",
+        "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
+        &["subject-path", "artifacts/*.tar.gz\nartifacts/*.zip\n"],
+    )?;
+    require_action_step(
+        &steps[8],
+        "Upload the target bundle",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        &[
+            "name",
+            "release-${{ matrix.target }}",
+            "path",
+            "artifacts/*",
+            "if-no-files-found",
+            "error",
+            "retention-days",
+            "7",
+        ],
+    )?;
+    Ok(())
+}
 
-    let mut next_index = 0;
-    for requirement in requirements {
-        let Some(relative_index) = steps[next_index..]
-            .iter()
-            .position(|step| requirement.matches(step))
-        else {
-            return Err(policy(format!(
-                "release build is missing the ordered {} step",
-                requirement.description()
-            )));
-        };
-        next_index += relative_index + 1;
+fn require_exact_release_assembly(assemble: &Job) -> Result<(), GateError> {
+    if assemble.name.as_deref() != Some("Assemble and reread private draft")
+        || assemble.runs_on.as_ref().and_then(Value::as_str) != Some("ubuntu-24.04")
+        || assemble.needs.as_ref().and_then(Value::as_str) != Some("build")
+        || assemble.condition.is_some()
+        || assemble.timeout_minutes.is_some()
+        || assemble.strategy.is_some()
+        || assemble.environment.is_some()
+        || assemble.uses.is_some()
+        || assemble.with.is_some()
+        || assemble.env.is_some()
+    {
+        return Err(policy(
+            "release assembly job shape differs from reviewed policy",
+        ));
+    }
+    let steps = assemble
+        .steps
+        .as_deref()
+        .ok_or_else(|| policy("release assembly steps are absent"))?;
+    if steps.len() != 6 {
+        return Err(policy(
+            "release assembly step inventory differs from reviewed policy",
+        ));
+    }
+    require_action_step(
+        &steps[0],
+        "Check out verification code",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        &["persist-credentials", "false"],
+    )?;
+    require_action_step(
+        &steps[1],
+        "Download the exact target set",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        &[
+            "pattern",
+            "release-*",
+            "path",
+            "artifacts",
+            "merge-multiple",
+            "true",
+        ],
+    )?;
+    require_command_step(
+        &steps[2],
+        "Verify and assemble the exact target set with the Rust gate",
+        "cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release verify assemble --asset-dir artifacts --repository \"$RELEASE_REPOSITORY\" --workflow .github/workflows/release.yml --ref \"$RELEASE_REF\" --source-sha \"$RELEASE_SOURCE_SHA\"",
+        &[
+            "RELEASE_REPOSITORY",
+            "${{ github.repository }}",
+            "RELEASE_REF",
+            "${{ github.ref }}",
+            "RELEASE_SOURCE_SHA",
+            "${{ github.sha }}",
+        ],
+    )?;
+    require_command_step(
+        &steps[3],
+        "Stage and freshly verify the private draft with the Rust gate",
+        "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release stage-candidate-draft --repo \"$RELEASE_REPOSITORY\" --candidate-tag \"$RELEASE_CANDIDATE_TAG\" --source-sha \"$RELEASE_SOURCE_SHA\" --asset-dir artifacts --deadline-seconds 600",
+        &[
+            "GH_TOKEN",
+            "${{ github.token }}",
+            "RELEASE_REPOSITORY",
+            "${{ github.repository }}",
+            "RELEASE_CANDIDATE_TAG",
+            "${{ github.ref_name }}",
+            "RELEASE_SOURCE_SHA",
+            "${{ github.sha }}",
+        ],
+    )?;
+    require_command_step(
+        &steps[4],
+        "Produce artifact-derived non-completing candidate evidence",
+        "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release verify --repo \"$RELEASE_REPOSITORY\" --decision-dir release/decisions --authorization-record release/decisions/release-candidate-authorization.json --authorization-schema scripts/release/release-candidate-authorization.schema.json --decision-record release/decisions/release-candidate.json --decision-schema scripts/release/release-decision.schema.json --require-private --fresh-download --evidence-kind candidate --evidence-schema scripts/release/release-evidence.schema.json --evidence-manifest target/release-policy/candidate-evidence.json",
+        &[
+            "GH_TOKEN",
+            "${{ github.token }}",
+            "RELEASE_REPOSITORY",
+            "${{ github.repository }}",
+        ],
+    )?;
+    require_action_step(
+        &steps[5],
+        "Upload the immutable candidate evidence",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        &[
+            "name",
+            "release-candidate-evidence",
+            "path",
+            "target/release-policy/candidate-evidence.json",
+            "if-no-files-found",
+            "error",
+            "retention-days",
+            "7",
+        ],
+    )?;
+    Ok(())
+}
+
+fn require_command_step(
+    step: &Step,
+    name: &str,
+    command: &str,
+    env: &[&str],
+) -> Result<(), GateError> {
+    if step.name.as_deref() != Some(name)
+        || step.id.is_some()
+        || step.condition.is_some()
+        || step.uses.is_some()
+        || step.with.is_some()
+        || step
+            .run
+            .as_deref()
+            .is_none_or(|run| !exact_script(run, command))
+        || step.shell.as_deref() != Some("bash")
+        || !exact_value_map(step.env.as_ref(), env)
+        || step.continue_on_error.is_some()
+        || step.timeout_minutes.is_some()
+        || step.working_directory.is_some()
+    {
+        return Err(policy(format!(
+            "release command step {name:?} differs from reviewed policy"
+        )));
     }
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum ReleaseBuildRequirement<'a> {
-    Command(&'a [&'a str], &'a str),
-    Action(&'a str, &'a str),
+fn require_action_step(
+    step: &Step,
+    name: &str,
+    action: &str,
+    arguments: &[&str],
+) -> Result<(), GateError> {
+    if step.name.as_deref() != Some(name)
+        || step.id.is_some()
+        || step.condition.is_some()
+        || step.uses.as_deref() != Some(action)
+        || !exact_value_map(step.with.as_ref(), arguments)
+        || step.run.is_some()
+        || step.shell.is_some()
+        || step.env.is_some()
+        || step.continue_on_error.is_some()
+        || step.timeout_minutes.is_some()
+        || step.working_directory.is_some()
+    {
+        return Err(policy(format!(
+            "release action step {name:?} differs from reviewed policy"
+        )));
+    }
+    Ok(())
 }
 
-impl<'a> ReleaseBuildRequirement<'a> {
-    fn matches(self, step: &Step) -> bool {
-        match self {
-            Self::Command(expected, _) => step
-                .run
-                .as_deref()
-                .is_some_and(|run| exact_command(run, expected)),
-            Self::Action(action, _) => step
-                .uses
-                .as_deref()
-                .and_then(|uses| uses.split_once('@'))
-                .is_some_and(|(name, _)| name == action),
-        }
-    }
+fn exact_script(observed: &str, expected: &str) -> bool {
+    observed
+        .split_whitespace()
+        .filter(|token| *token != "\\")
+        .eq(expected.split_whitespace())
+}
 
-    const fn description(self) -> &'a str {
-        match self {
-            Self::Command(_, description) | Self::Action(_, description) => description,
-        }
+fn exact_value_map(observed: Option<&BTreeMap<String, Value>>, expected: &[&str]) -> bool {
+    if !expected.len().is_multiple_of(2) {
+        return false;
+    }
+    let Some(observed) = observed else {
+        return expected.is_empty();
+    };
+    if observed.len() != expected.len() / 2 {
+        return false;
+    }
+    expected.chunks_exact(2).all(|pair| {
+        observed
+            .get(pair[0])
+            .is_some_and(|value| value_matches(value, pair[1]))
+    })
+}
+
+fn value_matches(value: &Value, expected: &str) -> bool {
+    match value {
+        Value::String(value) => value == expected,
+        Value::Bool(value) => value.to_string() == expected,
+        Value::Number(value) => value.to_string() == expected,
+        _ => false,
     }
 }
 
@@ -708,21 +889,6 @@ fn validate_publication(workflow: &Workflow) -> Result<(), GateError> {
         return Err(policy(
             "publication must serialize without cancelling by candidate tag",
         ));
-    }
-    Ok(())
-}
-
-fn require_action(job: &Job, action: &str) -> Result<(), GateError> {
-    if !job
-        .steps
-        .iter()
-        .flatten()
-        .filter_map(|step| step.uses.as_deref())
-        .any(|target| target.split_once('@').map(|(name, _)| name) == Some(action))
-    {
-        return Err(policy(format!(
-            "release job is missing required action '{action}'"
-        )));
     }
     Ok(())
 }

@@ -133,6 +133,65 @@ fn release_workflow_requires_every_build_stage_in_order() {
 }
 
 #[test]
+fn release_workflow_rejects_unmodeled_mutation_and_environment_drift() {
+    let root = fixture();
+    let source = release_workflow();
+    let attest = named_step(&source, "Attest the exact archive subject");
+    let upload_evidence = named_step(&source, "Upload the immutable candidate evidence");
+    let scenarios = [
+        (
+            "inserted binary replacement",
+            source.replacen(
+                &attest,
+                &format!(
+                    "      - name: Replace governed binary\n        shell: bash\n        run: cp unreviewed/clinker target/release/clinker\n{attest}"
+                ),
+                1,
+            ),
+        ),
+        (
+            "inserted direct release publication",
+            source.replacen(
+                &upload_evidence,
+                &format!(
+                    "      - name: Publish without the gate\n        shell: bash\n        run: gh release edit \"$RELEASE_CANDIDATE_TAG\" --draft=false\n{upload_evidence}"
+                ),
+                1,
+            ),
+        ),
+        (
+            "attacker-controlled build target",
+            source.replacen(
+                "BUILD_TARGET: ${{ matrix.target }}",
+                "BUILD_TARGET: ${{ github.ref_name }}",
+                1,
+            ),
+        ),
+        (
+            "swapped build source identity",
+            source.replacen(
+                "BUILD_SOURCE_SHA: ${{ github.sha }}",
+                "BUILD_SOURCE_SHA: ${{ matrix.target }}",
+                1,
+            ),
+        ),
+        (
+            "attacker-controlled assembly source identity",
+            source.replacen(
+                "RELEASE_SOURCE_SHA: ${{ github.sha }}",
+                "RELEASE_SOURCE_SHA: ${{ github.ref_name }}",
+                1,
+            ),
+        ),
+    ];
+
+    for (scenario, mutated) in scenarios {
+        assert_ne!(mutated, source, "scenario fixture must change: {scenario}");
+        assert_release_workflow_rejected(root.path(), &mutated, scenario);
+    }
+}
+
+#[test]
 fn typed_workflow_model_rejects_unknown_or_type_confused_policy() {
     let root = fixture();
     for (name, workflow) in [
