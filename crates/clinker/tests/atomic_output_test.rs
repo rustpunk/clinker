@@ -1,5 +1,5 @@
-//! Atomic output: outputs land via tempfile + atomic rename so a
-//! pipeline failure cannot leave a truncated final file behind.
+//! Atomic output: every output shape lands through destination-local staging
+//! so a pipeline failure cannot leave a truncated final file behind.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -64,14 +64,14 @@ nodes:
         "rows: {body}"
     );
 
-    // Sweep the dir for any leftover .tmp files — none should remain.
+    // Sweep the dir for hidden partial/reservation files — none should remain.
     let tmp_leftovers: Vec<PathBuf> = std::fs::read_dir(dir.path())
         .expect("readdir")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(".tmp"))
+                .is_some_and(|n| n.starts_with(".clinker-") || n.starts_with(".tmp"))
         })
         .collect();
     assert!(
@@ -143,6 +143,7 @@ fn executor_failure_preserves_partial_tempfile() {
     // WARN log so an operator can inspect partial output.
     std::fs::write(dir.path().join("input.csv"), "id,name\n1,Alice\n2,Bob\n").expect("write input");
     let output_path = dir.path().join("out.csv");
+    std::fs::write(&output_path, "previous valid output\n").expect("write previous output");
     let pipeline_path = dir.path().join("pipeline.yaml");
     let pipeline = r#"pipeline:
   name: atomic_output_runtime_failure
@@ -173,6 +174,7 @@ nodes:
     path: out.csv
     type: csv
     include_unmapped: true
+    if_exists: overwrite
 "#;
     std::fs::write(&pipeline_path, pipeline).expect("write pipeline");
 
@@ -187,27 +189,322 @@ nodes:
         "divzero pipeline must abort with non-zero exit"
     );
 
-    // The final output must not exist — atomic rename never ran.
-    assert!(
-        !output_path.exists(),
-        "final output path must not exist after runtime failure"
+    assert_eq!(
+        std::fs::read_to_string(&output_path).expect("read previous output"),
+        "previous valid output\n",
+        "overwrite must leave the previous final untouched until success"
     );
 
-    // A temp file must remain on disk so an operator can inspect
-    // partial output. tempfile::NamedTempFile names begin with `.tmp`
-    // by default on Linux.
+    // A destination-local hidden file remains so an operator can inspect the
+    // attempted replacement.
     let leftovers: Vec<_> = std::fs::read_dir(dir.path())
         .expect("readdir")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with(".tmp"))
+                .is_some_and(|n| n.starts_with(".clinker-out.csv-") && n.ends_with(".partial"))
         })
         .collect();
     assert!(
         !leftovers.is_empty(),
         "temp file must be preserved after runtime failure"
+    );
+}
+
+#[test]
+fn failed_force_run_preserves_existing_final() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("input.csv"), "id\n1\n").expect("write input");
+    std::fs::write(dir.path().join("out.csv"), "previous\n").expect("write previous output");
+    let pipeline_path = dir.path().join("pipeline.yaml");
+    std::fs::write(
+        &pipeline_path,
+        r#"pipeline:
+  name: force_failure_preserves_final
+error_handling:
+  strategy: fail_fast
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+- type: transform
+  name: fail
+  input: src
+  config:
+    cxl: |
+      emit boom = id / 0
+- type: output
+  name: out
+  input: fail
+  config:
+    name: out
+    path: out.csv
+    type: csv
+    if_exists: error
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&pipeline_path)
+        .arg("--force")
+        .output()
+        .expect("spawn clinker");
+
+    assert!(!output.status.success(), "forced failing run must fail");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("out.csv")).expect("read previous output"),
+        "previous\n"
+    );
+}
+
+#[test]
+fn fan_out_outputs_publish_only_after_success() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("input-a.csv"), "id\n1\n").expect("write input a");
+    std::fs::write(dir.path().join("input-b.csv"), "id\n2\n").expect("write input b");
+    for name in ["out_input-a.csv", "out_input-b.csv"] {
+        std::fs::write(dir.path().join(name), "previous\n").expect("write previous fan-out");
+    }
+    let pipeline_path = dir.path().join("pipeline.yaml");
+    std::fs::write(
+        &pipeline_path,
+        r#"pipeline:
+  name: fan_out_atomic_commit
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    glob: input-*.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+- type: output
+  name: out
+  input: src
+  config:
+    name: out
+    path: out_{source_file}.csv
+    type: csv
+    if_exists: overwrite
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&pipeline_path)
+        .output()
+        .expect("spawn clinker");
+    assert!(
+        output.status.success(),
+        "fan-out run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output_a =
+        std::fs::read_to_string(dir.path().join("out_input-a.csv")).expect("read fan-out a");
+    let output_b =
+        std::fs::read_to_string(dir.path().join("out_input-b.csv")).expect("read fan-out b");
+    let files: Vec<_> = std::fs::read_dir(dir.path())
+        .expect("read fan-out directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(
+        output_a.contains('1'),
+        "fan-out a: {output_a:?}; files={files:?}; stdout={}; stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output_b.contains('2'), "fan-out b: {output_b:?}");
+}
+
+#[test]
+fn failed_fan_out_run_preserves_every_existing_final() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("input-a.csv"), "id\n1\n").expect("write input a");
+    std::fs::write(dir.path().join("input-b.csv"), "id\n2\n").expect("write input b");
+    for name in ["out_input-a.csv", "out_input-b.csv"] {
+        std::fs::write(dir.path().join(name), format!("previous {name}\n"))
+            .expect("write previous fan-out");
+    }
+    let pipeline_path = dir.path().join("pipeline.yaml");
+    std::fs::write(
+        &pipeline_path,
+        r#"pipeline:
+  name: fan_out_failure_preserves_finals
+error_handling:
+  strategy: fail_fast
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    glob: input-*.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+- type: transform
+  name: fail
+  input: src
+  config:
+    cxl: |
+      emit boom = id / 0
+- type: output
+  name: out
+  input: fail
+  config:
+    name: out
+    path: out_{source_file}.csv
+    type: csv
+    if_exists: overwrite
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&pipeline_path)
+        .output()
+        .expect("spawn clinker");
+    assert!(!output.status.success(), "failing fan-out run must fail");
+    for name in ["out_input-a.csv", "out_input-b.csv"] {
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(name)).expect("read previous fan-out"),
+            format!("previous {name}\n")
+        );
+    }
+}
+
+#[test]
+fn fan_out_rejects_a_linked_destination_parent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    std::fs::write(dir.path().join("input-a.csv"), "id\n1\n").expect("write input");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("dest")).expect("link destination");
+    #[cfg(windows)]
+    {
+        let status = Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dir.path().join("dest"))
+            .arg(outside.path())
+            .status()
+            .expect("create destination junction");
+        assert!(status.success());
+    }
+    let pipeline_path = dir.path().join("pipeline.yaml");
+    std::fs::write(
+        &pipeline_path,
+        r#"pipeline:
+  name: fan_out_link_rejected
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    glob: input-*.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+- type: output
+  name: out
+  input: src
+  config:
+    name: out
+    path: dest/{source_file}.csv
+    type: csv
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&pipeline_path)
+        .output()
+        .expect("spawn clinker");
+    assert!(!output.status.success(), "linked fan-out parent must fail");
+    assert!(
+        std::fs::read_dir(outside.path())
+            .expect("read outside")
+            .next()
+            .is_none(),
+        "no external file may be created"
+    );
+}
+
+#[test]
+fn split_rollover_failure_preserves_existing_segment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("input.csv"), "id,group\n1,A\n2,A\n").expect("write input");
+    std::fs::write(dir.path().join("result_0001.csv"), "previous segment\n")
+        .expect("write previous segment");
+    let pipeline_path = dir.path().join("pipeline.yaml");
+    std::fs::write(
+        &pipeline_path,
+        r#"pipeline:
+  name: split_failure_preserves_segment
+error_handling:
+  strategy: fail_fast
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+      - { name: group, type: string }
+- type: output
+  name: out
+  input: src
+  config:
+    name: out
+    path: result.csv
+    type: csv
+    if_exists: overwrite
+    split:
+      max_records: 1
+      group_key: group
+      oversize_group: error
+"#,
+    )
+    .expect("write pipeline");
+
+    let output = Command::new(clinker_bin())
+        .current_dir(dir.path())
+        .arg("run")
+        .arg(&pipeline_path)
+        .output()
+        .expect("spawn clinker");
+
+    assert!(!output.status.success(), "oversize split group must fail");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("result_0001.csv")).expect("read previous segment"),
+        "previous segment\n"
+    );
+    assert!(
+        std::fs::read_dir(dir.path())
+            .expect("read output directory")
+            .filter_map(Result::ok)
+            .any(|entry| entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".clinker-result_0001.csv-")),
+        "failed split must retain a hidden segment partial"
     );
 }
 

@@ -130,32 +130,30 @@ interrupt takes precedence over the DLQ-partial code `2`.
 
 ## Output atomicity and retry-safety
 
-Single-file outputs are written **atomically**: each output streams into
-a sibling temp file in the same directory, and only after the pipeline
-completes successfully is that temp file **renamed** into the final path
-(followed by an `fsync` of the parent directory for crash durability).
+Outputs are written **atomically**: each output streams into a sibling hidden
+file in the same directory, and only after the pipeline completes successfully
+is that file **renamed** into the final path (followed by synchronization of the
+retained parent directory for crash durability).
 This is exercised by the CLI's `atomic_output_test` suite.
 
 The consequences an orchestrator can rely on:
 
 - A **killed or failed** attempt leaves **no half-written final file**.
-  On failure the temp file is kept and its path logged at `WARN` for
+  On failure the hidden partial is kept and its path logged at `WARN` for
   operator inspection, but the final path is untouched — a retry sees a
   clean slate.
 - A **retry can overwrite cleanly.** By default a pre-existing output
   aborts the run (exit `4`); pass **`--force`** to allow the new attempt
   to replace a previous attempt's output. Alternatively, an output's
   `if_exists: unique_suffix` policy hands each attempt a distinct,
-  race-safe path (the reservation uses `create_new`, so concurrent
-  attempts never clobber one another).
+  race-safe path through a hidden sibling reservation, so concurrent attempts
+  never expose placeholders or clobber one another.
 
-**Caveat — multi-file outputs are not yet atomic.** Fan-out outputs
-(one file per source file) and `split:` outputs write directly to their
-final paths rather than through the temp-then-rename path. A killed
-attempt can leave a partial fan-out or split file behind. The atomic
-guarantee above applies to **single-file outputs**; for multi-file
-outputs, a retry should treat the output directory as untrusted and clear
-it first.
+The same lifecycle covers fan-out outputs (one file per source file) and
+`split:` outputs. Their files join the run-scoped publication ledger as they
+open and are promoted only after the complete pipeline succeeds. A failed
+attempt may leave hidden partials for inspection, but it does not truncate or
+publish a fan-out/split final.
 
 ## Idempotency: what re-running a batch means today
 

@@ -456,7 +456,12 @@ impl StreamingConsumer for OutputStreamConsumer {
                 .take()
                 .expect("raw_writer_slot is Some until first record arrives");
             let schema = Arc::clone(projected.schema());
-            match build_format_writer(&self.spec.out_cfg, raw, schema) {
+            match build_format_writer(
+                &self.spec.out_cfg,
+                raw,
+                schema,
+                crate::output::staging::OutputStagingRegistry::default(),
+            ) {
                 Ok(w) => {
                     self.writer = Some(w);
                     if let Some(timer) = self.scan_timer_slot.take() {

@@ -461,6 +461,8 @@ impl PipelineExecutor {
         memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
     ) -> Result<ExecutionReport, PipelineError> {
         let started_at = Utc::now();
+        let output_staging = writers.output_staging.clone();
+        let auto_commit_staged = writers.auto_commit_staged;
 
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
@@ -758,6 +760,9 @@ impl PipelineExecutor {
             for (file_arc, ts) in outcome.watermark_observations {
                 watermarks.observe(&outcome.source_name, &file_arc, ts);
             }
+        }
+        if auto_commit_staged {
+            output_staging.commit_all()?;
         }
         collector.record(reader_timer.finish(total_ingested, total_ingested));
 
@@ -1236,6 +1241,7 @@ impl PipelineExecutor {
             source_vars_seeded_files: HashMap::new(),
             writers: writers.single,
             fan_out_writers: writers.fan_out,
+            output_staging: writers.output_staging,
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
             dlq_per_source: HashMap::new(),

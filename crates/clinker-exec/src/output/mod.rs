@@ -9,3 +9,4 @@
 pub mod containment;
 pub mod open;
 pub mod sidecar;
+pub mod staging;

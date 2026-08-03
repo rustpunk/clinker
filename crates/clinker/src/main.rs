@@ -1956,27 +1956,17 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         );
     }
 
-    // Outputs are written atomically: each output writes to a sibling
-    // tempfile, then renames into place after the pipeline completes
-    // successfully. On crash or pipeline error, the writing tempfile is
-    // left in place (and its path logged) so an operator can inspect
-    // partial output without the final path showing a truncated file.
-    //
-    // Cross-process race-safety for `if_exists: unique_suffix` comes
-    // from `OpenOptions::create_new` reservations: each output's
-    // resolved path holds a 0-byte placeholder file from the moment
-    // `open_output` returns until persist atomically replaces it.  The
-    // placeholder is wrapped in a `tempfile::TempPath`, mirroring what
-    // the rest of the codebase already does for tempfile cleanup, so
-    // any unwind path (panic, mid-persist failure, the explicit Err
-    // arm below) auto-unlinks remaining placeholders via `Drop`.
+    // Every output writes to a hidden destination-local leaf admitted through
+    // a retained containment boundary. The shared ledger also serves lazy
+    // split writers, and the CLI publishes the complete ledger only after the
+    // executor reports success. Failed runs leave existing finals untouched
+    // and preserve hidden partials for inspection.
     let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
         std::collections::HashMap::new();
-    let mut output_temps: Vec<PendingOutput> = Vec::new();
-    // output_name → final resolved path, kept after output_temps is
-    // consumed by the persist loop so the provenance sidecar can
-    // record the actual file written (not the bare template-rendered
-    // path on OutputConfig).
+    let output_staging = clinker_exec::output::staging::OutputStagingRegistry::default();
+    // output_name → final resolved path, retained so the provenance sidecar
+    // can record the actual file written (not the bare template-rendered path
+    // on OutputConfig).
     let mut resolved_output_paths: std::collections::HashMap<String, std::path::PathBuf> =
         std::collections::HashMap::new();
     let mut fan_out_writers: std::collections::HashMap<
@@ -1984,11 +1974,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         std::collections::HashMap<std::sync::Arc<str>, Box<dyn std::io::Write + Send>>,
     > = std::collections::HashMap::new();
     for output in pipeline_config.output_configs() {
-        // Split outputs route file creation through SplittingWriter's
-        // per-`{seq}` factory inside build_format_writer, which applies
-        // `if_exists` itself. The atomic tempfile pattern below is for
-        // single-file outputs only; for splits, install a sink writer
-        // here so the executor's drop of `raw_writer` is harmless.
+        // Split outputs lazily stage each `{seq}` file through the shared
+        // ledger inside `build_format_writer`. Install a sink here because the
+        // splitting writer owns every real segment handle.
         if output.split.is_some() {
             writers.insert(output.name.clone(), Box::new(std::io::sink()));
             resolved_output_paths.insert(output.name.clone(), output.path.clone().into());
@@ -2022,21 +2010,50 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     .replace("{source_file}", &label)
                     .replace("{source_path}", &path.to_string_lossy());
                 let resolved_path = std::path::PathBuf::from(&resolved);
-                if let Some(parent) = resolved_path.parent()
-                    && !parent.as_os_str().is_empty()
-                    && !parent.exists()
+                if !std::path::Path::new(&output.path).is_absolute() && resolved_path.is_absolute()
                 {
-                    std::fs::create_dir_all(parent)?;
+                    return Err(PipelineError::Config(
+                        clinker_plan::config::ConfigError::Validation(format!(
+                            "fan-out output {:?} rendered an absolute path from a relative template",
+                            output.name
+                        )),
+                    ));
                 }
-                let file = std::fs::File::create(&resolved_path)?;
+                let bare = resolved_path.clone();
+                let unique_suffix_width = output.unique_suffix_width;
+                let path_for_n = |n: Option<u64>| -> Result<
+                    std::path::PathBuf,
+                    clinker_plan::config::ConfigError,
+                > {
+                    Ok(match n {
+                        None => bare.clone(),
+                        Some(k) => {
+                            let suffix = if unique_suffix_width == 0 {
+                                format!("-{k}")
+                            } else {
+                                format!("-{:0>width$}", k, width = unique_suffix_width as usize)
+                            };
+                            clinker_exec::output::open::append_suffix_before_ext(&bare, &suffix)
+                        }
+                    })
+                };
+                let (_final_path, file) = output_staging.stage_output(
+                    output.name.clone(),
+                    output.if_exists,
+                    args.force,
+                    path_for_n,
+                )?;
                 per_file.insert(file_arc, Box::new(file));
             }
             fan_out_writers.insert(output.name.clone(), per_file);
-            // Skip the atomic-tempfile path; fan-out outputs write
-            // directly. Atomic per-file commit is a follow-up.
             continue;
         }
-        let bare = std::path::PathBuf::from(&output.path);
+        let bare = std::path::PathBuf::from(
+            output
+                .path
+                .replace("{source_file}", "<merged>")
+                .replace("{source_path}", "<merged>"),
+        );
         let unique_suffix_width = output.unique_suffix_width;
         let path_for_n =
             |n: Option<u64>| -> Result<std::path::PathBuf, clinker_plan::config::ConfigError> {
@@ -2052,35 +2069,22 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     }
                 })
             };
-        let (final_path, reservation_file) =
-            clinker_exec::output::open::open_output(output.if_exists, args.force, path_for_n)?;
-        drop(reservation_file);
-        let reservation = tempfile::TempPath::try_from_path(&final_path)?;
-        let parent = final_path.parent().filter(|p| !p.as_os_str().is_empty());
-        let temp = match parent {
-            Some(dir) => {
-                if !dir.exists() {
-                    std::fs::create_dir_all(dir)?;
-                }
-                tempfile::NamedTempFile::new_in(dir)?
-            }
-            None => tempfile::NamedTempFile::new_in(".")?,
-        };
-        let handle = temp.reopen()?;
+        let (final_path, handle) = output_staging.stage_output(
+            output.name.clone(),
+            output.if_exists,
+            args.force,
+            path_for_n,
+        )?;
         let writer: Box<dyn std::io::Write + Send> = Box::new(handle);
         writers.insert(output.name.clone(), writer);
         resolved_output_paths.insert(output.name.clone(), final_path.clone());
-        output_temps.push(PendingOutput {
-            name: output.name.clone(),
-            final_path,
-            temp,
-            reservation,
-        });
     }
 
     let registry = clinker_exec::executor::WriterRegistry {
         single: writers,
         fan_out: fan_out_writers,
+        output_staging: output_staging.clone(),
+        auto_commit_staged: false,
     };
     // Fresh per-run shutdown token. `ShutdownToken::new()` auto-registers
     // with the process-wide signal-handler registry installed in `main`,
@@ -2181,64 +2185,21 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             // the exact inputs the failure saw (cleanup = on_success); only
             // cleanup = always reaps them on failure.
             source_stager.cleanup(false);
-            // Reservations auto-unlink via TempPath::Drop when output_temps
-            // is dropped at end of scope. We just need to preserve the
-            // writing tempfiles for operator inspection and log.
-            for pending in output_temps {
-                let kept = pending.temp.into_temp_path().keep().ok();
+            for pending in output_staging.partials() {
                 tracing::warn!(
                     output = %pending.name,
                     final_path = %pending.final_path.display(),
-                    partial_path = ?kept,
+                    partial_path = %pending.partial_path.display(),
                     "pipeline failed; partial output preserved at temp path",
                 );
-                // pending.reservation drops here, unlinking the placeholder.
             }
             return Err(e);
         }
     };
 
-    // Pipeline succeeded — atomically promote each tempfile to its
-    // final path. Order: persist first (rename atomically replaces the
-    // reservation placeholder); only on success forget the reservation
-    // so its TempPath::Drop does not unlink the now-persisted output.
-    // Then fsync the parent dir so the rename's metadata is durable
-    // across a crash (Linux ext4/xfs default mount options do not
-    // synchronously flush parent-dir entries on rename).
-    for pending in output_temps {
-        let PendingOutput {
-            name: _,
-            final_path,
-            temp,
-            reservation,
-        } = pending;
-        temp.persist(&final_path).map_err(|e| {
-            tracing::error!(
-                final_path = %final_path.display(),
-                "failed to atomically rename output into place; temp file preserved",
-            );
-            std::io::Error::other(format!(
-                "atomic output rename failed for {}: {}",
-                final_path.display(),
-                e.error
-            ))
-        })?;
-        // Persist replaced the placeholder atomically; the file at
-        // `final_path` is now the actual output. Forget the TempPath
-        // so Drop does not unlink it. Equivalent to `keep()` but avoids
-        // surfacing platform-specific keep failures that, post-persist,
-        // would just confuse the operator.
-        std::mem::forget(reservation);
-        if let Some(parent) = final_path.parent().filter(|p| !p.as_os_str().is_empty())
-            && let Err(e) = fsync_dir(parent)
-        {
-            tracing::warn!(
-                final_path = %final_path.display(),
-                error = %e,
-                "fsync(parent_dir) failed; rename metadata may not survive a crash",
-            );
-        }
-    }
+    // Synchronization failure is a failed run even when the destination is
+    // already visible; the containment diagnostic states that exact condition.
+    output_staging.commit_all()?;
 
     let counters = &report.counters;
     let dlq_entries = &report.dlq_entries;
@@ -2543,6 +2504,7 @@ fn upstream_source_for_output(
         .node_indices()
         .find(|i| dag.graph[*i].name() == output_name)?;
     let mut cur = start;
+    let mut downstream = None;
     loop {
         match &dag.graph[cur] {
             PlanNode::Source { name, .. } => return Some(name.clone()),
@@ -2551,7 +2513,11 @@ fn upstream_source_for_output(
                 // Pick the FilePartitioned parent (the driver after
                 // the partition propagation pass). Falls back to
                 // `None` if the combine destroyed partitioning.
-                let parents: Vec<_> = dag.graph.neighbors(cur).collect();
+                let parents: Vec<_> = dag
+                    .graph
+                    .neighbors_undirected(cur)
+                    .filter(|neighbor| Some(*neighbor) != downstream)
+                    .collect();
                 let next = parents.into_iter().find(|p| {
                     dag.node_properties.get(p).is_some_and(|np| {
                         matches!(
@@ -2560,10 +2526,16 @@ fn upstream_source_for_output(
                         )
                     })
                 })?;
+                downstream = Some(cur);
                 cur = next;
             }
             _ => {
-                cur = dag.graph.neighbors(cur).next()?;
+                let next = dag
+                    .graph
+                    .neighbors_undirected(cur)
+                    .find(|neighbor| Some(*neighbor) != downstream)?;
+                downstream = Some(cur);
+                cur = next;
             }
         }
     }
@@ -2617,39 +2589,6 @@ fn run_metrics(cmd: &MetricsCommands) -> Result<(), std::io::Error> {
 /// Resolve thread count from CLI args or default to `num_cpus`.
 fn num_threads(args: &RunArgs) -> usize {
     args.threads.unwrap_or_else(num_cpus::get)
-}
-
-/// One per-output bookkeeping record carried from writer-loop to
-/// persist-loop. The `reservation` field is the 0-byte placeholder
-/// created by `open_output`; its `TempPath::Drop` auto-unlinks if
-/// anything between writer-loop and persist tears down (panic, Err
-/// arm, mid-persist failure).
-struct PendingOutput {
-    name: String,
-    final_path: std::path::PathBuf,
-    temp: tempfile::NamedTempFile,
-    reservation: tempfile::TempPath,
-}
-
-/// Force durable persistence of `dir`'s entry metadata to disk.
-///
-/// Called immediately after `tempfile::persist` (rename) so a crash
-/// between the rename returning and the kernel writing the parent-dir
-/// metadata cannot leave the rename invisible. Linux ext4/xfs default
-/// mount options do not implicitly fsync the parent dir on rename;
-/// see <https://yakking.branchable.com/posts/atomic-file-creation-tmpfile/>.
-///
-/// On non-Unix targets this is a no-op — opening directories for
-/// `fsync` is a Unix-ism, and Windows' `MoveFileExW` provides
-/// equivalent durability via the journal.
-#[cfg(unix)]
-fn fsync_dir(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn fsync_dir(_path: &std::path::Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// Render a "Resolved Outputs" block listing each output's expanded

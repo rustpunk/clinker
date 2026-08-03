@@ -8,6 +8,7 @@
 use std::ffi::OsString;
 use std::fs::File;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use clinker_plan::security::ValidatedPath;
 use thiserror::Error;
@@ -120,6 +121,23 @@ pub struct OutputContainment {
     parent: platform::DirectoryAnchor,
 }
 
+/// A destination-local hidden output that is ready for atomic publication.
+///
+/// The destination boundary and its retained parent handle stay alive from
+/// admission through [`Self::commit`]. Dropping this value before commit leaves
+/// the hidden partial in place for operator inspection and never touches the
+/// final destination.
+#[derive(Debug)]
+pub struct StagedOutput {
+    destination: OutputContainment,
+    quarantine_leaf: OsString,
+    quarantine_path: PathBuf,
+    disposition: PromotionDisposition,
+    reservation_leaf: Option<OsString>,
+}
+
+static QUARANTINE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 impl OutputContainment {
     /// Resolve a qualified profile before touching the destination, then open
     /// and retain its parent directory without following any link component.
@@ -171,6 +189,106 @@ impl OutputContainment {
             .open_leaf(&self.leaf, disposition, self.destination.as_path())
     }
 
+    /// Check the final leaf relative to the retained destination handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a security-policy error for a linked/reparse destination leaf,
+    /// or an I/O error when the leaf cannot be inspected.
+    pub fn destination_exists(&self) -> Result<bool, ContainmentError> {
+        self.parent
+            .leaf_exists(&self.leaf, self.destination.as_path())
+    }
+
+    /// Create a destination-local hidden file without opening or truncating the
+    /// final leaf. The returned [`StagedOutput`] retains the destination anchor
+    /// required for a later handle-relative promotion.
+    ///
+    /// # Errors
+    ///
+    /// Returns a security-policy or I/O error if a unique hidden leaf cannot be
+    /// created relative to the retained destination directory.
+    pub fn stage(
+        self,
+        disposition: PromotionDisposition,
+    ) -> Result<(StagedOutput, File), ContainmentError> {
+        let reservation_leaf = if disposition == PromotionDisposition::NoReplace {
+            if self.destination_exists()? {
+                return Err(ContainmentError::io(
+                    "reserve-destination-leaf",
+                    self.destination.as_path(),
+                    std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "destination already exists",
+                    ),
+                ));
+            }
+            let mut reservation_leaf = OsString::from(".clinker-");
+            reservation_leaf.push(&self.leaf);
+            reservation_leaf.push(".reservation");
+            let reservation_path =
+                parent_path_of(self.destination.as_path()).join(&reservation_leaf);
+            let reservation = self.parent.open_leaf(
+                &reservation_leaf,
+                OpenDisposition::CreateNew,
+                &reservation_path,
+            )?;
+            drop(reservation);
+            Some(reservation_leaf)
+        } else {
+            None
+        };
+        let parent_path = self
+            .destination
+            .as_path()
+            .parent()
+            .expect("construction requires a destination parent");
+        for _ in 0..1024 {
+            let counter = QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut quarantine_leaf = OsString::from(".clinker-");
+            quarantine_leaf.push(&self.leaf);
+            quarantine_leaf.push(format!("-{}-{counter}.partial", std::process::id()));
+            let quarantine_path = parent_path.join(&quarantine_leaf);
+            match self.parent.open_leaf(
+                &quarantine_leaf,
+                OpenDisposition::CreateNew,
+                &quarantine_path,
+            ) {
+                Ok(file) => {
+                    return Ok((
+                        StagedOutput {
+                            destination: self,
+                            quarantine_leaf,
+                            quarantine_path,
+                            disposition,
+                            reservation_leaf,
+                        },
+                        file,
+                    ));
+                }
+                Err(ContainmentError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    if let Some(reservation_leaf) = reservation_leaf.as_ref() {
+                        let _ = self.parent.remove_leaf(reservation_leaf);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(reservation_leaf) = reservation_leaf.as_ref() {
+            let _ = self.parent.remove_leaf(reservation_leaf);
+        }
+        Err(ContainmentError::io(
+            "create-quarantine-leaf",
+            self.destination.as_path(),
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique destination-local quarantine leaf",
+            ),
+        ))
+    }
+
     /// Atomically promote a validated source relative to its independently
     /// retained parent handle. Cross-filesystem promotion is rejected before
     /// rename; there is deliberately no copy fallback.
@@ -217,6 +335,57 @@ impl OutputContainment {
     }
 }
 
+impl StagedOutput {
+    /// The final destination selected for this staged output.
+    #[must_use]
+    pub fn destination(&self) -> &ValidatedPath {
+        self.destination.destination()
+    }
+
+    /// The hidden destination-local path holding partial or complete bytes.
+    #[must_use]
+    pub fn partial_path(&self) -> &Path {
+        &self.quarantine_path
+    }
+
+    /// Synchronize and atomically publish the hidden output through the parent
+    /// handle retained since admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns a collision, confinement, synchronization, or publication error.
+    pub fn commit(mut self) -> Result<(), ContainmentError> {
+        let result = self.destination.parent.promote(
+            &self.destination.parent,
+            &self.quarantine_leaf,
+            &self.destination.leaf,
+            self.disposition,
+            &self.quarantine_path,
+            self.destination.destination.as_path(),
+            false,
+        );
+        if result.is_ok()
+            && let Some(reservation_leaf) = self.reservation_leaf.take()
+        {
+            self.destination.parent.remove_leaf(&reservation_leaf)?;
+        }
+        result
+    }
+}
+
+impl Drop for StagedOutput {
+    fn drop(&mut self) {
+        if let Some(reservation_leaf) = self.reservation_leaf.take() {
+            let _ = self.destination.parent.remove_leaf(&reservation_leaf);
+        }
+    }
+}
+
+fn parent_path_of(path: &Path) -> &Path {
+    path.parent()
+        .expect("construction requires a destination parent")
+}
+
 fn absolute_path(path: &Path) -> Result<PathBuf, ContainmentError> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
@@ -237,6 +406,40 @@ fn normal_leaf(path: &Path) -> Result<OsString, ContainmentError> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use clinker_plan::security::validate_path;
+
+    use super::{ContainmentError, OutputContainment, PromotionDisposition};
+
+    #[test]
+    fn post_rename_sync_failure_reports_visible_destination() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let source_path = root.path().join("partial.bin");
+        let destination_path = root.path().join("result.bin");
+        std::fs::write(&source_path, b"complete artifact").expect("source artifact");
+        let source = validate_path(Path::new("partial.bin"), root.path(), false)
+            .expect("source fixture should validate");
+        let destination = validate_path(Path::new("result.bin"), root.path(), false)
+            .expect("destination fixture should validate");
+        let boundary = OutputContainment::for_profile(destination, "local-filesystem")
+            .expect("local destination should be supported");
+
+        let error = boundary
+            .promote_from_with_sync_fault(source, PromotionDisposition::Replace, true)
+            .expect_err("injected post-rename synchronization failure must surface");
+
+        assert!(matches!(error, ContainmentError::VisibleButUnsynced { .. }));
+        assert!(!source_path.exists(), "rename consumed the partial");
+        assert_eq!(
+            std::fs::read(destination_path).expect("visible final remains inspectable"),
+            b"complete artifact"
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod platform {
     use std::ffi::OsStr;
@@ -248,6 +451,7 @@ mod platform {
     use nix::fcntl::{OFlag, RenameFlags, openat, renameat, renameat2};
     use nix::sys::stat::{Mode, fstat};
     use nix::sys::statfs::{NFS_SUPER_MAGIC, fstatfs};
+    use nix::unistd::{UnlinkatFlags, unlinkat};
 
     use super::{ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition};
 
@@ -351,6 +555,31 @@ mod platform {
             )
             .map_err(|error| leaf_error(display_path, error))?;
             Ok(File::from(fd))
+        }
+
+        pub(super) fn leaf_exists(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<bool, ContainmentError> {
+            match openat(
+                &self.file,
+                leaf,
+                OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+                Mode::empty(),
+            ) {
+                Ok(fd) => {
+                    drop(fd);
+                    Ok(true)
+                }
+                Err(Errno::ENOENT) => Ok(false),
+                Err(error) => Err(leaf_error(display_path, error)),
+            }
+        }
+
+        pub(super) fn remove_leaf(&self, leaf: &OsStr) -> Result<(), ContainmentError> {
+            unlinkat(&self.file, leaf, UnlinkatFlags::NoRemoveDir)
+                .map_err(|error| nix_io("remove-contained-leaf", Path::new(leaf), error))
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -629,6 +858,50 @@ mod platform {
             Ok(unsafe { File::from_raw_fd(fd) })
         }
 
+        pub(super) fn leaf_exists(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<bool, ContainmentError> {
+            let leaf = c_string(leaf, display_path)?;
+            // SAFETY: the retained parent and one-component leaf meet openat's
+            // contract. A successful descriptor is closed immediately.
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    leaf.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                )
+            };
+            if fd >= 0 {
+                // SAFETY: openat returned a fresh descriptor.
+                drop(unsafe { File::from_raw_fd(fd) });
+                return Ok(true);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(false)
+            } else {
+                Err(leaf_error(display_path, error))
+            }
+        }
+
+        pub(super) fn remove_leaf(&self, leaf: &OsStr) -> Result<(), ContainmentError> {
+            let leaf = c_string(leaf, Path::new(leaf))?;
+            // SAFETY: the retained directory and one-component leaf satisfy
+            // unlinkat's contract.
+            let result = unsafe { libc::unlinkat(self.file.as_raw_fd(), leaf.as_ptr(), 0) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(ContainmentError::io(
+                    "remove-contained-leaf",
+                    Path::new(leaf.to_str().unwrap_or("<non-utf8>")),
+                    std::io::Error::last_os_error(),
+                ))
+            }
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub(super) fn promote(
             &self,
@@ -784,9 +1057,10 @@ mod platform {
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-        FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE_IF, FILE_RENAME_INFORMATION,
-        FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile, NtSetInformationFile,
+        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION, FILE_NON_DIRECTORY_FILE,
+        FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE_IF, FILE_RENAME_INFORMATION,
+        FILE_SYNCHRONOUS_IO_NONALERT, FileDispositionInformation, FileRenameInformation,
+        NtCreateFile, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         ERROR_INVALID_NAME, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE,
@@ -906,6 +1180,68 @@ mod platform {
             .map_err(|source| ContainmentError::io("open-contained-leaf", display_path, source))?;
             reject_reparse(&handle, display_path)?;
             Ok(File::from(handle))
+        }
+
+        pub(super) fn leaf_exists(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<bool, ContainmentError> {
+            match open_file_at(
+                &self.handle,
+                leaf,
+                FILE_GENERIC_READ,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            ) {
+                Ok(handle) => {
+                    reject_reparse(&handle, display_path)?;
+                    Ok(true)
+                }
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(source) => Err(ContainmentError::io(
+                    "inspect-contained-leaf",
+                    display_path,
+                    source,
+                )),
+            }
+        }
+
+        pub(super) fn remove_leaf(&self, leaf: &OsStr) -> Result<(), ContainmentError> {
+            let handle = open_file_at(
+                &self.handle,
+                leaf,
+                DELETE,
+                FILE_OPEN,
+                FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+            .map_err(|source| {
+                ContainmentError::io("open-contained-leaf-for-removal", Path::new(leaf), source)
+            })?;
+            let disposition = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
+            let mut status_block = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+            // SAFETY: the handle has DELETE access and all pointers refer to
+            // initialized storage for this synchronous native call.
+            let status = unsafe {
+                NtSetInformationFile(
+                    handle.as_raw_handle() as HANDLE,
+                    &mut status_block,
+                    (&disposition as *const FILE_DISPOSITION_INFORMATION).cast(),
+                    size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+                    FileDispositionInformation,
+                )
+            };
+            if status == STATUS_SUCCESS {
+                Ok(())
+            } else {
+                Err(ContainmentError::io(
+                    "remove-contained-leaf",
+                    Path::new(leaf),
+                    std::io::Error::from_raw_os_error(unsafe {
+                        RtlNtStatusToDosError(status) as i32
+                    }),
+                ))
+            }
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -1285,6 +1621,24 @@ mod platform {
             Err(ContainmentError::PolicyRequired {
                 profile: "local-filesystem".to_owned(),
                 detail: "output creation is unavailable without a handle-relative containment implementation",
+            })
+        }
+
+        pub(super) fn leaf_exists(
+            &self,
+            _leaf: &OsStr,
+            _display_path: &Path,
+        ) -> Result<bool, ContainmentError> {
+            Err(ContainmentError::PolicyRequired {
+                profile: "local-filesystem".to_owned(),
+                detail: "output inspection is unavailable without a handle-relative containment implementation",
+            })
+        }
+
+        pub(super) fn remove_leaf(&self, _leaf: &OsStr) -> Result<(), ContainmentError> {
+            Err(ContainmentError::PolicyRequired {
+                profile: "local-filesystem".to_owned(),
+                detail: "output cleanup is unavailable without a handle-relative containment implementation",
             })
         }
 

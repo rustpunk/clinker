@@ -34,10 +34,26 @@ use clinker_plan::error::PipelineError;
 ///
 /// Auto-converts from `HashMap<String, Box<dyn Write + Send>>` so
 /// existing callers that don't need fan-out keep the simpler shape.
-#[derive(Default)]
 pub struct WriterRegistry {
     pub single: HashMap<String, Box<dyn Write + Send>>,
     pub fan_out: HashMap<String, HashMap<std::sync::Arc<str>, Box<dyn Write + Send>>>,
+    /// Shared ledger used when split writers lazily open destination-local
+    /// hidden files. The CLI retains a clone and publishes after the run.
+    pub output_staging: crate::output::staging::OutputStagingRegistry,
+    /// Standalone executor callers have no outer publication owner, so their
+    /// registry commits staged split files after every writer has closed.
+    pub auto_commit_staged: bool,
+}
+
+impl Default for WriterRegistry {
+    fn default() -> Self {
+        Self {
+            single: HashMap::new(),
+            fan_out: HashMap::new(),
+            output_staging: crate::output::staging::OutputStagingRegistry::default(),
+            auto_commit_staged: true,
+        }
+    }
 }
 
 impl From<HashMap<String, Box<dyn Write + Send>>> for WriterRegistry {
@@ -45,6 +61,7 @@ impl From<HashMap<String, Box<dyn Write + Send>>> for WriterRegistry {
         Self {
             single,
             fan_out: HashMap::new(),
+            ..Self::default()
         }
     }
 }
@@ -424,6 +441,7 @@ pub(crate) fn build_format_writer(
     output: &OutputConfig,
     raw_writer: Box<dyn Write + Send>,
     schema: Arc<Schema>,
+    output_staging: crate::output::staging::OutputStagingRegistry,
 ) -> Result<Box<dyn FormatWriter>, PipelineError> {
     // Extract field definitions for fixed-width output (requires explicit schema).
     let field_defs = if matches!(output.format, OutputFormat::FixedWidth(_)) {
@@ -441,6 +459,7 @@ pub(crate) fn build_format_writer(
         let naming = split.naming.clone();
         let if_exists = output.if_exists;
         let unique_suffix_width = output.unique_suffix_width;
+        let output_name = output.name.clone();
 
         let file_factory: clinker_format::splitting::FileFactory =
             Box::new(move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
@@ -461,7 +480,8 @@ pub(crate) fn build_format_writer(
                         }
                     })
                 };
-                let (_path, file) = crate::output::open::open_output(if_exists, false, path_for_n)
+                let (_path, file) = output_staging
+                    .stage_output(output_name.clone(), if_exists, false, path_for_n)
                     .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
                 Ok(Box::new(BufWriter::with_capacity(65536, file)))
             });

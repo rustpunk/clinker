@@ -95,6 +95,7 @@ fn dispatch_routes_records_to_per_file_writers() {
     let writers = WriterRegistry {
         single: HashMap::new(),
         fan_out,
+        ..WriterRegistry::default()
     };
 
     let params = PipelineRunParams {

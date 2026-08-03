@@ -42,6 +42,24 @@ network traffic. The final output is still written as a hidden file on the
 destination filesystem and promoted there, so the completed file never relies
 on a cross-filesystem rename from local storage.
 
+This commit lifecycle applies to single-file, per-source-file fan-out, and
+`split:` outputs. Clinker does not open or truncate an existing final while a
+replacement is running. A failed run leaves every previous final unchanged and
+keeps destination-local hidden partials for operator inspection. After a
+successful run, each complete hidden file is synchronized and atomically
+promoted through the destination directory handle retained at admission.
+
+`if_exists: error` uses a no-replace promotion. `if_exists: overwrite` and
+`clinker run --force` replace only at successful promotion. `if_exists:
+unique_suffix` uses hidden sibling reservations so concurrent runs choose
+distinct final names without exposing zero-byte placeholders.
+
+Rendered fan-out paths are validated as new output paths. Directory traversal,
+an absolute result produced from a relative template, symbolic-link/reparse
+ancestors, and cross-filesystem promotion fail before a final is touched. Create
+the intended destination directories ahead of the run; Clinker does not follow
+rendered paths while creating missing fan-out parents.
+
 ## Direct broadcast to several outputs
 
 Several Output nodes may name the same input. This is a broadcast: every

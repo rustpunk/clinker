@@ -9,6 +9,10 @@ use clinker_plan::config::IfExistsPolicy;
 use clinker_plan::security::{ValidatedPath, validate_path};
 use tempfile::tempdir;
 
+fn clinker_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_clinker")
+}
+
 fn relative_output(root: &Path, relative: &str) -> ValidatedPath {
     validate_path(Path::new(relative), root, false).expect("test path should validate")
 }
@@ -276,17 +280,94 @@ fn remote_filesystem_matrix_semantics() {
         .expect("destination-local matrix sandbox");
     let sandbox_path = sandbox.path().to_path_buf();
 
-    let production_path = sandbox.path().join("production-open.bin");
-    let (opened_path, opened_file) =
-        open_output(
-            IfExistsPolicy::Error,
-            false,
-            |_| Ok(production_path.clone()),
-        )
-        .expect("production output open must detect and admit the mounted remote filesystem");
-    assert_eq!(opened_path, production_path);
-    drop(opened_file);
-    std::fs::remove_file(&production_path).expect("production output fixture cleanup");
+    // Exercise the actual CLI admission, writer, ledger, and promotion path on
+    // the mounted share. Direct boundary checks below remain focused fault
+    // coverage; this run is the qualification evidence for production wiring.
+    std::fs::write(sandbox.path().join("input.csv"), "id\n1\n").expect("matrix input");
+    std::fs::write(
+        sandbox.path().join("pipeline.yaml"),
+        r#"pipeline:
+  name: remote_output_commit
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+- type: output
+  name: out
+  input: src
+  config:
+    name: out
+    path: production-output.csv
+    type: csv
+"#,
+    )
+    .expect("matrix pipeline");
+    let output = std::process::Command::new(clinker_bin())
+        .current_dir(sandbox.path())
+        .args(["run", "pipeline.yaml"])
+        .output()
+        .expect("run production CLI on mounted share");
+    assert!(
+        output.status.success(),
+        "production CLI remote commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        std::fs::read_to_string(sandbox.path().join("production-output.csv"))
+            .expect("read production output")
+            .contains('1')
+    );
+
+    std::fs::write(sandbox.path().join("protected.csv"), "previous\n")
+        .expect("previous remote output");
+    std::fs::write(
+        sandbox.path().join("failure.yaml"),
+        r#"pipeline:
+  name: remote_output_failure
+error_handling:
+  strategy: fail_fast
+nodes:
+- type: source
+  name: src
+  config:
+    name: src
+    path: input.csv
+    type: csv
+    schema:
+      - { name: id, type: int }
+- type: transform
+  name: fail
+  input: src
+  config:
+    cxl: |
+      emit boom = id / 0
+- type: output
+  name: out
+  input: fail
+  config:
+    name: out
+    path: protected.csv
+    type: csv
+    if_exists: overwrite
+"#,
+    )
+    .expect("matrix failure pipeline");
+    let failed = std::process::Command::new(clinker_bin())
+        .current_dir(sandbox.path())
+        .args(["run", "failure.yaml"])
+        .output()
+        .expect("run failing production CLI on mounted share");
+    assert!(!failed.status.success(), "failure fixture must fail");
+    assert_eq!(
+        std::fs::read_to_string(sandbox.path().join("protected.csv"))
+            .expect("read protected remote output"),
+        "previous\n"
+    );
 
     let destination_dir = sandbox.path().join("destination");
     let outside_dir = sandbox.path().join("outside");

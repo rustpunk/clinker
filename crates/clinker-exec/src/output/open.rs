@@ -11,16 +11,16 @@ use clinker_plan::config::{ConfigError, IfExistsPolicy};
 use clinker_plan::error::PipelineError;
 use clinker_plan::security::{check_overwrite, validate_path};
 
-use super::containment::{ContainmentError, OpenDisposition, OutputContainment};
+use super::containment::{ContainmentError, OutputContainment, PromotionDisposition, StagedOutput};
 
 /// Open the next valid output sink given the active collision policy.
 ///
 /// `path_for_n` produces the candidate path for a given collision
 /// counter — `None` means "bare path with no counter applied". For
-/// `UniqueSuffix`, this function walks `1..=u64::MAX`, retrying via
-/// `OpenOptions::create_new(true)` until one slot wins. The
-/// race-safe `create_new` semantics ensure two concurrent runs writing
-/// into the same directory each get a distinct file.
+/// `UniqueSuffix`, this function walks `1..=u64::MAX`, acquiring an exclusive
+/// destination-local reservation until one slot wins. The race-safe
+/// reservation ensures concurrent runs writing into the same directory each
+/// get a distinct final name without exposing a partial final.
 ///
 /// `--force` (`cli_force = true`) downgrades `Error` → `Overwrite` for
 /// ad-hoc CLI runs without rewriting the pipeline YAML.
@@ -28,43 +28,36 @@ pub fn open_output<F>(
     policy: IfExistsPolicy,
     cli_force: bool,
     mut path_for_n: F,
-) -> Result<(PathBuf, File), PipelineError>
+) -> Result<(PathBuf, File, StagedOutput), PipelineError>
 where
     F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
 {
     let bare = path_for_n(None).map_err(PipelineError::Config)?;
 
     match policy {
-        IfExistsPolicy::Overwrite => {
-            let f = contained_open(&bare, OpenDisposition::Truncate)?;
-            Ok((bare, f))
-        }
+        IfExistsPolicy::Overwrite => stage_candidate(bare, PromotionDisposition::Replace),
         IfExistsPolicy::Error => {
             if cli_force {
-                let f = contained_open(&bare, OpenDisposition::Truncate)?;
-                return Ok((bare, f));
+                return stage_candidate(bare, PromotionDisposition::Replace);
             }
-            match contained_open(&bare, OpenDisposition::CreateNew) {
-                Ok(file) => Ok((bare, file)),
+            match stage_candidate(bare.clone(), PromotionDisposition::NoReplace) {
                 Err(error) if is_already_exists(&error) => Err(existing_output_error(&bare)),
-                Err(error) => Err(error),
+                result => result,
             }
         }
         IfExistsPolicy::UniqueSuffix => {
-            match contained_open(&bare, OpenDisposition::CreateNew) {
-                Ok(f) => return Ok((bare, f)),
-                Err(e) if !is_already_exists(&e) => {
-                    return Err(e);
-                }
-                Err(_) => {}
+            match stage_candidate(bare.clone(), PromotionDisposition::NoReplace) {
+                Ok(output) => return Ok(output),
+                Err(error) if is_already_exists(&error) => {}
+                Err(error) => return Err(error),
             }
 
             for n in 1u64..=u64::MAX {
                 let candidate = path_for_n(Some(n)).map_err(PipelineError::Config)?;
-                match contained_open(&candidate, OpenDisposition::CreateNew) {
-                    Ok(f) => return Ok((candidate, f)),
-                    Err(e) if is_already_exists(&e) => continue,
-                    Err(e) => return Err(e),
+                match stage_candidate(candidate, PromotionDisposition::NoReplace) {
+                    Ok(output) => return Ok(output),
+                    Err(error) if is_already_exists(&error) => continue,
+                    Err(error) => return Err(error),
                 }
             }
             Err(PipelineError::Io(std::io::Error::other(
@@ -90,7 +83,16 @@ pub fn append_suffix_before_ext(path: &Path, suffix: &str) -> PathBuf {
     }
 }
 
-fn contained_open(path: &Path, disposition: OpenDisposition) -> Result<File, PipelineError> {
+fn stage_candidate(
+    path: PathBuf,
+    disposition: PromotionDisposition,
+) -> Result<(PathBuf, File, StagedOutput), PipelineError> {
+    let boundary = contained_boundary(&path)?;
+    let (staged, file) = boundary.stage(disposition).map_err(containment_error)?;
+    Ok((path, file, staged))
+}
+
+fn contained_boundary(path: &Path) -> Result<OutputContainment, PipelineError> {
     let base = std::env::current_dir().map_err(PipelineError::Io)?;
     let validated = validate_path(path, &base, path.is_absolute()).map_err(|diagnostic| {
         PipelineError::Config(ConfigError::Validation(format!(
@@ -98,12 +100,10 @@ fn contained_open(path: &Path, disposition: OpenDisposition) -> Result<File, Pip
             diagnostic.code, diagnostic.message
         )))
     })?;
-    OutputContainment::for_profile(validated, "detected-filesystem")
-        .and_then(|boundary| boundary.open(disposition))
-        .map_err(containment_error)
+    OutputContainment::for_profile(validated, "detected-filesystem").map_err(containment_error)
 }
 
-fn containment_error(error: ContainmentError) -> PipelineError {
+pub(crate) fn containment_error(error: ContainmentError) -> PipelineError {
     match error {
         ContainmentError::Io {
             operation,
@@ -149,17 +149,21 @@ mod tests {
     }
 
     #[test]
-    fn overwrite_truncates_existing() {
+    fn overwrite_stages_without_touching_existing() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("out.csv");
         touch(&target);
-        let (path, _f) = open_output(IfExistsPolicy::Overwrite, false, |n| {
+        let (path, mut file, staged) = open_output(IfExistsPolicy::Overwrite, false, |n| {
             assert!(n.is_none());
             Ok(target.clone())
         })
         .unwrap();
         assert_eq!(path, target);
-        assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+        file.write_all(b"new").unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&target).unwrap(), b"x");
+        staged.commit().unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
     }
 
     #[test]
@@ -179,16 +183,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let target = dir.path().join("out.csv");
         touch(&target);
-        let (path, _f) = open_output(IfExistsPolicy::Error, true, |_| Ok(target.clone())).unwrap();
+        let (path, _f, _staged) =
+            open_output(IfExistsPolicy::Error, true, |_| Ok(target.clone())).unwrap();
         assert_eq!(path, target);
-        assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+        assert_eq!(std::fs::read(&target).unwrap(), b"x");
     }
 
     #[test]
     fn error_succeeds_when_absent() {
         let dir = tempdir().unwrap();
         let target = dir.path().join("fresh.csv");
-        let (path, _f) = open_output(IfExistsPolicy::Error, false, |_| Ok(target.clone())).unwrap();
+        let (path, _f, _staged) =
+            open_output(IfExistsPolicy::Error, false, |_| Ok(target.clone())).unwrap();
         assert_eq!(path, target);
     }
 
@@ -197,7 +203,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let bare = dir.path().join("out.csv");
         touch(&bare);
-        let (path, _f) = open_output(IfExistsPolicy::UniqueSuffix, false, |n| match n {
+        let (path, _f, _staged) = open_output(IfExistsPolicy::UniqueSuffix, false, |n| match n {
             None => Ok(bare.clone()),
             Some(k) => Ok(append_suffix_before_ext(&bare, &format!("-{k}"))),
         })
@@ -212,7 +218,7 @@ mod tests {
         touch(&bare);
         touch(&dir.path().join("out-1.csv"));
         touch(&dir.path().join("out-2.csv"));
-        let (path, _f) = open_output(IfExistsPolicy::UniqueSuffix, false, |n| match n {
+        let (path, _f, _staged) = open_output(IfExistsPolicy::UniqueSuffix, false, |n| match n {
             None => Ok(bare.clone()),
             Some(k) => Ok(append_suffix_before_ext(&bare, &format!("-{k}"))),
         })
@@ -224,7 +230,7 @@ mod tests {
     fn unique_suffix_uses_bare_when_free() {
         let dir = tempdir().unwrap();
         let bare = dir.path().join("fresh.csv");
-        let (path, _f) =
+        let (path, _f, _staged) =
             open_output(IfExistsPolicy::UniqueSuffix, false, |_| Ok(bare.clone())).unwrap();
         assert_eq!(path, bare);
     }

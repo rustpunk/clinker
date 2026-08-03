@@ -17,12 +17,15 @@ second, use-time boundary in `clinker-exec`:
    observation.
 2. Walk the destination ancestors without following symbolic links or reparse
    points and retain the destination-parent handle.
-3. Create the final leaf relative to that handle with owner-only Unix mode and
-   no-follow semantics. A replaced ancestor or linked leaf returns
-   `security_policy`.
-4. Open a promotion source through an independently anchored parent, compare
-   filesystem/volume identity, synchronize the complete source, and rename it
-   relative to the two handles.
+3. Create a uniquely named hidden quarantine leaf relative to that handle with
+   owner-only Unix mode and no-follow semantics. The final leaf is not opened
+   or truncated during staging. No-replace policies claim a hidden sibling
+   reservation so concurrent runs select distinct names without exposing an
+   empty final.
+4. Retain the boundary in a run-scoped publication ledger while single,
+   per-source-file fan-out, and split writers produce their bytes. Synchronize
+   the complete quarantine leaf and rename it to the final leaf relative to the
+   same retained parent handle only after the executor succeeds.
 5. Synchronize the destination directory after rename. Cross-filesystem
    promotion is refused; it never degrades to copying through a visible final
    path.
@@ -35,7 +38,9 @@ descendant and opens every leaf relative to the retained handle with
 `NtCreateFile`. It inspects each handle, compares volume identity, and promotes
 relative to the retained destination handle with `SetFileInformationByHandle`.
 The logical `ValidatedPath` remains required at the public containment boundary
-on every platform.
+on every platform. A promotion that made the destination visible but could not
+synchronize its parent is still a failed run and reports the visible-but-
+unsynchronized state; it is never reduced to a warning.
 
 ### Remote filesystem qualification
 
@@ -54,9 +59,11 @@ tokens:
   authorizes I/O as the configured guest identity.
 
 The dedicated CI matrix provisions each server and mount inside its runner,
-executes confinement, lock exclusion, synchronized promotion/visibility,
-cancellation, cross-filesystem refusal, and cleanup-liveness checks, and tears
-the environment down on every exit. Its per-profile artifact records the
+executes a real `clinker run` success and failed-overwrite preservation on the
+mounted share, plus focused confinement, lock exclusion, synchronized
+promotion/visibility, cancellation, cross-filesystem refusal, and cleanup-
+liveness checks. It tears the environment down on every exit. Its per-profile
+artifact records the
 runner image and kernel, exact client/server package versions, effective mount
 options, negotiated protocol observations, lock behavior, synchronization and
 failure-injection results, and teardown status.

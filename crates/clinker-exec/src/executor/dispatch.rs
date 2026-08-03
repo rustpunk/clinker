@@ -854,6 +854,9 @@ pub(crate) struct ExecutorContext<'a> {
     /// `{source_file}` / `{source_path}` AND whose input is
     /// `FilePartitioned`. Empty map means no fan-out outputs in this run.
     pub(crate) fan_out_writers: HashMap<String, HashMap<Arc<str>, Box<dyn Write + Send>>>,
+    /// Destination-local pending publication ledger shared by lazy split
+    /// writers and the run owner.
+    pub(crate) output_staging: crate::output::staging::OutputStagingRegistry,
     /// Body-scope `input:` reference table installed by the body
     /// executor before each body walk and cleared afterward. The
     /// Route dispatcher arm consults this map (when present) to

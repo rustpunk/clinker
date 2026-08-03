@@ -533,6 +533,7 @@ nodes:
     let writers = WriterRegistry {
         single: HashMap::new(),
         fan_out,
+        ..WriterRegistry::default()
     };
 
     let report =

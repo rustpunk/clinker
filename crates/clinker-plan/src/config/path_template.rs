@@ -355,11 +355,10 @@ const KNOWN_TOKENS: &[&str] = &[
     "execution_id",
     "batch_id",
     "n",
-    // Per-record tokens — resolved per record at runtime when the
-    // Output's parent has live `FilePartitioned` lineage. At
-    // single-render time they substitute to placeholder text (the
-    // first matched file's path/label) which is overwritten by the
-    // dispatcher once per-record fan-out lands.
+    // Per-record tokens — retained through single-render time so the planner
+    // can certify fan-out from the compiled path. The CLI replaces them per
+    // discovered source file, or with `<merged>` when partition lineage was
+    // consumed before the Output.
     "source_file",
     "source_path",
 ];
@@ -446,12 +445,8 @@ fn resolve_token(spec: &TokenSpec, ctx: &TemplateContext<'_>) -> Result<String, 
                 .unwrap_or_default()),
             None => Ok(ctx.source_name_default.unwrap_or("").to_string()),
         },
-        // Per-record tokens render to a placeholder at single-render
-        // time. The dispatcher's fan-out path overrides this when the
-        // Output's input has live `FilePartitioned` lineage; without
-        // fan-out (or with it consumed via Merge/Combine), this
-        // placeholder is what users see.
-        "source_file" | "source_path" => Ok("<merged>".to_string()),
+        "source_file" => Ok("{source_file}".to_string()),
+        "source_path" => Ok("{source_path}".to_string()),
         "channel" => Ok(ctx.channel.unwrap_or("").to_string()),
         "pipeline_hash" => {
             let hex = hex_lower(&ctx.pipeline_hash);

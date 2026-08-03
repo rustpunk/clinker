@@ -352,7 +352,12 @@ fn flush_clean_records_to_writers(
         let Some(raw_writer) = ctx.writers.remove(&output_name) else {
             continue;
         };
-        match build_format_writer(out_cfg, raw_writer, Arc::clone(&output_schema)) {
+        match build_format_writer(
+            out_cfg,
+            raw_writer,
+            Arc::clone(&output_schema),
+            ctx.output_staging.clone(),
+        ) {
             Ok(mut writer) => {
                 let mut write_failed = false;
                 for slot in &slots {
