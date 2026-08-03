@@ -35,6 +35,12 @@ use std::collections::HashMap;
 
 use crate::config::ConfigError;
 
+const DEFERRED_SOURCE_FILE: &str = "\u{e000}clinker-source-file\u{e001}";
+const DEFERRED_SOURCE_PATH: &str = "\u{e000}clinker-source-path\u{e001}";
+const DEFERRED_LITERAL_OPEN: &str = "\u{e000}clinker-literal-open\u{e001}";
+const DEFERRED_LITERAL_CLOSE: &str = "\u{e000}clinker-literal-close\u{e001}";
+const INTERNAL_MARKERS: [char; 2] = ['\u{e000}', '\u{e001}'];
+
 /// Parsed path template; immutable after [`PathTemplate::parse`].
 #[derive(Debug, Clone)]
 pub struct PathTemplate {
@@ -44,6 +50,8 @@ pub struct PathTemplate {
 #[derive(Debug, Clone)]
 enum Segment {
     Literal(String),
+    EscapedOpen,
+    EscapedClose,
     Token(TokenSpec),
 }
 
@@ -79,6 +87,11 @@ pub struct TemplateContext<'a> {
 impl PathTemplate {
     /// Parse a template string into a sequence of literals and tokens.
     pub fn parse(input: &str) -> Result<Self, ConfigError> {
+        if input.chars().any(|c| INTERNAL_MARKERS.contains(&c)) {
+            return Err(ConfigError::Validation(
+                "path template contains a reserved internal marker".to_string(),
+            ));
+        }
         let mut segments: Vec<Segment> = Vec::new();
         let mut buf = String::new();
         let mut chars = input.chars().peekable();
@@ -88,7 +101,10 @@ impl PathTemplate {
                 '{' => {
                     if chars.peek() == Some(&'{') {
                         chars.next();
-                        buf.push('{');
+                        if !buf.is_empty() {
+                            segments.push(Segment::Literal(std::mem::take(&mut buf)));
+                        }
+                        segments.push(Segment::EscapedOpen);
                         continue;
                     }
                     if !buf.is_empty() {
@@ -113,7 +129,10 @@ impl PathTemplate {
                 '}' => {
                     if chars.peek() == Some(&'}') {
                         chars.next();
-                        buf.push('}');
+                        if !buf.is_empty() {
+                            segments.push(Segment::Literal(std::mem::take(&mut buf)));
+                        }
+                        segments.push(Segment::EscapedClose);
                     } else {
                         return Err(ConfigError::Validation(format!(
                             "unmatched `}}` in path template {input:?} (use `}}}}` for a literal brace)"
@@ -131,10 +150,28 @@ impl PathTemplate {
 
     /// Render the template using `ctx`. Returns the resolved path string.
     pub fn render(&self, ctx: &TemplateContext<'_>) -> Result<String, ConfigError> {
+        self.render_with_escaped_literals(ctx, false)
+    }
+
+    fn render_with_escaped_literals(
+        &self,
+        ctx: &TemplateContext<'_>,
+        preserve_escaped: bool,
+    ) -> Result<String, ConfigError> {
         let mut out = String::new();
         for seg in &self.segments {
             match seg {
                 Segment::Literal(s) => out.push_str(s),
+                Segment::EscapedOpen => out.push_str(if preserve_escaped {
+                    DEFERRED_LITERAL_OPEN
+                } else {
+                    "{"
+                }),
+                Segment::EscapedClose => out.push_str(if preserve_escaped {
+                    DEFERRED_LITERAL_CLOSE
+                } else {
+                    "}"
+                }),
                 Segment::Token(spec) => {
                     let value = resolve_token(spec, ctx)?;
                     if let Some((prefix, suffix)) = &spec.conditional {
@@ -192,6 +229,27 @@ impl PathTemplate {
             .iter()
             .any(|s| matches!(s, Segment::Token(t) if PER_RECORD_TOKENS.contains(&t.name.as_str())))
     }
+}
+
+/// Whether a path contains a live per-record token, before or after the
+/// run-invariant portion of the template has been rendered.
+#[must_use]
+pub fn path_has_per_record_tokens(path: &str) -> bool {
+    if path.chars().any(|c| INTERNAL_MARKERS.contains(&c)) {
+        return path.contains(DEFERRED_SOURCE_FILE) || path.contains(DEFERRED_SOURCE_PATH);
+    }
+    PathTemplate::parse(path).is_ok_and(|template| template.has_per_record_tokens())
+}
+
+/// Substitute the typed deferred per-record segments in a resolved output
+/// path. Escaped literal braces remain ordinary text and cannot be mistaken
+/// for a live token.
+#[must_use]
+pub fn render_per_record_path(path: &str, source_file: &str, source_path: &str) -> String {
+    path.replace(DEFERRED_SOURCE_FILE, source_file)
+        .replace(DEFERRED_SOURCE_PATH, source_path)
+        .replace(DEFERRED_LITERAL_OPEN, "{")
+        .replace(DEFERRED_LITERAL_CLOSE, "}")
 }
 
 /// Render every Output node's `path:` template in place, with `n` set
@@ -283,7 +341,7 @@ pub fn resolve_output_path_templates_in_place(
             unique_suffix_width: 0,
         };
         let resolved = template
-            .render(&local_ctx)
+            .render_with_escaped_literals(&local_ctx, true)
             .map_err(|e| ConfigError::Validation(format!("output {output_name:?}: {e}")))?;
         body.output.path = resolved;
     }
@@ -445,8 +503,8 @@ fn resolve_token(spec: &TokenSpec, ctx: &TemplateContext<'_>) -> Result<String, 
                 .unwrap_or_default()),
             None => Ok(ctx.source_name_default.unwrap_or("").to_string()),
         },
-        "source_file" => Ok("{source_file}".to_string()),
-        "source_path" => Ok("{source_path}".to_string()),
+        "source_file" => Ok(DEFERRED_SOURCE_FILE.to_string()),
+        "source_path" => Ok(DEFERRED_SOURCE_PATH.to_string()),
         "channel" => Ok(ctx.channel.unwrap_or("").to_string()),
         "pipeline_hash" => {
             let hex = hex_lower(&ctx.pipeline_hash);
@@ -500,6 +558,29 @@ mod tests {
     fn escaped_braces() {
         let t = PathTemplate::parse("a{{b}}c.csv").unwrap();
         assert_eq!(t.render(&TemplateContext::default()).unwrap(), "a{b}c.csv");
+    }
+
+    #[test]
+    fn escaped_per_record_token_remains_literal_at_runtime() {
+        let template = PathTemplate::parse("literal-{{source_file}}-{source_file}.csv").unwrap();
+        let rendered = template
+            .render_with_escaped_literals(&TemplateContext::default(), true)
+            .unwrap();
+        assert_eq!(
+            render_per_record_path(&rendered, "orders", "east/orders.csv"),
+            "literal-{source_file}-orders.csv"
+        );
+    }
+
+    #[test]
+    fn escaped_per_record_token_does_not_request_fan_out() {
+        let template = PathTemplate::parse("literal-{{source_path}}.csv").unwrap();
+        assert!(!template.has_per_record_tokens());
+        assert!(!path_has_per_record_tokens(
+            &template
+                .render_with_escaped_literals(&TemplateContext::default(), true)
+                .unwrap()
+        ));
     }
 
     #[test]

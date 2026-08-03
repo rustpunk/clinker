@@ -4812,9 +4812,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         // document lands in its own valid single-document envelope rather than
         // being merged into one — exactly the remedy this gate's message names.
         let per_file_fanout = output.split.is_some()
-            || crate::config::path_template::PathTemplate::parse(&output.path)
-                .map(|t| t.has_per_record_tokens())
-                .unwrap_or(false);
+            || crate::config::path_template::path_has_per_record_tokens(&output.path);
         if per_file_fanout {
             continue;
         }
@@ -4847,11 +4845,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
     // single writer the document buffer flushes to).
     if config.any_source_has_document_dlq() {
         for output in config.output_configs() {
-            let Ok(template) = crate::config::path_template::PathTemplate::parse(&output.path)
-            else {
-                continue;
-            };
-            if template.has_per_record_tokens() {
+            if crate::config::path_template::path_has_per_record_tokens(&output.path) {
                 return Err(ConfigError::Validation(format!(
                     "[E343] output '{name}': a per-source-file output template \
                      (`{{source_file}}` / `{{source_path}}`) cannot be combined with a \
@@ -4929,9 +4923,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
             }
             let out = &output.name;
             let per_file_fanout = output.split.is_some()
-                || crate::config::path_template::PathTemplate::parse(&output.path)
-                    .map(|t| t.has_per_record_tokens())
-                    .unwrap_or(false);
+                || crate::config::path_template::path_has_per_record_tokens(&output.path);
             if per_file_fanout {
                 return Err(ConfigError::Validation(format!(
                     "[E347] output '{out}': `reconstruct_envelope` cannot be combined \
