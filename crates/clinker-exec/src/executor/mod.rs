@@ -712,7 +712,7 @@ impl PipelineExecutor {
             cumulative_spill_bytes,
             per_stage_spill_bytes,
             peak_consumer_usage_bytes,
-            interrupted,
+            mut interrupted,
             advisories,
         } = Self::execute_dag(
             &DagExecInputs {
@@ -762,7 +762,31 @@ impl PipelineExecutor {
             }
         }
         if auto_commit_staged {
-            output_staging.commit_all_if_complete(interrupted)?;
+            if !interrupted
+                && params
+                    .shutdown_token
+                    .as_ref()
+                    .is_some_and(|token| !token.try_begin_publication())
+            {
+                interrupted = true;
+            }
+            if let Some(outcome) = output_staging.commit_all_if_complete(interrupted)? {
+                use crate::output::staging::PublicationOutcome;
+                match outcome {
+                    PublicationOutcome::Complete { cleanup_debt, .. }
+                        if cleanup_debt.is_empty() => {}
+                    PublicationOutcome::Complete { cleanup_debt, .. } => {
+                        return Err(PipelineError::Io(std::io::Error::other(format!(
+                            "output publication completed with cleanup debt: {cleanup_debt:?}"
+                        ))));
+                    }
+                    incomplete @ PublicationOutcome::Incomplete { .. } => {
+                        return Err(PipelineError::Io(std::io::Error::other(format!(
+                            "output publication was incomplete: {incomplete:?}"
+                        ))));
+                    }
+                }
+            }
         }
         collector.record(reader_timer.finish(total_ingested, total_ingested));
 

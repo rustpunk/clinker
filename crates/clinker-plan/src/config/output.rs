@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 pub struct OutputConfig {
     pub name: String,
     pub path: String,
+    /// Typed runtime path segments populated during template resolution.
+    #[serde(skip, default)]
+    pub resolved_path_template: Option<super::path_template::ResolvedPathTemplate>,
     /// When `true` (default), every input field not explicitly emitted
     /// passes through to the output unchanged. When `false`, only
     /// explicitly emitted fields appear in the output. Also the path
@@ -103,6 +106,40 @@ pub struct OutputConfig {
     pub notes: Option<serde_json::Value>,
 }
 
+impl OutputConfig {
+    #[must_use]
+    pub fn has_per_record_path_tokens(&self) -> bool {
+        self.resolved_path_template.as_ref().map_or_else(
+            || super::path_template::path_has_per_record_tokens(&self.path),
+            super::path_template::ResolvedPathTemplate::has_per_record_tokens,
+        )
+    }
+
+    pub fn render_runtime_path(
+        &self,
+        source_file: &str,
+        source_path: &str,
+    ) -> Result<String, ConfigError> {
+        if let Some(template) = &self.resolved_path_template {
+            return Ok(template.render(source_file, source_path));
+        }
+        let template = super::path_template::PathTemplate::parse(&self.path)?;
+        let template = template.resolve_runtime(
+            &self.path,
+            &super::path_template::TemplateContext::default(),
+        )?;
+        Ok(template.render(source_file, source_path))
+    }
+
+    #[must_use]
+    pub fn authored_path_was_absolute(&self) -> bool {
+        self.resolved_path_template.as_ref().map_or_else(
+            || std::path::Path::new(&self.path).is_absolute(),
+            super::path_template::ResolvedPathTemplate::authored_absolute,
+        )
+    }
+}
+
 /// Collision policy when an Output node's resolved path already exists.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -152,6 +189,116 @@ pub struct SplitConfig {
 
 fn default_split_naming() -> String {
     "{stem}_{seq:04}.{ext}".to_string()
+}
+
+/// Parsed split filename template with one explicit sequence token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitNaming {
+    segments: Vec<SplitNamingSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SplitNamingSegment {
+    Literal(String),
+    Stem,
+    Extension,
+    Sequence(usize),
+}
+
+impl SplitNaming {
+    /// Parse `{stem}`, `{ext}`, and exactly one `{seq:NN}` token.
+    pub fn parse(authored: &str) -> Result<Self, ConfigError> {
+        let mut segments = Vec::new();
+        let mut rest = authored;
+        let mut sequences = 0_u8;
+        while let Some(open) = rest.find(['{', '}']) {
+            if !rest[..open].is_empty() {
+                segments.push(SplitNamingSegment::Literal(rest[..open].to_owned()));
+            }
+            if rest.as_bytes()[open] == b'}' {
+                return Err(ConfigError::Validation(
+                    "split naming contains an unmatched `}`".to_owned(),
+                ));
+            }
+            let after_open = &rest[open + 1..];
+            let close = after_open.find('}').ok_or_else(|| {
+                ConfigError::Validation("split naming contains an unclosed `{`".to_owned())
+            })?;
+            let token = &after_open[..close];
+            if token.contains('{') {
+                return Err(ConfigError::Validation(
+                    "split naming contains nested braces".to_owned(),
+                ));
+            }
+            match token {
+                "stem" => segments.push(SplitNamingSegment::Stem),
+                "ext" => segments.push(SplitNamingSegment::Extension),
+                _ => {
+                    let width = token.strip_prefix("seq:").ok_or_else(|| {
+                        ConfigError::Validation(format!(
+                            "split naming contains unknown token `{{{token}}}`"
+                        ))
+                    })?;
+                    if width.is_empty() || !width.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return Err(ConfigError::Validation(
+                            "split sequence token must use `{seq:NN}` with a numeric width"
+                                .to_owned(),
+                        ));
+                    }
+                    let width = width.parse::<usize>().map_err(|_| {
+                        ConfigError::Validation("split sequence width is too large".to_owned())
+                    })?;
+                    if !(1..=20).contains(&width) {
+                        return Err(ConfigError::Validation(
+                            "split sequence width must be between 1 and 20".to_owned(),
+                        ));
+                    }
+                    sequences += 1;
+                    segments.push(SplitNamingSegment::Sequence(width));
+                }
+            }
+            rest = &after_open[close + 1..];
+        }
+        if !rest.is_empty() {
+            segments.push(SplitNamingSegment::Literal(rest.to_owned()));
+        }
+        if sequences != 1 {
+            return Err(ConfigError::Validation(
+                "split naming must contain exactly one `{seq:NN}` token".to_owned(),
+            ));
+        }
+        Ok(Self { segments })
+    }
+
+    /// Render one filename without interpreting inserted values as template syntax.
+    #[must_use]
+    pub fn render(&self, base_path: &str, sequence: u32) -> String {
+        let path = std::path::Path::new(base_path);
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("output");
+        let extension = path
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("dat");
+        let mut filename = String::new();
+        for segment in &self.segments {
+            match segment {
+                SplitNamingSegment::Literal(value) => filename.push_str(value),
+                SplitNamingSegment::Stem => filename.push_str(stem),
+                SplitNamingSegment::Extension => filename.push_str(extension),
+                SplitNamingSegment::Sequence(width) => {
+                    use std::fmt::Write as _;
+                    let _ = write!(filename, "{sequence:0>width$}");
+                }
+            }
+        }
+        match path.parent().and_then(std::path::Path::to_str) {
+            Some(parent) if !parent.is_empty() => format!("{parent}/{filename}"),
+            _ => filename,
+        }
+    }
 }
 
 /// Policy when a single key group exceeds split file limits.
@@ -467,5 +614,34 @@ mod tests {
         // writer applies its documented `@` default.
         let opts: XmlOutputOptions = crate::yaml::from_str("record_element: row\n").unwrap();
         assert_eq!(opts.attribute_prefix, None);
+    }
+
+    #[test]
+    fn split_naming_honors_declared_sequence_widths() {
+        for (width, expected) in [
+            ("1", "out_7.csv"),
+            ("03", "out_007.csv"),
+            ("04", "out_0007.csv"),
+        ] {
+            let naming = SplitNaming::parse(&format!("{{stem}}_{{seq:{width}}}.{{ext}}"))
+                .expect("valid split naming");
+            assert_eq!(naming.render("dir/out.csv", 7), format!("dir/{expected}"));
+        }
+    }
+
+    #[test]
+    fn split_naming_rejects_missing_duplicate_malformed_and_unknown_tokens() {
+        for naming in [
+            "{stem}.{ext}",
+            "{seq:04}-{seq:04}",
+            "{seq:}",
+            "{seq:wide}",
+            "{seq:0}",
+            "{unknown}-{seq:04}",
+            "{stem-{seq:04}",
+            "{stem}}-{seq:04}",
+        ] {
+            assert!(SplitNaming::parse(naming).is_err(), "{naming}");
+        }
     }
 }

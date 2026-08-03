@@ -1454,21 +1454,13 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // top-level pipeline through the normal diagnostic path instead of letting
     // the runtime setup below panic. This is config inspection only: it does
     // not discover or open the source.
-    let input_path = pipeline_config
-        .source_configs()
-        .next()
-        .map(|source| {
-            if source.transport.is_file() {
-                source.path_str().to_string()
-            } else {
-                format!("<source:{}>", source.name)
-            }
-        })
-        .ok_or_else(|| {
-            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+    if pipeline_config.source_configs().next().is_none() {
+        return Err(PipelineError::Config(
+            clinker_plan::config::ConfigError::Validation(
                 "pipeline must declare at least one source node".to_string(),
-            ))
-        })?;
+            ),
+        ));
+    }
 
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
@@ -1990,13 +1982,9 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 .and_then(|stem| stem.to_str())
                 .unwrap_or("source");
             let destination = std::path::PathBuf::from(
-                clinker_plan::config::path_template::render_per_record_path(
-                    &output.path,
-                    source_file,
-                    &source_path.to_string_lossy(),
-                ),
+                output.render_runtime_path(source_file, &source_path.to_string_lossy())?,
             );
-            if !std::path::Path::new(&output.path).is_absolute() && destination.is_absolute() {
+            if !output.authored_path_was_absolute() && destination.is_absolute() {
                 return Err(PipelineError::Config(
                     clinker_plan::config::ConfigError::Validation(format!(
                         "fan-out output {:?} rendered an absolute path from a relative template",
@@ -2087,12 +2075,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             writers.insert(output.name.clone(), Box::new(std::io::sink()));
             continue;
         }
-        let bare =
-            std::path::PathBuf::from(clinker_plan::config::path_template::render_per_record_path(
-                &output.path,
-                "<merged>",
-                "<merged>",
-            ));
+        let bare = std::path::PathBuf::from(output.render_runtime_path("<merged>", "<merged>")?);
         let unique_suffix_width = output.unique_suffix_width;
         let path_for_n =
             |n: Option<u64>| -> Result<std::path::PathBuf, clinker_plan::config::ConfigError> {
@@ -2137,7 +2120,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         static_vars: channel_static_vars,
         source_vars: channel_source_vars,
         record_vars: channel_record_vars,
-        shutdown_token: Some(shutdown_token),
+        shutdown_token: Some(shutdown_token.clone()),
         spill_root_dir: spill_root_dir.clone(),
         spill_disk_cap_bytes,
         spill_compress: storage_config.spill.compress,
@@ -2188,7 +2171,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // post-overlay config — so the context it recompiles under must NOT carry
     // the overlay ops again (they would double-apply and collide). For a plain
     // run this is identical to `compile_ctx.clone()` (the op stream is empty).
-    let report = match PipelineExecutor::run_plan_with_readers_writers_in_context(
+    let mut report = match PipelineExecutor::run_plan_with_readers_writers_in_context(
         &compiled_plan,
         readers,
         registry,
@@ -2257,34 +2240,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             if buckets.is_empty() {
                 return Ok(());
             }
-            // DLQ user-row columns come from the source's authored
-            // `schema:` declaration, not from re-reading the input file.
-            // The authored schema is the runtime schema for every
-            // transport, and a pathless network source has no file to
-            // re-open, so deriving columns from the declaration is the
-            // single correct path for both file and network sources.
-            let input_schema = {
-                let mut builder = clinker_record::SchemaBuilder::new();
-                if let Some(body) = pipeline_config.source_bodies().next() {
-                    for col in body.schema.bound_columns().unwrap_or_default() {
-                        builder = builder.with_field(col.name.as_str());
-                    }
-                }
-                builder.build()
-            };
             let include_reason = dlq_config.include_reason.unwrap_or(true);
             let include_source_row = dlq_config.include_source_row.unwrap_or(true);
             for (target_path, bucket_entries) in &buckets {
                 if bucket_entries.is_empty() {
                     continue;
-                }
-                let target_dir = target_path
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                if !target_dir.exists() {
-                    std::fs::create_dir_all(&target_dir)?;
                 }
                 let bare = target_path.clone();
                 let (_final_path, dlq_handle) = output_staging.stage_output(
@@ -2301,12 +2261,65 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 clinker_exec::dlq::write_dlq(
                     dlq_handle,
                     &owned,
-                    &input_schema,
-                    &input_path,
                     include_reason,
                     include_source_row,
                 )
                 .map_err(PipelineError::Format)?;
+            }
+        }
+        for output in pipeline_config.output_configs() {
+            if !output.write_meta {
+                continue;
+            }
+            let targets = output_staging.pending_paths(&output.name);
+            let mut dlq_counts: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            for entry in dlq_entries {
+                if entry.stage.as_deref() == Some(&format!("output:{}", output.name)) {
+                    *dlq_counts
+                        .entry(format!("{:?}", entry.category))
+                        .or_default() += 1;
+                }
+            }
+            let elapsed_ms = (report.finished_at - report.started_at)
+                .num_milliseconds()
+                .max(0) as u64;
+            let hash_full = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
+            let hash_short = hash_full[..8.min(hash_full.len())].to_string();
+            for target in targets {
+                let sidecar = clinker_exec::output::sidecar::OutputSidecar {
+                    pipeline_path: args.config.to_string_lossy().into_owned(),
+                    pipeline_hash: hash_full.clone(),
+                    pipeline_hash_short: hash_short.clone(),
+                    channel: None,
+                    clinker_version: env!("CARGO_PKG_VERSION").to_string(),
+                    run_started_at: report.started_at.to_rfc3339(),
+                    run_finished_at: report.finished_at.to_rfc3339(),
+                    elapsed_total_ms: elapsed_ms,
+                    execution_id: Some(execution_id.clone()),
+                    batch_id: Some(batch_id.clone()),
+                    output_name: output.name.clone(),
+                    resolved_path: target.to_string_lossy().into_owned(),
+                    record_count: None,
+                    bytes_written: None,
+                    dlq_counts: dlq_counts.clone(),
+                    route_counts: std::collections::BTreeMap::new(),
+                    node_timings_ms: std::collections::BTreeMap::new(),
+                };
+                let bytes = clinker_exec::output::sidecar::serialize_sidecar(&sidecar)?;
+                let sidecar_path =
+                    clinker_exec::output::sidecar::OutputSidecar::sidecar_path(&target);
+                let bare = sidecar_path.clone();
+                let (_, mut handle) = output_staging.stage_output(
+                    format!("metadata sidecar for output {:?}", output.name),
+                    clinker_plan::config::IfExistsPolicy::Overwrite,
+                    false,
+                    move |n| {
+                        debug_assert!(n.is_none());
+                        Ok(bare.clone())
+                    },
+                )?;
+                std::io::Write::write_all(&mut handle, &bytes).map_err(PipelineError::Io)?;
             }
         }
         Ok(())
@@ -2324,6 +2337,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         return Err(error);
     }
 
+    let mut publication_failure: Option<String> = None;
     if report.interrupted {
         for pending in output_staging.partials() {
             tracing::warn!(
@@ -2333,60 +2347,77 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 "pipeline was interrupted; hidden output was not published",
             );
         }
+    } else if !shutdown_token.try_begin_publication() {
+        report.interrupted = true;
+        for pending in output_staging.partials() {
+            tracing::warn!(
+                output = %pending.name,
+                final_path = %pending.final_path.display(),
+                partial_path = %pending.partial_path.display(),
+                "shutdown won before publication; hidden output was not published",
+            );
+        }
     } else {
-        // Synchronization failure is a failed run even when a destination is
-        // already visible; the containment diagnostic states that exact condition.
-        output_staging.commit_all_if_complete(report.interrupted)?;
-    }
-
-    // Provenance sidecars for outputs that opted in via `write_meta`.
-    // Per-output record/byte/route counts are not yet surfaced from the
-    // executor; identity, timing, and DLQ-by-category come through.
-    for output in pipeline_config
-        .output_configs()
-        .filter(|_| !report.interrupted)
-    {
-        if !output.write_meta {
-            continue;
-        }
-        let mut dlq_counts: std::collections::BTreeMap<String, u64> =
-            std::collections::BTreeMap::new();
-        for e in dlq_entries {
-            if e.stage.as_deref() == Some(&format!("output:{}", output.name)) {
-                *dlq_counts.entry(format!("{:?}", e.category)).or_default() += 1;
+        use clinker_exec::output::staging::PublicationOutcome;
+        match output_staging.commit_all() {
+            Ok(PublicationOutcome::Complete { cleanup_debt, .. }) if cleanup_debt.is_empty() => {}
+            Ok(PublicationOutcome::Complete { cleanup_debt, .. }) => {
+                for debt in &cleanup_debt {
+                    tracing::error!(
+                        output = %debt.name,
+                        final_path = %debt.final_path.display(),
+                        stale_path = %debt.stale_path.display(),
+                        detail = %debt.detail,
+                        "output published with transaction cleanup debt",
+                    );
+                }
+                publication_failure = Some(format!(
+                    "output publication completed with {} cleanup debt item(s)",
+                    cleanup_debt.len()
+                ));
             }
-        }
-        let elapsed_ms = (report.finished_at - report.started_at)
-            .num_milliseconds()
-            .max(0) as u64;
-        let hash_full = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
-        let hash_short = hash_full[..8.min(hash_full.len())].to_string();
-        for target in output_staging.committed_paths(&output.name) {
-            let sidecar = clinker_exec::output::sidecar::OutputSidecar {
-                pipeline_path: args.config.to_string_lossy().into_owned(),
-                pipeline_hash: hash_full.clone(),
-                pipeline_hash_short: hash_short.clone(),
-                channel: None,
-                clinker_version: env!("CARGO_PKG_VERSION").to_string(),
-                run_started_at: report.started_at.to_rfc3339(),
-                run_finished_at: report.finished_at.to_rfc3339(),
-                elapsed_total_ms: elapsed_ms,
-                execution_id: Some(execution_id.clone()),
-                batch_id: Some(batch_id.clone()),
-                output_name: output.name.clone(),
-                resolved_path: target.to_string_lossy().into_owned(),
-                record_count: 0,
-                bytes_written: 0,
-                dlq_counts: dlq_counts.clone(),
-                route_counts: std::collections::BTreeMap::new(),
-                node_timings_ms: std::collections::BTreeMap::new(),
-            };
-            if let Err(e) = clinker_exec::output::sidecar::write_sidecar(&target, &sidecar) {
-                tracing::warn!(
-                    "failed to write provenance sidecar for output {:?} at {}: {e:?}",
-                    output.name,
-                    target.display(),
-                );
+            Ok(PublicationOutcome::Incomplete {
+                published,
+                visible_unsynchronized,
+                unpublished,
+                cleanup_debt,
+                error,
+            }) => {
+                for (name, path) in &published {
+                    tracing::error!(output = %name, final_path = %path.display(), "output is visible and synchronized");
+                }
+                for (name, path) in &visible_unsynchronized {
+                    tracing::error!(output = %name, final_path = %path.display(), "output is visible but parent synchronization failed");
+                }
+                for pending in &unpublished {
+                    tracing::error!(
+                        output = %pending.name,
+                        final_path = %pending.final_path.display(),
+                        partial_path = %pending.partial_path.display(),
+                        "output remains unpublished in quarantine",
+                    );
+                }
+                for debt in &cleanup_debt {
+                    tracing::error!(
+                        output = %debt.name,
+                        final_path = %debt.final_path.display(),
+                        stale_path = %debt.stale_path.display(),
+                        detail = %debt.detail,
+                        "publication also left cleanup debt",
+                    );
+                }
+                publication_failure = Some(error);
+            }
+            Err(error) => {
+                for pending in output_staging.partials() {
+                    tracing::error!(
+                        output = %pending.name,
+                        final_path = %pending.final_path.display(),
+                        partial_path = %pending.partial_path.display(),
+                        "publication preflight failed; output remains unpublished",
+                    );
+                }
+                publication_failure = Some(error.to_string());
             }
         }
     }
@@ -2429,6 +2460,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // even when some DLQ entries also landed.
     let exit_code: u8 = if report.interrupted {
         130
+    } else if publication_failure.is_some() {
+        4
     } else if counters.dlq_count > 0 {
         2
     } else {
@@ -2452,6 +2485,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         };
         let outcome = if report.interrupted {
             clinker_lineage::Terminal::Abort
+        } else if let Some(error) = &publication_failure {
+            clinker_lineage::Terminal::Fail {
+                error: error.clone(),
+            }
         } else {
             clinker_lineage::Terminal::Complete
         };

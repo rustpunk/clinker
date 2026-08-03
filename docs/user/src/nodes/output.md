@@ -45,29 +45,32 @@ on a cross-filesystem rename from local storage.
 This commit lifecycle applies to single-file, per-source-file fan-out, and
 `split:` outputs. Clinker does not open or truncate an existing final while a
 replacement is running. Before publication, Clinker synchronizes and validates
-the complete output set. For replacements it then moves each previous final to
-a hidden destination-local backup, promotes the new files, and removes the
-backups only after every promotion succeeds. A detected promotion or directory-
-sync failure rolls the whole set back and keeps the newly written bytes in
-hidden partials for inspection. If rollback itself fails, the error says so;
-Clinker does not report that the previous set was restored.
+the complete output set, then promotes each hidden file directly to its final
+name. An overwrite is one atomic replacement rename: Clinker never moves the
+previous final out of the way first. It also never claims that a multi-file set
+can be rolled back after some replacements are already visible.
 
-Publication is transactional recovery across a finite set, not one atomic
-filesystem operation for the set. Each individual rename is atomic, but a
-reader may briefly observe a mixture while the commit or rollback walks several
-destinations. A process or machine crash in that window can leave `.partial`,
-`.backup`, or `.reservation` siblings. Those names are recovery evidence; do
-not treat them as completed output or delete them while another run is live.
+Publication is not one atomic filesystem operation for the whole set. Each
+individual rename is atomic, but a reader may briefly observe a mixture while
+the finite commit walks several destinations. If a promotion or directory sync
+fails, Clinker stops, exits `4`, and reports three exact groups: finals that are
+visible and synchronized, finals that are visible but whose parent sync failed,
+and unpublished hidden partials. Already-visible finals stay visible; remaining
+old finals stay untouched. A process or machine crash in that window can leave
+the same mixed set plus `.partial` or `.reservation` siblings. Reconcile those
+named paths before retrying or consuming the set. Clinker does not create or
+use `.backup` files for output publication.
 
-`if_exists: error` uses a no-replace promotion. `if_exists: overwrite` and
-`clinker run --force` replace only at successful promotion. `if_exists:
-unique_suffix` uses hidden sibling reservations so concurrent runs choose
-distinct final names without exposing zero-byte placeholders. A reservation
-holds an operating-system lock and records its owner process. A later run
-reclaims it only after a short creation grace period and only when the lock is
-acquirable, proving that no live publisher owns it. If cleanup fails after a
-successful publication, the error names both the visible final and the stale
-reservation or backup; it does not call the publication itself unsuccessful.
+Every collision policy uses a hidden sibling reservation, including overwrite.
+This ensures only one live publisher may mutate a final destination. `if_exists:
+error` uses a no-replace promotion; `if_exists: overwrite` and `clinker run
+--force` replace only at successful promotion; `if_exists: unique_suffix`
+reserves candidate names until one wins. Reservations never expose zero-byte
+final placeholders. A reservation holds an operating-system lock and records
+its owner process. A later run reclaims it only after a short creation grace
+period and only when the lock is acquirable, proving that no live publisher owns
+it. If reservation cleanup fails after successful publication, Clinker exits
+`4` and names both the visible final and stale reservation as cleanup debt.
 
 Rendered fan-out paths are validated as new output paths. Directory traversal,
 an absolute result produced from a relative template, symbolic-link/reparse
@@ -79,14 +82,18 @@ rendered paths while creating missing fan-out parents.
 source file. Two source files that render to the same destination are rejected
 before any output is staged, with both source paths in the diagnostic. Escape a
 token as `{{source_file}}` or `{{source_path}}` when the braces are intended as
-literal filename text. When fan-out is combined with `split:`, every source has
-its own segment sequence: each starts at sequence 1 and rolls over
-independently.
+literal filename text. Runtime source names and paths are inserted as opaque
+text: braces inside an actual filename are never interpreted as another token.
+When fan-out is combined with `split:`, every source has its own segment
+sequence: each starts at sequence 1 and rolls over independently.
 
 With `write_meta: true`, Clinker writes a `.meta.json` sidecar for every actual
 committed final. A split output therefore gets one sidecar per segment, and a
 fan-out output gets one per rendered destination; no sidecar is written for the
-unrendered base template.
+unrendered base template. Main outputs and sidecars share the same publication
+ledger, so a path collision between any two of them fails before publication
+and names both producers. Counters that are not known at sidecar-preparation
+time are omitted from the JSON rather than written as misleading zeroes.
 
 ## Direct broadcast to several outputs
 
@@ -522,11 +529,17 @@ Split output into multiple files based on record count, byte size, or group boun
 | `max_records` | No | -- | Soft record count limit per file |
 | `max_bytes` | No | -- | Soft byte size limit per file |
 | `group_key` | No | -- | Field name -- never split within a group sharing this key value |
-| `naming` | No | `"{stem}_{seq:04}.{ext}"` | File naming pattern. `{stem}` is the base name, `{seq:04}` is a zero-padded sequence number, `{ext}` is the file extension |
+| `naming` | No | `"{stem}_{seq:04}.{ext}"` | File naming pattern. It must contain exactly one `{seq:NN}` token, where `NN` is a decimal width from 1 through 20. `{stem}` is the base name and `{ext}` is the file extension. |
 | `repeat_header` | No | `true` | Repeat CSV header row in each split file |
 | `oversize_group` | No | `warn` | What to do when a single key group exceeds file limits |
 
 At least one of `max_records` or `max_bytes` should be specified for splitting to have any effect.
+
+The naming grammar is strict: `{stem}`, `{ext}`, and the one required
+`{seq:NN}` token are the only placeholders. Unknown placeholders, a bare
+`{seq}`, non-numeric or out-of-range widths, and duplicate or missing sequence
+tokens are rejected during configuration validation. For example,
+`{stem}_{seq:03}.{ext}` renders sequence 7 as `007`.
 
 For formats whose output wraps the whole file in framing -- a JSON array or an XML root element -- each split file is a complete, independently valid document: the framing is closed at rotation and reopened for the next file.
 

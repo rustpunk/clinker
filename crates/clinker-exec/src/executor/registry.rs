@@ -460,14 +460,15 @@ pub(crate) fn build_format_writer(
     if let Some(ref split) = output.split {
         let policy = build_split_policy(split);
         let output_path = output.path.clone();
-        let naming = split.naming.clone();
+        let naming = clinker_plan::config::SplitNaming::parse(&split.naming)
+            .map_err(PipelineError::Config)?;
         let if_exists = output.if_exists;
         let unique_suffix_width = output.unique_suffix_width;
         let output_name = output.name.clone();
 
         let file_factory: clinker_format::splitting::FileFactory =
             Box::new(move |seq: u32| -> std::io::Result<Box<dyn Write + Send>> {
-                let bare = std::path::PathBuf::from(apply_split_naming(&output_path, &naming, seq));
+                let bare = std::path::PathBuf::from(naming.render(&output_path, seq));
                 let path_for_n = |n: Option<u64>| -> Result<
                     std::path::PathBuf,
                     clinker_plan::config::ConfigError,
@@ -522,30 +523,6 @@ fn build_split_policy(split: &clinker_plan::config::SplitConfig) -> SplitPolicy 
             clinker_plan::config::SplitOversizeGroupPolicy::Error => OversizeGroupPolicy::Error,
             clinker_plan::config::SplitOversizeGroupPolicy::Allow => OversizeGroupPolicy::Allow,
         },
-    }
-}
-
-/// Apply `{stem}_{seq:04}.{ext}` naming pattern to an output path.
-fn apply_split_naming(base_path: &str, naming: &str, seq: u32) -> String {
-    let path = std::path::Path::new(base_path);
-    let stem = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("output");
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("dat");
-    let parent = path.parent().unwrap_or(std::path::Path::new(""));
-
-    let filename = naming
-        .replace("{stem}", stem)
-        .replace("{ext}", ext)
-        .replace("{seq:04}", &format!("{seq:04}"));
-
-    // Join with a forward slash, not the OS separator: split output paths
-    // must be byte-identical across platforms — Windows `Path::join` would
-    // emit `\`, diverging from the forward-slash paths authored in config.
-    match parent.to_str() {
-        Some(p) if !p.is_empty() => format!("{p}/{filename}"),
-        _ => filename,
     }
 }
 

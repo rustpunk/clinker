@@ -150,7 +150,6 @@ pub struct StagedOutput {
     quarantine_path: PathBuf,
     disposition: PromotionDisposition,
     reservation: Option<Reservation>,
-    backup: Option<(OsString, PathBuf)>,
     state: PublicationState,
 }
 
@@ -164,10 +163,8 @@ struct Reservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PublicationState {
     Quarantined,
-    BackupPrepared,
     Published,
     VisibleButUnsynced,
-    RolledBack,
     Finalized,
 }
 
@@ -251,26 +248,21 @@ impl OutputContainment {
         self,
         disposition: PromotionDisposition,
     ) -> Result<(StagedOutput, File), ContainmentError> {
-        let reservation = if disposition == PromotionDisposition::NoReplace {
-            if self.destination_exists()? {
-                return Err(ContainmentError::io(
-                    "reserve-destination-leaf",
-                    self.destination.as_path(),
-                    std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "destination already exists",
-                    ),
-                ));
-            }
-            let mut reservation_leaf = OsString::from(".clinker-");
-            reservation_leaf.push(&self.leaf);
-            reservation_leaf.push(".reservation");
-            let reservation_path =
-                parent_path_of(self.destination.as_path()).join(&reservation_leaf);
-            Some(self.acquire_reservation(reservation_leaf, reservation_path)?)
-        } else {
-            None
-        };
+        if disposition == PromotionDisposition::NoReplace && self.destination_exists()? {
+            return Err(ContainmentError::io(
+                "reserve-destination-leaf",
+                self.destination.as_path(),
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination already exists",
+                ),
+            ));
+        }
+        let mut reservation_leaf = OsString::from(".clinker-");
+        reservation_leaf.push(&self.leaf);
+        reservation_leaf.push(".reservation");
+        let reservation_path = parent_path_of(self.destination.as_path()).join(&reservation_leaf);
+        let reservation = Some(self.acquire_reservation(reservation_leaf, reservation_path)?);
         let parent_path = self
             .destination
             .as_path()
@@ -295,7 +287,6 @@ impl OutputContainment {
                             quarantine_path,
                             disposition,
                             reservation,
-                            backup: None,
                             state: PublicationState::Quarantined,
                         },
                         file,
@@ -331,15 +322,27 @@ impl OutputContainment {
                 .open_leaf(&leaf, OpenDisposition::CreateNew, &path)
             {
                 Ok(mut file) => {
-                    FileExt::lock(&file).map_err(|source| {
-                        ContainmentError::io("lock-destination-reservation", &path, source)
-                    })?;
-                    writeln!(file, "pid={}", std::process::id()).map_err(|source| {
-                        ContainmentError::io("write-destination-reservation", &path, source)
-                    })?;
-                    file.sync_all().map_err(|source| {
-                        ContainmentError::io("sync-destination-reservation", &path, source)
-                    })?;
+                    if let Err(source) = FileExt::try_lock(&file) {
+                        drop(file);
+                        let _ = self.parent.remove_leaf(&leaf);
+                        return Err(ContainmentError::io(
+                            "lock-destination-reservation",
+                            &path,
+                            source.into(),
+                        ));
+                    }
+                    if let Err(source) =
+                        writeln!(file, "pid={}", std::process::id()).and_then(|()| file.sync_all())
+                    {
+                        let _ = FileExt::unlock(&file);
+                        drop(file);
+                        let _ = self.parent.remove_leaf(&leaf);
+                        return Err(ContainmentError::io(
+                            "initialize-destination-reservation",
+                            &path,
+                            source,
+                        ));
+                    }
                     return Ok(Reservation { leaf, path, file });
                 }
                 Err(ContainmentError::Io { source, .. })
@@ -473,56 +476,6 @@ impl StagedOutput {
         Ok(())
     }
 
-    /// Move an existing replaceable final to a destination-local backup so a
-    /// later failed promotion can restore the complete pre-run set.
-    pub(crate) fn prepare_backup(&mut self) -> Result<(), ContainmentError> {
-        if self.disposition != PromotionDisposition::Replace
-            || !self.destination.destination_exists()?
-        {
-            return Ok(());
-        }
-        let parent_path = parent_path_of(self.destination.destination.as_path());
-        for _ in 0..1024 {
-            let counter = QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let mut backup_leaf = OsString::from(".clinker-");
-            backup_leaf.push(&self.destination.leaf);
-            backup_leaf.push(format!("-{}-{counter}.backup", std::process::id()));
-            let backup_path = parent_path.join(&backup_leaf);
-            let result = self.destination.parent.promote(
-                &self.destination.parent,
-                &self.destination.leaf,
-                &backup_leaf,
-                PromotionDisposition::NoReplace,
-                self.destination.destination.as_path(),
-                &backup_path,
-                false,
-            );
-            match result {
-                Ok(()) => {
-                    self.backup = Some((backup_leaf, backup_path));
-                    self.state = PublicationState::BackupPrepared;
-                    return Ok(());
-                }
-                Err(ContainmentError::Io { ref source, .. })
-                    if source.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error @ ContainmentError::VisibleButUnsynced { .. }) => {
-                    self.backup = Some((backup_leaf, backup_path));
-                    self.state = PublicationState::BackupPrepared;
-                    return Err(error);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(ContainmentError::io(
-            "create-publication-backup",
-            self.destination.destination.as_path(),
-            std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "could not allocate a unique destination-local backup leaf",
-            ),
-        ))
-    }
-
     pub(crate) fn publish(&mut self, fail_after_rename: bool) -> Result<(), ContainmentError> {
         let result = self.destination.parent.promote(
             &self.destination.parent,
@@ -543,52 +496,37 @@ impl StagedOutput {
         result
     }
 
-    /// Restore the exact pre-run final while preserving newly written bytes in
-    /// their quarantine path.
-    pub(crate) fn rollback(&mut self) -> Result<(), ContainmentError> {
-        if matches!(
-            self.state,
-            PublicationState::Published | PublicationState::VisibleButUnsynced
-        ) {
-            self.destination.parent.promote(
-                &self.destination.parent,
-                &self.destination.leaf,
-                &self.quarantine_leaf,
-                PromotionDisposition::NoReplace,
-                self.destination.destination.as_path(),
-                &self.quarantine_path,
-                false,
-            )?;
-        }
-        if let Some((backup_leaf, backup_path)) = self.backup.take() {
-            self.destination.parent.promote(
-                &self.destination.parent,
-                &backup_leaf,
-                &self.destination.leaf,
-                PromotionDisposition::NoReplace,
-                &backup_path,
-                self.destination.destination.as_path(),
-                false,
-            )?;
-        }
-        self.state = PublicationState::RolledBack;
-        Ok(())
+    /// Remove the transaction reservation after this output has published.
+    pub(crate) fn finalize(&mut self) -> Result<(), ContainmentError> {
+        self.finalize_with_cleanup_fault(false)
     }
 
-    /// Remove transaction artifacts only after every output has published.
-    pub(crate) fn finalize(&mut self) -> Result<(), ContainmentError> {
-        if let Some((backup_leaf, backup_path)) = self.backup.take()
-            && let Err(source) = self.destination.parent.remove_leaf(&backup_leaf)
-        {
-            return Err(ContainmentError::PublishedCleanup {
-                path: self.destination.destination.as_path().to_path_buf(),
-                stale_path: backup_path,
-                source: Box::new(source),
-            });
-        }
+    /// Deterministic seam for verifying that post-publication cleanup failures
+    /// remain visible as operator debt instead of being mistaken for a failed
+    /// rename. Production callers always pass `false` through [`Self::finalize`].
+    pub(crate) fn finalize_with_cleanup_fault(
+        &mut self,
+        fail_cleanup: bool,
+    ) -> Result<(), ContainmentError> {
         if let Some(reservation) = self.reservation.take() {
             let _ = FileExt::unlock(&reservation.file);
             drop(reservation.file);
+            if fail_cleanup {
+                self.state = PublicationState::Finalized;
+                let source = ContainmentError::io(
+                    "remove-destination-reservation",
+                    &reservation.path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected reservation cleanup failure",
+                    ),
+                );
+                return Err(ContainmentError::PublishedCleanup {
+                    path: self.destination.destination.as_path().to_path_buf(),
+                    stale_path: reservation.path,
+                    source: Box::new(source),
+                });
+            }
             if let Err(source) = self.destination.parent.remove_leaf(&reservation.leaf) {
                 return Err(ContainmentError::PublishedCleanup {
                     path: self.destination.destination.as_path().to_path_buf(),
@@ -596,6 +534,18 @@ impl StagedOutput {
                     source: Box::new(source),
                 });
             }
+        }
+        self.state = PublicationState::Finalized;
+        Ok(())
+    }
+
+    /// Remove an unpublishable quarantine and release its destination lock.
+    pub(crate) fn discard(mut self) -> Result<(), ContainmentError> {
+        self.destination.parent.remove_leaf(&self.quarantine_leaf)?;
+        if let Some(reservation) = self.reservation.take() {
+            let _ = FileExt::unlock(&reservation.file);
+            drop(reservation.file);
+            self.destination.parent.remove_leaf(&reservation.leaf)?;
         }
         self.state = PublicationState::Finalized;
         Ok(())
@@ -609,12 +559,10 @@ impl StagedOutput {
     /// Returns a collision, confinement, synchronization, or publication error.
     pub fn commit(mut self) -> Result<(), ContainmentError> {
         self.preflight()?;
-        if let Err(error) = self.prepare_backup() {
-            let _ = self.rollback();
-            return Err(error);
-        }
         if let Err(error) = self.publish(false) {
-            let _ = self.rollback();
+            if matches!(error, ContainmentError::VisibleButUnsynced { .. }) {
+                let _ = self.finalize();
+            }
             return Err(error);
         }
         self.finalize()
@@ -622,7 +570,13 @@ impl StagedOutput {
 }
 
 impl Drop for StagedOutput {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            let _ = FileExt::unlock(&reservation.file);
+            drop(reservation.file);
+            let _ = self.destination.parent.remove_leaf(&reservation.leaf);
+        }
+    }
 }
 
 fn parent_path_of(path: &Path) -> &Path {
@@ -714,6 +668,34 @@ mod tests {
         let (_staged, _file) = recovered
             .stage(PromotionDisposition::NoReplace)
             .expect("dead owner's aged reservation should be reclaimed");
+    }
+
+    #[test]
+    fn replace_reservation_allows_only_one_live_publisher() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let destination = || {
+            validate_path(Path::new("result.bin"), root.path(), false)
+                .expect("destination fixture should validate")
+        };
+        let first = OutputContainment::for_profile(destination(), "local-filesystem")
+            .expect("local destination should be supported");
+        let (staged, file) = first
+            .stage(PromotionDisposition::Replace)
+            .expect("first replacement reserves destination");
+
+        let competing = OutputContainment::for_profile(destination(), "local-filesystem")
+            .expect("competing boundary");
+        let error = competing
+            .stage(PromotionDisposition::Replace)
+            .expect_err("live replacement reservation must reject a competitor");
+        assert!(error.to_string().contains("reserved"), "{error}");
+
+        drop(file);
+        drop(staged);
+        let next = OutputContainment::for_profile(destination(), "local-filesystem")
+            .expect("next boundary");
+        next.stage(PromotionDisposition::Replace)
+            .expect("dropping the first publisher releases the reservation");
     }
 
     #[cfg(target_os = "macos")]

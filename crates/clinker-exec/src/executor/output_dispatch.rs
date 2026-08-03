@@ -1102,6 +1102,7 @@ fn emit_fan_out(
         let mut resolved_config = fan_ctx.out_cfg.clone();
         if let Some(path) = resolved_paths.remove(&file_arc) {
             resolved_config.path = path;
+            resolved_config.resolved_path_template = None;
         } else if resolved_config.split.is_some() {
             fan_ctx.output_errors.push(PipelineError::Internal {
                 op: "fan_out",

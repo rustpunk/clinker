@@ -62,7 +62,7 @@ The DLQ is always written as CSV, regardless of the pipeline's input/output form
 |-------|----------|---------|-------------|
 | `path` | No | -- | File path for DLQ output. If omitted, DLQ records are logged but not written to file. |
 | `include_reason` | No | -- | Include `_cxl_dlq_error_category` and `_cxl_dlq_error_detail` columns. |
-| `include_source_row` | No | -- | Include original source fields alongside DLQ metadata. |
+| `include_source_row` | No | -- | Include the stable alphabetical union of user source fields across all DLQ records. A field absent from one record is an empty cell. |
 
 ## DLQ columns
 
@@ -72,7 +72,7 @@ Every DLQ record includes these metadata columns:
 |--------|-------------|
 | `_cxl_dlq_id` | UUID v7 (time-ordered unique identifier) |
 | `_cxl_dlq_timestamp` | RFC 3339 timestamp of when the error occurred |
-| `_cxl_dlq_source_file` | Input filename that produced the failing record |
+| `_cxl_dlq_source_file` | Input filename carried by that failing record's `$source.file` provenance (or `<merged>` when no source-file provenance exists) |
 | `_cxl_dlq_source_row` | 1-based row number in the source file |
 | `_cxl_dlq_stage` | Name of the transform or aggregate node where the error occurred |
 | `_cxl_dlq_route` | Route branch name (if the error occurred after routing) |
@@ -84,6 +84,12 @@ When `include_reason: true` is set, two additional columns appear:
 |--------|-------------|
 | `_cxl_dlq_error_category` | Machine-readable error classification |
 | `_cxl_dlq_error_detail` | Human-readable error description |
+
+DLQ batches may contain records from different source schemas. Clinker derives
+the optional source-row columns from every record in the batch, filters
+engine-only sidecars, and writes their alphabetical union so the CSV shape does
+not depend on which schema arrived first. Source-file provenance is likewise
+read per record; one file's path is never reused for a later heterogeneous row.
 
 ## Error categories
 

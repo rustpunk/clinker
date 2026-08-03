@@ -17,29 +17,32 @@ second, use-time boundary in `clinker-exec`:
    observation.
 2. Walk the destination ancestors without following symbolic links or reparse
    points and retain the destination-parent handle.
-3. Create a uniquely named hidden quarantine leaf relative to that handle with
-   owner-only Unix mode and no-follow semantics. The final leaf is not opened
-   or truncated during staging. No-replace policies claim a hidden sibling
-   reservation so concurrent runs select distinct names without exposing an
-   empty final. The reservation carries the owner PID and an exclusive `fs4`
-   lock. An existing reservation is reclaimed only after a creation-grace
-   interval and a successful non-blocking exclusive lock, which distinguishes a
-   dead owner from a live or newly starting publisher.
+3. Claim a hidden sibling reservation, then create a uniquely named hidden
+   quarantine leaf relative to that handle with owner-only Unix mode and
+   no-follow semantics. The final leaf is not opened or truncated during
+   staging. Every disposition, including replacement, holds the reservation so
+   concurrent runs cannot both mutate one destination. The reservation carries
+   the owner PID and an exclusive non-blocking `fs4` lock. An existing
+   reservation is reclaimed only after a creation-grace interval and a
+   successful lock, which distinguishes a dead owner from a live or newly
+   starting publisher. Lock or initialization failure immediately removes any
+   reservation created by that attempt.
 4. Retain the boundary in a run-scoped publication ledger while single,
    per-source-file fan-out, and split writers produce their bytes. After the
    executor succeeds, preflight every quarantine and destination before the
-   first mutation. Move replaceable previous finals to unique destination-local
-   backups, then promote every quarantine through the retained handles.
-5. If any promotion or post-rename directory synchronization fails, walk the
-   changed entries in reverse: move newly visible finals back to their
-   quarantine names and restore every backup. A deterministic second-promotion
-   fault test proves that both previous finals return and both new quarantines
-   remain inspectable. Rollback failure is combined with the publication error,
-   never hidden.
-6. After every promotion succeeds, remove backups and reservations and record
-   the exact committed final paths used by metadata sidecars. Cleanup failure
-   is a distinct post-publication state naming the visible final and stale
-   artifact. Cross-filesystem
+   first mutation, then promote each quarantine directly through the retained
+   handles. Replacement is one atomic rename; the old final is never moved to a
+   backup first.
+5. If any promotion or post-rename directory synchronization fails, stop and
+   return a typed outcome containing the exact synchronized-visible,
+   visible-unsynchronized, and unpublished sets. Already-visible finals are not
+   rolled back, and unvisited finals remain untouched. Deterministic fault tests
+   pin this partial-set accounting.
+6. After each successful promotion, remove its reservation and record the exact
+   committed final path. Cleanup failure is typed post-publication debt naming
+   the visible final and stale reservation. Metadata sidecars are serialized
+   before this point and join the same ledger and collision namespace as data
+   outputs. Cross-filesystem
    promotion is refused; it never degrades to copying through a visible final
    path.
 
@@ -54,15 +57,17 @@ relative to the retained destination handle with `NtSetInformationFile`.
 The logical `ValidatedPath` remains required at the public containment boundary
 on every platform. A promotion that made the destination visible but could not
 synchronize its parent enters the explicit visible-but-unsynchronized state;
-the ledger attempts rollback and never reduces that condition to a warning.
+the ledger reports it as an operational failure and never reduces it to a
+warning or claims rollback.
 
 The set protocol is recoverable, not globally atomic: individual renames are
 atomic, while a multi-file commit has an observation window in which old and new
 entries can coexist. An uncatchable process or machine failure may leave hidden
-`.partial`, `.backup`, and `.reservation` entries. The names preserve both sides
-for operator recovery; reservation liveness is established by the lock plus
-grace rule rather than by silently deleting a file that might belong to a live
-run.
+`.partial` and `.reservation` entries alongside a subset of newly visible
+finals. The reported/path-observed set is the recovery record; reservation
+liveness is established by the lock plus grace rule rather than by silently
+deleting a file that might belong to a live run. Output publication does not use
+`.backup` entries.
 
 ### Remote filesystem qualification
 

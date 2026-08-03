@@ -267,10 +267,6 @@ nodes:
 /// all attributed to `src_b` in the `_cxl_dlq_source_name` column.
 #[test]
 fn dlq_csv_sidecar_attributes_every_row_to_originating_source() {
-    use std::sync::Arc;
-
-    use clinker_record::{Schema, SchemaBuilder};
-
     let yaml = r#"
 pipeline:
   name: dlq_attribution_sidecar
@@ -343,20 +339,9 @@ nodes:
 
     // Round-trip the DLQ vector through the CSV writer and read the
     // header + body back to assert column-level attribution.
-    let dlq_schema: Arc<Schema> = SchemaBuilder::new()
-        .with_field("id")
-        .with_field("tag")
-        .build();
     let mut buf = Vec::new();
-    clinker_exec::dlq::write_dlq(
-        &mut buf,
-        &report.dlq_entries,
-        &dlq_schema,
-        "input.csv",
-        true,
-        true,
-    )
-    .expect("write_dlq must succeed");
+    clinker_exec::dlq::write_dlq(&mut buf, &report.dlq_entries, true, true)
+        .expect("write_dlq must succeed");
     let csv = String::from_utf8(buf).unwrap();
     let mut lines = csv.lines();
     let header: Vec<&str> = lines.next().unwrap().split(',').collect();

@@ -1,5 +1,6 @@
 //! Run-scoped ledger for destination-local output staging and publication.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -7,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use clinker_plan::config::{ConfigError, IfExistsPolicy};
 use clinker_plan::error::PipelineError;
 
-use super::containment::StagedOutput;
+use super::containment::{ContainmentError, StagedOutput};
 use super::open::{containment_error, open_output};
 
 #[derive(Debug)]
@@ -28,6 +29,54 @@ pub struct PartialOutput {
     pub partial_path: PathBuf,
 }
 
+/// A final destination that published but left a removable transaction file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupDebt {
+    pub name: String,
+    pub final_path: PathBuf,
+    pub stale_path: PathBuf,
+    pub detail: String,
+}
+
+/// Truthful result of a run-scoped publication attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PublicationOutcome {
+    Complete {
+        published: Vec<(String, PathBuf)>,
+        cleanup_debt: Vec<CleanupDebt>,
+    },
+    Incomplete {
+        published: Vec<(String, PathBuf)>,
+        visible_unsynchronized: Vec<(String, PathBuf)>,
+        unpublished: Vec<PartialOutput>,
+        cleanup_debt: Vec<CleanupDebt>,
+        error: String,
+    },
+}
+
+impl PublicationOutcome {
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete { .. })
+    }
+
+    #[must_use]
+    pub fn cleanup_debt(&self) -> &[CleanupDebt] {
+        match self {
+            Self::Complete { cleanup_debt, .. } | Self::Incomplete { cleanup_debt, .. } => {
+                cleanup_debt
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RegistryState {
+    pending: Vec<PendingOutput>,
+    committed: Vec<(String, PathBuf)>,
+    claims: BTreeMap<String, (String, PathBuf)>,
+}
+
 /// Shared pending-publication ledger used by single, fan-out, and split sinks.
 ///
 /// Split writers may create files from executor-owned threads, so clones all
@@ -35,8 +84,7 @@ pub struct PartialOutput {
 /// after the executor has dropped every writer.
 #[derive(Clone, Debug, Default)]
 pub struct OutputStagingRegistry {
-    pending: Arc<Mutex<Vec<PendingOutput>>>,
-    committed: Arc<Mutex<Vec<(String, PathBuf)>>>,
+    state: Arc<Mutex<RegistryState>>,
 }
 
 impl OutputStagingRegistry {
@@ -51,20 +99,51 @@ impl OutputStagingRegistry {
         name: impl Into<String>,
         policy: IfExistsPolicy,
         cli_force: bool,
-        path_for_n: F,
+        mut path_for_n: F,
     ) -> Result<(PathBuf, File), PipelineError>
     where
         F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
     {
-        let (final_path, file, staged) = open_output(policy, cli_force, path_for_n)?;
-        self.pending
+        let name = name.into();
+        let mut state = self
+            .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(PendingOutput {
-                name: name.into(),
-                final_path: final_path.clone(),
-                staged,
-            });
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Exact-path policies can collide with an entry already staged by this
+        // run. Detect that in the shared ledger before the filesystem
+        // reservation rejects the second opener, so the diagnostic retains
+        // both authored producer names. Unique-suffix deliberately probes the
+        // next candidate instead and is checked after selection.
+        let bare = if policy == IfExistsPolicy::UniqueSuffix {
+            None
+        } else {
+            let bare = path_for_n(None).map_err(PipelineError::Config)?;
+            let key = destination_key(&bare)?;
+            if let Some((first_name, first_path)) = state.claims.get(&key) {
+                return Err(collision_error(&name, &bare, first_name, first_path));
+            }
+            Some(bare)
+        };
+        let (final_path, file, staged) = if let Some(bare) = bare {
+            open_output(policy, cli_force, |n| match n {
+                None => Ok(bare.clone()),
+                Some(n) => path_for_n(Some(n)),
+            })?
+        } else {
+            open_output(policy, cli_force, path_for_n)?
+        };
+        let key = destination_key(&final_path)?;
+        if let Some((first_name, first_path)) = state.claims.get(&key) {
+            drop(file);
+            let _ = staged.discard();
+            return Err(collision_error(&name, &final_path, first_name, first_path));
+        }
+        state.claims.insert(key, (name.clone(), final_path.clone()));
+        state.pending.push(PendingOutput {
+            name,
+            final_path: final_path.clone(),
+            staged,
+        });
         Ok((final_path, file))
     }
 
@@ -72,9 +151,10 @@ impl OutputStagingRegistry {
     /// inspectable partials after a failed run without consuming the ledger.
     #[must_use]
     pub fn partials(&self) -> Vec<PartialOutput> {
-        self.pending
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending
             .iter()
             .map(|pending| PartialOutput {
                 name: pending.name.clone(),
@@ -87,12 +167,26 @@ impl OutputStagingRegistry {
     /// Final paths successfully committed for one authored output name.
     #[must_use]
     pub fn committed_paths(&self, name: &str) -> Vec<PathBuf> {
-        self.committed
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .committed
             .iter()
             .filter(|(entry_name, _)| entry_name == name)
             .map(|(_, path)| path.clone())
+            .collect()
+    }
+
+    /// Snapshot every staged final path, including split and fan-out segments.
+    #[must_use]
+    pub fn pending_paths(&self, name: &str) -> Vec<PathBuf> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending
+            .iter()
+            .filter(|entry| entry.name == name)
+            .map(|entry| entry.final_path.clone())
             .collect()
     }
 
@@ -100,19 +194,24 @@ impl OutputStagingRegistry {
     ///
     /// # Errors
     ///
-    /// Stops at the first failed promotion and returns its precise containment
-    /// or durability diagnostic. Unattempted hidden files remain preserved.
-    pub fn commit_all(&self) -> Result<(), PipelineError> {
-        self.commit_all_inner(None)
+    /// Stops at the first failed promotion and reports every visible,
+    /// unsynchronized, and unpublished path without attempting set rollback.
+    pub fn commit_all(&self) -> Result<PublicationOutcome, PipelineError> {
+        self.commit_all_inner(None, None, None)
     }
 
-    fn commit_all_inner(&self, fail_after_rename_at: Option<usize>) -> Result<(), PipelineError> {
-        let mut pending = {
-            let mut guard = self
-                .pending
+    fn commit_all_inner(
+        &self,
+        fail_before_rename_at: Option<usize>,
+        fail_after_rename_at: Option<usize>,
+        fail_cleanup_at: Option<usize>,
+    ) -> Result<PublicationOutcome, PipelineError> {
+        let pending = {
+            let mut state = self
+                .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            std::mem::take(&mut *guard)
+            std::mem::take(&mut state.pending)
         };
         for entry in &pending {
             if let Err(error) = entry.staged.preflight() {
@@ -120,98 +219,194 @@ impl OutputStagingRegistry {
                 return Err(containment_error(error));
             }
         }
-
-        for index in 0..pending.len() {
-            if let Err(error) = pending[index].staged.prepare_backup() {
-                let rollback = rollback_all(&mut pending);
-                self.restore_pending(pending);
-                return Err(containment_error(with_rollback(error, rollback)));
+        let mut remaining = VecDeque::from(pending);
+        let mut published = Vec::new();
+        let mut visible_unsynchronized = Vec::new();
+        let mut cleanup_debt = Vec::new();
+        let mut index = 0_usize;
+        while let Some(mut entry) = remaining.pop_front() {
+            if fail_before_rename_at == Some(index) {
+                remaining.push_front(entry);
+                let unpublished = partials_from(remaining.iter());
+                self.restore_pending(remaining.into());
+                self.record_committed(&published, &visible_unsynchronized);
+                return Ok(PublicationOutcome::Incomplete {
+                    published,
+                    visible_unsynchronized,
+                    unpublished,
+                    cleanup_debt,
+                    error: "injected failure before destination rename".to_owned(),
+                });
             }
-        }
-
-        for index in 0..pending.len() {
-            if let Err(error) = pending[index]
-                .staged
-                .publish(fail_after_rename_at == Some(index))
-            {
-                let rollback = rollback_all(&mut pending);
-                self.restore_pending(pending);
-                return Err(containment_error(with_rollback(error, rollback)));
+            match entry.staged.publish(fail_after_rename_at == Some(index)) {
+                Ok(()) => {
+                    let identity = (entry.name.clone(), entry.final_path.clone());
+                    if let Err(error) = entry
+                        .staged
+                        .finalize_with_cleanup_fault(fail_cleanup_at == Some(index))
+                    {
+                        cleanup_debt.push(cleanup_debt_for(&entry, error));
+                    }
+                    published.push(identity);
+                }
+                Err(error @ ContainmentError::VisibleButUnsynced { .. }) => {
+                    let identity = (entry.name.clone(), entry.final_path.clone());
+                    if let Err(cleanup) = entry
+                        .staged
+                        .finalize_with_cleanup_fault(fail_cleanup_at == Some(index))
+                    {
+                        cleanup_debt.push(cleanup_debt_for(&entry, cleanup));
+                    }
+                    visible_unsynchronized.push(identity);
+                    let unpublished = partials_from(remaining.iter());
+                    self.restore_pending(remaining.into());
+                    self.record_committed(&published, &visible_unsynchronized);
+                    return Ok(PublicationOutcome::Incomplete {
+                        published,
+                        visible_unsynchronized,
+                        unpublished,
+                        cleanup_debt,
+                        error: error.to_string(),
+                    });
+                }
+                Err(error) => {
+                    remaining.push_front(entry);
+                    let unpublished = partials_from(remaining.iter());
+                    self.restore_pending(remaining.into());
+                    self.record_committed(&published, &visible_unsynchronized);
+                    return Ok(PublicationOutcome::Incomplete {
+                        published,
+                        visible_unsynchronized,
+                        unpublished,
+                        cleanup_debt,
+                        error: error.to_string(),
+                    });
+                }
             }
+            index += 1;
         }
-
-        let committed: Vec<_> = pending
-            .iter()
-            .map(|entry| (entry.name.clone(), entry.final_path.clone()))
-            .collect();
-        let mut cleanup_error = None;
-        for entry in &mut pending {
-            if let Err(error) = entry.staged.finalize()
-                && cleanup_error.is_none()
-            {
-                cleanup_error = Some(error);
-            }
-        }
-        self.committed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .extend(committed);
-        cleanup_error.map_or(Ok(()), |error| Err(containment_error(error)))
+        self.record_committed(&published, &[]);
+        Ok(PublicationOutcome::Complete {
+            published,
+            cleanup_debt,
+        })
     }
 
     fn restore_pending(&self, pending: Vec<PendingOutput>) {
-        self.pending
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending
             .extend(pending);
     }
 
+    fn record_committed(
+        &self,
+        published: &[(String, PathBuf)],
+        visible_unsynchronized: &[(String, PathBuf)],
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.committed.extend_from_slice(published);
+        state.committed.extend_from_slice(visible_unsynchronized);
+    }
+
     #[cfg(test)]
-    fn commit_all_with_fault(&self, fail_after_rename_at: usize) -> Result<(), PipelineError> {
-        self.commit_all_inner(Some(fail_after_rename_at))
+    fn commit_all_with_fault(
+        &self,
+        fail_after_rename_at: usize,
+    ) -> Result<PublicationOutcome, PipelineError> {
+        self.commit_all_inner(None, Some(fail_after_rename_at), None)
+    }
+
+    #[cfg(test)]
+    fn commit_all_with_pre_rename_fault(
+        &self,
+        fail_before_rename_at: usize,
+    ) -> Result<PublicationOutcome, PipelineError> {
+        self.commit_all_inner(Some(fail_before_rename_at), None, None)
+    }
+
+    #[cfg(test)]
+    fn commit_all_with_cleanup_fault(
+        &self,
+        fail_cleanup_at: usize,
+    ) -> Result<PublicationOutcome, PipelineError> {
+        self.commit_all_inner(None, None, Some(fail_cleanup_at))
     }
 
     /// Publish the ledger only for a complete, non-interrupted execution.
     ///
-    /// Returns `false` without consuming any entry when shutdown interrupted
+    /// Returns `None` without consuming any entry when shutdown interrupted
     /// the run, leaving every quarantine path available for inspection.
     ///
     /// # Errors
     ///
     /// Returns the same publication failures as [`Self::commit_all`].
-    pub fn commit_all_if_complete(&self, interrupted: bool) -> Result<bool, PipelineError> {
+    pub fn commit_all_if_complete(
+        &self,
+        interrupted: bool,
+    ) -> Result<Option<PublicationOutcome>, PipelineError> {
         if interrupted {
-            return Ok(false);
+            return Ok(None);
         }
-        self.commit_all()?;
-        Ok(true)
+        self.commit_all().map(Some)
     }
 }
 
-fn rollback_all(pending: &mut [PendingOutput]) -> Option<super::containment::ContainmentError> {
-    let mut first_error = None;
-    for entry in pending.iter_mut().rev() {
-        if let Err(error) = entry.staged.rollback()
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
-    }
-    first_error
+fn collision_error(
+    name: &str,
+    final_path: &std::path::Path,
+    first_name: &str,
+    first_path: &std::path::Path,
+) -> PipelineError {
+    PipelineError::Config(ConfigError::Validation(format!(
+        "output destination collision: producer {name:?} resolves to {} already claimed by producer {first_name:?} at {}",
+        final_path.display(),
+        first_path.display(),
+    )))
 }
 
-fn with_rollback(
-    publication: super::containment::ContainmentError,
-    rollback: Option<super::containment::ContainmentError>,
-) -> super::containment::ContainmentError {
-    match rollback {
-        None => publication,
-        Some(rollback) => super::containment::ContainmentError::Io {
-            operation: "rollback-publication-set",
-            path: PathBuf::from("<multiple outputs>"),
-            source: std::io::Error::other(format!(
-                "publication failed: {publication}; rollback also failed: {rollback}"
-            )),
+fn destination_key(path: &std::path::Path) -> Result<String, PipelineError> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(PipelineError::Io)?
+            .join(path)
+    };
+    Ok(clinker_plan::config::collision_key(
+        &absolute.to_string_lossy(),
+    ))
+}
+
+fn partials_from<'a>(entries: impl Iterator<Item = &'a PendingOutput>) -> Vec<PartialOutput> {
+    entries
+        .map(|entry| PartialOutput {
+            name: entry.name.clone(),
+            final_path: entry.final_path.clone(),
+            partial_path: entry.staged.partial_path().to_path_buf(),
+        })
+        .collect()
+}
+
+fn cleanup_debt_for(entry: &PendingOutput, error: ContainmentError) -> CleanupDebt {
+    match error {
+        ContainmentError::PublishedCleanup {
+            stale_path, source, ..
+        } => CleanupDebt {
+            name: entry.name.clone(),
+            final_path: entry.final_path.clone(),
+            stale_path,
+            detail: source.to_string(),
+        },
+        other => CleanupDebt {
+            name: entry.name.clone(),
+            final_path: entry.final_path.clone(),
+            stale_path: entry.final_path.clone(),
+            detail: other.to_string(),
         },
     }
 }
@@ -222,7 +417,7 @@ mod tests {
 
     use clinker_plan::config::IfExistsPolicy;
 
-    use super::OutputStagingRegistry;
+    use super::{OutputStagingRegistry, PublicationOutcome};
 
     #[test]
     fn interrupted_execution_keeps_existing_final_and_quarantine() {
@@ -239,7 +434,12 @@ mod tests {
         file.write_all(b"new\n").expect("write quarantine");
         drop(file);
 
-        assert!(!registry.commit_all_if_complete(true).expect("skip commit"));
+        assert!(
+            registry
+                .commit_all_if_complete(true)
+                .expect("skip commit")
+                .is_none()
+        );
         assert_eq!(
             std::fs::read(&final_path).expect("read existing final"),
             b"previous\n"
@@ -253,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn second_promotion_failure_rolls_back_the_complete_output_set() {
+    fn second_post_rename_failure_reports_the_exact_visible_set() {
         let root = tempfile::tempdir().expect("temporary output root");
         let first = root.path().join("first.csv");
         let second = root.path().join("second.csv");
@@ -273,24 +473,135 @@ mod tests {
             file.write_all(body).expect("write quarantine");
         }
 
-        let error = registry
+        let outcome = registry
             .commit_all_with_fault(1)
-            .expect_err("second promotion must fail after rename");
-        assert!(error.to_string().contains("visible"), "{error}");
-        assert_eq!(std::fs::read(&first).expect("first final"), b"old first\n");
+            .expect("publication outcome");
+        let PublicationOutcome::Incomplete {
+            published,
+            visible_unsynchronized,
+            unpublished,
+            error,
+            ..
+        } = outcome
+        else {
+            panic!("fault must report an incomplete publication");
+        };
+        assert!(error.contains("visible"), "{error}");
+        assert_eq!(published, vec![("first".to_owned(), first.clone())]);
+        assert_eq!(
+            visible_unsynchronized,
+            vec![("second".to_owned(), second.clone())]
+        );
+        assert!(unpublished.is_empty());
+        assert_eq!(std::fs::read(&first).expect("first final"), b"new first\n");
         assert_eq!(
             std::fs::read(&second).expect("second final"),
-            b"old second\n"
-        );
-        let partials = registry.partials();
-        assert_eq!(partials.len(), 2);
-        assert_eq!(
-            std::fs::read(&partials[0].partial_path).expect("first partial"),
-            b"new first\n"
-        );
-        assert_eq!(
-            std::fs::read(&partials[1].partial_path).expect("second partial"),
             b"new second\n"
+        );
+        assert!(registry.partials().is_empty());
+    }
+
+    #[test]
+    fn failure_between_promotions_preserves_unvisited_final_and_can_resume() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let first = root.path().join("first.csv");
+        let second = root.path().join("second.csv");
+        std::fs::write(&first, b"old first\n").expect("old first");
+        std::fs::write(&second, b"old second\n").expect("old second");
+        let registry = OutputStagingRegistry::default();
+        for (name, path, body) in [
+            ("first", first.clone(), b"new first\n".as_slice()),
+            ("second", second.clone(), b"new second\n".as_slice()),
+        ] {
+            let (_, mut file) = registry
+                .stage_output(name, IfExistsPolicy::Overwrite, false, move |_| {
+                    Ok(path.clone())
+                })
+                .expect("stage output");
+            file.write_all(body).expect("write quarantine");
+        }
+
+        let outcome = registry
+            .commit_all_with_pre_rename_fault(1)
+            .expect("typed partial outcome");
+        let PublicationOutcome::Incomplete {
+            published,
+            visible_unsynchronized,
+            unpublished,
+            ..
+        } = outcome
+        else {
+            panic!("injected boundary fault must be incomplete");
+        };
+        assert_eq!(published, vec![("first".to_owned(), first.clone())]);
+        assert!(visible_unsynchronized.is_empty());
+        assert_eq!(unpublished.len(), 1);
+        assert_eq!(unpublished[0].final_path, second);
+        assert_eq!(std::fs::read(&first).unwrap(), b"new first\n");
+        assert_eq!(std::fs::read(&second).unwrap(), b"old second\n");
+
+        let resumed = registry.commit_all().expect("resume remaining publication");
+        assert!(resumed.is_complete());
+        assert_eq!(std::fs::read(&first).unwrap(), b"new first\n");
+        assert_eq!(std::fs::read(&second).unwrap(), b"new second\n");
+    }
+
+    #[test]
+    fn global_ledger_rejects_collisions_with_both_producer_names() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let final_path = root.path().join("shared.csv");
+        let registry = OutputStagingRegistry::default();
+        let first = final_path.clone();
+        registry
+            .stage_output("primary", IfExistsPolicy::Overwrite, false, move |_| {
+                Ok(first.clone())
+            })
+            .expect("first claim");
+        let second = final_path.clone();
+        let error = registry
+            .stage_output(
+                "metadata sidecar",
+                IfExistsPolicy::Overwrite,
+                false,
+                move |_| Ok(second.clone()),
+            )
+            .expect_err("duplicate destination must fail");
+        let rendered = error.to_string();
+        assert!(rendered.contains("primary"), "{rendered}");
+        assert!(rendered.contains("metadata sidecar"), "{rendered}");
+    }
+
+    #[test]
+    fn post_publication_cleanup_failure_is_reported_as_debt() {
+        let root = tempfile::tempdir().expect("temporary output root");
+        let final_path = root.path().join("result.csv");
+        let registry = OutputStagingRegistry::default();
+        let bare = final_path.clone();
+        let (_, mut file) = registry
+            .stage_output("out", IfExistsPolicy::Overwrite, false, move |_| {
+                Ok(bare.clone())
+            })
+            .expect("stage output");
+        file.write_all(b"published\n").expect("write quarantine");
+        drop(file);
+
+        let outcome = registry
+            .commit_all_with_cleanup_fault(0)
+            .expect("typed publication outcome");
+        let PublicationOutcome::Complete {
+            published,
+            cleanup_debt,
+        } = outcome
+        else {
+            panic!("cleanup failure occurs after successful publication");
+        };
+        assert_eq!(published, vec![("out".to_owned(), final_path.clone())]);
+        assert_eq!(cleanup_debt.len(), 1);
+        assert_eq!(cleanup_debt[0].final_path, final_path);
+        assert!(cleanup_debt[0].stale_path.exists());
+        assert_eq!(
+            std::fs::read(&cleanup_debt[0].final_path).expect("published final"),
+            b"published\n"
         );
     }
 }

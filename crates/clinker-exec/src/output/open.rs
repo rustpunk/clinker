@@ -119,6 +119,10 @@ pub(crate) fn containment_error(error: ContainmentError) -> PipelineError {
                 ),
             ))
         }
+        error @ (ContainmentError::VisibleButUnsynced { .. }
+        | ContainmentError::PublishedCleanup { .. }) => {
+            PipelineError::Io(std::io::Error::other(error.to_string()))
+        }
         other => PipelineError::Config(ConfigError::Validation(other.to_string())),
     }
 }
@@ -233,6 +237,19 @@ mod tests {
         let (path, _f, _staged) =
             open_output(IfExistsPolicy::UniqueSuffix, false, |_| Ok(bare.clone())).unwrap();
         assert_eq!(path, bare);
+    }
+
+    #[test]
+    fn staging_does_not_create_a_missing_parent_directory() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("missing");
+        let target = parent.join("out.csv");
+
+        let error = open_output(IfExistsPolicy::Overwrite, false, |_| Ok(target.clone()))
+            .expect_err("missing parent must fail before staging");
+
+        assert!(!parent.exists(), "output admission must not create parents");
+        assert!(error.to_string().contains("missing"), "{error}");
     }
 
     #[test]

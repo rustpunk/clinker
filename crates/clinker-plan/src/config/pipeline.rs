@@ -4738,6 +4738,14 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
     // rejections in lockstep; a fourth single-envelope format is one match
     // arm, not a fourth copied loop.
     for output in config.output_configs() {
+        if let Some(split) = &output.split {
+            SplitNaming::parse(&split.naming).map_err(|error| {
+                ConfigError::Validation(format!(
+                    "[E367] output {:?}: invalid split naming {:?}: {error}; use a pattern such as `{{stem}}_{{seq:04}}.{{ext}}`",
+                    output.name, split.naming,
+                ))
+            })?;
+        }
         // The CSV writer lowers `delimiter` to a single byte; reject a lossy
         // value here for the same reason the source side does.
         if let OutputFormat::Csv(Some(opts)) = &output.format
@@ -4811,8 +4819,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         // path template) routes each document to its own output file, so every
         // document lands in its own valid single-document envelope rather than
         // being merged into one — exactly the remedy this gate's message names.
-        let per_file_fanout = output.split.is_some()
-            || crate::config::path_template::path_has_per_record_tokens(&output.path);
+        let per_file_fanout = output.split.is_some() || output.has_per_record_path_tokens();
         if per_file_fanout {
             continue;
         }
@@ -4845,7 +4852,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
     // single writer the document buffer flushes to).
     if config.any_source_has_document_dlq() {
         for output in config.output_configs() {
-            if crate::config::path_template::path_has_per_record_tokens(&output.path) {
+            if output.has_per_record_path_tokens() {
                 return Err(ConfigError::Validation(format!(
                     "[E343] output '{name}': a per-source-file output template \
                      (`{{source_file}}` / `{{source_path}}`) cannot be combined with a \
@@ -4922,8 +4929,7 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
                 continue;
             }
             let out = &output.name;
-            let per_file_fanout = output.split.is_some()
-                || crate::config::path_template::path_has_per_record_tokens(&output.path);
+            let per_file_fanout = output.split.is_some() || output.has_per_record_path_tokens();
             if per_file_fanout {
                 return Err(ConfigError::Validation(format!(
                     "[E347] output '{out}': `reconstruct_envelope` cannot be combined \
