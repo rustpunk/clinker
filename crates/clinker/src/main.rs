@@ -1981,6 +1981,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             .and_then(|source| source_files_by_name.get(source.as_str()))
             .cloned()
             .unwrap_or_default();
+        let mut identities: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf> =
+            std::collections::HashMap::new();
         let mut rendered = Vec::with_capacity(files.len());
         for source_path in files {
             let source_key: std::sync::Arc<str> =
@@ -2001,6 +2003,18 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     clinker_plan::config::ConfigError::Validation(format!(
                         "fan-out output {:?} rendered an absolute path from a relative template",
                         output.name
+                    )),
+                ));
+            }
+            let identity = std::path::absolute(&destination)?;
+            if let Some(first_source) = identities.insert(identity.clone(), source_path.clone()) {
+                return Err(PipelineError::Config(
+                    clinker_plan::config::ConfigError::Validation(format!(
+                        "fan-out output {:?} renders both {} and {} to {}; include {{source_path}} or another distinguishing path component",
+                        output.name,
+                        first_source.display(),
+                        source_path.display(),
+                        identity.display(),
                     )),
                 ));
             }
