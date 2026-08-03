@@ -854,6 +854,9 @@ pub(crate) struct ExecutorContext<'a> {
     /// `{source_file}` / `{source_path}` AND whose input is
     /// `FilePartitioned`. Empty map means no fan-out outputs in this run.
     pub(crate) fan_out_writers: HashMap<String, HashMap<Arc<str>, Box<dyn Write + Send>>>,
+    /// Resolved base paths for fan-out writers. Required when the output also
+    /// splits, because each per-source writer lazily opens its own segments.
+    pub(crate) fan_out_paths: HashMap<String, HashMap<Arc<str>, String>>,
     /// Destination-local pending publication ledger shared by lazy split
     /// writers and the run owner.
     pub(crate) output_staging: crate::output::staging::OutputStagingRegistry,

@@ -37,6 +37,9 @@ use clinker_plan::error::PipelineError;
 pub struct WriterRegistry {
     pub single: HashMap<String, Box<dyn Write + Send>>,
     pub fan_out: HashMap<String, HashMap<std::sync::Arc<str>, Box<dyn Write + Send>>>,
+    /// Per-source resolved base path paired with [`Self::fan_out`]. Split
+    /// writers use it when lazily naming each source's segment sequence.
+    pub fan_out_paths: HashMap<String, HashMap<std::sync::Arc<str>, String>>,
     /// Shared ledger used when split writers lazily open destination-local
     /// hidden files. The CLI retains a clone and publishes after the run.
     pub output_staging: crate::output::staging::OutputStagingRegistry,
@@ -50,6 +53,7 @@ impl Default for WriterRegistry {
         Self {
             single: HashMap::new(),
             fan_out: HashMap::new(),
+            fan_out_paths: HashMap::new(),
             output_staging: crate::output::staging::OutputStagingRegistry::default(),
             auto_commit_staged: true,
         }

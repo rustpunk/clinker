@@ -1241,6 +1241,7 @@ impl PipelineExecutor {
             source_vars_seeded_files: HashMap::new(),
             writers: writers.single,
             fan_out_writers: writers.fan_out,
+            fan_out_paths: writers.fan_out_paths,
             output_staging: writers.output_staging,
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),

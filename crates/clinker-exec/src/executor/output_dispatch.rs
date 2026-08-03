@@ -346,6 +346,7 @@ pub(crate) fn dispatch_output(
     // selects the right writer; the registry holds N writers
     // (one per discovered file).
     let fan_out_writers = ctx.fan_out_writers.remove(name);
+    let fan_out_paths = ctx.fan_out_paths.remove(name).unwrap_or_default();
     let single_writer = if fan_out_writers.is_none() {
         ctx.writers.remove(name)
     } else {
@@ -387,7 +388,13 @@ pub(crate) fn dispatch_output(
                 .map(|_| mapping_probe(&mut ctx.mapping_probes, name, out_cfg)),
         };
         if let Some(per_file) = fan_out_writers {
-            emit_fan_out(&mut fan_ctx, &unbuffered, per_file, scan_timer);
+            emit_fan_out(
+                &mut fan_ctx,
+                &unbuffered,
+                per_file,
+                fan_out_paths,
+                scan_timer,
+            );
         } else if let Some(raw_writer) = single_writer {
             emit_single_writer(&mut fan_ctx, raw_writer, &unbuffered, scan_timer);
         }
@@ -1082,6 +1089,7 @@ fn emit_fan_out(
     fan_ctx: &mut FanOutContext<'_>,
     unbuffered: &[(Record, u64)],
     per_file: HashMap<Arc<str>, Box<dyn Write + Send>>,
+    mut resolved_paths: HashMap<Arc<str>, String>,
     scan_timer: crate::executor::stage_metrics::StageTimer,
 ) {
     use std::collections::HashMap as Hm;
@@ -1091,8 +1099,21 @@ fn emit_fan_out(
     // siblings still get their chance.
     let mut format_writers: Hm<Arc<str>, Box<dyn clinker_format::FormatWriter>> = Hm::new();
     for (file_arc, raw) in per_file {
+        let mut resolved_config = fan_ctx.out_cfg.clone();
+        if let Some(path) = resolved_paths.remove(&file_arc) {
+            resolved_config.path = path;
+        } else if resolved_config.split.is_some() {
+            fan_ctx.output_errors.push(PipelineError::Internal {
+                op: "fan_out",
+                node: fan_ctx.name.to_string(),
+                detail: format!(
+                    "split fan-out writer for source file {file_arc:?} has no resolved base path"
+                ),
+            });
+            continue;
+        }
         match build_format_writer(
-            fan_ctx.out_cfg,
+            &resolved_config,
             raw,
             Arc::clone(fan_ctx.output_schema),
             fan_ctx.output_staging.clone(),

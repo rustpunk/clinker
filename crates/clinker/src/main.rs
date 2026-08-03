@@ -1965,60 +1965,80 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
         std::collections::HashMap::new();
     let output_staging = clinker_exec::output::staging::OutputStagingRegistry::default();
-    // output_name → final resolved path, retained so the provenance sidecar
-    // can record the actual file written (not the bare template-rendered path
-    // on OutputConfig).
     let mut resolved_output_paths: std::collections::HashMap<String, std::path::PathBuf> =
         std::collections::HashMap::new();
+    let mut fan_out_destinations: std::collections::HashMap<
+        String,
+        Vec<(std::sync::Arc<str>, std::path::PathBuf, std::path::PathBuf)>,
+    > = std::collections::HashMap::new();
+    for output in pipeline_config.output_configs() {
+        if !output_is_fan_out(compiled_plan.dag(), &output.name) {
+            continue;
+        }
+        let upstream_source = upstream_source_for_output(compiled_plan.dag(), &output.name);
+        let files = upstream_source
+            .as_ref()
+            .and_then(|source| source_files_by_name.get(source.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        let mut rendered = Vec::with_capacity(files.len());
+        for source_path in files {
+            let source_key: std::sync::Arc<str> =
+                std::sync::Arc::from(source_path.to_string_lossy().into_owned());
+            let source_file = source_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("source");
+            let destination = std::path::PathBuf::from(
+                clinker_plan::config::path_template::render_per_record_path(
+                    &output.path,
+                    source_file,
+                    &source_path.to_string_lossy(),
+                ),
+            );
+            if !std::path::Path::new(&output.path).is_absolute() && destination.is_absolute() {
+                return Err(PipelineError::Config(
+                    clinker_plan::config::ConfigError::Validation(format!(
+                        "fan-out output {:?} rendered an absolute path from a relative template",
+                        output.name
+                    )),
+                ));
+            }
+            rendered.push((source_key, destination, source_path));
+        }
+        fan_out_destinations.insert(output.name.clone(), rendered);
+    }
     let mut fan_out_writers: std::collections::HashMap<
         String,
         std::collections::HashMap<std::sync::Arc<str>, Box<dyn std::io::Write + Send>>,
     > = std::collections::HashMap::new();
+    let mut fan_out_paths: std::collections::HashMap<
+        String,
+        std::collections::HashMap<std::sync::Arc<str>, String>,
+    > = std::collections::HashMap::new();
     for output in pipeline_config.output_configs() {
-        // Split outputs lazily stage each `{seq}` file through the shared
-        // ledger inside `build_format_writer`. Install a sink here because the
-        // splitting writer owns every real segment handle.
-        if output.split.is_some() {
-            writers.insert(output.name.clone(), Box::new(std::io::sink()));
-            resolved_output_paths.insert(output.name.clone(), output.path.clone().into());
-            continue;
-        }
         // Fan-out path: when the plan flagged this Output for per-
         // source-file routing, render the template once per matched
         // source file. Each rendered path gets its own writer; the
         // dispatcher routes records by `$source.file` Arc.
         if output_is_fan_out(compiled_plan.dag(), &output.name) {
-            let upstream_source = upstream_source_for_output(compiled_plan.dag(), &output.name);
-            let files = upstream_source
-                .as_ref()
-                .and_then(|s| source_files_by_name.get(s.as_str()))
-                .cloned()
-                .unwrap_or_default();
             let mut per_file: std::collections::HashMap<
                 std::sync::Arc<str>,
                 Box<dyn std::io::Write + Send>,
             > = std::collections::HashMap::new();
-            for path in files {
-                let file_arc: std::sync::Arc<str> =
-                    std::sync::Arc::from(path.to_string_lossy().into_owned());
-                let label = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("source")
-                    .to_string();
-                let resolved = output
-                    .path
-                    .replace("{source_file}", &label)
-                    .replace("{source_path}", &path.to_string_lossy());
-                let resolved_path = std::path::PathBuf::from(&resolved);
-                if !std::path::Path::new(&output.path).is_absolute() && resolved_path.is_absolute()
-                {
-                    return Err(PipelineError::Config(
-                        clinker_plan::config::ConfigError::Validation(format!(
-                            "fan-out output {:?} rendered an absolute path from a relative template",
-                            output.name
-                        )),
-                    ));
+            let mut per_file_paths = std::collections::HashMap::new();
+            for (file_arc, resolved_path, _source_path) in fan_out_destinations
+                .remove(&output.name)
+                .unwrap_or_default()
+            {
+                per_file_paths.insert(
+                    std::sync::Arc::clone(&file_arc),
+                    resolved_path.to_string_lossy().into_owned(),
+                );
+                if output.split.is_some() {
+                    resolved_output_paths.insert(output.name.clone(), resolved_path.clone());
+                    per_file.insert(file_arc, Box::new(std::io::sink()));
+                    continue;
                 }
                 let bare = resolved_path.clone();
                 let unique_suffix_width = output.unique_suffix_width;
@@ -2038,23 +2058,32 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                         }
                     })
                 };
-                let (_final_path, file) = output_staging.stage_output(
+                let (final_path, file) = output_staging.stage_output(
                     output.name.clone(),
                     output.if_exists,
                     false,
                     path_for_n,
                 )?;
+                resolved_output_paths.insert(output.name.clone(), final_path);
                 per_file.insert(file_arc, Box::new(file));
             }
             fan_out_writers.insert(output.name.clone(), per_file);
+            fan_out_paths.insert(output.name.clone(), per_file_paths);
             continue;
         }
-        let bare = std::path::PathBuf::from(
-            output
-                .path
-                .replace("{source_file}", "<merged>")
-                .replace("{source_path}", "<merged>"),
-        );
+        // Non-fan-out split outputs lazily stage each `{seq}` file through the
+        // shared ledger inside `build_format_writer`.
+        if output.split.is_some() {
+            writers.insert(output.name.clone(), Box::new(std::io::sink()));
+            resolved_output_paths.insert(output.name.clone(), output.path.clone().into());
+            continue;
+        }
+        let bare =
+            std::path::PathBuf::from(clinker_plan::config::path_template::render_per_record_path(
+                &output.path,
+                "<merged>",
+                "<merged>",
+            ));
         let unique_suffix_width = output.unique_suffix_width;
         let path_for_n =
             |n: Option<u64>| -> Result<std::path::PathBuf, clinker_plan::config::ConfigError> {
@@ -2078,12 +2107,13 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         )?;
         let writer: Box<dyn std::io::Write + Send> = Box::new(handle);
         writers.insert(output.name.clone(), writer);
-        resolved_output_paths.insert(output.name.clone(), final_path.clone());
+        resolved_output_paths.insert(output.name.clone(), final_path);
     }
 
     let registry = clinker_exec::executor::WriterRegistry {
         single: writers,
         fan_out: fan_out_writers,
+        fan_out_paths,
         output_staging: output_staging.clone(),
         auto_commit_staged: false,
     };
