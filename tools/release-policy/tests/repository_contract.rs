@@ -201,6 +201,39 @@ fn authenticated_apply_rejects_partial_or_authority_widening_readback() {
 }
 
 #[test]
+fn authenticated_apply_rejects_decisions_without_independent_policy_jobs() {
+    for missing_context in ["Dependency policy", "Release policy"] {
+        let root = fixture();
+        copy_decisions(root.path());
+        let path = root.path().join("decisions/release-rules.json");
+        let mut decision: Value =
+            serde_json::from_slice(&fs::read(&path).expect("read release rules fixture"))
+                .expect("release rules fixture JSON");
+        decision["ruleset"]["main_rule"]["required_status_checks"]
+            .as_array_mut()
+            .expect("required status checks array")
+            .retain(|check| check["context"] != missing_context);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&decision).expect("serialize release rules fixture"),
+        )
+        .expect("write release rules fixture");
+        install_fake_gh(root.path(), approved_rulesets(), approved_environment());
+
+        let evidence = root.path().join("repository-controls-evidence.json");
+        let output = authenticated_gate(root.path(), &evidence);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "missing context: {missing_context}"
+        );
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+        assert!(!evidence.exists());
+    }
+}
+
+#[test]
 fn two_person_environment_mode_uses_exact_reviewers_and_prevents_self_review() {
     let root = fixture();
     copy_decisions(root.path());
@@ -337,7 +370,7 @@ esac
 }
 
 fn approved_rulesets() -> &'static str {
-    r#"[{"id":11,"name":"Clinker protected main","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":7,"actor_type":"User","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/heads/main"],"exclude":[]}},"rules":[{"type":"required_linear_history"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true,"do_not_enforce_on_create":false,"required_status_checks":[{"context":"check","integration_id":15368},{"context":"cross-platform","integration_id":15368},{"context":"deny","integration_id":15368},{"context":"filesystem-matrix (linux-nfsv4.1-loopback-ci)","integration_id":15368},{"context":"filesystem-matrix (linux-smb3.1.1-loopback-ci)","integration_id":15368},{"context":"test-macos","integration_id":15368},{"context":"test-windows","integration_id":15368}]}},{"type":"pull_request","parameters":{"required_approving_review_count":1,"dismiss_stale_reviews_on_push":false,"require_code_owner_review":true,"require_last_push_approval":true,"required_review_thread_resolution":true,"allowed_merge_methods":["squash"]}}]},{"id":12,"name":"Clinker protected release tags","target":"tag","enforcement":"active","bypass_actors":[{"actor_id":7,"actor_type":"User","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/tags/v*.*.*"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"},{"type":"non_fast_forward"}]}]"#
+    r#"[{"id":11,"name":"Clinker protected main","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":7,"actor_type":"User","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/heads/main"],"exclude":[]}},"rules":[{"type":"required_linear_history"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true,"do_not_enforce_on_create":false,"required_status_checks":[{"context":"Dependency policy","integration_id":15368},{"context":"Release policy","integration_id":15368},{"context":"check","integration_id":15368},{"context":"cross-platform","integration_id":15368},{"context":"deny","integration_id":15368},{"context":"filesystem-matrix (linux-nfsv4.1-loopback-ci)","integration_id":15368},{"context":"filesystem-matrix (linux-smb3.1.1-loopback-ci)","integration_id":15368},{"context":"test-macos","integration_id":15368},{"context":"test-windows","integration_id":15368}]}},{"type":"pull_request","parameters":{"required_approving_review_count":1,"dismiss_stale_reviews_on_push":false,"require_code_owner_review":true,"require_last_push_approval":true,"required_review_thread_resolution":true,"allowed_merge_methods":["squash"]}}]},{"id":12,"name":"Clinker protected release tags","target":"tag","enforcement":"active","bypass_actors":[{"actor_id":7,"actor_type":"User","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/tags/v*.*.*"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"},{"type":"non_fast_forward"}]}]"#
 }
 
 fn broadened_rulesets() -> &'static str {

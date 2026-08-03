@@ -387,10 +387,22 @@ fn desired_controls(request: &ApplyRequest) -> Result<Desired, GateError> {
             }))
         })
         .collect::<Result<Vec<_>, GateError>>()?;
-    let checks = main
+    let check_records = main
         .get("required_status_checks")
         .and_then(Value::as_array)
-        .ok_or_else(|| policy("required status checks are absent"))?
+        .ok_or_else(|| policy("required status checks are absent"))?;
+    let check_contexts = check_records
+        .iter()
+        .filter_map(|check| check.get("context").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    for required in ["Dependency policy", "Release policy"] {
+        if !check_contexts.contains(required) {
+            return Err(policy(format!(
+                "required status checks omit the {required} job"
+            )));
+        }
+    }
+    let checks = check_records
         .iter()
         .map(|check| {
             let context = check

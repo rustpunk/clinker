@@ -17,6 +17,14 @@
       "enforcement": "active",
       "required_status_checks": [
         {
+          "context": "Dependency policy",
+          "app_ref": "app:github-actions"
+        },
+        {
+          "context": "Release policy",
+          "app_ref": "app:github-actions"
+        },
+        {
           "context": "check",
           "app_ref": "app:github-actions"
         },
