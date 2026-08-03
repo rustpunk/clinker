@@ -12,7 +12,9 @@ use tempfile::{Builder, NamedTempFile};
 use crate::bundle::{self, AssemblyRequest};
 use crate::canonical;
 use crate::child::{self, ChildSpec, Termination};
-use crate::cli::github::{GitHubTransport, Method, Request as GitHubRequest};
+use crate::cli::github::{
+    DownloadedAsset, GitHubTransport, MAX_RELEASE_ASSET_BYTES, Method, Request as GitHubRequest,
+};
 use crate::decision::{self, DecisionRequest};
 use crate::digest::sha256_hex;
 use crate::error::GateError;
@@ -243,8 +245,8 @@ pub fn stage_candidate_draft(
     reject_remote_asset_drift(&existing, &expected)?;
     for (name, local) in &expected {
         if let Some(asset_id) = existing.get(name) {
-            let bytes = download_release_asset(&request.repository, asset_id, deadline, transport)?;
-            if &bytes != local {
+            let asset = download_release_asset(&request.repository, asset_id, deadline, transport)?;
+            if !asset.matches_bytes(local) {
                 return Err(policy(format!(
                     "existing candidate asset differs from local authority: {name}"
                 )));
@@ -296,8 +298,11 @@ pub fn stage_candidate_draft(
         ));
     }
     for (name, asset_id) in final_assets {
-        let bytes = download_release_asset(&request.repository, &asset_id, deadline, transport)?;
-        if expected.get(&name) != Some(&bytes) {
+        let asset = download_release_asset(&request.repository, &asset_id, deadline, transport)?;
+        if expected
+            .get(&name)
+            .is_none_or(|expected| !asset.matches_bytes(expected))
+        {
             return Err(policy(format!(
                 "fresh staged candidate asset differs from local authority: {name}"
             )));
@@ -569,8 +574,8 @@ fn download_release_asset(
     asset_id: &str,
     deadline: Duration,
     transport: &mut dyn GitHubTransport,
-) -> Result<Vec<u8>, GateError> {
-    let response = transport.send(
+) -> Result<DownloadedAsset, GateError> {
+    transport.download(
         &GitHubRequest::new(
             Method::Get,
             format!("repos/{repository}/releases/assets/{asset_id}"),
@@ -578,10 +583,8 @@ fn download_release_asset(
         )
         .header("Accept", "application/octet-stream")
         .raw(),
-    )?;
-    response
-        .raw
-        .ok_or_else(|| policy("candidate asset download did not return raw bytes"))
+        MAX_RELEASE_ASSET_BYTES,
+    )
 }
 
 fn release_object<'a>(value: &'a Value, label: &str) -> Result<&'a Map<String, Value>, GateError> {

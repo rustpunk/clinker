@@ -15,7 +15,7 @@ use crate::error::GateError;
 use crate::evidence::{self, EvidenceExpectation, EvidenceWrite};
 use crate::limits::{MAX_INPUT_BYTES, MAX_SCHEMA_BYTES, read_bounded};
 
-use super::github::{GitHubTransport, Method, Request};
+use super::github::{GitHubTransport, MAX_RELEASE_ASSET_BYTES, Method, Request};
 
 const REPOSITORY: &str = "rustpunk/clinker";
 const EVIDENCE_SCHEMA_ID: &str = "clinker.release-evidence/v1";
@@ -546,7 +546,7 @@ fn verify_release_assets(
         if observed.contains_key(name) {
             return Err(policy("release asset names must be unique"));
         }
-        let response = transport.send(
+        let asset = transport.download(
             &Request::new(
                 Method::Get,
                 format!("repos/{repository}/releases/assets/{id}"),
@@ -554,11 +554,9 @@ fn verify_release_assets(
             )
             .header("Accept", "application/octet-stream")
             .raw(),
+            MAX_RELEASE_ASSET_BYTES,
         )?;
-        let bytes = response
-            .raw
-            .ok_or_else(|| policy("release asset transport did not return raw bytes"))?;
-        observed.insert(name.to_owned(), digest::sha256_hex(&bytes));
+        observed.insert(name.to_owned(), asset.sha256().to_owned());
     }
     if observed != expected {
         return Err(policy(

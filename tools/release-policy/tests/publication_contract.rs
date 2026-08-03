@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use clinker_release_policy::canonical;
-use clinker_release_policy::cli::github::{GitHubTransport, Request, Response};
+use clinker_release_policy::cli::github::{
+    ChildGitHubTransport, GitHubTransport, Method, Request, Response,
+};
 use clinker_release_policy::cli::publication::{
     self, DispatchRequest, InspectionRequest, ProtectedPublishRequest, VerificationRequest,
     WorkflowContext,
@@ -20,6 +22,7 @@ use tempfile::TempDir;
 
 const DRAFT_SOURCE_SHA: &str = "1111111111111111111111111111111111111111";
 const DRAFT_RELEASE_NOTES: &str = "# Clinker v0.1.0\n\nGenerated release notes.";
+const LARGE_ASSET_BYTES: usize = 300 * 1024;
 const DRAFT_INVENTORY: &str = r#"schema = "clinker.release-inventory/v1"
 version_source = "Cargo.toml:workspace.package.version"
 license = "MIT"
@@ -68,6 +71,44 @@ root_name = "clinker-v{version}-x86_64-pc-windows-msvc"
 
 struct Fixture {
     root: TempDir,
+}
+
+#[test]
+fn production_transport_streams_assets_beyond_the_diagnostic_limit() {
+    let root = tempfile::tempdir().expect("temporary transport fixture");
+    let program = root.path().join("gh");
+    fs::write(
+        &program,
+        "#!/usr/bin/env bash\nset -euo pipefail\ndd if=/dev/zero bs=1024 count=300 status=none\n",
+    )
+    .expect("fake GitHub executable");
+    let mut permissions = fs::metadata(&program)
+        .expect("fake GitHub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&program, permissions).expect("fake GitHub executable mode");
+    let request = Request::new(
+        Method::Get,
+        "repos/rustpunk/clinker/releases/assets/42",
+        std::time::Duration::from_secs(10),
+    )
+    .header("Accept", "application/octet-stream")
+    .raw();
+
+    let mut transport = ChildGitHubTransport::with_program(program, BTreeMap::new());
+    let asset = transport
+        .download(&request, 512 * 1024)
+        .expect("large asset must stream to a bounded file");
+    assert_eq!(asset.length(), LARGE_ASSET_BYTES as u64);
+    assert_eq!(
+        asset.sha256(),
+        digest::sha256_hex(&vec![0; LARGE_ASSET_BYTES])
+    );
+
+    let error = transport
+        .download(&request, 256 * 1024)
+        .expect_err("asset above the explicit maximum must be rejected");
+    assert!(error.to_string().contains("explicit byte limit"));
 }
 
 impl Fixture {

@@ -2,7 +2,8 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read};
+use std::fs::File;
+use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -145,6 +146,79 @@ pub fn run(spec: ChildSpec) -> Result<ChildResult, GateError> {
     })
 }
 
+/// Run one explicit command while streaming standard output into a file.
+///
+/// Standard error remains bounded by [`ChildSpec::output_limit`]. Standard
+/// output is drained without retaining it in memory, written up to
+/// `file_limit`, and reported as truncated if the child emits any additional
+/// byte.
+///
+/// # Errors
+///
+/// Returns an error when the child specification is invalid, the output limit
+/// is zero, the child cannot be spawned or reaped, or either output lane cannot
+/// be drained.
+pub fn run_stdout_to_file(
+    spec: ChildSpec,
+    output: File,
+    file_limit: u64,
+) -> Result<ChildResult, GateError> {
+    validate_spec(&spec)?;
+    if file_limit == 0 {
+        return Err(GateError::usage(
+            "child file output limit must be greater than zero",
+        ));
+    }
+
+    let mut command = Command::new(&spec.program);
+    command
+        .args(&spec.arguments)
+        .env_clear()
+        .envs(&spec.environment)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| GateError::io("spawn child process", &error))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GateError::internal("child.stdout", "child stdout pipe is missing"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| GateError::internal("child.stderr", "child stderr pipe is missing"))?;
+    let stderr_limit = spec.output_limit;
+    let stdout_reader = thread::spawn(move || capture_to_file(stdout, output, file_limit));
+    let stderr_reader = thread::spawn(move || capture(stderr, stderr_limit));
+
+    let termination = match child
+        .wait_timeout(spec.timeout)
+        .map_err(|error| GateError::io("wait for child process", &error))?
+    {
+        Some(status) => Termination::Exited(status.code()),
+        None => {
+            terminate_group(&mut child)?;
+            Termination::TimedOut
+        }
+    };
+    let stdout = join_capture(stdout_reader, "stdout")?;
+    let stderr = join_capture(stderr_reader, "stderr")?;
+
+    Ok(ChildResult {
+        program: spec.program,
+        arguments: spec.arguments,
+        termination,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        stdout_truncated: stdout.truncated,
+        stderr_truncated: stderr.truncated,
+    })
+}
+
 fn validate_spec(spec: &ChildSpec) -> Result<(), GateError> {
     if spec.program.as_os_str().is_empty() {
         return Err(GateError::usage("child program must not be empty"));
@@ -222,6 +296,28 @@ fn capture(mut reader: impl Read, limit: usize) -> io::Result<Captured> {
     }
     Ok(Captured {
         bytes: retained,
+        truncated,
+    })
+}
+
+fn capture_to_file(mut reader: impl Read, mut output: File, limit: u64) -> io::Result<Captured> {
+    let mut written = 0_u64;
+    let mut truncated = false;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(written);
+        let keep = usize::try_from(remaining.min(read as u64)).unwrap_or(read);
+        output.write_all(&buffer[..keep])?;
+        written += keep as u64;
+        truncated |= keep < read;
+    }
+    output.flush()?;
+    Ok(Captured {
+        bytes: Vec::new(),
         truncated,
     })
 }
