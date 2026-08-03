@@ -581,7 +581,7 @@ check_contract_register() {
     }
 
     function valid_owner(value) {
-      return value ~ /(^|[^[:alnum:]])Phase[[:space:]]+[0-9]+([.][0-9]+)?([^[:alnum:]]|$)/ \
+      return value ~ /(^|[^[:alnum:]])[A-Z][A-Z0-9]*-[0-9][0-9]([^[:alnum:]]|$)/ \
         || value ~ /(^|[^[:alnum:]])v[0-9]+([^[:alnum:]]|$)/
     }
 
@@ -648,7 +648,7 @@ check_contract_register() {
         emit(NR, "contract row has invalid Status " status, "use implemented, partially-implemented, locked-not-implemented, deferred, or external-mutable")
       }
       if (!valid_owner(owner)) {
-        emit(NR, "contract row Owner does not name a Phase N or vN boundary", "name at least one owning phase or version boundary")
+        emit(NR, "contract row Owner does not name a requirement or version boundary", "name at least one owning requirement or version boundary")
       }
       if (verified !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) {
         emit(NR, "contract row Last verified is not YYYY-MM-DD", "use an ISO-shaped date such as 2026-07-29")
@@ -785,10 +785,10 @@ validate_ledger_entry() {
       "add '- Evidence: path/to/source or another source-backed citation'"
   fi
   if ! printf '%s\n' "$body" \
-    | grep -Eq 'Implementation owner:\**[[:space:]].*(Phase[[:space:]]+[0-9]+([.][0-9]+)?|[A-Z][A-Z0-9]*-[0-9]{2})'; then
+    | grep -Eq 'Implementation owner:\**[[:space:]].*([A-Z][A-Z0-9]*-[0-9]{2}|v[0-9]+)'; then
     report_failure "$relative" \
-      "question $id has no Implementation owner naming a phase or requirement" \
-      "add '- Implementation owner: Phase N / REQ-NN'"
+      "question $id has no Implementation owner naming a requirement or version boundary" \
+      "add '- Implementation owner: REQ-NN'"
   fi
   if ! printf '%s\n' "$body" | grep -Eq 'Verified:\**[[:space:]]*[0-9]{4}-[0-9]{2}-[0-9]{2}([[:space:]]|$)'; then
     report_failure "$relative" "question $id has no YYYY-MM-DD Verified field" \
@@ -1119,7 +1119,7 @@ run_self_test() {
         '- Status: Resolved' \
         '- Decision: D-01' \
         '- Evidence: `docs/ai/README.md`' \
-        '- Implementation owner: Phase 2 / CONT-01' \
+        '- Implementation owner: CONT-01' \
         '- Verified: 2026-07-28' \
         ''
     done
@@ -1209,7 +1209,7 @@ run_self_test() {
         3) status=deferred ;;
         *) status=external-mutable ;;
       esac
-      owner='Phase 1'
+      owner='CONT-01'
       [ "$id" -ne 27 ] || owner='v2 / RST-01'
       evidence='Planner source code'
       [ "$((id % 2))" -ne 0 ] || evidence='`docs/ai/README.md`'
@@ -1258,11 +1258,11 @@ run_self_test() {
     return 1
   fi
 
-  sed '/^| D-03 |/s/| Phase 1 |/| Owner TBD |/' \
+  sed '/^| D-03 |/s/| CONT-01 |/| Owner TBD |/' \
     "$fixture_root/contracts.clean" \
     > "$fixture_root/docs/ai/15_PRODUCTION_CONTRACTS.md"
   if run_scan >"$failure_log" 2>&1 \
-    || ! grep -q 'contract row Owner does not name a Phase N or vN boundary' "$failure_log"; then
+    || ! grep -q 'contract row Owner does not name a requirement or version boundary' "$failure_log"; then
     printf 'self-test failed: malformed contract owner was not rejected\n' >&2
     return 1
   fi
