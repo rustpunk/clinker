@@ -2,7 +2,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use clinker_exec::output::attempt::{AttemptFault, AttemptPublication};
+use clinker_exec::output::attempt::{
+    ArtifactKind, ArtifactRegistration, AttemptFault, AttemptPublication,
+};
 use clinker_exec::output::containment::PromotionDisposition;
 use clinker_exec::output::staging::OutputStagingRegistry;
 use clinker_exec::pipeline::shutdown::ShutdownToken;
@@ -414,4 +416,195 @@ fn list_before_the_first_run_treats_a_missing_local_destination_as_empty() {
     assert!(list.status.success(), "{}", stderr(&list));
     let value: serde_json::Value = serde_json::from_slice(&list.stdout).expect("compact JSON");
     assert_eq!(value["roots"], serde_json::json!([]));
+}
+
+#[test]
+fn ordinary_run_publishes_every_managed_artifact_kind_and_removes_success_state() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    std::fs::create_dir(workspace.path().join("output")).expect("output directory");
+    std::fs::create_dir(workspace.path().join("spool")).expect("local spool directory");
+    std::fs::write(
+        workspace.path().join("input-a.csv"),
+        "id,amount\n1,1\n2,0\n",
+    )
+    .expect("first input");
+    std::fs::write(
+        workspace.path().join("input-b.csv"),
+        "id,amount\n3,1\n4,0\n",
+    )
+    .expect("second input");
+    std::fs::write(
+        workspace.path().join("clinker.toml"),
+        format!(
+            "[storage.publication]\nmode = \"local_then_publish\"\nlocal_spool_dir = \"{}\"\nmax_attempt_bytes = \"1MB\"\nretained_byte_limit = \"2MB\"\nmin_free_bytes = \"1B\"\n",
+            workspace
+                .path()
+                .join("spool")
+                .display()
+                .to_string()
+                .replace('\\', "\\\\")
+        ),
+    )
+    .expect("publication config");
+    std::fs::write(
+        workspace.path().join("pipeline.yaml"),
+        r#"pipeline:
+  name: managed_artifact_lifecycle
+error_handling:
+  strategy: continue
+  dlq:
+    path: output/errors.csv
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      glob: input-*.csv
+      schema:
+        - { name: id, type: int }
+        - { name: amount, type: int }
+  - type: transform
+    name: checked
+    input: source
+    config:
+      cxl: |
+        emit id = id
+        emit value = 10 / amount
+  - type: output
+    name: primary
+    input: checked
+    config:
+      name: primary
+      type: csv
+      path: output/primary.csv
+      write_meta: true
+  - type: output
+    name: fan
+    input: source
+    config:
+      name: fan
+      type: csv
+      path: output/fan_{source_file}.csv
+  - type: output
+    name: split
+    input: checked
+    config:
+      name: split
+      type: csv
+      path: output/split.csv
+      split:
+        max_records: 1
+"#,
+    )
+    .expect("pipeline config");
+
+    let run = clinker_in(workspace.path(), &["run", "pipeline.yaml"]);
+    assert_eq!(run.status.code(), Some(2), "{}", stderr(&run));
+    for leaf in [
+        "primary.csv",
+        "primary.csv.meta.json",
+        "fan_input-a.csv",
+        "fan_input-b.csv",
+        "split_0001.csv",
+        "split_0002.csv",
+        "errors.csv",
+    ] {
+        assert!(
+            workspace.path().join("output").join(leaf).is_file(),
+            "missing published artifact {leaf}; stderr: {}",
+            stderr(&run)
+        );
+    }
+    assert!(
+        !workspace.path().join("output/.clinker-attempts").exists(),
+        "successful publication must remove attempt metadata last"
+    );
+    assert!(
+        !workspace.path().join("spool/.clinker-attempts").exists(),
+        "successful local spool ownership must also be removed"
+    );
+}
+
+#[test]
+fn ordinary_run_retains_truthful_abandoned_state_when_actual_bytes_exceed_admission() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    std::fs::create_dir(workspace.path().join("output")).expect("output directory");
+    let mut input = String::from("value\n");
+    input.push_str(&"x".repeat(1_100_000));
+    input.push('\n');
+    std::fs::write(workspace.path().join("input.csv"), input).expect("large input");
+    std::fs::write(
+        workspace.path().join("clinker.toml"),
+        "[storage.publication]\nfailed_retention_seconds = 0\ncreation_grace_seconds = 1\nmax_attempt_bytes = \"1MB\"\nretained_byte_limit = \"2MB\"\nmin_free_bytes = \"1B\"\n",
+    )
+    .expect("publication config");
+    std::fs::write(workspace.path().join("pipeline.yaml"), PIPELINE).expect("pipeline config");
+
+    let run = clinker_in(workspace.path(), &["run", "pipeline.yaml"]);
+    assert_eq!(run.status.code(), Some(4), "{}", stderr(&run));
+    assert!(!workspace.path().join("output/result.csv").exists());
+    let namespace = workspace.path().join("output/.clinker-attempts");
+    let attempts = std::fs::read_dir(&namespace)
+        .expect("retained namespace")
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    assert_eq!(attempts.len(), 1, "one run must own one retained attempt");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(attempts[0].path().join("manifest.json")).expect("retained manifest"),
+    )
+    .expect("valid retained manifest");
+    assert_eq!(manifest["state"], "abandoned");
+    assert_eq!(manifest["artifact_count"], 1);
+    assert_eq!(manifest["artifacts"][0]["logical_leaf"], "result.csv");
+    assert_eq!(manifest["artifacts"][0]["state"], "unpublished");
+}
+
+#[test]
+fn attempt_owned_replace_and_no_replace_share_the_race_safe_destination_reservation() {
+    for disposition in [
+        PromotionDisposition::Replace,
+        PromotionDisposition::NoReplace,
+    ] {
+        let root = tempfile::tempdir().expect("destination");
+        let policy = clinker_plan::config::ClinkerToml::parse(
+            "[storage.publication]\nmax_attempt_bytes = \"1MB\"\nretained_byte_limit = \"2MB\"\nmin_free_bytes = \"1B\"\n",
+        )
+        .expect("publication config")
+        .storage
+        .publication
+        .resolve(root.path(), 1, u64::MAX)
+        .expect("resolved publication policy");
+        let registration = || {
+            ArtifactRegistration::new(
+                ArtifactKind::Primary,
+                "primary",
+                "result.csv",
+                validated(root.path(), "result.csv"),
+                disposition,
+            )
+            .expect("artifact registration")
+        };
+        let first_registry = OutputStagingRegistry::default();
+        let (_first_attempt, _first_writers) = AttemptPublication::create_run(
+            policy.clone(),
+            &first_registry,
+            EXECUTION_ID,
+            1_000,
+            2_000,
+            vec![registration()],
+        )
+        .expect("first publisher reserves destination");
+        let second_registry = OutputStagingRegistry::default();
+        let error = AttemptPublication::create_run(
+            policy,
+            &second_registry,
+            "018f47a2-9a41-7a27-b4d6-4f7137e3c160",
+            1_000,
+            2_000,
+            vec![registration()],
+        )
+        .expect_err("live destination reservation must reject a second attempt");
+        assert!(error.to_string().contains("reserved"), "{error}");
+    }
 }

@@ -485,9 +485,18 @@ pub(crate) fn build_format_writer(
                         }
                     })
                 };
-                let (_path, file) = output_staging
-                    .stage_output(output_name.clone(), if_exists, false, path_for_n)
-                    .map_err(|e| std::io::Error::other(format!("{e:?}")))?;
+                let staged = if output_staging.has_run_attempt() {
+                    output_staging.stage_attempt_output(
+                        crate::output::attempt::ArtifactKind::Split,
+                        output_name.clone(),
+                        if_exists,
+                        false,
+                        path_for_n,
+                    )
+                } else {
+                    output_staging.stage_output(output_name.clone(), if_exists, false, path_for_n)
+                };
+                let (_path, file) = staged.map_err(|e| std::io::Error::other(format!("{e:?}")))?;
                 Ok(Box::new(BufWriter::with_capacity(65536, file)))
             });
 

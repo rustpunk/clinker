@@ -2,14 +2,17 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use clinker_plan::config::{ConfigError, IfExistsPolicy, ResolvedPublicationPolicy};
 use clinker_plan::error::PipelineError;
-use clinker_plan::security::ValidatedPath;
+use clinker_plan::security::{ValidatedPath, check_overwrite, validate_path};
 
-use super::containment::{ContainmentError, OutputContainment, PromotionDisposition, StagedOutput};
+use super::attempt::{ArtifactKind, ArtifactRegistration, AttemptError, RunAttemptPublication};
+use super::containment::{
+    AttemptDestinationReservation, ContainmentError, PromotionDisposition, StagedOutput,
+};
 use super::open::{containment_error, open_output, open_output_with_policy};
 
 #[derive(Debug)]
@@ -23,10 +26,9 @@ struct PendingOutput {
 enum PendingStage {
     DestinationLocal(StagedOutput),
     AttemptOwned {
-        destination: OutputContainment,
+        reservation: AttemptDestinationReservation,
         source: ValidatedPath,
         source_path: PathBuf,
-        disposition: PromotionDisposition,
     },
 }
 
@@ -41,13 +43,20 @@ impl PendingStage {
     fn preflight(&self) -> Result<(), ContainmentError> {
         match self {
             Self::DestinationLocal(staged) => staged.preflight(),
-            Self::AttemptOwned { source_path, .. } => std::fs::File::open(source_path)
-                .and_then(|file| file.sync_all())
-                .map_err(|source| ContainmentError::Io {
-                    operation: "sync-attempt-artifact",
-                    path: source_path.clone(),
-                    source,
-                }),
+            Self::AttemptOwned {
+                reservation,
+                source_path,
+                ..
+            } => {
+                std::fs::File::open(source_path)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|source| ContainmentError::Io {
+                        operation: "sync-attempt-artifact",
+                        path: source_path.clone(),
+                        source,
+                    })?;
+                reservation.preflight()
+            }
         }
     }
 
@@ -55,30 +64,19 @@ impl PendingStage {
         match self {
             Self::DestinationLocal(staged) => staged.publish(fail_after_rename),
             Self::AttemptOwned {
-                destination,
+                reservation,
                 source,
-                disposition,
                 ..
-            } => destination.promote_from_with_sync_fault(
-                source.clone(),
-                *disposition,
-                fail_after_rename,
-            ),
+            } => reservation.publish_from(source.clone(), fail_after_rename),
         }
     }
 
     fn finalize_with_cleanup_fault(&mut self, fail_cleanup: bool) -> Result<(), ContainmentError> {
         match self {
             Self::DestinationLocal(staged) => staged.finalize_with_cleanup_fault(fail_cleanup),
-            Self::AttemptOwned { source_path, .. } if fail_cleanup => Err(ContainmentError::Io {
-                operation: "finalize-attempt-artifact",
-                path: source_path.clone(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "injected attempt cleanup failure",
-                ),
-            }),
-            Self::AttemptOwned { .. } => Ok(()),
+            Self::AttemptOwned { reservation, .. } => {
+                reservation.finalize_with_cleanup_fault(fail_cleanup)
+            }
         }
     }
 }
@@ -147,12 +145,35 @@ struct RegistryState {
 /// Split writers may create files from executor-owned threads, so clones all
 /// point to the same synchronized ledger. Publication remains owned by the CLI
 /// after the executor has dropped every writer.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct OutputStagingRegistry {
     state: Arc<Mutex<RegistryState>>,
+    attempt: Option<RunAttemptPublication>,
+}
+
+impl Default for OutputStagingRegistry {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RegistryState::default())),
+            attempt: None,
+        }
+    }
 }
 
 impl OutputStagingRegistry {
+    /// Attach the shared output ledger to one run-owned publication attempt.
+    pub fn for_run_attempt(attempt: RunAttemptPublication) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(RegistryState::default())),
+            attempt: Some(attempt),
+        }
+    }
+
+    /// Whether dynamic artifacts are owned by a run attempt.
+    pub(crate) fn has_run_attempt(&self) -> bool {
+        self.attempt.is_some()
+    }
+
     /// Stage one resolved output without touching its final leaf.
     ///
     /// # Errors
@@ -195,6 +216,96 @@ impl OutputStagingRegistry {
             cli_force,
             path_for_n,
         )
+    }
+
+    /// Stage one dynamically resolved artifact through this run's owned
+    /// attempt and the ordinary collision-policy vocabulary.
+    pub fn stage_attempt_output<F>(
+        &self,
+        kind: ArtifactKind,
+        name: impl Into<String>,
+        policy: IfExistsPolicy,
+        cli_force: bool,
+        mut path_for_n: F,
+    ) -> Result<(PathBuf, File), PipelineError>
+    where
+        F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
+    {
+        let name = name.into();
+        let bare = path_for_n(None).map_err(PipelineError::Config)?;
+        let disposition = match policy {
+            IfExistsPolicy::Overwrite => PromotionDisposition::Replace,
+            IfExistsPolicy::Error if cli_force => PromotionDisposition::Replace,
+            IfExistsPolicy::Error | IfExistsPolicy::UniqueSuffix => PromotionDisposition::NoReplace,
+        };
+        let stage = |path: PathBuf| self.stage_attempt_candidate(kind, &name, disposition, path);
+        match policy {
+            IfExistsPolicy::Overwrite => stage(bare),
+            IfExistsPolicy::Error => match stage(bare.clone()) {
+                Err(error) if !cli_force && attempt_is_already_exists(&error) => {
+                    Err(attempt_existing_output_error(&bare))
+                }
+                result => result,
+            },
+            IfExistsPolicy::UniqueSuffix => {
+                match stage(bare.clone()) {
+                    Ok(output) => return Ok(output),
+                    Err(error) if attempt_is_already_exists(&error) => {}
+                    Err(error) => return Err(error),
+                }
+                for n in 1_u64..=u64::MAX {
+                    let candidate = path_for_n(Some(n)).map_err(PipelineError::Config)?;
+                    match stage(candidate) {
+                        Ok(output) => return Ok(output),
+                        Err(error) if attempt_is_already_exists(&error) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(PipelineError::Io(std::io::Error::other(
+                    "exhausted u64 collision counter for unique_suffix policy",
+                )))
+            }
+        }
+    }
+
+    fn stage_attempt_candidate(
+        &self,
+        kind: ArtifactKind,
+        name: &str,
+        disposition: PromotionDisposition,
+        final_path: PathBuf,
+    ) -> Result<(PathBuf, File), PipelineError> {
+        let attempt = self
+            .attempt
+            .as_ref()
+            .ok_or_else(|| PipelineError::Internal {
+                op: "attempt-publication",
+                node: name.to_owned(),
+                detail: "attempt-owned output registry has no run attempt".to_owned(),
+            })?;
+        let base = std::env::current_dir().map_err(PipelineError::Io)?;
+        let destination =
+            validate_path(&final_path, &base, final_path.is_absolute()).map_err(|diagnostic| {
+                PipelineError::Config(ConfigError::Validation(format!(
+                    "{}: {}",
+                    diagnostic.code, diagnostic.message
+                )))
+            })?;
+        let logical_leaf = final_path
+            .file_name()
+            .and_then(|leaf| leaf.to_str())
+            .ok_or_else(|| {
+                PipelineError::Config(ConfigError::Validation(
+                    "output artifact leaf must be valid UTF-8".to_owned(),
+                ))
+            })?;
+        let registration =
+            ArtifactRegistration::new(kind, name, logical_leaf, destination, disposition)
+                .map_err(attempt_error_to_pipeline)?;
+        let writer = attempt
+            .stage(self, registration)
+            .map_err(attempt_error_to_pipeline)?;
+        Ok((final_path, writer.into_file()))
     }
 
     fn stage_output_inner<F>(
@@ -264,9 +375,8 @@ impl OutputStagingRegistry {
         &self,
         name: String,
         final_path: PathBuf,
-        destination: OutputContainment,
+        reservation: AttemptDestinationReservation,
         source: ValidatedPath,
-        disposition: PromotionDisposition,
     ) -> Result<(), PipelineError> {
         let mut state = self
             .state
@@ -282,12 +392,27 @@ impl OutputStagingRegistry {
             name,
             final_path,
             staged: PendingStage::AttemptOwned {
-                destination,
+                reservation,
                 source,
                 source_path,
-                disposition,
             },
         });
+        Ok(())
+    }
+
+    pub(crate) fn ensure_destination_available(
+        &self,
+        name: &str,
+        final_path: &std::path::Path,
+    ) -> Result<(), PipelineError> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = destination_key(final_path)?;
+        if let Some((first_name, first_path)) = state.claims.get(&key) {
+            return Err(collision_error(name, final_path, first_name, first_path));
+        }
         Ok(())
     }
 
@@ -524,6 +649,28 @@ fn destination_key(path: &std::path::Path) -> Result<String, PipelineError> {
     Ok(clinker_plan::config::collision_key(
         &absolute.to_string_lossy(),
     ))
+}
+
+fn attempt_error_to_pipeline(error: AttemptError) -> PipelineError {
+    match error {
+        AttemptError::Containment(error) => containment_error(error),
+        AttemptError::Pipeline(error) => error,
+        other => PipelineError::Config(ConfigError::Validation(other.to_string())),
+    }
+}
+
+fn attempt_is_already_exists(error: &PipelineError) -> bool {
+    matches!(error, PipelineError::Io(source) if source.kind() == std::io::ErrorKind::AlreadyExists)
+}
+
+fn attempt_existing_output_error(path: &Path) -> PipelineError {
+    let detail = match check_overwrite(path) {
+        Err(diagnostic) => diagnostic.message,
+        Ok(()) => format!(
+            "output file already exists: {path:?} — use --force or set if_exists: overwrite"
+        ),
+    };
+    PipelineError::Config(ConfigError::Validation(format!("E-SEC-001: {detail}")))
 }
 
 fn partials_from<'a>(entries: impl Iterator<Item = &'a PendingOutput>) -> Vec<PartialOutput> {

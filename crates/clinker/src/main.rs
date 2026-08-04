@@ -1457,6 +1457,53 @@ fn staging_error(e: clinker_channel::StagingError) -> PipelineError {
     PipelineError::Config(clinker_plan::config::ConfigError::Validation(e.to_string()))
 }
 
+struct RunAttemptAbandonGuard(clinker_exec::output::attempt::RunAttemptPublication);
+
+impl Drop for RunAttemptAbandonGuard {
+    fn drop(&mut self) {
+        let _ = self.0.abandon();
+    }
+}
+
+fn insert_publication_root(
+    roots: &mut std::collections::BTreeMap<
+        std::path::PathBuf,
+        clinker_plan::security::ValidatedPath,
+    >,
+    destination: &std::path::Path,
+) -> Result<(), PipelineError> {
+    let parent = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let base = std::env::current_dir().map_err(PipelineError::Io)?;
+    let root = clinker_plan::security::validate_path(parent, &base, parent.is_absolute()).map_err(
+        |diagnostic| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(format!(
+                "{}: {}",
+                diagnostic.code, diagnostic.message
+            )))
+        },
+    )?;
+    roots.insert(root.as_path().to_path_buf(), root);
+    Ok(())
+}
+
+fn run_unix_ms() -> Result<u64, PipelineError> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                "system clock is earlier than the Unix epoch".to_owned(),
+            ))
+        })?;
+    u64::try_from(duration.as_millis()).map_err(|_| {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+            "system clock exceeds the supported publication range".to_owned(),
+        ))
+    })
+}
+
 fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Resolve CLINKER_ENV
     if let Some(env_name) = args
@@ -2184,7 +2231,6 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // and preserve hidden partials for inspection.
     let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
         std::collections::HashMap::new();
-    let output_staging = clinker_exec::output::staging::OutputStagingRegistry::default();
     let mut fan_out_destinations: std::collections::HashMap<
         String,
         Vec<(std::sync::Arc<str>, std::path::PathBuf, std::path::PathBuf)>,
@@ -2236,6 +2282,110 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         }
         fan_out_destinations.insert(output.name.clone(), rendered);
     }
+
+    // Resolve publication against every compiled destination parent before
+    // the first output reservation or attempt file is created. The estimate
+    // is deliberately the effective configured ceiling (the lower of the
+    // per-attempt and retained-byte limits): admission is advisory, but a run
+    // admitted below its own enforced byte ceiling could otherwise fail merely
+    // because formatting expands the source representation.
+    let mut publication_roots = std::collections::BTreeMap::new();
+    for output in pipeline_config.output_configs() {
+        if let Some(destinations) = fan_out_destinations.get(&output.name) {
+            for (_, destination, _) in destinations {
+                insert_publication_root(&mut publication_roots, destination)?;
+            }
+        } else {
+            let destination =
+                std::path::PathBuf::from(output.render_runtime_path("<merged>", "<merged>")?);
+            insert_publication_root(&mut publication_roots, &destination)?;
+        }
+    }
+    if let Some(dlq) = &pipeline_config.error_handling.dlq {
+        if let Some(path) = &dlq.path {
+            insert_publication_root(&mut publication_roots, std::path::Path::new(path))?;
+        }
+        for per_source in dlq.per_source.values() {
+            if let Some(path) = &per_source.path {
+                insert_publication_root(&mut publication_roots, std::path::Path::new(path))?;
+            }
+        }
+    }
+    if publication_roots.is_empty() {
+        return Err(PipelineError::Config(
+            clinker_plan::config::ConfigError::Validation(
+                "compiled pipeline has no file destination roots".to_owned(),
+            ),
+        ));
+    }
+    let estimated_attempt_bytes = storage_config
+        .publication
+        .max_attempt_bytes
+        .0
+        .min(storage_config.publication.retained_byte_limit.0);
+    let mut publication_policy = None;
+    for root in publication_roots.values() {
+        let observed_free_bytes = clinker_exec::output::attempt::observed_available_space(
+            root.as_path(),
+        )
+        .map_err(|error| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                error.to_string(),
+            ))
+        })?;
+        let resolved = storage_config
+            .publication
+            .resolve(root.as_path(), estimated_attempt_bytes, observed_free_bytes)
+            .map_err(|error| {
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                    error.to_string(),
+                ))
+            })?;
+        if publication_policy
+            .as_ref()
+            .map(
+                |current: &clinker_plan::config::ResolvedPublicationPolicy| {
+                    current.explain().observed_free_bytes > observed_free_bytes
+                },
+            )
+            .unwrap_or(true)
+        {
+            publication_policy = Some(resolved);
+        }
+    }
+    let publication_policy = publication_policy.expect("non-empty roots resolve one policy");
+    let created_unix_ms = run_unix_ms()?;
+    let eligible_after_unix_ms = created_unix_ms
+        .checked_add(
+            publication_policy
+                .creation_grace_seconds()
+                .checked_mul(1_000)
+                .ok_or_else(|| {
+                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                        "storage.publication creation grace overflows the durable clock".to_owned(),
+                    ))
+                })?,
+        )
+        .ok_or_else(|| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                "publication attempt eligibility overflows the durable clock".to_owned(),
+            ))
+        })?;
+    let run_attempt = clinker_exec::output::attempt::RunAttemptPublication::create(
+        publication_policy,
+        &execution_id,
+        created_unix_ms,
+        eligible_after_unix_ms,
+        publication_roots.into_values().collect(),
+    )
+    .map_err(|error| {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+            error.to_string(),
+        ))
+    })?;
+    let _attempt_guard = RunAttemptAbandonGuard(run_attempt.clone());
+    let output_staging =
+        clinker_exec::output::staging::OutputStagingRegistry::for_run_attempt(run_attempt.clone());
     let mut fan_out_writers: std::collections::HashMap<
         String,
         std::collections::HashMap<std::sync::Arc<str>, Box<dyn std::io::Write + Send>>,
@@ -2285,7 +2435,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                         }
                     })
                 };
-                let (_final_path, file) = output_staging.stage_output(
+                let (_final_path, file) = output_staging.stage_attempt_output(
+                    clinker_exec::output::attempt::ArtifactKind::FanOut,
                     output.name.clone(),
                     output.if_exists,
                     false,
@@ -2319,7 +2470,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     }
                 })
             };
-        let (_final_path, handle) = output_staging.stage_output(
+        let (_final_path, handle) = output_staging.stage_attempt_output(
+            clinker_exec::output::attempt::ArtifactKind::Primary,
             output.name.clone(),
             output.if_exists,
             false,
@@ -2435,14 +2587,11 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             // the exact inputs the failure saw (cleanup = on_success); only
             // cleanup = always reaps them on failure.
             source_stager.cleanup(false);
-            for pending in output_staging.partials() {
-                tracing::warn!(
-                    output = %pending.name,
-                    final_path = %pending.final_path.display(),
-                    partial_path = %pending.partial_path.display(),
-                    "pipeline failed; partial output preserved at temp path",
-                );
-            }
+            run_attempt.abandon().map_err(|attempt_error| {
+                PipelineError::Io(std::io::Error::other(format!(
+                    "pipeline failed and attempt state could not be persisted: {attempt_error}"
+                )))
+            })?;
             return Err(e);
         }
     };
@@ -2475,7 +2624,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     continue;
                 }
                 let bare = target_path.clone();
-                let (_final_path, dlq_handle) = output_staging.stage_output(
+                let (_final_path, dlq_handle) = output_staging.stage_attempt_output(
+                    clinker_exec::output::attempt::ArtifactKind::Dlq,
                     "dead-letter output",
                     clinker_plan::config::IfExistsPolicy::Overwrite,
                     false,
@@ -2515,6 +2665,15 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             let hash_full = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
             let hash_short = hash_full[..8.min(hash_full.len())].to_string();
             for target in targets {
+                let resolved_path = if output.authored_path_was_absolute() {
+                    target.clone()
+                } else {
+                    let current_dir = std::env::current_dir().map_err(PipelineError::Io)?;
+                    target
+                        .strip_prefix(current_dir)
+                        .unwrap_or(&target)
+                        .to_path_buf()
+                };
                 let sidecar = clinker_exec::output::sidecar::OutputSidecar {
                     pipeline_path: args.config.to_string_lossy().into_owned(),
                     pipeline_hash: hash_full.clone(),
@@ -2527,7 +2686,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     execution_id: Some(execution_id.clone()),
                     batch_id: Some(batch_id.clone()),
                     output_name: output.name.clone(),
-                    resolved_path: target.to_string_lossy().into_owned(),
+                    resolved_path: resolved_path.to_string_lossy().into_owned(),
                     record_count: None,
                     bytes_written: None,
                     dlq_counts: dlq_counts.clone(),
@@ -2538,7 +2697,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 let sidecar_path =
                     clinker_exec::output::sidecar::OutputSidecar::sidecar_path(&target);
                 let bare = sidecar_path.clone();
-                let (_, mut handle) = output_staging.stage_output(
+                let (_, mut handle) = output_staging.stage_attempt_output(
+                    clinker_exec::output::attempt::ArtifactKind::Sidecar,
                     format!("metadata sidecar for output {:?}", output.name),
                     clinker_plan::config::IfExistsPolicy::Overwrite,
                     false,
@@ -2554,99 +2714,59 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     })();
     if let Err(error) = publication_preparation {
         source_stager.cleanup(false);
-        for pending in output_staging.partials() {
-            tracing::warn!(
-                output = %pending.name,
-                final_path = %pending.final_path.display(),
-                partial_path = %pending.partial_path.display(),
-                "publication preparation failed; hidden output preserved",
-            );
-        }
+        run_attempt.abandon().map_err(|attempt_error| {
+            PipelineError::Io(std::io::Error::other(format!(
+                "publication preparation failed and attempt state could not be persisted: {attempt_error}"
+            )))
+        })?;
         return Err(error);
     }
 
     let mut publication_failure: Option<String> = None;
     if report.interrupted {
-        for pending in output_staging.partials() {
-            tracing::warn!(
-                output = %pending.name,
-                final_path = %pending.final_path.display(),
-                partial_path = %pending.partial_path.display(),
-                "pipeline was interrupted; hidden output was not published",
-            );
-        }
-    } else if !shutdown_token.try_begin_publication() {
-        report.interrupted = true;
-        for pending in output_staging.partials() {
-            tracing::warn!(
-                output = %pending.name,
-                final_path = %pending.final_path.display(),
-                partial_path = %pending.partial_path.display(),
-                "shutdown won before publication; hidden output was not published",
-            );
-        }
+        run_attempt.abandon().map_err(|error| {
+            PipelineError::Io(std::io::Error::other(format!(
+                "interrupted attempt state could not be persisted: {error}"
+            )))
+        })?;
     } else {
-        use clinker_exec::output::staging::PublicationOutcome;
-        match output_staging.commit_all() {
-            Ok(PublicationOutcome::Complete { cleanup_debt, .. }) if cleanup_debt.is_empty() => {}
-            Ok(PublicationOutcome::Complete { cleanup_debt, .. }) => {
-                for debt in &cleanup_debt {
-                    tracing::error!(
-                        output = %debt.name,
-                        final_path = %debt.final_path.display(),
-                        stale_path = %debt.stale_path.display(),
-                        detail = %debt.detail,
-                        "output published with transaction cleanup debt",
-                    );
-                }
-                publication_failure = Some(format!(
-                    "output publication completed with {} cleanup debt item(s)",
-                    cleanup_debt.len()
-                ));
-            }
-            Ok(PublicationOutcome::Incomplete {
-                published,
-                visible_unsynchronized,
-                unpublished,
-                cleanup_debt,
-                error,
-            }) => {
-                for (name, path) in &published {
-                    tracing::error!(output = %name, final_path = %path.display(), "output is visible and synchronized");
-                }
-                for (name, path) in &visible_unsynchronized {
-                    tracing::error!(output = %name, final_path = %path.display(), "output is visible but parent synchronization failed");
-                }
-                for pending in &unpublished {
-                    tracing::error!(
-                        output = %pending.name,
-                        final_path = %pending.final_path.display(),
-                        partial_path = %pending.partial_path.display(),
-                        "output remains unpublished in quarantine",
-                    );
-                }
-                for debt in &cleanup_debt {
-                    tracing::error!(
-                        output = %debt.name,
-                        final_path = %debt.final_path.display(),
-                        stale_path = %debt.stale_path.display(),
-                        detail = %debt.detail,
-                        "publication also left cleanup debt",
-                    );
-                }
-                publication_failure = Some(error);
-            }
+        match run_attempt.mark_all_ready() {
             Err(error) => {
-                for pending in output_staging.partials() {
-                    tracing::error!(
-                        output = %pending.name,
-                        final_path = %pending.final_path.display(),
-                        partial_path = %pending.partial_path.display(),
-                        "publication preflight failed; output remains unpublished",
-                    );
+                let detail = error.to_string();
+                if let Err(abandon_error) = run_attempt.abandon() {
+                    publication_failure = Some(format!(
+                        "output readiness failed: {detail}; attempt state could not be abandoned: {abandon_error}"
+                    ));
+                } else {
+                    publication_failure = Some(format!("output readiness failed: {detail}"));
                 }
-                publication_failure = Some(error.to_string());
             }
+            Ok(()) => match run_attempt.publish_run(&output_staging, &shutdown_token) {
+                Ok(None) => report.interrupted = true,
+                Ok(Some(clinker_exec::output::attempt::AttemptPublicationOutcome::Complete {
+                    cleanup_debt_count: 0,
+                    ..
+                })) => {}
+                Ok(Some(clinker_exec::output::attempt::AttemptPublicationOutcome::Complete {
+                    cleanup_debt_count,
+                    ..
+                })) => {
+                    publication_failure = Some(format!(
+                        "output publication completed with {cleanup_debt_count} cleanup debt item(s)"
+                    ));
+                }
+                Ok(Some(
+                    clinker_exec::output::attempt::AttemptPublicationOutcome::Incomplete {
+                        cleanup_debt_count,
+                        ..
+                    },
+                )) => {
+                    publication_failure = Some(format!(
+                        "output publication was incomplete with {cleanup_debt_count} cleanup debt item(s); inspect execution {execution_id}"
+                    ));
+                }
+                Err(error) => publication_failure = Some(error.to_string()),
+            },
         }
     }
 

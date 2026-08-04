@@ -256,6 +256,20 @@ pub struct StagedOutput {
     state: PublicationState,
 }
 
+/// Destination reservation retained while an attempt-owned artifact is
+/// written outside the destination directory.
+///
+/// This is the reservation half of [`StagedOutput`]. It deliberately reuses
+/// the same final-leaf lock and handle-relative promotion boundary while the
+/// artifact bytes remain owned by an [`AttemptPublication`](super::attempt::AttemptPublication)
+/// root.
+#[derive(Debug)]
+pub(crate) struct AttemptDestinationReservation {
+    destination: OutputContainment,
+    disposition: PromotionDisposition,
+    reservation: Option<Reservation>,
+}
+
 #[derive(Debug)]
 struct Reservation {
     leaf: OsString,
@@ -351,45 +365,7 @@ impl OutputContainment {
         self,
         disposition: PromotionDisposition,
     ) -> Result<(StagedOutput, File), ContainmentError> {
-        if disposition == PromotionDisposition::NoReplace && self.destination_exists()? {
-            return Err(ContainmentError::io(
-                "reserve-destination-leaf",
-                self.destination.as_path(),
-                std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "destination already exists",
-                ),
-            ));
-        }
-        let mut reservation_leaf = OsString::from(".clinker-");
-        reservation_leaf.push(&self.leaf);
-        reservation_leaf.push(".reservation");
-        let reservation_path = parent_path_of(self.destination.as_path()).join(&reservation_leaf);
-        let mut reservation = Some(self.acquire_reservation(reservation_leaf, reservation_path)?);
-        // The destination can appear after the initial existence check while
-        // this caller waits for the previous publisher to release its
-        // reservation. Revalidate after acquiring the reservation so a
-        // no-replace caller never stages against a name that is now occupied.
-        if disposition == PromotionDisposition::NoReplace {
-            match self.destination_exists() {
-                Ok(false) => {}
-                Ok(true) => {
-                    self.release_reservation(reservation.take())?;
-                    return Err(ContainmentError::io(
-                        "reserve-destination-leaf",
-                        self.destination.as_path(),
-                        std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "destination appeared before its reservation was acquired",
-                        ),
-                    ));
-                }
-                Err(error) => {
-                    self.release_reservation(reservation.take())?;
-                    return Err(error);
-                }
-            }
-        }
+        let reservation = Some(self.reserve_destination(disposition)?);
         let parent_path = self
             .destination
             .as_path()
@@ -436,6 +412,66 @@ impl OutputContainment {
                 "could not allocate a unique destination-local quarantine leaf",
             ),
         ))
+    }
+
+    /// Retain the ordinary destination reservation for an attempt-owned
+    /// quarantine file.
+    pub(crate) fn reserve_for_attempt(
+        self,
+        disposition: PromotionDisposition,
+    ) -> Result<AttemptDestinationReservation, ContainmentError> {
+        let reservation = self.reserve_destination(disposition)?;
+        Ok(AttemptDestinationReservation {
+            destination: self,
+            disposition,
+            reservation: Some(reservation),
+        })
+    }
+
+    fn reserve_destination(
+        &self,
+        disposition: PromotionDisposition,
+    ) -> Result<Reservation, ContainmentError> {
+        if disposition == PromotionDisposition::NoReplace && self.destination_exists()? {
+            return Err(ContainmentError::io(
+                "reserve-destination-leaf",
+                self.destination.as_path(),
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination already exists",
+                ),
+            ));
+        }
+        let mut reservation_leaf = OsString::from(".clinker-");
+        reservation_leaf.push(&self.leaf);
+        reservation_leaf.push(".reservation");
+        let reservation_path = parent_path_of(self.destination.as_path()).join(&reservation_leaf);
+        let reservation = self.acquire_reservation(reservation_leaf, reservation_path)?;
+        // The destination can appear after the initial existence check while
+        // this caller waits for the previous publisher to release its
+        // reservation. Revalidate after acquiring the reservation so a
+        // no-replace caller never stages against a name that is now occupied.
+        if disposition == PromotionDisposition::NoReplace {
+            match self.destination_exists() {
+                Ok(false) => {}
+                Ok(true) => {
+                    self.release_reservation(Some(reservation))?;
+                    return Err(ContainmentError::io(
+                        "reserve-destination-leaf",
+                        self.destination.as_path(),
+                        std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "destination appeared before its reservation was acquired",
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    self.release_reservation(Some(reservation))?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(reservation)
     }
 
     fn acquire_reservation(
@@ -697,6 +733,76 @@ impl StagedOutput {
 }
 
 impl Drop for StagedOutput {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            let _ = FileExt::unlock(&reservation.file);
+            drop(reservation.file);
+            let _ = self.destination.parent.remove_leaf(&reservation.leaf);
+        }
+    }
+}
+
+impl AttemptDestinationReservation {
+    pub(crate) fn preflight(&self) -> Result<(), ContainmentError> {
+        if self.disposition == PromotionDisposition::NoReplace
+            && self.destination.destination_exists()?
+        {
+            return Err(ContainmentError::io(
+                "preflight-destination-leaf",
+                self.destination.destination.as_path(),
+                std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "destination appeared after its reservation was acquired",
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn publish_from(
+        &self,
+        source: ValidatedPath,
+        fail_after_rename: bool,
+    ) -> Result<(), ContainmentError> {
+        self.destination
+            .promote_from_with_sync_fault(source, self.disposition, fail_after_rename)
+    }
+
+    pub(crate) fn finalize_with_cleanup_fault(
+        &mut self,
+        fail_cleanup: bool,
+    ) -> Result<(), ContainmentError> {
+        if let Some(reservation) = self.reservation.take() {
+            let _ = FileExt::unlock(&reservation.file);
+            drop(reservation.file);
+            if fail_cleanup {
+                let source = ContainmentError::io(
+                    "remove-destination-reservation",
+                    &reservation.path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected reservation cleanup failure",
+                    ),
+                );
+                return Err(ContainmentError::PublishedCleanup {
+                    path: self.destination.destination.as_path().to_path_buf(),
+                    stale_path: reservation.path,
+                    source: Box::new(source),
+                });
+            }
+            if let Err(source) = self.destination.parent.remove_leaf(&reservation.leaf) {
+                return Err(ContainmentError::PublishedCleanup {
+                    path: self.destination.destination.as_path().to_path_buf(),
+                    stale_path: reservation.path,
+                    source: Box::new(source),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AttemptDestinationReservation {
     fn drop(&mut self) {
         if let Some(reservation) = self.reservation.take() {
             let _ = FileExt::unlock(&reservation.file);

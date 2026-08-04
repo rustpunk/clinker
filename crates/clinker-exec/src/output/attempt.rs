@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use clinker_plan::config::{DestinationProfile, PublicationMode, ResolvedPublicationPolicy};
@@ -33,6 +33,16 @@ pub const ARTIFACT_MAX_ENCODED_BYTES: usize = 992;
 pub const MANIFEST_MAX_ARTIFACTS: usize = 4096;
 pub const MANIFEST_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const PUBLICATION_COPY_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Observe destination free space at publication admission without reserving
+/// capacity.
+pub fn observed_available_space(path: &Path) -> Result<u64, AttemptError> {
+    fs4::available_space(path).map_err(|source| AttemptError::Io {
+        operation: "observe publication free space",
+        path: path.to_path_buf(),
+        source,
+    })
+}
 
 /// Exact cross-platform outcome vocabulary preserved by publication and cleanup.
 pub const ATTEMPT_EDGE_OUTCOME_TAXONOMY: [&str; 6] = [
@@ -235,6 +245,11 @@ impl AttemptArtifactWriter {
     /// Borrow the restrictive file handle used by the format writer.
     pub fn file_mut(&mut self) -> &mut File {
         &mut self.file
+    }
+
+    /// Transfer the restrictive artifact handle to an existing format writer.
+    pub(crate) fn into_file(self) -> File {
+        self.file
     }
 }
 
@@ -2566,6 +2581,7 @@ fn legacy_inspection(execution_id: &str, disposition: CleanupDisposition) -> Att
 /// Retained ownership boundary for one execution directory.
 #[derive(Debug)]
 pub struct AttemptRoot {
+    destination: AnchoredDirectory,
     namespace: AnchoredDirectory,
     directory: AnchoredDirectory,
     execution_id: String,
@@ -2585,6 +2601,7 @@ impl AttemptRoot {
         let directory = namespace.create_child(execution_id)?;
         let path = directory.path().to_path_buf();
         Ok(Self {
+            destination,
             namespace,
             directory,
             execution_id: execution_id.to_owned(),
@@ -2613,6 +2630,7 @@ impl AttemptRoot {
         };
         let path = directory.path().to_path_buf();
         Ok(Some(Self {
+            destination,
             namespace,
             directory,
             execution_id: execution_id.to_owned(),
@@ -2622,6 +2640,7 @@ impl AttemptRoot {
 
     fn remove_empty(self) -> Result<(), AttemptError> {
         let Self {
+            destination,
             namespace,
             directory,
             execution_id,
@@ -2630,7 +2649,19 @@ impl AttemptRoot {
         drop(directory);
         namespace.remove_child(&execution_id)?;
         namespace.sync()?;
-        Ok(())
+        drop(namespace);
+        match destination.remove_child(".clinker-attempts") {
+            Ok(()) => destination.sync().map_err(AttemptError::from),
+            Err(error)
+                if matches!(
+                    containment_kind(&error),
+                    Some(std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound)
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 }
 
@@ -2668,6 +2699,111 @@ pub struct AttemptPublication {
     terminal: bool,
     fault: Option<AttemptFault>,
     test_hook: Option<Box<dyn FnOnce(AttemptTestEvent) + Send>>,
+}
+
+/// Cloneable run edge that keeps one [`AttemptPublication`] shared by the CLI
+/// and lazy executor-owned split writers.
+#[derive(Clone, Debug)]
+pub struct RunAttemptPublication {
+    inner: Arc<Mutex<AttemptPublication>>,
+}
+
+impl RunAttemptPublication {
+    /// Create one empty run-owned attempt over a finite set of compiled
+    /// destination-parent roots.
+    pub fn create(
+        policy: ResolvedPublicationPolicy,
+        execution_id: &str,
+        created_unix_ms: u64,
+        eligible_after_unix_ms: u64,
+        destination_roots: Vec<ValidatedPath>,
+    ) -> Result<Self, AttemptError> {
+        AttemptPublication::create_dynamic_run(
+            policy,
+            execution_id,
+            created_unix_ms,
+            eligible_after_unix_ms,
+            destination_roots,
+        )
+        .map(|attempt| Self {
+            inner: Arc::new(Mutex::new(attempt)),
+        })
+    }
+
+    pub(crate) fn stage(
+        &self,
+        registry: &OutputStagingRegistry,
+        registration: ArtifactRegistration,
+    ) -> Result<AttemptArtifactWriter, AttemptError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stage_registered(registry, registration)
+    }
+
+    /// Synchronize every closed writer and persist the attempt as ready.
+    pub fn mark_all_ready(&self) -> Result<(), AttemptError> {
+        let mut attempt = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let artifact_ids = attempt
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_id.clone())
+            .collect::<Vec<_>>();
+        if artifact_ids.is_empty() {
+            let mut ready = attempt.manifest.clone();
+            ready.state = AttemptState::Ready;
+            return attempt.persist_replacement(ready, false);
+        }
+        for artifact_id in artifact_ids {
+            attempt.mark_ready(&artifact_id)?;
+        }
+        Ok(())
+    }
+
+    /// Persist a terminal non-publication state without deleting owned bytes.
+    pub fn abandon(&self) -> Result<(), AttemptError> {
+        let mut attempt = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if attempt.terminal {
+            return Ok(());
+        }
+        if matches!(
+            attempt.manifest.state,
+            AttemptState::Publishing | AttemptState::Complete | AttemptState::Incomplete
+        ) {
+            return Err(AttemptError::InvalidTransition(
+                "attempt can no longer be abandoned",
+            ));
+        }
+        let mut abandoned = attempt.manifest.clone();
+        abandoned.state = AttemptState::Abandoned;
+        for artifact in &mut abandoned.artifacts {
+            if artifact.state != ArtifactState::Published {
+                artifact.state = ArtifactState::Unpublished;
+            }
+        }
+        attempt.persist_replacement(abandoned, false)?;
+        attempt.terminal = true;
+        Ok(())
+    }
+
+    /// Publish through the existing cancellation gate and return path-free
+    /// per-artifact truth.
+    pub fn publish_run(
+        &self,
+        registry: &OutputStagingRegistry,
+        shutdown: &ShutdownToken,
+    ) -> Result<Option<AttemptPublicationOutcome>, AttemptError> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .publish_run(registry, shutdown)
+    }
 }
 
 impl std::fmt::Debug for AttemptPublication {
@@ -2795,13 +2931,61 @@ impl AttemptPublication {
                 .or_insert(parent);
         }
 
+        let mut attempt = Self::create_dynamic_run(
+            policy,
+            execution_id,
+            created_unix_ms,
+            eligible_after_unix_ms,
+            destination_roots.into_values().collect(),
+        )?;
+
+        let mut writers = Vec::with_capacity(registrations.len());
+        for registration in registrations {
+            writers.push(attempt.stage_registered(registry, registration)?);
+        }
+        Ok((attempt, writers))
+    }
+
+    fn create_dynamic_run(
+        policy: ResolvedPublicationPolicy,
+        execution_id: &str,
+        created_unix_ms: u64,
+        eligible_after_unix_ms: u64,
+        destination_roots: Vec<ValidatedPath>,
+    ) -> Result<Self, AttemptError> {
+        validate_execution_id(execution_id)?;
+        if destination_roots.is_empty() || destination_roots.len() > MANIFEST_MAX_ARTIFACTS {
+            return Err(AttemptError::InvalidManifest(
+                "run destination-root count is outside the bounded range",
+            ));
+        }
+        let mut roots = BTreeMap::new();
+        for root in destination_roots {
+            roots
+                .entry(destination_root_key(root.as_path()))
+                .or_insert(root);
+        }
+
+        // Verify every compiled root through the exact qualified containment
+        // profile before creating any attempt directory.
+        for root in roots.values() {
+            let probe = validate_path(
+                Path::new(".clinker-publication-probe"),
+                root.as_path(),
+                false,
+            )
+            .map_err(|_| AttemptError::InvalidManifest("destination root failed validation"))?;
+            OutputContainment::for_profile(
+                probe,
+                containment_profile(policy.destination_profile()),
+            )?;
+        }
+
         let owner_root = match policy.mode() {
-            PublicationMode::Direct => destination_roots
+            PublicationMode::Direct => roots
                 .first_key_value()
                 .map(|(_, root)| root.clone())
-                .ok_or(AttemptError::InvalidManifest(
-                    "run registration has no destination root",
-                ))?,
+                .ok_or(AttemptError::InvalidManifest("run has no destination root"))?,
             PublicationMode::LocalThenPublish => {
                 let spool = policy
                     .local_spool_dir()
@@ -2813,18 +2997,6 @@ impl AttemptPublication {
                 })?
             }
         };
-
-        // Exact remote-profile verification happens through the retained
-        // destination-parent containment boundary before any attempt directory
-        // is created. The policy layer has already rejected an unqualified
-        // network destination; this probe distinguishes NFS from SMB.
-        for registration in &registrations {
-            OutputContainment::for_profile(
-                registration.destination.clone(),
-                containment_profile(policy.destination_profile()),
-            )?;
-        }
-
         let owner_profile = match policy.mode() {
             PublicationMode::Direct => policy.destination_profile(),
             PublicationMode::LocalThenPublish => DestinationProfile::Local,
@@ -2838,17 +3010,12 @@ impl AttemptPublication {
         )?;
         attempt.policy = Some(policy);
         attempt.destination_root_keys.clear();
-        for (key, root) in destination_roots {
+        for (key, root) in roots {
             attempt.ensure_destination_root(key.clone(), root)?;
             attempt.destination_root_keys.push(key);
         }
         attempt.destination_root_keys.sort();
-
-        let mut writers = Vec::with_capacity(registrations.len());
-        for registration in registrations {
-            writers.push(attempt.stage_registered(registry, registration)?);
-        }
-        Ok((attempt, writers))
+        Ok(attempt)
     }
 
     /// Existing execution identity shared by every managed artifact.
@@ -2934,7 +3101,19 @@ impl AttemptPublication {
         let artifact_id = format!("artifact-{:08x}", self.artifacts.len() + 1);
         let destination_root = destination_parent(&registration.destination)?;
         let publication_root_key = destination_root_key(destination_root.as_path());
-        self.ensure_destination_root(publication_root_key.clone(), destination_root)?;
+        if self
+            .destination_root_keys
+            .binary_search(&publication_root_key)
+            .is_err()
+        {
+            return Err(AttemptError::InvalidManifest(
+                "artifact destination is outside the compiled run roots",
+            ));
+        }
+        registry.ensure_destination_available(
+            &registration.producer_label,
+            registration.destination.as_path(),
+        )?;
 
         let publication_leaf = if mode == PublicationMode::LocalThenPublish
             && publication_root_key == self.owner_root_key
@@ -2945,6 +3124,11 @@ impl AttemptPublication {
         };
         let publication_source =
             self.validated_artifact_in_root(&publication_root_key, &publication_leaf)?;
+        let destination_boundary = OutputContainment::for_profile(
+            registration.destination.clone(),
+            containment_profile(profile),
+        )?;
+        let reservation = destination_boundary.reserve_for_attempt(registration.disposition)?;
         let (local_source, file, copied_from_local) = match mode {
             PublicationMode::Direct => {
                 let file =
@@ -2958,17 +3142,25 @@ impl AttemptPublication {
             }
         };
 
-        let destination_boundary = OutputContainment::for_profile(
-            registration.destination.clone(),
-            containment_profile(profile),
-        )?;
-        registry.register_attempt_output(
+        if let Err(error) = registry.register_attempt_output(
             registration.producer_label.clone(),
             registration.destination.as_path().to_path_buf(),
-            destination_boundary,
+            reservation,
             publication_source.clone(),
-            registration.disposition,
-        )?;
+        ) {
+            let source_key = if copied_from_local {
+                &self.owner_root_key
+            } else {
+                &publication_root_key
+            };
+            let source_leaf = if copied_from_local {
+                artifact_id.as_str()
+            } else {
+                publication_leaf.as_str()
+            };
+            let _ = self.remove_artifact_in_root(source_key, source_leaf);
+            return Err(error.into());
+        }
         let entry = ArtifactManifest::new(
             &artifact_id,
             &registration.producer_label,
@@ -3017,6 +3209,27 @@ impl AttemptPublication {
             .root
             .directory
             .create_file(leaf)
+            .map_err(AttemptError::from)
+    }
+
+    fn remove_artifact_in_root(&self, root_key: &str, leaf: &str) -> Result<(), AttemptError> {
+        if root_key == self.owner_root_key {
+            return self
+                .attempt_root
+                .as_ref()
+                .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?
+                .directory
+                .remove_file(leaf)
+                .map_err(AttemptError::from);
+        }
+        self.additional_roots
+            .get(root_key)
+            .ok_or(AttemptError::InvalidTransition(
+                "destination attempt root is missing",
+            ))?
+            .root
+            .directory
+            .remove_file(leaf)
             .map_err(AttemptError::from)
     }
 
@@ -3077,16 +3290,20 @@ impl AttemptPublication {
             .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?;
         let source = validate_path(Path::new(&artifact_id), &attempt_root.path, false)
             .map_err(|_| AttemptError::InvalidManifest("artifact path failed validation"))?;
-        let file = attempt_root.directory.create_file(&artifact_id)?;
+        registry.ensure_destination_available(producer_label, destination.as_path())?;
         let destination_boundary =
             OutputContainment::for_profile(destination.clone(), "local-filesystem")?;
-        registry.register_attempt_output(
+        let reservation = destination_boundary.reserve_for_attempt(disposition)?;
+        let file = attempt_root.directory.create_file(&artifact_id)?;
+        if let Err(error) = registry.register_attempt_output(
             producer_label.to_owned(),
             destination.as_path().to_path_buf(),
-            destination_boundary,
+            reservation,
             source.clone(),
-            disposition,
-        )?;
+        ) {
+            let _ = attempt_root.directory.remove_file(&artifact_id);
+            return Err(error.into());
+        }
         let entry = ArtifactManifest::new(
             &artifact_id,
             producer_label,
@@ -3298,10 +3515,23 @@ impl AttemptPublication {
         let mut publishing = self.manifest.clone();
         publishing.state = AttemptState::Publishing;
         self.persist_replacement(publishing, false)?;
-        let outcome = match self.fault {
-            Some(AttemptFault::BeforeRename) => registry.commit_all_inner(Some(0), None, None)?,
-            Some(AttemptFault::DirectorySync) => registry.commit_all_inner(None, Some(0), None)?,
-            _ => registry.commit_all()?,
+        let outcome_result = match self.fault {
+            Some(AttemptFault::BeforeRename) => registry.commit_all_inner(Some(0), None, None),
+            Some(AttemptFault::DirectorySync) => registry.commit_all_inner(None, Some(0), None),
+            _ => registry.commit_all(),
+        };
+        let outcome = match outcome_result {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let mut incomplete = self.manifest.clone();
+                incomplete.state = AttemptState::Incomplete;
+                for artifact in &mut incomplete.artifacts {
+                    artifact.state = ArtifactState::Unpublished;
+                }
+                self.persist_replacement(incomplete, false)?;
+                self.terminal = true;
+                return Err(error.into());
+            }
         };
         let mut finished = self.manifest.clone();
         match &outcome {
@@ -3634,7 +3864,15 @@ fn destination_parent(destination: &ValidatedPath) -> Result<ValidatedPath, Atte
 }
 
 fn destination_root_key(path: &Path) -> String {
-    clinker_plan::config::collision_key(&path.to_string_lossy())
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let normalized = absolute.canonicalize().unwrap_or(absolute);
+    clinker_plan::config::collision_key(&normalized.to_string_lossy())
 }
 
 fn containment_profile(profile: DestinationProfile) -> &'static str {
