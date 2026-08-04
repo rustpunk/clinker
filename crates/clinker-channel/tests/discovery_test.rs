@@ -67,7 +67,10 @@ fn resolves_channel_suffixed_overlay_by_tenant_id() {
     .expect("overlay should be found");
 
     assert_eq!(resolved.kind, OverlayKind::Pipeline);
-    assert_eq!(resolved.path, dir.join("orders.channel.yaml"));
+    assert_eq!(
+        resolved.path,
+        fs::canonicalize(dir.join("orders.channel.yaml")).expect("canonical overlay path")
+    );
     assert_eq!(
         resolved.overlay.channel.target,
         "../../pipeline/orders.yaml"
