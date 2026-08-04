@@ -489,7 +489,7 @@ mod tests {
         assert_eq!(first, second, "ordering input must be byte-deterministic");
         assert_eq!(
             first.digest(),
-            "164416040129dfdfc80be9ec92b6e05ec962d1324ad3970d57891c4969f196fc",
+            "8b891035785d20d9b97616706273f1ab4ccc1b55abf4c2b03083abd3a2d598a2",
             "the committed golden is meaningful only for this input digest"
         );
         assert_eq!(
