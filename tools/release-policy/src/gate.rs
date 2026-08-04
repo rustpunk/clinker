@@ -15,7 +15,7 @@ use crate::digest;
 use crate::error::GateError;
 use crate::evidence;
 use crate::filesystem::{self, NFS_PROFILE, SMB_PROFILE};
-use crate::limits::{DEFAULT_CHILD_OUTPUT_BYTES, MAX_INPUT_BYTES, read_bounded};
+use crate::limits::{MAX_CHILD_OUTPUT_BYTES, MAX_INPUT_BYTES, read_bounded};
 
 const PRE_CANDIDATE_SCHEMA: &str = "clinker.pre-candidate-evidence/v1";
 const FINAL_SCHEMA: &str = "clinker.final-evidence/v1";
@@ -29,18 +29,6 @@ const TARGETS: [&str; 4] = [
     "x86_64-apple-darwin",
     "x86_64-pc-windows-msvc",
     "x86_64-unknown-linux-gnu",
-];
-const RELEASE_BUILD_CHECKS: [(&str, &str); 4] = [
-    ("release-build-aarch64-apple-darwin", "aarch64-apple-darwin"),
-    ("release-build-x86_64-apple-darwin", "x86_64-apple-darwin"),
-    (
-        "release-build-x86_64-pc-windows-msvc",
-        "x86_64-pc-windows-msvc",
-    ),
-    (
-        "release-build-x86_64-unknown-linux-gnu",
-        "x86_64-unknown-linux-gnu",
-    ),
 ];
 
 /// Exact pre-candidate input shape.
@@ -179,6 +167,19 @@ const COMMAND_CHECKS: &[CommandCheck] = &[
         ],
     },
     CommandCheck {
+        name: "release-bundle-contract",
+        program: "cargo",
+        arguments: &[
+            "test",
+            "--manifest-path",
+            "tools/release-policy/Cargo.toml",
+            "--locked",
+            "--offline",
+            "--test",
+            "release_contract",
+        ],
+    },
+    CommandCheck {
         name: "filesystem-matrix-topology",
         program: "cargo",
         arguments: &[
@@ -272,7 +273,7 @@ const COMMAND_CHECKS: &[CommandCheck] = &[
     CommandCheck {
         name: "cargo-deny",
         program: "cargo",
-        arguments: &["deny", "check", "--locked"],
+        arguments: &["deny", "--locked", "check"],
     },
     CommandCheck {
         name: "documentation-contract",
@@ -294,7 +295,7 @@ pub fn run_pre_candidate(request: &PreCandidateRequest) -> Result<(), GateError>
         ));
     }
 
-    let mut checks = Vec::with_capacity(COMMAND_CHECKS.len() + 9);
+    let mut checks = Vec::with_capacity(COMMAND_CHECKS.len() + 5);
     let mut failures = Vec::new();
     let repository_controls = check_repository_controls(
         &request.repository_controls_evidence,
@@ -317,17 +318,6 @@ pub fn run_pre_candidate(request: &PreCandidateRequest) -> Result<(), GateError>
             &mut failures,
         );
     }
-    for (name, target) in RELEASE_BUILD_CHECKS {
-        run_release_build_check(
-            name,
-            target,
-            &repository_revision,
-            request.command_deadline_seconds,
-            &mut checks,
-            &mut failures,
-        );
-    }
-
     let manifest = json!({
         "schema": PRE_CANDIDATE_SCHEMA,
         "stage": "pre-candidate",
@@ -628,60 +618,6 @@ fn run_command_check(
     }
 }
 
-fn run_release_build_check(
-    name: &'static str,
-    target: &'static str,
-    source_sha: &str,
-    deadline: u64,
-    checks: &mut Vec<CheckObservation>,
-    failures: &mut Vec<FailureObservation>,
-) {
-    if !is_hex(source_sha, 40) {
-        checks.push(failed(name, None, false, false, false));
-        failures.push(FailureObservation {
-            check: name,
-            reason: "missing-source-revision",
-        });
-        return;
-    }
-    let arguments = vec![
-        OsString::from("run"),
-        OsString::from("--quiet"),
-        OsString::from("--manifest-path"),
-        OsString::from("tools/release-policy/Cargo.toml"),
-        OsString::from("--locked"),
-        OsString::from("--offline"),
-        OsString::from("--"),
-        OsString::from("release"),
-        OsString::from("build-bundle"),
-        OsString::from("--target"),
-        OsString::from(target),
-        OsString::from("--source-sha"),
-        OsString::from(source_sha),
-        OsString::from("--output-dir"),
-        OsString::from(format!(
-            "target/release-policy/pre-candidate-builds/{target}"
-        )),
-    ];
-    match run_owned_child("cargo", arguments, deadline) {
-        Ok(result) if command_passed(&result) => checks.push(passed(name)),
-        Ok(result) => {
-            checks.push(observation(name, &result));
-            failures.push(FailureObservation {
-                check: name,
-                reason: "command-failed",
-            });
-        }
-        Err(_) => {
-            checks.push(failed(name, None, false, false, false));
-            failures.push(FailureObservation {
-                check: name,
-                reason: "command-unavailable",
-            });
-        }
-    }
-}
-
 fn run_child(
     program: &str,
     arguments: &[&str],
@@ -705,7 +641,9 @@ fn run_owned_child(
         "CI",
         "CARGO_BUILD_JOBS",
         "CARGO_INCREMENTAL",
+        "CARGO_TARGET_DIR",
         "NO_COLOR",
+        "TMPDIR",
     ] {
         if let Some(value) = std::env::var_os(name) {
             environment.insert(OsString::from(name), value);
@@ -716,7 +654,7 @@ fn run_owned_child(
         arguments,
         environment,
         timeout: Duration::from_secs(deadline),
-        output_limit: DEFAULT_CHILD_OUTPUT_BYTES,
+        output_limit: MAX_CHILD_OUTPUT_BYTES,
     })
 }
 
@@ -1157,7 +1095,6 @@ fn validate_pre_candidate(value: &Value) -> Result<(), GateError> {
         "filesystem-evidence-coherence",
     ];
     expected_checks.extend(COMMAND_CHECKS.iter().map(|check| check.name));
-    expected_checks.extend(RELEASE_BUILD_CHECKS.iter().map(|(name, _)| *name));
     if checks.len() != expected_checks.len() {
         return Err(policy(
             "pre-candidate checks do not match the complete one-shot inventory",

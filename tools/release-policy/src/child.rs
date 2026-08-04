@@ -26,8 +26,10 @@ const ALLOWED_ENVIRONMENT: &[&str] = &[
     "CI",
     "CARGO_BUILD_JOBS",
     "CARGO_INCREMENTAL",
+    "CARGO_TARGET_DIR",
     "CLINKER_FILESYSTEM_PROFILE",
     "CLINKER_FILESYSTEM_ROOT",
+    "GH_CONFIG_DIR",
     "GH_TOKEN",
     "GITHUB_ACTOR",
     "GITHUB_REF",
@@ -41,8 +43,38 @@ const ALLOWED_ENVIRONMENT: &[&str] = &[
     "PATH",
     "RUNNER_TEMP",
     "SOURCE_DATE_EPOCH",
+    "TMPDIR",
     "TZ",
 ];
+
+/// Return the minimal environment needed for authenticated GitHub CLI calls.
+///
+/// The GitHub CLI normally discovers its stored credentials through the process home
+/// directory. Child processes do not inherit `HOME`, so resolve that location once and
+/// pass only the narrower `GH_CONFIG_DIR` capability.
+pub fn github_environment() -> BTreeMap<OsString, OsString> {
+    let mut environment = BTreeMap::new();
+    for name in [
+        "PATH",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "NO_COLOR",
+        "LANG",
+        "LC_ALL",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            environment.insert(OsString::from(name), value);
+        }
+    }
+    let config_dir = std::env::var_os("GH_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME").map(|path| PathBuf::from(path).join("gh")))
+        .or_else(|| std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".config/gh")));
+    if let Some(config_dir) = config_dir {
+        environment.insert(OsString::from("GH_CONFIG_DIR"), config_dir.into_os_string());
+    }
+    environment
+}
 
 /// Explicit process input. No shell is involved and the inherited environment is cleared.
 #[derive(Debug, Clone)]

@@ -188,6 +188,29 @@ fn exact_authenticated_apply_argv_records_complete_immediate_readback() {
 }
 
 #[test]
+fn authenticated_apply_bootstraps_an_absent_release_environment() {
+    let root = fixture();
+    copy_decisions(root.path());
+    install_fake_gh_with_environment_state(
+        root.path(),
+        approved_rulesets(),
+        approved_environment(),
+        false,
+    );
+    let evidence = root.path().join("repository-controls-evidence.json");
+
+    let output = authenticated_gate(root.path(), &evidence);
+
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(
+        output.stdout,
+        b"Release repository controls applied and verified\n"
+    );
+    assert!(output.stderr.is_empty());
+    assert!(evidence.exists());
+}
+
+#[test]
 fn authenticated_apply_rejects_partial_or_authority_widening_readback() {
     let root = fixture();
     copy_decisions(root.path());
@@ -321,8 +344,41 @@ fn authenticated_gate(root: &Path, evidence: &Path) -> Output {
 }
 
 fn install_fake_gh(root: &Path, rulesets: &str, environment: &str) {
+    install_fake_gh_with_environment_state(root, rulesets, environment, true);
+}
+
+fn install_fake_gh_with_environment_state(
+    root: &Path,
+    rulesets: &str,
+    environment: &str,
+    environment_initially_present: bool,
+) {
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("fake executable directory");
+    let parsed_rulesets: Vec<Value> =
+        serde_json::from_str(rulesets).expect("fake rulesets must be JSON");
+    let summaries = parsed_rulesets
+        .iter()
+        .map(|ruleset| {
+            serde_json::json!({
+                "id": ruleset["id"],
+                "name": ruleset["name"],
+                "target": ruleset["target"],
+                "enforcement": ruleset["enforcement"],
+            })
+        })
+        .collect::<Vec<_>>();
+    let ruleset_detail_cases = parsed_rulesets
+        .iter()
+        .map(|ruleset| {
+            format!(
+                "  repos/rustpunk/clinker/rulesets/{}) printf '%s\\n' '{}' ;;",
+                ruleset["id"].as_u64().expect("fake ruleset id"),
+                serde_json::to_string(ruleset).expect("serialize fake ruleset")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let script = format!(
         r#"#!/usr/bin/env bash
 set -euo pipefail
@@ -344,11 +400,19 @@ case "$endpoint" in
   users/rustpunk) printf '{{"id":7,"login":"rustpunk"}}\n' ;;
   users/reviewer) printf '{{"id":8,"login":"reviewer"}}\n' ;;
   apps/github-actions) printf '{{"id":15368,"slug":"github-actions"}}\n' ;;
-  repos/rustpunk/clinker/rulesets*)
+  repos/rustpunk/clinker/rulesets\?*)
     if [[ -f "$state" ]]; then
-      printf '%s\n' '{rulesets}'
+      printf '%s\n' '{ruleset_summaries}'
     else
       printf '[]\n'
+    fi
+    ;;
+{ruleset_detail_cases}
+  repos/rustpunk/clinker/environments\?*)
+    if [[ -f "$state" || "{environment_initially_present}" == true ]]; then
+      printf '{{"total_count":1,"environments":[{{"name":"release"}}]}}\n'
+    else
+      printf '{{"total_count":0,"environments":[]}}\n'
     fi
     ;;
   repos/rustpunk/clinker/environments/release) printf '%s\n' '{environment}' ;;
@@ -358,9 +422,12 @@ case "$endpoint" in
   *) printf 'unexpected fake gh endpoint: %s\n' "$endpoint" >&2; exit 9 ;;
 esac
 "#,
-        rulesets = rulesets,
+        ruleset_summaries =
+            serde_json::to_string(&summaries).expect("serialize fake ruleset summaries"),
+        ruleset_detail_cases = ruleset_detail_cases,
         environment = environment,
         branch_policies = r#"{"total_count":1,"branch_policies":[{"name":"v*.*.*","type":"tag"}]}"#,
+        environment_initially_present = environment_initially_present,
     );
     let path = bin.join("gh");
     fs::write(&path, script).expect("fake gh executable");
@@ -370,7 +437,7 @@ esac
 }
 
 fn approved_rulesets() -> &'static str {
-    r#"[{"id":11,"name":"Clinker protected main","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":7,"actor_type":"User","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/heads/main"],"exclude":[]}},"rules":[{"type":"required_linear_history"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true,"do_not_enforce_on_create":false,"required_status_checks":[{"context":"Dependency policy","integration_id":15368},{"context":"Release policy","integration_id":15368},{"context":"check","integration_id":15368},{"context":"cross-platform","integration_id":15368},{"context":"deny","integration_id":15368},{"context":"filesystem-matrix (linux-nfsv4.1-loopback-ci)","integration_id":15368},{"context":"filesystem-matrix (linux-smb3.1.1-loopback-ci)","integration_id":15368},{"context":"test-macos","integration_id":15368},{"context":"test-windows","integration_id":15368}]}},{"type":"pull_request","parameters":{"required_approving_review_count":1,"dismiss_stale_reviews_on_push":false,"require_code_owner_review":true,"require_last_push_approval":true,"required_review_thread_resolution":true,"allowed_merge_methods":["squash"]}}]},{"id":12,"name":"Clinker protected release tags","target":"tag","enforcement":"active","bypass_actors":[{"actor_id":7,"actor_type":"User","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/tags/v*.*.*"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"},{"type":"non_fast_forward"}]}]"#
+    r#"[{"id":11,"name":"Clinker protected main","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":7,"actor_type":"User","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/heads/main"],"exclude":[]}},"rules":[{"type":"required_linear_history"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true,"do_not_enforce_on_create":false,"required_status_checks":[{"context":"Dependency policy","integration_id":15368},{"context":"Release policy","integration_id":15368},{"context":"check","integration_id":15368},{"context":"cross-platform","integration_id":15368},{"context":"deny","integration_id":15368},{"context":"filesystem-matrix (linux-nfsv4.1-loopback-ci)","integration_id":15368},{"context":"filesystem-matrix (linux-smb3.1.1-loopback-ci)","integration_id":15368},{"context":"test-macos","integration_id":15368},{"context":"test-windows","integration_id":15368}]}},{"type":"pull_request","parameters":{"required_approving_review_count":1,"dismiss_stale_reviews_on_push":false,"require_code_owner_review":true,"require_last_push_approval":true,"required_review_thread_resolution":true,"required_reviewers":[],"allowed_merge_methods":["squash"]}}]},{"id":12,"name":"Clinker protected release tags","target":"tag","enforcement":"active","bypass_actors":[{"actor_id":7,"actor_type":"User","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["refs/tags/v*.*.*"],"exclude":[]}},"rules":[{"type":"creation"},{"type":"update"},{"type":"deletion"},{"type":"non_fast_forward"}]}]"#
 }
 
 fn broadened_rulesets() -> &'static str {
@@ -378,11 +445,11 @@ fn broadened_rulesets() -> &'static str {
 }
 
 fn approved_environment() -> &'static str {
-    r#"{"name":"release","protection_rules":[{"type":"required_reviewers","prevent_self_review":false,"reviewers":[{"type":"User","reviewer":{"id":7,"login":"rustpunk"}}]}],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}"#
+    r#"{"name":"release","protection_rules":[{"type":"required_reviewers","prevent_self_review":false,"reviewers":[{"type":"User","reviewer":{"id":7,"login":"rustpunk"}}]},{"type":"branch_policy"}],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}"#
 }
 
 fn two_person_environment() -> &'static str {
-    r#"{"name":"release","protection_rules":[{"type":"required_reviewers","prevent_self_review":true,"reviewers":[{"type":"User","reviewer":{"id":7,"login":"rustpunk"}},{"type":"User","reviewer":{"id":8,"login":"reviewer"}}]}],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}"#
+    r#"{"name":"release","protection_rules":[{"type":"required_reviewers","prevent_self_review":true,"reviewers":[{"type":"User","reviewer":{"id":7,"login":"rustpunk"}},{"type":"User","reviewer":{"id":8,"login":"reviewer"}}]},{"type":"branch_policy"}],"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}"#
 }
 
 fn json_array(values: &[&str]) -> Value {
