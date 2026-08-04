@@ -3,15 +3,19 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use clinker_exec::output::attempt::{
-    ARTIFACT_MAX_ENCODED_BYTES, ArtifactKind, ArtifactManifest, ArtifactRegistration,
-    ArtifactState, AttemptFault, AttemptManifest, AttemptPublication, AttemptState,
-    AttemptTestStage, CleanupDisposition, MANIFEST_MAX_ARTIFACTS, MANIFEST_MAX_BYTES,
-    PUBLICATION_COPY_BUFFER_BYTES, SanitizedPathOptIn,
+    ARTIFACT_MAX_ENCODED_BYTES, ATTEMPT_EDGE_OUTCOME_TAXONOMY, ATTEMPT_PUBLICATION_PROHIBITIONS,
+    ArtifactKind, ArtifactManifest, ArtifactRegistration, ArtifactState, AttemptContinuation,
+    AttemptFault, AttemptManifest, AttemptPublication, AttemptQuery, AttemptState,
+    AttemptTestStage, CleanupDebtKind, CleanupDisposition, MANIFEST_MAX_ARTIFACTS,
+    MANIFEST_MAX_BYTES, PUBLICATION_COPY_BUFFER_BYTES, PurgeDisposition, SanitizedPathOptIn,
 };
 use clinker_exec::output::containment::PromotionDisposition;
 use clinker_exec::output::staging::{OutputStagingRegistry, PublicationOutcome};
 use clinker_exec::pipeline::shutdown::ShutdownToken;
-use clinker_plan::config::{ClinkerToml, PublicationMode, ResolvedPublicationPolicy};
+use clinker_plan::config::{
+    ClinkerToml, CompileContext, PublicationMode, ResolvedPublicationPolicy, load_config_from_str,
+};
+use clinker_plan::plan::CompiledPlan;
 use clinker_plan::security::{ValidatedPath, validate_path};
 
 const EXECUTION_ID: &str = "018f47a2-9a41-7a27-b4d6-4f7137e3c159";
@@ -47,6 +51,56 @@ fn resolved_policy(
         .publication
         .resolve(destination_root, estimated_attempt_bytes, 8_000_000_000)
         .expect("resolve publication fixture")
+}
+
+fn bounded_policy(
+    destination_root: &Path,
+    failed_retention_seconds: u64,
+    entry_limit: u64,
+    byte_limit: u64,
+    time_limit_ms: u64,
+) -> ResolvedPublicationPolicy {
+    let config = format!(
+        "[storage.publication]\nfailed_retention_seconds = {failed_retention_seconds}\nsweep_entry_limit = {entry_limit}\nsweep_byte_limit = \"{byte_limit}B\"\nsweep_time_limit_ms = {time_limit_ms}\n"
+    );
+    ClinkerToml::parse(&config)
+        .expect("parse bounded publication fixture")
+        .storage
+        .publication
+        .resolve(destination_root, 1, 8_000_000_000)
+        .expect("resolve bounded publication fixture")
+}
+
+fn compiled_plan(name: &str) -> CompiledPlan {
+    let yaml = format!(
+        r#"pipeline:
+  name: {name}
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: input.csv
+      schema: [{{ name: id, type: int }}]
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: output.csv
+"#
+    );
+    load_config_from_str(&yaml)
+        .expect("load query plan")
+        .compile(&CompileContext::default())
+        .expect("compile query plan")
+}
+
+fn query(root: &Path, policy: &ResolvedPublicationPolicy, name: &str) -> AttemptQuery {
+    AttemptQuery::new(&compiled_plan(name), policy, vec![validated(root, ".")])
+        .expect("construct attempt query")
 }
 
 fn registration(
@@ -727,8 +781,21 @@ fn anchored_cleanup_rejects_linked_artifacts_without_mutating_outside_data() {
             .disposition(),
         CleanupDisposition::Kept
     );
-    assert_eq!(std::fs::read(outside_canary).unwrap(), b"outside");
+    assert_eq!(std::fs::read(&outside_canary).unwrap(), b"outside");
     assert!(attempt_root.exists());
+
+    let policy = bounded_policy(root.path(), 0, 1_000, 8_000_000_000, 2_000);
+    let query = query(root.path(), &policy, "linked_purge_refusal");
+    let root_id = query.owned_root_ids()[0].to_owned();
+    let request = query
+        .purge_execution(&root_id, EXECUTION_ID)
+        .expect("typed linked-attempt selector");
+    let report = query
+        .execute(&request, 400_000, None, &ShutdownToken::detached())
+        .expect("linked artifact remains a keep outcome");
+    assert_eq!(report.disposition(), PurgeDisposition::Kept);
+    assert_eq!(std::fs::read(outside_canary).unwrap(), b"outside");
+    assert!(attempt_root.join("manifest.json").exists());
 }
 
 #[test]
@@ -784,6 +851,475 @@ fn orphan_cleanup_is_metadata_last_and_idempotent() {
     let repeated = AttemptPublication::cleanup(validated(root.path(), "."), EXECUTION_ID, 400_000)
         .expect("idempotent cleanup");
     assert_eq!(repeated.disposition(), CleanupDisposition::AlreadyAbsent);
+}
+
+#[test]
+fn bounded_attempt_listing_stops_at_exact_entry_byte_and_monotonic_time_limits() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let attempt = begin(root.path());
+    drop(attempt);
+
+    let entry_policy = bounded_policy(root.path(), 86_400, 1, 8_000_000_000, 2_000);
+    let entry_query = query(root.path(), &entry_policy, "entry_budget");
+    let root_id = entry_query.owned_root_ids()[0].to_owned();
+    let entry_page = entry_query
+        .list(&root_id, 400_000, None)
+        .expect("bounded entry listing");
+    assert_eq!(entry_page.considered_entries(), 1);
+    assert!(entry_page.considered_bytes() <= entry_policy.sweep_byte_limit());
+    assert!(entry_page.continuation().is_some());
+    assert!(
+        entry_page
+            .cleanup_debt()
+            .iter()
+            .any(|debt| debt.kind() == CleanupDebtKind::EntryBudget)
+    );
+
+    let byte_policy = bounded_policy(root.path(), 86_400, 1_000, 1, 2_000);
+    let byte_query = query(root.path(), &byte_policy, "byte_budget");
+    let root_id = byte_query.owned_root_ids()[0].to_owned();
+    let byte_page = byte_query
+        .list(&root_id, 400_000, None)
+        .expect("bounded byte listing");
+    assert!(byte_page.considered_bytes() <= 1);
+    assert!(
+        byte_page
+            .cleanup_debt()
+            .iter()
+            .any(|debt| debt.kind() == CleanupDebtKind::ByteBudget)
+    );
+
+    let time_policy = bounded_policy(root.path(), 86_400, 1_000, 8_000_000_000, 2);
+    let time_query = query(root.path(), &time_policy, "time_budget");
+    let root_id = time_query.owned_root_ids()[0].to_owned();
+    let mut ticks = [0, 0, 2, 2].into_iter();
+    let time_page = time_query
+        .list_with_elapsed(&root_id, 400_000, None, || ticks.next().unwrap_or(2))
+        .expect("deterministic monotonic time listing");
+    assert_eq!(time_page.elapsed_ms(), 2);
+    assert!(
+        time_page
+            .cleanup_debt()
+            .iter()
+            .any(|debt| debt.kind() == CleanupDebtKind::TimeBudget)
+    );
+}
+
+#[test]
+fn continuation_is_versioned_plan_root_selector_bound_and_single_use() {
+    let first = tempfile::tempdir().expect("first destination");
+    let second = tempfile::tempdir().expect("second destination");
+    let first_attempt = begin(first.path());
+    drop(first_attempt);
+    let policy = bounded_policy(first.path(), 86_400, 1, 8_000_000_000, 2_000);
+    let query = AttemptQuery::new(
+        &compiled_plan("continuation_binding"),
+        &policy,
+        vec![validated(first.path(), "."), validated(second.path(), ".")],
+    )
+    .expect("construct multi-root query");
+    let roots = query
+        .owned_root_ids()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let (first_root, page) = roots
+        .iter()
+        .find_map(|root_id| {
+            let page = query.list(root_id, 400_000, None).ok()?;
+            if page.continuation().is_some() {
+                Some((root_id.to_owned(), page))
+            } else {
+                None
+            }
+        })
+        .expect("one owned root contains the bounded attempt");
+    let second_root = roots
+        .into_iter()
+        .find(|root_id| root_id != &first_root)
+        .expect("second owned root");
+    let continuation = page.continuation().expect("entry budget continuation");
+    let bytes = continuation.to_bytes().expect("canonical continuation");
+    let decoded = AttemptContinuation::from_bytes(&bytes).expect("versioned continuation");
+
+    assert!(query.list(&second_root, 400_000, Some(&decoded)).is_err());
+
+    let altered_plan = AttemptQuery::new(
+        &compiled_plan("altered_continuation_binding"),
+        &policy,
+        vec![validated(first.path(), ".")],
+    )
+    .expect("construct altered-plan query");
+    let altered_root = altered_plan.owned_root_ids()[0].to_owned();
+    assert!(
+        altered_plan
+            .list(&altered_root, 400_000, Some(&decoded))
+            .is_err()
+    );
+
+    let altered_cursor = String::from_utf8(bytes.clone())
+        .expect("continuation UTF-8")
+        .replacen(EXECUTION_ID, "018f47a2-9a41-7a27-b4d6-4f7137e3c158", 1);
+    assert!(AttemptContinuation::from_bytes(altered_cursor.as_bytes()).is_err());
+
+    let stale = String::from_utf8(bytes)
+        .expect("continuation UTF-8")
+        .replacen("clinker.attempt-continuation/v1", "unsupported", 1);
+    assert!(AttemptContinuation::from_bytes(stale.as_bytes()).is_err());
+
+    query
+        .list(&first_root, 400_000, Some(&decoded))
+        .expect("first continuation use");
+    assert!(query.list(&first_root, 400_000, Some(&decoded)).is_err());
+}
+
+#[test]
+fn inspection_is_path_free_and_reports_owned_manifest_truth_and_ambiguity() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let registry = OutputStagingRegistry::default();
+    let mut attempt = begin(root.path());
+    let artifact_id = stage_ready(&mut attempt, &registry, root.path(), b"retained bytes");
+    let attempt_path = attempt.attempt_root().to_path_buf();
+    drop(attempt);
+    let policy = bounded_policy(root.path(), 86_400, 1_000, 8_000_000_000, 2_000);
+    let query = query(root.path(), &policy, "inspect_truth");
+    let root_id = query.owned_root_ids()[0].to_owned();
+
+    let inspection = query
+        .inspect(&root_id, EXECUTION_ID, 400_000)
+        .expect("inspect retained attempt");
+    assert_eq!(inspection.execution_id(), EXECUTION_ID);
+    assert_eq!(inspection.state(), Some(AttemptState::Ready));
+    assert_eq!(inspection.created_unix_ms(), Some(1_000));
+    assert_eq!(inspection.eligible_after_unix_ms(), Some(301_000));
+    assert_eq!(inspection.artifact_ids(), &[artifact_id]);
+    assert!(inspection.cleanup_debt().is_empty());
+    assert!(!format!("{inspection:?}").contains(&attempt_path.display().to_string()));
+    assert_eq!(
+        inspection.physical_path_for_sanitized_output(SanitizedPathOptIn),
+        Some(attempt_path.as_path())
+    );
+
+    std::fs::write(attempt_path.join("unknown-child"), b"unrelated")
+        .expect("unknown child fixture");
+    let ambiguous = query
+        .inspect(&root_id, EXECUTION_ID, 400_000)
+        .expect("ambiguous inspection remains reportable");
+    assert_eq!(ambiguous.disposition(), CleanupDisposition::Kept);
+    assert!(
+        ambiguous
+            .cleanup_debt()
+            .iter()
+            .any(|debt| debt.kind() == CleanupDebtKind::UnknownChild)
+    );
+    assert!(attempt_path.join("unknown-child").exists());
+}
+
+#[test]
+fn malformed_linked_and_rollback_clock_attempts_are_kept_and_reported() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let malformed_id = "018f47a2-9a41-7a27-b4d6-4f7137e3c161";
+    let malformed_root = root.path().join(".clinker-attempts").join(malformed_id);
+    std::fs::create_dir_all(&malformed_root).expect("malformed attempt root");
+    std::fs::write(malformed_root.join("live.lock"), b"").expect("lock fixture");
+    std::fs::write(malformed_root.join("manifest.json"), b"{").expect("malformed fixture");
+    let policy = bounded_policy(root.path(), 86_400, 1_000, 8_000_000_000, 2_000);
+    let query = query(root.path(), &policy, "ambiguous_truth");
+    let root_id = query.owned_root_ids()[0].to_owned();
+
+    let malformed = query
+        .inspect(&root_id, malformed_id, 400_000)
+        .expect("malformed attempt is a keep outcome");
+    assert!(
+        malformed
+            .cleanup_debt()
+            .iter()
+            .any(|debt| debt.kind() == CleanupDebtKind::InvalidManifest)
+    );
+    let list = query
+        .list(&root_id, 400_000, None)
+        .expect("malformed ownership remains path-free list debt");
+    assert!(list.entries().is_empty());
+    assert!(
+        list.cleanup_debt()
+            .iter()
+            .any(|debt| debt.kind() == CleanupDebtKind::InvalidManifest)
+    );
+
+    let future_id = "018f47a2-9a41-7a27-b4d6-4f7137e3c162";
+    let future = AttemptPublication::create(validated(root.path(), "."), future_id, 1_000, 301_000)
+        .expect("future-clock fixture");
+    drop(future);
+    let rollback = query
+        .inspect(&root_id, future_id, 500)
+        .expect("rollback clock is a keep outcome");
+    assert!(
+        rollback
+            .cleanup_debt()
+            .iter()
+            .any(|debt| debt.kind() == CleanupDebtKind::ClockAmbiguous)
+    );
+
+    let absent = query
+        .inspect(&root_id, EXECUTION_ID, 500)
+        .expect("missing attempt is still path-confined");
+    assert_eq!(absent.disposition(), CleanupDisposition::AlreadyAbsent);
+    assert!(malformed_root.exists());
+}
+
+#[test]
+fn failed_retention_zero_and_default_are_exact_without_weakening_clock_checks() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let zero = bounded_policy(root.path(), 0, 1_000, 8_000_000_000, 2_000);
+    let default = resolved_policy(root.path(), PublicationMode::Direct, None, 1);
+    assert_eq!(zero.failed_retention_seconds(), 0);
+    assert_eq!(default.failed_retention_seconds(), 86_400);
+    let over_cap = ClinkerToml::parse("[storage.publication]\nfailed_retention_seconds = 604801\n")
+        .expect("parse over-cap fixture")
+        .storage
+        .publication
+        .resolve(root.path(), 1, 8_000_000_000);
+    assert!(over_cap.is_err(), "the seven-day retention cap is exact");
+
+    let manifest = AttemptManifest::new(
+        EXECUTION_ID,
+        1_000,
+        301_000,
+        AttemptState::Abandoned,
+        Vec::new(),
+    )
+    .expect("abandoned manifest");
+    assert!(manifest.to_bytes().is_ok());
+    assert!(AttemptManifest::from_bytes(&manifest.to_bytes().unwrap(), 999).is_err());
+
+    let attempt = begin(root.path());
+    let manifest_path = attempt.manifest_path().to_path_buf();
+    drop(attempt);
+    std::fs::write(&manifest_path, manifest.to_bytes().unwrap()).expect("abandoned fixture");
+    let zero_query = query(root.path(), &zero, "zero_retention");
+    let root_id = zero_query.owned_root_ids()[0].to_owned();
+    let inspection = zero_query
+        .inspect(&root_id, EXECUTION_ID, 1_000)
+        .expect("zero-retention inspection");
+    assert!(inspection.is_eligible());
+    let default_query = query(root.path(), &default, "default_retention");
+    let default_root = default_query.owned_root_ids()[0].to_owned();
+    assert!(
+        !default_query
+            .inspect(&default_root, EXECUTION_ID, 400_000)
+            .expect("default-retention inspection")
+            .is_eligible()
+    );
+    assert!(
+        !default_query
+            .inspect(&default_root, EXECUTION_ID, 86_400_999)
+            .expect("one millisecond before default retention")
+            .is_eligible()
+    );
+    assert!(
+        default_query
+            .inspect(&default_root, EXECUTION_ID, 86_401_000)
+            .expect("exact default retention boundary")
+            .is_eligible()
+    );
+}
+
+#[test]
+fn purge_preview_by_execution_or_expiry_is_bounded_and_non_mutating() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let registry = OutputStagingRegistry::default();
+    let mut attempt = begin(root.path());
+    let artifact_id = stage_ready(&mut attempt, &registry, root.path(), b"preview only");
+    let attempt_root = attempt.attempt_root().to_path_buf();
+    drop(attempt);
+    let policy = bounded_policy(root.path(), 86_400, 1_000, 8_000_000_000, 2_000);
+    let query = query(root.path(), &policy, "purge_preview");
+    let root_id = query.owned_root_ids()[0].to_owned();
+
+    let exact = query
+        .purge_execution(&root_id, EXECUTION_ID)
+        .expect("typed execution purge selector");
+    let exact_preview = query
+        .preview(&exact, 400_000, None)
+        .expect("preview exact execution");
+    assert_eq!(exact_preview.selected_execution_ids(), &[EXECUTION_ID]);
+    assert!(exact_preview.cleanup_debt().is_empty());
+
+    let expired = query
+        .purge_expired(&root_id)
+        .expect("typed expired selector");
+    let expired_preview = query
+        .preview(&expired, 400_000, None)
+        .expect("preview expired attempts");
+    assert_eq!(expired_preview.selected_execution_ids(), &[EXECUTION_ID]);
+    assert!(attempt_root.join("manifest.json").is_file());
+    assert!(attempt_root.join(artifact_id).is_file());
+
+    let expired_report = query
+        .execute(&expired, 400_000, None, &ShutdownToken::detached())
+        .expect("expired execution revalidates and purges within one aggregate budget");
+    assert_eq!(
+        expired_report.disposition(),
+        PurgeDisposition::Removed,
+        "{expired_report:?}"
+    );
+    assert_eq!(expired_report.removed_execution_ids(), &[EXECUTION_ID]);
+    assert!(expired_report.bounds().considered_entries() <= policy.sweep_entry_limit());
+    assert!(expired_report.bounds().considered_bytes() <= policy.sweep_byte_limit());
+    assert!(!attempt_root.exists());
+}
+
+#[test]
+fn purge_is_metadata_last_resumable_and_idempotent_after_partial_progress() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let registry = OutputStagingRegistry::default();
+    let mut attempt = begin(root.path());
+    let (first, mut first_file) = attempt
+        .stage_direct(
+            &registry,
+            validated(root.path(), "result.bin"),
+            "primary-output",
+            "result.bin",
+            PromotionDisposition::Replace,
+        )
+        .expect("first direct artifact");
+    let (second, mut second_file) = attempt
+        .stage_direct(
+            &registry,
+            validated(root.path(), "second.bin"),
+            "secondary-output",
+            "second.bin",
+            PromotionDisposition::Replace,
+        )
+        .expect("second direct artifact");
+    first_file.write_all(b"first").expect("first bytes");
+    second_file.write_all(b"second").expect("second bytes");
+    drop(first_file);
+    drop(second_file);
+    attempt.mark_ready(&first).expect("first ready");
+    attempt.mark_ready(&second).expect("second ready");
+    let attempt_root = attempt.attempt_root().to_path_buf();
+    drop(attempt);
+
+    let policy = bounded_policy(root.path(), 86_400, 1_000, 8_000_000_000, 2);
+    let query = query(root.path(), &policy, "partial_purge");
+    let root_id = query.owned_root_ids()[0].to_owned();
+    let request = query
+        .purge_execution(&root_id, EXECUTION_ID)
+        .expect("typed purge request");
+    let shutdown = ShutdownToken::detached();
+    let mut calls = 0_u64;
+    let partial = query
+        .execute_with_elapsed(&request, 400_000, None, &shutdown, || {
+            calls += 1;
+            if calls <= 7 { 0 } else { 2 }
+        })
+        .expect("bounded partial purge");
+    assert_eq!(partial.disposition(), PurgeDisposition::Partial);
+    assert_eq!(partial.removed_artifact_count(), 1);
+    assert_eq!(partial.kept_execution_ids(), &[EXECUTION_ID]);
+    assert!(partial.continuation().is_some());
+    assert!(attempt_root.join("manifest.json").is_file());
+    assert!(attempt_root.join("live.lock").is_file());
+    assert_ne!(
+        attempt_root.join(&first).exists(),
+        attempt_root.join(&second).exists(),
+        "exactly one owned artifact should be removed before the time stop"
+    );
+
+    let continuation = partial.continuation().expect("partial continuation");
+    let completed = query
+        .execute(
+            &request,
+            400_000,
+            Some(continuation),
+            &ShutdownToken::detached(),
+        )
+        .expect("retry finishes from durable ownership metadata");
+    assert_eq!(
+        completed.disposition(),
+        PurgeDisposition::Removed,
+        "{completed:?}"
+    );
+    assert!(completed.kept_execution_ids().is_empty());
+    assert!(!attempt_root.exists());
+
+    let repeated = query
+        .execute(&request, 400_000, None, &ShutdownToken::detached())
+        .expect("repeated purge is idempotent");
+    assert_eq!(repeated.disposition(), PurgeDisposition::AlreadyAbsent);
+}
+
+#[test]
+fn purge_never_overrides_live_invalid_linked_or_unknown_ownership() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let policy = bounded_policy(root.path(), 0, 1_000, 8_000_000_000, 2_000);
+    let query = query(root.path(), &policy, "purge_refusals");
+    let root_id = query.owned_root_ids()[0].to_owned();
+    let live = begin(root.path());
+    let request = query
+        .purge_execution(&root_id, EXECUTION_ID)
+        .expect("typed purge request");
+    let live_report = query
+        .execute(&request, 400_000, None, &ShutdownToken::detached())
+        .expect("live attempt is a keep outcome");
+    assert_eq!(live_report.disposition(), PurgeDisposition::Kept);
+    assert_eq!(live_report.kept_execution_ids(), &[EXECUTION_ID]);
+    assert!(
+        live_report
+            .cleanup_debt()
+            .iter()
+            .any(|debt| debt.kind() == CleanupDebtKind::LiveAttempt)
+    );
+    assert!(live.attempt_root().exists());
+    let attempt_root = live.attempt_root().to_path_buf();
+    drop(live);
+
+    std::fs::write(attempt_root.join("unrelated"), b"canary").expect("unknown child");
+    let unknown = query
+        .execute(&request, 400_000, None, &ShutdownToken::detached())
+        .expect("unknown child is a keep outcome");
+    assert_eq!(unknown.disposition(), PurgeDisposition::Kept);
+    assert_eq!(
+        std::fs::read(attempt_root.join("unrelated")).unwrap(),
+        b"canary"
+    );
+    assert!(attempt_root.join("manifest.json").exists());
+}
+
+#[test]
+fn interrupted_purge_keeps_owner_metadata_and_exact_taxonomy_and_prohibitions() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let attempt = begin(root.path());
+    let attempt_root = attempt.attempt_root().to_path_buf();
+    drop(attempt);
+    let policy = bounded_policy(root.path(), 0, 1_000, 8_000_000_000, 2_000);
+    let query = query(root.path(), &policy, "interrupted_purge");
+    let root_id = query.owned_root_ids()[0].to_owned();
+    let request = query
+        .purge_execution(&root_id, EXECUTION_ID)
+        .expect("typed purge request");
+    let shutdown = ShutdownToken::detached();
+    shutdown.request();
+    let report = query
+        .execute(&request, 400_000, None, &shutdown)
+        .expect("interruption is reported, not inferred as success");
+    assert_eq!(report.disposition(), PurgeDisposition::Partial);
+    assert!(attempt_root.join("manifest.json").is_file());
+    assert!(attempt_root.join("live.lock").is_file());
+
+    assert_eq!(
+        ATTEMPT_EDGE_OUTCOME_TAXONOMY,
+        [
+            "cancellation_no_final",
+            "cleanup_liveness",
+            "confinement",
+            "cross_filesystem_no_copy",
+            "rename_visibility",
+            "sync_durability",
+        ]
+    );
+    assert_eq!(ATTEMPT_PUBLICATION_PROHIBITIONS.len(), 5);
 }
 
 #[allow(dead_code)]

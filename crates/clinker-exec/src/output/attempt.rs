@@ -4,9 +4,12 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::Instant;
 
 use clinker_plan::config::{DestinationProfile, PublicationMode, ResolvedPublicationPolicy};
 use clinker_plan::error::PipelineError;
+use clinker_plan::plan::CompiledPlan;
 use clinker_plan::security::{ValidatedPath, validate_path};
 use fs4::FileExt;
 use serde::{Deserialize, Serialize};
@@ -20,6 +23,8 @@ use super::staging::{OutputStagingRegistry, PublicationOutcome};
 use crate::pipeline::shutdown::ShutdownToken;
 
 const MANIFEST_SCHEMA: &str = "clinker.attempt-manifest/v1";
+const CONTINUATION_SCHEMA: &str = "clinker.attempt-continuation/v1";
+const OWNER_METADATA_CURSOR: &str = "owner-metadata-last";
 const PRODUCER_MAX_CHARS: usize = 96;
 const PRODUCER_MAX_ENCODED_BYTES: usize = 192;
 const LOGICAL_MAX_CHARS: usize = 384;
@@ -28,6 +33,25 @@ pub const ARTIFACT_MAX_ENCODED_BYTES: usize = 992;
 pub const MANIFEST_MAX_ARTIFACTS: usize = 4096;
 pub const MANIFEST_MAX_BYTES: usize = 4 * 1024 * 1024;
 pub const PUBLICATION_COPY_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Exact cross-platform outcome vocabulary preserved by publication and cleanup.
+pub const ATTEMPT_EDGE_OUTCOME_TAXONOMY: [&str; 6] = [
+    "cancellation_no_final",
+    "cleanup_liveness",
+    "confinement",
+    "cross_filesystem_no_copy",
+    "rename_visibility",
+    "sync_durability",
+];
+
+/// Shared publication and cleanup prohibitions kept as an executable contract.
+pub const ATTEMPT_PUBLICATION_PROHIBITIONS: [&str; 5] = [
+    "no_visible_final_copy_fallback",
+    "no_automatic_publication_mode_fallback",
+    "no_cross_artifact_set_atomicity_claim",
+    "no_cross_run_staging_sharing",
+    "no_destructive_cleanup_by_raw_path",
+];
 
 /// Managed artifact role within one run-owned publication attempt.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -513,10 +537,150 @@ pub enum CleanupDisposition {
     Kept,
 }
 
+/// Stable reason an attempt remains retained or a bounded query stops.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupDebtKind {
+    /// The entry budget was consumed exactly.
+    EntryBudget,
+    /// The considered-byte budget would be exceeded by the next regular file.
+    ByteBudget,
+    /// The monotonic elapsed-time budget was consumed exactly.
+    TimeBudget,
+    /// The supplied monotonic clock moved backwards.
+    MonotonicClock,
+    /// A live owner still holds the attempt lock.
+    LiveAttempt,
+    /// Ownership metadata was missing or inconsistent.
+    InvalidOwnership,
+    /// The durable manifest was malformed, unsupported, or unreadable.
+    InvalidManifest,
+    /// The attempt contained a child not named by its ownership manifest.
+    UnknownChild,
+    /// A link, reparse point, or other unsupported filesystem object was observed.
+    UnsafeEntry,
+    /// Durable wall-clock evidence was ambiguous.
+    ClockAmbiguous,
+    /// A contained filesystem operation failed conservatively.
+    Operational,
+    /// Cleanup was interrupted after making bounded progress.
+    Interrupted,
+}
+
+/// Path-free, bounded cleanup debt suitable for operator diagnostics.
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CleanupDebt {
+    kind: CleanupDebtKind,
+    detail: &'static str,
+}
+
+impl CleanupDebt {
+    fn new(kind: CleanupDebtKind, detail: &'static str) -> Self {
+        Self { kind, detail }
+    }
+
+    /// Stable debt category.
+    pub fn kind(&self) -> CleanupDebtKind {
+        self.kind
+    }
+
+    /// Bounded path-free explanation.
+    pub fn detail(&self) -> &'static str {
+        self.detail
+    }
+}
+
+/// Versioned opaque cursor for a single bounded selector.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AttemptContinuation {
+    schema: String,
+    plan_hash: [u8; 32],
+    root_identifier: String,
+    selector: String,
+    cursor: Option<String>,
+    binding: [u8; 32],
+}
+
+impl AttemptContinuation {
+    /// Encode a canonical compact continuation.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, AttemptError> {
+        validate_continuation(self)?;
+        serde_json::to_vec(self).map_err(AttemptError::Serialize)
+    }
+
+    /// Decode and validate a versioned canonical continuation.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, AttemptError> {
+        if bytes.len() > 2_048 {
+            return Err(AttemptError::InvalidContinuation(
+                "continuation exceeds its encoded byte limit",
+            ));
+        }
+        let continuation: Self =
+            serde_json::from_slice(bytes).map_err(AttemptError::Deserialize)?;
+        validate_continuation(&continuation)?;
+        if continuation.to_bytes()?.as_slice() != bytes {
+            return Err(AttemptError::InvalidContinuation(
+                "continuation is not in canonical compact form",
+            ));
+        }
+        Ok(continuation)
+    }
+}
+
+/// Exact query bounds consumed by a list, inspection, preview, or purge.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AttemptQueryBounds {
+    considered_entries: u64,
+    considered_bytes: u64,
+    elapsed_ms: u64,
+}
+
+impl AttemptQueryBounds {
+    /// Directory entries visited through retained handles.
+    pub fn considered_entries(&self) -> u64 {
+        self.considered_entries
+    }
+
+    /// Regular-file sizes admitted into the considered-byte budget.
+    pub fn considered_bytes(&self) -> u64 {
+        self.considered_bytes
+    }
+
+    /// Last observed monotonic elapsed time.
+    pub fn elapsed_ms(&self) -> u64 {
+        self.elapsed_ms
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
 pub struct AttemptInspection {
     execution_id: String,
     disposition: CleanupDisposition,
+    state: Option<AttemptState>,
+    created_unix_ms: Option<u64>,
+    eligible_after_unix_ms: Option<u64>,
+    artifact_ids: Vec<String>,
+    cleanup_debt: Vec<CleanupDebt>,
+    bounds: AttemptQueryBounds,
+    physical_path: Option<PathBuf>,
+    eligible: bool,
+}
+
+impl std::fmt::Debug for AttemptInspection {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AttemptInspection")
+            .field("execution_id", &self.execution_id)
+            .field("disposition", &self.disposition)
+            .field("state", &self.state)
+            .field("created_unix_ms", &self.created_unix_ms)
+            .field("eligible_after_unix_ms", &self.eligible_after_unix_ms)
+            .field("artifact_ids", &self.artifact_ids)
+            .field("cleanup_debt", &self.cleanup_debt)
+            .field("bounds", &self.bounds)
+            .field("eligible", &self.eligible)
+            .finish()
+    }
 }
 
 impl AttemptInspection {
@@ -526,6 +690,1876 @@ impl AttemptInspection {
 
     pub fn disposition(&self) -> CleanupDisposition {
         self.disposition
+    }
+
+    /// Durable attempt lifecycle state, when ownership parsed successfully.
+    pub fn state(&self) -> Option<AttemptState> {
+        self.state
+    }
+
+    /// Persisted creation timestamp, when ownership parsed successfully.
+    pub fn created_unix_ms(&self) -> Option<u64> {
+        self.created_unix_ms
+    }
+
+    /// Persisted creation-grace timestamp, when ownership parsed successfully.
+    pub fn eligible_after_unix_ms(&self) -> Option<u64> {
+        self.eligible_after_unix_ms
+    }
+
+    /// Stable logical artifact identities named by the durable manifest.
+    pub fn artifact_ids(&self) -> &[String] {
+        &self.artifact_ids
+    }
+
+    /// Conservative reasons this attempt remains retained.
+    pub fn cleanup_debt(&self) -> &[CleanupDebt] {
+        &self.cleanup_debt
+    }
+
+    /// Exact bounds consumed while producing this inspection.
+    pub fn bounds(&self) -> AttemptQueryBounds {
+        self.bounds
+    }
+
+    /// Whether durable state and the configured policy make this attempt eligible.
+    pub fn is_eligible(&self) -> bool {
+        self.eligible
+    }
+
+    /// Physical attempt path behind explicit sanitized-output opt-in.
+    pub fn physical_path_for_sanitized_output(&self, _opt_in: SanitizedPathOptIn) -> Option<&Path> {
+        self.physical_path.as_deref()
+    }
+}
+
+/// Path-free list entry for one positively identified attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptListEntry {
+    inspection: AttemptInspection,
+}
+
+impl AttemptListEntry {
+    /// Logical execution identity from a supported manifest.
+    pub fn execution_id(&self) -> &str {
+        self.inspection.execution_id()
+    }
+
+    /// Full path-free inspection truth.
+    pub fn inspection(&self) -> &AttemptInspection {
+        &self.inspection
+    }
+}
+
+/// One bounded page of owned attempts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptList {
+    entries: Vec<AttemptListEntry>,
+    continuation: Option<AttemptContinuation>,
+    cleanup_debt: Vec<CleanupDebt>,
+    bounds: AttemptQueryBounds,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PurgeSelector {
+    Execution(String),
+    Expired,
+}
+
+/// Typed purge selector bound to a compiled plan and owned root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PurgeRequest {
+    plan_hash: [u8; 32],
+    root_identifier: String,
+    selector: PurgeSelector,
+}
+
+/// Exact terminal state of one purge invocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PurgeDisposition {
+    /// The selected attempt and its owner metadata were removed.
+    Removed,
+    /// The selected attempt was already absent.
+    AlreadyAbsent,
+    /// Safety or eligibility evidence required retaining the attempt.
+    Kept,
+    /// Bounded work stopped after zero or more safe mutations.
+    Partial,
+}
+
+/// Non-mutating bounded purge selection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PurgePreview {
+    selected_execution_ids: Vec<String>,
+    inspections: Vec<AttemptInspection>,
+    continuation: Option<AttemptContinuation>,
+    cleanup_debt: Vec<CleanupDebt>,
+    bounds: AttemptQueryBounds,
+}
+
+impl PurgePreview {
+    /// Eligible logical executions selected without filesystem mutation.
+    pub fn selected_execution_ids(&self) -> &[String] {
+        &self.selected_execution_ids
+    }
+
+    /// Path-free inspection evidence behind the selection.
+    pub fn inspections(&self) -> &[AttemptInspection] {
+        &self.inspections
+    }
+
+    /// Cursor for the next bounded preview page.
+    pub fn continuation(&self) -> Option<&AttemptContinuation> {
+        self.continuation.as_ref()
+    }
+
+    /// Budget and ambiguity debt encountered during preview.
+    pub fn cleanup_debt(&self) -> &[CleanupDebt] {
+        &self.cleanup_debt
+    }
+
+    /// Exact bounds consumed by preview.
+    pub fn bounds(&self) -> AttemptQueryBounds {
+        self.bounds
+    }
+}
+
+/// Exact bounded result of purge execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PurgeReport {
+    disposition: PurgeDisposition,
+    selected_execution_ids: Vec<String>,
+    removed_execution_ids: Vec<String>,
+    kept_execution_ids: Vec<String>,
+    removed_artifact_count: usize,
+    continuation: Option<AttemptContinuation>,
+    cleanup_debt: Vec<CleanupDebt>,
+    bounds: AttemptQueryBounds,
+}
+
+impl PurgeReport {
+    /// Terminal state of this bounded invocation.
+    pub fn disposition(&self) -> PurgeDisposition {
+        self.disposition
+    }
+
+    /// Logical executions selected by the request.
+    pub fn selected_execution_ids(&self) -> &[String] {
+        &self.selected_execution_ids
+    }
+
+    /// Logical executions fully removed by this invocation.
+    pub fn removed_execution_ids(&self) -> &[String] {
+        &self.removed_execution_ids
+    }
+
+    /// Logical executions retained after this invocation.
+    pub fn kept_execution_ids(&self) -> &[String] {
+        &self.kept_execution_ids
+    }
+
+    /// Owned artifact files removed by this invocation.
+    pub fn removed_artifact_count(&self) -> usize {
+        self.removed_artifact_count
+    }
+
+    /// Cursor required to resume partial bounded cleanup.
+    pub fn continuation(&self) -> Option<&AttemptContinuation> {
+        self.continuation.as_ref()
+    }
+
+    /// Exact retryable cleanup debt.
+    pub fn cleanup_debt(&self) -> &[CleanupDebt] {
+        &self.cleanup_debt
+    }
+
+    /// Exact bounds consumed by execution.
+    pub fn bounds(&self) -> AttemptQueryBounds {
+        self.bounds
+    }
+}
+
+impl AttemptList {
+    /// Positively identified attempts in deterministic logical order.
+    pub fn entries(&self) -> &[AttemptListEntry] {
+        &self.entries
+    }
+
+    /// Cursor for the next bounded page, if traversal stopped early.
+    pub fn continuation(&self) -> Option<&AttemptContinuation> {
+        self.continuation.as_ref()
+    }
+
+    /// Query-level budget or ambiguity debt.
+    pub fn cleanup_debt(&self) -> &[CleanupDebt] {
+        &self.cleanup_debt
+    }
+
+    /// Directory entries visited through retained handles.
+    pub fn considered_entries(&self) -> u64 {
+        self.bounds.considered_entries()
+    }
+
+    /// Regular-file metadata bytes admitted by the query.
+    pub fn considered_bytes(&self) -> u64 {
+        self.bounds.considered_bytes()
+    }
+
+    /// Last monotonic elapsed time observed by the query.
+    pub fn elapsed_ms(&self) -> u64 {
+        self.bounds.elapsed_ms()
+    }
+}
+
+#[derive(Clone, Debug)]
+struct OwnedAttemptRoot {
+    identifier: String,
+    destination: ValidatedPath,
+}
+
+/// Compiled-plan-bound entry point for retained-attempt operations.
+#[derive(Debug)]
+pub struct AttemptQuery {
+    plan_hash: [u8; 32],
+    policy: ResolvedPublicationPolicy,
+    roots: Vec<OwnedAttemptRoot>,
+    consumed_continuations: Mutex<std::collections::BTreeSet<String>>,
+}
+
+impl AttemptQuery {
+    /// Bind retained-attempt operations to one freshly compiled plan, one
+    /// resolved publication policy, and a finite set of validated roots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] when no root is supplied or two roots collapse
+    /// to the same path-free ownership identifier.
+    pub fn new(
+        plan: &CompiledPlan,
+        policy: &ResolvedPublicationPolicy,
+        destination_roots: Vec<ValidatedPath>,
+    ) -> Result<Self, AttemptError> {
+        if destination_roots.is_empty() {
+            return Err(AttemptError::InvalidQuery(
+                "at least one owned root is required",
+            ));
+        }
+        let mut roots = destination_roots
+            .into_iter()
+            .map(|destination| OwnedAttemptRoot {
+                identifier: owned_root_identifier(destination.as_path()),
+                destination,
+            })
+            .collect::<Vec<_>>();
+        roots.sort_by(|left, right| left.identifier.cmp(&right.identifier));
+        if roots
+            .windows(2)
+            .any(|pair| pair[0].identifier == pair[1].identifier)
+        {
+            return Err(AttemptError::InvalidQuery(
+                "owned destination roots must be distinct",
+            ));
+        }
+        Ok(Self {
+            plan_hash: *plan.pipeline_hash(),
+            policy: policy.clone(),
+            roots,
+            consumed_continuations: Mutex::new(std::collections::BTreeSet::new()),
+        })
+    }
+
+    /// Path-free identifiers for the finite roots admitted by this query.
+    pub fn owned_root_ids(&self) -> Vec<&str> {
+        self.roots
+            .iter()
+            .map(|root| root.identifier.as_str())
+            .collect()
+    }
+
+    /// Enumerate a bounded page using a process monotonic clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] for an invalid root or continuation binding.
+    pub fn list(
+        &self,
+        root_identifier: &str,
+        observed_unix_ms: u64,
+        continuation: Option<&AttemptContinuation>,
+    ) -> Result<AttemptList, AttemptError> {
+        let started = Instant::now();
+        self.list_with_elapsed(root_identifier, observed_unix_ms, continuation, || {
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+        })
+    }
+
+    /// Deterministic monotonic-clock form used by embedders and boundary tests.
+    /// Each returned value is elapsed milliseconds since this query began.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] for an invalid root or continuation binding.
+    #[doc(hidden)]
+    pub fn list_with_elapsed<F>(
+        &self,
+        root_identifier: &str,
+        observed_unix_ms: u64,
+        continuation: Option<&AttemptContinuation>,
+        mut elapsed_ms: F,
+    ) -> Result<AttemptList, AttemptError>
+    where
+        F: FnMut() -> u64,
+    {
+        let root = self.root(root_identifier)?;
+        let cursor = self.validate_selector_continuation(root_identifier, "list", continuation)?;
+        let mut budget = QueryBudget::new(&self.policy);
+        budget.observe_time(elapsed_ms())?;
+        let mut list = AttemptList {
+            entries: Vec::new(),
+            continuation: None,
+            cleanup_debt: Vec::new(),
+            bounds: AttemptQueryBounds::default(),
+        };
+
+        let destination = match AnchoredDirectory::open(&root.destination) {
+            Ok(destination) => destination,
+            Err(_) => {
+                list.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::Operational,
+                    "owned root could not be opened through retained handles",
+                ));
+                list.bounds = budget.bounds();
+                return Ok(list);
+            }
+        };
+        let namespace = match destination.open_child(".clinker-attempts") {
+            Ok(namespace) => namespace,
+            Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
+                list.bounds = budget.bounds();
+                return Ok(list);
+            }
+            Err(_) => {
+                list.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::UnsafeEntry,
+                    "attempt namespace failed handle-relative confinement checks",
+                ));
+                list.bounds = budget.bounds();
+                return Ok(list);
+            }
+        };
+        let remaining = budget.remaining_entries_as_usize();
+        let mut namespace_entries = match namespace.bounded_entries(remaining) {
+            Ok(entries) => entries,
+            Err(_) => {
+                list.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::Operational,
+                    "attempt namespace enumeration failed",
+                ));
+                list.bounds = budget.bounds();
+                return Ok(list);
+            }
+        };
+        namespace_entries
+            .entries
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        let mut last_cursor = cursor.clone();
+        for entry in namespace_entries.entries {
+            let Ok(name) = entry.name.into_string() else {
+                list.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::InvalidOwnership,
+                    "attempt namespace contains a non-UTF-8 child",
+                ));
+                continue;
+            };
+            if cursor.as_ref().is_some_and(|cursor| name <= *cursor) {
+                continue;
+            }
+            if let Err(debt) = budget.visit(entry.kind, entry.size_bytes, elapsed_ms()) {
+                list.cleanup_debt.push(debt);
+                list.continuation = Some(self.continuation(root_identifier, "list", last_cursor));
+                list.bounds = budget.bounds();
+                return Ok(list);
+            }
+            last_cursor = Some(name.clone());
+            if entry.kind != ContainedEntryKind::Directory || validate_execution_id(&name).is_err()
+            {
+                list.cleanup_debt.push(CleanupDebt::new(
+                    if matches!(entry.kind, ContainedEntryKind::LinkOrReparse) {
+                        CleanupDebtKind::UnsafeEntry
+                    } else {
+                        CleanupDebtKind::InvalidOwnership
+                    },
+                    "attempt namespace child is not a supported execution directory",
+                ));
+                continue;
+            }
+            let inspection = inspect_owned_attempt(
+                root,
+                &name,
+                observed_unix_ms,
+                &self.policy,
+                &mut budget,
+                &mut elapsed_ms,
+            );
+            if inspection
+                .cleanup_debt
+                .iter()
+                .any(|debt| is_budget_debt(debt.kind))
+            {
+                list.cleanup_debt.extend(
+                    inspection
+                        .cleanup_debt
+                        .iter()
+                        .filter(|debt| is_budget_debt(debt.kind))
+                        .cloned(),
+                );
+                list.continuation =
+                    Some(self.continuation(root_identifier, "list", Some(name.clone())));
+            }
+            if inspection.state.is_some() {
+                list.entries.push(AttemptListEntry { inspection });
+            } else {
+                for debt in inspection.cleanup_debt {
+                    if !list.cleanup_debt.contains(&debt) {
+                        list.cleanup_debt.push(debt);
+                    }
+                }
+            }
+            if list.continuation.is_some() {
+                break;
+            }
+        }
+        if list.continuation.is_none() && !namespace_entries.complete {
+            list.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::EntryBudget,
+                "entry budget stopped attempt namespace enumeration",
+            ));
+            list.continuation = Some(self.continuation(root_identifier, "list", last_cursor));
+        }
+        list.bounds = budget.bounds();
+        Ok(list)
+    }
+
+    /// Inspect one logical execution without mutating its files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] when the root or execution selector is invalid.
+    pub fn inspect(
+        &self,
+        root_identifier: &str,
+        execution_id: &str,
+        observed_unix_ms: u64,
+    ) -> Result<AttemptInspection, AttemptError> {
+        validate_execution_id(execution_id)?;
+        let root = self.root(root_identifier)?;
+        let started = Instant::now();
+        let mut elapsed = || u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let mut budget = QueryBudget::new(&self.policy);
+        budget.observe_time(elapsed())?;
+        budget
+            .visit(ContainedEntryKind::Directory, None, elapsed())
+            .map_err(|_| {
+                AttemptError::InvalidQuery(
+                    "entry or time budget cannot admit the execution selector",
+                )
+            })?;
+        Ok(inspect_owned_attempt(
+            root,
+            execution_id,
+            observed_unix_ms,
+            &self.policy,
+            &mut budget,
+            &mut elapsed,
+        ))
+    }
+
+    /// Create a compiled-plan-bound selector for one logical execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] when the root or execution identity is invalid.
+    pub fn purge_execution(
+        &self,
+        root_identifier: &str,
+        execution_id: &str,
+    ) -> Result<PurgeRequest, AttemptError> {
+        self.root(root_identifier)?;
+        validate_execution_id(execution_id)?;
+        Ok(PurgeRequest {
+            plan_hash: self.plan_hash,
+            root_identifier: root_identifier.to_owned(),
+            selector: PurgeSelector::Execution(execution_id.to_owned()),
+        })
+    }
+
+    /// Create a compiled-plan-bound selector for all policy-expired attempts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] when the root is not owned by this query.
+    pub fn purge_expired(&self, root_identifier: &str) -> Result<PurgeRequest, AttemptError> {
+        self.root(root_identifier)?;
+        Ok(PurgeRequest {
+            plan_hash: self.plan_hash,
+            root_identifier: root_identifier.to_owned(),
+            selector: PurgeSelector::Expired,
+        })
+    }
+
+    /// Select purge candidates with the same bounds as execution and no writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] for a request or continuation not bound to this query.
+    pub fn preview(
+        &self,
+        request: &PurgeRequest,
+        observed_unix_ms: u64,
+        continuation: Option<&AttemptContinuation>,
+    ) -> Result<PurgePreview, AttemptError> {
+        self.validate_request(request)?;
+        let selector = purge_selector_name(&request.selector);
+        let cursor =
+            self.validate_selector_continuation(&request.root_identifier, &selector, continuation)?;
+        match &request.selector {
+            PurgeSelector::Execution(execution_id) => {
+                if cursor.is_some() {
+                    return Err(AttemptError::InvalidContinuation(
+                        "completed execution preview has no continuation cursor",
+                    ));
+                }
+                let inspection =
+                    self.inspect(&request.root_identifier, execution_id, observed_unix_ms)?;
+                let selected_execution_ids = if inspection.is_eligible() {
+                    vec![execution_id.clone()]
+                } else {
+                    Vec::new()
+                };
+                Ok(PurgePreview {
+                    cleanup_debt: inspection.cleanup_debt.clone(),
+                    bounds: inspection.bounds,
+                    inspections: vec![inspection],
+                    selected_execution_ids,
+                    continuation: None,
+                })
+            }
+            PurgeSelector::Expired => {
+                let list_continuation = continuation.map(|continuation| AttemptContinuation {
+                    schema: CONTINUATION_SCHEMA.to_owned(),
+                    plan_hash: continuation.plan_hash,
+                    root_identifier: continuation.root_identifier.clone(),
+                    selector: "list".to_owned(),
+                    cursor: continuation.cursor.clone(),
+                    binding: continuation_binding(
+                        &continuation.plan_hash,
+                        &continuation.root_identifier,
+                        "list",
+                        continuation.cursor.as_deref(),
+                    ),
+                });
+                let list = self.list(
+                    &request.root_identifier,
+                    observed_unix_ms,
+                    list_continuation.as_ref(),
+                )?;
+                let inspections = list
+                    .entries
+                    .into_iter()
+                    .map(|entry| entry.inspection)
+                    .collect::<Vec<_>>();
+                let selected_execution_ids = inspections
+                    .iter()
+                    .filter(|inspection| inspection.is_eligible())
+                    .map(|inspection| inspection.execution_id.clone())
+                    .collect();
+                let next = list.continuation.map(|continuation| {
+                    self.continuation(&request.root_identifier, &selector, continuation.cursor)
+                });
+                Ok(PurgePreview {
+                    selected_execution_ids,
+                    inspections,
+                    continuation: next,
+                    cleanup_debt: list.cleanup_debt,
+                    bounds: list.bounds,
+                })
+            }
+        }
+    }
+
+    /// Execute bounded metadata-last cleanup with a process monotonic clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] for a request or continuation not bound to this query.
+    pub fn execute(
+        &self,
+        request: &PurgeRequest,
+        observed_unix_ms: u64,
+        continuation: Option<&AttemptContinuation>,
+        shutdown: &ShutdownToken,
+    ) -> Result<PurgeReport, AttemptError> {
+        let started = Instant::now();
+        self.execute_with_elapsed(request, observed_unix_ms, continuation, shutdown, || {
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+        })
+    }
+
+    /// Deterministic monotonic-clock form of [`Self::execute`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] for a request or continuation not bound to this query.
+    #[doc(hidden)]
+    pub fn execute_with_elapsed<F>(
+        &self,
+        request: &PurgeRequest,
+        observed_unix_ms: u64,
+        continuation: Option<&AttemptContinuation>,
+        shutdown: &ShutdownToken,
+        mut elapsed_ms: F,
+    ) -> Result<PurgeReport, AttemptError>
+    where
+        F: FnMut() -> u64,
+    {
+        self.validate_request(request)?;
+        match &request.selector {
+            PurgeSelector::Execution(execution_id) => {
+                let selector_name = purge_selector_name(&request.selector);
+                let cursor = self.validate_selector_continuation(
+                    &request.root_identifier,
+                    &selector_name,
+                    continuation,
+                )?;
+                self.execute_one(
+                    request,
+                    execution_id,
+                    observed_unix_ms,
+                    cursor,
+                    shutdown,
+                    &mut elapsed_ms,
+                    AttemptQueryBounds::default(),
+                )
+            }
+            PurgeSelector::Expired => {
+                let preview = self.preview(request, observed_unix_ms, continuation)?;
+                if preview.selected_execution_ids.is_empty() {
+                    return Ok(PurgeReport {
+                        disposition: if preview.continuation.is_some() {
+                            PurgeDisposition::Partial
+                        } else {
+                            PurgeDisposition::Kept
+                        },
+                        selected_execution_ids: Vec::new(),
+                        removed_execution_ids: Vec::new(),
+                        kept_execution_ids: Vec::new(),
+                        removed_artifact_count: 0,
+                        continuation: preview.continuation,
+                        cleanup_debt: preview.cleanup_debt,
+                        bounds: preview.bounds,
+                    });
+                }
+                // Expired sweeps remain finite. Each selected execution is
+                // independently revalidated and locked immediately before mutation.
+                let mut report = PurgeReport {
+                    disposition: if preview.continuation.is_some() {
+                        PurgeDisposition::Partial
+                    } else {
+                        PurgeDisposition::Removed
+                    },
+                    selected_execution_ids: preview.selected_execution_ids.clone(),
+                    removed_execution_ids: Vec::new(),
+                    kept_execution_ids: preview.selected_execution_ids.clone(),
+                    removed_artifact_count: 0,
+                    continuation: preview.continuation,
+                    cleanup_debt: preview.cleanup_debt,
+                    bounds: preview.bounds,
+                };
+                for execution_id in preview.selected_execution_ids {
+                    let exact = self.purge_execution(&request.root_identifier, &execution_id)?;
+                    let child = self.execute_one(
+                        &exact,
+                        &execution_id,
+                        observed_unix_ms,
+                        None,
+                        shutdown,
+                        &mut elapsed_ms,
+                        report.bounds,
+                    )?;
+                    report.removed_artifact_count = report
+                        .removed_artifact_count
+                        .checked_add(child.removed_artifact_count)
+                        .ok_or(AttemptError::InvalidQuery(
+                            "purge artifact accounting overflowed",
+                        ))?;
+                    report
+                        .removed_execution_ids
+                        .extend(child.removed_execution_ids);
+                    let removed = report
+                        .removed_execution_ids
+                        .iter()
+                        .cloned()
+                        .collect::<std::collections::BTreeSet<_>>();
+                    report
+                        .kept_execution_ids
+                        .retain(|kept| !removed.contains(kept));
+                    report.cleanup_debt.extend(child.cleanup_debt);
+                    report.bounds = child.bounds;
+                    if child.disposition != PurgeDisposition::Removed {
+                        report.disposition = child.disposition;
+                        report.continuation = child.continuation;
+                        break;
+                    }
+                }
+                Ok(report)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_one<F>(
+        &self,
+        request: &PurgeRequest,
+        execution_id: &str,
+        observed_unix_ms: u64,
+        cursor: Option<String>,
+        shutdown: &ShutdownToken,
+        elapsed_ms: &mut F,
+        initial_bounds: AttemptQueryBounds,
+    ) -> Result<PurgeReport, AttemptError>
+    where
+        F: FnMut() -> u64,
+    {
+        let root = self.root(&request.root_identifier)?;
+        let selector_name = purge_selector_name(&request.selector);
+        let mut report = PurgeReport {
+            disposition: PurgeDisposition::Kept,
+            selected_execution_ids: vec![execution_id.to_owned()],
+            removed_execution_ids: Vec::new(),
+            kept_execution_ids: vec![execution_id.to_owned()],
+            removed_artifact_count: 0,
+            continuation: None,
+            cleanup_debt: Vec::new(),
+            bounds: AttemptQueryBounds::default(),
+        };
+        let mut budget = QueryBudget::resume(&self.policy, initial_bounds);
+        budget.observe_time(elapsed_ms())?;
+        if let Err(debt) = budget.visit(ContainedEntryKind::Directory, None, elapsed_ms()) {
+            report.disposition = PurgeDisposition::Partial;
+            report.cleanup_debt.push(debt);
+            report.continuation =
+                Some(self.continuation(&request.root_identifier, &selector_name, cursor));
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+        let Some(attempt_root) = (match AttemptRoot::open(&root.destination, execution_id) {
+            Ok(attempt_root) => attempt_root,
+            Err(_) => {
+                report.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::UnsafeEntry,
+                    "execution directory failed handle-relative confinement checks",
+                ));
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+        }) else {
+            report.disposition = PurgeDisposition::AlreadyAbsent;
+            report.kept_execution_ids.clear();
+            report.bounds = budget.bounds();
+            return Ok(report);
+        };
+
+        if cursor.as_deref() == Some(OWNER_METADATA_CURSOR) {
+            let entries = match attempt_root
+                .directory
+                .bounded_entries(budget.remaining_entries_as_usize())
+            {
+                Ok(entries) => entries,
+                Err(_) => {
+                    report.disposition = PurgeDisposition::Partial;
+                    report.cleanup_debt.push(CleanupDebt::new(
+                        CleanupDebtKind::Operational,
+                        "owner-metadata retry enumeration failed",
+                    ));
+                    report.continuation = Some(self.continuation(
+                        &request.root_identifier,
+                        &selector_name,
+                        Some(OWNER_METADATA_CURSOR.to_owned()),
+                    ));
+                    report.bounds = budget.bounds();
+                    return Ok(report);
+                }
+            };
+            if !entries.complete {
+                report.disposition = PurgeDisposition::Partial;
+                report.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::EntryBudget,
+                    "entry budget stopped owner-metadata retry",
+                ));
+                report.continuation = Some(self.continuation(
+                    &request.root_identifier,
+                    &selector_name,
+                    Some(OWNER_METADATA_CURSOR.to_owned()),
+                ));
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+            let mut names = std::collections::BTreeSet::new();
+            for entry in entries.entries {
+                if let Err(debt) = budget.visit(entry.kind, entry.size_bytes, elapsed_ms()) {
+                    report.disposition = PurgeDisposition::Partial;
+                    report.cleanup_debt.push(debt);
+                    report.continuation = Some(self.continuation(
+                        &request.root_identifier,
+                        &selector_name,
+                        Some(OWNER_METADATA_CURSOR.to_owned()),
+                    ));
+                    report.bounds = budget.bounds();
+                    return Ok(report);
+                }
+                let Ok(name) = entry.name.into_string() else {
+                    report.disposition = PurgeDisposition::Partial;
+                    report.cleanup_debt.push(CleanupDebt::new(
+                        CleanupDebtKind::InvalidOwnership,
+                        "owner-metadata retry found a non-UTF-8 child",
+                    ));
+                    report.continuation = Some(self.continuation(
+                        &request.root_identifier,
+                        &selector_name,
+                        Some(OWNER_METADATA_CURSOR.to_owned()),
+                    ));
+                    report.bounds = budget.bounds();
+                    return Ok(report);
+                };
+                if entry.kind != ContainedEntryKind::File {
+                    report.disposition = PurgeDisposition::Partial;
+                    report.cleanup_debt.push(CleanupDebt::new(
+                        CleanupDebtKind::UnsafeEntry,
+                        "owner-metadata retry found an unsafe filesystem entry",
+                    ));
+                    report.continuation = Some(self.continuation(
+                        &request.root_identifier,
+                        &selector_name,
+                        Some(OWNER_METADATA_CURSOR.to_owned()),
+                    ));
+                    report.bounds = budget.bounds();
+                    return Ok(report);
+                }
+                names.insert(name);
+            }
+            if names.is_empty() {
+                if attempt_root.remove_empty().is_err() {
+                    report.disposition = PurgeDisposition::Partial;
+                    report.cleanup_debt.push(CleanupDebt::new(
+                        CleanupDebtKind::Operational,
+                        "empty attempt root could not be removed last",
+                    ));
+                    report.continuation = Some(self.continuation(
+                        &request.root_identifier,
+                        &selector_name,
+                        Some(OWNER_METADATA_CURSOR.to_owned()),
+                    ));
+                    report.bounds = budget.bounds();
+                    return Ok(report);
+                }
+            } else if names == ["live.lock".to_owned()].into_iter().collect() {
+                let lock = match attempt_root.directory.open_file("live.lock") {
+                    Ok(lock) => lock,
+                    Err(_) => {
+                        report.disposition = PurgeDisposition::Partial;
+                        report.cleanup_debt.push(CleanupDebt::new(
+                            CleanupDebtKind::Operational,
+                            "owner-metadata retry could not open the liveness guard",
+                        ));
+                        report.continuation = Some(self.continuation(
+                            &request.root_identifier,
+                            &selector_name,
+                            Some(OWNER_METADATA_CURSOR.to_owned()),
+                        ));
+                        report.bounds = budget.bounds();
+                        return Ok(report);
+                    }
+                };
+                if FileExt::try_lock(&lock).is_err() {
+                    report.disposition = PurgeDisposition::Partial;
+                    report.cleanup_debt.push(CleanupDebt::new(
+                        CleanupDebtKind::LiveAttempt,
+                        "owner-metadata retry found a live writer",
+                    ));
+                    report.continuation = Some(self.continuation(
+                        &request.root_identifier,
+                        &selector_name,
+                        Some(OWNER_METADATA_CURSOR.to_owned()),
+                    ));
+                    report.bounds = budget.bounds();
+                    return Ok(report);
+                }
+                let _ = FileExt::unlock(&lock);
+                drop(lock);
+                if attempt_root.directory.remove_file("live.lock").is_err()
+                    || attempt_root.remove_empty().is_err()
+                {
+                    report.disposition = PurgeDisposition::Partial;
+                    report.cleanup_debt.push(CleanupDebt::new(
+                        CleanupDebtKind::Operational,
+                        "owner metadata or empty attempt root could not be removed last",
+                    ));
+                    report.continuation = Some(self.continuation(
+                        &request.root_identifier,
+                        &selector_name,
+                        Some(OWNER_METADATA_CURSOR.to_owned()),
+                    ));
+                    report.bounds = budget.bounds();
+                    return Ok(report);
+                }
+            } else {
+                report.disposition = PurgeDisposition::Partial;
+                report.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::UnknownChild,
+                    "owner-metadata retry found unrelated attempt contents",
+                ));
+                report.continuation = Some(self.continuation(
+                    &request.root_identifier,
+                    &selector_name,
+                    Some(OWNER_METADATA_CURSOR.to_owned()),
+                ));
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+            report.disposition = PurgeDisposition::Removed;
+            report.removed_execution_ids.push(execution_id.to_owned());
+            report.kept_execution_ids.clear();
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+
+        let lock = match attempt_root.directory.open_file("live.lock") {
+            Ok(lock) => lock,
+            Err(_) => {
+                report.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::InvalidOwnership,
+                    "attempt liveness metadata could not be opened",
+                ));
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+        };
+        if FileExt::try_lock(&lock).is_err() {
+            report.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::LiveAttempt,
+                "attempt liveness lock is held by a writer",
+            ));
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+
+        let mut entries = match attempt_root
+            .directory
+            .bounded_entries(budget.remaining_entries_as_usize())
+        {
+            Ok(entries) => entries,
+            Err(_) => {
+                report.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::Operational,
+                    "attempt directory enumeration failed",
+                ));
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+        };
+        entries
+            .entries
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        let mut observed = BTreeMap::new();
+        for entry in entries.entries {
+            if let Err(debt) = budget.visit(entry.kind, entry.size_bytes, elapsed_ms()) {
+                report.disposition = PurgeDisposition::Partial;
+                report.cleanup_debt.push(debt);
+                report.continuation =
+                    Some(self.continuation(&request.root_identifier, &selector_name, cursor));
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+            let Ok(name) = entry.name.into_string() else {
+                report.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::InvalidOwnership,
+                    "attempt contains a non-UTF-8 child",
+                ));
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            };
+            observed.insert(name, entry.kind);
+        }
+        if !entries.complete {
+            report.disposition = PurgeDisposition::Partial;
+            report.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::EntryBudget,
+                "entry budget stopped purge ownership validation",
+            ));
+            report.continuation =
+                Some(self.continuation(&request.root_identifier, &selector_name, cursor));
+            let _ = FileExt::unlock(&lock);
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+        if observed.get("live.lock") != Some(&ContainedEntryKind::File)
+            || observed.get("manifest.json") != Some(&ContainedEntryKind::File)
+        {
+            report.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::InvalidOwnership,
+                "attempt ownership metadata is missing or invalid",
+            ));
+            let _ = FileExt::unlock(&lock);
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+        let manifest = match read_manifest_from_anchor(&attempt_root.directory, observed_unix_ms) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                report.cleanup_debt.push(manifest_cleanup_debt(&error));
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+        };
+        let expected = manifest
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_id.as_str())
+            .chain(["live.lock", "manifest.json"])
+            .collect::<std::collections::BTreeSet<_>>();
+        let refusal = if manifest.execution_id != execution_id {
+            Some(CleanupDebt::new(
+                CleanupDebtKind::InvalidOwnership,
+                "manifest execution identity does not match the typed selector",
+            ))
+        } else if observed
+            .keys()
+            .any(|name| !expected.contains(name.as_str()))
+        {
+            Some(CleanupDebt::new(
+                CleanupDebtKind::UnknownChild,
+                "attempt contains a child not named by its ownership manifest",
+            ))
+        } else if observed.iter().any(|(name, kind)| {
+            name != "live.lock" && name != "manifest.json" && *kind != ContainedEntryKind::File
+        }) {
+            Some(CleanupDebt::new(
+                CleanupDebtKind::UnsafeEntry,
+                "manifest-owned artifact is a link, reparse point, or unsupported entry",
+            ))
+        } else {
+            None
+        };
+        if let Some(debt) = refusal {
+            report.cleanup_debt.push(debt);
+            let _ = FileExt::unlock(&lock);
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+        match cleanup_eligible(&manifest, observed_unix_ms, &self.policy) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+            Err(debt) => {
+                report.cleanup_debt.push(debt);
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+        }
+
+        let mut last_removed = cursor;
+        for artifact in &manifest.artifacts {
+            if last_removed
+                .as_ref()
+                .is_some_and(|cursor| artifact.artifact_id <= *cursor)
+            {
+                continue;
+            }
+            if shutdown.is_requested() {
+                report.disposition = PurgeDisposition::Partial;
+                report.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::Interrupted,
+                    "cleanup was interrupted with ownership metadata retained",
+                ));
+                report.continuation =
+                    Some(self.continuation(&request.root_identifier, &selector_name, last_removed));
+                let _ = attempt_root.directory.sync();
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+            if let Err(debt) = budget.check_time(elapsed_ms()) {
+                report.disposition = PurgeDisposition::Partial;
+                report.cleanup_debt.push(debt);
+                report.continuation =
+                    Some(self.continuation(&request.root_identifier, &selector_name, last_removed));
+                let _ = attempt_root.directory.sync();
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+            if observed.contains_key(&artifact.artifact_id) {
+                if attempt_root
+                    .directory
+                    .remove_file(&artifact.artifact_id)
+                    .is_err()
+                {
+                    report.disposition = PurgeDisposition::Partial;
+                    report.cleanup_debt.push(CleanupDebt::new(
+                        CleanupDebtKind::Operational,
+                        "owned artifact removal failed with owner metadata retained",
+                    ));
+                    report.continuation = Some(self.continuation(
+                        &request.root_identifier,
+                        &selector_name,
+                        last_removed,
+                    ));
+                    let _ = attempt_root.directory.sync();
+                    let _ = FileExt::unlock(&lock);
+                    report.bounds = budget.bounds();
+                    return Ok(report);
+                }
+                report.removed_artifact_count += 1;
+            }
+            last_removed = Some(artifact.artifact_id.clone());
+        }
+        if shutdown.is_requested() {
+            report.disposition = PurgeDisposition::Partial;
+            report.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::Interrupted,
+                "cleanup was interrupted with ownership metadata retained",
+            ));
+            report.continuation =
+                Some(self.continuation(&request.root_identifier, &selector_name, last_removed));
+            let _ = attempt_root.directory.sync();
+            let _ = FileExt::unlock(&lock);
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+        let final_entries = match attempt_root
+            .directory
+            .bounded_entries(budget.remaining_entries_as_usize())
+        {
+            Ok(entries) => entries,
+            Err(_) => {
+                report.disposition = PurgeDisposition::Partial;
+                report.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::Operational,
+                    "final owner-metadata revalidation failed",
+                ));
+                report.continuation =
+                    Some(self.continuation(&request.root_identifier, &selector_name, last_removed));
+                let _ = attempt_root.directory.sync();
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+        };
+        let final_complete = final_entries.complete;
+        let mut final_names = std::collections::BTreeSet::new();
+        for entry in final_entries.entries {
+            if let Err(debt) = budget.visit(entry.kind, entry.size_bytes, elapsed_ms()) {
+                report.disposition = PurgeDisposition::Partial;
+                report.cleanup_debt.push(debt);
+                report.continuation =
+                    Some(self.continuation(&request.root_identifier, &selector_name, last_removed));
+                let _ = attempt_root.directory.sync();
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+            let Ok(name) = entry.name.into_string() else {
+                report.disposition = PurgeDisposition::Partial;
+                report.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::InvalidOwnership,
+                    "final owner metadata contains a non-UTF-8 child",
+                ));
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            };
+            if entry.kind != ContainedEntryKind::File {
+                report.disposition = PurgeDisposition::Partial;
+                report.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::UnsafeEntry,
+                    "final owner metadata contains an unsafe filesystem entry",
+                ));
+                let _ = FileExt::unlock(&lock);
+                report.bounds = budget.bounds();
+                return Ok(report);
+            }
+            final_names.insert(name);
+        }
+        if !final_complete
+            || final_names
+                != ["live.lock".to_owned(), "manifest.json".to_owned()]
+                    .into_iter()
+                    .collect()
+        {
+            report.disposition = PurgeDisposition::Partial;
+            report.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::UnknownChild,
+                "attempt contents changed before owner metadata removal",
+            ));
+            let _ = FileExt::unlock(&lock);
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+        if attempt_root.directory.sync().is_err()
+            || attempt_root.directory.remove_file("manifest.json").is_err()
+        {
+            report.disposition = PurgeDisposition::Partial;
+            report.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::Operational,
+                "artifact cleanup completed but manifest removal failed",
+            ));
+            report.continuation =
+                Some(self.continuation(&request.root_identifier, &selector_name, last_removed));
+            let _ = FileExt::unlock(&lock);
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+        if attempt_root.directory.sync().is_err() {
+            report.disposition = PurgeDisposition::Partial;
+            report.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::Operational,
+                "manifest removal completed but its directory sync was uncertain",
+            ));
+            report.continuation = Some(self.continuation(
+                &request.root_identifier,
+                &selector_name,
+                Some(OWNER_METADATA_CURSOR.to_owned()),
+            ));
+            let _ = FileExt::unlock(&lock);
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+        let _ = FileExt::unlock(&lock);
+        drop(lock);
+        if attempt_root.directory.remove_file("live.lock").is_err()
+            || attempt_root.remove_empty().is_err()
+        {
+            report.disposition = PurgeDisposition::Partial;
+            report.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::Operational,
+                "owner metadata or empty attempt root could not be removed last",
+            ));
+            report.continuation = Some(self.continuation(
+                &request.root_identifier,
+                &selector_name,
+                Some(OWNER_METADATA_CURSOR.to_owned()),
+            ));
+            report.bounds = budget.bounds();
+            return Ok(report);
+        }
+        report.disposition = PurgeDisposition::Removed;
+        report.removed_execution_ids.push(execution_id.to_owned());
+        report.kept_execution_ids.clear();
+        report.bounds = budget.bounds();
+        Ok(report)
+    }
+
+    fn validate_request(&self, request: &PurgeRequest) -> Result<(), AttemptError> {
+        self.root(&request.root_identifier)?;
+        if request.plan_hash != self.plan_hash {
+            return Err(AttemptError::InvalidQuery(
+                "purge request is not bound to this compiled plan",
+            ));
+        }
+        if let PurgeSelector::Execution(execution_id) = &request.selector {
+            validate_execution_id(execution_id)?;
+        }
+        Ok(())
+    }
+
+    fn root(&self, root_identifier: &str) -> Result<&OwnedAttemptRoot, AttemptError> {
+        self.roots
+            .iter()
+            .find(|root| root.identifier == root_identifier)
+            .ok_or(AttemptError::InvalidQuery(
+                "root identifier is not owned by the compiled query",
+            ))
+    }
+
+    fn continuation(
+        &self,
+        root_identifier: &str,
+        selector: &str,
+        cursor: Option<String>,
+    ) -> AttemptContinuation {
+        let binding = continuation_binding(
+            &self.plan_hash,
+            root_identifier,
+            selector,
+            cursor.as_deref(),
+        );
+        AttemptContinuation {
+            schema: CONTINUATION_SCHEMA.to_owned(),
+            plan_hash: self.plan_hash,
+            root_identifier: root_identifier.to_owned(),
+            selector: selector.to_owned(),
+            cursor,
+            binding,
+        }
+    }
+
+    fn validate_selector_continuation(
+        &self,
+        root_identifier: &str,
+        selector: &str,
+        continuation: Option<&AttemptContinuation>,
+    ) -> Result<Option<String>, AttemptError> {
+        let Some(continuation) = continuation else {
+            return Ok(None);
+        };
+        validate_continuation(continuation)?;
+        if continuation.plan_hash != self.plan_hash
+            || continuation.root_identifier != root_identifier
+            || continuation.selector != selector
+        {
+            return Err(AttemptError::InvalidContinuation(
+                "continuation is not bound to this compiled plan, root, and selector",
+            ));
+        }
+        let token = blake3::hash(&continuation.to_bytes()?).to_hex().to_string();
+        let mut consumed = self
+            .consumed_continuations
+            .lock()
+            .map_err(|_| AttemptError::InvalidContinuation("continuation replay guard failed"))?;
+        if !consumed.insert(token) {
+            return Err(AttemptError::InvalidContinuation(
+                "continuation selector was already consumed",
+            ));
+        }
+        Ok(continuation.cursor.clone())
+    }
+}
+
+#[derive(Debug)]
+struct QueryBudget {
+    entry_limit: u64,
+    byte_limit: u64,
+    time_limit_ms: u64,
+    bounds: AttemptQueryBounds,
+    last_elapsed_ms: Option<u64>,
+}
+
+impl QueryBudget {
+    fn new(policy: &ResolvedPublicationPolicy) -> Self {
+        Self {
+            entry_limit: policy.sweep_entry_limit(),
+            byte_limit: policy.sweep_byte_limit(),
+            time_limit_ms: policy.sweep_time_limit_ms(),
+            bounds: AttemptQueryBounds::default(),
+            last_elapsed_ms: None,
+        }
+    }
+
+    fn resume(policy: &ResolvedPublicationPolicy, bounds: AttemptQueryBounds) -> Self {
+        Self {
+            entry_limit: policy.sweep_entry_limit(),
+            byte_limit: policy.sweep_byte_limit(),
+            time_limit_ms: policy.sweep_time_limit_ms(),
+            bounds,
+            last_elapsed_ms: None,
+        }
+    }
+
+    fn observe_time(&mut self, elapsed_ms: u64) -> Result<(), AttemptError> {
+        if self
+            .last_elapsed_ms
+            .is_some_and(|previous| elapsed_ms < previous)
+        {
+            return Err(AttemptError::InvalidQuery(
+                "monotonic elapsed time moved backwards",
+            ));
+        }
+        self.last_elapsed_ms = Some(elapsed_ms);
+        self.bounds.elapsed_ms = elapsed_ms;
+        Ok(())
+    }
+
+    fn visit(
+        &mut self,
+        kind: ContainedEntryKind,
+        size_bytes: Option<u64>,
+        elapsed_ms: u64,
+    ) -> Result<(), CleanupDebt> {
+        if self
+            .last_elapsed_ms
+            .is_some_and(|previous| elapsed_ms < previous)
+        {
+            return Err(CleanupDebt::new(
+                CleanupDebtKind::MonotonicClock,
+                "monotonic elapsed time moved backwards",
+            ));
+        }
+        self.last_elapsed_ms = Some(elapsed_ms);
+        self.bounds.elapsed_ms = elapsed_ms;
+        if elapsed_ms >= self.time_limit_ms {
+            return Err(CleanupDebt::new(
+                CleanupDebtKind::TimeBudget,
+                "monotonic time budget stopped the query",
+            ));
+        }
+        if self.bounds.considered_entries == self.entry_limit {
+            return Err(CleanupDebt::new(
+                CleanupDebtKind::EntryBudget,
+                "entry budget stopped the query",
+            ));
+        }
+        self.bounds.considered_entries =
+            self.bounds
+                .considered_entries
+                .checked_add(1)
+                .ok_or_else(|| {
+                    CleanupDebt::new(
+                        CleanupDebtKind::EntryBudget,
+                        "entry accounting overflow stopped the query",
+                    )
+                })?;
+        if kind == ContainedEntryKind::File {
+            let bytes = size_bytes.ok_or_else(|| {
+                CleanupDebt::new(
+                    CleanupDebtKind::Operational,
+                    "regular-file metadata omitted its byte length",
+                )
+            })?;
+            let next = self
+                .bounds
+                .considered_bytes
+                .checked_add(bytes)
+                .ok_or_else(|| {
+                    CleanupDebt::new(
+                        CleanupDebtKind::ByteBudget,
+                        "considered-byte accounting overflow stopped the query",
+                    )
+                })?;
+            if next > self.byte_limit {
+                return Err(CleanupDebt::new(
+                    CleanupDebtKind::ByteBudget,
+                    "considered-byte budget stopped the query",
+                ));
+            }
+            self.bounds.considered_bytes = next;
+        }
+        Ok(())
+    }
+
+    fn check_time(&mut self, elapsed_ms: u64) -> Result<(), CleanupDebt> {
+        if self
+            .last_elapsed_ms
+            .is_some_and(|previous| elapsed_ms < previous)
+        {
+            return Err(CleanupDebt::new(
+                CleanupDebtKind::MonotonicClock,
+                "monotonic elapsed time moved backwards",
+            ));
+        }
+        self.last_elapsed_ms = Some(elapsed_ms);
+        self.bounds.elapsed_ms = elapsed_ms;
+        if elapsed_ms >= self.time_limit_ms {
+            Err(CleanupDebt::new(
+                CleanupDebtKind::TimeBudget,
+                "monotonic time budget stopped cleanup",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn remaining_entries_as_usize(&self) -> usize {
+        usize::try_from(
+            self.entry_limit
+                .saturating_sub(self.bounds.considered_entries),
+        )
+        .unwrap_or(usize::MAX)
+    }
+
+    fn bounds(&self) -> AttemptQueryBounds {
+        self.bounds
+    }
+}
+
+fn inspect_owned_attempt<F>(
+    root: &OwnedAttemptRoot,
+    execution_id: &str,
+    observed_unix_ms: u64,
+    policy: &ResolvedPublicationPolicy,
+    budget: &mut QueryBudget,
+    elapsed_ms: &mut F,
+) -> AttemptInspection
+where
+    F: FnMut() -> u64,
+{
+    let mut inspection = AttemptInspection {
+        execution_id: execution_id.to_owned(),
+        disposition: CleanupDisposition::Kept,
+        state: None,
+        created_unix_ms: None,
+        eligible_after_unix_ms: None,
+        artifact_ids: Vec::new(),
+        cleanup_debt: Vec::new(),
+        bounds: budget.bounds(),
+        physical_path: None,
+        eligible: false,
+    };
+    let attempt_root = match AttemptRoot::open(&root.destination, execution_id) {
+        Ok(Some(attempt_root)) => attempt_root,
+        Ok(None) => {
+            inspection.disposition = CleanupDisposition::AlreadyAbsent;
+            inspection.bounds = budget.bounds();
+            return inspection;
+        }
+        Err(_) => {
+            inspection.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::UnsafeEntry,
+                "execution directory failed handle-relative confinement checks",
+            ));
+            inspection.bounds = budget.bounds();
+            return inspection;
+        }
+    };
+    inspection.physical_path = Some(attempt_root.path.clone());
+    let mut entries = match attempt_root
+        .directory
+        .bounded_entries(budget.remaining_entries_as_usize())
+    {
+        Ok(entries) => entries,
+        Err(_) => {
+            inspection.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::Operational,
+                "attempt directory enumeration failed",
+            ));
+            inspection.bounds = budget.bounds();
+            return inspection;
+        }
+    };
+    entries
+        .entries
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    let mut observed = BTreeMap::new();
+    for entry in entries.entries {
+        if let Err(debt) = budget.visit(entry.kind, entry.size_bytes, elapsed_ms()) {
+            inspection.cleanup_debt.push(debt);
+            inspection.bounds = budget.bounds();
+            return inspection;
+        }
+        let Ok(name) = entry.name.into_string() else {
+            inspection.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::InvalidOwnership,
+                "attempt contains a non-UTF-8 child",
+            ));
+            continue;
+        };
+        if observed.insert(name, entry.kind).is_some() {
+            inspection.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::InvalidOwnership,
+                "attempt contains duplicate child identities",
+            ));
+        }
+    }
+    if !entries.complete {
+        inspection.cleanup_debt.push(CleanupDebt::new(
+            CleanupDebtKind::EntryBudget,
+            "entry budget stopped attempt inspection",
+        ));
+        inspection.bounds = budget.bounds();
+        return inspection;
+    }
+    if observed.get("live.lock") != Some(&ContainedEntryKind::File)
+        || observed.get("manifest.json") != Some(&ContainedEntryKind::File)
+    {
+        inspection.cleanup_debt.push(CleanupDebt::new(
+            CleanupDebtKind::InvalidOwnership,
+            "attempt ownership metadata is missing or not a regular file",
+        ));
+        inspection.bounds = budget.bounds();
+        return inspection;
+    }
+    if observed.values().any(|kind| {
+        matches!(
+            kind,
+            ContainedEntryKind::LinkOrReparse
+                | ContainedEntryKind::Directory
+                | ContainedEntryKind::Other
+        )
+    }) {
+        inspection.cleanup_debt.push(CleanupDebt::new(
+            CleanupDebtKind::UnsafeEntry,
+            "attempt contains a link, reparse point, directory, or unsupported entry",
+        ));
+    }
+
+    let manifest = match read_manifest_from_anchor(&attempt_root.directory, observed_unix_ms) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            inspection.cleanup_debt.push(manifest_cleanup_debt(&error));
+            inspection.bounds = budget.bounds();
+            return inspection;
+        }
+    };
+    if manifest.execution_id != execution_id {
+        inspection.cleanup_debt.push(CleanupDebt::new(
+            CleanupDebtKind::InvalidOwnership,
+            "manifest execution identity does not match the typed selector",
+        ));
+    }
+    inspection.state = Some(manifest.state);
+    inspection.created_unix_ms = Some(manifest.created_unix_ms);
+    inspection.eligible_after_unix_ms = Some(manifest.eligible_after_unix_ms);
+    inspection.artifact_ids = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.artifact_id.clone())
+        .collect();
+
+    let expected = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.artifact_id.as_str())
+        .chain(["live.lock", "manifest.json"])
+        .collect::<std::collections::BTreeSet<_>>();
+    if observed
+        .keys()
+        .any(|name| !expected.contains(name.as_str()))
+    {
+        inspection.cleanup_debt.push(CleanupDebt::new(
+            CleanupDebtKind::UnknownChild,
+            "attempt contains a child not named by its ownership manifest",
+        ));
+    }
+    for artifact in &manifest.artifacts {
+        match observed.get(&artifact.artifact_id) {
+            Some(ContainedEntryKind::File) => {
+                if attempt_root
+                    .directory
+                    .open_file(&artifact.artifact_id)
+                    .is_err()
+                {
+                    inspection.cleanup_debt.push(CleanupDebt::new(
+                        CleanupDebtKind::Operational,
+                        "owned artifact could not be opened through its retained handle",
+                    ));
+                }
+            }
+            None => inspection.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::Operational,
+                "manifest-owned artifact is already absent",
+            )),
+            Some(_) => inspection.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::UnsafeEntry,
+                "manifest-owned artifact is not a regular file",
+            )),
+        }
+    }
+
+    match attempt_root.directory.open_file("live.lock") {
+        Ok(lock) => {
+            if FileExt::try_lock(&lock).is_err() {
+                inspection.cleanup_debt.push(CleanupDebt::new(
+                    CleanupDebtKind::LiveAttempt,
+                    "attempt liveness lock is held by a writer",
+                ));
+            } else {
+                let _ = FileExt::unlock(&lock);
+            }
+        }
+        Err(_) => inspection.cleanup_debt.push(CleanupDebt::new(
+            CleanupDebtKind::InvalidOwnership,
+            "attempt liveness metadata could not be opened",
+        )),
+    }
+
+    inspection.eligible = match cleanup_eligible(&manifest, observed_unix_ms, policy) {
+        Ok(eligible) => eligible,
+        Err(debt) => {
+            inspection.cleanup_debt.push(debt);
+            false
+        }
+    } && !inspection.cleanup_debt.iter().any(|debt| {
+        matches!(
+            debt.kind,
+            CleanupDebtKind::LiveAttempt
+                | CleanupDebtKind::InvalidOwnership
+                | CleanupDebtKind::InvalidManifest
+                | CleanupDebtKind::UnknownChild
+                | CleanupDebtKind::UnsafeEntry
+                | CleanupDebtKind::ClockAmbiguous
+        )
+    });
+    inspection.bounds = budget.bounds();
+    inspection
+}
+
+fn cleanup_eligible(
+    manifest: &AttemptManifest,
+    observed_unix_ms: u64,
+    policy: &ResolvedPublicationPolicy,
+) -> Result<bool, CleanupDebt> {
+    if manifest.created_unix_ms > observed_unix_ms
+        || manifest.eligible_after_unix_ms < manifest.created_unix_ms
+    {
+        return Err(CleanupDebt::new(
+            CleanupDebtKind::ClockAmbiguous,
+            "durable attempt timestamps are inconsistent with the observation clock",
+        ));
+    }
+    let eligible_after = match manifest.state {
+        AttemptState::Complete => manifest.created_unix_ms,
+        AttemptState::Incomplete | AttemptState::Abandoned => {
+            let retention_ms = policy
+                .failed_retention_seconds()
+                .checked_mul(1_000)
+                .ok_or_else(|| {
+                    CleanupDebt::new(
+                        CleanupDebtKind::ClockAmbiguous,
+                        "failed-attempt retention overflows the durable clock",
+                    )
+                })?;
+            manifest
+                .created_unix_ms
+                .checked_add(retention_ms)
+                .ok_or_else(|| {
+                    CleanupDebt::new(
+                        CleanupDebtKind::ClockAmbiguous,
+                        "failed-attempt eligibility overflows the durable clock",
+                    )
+                })?
+        }
+        AttemptState::Staging | AttemptState::Ready | AttemptState::Publishing => {
+            manifest.eligible_after_unix_ms
+        }
+    };
+    Ok(eligible_after <= observed_unix_ms)
+}
+
+fn manifest_cleanup_debt(error: &AttemptError) -> CleanupDebt {
+    match error {
+        AttemptError::InvalidManifest(
+            "eligible clock precedes attempt creation"
+            | "attempt creation clock is later than observation clock",
+        ) => CleanupDebt::new(
+            CleanupDebtKind::ClockAmbiguous,
+            "durable attempt timestamps are inconsistent with the observation clock",
+        ),
+        _ => CleanupDebt::new(
+            CleanupDebtKind::InvalidManifest,
+            "attempt manifest is malformed, unsupported, or unreadable",
+        ),
+    }
+}
+
+fn is_budget_debt(kind: CleanupDebtKind) -> bool {
+    matches!(
+        kind,
+        CleanupDebtKind::EntryBudget
+            | CleanupDebtKind::ByteBudget
+            | CleanupDebtKind::TimeBudget
+            | CleanupDebtKind::MonotonicClock
+    )
+}
+
+fn purge_selector_name(selector: &PurgeSelector) -> String {
+    match selector {
+        PurgeSelector::Execution(execution_id) => format!("purge-execution:{execution_id}"),
+        PurgeSelector::Expired => "purge-expired".to_owned(),
+    }
+}
+
+fn validate_continuation(continuation: &AttemptContinuation) -> Result<(), AttemptError> {
+    if continuation.schema != CONTINUATION_SCHEMA {
+        return Err(AttemptError::InvalidContinuation(
+            "unsupported attempt continuation schema",
+        ));
+    }
+    if continuation.root_identifier.len() != 64
+        || !continuation
+            .root_identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(AttemptError::InvalidContinuation(
+            "continuation root identifier is invalid",
+        ));
+    }
+    if continuation.selector != "list"
+        && !continuation.selector.starts_with("purge-execution:")
+        && continuation.selector != "purge-expired"
+    {
+        return Err(AttemptError::InvalidContinuation(
+            "continuation selector is unsupported",
+        ));
+    }
+    if continuation.cursor.as_ref().is_some_and(|cursor| {
+        cursor.len() > 128 || cursor.is_empty() || cursor.contains(['/', '\\'])
+    }) {
+        return Err(AttemptError::InvalidContinuation(
+            "continuation cursor is invalid",
+        ));
+    }
+    if continuation.binding
+        != continuation_binding(
+            &continuation.plan_hash,
+            &continuation.root_identifier,
+            &continuation.selector,
+            continuation.cursor.as_deref(),
+        )
+    {
+        return Err(AttemptError::InvalidContinuation(
+            "continuation binding does not match its selector and cursor",
+        ));
+    }
+    Ok(())
+}
+
+fn continuation_binding(
+    plan_hash: &[u8; 32],
+    root_identifier: &str,
+    selector: &str,
+    cursor: Option<&str>,
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CONTINUATION_SCHEMA.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(plan_hash);
+    hasher.update(&[0]);
+    hasher.update(root_identifier.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(selector.as_bytes());
+    hasher.update(&[0]);
+    if let Some(cursor) = cursor {
+        hasher.update(cursor.as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn owned_root_identifier(path: &Path) -> String {
+    blake3::hash(destination_root_key(path).as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn legacy_inspection(execution_id: &str, disposition: CleanupDisposition) -> AttemptInspection {
+    AttemptInspection {
+        execution_id: execution_id.to_owned(),
+        disposition,
+        state: None,
+        created_unix_ms: None,
+        eligible_after_unix_ms: None,
+        artifact_ids: Vec::new(),
+        cleanup_debt: Vec::new(),
+        bounds: AttemptQueryBounds::default(),
+        physical_path: None,
+        eligible: disposition == CleanupDisposition::Removed,
     }
 }
 
@@ -1369,18 +3403,15 @@ impl AttemptPublication {
         observed_unix_ms: u64,
     ) -> Result<AttemptInspection, AttemptError> {
         validate_execution_id(execution_id)?;
-        let kept = || AttemptInspection {
-            execution_id: execution_id.to_owned(),
-            disposition: CleanupDisposition::Kept,
-        };
+        let kept = || legacy_inspection(execution_id, CleanupDisposition::Kept);
         let Some(attempt_root) = (match AttemptRoot::open(&destination_root, execution_id) {
             Ok(root) => root,
             Err(_) => return Ok(kept()),
         }) else {
-            return Ok(AttemptInspection {
-                execution_id: execution_id.to_owned(),
-                disposition: CleanupDisposition::AlreadyAbsent,
-            });
+            return Ok(legacy_inspection(
+                execution_id,
+                CleanupDisposition::AlreadyAbsent,
+            ));
         };
 
         let lock = match attempt_root.directory.open_file("live.lock") {
@@ -1457,10 +3488,7 @@ impl AttemptPublication {
         if attempt_root.remove_empty().is_err() {
             return Ok(kept());
         }
-        Ok(AttemptInspection {
-            execution_id: execution_id.to_owned(),
-            disposition: CleanupDisposition::Removed,
-        })
+        Ok(legacy_inspection(execution_id, CleanupDisposition::Removed))
     }
 
     pub fn set_fault_for_testing(&mut self, fault: AttemptFault) {
@@ -1555,6 +3583,10 @@ pub enum AttemptError {
     InvalidManifest(&'static str),
     #[error("invalid attempt transition: {0}")]
     InvalidTransition(&'static str),
+    #[error("invalid attempt query: {0}")]
+    InvalidQuery(&'static str),
+    #[error("invalid attempt continuation: {0}")]
+    InvalidContinuation(&'static str),
     #[error("injected attempt publication failure at {0}")]
     Injected(&'static str),
     #[error("artifact destination collision between producers {first:?} and {second:?}")]

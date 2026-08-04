@@ -154,6 +154,14 @@ pub(crate) enum ContainedEntryKind {
 pub(crate) struct ContainedEntry {
     pub(crate) name: OsString,
     pub(crate) kind: ContainedEntryKind,
+    pub(crate) size_bytes: Option<u64>,
+}
+
+/// Exact result of a handle-relative enumeration stopped at a caller budget.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct BoundedEntries {
+    pub(crate) entries: Vec<ContainedEntry>,
+    pub(crate) complete: bool,
 }
 
 /// A retained, link-free directory used for attempt ownership and deletion.
@@ -197,6 +205,19 @@ impl AnchoredDirectory {
     }
 
     pub(crate) fn entries(&self, limit: usize) -> Result<Vec<ContainedEntry>, ContainmentError> {
+        let result = self.anchor.entries(&self.path, limit)?;
+        if result.complete {
+            Ok(result.entries)
+        } else {
+            Err(ContainmentError::security(
+                "contained_directory_entry_limit",
+                &self.path,
+                "contained directory exceeds its bounded entry limit",
+            ))
+        }
+    }
+
+    pub(crate) fn bounded_entries(&self, limit: usize) -> Result<BoundedEntries, ContainmentError> {
         self.anchor.entries(&self.path, limit)
     }
 
@@ -869,8 +890,8 @@ mod platform {
     use nix::unistd::{UnlinkatFlags, unlinkat};
 
     use super::{
-        ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile, OpenDisposition,
-        PromotionDisposition,
+        BoundedEntries, ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile,
+        OpenDisposition, PromotionDisposition,
     };
 
     const CIFS_SUPER_MAGIC: u32 = 0xff53_4d42;
@@ -1068,7 +1089,7 @@ mod platform {
             &self,
             display_path: &Path,
             limit: usize,
-        ) -> Result<Vec<ContainedEntry>, ContainmentError> {
+        ) -> Result<BoundedEntries, ContainmentError> {
             let cloned = self.file.try_clone().map_err(|source| {
                 ContainmentError::io("clone-contained-directory", display_path, source)
             })?;
@@ -1084,8 +1105,19 @@ mod platform {
                     std::io::Error::last_os_error(),
                 ));
             }
+            // `dup`/`try_clone` shares the directory offset with the retained
+            // anchor. Reset the new stream so every bounded query observes a
+            // fresh snapshot from the first child.
+            // SAFETY: `directory` owns a successful `fdopendir` result.
+            unsafe { libc::rewinddir(directory.0) };
             let mut entries = Vec::new();
             loop {
+                if entries.len() == limit {
+                    return Ok(BoundedEntries {
+                        entries,
+                        complete: false,
+                    });
+                }
                 Errno::clear();
                 // SAFETY: directory remains valid until closedir below.
                 let entry = unsafe { libc::readdir(directory.0) };
@@ -1098,7 +1130,10 @@ mod platform {
                             std::io::Error::from_raw_os_error(error),
                         ));
                     }
-                    break;
+                    return Ok(BoundedEntries {
+                        entries,
+                        complete: true,
+                    });
                 }
                 // SAFETY: d_name is NUL-terminated for a successful readdir result.
                 let bytes = unsafe {
@@ -1109,13 +1144,6 @@ mod platform {
                 if bytes == b"." || bytes == b".." {
                     continue;
                 }
-                if entries.len() == limit {
-                    return Err(ContainmentError::security(
-                        "contained_directory_entry_limit",
-                        display_path,
-                        "contained directory exceeds its bounded entry limit",
-                    ));
-                }
                 let name = OsString::from_vec(bytes);
                 let stat = fstatat(&self.file, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
                     .map_err(|error| nix_io("inspect-contained-entry", display_path, error))?;
@@ -1125,9 +1153,23 @@ mod platform {
                     SFlag::S_IFLNK => ContainedEntryKind::LinkOrReparse,
                     _ => ContainedEntryKind::Other,
                 };
-                entries.push(ContainedEntry { name, kind });
+                let size_bytes = if kind == ContainedEntryKind::File {
+                    Some(stat.st_size.try_into().map_err(|_| {
+                        ContainmentError::security(
+                            "invalid_contained_file_size",
+                            display_path,
+                            "regular-file metadata reported a negative byte length",
+                        )
+                    })?)
+                } else {
+                    None
+                };
+                entries.push(ContainedEntry {
+                    name,
+                    kind,
+                    size_bytes,
+                });
             }
-            Ok(entries)
         }
 
         pub(super) fn remove_child(
@@ -1303,8 +1345,8 @@ mod platform {
     use std::path::{Component, Path};
 
     use super::{
-        ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile, OpenDisposition,
-        PromotionDisposition,
+        BoundedEntries, ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile,
+        OpenDisposition, PromotionDisposition,
     };
 
     #[derive(Debug)]
@@ -1561,7 +1603,7 @@ mod platform {
             &self,
             display_path: &Path,
             limit: usize,
-        ) -> Result<Vec<ContainedEntry>, ContainmentError> {
+        ) -> Result<BoundedEntries, ContainmentError> {
             let cloned = self.file.try_clone().map_err(|source| {
                 ContainmentError::io("clone-contained-directory", display_path, source)
             })?;
@@ -1577,8 +1619,19 @@ mod platform {
                     std::io::Error::last_os_error(),
                 ));
             }
+            // `dup`/`try_clone` shares the directory offset with the retained
+            // anchor. Reset the new stream so every bounded query observes a
+            // fresh snapshot from the first child.
+            // SAFETY: `directory` owns a successful `fdopendir` result.
+            unsafe { libc::rewinddir(directory.0) };
             let mut entries = Vec::new();
             loop {
+                if entries.len() == limit {
+                    return Ok(BoundedEntries {
+                        entries,
+                        complete: false,
+                    });
+                }
                 // SAFETY: platform errno pointer is valid for this thread.
                 unsafe { *libc::__error() = 0 };
                 // SAFETY: directory remains valid until closedir below.
@@ -1593,7 +1646,10 @@ mod platform {
                             std::io::Error::from_raw_os_error(error),
                         ));
                     }
-                    break;
+                    return Ok(BoundedEntries {
+                        entries,
+                        complete: true,
+                    });
                 }
                 // SAFETY: d_name is NUL-terminated for a successful readdir result.
                 let bytes = unsafe {
@@ -1603,13 +1659,6 @@ mod platform {
                 };
                 if bytes == b"." || bytes == b".." {
                     continue;
-                }
-                if entries.len() == limit {
-                    return Err(ContainmentError::security(
-                        "contained_directory_entry_limit",
-                        display_path,
-                        "contained directory exceeds its bounded entry limit",
-                    ));
                 }
                 let name = OsString::from_vec(bytes);
                 let c_name = c_string(&name, display_path)?;
@@ -1631,16 +1680,30 @@ mod platform {
                     ));
                 }
                 // SAFETY: successful fstatat initialized stat.
-                let mode = unsafe { stat.assume_init() }.st_mode;
-                let kind = match mode & libc::S_IFMT {
+                let stat = unsafe { stat.assume_init() };
+                let kind = match stat.st_mode & libc::S_IFMT {
                     libc::S_IFREG => ContainedEntryKind::File,
                     libc::S_IFDIR => ContainedEntryKind::Directory,
                     libc::S_IFLNK => ContainedEntryKind::LinkOrReparse,
                     _ => ContainedEntryKind::Other,
                 };
-                entries.push(ContainedEntry { name, kind });
+                let size_bytes = if kind == ContainedEntryKind::File {
+                    Some(stat.st_size.try_into().map_err(|_| {
+                        ContainmentError::security(
+                            "invalid_contained_file_size",
+                            display_path,
+                            "regular-file metadata reported a negative byte length",
+                        )
+                    })?)
+                } else {
+                    None
+                };
+                entries.push(ContainedEntry {
+                    name,
+                    kind,
+                    size_bytes,
+                });
             }
-            Ok(entries)
         }
 
         pub(super) fn remove_child(
@@ -1848,8 +1911,8 @@ mod platform {
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     use super::{
-        ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile, OpenDisposition,
-        PromotionDisposition,
+        BoundedEntries, ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile,
+        OpenDisposition, PromotionDisposition,
     };
 
     #[derive(Debug)]
@@ -2091,10 +2154,16 @@ mod platform {
             &self,
             display_path: &Path,
             limit: usize,
-        ) -> Result<Vec<ContainedEntry>, ContainmentError> {
+        ) -> Result<BoundedEntries, ContainmentError> {
             let mut entries = Vec::new();
             let mut restart = true;
             loop {
+                if entries.len() == limit {
+                    return Ok(BoundedEntries {
+                        entries,
+                        complete: false,
+                    });
+                }
                 let mut storage = vec![0_u64; 8192];
                 let mut status_block = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
                 // SAFETY: the retained directory handle and storage remain valid
@@ -2116,7 +2185,10 @@ mod platform {
                 };
                 restart = false;
                 if status == STATUS_NO_MORE_FILES {
-                    break;
+                    return Ok(BoundedEntries {
+                        entries,
+                        complete: true,
+                    });
                 }
                 if status != STATUS_SUCCESS {
                     return Err(ContainmentError::io(
@@ -2137,13 +2209,6 @@ mod platform {
                 if name == OsStr::new(".") || name == OsStr::new("..") {
                     continue;
                 }
-                if entries.len() == limit {
-                    return Err(ContainmentError::security(
-                        "contained_directory_entry_limit",
-                        display_path,
-                        "contained directory exceeds its bounded entry limit",
-                    ));
-                }
                 let kind = if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
                     ContainedEntryKind::LinkOrReparse
                 } else if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
@@ -2154,9 +2219,23 @@ mod platform {
                     // Ordinary files can carry archive/hidden bits instead of NORMAL.
                     ContainedEntryKind::File
                 };
-                entries.push(ContainedEntry { name, kind });
+                let size_bytes = if kind == ContainedEntryKind::File {
+                    Some(info.EndOfFile.try_into().map_err(|_| {
+                        ContainmentError::security(
+                            "invalid_contained_file_size",
+                            display_path,
+                            "regular-file metadata reported a negative byte length",
+                        )
+                    })?)
+                } else {
+                    None
+                };
+                entries.push(ContainedEntry {
+                    name,
+                    kind,
+                    size_bytes,
+                });
             }
-            Ok(entries)
         }
 
         pub(super) fn remove_child(
@@ -2582,7 +2661,7 @@ mod platform {
     use std::path::{Path, PathBuf};
 
     use super::{
-        ContainedEntry, ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition,
+        BoundedEntries, ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition,
     };
 
     #[derive(Debug)]
@@ -2669,7 +2748,7 @@ mod platform {
             &self,
             _display_path: &Path,
             _limit: usize,
-        ) -> Result<Vec<ContainedEntry>, ContainmentError> {
+        ) -> Result<BoundedEntries, ContainmentError> {
             unsupported_directory()
         }
 
