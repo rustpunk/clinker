@@ -82,7 +82,7 @@ struct Desired {
 #[derive(Debug)]
 struct Snapshot {
     rulesets: Value,
-    environment: Value,
+    environment: Option<Value>,
     branch_policies: Value,
     immutable_releases: Value,
     repository_settings: Value,
@@ -137,7 +137,7 @@ pub(super) fn apply_and_verify(repo_root: &Path, request: &ApplyRequest) -> Resu
         "completion_eligible": false,
         "readback": {
             "rulesets": normalize_rulesets(&after.rulesets)?,
-            "environment": normalize_environment(&after.environment)?,
+            "environment": normalize_present_environment(&after.environment)?,
             "deployment_branch_policies": normalize_branch_policies(&after.branch_policies)?,
             "immutable_releases": normalize_immutable(&after.immutable_releases)?,
             "repository_settings": normalize_repository(&after.repository_settings)?,
@@ -433,6 +433,7 @@ fn desired_controls(request: &ApplyRequest) -> Result<Desired, GateError> {
                     "require_code_owner_review": true,
                     "require_last_push_approval": true,
                     "required_review_thread_resolution": true,
+                    "required_reviewers": [],
                     "allowed_merge_methods": ["squash"],
                 }},
             ],
@@ -531,37 +532,106 @@ fn resolve_app_id(slug: &str) -> Result<u64, GateError> {
 fn read_snapshot(repository: &str) -> Result<Snapshot, GateError> {
     validate_repository_name(repository)?;
     let endpoint = |suffix: &str| format!("repos/{repository}{suffix}");
+    let environments = gh_json(&[
+        "api",
+        "--method",
+        "GET",
+        &endpoint("/environments?per_page=100"),
+    ])?;
+    let release_environment_exists = environments
+        .get("environments")
+        .and_then(Value::as_array)
+        .ok_or_else(|| policy("repository environments readback is incomplete"))?
+        .iter()
+        .any(|environment| environment.get("name").and_then(Value::as_str) == Some("release"));
+    let (environment, branch_policies) = if release_environment_exists {
+        (
+            Some(gh_json(&[
+                "api",
+                "--method",
+                "GET",
+                &endpoint("/environments/release"),
+            ])?),
+            gh_json(&[
+                "api",
+                "--method",
+                "GET",
+                &endpoint("/environments/release/deployment-branch-policies"),
+            ])?,
+        )
+    } else {
+        (None, json!({"total_count": 0, "branch_policies": []}))
+    };
     Ok(Snapshot {
-        rulesets: gh_json(&[
-            "api",
-            "--method",
-            "GET",
-            &endpoint("/rulesets?includes_parents=false"),
-        ])?,
-        environment: gh_json(&["api", "--method", "GET", &endpoint("/environments/release")])?,
-        branch_policies: gh_json(&[
-            "api",
-            "--method",
-            "GET",
-            &endpoint("/environments/release/deployment-branch-policies"),
-        ])?,
+        rulesets: read_rulesets(repository)?,
+        environment,
+        branch_policies,
         immutable_releases: gh_json(&["api", "--method", "GET", &endpoint("/immutable-releases")])?,
         repository_settings: gh_json(&["api", "--method", "GET", &endpoint("")])?,
     })
 }
 
+fn read_rulesets(repository: &str) -> Result<Value, GateError> {
+    let endpoint = |suffix: &str| format!("repos/{repository}{suffix}");
+    let listed = gh_json(&[
+        "api",
+        "--method",
+        "GET",
+        &endpoint("/rulesets?includes_parents=false"),
+    ])?;
+    let summaries = listed
+        .as_array()
+        .ok_or_else(|| policy("ruleset readback must be an array"))?;
+    let mut rulesets = Vec::with_capacity(summaries.len());
+    for summary in summaries {
+        if summary.get("conditions").is_some()
+            && summary.get("rules").is_some()
+            && summary.get("bypass_actors").is_some()
+        {
+            rulesets.push(summary.clone());
+            continue;
+        }
+        let id = summary
+            .get("id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| policy("ruleset summary has no numeric id"))?;
+        rulesets.push(gh_json(&[
+            "api",
+            "--method",
+            "GET",
+            &endpoint(&format!("/rulesets/{id}")),
+        ])?);
+    }
+    Ok(Value::Array(rulesets))
+}
+
 fn compare_snapshot(snapshot: &Snapshot, desired: &Desired) -> Result<(), GateError> {
-    if normalize_rulesets(&snapshot.rulesets)? != normalize_rulesets(&desired.rulesets)?
-        || normalize_environment(&snapshot.environment)?
-            != normalize_environment(&desired.environment)?
-        || normalize_branch_policies(&snapshot.branch_policies)?
-            != normalize_branch_policies(&desired.branch_policies)?
-        || normalize_immutable(&snapshot.immutable_releases)?
-            != normalize_immutable(&desired.immutable_releases)?
-        || normalize_repository(&snapshot.repository_settings)?
-            != normalize_repository(&desired.repository_settings)?
+    if normalize_rulesets(&snapshot.rulesets)? != normalize_rulesets(&desired.rulesets)? {
+        return Err(policy("repository rulesets do not match approved policy"));
+    }
+    if normalize_present_environment(&snapshot.environment)?
+        != normalize_environment(&desired.environment)?
     {
-        return Err(policy("repository controls do not match approved policy"));
+        return Err(policy("release environment does not match approved policy"));
+    }
+    if normalize_branch_policies(&snapshot.branch_policies)?
+        != normalize_branch_policies(&desired.branch_policies)?
+    {
+        return Err(policy(
+            "release deployment branch policies do not match approved policy",
+        ));
+    }
+    if normalize_immutable(&snapshot.immutable_releases)?
+        != normalize_immutable(&desired.immutable_releases)?
+    {
+        return Err(policy("immutable releases do not match approved policy"));
+    }
+    if normalize_repository(&snapshot.repository_settings)?
+        != normalize_repository(&desired.repository_settings)?
+    {
+        return Err(policy(
+            "repository merge settings do not match approved policy",
+        ));
     }
     Ok(())
 }
@@ -609,7 +679,14 @@ fn apply_delta(
             gh_input(method, &destination, wanted, evidence_path)?;
         }
     }
-    if normalize_environment(&before.environment)? != normalize_environment(&desired.environment)? {
+    if before
+        .environment
+        .as_ref()
+        .map(normalize_environment)
+        .transpose()?
+        .as_ref()
+        != Some(&normalize_environment(&desired.environment)?)
+    {
         let payload = environment_payload(&desired.environment)?;
         gh_input(
             "PUT",
@@ -770,14 +847,27 @@ fn normalize_environment(value: &Value) -> Result<Value, GateError> {
         .get("protection_rules")
         .and_then(Value::as_array)
         .ok_or_else(|| policy("environment protection rules are absent"))?;
-    if rules.len() != 1
-        || rules[0].get("type").and_then(Value::as_str) != Some("required_reviewers")
-    {
+    if rules.iter().any(|rule| {
+        !matches!(
+            rule.get("type").and_then(Value::as_str),
+            Some("required_reviewers" | "branch_policy")
+        )
+    }) {
+        return Err(policy(
+            "environment contains an unapproved protection rule type",
+        ));
+    }
+    let reviewer_rules = rules
+        .iter()
+        .filter(|rule| rule.get("type").and_then(Value::as_str) == Some("required_reviewers"))
+        .collect::<Vec<_>>();
+    if reviewer_rules.len() != 1 {
         return Err(policy(
             "environment must have exactly one required-reviewers rule",
         ));
     }
-    let mut reviewers = rules[0]
+    let reviewer_rule = reviewer_rules[0];
+    let mut reviewers = reviewer_rule
         .get("reviewers")
         .and_then(Value::as_array)
         .ok_or_else(|| policy("environment reviewers are absent"))?
@@ -794,7 +884,7 @@ fn normalize_environment(value: &Value) -> Result<Value, GateError> {
         "name": required_value(value, "name", "environment readback")?,
         "protection_rules": [{
             "type": "required_reviewers",
-            "prevent_self_review": required_value(&rules[0], "prevent_self_review", "environment readback")?,
+            "prevent_self_review": required_value(reviewer_rule, "prevent_self_review", "environment readback")?,
             "reviewers": reviewers,
         }],
         "deployment_branch_policy": required_value(
@@ -803,6 +893,13 @@ fn normalize_environment(value: &Value) -> Result<Value, GateError> {
             "environment readback",
         )?,
     }))
+}
+
+fn normalize_present_environment(value: &Option<Value>) -> Result<Value, GateError> {
+    value
+        .as_ref()
+        .ok_or_else(|| policy("release environment is absent"))
+        .and_then(normalize_environment)
 }
 
 fn normalize_branch_policies(value: &Value) -> Result<Value, GateError> {
@@ -889,19 +986,6 @@ fn gh_json(arguments: &[&str]) -> Result<Value, GateError> {
 }
 
 fn gh(arguments: &[&str]) -> Result<Vec<u8>, GateError> {
-    let mut environment = BTreeMap::new();
-    for name in [
-        "PATH",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "NO_COLOR",
-        "LANG",
-        "LC_ALL",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            environment.insert(OsString::from(name), value);
-        }
-    }
     let mut command_arguments = Vec::with_capacity(arguments.len() + 2);
     for (index, argument) in arguments.iter().enumerate() {
         command_arguments.push(OsString::from(argument));
@@ -913,7 +997,7 @@ fn gh(arguments: &[&str]) -> Result<Vec<u8>, GateError> {
     let result = child::run(ChildSpec {
         program: PathBuf::from("gh"),
         arguments: command_arguments,
-        environment,
+        environment: child::github_environment(),
         timeout: Duration::from_secs(300),
         output_limit: MAX_CHILD_OUTPUT_BYTES,
     })?;

@@ -325,9 +325,9 @@ struct PublicationDomain {
 #[derive(Debug, Subcommand)]
 enum PublicationOperation {
     /// Create the one authorized immutable candidate tag.
-    CreateCandidateTag(PublicationCandidateAuthorityArgs),
+    CreateCandidateTag(PublicationCandidateAuthorizationArgs),
     /// Reread and peel the authorized protected tag.
-    ResolveProtectedRef(PublicationCandidateAuthorityArgs),
+    ResolveProtectedRef(PublicationCandidateAuthorizationArgs),
     /// Dispatch the protected publication workflow exactly once.
     Dispatch(PublicationDispatchArgs),
     /// Print the exact run, job, and environment requiring inspection.
@@ -346,7 +346,7 @@ enum PublicationOperation {
 }
 
 #[derive(Debug, Args)]
-struct PublicationCandidateAuthorityArgs {
+struct PublicationCandidateAuthorizationArgs {
     #[arg(long)]
     repo: String,
     #[arg(long)]
@@ -354,21 +354,15 @@ struct PublicationCandidateAuthorityArgs {
     #[arg(long)]
     authorization_schema: PathBuf,
     #[arg(long)]
-    decision_record: PathBuf,
-    #[arg(long)]
-    decision_schema: PathBuf,
-    #[arg(long)]
     deadline_seconds: u64,
 }
 
-impl PublicationCandidateAuthorityArgs {
-    fn into_request(self) -> publication::CandidateAuthorityRequest {
-        publication::CandidateAuthorityRequest {
+impl PublicationCandidateAuthorizationArgs {
+    fn into_request(self) -> publication::CandidateAuthorizationRequest {
+        publication::CandidateAuthorizationRequest {
             repository: self.repo,
             authorization_record: self.authorization_record,
             authorization_schema: self.authorization_schema,
-            decision_record: self.decision_record,
-            decision_schema: self.decision_schema,
             deadline_seconds: self.deadline_seconds,
         }
     }
@@ -1085,13 +1079,31 @@ impl ReleaseVerifyArgs {
                 "choose exactly one candidate producer or candidate readback flag shape",
             ));
         }
+        if producer
+            && (self.decision_dir.is_some()
+                || self.decision_record.is_some()
+                || self.decision_schema.is_some())
+        {
+            return Err(GateError::usage(
+                "candidate production accepts authorization and observed draft state, not a post-build decision",
+            ));
+        }
+        if readback
+            && (self.decision_dir.is_none()
+                || self.decision_record.is_none()
+                || self.decision_schema.is_none())
+        {
+            return Err(GateError::usage(
+                "candidate readback requires --decision-dir, --decision-record, and --decision-schema",
+            ));
+        }
         Ok(VerifyRequest::Candidate(CandidateRequest {
             repository: required(self.repo, "--repo")?,
-            decision_dir: required(self.decision_dir, "--decision-dir")?,
+            decision_dir: self.decision_dir,
             authorization_record: required(self.authorization_record, "--authorization-record")?,
             authorization_schema: required(self.authorization_schema, "--authorization-schema")?,
-            decision_record: required(self.decision_record, "--decision-record")?,
-            decision_schema: required(self.decision_schema, "--decision-schema")?,
+            decision_record: self.decision_record,
+            decision_schema: self.decision_schema,
             candidate_evidence: self.candidate_evidence,
             evidence_schema: required(self.evidence_schema, "--evidence-schema")?,
             evidence_manifest: self.evidence_manifest,

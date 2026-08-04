@@ -360,29 +360,6 @@ fn candidate_producer_and_readback_use_two_fresh_private_downloads() {
     )
     .expect("decision JSON");
     let mut authorization = authorization_fixture["authorized"].clone();
-    let mut archive_digests = serde_json::Map::new();
-    for target in [
-        "aarch64-apple-darwin",
-        "x86_64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-        "x86_64-unknown-linux-gnu",
-    ] {
-        let extension = if target == "x86_64-pc-windows-msvc" {
-            "zip"
-        } else {
-            "tar.gz"
-        };
-        let name = format!("clinker-v0.1.0-{target}.{extension}");
-        archive_digests.insert(
-            target.to_owned(),
-            Value::String(clinker_release_policy::digest::sha256_hex(
-                &fs::read(asset_dir.join(name)).expect("archive bytes"),
-            )),
-        );
-    }
-    let checksum_sha256 = clinker_release_policy::digest::sha256_hex(
-        &fs::read(asset_dir.join("SHA256SUMS")).expect("checksum bytes"),
-    );
     let identity = authorization["authorization"]
         .as_object_mut()
         .expect("authorization identity");
@@ -390,20 +367,9 @@ fn candidate_producer_and_readback_use_two_fresh_private_downloads() {
         ("candidate_tag", json!("v0.1.0")),
         ("candidate_version", json!("0.1.0")),
         ("source_sha", json!(SOURCE_SHA)),
-        (
-            "build_workflow_sha",
-            json!("2222222222222222222222222222222222222222"),
-        ),
         ("publish_workflow_ref", json!("v0.1.0")),
         ("publish_workflow_ref_resolved_sha", json!(SOURCE_SHA)),
         ("publish_workflow_sha", json!(SOURCE_SHA)),
-        ("candidate_release_id", json!("release-100")),
-        ("checksum_sha256", json!(checksum_sha256)),
-        ("archive_digests", Value::Object(archive_digests)),
-        (
-            "ci_run_ref",
-            json!("https://github.com/rustpunk/clinker/actions/runs/100"),
-        ),
         ("changelog_ref", json!("CHANGELOG.md#010")),
         ("inventory_ref", json!("release/inventory.toml")),
         (
@@ -428,44 +394,10 @@ fn candidate_producer_and_readback_use_two_fresh_private_downloads() {
     )
     .expect("authorization record");
 
-    let mut decision = accepted_fixture["records"][6].clone();
-    for field in [
-        "candidate_tag",
-        "candidate_version",
-        "source_sha",
-        "build_workflow_sha",
-        "publish_workflow_ref",
-        "publish_workflow_ref_resolved_sha",
-        "publish_workflow_sha",
-        "candidate_release_id",
-        "checksum_sha256",
-        "archive_digests",
-        "ci_run_ref",
-        "changelog_ref",
-        "inventory_ref",
-        "authorized_release_maintainer_ref",
-        "approved_at",
-    ] {
-        decision[field] = authorization["authorization"][field].clone();
-    }
-    decision["candidate_authorization_ref"] = json!("decisions/authorization.json");
-    decision["candidate_authorization_sha256"] = json!(authorization_digest);
-    decision["candidate_tag_creation_ref"] =
-        json!("https://api.github.com/repos/rustpunk/clinker/git/refs/tags/v0.1.0");
-    decision["candidate_tag_readback_ref"] =
-        json!("https://api.github.com/repos/rustpunk/clinker/git/ref/tags/v0.1.0");
-    decision["authorization_recorded_at"] = authorization["recorded_at"].clone();
-    let decision_path = decision_dir.join("decision.json");
-    fs::write(
-        &decision_path,
-        serde_json::to_vec_pretty(&decision).unwrap(),
-    )
-    .expect("decision record");
-
     let release_notes = "# Clinker v0.1.0\n\nGenerated release notes.";
     let release_metadata = json!({
         "build_workflow_path": ".github/workflows/release.yml",
-        "build_workflow_sha": "2222222222222222222222222222222222222222",
+        "build_workflow_sha": SOURCE_SHA,
         "build_run_id": "100",
         "build_event": "push",
         "build_ref": "refs/tags/v0.1.0",
@@ -557,16 +489,10 @@ fn main() {
             "verify",
             "--repo",
             "rustpunk/clinker",
-            "--decision-dir",
-            "decisions",
             "--authorization-record",
             "decisions/authorization.json",
             "--authorization-schema",
             "authorization-schema.json",
-            "--decision-record",
-            "decisions/decision.json",
-            "--decision-schema",
-            "decision-schema.json",
             "--require-private",
             "--fresh-download",
             "--evidence-kind",
@@ -580,6 +506,42 @@ fn main() {
     );
     assert_success(&producer);
     assert!(evidence.is_file());
+    let candidate: Value =
+        serde_json::from_slice(&fs::read(&evidence).expect("candidate evidence"))
+            .expect("candidate evidence JSON");
+    let mut decision = accepted_fixture["records"][6].clone();
+    for field in [
+        "candidate_tag",
+        "candidate_version",
+        "source_sha",
+        "build_workflow_sha",
+        "publish_workflow_ref",
+        "publish_workflow_ref_resolved_sha",
+        "publish_workflow_sha",
+        "candidate_release_id",
+        "checksum_sha256",
+        "archive_digests",
+        "ci_run_ref",
+        "changelog_ref",
+        "inventory_ref",
+        "authorized_release_maintainer_ref",
+    ] {
+        decision[field] = candidate[field].clone();
+    }
+    decision["approved_at"] = authorization["authorization"]["approved_at"].clone();
+    decision["candidate_authorization_ref"] = json!("decisions/authorization.json");
+    decision["candidate_authorization_sha256"] = json!(authorization_digest);
+    decision["candidate_tag_creation_ref"] =
+        json!("https://api.github.com/repos/rustpunk/clinker/git/refs/tags/v0.1.0");
+    decision["candidate_tag_readback_ref"] =
+        json!("https://api.github.com/repos/rustpunk/clinker/git/ref/tags/v0.1.0");
+    decision["authorization_recorded_at"] = authorization["recorded_at"].clone();
+    let decision_path = decision_dir.join("decision.json");
+    fs::write(
+        &decision_path,
+        serde_json::to_vec_pretty(&decision).unwrap(),
+    )
+    .expect("decision record");
     let readback = fixture.run_with_path(
         &[
             "release",
@@ -626,16 +588,10 @@ fn downstream_candidate_producer_argv_dispatches_before_domain_rejection() {
         "verify",
         "--repo",
         "rustpunk/clinker",
-        "--decision-dir",
-        "decisions",
         "--authorization-record",
         "authorization.json",
         "--authorization-schema",
         "authorization-schema.json",
-        "--decision-record",
-        "decision.json",
-        "--decision-schema",
-        "decision-schema.json",
         "--require-private",
         "--fresh-download",
         "--evidence-kind",

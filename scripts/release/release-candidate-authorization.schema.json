@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "clinker.release-candidate-authorization/v1",
   "title": "Clinker release candidate authorization",
-  "description": "Normative create-only human authority artifact for the locked clinker-release-policy Rust CLI. The sibling digest covers the nested authorization object, while the Rust validator enforces cross-field and digest identity.",
+  "description": "Normative create-only pre-build human authority artifact for the locked clinker-release-policy Rust CLI. It contains only values knowable before candidate construction. The sibling digest covers the nested authorization object, while the Rust validator enforces cross-field and digest identity.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -80,30 +80,6 @@
         "minLength": 1
       }
     },
-    "archiveDigests": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "x86_64-unknown-linux-gnu",
-        "x86_64-pc-windows-msvc",
-        "x86_64-apple-darwin",
-        "aarch64-apple-darwin"
-      ],
-      "properties": {
-        "x86_64-unknown-linux-gnu": {
-          "$ref": "#/$defs/digest"
-        },
-        "x86_64-pc-windows-msvc": {
-          "$ref": "#/$defs/digest"
-        },
-        "x86_64-apple-darwin": {
-          "$ref": "#/$defs/digest"
-        },
-        "aarch64-apple-darwin": {
-          "$ref": "#/$defs/digest"
-        }
-      }
-    },
     "authorized": {
       "type": "object",
       "additionalProperties": false,
@@ -117,14 +93,9 @@
         "candidate_tag",
         "candidate_version",
         "source_sha",
-        "build_workflow_sha",
         "publish_workflow_ref",
         "publish_workflow_ref_resolved_sha",
         "publish_workflow_sha",
-        "candidate_release_id",
-        "checksum_sha256",
-        "archive_digests",
-        "ci_run_ref",
         "changelog_ref",
         "inventory_ref",
         "authorized_release_maintainer_ref"
@@ -160,9 +131,6 @@
         "source_sha": {
           "$ref": "#/$defs/sha"
         },
-        "build_workflow_sha": {
-          "$ref": "#/$defs/sha"
-        },
         "publish_workflow_ref": {
           "type": "string",
           "minLength": 1
@@ -172,20 +140,6 @@
         },
         "publish_workflow_sha": {
           "$ref": "#/$defs/sha"
-        },
-        "candidate_release_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "checksum_sha256": {
-          "$ref": "#/$defs/digest"
-        },
-        "archive_digests": {
-          "$ref": "#/$defs/archiveDigests"
-        },
-        "ci_run_ref": {
-          "type": "string",
-          "minLength": 1
         },
         "changelog_ref": {
           "type": "string",

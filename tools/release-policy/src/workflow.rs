@@ -862,7 +862,7 @@ fn require_exact_release_assembly(assemble: &Job) -> Result<(), GateError> {
         .steps
         .as_deref()
         .ok_or_else(|| policy("release assembly steps are absent"))?;
-    if steps.len() != 10 {
+    if steps.len() != 8 {
         return Err(policy(
             "release assembly step inventory differs from reviewed policy",
         ));
@@ -949,32 +949,6 @@ fn require_exact_release_assembly(assemble: &Job) -> Result<(), GateError> {
             "${{ github.ref_name }}",
             "RELEASE_SOURCE_SHA",
             "${{ github.sha }}",
-        ],
-    )?;
-    require_command_step(
-        &steps[8],
-        "Produce artifact-derived non-completing candidate evidence",
-        "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release verify --repo \"$RELEASE_REPOSITORY\" --decision-dir release/decisions --authorization-record release/decisions/release-candidate-authorization.json --authorization-schema scripts/release/release-candidate-authorization.schema.json --decision-record release/decisions/release-candidate.json --decision-schema scripts/release/release-decision.schema.json --require-private --fresh-download --evidence-kind candidate --evidence-schema scripts/release/release-evidence.schema.json --evidence-manifest target/release-policy/candidate-evidence.json",
-        &[
-            "GH_TOKEN",
-            "${{ github.token }}",
-            "RELEASE_REPOSITORY",
-            "${{ github.repository }}",
-        ],
-    )?;
-    require_action_step(
-        &steps[9],
-        "Upload the immutable candidate evidence",
-        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
-        &[
-            "name",
-            "release-candidate-evidence",
-            "path",
-            "target/release-policy/candidate-evidence.json",
-            "if-no-files-found",
-            "error",
-            "retention-days",
-            "7",
         ],
     )?;
     Ok(())

@@ -190,15 +190,9 @@ impl ChildGitHubTransport {
     /// Build the production transport from the allowlisted process environment.
     #[must_use]
     pub fn from_environment() -> Self {
-        let mut environment = BTreeMap::new();
-        for name in ["GH_TOKEN", "GITHUB_TOKEN", "NO_COLOR", "PATH"] {
-            if let Some(value) = std::env::var_os(name) {
-                environment.insert(OsString::from(name), value);
-            }
-        }
         Self {
             program: PathBuf::from("gh"),
-            environment,
+            environment: child::github_environment(),
         }
     }
 

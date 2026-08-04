@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const AUTHORITY: &str = "f235dd6285bcdca002d0736e2b3d6e0494ad3f6d8ca3a6fbdbf947ea0ec88aa5";
+const AUTHORITY: &str = "61a9eead1082ea72871ac09dabca73e9cde6deaf00db920cdd4587944d4aa0a0";
 const NFS: &str = "linux-nfsv4.1-loopback-ci";
 const SMB: &str = "linux-smb3.1.1-loopback-ci";
 const NFS_EVIDENCE: &str = "target/release-policy/filesystem-linux-nfsv4.1-loopback-ci.json";
@@ -757,13 +757,14 @@ fn invocations(root: &Path) -> Vec<String> {
 }
 
 fn expected_invocations() -> Vec<String> {
-    let mut expected = vec![
+    let expected = vec![
         "git\trev-parse\tHEAD".to_owned(),
         "cargo\trun\t--quiet\t--manifest-path\ttools/dependency-policy/Cargo.toml\t--target-dir\ttarget/clinker-release-policy-pre-candidate-dependency\t--locked\t--offline\t--\t--scope\tfinal\t--root\t.".to_owned(),
         "cargo\trun\t--quiet\t--manifest-path\ttools/release-policy/Cargo.toml\t--locked\t--offline\t--\tworkflow\tverify".to_owned(),
         "cargo\trun\t--quiet\t--manifest-path\ttools/release-policy/Cargo.toml\t--locked\t--offline\t--\trepository\tverify\t--config-only".to_owned(),
         "cargo\trun\t--quiet\t--manifest-path\ttools/release-policy/Cargo.toml\t--locked\t--offline\t--\tinventory\tcheck".to_owned(),
         "cargo\ttest\t--manifest-path\ttools/release-policy/Cargo.toml\t--locked\t--offline\t--test\tdecision_contract".to_owned(),
+        "cargo\ttest\t--manifest-path\ttools/release-policy/Cargo.toml\t--locked\t--offline\t--test\trelease_contract".to_owned(),
         "cargo\trun\t--quiet\t--manifest-path\ttools/release-policy/Cargo.toml\t--locked\t--offline\t--\tfilesystem\tself-test".to_owned(),
         "cargo\ttest\t--locked\t-p\tclinker\t--test\toutput_containment".to_owned(),
         "cargo\tfmt\t--all\t--\t--check".to_owned(),
@@ -774,18 +775,10 @@ fn expected_invocations() -> Vec<String> {
         "cargo\tclippy\t--workspace\t--\t-D\twarnings".to_owned(),
         "cargo\tclippy\t--workspace\t--all-targets\t--\t-D\twarnings".to_owned(),
         "cargo\ttest\t--workspace".to_owned(),
-        "cargo\tdeny\tcheck\t--locked".to_owned(),
+        "cargo\tdeny\t--locked\tcheck".to_owned(),
         "bash\tscripts/check-ai-docs.sh".to_owned(),
         "git\tdiff\t--check".to_owned(),
     ];
-    expected.extend([
-        "aarch64-apple-darwin",
-        "x86_64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-        "x86_64-unknown-linux-gnu",
-    ].map(|target| format!(
-        "cargo\trun\t--quiet\t--manifest-path\ttools/release-policy/Cargo.toml\t--locked\t--offline\t--\trelease\tbuild-bundle\t--target\t{target}\t--source-sha\t{SHA}\t--output-dir\ttarget/release-policy/pre-candidate-builds/{target}"
-    )));
     expected
 }
 

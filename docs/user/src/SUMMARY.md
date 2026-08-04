@@ -6,6 +6,7 @@
 # Getting Started
 
 - [Installation](getting-started/installation.md)
+- [Verify a Release](getting-started/verify-release.md)
 - [Your First Pipeline](getting-started/first-pipeline.md)
 - [Key Concepts](getting-started/concepts.md)
 

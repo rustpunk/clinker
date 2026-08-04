@@ -294,9 +294,15 @@ fn assert_public_command_was_dispatched(output: &Output) {
 #[test]
 fn protected_dispatch_interface() {
     let fixture = Fixture::new();
-    let authority = [
+    let authorization = [
         "--repo",
         "rustpunk/clinker",
+        "--authorization-record",
+        "decisions/authorization.json",
+        "--authorization-schema",
+        "authorization-schema.json",
+    ];
+    let authority = [
         "--authorization-record",
         "decisions/authorization.json",
         "--authorization-schema",
@@ -309,9 +315,20 @@ fn protected_dispatch_interface() {
 
     for operation in ["create-candidate-tag", "resolve-protected-ref"] {
         let mut arguments = vec!["publication", operation];
-        arguments.extend(authority);
+        arguments.extend(authorization);
         arguments.extend(["--deadline-seconds", "120"]);
         assert_public_command_was_dispatched(&fixture.run(&arguments));
+
+        arguments.splice(
+            arguments.len() - 2..arguments.len() - 2,
+            [
+                "--decision-record",
+                "decisions/candidate.json",
+                "--decision-schema",
+                "decision-schema.json",
+            ],
+        );
+        assert_eq!(fixture.run(&arguments).status.code(), Some(2));
     }
 
     let mut dispatch = vec!["publication", "dispatch"];
@@ -323,7 +340,7 @@ fn protected_dispatch_interface() {
         "--decision-dir",
         "decisions",
     ]);
-    dispatch.extend_from_slice(&authority[2..]);
+    dispatch.extend_from_slice(&authority);
     dispatch.extend([
         "--approval-record",
         "decisions/approval.json",
@@ -387,7 +404,7 @@ fn protected_dispatch_interface() {
     ] {
         let mut arguments = vec!["publication", operation];
         arguments.extend(["--repo", "rustpunk/clinker", "--decision-dir", "decisions"]);
-        arguments.extend_from_slice(&authority[2..]);
+        arguments.extend_from_slice(&authority);
         arguments.extend([
             "--approval-record",
             "decisions/approval.json",
@@ -811,7 +828,7 @@ impl StateFixture {
             .expect("decision fixture"),
         )
         .expect("decision JSON");
-        let mut authorization = authorization_fixture["authorized"].clone();
+        let authorization = authorization_fixture["authorized"].clone();
         let archive_bytes = [
             "aarch64-apple-darwin",
             "x86_64-apple-darwin",
@@ -828,10 +845,12 @@ impl StateFixture {
             .iter()
             .map(|(target, bytes)| (target.clone(), Value::String(digest::sha256_hex(bytes))))
             .collect::<Map<_, _>>();
-        authorization["authorization"]["archive_digests"] = Value::Object(digests.clone());
         let nested = canonical_value(&authorization["authorization"]);
         let authorization_digest = digest::sha256_hex(&canonical::to_bytes(&nested).unwrap());
-        authorization["candidate_authorization_sha256"] = json!(authorization_digest);
+        assert_eq!(
+            authorization["candidate_authorization_sha256"],
+            json!(authorization_digest)
+        );
 
         let records = decisions_fixture["records"]
             .as_array()
@@ -856,9 +875,12 @@ impl StateFixture {
             .expect("environment decision")
             .clone();
 
-        let identity = authorization["authorization"]
-            .as_object()
-            .expect("authorization identity");
+        let checksum_bytes = b"fixture checksums\n".to_vec();
+        let checksum_sha256 = digest::sha256_hex(&checksum_bytes);
+        for record in [&mut decision, &mut approval] {
+            record["checksum_sha256"] = json!(checksum_sha256);
+        }
+        let identity = decision.as_object().expect("candidate identity");
         let archives = archive_bytes
             .iter()
             .map(|(target, _)| {
@@ -888,7 +910,7 @@ impl StateFixture {
                 })
             })
             .collect::<Vec<_>>();
-        let mut asset_bytes = vec![("SHA256SUMS".to_owned(), b"fixture checksums\n".to_vec())];
+        let mut asset_bytes = vec![("SHA256SUMS".to_owned(), checksum_bytes)];
         for (archive, (_, bytes)) in archives.iter().zip(&archive_bytes) {
             let name = archive["archive_name"].as_str().unwrap().to_owned();
             asset_bytes.push((name.clone(), bytes.clone()));
@@ -1025,7 +1047,7 @@ impl StateFixture {
             candidate_decision_blob_sha: digest::git_blob_sha1_hex(&decision),
             candidate_evidence_blob_sha: digest::git_blob_sha1_hex(&candidate),
             source_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
-            build_workflow_sha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+            build_workflow_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             publish_workflow_ref: "v3.0.0".to_owned(),
             publish_workflow_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
             candidate_release_id: "release-300".to_owned(),
@@ -1607,16 +1629,10 @@ fn exact_downstream_validator_argv_are_typed() {
             "verify",
             "--repo",
             "rustpunk/clinker",
-            "--decision-dir",
-            "decisions",
             "--authorization-record",
             "decisions/authorization.json",
             "--authorization-schema",
             "authorization-schema.json",
-            "--decision-record",
-            "decisions/candidate.json",
-            "--decision-schema",
-            "decision-schema.json",
             "--require-private",
             "--fresh-download",
             "--evidence-kind",
