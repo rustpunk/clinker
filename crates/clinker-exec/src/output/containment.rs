@@ -262,7 +262,31 @@ impl OutputContainment {
         reservation_leaf.push(&self.leaf);
         reservation_leaf.push(".reservation");
         let reservation_path = parent_path_of(self.destination.as_path()).join(&reservation_leaf);
-        let reservation = Some(self.acquire_reservation(reservation_leaf, reservation_path)?);
+        let mut reservation = Some(self.acquire_reservation(reservation_leaf, reservation_path)?);
+        // The destination can appear after the initial existence check while
+        // this caller waits for the previous publisher to release its
+        // reservation. Revalidate after acquiring the reservation so a
+        // no-replace caller never stages against a name that is now occupied.
+        if disposition == PromotionDisposition::NoReplace {
+            match self.destination_exists() {
+                Ok(false) => {}
+                Ok(true) => {
+                    self.release_reservation(reservation.take())?;
+                    return Err(ContainmentError::io(
+                        "reserve-destination-leaf",
+                        self.destination.as_path(),
+                        std::io::Error::new(
+                            std::io::ErrorKind::AlreadyExists,
+                            "destination appeared before its reservation was acquired",
+                        ),
+                    ));
+                }
+                Err(error) => {
+                    self.release_reservation(reservation.take())?;
+                    return Err(error);
+                }
+            }
+        }
         let parent_path = self
             .destination
             .as_path()
