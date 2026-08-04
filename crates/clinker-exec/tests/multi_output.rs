@@ -571,6 +571,16 @@ fn shared_port_output_combine_resident_spill_parity() {
             test_params(),
         )
         .expect("resident shared Output plus Combine executes");
+        // Keep a small, committed pressure pad live while deriving and using
+        // the budget. Windows test binaries can have a very low PrivateUsage
+        // baseline, making ordinary per-run allocator growth larger than the
+        // 20% hard-limit headroom even after test-thread isolation. Touching
+        // each page makes the baseline representative and keeps that fixed
+        // growth well inside the headroom on every first-class platform.
+        let mut pressure_pad = vec![0_u8; 16 * 1024 * 1024];
+        for page in pressure_pad.chunks_mut(4096) {
+            page[0] = 1;
+        }
         // Keep the hard limit above this test process while placing the 80% soft
         // threshold below its current RSS. The 20% headroom absorbs allocator and
         // platform-accounting growth during setup without losing forced spill.
@@ -594,6 +604,7 @@ fn shared_port_output_combine_resident_spill_parity() {
         assert!(spilled.0.cumulative_spill_bytes > 0);
         assert_eq!(resident.1["direct"], spilled.1["direct"]);
         assert_eq!(resident.1["combined"], spilled.1["combined"]);
+        std::hint::black_box(&pressure_pad);
     });
 }
 
