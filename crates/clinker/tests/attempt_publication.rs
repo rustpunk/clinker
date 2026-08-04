@@ -4,7 +4,8 @@ use std::sync::mpsc;
 
 use clinker_exec::output::attempt::{
     ARTIFACT_MAX_ENCODED_BYTES, ArtifactManifest, ArtifactState, AttemptFault, AttemptManifest,
-    AttemptPublication, AttemptState, AttemptTestStage, MANIFEST_MAX_ARTIFACTS, MANIFEST_MAX_BYTES,
+    AttemptPublication, AttemptState, AttemptTestStage, CleanupDisposition, MANIFEST_MAX_ARTIFACTS,
+    MANIFEST_MAX_BYTES,
 };
 use clinker_exec::output::containment::PromotionDisposition;
 use clinker_exec::output::staging::{OutputStagingRegistry, PublicationOutcome};
@@ -374,6 +375,100 @@ fn cross_filesystem_promotion_has_no_visible_copy_fallback() {
         );
         assert!(!destination_root.path().join("result.bin").exists());
     }
+}
+
+#[test]
+fn cleanup_keeps_live_unowned_malformed_and_unexpected_attempts() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let root_path = validated(root.path(), ".");
+
+    let live = begin(root.path());
+    assert_eq!(
+        AttemptPublication::cleanup(root_path.clone(), EXECUTION_ID, 400_000)
+            .expect("live cleanup inspection")
+            .disposition(),
+        CleanupDisposition::Kept
+    );
+    assert!(live.attempt_root().exists());
+    drop(live);
+
+    let malformed_id = "018f47a2-9a41-7a27-b4d6-4f7137e3c161";
+    let malformed_root = root.path().join(".clinker-attempts").join(malformed_id);
+    std::fs::create_dir(&malformed_root).expect("malformed attempt root");
+    std::fs::write(malformed_root.join("live.lock"), b"").expect("orphan lock");
+    std::fs::write(malformed_root.join("manifest.json"), b"{").expect("malformed manifest");
+    assert_eq!(
+        AttemptPublication::cleanup(root_path.clone(), malformed_id, 400_000)
+            .expect("malformed cleanup inspection")
+            .disposition(),
+        CleanupDisposition::Kept
+    );
+    assert!(malformed_root.exists());
+
+    let unowned_id = "018f47a2-9a41-7a27-b4d6-4f7137e3c162";
+    let unowned_root = root.path().join(".clinker-attempts").join(unowned_id);
+    std::fs::create_dir(&unowned_root).expect("unowned matching directory");
+    std::fs::write(unowned_root.join("outside-canary"), b"unrelated").expect("unrelated data");
+    assert_eq!(
+        AttemptPublication::cleanup(root_path, unowned_id, 400_000)
+            .expect("unowned cleanup inspection")
+            .disposition(),
+        CleanupDisposition::Kept
+    );
+    assert_eq!(
+        std::fs::read(unowned_root.join("outside-canary")).unwrap(),
+        b"unrelated"
+    );
+}
+
+#[test]
+fn anchored_cleanup_rejects_linked_artifacts_without_mutating_outside_data() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let outside = tempfile::tempdir().expect("outside directory");
+    let outside_canary = outside.path().join("canary.bin");
+    std::fs::write(&outside_canary, b"outside").expect("outside canary");
+    let registry = OutputStagingRegistry::default();
+    let mut attempt = begin(root.path());
+    let artifact_id = stage_ready(&mut attempt, &registry, root.path(), b"owned");
+    let attempt_root = attempt.attempt_root().to_path_buf();
+    drop(attempt);
+    std::fs::remove_file(attempt_root.join(&artifact_id)).expect("remove owned artifact fixture");
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside_canary, attempt_root.join(&artifact_id))
+        .expect("artifact symlink fixture");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&outside_canary, attempt_root.join(&artifact_id))
+        .expect("artifact symlink fixture");
+
+    assert_eq!(
+        AttemptPublication::cleanup(validated(root.path(), "."), EXECUTION_ID, 400_000)
+            .expect("linked cleanup inspection")
+            .disposition(),
+        CleanupDisposition::Kept
+    );
+    assert_eq!(std::fs::read(outside_canary).unwrap(), b"outside");
+    assert!(attempt_root.exists());
+}
+
+#[test]
+fn orphan_cleanup_is_metadata_last_and_idempotent() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let registry = OutputStagingRegistry::default();
+    let mut attempt = begin(root.path());
+    stage_ready(&mut attempt, &registry, root.path(), b"orphaned");
+    let attempt_root = attempt.attempt_root().to_path_buf();
+    drop(attempt);
+
+    let first = AttemptPublication::cleanup(validated(root.path(), "."), EXECUTION_ID, 400_000)
+        .expect("orphan cleanup");
+    assert_eq!(first.disposition(), CleanupDisposition::Removed);
+    assert_eq!(first.execution_id(), EXECUTION_ID);
+    assert!(!attempt_root.exists());
+
+    let repeated = AttemptPublication::cleanup(validated(root.path(), "."), EXECUTION_ID, 400_000)
+        .expect("idempotent cleanup");
+    assert_eq!(repeated.disposition(), CleanupDisposition::AlreadyAbsent);
 }
 
 #[allow(dead_code)]
