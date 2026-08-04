@@ -601,6 +601,41 @@ fn every_registered_scenario_has_a_gate() {
 }
 
 #[test]
+fn every_scenario_directory_is_registered() {
+    // The one direction the pair above cannot see. Between them they close the
+    // loop between the two *lists*, proving REGISTRY and GATES name exactly the
+    // same scenarios — but both start from a list, and neither looks at the
+    // corpus on disk. A directory holding a pipeline, a README and committed
+    // goldens that no list names is invisible to all of it: `gen` never
+    // materialises its input, no gate ever runs it, and the suite stays fully
+    // green while the golden inside states a correct answer nothing checks.
+    //
+    // The shape arises whenever a scenario exists on one branch and not
+    // another: the files linger untracked in a shared checkout, one `git add`
+    // away from being committed into a tree that does not register them.
+    let corpus = repo_root().join("examples/scenarios");
+    let mut unregistered: Vec<String> = std::fs::read_dir(&corpus)
+        .unwrap_or_else(|e| panic!("read {}: {e}", corpus.display()))
+        .map(|entry| entry.expect("scenario corpus entry"))
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !REGISTRY.iter().any(|scenario| scenario.id == *name))
+        .collect();
+    // `read_dir` order is arbitrary; sort so the message is reproducible.
+    unregistered.sort();
+
+    assert!(
+        unregistered.is_empty(),
+        "examples/scenarios/ holds directories absent from the generator \
+         registry: {}. An unregistered directory is never generated and never \
+         executed, so any committed golden inside it asserts nothing. Either \
+         add a `Scenario` entry to `clinker_scenarios::REGISTRY` — the sibling \
+         guard will then require its `Gate` — or delete the directory.",
+        unregistered.join(", "),
+    );
+}
+
+#[test]
 fn blanking_leaves_later_columns_untouched() {
     // The DLQ's trailing columns embed the original record and may contain
     // quoted commas; blanking must not disturb them.
