@@ -27,18 +27,13 @@ const BUILD_WORKFLOW: &str = ".github/workflows/release.yml";
 const PUBLISH_WORKFLOW: &str = ".github/workflows/publish-release.yml";
 const METADATA_MARKER: &str = "\n\n<!-- clinker-release-metadata\n";
 const METADATA_END: &str = "\n-->\n";
-const IDENTITY_FIELDS: [&str; 14] = [
+const AUTHORIZATION_IDENTITY_FIELDS: [&str; 9] = [
     "candidate_tag",
     "candidate_version",
     "source_sha",
-    "build_workflow_sha",
     "publish_workflow_ref",
     "publish_workflow_ref_resolved_sha",
     "publish_workflow_sha",
-    "candidate_release_id",
-    "checksum_sha256",
-    "archive_digests",
-    "ci_run_ref",
     "changelog_ref",
     "inventory_ref",
     "authorized_release_maintainer_ref",
@@ -49,16 +44,16 @@ const IDENTITY_FIELDS: [&str; 14] = [
 pub struct CandidateRequest {
     /// Exact repository identity.
     pub repository: String,
-    /// Canonical decision directory.
-    pub decision_dir: PathBuf,
+    /// Canonical decision directory, required only for accepted-candidate readback.
+    pub decision_dir: Option<PathBuf>,
     /// Separate candidate-authorization record.
     pub authorization_record: PathBuf,
     /// Candidate-authorization schema.
     pub authorization_schema: PathBuf,
-    /// Accepted candidate decision.
-    pub decision_record: PathBuf,
-    /// Decision schema.
-    pub decision_schema: PathBuf,
+    /// Accepted post-build candidate decision, required only for readback.
+    pub decision_record: Option<PathBuf>,
+    /// Decision schema, required only for readback.
+    pub decision_schema: Option<PathBuf>,
     /// Existing candidate evidence for fresh byte readback.
     pub candidate_evidence: Option<PathBuf>,
     /// Candidate evidence schema.
@@ -718,36 +713,9 @@ pub fn verify_candidate(repo_root: &Path, request: &CandidateRequest) -> Result<
     }
     let root = fs::canonicalize(repo_root)
         .map_err(|error| GateError::io("resolve repository root", &error))?;
-    let decision_dir = contained_directory(&root, &request.decision_dir)?;
-    for path in [&request.authorization_record, &request.decision_record] {
-        let path = contained_file(&root, path)?;
-        if !path.starts_with(&decision_dir) {
-            return Err(policy(
-                "candidate authority records must remain beneath --decision-dir",
-            ));
-        }
-    }
-    for path in [
-        &request.authorization_schema,
-        &request.decision_schema,
-        &request.evidence_schema,
-    ] {
-        contained_file(&root, path)?;
-    }
-
-    decision::validate(&DecisionRequest {
-        schema: Some(resolve(&root, &request.decision_schema)),
-        records: vec![resolve(&root, &request.decision_record)],
-        authorization_schema: Some(resolve(&root, &request.authorization_schema)),
-        authorization_record: Some(resolve(&root, &request.authorization_record)),
-        candidate_evidence: None,
-        require_ids: Vec::new(),
-        require_authorization_id: None,
-        require_authorized: true,
-        require_complete: false,
-        require_accepted: true,
-    })?;
-
+    contained_file(&root, &request.authorization_record)?;
+    contained_file(&root, &request.authorization_schema)?;
+    contained_file(&root, &request.evidence_schema)?;
     let existing_candidate = if let Some(candidate) = &request.candidate_evidence {
         let candidate = contained_file(&root, candidate)?;
         crate::cli::publication::validate_evidence_file(
@@ -759,6 +727,53 @@ pub fn verify_candidate(repo_root: &Path, request: &CandidateRequest) -> Result<
     } else {
         None
     };
+    match (
+        &request.decision_dir,
+        &request.decision_record,
+        &request.decision_schema,
+    ) {
+        (Some(directory), Some(record), Some(schema)) => {
+            let decision_dir = contained_directory(&root, directory)?;
+            for path in [&request.authorization_record, record] {
+                let path = contained_file(&root, path)?;
+                if !path.starts_with(&decision_dir) {
+                    return Err(policy(
+                        "candidate authority records must remain beneath --decision-dir",
+                    ));
+                }
+            }
+            contained_file(&root, schema)?;
+            decision::validate(&DecisionRequest {
+                schema: Some(resolve(&root, schema)),
+                records: vec![resolve(&root, record)],
+                authorization_schema: Some(resolve(&root, &request.authorization_schema)),
+                authorization_record: Some(resolve(&root, &request.authorization_record)),
+                candidate_evidence: existing_candidate.clone(),
+                require_ids: Vec::new(),
+                require_authorization_id: None,
+                require_authorized: true,
+                require_complete: false,
+                require_accepted: true,
+            })?;
+        }
+        (None, None, None) => decision::validate(&DecisionRequest {
+            schema: None,
+            records: Vec::new(),
+            authorization_schema: Some(resolve(&root, &request.authorization_schema)),
+            authorization_record: Some(resolve(&root, &request.authorization_record)),
+            candidate_evidence: None,
+            require_ids: Vec::new(),
+            require_authorization_id: None,
+            require_authorized: true,
+            require_complete: false,
+            require_accepted: false,
+        })?,
+        _ => {
+            return Err(policy(
+                "candidate decision directory, record, and schema must be supplied together",
+            ));
+        }
+    }
     let destination = if let Some(destination) = &request.evidence_manifest {
         let destination = resolve(&root, destination);
         let parent = destination
@@ -826,7 +841,8 @@ pub fn verify_candidate(repo_root: &Path, request: &CandidateRequest) -> Result<
             source_sha: source_sha.to_owned(),
         },
     )?;
-    verify_authorized_digests(&release_inventory, first.path(), authority)?;
+    let (archive_digests, checksum_sha256) =
+        observed_candidate_digests(&release_inventory, first.path())?;
 
     let final_release = release_view(&request.repository, tag)?;
     if initial_release != final_release {
@@ -834,14 +850,19 @@ pub fn verify_candidate(repo_root: &Path, request: &CandidateRequest) -> Result<
             "private release identity changed during fresh reread",
         ));
     }
+    let observation = CandidateObservation {
+        release: &initial_release,
+        tag: &initial_tag,
+        archive_digests: &archive_digests,
+        checksum_sha256: &checksum_sha256,
+    };
     let candidate = candidate_value(
         &request.repository,
         &release_inventory,
         first.path(),
         authority,
         authorization_digest,
-        &initial_release,
-        &initial_tag,
+        &observation,
     )?;
     let candidate_bytes = serde_json::to_vec(&candidate).map_err(|_| {
         GateError::internal(
@@ -931,23 +952,10 @@ fn gh_json(arguments: &[&str]) -> Result<Value, GateError> {
 }
 
 fn gh(arguments: &[&str]) -> Result<Vec<u8>, GateError> {
-    let mut environment = BTreeMap::new();
-    for name in [
-        "PATH",
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "NO_COLOR",
-        "LANG",
-        "LC_ALL",
-    ] {
-        if let Some(value) = std::env::var_os(name) {
-            environment.insert(OsString::from(name), value);
-        }
-    }
     let result = child::run(ChildSpec {
         program: PathBuf::from("gh"),
         arguments: arguments.iter().map(OsString::from).collect(),
-        environment,
+        environment: child::github_environment(),
         timeout: Duration::from_secs(300),
         output_limit: MAX_CHILD_OUTPUT_BYTES,
     })?;
@@ -971,13 +979,12 @@ fn validate_release_view(release: &Value, authority: &Map<String, Value>) -> Res
     if release.get("isDraft").and_then(Value::as_bool) != Some(true) {
         return Err(policy("candidate release is not a private draft"));
     }
-    for (observed, field) in [("tagName", "candidate_tag"), ("id", "candidate_release_id")] {
-        if release.get(observed) != authority.get(field) {
-            return Err(policy(format!(
-                "release {observed} does not match candidate authority"
-            )));
-        }
+    if release.get("tagName") != authority.get("candidate_tag") {
+        return Err(policy(
+            "release tagName does not match candidate authorization",
+        ));
     }
+    string_field(release, "id", "release readback")?;
     let body = release
         .get("body")
         .and_then(Value::as_str)
@@ -1002,18 +1009,26 @@ fn validate_release_view(release: &Value, authority: &Map<String, Value>) -> Res
         "private release metadata",
     )?;
     for (metadata_field, authority_field) in [
-        ("build_workflow_sha", "build_workflow_sha"),
         ("build_head_sha", "source_sha"),
         ("source_sha", "source_sha"),
         ("publish_workflow_ref", "publish_workflow_ref"),
         ("publish_workflow_sha", "publish_workflow_sha"),
-        ("candidate_release_id", "candidate_release_id"),
     ] {
         if metadata.get(metadata_field) != authority.get(authority_field) {
             return Err(policy(format!(
                 "release metadata {metadata_field} does not match candidate authority"
             )));
         }
+    }
+    if metadata.get("build_workflow_sha") != authority.get("source_sha") {
+        return Err(policy(
+            "release metadata build_workflow_sha does not match the authorized source",
+        ));
+    }
+    if metadata.get("candidate_release_id") != release.get("id") {
+        return Err(policy(
+            "release metadata candidate_release_id does not match release readback",
+        ));
     }
     if metadata.get("build_workflow_path") != Some(&Value::String(BUILD_WORKFLOW.to_owned()))
         || metadata.get("build_event") != Some(&Value::String("push".to_owned()))
@@ -1108,15 +1123,10 @@ fn require_complete_asset_set(
     Ok(())
 }
 
-fn verify_authorized_digests(
+fn observed_candidate_digests(
     inventory: &inventory::ReleaseInventory,
     directory: &Path,
-    authority: &Map<String, Value>,
-) -> Result<(), GateError> {
-    let expected = authority
-        .get("archive_digests")
-        .and_then(Value::as_object)
-        .ok_or_else(|| policy("candidate archive digest authority is absent"))?;
+) -> Result<(Map<String, Value>, String), GateError> {
     let mut observed = Map::new();
     for target in &inventory.targets {
         let path = directory.join(&target.archive_name);
@@ -1133,22 +1143,19 @@ fn verify_authorized_digests(
             ),
         );
     }
-    if &observed != expected {
-        return Err(policy(
-            "fresh archive digests do not match candidate authority",
-        ));
-    }
     let checksum = read_bounded(
         &directory.join("SHA256SUMS"),
         "read candidate checksums",
         MAX_INPUT_BYTES,
     )?;
-    if authority.get("checksum_sha256") != Some(&Value::String(sha256_hex(&checksum))) {
-        return Err(policy(
-            "fresh checksum digest does not match candidate authority",
-        ));
-    }
-    Ok(())
+    Ok((observed, sha256_hex(&checksum)))
+}
+
+struct CandidateObservation<'a> {
+    release: &'a Value,
+    tag: &'a Value,
+    archive_digests: &'a Map<String, Value>,
+    checksum_sha256: &'a str,
 }
 
 fn candidate_value(
@@ -1157,8 +1164,7 @@ fn candidate_value(
     directory: &Path,
     authority: &Map<String, Value>,
     authorization_digest: &str,
-    release: &Value,
-    tag: &Value,
+    observation: &CandidateObservation<'_>,
 ) -> Result<Value, GateError> {
     let mut candidate = Map::new();
     candidate.insert(
@@ -1184,7 +1190,7 @@ fn candidate_value(
         "candidate_authorization_sha256".to_owned(),
         Value::String(authorization_digest.to_owned()),
     );
-    for field in IDENTITY_FIELDS {
+    for field in AUTHORIZATION_IDENTITY_FIELDS {
         candidate.insert(
             field.to_owned(),
             authority
@@ -1193,23 +1199,50 @@ fn candidate_value(
                 .ok_or_else(|| policy(format!("candidate authority is missing {field}")))?,
         );
     }
-    let release = release
+    let release = observation
+        .release
         .as_object()
         .ok_or_else(|| policy("release readback must be an object"))?;
     let (_, metadata_text) =
         split_release_body(string_field(release, "body", "release readback")?)?;
     let metadata = metadata_value(metadata_text)?;
+    let build_run_id = metadata
+        .get("build_run_id")
+        .cloned()
+        .ok_or_else(|| policy("release metadata is missing build_run_id"))?;
+    let build_run_id_text = build_run_id
+        .as_str()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| policy("release metadata build_run_id must be a non-empty string"))?;
+    let ci_run_ref = format!("https://github.com/{repository}/actions/runs/{build_run_id_text}");
+    candidate.insert(
+        "build_workflow_sha".to_owned(),
+        metadata
+            .get("build_workflow_sha")
+            .cloned()
+            .ok_or_else(|| policy("release metadata is missing build_workflow_sha"))?,
+    );
+    candidate.insert(
+        "candidate_release_id".to_owned(),
+        release
+            .get("id")
+            .cloned()
+            .ok_or_else(|| policy("release readback is missing id"))?,
+    );
+    candidate.insert(
+        "checksum_sha256".to_owned(),
+        Value::String(observation.checksum_sha256.to_owned()),
+    );
+    candidate.insert(
+        "archive_digests".to_owned(),
+        Value::Object(observation.archive_digests.clone()),
+    );
+    candidate.insert("ci_run_ref".to_owned(), Value::String(ci_run_ref.clone()));
     candidate.insert(
         "build_workflow_path".to_owned(),
         Value::String(BUILD_WORKFLOW.to_owned()),
     );
-    candidate.insert(
-        "build_run_id".to_owned(),
-        metadata
-            .get("build_run_id")
-            .cloned()
-            .ok_or_else(|| policy("release metadata is missing build_run_id"))?,
-    );
+    candidate.insert("build_run_id".to_owned(), build_run_id);
     candidate.insert(
         "build_head_sha".to_owned(),
         authority
@@ -1222,10 +1255,7 @@ fn candidate_value(
         Value::String(PUBLISH_WORKFLOW.to_owned()),
     );
 
-    let digests = authority
-        .get("archive_digests")
-        .and_then(Value::as_object)
-        .ok_or_else(|| policy("candidate archive digest authority is absent"))?;
+    let digests = observation.archive_digests;
     let mut archives = Vec::new();
     let mut attestations = Vec::new();
     let mut targets = inventory.targets.iter().collect::<Vec<_>>();
@@ -1266,7 +1296,9 @@ fn candidate_value(
         "tag_readback_ref".to_owned(),
         Value::String(
             string_field(
-                tag.as_object()
+                observation
+                    .tag
+                    .as_object()
                     .ok_or_else(|| policy("tag readback must be an object"))?,
                 "url",
                 "tag readback",
@@ -1276,10 +1308,7 @@ fn candidate_value(
     );
     candidate.insert(
         "release_trigger_event_ref".to_owned(),
-        authority
-            .get("ci_run_ref")
-            .cloned()
-            .ok_or_else(|| policy("candidate authority is missing ci_run_ref"))?,
+        Value::String(ci_run_ref),
     );
     Ok(Value::Object(candidate))
 }

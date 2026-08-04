@@ -36,6 +36,17 @@ const IDENTITY_FIELDS: [&str; 14] = [
     "inventory_ref",
     "authorized_release_maintainer_ref",
 ];
+const AUTHORIZATION_IDENTITY_FIELDS: [&str; 9] = [
+    "candidate_tag",
+    "candidate_version",
+    "source_sha",
+    "publish_workflow_ref",
+    "publish_workflow_ref_resolved_sha",
+    "publish_workflow_sha",
+    "changelog_ref",
+    "inventory_ref",
+    "authorized_release_maintainer_ref",
+];
 
 /// Fully preflighted decision-validation request.
 #[derive(Debug, Clone)]
@@ -934,7 +945,7 @@ fn validate_authorization(
         "recorded_at",
     ];
     if status == "authorized" {
-        expected.extend_from_slice(&IDENTITY_FIELDS);
+        expected.extend_from_slice(&AUTHORIZATION_IDENTITY_FIELDS);
         expected.push("approved_at");
     }
     exact_keys(nested, &expected, "authorization")?;
@@ -971,7 +982,7 @@ fn validate_authorization(
                 "authorization approved_at must not follow recorded_at",
             ));
         }
-        validate_candidate_identity(nested, "authorization")?;
+        validate_authorization_identity(nested)?;
     } else {
         expect_string(
             artifact,
@@ -1069,7 +1080,7 @@ fn validate_record_set(
             required(artifact, "authorization", "authorization artifact")?,
             "authorization",
         )?;
-        compare_identity(nested, candidate, "release candidate")?;
+        compare_authorization_identity(nested, candidate, "release candidate")?;
         compare_field(
             artifact,
             candidate,
@@ -1086,7 +1097,7 @@ fn validate_record_set(
         if let Some(evidence) = candidate_evidence {
             validate_candidate_evidence(evidence)?;
             let evidence = object(evidence, "candidate evidence")?;
-            compare_identity(nested, evidence, "candidate evidence")?;
+            compare_identity(candidate, evidence, "candidate evidence")?;
             compare_field(
                 artifact,
                 evidence,
@@ -1099,7 +1110,7 @@ fn validate_record_set(
             ));
         }
         if let Some(approval) = by_id.get("publication-approval") {
-            compare_identity(nested, approval, "publication approval")?;
+            compare_identity(candidate, approval, "publication approval")?;
             compare_field(
                 artifact,
                 approval,
@@ -1432,7 +1443,7 @@ fn validate_candidate_identity(
     }
     expect_string(value, "candidate_version", &tag[1..], field)?;
     let source = sha40(required(value, "source_sha", field)?, "source_sha")?;
-    sha40(
+    let build = sha40(
         required(value, "build_workflow_sha", field)?,
         "build_workflow_sha",
     )?;
@@ -1445,9 +1456,9 @@ fn validate_candidate_identity(
         "publish_workflow_sha",
     )?;
     expect_string(value, "publish_workflow_ref", &tag, field)?;
-    if resolved != publish || publish != source {
+    if build != source || resolved != publish || publish != source {
         return Err(policy(format!(
-            "{field} publish authority must equal source_sha"
+            "{field} build and publish authority must equal source_sha"
         )));
     }
     nonempty_string(value, "candidate_release_id", field)?;
@@ -1467,6 +1478,39 @@ fn validate_candidate_identity(
         evidence_ref(required(value, name, field)?, name)?;
     }
     nonempty_string(value, "authorized_release_maintainer_ref", field)?;
+    Ok(())
+}
+
+fn validate_authorization_identity(
+    value: &BTreeMap<String, CanonicalValue>,
+) -> Result<(), GateError> {
+    let tag = nonempty_string(value, "candidate_tag", "authorization")?;
+    if !valid_semver_tag(&tag) {
+        return Err(policy("authorization.candidate_tag must be v<semver>"));
+    }
+    expect_string(value, "candidate_version", &tag[1..], "authorization")?;
+    let source = sha40(
+        required(value, "source_sha", "authorization")?,
+        "source_sha",
+    )?;
+    let resolved = sha40(
+        required(value, "publish_workflow_ref_resolved_sha", "authorization")?,
+        "publish_workflow_ref_resolved_sha",
+    )?;
+    let publish = sha40(
+        required(value, "publish_workflow_sha", "authorization")?,
+        "publish_workflow_sha",
+    )?;
+    expect_string(value, "publish_workflow_ref", &tag, "authorization")?;
+    if resolved != publish || publish != source {
+        return Err(policy(
+            "authorization publish authority must equal source_sha",
+        ));
+    }
+    for name in ["changelog_ref", "inventory_ref"] {
+        evidence_ref(required(value, name, "authorization")?, name)?;
+    }
+    nonempty_string(value, "authorized_release_maintainer_ref", "authorization")?;
     Ok(())
 }
 
@@ -1494,6 +1538,21 @@ fn compare_identity(
     name: &str,
 ) -> Result<(), GateError> {
     for field in IDENTITY_FIELDS {
+        if authority.get(field) != consumer.get(field) {
+            return Err(policy(format!(
+                "{name}.{field} must match candidate authorization"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn compare_authorization_identity(
+    authority: &BTreeMap<String, CanonicalValue>,
+    consumer: &BTreeMap<String, CanonicalValue>,
+    name: &str,
+) -> Result<(), GateError> {
+    for field in AUTHORIZATION_IDENTITY_FIELDS {
         if authority.get(field) != consumer.get(field) {
             return Err(policy(format!(
                 "{name}.{field} must match candidate authorization"

@@ -27,7 +27,16 @@ const PUBLISH_WORKFLOW: &str = "publish-release.yml";
 const JOB_NAME: &str = "publish-approved-release";
 const ENVIRONMENT: &str = "release";
 
-/// Shared authority inputs for candidate-tag creation and readback.
+/// Pre-build human authorization used only for protected tag creation and readback.
+#[derive(Debug, Clone)]
+pub struct CandidateAuthorizationRequest {
+    pub repository: String,
+    pub authorization_record: PathBuf,
+    pub authorization_schema: PathBuf,
+    pub deadline_seconds: u64,
+}
+
+/// Post-build accepted authority used by protected publication.
 #[derive(Debug, Clone)]
 pub struct CandidateAuthorityRequest {
     pub repository: String,
@@ -415,7 +424,6 @@ fn validate_protected_authority(
     for (field_name, expected) in [
         ("candidate_tag", request.candidate_tag.as_str()),
         ("source_sha", request.source_sha.as_str()),
-        ("build_workflow_sha", request.build_workflow_sha.as_str()),
         (
             "publish_workflow_ref",
             request.publish_workflow_ref.as_str(),
@@ -424,13 +432,28 @@ fn validate_protected_authority(
             "publish_workflow_sha",
             request.publish_workflow_sha.as_str(),
         ),
+    ] {
+        for (object, label) in [
+            (nested, "candidate authorization payload"),
+            (decision, "candidate decision"),
+            (candidate, "candidate evidence"),
+            (approval, "publication approval"),
+        ] {
+            if string_field(object, field_name, label)? != expected {
+                return Err(policy(format!(
+                    "{label}.{field_name} differs from protected workflow input"
+                )));
+            }
+        }
+    }
+    for (field_name, expected) in [
+        ("build_workflow_sha", request.build_workflow_sha.as_str()),
         (
             "candidate_release_id",
             request.candidate_release_id.as_str(),
         ),
     ] {
         for (object, label) in [
-            (nested, "candidate authorization payload"),
             (decision, "candidate decision"),
             (candidate, "candidate evidence"),
             (approval, "publication approval"),
@@ -682,11 +705,11 @@ fn required_environment(name: &'static str) -> Result<String, GateError> {
 
 /// Create the one immutable candidate tag from accepted authority.
 pub fn create_candidate_tag(
-    request: &CandidateAuthorityRequest,
+    request: &CandidateAuthorizationRequest,
     transport: &mut dyn GitHubTransport,
 ) -> Result<String, GateError> {
-    let authority = load_authority(request, None, None, None)?;
-    let authorization = object(&authority.authorization, "authorization")?;
+    let authority = load_candidate_authorization(request)?;
+    let authorization = object(&authority, "authorization")?;
     let nested = object(
         field(authorization, "authorization", "authorization")?,
         "authorization",
@@ -706,11 +729,11 @@ pub fn create_candidate_tag(
 
 /// Resolve and peel the protected candidate tag without mutation.
 pub fn resolve_protected_ref(
-    request: &CandidateAuthorityRequest,
+    request: &CandidateAuthorizationRequest,
     transport: &mut dyn GitHubTransport,
 ) -> Result<String, GateError> {
-    let authority = load_authority(request, None, None, None)?;
-    let authorization = object(&authority.authorization, "authorization")?;
+    let authority = load_candidate_authorization(request)?;
+    let authorization = object(&authority, "authorization")?;
     let nested = object(
         field(authorization, "authorization", "authorization")?,
         "authorization",
@@ -1302,6 +1325,33 @@ fn load_authority(
     })
 }
 
+fn load_candidate_authorization(
+    request: &CandidateAuthorizationRequest,
+) -> Result<Value, GateError> {
+    require_repository(&request.repository)?;
+    deadline(request.deadline_seconds)?;
+    decision::validate(&DecisionRequest {
+        schema: None,
+        records: Vec::new(),
+        authorization_schema: Some(request.authorization_schema.clone()),
+        authorization_record: Some(request.authorization_record.clone()),
+        candidate_evidence: None,
+        require_ids: Vec::new(),
+        require_authorization_id: None,
+        require_authorized: true,
+        require_complete: false,
+        require_accepted: false,
+    })?;
+    parse_json(
+        &read_bounded(
+            &request.authorization_record,
+            "read candidate authorization",
+            MAX_INPUT_BYTES,
+        )?,
+        "candidate authorization",
+    )
+}
+
 fn validate_decision_directory(
     directory: &Path,
     authority: &CandidateAuthorityRequest,
@@ -1607,6 +1657,8 @@ fn validate_candidate(value: &Value) -> Result<(), GateError> {
     )?;
     if string_field(object, "source_sha", "candidate evidence")?
         != string_field(object, "build_head_sha", "candidate evidence")?
+        || string_field(object, "source_sha", "candidate evidence")?
+            != string_field(object, "build_workflow_sha", "candidate evidence")?
         || string_field(object, "source_sha", "candidate evidence")?
             != string_field(object, "publish_workflow_sha", "candidate evidence")?
         || string_field(object, "source_sha", "candidate evidence")?

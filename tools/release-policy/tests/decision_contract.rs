@@ -218,6 +218,19 @@ fn decision_validate_rejects_policy_data_with_exit_one_and_bounded_stderr() {
     ]);
     assert_policy_rejection(&stale_output);
 
+    let mut premature = authorizations["authorized"].clone();
+    premature["authorization"]["candidate_release_id"] = json!("release-not-built-yet");
+    let premature_path = write_json(&directory, "premature-release-id.json", &premature);
+    let premature_output = gate(&[
+        "decision",
+        "validate",
+        "--authorization-schema",
+        AUTHORIZATION_SCHEMA,
+        "--authorization-record",
+        premature_path.to_str().unwrap(),
+    ]);
+    assert_policy_rejection(&premature_output);
+
     for (name, value) in invalid_cases.drain(..) {
         let path = write_json(&directory, name, &value);
         assert_policy_rejection(&gate(&decision_args(&path)));
@@ -314,87 +327,14 @@ fn governed_assets(archives: &[Value]) -> Vec<Value> {
 }
 
 fn valid_candidate() -> Value {
-    let authorizations = fixture(AUTHORIZATION_FIXTURE);
-    let authorization = &authorizations["authorized"];
-    let identity = &authorization["authorization"];
-    let mut targets = identity["archive_digests"]
-        .as_object()
-        .expect("archive digests must be an object")
-        .keys()
-        .cloned()
-        .collect::<Vec<_>>();
-    targets.sort();
-    let archives = targets
-        .iter()
-        .map(|target| {
-            let extension = if target.ends_with("windows-msvc") {
-                "zip"
-            } else {
-                "tar.gz"
-            };
-            json!({
-                "target": target,
-                "archive_name": format!(
-                    "clinker-v{}-{target}.{extension}",
-                    identity["candidate_version"].as_str().unwrap()
-                ),
-                "sha256": identity["archive_digests"][target],
-            })
-        })
-        .collect::<Vec<_>>();
-    let attestations = archives
-        .iter()
-        .map(|archive| {
-            json!({
-                "archive_name": archive["archive_name"],
-                "subject_sha256": archive["sha256"],
-                "repository": "rustpunk/clinker",
-                "workflow": ".github/workflows/release.yml",
-                "ref": format!("refs/tags/{}", identity["candidate_tag"].as_str().unwrap()),
-                "source_sha": identity["source_sha"],
-                "runner_environment": "github-hosted",
-            })
-        })
-        .collect::<Vec<_>>();
-    let assets = governed_assets(&archives);
-
-    json!({
-        "schema": "clinker.candidate-evidence/v1",
-        "kind": "candidate",
-        "state": "candidate-verified",
-        "revision": 0,
-        "release_status": "incomplete",
-        "completion_eligible": false,
-        "immutable_authority_sha256": authorization["candidate_authorization_sha256"],
-        "candidate_authorization_sha256": authorization["candidate_authorization_sha256"],
-        "candidate_tag": identity["candidate_tag"],
-        "candidate_version": identity["candidate_version"],
-        "source_sha": identity["source_sha"],
-        "build_workflow_sha": identity["build_workflow_sha"],
-        "publish_workflow_ref": identity["publish_workflow_ref"],
-        "publish_workflow_ref_resolved_sha": identity["publish_workflow_ref_resolved_sha"],
-        "publish_workflow_sha": identity["publish_workflow_sha"],
-        "candidate_release_id": identity["candidate_release_id"],
-        "checksum_sha256": identity["checksum_sha256"],
-        "archive_digests": identity["archive_digests"],
-        "ci_run_ref": identity["ci_run_ref"],
-        "changelog_ref": identity["changelog_ref"],
-        "inventory_ref": identity["inventory_ref"],
-        "authorized_release_maintainer_ref": identity["authorized_release_maintainer_ref"],
-        "build_workflow_path": ".github/workflows/release.yml",
-        "build_run_id": "1001",
-        "build_head_sha": identity["source_sha"],
-        "publish_workflow_path": ".github/workflows/publish-release.yml",
-        "archives": archives,
-        "attestations": attestations,
-        "assets": assets,
-        "tag_mutation_performed": false,
-        "tag_readback_ref": format!(
-            "https://github.com/rustpunk/clinker/git/ref/tags/{}",
-            identity["candidate_tag"].as_str().unwrap()
-        ),
-        "release_trigger_event_ref": "https://github.com/rustpunk/clinker/actions/runs/1001",
-    })
+    let accepted = fixture(ACCEPTED_FIXTURE);
+    let mut candidate = accepted["candidate_evidence"].clone();
+    candidate["assets"] = Value::Array(governed_assets(
+        candidate["archives"]
+            .as_array()
+            .expect("candidate archives"),
+    ));
+    candidate
 }
 
 fn valid_publication() -> Value {

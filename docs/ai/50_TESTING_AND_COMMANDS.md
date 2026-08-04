@@ -277,6 +277,61 @@ private candidate. The policy tool is therefore not a Windows build
 dependency; platform-specific release jobs do not duplicate its Unix process,
 locking, or filesystem controls.
 
+Candidate authorization deliberately precedes the build and contains only
+values knowable before the protected tag exists. Validate that record, create
+the tag, and reread the protected ref with the same immutable authorization:
+
+```bash
+cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+  decision validate \
+  --authorization-schema scripts/release/release-candidate-authorization.schema.json \
+  --authorization-record path/to/authorization.json \
+  --require-authorization-id release-candidate-authorization \
+  --require-authorized
+
+cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+  publication create-candidate-tag \
+  --repo rustpunk/clinker \
+  --authorization-record path/to/authorization.json \
+  --authorization-schema scripts/release/release-candidate-authorization.schema.json \
+  --deadline-seconds 120
+
+cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+  publication resolve-protected-ref \
+  --repo rustpunk/clinker \
+  --authorization-record path/to/authorization.json \
+  --authorization-schema scripts/release/release-candidate-authorization.schema.json \
+  --deadline-seconds 120
+```
+
+After the tag workflow has staged and freshly reread the private draft, derive
+candidate evidence from the observed release ID, workflow run, checksums, and
+archive bytes. A maintainer can then accept that exact evidence in the
+candidate decision; neither the release ID nor artifact digests are guessed in
+the pre-build authorization.
+
+```bash
+cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+  release verify \
+  --repo rustpunk/clinker \
+  --authorization-record path/to/authorization.json \
+  --authorization-schema scripts/release/release-candidate-authorization.schema.json \
+  --require-private \
+  --fresh-download \
+  --evidence-kind candidate \
+  --evidence-schema scripts/release/release-evidence.schema.json \
+  --evidence-manifest target/release-policy/candidate-evidence.json
+
+cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+  decision validate \
+  --schema scripts/release/release-decision.schema.json \
+  --record path/to/candidate-decision.json \
+  --authorization-schema scripts/release/release-candidate-authorization.schema.json \
+  --authorization-record path/to/authorization.json \
+  --candidate-evidence target/release-policy/candidate-evidence.json \
+  --require-accepted
+```
+
 ## 8. Docs Generation Command
 
 Rust API docs:

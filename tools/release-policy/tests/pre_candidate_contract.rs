@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const AUTHORITY: &str = "f235dd6285bcdca002d0736e2b3d6e0494ad3f6d8ca3a6fbdbf947ea0ec88aa5";
+const AUTHORITY: &str = "61a9eead1082ea72871ac09dabca73e9cde6deaf00db920cdd4587944d4aa0a0";
 const NFS: &str = "linux-nfsv4.1-loopback-ci";
 const SMB: &str = "linux-smb3.1.1-loopback-ci";
 const NFS_EVIDENCE: &str = "target/release-policy/filesystem-linux-nfsv4.1-loopback-ci.json";

@@ -113,8 +113,6 @@ fn release_workflow_requires_every_build_and_assembly_stage_in_order() {
             "Build and verify the exact release asset set with Rust policy",
             "Attest the verified release archives",
             "Stage and freshly verify the private draft with the Rust gate",
-            "Produce artifact-derived non-completing candidate evidence",
-            "Upload the immutable candidate evidence",
         ][..],
     ] {
         let blocks = names
@@ -153,7 +151,10 @@ fn release_workflow_rejects_unmodeled_mutation_and_environment_drift() {
     let root = fixture();
     let source = release_workflow();
     let attest = named_step(&source, "Attest the verified release archives");
-    let upload_evidence = named_step(&source, "Upload the immutable candidate evidence");
+    let stage_draft = named_step(
+        &source,
+        "Stage and freshly verify the private draft with the Rust gate",
+    );
     let scenarios = [
         (
             "inserted binary replacement",
@@ -168,9 +169,9 @@ fn release_workflow_rejects_unmodeled_mutation_and_environment_drift() {
         (
             "inserted direct release publication",
             source.replacen(
-                &upload_evidence,
+                &stage_draft,
                 &format!(
-                    "      - name: Publish without the gate\n        shell: bash\n        run: gh release edit \"$RELEASE_CANDIDATE_TAG\" --draft=false\n{upload_evidence}"
+                    "      - name: Publish without the gate\n        shell: bash\n        run: gh release edit \"$RELEASE_CANDIDATE_TAG\" --draft=false\n{stage_draft}"
                 ),
                 1,
             ),
@@ -204,6 +205,22 @@ fn release_workflow_rejects_unmodeled_mutation_and_environment_drift() {
     for (scenario, mutated) in scenarios {
         assert_ne!(mutated, source, "scenario fixture must change: {scenario}");
         assert_release_workflow_rejected(root.path(), &mutated, scenario);
+    }
+}
+
+#[test]
+fn tag_workflow_stops_before_post_build_acceptance() {
+    let source = release_workflow();
+    for forbidden in [
+        "release-candidate-authorization.json",
+        "release-candidate.json",
+        "candidate-evidence.json",
+        "release-candidate-evidence",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "tag workflow must not consume or create post-build acceptance state: {forbidden}"
+        );
     }
 }
 
