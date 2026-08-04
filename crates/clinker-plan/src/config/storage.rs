@@ -99,6 +99,555 @@ pub struct StorageConfig {
     /// staging-copy engine per matched source.
     #[serde(default)]
     pub staging: StagingPolicy,
+    /// `[storage.publication]` — bounded output publication and retained
+    /// attempt policy.
+    #[serde(default)]
+    pub publication: PublicationPolicy,
+}
+
+const GIGABYTE: u64 = 1_000_000_000;
+const DEFAULT_FAILED_RETENTION_SECONDS: u64 = 86_400;
+const MAX_FAILED_RETENTION_SECONDS: u64 = 604_800;
+const DEFAULT_CREATION_GRACE_SECONDS: u64 = 300;
+const MAX_CREATION_GRACE_SECONDS: u64 = 3_600;
+const DEFAULT_MAX_ATTEMPT_BYTES: u64 = 4 * GIGABYTE;
+const MAX_MAX_ATTEMPT_BYTES: u64 = 16 * GIGABYTE;
+const DEFAULT_RETAINED_BYTE_LIMIT: u64 = 8 * GIGABYTE;
+const MAX_RETAINED_BYTE_LIMIT: u64 = 64 * GIGABYTE;
+const DEFAULT_RETAINED_ATTEMPT_LIMIT: u64 = 8;
+const MAX_RETAINED_ATTEMPT_LIMIT: u64 = 128;
+const DEFAULT_MIN_FREE_BYTES: u64 = 2 * GIGABYTE;
+const MAX_MIN_FREE_BYTES: u64 = 64 * GIGABYTE;
+const DEFAULT_SWEEP_ENTRY_LIMIT: u64 = 1_000;
+const MAX_SWEEP_ENTRY_LIMIT: u64 = 10_000;
+const DEFAULT_SWEEP_BYTE_LIMIT: u64 = 8 * GIGABYTE;
+const MAX_SWEEP_BYTE_LIMIT: u64 = 64 * GIGABYTE;
+const DEFAULT_SWEEP_TIME_LIMIT_MS: u64 = 2_000;
+const MAX_SWEEP_TIME_LIMIT_MS: u64 = 30_000;
+
+fn default_failed_retention_seconds() -> u64 {
+    DEFAULT_FAILED_RETENTION_SECONDS
+}
+
+fn default_creation_grace_seconds() -> u64 {
+    DEFAULT_CREATION_GRACE_SECONDS
+}
+
+fn default_max_attempt_bytes() -> ByteSize {
+    ByteSize(DEFAULT_MAX_ATTEMPT_BYTES)
+}
+
+fn default_retained_byte_limit() -> ByteSize {
+    ByteSize(DEFAULT_RETAINED_BYTE_LIMIT)
+}
+
+fn default_retained_attempt_limit() -> u64 {
+    DEFAULT_RETAINED_ATTEMPT_LIMIT
+}
+
+fn default_min_free_bytes() -> ByteSize {
+    ByteSize(DEFAULT_MIN_FREE_BYTES)
+}
+
+fn default_sweep_entry_limit() -> u64 {
+    DEFAULT_SWEEP_ENTRY_LIMIT
+}
+
+fn default_sweep_byte_limit() -> ByteSize {
+    ByteSize(DEFAULT_SWEEP_BYTE_LIMIT)
+}
+
+fn default_sweep_time_limit_ms() -> u64 {
+    DEFAULT_SWEEP_TIME_LIMIT_MS
+}
+
+/// How output bytes reach destination-local publication quarantine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationMode {
+    /// Write directly into quarantine on the destination filesystem.
+    #[default]
+    Direct,
+    /// Write into a restrictive local spool, then copy and verify into
+    /// destination-local quarantine before promotion.
+    LocalThenPublish,
+}
+
+/// Qualified filesystem profile selected for the publication destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DestinationProfile {
+    /// A durable local filesystem.
+    #[default]
+    Local,
+    /// A qualified NFSv4.1 destination.
+    NfsV4_1,
+    /// A qualified SMB3.1.1 destination.
+    Smb3_1_1,
+}
+
+impl DestinationProfile {
+    /// Author-facing profile spelling used by config and diagnostics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::NfsV4_1 => "nfs_v4_1",
+            Self::Smb3_1_1 => "smb_3_1_1",
+        }
+    }
+}
+
+/// Meaning of the capacity value exposed in publication explanation data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationCapacity {
+    /// A one-time free-space observation used only as an admission check.
+    AdvisoryObservation,
+}
+
+/// Support verdict exposed in publication explanation data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicationSupportStatus {
+    /// The selected profile passed local admission checks.
+    Supported,
+}
+
+/// Stable typed fields for text and structured publication explanations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PublicationExplain {
+    /// Resolved `publication.mode`.
+    pub mode: PublicationMode,
+    /// Resolved `publication.destination_profile`.
+    pub destination_profile: DestinationProfile,
+    /// Resolved `publication.failed_retention_seconds`.
+    pub failed_retention_seconds: u64,
+    /// Capacity admission semantics.
+    pub capacity: PublicationCapacity,
+    /// Checked upper-bound estimate supplied at admission.
+    pub estimated_attempt_bytes: u64,
+    /// Free bytes observed once at admission.
+    pub observed_free_bytes: u64,
+    /// Support verdict for the selected profile.
+    pub support_status: PublicationSupportStatus,
+}
+
+/// Strict `[storage.publication]` author configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicationPolicy {
+    /// Publication routing mode.
+    #[serde(default)]
+    pub mode: PublicationMode,
+    /// Qualified destination filesystem profile.
+    #[serde(default)]
+    pub destination_profile: DestinationProfile,
+    /// Required local spool for local-then-publish mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_spool_dir: Option<PathBuf>,
+    /// Retention for failed attempts in seconds. Zero is allowed.
+    #[serde(default = "default_failed_retention_seconds")]
+    pub failed_retention_seconds: u64,
+    /// Grace period for attempts whose creation may still be in progress.
+    #[serde(default = "default_creation_grace_seconds")]
+    pub creation_grace_seconds: u64,
+    /// Maximum admitted byte estimate for one attempt.
+    #[serde(default = "default_max_attempt_bytes")]
+    pub max_attempt_bytes: ByteSize,
+    /// Maximum aggregate bytes retained for attempts.
+    #[serde(default = "default_retained_byte_limit")]
+    pub retained_byte_limit: ByteSize,
+    /// Maximum number of retained attempts.
+    #[serde(default = "default_retained_attempt_limit")]
+    pub retained_attempt_limit: u64,
+    /// Additional free-space headroom required at admission.
+    #[serde(default = "default_min_free_bytes")]
+    pub min_free_bytes: ByteSize,
+    /// Maximum directory entries considered by one cleanup sweep.
+    #[serde(default = "default_sweep_entry_limit")]
+    pub sweep_entry_limit: u64,
+    /// Maximum bytes considered by one cleanup sweep.
+    #[serde(default = "default_sweep_byte_limit")]
+    pub sweep_byte_limit: ByteSize,
+    /// Maximum elapsed milliseconds spent by one cleanup sweep.
+    #[serde(default = "default_sweep_time_limit_ms")]
+    pub sweep_time_limit_ms: u64,
+}
+
+impl Default for PublicationPolicy {
+    fn default() -> Self {
+        Self {
+            mode: PublicationMode::Direct,
+            destination_profile: DestinationProfile::Local,
+            local_spool_dir: None,
+            failed_retention_seconds: DEFAULT_FAILED_RETENTION_SECONDS,
+            creation_grace_seconds: DEFAULT_CREATION_GRACE_SECONDS,
+            max_attempt_bytes: default_max_attempt_bytes(),
+            retained_byte_limit: default_retained_byte_limit(),
+            retained_attempt_limit: DEFAULT_RETAINED_ATTEMPT_LIMIT,
+            min_free_bytes: default_min_free_bytes(),
+            sweep_entry_limit: DEFAULT_SWEEP_ENTRY_LIMIT,
+            sweep_byte_limit: default_sweep_byte_limit(),
+            sweep_time_limit_ms: DEFAULT_SWEEP_TIME_LIMIT_MS,
+        }
+    }
+}
+
+/// Publication policy after strict validation and advisory admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPublicationPolicy {
+    mode: PublicationMode,
+    destination_profile: DestinationProfile,
+    local_spool_dir: Option<PathBuf>,
+    failed_retention_seconds: u64,
+    creation_grace_seconds: u64,
+    max_attempt_bytes: u64,
+    retained_byte_limit: u64,
+    retained_attempt_limit: u64,
+    min_free_bytes: u64,
+    sweep_entry_limit: u64,
+    sweep_byte_limit: u64,
+    sweep_time_limit_ms: u64,
+    estimated_attempt_bytes: u64,
+    observed_free_bytes: u64,
+}
+
+impl PublicationPolicy {
+    /// Resolve this policy before any attempt or output is created.
+    ///
+    /// `observed_free_bytes` is a single admission-time observation supplied
+    /// by the caller. It reserves no capacity and cannot guarantee that later
+    /// writes or syncs avoid `ENOSPC` or `EDQUOT`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageConfigError`] for invalid bounds, profile mismatch,
+    /// an unsuitable local spool, checked-arithmetic overflow, an oversized
+    /// estimate, or insufficient observed free space.
+    pub fn resolve(
+        &self,
+        destination_root: &Path,
+        estimated_attempt_bytes: u64,
+        observed_free_bytes: u64,
+    ) -> Result<ResolvedPublicationPolicy, StorageConfigError> {
+        let fs_kind = crate::config::fs_type::classify(destination_root).map_err(|error| {
+            StorageConfigError::PublicationDestinationUnprobeable {
+                path: destination_root.to_path_buf(),
+                source: error.to_string(),
+            }
+        })?;
+        self.resolve_for_fs_kind(
+            destination_root,
+            fs_kind,
+            estimated_attempt_bytes,
+            observed_free_bytes,
+        )
+    }
+
+    fn resolve_for_fs_kind(
+        &self,
+        _destination_root: &Path,
+        fs_kind: crate::config::FsKind,
+        estimated_attempt_bytes: u64,
+        observed_free_bytes: u64,
+    ) -> Result<ResolvedPublicationPolicy, StorageConfigError> {
+        self.validate_bounds()?;
+        let required_free_bytes = estimated_attempt_bytes
+            .checked_add(self.min_free_bytes.0)
+            .ok_or(StorageConfigError::PublicationCapacityOverflow {
+                estimated_attempt_bytes,
+                min_free_bytes: self.min_free_bytes.0,
+            })?;
+
+        match (self.destination_profile, fs_kind) {
+            (DestinationProfile::Local, crate::config::FsKind::Local)
+            | (DestinationProfile::NfsV4_1, crate::config::FsKind::Network)
+            | (DestinationProfile::Smb3_1_1, crate::config::FsKind::Network) => {}
+            (profile, detected) => {
+                return Err(StorageConfigError::PublicationProfileMismatch { profile, detected });
+            }
+        }
+
+        let local_spool_dir = self.validate_local_spool()?;
+        if estimated_attempt_bytes > self.max_attempt_bytes.0 {
+            return Err(StorageConfigError::PublicationEstimateExceedsLimit {
+                key: "max_attempt_bytes",
+                estimated_attempt_bytes,
+                limit_bytes: self.max_attempt_bytes.0,
+            });
+        }
+        if estimated_attempt_bytes > self.retained_byte_limit.0 {
+            return Err(StorageConfigError::PublicationEstimateExceedsLimit {
+                key: "retained_byte_limit",
+                estimated_attempt_bytes,
+                limit_bytes: self.retained_byte_limit.0,
+            });
+        }
+        if observed_free_bytes < required_free_bytes {
+            return Err(StorageConfigError::PublicationCapacityInsufficient {
+                estimated_attempt_bytes,
+                min_free_bytes: self.min_free_bytes.0,
+                observed_free_bytes,
+                required_free_bytes,
+            });
+        }
+
+        Ok(ResolvedPublicationPolicy {
+            mode: self.mode,
+            destination_profile: self.destination_profile,
+            local_spool_dir,
+            failed_retention_seconds: self.failed_retention_seconds,
+            creation_grace_seconds: self.creation_grace_seconds,
+            max_attempt_bytes: self.max_attempt_bytes.0,
+            retained_byte_limit: self.retained_byte_limit.0,
+            retained_attempt_limit: self.retained_attempt_limit,
+            min_free_bytes: self.min_free_bytes.0,
+            sweep_entry_limit: self.sweep_entry_limit,
+            sweep_byte_limit: self.sweep_byte_limit.0,
+            sweep_time_limit_ms: self.sweep_time_limit_ms,
+            estimated_attempt_bytes,
+            observed_free_bytes,
+        })
+    }
+
+    fn validate_bounds(&self) -> Result<(), StorageConfigError> {
+        validate_publication_bound(
+            "failed_retention_seconds",
+            self.failed_retention_seconds,
+            MAX_FAILED_RETENTION_SECONDS,
+            true,
+            "failed_retention_seconds = 604800",
+        )?;
+        validate_publication_bound(
+            "creation_grace_seconds",
+            self.creation_grace_seconds,
+            MAX_CREATION_GRACE_SECONDS,
+            false,
+            "creation_grace_seconds = 3600",
+        )?;
+        validate_publication_bound(
+            "max_attempt_bytes",
+            self.max_attempt_bytes.0,
+            MAX_MAX_ATTEMPT_BYTES,
+            false,
+            "max_attempt_bytes = \"16GB\"",
+        )?;
+        validate_publication_bound(
+            "retained_byte_limit",
+            self.retained_byte_limit.0,
+            MAX_RETAINED_BYTE_LIMIT,
+            false,
+            "retained_byte_limit = \"64GB\"",
+        )?;
+        validate_publication_bound(
+            "retained_attempt_limit",
+            self.retained_attempt_limit,
+            MAX_RETAINED_ATTEMPT_LIMIT,
+            false,
+            "retained_attempt_limit = 128",
+        )?;
+        validate_publication_bound(
+            "min_free_bytes",
+            self.min_free_bytes.0,
+            MAX_MIN_FREE_BYTES,
+            false,
+            "min_free_bytes = \"64GB\"",
+        )?;
+        validate_publication_bound(
+            "sweep_entry_limit",
+            self.sweep_entry_limit,
+            MAX_SWEEP_ENTRY_LIMIT,
+            false,
+            "sweep_entry_limit = 10000",
+        )?;
+        validate_publication_bound(
+            "sweep_byte_limit",
+            self.sweep_byte_limit.0,
+            MAX_SWEEP_BYTE_LIMIT,
+            false,
+            "sweep_byte_limit = \"64GB\"",
+        )?;
+        validate_publication_bound(
+            "sweep_time_limit_ms",
+            self.sweep_time_limit_ms,
+            MAX_SWEEP_TIME_LIMIT_MS,
+            false,
+            "sweep_time_limit_ms = 30000",
+        )
+    }
+
+    fn validate_local_spool(&self) -> Result<Option<PathBuf>, StorageConfigError> {
+        if self.mode == PublicationMode::Direct {
+            return Ok(self.local_spool_dir.clone());
+        }
+
+        let path = self
+            .local_spool_dir
+            .as_ref()
+            .ok_or(StorageConfigError::PublicationLocalSpoolRequired)?;
+        let metadata = std::fs::metadata(path).map_err(|error| {
+            StorageConfigError::PublicationLocalSpoolInvalid {
+                path: path.clone(),
+                source: error.to_string(),
+            }
+        })?;
+        if !metadata.is_dir() {
+            return Err(StorageConfigError::PublicationLocalSpoolInvalid {
+                path: path.clone(),
+                source: "path is not a directory".to_string(),
+            });
+        }
+        let kind = crate::config::fs_type::classify(path).map_err(|error| {
+            StorageConfigError::PublicationLocalSpoolInvalid {
+                path: path.clone(),
+                source: error.to_string(),
+            }
+        })?;
+        if kind != crate::config::FsKind::Local {
+            return Err(StorageConfigError::PublicationLocalSpoolInvalid {
+                path: path.clone(),
+                source: format!("detected {kind:?} filesystem; a local filesystem is required"),
+            });
+        }
+
+        let probe = tempfile::Builder::new()
+            .prefix(".clinker-publication-probe-")
+            .tempfile_in(path)
+            .map_err(|error| StorageConfigError::PublicationLocalSpoolInvalid {
+                path: path.clone(),
+                source: error.to_string(),
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = probe
+                .as_file()
+                .metadata()
+                .map_err(|error| StorageConfigError::PublicationLocalSpoolInvalid {
+                    path: path.clone(),
+                    source: error.to_string(),
+                })?
+                .permissions()
+                .mode();
+            if mode & 0o077 != 0 {
+                return Err(StorageConfigError::PublicationLocalSpoolInvalid {
+                    path: path.clone(),
+                    source: format!("probe file mode {:o} is not owner-only", mode & 0o777),
+                });
+            }
+        }
+        drop(probe);
+        Ok(Some(path.clone()))
+    }
+}
+
+fn validate_publication_bound(
+    key: &'static str,
+    value: u64,
+    maximum: u64,
+    zero_allowed: bool,
+    correction: &'static str,
+) -> Result<(), StorageConfigError> {
+    if (!zero_allowed && value == 0) || value > maximum {
+        return Err(StorageConfigError::PublicationValueOutOfRange {
+            key,
+            value,
+            maximum,
+            zero_allowed,
+            correction,
+        });
+    }
+    Ok(())
+}
+
+impl ResolvedPublicationPolicy {
+    /// Resolved publication routing mode.
+    pub fn mode(&self) -> PublicationMode {
+        self.mode
+    }
+
+    /// Qualified destination profile admitted for this run.
+    pub fn destination_profile(&self) -> DestinationProfile {
+        self.destination_profile
+    }
+
+    /// Local spool used by local-then-publish mode, if configured.
+    pub fn local_spool_dir(&self) -> Option<&Path> {
+        self.local_spool_dir.as_deref()
+    }
+
+    /// Failed-attempt retention duration in seconds.
+    pub fn failed_retention_seconds(&self) -> u64 {
+        self.failed_retention_seconds
+    }
+
+    /// Creation grace duration in seconds.
+    pub fn creation_grace_seconds(&self) -> u64 {
+        self.creation_grace_seconds
+    }
+
+    /// Maximum estimated bytes for one attempt.
+    pub fn max_attempt_bytes(&self) -> u64 {
+        self.max_attempt_bytes
+    }
+
+    /// Aggregate retained-attempt byte limit.
+    pub fn retained_byte_limit(&self) -> u64 {
+        self.retained_byte_limit
+    }
+
+    /// Retained-attempt count limit.
+    pub fn retained_attempt_limit(&self) -> u64 {
+        self.retained_attempt_limit
+    }
+
+    /// Admission headroom in bytes.
+    pub fn min_free_bytes(&self) -> u64 {
+        self.min_free_bytes
+    }
+
+    /// Maximum entries considered by one cleanup sweep.
+    pub fn sweep_entry_limit(&self) -> u64 {
+        self.sweep_entry_limit
+    }
+
+    /// Maximum bytes considered by one cleanup sweep.
+    pub fn sweep_byte_limit(&self) -> u64 {
+        self.sweep_byte_limit
+    }
+
+    /// Maximum elapsed milliseconds for one cleanup sweep.
+    pub fn sweep_time_limit_ms(&self) -> u64 {
+        self.sweep_time_limit_ms
+    }
+
+    /// Typed fields for text and structured publication explanations.
+    pub fn explain(&self) -> PublicationExplain {
+        PublicationExplain {
+            mode: self.mode,
+            destination_profile: self.destination_profile,
+            failed_retention_seconds: self.failed_retention_seconds,
+            capacity: PublicationCapacity::AdvisoryObservation,
+            estimated_attempt_bytes: self.estimated_attempt_bytes,
+            observed_free_bytes: self.observed_free_bytes,
+            support_status: PublicationSupportStatus::Supported,
+        }
+    }
+
+    /// Capacity admission never reserves blocks or quota.
+    pub fn reserves_capacity(&self) -> bool {
+        false
+    }
+
+    /// A successful admission observation cannot guarantee completion.
+    pub fn guarantees_completion(&self) -> bool {
+        false
+    }
+
+    /// Later writes and syncs can truthfully fail with `ENOSPC` or `EDQUOT`.
+    pub fn late_enospc_or_edquot_possible(&self) -> bool {
+        true
+    }
 }
 
 /// Default `[channel]` root when the table or its `root` key is omitted.
@@ -735,6 +1284,44 @@ pub enum StorageConfigError {
         staging_dir: PathBuf,
         source: PathBuf,
     },
+    /// A publication bound is zero when disallowed or exceeds its ceiling.
+    PublicationValueOutOfRange {
+        key: &'static str,
+        value: u64,
+        maximum: u64,
+        zero_allowed: bool,
+        correction: &'static str,
+    },
+    /// The destination filesystem could not be classified before effects.
+    PublicationDestinationUnprobeable { path: PathBuf, source: String },
+    /// The selected destination profile disagrees with detection.
+    PublicationProfileMismatch {
+        profile: DestinationProfile,
+        detected: crate::config::FsKind,
+    },
+    /// Local-then-publish was selected without a local spool.
+    PublicationLocalSpoolRequired,
+    /// The local spool is missing, unsuitable, or cannot create an owner-only
+    /// probe file.
+    PublicationLocalSpoolInvalid { path: PathBuf, source: String },
+    /// Estimate plus configured headroom overflowed `u64`.
+    PublicationCapacityOverflow {
+        estimated_attempt_bytes: u64,
+        min_free_bytes: u64,
+    },
+    /// The attempt estimate exceeds a configured byte limit.
+    PublicationEstimateExceedsLimit {
+        key: &'static str,
+        estimated_attempt_bytes: u64,
+        limit_bytes: u64,
+    },
+    /// The advisory free-space observation is below estimate plus headroom.
+    PublicationCapacityInsufficient {
+        estimated_attempt_bytes: u64,
+        min_free_bytes: u64,
+        observed_free_bytes: u64,
+        required_free_bytes: u64,
+    },
 }
 
 impl std::fmt::Display for StorageConfigError {
@@ -794,6 +1381,58 @@ impl std::fmt::Display for StorageConfigError {
                 staging_dir.display(),
                 source.display()
             ),
+            Self::PublicationValueOutOfRange {
+                key,
+                value,
+                maximum,
+                zero_allowed,
+                correction,
+            } => write!(
+                f,
+                "storage.publication.{key} value {value} is outside the supported range ({}..={maximum}); use `[storage.publication]\n{correction}`",
+                u8::from(!zero_allowed)
+            ),
+            Self::PublicationDestinationUnprobeable { .. } => write!(
+                f,
+                "storage.publication.destination_profile could not classify the destination before publication; verify that the destination root exists and is inspectable"
+            ),
+            Self::PublicationProfileMismatch { profile, detected } => write!(
+                f,
+                "storage.publication.destination_profile = \"{}\" does not match the detected {detected:?} filesystem; for a qualified share use `[storage.publication]\ndestination_profile = \"nfs_v4_1\"` or `[storage.publication]\ndestination_profile = \"smb_3_1_1\"`",
+                profile.as_str()
+            ),
+            Self::PublicationLocalSpoolRequired => write!(
+                f,
+                "storage.publication.mode = \"local_then_publish\" requires a restrictively creatable local spool; set `[storage.publication]\nmode = \"local_then_publish\"\nlocal_spool_dir = \"/path/to/local/spool\"`"
+            ),
+            Self::PublicationLocalSpoolInvalid { .. } => write!(
+                f,
+                "storage.publication.local_spool_dir is not a restrictively creatable local directory; set `[storage.publication]\nmode = \"local_then_publish\"\nlocal_spool_dir = \"/path/to/local/spool\"`"
+            ),
+            Self::PublicationCapacityOverflow {
+                estimated_attempt_bytes,
+                min_free_bytes,
+            } => write!(
+                f,
+                "publication capacity estimate overflow: estimated_attempt_bytes {estimated_attempt_bytes} + storage.publication.min_free_bytes {min_free_bytes}; reduce the estimate or set `[storage.publication]\nmin_free_bytes = \"2GB\"`"
+            ),
+            Self::PublicationEstimateExceedsLimit {
+                key,
+                estimated_attempt_bytes,
+                limit_bytes,
+            } => write!(
+                f,
+                "estimated_attempt_bytes {estimated_attempt_bytes} exceeds storage.publication.{key} {limit_bytes}; reduce the attempt or set `[storage.publication]\n{key} = \"{estimated_attempt_bytes}B\"` within the documented hard ceiling"
+            ),
+            Self::PublicationCapacityInsufficient {
+                estimated_attempt_bytes,
+                min_free_bytes,
+                observed_free_bytes,
+                required_free_bytes,
+            } => write!(
+                f,
+                "publication observed_free_bytes {observed_free_bytes} is below estimated_attempt_bytes {estimated_attempt_bytes} + storage.publication.min_free_bytes {min_free_bytes} = {required_free_bytes}; this admission check is advisory, does not reserve capacity, and later ENOSPC/EDQUOT remains possible"
+            ),
         }
     }
 }
@@ -818,7 +1457,12 @@ mod tests {
         let policy = PublicationPolicy::default();
 
         let error = policy
-            .resolve_for_fs_kind(destination.path(), FsKind::Network, 1, u64::MAX)
+            .resolve_for_fs_kind(
+                destination.path(),
+                crate::config::FsKind::Network,
+                1,
+                u64::MAX,
+            )
             .expect_err("local profile must reject a detected share");
 
         let rendered = error.to_string();
