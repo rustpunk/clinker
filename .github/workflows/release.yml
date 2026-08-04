@@ -43,20 +43,22 @@ jobs:
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
+            binary_suffix: ""
           - target: x86_64-pc-windows-msvc
             os: windows-2025
+            binary_suffix: .exe
           - target: aarch64-apple-darwin
             os: macos-15
+            binary_suffix: ""
           - target: x86_64-apple-darwin
             os: macos-15-intel
+            binary_suffix: ""
     steps:
       - name: Check out the candidate source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -75,10 +77,6 @@ jobs:
         shell: bash
         run: cargo fetch --locked
 
-      - name: Fetch the locked release policy dependencies
-        shell: bash
-        run: cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked
-
       - name: Build the governed target executables
         env:
           BUILD_TARGET: ${{ matrix.target }}
@@ -87,37 +85,27 @@ jobs:
           cargo build --locked --offline --release --target "$BUILD_TARGET"
           -p clinker -p cxl-cli
 
-      - name: Validate the repository release inventory
-        shell: bash
-        run: >-
-          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml
-          --locked --offline -- inventory check --print-json
-
-      - name: Build the locked target bundle with the Rust gate
+      - name: Smoke-test the native target executables
         env:
           BUILD_TARGET: ${{ matrix.target }}
-          BUILD_SOURCE_SHA: ${{ github.sha }}
+          BINARY_SUFFIX: ${{ matrix.binary_suffix }}
         shell: bash
-        run: >-
-          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml
-          --locked --offline -- release build-bundle
-          --target "$BUILD_TARGET" --source-sha "$BUILD_SOURCE_SHA"
-          --output-dir artifacts
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          "target/$BUILD_TARGET/release/clinker$BINARY_SUFFIX" --version
+          "target/$BUILD_TARGET/release/cxl$BINARY_SUFFIX" --version
 
-      - name: Attest the exact archive subject
-        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
-        with:
-          subject-path: |
-            artifacts/*.tar.gz
-            artifacts/*.zip
-
-      - name: Upload the target bundle
+      - name: Upload the native target executables
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-${{ matrix.target }}
-          path: artifacts/*
+          name: release-input-${{ matrix.target }}
+          path: |
+            target/${{ matrix.target }}/release/clinker${{ matrix.binary_suffix }}
+            target/${{ matrix.target }}/release/cxl${{ matrix.binary_suffix }}
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
 
   assemble-draft:
     name: Assemble and reread private draft
@@ -125,20 +113,39 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Check out verification code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Download the exact target set
+      - name: Download the Linux build input
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          pattern: release-*
-          path: artifacts
-          merge-multiple: true
+          name: release-input-x86_64-unknown-linux-gnu
+          path: target/x86_64-unknown-linux-gnu/release
 
-      - name: Verify and assemble the exact target set with the Rust gate
+      - name: Download the Windows build input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-input-x86_64-pc-windows-msvc
+          path: target/x86_64-pc-windows-msvc/release
+
+      - name: Download the Apple silicon build input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-input-aarch64-apple-darwin
+          path: target/aarch64-apple-darwin/release
+
+      - name: Download the Intel macOS build input
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-input-x86_64-apple-darwin
+          path: target/x86_64-apple-darwin/release
+
+      - name: Build and verify the exact release asset set with Rust policy
         env:
           RELEASE_REPOSITORY: ${{ github.repository }}
           RELEASE_REF: ${{ github.ref }}
@@ -147,12 +154,41 @@ jobs:
         run: |
           cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked
           cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+            inventory check --print-json
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+            release build-bundle \
+            --target x86_64-unknown-linux-gnu \
+            --source-sha "$RELEASE_SOURCE_SHA" \
+            --output-dir artifacts
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+            release build-bundle \
+            --target x86_64-pc-windows-msvc \
+            --source-sha "$RELEASE_SOURCE_SHA" \
+            --output-dir artifacts
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+            release build-bundle \
+            --target aarch64-apple-darwin \
+            --source-sha "$RELEASE_SOURCE_SHA" \
+            --output-dir artifacts
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
+            release build-bundle \
+            --target x86_64-apple-darwin \
+            --source-sha "$RELEASE_SOURCE_SHA" \
+            --output-dir artifacts
+          cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- \
             release verify assemble \
             --asset-dir artifacts \
             --repository "$RELEASE_REPOSITORY" \
             --workflow .github/workflows/release.yml \
             --ref "$RELEASE_REF" \
             --source-sha "$RELEASE_SOURCE_SHA"
+
+      - name: Attest the verified release archives
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/*.zip
 
       - name: Stage and freshly verify the private draft with the Rust gate
         env:

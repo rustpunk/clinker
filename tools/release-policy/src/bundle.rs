@@ -81,12 +81,7 @@ pub fn build(
         .join("release");
     let mut entries = Vec::with_capacity(5);
     for binary in &inventory.binaries {
-        entries.push(read_binary(
-            binary,
-            target,
-            &binary_dir,
-            &inventory.version,
-        )?);
+        entries.push(read_binary(binary, target, &binary_dir)?);
     }
     for (name, mode) in [
         ("README.md", 0o644),
@@ -266,12 +261,10 @@ fn read_binary(
     binary: &BinarySpec,
     target: &TargetSpec,
     binary_dir: &Path,
-    version: &str,
 ) -> Result<ArchiveEntry, GateError> {
     let name = format!("{}{}", binary.name, target.binary_suffix);
     let path = binary_dir.join(&name);
     let bytes = read_regular(&path, "read release binary")?;
-    smoke_binary(&path, &name, &binary.smoke_args, version)?;
     Ok(ArchiveEntry {
         name,
         bytes,

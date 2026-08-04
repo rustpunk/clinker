@@ -95,45 +95,56 @@ fn exact_workflow_verify_argv_accepts_the_governed_repository() {
 }
 
 #[test]
-fn release_workflow_requires_every_build_stage_in_order() {
+fn release_workflow_requires_every_build_and_assembly_stage_in_order() {
     let root = fixture();
     let source = release_workflow();
-    let names = [
-        "Fetch the locked workspace dependencies",
-        "Fetch the locked release policy dependencies",
-        "Build the governed target executables",
-        "Validate the repository release inventory",
-        "Build the locked target bundle with the Rust gate",
-        "Attest the exact archive subject",
-        "Upload the target bundle",
-    ];
-    let blocks = names
-        .iter()
-        .map(|name| named_step(&source, name))
-        .collect::<Vec<_>>();
+    for names in [
+        &[
+            "Fetch the locked workspace dependencies",
+            "Build the governed target executables",
+            "Smoke-test the native target executables",
+            "Upload the native target executables",
+        ][..],
+        &[
+            "Download the Linux build input",
+            "Download the Windows build input",
+            "Download the Apple silicon build input",
+            "Download the Intel macOS build input",
+            "Build and verify the exact release asset set with Rust policy",
+            "Attest the verified release archives",
+            "Stage and freshly verify the private draft with the Rust gate",
+            "Produce artifact-derived non-completing candidate evidence",
+            "Upload the immutable candidate evidence",
+        ][..],
+    ] {
+        let blocks = names
+            .iter()
+            .map(|name| named_step(&source, name))
+            .collect::<Vec<_>>();
 
-    for (name, block) in names.iter().zip(&blocks) {
-        let without_step = source.replacen(block, "", 1);
-        assert_ne!(without_step, source, "scenario fixture must change: {name}");
-        assert_release_workflow_rejected(root.path(), &without_step, name);
-    }
+        for (name, block) in names.iter().zip(&blocks) {
+            let without_step = source.replacen(block, "", 1);
+            assert_ne!(without_step, source, "scenario fixture must change: {name}");
+            assert_release_workflow_rejected(root.path(), &without_step, name);
+        }
 
-    for (index, pair) in blocks.windows(2).enumerate() {
-        let adjacent = format!("{}{}", pair[0], pair[1]);
-        let reversed = format!("{}{}", pair[1], pair[0]);
-        let reordered = source.replacen(&adjacent, &reversed, 1);
-        assert_ne!(
-            reordered,
-            source,
-            "adjacent release steps must be discoverable: {} then {}",
-            names[index],
-            names[index + 1]
-        );
-        assert_release_workflow_rejected(
-            root.path(),
-            &reordered,
-            &format!("{} after {}", names[index], names[index + 1]),
-        );
+        for (index, pair) in blocks.windows(2).enumerate() {
+            let adjacent = format!("{}{}", pair[0], pair[1]);
+            let reversed = format!("{}{}", pair[1], pair[0]);
+            let reordered = source.replacen(&adjacent, &reversed, 1);
+            assert_ne!(
+                reordered,
+                source,
+                "adjacent release steps must be discoverable: {} then {}",
+                names[index],
+                names[index + 1]
+            );
+            assert_release_workflow_rejected(
+                root.path(),
+                &reordered,
+                &format!("{} after {}", names[index], names[index + 1]),
+            );
+        }
     }
 }
 
@@ -141,7 +152,7 @@ fn release_workflow_requires_every_build_stage_in_order() {
 fn release_workflow_rejects_unmodeled_mutation_and_environment_drift() {
     let root = fixture();
     let source = release_workflow();
-    let attest = named_step(&source, "Attest the exact archive subject");
+    let attest = named_step(&source, "Attest the verified release archives");
     let upload_evidence = named_step(&source, "Upload the immutable candidate evidence");
     let scenarios = [
         (
@@ -173,10 +184,10 @@ fn release_workflow_rejects_unmodeled_mutation_and_environment_drift() {
             ),
         ),
         (
-            "swapped build source identity",
+            "attacker-controlled binary suffix",
             source.replacen(
-                "BUILD_SOURCE_SHA: ${{ github.sha }}",
-                "BUILD_SOURCE_SHA: ${{ matrix.target }}",
+                "BINARY_SUFFIX: ${{ matrix.binary_suffix }}",
+                "BINARY_SUFFIX: ${{ github.ref_name }}",
                 1,
             ),
         ),

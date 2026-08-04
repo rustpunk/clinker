@@ -269,6 +269,14 @@ Status: **Verified.** The Rust-only audit checks the real repository as well as
 negative fixtures, and the compatibility scripts perform one unchanged Rust
 delegation without carrying policy semantics.
 
+The tag workflow builds and smoke-tests `clinker` and `cxl` on each native
+runner, then transfers only those exact executables to the Ubuntu assembly
+job. The assembly job runs the detached policy tool to create and verify all
+four deterministic archives, attest the final archive subjects, and stage the
+private candidate. The policy tool is therefore not a Windows build
+dependency; platform-specific release jobs do not duplicate its Unix process,
+locking, or filesystem controls.
+
 ## 8. Docs Generation Command
 
 Rust API docs:

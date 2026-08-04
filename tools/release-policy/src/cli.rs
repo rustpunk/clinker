@@ -302,7 +302,7 @@ enum Domain {
     Inventory(InventoryDomain),
     /// Qualify exact disposable remote-filesystem profiles.
     Filesystem(FilesystemDomain),
-    /// Build or verify native release artifacts.
+    /// Build or verify release artifacts.
     Release(ReleaseDomain),
     /// Verify repository workflow trust policy.
     Workflow(WorkflowDomain),
@@ -917,7 +917,7 @@ struct ReleaseDomain {
 
 #[derive(Debug, Subcommand)]
 enum ReleaseOperation {
-    /// Build one deterministic native suite archive and sidecars.
+    /// Build one deterministic suite archive and sidecars.
     BuildBundle(ReleaseBuildBundleArgs),
     /// Verify a complete assembly or artifact-derived candidate.
     Verify(Box<ReleaseVerifyArgs>),

@@ -370,17 +370,14 @@ fn expected_permissions(
         )],
         "release.yml" => vec![
             ("dependency-policy", read()),
-            (
-                "build",
-                BTreeMap::from([
-                    ("attestations", Access::Write),
-                    ("contents", Access::Read),
-                    ("id-token", Access::Write),
-                ]),
-            ),
+            ("build", read()),
             (
                 "assemble-draft",
-                BTreeMap::from([("contents", Access::Write)]),
+                BTreeMap::from([
+                    ("attestations", Access::Write),
+                    ("contents", Access::Write),
+                    ("id-token", Access::Write),
+                ]),
             ),
         ],
         "publish-release.yml" => vec![(
@@ -769,10 +766,10 @@ fn require_exact_release_build(build: &Job) -> Result<(), GateError> {
         || strategy.matrix
             != json!({
                 "include": [
-                    {"target": "x86_64-unknown-linux-gnu", "os": "ubuntu-24.04"},
-                    {"target": "x86_64-pc-windows-msvc", "os": "windows-2025"},
-                    {"target": "aarch64-apple-darwin", "os": "macos-15"},
-                    {"target": "x86_64-apple-darwin", "os": "macos-15-intel"}
+                    {"target": "x86_64-unknown-linux-gnu", "os": "ubuntu-24.04", "binary_suffix": ""},
+                    {"target": "x86_64-pc-windows-msvc", "os": "windows-2025", "binary_suffix": ".exe"},
+                    {"target": "aarch64-apple-darwin", "os": "macos-15", "binary_suffix": ""},
+                    {"target": "x86_64-apple-darwin", "os": "macos-15-intel", "binary_suffix": ""}
                 ]
             })
     {
@@ -784,7 +781,7 @@ fn require_exact_release_build(build: &Job) -> Result<(), GateError> {
         .steps
         .as_deref()
         .ok_or_else(|| policy("release build steps are absent"))?;
-    if steps.len() != 9 {
+    if steps.len() != 6 {
         return Err(policy(
             "release build step inventory differs from reviewed policy",
         ));
@@ -809,52 +806,37 @@ fn require_exact_release_build(build: &Job) -> Result<(), GateError> {
     )?;
     require_command_step(
         &steps[3],
-        "Fetch the locked release policy dependencies",
-        "cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked",
-        &[],
-    )?;
-    require_command_step(
-        &steps[4],
         "Build the governed target executables",
         "cargo build --locked --offline --release --target \"$BUILD_TARGET\" -p clinker -p cxl-cli",
         &["BUILD_TARGET", "${{ matrix.target }}"],
     )?;
-    require_command_step(
-        &steps[5],
-        "Validate the repository release inventory",
-        "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- inventory check --print-json",
-        &[],
-    )?;
-    require_command_step(
-        &steps[6],
-        "Build the locked target bundle with the Rust gate",
-        "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release build-bundle --target \"$BUILD_TARGET\" --source-sha \"$BUILD_SOURCE_SHA\" --output-dir artifacts",
+    require_command_step_with_timeout(
+        &steps[4],
+        "Smoke-test the native target executables",
+        "set -euo pipefail \"target/$BUILD_TARGET/release/clinker$BINARY_SUFFIX\" --version \"target/$BUILD_TARGET/release/cxl$BINARY_SUFFIX\" --version",
         &[
             "BUILD_TARGET",
             "${{ matrix.target }}",
-            "BUILD_SOURCE_SHA",
-            "${{ github.sha }}",
+            "BINARY_SUFFIX",
+            "${{ matrix.binary_suffix }}",
         ],
+        Some(1),
     )?;
     require_action_step(
-        &steps[7],
-        "Attest the exact archive subject",
-        "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
-        &["subject-path", "artifacts/*.tar.gz\nartifacts/*.zip\n"],
-    )?;
-    require_action_step(
-        &steps[8],
-        "Upload the target bundle",
+        &steps[5],
+        "Upload the native target executables",
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
         &[
             "name",
-            "release-${{ matrix.target }}",
+            "release-input-${{ matrix.target }}",
             "path",
-            "artifacts/*",
+            "target/${{ matrix.target }}/release/clinker${{ matrix.binary_suffix }}\ntarget/${{ matrix.target }}/release/cxl${{ matrix.binary_suffix }}\n",
             "if-no-files-found",
             "error",
             "retention-days",
             "7",
+            "compression-level",
+            "0",
         ],
     )?;
     Ok(())
@@ -880,7 +862,7 @@ fn require_exact_release_assembly(assemble: &Job) -> Result<(), GateError> {
         .steps
         .as_deref()
         .ok_or_else(|| policy("release assembly steps are absent"))?;
-    if steps.len() != 6 {
+    if steps.len() != 10 {
         return Err(policy(
             "release assembly step inventory differs from reviewed policy",
         ));
@@ -893,21 +875,52 @@ fn require_exact_release_assembly(assemble: &Job) -> Result<(), GateError> {
     )?;
     require_action_step(
         &steps[1],
-        "Download the exact target set",
+        "Download the Linux build input",
         "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
         &[
-            "pattern",
-            "release-*",
+            "name",
+            "release-input-x86_64-unknown-linux-gnu",
             "path",
-            "artifacts",
-            "merge-multiple",
-            "true",
+            "target/x86_64-unknown-linux-gnu/release",
+        ],
+    )?;
+    require_action_step(
+        &steps[2],
+        "Download the Windows build input",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        &[
+            "name",
+            "release-input-x86_64-pc-windows-msvc",
+            "path",
+            "target/x86_64-pc-windows-msvc/release",
+        ],
+    )?;
+    require_action_step(
+        &steps[3],
+        "Download the Apple silicon build input",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        &[
+            "name",
+            "release-input-aarch64-apple-darwin",
+            "path",
+            "target/aarch64-apple-darwin/release",
+        ],
+    )?;
+    require_action_step(
+        &steps[4],
+        "Download the Intel macOS build input",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+        &[
+            "name",
+            "release-input-x86_64-apple-darwin",
+            "path",
+            "target/x86_64-apple-darwin/release",
         ],
     )?;
     require_command_step(
-        &steps[2],
-        "Verify and assemble the exact target set with the Rust gate",
-        "cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release verify assemble --asset-dir artifacts --repository \"$RELEASE_REPOSITORY\" --workflow .github/workflows/release.yml --ref \"$RELEASE_REF\" --source-sha \"$RELEASE_SOURCE_SHA\"",
+        &steps[5],
+        "Build and verify the exact release asset set with Rust policy",
+        "cargo fetch --manifest-path tools/release-policy/Cargo.toml --locked cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- inventory check --print-json cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release build-bundle --target x86_64-unknown-linux-gnu --source-sha \"$RELEASE_SOURCE_SHA\" --output-dir artifacts cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release build-bundle --target x86_64-pc-windows-msvc --source-sha \"$RELEASE_SOURCE_SHA\" --output-dir artifacts cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release build-bundle --target aarch64-apple-darwin --source-sha \"$RELEASE_SOURCE_SHA\" --output-dir artifacts cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release build-bundle --target x86_64-apple-darwin --source-sha \"$RELEASE_SOURCE_SHA\" --output-dir artifacts cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release verify assemble --asset-dir artifacts --repository \"$RELEASE_REPOSITORY\" --workflow .github/workflows/release.yml --ref \"$RELEASE_REF\" --source-sha \"$RELEASE_SOURCE_SHA\"",
         &[
             "RELEASE_REPOSITORY",
             "${{ github.repository }}",
@@ -917,8 +930,14 @@ fn require_exact_release_assembly(assemble: &Job) -> Result<(), GateError> {
             "${{ github.sha }}",
         ],
     )?;
+    require_action_step(
+        &steps[6],
+        "Attest the verified release archives",
+        "actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373",
+        &["subject-path", "artifacts/*.tar.gz\nartifacts/*.zip\n"],
+    )?;
     require_command_step(
-        &steps[3],
+        &steps[7],
         "Stage and freshly verify the private draft with the Rust gate",
         "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release stage-candidate-draft --repo \"$RELEASE_REPOSITORY\" --candidate-tag \"$RELEASE_CANDIDATE_TAG\" --source-sha \"$RELEASE_SOURCE_SHA\" --asset-dir artifacts --deadline-seconds 600",
         &[
@@ -933,7 +952,7 @@ fn require_exact_release_assembly(assemble: &Job) -> Result<(), GateError> {
         ],
     )?;
     require_command_step(
-        &steps[4],
+        &steps[8],
         "Produce artifact-derived non-completing candidate evidence",
         "cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- release verify --repo \"$RELEASE_REPOSITORY\" --decision-dir release/decisions --authorization-record release/decisions/release-candidate-authorization.json --authorization-schema scripts/release/release-candidate-authorization.schema.json --decision-record release/decisions/release-candidate.json --decision-schema scripts/release/release-decision.schema.json --require-private --fresh-download --evidence-kind candidate --evidence-schema scripts/release/release-evidence.schema.json --evidence-manifest target/release-policy/candidate-evidence.json",
         &[
@@ -944,7 +963,7 @@ fn require_exact_release_assembly(assemble: &Job) -> Result<(), GateError> {
         ],
     )?;
     require_action_step(
-        &steps[5],
+        &steps[9],
         "Upload the immutable candidate evidence",
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
         &[
@@ -967,6 +986,16 @@ fn require_command_step(
     command: &str,
     env: &[&str],
 ) -> Result<(), GateError> {
+    require_command_step_with_timeout(step, name, command, env, None)
+}
+
+fn require_command_step_with_timeout(
+    step: &Step,
+    name: &str,
+    command: &str,
+    env: &[&str],
+    timeout_minutes: Option<u64>,
+) -> Result<(), GateError> {
     if step.name.as_deref() != Some(name)
         || step.id.is_some()
         || step.condition.is_some()
@@ -979,7 +1008,7 @@ fn require_command_step(
         || step.shell.as_deref() != Some("bash")
         || !exact_value_map(step.env.as_ref(), env)
         || step.continue_on_error.is_some()
-        || step.timeout_minutes.is_some()
+        || step.timeout_minutes != timeout_minutes
         || step.working_directory.is_some()
     {
         return Err(policy(format!(

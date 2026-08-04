@@ -114,11 +114,15 @@ impl RepositoryFixture {
         let binary_dir = self.path().join("target").join(target).join("release");
         fs::create_dir_all(&binary_dir).expect("binary directory");
         for name in ["clinker", "cxl"] {
-            fs::copy(
-                &self.fixture_binary,
-                binary_dir.join(format!("{name}{suffix}")),
-            )
-            .expect("copy fixture binary");
+            let installed = binary_dir.join(format!("{name}{suffix}"));
+            fs::copy(&self.fixture_binary, &installed).expect("copy fixture binary");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                fs::set_permissions(&installed, fs::Permissions::from_mode(0o644))
+                    .expect("simulate workflow artifact permission loss");
+            }
         }
     }
 
