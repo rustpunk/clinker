@@ -1,0 +1,23 @@
+{
+  "schema": "clinker.decision/v1",
+  "decision_id": "remote-share",
+  "control_id": "remote-filesystem-safety",
+  "status": "accepted",
+  "selection": "evidenced-matrix",
+  "approver_role_ref": "maintainer:architecture",
+  "evidence_refs": [
+    "docs/engine/src/output-internals.md",
+    "docs/user/src/nodes/output.md",
+    ".github/workflows/ci.yml",
+    "crates/clinker/tests/output_containment.rs"
+  ],
+  "recorded_at": "2026-07-30T03:01:04Z",
+  "support_matrix": {
+    "policy": "evidenced-matrix",
+    "combinations": [
+      "linux-nfsv4.1-loopback-ci",
+      "linux-smb3.1.1-loopback-ci"
+    ],
+    "unlisted_behavior": "policy_required"
+  }
+}

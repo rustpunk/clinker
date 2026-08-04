@@ -4,6 +4,114 @@ Output nodes are the terminal sinks of a pipeline. When the planner certifies a 
 
 *User-facing view: the User Guide's "Output Nodes" page.*
 
+## Use-time filesystem containment
+
+Plan-time path validation produces a `ValidatedPath`, but that proof alone is
+not durable: an ancestor can be replaced after validation and before the
+operating system opens the output. Output creation therefore passes through a
+second, use-time boundary in `clinker-exec`:
+
+1. Resolve the runtime policy before opening the leaf. Normal output opens use
+   the filesystem observed from the retained parent handle; explicit profile
+   names exist only for the qualification harness and must match that
+   observation.
+2. Walk the destination ancestors without following symbolic links or reparse
+   points and retain the destination-parent handle.
+3. Claim a hidden sibling reservation, then create a uniquely named hidden
+   quarantine leaf relative to that handle with owner-only Unix mode and
+   no-follow semantics. The final leaf is not opened or truncated during
+   staging. Every disposition, including replacement, holds the reservation so
+   concurrent runs cannot both mutate one destination. The reservation carries
+   the owner PID and an exclusive non-blocking `fs4` lock. An existing
+   reservation is reclaimed only after a creation-grace interval and a
+   successful lock, which distinguishes a dead owner from a live or newly
+   starting publisher. Lock or initialization failure immediately removes any
+   reservation created by that attempt.
+4. Retain the boundary in a run-scoped publication ledger while single,
+   per-source-file fan-out, and split writers produce their bytes. After the
+   executor succeeds, preflight every quarantine and destination before the
+   first mutation, then promote each quarantine directly through the retained
+   handles. Replacement is one atomic rename; the old final is never moved to a
+   backup first.
+5. If any promotion or post-rename directory synchronization fails, stop and
+   return a typed outcome containing the exact synchronized-visible,
+   visible-unsynchronized, and unpublished sets. Already-visible finals are not
+   rolled back, and unvisited finals remain untouched. Deterministic fault tests
+   pin this partial-set accounting.
+6. After each successful promotion, remove its reservation and record the exact
+   committed final path. Cleanup failure is typed post-publication debt naming
+   the visible final and stale reservation. Metadata sidecars are serialized
+   before this point and join the same ledger and collision namespace as data
+   outputs. Cross-filesystem
+   promotion is refused; it never degrades to copying through a visible final
+   path.
+
+Linux uses the locked `nix` filesystem bindings for `openat`, `renameat` /
+`renameat2`, `fstatfs`, and directory synchronization. macOS uses the matching
+`libc` `openat`, `fstat`, `fstatfs`, `renameat`, and `renameatx_np(RENAME_EXCL)`
+primitives. Windows opens
+the drive root with reparse-point-aware `CreateFileW`, then walks every
+descendant and opens every leaf relative to the retained handle with
+`NtCreateFile`. It inspects each handle, compares volume identity, and promotes
+relative to the retained destination handle with `NtSetInformationFile`.
+The logical `ValidatedPath` remains required at the public containment boundary
+on every platform. A promotion that made the destination visible but could not
+synchronize its parent enters the explicit visible-but-unsynchronized state;
+the ledger reports it as an operational failure and never reduces it to a
+warning or claims rollback.
+
+The set protocol is recoverable, not globally atomic: individual renames are
+atomic, while a multi-file commit has an observation window in which old and new
+entries can coexist. An uncatchable process or machine failure may leave hidden
+`.partial` and `.reservation` entries alongside a subset of newly visible
+finals. The reported/path-observed set is the recovery record; reservation
+liveness is established by the lock plus grace rule rather than by silently
+deleting a file that might belong to a live run. Output publication does not use
+`.backup` entries.
+
+### Remote filesystem qualification
+
+Normal CLI output is admitted from the filesystem type observed through the
+retained parent handle, including NFS and SMB shares. The profile strings below
+are qualification labels, not pipeline settings and not runtime admission
+tokens:
+
+- `linux-nfsv4.1-loopback-ci`: a disposable GitHub-hosted `ubuntu-24.04` VM,
+  Linux kernel NFS client/server, NFSv4.1 over TCP, a hard mount, and remote
+  locking without a local-only lock mode.
+- `linux-smb3.1.1-loopback-ci`: the same runner class, Linux kernel CIFS client,
+  Samba server, SMB3.1.1, `cache=strict`, remote byte-range locking without
+  `nobrl`, and strict synchronization without `nostrictsync`. The loopback
+  client disables only client-side permission checks with `noperm`; Samba still
+  authorizes I/O as the configured guest identity.
+
+The dedicated CI matrix provisions each server and mount inside its runner,
+executes a real `clinker run` success and failed-overwrite preservation on the
+mounted share, plus focused confinement, lock exclusion, synchronized
+promotion/visibility, cancellation, cross-filesystem refusal, and cleanup-
+liveness checks. It tears the environment down on every exit. Its per-profile
+artifact records the
+runner image and kernel, exact client/server package versions, effective mount
+options, negotiated protocol observations, lock behavior, synchronization and
+failure-injection results, and teardown status.
+
+A profile is support-eligible only when that exact cell writes `status: passed`,
+`support_eligible: true`, and successful teardown evidence. Missing packages or
+administrative capability, mount/provision failure, incomplete observations, a
+semantic failure, or cleanup failure leaves `status: incomplete` and cannot be
+interpreted as support. These loopback results do not certify a corporate
+share, vendor NAS device, Windows/macOS client, clustered server, or different
+server/mount configuration. They prove the implementation against controlled
+representatives. Operators of other shares must validate their server and mount
+semantics; runtime detection does not turn CI evidence into a vendor support
+claim.
+
+Executor spill should remain on local storage for predictable bounded-memory
+performance. Local working data is distinct from destination quarantine:
+completed bytes still need to be streamed into a destination-local hidden file,
+synchronized there, and promoted on that same share. A local working copy
+reduces random network I/O; it cannot make a cross-filesystem rename atomic.
+
 ## Streaming vs. buffered
 
 When a single Output sits directly downstream of an eligible linear producer, a bounded crossbeam channel connects the producer arm to the writer thread, and `Writer::write_record` fires **per record** as the producer emits. For a `Merge.interleave` whose direct predecessors are exclusively owned Sources, this combines with Source-to-Merge receiver fusion to form an end-to-end live path. Each Source must have exactly one outgoing edge, targeting that Merge; sharing any predecessor rejects receiver fusion for the whole Merge.

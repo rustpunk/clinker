@@ -1,0 +1,14 @@
+{
+  "schema": "clinker.release-policy-vectors/v1",
+  "canonical": {
+    "input": {"nested": {"z": null, "x": true}, "b": "é", "a": 1},
+    "bytes_utf8": "{\"a\":1,\"b\":\"é\",\"nested\":{\"x\":true,\"z\":null}}",
+    "git_blob_sha1": "cc2ab65712d8618b7ca1140352540351d10a011b",
+    "sha256": "a90ccc1132f126927f204d499e29c76a8f93bc5e9e03167b8b1106d52eed11b8"
+  },
+  "rejected_json": [
+    {"name": "float", "json": "{\"value\":1.5}"},
+    {"name": "duplicate-key", "json": "{\"value\":1,\"value\":2}"},
+    {"name": "non-finite", "json": "{\"value\":NaN}"}
+  ]
+}

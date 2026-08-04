@@ -7,9 +7,7 @@ on:
     - cron: "17 * * * *"
   workflow_dispatch:
 
-permissions:
-  contents: write
-  pull-requests: write
+permissions: {}
 
 concurrency:
   group: pr-auto-update-branches-${{ github.repository }}
@@ -23,6 +21,9 @@ jobs:
     # still auto-rebases every open PR, but those rebases no longer auto-start the
     # CI gauntlet — a maintainer runs CI manually when they choose to validate a
     # rebased PR.
-    uses: rustpunk/github-workflows/.github/workflows/pr-auto-update-branches.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+    uses: rustpunk/github-workflows/.github/workflows/pr-auto-update-branches.yml@dcce0223c35757e50778e54b89572c9ae8804219 # reviewed 2026-06-16 (no tag)
     with:
       base: main

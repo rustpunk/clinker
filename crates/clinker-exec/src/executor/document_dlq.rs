@@ -569,7 +569,12 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                 return;
             };
             let output_schema = Arc::clone(projected[0].schema());
-            match build_format_writer(self.out_cfg, raw_writer, output_schema) {
+            match build_format_writer(
+                self.out_cfg,
+                raw_writer,
+                output_schema,
+                ctx.output_staging.clone(),
+            ) {
                 Ok(w) => self.writer = Some(w),
                 Err(e) => {
                     ctx.output_errors.push(e);

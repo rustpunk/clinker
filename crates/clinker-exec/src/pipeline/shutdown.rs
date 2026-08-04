@@ -3,14 +3,16 @@
 //! Each `PipelineExecutor` run owns a [`ShutdownToken`] that the executor
 //! checks at operator chunk boundaries during dispatch and inside
 //! `Arena::build`.
-//! Tokens are cheap `Arc<AtomicBool>` handles — clones share the same flag.
+//! Tokens are cheap atomic state handles. Cancellation and publication race at
+//! one compare-and-swap point, so either cancellation wins before the first
+//! final rename or publication owns the bounded commit to completion.
 //!
 //! `install_signal_handler()` installs a process-wide `ctrlc` handler that
 //! broadcasts shutdown to every live token via a `Weak` registry. This keeps
 //! production SIGINT handling intact while eliminating the global mutable
 //! state that previously caused tests to race against each other.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 /// A handle to a per-execution shutdown flag. Cheap to clone — clones share
@@ -18,8 +20,12 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 /// and inside `Arena::build`.
 #[derive(Clone, Debug)]
 pub struct ShutdownToken {
-    flag: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
 }
+
+const ACTIVE: u8 = 0;
+const CANCELLED: u8 = 1;
+const PUBLISHING: u8 = 2;
 
 impl Default for ShutdownToken {
     fn default() -> Self {
@@ -32,42 +38,59 @@ impl ShutdownToken {
     /// signal handler. SIGINT/SIGTERM (when `install_signal_handler` has been
     /// called) will trip every live token.
     pub fn new() -> Self {
-        let flag = Arc::new(AtomicBool::new(false));
-        register(&flag);
-        Self { flag }
+        let state = Arc::new(AtomicU8::new(ACTIVE));
+        register(&state);
+        Self { state }
     }
 
     /// Create a token that is NOT registered with the signal handler. Useful
     /// for tests that want isolation from the process-wide SIGINT broadcast.
     pub fn detached() -> Self {
         Self {
-            flag: Arc::new(AtomicBool::new(false)),
+            state: Arc::new(AtomicU8::new(ACTIVE)),
         }
     }
 
     /// Programmatically request shutdown on this token (and any clones).
     pub fn request(&self) {
-        self.flag.store(true, Ordering::SeqCst);
+        let _ = self
+            .state
+            .compare_exchange(ACTIVE, CANCELLED, Ordering::SeqCst, Ordering::SeqCst);
     }
 
     /// Check whether shutdown has been requested on this token.
     pub fn is_requested(&self) -> bool {
-        self.flag.load(Ordering::SeqCst)
+        self.state.load(Ordering::SeqCst) == CANCELLED
+    }
+
+    /// Atomically cross the point of no return immediately before publication.
+    /// Returns `false` when cancellation won first. Once this returns `true`, a
+    /// later signal cannot interrupt the bounded destination commit.
+    #[must_use]
+    pub fn try_begin_publication(&self) -> bool {
+        match self
+            .state
+            .compare_exchange(ACTIVE, PUBLISHING, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => true,
+            Err(PUBLISHING) => true,
+            Err(_) => false,
+        }
     }
 }
 
 /// Process-wide registry of weak handles to live shutdown flags. The signal
 /// handler walks this list and stores `true` into every live entry. Dead
 /// `Weak`s are pruned lazily on each insert.
-fn registry() -> &'static Mutex<Vec<Weak<AtomicBool>>> {
-    static REGISTRY: OnceLock<Mutex<Vec<Weak<AtomicBool>>>> = OnceLock::new();
+fn registry() -> &'static Mutex<Vec<Weak<AtomicU8>>> {
+    static REGISTRY: OnceLock<Mutex<Vec<Weak<AtomicU8>>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn register(flag: &Arc<AtomicBool>) {
+fn register(state: &Arc<AtomicU8>) {
     let mut guard = registry().lock().expect("shutdown registry poisoned");
     guard.retain(|w| w.strong_count() > 0);
-    guard.push(Arc::downgrade(flag));
+    guard.push(Arc::downgrade(state));
 }
 
 /// Install the SIGINT + SIGTERM handler. Safe to call multiple times — only
@@ -83,8 +106,13 @@ pub fn install_signal_handler() -> Result<(), String> {
         if let Err(e) = ctrlc::set_handler(move || {
             let guard = registry().lock().expect("shutdown registry poisoned");
             for weak in guard.iter() {
-                if let Some(flag) = weak.upgrade() {
-                    flag.store(true, Ordering::SeqCst);
+                if let Some(state) = weak.upgrade() {
+                    let _ = state.compare_exchange(
+                        ACTIVE,
+                        CANCELLED,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
                 }
             }
         }) {
@@ -130,6 +158,19 @@ mod tests {
         a.request();
         assert!(a.is_requested());
         assert!(!b.is_requested());
+    }
+
+    #[test]
+    fn cancellation_and_publication_have_one_point_of_no_return() {
+        let cancelled = ShutdownToken::detached();
+        cancelled.request();
+        assert!(!cancelled.try_begin_publication());
+
+        let publishing = ShutdownToken::detached();
+        assert!(publishing.try_begin_publication());
+        publishing.request();
+        assert!(!publishing.is_requested());
+        assert!(publishing.try_begin_publication());
     }
 
     #[test]

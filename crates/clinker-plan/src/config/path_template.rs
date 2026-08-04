@@ -44,6 +44,8 @@ pub struct PathTemplate {
 #[derive(Debug, Clone)]
 enum Segment {
     Literal(String),
+    EscapedOpen,
+    EscapedClose,
     Token(TokenSpec),
 }
 
@@ -52,6 +54,69 @@ struct TokenSpec {
     name: String,
     arg: Option<String>,
     conditional: Option<(String, String)>,
+}
+
+/// Run-invariant path segments plus typed per-record substitutions.
+#[derive(Debug, Clone)]
+pub struct ResolvedPathTemplate {
+    segments: Vec<ResolvedSegment>,
+    authored_absolute: bool,
+}
+
+#[derive(Debug, Clone)]
+enum ResolvedSegment {
+    Literal(String),
+    Runtime {
+        kind: RuntimeToken,
+        conditional: Option<(String, String)>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeToken {
+    SourceFile,
+    SourcePath,
+}
+
+impl ResolvedPathTemplate {
+    #[must_use]
+    pub fn has_per_record_tokens(&self) -> bool {
+        self.segments
+            .iter()
+            .any(|segment| matches!(segment, ResolvedSegment::Runtime { .. }))
+    }
+
+    #[must_use]
+    pub const fn authored_absolute(&self) -> bool {
+        self.authored_absolute
+    }
+
+    /// Render typed runtime segments in one pass. Inserted values are opaque.
+    #[must_use]
+    pub fn render(&self, source_file: &str, source_path: &str) -> String {
+        let mut output = String::new();
+        for segment in &self.segments {
+            match segment {
+                ResolvedSegment::Literal(value) => output.push_str(value),
+                ResolvedSegment::Runtime { kind, conditional } => {
+                    let value = match kind {
+                        RuntimeToken::SourceFile => source_file,
+                        RuntimeToken::SourcePath => source_path,
+                    };
+                    if let Some((prefix, suffix)) = conditional {
+                        if !value.is_empty() {
+                            output.push_str(prefix);
+                            output.push_str(value);
+                            output.push_str(suffix);
+                        }
+                    } else {
+                        output.push_str(value);
+                    }
+                }
+            }
+        }
+        output
+    }
 }
 
 /// Runtime values bound to each render call.
@@ -88,7 +153,10 @@ impl PathTemplate {
                 '{' => {
                     if chars.peek() == Some(&'{') {
                         chars.next();
-                        buf.push('{');
+                        if !buf.is_empty() {
+                            segments.push(Segment::Literal(std::mem::take(&mut buf)));
+                        }
+                        segments.push(Segment::EscapedOpen);
                         continue;
                     }
                     if !buf.is_empty() {
@@ -113,7 +181,10 @@ impl PathTemplate {
                 '}' => {
                     if chars.peek() == Some(&'}') {
                         chars.next();
-                        buf.push('}');
+                        if !buf.is_empty() {
+                            segments.push(Segment::Literal(std::mem::take(&mut buf)));
+                        }
+                        segments.push(Segment::EscapedClose);
                     } else {
                         return Err(ConfigError::Validation(format!(
                             "unmatched `}}` in path template {input:?} (use `}}}}` for a literal brace)"
@@ -135,6 +206,8 @@ impl PathTemplate {
         for seg in &self.segments {
             match seg {
                 Segment::Literal(s) => out.push_str(s),
+                Segment::EscapedOpen => out.push('{'),
+                Segment::EscapedClose => out.push('}'),
                 Segment::Token(spec) => {
                     let value = resolve_token(spec, ctx)?;
                     if let Some((prefix, suffix)) = &spec.conditional {
@@ -150,6 +223,51 @@ impl PathTemplate {
             }
         }
         Ok(out)
+    }
+
+    /// Resolve invariant tokens while retaining per-record tokens as typed segments.
+    pub fn resolve_runtime(
+        &self,
+        authored: &str,
+        ctx: &TemplateContext<'_>,
+    ) -> Result<ResolvedPathTemplate, ConfigError> {
+        let mut segments = Vec::new();
+        for segment in &self.segments {
+            match segment {
+                Segment::Literal(value) => segments.push(ResolvedSegment::Literal(value.clone())),
+                Segment::EscapedOpen => segments.push(ResolvedSegment::Literal("{".to_owned())),
+                Segment::EscapedClose => segments.push(ResolvedSegment::Literal("}".to_owned())),
+                Segment::Token(spec) if spec.name == "source_file" => {
+                    segments.push(ResolvedSegment::Runtime {
+                        kind: RuntimeToken::SourceFile,
+                        conditional: spec.conditional.clone(),
+                    });
+                }
+                Segment::Token(spec) if spec.name == "source_path" => {
+                    segments.push(ResolvedSegment::Runtime {
+                        kind: RuntimeToken::SourcePath,
+                        conditional: spec.conditional.clone(),
+                    });
+                }
+                Segment::Token(spec) => {
+                    let value = resolve_token(spec, ctx)?;
+                    let value = if let Some((prefix, suffix)) = &spec.conditional {
+                        if value.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{prefix}{value}{suffix}")
+                        }
+                    } else {
+                        value
+                    };
+                    segments.push(ResolvedSegment::Literal(value));
+                }
+            }
+        }
+        Ok(ResolvedPathTemplate {
+            segments,
+            authored_absolute: std::path::Path::new(authored).is_absolute(),
+        })
     }
 
     /// Whether the template body references the named token at least once.
@@ -192,6 +310,26 @@ impl PathTemplate {
             .iter()
             .any(|s| matches!(s, Segment::Token(t) if PER_RECORD_TOKENS.contains(&t.name.as_str())))
     }
+}
+
+/// Whether a path contains a live per-record token, before or after the
+/// run-invariant portion of the template has been rendered.
+#[must_use]
+pub fn path_has_per_record_tokens(path: &str) -> bool {
+    PathTemplate::parse(path).is_ok_and(|template| template.has_per_record_tokens())
+}
+
+/// Substitute the typed deferred per-record segments in a resolved output
+/// path. Escaped literal braces remain ordinary text and cannot be mistaken
+/// for a live token.
+#[must_use]
+pub fn render_per_record_path(path: &str, source_file: &str, source_path: &str) -> String {
+    PathTemplate::parse(path)
+        .and_then(|template| template.resolve_runtime(path, &TemplateContext::default()))
+        .map_or_else(
+            |_| path.to_owned(),
+            |template| template.render(source_file, source_path),
+        )
 }
 
 /// Render every Output node's `path:` template in place, with `n` set
@@ -283,9 +421,10 @@ pub fn resolve_output_path_templates_in_place(
             unique_suffix_width: 0,
         };
         let resolved = template
-            .render(&local_ctx)
+            .resolve_runtime(&body.output.path, &local_ctx)
             .map_err(|e| ConfigError::Validation(format!("output {output_name:?}: {e}")))?;
-        body.output.path = resolved;
+        body.output.path = resolved.render("source-file", "source-path");
+        body.output.resolved_path_template = Some(resolved);
     }
     Ok(())
 }
@@ -355,11 +494,10 @@ const KNOWN_TOKENS: &[&str] = &[
     "execution_id",
     "batch_id",
     "n",
-    // Per-record tokens — resolved per record at runtime when the
-    // Output's parent has live `FilePartitioned` lineage. At
-    // single-render time they substitute to placeholder text (the
-    // first matched file's path/label) which is overwritten by the
-    // dispatcher once per-record fan-out lands.
+    // Per-record tokens — retained through single-render time so the planner
+    // can certify fan-out from the compiled path. The CLI replaces them per
+    // discovered source file, or with `<merged>` when partition lineage was
+    // consumed before the Output.
     "source_file",
     "source_path",
 ];
@@ -446,12 +584,10 @@ fn resolve_token(spec: &TokenSpec, ctx: &TemplateContext<'_>) -> Result<String, 
                 .unwrap_or_default()),
             None => Ok(ctx.source_name_default.unwrap_or("").to_string()),
         },
-        // Per-record tokens render to a placeholder at single-render
-        // time. The dispatcher's fan-out path overrides this when the
-        // Output's input has live `FilePartitioned` lineage; without
-        // fan-out (or with it consumed via Merge/Combine), this
-        // placeholder is what users see.
-        "source_file" | "source_path" => Ok("<merged>".to_string()),
+        "source_file" | "source_path" => Err(ConfigError::Validation(format!(
+            "token {{{}}} requires a per-record render context",
+            spec.name
+        ))),
         "channel" => Ok(ctx.channel.unwrap_or("").to_string()),
         "pipeline_hash" => {
             let hex = hex_lower(&ctx.pipeline_hash);
@@ -505,6 +641,47 @@ mod tests {
     fn escaped_braces() {
         let t = PathTemplate::parse("a{{b}}c.csv").unwrap();
         assert_eq!(t.render(&TemplateContext::default()).unwrap(), "a{b}c.csv");
+    }
+
+    #[test]
+    fn escaped_per_record_token_remains_literal_at_runtime() {
+        let template = PathTemplate::parse("literal-{{source_file}}-{source_file}.csv").unwrap();
+        let rendered = template
+            .resolve_runtime(
+                "literal-{{source_file}}-{source_file}.csv",
+                &TemplateContext::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            rendered.render("orders", "east/orders.csv"),
+            "literal-{source_file}-orders.csv"
+        );
+    }
+
+    #[test]
+    fn escaped_per_record_token_does_not_request_fan_out() {
+        let template = PathTemplate::parse("literal-{{source_path}}.csv").unwrap();
+        assert!(!template.has_per_record_tokens());
+        assert!(
+            !template
+                .resolve_runtime("literal-{{source_path}}.csv", &TemplateContext::default())
+                .unwrap()
+                .has_per_record_tokens()
+        );
+    }
+
+    #[test]
+    fn runtime_values_and_private_use_literals_are_never_reinterpreted() {
+        let authored = "\u{e000}clinker-source-file\u{e001}-{{source_path}}-{source_file}.csv";
+        let template = PathTemplate::parse(authored)
+            .unwrap()
+            .resolve_runtime(authored, &TemplateContext::default())
+            .unwrap();
+        let inserted = "orders-{source_path}-\u{e000}clinker-source-path\u{e001}";
+        assert_eq!(
+            template.render(inserted, "ignored"),
+            format!("\u{e000}clinker-source-file\u{e001}-{{source_path}}-{inserted}.csv")
+        );
     }
 
     #[test]

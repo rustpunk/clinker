@@ -40,8 +40,10 @@ pub struct OutputSidecar {
     pub batch_id: Option<String>,
     pub output_name: String,
     pub resolved_path: String,
-    pub record_count: u64,
-    pub bytes_written: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
     /// DLQ record counts bucketed by classification reason. Empty when
     /// the output has no DLQ branch wired.
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
@@ -73,6 +75,17 @@ pub fn hash_to_hex(bytes: &[u8; 32]) -> String {
     s
 }
 
+/// Serialize a sidecar for staging in the shared publication transaction.
+pub fn serialize_sidecar(sidecar: &OutputSidecar) -> Result<Vec<u8>, PipelineError> {
+    let mut bytes = serde_json::to_vec_pretty(sidecar).map_err(|error| {
+        PipelineError::Io(std::io::Error::other(format!(
+            "failed to serialize output sidecar: {error}"
+        )))
+    })?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
 /// Write the sidecar JSON next to the output file.
 ///
 /// Pretty-prints for human readability since sidecars are typically
@@ -80,13 +93,10 @@ pub fn hash_to_hex(bytes: &[u8; 32]) -> String {
 /// auxiliary to the main file, not part of the data set.
 pub fn write_sidecar(output_path: &Path, sidecar: &OutputSidecar) -> Result<(), PipelineError> {
     let path = OutputSidecar::sidecar_path(output_path);
-    let f = File::create(&path).map_err(PipelineError::Io)?;
-    serde_json::to_writer_pretty(f, sidecar).map_err(|e| {
-        PipelineError::Io(std::io::Error::other(format!(
-            "failed to serialize sidecar JSON for {}: {e}",
-            path.display()
-        )))
-    })?;
+    let mut f = File::create(&path).map_err(PipelineError::Io)?;
+    use std::io::Write as _;
+    f.write_all(&serialize_sidecar(sidecar)?)
+        .map_err(PipelineError::Io)?;
     Ok(())
 }
 
@@ -109,8 +119,8 @@ mod tests {
             batch_id: Some("batch-1".into()),
             output_name: "results".into(),
             resolved_path: "./output/customers-acme.csv".into(),
-            record_count: 1234,
-            bytes_written: 56789,
+            record_count: Some(1234),
+            bytes_written: Some(56789),
             dlq_counts: BTreeMap::from([("schema_mismatch".into(), 3u64)]),
             route_counts: BTreeMap::from([("router_main.high_value".into(), 80u64)]),
             node_timings_ms: BTreeMap::from([("source1".into(), 12u64)]),
@@ -151,6 +161,17 @@ mod tests {
         assert!(!json.contains("dlq_counts"));
         assert!(!json.contains("route_counts"));
         assert!(!json.contains("node_timings_ms"));
+    }
+
+    #[test]
+    fn unknown_output_counters_are_omitted_in_json() {
+        let mut sidecar = sample();
+        sidecar.record_count = None;
+        sidecar.bytes_written = None;
+
+        let json = String::from_utf8(serialize_sidecar(&sidecar).unwrap()).unwrap();
+        assert!(!json.contains("record_count"));
+        assert!(!json.contains("bytes_written"));
     }
 
     #[test]

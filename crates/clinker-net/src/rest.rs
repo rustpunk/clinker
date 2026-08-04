@@ -12,11 +12,14 @@
 //! Transform stage exactly like file sources.
 //!
 //! Finiteness is a HARD reader property: [`RestSourceConfig::max_pages`]
-//! is mandatory and the reader stops at the cap even if the server keeps
+//! is mandatory and the reader fails closed at the cap if the server keeps
 //! offering a next page. The pull runs on its own `std::thread` (the
 //! ingest thread) driving a blocking `ureq` client to exhaustion, with
 //! no async runtime.
 
+mod continuation;
+
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,11 +37,21 @@ use indexmap::IndexMap;
 
 use crate::{io_err, schema_err};
 
+use continuation::{AuthorizedUrl, ContinuationError, Origin};
+
+fn continuation_format_error(error: ContinuationError) -> FormatError {
+    io_err(error.to_string())
+}
+
 /// Per-body cap. Each individual page body is bounded so a misbehaving
 /// server cannot stream an unbounded body into one `read_to_vec`. 64 MiB
 /// is generous for one page of a paginated API; the reader's overall
 /// finiteness comes from `max_pages` / `max_records`.
 const MAX_PAGE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Redirect budget for one logical page request. The transport agent follows
+/// zero redirects itself; every hop is resolved and authorized here.
+const MAX_REDIRECTS: u32 = 10;
 
 /// Synchronous paginated HTTP source. One per declared `rest` Source;
 /// owned by that source's ingest thread. Constructed through
@@ -46,6 +59,8 @@ const MAX_PAGE_BYTES: u64 = 64 * 1024 * 1024;
 pub(crate) struct RestRecordSource {
     agent: ureq::Agent,
     cfg: RestSourceConfig,
+    admitted_origin: Origin,
+    base_url: AuthorizedUrl,
     format: InputFormat,
     multi_value: MultiValueRead,
     schema_decl: Vec<Column>,
@@ -71,6 +86,9 @@ pub(crate) struct RestRecordSource {
     next: NextPage,
     pages_fetched: u32,
     records_emitted: u64,
+    /// Authorized logical page URLs already requested in this finite pull.
+    /// Reappearance is a continuation cycle and fails before a repeat request.
+    visited_pages: HashSet<String>,
     shutdown: Option<ShutdownToken>,
 }
 
@@ -100,7 +118,7 @@ enum NextPage {
     /// or `None` once no `rel="next"` link is present. The first request
     /// uses the base URL.
     LinkHeader {
-        next_url: Option<String>,
+        next_url: Option<AuthorizedUrl>,
         more: bool,
     },
     /// Single GET, no pagination.
@@ -118,10 +136,16 @@ impl RestRecordSource {
         schema_decl: &[Column],
         on_unmapped: OnUnmapped,
     ) -> Result<Self, FormatError> {
+        let (admitted_origin, base_url) =
+            continuation::authorize_initial(&cfg.url).map_err(continuation_format_error)?;
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(cfg.timeout_secs)))
             // Inspect status codes manually: 5xx is a retry, 4xx is fatal.
             .http_status_as_error(false)
+            // Redirects are a server-directed request boundary. Disable ureq's
+            // automatic following so every hop passes through origin policy
+            // before request construction and credential application.
+            .max_redirects(0)
             .build()
             .into();
 
@@ -164,6 +188,8 @@ impl RestRecordSource {
         Ok(Self {
             agent,
             cfg,
+            admitted_origin,
+            base_url,
             format: source.format.clone(),
             multi_value: MultiValueRead::from_source(source, schema_decl),
             schema_decl: schema_decl.to_vec(),
@@ -175,16 +201,15 @@ impl RestRecordSource {
             next,
             pages_fetched: 0,
             records_emitted: 0,
+            visited_pages: HashSet::new(),
             shutdown: None,
         })
     }
 
-    /// Whether the page/record cap or a shutdown request forbids fetching
-    /// another page.
-    fn cap_reached(&self) -> bool {
-        if self.pages_fetched >= self.cfg.max_pages {
-            return true;
-        }
+    /// Whether an explicit record cap or shutdown request ends the pull.
+    /// Page-bound exhaustion is handled separately after checking whether the
+    /// server actually offered another continuation.
+    fn stop_requested(&self) -> bool {
         if let Some(max) = self.cfg.max_records
             && self.records_emitted >= max
         {
@@ -197,13 +222,28 @@ impl RestRecordSource {
     /// installing its decoder as `current_page`. Returns `Ok(false)` when
     /// the cursor is exhausted (clean EOF).
     fn fetch_next_page(&mut self) -> Result<bool, FormatError> {
-        if self.cap_reached() {
+        if self.stop_requested() {
             return Ok(false);
         }
-        let url = match self.build_request_url() {
+        let url = match self.build_request_url()? {
             Some(url) => url,
             None => return Ok(false),
         };
+        if self.pages_fetched >= self.cfg.max_pages {
+            return Err(io_err(format!(
+                "{}; rest source {:?}: page_limit_reached max_pages={} next_page={} target={}",
+                ContinuationError::for_code("rest.protocol.page_limit_reached"),
+                self.source_name,
+                self.cfg.max_pages,
+                self.pages_fetched.saturating_add(1),
+                url.diagnostic_target(),
+            )));
+        }
+        if !self.visited_pages.insert(url.as_str().to_owned()) {
+            return Err(continuation_format_error(ContinuationError::for_code(
+                "rest.protocol.unsupported_continuation",
+            )));
+        }
 
         let bytes = self.get_with_retry(&url)?;
         self.pages_fetched += 1;
@@ -256,9 +296,9 @@ impl RestRecordSource {
 
     /// Compute the URL for the next request, or `None` when the cursor is
     /// exhausted.
-    fn build_request_url(&self) -> Option<String> {
-        match &self.next {
-            NextPage::Single { fetched } => (!fetched).then(|| self.cfg.url.clone()),
+    fn build_request_url(&self) -> Result<Option<AuthorizedUrl>, FormatError> {
+        let raw = match &self.next {
+            NextPage::Single { fetched } => (!fetched).then(|| self.base_url.as_str().to_owned()),
             NextPage::Offset {
                 offset_param,
                 limit_param,
@@ -267,7 +307,7 @@ impl RestRecordSource {
                 more,
             } => more.then(|| {
                 append_query(
-                    &self.cfg.url,
+                    self.base_url.as_str(),
                     &[
                         (offset_param, &offset.to_string()),
                         (limit_param, &limit.to_string()),
@@ -280,12 +320,54 @@ impl RestRecordSource {
                 more,
                 ..
             } => more.then(|| match token {
-                Some(t) => append_query(&self.cfg.url, &[(cursor_param, t)]),
-                None => self.cfg.url.clone(),
+                Some(t) => append_query(self.base_url.as_str(), &[(cursor_param, t)]),
+                None => self.base_url.as_str().to_owned(),
             }),
             NextPage::LinkHeader { next_url, more } => {
-                more.then(|| next_url.clone().unwrap_or_else(|| self.cfg.url.clone()))
+                return Ok(more.then(|| next_url.clone().unwrap_or_else(|| self.base_url.clone())));
             }
+        };
+        raw.map(|raw| {
+            continuation::resolve_and_authorize(&self.base_url, &raw, &self.admitted_origin)
+                .map_err(continuation_format_error)
+        })
+        .transpose()
+    }
+
+    fn continuation_failure(code: &'static str) -> FormatError {
+        continuation_format_error(ContinuationError::for_code(code))
+    }
+
+    fn sanitized_request_failure(
+        &self,
+        url: &AuthorizedUrl,
+        attempt: u32,
+        failure: RequestFailure,
+    ) -> FormatError {
+        io_err(format!(
+            "rest source {:?}: request_failed class={} attempt={} page={} target={}",
+            self.source_name,
+            failure.as_str(),
+            attempt,
+            self.pages_fetched.saturating_add(1),
+            url.diagnostic_target(),
+        ))
+    }
+
+    fn request_for(
+        &self,
+        url: &AuthorizedUrl,
+    ) -> ureq::RequestBuilder<ureq::typestate::WithoutBody> {
+        match &self.cfg.auth {
+            RestAuth::None => self.agent.get(url.as_str()),
+            RestAuth::Bearer { token } => self
+                .agent
+                .get(url.as_str())
+                .header("Authorization", format!("Bearer {token}")),
+            RestAuth::Header { name, value } => self
+                .agent
+                .get(url.as_str())
+                .header(name.as_str(), value.as_str()),
         }
     }
 
@@ -322,7 +404,7 @@ impl RestRecordSource {
     /// errors retry up to `cfg.retries`; a 4xx is a fatal hard error
     /// (the request is malformed, retrying cannot help). Polls the
     /// shutdown token between attempts so cancellation lands promptly.
-    fn get_with_retry(&self, url: &str) -> Result<PageResponse, FormatError> {
+    fn get_with_retry(&self, start_url: &AuthorizedUrl) -> Result<PageResponse, FormatError> {
         let mut attempt: u32 = 0;
         loop {
             if self.shutdown.as_ref().is_some_and(|t| t.is_requested()) {
@@ -331,68 +413,157 @@ impl RestRecordSource {
                     self.source_name
                 )));
             }
-            let request = match &self.cfg.auth {
-                RestAuth::None => self.agent.get(url),
-                RestAuth::Bearer { token } => self
-                    .agent
-                    .get(url)
-                    .header("Authorization", format!("Bearer {token}")),
-                RestAuth::Header { name, value } => {
-                    self.agent.get(url).header(name.as_str(), value.as_str())
-                }
-            };
-            match request.call() {
-                Ok(mut response) => {
-                    let status = response.status().as_u16();
-                    if (500..600).contains(&status) {
-                        if attempt < self.cfg.retries {
-                            attempt += 1;
-                            continue;
+            let mut url = start_url.clone();
+            let mut redirects = HashSet::from([url.as_str().to_owned()]);
+            let mut redirect_count = 0_u32;
+            let retry_failure = loop {
+                let request = self.request_for(&url);
+                let mut response = match request.call() {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let failure = RequestFailure::from_transport(&error);
+                        if matches!(failure, RequestFailure::HttpStatus(400..=499)) {
+                            return Err(self.sanitized_request_failure(
+                                &url,
+                                attempt.saturating_add(1),
+                                failure,
+                            ));
                         }
-                        return Err(io_err(format!(
-                            "rest source {:?}: server error {status} after {} retries (url {url})",
-                            self.source_name, self.cfg.retries
-                        )));
+                        break failure;
                     }
-                    if !(200..300).contains(&status) {
-                        return Err(io_err(format!(
-                            "rest source {:?}: HTTP {status} (url {url})",
-                            self.source_name
-                        )));
+                };
+                let status = response.status().as_u16();
+                if (300..400).contains(&status) {
+                    if redirect_count >= MAX_REDIRECTS {
+                        return Err(Self::continuation_failure(
+                            "rest.protocol.unsupported_continuation",
+                        ));
                     }
-                    let next_link = response
-                        .headers()
-                        .get_all(ureq::http::header::LINK)
-                        .iter()
-                        .filter_map(|v| v.to_str().ok())
-                        .find_map(parse_next_link);
-                    let body = response
-                        .body_mut()
-                        .with_config()
-                        .limit(MAX_PAGE_BYTES)
-                        .read_to_vec()
-                        .map_err(|e| {
-                            io_err(format!(
-                                "rest source {:?}: reading body: {e}",
-                                self.source_name
-                            ))
-                        })?;
-                    return Ok(PageResponse { body, next_link });
+                    let target = continuation::redirect_location(
+                        response.headers(),
+                        &url,
+                        &self.admitted_origin,
+                    )
+                    .map_err(continuation_format_error)?;
+                    if !redirects.insert(target.as_str().to_owned()) {
+                        return Err(Self::continuation_failure(
+                            "rest.protocol.unsupported_continuation",
+                        ));
+                    }
+                    redirect_count = redirect_count.saturating_add(1);
+                    url = target;
+                    continue;
                 }
-                Err(e) => {
-                    // Transport-level failure (connect / timeout / TLS).
-                    // Transient — retry within the bound.
-                    if attempt < self.cfg.retries {
-                        attempt += 1;
-                        continue;
-                    }
-                    return Err(io_err(format!(
-                        "rest source {:?}: request failed after {} retries: {e} (url {url})",
-                        self.source_name, self.cfg.retries
-                    )));
+                if (500..600).contains(&status) {
+                    break RequestFailure::HttpStatus(status);
                 }
+                if !(200..300).contains(&status) {
+                    return Err(self.sanitized_request_failure(
+                        &url,
+                        attempt.saturating_add(1),
+                        RequestFailure::HttpStatus(status),
+                    ));
+                }
+                let next_link = if matches!(self.next, NextPage::LinkHeader { .. }) {
+                    continuation::next_link(response.headers(), &url, &self.admitted_origin)
+                        .map_err(continuation_format_error)?
+                } else {
+                    None
+                };
+                let body = match response
+                    .body_mut()
+                    .with_config()
+                    .limit(MAX_PAGE_BYTES)
+                    .read_to_vec()
+                {
+                    Ok(body) => body,
+                    Err(error) => {
+                        let failure = RequestFailure::from_transport(&error);
+                        if failure.retryable_body_read() {
+                            break failure;
+                        }
+                        return Err(self.sanitized_request_failure(
+                            &url,
+                            attempt.saturating_add(1),
+                            failure,
+                        ));
+                    }
+                };
+                return Ok(PageResponse { body, next_link });
+            };
+            if attempt < self.cfg.retries {
+                attempt = attempt.saturating_add(1);
+                continue;
             }
+            return Err(self.sanitized_request_failure(
+                &url,
+                attempt.saturating_add(1),
+                retry_failure,
+            ));
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RequestFailure {
+    HttpStatus(u16),
+    Timeout,
+    HostNotFound,
+    Tls,
+    ProxyConnection,
+    Connection,
+    Protocol,
+    BodyLimit,
+    Io(std::io::ErrorKind),
+    Transport,
+}
+
+impl RequestFailure {
+    fn from_transport(error: &ureq::Error) -> Self {
+        match error {
+            ureq::Error::StatusCode(status) => Self::HttpStatus(*status),
+            ureq::Error::Timeout(_) => Self::Timeout,
+            ureq::Error::HostNotFound => Self::HostNotFound,
+            ureq::Error::Tls(_) => Self::Tls,
+            ureq::Error::ConnectProxyFailed(_) => Self::ProxyConnection,
+            ureq::Error::ConnectionFailed => Self::Connection,
+            ureq::Error::Protocol(_) => Self::Protocol,
+            ureq::Error::BodyExceedsLimit(_) => Self::BodyLimit,
+            ureq::Error::Io(error) => Self::Io(error.kind()),
+            _ => Self::Transport,
+        }
+    }
+
+    fn as_str(self) -> String {
+        match self {
+            Self::HttpStatus(status) => format!("http_status_{status}"),
+            Self::Timeout => "timeout".to_owned(),
+            Self::HostNotFound => "host_not_found".to_owned(),
+            Self::Tls => "tls".to_owned(),
+            Self::ProxyConnection => "proxy_connection".to_owned(),
+            Self::Connection => "connection".to_owned(),
+            Self::Protocol => "protocol".to_owned(),
+            Self::BodyLimit => "body_limit".to_owned(),
+            Self::Io(kind) => format!("io_{kind:?}").to_ascii_lowercase(),
+            Self::Transport => "transport".to_owned(),
+        }
+    }
+
+    fn retryable_body_read(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout
+                | Self::Connection
+                | Self::Io(
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::WouldBlock
+                )
+        )
     }
 }
 
@@ -400,7 +571,7 @@ impl RestRecordSource {
 /// link URL (Link-header strategy only).
 struct PageResponse {
     body: Vec<u8>,
-    next_link: Option<String>,
+    next_link: Option<AuthorizedUrl>,
 }
 
 impl RecordSource for RestRecordSource {
@@ -576,30 +747,6 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-/// Parse the `rel="next"` URL out of one RFC 5988 `Link` header value.
-/// A header value is a comma-separated list of `<url>; rel="..."`
-/// entries; this returns the URL whose `rel` is `next`.
-fn parse_next_link(header: &str) -> Option<String> {
-    for entry in header.split(',') {
-        let entry = entry.trim();
-        let Some((url_part, params)) = entry.split_once(';') else {
-            continue;
-        };
-        let url = url_part
-            .trim()
-            .trim_start_matches('<')
-            .trim_end_matches('>');
-        let is_next = params.split(';').any(|p| {
-            let p = p.trim();
-            p == "rel=\"next\"" || p == "rel=next"
-        });
-        if is_next {
-            return Some(url.to_string());
-        }
-    }
-    None
-}
-
 fn build_json_config(
     opts: Option<&clinker_plan::config::JsonInputOptions>,
     multi_value: &MultiValueRead,
@@ -658,21 +805,6 @@ fn build_xml_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_next_link_extracts_rel_next() {
-        let h = r#"<https://api.example.com/r?page=2>; rel="next", <https://api.example.com/r?page=5>; rel="last""#;
-        assert_eq!(
-            parse_next_link(h).as_deref(),
-            Some("https://api.example.com/r?page=2")
-        );
-    }
-
-    #[test]
-    fn parse_next_link_absent_when_no_next() {
-        let h = r#"<https://api.example.com/r?page=1>; rel="prev""#;
-        assert_eq!(parse_next_link(h), None);
-    }
 
     #[test]
     fn append_query_picks_separator() {

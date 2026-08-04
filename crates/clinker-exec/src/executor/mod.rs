@@ -461,6 +461,8 @@ impl PipelineExecutor {
         memory_budget: std::sync::Arc<crate::pipeline::memory::MemoryArbitrator>,
     ) -> Result<ExecutionReport, PipelineError> {
         let started_at = Utc::now();
+        let output_staging = writers.output_staging.clone();
+        let auto_commit_staged = writers.auto_commit_staged;
 
         let source_configs: Vec<_> = config.source_configs().cloned().collect();
         let output_configs: Vec<_> = config.output_configs().cloned().collect();
@@ -710,7 +712,7 @@ impl PipelineExecutor {
             cumulative_spill_bytes,
             per_stage_spill_bytes,
             peak_consumer_usage_bytes,
-            interrupted,
+            mut interrupted,
             advisories,
         } = Self::execute_dag(
             &DagExecInputs {
@@ -757,6 +759,33 @@ impl PipelineExecutor {
             total_ingested += outcome.total_count;
             for (file_arc, ts) in outcome.watermark_observations {
                 watermarks.observe(&outcome.source_name, &file_arc, ts);
+            }
+        }
+        if auto_commit_staged {
+            if !interrupted
+                && params
+                    .shutdown_token
+                    .as_ref()
+                    .is_some_and(|token| !token.try_begin_publication())
+            {
+                interrupted = true;
+            }
+            if let Some(outcome) = output_staging.commit_all_if_complete(interrupted)? {
+                use crate::output::staging::PublicationOutcome;
+                match outcome {
+                    PublicationOutcome::Complete { cleanup_debt, .. }
+                        if cleanup_debt.is_empty() => {}
+                    PublicationOutcome::Complete { cleanup_debt, .. } => {
+                        return Err(PipelineError::Io(std::io::Error::other(format!(
+                            "output publication completed with cleanup debt: {cleanup_debt:?}"
+                        ))));
+                    }
+                    incomplete @ PublicationOutcome::Incomplete { .. } => {
+                        return Err(PipelineError::Io(std::io::Error::other(format!(
+                            "output publication was incomplete: {incomplete:?}"
+                        ))));
+                    }
+                }
             }
         }
         collector.record(reader_timer.finish(total_ingested, total_ingested));
@@ -1236,6 +1265,8 @@ impl PipelineExecutor {
             source_vars_seeded_files: HashMap::new(),
             writers: writers.single,
             fan_out_writers: writers.fan_out,
+            fan_out_paths: writers.fan_out_paths,
+            output_staging: writers.output_staging,
             counters: std::mem::take(counters),
             dlq_entries: std::mem::take(dlq_entries),
             dlq_per_source: HashMap::new(),

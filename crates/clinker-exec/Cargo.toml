@@ -46,11 +46,20 @@ clinker-bench-support = { workspace = true, optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ctrlc = { version = "3", features = ["termination"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31.2", default-features = false, features = ["fs"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = [
-    "Win32_System_ProcessStatus",
-    "Win32_System_Threading",
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_ProcessStatus",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
 ] }
 
 [features]

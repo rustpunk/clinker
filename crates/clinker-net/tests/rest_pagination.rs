@@ -248,20 +248,36 @@ fn link_header_pagination_drains_to_last_page_eof() {
 }
 
 #[test]
-fn max_pages_cap_halts_even_if_server_offers_more() {
-    // The Link server keeps offering a next link until the dataset ends,
-    // but a max_pages=1 cap must stop after the first page regardless.
+fn max_pages_cap_fails_if_server_offers_more() {
+    // A configured page cap is a traversal bound, not permission to publish a
+    // truncated prefix as a completed pull. If the first page still advertises
+    // continuation, the reader yields that admitted page and then fails closed.
     let (url, stop, handle) = spawn_link_server();
     let pagination = "        pagination:\n          strategy: link_header";
     let mut reader = build_reader(pagination, 1, &url);
 
-    let ids = drain(reader.as_mut());
+    let mut ids = Vec::new();
+    for _ in 0..PAGE_SIZE {
+        let record = reader
+            .next_record()
+            .expect("first admitted page")
+            .expect("record from first page");
+        let Some(clinker_record::Value::Integer(id)) = record.get("id") else {
+            panic!("record id must be an integer")
+        };
+        ids.push(*id);
+    }
+    let error = reader
+        .next_record()
+        .expect_err("offered continuation beyond max_pages must fail");
     shutdown_server(&url, &stop, handle);
 
-    assert_eq!(
-        ids,
-        vec![0, 1, 2],
-        "max_pages cap must stop the reader at the first page"
+    assert_eq!(ids, vec![0, 1, 2]);
+    assert!(
+        error
+            .to_string()
+            .contains("rest.protocol.page_limit_reached"),
+        "page-bound failure must carry the stable classification: {error}"
     );
 }
 

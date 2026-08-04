@@ -1,0 +1,87 @@
+{
+  "schema": "clinker.decision/v1",
+  "decision_id": "release-environment",
+  "control_id": "release-environment",
+  "status": "accepted",
+  "selection": "single-maintainer-inspect-then-approve",
+  "approver_role_ref": "user:rustpunk",
+  "evidence_refs": [
+    ".github/workflows/publish-release.yml",
+    "scripts/release/fixtures/release-decisions/accepted-record-set.json"
+  ],
+  "recorded_at": "2026-07-31T05:18:35Z",
+  "environment_policy": {
+    "approval_mode": "single-maintainer-inspect-then-approve",
+    "environment": "release",
+    "workflow": ".github/workflows/publish-release.yml",
+    "job": "publish-approved-release",
+    "approval_kind": "manual",
+    "automated_approval": false,
+    "generic_admin_bypass": false,
+    "prevent_self_review": false,
+    "maintainer_actor_refs": [
+      "user:rustpunk"
+    ],
+    "trigger_actor_ref": "user:rustpunk",
+    "deployment_restriction": {
+      "ref_type": "tag",
+      "tag_pattern": "v<semver>",
+      "branches_allowed": false
+    },
+    "concurrency": {
+      "scope": "candidate-tag",
+      "max_in_progress": 1,
+      "redispatch_allowed": false
+    },
+    "inspection_contract": {
+      "required_fields": [
+        "run_id",
+        "job_id",
+        "environment",
+        "candidate_tag",
+        "inspector_actor_ref",
+        "inspection_started_at",
+        "inspection_completed_at",
+        "inspection_evidence_ref"
+      ],
+      "exact_run_candidate_required": true,
+      "actor_rule": "eligible-maintainer"
+    },
+    "approval_contract": {
+      "required_fields": [
+        "run_id",
+        "job_id",
+        "environment",
+        "candidate_tag",
+        "approver_actor_ref",
+        "approved_at",
+        "approval_receipt_ref",
+        "approval_kind",
+        "automated_approval"
+      ],
+      "exact_run_candidate_required": true,
+      "actor_rule": "configured-maintainer"
+    },
+    "ordering_contract": {
+      "shared_identity_fields": [
+        "run_id",
+        "job_id",
+        "environment",
+        "candidate_tag"
+      ],
+      "timestamp_order": [
+        "inspection_started_at",
+        "inspection_completed_at",
+        "approved_at"
+      ],
+      "strictly_increasing": true
+    },
+    "draft_policy": {
+      "exact_final_reread_required": true,
+      "byte_identical_partial_reconciliation_only": true,
+      "already_published_exact_match_behavior": "verification-only",
+      "mismatch_recovery": "new-version-only"
+    },
+    "two_person_unavailable_reason": "Only one distinct human release maintainer is available."
+  }
+}

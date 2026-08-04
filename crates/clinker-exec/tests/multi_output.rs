@@ -1114,7 +1114,7 @@ fn test_dlq_columns_in_csv() {
     }];
 
     let mut buf = Vec::new();
-    write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
+    write_dlq(&mut buf, &entries, true, true).unwrap();
     let output = String::from_utf8(buf).unwrap();
 
     let header = output.lines().next().unwrap();
@@ -1189,9 +1189,8 @@ nodes:
 
     // Verify the DLQ CSV includes new columns
     use clinker_exec::dlq::write_dlq;
-    let schema = dlq[0].original_record.schema().clone();
     let mut buf = Vec::new();
-    write_dlq(&mut buf, &dlq, &schema, "input.csv", true, true).unwrap();
+    write_dlq(&mut buf, &dlq, true, true).unwrap();
     let output = String::from_utf8(buf).unwrap();
     let header = output.lines().next().unwrap();
     assert!(header.contains("_cxl_dlq_stage"));

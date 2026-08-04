@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:clinker:openlineage:facet:failure-run:v1",
+  "title": "ClinkerFailureRunFacet",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["_producer", "_schemaURL", "code", "category", "retryAdvice", "message"],
+  "properties": {
+    "_producer": { "type": "string" },
+    "_schemaURL": { "type": "string" },
+    "code": { "type": "string" },
+    "category": { "type": "string" },
+    "retryAdvice": { "type": "string" },
+    "message": { "type": "string" }
+  }
+}

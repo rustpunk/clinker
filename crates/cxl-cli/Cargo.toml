@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Standalone CXL language validator, evaluator, and formatter"
 
+[[bin]]
+name = "cxl"
+path = "src/main.rs"
+
 [dependencies]
 cxl = { workspace = true }
 clinker-record = { workspace = true }

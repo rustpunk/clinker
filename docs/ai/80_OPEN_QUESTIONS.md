@@ -483,6 +483,44 @@ see the Resolved Archive. This entry keeps the one remaining follow-on.)
 - Priority: Medium
 - Filed: 2026-07-02; narrowed to the `clinker guess` follow-on 2026-07-24.
 
+### 32. Output permissions are secure but not configurable for shared drop zones
+
+- Question: Unix output files are created with owner-only mode `0600`. Should
+  Clinker expose a validated output-permission policy for destinations whose
+  intended consumer is a different service account or group?
+- Why it matters: `0600` is a safe default and prevents accidental disclosure,
+  but it requires an external ACL/ownership policy for common ETL drop-zone
+  workflows. Silently honoring process umask would make the effective access
+  harder to review and would weaken the current default.
+- Files/modules involved:
+  `crates/clinker-exec/src/output/containment.rs`, output configuration in
+  `clinker-plan`, and `docs/user/src/nodes/output.md`.
+- Suggested way to resolve it: Research group-owned drop-zone practices on
+  Unix, NFS, and SMB; decide whether the surface should be an explicit mode,
+  an ACL-oriented policy, or remain external. Preserve `0600` as the default
+  and reject unsafe or unsupported values rather than inheriting ambient umask.
+- Priority: Medium
+- Filed: 2026-08-02.
+
+### 33. Corporate TLS roots are not configurable for REST sources
+
+- Question: Should REST sources trust the platform certificate store, accept an
+  explicit CA bundle path, or support both for TLS-inspecting corporate
+  proxies?
+- Why it matters: Proxy routing already follows the standard proxy environment,
+  but the current `ureq` Rustls feature uses bundled public Web PKI roots. A
+  private corporate CA installed on the host is therefore not enough to make an
+  intercepted vendor connection trusted.
+- Files/modules involved: root `Cargo.toml`, `crates/clinker-net/src/rest.rs`,
+  and `docs/user/src/formats/source-network.md`.
+- Suggested way to resolve it: Compare Rustls platform verification with an
+  explicit PEM bundle surface across Linux, macOS, and Windows; threat-model CA
+  path substitution and diagnostics; obtain dependency approval before adding
+  a verifier or certificate-loading crate. Never add an insecure skip-verify
+  option.
+- Priority: High
+- Filed: 2026-08-02.
+
 ## Resolved Archive
 
 Numbers are never reused. One line per entry: the answer and its evidence.

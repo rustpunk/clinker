@@ -277,8 +277,6 @@ impl ExecutionPlanDag {
     /// emitted single file just concatenates records from every source
     /// file into one writer in arrival order.
     fn populate_fan_out_flags(&mut self) {
-        use crate::config::path_template::PathTemplate;
-
         // Snapshot indices and partitioning so we can mutate plan
         // payloads without holding the immutable borrow on
         // `node_properties`.
@@ -315,13 +313,7 @@ impl ExecutionPlanDag {
             else {
                 continue;
             };
-            // Parse the template to detect per-record tokens. Failed
-            // parses leave the flag at `false`; the existing path-
-            // validation pass surfaces the parse error separately.
-            let Ok(template) = PathTemplate::parse(&payload.output.path) else {
-                continue;
-            };
-            if template.has_per_record_tokens() {
+            if payload.output.has_per_record_path_tokens() {
                 payload.fan_out_per_source_file = true;
             }
         }

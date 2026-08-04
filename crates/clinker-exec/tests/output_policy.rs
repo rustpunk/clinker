@@ -2,8 +2,7 @@
 //!
 //! Covers each `if_exists` policy through `open_output`, the path-template
 //! interaction with `OutputConfig`, and a multi-threaded race test that
-//! exercises the `OpenOptions::create_new` retry loop under concurrent
-//! contention.
+//! exercises destination-local reservations under concurrent contention.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -25,20 +24,24 @@ fn touch(path: &Path) {
 }
 
 #[test]
-fn overwrite_policy_truncates_existing_file() {
+fn overwrite_policy_preserves_existing_file_until_commit() {
     let dir = tempfile::tempdir().unwrap();
     let target = dir.path().join("out.csv");
     touch(&target);
     let written = std::fs::metadata(&target).unwrap().len();
     assert_eq!(written, 1);
 
-    let (path, _f) = open_output(IfExistsPolicy::Overwrite, false, |n| {
+    let (path, mut file, staged) = open_output(IfExistsPolicy::Overwrite, false, |n| {
         assert!(n.is_none());
         Ok(target.clone())
     })
     .unwrap();
     assert_eq!(path, target);
-    assert_eq!(std::fs::metadata(&target).unwrap().len(), 0);
+    file.write_all(b"replacement").unwrap();
+    drop(file);
+    assert_eq!(std::fs::read(&target).unwrap(), b"x");
+    staged.commit().unwrap();
+    assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
 }
 
 #[test]
@@ -50,7 +53,8 @@ fn error_policy_refuses_existing_unless_force() {
     let result = open_output(IfExistsPolicy::Error, false, |_| Ok(target.clone()));
     assert!(result.is_err(), "policy=Error must refuse existing file");
 
-    let (path, _f) = open_output(IfExistsPolicy::Error, true, |_| Ok(target.clone())).unwrap();
+    let (path, _f, _staged) =
+        open_output(IfExistsPolicy::Error, true, |_| Ok(target.clone())).unwrap();
     assert_eq!(path, target, "cli_force should downgrade Error → Overwrite");
 }
 
@@ -62,7 +66,7 @@ fn unique_suffix_walks_until_free_slot() {
     touch(&dir.path().join("out-1.csv"));
     touch(&dir.path().join("out-2.csv"));
 
-    let (path, _f) = open_output(IfExistsPolicy::UniqueSuffix, false, |n| {
+    let (path, _f, _staged) = open_output(IfExistsPolicy::UniqueSuffix, false, |n| {
         Ok(match n {
             None => bare.clone(),
             Some(k) => append_suffix_before_ext(&bare, &format!("-{k}")),
@@ -76,9 +80,8 @@ fn unique_suffix_walks_until_free_slot() {
 fn unique_suffix_race_under_concurrency() {
     // Twelve threads racing for the same bare path should each receive
     // a distinct file without anyone clobbering anyone else. This is
-    // the property `OpenOptions::create_new` is supposed to give us;
-    // the test guards against a regression to plain `File::create` in
-    // the policy layer.
+    // Hidden create-new reservations provide the race safety here; the test
+    // guards against a regression to an inspect-then-create policy.
     let dir = tempfile::tempdir().unwrap();
     let bare = Arc::new(dir.path().join("race.csv"));
     let started = Arc::new(AtomicUsize::new(0));
@@ -96,11 +99,14 @@ fn unique_suffix_race_under_concurrency() {
                 std::hint::spin_loop();
             }
             let bare_path = (*bare).clone();
-            let (path, _f) = open_output(IfExistsPolicy::UniqueSuffix, false, |n| match n {
-                None => Ok(bare_path.clone()),
-                Some(k) => Ok(append_suffix_before_ext(&bare_path, &format!("-{k}"))),
-            })
-            .unwrap();
+            let (path, file, staged) =
+                open_output(IfExistsPolicy::UniqueSuffix, false, |n| match n {
+                    None => Ok(bare_path.clone()),
+                    Some(k) => Ok(append_suffix_before_ext(&bare_path, &format!("-{k}"))),
+                })
+                .unwrap();
+            drop(file);
+            staged.commit().unwrap();
             path
         }));
     }

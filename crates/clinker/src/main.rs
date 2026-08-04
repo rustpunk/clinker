@@ -1430,6 +1430,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let mut pipeline_config =
         clinker_plan::config::load_config_with_vars_and_patches(&args.config, &[], source_patches)
             .map_err(PipelineError::Config)?;
+    apply_cli_force_policy(&mut pipeline_config, args.force);
 
     // A `--memory-limit` flag overrides the pipeline's `memory.limit`, matching
     // the documented CLI-wins precedence. The flag is validated at the boundary,
@@ -1453,21 +1454,13 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // top-level pipeline through the normal diagnostic path instead of letting
     // the runtime setup below panic. This is config inspection only: it does
     // not discover or open the source.
-    let input_path = pipeline_config
-        .source_configs()
-        .next()
-        .map(|source| {
-            if source.transport.is_file() {
-                source.path_str().to_string()
-            } else {
-                format!("<source:{}>", source.name)
-            }
-        })
-        .ok_or_else(|| {
-            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+    if pipeline_config.source_configs().next().is_none() {
+        return Err(PipelineError::Config(
+            clinker_plan::config::ConfigError::Validation(
                 "pipeline must declare at least one source node".to_string(),
-            ))
-        })?;
+            ),
+        ));
+    }
 
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
@@ -1956,87 +1949,133 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         );
     }
 
-    // Outputs are written atomically: each output writes to a sibling
-    // tempfile, then renames into place after the pipeline completes
-    // successfully. On crash or pipeline error, the writing tempfile is
-    // left in place (and its path logged) so an operator can inspect
-    // partial output without the final path showing a truncated file.
-    //
-    // Cross-process race-safety for `if_exists: unique_suffix` comes
-    // from `OpenOptions::create_new` reservations: each output's
-    // resolved path holds a 0-byte placeholder file from the moment
-    // `open_output` returns until persist atomically replaces it.  The
-    // placeholder is wrapped in a `tempfile::TempPath`, mirroring what
-    // the rest of the codebase already does for tempfile cleanup, so
-    // any unwind path (panic, mid-persist failure, the explicit Err
-    // arm below) auto-unlinks remaining placeholders via `Drop`.
+    // Every output writes to a hidden destination-local leaf admitted through
+    // a retained containment boundary. The shared ledger also serves lazy
+    // split writers, and the CLI publishes the complete ledger only after the
+    // executor reports success. Failed runs leave existing finals untouched
+    // and preserve hidden partials for inspection.
     let mut writers: std::collections::HashMap<String, Box<dyn std::io::Write + Send>> =
         std::collections::HashMap::new();
-    let mut output_temps: Vec<PendingOutput> = Vec::new();
-    // output_name → final resolved path, kept after output_temps is
-    // consumed by the persist loop so the provenance sidecar can
-    // record the actual file written (not the bare template-rendered
-    // path on OutputConfig).
-    let mut resolved_output_paths: std::collections::HashMap<String, std::path::PathBuf> =
-        std::collections::HashMap::new();
+    let output_staging = clinker_exec::output::staging::OutputStagingRegistry::default();
+    let mut fan_out_destinations: std::collections::HashMap<
+        String,
+        Vec<(std::sync::Arc<str>, std::path::PathBuf, std::path::PathBuf)>,
+    > = std::collections::HashMap::new();
+    for output in pipeline_config.output_configs() {
+        if !output_is_fan_out(compiled_plan.dag(), &output.name) {
+            continue;
+        }
+        let upstream_source = upstream_source_for_output(compiled_plan.dag(), &output.name);
+        let files = upstream_source
+            .as_ref()
+            .and_then(|source| source_files_by_name.get(source.as_str()))
+            .cloned()
+            .unwrap_or_default();
+        let mut identities: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf> =
+            std::collections::HashMap::new();
+        let mut rendered = Vec::with_capacity(files.len());
+        for source_path in files {
+            let source_key: std::sync::Arc<str> =
+                std::sync::Arc::from(source_path.to_string_lossy().into_owned());
+            let source_file = source_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("source");
+            let destination = std::path::PathBuf::from(
+                output.render_runtime_path(source_file, &source_path.to_string_lossy())?,
+            );
+            if !output.authored_path_was_absolute() && destination.is_absolute() {
+                return Err(PipelineError::Config(
+                    clinker_plan::config::ConfigError::Validation(format!(
+                        "fan-out output {:?} rendered an absolute path from a relative template",
+                        output.name
+                    )),
+                ));
+            }
+            let identity = std::path::absolute(&destination)?;
+            if let Some(first_source) = identities.insert(identity.clone(), source_path.clone()) {
+                return Err(PipelineError::Config(
+                    clinker_plan::config::ConfigError::Validation(format!(
+                        "fan-out output {:?} renders both {} and {} to {}; include {{source_path}} or another distinguishing path component",
+                        output.name,
+                        first_source.display(),
+                        source_path.display(),
+                        identity.display(),
+                    )),
+                ));
+            }
+            rendered.push((source_key, destination, source_path));
+        }
+        fan_out_destinations.insert(output.name.clone(), rendered);
+    }
     let mut fan_out_writers: std::collections::HashMap<
         String,
         std::collections::HashMap<std::sync::Arc<str>, Box<dyn std::io::Write + Send>>,
     > = std::collections::HashMap::new();
+    let mut fan_out_paths: std::collections::HashMap<
+        String,
+        std::collections::HashMap<std::sync::Arc<str>, String>,
+    > = std::collections::HashMap::new();
     for output in pipeline_config.output_configs() {
-        // Split outputs route file creation through SplittingWriter's
-        // per-`{seq}` factory inside build_format_writer, which applies
-        // `if_exists` itself. The atomic tempfile pattern below is for
-        // single-file outputs only; for splits, install a sink writer
-        // here so the executor's drop of `raw_writer` is harmless.
-        if output.split.is_some() {
-            writers.insert(output.name.clone(), Box::new(std::io::sink()));
-            resolved_output_paths.insert(output.name.clone(), output.path.clone().into());
-            continue;
-        }
         // Fan-out path: when the plan flagged this Output for per-
         // source-file routing, render the template once per matched
         // source file. Each rendered path gets its own writer; the
         // dispatcher routes records by `$source.file` Arc.
         if output_is_fan_out(compiled_plan.dag(), &output.name) {
-            let upstream_source = upstream_source_for_output(compiled_plan.dag(), &output.name);
-            let files = upstream_source
-                .as_ref()
-                .and_then(|s| source_files_by_name.get(s.as_str()))
-                .cloned()
-                .unwrap_or_default();
             let mut per_file: std::collections::HashMap<
                 std::sync::Arc<str>,
                 Box<dyn std::io::Write + Send>,
             > = std::collections::HashMap::new();
-            for path in files {
-                let file_arc: std::sync::Arc<str> =
-                    std::sync::Arc::from(path.to_string_lossy().into_owned());
-                let label = path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("source")
-                    .to_string();
-                let resolved = output
-                    .path
-                    .replace("{source_file}", &label)
-                    .replace("{source_path}", &path.to_string_lossy());
-                let resolved_path = std::path::PathBuf::from(&resolved);
-                if let Some(parent) = resolved_path.parent()
-                    && !parent.as_os_str().is_empty()
-                    && !parent.exists()
-                {
-                    std::fs::create_dir_all(parent)?;
+            let mut per_file_paths = std::collections::HashMap::new();
+            for (file_arc, resolved_path, _source_path) in fan_out_destinations
+                .remove(&output.name)
+                .unwrap_or_default()
+            {
+                per_file_paths.insert(
+                    std::sync::Arc::clone(&file_arc),
+                    resolved_path.to_string_lossy().into_owned(),
+                );
+                if output.split.is_some() {
+                    per_file.insert(file_arc, Box::new(std::io::sink()));
+                    continue;
                 }
-                let file = std::fs::File::create(&resolved_path)?;
+                let bare = resolved_path.clone();
+                let unique_suffix_width = output.unique_suffix_width;
+                let path_for_n = |n: Option<u64>| -> Result<
+                    std::path::PathBuf,
+                    clinker_plan::config::ConfigError,
+                > {
+                    Ok(match n {
+                        None => bare.clone(),
+                        Some(k) => {
+                            let suffix = if unique_suffix_width == 0 {
+                                format!("-{k}")
+                            } else {
+                                format!("-{:0>width$}", k, width = unique_suffix_width as usize)
+                            };
+                            clinker_exec::output::open::append_suffix_before_ext(&bare, &suffix)
+                        }
+                    })
+                };
+                let (_final_path, file) = output_staging.stage_output(
+                    output.name.clone(),
+                    output.if_exists,
+                    false,
+                    path_for_n,
+                )?;
                 per_file.insert(file_arc, Box::new(file));
             }
             fan_out_writers.insert(output.name.clone(), per_file);
-            // Skip the atomic-tempfile path; fan-out outputs write
-            // directly. Atomic per-file commit is a follow-up.
+            fan_out_paths.insert(output.name.clone(), per_file_paths);
             continue;
         }
-        let bare = std::path::PathBuf::from(&output.path);
+        // Non-fan-out split outputs lazily stage each `{seq}` file through the
+        // shared ledger inside `build_format_writer`.
+        if output.split.is_some() {
+            writers.insert(output.name.clone(), Box::new(std::io::sink()));
+            continue;
+        }
+        let bare = std::path::PathBuf::from(output.render_runtime_path("<merged>", "<merged>")?);
         let unique_suffix_width = output.unique_suffix_width;
         let path_for_n =
             |n: Option<u64>| -> Result<std::path::PathBuf, clinker_plan::config::ConfigError> {
@@ -2052,35 +2091,22 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                     }
                 })
             };
-        let (final_path, reservation_file) =
-            clinker_exec::output::open::open_output(output.if_exists, args.force, path_for_n)?;
-        drop(reservation_file);
-        let reservation = tempfile::TempPath::try_from_path(&final_path)?;
-        let parent = final_path.parent().filter(|p| !p.as_os_str().is_empty());
-        let temp = match parent {
-            Some(dir) => {
-                if !dir.exists() {
-                    std::fs::create_dir_all(dir)?;
-                }
-                tempfile::NamedTempFile::new_in(dir)?
-            }
-            None => tempfile::NamedTempFile::new_in(".")?,
-        };
-        let handle = temp.reopen()?;
+        let (_final_path, handle) = output_staging.stage_output(
+            output.name.clone(),
+            output.if_exists,
+            false,
+            path_for_n,
+        )?;
         let writer: Box<dyn std::io::Write + Send> = Box::new(handle);
         writers.insert(output.name.clone(), writer);
-        resolved_output_paths.insert(output.name.clone(), final_path.clone());
-        output_temps.push(PendingOutput {
-            name: output.name.clone(),
-            final_path,
-            temp,
-            reservation,
-        });
     }
 
     let registry = clinker_exec::executor::WriterRegistry {
         single: writers,
         fan_out: fan_out_writers,
+        fan_out_paths,
+        output_staging: output_staging.clone(),
+        auto_commit_staged: false,
     };
     // Fresh per-run shutdown token. `ShutdownToken::new()` auto-registers
     // with the process-wide signal-handler registry installed in `main`,
@@ -2094,7 +2120,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         static_vars: channel_static_vars,
         source_vars: channel_source_vars,
         record_vars: channel_record_vars,
-        shutdown_token: Some(shutdown_token),
+        shutdown_token: Some(shutdown_token.clone()),
         spill_root_dir: spill_root_dir.clone(),
         spill_disk_cap_bytes,
         spill_compress: storage_config.spill.compress,
@@ -2145,7 +2171,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // post-overlay config — so the context it recompiles under must NOT carry
     // the overlay ops again (they would double-apply and collide). For a plain
     // run this is identical to `compile_ctx.clone()` (the op stream is empty).
-    let report = match PipelineExecutor::run_plan_with_readers_writers_in_context(
+    let mut report = match PipelineExecutor::run_plan_with_readers_writers_in_context(
         &compiled_plan,
         readers,
         registry,
@@ -2181,64 +2207,17 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             // the exact inputs the failure saw (cleanup = on_success); only
             // cleanup = always reaps them on failure.
             source_stager.cleanup(false);
-            // Reservations auto-unlink via TempPath::Drop when output_temps
-            // is dropped at end of scope. We just need to preserve the
-            // writing tempfiles for operator inspection and log.
-            for pending in output_temps {
-                let kept = pending.temp.into_temp_path().keep().ok();
+            for pending in output_staging.partials() {
                 tracing::warn!(
                     output = %pending.name,
                     final_path = %pending.final_path.display(),
-                    partial_path = ?kept,
+                    partial_path = %pending.partial_path.display(),
                     "pipeline failed; partial output preserved at temp path",
                 );
-                // pending.reservation drops here, unlinking the placeholder.
             }
             return Err(e);
         }
     };
-
-    // Pipeline succeeded — atomically promote each tempfile to its
-    // final path. Order: persist first (rename atomically replaces the
-    // reservation placeholder); only on success forget the reservation
-    // so its TempPath::Drop does not unlink the now-persisted output.
-    // Then fsync the parent dir so the rename's metadata is durable
-    // across a crash (Linux ext4/xfs default mount options do not
-    // synchronously flush parent-dir entries on rename).
-    for pending in output_temps {
-        let PendingOutput {
-            name: _,
-            final_path,
-            temp,
-            reservation,
-        } = pending;
-        temp.persist(&final_path).map_err(|e| {
-            tracing::error!(
-                final_path = %final_path.display(),
-                "failed to atomically rename output into place; temp file preserved",
-            );
-            std::io::Error::other(format!(
-                "atomic output rename failed for {}: {}",
-                final_path.display(),
-                e.error
-            ))
-        })?;
-        // Persist replaced the placeholder atomically; the file at
-        // `final_path` is now the actual output. Forget the TempPath
-        // so Drop does not unlink it. Equivalent to `keep()` but avoids
-        // surfacing platform-specific keep failures that, post-persist,
-        // would just confuse the operator.
-        std::mem::forget(reservation);
-        if let Some(parent) = final_path.parent().filter(|p| !p.as_os_str().is_empty())
-            && let Err(e) = fsync_dir(parent)
-        {
-            tracing::warn!(
-                final_path = %final_path.display(),
-                error = %e,
-                "fsync(parent_dir) failed; rename metadata may not survive a crash",
-            );
-        }
-    }
 
     let counters = &report.counters;
     let dlq_entries = &report.dlq_entries;
@@ -2250,115 +2229,196 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Per-source `path:` overrides partition entries into separate
     // sidecar files; entries from sources without an override fall
     // through to `dlq_config.path` (the pipeline-wide sink).
-    if !dlq_entries.is_empty()
-        && let Some(ref dlq_config) = pipeline_config.error_handling.dlq
-    {
-        let buckets = clinker_exec::dlq::partition_dlq_entries(dlq_entries, dlq_config);
-        if !buckets.is_empty() {
-            // DLQ user-row columns come from the source's authored
-            // `schema:` declaration, not from re-reading the input file.
-            // The authored schema is the runtime schema for every
-            // transport, and a pathless network source has no file to
-            // re-open, so deriving columns from the declaration is the
-            // single correct path for both file and network sources.
-            let input_schema = {
-                let mut builder = clinker_record::SchemaBuilder::new();
-                if let Some(body) = pipeline_config.source_bodies().next() {
-                    for col in body.schema.bound_columns().unwrap_or_default() {
-                        builder = builder.with_field(col.name.as_str());
-                    }
-                }
-                builder.build()
-            };
+    let publication_preparation = (|| -> Result<(), PipelineError> {
+        if report.interrupted {
+            return Ok(());
+        }
+        if !dlq_entries.is_empty()
+            && let Some(ref dlq_config) = pipeline_config.error_handling.dlq
+        {
+            let buckets = clinker_exec::dlq::partition_dlq_entries(dlq_entries, dlq_config);
+            if buckets.is_empty() {
+                return Ok(());
+            }
             let include_reason = dlq_config.include_reason.unwrap_or(true);
             let include_source_row = dlq_config.include_source_row.unwrap_or(true);
             for (target_path, bucket_entries) in &buckets {
                 if bucket_entries.is_empty() {
                     continue;
                 }
-                let target_dir = target_path
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| std::path::PathBuf::from("."));
-                if !target_dir.exists() {
-                    std::fs::create_dir_all(&target_dir)?;
-                }
-                let dlq_temp = tempfile::NamedTempFile::new_in(&target_dir)?;
-                let dlq_temp_handle = dlq_temp.reopen()?;
+                let bare = target_path.clone();
+                let (_final_path, dlq_handle) = output_staging.stage_output(
+                    "dead-letter output",
+                    clinker_plan::config::IfExistsPolicy::Overwrite,
+                    false,
+                    move |n| {
+                        debug_assert!(n.is_none());
+                        Ok(bare.clone())
+                    },
+                )?;
                 let owned: Vec<clinker_exec::executor::DlqEntry> =
                     bucket_entries.iter().map(|e| (*e).clone()).collect();
                 clinker_exec::dlq::write_dlq(
-                    dlq_temp_handle,
+                    dlq_handle,
                     &owned,
-                    &input_schema,
-                    &input_path,
                     include_reason,
                     include_source_row,
                 )
                 .map_err(PipelineError::Format)?;
-                dlq_temp.persist(target_path).map_err(|e| {
-                    tracing::error!(
-                        final_path = %target_path.display(),
-                        "failed to atomically rename DLQ output into place; temp file preserved",
-                    );
-                    PipelineError::Io(std::io::Error::other(format!(
-                        "atomic DLQ rename failed for {}: {}",
-                        target_path.display(),
-                        e.error
-                    )))
-                })?;
             }
         }
+        for output in pipeline_config.output_configs() {
+            if !output.write_meta {
+                continue;
+            }
+            let targets = output_staging.pending_paths(&output.name);
+            let mut dlq_counts: std::collections::BTreeMap<String, u64> =
+                std::collections::BTreeMap::new();
+            for entry in dlq_entries {
+                if entry.stage.as_deref() == Some(&format!("output:{}", output.name)) {
+                    *dlq_counts
+                        .entry(format!("{:?}", entry.category))
+                        .or_default() += 1;
+                }
+            }
+            let elapsed_ms = (report.finished_at - report.started_at)
+                .num_milliseconds()
+                .max(0) as u64;
+            let hash_full = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
+            let hash_short = hash_full[..8.min(hash_full.len())].to_string();
+            for target in targets {
+                let sidecar = clinker_exec::output::sidecar::OutputSidecar {
+                    pipeline_path: args.config.to_string_lossy().into_owned(),
+                    pipeline_hash: hash_full.clone(),
+                    pipeline_hash_short: hash_short.clone(),
+                    channel: None,
+                    clinker_version: env!("CARGO_PKG_VERSION").to_string(),
+                    run_started_at: report.started_at.to_rfc3339(),
+                    run_finished_at: report.finished_at.to_rfc3339(),
+                    elapsed_total_ms: elapsed_ms,
+                    execution_id: Some(execution_id.clone()),
+                    batch_id: Some(batch_id.clone()),
+                    output_name: output.name.clone(),
+                    resolved_path: target.to_string_lossy().into_owned(),
+                    record_count: None,
+                    bytes_written: None,
+                    dlq_counts: dlq_counts.clone(),
+                    route_counts: std::collections::BTreeMap::new(),
+                    node_timings_ms: std::collections::BTreeMap::new(),
+                };
+                let bytes = clinker_exec::output::sidecar::serialize_sidecar(&sidecar)?;
+                let sidecar_path =
+                    clinker_exec::output::sidecar::OutputSidecar::sidecar_path(&target);
+                let bare = sidecar_path.clone();
+                let (_, mut handle) = output_staging.stage_output(
+                    format!("metadata sidecar for output {:?}", output.name),
+                    clinker_plan::config::IfExistsPolicy::Overwrite,
+                    false,
+                    move |n| {
+                        debug_assert!(n.is_none());
+                        Ok(bare.clone())
+                    },
+                )?;
+                std::io::Write::write_all(&mut handle, &bytes).map_err(PipelineError::Io)?;
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = publication_preparation {
+        source_stager.cleanup(false);
+        for pending in output_staging.partials() {
+            tracing::warn!(
+                output = %pending.name,
+                final_path = %pending.final_path.display(),
+                partial_path = %pending.partial_path.display(),
+                "publication preparation failed; hidden output preserved",
+            );
+        }
+        return Err(error);
     }
 
-    // Provenance sidecars for outputs that opted in via `write_meta`.
-    // Per-output record/byte/route counts are not yet surfaced from the
-    // executor; identity, timing, and DLQ-by-category come through.
-    for output in pipeline_config.output_configs() {
-        if !output.write_meta {
-            continue;
-        }
-        let mut dlq_counts: std::collections::BTreeMap<String, u64> =
-            std::collections::BTreeMap::new();
-        for e in dlq_entries {
-            if e.stage.as_deref() == Some(&format!("output:{}", output.name)) {
-                *dlq_counts.entry(format!("{:?}", e.category)).or_default() += 1;
-            }
-        }
-        let elapsed_ms = (report.finished_at - report.started_at)
-            .num_milliseconds()
-            .max(0) as u64;
-        let hash_full = clinker_exec::output::sidecar::hash_to_hex(&pipeline_hash);
-        let hash_short = hash_full[..8.min(hash_full.len())].to_string();
-        let target = resolved_output_paths
-            .get(&output.name)
-            .cloned()
-            .unwrap_or_else(|| std::path::PathBuf::from(&output.path));
-        let sidecar = clinker_exec::output::sidecar::OutputSidecar {
-            pipeline_path: args.config.to_string_lossy().into_owned(),
-            pipeline_hash: hash_full,
-            pipeline_hash_short: hash_short,
-            channel: None,
-            clinker_version: env!("CARGO_PKG_VERSION").to_string(),
-            run_started_at: report.started_at.to_rfc3339(),
-            run_finished_at: report.finished_at.to_rfc3339(),
-            elapsed_total_ms: elapsed_ms,
-            execution_id: Some(execution_id.clone()),
-            batch_id: Some(batch_id.clone()),
-            output_name: output.name.clone(),
-            resolved_path: target.to_string_lossy().into_owned(),
-            record_count: 0,
-            bytes_written: 0,
-            dlq_counts,
-            route_counts: std::collections::BTreeMap::new(),
-            node_timings_ms: std::collections::BTreeMap::new(),
-        };
-        if let Err(e) = clinker_exec::output::sidecar::write_sidecar(&target, &sidecar) {
+    let mut publication_failure: Option<String> = None;
+    if report.interrupted {
+        for pending in output_staging.partials() {
             tracing::warn!(
-                "failed to write provenance sidecar for output {:?}: {e:?}",
-                output.name
+                output = %pending.name,
+                final_path = %pending.final_path.display(),
+                partial_path = %pending.partial_path.display(),
+                "pipeline was interrupted; hidden output was not published",
             );
+        }
+    } else if !shutdown_token.try_begin_publication() {
+        report.interrupted = true;
+        for pending in output_staging.partials() {
+            tracing::warn!(
+                output = %pending.name,
+                final_path = %pending.final_path.display(),
+                partial_path = %pending.partial_path.display(),
+                "shutdown won before publication; hidden output was not published",
+            );
+        }
+    } else {
+        use clinker_exec::output::staging::PublicationOutcome;
+        match output_staging.commit_all() {
+            Ok(PublicationOutcome::Complete { cleanup_debt, .. }) if cleanup_debt.is_empty() => {}
+            Ok(PublicationOutcome::Complete { cleanup_debt, .. }) => {
+                for debt in &cleanup_debt {
+                    tracing::error!(
+                        output = %debt.name,
+                        final_path = %debt.final_path.display(),
+                        stale_path = %debt.stale_path.display(),
+                        detail = %debt.detail,
+                        "output published with transaction cleanup debt",
+                    );
+                }
+                publication_failure = Some(format!(
+                    "output publication completed with {} cleanup debt item(s)",
+                    cleanup_debt.len()
+                ));
+            }
+            Ok(PublicationOutcome::Incomplete {
+                published,
+                visible_unsynchronized,
+                unpublished,
+                cleanup_debt,
+                error,
+            }) => {
+                for (name, path) in &published {
+                    tracing::error!(output = %name, final_path = %path.display(), "output is visible and synchronized");
+                }
+                for (name, path) in &visible_unsynchronized {
+                    tracing::error!(output = %name, final_path = %path.display(), "output is visible but parent synchronization failed");
+                }
+                for pending in &unpublished {
+                    tracing::error!(
+                        output = %pending.name,
+                        final_path = %pending.final_path.display(),
+                        partial_path = %pending.partial_path.display(),
+                        "output remains unpublished in quarantine",
+                    );
+                }
+                for debt in &cleanup_debt {
+                    tracing::error!(
+                        output = %debt.name,
+                        final_path = %debt.final_path.display(),
+                        stale_path = %debt.stale_path.display(),
+                        detail = %debt.detail,
+                        "publication also left cleanup debt",
+                    );
+                }
+                publication_failure = Some(error);
+            }
+            Err(error) => {
+                for pending in output_staging.partials() {
+                    tracing::error!(
+                        output = %pending.name,
+                        final_path = %pending.final_path.display(),
+                        partial_path = %pending.partial_path.display(),
+                        "publication preflight failed; output remains unpublished",
+                    );
+                }
+                publication_failure = Some(error.to_string());
+            }
         }
     }
 
@@ -2400,6 +2460,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // even when some DLQ entries also landed.
     let exit_code: u8 = if report.interrupted {
         130
+    } else if publication_failure.is_some() {
+        4
     } else if counters.dlq_count > 0 {
         2
     } else {
@@ -2423,6 +2485,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         };
         let outcome = if report.interrupted {
             clinker_lineage::Terminal::Abort
+        } else if let Some(error) = &publication_failure {
+            clinker_lineage::Terminal::Fail {
+                error: error.clone(),
+            }
         } else {
             clinker_lineage::Terminal::Complete
         };
@@ -2505,6 +2571,19 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     Ok(exit_code)
 }
 
+fn apply_cli_force_policy(config: &mut clinker_plan::config::PipelineConfig, force: bool) {
+    if !force {
+        return;
+    }
+    for node in &mut config.nodes {
+        if let clinker_plan::config::PipelineNode::Output { config: body, .. } = &mut node.value
+            && body.output.if_exists == clinker_plan::config::IfExistsPolicy::Error
+        {
+            body.output.if_exists = clinker_plan::config::IfExistsPolicy::Overwrite;
+        }
+    }
+}
+
 /// Whether the named Output is flagged for per-source-file fan-out by
 /// the plan-time `populate_fan_out_flags` pass. Returns `false` for
 /// outputs whose template lacks per-record tokens or whose input is
@@ -2543,6 +2622,7 @@ fn upstream_source_for_output(
         .node_indices()
         .find(|i| dag.graph[*i].name() == output_name)?;
     let mut cur = start;
+    let mut downstream = None;
     loop {
         match &dag.graph[cur] {
             PlanNode::Source { name, .. } => return Some(name.clone()),
@@ -2551,7 +2631,11 @@ fn upstream_source_for_output(
                 // Pick the FilePartitioned parent (the driver after
                 // the partition propagation pass). Falls back to
                 // `None` if the combine destroyed partitioning.
-                let parents: Vec<_> = dag.graph.neighbors(cur).collect();
+                let parents: Vec<_> = dag
+                    .graph
+                    .neighbors_undirected(cur)
+                    .filter(|neighbor| Some(*neighbor) != downstream)
+                    .collect();
                 let next = parents.into_iter().find(|p| {
                     dag.node_properties.get(p).is_some_and(|np| {
                         matches!(
@@ -2560,10 +2644,16 @@ fn upstream_source_for_output(
                         )
                     })
                 })?;
+                downstream = Some(cur);
                 cur = next;
             }
             _ => {
-                cur = dag.graph.neighbors(cur).next()?;
+                let next = dag
+                    .graph
+                    .neighbors_undirected(cur)
+                    .find(|neighbor| Some(*neighbor) != downstream)?;
+                downstream = Some(cur);
+                cur = next;
             }
         }
     }
@@ -2617,39 +2707,6 @@ fn run_metrics(cmd: &MetricsCommands) -> Result<(), std::io::Error> {
 /// Resolve thread count from CLI args or default to `num_cpus`.
 fn num_threads(args: &RunArgs) -> usize {
     args.threads.unwrap_or_else(num_cpus::get)
-}
-
-/// One per-output bookkeeping record carried from writer-loop to
-/// persist-loop. The `reservation` field is the 0-byte placeholder
-/// created by `open_output`; its `TempPath::Drop` auto-unlinks if
-/// anything between writer-loop and persist tears down (panic, Err
-/// arm, mid-persist failure).
-struct PendingOutput {
-    name: String,
-    final_path: std::path::PathBuf,
-    temp: tempfile::NamedTempFile,
-    reservation: tempfile::TempPath,
-}
-
-/// Force durable persistence of `dir`'s entry metadata to disk.
-///
-/// Called immediately after `tempfile::persist` (rename) so a crash
-/// between the rename returning and the kernel writing the parent-dir
-/// metadata cannot leave the rename invisible. Linux ext4/xfs default
-/// mount options do not implicitly fsync the parent dir on rename;
-/// see <https://yakking.branchable.com/posts/atomic-file-creation-tmpfile/>.
-///
-/// On non-Unix targets this is a no-op — opening directories for
-/// `fsync` is a Unix-ism, and Windows' `MoveFileExW` provides
-/// equivalent durability via the journal.
-#[cfg(unix)]
-fn fsync_dir(path: &std::path::Path) -> std::io::Result<()> {
-    std::fs::File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn fsync_dir(_path: &std::path::Path) -> std::io::Result<()> {
-    Ok(())
 }
 
 /// Render a "Resolved Outputs" block listing each output's expanded

@@ -5,9 +5,9 @@
 //! [`DlqEntry`] records into the on-disk CSV shape, which couples to the
 //! pipeline's config and executor types.
 
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use clinker_record::{FieldMetadata, Schema, Value};
 
@@ -33,35 +33,32 @@ use clinker_plan::config::DlqConfig;
 pub fn write_dlq<W: Write>(
     writer: W,
     entries: &[DlqEntry],
-    source_schema: &Arc<Schema>,
-    source_file: &str,
     include_reason: bool,
     include_source_row: bool,
 ) -> Result<(), clinker_format::FormatError> {
     let mut csv_writer = csv::WriterBuilder::new().from_writer(writer);
 
     // Build header
-    let mut header: Vec<&str> = vec![
-        "_cxl_dlq_id",
-        "_cxl_dlq_timestamp",
-        "_cxl_dlq_source_file",
-        "_cxl_dlq_source_name",
-        "_cxl_dlq_source_row",
-        "_cxl_dlq_triggering_field",
-        "_cxl_dlq_triggering_value",
+    let user_columns = stable_user_columns(entries);
+    let mut header: Vec<String> = vec![
+        "_cxl_dlq_id".into(),
+        "_cxl_dlq_timestamp".into(),
+        "_cxl_dlq_source_file".into(),
+        "_cxl_dlq_source_name".into(),
+        "_cxl_dlq_source_row".into(),
+        "_cxl_dlq_triggering_field".into(),
+        "_cxl_dlq_triggering_value".into(),
     ];
     if include_reason {
-        header.push("_cxl_dlq_error_category");
-        header.push("_cxl_dlq_error_detail");
+        header.push("_cxl_dlq_error_category".into());
+        header.push("_cxl_dlq_error_detail".into());
     }
     // Stage, route, and trigger columns always present (nullable)
-    header.push("_cxl_dlq_stage");
-    header.push("_cxl_dlq_route");
-    header.push("_cxl_dlq_trigger");
+    header.push("_cxl_dlq_stage".into());
+    header.push("_cxl_dlq_route".into());
+    header.push("_cxl_dlq_trigger".into());
     if include_source_row {
-        for (_, name) in dlq_user_columns(source_schema) {
-            header.push(name);
-        }
+        header.extend(user_columns.iter().cloned());
     }
     csv_writer.write_record(&header)?;
 
@@ -72,7 +69,7 @@ pub fn write_dlq<W: Write>(
         let mut row: Vec<String> = vec![
             id,
             timestamp,
-            source_file.to_string(),
+            source_file_of(entry).to_owned(),
             entry.source_name.as_ref().to_string(),
             entry.source_row.to_string(),
             entry.triggering_field.as_deref().unwrap_or("").to_string(),
@@ -94,7 +91,7 @@ pub fn write_dlq<W: Write>(
         row.push(entry.trigger.to_string());
 
         if include_source_row {
-            for (_, name) in dlq_user_columns(source_schema) {
+            for name in &user_columns {
                 let value = entry.original_record.get(name).unwrap_or(&Value::Null);
                 row.push(value_to_string(value));
             }
@@ -105,6 +102,45 @@ pub fn write_dlq<W: Write>(
 
     csv_writer.flush()?;
     Ok(())
+}
+
+fn stable_user_columns(entries: &[DlqEntry]) -> Vec<String> {
+    let mut shared_layout: Option<Vec<String>> = None;
+    for entry in entries {
+        let layout = dlq_user_columns(entry.original_record.schema())
+            .map(|(_, name)| name.to_owned())
+            .collect::<Vec<_>>();
+        match shared_layout.as_ref() {
+            None => shared_layout = Some(layout),
+            Some(columns) if columns == &layout => {}
+            Some(_) => {
+                return entries
+                    .iter()
+                    .flat_map(|entry| {
+                        dlq_user_columns(entry.original_record.schema()).map(|(_, name)| name)
+                    })
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+            }
+        }
+    }
+    shared_layout.unwrap_or_default()
+}
+
+fn source_file_of(entry: &DlqEntry) -> &str {
+    let schema = entry.original_record.schema();
+    for index in 0..schema.column_count() {
+        if matches!(
+            schema.field_metadata(index),
+            Some(FieldMetadata::SourceFile)
+        ) && let Some(Value::String(path)) = entry.original_record.values().get(index)
+        {
+            return path;
+        }
+    }
+    "<merged>"
 }
 
 /// Partition DLQ entries by configured per-source `path:` override.
@@ -221,6 +257,7 @@ mod tests {
     use super::*;
     use clinker_core_types::dlq::DlqErrorCategory;
     use clinker_record::Record;
+    use std::sync::Arc;
 
     fn make_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec!["name".into(), "value".into()]))
@@ -261,9 +298,8 @@ mod tests {
             "Alice",
             "bad",
         )];
-        let schema = make_schema();
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
+        write_dlq(&mut buf, &entries, true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
 
         let header_line = output.lines().next().unwrap();
@@ -290,9 +326,8 @@ mod tests {
             make_dlq_entry(1, DlqErrorCategory::TypeCoercionFailure, "err1", "a", "1"),
             make_dlq_entry(2, DlqErrorCategory::TypeCoercionFailure, "err2", "b", "2"),
         ];
-        let schema = make_schema();
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
+        write_dlq(&mut buf, &entries, true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
         let lines: Vec<&str> = output.lines().collect();
 
@@ -316,9 +351,8 @@ mod tests {
                 )
             })
             .collect();
-        let schema = make_schema();
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
+        write_dlq(&mut buf, &entries, true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
         let ids: Vec<&str> = output
             .lines()
@@ -340,9 +374,8 @@ mod tests {
             "a",
             "1",
         )];
-        let schema = make_schema();
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
+        write_dlq(&mut buf, &entries, true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
         let data_line = output.lines().nth(1).unwrap();
         assert!(data_line.contains("missing_required_field"));
@@ -357,9 +390,8 @@ mod tests {
             "a",
             "1",
         )];
-        let schema = make_schema();
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
+        write_dlq(&mut buf, &entries, true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
         let data_line = output.lines().nth(1).unwrap();
         assert!(data_line.contains("type_coercion_failure"));
@@ -374,9 +406,8 @@ mod tests {
             "a",
             "1",
         )];
-        let schema = make_schema();
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
+        write_dlq(&mut buf, &entries, true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
         let data_line = output.lines().nth(1).unwrap();
         assert!(data_line.contains("nan_in_output_field"));
@@ -391,9 +422,8 @@ mod tests {
             "a",
             "1",
         )];
-        let schema = make_schema();
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
+        write_dlq(&mut buf, &entries, true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
         let data_line = output.lines().nth(1).unwrap();
         assert!(data_line.contains("validation_failure"));
@@ -408,9 +438,8 @@ mod tests {
             "a",
             "1",
         )];
-        let schema = make_schema();
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
+        write_dlq(&mut buf, &entries, true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
         let data_line = output.lines().nth(1).unwrap();
         assert!(data_line.contains("aggregate_type_error"));
@@ -425,9 +454,8 @@ mod tests {
             "a",
             "1",
         )];
-        let schema = make_schema();
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
+        write_dlq(&mut buf, &entries, true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
         let data_line = output.lines().nth(1).unwrap();
         assert!(data_line.contains("required_field_conversion_failure"));
@@ -442,9 +470,8 @@ mod tests {
             "a",
             "1",
         )];
-        let schema = make_schema();
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &entries, &schema, "input.csv", false, true).unwrap();
+        write_dlq(&mut buf, &entries, false, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
 
         let header_line = output.lines().next().unwrap();
@@ -463,9 +490,8 @@ mod tests {
             "Alice",
             "1",
         )];
-        let schema = make_schema();
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &entries, &schema, "input.csv", true, false).unwrap();
+        write_dlq(&mut buf, &entries, true, false).unwrap();
         let output = String::from_utf8(buf).unwrap();
 
         let header_line = output.lines().next().unwrap();
@@ -478,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dlq_source_fields_schema_order() {
+    fn test_dlq_source_fields_keep_shared_schema_order() {
         let schema = Arc::new(Schema::new(vec![
             "zulu".into(),
             "alpha".into(),
@@ -505,18 +531,87 @@ mod tests {
             triggering_value: None,
         }];
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
+        write_dlq(&mut buf, &entries, true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
 
         let header_line = output.lines().next().unwrap();
         let columns: Vec<&str> = header_line.split(',').collect();
-        // Source fields in schema order (zulu, alpha, mike), not alphabetical.
+        // A single shared schema keeps the user-declared order. Only genuinely
+        // heterogeneous layouts need the lexical union fallback.
         // Columns 0-4 are the identity prelude; 5-6 are triggering_field/
         // triggering_value; 7-8 are error category/detail; 9-11 are
         // stage/route/trigger.
         assert_eq!(columns[12], "zulu");
         assert_eq!(columns[13], "alpha");
         assert_eq!(columns[14], "mike");
+    }
+
+    #[test]
+    fn heterogeneous_records_use_union_columns_and_per_record_source_file() {
+        use clinker_record::SchemaBuilder;
+
+        let alpha_schema = SchemaBuilder::new()
+            .with_field("alpha")
+            .with_field_meta("$source.file", FieldMetadata::SourceFile)
+            .build();
+        let beta_schema = SchemaBuilder::new()
+            .with_field("beta")
+            .with_field_meta("$source.file", FieldMetadata::SourceFile)
+            .build();
+        let entry = |record, source_name: &'static str| DlqEntry {
+            source_row: 1,
+            category: DlqErrorCategory::TypeCoercionFailure,
+            error_message: "bad value".to_owned(),
+            original_record: record,
+            stage: None,
+            route: None,
+            trigger: true,
+            source_name: Arc::from(source_name),
+            triggering_field: None,
+            triggering_value: None,
+        };
+        let entries = vec![
+            entry(
+                Record::new(
+                    beta_schema,
+                    vec![
+                        Value::String("B".into()),
+                        Value::String("inputs/beta.csv".into()),
+                    ],
+                ),
+                "beta-source",
+            ),
+            entry(
+                Record::new(
+                    alpha_schema,
+                    vec![
+                        Value::String("A".into()),
+                        Value::String("inputs/alpha.csv".into()),
+                    ],
+                ),
+                "alpha-source",
+            ),
+        ];
+
+        let mut bytes = Vec::new();
+        write_dlq(&mut bytes, &entries, true, true).expect("write heterogeneous DLQ");
+        let mut reader = csv::Reader::from_reader(bytes.as_slice());
+        let header = reader.headers().expect("DLQ header").clone();
+        let alpha = header.iter().position(|name| name == "alpha").unwrap();
+        let beta = header.iter().position(|name| name == "beta").unwrap();
+        assert!(alpha < beta, "union columns must have stable lexical order");
+        assert!(!header.iter().any(|name| name == "$source.file"));
+
+        let rows = reader
+            .records()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("DLQ rows");
+        assert_eq!(&rows[0][2], "inputs/beta.csv");
+        assert_eq!(&rows[0][alpha], "");
+        assert_eq!(&rows[0][beta], "B");
+        assert_eq!(&rows[1][2], "inputs/alpha.csv");
+        assert_eq!(&rows[1][alpha], "A");
+        assert_eq!(&rows[1][beta], "");
     }
 
     #[test]
@@ -528,9 +623,8 @@ mod tests {
             "a",
             "1",
         )];
-        let schema = make_schema();
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &entries, &schema, "input.csv", true, true).unwrap();
+        write_dlq(&mut buf, &entries, true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
 
         let data_line = output.lines().nth(1).unwrap();
@@ -588,7 +682,7 @@ mod tests {
             triggering_value: None,
         };
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &[entry], &schema, "input.csv", true, true).unwrap();
+        write_dlq(&mut buf, &[entry], true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
         let header = output.lines().next().expect("header line");
         let columns: Vec<&str> = header.split(',').collect();
@@ -644,7 +738,7 @@ mod tests {
             triggering_value: Some(Value::String("not-a-number".into())),
         };
         let mut buf = Vec::new();
-        write_dlq(&mut buf, &[entry], &schema, "input.csv", true, true).unwrap();
+        write_dlq(&mut buf, &[entry], true, true).unwrap();
         let output = String::from_utf8(buf).unwrap();
         let body = output.lines().nth(1).expect("body line");
         let cells: Vec<&str> = body.split(',').collect();

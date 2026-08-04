@@ -1,0 +1,25 @@
+[package]
+name = "clinker-dependency-policy"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Rust-only dependency policy for Clinker's shared failure vocabulary"
+publish = false
+
+[workspace]
+
+[dependencies]
+proc-macro2 = { version = "=1.0.107", default-features = false }
+serde_json = { version = "=1.0.149", default-features = false, features = ["std"] }
+syn = { version = "=2.0.117", default-features = false, features = ["clone-impls", "full", "parsing", "visit"] }
+toml = { version = "=0.8.23", default-features = false, features = ["parse"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+correctness = "deny"
+suspicious = "warn"
+style = "warn"
+complexity = "warn"
+perf = "warn"

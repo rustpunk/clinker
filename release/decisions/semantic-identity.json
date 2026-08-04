@@ -1,0 +1,18 @@
+{
+  "schema": "clinker.decision/v1",
+  "decision_id": "semantic-identity",
+  "control_id": "identity-binding",
+  "status": "accepted",
+  "selection": "shared-primitive-now",
+  "approver_role_ref": "maintainer:architecture",
+  "evidence_refs": [
+    "docs/ai/30_DESIGN_RULES.md",
+    "crates/clinker-plan/src/plan/compiled.rs",
+    "crates/clinker-core-types/src/failure.rs"
+  ],
+  "recorded_at": "2026-07-29T20:57:47Z",
+  "semantic_identity": {
+    "owner_crate": "clinker-plan",
+    "pipeline_hash_substitution_forbidden": true
+  }
+}

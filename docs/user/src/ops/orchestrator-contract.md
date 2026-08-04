@@ -69,11 +69,13 @@ one in exit-codes.md in sync when any of those change.
   `non_retryable_error_types`).
 - **Retry with backoff: `4`.** Transient infrastructure faults (a
   not-yet-arrived input file, a full or contended volume, a locked
-  resource) usually clear on their own. A bounded exponential backoff is
-  safe here **because output is atomic** (next section) — a failed
-  attempt leaves nothing half-written for the retry to trip over. Keep
-  `maximum_attempts` finite so a permanently-bad input eventually fails
-  the workflow rather than retrying forever.
+  resource) usually clear on their own. Use bounded exponential backoff,
+  but first inspect publication diagnostics: every individual final is
+  atomic, while a failed multi-file commit may leave a named subset of
+  complete finals visible. A stable-input retry with replacement enabled
+  converges that set; an external consumer must not treat the set as complete
+  until the retry succeeds. Keep `maximum_attempts` finite so a permanently-bad
+  input eventually fails the workflow rather than retrying forever.
 - **Success, with a caveat: `2`.** Exit `2` means the pipeline *finished*
   — it is success-with-warnings, not a crash. The rejected records are in
   the configured DLQ file; the counts (`records_dlq`, `dlq_path`,
@@ -88,9 +90,9 @@ one in exit-codes.md in sync when any of those change.
 
 Clinker installs a process-wide handler for **both SIGINT and SIGTERM**
 (the `ctrlc` crate's "termination" feature). Either signal requests a
-**graceful drain**: in-flight work finishes, worker threads join, already
-completed outputs are committed, and the process exits **130** with the
-run marked interrupted.
+**graceful drain**: in-flight work finishes and worker threads join. If
+cancellation wins the atomic publication gate, no staged output or sidecar is
+promoted and the process exits **130** with the run marked interrupted.
 
 **Cancellation is bounded-latency, not instantaneous.** The shutdown
 request is a flag that the executor polls at well-defined points:
@@ -109,62 +111,68 @@ of processing time. Size your timeouts accordingly:
   healthy, draining run to a hard kill.
 - The worker must translate a Temporal cancellation into a child
   **SIGTERM** (which Clinker drains cleanly), and use **SIGKILL only as a
-  last resort** after the grace period expires. SIGKILL cannot be caught,
-  so it skips the graceful drain — but the atomic-output guarantee below
-  still protects the final files.
+  last resort** after the grace period expires. SIGKILL cannot be caught. If
+  it lands during the bounded multi-file publication loop, it can leave a
+  subset of complete finals visible; reconcile the set as described below.
 
 ### What a cancelled run leaves behind
 
-- If the interrupt lands during **streaming dispatch**, the run drains
-  what is in flight and any *completed* single-file output is atomically
-  renamed into place — durable, never truncated. That output reflects a
-  **partial pass** (fewer input records than a full run), so a retry
-  should overwrite it, not append to it.
-- If the interrupt lands during a **blocking-operator build**, no final
-  output is produced and the writing temp file is preserved for
-  inspection.
+- If the interrupt wins before the **publication point of no return**, no
+  final is produced. Every completed output and sidecar remains in its hidden
+  destination-local file for inspection, regardless of whether interruption
+  was observed during streaming dispatch or a blocking build.
+- If publication wins that single atomic race first, later signals do not
+  interrupt the finite promotion loop. The run completes publication and
+  reports its ordinary success, DLQ-partial, or publication-failure status.
+  Orchestrators must allow that bounded commit to finish instead of assuming a
+  signal sent after the gate will force exit `130`.
 
-Either way the exit code is `130` and there is **never a truncated final
-file**. A partial DLQ plus an interrupt still reports `130` — the
-interrupt takes precedence over the DLQ-partial code `2`.
+When cancellation wins, exit `130` takes precedence over DLQ-partial code `2`.
+No individual final is ever partially written: a final path contains either
+its previous complete bytes or newly promoted complete bytes.
 
 ## Output atomicity and retry-safety
 
-Single-file outputs are written **atomically**: each output streams into
-a sibling temp file in the same directory, and only after the pipeline
-completes successfully is that temp file **renamed** into the final path
-(followed by an `fsync` of the parent directory for crash durability).
-This is exercised by the CLI's `atomic_output_test` suite.
+Each output is written **atomically per artifact**: it streams into a sibling
+hidden file in the same directory, and only after the pipeline completes
+successfully is that file **renamed** into the final path (followed by
+synchronization of the retained parent directory for crash durability). Main
+outputs and metadata sidecars share one run-scoped ledger and collision
+namespace.
 
 The consequences an orchestrator can rely on:
 
-- A **killed or failed** attempt leaves **no half-written final file**.
-  On failure the temp file is kept and its path logged at `WARN` for
-  operator inspection, but the final path is untouched — a retry sees a
-  clean slate.
-- A **retry can overwrite cleanly.** By default a pre-existing output
-  aborts the run (exit `4`); pass **`--force`** to allow the new attempt
-  to replace a previous attempt's output. Alternatively, an output's
-  `if_exists: unique_suffix` policy hands each attempt a distinct,
-  race-safe path (the reservation uses `create_new`, so concurrent
-  attempts never clobber one another).
+- A failure before publication leaves **no half-written final file**. Hidden
+  partials are kept and logged for operator inspection, and previous finals are
+  untouched.
+- A failure or hard kill during a multi-artifact publication may leave an exact
+  subset of newly promoted complete finals visible. Clinker never moves old
+  finals to backups and never rolls visible replacements back. A caught
+  failure logs synchronized-visible, visible-unsynchronized, unpublished, and
+  cleanup-debt paths separately and exits `4`.
+- A **retry can overwrite cleanly.** The default `if_exists: overwrite`
+  replaces a previous attempt's output only during successful promotion. If a
+  pipeline explicitly uses `if_exists: error`, pass **`--force`** for the retry
+  or change that policy deliberately. Alternatively, `if_exists:
+  unique_suffix` hands each attempt a distinct,
+  race-safe path through a hidden sibling reservation. All collision policies,
+  including overwrite, reserve the destination so only one live publisher can
+  mutate it.
 
-**Caveat — multi-file outputs are not yet atomic.** Fan-out outputs
-(one file per source file) and `split:` outputs write directly to their
-final paths rather than through the temp-then-rename path. A killed
-attempt can leave a partial fan-out or split file behind. The atomic
-guarantee above applies to **single-file outputs**; for multi-file
-outputs, a retry should treat the output directory as untrusted and clear
-it first.
+The same lifecycle covers fan-out outputs (one file per source file) and
+`split:` outputs. Their files join the run-scoped publication ledger as they
+open and are promoted only after the complete pipeline succeeds. Readers that
+need set-level consistency must wait for the process's successful exit; the
+filesystem cannot make several destination renames globally atomic.
 
 ## Idempotency: what re-running a batch means today
 
 Clinker treats every run as a **fresh, finite pass** over its input.
 There is no checkpoint, no resume cursor, and no incremental state
 carried between attempts: a retry **reprocesses all input from the
-start**. "Cancel + retry" therefore means *discard the partial output and
-recompute the whole batch* — which, combined with atomic single-file
-output and `--force`, is safe to wire into a `RetryPolicy`.
+start**. "Cancel + retry" therefore means *discard the hidden partials and
+recompute the whole batch*. A retry after exit `4` may also need to replace the
+complete subset named by the prior publication diagnostics.
 
 Two conditions make retries idempotent:
 

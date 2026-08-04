@@ -35,6 +35,19 @@ clinker-scenarios -> (no workspace dependencies; dev-dependency of clinker)
 
 Important normal dependency edges from `cargo metadata --no-deps`: `cxl -> clinker-record`; `clinker-format -> clinker-record, cxl`; `clinker-plan -> clinker-core-types, clinker-format, clinker-record, cxl`; `clinker-exec -> clinker-core-types, clinker-format, clinker-plan, clinker-record, cxl`; `clinker-channel -> clinker-core-types, clinker-plan, clinker-record`; `clinker-net -> clinker-exec, clinker-format, clinker-plan, clinker-record`; `clinker -> clinker-channel, clinker-core-types, clinker-exec, clinker-format, clinker-lineage, clinker-net, clinker-plan, clinker-record`; `cxl-cli -> cxl, clinker-record`; `clinker-schema -> clinker-plan`; `clinker-lineage -> clinker-plan, clinker-record, cxl`.
 
+### Shared failure taxonomy boundary
+
+`clinker-core-types::failure` owns the serialization-neutral failure taxonomy.
+The only approved root types for the network and lineage consumers are
+`FailureClassification`, `FailureCategory`, and `RetryAdvice`. The approved
+normal dependency edges are `clinker-net -> clinker-core-types` and
+`clinker-lineage -> clinker-core-types`. Consumer crates adapt these values at
+their edges and do not re-export the shared taxonomy.
+
+Semantic plan identity remains in `clinker-plan`; dataset identity remains in
+`clinker-lineage`. The shared vocabulary therefore owns neither identity nor
+wire-format serialization policy.
+
 ## Current Layering Rules Inferred From Source
 
 - `clinker-core-types` appears intended as a leaf crate: its crate docs say it holds spans, diagnostics, graph, and DLQ vocabulary and "deliberately holds no executor, config, or schema types" (`crates/clinker-core-types/src/lib.rs`).

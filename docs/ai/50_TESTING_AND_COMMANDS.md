@@ -234,6 +234,49 @@ cargo deny check
 
 Status: **Verified outside the filesystem sandbox.** In the sandbox it failed to acquire `~/.cargo/advisory-dbs/db.lock` because that path was read-only. The successful run emitted warnings about duplicate allowed dependencies and stale ignore/allow config, but exited 0 with `advisories ok, bans ok, licenses ok, sources ok`.
 
+## 7.1. Dependency Policy
+
+The shared-failure dependency gate is a detached Rust tool with its own locked
+manifest under `tools/dependency-policy`. It is excluded from workspace membership
+and does not add a runtime dependency to Clinker.
+
+```bash
+cargo fmt --manifest-path tools/dependency-policy/Cargo.toml --all -- --check
+cargo clippy --manifest-path tools/dependency-policy/Cargo.toml --all-targets --locked --offline -- -D warnings
+cargo test --manifest-path tools/dependency-policy/Cargo.toml --locked --offline
+cargo run --manifest-path tools/dependency-policy/Cargo.toml --locked --offline -- --scope final --root .
+```
+
+Status: **Verified.** The checker uses `syn` and fails closed on unresolved or
+unsupported production Rust rather than falling back to text parsing.
+
+## 7.2. Release Policy
+
+Release, workflow, filesystem, repository-control, and evidence policy live in
+the detached Rust tool under `tools/release-policy`. The repository has no Python
+implementation or fallback for these gates.
+
+```bash
+cargo fmt --manifest-path tools/release-policy/Cargo.toml --all -- --check
+cargo clippy --manifest-path tools/release-policy/Cargo.toml --all-targets --locked --offline -- -D warnings
+cargo test --manifest-path tools/release-policy/Cargo.toml --locked --offline
+cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- workflow verify
+cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- boundary audit --scope rust-only --root .
+cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem self-test
+```
+
+Status: **Verified.** The Rust-only audit checks the real repository as well as
+negative fixtures, and the compatibility scripts perform one unchanged Rust
+delegation without carrying policy semantics.
+
+The tag workflow builds and smoke-tests `clinker` and `cxl` on each native
+runner, then transfers only those exact executables to the Ubuntu assembly
+job. The assembly job runs the detached policy tool to create and verify all
+four deterministic archives, attest the final archive subjects, and stage the
+private candidate. The policy tool is therefore not a Windows build
+dependency; platform-specific release jobs do not duplicate its Unix process,
+locking, or filesystem controls.
+
 ## 8. Docs Generation Command
 
 Rust API docs:

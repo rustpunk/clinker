@@ -346,6 +346,7 @@ pub(crate) fn dispatch_output(
     // selects the right writer; the registry holds N writers
     // (one per discovered file).
     let fan_out_writers = ctx.fan_out_writers.remove(name);
+    let fan_out_paths = ctx.fan_out_paths.remove(name).unwrap_or_default();
     let single_writer = if fan_out_writers.is_none() {
         ctx.writers.remove(name)
     } else {
@@ -366,6 +367,7 @@ pub(crate) fn dispatch_output(
     // through `push_dlq`, `written_rows` drives the ok/written/emitted counts.
     let mut dlq_pending: Vec<DlqEntry> = Vec::new();
     let mut written_rows: Vec<u64> = Vec::new();
+    let output_staging = ctx.output_staging.clone();
     {
         let mut fan_ctx = FanOutContext {
             name,
@@ -379,13 +381,20 @@ pub(crate) fn dispatch_output(
             strategy,
             dlq_pending: &mut dlq_pending,
             written_rows: &mut written_rows,
+            output_staging: &output_staging,
             mapping_probe: out_cfg
                 .mapping
                 .as_ref()
                 .map(|_| mapping_probe(&mut ctx.mapping_probes, name, out_cfg)),
         };
         if let Some(per_file) = fan_out_writers {
-            emit_fan_out(&mut fan_ctx, &unbuffered, per_file, scan_timer);
+            emit_fan_out(
+                &mut fan_ctx,
+                &unbuffered,
+                per_file,
+                fan_out_paths,
+                scan_timer,
+            );
         } else if let Some(raw_writer) = single_writer {
             emit_single_writer(&mut fan_ctx, raw_writer, &unbuffered, scan_timer);
         }
@@ -677,7 +686,12 @@ fn dispatch_output_envelope(
             // boundary logic is unit-testable against a probe writer.
             driver.on_record(record.doc_ctx(), &projected, &mut |schema| {
                 let raw_writer = ctx.writers.remove(name)?;
-                Some(build_format_writer(&out_cfg, raw_writer, schema))
+                Some(build_format_writer(
+                    &out_cfg,
+                    raw_writer,
+                    schema,
+                    ctx.output_staging.clone(),
+                ))
             });
         }
         // Count unconditionally per record, independent of whether a writer is
@@ -981,6 +995,7 @@ struct FanOutContext<'a> {
     /// streaming arm; a record a collision dead-letters is simply never pushed
     /// here, so a written sibling sharing its row_num still counts.
     written_rows: &'a mut Vec<u64>,
+    output_staging: &'a crate::output::staging::OutputStagingRegistry,
 }
 
 /// Write `unbuffered` through a single pre-opened writer. Errors from
@@ -997,6 +1012,7 @@ fn emit_single_writer(
         fan_ctx.out_cfg,
         raw_writer,
         Arc::clone(fan_ctx.output_schema),
+        fan_ctx.output_staging.clone(),
     ) {
         Ok(mut csv_writer) => {
             fan_ctx.collector.record(scan_timer.finish(1, 1));
@@ -1073,6 +1089,7 @@ fn emit_fan_out(
     fan_ctx: &mut FanOutContext<'_>,
     unbuffered: &[(Record, u64)],
     per_file: HashMap<Arc<str>, Box<dyn Write + Send>>,
+    mut resolved_paths: HashMap<Arc<str>, String>,
     scan_timer: crate::executor::stage_metrics::StageTimer,
 ) {
     use std::collections::HashMap as Hm;
@@ -1082,7 +1099,26 @@ fn emit_fan_out(
     // siblings still get their chance.
     let mut format_writers: Hm<Arc<str>, Box<dyn clinker_format::FormatWriter>> = Hm::new();
     for (file_arc, raw) in per_file {
-        match build_format_writer(fan_ctx.out_cfg, raw, Arc::clone(fan_ctx.output_schema)) {
+        let mut resolved_config = fan_ctx.out_cfg.clone();
+        if let Some(path) = resolved_paths.remove(&file_arc) {
+            resolved_config.path = path;
+            resolved_config.resolved_path_template = None;
+        } else if resolved_config.split.is_some() {
+            fan_ctx.output_errors.push(PipelineError::Internal {
+                op: "fan_out",
+                node: fan_ctx.name.to_string(),
+                detail: format!(
+                    "split fan-out writer for source file {file_arc:?} has no resolved base path"
+                ),
+            });
+            continue;
+        }
+        match build_format_writer(
+            &resolved_config,
+            raw,
+            Arc::clone(fan_ctx.output_schema),
+            fan_ctx.output_staging.clone(),
+        ) {
             Ok(fw) => {
                 format_writers.insert(file_arc, fw);
             }

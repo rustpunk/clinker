@@ -767,15 +767,8 @@ nodes:
     // — see `dlq::dlq_user_columns`. Drive `write_dlq` directly
     // against the entry to verify the on-disk shape.
     let mut buf = Vec::new();
-    clinker_exec::dlq::write_dlq(
-        &mut buf,
-        std::slice::from_ref(entry),
-        record_schema,
-        "test.csv",
-        true,
-        true,
-    )
-    .expect("write_dlq");
+    clinker_exec::dlq::write_dlq(&mut buf, std::slice::from_ref(entry), true, true)
+        .expect("write_dlq");
     let dlq_csv = String::from_utf8(buf).expect("utf8 dlq csv");
     let header_line = dlq_csv.lines().next().expect("dlq csv has header");
     assert!(
