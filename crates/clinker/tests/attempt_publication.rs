@@ -215,6 +215,216 @@ fn run_attempt_owns_every_artifact_kind_across_bounded_destination_roots() {
     }
 }
 
+fn assert_root_local_recovery(
+    policy: &ResolvedPublicationPolicy,
+    roots: &[&Path],
+    expected_artifact_counts: &[usize],
+    plan_name: &str,
+) {
+    let query = AttemptQuery::new(
+        &compiled_plan(plan_name),
+        policy,
+        roots.iter().map(|root| validated(root, ".")).collect(),
+    )
+    .expect("construct multi-root recovery query");
+    let root_ids = query
+        .owned_root_ids()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let mut observed_counts = Vec::new();
+    let mut observed_artifact_ids = Vec::new();
+    for root_id in &root_ids {
+        let list = query
+            .list(root_id, 100_000_000, None)
+            .expect("list root-local attempt");
+        assert_eq!(list.entries().len(), 1);
+        assert!(
+            list.cleanup_debt()
+                .iter()
+                .all(|debt| debt.kind() != CleanupDebtKind::InvalidManifest)
+        );
+        let inspection = query
+            .inspect(root_id, EXECUTION_ID, 100_000_000)
+            .expect("inspect root-local attempt");
+        assert_eq!(inspection.state(), Some(AttemptState::Abandoned));
+        assert!(inspection.is_eligible());
+        assert!(
+            inspection
+                .cleanup_debt()
+                .iter()
+                .all(|debt| debt.kind() != CleanupDebtKind::Operational)
+        );
+        observed_counts.push(inspection.artifact_ids().len());
+        observed_artifact_ids.extend(inspection.artifact_ids().iter().cloned());
+
+        let request = query
+            .purge_execution(root_id, EXECUTION_ID)
+            .expect("select root-local attempt");
+        let report = query
+            .execute(&request, 100_000_000, None, &ShutdownToken::detached())
+            .expect("purge root-local attempt");
+        assert_eq!(report.disposition(), PurgeDisposition::Removed);
+        assert_eq!(
+            report.removed_artifact_count(),
+            inspection.artifact_ids().len()
+        );
+    }
+    observed_counts.sort_unstable();
+    let mut expected = expected_artifact_counts.to_vec();
+    expected.sort_unstable();
+    assert_eq!(observed_counts, expected);
+    observed_artifact_ids.sort();
+    assert_eq!(
+        observed_artifact_ids,
+        vec![
+            "artifact-00000001".to_owned(),
+            "artifact-00000002".to_owned()
+        ]
+    );
+    for root in roots {
+        assert!(!root.join(".clinker-attempts").exists());
+    }
+}
+
+#[test]
+fn failed_direct_multi_root_attempt_is_inspectable_and_purgeable_per_root() {
+    let first = tempfile::tempdir().expect("first destination");
+    let second = tempfile::tempdir().expect("second destination");
+    let registry = OutputStagingRegistry::default();
+    let policy = resolved_policy(first.path(), PublicationMode::Direct, None, 1_024);
+    let registrations = vec![
+        registration(ArtifactKind::Primary, first.path(), "first.bin", "first"),
+        registration(ArtifactKind::Sidecar, second.path(), "second.bin", "second"),
+    ];
+    let (mut attempt, mut writers) = AttemptPublication::create_run(
+        policy.clone(),
+        &registry,
+        EXECUTION_ID,
+        1_000,
+        301_000,
+        registrations,
+    )
+    .expect("create direct multi-root attempt");
+    for writer in &mut writers {
+        writer.file_mut().write_all(b"retained").unwrap();
+        attempt.mark_ready(writer.artifact_id()).unwrap();
+    }
+    drop(writers);
+    let shutdown = ShutdownToken::detached();
+    shutdown.request();
+    assert!(attempt.publish_run(&registry, &shutdown).unwrap().is_none());
+    drop(attempt);
+
+    let manifests = [first.path(), second.path()].map(|root| {
+        AttemptManifest::read(
+            &root
+                .join(".clinker-attempts")
+                .join(EXECUTION_ID)
+                .join("manifest.json"),
+            100_000_000,
+        )
+        .expect("each direct root has a durable manifest")
+    });
+    for manifest in &manifests {
+        assert_eq!(manifest.state(), AttemptState::Abandoned);
+        assert_eq!(manifest.artifact_count(), 2);
+    }
+    assert_eq!(manifests[0], manifests[1]);
+    assert_root_local_recovery(
+        &policy,
+        &[first.path(), second.path()],
+        &[1, 1],
+        "direct_multi_root_recovery",
+    );
+}
+
+#[test]
+fn failed_local_then_publish_multi_root_attempt_is_purgeable_per_root() {
+    let first = tempfile::tempdir().expect("first destination");
+    let second = tempfile::tempdir().expect("second destination");
+    let spool = tempfile::tempdir().expect("local spool");
+    let registry = OutputStagingRegistry::default();
+    let policy = resolved_policy(
+        first.path(),
+        PublicationMode::LocalThenPublish,
+        Some(spool.path()),
+        1_024,
+    );
+    let registrations = vec![
+        registration(ArtifactKind::Primary, first.path(), "first.bin", "first"),
+        registration(ArtifactKind::Dlq, second.path(), "errors.bin", "errors"),
+    ];
+    let (mut attempt, mut writers) = AttemptPublication::create_run(
+        policy.clone(),
+        &registry,
+        EXECUTION_ID,
+        1_000,
+        301_000,
+        registrations,
+    )
+    .expect("create local-then-publish multi-root attempt");
+    for writer in &mut writers {
+        writer.file_mut().write_all(b"retained").unwrap();
+        attempt.mark_ready(writer.artifact_id()).unwrap();
+    }
+    drop(writers);
+    let shutdown = ShutdownToken::detached();
+    shutdown.request();
+    assert!(attempt.publish_run(&registry, &shutdown).unwrap().is_none());
+    drop(attempt);
+
+    let manifests = [first.path(), second.path(), spool.path()].map(|root| {
+        AttemptManifest::read(
+            &root
+                .join(".clinker-attempts")
+                .join(EXECUTION_ID)
+                .join("manifest.json"),
+            100_000_000,
+        )
+        .expect("each local-then-publish root has a durable manifest")
+    });
+    for manifest in &manifests {
+        assert_eq!(manifest.state(), AttemptState::Abandoned);
+        assert_eq!(manifest.artifact_count(), 2);
+    }
+    assert!(manifests.windows(2).all(|pair| pair[0] == pair[1]));
+    assert_root_local_recovery(
+        &policy,
+        &[first.path(), second.path(), spool.path()],
+        &[0, 1, 1],
+        "local_then_publish_multi_root_recovery",
+    );
+}
+
+#[test]
+fn local_then_publish_refuses_same_spool_and_destination_before_attempt_creation() {
+    let root = tempfile::tempdir().expect("destination and spool");
+    let registry = OutputStagingRegistry::default();
+    let policy = resolved_policy(
+        root.path(),
+        PublicationMode::LocalThenPublish,
+        Some(root.path()),
+        1_024,
+    );
+    let error = AttemptPublication::create_run(
+        policy,
+        &registry,
+        EXECUTION_ID,
+        1_000,
+        301_000,
+        vec![registration(
+            ArtifactKind::Primary,
+            root.path(),
+            "result.bin",
+            "primary",
+        )],
+    )
+    .expect_err("same spool and destination root must fail preflight");
+    assert!(error.to_string().contains("local spool"), "{error}");
+    assert!(!root.path().join(".clinker-attempts").exists());
+}
+
 #[test]
 fn duplicate_run_registration_refuses_before_attempt_creation() {
     let root = tempfile::tempdir().expect("destination");

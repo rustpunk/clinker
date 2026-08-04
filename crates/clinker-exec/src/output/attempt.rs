@@ -722,7 +722,8 @@ impl AttemptInspection {
         self.eligible_after_unix_ms
     }
 
-    /// Stable logical artifact identities named by the durable manifest.
+    /// Stable logical artifact identities physically observed in this root and
+    /// named by the durable manifest.
     pub fn artifact_ids(&self) -> &[String] {
         &self.artifact_ids
     }
@@ -2331,12 +2332,6 @@ where
     inspection.state = Some(manifest.state);
     inspection.created_unix_ms = Some(manifest.created_unix_ms);
     inspection.eligible_after_unix_ms = Some(manifest.eligible_after_unix_ms);
-    inspection.artifact_ids = manifest
-        .artifacts
-        .iter()
-        .map(|artifact| artifact.artifact_id.clone())
-        .collect();
-
     let expected = manifest
         .artifacts
         .iter()
@@ -2355,6 +2350,7 @@ where
     for artifact in &manifest.artifacts {
         match observed.get(&artifact.artifact_id) {
             Some(ContainedEntryKind::File) => {
+                inspection.artifact_ids.push(artifact.artifact_id.clone());
                 if attempt_root
                     .directory
                     .open_file(&artifact.artifact_id)
@@ -2366,10 +2362,7 @@ where
                     ));
                 }
             }
-            None => inspection.cleanup_debt.push(CleanupDebt::new(
-                CleanupDebtKind::Operational,
-                "manifest-owned artifact is already absent",
-            )),
+            None => {}
             Some(_) => inspection.cleanup_debt.push(CleanupDebt::new(
                 CleanupDebtKind::UnsafeEntry,
                 "manifest-owned artifact is not a regular file",
@@ -2680,6 +2673,7 @@ struct ArtifactRuntime {
 #[derive(Debug)]
 struct AdditionalAttemptRoot {
     root: AttemptRoot,
+    profile: DestinationProfile,
     lock_file: Option<File>,
 }
 
@@ -2997,6 +2991,13 @@ impl AttemptPublication {
                 })?
             }
         };
+        if policy.mode() == PublicationMode::LocalThenPublish
+            && roots.contains_key(&destination_root_key(owner_root.as_path()))
+        {
+            return Err(AttemptError::InvalidManifest(
+                "local spool and destination parent must be distinct",
+            ));
+        }
         let owner_profile = match policy.mode() {
             PublicationMode::Direct => policy.destination_profile(),
             PublicationMode::LocalThenPublish => DestinationProfile::Local,
@@ -3073,10 +3074,25 @@ impl AttemptPublication {
             path: lock_path,
             source: source.into(),
         })?;
+        let profile = self
+            .policy
+            .as_ref()
+            .ok_or(AttemptError::InvalidTransition(
+                "run attempt has no resolved publication policy",
+            ))?
+            .destination_profile();
+        if let Err(error) = persist_manifest_in_root(&root, profile, &self.manifest, false) {
+            let _ = FileExt::unlock(&lock_file);
+            drop(lock_file);
+            let _ = root.directory.remove_file("live.lock");
+            let _ = root.remove_empty();
+            return Err(error);
+        }
         self.additional_roots.insert(
             key,
             AdditionalAttemptRoot {
                 root,
+                profile,
                 lock_file: Some(lock_file),
             },
         );
@@ -3680,26 +3696,40 @@ impl AttemptPublication {
         {
             return Ok(kept());
         }
-        let expected_count = manifest.artifacts.len() + 2;
-        if observed.len() != expected_count {
+        let expected = manifest
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_id.as_str())
+            .chain(["live.lock", "manifest.json"])
+            .collect::<std::collections::BTreeSet<_>>();
+        if observed
+            .keys()
+            .any(|name| !expected.contains(name.as_str()))
+        {
             return Ok(kept());
         }
         for artifact in &manifest.artifacts {
-            if observed.get(&artifact.artifact_id) != Some(&ContainedEntryKind::File)
-                || attempt_root
-                    .directory
-                    .open_file(&artifact.artifact_id)
-                    .is_err()
-            {
-                return Ok(kept());
+            match observed.get(&artifact.artifact_id) {
+                Some(ContainedEntryKind::File) => {
+                    if attempt_root
+                        .directory
+                        .open_file(&artifact.artifact_id)
+                        .is_err()
+                    {
+                        return Ok(kept());
+                    }
+                }
+                None => {}
+                Some(_) => return Ok(kept()),
             }
         }
 
         for artifact in &manifest.artifacts {
-            if attempt_root
-                .directory
-                .remove_file(&artifact.artifact_id)
-                .is_err()
+            if observed.contains_key(&artifact.artifact_id)
+                && attempt_root
+                    .directory
+                    .remove_file(&artifact.artifact_id)
+                    .is_err()
             {
                 return Ok(kept());
             }
@@ -3741,6 +3771,7 @@ impl AttemptPublication {
         let old = std::mem::replace(&mut self.manifest, manifest);
         if let Err(error) = self.persist_manifest(inject_replace_failure) {
             self.manifest = old;
+            let _ = self.persist_manifest(false);
             return Err(error);
         }
         Ok(())
@@ -3751,36 +3782,23 @@ impl AttemptPublication {
             .attempt_root
             .as_ref()
             .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?;
-        let next_path = attempt_root.path.join("manifest.next");
-        match attempt_root.directory.remove_file("manifest.next") {
-            Ok(()) => {}
-            Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {}
-            Err(error) => return Err(error.into()),
+        persist_manifest_in_root(
+            attempt_root,
+            self.owner_profile,
+            &self.manifest,
+            inject_replace_failure,
+        )?;
+        for additional in self.additional_roots.values() {
+            persist_manifest_in_root(&additional.root, additional.profile, &self.manifest, false)?;
         }
-        let mut next = attempt_root.directory.create_file("manifest.next")?;
-        next.write_all(&self.manifest.to_bytes()?)
-            .and_then(|()| next.sync_all())
-            .map_err(|source| AttemptError::Io {
-                operation: "write attempt manifest replacement",
-                path: next_path.clone(),
-                source,
-            })?;
-        drop(next);
-        if inject_replace_failure {
-            return Err(AttemptError::Injected("manifest replacement"));
-        }
-        let source = validate_path(Path::new("manifest.next"), &attempt_root.path, false)
-            .map_err(|_| AttemptError::InvalidManifest("manifest source failed validation"))?;
-        let destination = validate_path(Path::new("manifest.json"), &attempt_root.path, false)
-            .map_err(|_| AttemptError::InvalidManifest("manifest destination failed validation"))?;
-        OutputContainment::for_profile(destination, containment_profile(self.owner_profile))?
-            .promote_from(source, PromotionDisposition::Replace)?;
         Ok(())
     }
 
     fn remove_completed_attempt(&mut self) -> Result<(), AttemptError> {
         let additional_roots = std::mem::take(&mut self.additional_roots);
         for (_, mut additional) in additional_roots {
+            additional.root.directory.remove_file("manifest.json")?;
+            additional.root.directory.sync()?;
             if let Some(lock) = additional.lock_file.take() {
                 let _ = FileExt::unlock(&lock);
                 drop(lock);
@@ -3873,6 +3891,39 @@ fn destination_root_key(path: &Path) -> String {
     };
     let normalized = absolute.canonicalize().unwrap_or(absolute);
     clinker_plan::config::collision_key(&normalized.to_string_lossy())
+}
+
+fn persist_manifest_in_root(
+    attempt_root: &AttemptRoot,
+    profile: DestinationProfile,
+    manifest: &AttemptManifest,
+    inject_replace_failure: bool,
+) -> Result<(), AttemptError> {
+    let next_path = attempt_root.path.join("manifest.next");
+    match attempt_root.directory.remove_file("manifest.next") {
+        Ok(()) => {}
+        Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut next = attempt_root.directory.create_file("manifest.next")?;
+    next.write_all(&manifest.to_bytes()?)
+        .and_then(|()| next.sync_all())
+        .map_err(|source| AttemptError::Io {
+            operation: "write attempt manifest replacement",
+            path: next_path,
+            source,
+        })?;
+    drop(next);
+    if inject_replace_failure {
+        return Err(AttemptError::Injected("manifest replacement"));
+    }
+    let source = validate_path(Path::new("manifest.next"), &attempt_root.path, false)
+        .map_err(|_| AttemptError::InvalidManifest("manifest source failed validation"))?;
+    let destination = validate_path(Path::new("manifest.json"), &attempt_root.path, false)
+        .map_err(|_| AttemptError::InvalidManifest("manifest destination failed validation"))?;
+    OutputContainment::for_profile(destination, containment_profile(profile))?
+        .promote_from(source, PromotionDisposition::Replace)?;
+    Ok(())
 }
 
 fn containment_profile(profile: DestinationProfile) -> &'static str {
