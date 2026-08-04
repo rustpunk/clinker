@@ -452,6 +452,41 @@ fn anchored_cleanup_rejects_linked_artifacts_without_mutating_outside_data() {
 }
 
 #[test]
+fn attempt_creation_and_cleanup_reject_replaced_directory_components() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let outside = tempfile::tempdir().expect("outside directory");
+    let outside_canary = outside.path().join("canary.bin");
+    std::fs::write(&outside_canary, b"outside").expect("outside canary");
+    let namespace = root.path().join(".clinker-attempts");
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path(), &namespace).expect("namespace symlink fixture");
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&namespace)
+            .arg(outside.path())
+            .status()
+            .expect("namespace junction command");
+        assert!(status.success(), "namespace junction fixture");
+    }
+
+    assert!(
+        AttemptPublication::create(validated(root.path(), "."), EXECUTION_ID, 1_000, 301_000)
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&outside_canary).unwrap(), b"outside");
+    assert!(!outside.path().join(EXECUTION_ID).exists());
+
+    let inspection =
+        AttemptPublication::cleanup(validated(root.path(), "."), EXECUTION_ID, 400_000)
+            .expect("replaced namespace is conservatively inspected");
+    assert_eq!(inspection.disposition(), CleanupDisposition::Kept);
+    assert_eq!(std::fs::read(outside_canary).unwrap(), b"outside");
+}
+
+#[test]
 fn orphan_cleanup_is_metadata_last_and_idempotent() {
     let root = tempfile::tempdir().expect("temporary destination");
     let registry = OutputStagingRegistry::default();

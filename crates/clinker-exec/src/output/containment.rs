@@ -137,6 +137,88 @@ pub struct OutputContainment {
     parent: platform::DirectoryAnchor,
 }
 
+/// Kind observed for one child through a retained directory handle.
+// Some native targets cannot expose every filesystem entry kind, while the
+// shared cleanup policy still needs the complete conservative vocabulary.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ContainedEntryKind {
+    File,
+    Directory,
+    LinkOrReparse,
+    Other,
+}
+
+/// A bounded child-directory entry returned by handle-relative enumeration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ContainedEntry {
+    pub(crate) name: OsString,
+    pub(crate) kind: ContainedEntryKind,
+}
+
+/// A retained, link-free directory used for attempt ownership and deletion.
+#[derive(Debug)]
+pub(crate) struct AnchoredDirectory {
+    path: PathBuf,
+    anchor: platform::DirectoryAnchor,
+}
+
+impl AnchoredDirectory {
+    pub(crate) fn open(path: &ValidatedPath) -> Result<Self, ContainmentError> {
+        let path = absolute_path(path.as_path())?;
+        let anchor = platform::DirectoryAnchor::open(&path)?;
+        Ok(Self { path, anchor })
+    }
+
+    pub(crate) fn create_child(&self, leaf: &str) -> Result<Self, ContainmentError> {
+        let leaf = checked_child(leaf, &self.path)?;
+        let path = self.path.join(&leaf);
+        let anchor = self.anchor.create_child(&leaf, &path)?;
+        Ok(Self { path, anchor })
+    }
+
+    pub(crate) fn open_child(&self, leaf: &str) -> Result<Self, ContainmentError> {
+        let leaf = checked_child(leaf, &self.path)?;
+        let path = self.path.join(&leaf);
+        let anchor = self.anchor.open_child(&leaf, &path)?;
+        Ok(Self { path, anchor })
+    }
+
+    pub(crate) fn create_file(&self, leaf: &str) -> Result<File, ContainmentError> {
+        let leaf = checked_child(leaf, &self.path)?;
+        self.anchor
+            .open_leaf(&leaf, OpenDisposition::CreateNew, &self.path.join(&leaf))
+    }
+
+    pub(crate) fn open_file(&self, leaf: &str) -> Result<File, ContainmentError> {
+        let leaf = checked_child(leaf, &self.path)?;
+        self.anchor
+            .open_existing_leaf(&leaf, &self.path.join(&leaf))
+    }
+
+    pub(crate) fn entries(&self, limit: usize) -> Result<Vec<ContainedEntry>, ContainmentError> {
+        self.anchor.entries(&self.path, limit)
+    }
+
+    pub(crate) fn remove_file(&self, leaf: &str) -> Result<(), ContainmentError> {
+        let leaf = checked_child(leaf, &self.path)?;
+        self.anchor.remove_leaf(&leaf)
+    }
+
+    pub(crate) fn remove_child(&self, leaf: &str) -> Result<(), ContainmentError> {
+        let leaf = checked_child(leaf, &self.path)?;
+        self.anchor.remove_child(&leaf, &self.path.join(&leaf))
+    }
+
+    pub(crate) fn sync(&self) -> Result<(), ContainmentError> {
+        self.anchor.sync(&self.path)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// A destination-local hidden output that is ready for atomic publication.
 ///
 /// The destination boundary and its retained parent handle stay alive from
@@ -628,6 +710,18 @@ fn normal_leaf(path: &Path) -> Result<OsString, ContainmentError> {
     }
 }
 
+fn checked_child(leaf: &str, parent: &Path) -> Result<OsString, ContainmentError> {
+    let path = Path::new(leaf);
+    match (path.components().next(), path.components().count()) {
+        (Some(Component::Normal(name)), 1) if !name.is_empty() => Ok(name.to_os_string()),
+        _ => Err(ContainmentError::security(
+            "invalid_contained_child",
+            parent,
+            "contained child must be one normal path component",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "macos")]
@@ -762,18 +856,22 @@ mod tests {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use std::ffi::OsStr;
+    use std::ffi::{CString, OsStr, OsString};
     use std::fs::File;
-    use std::os::fd::OwnedFd;
+    use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::{Component, Path};
 
     use nix::errno::Errno;
-    use nix::fcntl::{OFlag, RenameFlags, openat, renameat, renameat2};
-    use nix::sys::stat::{Mode, fstat};
+    use nix::fcntl::{AtFlags, OFlag, RenameFlags, openat, renameat, renameat2};
+    use nix::sys::stat::{Mode, SFlag, fstat, fstatat};
     use nix::sys::statfs::{NFS_SUPER_MAGIC, fstatfs};
     use nix::unistd::{UnlinkatFlags, unlinkat};
 
-    use super::{ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition};
+    use super::{
+        ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile, OpenDisposition,
+        PromotionDisposition,
+    };
 
     const CIFS_SUPER_MAGIC: u32 = 0xff53_4d42;
     const SMB2_SUPER_MAGIC: u32 = 0xfe53_4d42;
@@ -783,6 +881,17 @@ mod platform {
     pub(super) struct DirectoryAnchor {
         file: File,
         device: u64,
+    }
+
+    struct DirectoryStream(*mut libc::DIR);
+
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: the pointer was returned by fdopendir and is closed once.
+                unsafe { libc::closedir(self.0) };
+            }
+        }
     }
 
     impl DirectoryAnchor {
@@ -917,6 +1026,125 @@ mod platform {
                 .map_err(|error| nix_io("remove-contained-leaf", Path::new(leaf), error))
         }
 
+        pub(super) fn create_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            let name = c_string(leaf, display_path)?;
+            // SAFETY: the retained directory and one-component name satisfy mkdirat.
+            let result = unsafe { libc::mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o700) };
+            if result != 0 {
+                return Err(ContainmentError::io(
+                    "create-contained-directory",
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            self.open_child(leaf, display_path)
+        }
+
+        pub(super) fn open_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            let fd = openat(
+                &self.file,
+                leaf,
+                OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|error| component_error(display_path, error))?;
+            let stat = fstat(&fd)
+                .map_err(|error| nix_io("inspect-contained-directory", display_path, error))?;
+            Ok(Self {
+                file: File::from(fd),
+                device: stat.st_dev as u64,
+            })
+        }
+
+        pub(super) fn entries(
+            &self,
+            display_path: &Path,
+            limit: usize,
+        ) -> Result<Vec<ContainedEntry>, ContainmentError> {
+            let cloned = self.file.try_clone().map_err(|source| {
+                ContainmentError::io("clone-contained-directory", display_path, source)
+            })?;
+            // SAFETY: fdopendir takes ownership of the cloned descriptor.
+            let raw_fd = cloned.into_raw_fd();
+            let directory = DirectoryStream(unsafe { libc::fdopendir(raw_fd) });
+            if directory.0.is_null() {
+                // SAFETY: fdopendir failed and therefore did not take ownership.
+                unsafe { libc::close(raw_fd) };
+                return Err(ContainmentError::io(
+                    "enumerate-contained-directory",
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            let mut entries = Vec::new();
+            loop {
+                Errno::clear();
+                // SAFETY: directory remains valid until closedir below.
+                let entry = unsafe { libc::readdir(directory.0) };
+                if entry.is_null() {
+                    let error = Errno::last_raw();
+                    if error != 0 {
+                        return Err(ContainmentError::io(
+                            "enumerate-contained-directory",
+                            display_path,
+                            std::io::Error::from_raw_os_error(error),
+                        ));
+                    }
+                    break;
+                }
+                // SAFETY: d_name is NUL-terminated for a successful readdir result.
+                let bytes = unsafe {
+                    std::ffi::CStr::from_ptr((*entry).d_name.as_ptr())
+                        .to_bytes()
+                        .to_vec()
+                };
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                if entries.len() == limit {
+                    return Err(ContainmentError::security(
+                        "contained_directory_entry_limit",
+                        display_path,
+                        "contained directory exceeds its bounded entry limit",
+                    ));
+                }
+                let name = OsString::from_vec(bytes);
+                let stat = fstatat(&self.file, name.as_os_str(), AtFlags::AT_SYMLINK_NOFOLLOW)
+                    .map_err(|error| nix_io("inspect-contained-entry", display_path, error))?;
+                let kind = match SFlag::from_bits_truncate(stat.st_mode) {
+                    SFlag::S_IFREG => ContainedEntryKind::File,
+                    SFlag::S_IFDIR => ContainedEntryKind::Directory,
+                    SFlag::S_IFLNK => ContainedEntryKind::LinkOrReparse,
+                    _ => ContainedEntryKind::Other,
+                };
+                entries.push(ContainedEntry { name, kind });
+            }
+            Ok(entries)
+        }
+
+        pub(super) fn remove_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<(), ContainmentError> {
+            unlinkat(&self.file, leaf, UnlinkatFlags::RemoveDir)
+                .map_err(|error| nix_io("remove-contained-directory", display_path, error))
+        }
+
+        pub(super) fn sync(&self, display_path: &Path) -> Result<(), ContainmentError> {
+            self.file.sync_all().map_err(|source| {
+                ContainmentError::io("sync-contained-directory", display_path, source)
+            })
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub(super) fn promote(
             &self,
@@ -1034,6 +1262,16 @@ mod platform {
         )
     }
 
+    fn c_string(name: &OsStr, path: &Path) -> Result<CString, ContainmentError> {
+        CString::new(name.as_bytes()).map_err(|_| {
+            ContainmentError::security(
+                "nul_path_component",
+                path,
+                "output path component contains a NUL byte",
+            )
+        })
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{
@@ -1057,19 +1295,33 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use std::ffi::{CString, OsStr};
+    use std::ffi::{CString, OsStr, OsString};
     use std::fs::File;
     use std::mem::MaybeUninit;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::path::{Component, Path};
 
-    use super::{ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition};
+    use super::{
+        ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile, OpenDisposition,
+        PromotionDisposition,
+    };
 
     #[derive(Debug)]
     pub(super) struct DirectoryAnchor {
         file: File,
         device: u64,
+    }
+
+    struct DirectoryStream(*mut libc::DIR);
+
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: the pointer was returned by fdopendir and is closed once.
+                unsafe { libc::closedir(self.0) };
+            }
+        }
     }
 
     impl DirectoryAnchor {
@@ -1258,6 +1510,165 @@ mod platform {
             }
         }
 
+        pub(super) fn create_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            let name = c_string(leaf, display_path)?;
+            // SAFETY: retained parent and one-component name satisfy mkdirat.
+            let result = unsafe { libc::mkdirat(self.file.as_raw_fd(), name.as_ptr(), 0o700) };
+            if result != 0 {
+                return Err(ContainmentError::io(
+                    "create-contained-directory",
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            self.open_child(leaf, display_path)
+        }
+
+        pub(super) fn open_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            let name = c_string(leaf, display_path)?;
+            // SAFETY: retained parent and one-component name satisfy openat.
+            let fd = unsafe {
+                libc::openat(
+                    self.file.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(component_error(
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            // SAFETY: successful openat returned a fresh descriptor.
+            let file = unsafe { File::from_raw_fd(fd) };
+            let stat = file_stat(&file, display_path)?;
+            Ok(Self {
+                file,
+                device: stat.st_dev as u64,
+            })
+        }
+
+        pub(super) fn entries(
+            &self,
+            display_path: &Path,
+            limit: usize,
+        ) -> Result<Vec<ContainedEntry>, ContainmentError> {
+            let cloned = self.file.try_clone().map_err(|source| {
+                ContainmentError::io("clone-contained-directory", display_path, source)
+            })?;
+            // SAFETY: fdopendir takes ownership of the cloned descriptor.
+            let raw_fd = cloned.into_raw_fd();
+            let directory = DirectoryStream(unsafe { libc::fdopendir(raw_fd) });
+            if directory.0.is_null() {
+                // SAFETY: fdopendir failed and therefore did not take ownership.
+                unsafe { libc::close(raw_fd) };
+                return Err(ContainmentError::io(
+                    "enumerate-contained-directory",
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ));
+            }
+            let mut entries = Vec::new();
+            loop {
+                // SAFETY: platform errno pointer is valid for this thread.
+                unsafe { *libc::__error() = 0 };
+                // SAFETY: directory remains valid until closedir below.
+                let entry = unsafe { libc::readdir(directory.0) };
+                if entry.is_null() {
+                    // SAFETY: platform errno pointer is valid for this thread.
+                    let error = unsafe { *libc::__error() };
+                    if error != 0 {
+                        return Err(ContainmentError::io(
+                            "enumerate-contained-directory",
+                            display_path,
+                            std::io::Error::from_raw_os_error(error),
+                        ));
+                    }
+                    break;
+                }
+                // SAFETY: d_name is NUL-terminated for a successful readdir result.
+                let bytes = unsafe {
+                    std::ffi::CStr::from_ptr((*entry).d_name.as_ptr())
+                        .to_bytes()
+                        .to_vec()
+                };
+                if bytes == b"." || bytes == b".." {
+                    continue;
+                }
+                if entries.len() == limit {
+                    return Err(ContainmentError::security(
+                        "contained_directory_entry_limit",
+                        display_path,
+                        "contained directory exceeds its bounded entry limit",
+                    ));
+                }
+                let name = OsString::from_vec(bytes);
+                let c_name = c_string(&name, display_path)?;
+                let mut stat = MaybeUninit::<libc::stat>::uninit();
+                // SAFETY: pointers are valid and AT_SYMLINK_NOFOLLOW preserves entry type.
+                let result = unsafe {
+                    libc::fstatat(
+                        self.file.as_raw_fd(),
+                        c_name.as_ptr(),
+                        stat.as_mut_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                };
+                if result != 0 {
+                    return Err(ContainmentError::io(
+                        "inspect-contained-entry",
+                        display_path,
+                        std::io::Error::last_os_error(),
+                    ));
+                }
+                // SAFETY: successful fstatat initialized stat.
+                let mode = unsafe { stat.assume_init() }.st_mode;
+                let kind = match mode & libc::S_IFMT {
+                    libc::S_IFREG => ContainedEntryKind::File,
+                    libc::S_IFDIR => ContainedEntryKind::Directory,
+                    libc::S_IFLNK => ContainedEntryKind::LinkOrReparse,
+                    _ => ContainedEntryKind::Other,
+                };
+                entries.push(ContainedEntry { name, kind });
+            }
+            Ok(entries)
+        }
+
+        pub(super) fn remove_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<(), ContainmentError> {
+            let leaf = c_string(leaf, display_path)?;
+            // SAFETY: retained parent and one-component name satisfy unlinkat.
+            let result =
+                unsafe { libc::unlinkat(self.file.as_raw_fd(), leaf.as_ptr(), libc::AT_REMOVEDIR) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(ContainmentError::io(
+                    "remove-contained-directory",
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ))
+            }
+        }
+
+        pub(super) fn sync(&self, display_path: &Path) -> Result<(), ContainmentError> {
+            self.file.sync_all().map_err(|source| {
+                ContainmentError::io("sync-contained-directory", display_path, source)
+            })
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub(super) fn promote(
             &self,
@@ -1407,35 +1818,39 @@ mod platform {
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::fs::File;
     use std::mem::{MaybeUninit, size_of};
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
     use std::path::{Component, Path, PathBuf};
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DISPOSITION_INFORMATION, FILE_NON_DIRECTORY_FILE,
-        FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE_IF, FILE_RENAME_INFORMATION,
-        FILE_SYNCHRONOUS_IO_NONALERT, FileDispositionInformation, FileRenameInformation,
-        NtCreateFile, NtSetInformationFile,
+        FILE_CREATE, FILE_DIRECTORY_FILE, FILE_DIRECTORY_INFORMATION, FILE_DISPOSITION_INFORMATION,
+        FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE_IF,
+        FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileDirectoryInformation,
+        FileDispositionInformation, FileRenameInformation, NtCreateFile, NtQueryDirectoryFile,
+        NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         ERROR_INVALID_NAME, HANDLE, INVALID_HANDLE_VALUE, OBJ_CASE_INSENSITIVE,
-        RtlNtStatusToDosError, STATUS_SUCCESS, UNICODE_STRING,
+        RtlNtStatusToDosError, STATUS_NO_MORE_FILES, STATUS_SUCCESS, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo, FlushFileBuffers,
-        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetVolumeInformationByHandleW,
-        OPEN_EXISTING, SYNCHRONIZE,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileAttributeTagInfo,
+        FlushFileBuffers, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+        GetVolumeInformationByHandleW, OPEN_EXISTING, SYNCHRONIZE,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-    use super::{ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition};
+    use super::{
+        ContainedEntry, ContainedEntryKind, ContainmentError, FilesystemProfile, OpenDisposition,
+        PromotionDisposition,
+    };
 
     #[derive(Debug)]
     pub(super) struct DirectoryAnchor {
@@ -1619,6 +2034,160 @@ mod platform {
                         RtlNtStatusToDosError(status) as i32
                     }),
                 ))
+            }
+        }
+
+        pub(super) fn create_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            let handle = open_file_at(
+                &self.handle,
+                leaf,
+                FILE_LIST_DIRECTORY | FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | SYNCHRONIZE,
+                FILE_CREATE,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+            .map_err(|source| {
+                ContainmentError::io("create-contained-directory", display_path, source)
+            })?;
+            reject_directory_reparse(&handle, display_path)?;
+            let canonical = final_path(&handle, display_path)?;
+            let volume_serial = volume_serial(&handle, display_path)?;
+            Ok(Self {
+                handle,
+                canonical,
+                volume_serial,
+            })
+        }
+
+        pub(super) fn open_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            let handle = open_file_at(
+                &self.handle,
+                leaf,
+                FILE_LIST_DIRECTORY | FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | SYNCHRONIZE,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+            .map_err(|source| {
+                ContainmentError::io("open-contained-directory", display_path, source)
+            })?;
+            reject_directory_reparse(&handle, display_path)?;
+            let canonical = final_path(&handle, display_path)?;
+            let volume_serial = volume_serial(&handle, display_path)?;
+            Ok(Self {
+                handle,
+                canonical,
+                volume_serial,
+            })
+        }
+
+        pub(super) fn entries(
+            &self,
+            display_path: &Path,
+            limit: usize,
+        ) -> Result<Vec<ContainedEntry>, ContainmentError> {
+            let mut entries = Vec::new();
+            let mut restart = true;
+            loop {
+                let mut storage = vec![0_u64; 8192];
+                let mut status_block = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+                // SAFETY: the retained directory handle and storage remain valid
+                // for this synchronous, single-entry query.
+                let status = unsafe {
+                    NtQueryDirectoryFile(
+                        self.handle.as_raw_handle() as HANDLE,
+                        std::ptr::null_mut(),
+                        None,
+                        std::ptr::null(),
+                        &mut status_block,
+                        storage.as_mut_ptr().cast(),
+                        (storage.len() * size_of::<u64>()) as u32,
+                        FileDirectoryInformation,
+                        true,
+                        std::ptr::null(),
+                        restart,
+                    )
+                };
+                restart = false;
+                if status == STATUS_NO_MORE_FILES {
+                    break;
+                }
+                if status != STATUS_SUCCESS {
+                    return Err(ContainmentError::io(
+                        "enumerate-contained-directory",
+                        display_path,
+                        std::io::Error::from_raw_os_error(unsafe {
+                            RtlNtStatusToDosError(status) as i32
+                        }),
+                    ));
+                }
+                // SAFETY: a successful query initialized one directory record.
+                let info = unsafe { &*storage.as_ptr().cast::<FILE_DIRECTORY_INFORMATION>() };
+                let length = info.FileNameLength as usize / size_of::<u16>();
+                // SAFETY: FileNameLength describes initialized UTF-16 storage in this record.
+                let name = OsString::from_wide(unsafe {
+                    std::slice::from_raw_parts(info.FileName.as_ptr(), length)
+                });
+                if name == OsStr::new(".") || name == OsStr::new("..") {
+                    continue;
+                }
+                if entries.len() == limit {
+                    return Err(ContainmentError::security(
+                        "contained_directory_entry_limit",
+                        display_path,
+                        "contained directory exceeds its bounded entry limit",
+                    ));
+                }
+                let kind = if info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                    ContainedEntryKind::LinkOrReparse
+                } else if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
+                    ContainedEntryKind::Directory
+                } else if info.FileAttributes & FILE_ATTRIBUTE_NORMAL != 0 {
+                    ContainedEntryKind::File
+                } else {
+                    // Ordinary files can carry archive/hidden bits instead of NORMAL.
+                    ContainedEntryKind::File
+                };
+                entries.push(ContainedEntry { name, kind });
+            }
+            Ok(entries)
+        }
+
+        pub(super) fn remove_child(
+            &self,
+            leaf: &OsStr,
+            display_path: &Path,
+        ) -> Result<(), ContainmentError> {
+            let handle = open_file_at(
+                &self.handle,
+                leaf,
+                DELETE | SYNCHRONIZE,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            )
+            .map_err(|source| {
+                ContainmentError::io("open-contained-directory-for-removal", display_path, source)
+            })?;
+            reject_directory_reparse(&handle, display_path)?;
+            delete_handle(&handle, display_path, "remove-contained-directory")
+        }
+
+        pub(super) fn sync(&self, display_path: &Path) -> Result<(), ContainmentError> {
+            // SAFETY: retained directory handle is valid for the duration of this call.
+            if unsafe { FlushFileBuffers(self.handle.as_raw_handle() as HANDLE) } == 0 {
+                Err(ContainmentError::io(
+                    "sync-contained-directory",
+                    display_path,
+                    std::io::Error::last_os_error(),
+                ))
+            } else {
+                Ok(())
             }
         }
 
@@ -1870,6 +2439,53 @@ mod platform {
         }
     }
 
+    fn reject_directory_reparse(handle: &OwnedHandle, path: &Path) -> Result<(), ContainmentError> {
+        let attributes = attributes(handle, path)?;
+        if attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ContainmentError::security(
+                "linked_or_replaced_ancestor",
+                path,
+                "contained directory is a reparse point or was replaced",
+            ));
+        }
+        if attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+            return Err(ContainmentError::security(
+                "non_directory_ancestor",
+                path,
+                "contained directory entry is not a directory",
+            ));
+        }
+        Ok(())
+    }
+
+    fn delete_handle(
+        handle: &OwnedHandle,
+        path: &Path,
+        operation: &'static str,
+    ) -> Result<(), ContainmentError> {
+        let disposition = FILE_DISPOSITION_INFORMATION { DeleteFile: true };
+        let mut status_block = unsafe { std::mem::zeroed::<IO_STATUS_BLOCK>() };
+        // SAFETY: handle carries DELETE access and pointers reference initialized storage.
+        let status = unsafe {
+            NtSetInformationFile(
+                handle.as_raw_handle() as HANDLE,
+                &mut status_block,
+                (&disposition as *const FILE_DISPOSITION_INFORMATION).cast(),
+                size_of::<FILE_DISPOSITION_INFORMATION>() as u32,
+                FileDispositionInformation,
+            )
+        };
+        if status == STATUS_SUCCESS {
+            Ok(())
+        } else {
+            Err(ContainmentError::io(
+                operation,
+                path,
+                std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) as i32 }),
+            ))
+        }
+    }
+
     fn attributes(
         handle: &OwnedHandle,
         path: &Path,
@@ -1965,7 +2581,9 @@ mod platform {
     use std::fs::File;
     use std::path::{Path, PathBuf};
 
-    use super::{ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition};
+    use super::{
+        ContainedEntry, ContainmentError, FilesystemProfile, OpenDisposition, PromotionDisposition,
+    };
 
     #[derive(Debug)]
     pub(super) struct DirectoryAnchor {
@@ -2031,6 +2649,42 @@ mod platform {
             })
         }
 
+        pub(super) fn create_child(
+            &self,
+            _leaf: &OsStr,
+            _display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            unsupported_directory()
+        }
+
+        pub(super) fn open_child(
+            &self,
+            _leaf: &OsStr,
+            _display_path: &Path,
+        ) -> Result<Self, ContainmentError> {
+            unsupported_directory()
+        }
+
+        pub(super) fn entries(
+            &self,
+            _display_path: &Path,
+            _limit: usize,
+        ) -> Result<Vec<ContainedEntry>, ContainmentError> {
+            unsupported_directory()
+        }
+
+        pub(super) fn remove_child(
+            &self,
+            _leaf: &OsStr,
+            _display_path: &Path,
+        ) -> Result<(), ContainmentError> {
+            unsupported_directory()
+        }
+
+        pub(super) fn sync(&self, _display_path: &Path) -> Result<(), ContainmentError> {
+            unsupported_directory()
+        }
+
         #[allow(clippy::too_many_arguments)]
         pub(super) fn promote(
             &self,
@@ -2056,5 +2710,12 @@ mod platform {
             FilesystemProfile::LinuxNfsV41LoopbackCi => "linux-nfsv4.1-loopback-ci",
             FilesystemProfile::LinuxSmb311LoopbackCi => "linux-smb3.1.1-loopback-ci",
         }
+    }
+
+    fn unsupported_directory<T>() -> Result<T, ContainmentError> {
+        Err(ContainmentError::PolicyRequired {
+            profile: "local-filesystem".to_owned(),
+            detail: "attempt cleanup is unavailable without a handle-relative directory implementation",
+        })
     }
 }

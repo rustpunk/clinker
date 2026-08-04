@@ -1,6 +1,7 @@
 //! Destination-owned attempt manifests and finite artifact publication.
 
-use std::fs::{File, OpenOptions};
+use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -10,7 +11,10 @@ use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::containment::{ContainmentError, OutputContainment, PromotionDisposition};
+use super::containment::{
+    AnchoredDirectory, ContainedEntryKind, ContainmentError, OutputContainment,
+    PromotionDisposition,
+};
 use super::staging::{OutputStagingRegistry, PublicationOutcome};
 use crate::pipeline::shutdown::ShutdownToken;
 
@@ -312,6 +316,100 @@ pub struct AttemptTestEvent {
     pub stage: AttemptTestStage,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CleanupDisposition {
+    Removed,
+    AlreadyAbsent,
+    Kept,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptInspection {
+    execution_id: String,
+    disposition: CleanupDisposition,
+}
+
+impl AttemptInspection {
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
+    }
+
+    pub fn disposition(&self) -> CleanupDisposition {
+        self.disposition
+    }
+}
+
+/// Retained ownership boundary for one execution directory.
+#[derive(Debug)]
+pub struct AttemptRoot {
+    namespace: AnchoredDirectory,
+    directory: AnchoredDirectory,
+    execution_id: String,
+    path: PathBuf,
+}
+
+impl AttemptRoot {
+    fn create(destination_root: &ValidatedPath, execution_id: &str) -> Result<Self, AttemptError> {
+        let destination = AnchoredDirectory::open(destination_root)?;
+        let namespace = match destination.create_child(".clinker-attempts") {
+            Ok(namespace) => namespace,
+            Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::AlreadyExists) => {
+                destination.open_child(".clinker-attempts")?
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let directory = namespace.create_child(execution_id)?;
+        let path = directory.path().to_path_buf();
+        Ok(Self {
+            namespace,
+            directory,
+            execution_id: execution_id.to_owned(),
+            path,
+        })
+    }
+
+    fn open(
+        destination_root: &ValidatedPath,
+        execution_id: &str,
+    ) -> Result<Option<Self>, AttemptError> {
+        let destination = AnchoredDirectory::open(destination_root)?;
+        let namespace = match destination.open_child(".clinker-attempts") {
+            Ok(namespace) => namespace,
+            Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let directory = match namespace.open_child(execution_id) {
+            Ok(directory) => directory,
+            Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let path = directory.path().to_path_buf();
+        Ok(Some(Self {
+            namespace,
+            directory,
+            execution_id: execution_id.to_owned(),
+            path,
+        }))
+    }
+
+    fn remove_empty(self) -> Result<(), AttemptError> {
+        let Self {
+            namespace,
+            directory,
+            execution_id,
+            ..
+        } = self;
+        drop(directory);
+        namespace.remove_child(&execution_id)?;
+        namespace.sync()?;
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 struct ArtifactRuntime {
     artifact_id: String,
@@ -321,9 +419,8 @@ struct ArtifactRuntime {
 /// One destination-owned execution attempt.
 pub struct AttemptPublication {
     execution_id: String,
-    attempt_root: PathBuf,
+    attempt_root: Option<AttemptRoot>,
     manifest_path: PathBuf,
-    lock_path: PathBuf,
     lock_file: Option<File>,
     manifest: AttemptManifest,
     artifacts: Vec<ArtifactRuntime>,
@@ -337,7 +434,10 @@ impl std::fmt::Debug for AttemptPublication {
         formatter
             .debug_struct("AttemptPublication")
             .field("execution_id", &self.execution_id)
-            .field("attempt_root", &self.attempt_root)
+            .field(
+                "attempt_root",
+                &self.attempt_root.as_ref().map(|root| root.path.as_path()),
+            )
             .field("manifest", &self.manifest)
             .field("terminal", &self.terminal)
             .finish_non_exhaustive()
@@ -352,13 +452,9 @@ impl AttemptPublication {
         eligible_after_unix_ms: u64,
     ) -> Result<Self, AttemptError> {
         validate_execution_id(execution_id)?;
-        let attempt_root = destination_root
-            .as_path()
-            .join(".clinker-attempts")
-            .join(execution_id);
-        create_restrictive_directory(&attempt_root)?;
-        let lock_path = attempt_root.join("live.lock");
-        let lock_file = restrictive_file(&lock_path, true)?;
+        let attempt_root = AttemptRoot::create(&destination_root, execution_id)?;
+        let lock_path = attempt_root.path.join("live.lock");
+        let lock_file = attempt_root.directory.create_file("live.lock")?;
         FileExt::try_lock(&lock_file).map_err(|source| AttemptError::Io {
             operation: "lock live attempt",
             path: lock_path.clone(),
@@ -373,10 +469,9 @@ impl AttemptPublication {
         )?;
         let mut publication = Self {
             execution_id: execution_id.to_owned(),
-            manifest_path: attempt_root.join("manifest.json"),
-            lock_path,
+            manifest_path: attempt_root.path.join("manifest.json"),
             lock_file: Some(lock_file),
-            attempt_root,
+            attempt_root: Some(attempt_root),
             manifest,
             artifacts: Vec::new(),
             terminal: false,
@@ -392,7 +487,11 @@ impl AttemptPublication {
     }
 
     pub fn attempt_root(&self) -> &Path {
-        &self.attempt_root
+        &self
+            .attempt_root
+            .as_ref()
+            .expect("attempt root exists until successful cleanup")
+            .path
     }
 
     pub fn stage_direct(
@@ -409,10 +508,13 @@ impl AttemptPublication {
             ));
         }
         let artifact_id = format!("artifact-{:08x}", self.artifacts.len() + 1);
-        let source_path = self.attempt_root.join(&artifact_id);
-        let source = validate_path(Path::new(&artifact_id), &self.attempt_root, false)
+        let attempt_root = self
+            .attempt_root
+            .as_ref()
+            .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?;
+        let source = validate_path(Path::new(&artifact_id), &attempt_root.path, false)
             .map_err(|_| AttemptError::InvalidManifest("artifact path failed validation"))?;
-        let file = restrictive_file(&source_path, true)?;
+        let file = attempt_root.directory.create_file(&artifact_id)?;
         let destination_boundary =
             OutputContainment::for_profile(destination.clone(), "local-filesystem")?;
         registry.register_attempt_output(
@@ -578,6 +680,107 @@ impl AttemptPublication {
         Ok(Some(outcome))
     }
 
+    /// Inspect and, only with exact ownership proof, remove one orphaned attempt.
+    pub fn cleanup(
+        destination_root: ValidatedPath,
+        execution_id: &str,
+        observed_unix_ms: u64,
+    ) -> Result<AttemptInspection, AttemptError> {
+        validate_execution_id(execution_id)?;
+        let kept = || AttemptInspection {
+            execution_id: execution_id.to_owned(),
+            disposition: CleanupDisposition::Kept,
+        };
+        let Some(attempt_root) = (match AttemptRoot::open(&destination_root, execution_id) {
+            Ok(root) => root,
+            Err(_) => return Ok(kept()),
+        }) else {
+            return Ok(AttemptInspection {
+                execution_id: execution_id.to_owned(),
+                disposition: CleanupDisposition::AlreadyAbsent,
+            });
+        };
+
+        let lock = match attempt_root.directory.open_file("live.lock") {
+            Ok(lock) => lock,
+            Err(_) => return Ok(kept()),
+        };
+        if FileExt::try_lock(&lock).is_err() {
+            return Ok(kept());
+        }
+
+        let entries = match attempt_root.directory.entries(MANIFEST_MAX_ARTIFACTS + 3) {
+            Ok(entries) => entries,
+            Err(_) => return Ok(kept()),
+        };
+        let mut observed = BTreeMap::new();
+        for entry in entries {
+            let Ok(name) = entry.name.into_string() else {
+                return Ok(kept());
+            };
+            if observed.insert(name, entry.kind).is_some() {
+                return Ok(kept());
+            }
+        }
+        if observed.get("live.lock") != Some(&ContainedEntryKind::File)
+            || observed.get("manifest.json") != Some(&ContainedEntryKind::File)
+        {
+            return Ok(kept());
+        }
+
+        let manifest = match read_manifest_from_anchor(&attempt_root.directory, observed_unix_ms) {
+            Ok(manifest) => manifest,
+            Err(_) => return Ok(kept()),
+        };
+        if manifest.execution_id != execution_id
+            || manifest.eligible_after_unix_ms > observed_unix_ms
+        {
+            return Ok(kept());
+        }
+        let expected_count = manifest.artifacts.len() + 2;
+        if observed.len() != expected_count {
+            return Ok(kept());
+        }
+        for artifact in &manifest.artifacts {
+            if observed.get(&artifact.artifact_id) != Some(&ContainedEntryKind::File)
+                || attempt_root
+                    .directory
+                    .open_file(&artifact.artifact_id)
+                    .is_err()
+            {
+                return Ok(kept());
+            }
+        }
+
+        for artifact in &manifest.artifacts {
+            if attempt_root
+                .directory
+                .remove_file(&artifact.artifact_id)
+                .is_err()
+            {
+                return Ok(kept());
+            }
+        }
+        if attempt_root.directory.sync().is_err()
+            || attempt_root.directory.remove_file("manifest.json").is_err()
+            || attempt_root.directory.sync().is_err()
+        {
+            return Ok(kept());
+        }
+        let _ = FileExt::unlock(&lock);
+        drop(lock);
+        if attempt_root.directory.remove_file("live.lock").is_err() {
+            return Ok(kept());
+        }
+        if attempt_root.remove_empty().is_err() {
+            return Ok(kept());
+        }
+        Ok(AttemptInspection {
+            execution_id: execution_id.to_owned(),
+            disposition: CleanupDisposition::Removed,
+        })
+    }
+
     pub fn set_fault_for_testing(&mut self, fault: AttemptFault) {
         self.fault = Some(fault);
     }
@@ -604,19 +807,17 @@ impl AttemptPublication {
     }
 
     fn persist_manifest(&mut self, inject_replace_failure: bool) -> Result<(), AttemptError> {
-        let next_path = self.attempt_root.join("manifest.next");
-        match std::fs::remove_file(&next_path) {
+        let attempt_root = self
+            .attempt_root
+            .as_ref()
+            .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?;
+        let next_path = attempt_root.path.join("manifest.next");
+        match attempt_root.directory.remove_file("manifest.next") {
             Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(AttemptError::Io {
-                    operation: "remove stale manifest replacement",
-                    path: next_path,
-                    source,
-                });
-            }
+            Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {}
+            Err(error) => return Err(error.into()),
         }
-        let mut next = restrictive_file(&next_path, true)?;
+        let mut next = attempt_root.directory.create_file("manifest.next")?;
         next.write_all(&self.manifest.to_bytes()?)
             .and_then(|()| next.sync_all())
             .map_err(|source| AttemptError::Io {
@@ -628,9 +829,9 @@ impl AttemptPublication {
         if inject_replace_failure {
             return Err(AttemptError::Injected("manifest replacement"));
         }
-        let source = validate_path(Path::new("manifest.next"), &self.attempt_root, false)
+        let source = validate_path(Path::new("manifest.next"), &attempt_root.path, false)
             .map_err(|_| AttemptError::InvalidManifest("manifest source failed validation"))?;
-        let destination = validate_path(Path::new("manifest.json"), &self.attempt_root, false)
+        let destination = validate_path(Path::new("manifest.json"), &attempt_root.path, false)
             .map_err(|_| AttemptError::InvalidManifest("manifest destination failed validation"))?;
         OutputContainment::for_profile(destination, "local-filesystem")?
             .promote_from(source, PromotionDisposition::Replace)?;
@@ -638,25 +839,22 @@ impl AttemptPublication {
     }
 
     fn remove_completed_attempt(&mut self) -> Result<(), AttemptError> {
-        std::fs::remove_file(&self.manifest_path).map_err(|source| AttemptError::Io {
-            operation: "remove complete manifest",
-            path: self.manifest_path.clone(),
-            source,
-        })?;
+        let attempt_root = self
+            .attempt_root
+            .as_ref()
+            .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?;
+        attempt_root.directory.remove_file("manifest.json")?;
+        attempt_root.directory.sync()?;
         if let Some(lock) = self.lock_file.take() {
             let _ = FileExt::unlock(&lock);
             drop(lock);
         }
-        std::fs::remove_file(&self.lock_path).map_err(|source| AttemptError::Io {
-            operation: "remove attempt lock",
-            path: self.lock_path.clone(),
-            source,
-        })?;
-        std::fs::remove_dir(&self.attempt_root).map_err(|source| AttemptError::Io {
-            operation: "remove completed attempt directory",
-            path: self.attempt_root.clone(),
-            source,
-        })
+        attempt_root.directory.remove_file("live.lock")?;
+        let attempt_root = self
+            .attempt_root
+            .take()
+            .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?;
+        attempt_root.remove_empty()
     }
 }
 
@@ -694,6 +892,33 @@ fn validate_execution_id(execution_id: &str) -> Result<(), AttemptError> {
         ));
     }
     Ok(())
+}
+
+fn read_manifest_from_anchor(
+    directory: &AnchoredDirectory,
+    observed_unix_ms: u64,
+) -> Result<AttemptManifest, AttemptError> {
+    let mut file = directory.open_file("manifest.json")?;
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take((MANIFEST_MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|source| AttemptError::Io {
+            operation: "read anchored attempt manifest",
+            path: directory.path().join("manifest.json"),
+            source,
+        })?;
+    AttemptManifest::from_bytes(&bytes, observed_unix_ms)
+}
+
+fn containment_kind(error: &ContainmentError) -> Option<std::io::ErrorKind> {
+    match error {
+        ContainmentError::Io { source, .. }
+        | ContainmentError::VisibleButUnsynced { source, .. } => Some(source.kind()),
+        ContainmentError::PublishedCleanup { .. }
+        | ContainmentError::SecurityPolicy { .. }
+        | ContainmentError::PolicyRequired { .. } => None,
+    }
 }
 
 fn validate_artifact_id(artifact_id: &str) -> Result<(), AttemptError> {
@@ -734,39 +959,4 @@ fn validate_text(
         });
     }
     Ok(())
-}
-
-fn create_restrictive_directory(path: &Path) -> Result<(), AttemptError> {
-    std::fs::create_dir_all(path).map_err(|source| AttemptError::Io {
-        operation: "create attempt directory",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
-            |source| AttemptError::Io {
-                operation: "restrict attempt directory",
-                path: path.to_path_buf(),
-                source,
-            },
-        )?;
-    }
-    Ok(())
-}
-
-fn restrictive_file(path: &Path, create_new: bool) -> Result<File, AttemptError> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create_new(create_new);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    options.open(path).map_err(|source| AttemptError::Io {
-        operation: "create restrictive attempt file",
-        path: path.to_path_buf(),
-        source,
-    })
 }
