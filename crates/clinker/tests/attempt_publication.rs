@@ -3,13 +3,15 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use clinker_exec::output::attempt::{
-    ARTIFACT_MAX_ENCODED_BYTES, ArtifactManifest, ArtifactState, AttemptFault, AttemptManifest,
-    AttemptPublication, AttemptState, AttemptTestStage, CleanupDisposition, MANIFEST_MAX_ARTIFACTS,
-    MANIFEST_MAX_BYTES,
+    ARTIFACT_MAX_ENCODED_BYTES, ArtifactKind, ArtifactManifest, ArtifactRegistration,
+    ArtifactState, AttemptFault, AttemptManifest, AttemptPublication, AttemptState,
+    AttemptTestStage, CleanupDisposition, MANIFEST_MAX_ARTIFACTS, MANIFEST_MAX_BYTES,
+    PUBLICATION_COPY_BUFFER_BYTES,
 };
 use clinker_exec::output::containment::PromotionDisposition;
 use clinker_exec::output::staging::{OutputStagingRegistry, PublicationOutcome};
 use clinker_exec::pipeline::shutdown::ShutdownToken;
+use clinker_plan::config::{ClinkerToml, PublicationMode, ResolvedPublicationPolicy};
 use clinker_plan::security::{ValidatedPath, validate_path};
 
 const EXECUTION_ID: &str = "018f47a2-9a41-7a27-b4d6-4f7137e3c159";
@@ -21,6 +23,264 @@ fn validated(root: &Path, relative: &str) -> ValidatedPath {
 fn begin(root: &Path) -> AttemptPublication {
     AttemptPublication::create(validated(root, "."), EXECUTION_ID, 1_000, 301_000)
         .expect("attempt should be created")
+}
+
+fn resolved_policy(
+    destination_root: &Path,
+    mode: PublicationMode,
+    spool: Option<&Path>,
+    estimated_attempt_bytes: u64,
+) -> ResolvedPublicationPolicy {
+    let config = match (mode, spool) {
+        (PublicationMode::Direct, _) => String::new(),
+        (PublicationMode::LocalThenPublish, Some(spool)) => format!(
+            "[storage.publication]\nmode = \"local_then_publish\"\nlocal_spool_dir = \"{}\"\n",
+            spool.display().to_string().replace('\\', "\\\\")
+        ),
+        (PublicationMode::LocalThenPublish, None) => {
+            panic!("local_then_publish fixture requires a spool")
+        }
+    };
+    ClinkerToml::parse(&config)
+        .expect("parse publication fixture")
+        .storage
+        .publication
+        .resolve(destination_root, estimated_attempt_bytes, 8_000_000_000)
+        .expect("resolve publication fixture")
+}
+
+fn registration(
+    kind: ArtifactKind,
+    root: &Path,
+    leaf: &str,
+    producer: &str,
+) -> ArtifactRegistration {
+    ArtifactRegistration::new(
+        kind,
+        producer,
+        leaf,
+        validated(root, leaf),
+        PromotionDisposition::Replace,
+    )
+    .expect("valid artifact registration")
+}
+
+#[test]
+fn run_attempt_owns_every_artifact_kind_across_bounded_destination_roots() {
+    let first = tempfile::tempdir().expect("first destination");
+    let second = tempfile::tempdir().expect("second destination");
+    let registry = OutputStagingRegistry::default();
+    let policy = resolved_policy(first.path(), PublicationMode::Direct, None, 1_024);
+    let registrations = vec![
+        registration(
+            ArtifactKind::Primary,
+            first.path(),
+            "primary.bin",
+            "primary",
+        ),
+        registration(ArtifactKind::FanOut, first.path(), "fan.bin", "fan-out"),
+        registration(ArtifactKind::Split, second.path(), "split.bin", "split"),
+        registration(
+            ArtifactKind::Dlq,
+            second.path(),
+            "errors.bin",
+            "dead-letter",
+        ),
+        registration(
+            ArtifactKind::Sidecar,
+            second.path(),
+            "result.meta.json",
+            "sidecar",
+        ),
+    ];
+
+    let (mut attempt, mut writers) = AttemptPublication::create_run(
+        policy,
+        &registry,
+        EXECUTION_ID,
+        1_000,
+        301_000,
+        registrations,
+    )
+    .expect("create run attempt");
+
+    assert_eq!(attempt.execution_id(), EXECUTION_ID);
+    assert_eq!(attempt.destination_root_count(), 2);
+    assert_eq!(
+        attempt.registered_kinds(),
+        vec![
+            ArtifactKind::Primary,
+            ArtifactKind::FanOut,
+            ArtifactKind::Split,
+            ArtifactKind::Dlq,
+            ArtifactKind::Sidecar,
+        ]
+    );
+    for (index, writer) in writers.iter_mut().enumerate() {
+        write!(writer.file_mut(), "artifact {index}").expect("write artifact");
+        attempt
+            .mark_ready(writer.artifact_id())
+            .expect("mark artifact ready");
+    }
+    assert!(
+        writers
+            .iter()
+            .all(|writer| writer.execution_id() == EXECUTION_ID)
+    );
+    drop(writers);
+
+    let outcome = attempt
+        .publish(&registry, &ShutdownToken::detached())
+        .expect("publish run attempt")
+        .expect("publication gate won");
+    assert!(outcome.is_complete());
+    for (root, leaf) in [
+        (first.path(), "primary.bin"),
+        (first.path(), "fan.bin"),
+        (second.path(), "split.bin"),
+        (second.path(), "errors.bin"),
+        (second.path(), "result.meta.json"),
+    ] {
+        assert!(root.join(leaf).is_file(), "missing {leaf}");
+    }
+}
+
+#[test]
+fn duplicate_run_registration_refuses_before_attempt_creation() {
+    let root = tempfile::tempdir().expect("destination");
+    let registry = OutputStagingRegistry::default();
+    let policy = resolved_policy(root.path(), PublicationMode::Direct, None, 1_024);
+    let registrations = vec![
+        registration(ArtifactKind::Primary, root.path(), "same.bin", "primary"),
+        registration(ArtifactKind::Sidecar, root.path(), "same.bin", "sidecar"),
+    ];
+
+    let error = AttemptPublication::create_run(
+        policy,
+        &registry,
+        EXECUTION_ID,
+        1_000,
+        301_000,
+        registrations,
+    )
+    .expect_err("duplicate final must fail");
+
+    assert!(error.to_string().contains("collision"), "{error}");
+    assert!(!root.path().join(".clinker-attempts").exists());
+}
+
+#[test]
+fn local_then_publish_copies_in_bounded_chunks_and_verifies_destination() {
+    let destination = tempfile::tempdir().expect("destination");
+    let spool = tempfile::tempdir().expect("local spool");
+    let registry = OutputStagingRegistry::default();
+    let body = vec![0x5a; PUBLICATION_COPY_BUFFER_BYTES * 2 + 17];
+    let policy = resolved_policy(
+        destination.path(),
+        PublicationMode::LocalThenPublish,
+        Some(spool.path()),
+        body.len() as u64,
+    );
+    let registrations = vec![registration(
+        ArtifactKind::Primary,
+        destination.path(),
+        "result.bin",
+        "primary",
+    )];
+    let (mut attempt, mut writers) = AttemptPublication::create_run(
+        policy,
+        &registry,
+        EXECUTION_ID,
+        1_000,
+        301_000,
+        registrations,
+    )
+    .expect("create local-then-publish attempt");
+    let writer = writers.first_mut().expect("writer");
+    writer
+        .file_mut()
+        .write_all(&body)
+        .expect("write local bytes");
+    let artifact_id = writer.artifact_id().to_owned();
+    drop(writers);
+    let local_artifact = spool
+        .path()
+        .join(".clinker-attempts")
+        .join(EXECUTION_ID)
+        .join(&artifact_id);
+    let destination_artifact = destination
+        .path()
+        .join(".clinker-attempts")
+        .join(EXECUTION_ID)
+        .join(&artifact_id);
+    assert!(local_artifact.is_file());
+    assert!(!destination_artifact.exists());
+
+    attempt.mark_ready(&artifact_id).expect("copy and verify");
+    assert!(
+        !local_artifact.exists(),
+        "spool copy is released only after destination ownership"
+    );
+    assert_eq!(std::fs::read(&destination_artifact).unwrap(), body);
+
+    let outcome = attempt
+        .publish(&registry, &ShutdownToken::detached())
+        .expect("publish")
+        .expect("publication gate won");
+    assert!(outcome.is_complete());
+    assert_eq!(
+        std::fs::read(destination.path().join("result.bin")).unwrap(),
+        body
+    );
+}
+
+#[test]
+fn local_then_publish_copy_and_digest_failures_never_fallback_to_direct() {
+    for fault in [AttemptFault::Copy, AttemptFault::Digest] {
+        let destination = tempfile::tempdir().expect("destination");
+        let spool = tempfile::tempdir().expect("local spool");
+        let registry = OutputStagingRegistry::default();
+        let policy = resolved_policy(
+            destination.path(),
+            PublicationMode::LocalThenPublish,
+            Some(spool.path()),
+            64,
+        );
+        let registrations = vec![registration(
+            ArtifactKind::Primary,
+            destination.path(),
+            "result.bin",
+            "primary",
+        )];
+        let (mut attempt, mut writers) = AttemptPublication::create_run(
+            policy,
+            &registry,
+            EXECUTION_ID,
+            1_000,
+            301_000,
+            registrations,
+        )
+        .expect("create attempt");
+        let artifact_id = writers[0].artifact_id().to_owned();
+        writers[0]
+            .file_mut()
+            .write_all(b"failure boundary")
+            .expect("write spool");
+        drop(writers);
+        attempt.set_fault_for_testing(fault);
+
+        assert!(attempt.mark_ready(&artifact_id).is_err(), "fault {fault:?}");
+        assert!(!destination.path().join("result.bin").exists());
+        assert!(
+            spool
+                .path()
+                .join(".clinker-attempts")
+                .join(EXECUTION_ID)
+                .join(&artifact_id)
+                .exists(),
+            "failed {fault:?} must retain the local source"
+        );
+    }
 }
 
 fn stage_ready(
