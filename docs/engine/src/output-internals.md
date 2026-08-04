@@ -130,17 +130,38 @@ tokens:
   authorizes I/O as the configured guest identity.
 
 The dedicated CI matrix provisions each server and mount inside its runner,
-executes a real `clinker run` success and failed-overwrite preservation on the
-mounted share, plus focused confinement, lock exclusion, synchronized
-promotion/visibility, cancellation, cross-filesystem refusal, and cleanup-
-liveness checks. It tears the environment down on every exit. Its per-profile
-artifact records the
-runner image and kernel, exact client/server package versions, effective mount
-options, negotiated protocol observations, lock behavior, synchronization and
-failure-injection results, and teardown status.
+places the exported root on a mounted 64 MiB temporary filesystem, and executes
+both publication modes. Success pauses after the exact `Complete` manifest and
+final are synchronized but before normal attempt cleanup. The harness reopens
+both through the mounted client, releases cleanup, and then proves the final is
+still present while the successful attempt root and manifest are absent. This
+barrier is installed only through a programmatic Linux qualification API; YAML,
+the ordinary CLI, and environment configuration cannot enable it, and success
+still creates no receipt or sidecar.
+
+The same local, identity-bound control pauses before copy, file sync, rename,
+and parent-directory sync. For every applicable mode/stage pair, the harness
+force-detaches the client mount, stops the exact NFS service or Samba PID,
+releases the operation, observes a bounded non-success, restarts and remounts
+the exact profile, and reopens its retained manifest. It then exercises bounded
+list, inspect, purge preview, and purge execution. A separate attempt fills the
+mounted bounded backing until the operating system returns `ENOSPC`; the final
+must remain absent and operator cleanup must remove the staging attempt.
+Deterministic `EDQUOT` coverage is recorded only as `seam_covered` unless a real
+quota is separately provisioned and observed.
+
+Evidence uses `clinker.filesystem-matrix-evidence/2`. It records the runner and
+kernel, exact package and protocol observations, mount and lock behavior, the
+six unchanged edge outcomes, six lifecycle classes, ordered success and
+interruption readbacks, real capacity behavior, recovery, persistence,
+operator cleanup, and environment teardown. Teardown and bounded evidence/log
+upload run unconditionally for passing, failing, timed-out, and interrupted
+matrix cells. Legacy schema 1 or any missing, unknown, or truncated proof is
+ineligible.
 
 A profile is support-eligible only when that exact cell writes `status: passed`,
-`support_eligible: true`, and successful teardown evidence. Missing packages or
+`support_eligible: true`, and successful client-mount, bounded-backing, service,
+and workspace teardown evidence. Missing packages or
 administrative capability, mount/provision failure, incomplete observations, a
 semantic failure, or cleanup failure leaves `status: incomplete` and cannot be
 interpreted as support. These loopback results do not certify a corporate

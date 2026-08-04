@@ -1,6 +1,12 @@
 use std::io::Write;
+#[cfg(target_os = "linux")]
+use std::io::{BufRead, BufReader};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 use clinker_exec::output::attempt::{
     ARTIFACT_MAX_ENCODED_BYTES, ATTEMPT_EDGE_OUTCOME_TAXONOMY, ATTEMPT_PUBLICATION_PROHIBITIONS,
@@ -567,6 +573,737 @@ fn local_then_publish_copy_and_digest_failures_never_fallback_to_direct() {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn read_control_message(reader: &mut BufReader<UnixStream>) -> serde_json::Value {
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .expect("read bounded publication control message");
+    assert!(
+        !line.is_empty(),
+        "publication control endpoint closed early"
+    );
+    serde_json::from_str(&line).expect("publication control message must be JSON")
+}
+
+#[cfg(target_os = "linux")]
+fn release_control_message(stream: &mut UnixStream, mut message: serde_json::Value) {
+    message["action"] = serde_json::Value::String("release".to_owned());
+    serde_json::to_writer(&mut *stream, &message).expect("write publication release");
+    stream
+        .write_all(b"\n")
+        .expect("terminate publication release");
+    stream.flush().expect("flush publication release");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn qualification_control_binds_every_real_stage_to_attempt_artifact_and_mode() {
+    for (mode, expected_stages) in [
+        (
+            PublicationMode::Direct,
+            vec![
+                "file_synchronization",
+                "rename",
+                "parent_directory_synchronization",
+                "complete_before_cleanup",
+            ],
+        ),
+        (
+            PublicationMode::LocalThenPublish,
+            vec![
+                "copy",
+                "file_synchronization",
+                "rename",
+                "parent_directory_synchronization",
+                "complete_before_cleanup",
+            ],
+        ),
+    ] {
+        let destination = tempfile::tempdir().expect("destination");
+        let spool = tempfile::tempdir().expect("local spool");
+        let registry = OutputStagingRegistry::default();
+        let policy = resolved_policy(
+            destination.path(),
+            mode,
+            (mode == PublicationMode::LocalThenPublish).then_some(spool.path()),
+            64,
+        );
+        let (mut attempt, mut writers) = AttemptPublication::create_run(
+            policy,
+            &registry,
+            EXECUTION_ID,
+            1_000,
+            301_000,
+            vec![registration(
+                ArtifactKind::Primary,
+                destination.path(),
+                "result.bin",
+                "primary",
+            )],
+        )
+        .expect("create controlled attempt");
+        writers[0]
+            .file_mut()
+            .write_all(b"controlled publication")
+            .expect("write controlled artifact");
+        let artifact_id = writers[0].artifact_id().to_owned();
+        drop(writers);
+        let manifest_path = attempt.manifest_path().to_path_buf();
+        let attempt_root = attempt.attempt_root().to_path_buf();
+        let (attempt_stream, mut harness_stream) = UnixStream::pair().expect("local endpoint");
+        attempt
+            .install_qualification_stage_control(attempt_stream, Duration::from_secs(2))
+            .expect("install qualification control");
+
+        let artifact_for_child = artifact_id.clone();
+        let handle = std::thread::spawn(move || {
+            attempt.mark_ready(&artifact_for_child)?;
+            attempt.publish(&registry, &ShutdownToken::detached())
+        });
+        let mut reader = BufReader::new(harness_stream.try_clone().expect("clone endpoint"));
+        for expected_stage in expected_stages {
+            let message = read_control_message(&mut reader);
+            assert_eq!(message["schema"], "clinker.attempt-stage-control/v1");
+            assert_eq!(message["action"], "stage_ready");
+            assert_eq!(message["execution_id"], EXECUTION_ID);
+            assert_eq!(message["artifact_id"], artifact_id);
+            assert_eq!(
+                message["publication_mode"],
+                match mode {
+                    PublicationMode::Direct => "direct",
+                    PublicationMode::LocalThenPublish => "local_then_publish",
+                }
+            );
+            assert_eq!(message["stage"], expected_stage);
+            if expected_stage == "complete_before_cleanup" {
+                let complete = AttemptManifest::read(&manifest_path, 1_000)
+                    .expect("pre-cleanup Complete manifest must be durable");
+                assert_eq!(complete.execution_id(), EXECUTION_ID);
+                assert_eq!(complete.state(), AttemptState::Complete);
+                assert_eq!(complete.artifacts()[0].artifact_id(), artifact_id);
+                assert_eq!(complete.artifacts()[0].state(), ArtifactState::Published);
+                assert!(destination.path().join("result.bin").is_file());
+            }
+            release_control_message(&mut harness_stream, message);
+        }
+        let outcome = handle
+            .join()
+            .expect("controlled attempt thread")
+            .expect("controlled publication")
+            .expect("publication gate won");
+        assert!(outcome.is_complete());
+        assert_eq!(
+            std::fs::read(destination.path().join("result.bin")).unwrap(),
+            b"controlled publication"
+        );
+        assert!(!manifest_path.exists());
+        assert!(!attempt_root.exists());
+        assert!(!destination.path().join(".clinker-attempts").exists());
+        assert!(!spool.path().join(".clinker-attempts").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn qualification_control_fails_closed_on_malformed_duplicate_missing_or_cross_attempt_release() {
+    for failure in ["malformed", "duplicate", "missing", "cross-attempt"] {
+        let destination = tempfile::tempdir().expect("destination");
+        let registry = OutputStagingRegistry::default();
+        let policy = resolved_policy(destination.path(), PublicationMode::Direct, None, 64);
+        let (mut attempt, mut writers) = AttemptPublication::create_run(
+            policy,
+            &registry,
+            EXECUTION_ID,
+            1_000,
+            301_000,
+            vec![registration(
+                ArtifactKind::Primary,
+                destination.path(),
+                "result.bin",
+                "primary",
+            )],
+        )
+        .expect("create controlled attempt");
+        writers[0].file_mut().write_all(b"retained").unwrap();
+        let artifact_id = writers[0].artifact_id().to_owned();
+        drop(writers);
+        let manifest_path = attempt.manifest_path().to_path_buf();
+        let (attempt_stream, mut harness_stream) = UnixStream::pair().expect("local endpoint");
+        attempt
+            .install_qualification_stage_control(attempt_stream, Duration::from_millis(100))
+            .expect("install qualification control");
+        let artifact_for_child = artifact_id.clone();
+        let handle = std::thread::spawn(move || {
+            attempt.mark_ready(&artifact_for_child)?;
+            attempt.publish(&registry, &ShutdownToken::detached())
+        });
+        let mut reader = BufReader::new(harness_stream.try_clone().expect("clone endpoint"));
+        let message = read_control_message(&mut reader);
+        match failure {
+            "malformed" => harness_stream.write_all(b"{}\n").unwrap(),
+            "duplicate" => {
+                release_control_message(&mut harness_stream, message.clone());
+                release_control_message(&mut harness_stream, message);
+            }
+            "missing" => drop(harness_stream),
+            "cross-attempt" => {
+                let mut changed = message;
+                changed["execution_id"] =
+                    serde_json::Value::String("018f47a2-9a41-7a27-b4d6-4f7137e3c160".to_owned());
+                release_control_message(&mut harness_stream, changed);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            handle.join().expect("controlled attempt thread").is_err(),
+            "{failure} release must fail closed"
+        );
+        let retained = AttemptManifest::read(&manifest_path, 1_000)
+            .expect("failed control retains owner metadata");
+        assert_ne!(retained.state(), AttemptState::Complete);
+        assert!(!destination.path().join("result.bin").exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_send(stream: &mut UnixStream, value: &serde_json::Value) {
+    serde_json::to_writer(&mut *stream, value).expect("encode matrix control message");
+    stream.write_all(b"\n").expect("terminate matrix message");
+    stream.flush().expect("flush matrix message");
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_wait(reader: &mut BufReader<UnixStream>, action: &str, scenario: &str) {
+    let message = read_control_message(reader);
+    assert_eq!(
+        message["schema"],
+        "clinker.filesystem-publication-control/1"
+    );
+    assert_eq!(message["action"], action);
+    assert_eq!(message["scenario"], scenario);
+    assert_eq!(message.as_object().expect("control object").len(), 3);
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_connection(mount_root: &Path, scenario: &str, mode: PublicationMode) -> UnixStream {
+    let endpoint = mount_root
+        .parent()
+        .expect("matrix mount has a disposable parent")
+        .join("publication-control.sock");
+    let mut stream = UnixStream::connect(endpoint).expect("connect publication matrix control");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("bound matrix control reads");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(30)))
+        .expect("bound matrix control writes");
+    matrix_send(
+        &mut stream,
+        &serde_json::json!({
+            "action": "scenario_begin",
+            "publication_mode": match mode {
+                PublicationMode::Direct => "direct",
+                PublicationMode::LocalThenPublish => "local_then_publish",
+            },
+            "scenario": scenario,
+            "schema": "clinker.filesystem-publication-control/1",
+        }),
+    );
+    stream
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_execution_id(index: u64) -> String {
+    format!("018f47a2-9a41-7a27-b4d6-{index:012x}")
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_operator_proof(
+    destination: &Path,
+    mode: PublicationMode,
+    spool: Option<&Path>,
+    execution_id: &str,
+    plan_name: &str,
+) -> AttemptState {
+    let policy = resolved_policy(destination, mode, spool, 256 * 1024 * 1024);
+    let mut roots = vec![validated(destination, ".")];
+    if let Some(spool) = spool {
+        roots.push(validated(spool, "."));
+    }
+    let query = AttemptQuery::new(&compiled_plan(plan_name), &policy, roots)
+        .expect("construct mounted operator query");
+    let mut observed_state = None;
+    for root_id in query
+        .owned_root_ids()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+    {
+        let listed = query
+            .list(&root_id, 100_000_000, None)
+            .expect("list mounted retained attempt");
+        assert_eq!(listed.entries().len(), 1);
+        assert!(listed.cleanup_debt().is_empty());
+        let inspected = query
+            .inspect(&root_id, execution_id, 100_000_000)
+            .expect("inspect mounted retained attempt");
+        let state = inspected.state().expect("retained state");
+        assert_ne!(state, AttemptState::Complete);
+        assert_eq!(observed_state.get_or_insert(state), &state);
+        assert!(inspected.cleanup_debt().is_empty());
+        let request = query
+            .purge_execution(&root_id, execution_id)
+            .expect("select exact mounted attempt");
+        let preview = query
+            .preview(&request, 100_000_000, None)
+            .expect("preview exact mounted purge");
+        assert_eq!(preview.selected_execution_ids(), &[execution_id]);
+        assert!(preview.cleanup_debt().is_empty());
+    }
+    observed_state.expect("at least one mounted operator root")
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_execute_purge(
+    destination: &Path,
+    mode: PublicationMode,
+    spool: Option<&Path>,
+    execution_id: &str,
+    plan_name: &str,
+) {
+    let policy = resolved_policy(destination, mode, spool, 256 * 1024 * 1024);
+    let mut roots = vec![validated(destination, ".")];
+    if let Some(spool) = spool {
+        roots.push(validated(spool, "."));
+    }
+    let query = AttemptQuery::new(&compiled_plan(plan_name), &policy, roots)
+        .expect("construct mounted operator query");
+    for root_id in query
+        .owned_root_ids()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>()
+    {
+        let request = query
+            .purge_execution(&root_id, execution_id)
+            .expect("select exact mounted attempt");
+        let report = query
+            .execute(&request, 100_000_000, None, &ShutdownToken::detached())
+            .expect("execute exact mounted purge");
+        assert_eq!(report.disposition(), PurgeDisposition::Removed);
+        assert!(report.cleanup_debt().is_empty());
+    }
+    assert!(
+        !destination
+            .join(".clinker-attempts")
+            .join(execution_id)
+            .exists()
+    );
+    if let Some(spool) = spool {
+        assert!(!spool.join(".clinker-attempts").join(execution_id).exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_attempt(
+    destination: &Path,
+    mode: PublicationMode,
+    spool: Option<&Path>,
+    execution_id: &str,
+    leaf: &str,
+    disposition: PromotionDisposition,
+) -> (
+    AttemptPublication,
+    Vec<clinker_exec::output::attempt::AttemptArtifactWriter>,
+    OutputStagingRegistry,
+) {
+    let registry = OutputStagingRegistry::default();
+    let policy = resolved_policy(destination, mode, spool, 256 * 1024 * 1024);
+    let (attempt, writers) = AttemptPublication::create_run(
+        policy,
+        &registry,
+        execution_id,
+        1_000,
+        2_000,
+        vec![
+            ArtifactRegistration::new(
+                ArtifactKind::Primary,
+                "matrix-output",
+                leaf,
+                validated(destination, leaf),
+                disposition,
+            )
+            .expect("matrix registration"),
+        ],
+    )
+    .expect("create mounted matrix attempt");
+    (attempt, writers, registry)
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_success(destination: &Path, mode: PublicationMode, spool: Option<&Path>, index: u64) {
+    let scenario = format!(
+        "success-{}",
+        match mode {
+            PublicationMode::Direct => "direct",
+            PublicationMode::LocalThenPublish => "local_then_publish",
+        }
+    );
+    let execution_id = matrix_execution_id(index);
+    let leaf = format!("{scenario}.bin");
+    let mut stream = matrix_connection(destination, &scenario, mode);
+    let mut reader = BufReader::new(stream.try_clone().expect("clone matrix endpoint"));
+    let (mut attempt, mut writers, registry) = matrix_attempt(
+        destination,
+        mode,
+        spool,
+        &execution_id,
+        &leaf,
+        PromotionDisposition::Replace,
+    );
+    writers[0]
+        .file_mut()
+        .write_all(b"mounted success")
+        .expect("write mounted success");
+    let artifact_id = writers[0].artifact_id().to_owned();
+    drop(writers);
+    attempt
+        .install_qualification_stage_control(
+            stream.try_clone().expect("clone qualification endpoint"),
+            Duration::from_secs(30),
+        )
+        .expect("install mounted qualification control");
+    attempt
+        .mark_ready(&artifact_id)
+        .expect("mounted success becomes ready");
+    let outcome = attempt
+        .publish(&registry, &ShutdownToken::detached())
+        .expect("mounted success publication")
+        .expect("mounted success owns publication gate");
+    assert!(outcome.is_complete());
+    assert_eq!(
+        std::fs::read(destination.join(&leaf)).unwrap(),
+        b"mounted success"
+    );
+    assert!(
+        !destination
+            .join(".clinker-attempts")
+            .join(&execution_id)
+            .exists()
+    );
+    matrix_send(
+        &mut stream,
+        &serde_json::json!({
+            "action": "success_complete",
+            "scenario": scenario,
+            "schema": "clinker.filesystem-publication-control/1",
+        }),
+    );
+    matrix_wait(&mut reader, "finish", &scenario);
+    std::fs::remove_file(destination.join(leaf)).expect("remove successful matrix final");
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_ordinary_failure(
+    destination: &Path,
+    mode: PublicationMode,
+    spool: Option<&Path>,
+    index: u64,
+) {
+    let scenario = format!(
+        "ordinary-failure-{}",
+        match mode {
+            PublicationMode::Direct => "direct",
+            PublicationMode::LocalThenPublish => "local_then_publish",
+        }
+    );
+    let execution_id = matrix_execution_id(index);
+    let leaf = format!("{scenario}.bin");
+    std::fs::write(destination.join(&leaf), b"existing final").expect("preexisting final");
+    let mut stream = matrix_connection(destination, &scenario, mode);
+    let mut reader = BufReader::new(stream.try_clone().expect("clone matrix endpoint"));
+    let (mut attempt, mut writers, registry) = matrix_attempt(
+        destination,
+        mode,
+        spool,
+        &execution_id,
+        &leaf,
+        PromotionDisposition::NoReplace,
+    );
+    writers[0]
+        .file_mut()
+        .write_all(b"replacement")
+        .expect("write colliding artifact");
+    let artifact_id = writers[0].artifact_id().to_owned();
+    drop(writers);
+    attempt
+        .mark_ready(&artifact_id)
+        .expect("failure becomes ready");
+    let non_success = match attempt.publish(&registry, &ShutdownToken::detached()) {
+        Err(_) | Ok(None) => true,
+        Ok(Some(outcome)) => !outcome.is_complete(),
+    };
+    assert!(
+        non_success,
+        "ordinary collision must retain non-success truth"
+    );
+    drop(attempt);
+    let state = matrix_operator_proof(destination, mode, spool, &execution_id, &scenario);
+    matrix_send(
+        &mut stream,
+        &serde_json::json!({
+            "action": "recovery_ready",
+            "artifact_id": artifact_id,
+            "execution_id": execution_id,
+            "manifest_state": format!("{state:?}").to_ascii_lowercase(),
+            "scenario": scenario,
+            "schema": "clinker.filesystem-publication-control/1",
+        }),
+    );
+    matrix_wait(&mut reader, "purge", &scenario);
+    matrix_execute_purge(destination, mode, spool, &execution_id, &scenario);
+    matrix_send(
+        &mut stream,
+        &serde_json::json!({
+            "action": "purge_complete",
+            "scenario": scenario,
+            "schema": "clinker.filesystem-publication-control/1",
+        }),
+    );
+    matrix_wait(&mut reader, "finish", &scenario);
+    std::fs::remove_file(destination.join(leaf)).expect("remove preexisting final");
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_interruption(
+    destination: &Path,
+    mode: PublicationMode,
+    spool: Option<&Path>,
+    stage: &str,
+    index: u64,
+) {
+    let mode_name = match mode {
+        PublicationMode::Direct => "direct",
+        PublicationMode::LocalThenPublish => "local_then_publish",
+    };
+    let scenario = format!("interruption-{mode_name}-{stage}");
+    let execution_id = matrix_execution_id(index);
+    let leaf = format!("{scenario}.bin");
+    let mut stream = matrix_connection(destination, &scenario, mode);
+    let mut reader = BufReader::new(stream.try_clone().expect("clone matrix endpoint"));
+    let (mut attempt, mut writers, registry) = matrix_attempt(
+        destination,
+        mode,
+        spool,
+        &execution_id,
+        &leaf,
+        PromotionDisposition::Replace,
+    );
+    writers[0]
+        .file_mut()
+        .write_all(b"mounted interruption")
+        .expect("write interrupted artifact");
+    let artifact_id = writers[0].artifact_id().to_owned();
+    drop(writers);
+    attempt
+        .install_qualification_stage_control(
+            stream.try_clone().expect("clone qualification endpoint"),
+            Duration::from_secs(30),
+        )
+        .expect("install mounted interruption control");
+    let non_success = if matches!(stage, "copy" | "file_synchronization") {
+        attempt.mark_ready(&artifact_id).is_err()
+    } else {
+        match attempt
+            .mark_ready(&artifact_id)
+            .and_then(|()| attempt.publish(&registry, &ShutdownToken::detached()))
+        {
+            Err(_) | Ok(None) => true,
+            Ok(Some(outcome)) => !outcome.is_complete(),
+        }
+    };
+    assert!(
+        non_success,
+        "mounted disruption must retain non-success truth"
+    );
+    drop(attempt);
+    matrix_send(
+        &mut stream,
+        &serde_json::json!({
+            "action": "interruption_observed",
+            "scenario": scenario,
+            "schema": "clinker.filesystem-publication-control/1",
+        }),
+    );
+    matrix_wait(&mut reader, "recover", &scenario);
+    let state = matrix_operator_proof(destination, mode, spool, &execution_id, &scenario);
+    matrix_send(
+        &mut stream,
+        &serde_json::json!({
+            "action": "recovery_ready",
+            "artifact_id": artifact_id,
+            "execution_id": execution_id,
+            "manifest_state": format!("{state:?}").to_ascii_lowercase(),
+            "scenario": scenario,
+            "schema": "clinker.filesystem-publication-control/1",
+        }),
+    );
+    matrix_wait(&mut reader, "purge", &scenario);
+    matrix_execute_purge(destination, mode, spool, &execution_id, &scenario);
+    matrix_send(
+        &mut stream,
+        &serde_json::json!({
+            "action": "purge_complete",
+            "scenario": scenario,
+            "schema": "clinker.filesystem-publication-control/1",
+        }),
+    );
+    matrix_wait(&mut reader, "finish", &scenario);
+    if destination.join(&leaf).exists() {
+        std::fs::remove_file(destination.join(leaf)).expect("remove interrupted visible final");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_enospc(destination: &Path, index: u64) {
+    let scenario = "capacity-enospc";
+    let execution_id = matrix_execution_id(index);
+    let leaf = "capacity-enospc.bin";
+    let mut stream = matrix_connection(destination, scenario, PublicationMode::Direct);
+    let mut reader = BufReader::new(stream.try_clone().expect("clone matrix endpoint"));
+    let (attempt, mut writers, _registry) = matrix_attempt(
+        destination,
+        PublicationMode::Direct,
+        None,
+        &execution_id,
+        leaf,
+        PromotionDisposition::Replace,
+    );
+    let block = vec![0x5a; 1024 * 1024];
+    let mut observed = None;
+    for _ in 0..256 {
+        if let Err(error) = writers[0].file_mut().write_all(&block) {
+            observed = error.raw_os_error();
+            break;
+        }
+    }
+    if observed.is_none()
+        && let Err(error) = writers[0].file_mut().sync_all()
+    {
+        observed = error.raw_os_error();
+    }
+    assert_eq!(observed, Some(28), "mounted backing must return ENOSPC");
+    drop(writers);
+    drop(attempt);
+    assert!(!destination.join(leaf).exists());
+    let state = matrix_operator_proof(
+        destination,
+        PublicationMode::Direct,
+        None,
+        &execution_id,
+        scenario,
+    );
+    assert_eq!(state, AttemptState::Staging);
+    matrix_send(
+        &mut stream,
+        &serde_json::json!({
+            "action": "capacity_ready",
+            "artifact_id": "artifact-00000001",
+            "enospc_raw_os_error": 28,
+            "execution_id": execution_id,
+            "manifest_state": "staging",
+            "scenario": scenario,
+            "schema": "clinker.filesystem-publication-control/1",
+        }),
+    );
+    matrix_wait(&mut reader, "purge", scenario);
+    matrix_execute_purge(
+        destination,
+        PublicationMode::Direct,
+        None,
+        &execution_id,
+        scenario,
+    );
+    matrix_send(
+        &mut stream,
+        &serde_json::json!({
+            "action": "purge_complete",
+            "scenario": scenario,
+            "schema": "clinker.filesystem-publication-control/1",
+        }),
+    );
+    matrix_wait(&mut reader, "finish", scenario);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_filesystem_publication_matrix() {
+    let (Ok(profile), Ok(mount_root)) = (
+        std::env::var("CLINKER_FILESYSTEM_PROFILE"),
+        std::env::var("CLINKER_FILESYSTEM_ROOT"),
+    ) else {
+        return;
+    };
+    assert!(matches!(
+        profile.as_str(),
+        "linux-nfsv4.1-loopback-ci" | "linux-smb3.1.1-loopback-ci"
+    ));
+    let mount_root = PathBuf::from(mount_root);
+    let destination = mount_root.join(".clinker-publication-matrix");
+    std::fs::create_dir(&destination).expect("create mounted publication sandbox");
+    let spool = tempfile::tempdir().expect("local publication spool");
+
+    matrix_success(&destination, PublicationMode::Direct, None, 1);
+    matrix_success(
+        &destination,
+        PublicationMode::LocalThenPublish,
+        Some(spool.path()),
+        2,
+    );
+    matrix_ordinary_failure(&destination, PublicationMode::Direct, None, 3);
+    matrix_ordinary_failure(
+        &destination,
+        PublicationMode::LocalThenPublish,
+        Some(spool.path()),
+        4,
+    );
+
+    let mut index = 10;
+    for (mode, stages) in [
+        (
+            PublicationMode::Direct,
+            &[
+                "file_synchronization",
+                "rename",
+                "parent_directory_synchronization",
+            ][..],
+        ),
+        (
+            PublicationMode::LocalThenPublish,
+            &[
+                "copy",
+                "file_synchronization",
+                "rename",
+                "parent_directory_synchronization",
+            ][..],
+        ),
+    ] {
+        for stage in stages {
+            matrix_interruption(
+                &destination,
+                mode,
+                (mode == PublicationMode::LocalThenPublish).then_some(spool.path()),
+                stage,
+                index,
+            );
+            index += 1;
+        }
+    }
+    matrix_enospc(&destination, 30);
+    std::fs::remove_dir(&destination).expect("remove mounted publication sandbox");
+}
+
 fn stage_ready(
     attempt: &mut AttemptPublication,
     registry: &OutputStagingRegistry,
@@ -738,6 +1475,49 @@ fn injected_boundaries_leave_exact_non_success_state() {
         );
         assert_eq!(root.path().join("result.bin").exists(), final_visible);
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn quota_fault_is_an_explicit_seam_and_never_a_mounted_observation() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let registry = OutputStagingRegistry::default();
+    let mut attempt = begin(root.path());
+    let (artifact_id, mut file) = attempt
+        .stage_direct(
+            &registry,
+            validated(root.path(), "result.bin"),
+            "primary-output",
+            "result.bin",
+            PromotionDisposition::Replace,
+        )
+        .expect("stage artifact");
+    file.write_all(b"quota boundary").expect("write fixture");
+    drop(file);
+    attempt.set_fault_for_testing(AttemptFault::Quota);
+
+    let error = attempt
+        .mark_ready(&artifact_id)
+        .expect_err("quota seam must fail closed");
+    match error {
+        clinker_exec::output::attempt::AttemptError::Io { source, .. } => {
+            assert_eq!(source.raw_os_error(), Some(122));
+        }
+        other => panic!("quota seam returned the wrong error: {other}"),
+    }
+    let retained = AttemptManifest::read(attempt.manifest_path(), 1_000)
+        .expect("quota seam retains owner metadata");
+    assert_eq!(retained.state(), AttemptState::Staging);
+    assert_eq!(retained.artifacts()[0].state(), ArtifactState::Staging);
+    assert!(!root.path().join("result.bin").exists());
+}
+
+#[test]
+fn qualification_control_has_no_pipeline_configuration_route() {
+    let error =
+        ClinkerToml::parse("[storage.publication]\nqualification_control = \"control.sock\"\n")
+            .expect_err("qualification control must not be configurable");
+    assert!(error.to_string().contains("qualification_control"));
 }
 
 fn artifact(

@@ -260,6 +260,8 @@ implementation or fallback for these gates.
 cargo fmt --manifest-path tools/release-policy/Cargo.toml --all -- --check
 cargo clippy --manifest-path tools/release-policy/Cargo.toml --all-targets --locked --offline -- -D warnings
 cargo test --manifest-path tools/release-policy/Cargo.toml --locked --offline
+cargo test -p clinker --test attempt_publication --locked --offline
+cargo test -p clinker --test output_containment --locked --offline
 cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- workflow verify
 cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- boundary audit --scope rust-only --root .
 cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --offline -- filesystem self-test
@@ -268,6 +270,16 @@ cargo run --quiet --manifest-path tools/release-policy/Cargo.toml --locked --off
 Status: **Verified.** The Rust-only audit checks the real repository as well as
 negative fixtures, and the compatibility scripts perform one unchanged Rust
 delegation without carrying policy semantics.
+
+`filesystem self-test` validates the direct two-profile hosted-runner topology,
+including unconditional teardown followed by unconditional bounded evidence
+upload. Local tests validate the strict
+`clinker.filesystem-matrix-evidence/2` parser and reject legacy, unknown,
+missing, or truncated lifecycle, stage, capacity, operator, recovery,
+persistence, and teardown proof. Actual NFSv4.1/SMB3.1.1 interruption and
+mounted `ENOSPC` certification runs only in the privileged `filesystem-matrix`
+job; an ordinary local run cannot create positive support evidence. Injected
+`EDQUOT` remains non-qualifying seam coverage.
 
 The tag workflow builds and smoke-tests `clinker` and `cxl` on each native
 runner, then transfers only those exact executables to the Ubuntu assembly

@@ -15,6 +15,12 @@ use super::containment::{
 };
 use super::open::{containment_error, open_output, open_output_with_policy};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AttemptCommitStage {
+    Rename,
+    ParentDirectorySynchronization,
+}
+
 #[derive(Debug)]
 struct PendingOutput {
     name: String,
@@ -60,14 +66,24 @@ impl PendingStage {
         }
     }
 
-    fn publish(&mut self, fail_after_rename: bool) -> Result<(), ContainmentError> {
+    fn publish(
+        &mut self,
+        fail_after_rename: bool,
+        before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
+    ) -> Result<(), ContainmentError> {
         match self {
-            Self::DestinationLocal(staged) => staged.publish(fail_after_rename),
+            Self::DestinationLocal(staged) => {
+                staged.publish_with_sync_barrier(fail_after_rename, before_parent_directory_sync)
+            }
             Self::AttemptOwned {
                 reservation,
                 source,
                 ..
-            } => reservation.publish_from(source.clone(), fail_after_rename),
+            } => reservation.publish_from_with_sync_barrier(
+                source.clone(),
+                fail_after_rename,
+                before_parent_directory_sync,
+            ),
         }
     }
 
@@ -466,7 +482,14 @@ impl OutputStagingRegistry {
     /// Stops at the first failed promotion and reports every visible,
     /// unsynchronized, and unpublished path without attempting set rollback.
     pub fn commit_all(&self) -> Result<PublicationOutcome, PipelineError> {
-        self.commit_all_inner(None, None, None)
+        self.commit_all_inner(None, None, None, None)
+    }
+
+    pub(crate) fn commit_all_with_stage_control(
+        &self,
+        control: &mut dyn FnMut(usize, AttemptCommitStage) -> std::io::Result<()>,
+    ) -> Result<PublicationOutcome, PipelineError> {
+        self.commit_all_inner(None, None, None, Some(control))
     }
 
     pub(crate) fn commit_all_inner(
@@ -474,6 +497,7 @@ impl OutputStagingRegistry {
         fail_before_rename_at: Option<usize>,
         fail_after_rename_at: Option<usize>,
         fail_cleanup_at: Option<usize>,
+        mut control: Option<&mut dyn FnMut(usize, AttemptCommitStage) -> std::io::Result<()>>,
     ) -> Result<PublicationOutcome, PipelineError> {
         let pending = {
             let mut state = self
@@ -494,6 +518,14 @@ impl OutputStagingRegistry {
         let mut cleanup_debt = Vec::new();
         let mut index = 0_usize;
         while let Some(mut entry) = remaining.pop_front() {
+            if let Some(control) = control.as_deref_mut()
+                && let Err(error) = control(index, AttemptCommitStage::Rename)
+            {
+                remaining.push_front(entry);
+                self.restore_pending(remaining.into());
+                self.record_committed(&published, &visible_unsynchronized);
+                return Err(PipelineError::Io(error));
+            }
             if fail_before_rename_at == Some(index) {
                 remaining.push_front(entry);
                 let unpublished = partials_from(remaining.iter());
@@ -507,7 +539,14 @@ impl OutputStagingRegistry {
                     error: "injected failure before destination rename".to_owned(),
                 });
             }
-            match entry.staged.publish(fail_after_rename_at == Some(index)) {
+            let mut before_parent_directory_sync = || match control.as_deref_mut() {
+                Some(control) => control(index, AttemptCommitStage::ParentDirectorySynchronization),
+                None => Ok(()),
+            };
+            match entry.staged.publish(
+                fail_after_rename_at == Some(index),
+                Some(&mut before_parent_directory_sync),
+            ) {
                 Ok(()) => {
                     let identity = (entry.name.clone(), entry.final_path.clone());
                     if let Err(error) = entry
@@ -587,7 +626,7 @@ impl OutputStagingRegistry {
         &self,
         fail_after_rename_at: usize,
     ) -> Result<PublicationOutcome, PipelineError> {
-        self.commit_all_inner(None, Some(fail_after_rename_at), None)
+        self.commit_all_inner(None, Some(fail_after_rename_at), None, None)
     }
 
     #[cfg(test)]
@@ -595,7 +634,7 @@ impl OutputStagingRegistry {
         &self,
         fail_before_rename_at: usize,
     ) -> Result<PublicationOutcome, PipelineError> {
-        self.commit_all_inner(Some(fail_before_rename_at), None, None)
+        self.commit_all_inner(Some(fail_before_rename_at), None, None, None)
     }
 
     #[cfg(test)]
@@ -603,7 +642,7 @@ impl OutputStagingRegistry {
         &self,
         fail_cleanup_at: usize,
     ) -> Result<PublicationOutcome, PipelineError> {
-        self.commit_all_inner(None, None, Some(fail_cleanup_at))
+        self.commit_all_inner(None, None, Some(fail_cleanup_at), None)
     }
 
     /// Publish the ledger only for a complete, non-interrupted execution.

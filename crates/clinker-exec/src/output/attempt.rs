@@ -1,11 +1,15 @@
 //! Destination-owned attempt manifests and finite artifact publication.
 
 use std::collections::BTreeMap;
+#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
 use std::fs::File;
-use std::io::{Read, Seek, Write};
+use std::io::{BufReader, Read, Seek, Write};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clinker_plan::config::{DestinationProfile, PublicationMode, ResolvedPublicationPolicy};
 use clinker_plan::error::PipelineError;
@@ -19,7 +23,7 @@ use super::containment::{
     AnchoredDirectory, ContainedEntryKind, ContainmentError, OutputContainment,
     PromotionDisposition,
 };
-use super::staging::{OutputStagingRegistry, PublicationOutcome};
+use super::staging::{AttemptCommitStage, OutputStagingRegistry, PublicationOutcome};
 use crate::pipeline::shutdown::ShutdownToken;
 
 const MANIFEST_SCHEMA: &str = "clinker.attempt-manifest/v1";
@@ -525,6 +529,7 @@ impl AttemptManifest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttemptFault {
     Write,
+    Quota,
     Copy,
     FileSync,
     DestinationFileSync,
@@ -534,15 +539,125 @@ pub enum AttemptFault {
     DirectorySync,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AttemptTestStage {
+    Copy,
+    FileSynchronization,
+    Rename,
+    ParentDirectorySynchronization,
     CompleteBeforeCleanup,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttemptTestEvent {
     pub execution_id: String,
+    pub artifact_id: String,
+    pub publication_mode: PublicationMode,
     pub stage: AttemptTestStage,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AttemptControlMessage {
+    schema: String,
+    action: String,
+    execution_id: String,
+    artifact_id: String,
+    publication_mode: PublicationMode,
+    stage: AttemptTestStage,
+}
+
+#[cfg(target_os = "linux")]
+struct QualificationStageControl {
+    writer: UnixStream,
+    reader: BufReader<UnixStream>,
+    seen: BTreeSet<(String, AttemptTestStage)>,
+}
+
+#[cfg(target_os = "linux")]
+impl QualificationStageControl {
+    fn new(stream: UnixStream, timeout: Duration) -> Result<Self, AttemptError> {
+        if timeout.is_zero() || timeout > Duration::from_secs(30) {
+            return Err(AttemptError::QualificationControl(
+                "qualification control timeout is outside its bound",
+            ));
+        }
+        stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|()| stream.set_write_timeout(Some(timeout)))
+            .map_err(|_| {
+                AttemptError::QualificationControl("qualification control timeout setup failed")
+            })?;
+        let reader = BufReader::new(stream.try_clone().map_err(|_| {
+            AttemptError::QualificationControl("qualification control endpoint clone failed")
+        })?);
+        Ok(Self {
+            writer: stream,
+            reader,
+            seen: BTreeSet::new(),
+        })
+    }
+
+    fn await_release(&mut self, event: AttemptTestEvent) -> Result<(), AttemptError> {
+        if !self.seen.insert((event.artifact_id.clone(), event.stage)) {
+            return Err(AttemptError::QualificationControl(
+                "qualification control stage was emitted more than once",
+            ));
+        }
+        let ready = AttemptControlMessage {
+            schema: "clinker.attempt-stage-control/v1".to_owned(),
+            action: "stage_ready".to_owned(),
+            execution_id: event.execution_id.clone(),
+            artifact_id: event.artifact_id.clone(),
+            publication_mode: event.publication_mode,
+            stage: event.stage,
+        };
+        serde_json::to_writer(&mut self.writer, &ready).map_err(|_| {
+            AttemptError::QualificationControl("qualification stage-ready encoding failed")
+        })?;
+        self.writer
+            .write_all(b"\n")
+            .and_then(|()| self.writer.flush())
+            .map_err(|_| {
+                AttemptError::QualificationControl("qualification stage-ready delivery failed")
+            })?;
+
+        let mut encoded = Vec::new();
+        loop {
+            if encoded.len() == 4_096 {
+                return Err(AttemptError::QualificationControl(
+                    "qualification release exceeds its byte bound",
+                ));
+            }
+            let mut byte = [0_u8; 1];
+            self.reader.read_exact(&mut byte).map_err(|_| {
+                AttemptError::QualificationControl(
+                    "qualification release was missing or exceeded its deadline",
+                )
+            })?;
+            if byte[0] == b'\n' {
+                break;
+            }
+            encoded.push(byte[0]);
+        }
+        let release: AttemptControlMessage = serde_json::from_slice(&encoded).map_err(|_| {
+            AttemptError::QualificationControl("qualification release is malformed")
+        })?;
+        if release.schema != ready.schema
+            || release.action != "release"
+            || release.execution_id != ready.execution_id
+            || release.artifact_id != ready.artifact_id
+            || release.publication_mode != ready.publication_mode
+            || release.stage != ready.stage
+        {
+            return Err(AttemptError::QualificationControl(
+                "qualification release does not match the exact stage identity",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2693,6 +2808,8 @@ pub struct AttemptPublication {
     terminal: bool,
     fault: Option<AttemptFault>,
     test_hook: Option<Box<dyn FnOnce(AttemptTestEvent) + Send>>,
+    #[cfg(target_os = "linux")]
+    qualification_stage_control: Option<QualificationStageControl>,
 }
 
 /// Cloneable run edge that keeps one [`AttemptPublication`] shared by the CLI
@@ -2871,6 +2988,8 @@ impl AttemptPublication {
             terminal: false,
             fault: None,
             test_hook: None,
+            #[cfg(target_os = "linux")]
+            qualification_stage_control: None,
         };
         publication.persist_manifest(false)?;
         Ok(publication)
@@ -3362,11 +3481,22 @@ impl AttemptPublication {
         let copied_from_local = runtime.copied_from_local;
 
         let local_path = local_source.as_path();
+        #[cfg(unix)]
+        if self.fault == Some(AttemptFault::Quota) {
+            return Err(AttemptError::Io {
+                operation: "sync staged artifact",
+                path: local_path.to_path_buf(),
+                source: std::io::Error::from_raw_os_error(libc::EDQUOT),
+            });
+        }
         let mut local_file = File::open(local_path).map_err(|source| AttemptError::Io {
             operation: "open staged artifact",
             path: local_path.to_path_buf(),
             source,
         })?;
+        if !copied_from_local {
+            self.await_qualification_release(artifact_id, AttemptTestStage::FileSynchronization)?;
+        }
         if self.fault == Some(AttemptFault::FileSync) {
             return Err(AttemptError::Injected("artifact file sync"));
         }
@@ -3384,6 +3514,7 @@ impl AttemptPublication {
             })?
             .len();
         let (size_bytes, digest) = if copied_from_local {
+            self.await_qualification_release(artifact_id, AttemptTestStage::Copy)?;
             if self.fault == Some(AttemptFault::Copy) {
                 return Err(AttemptError::Injected("artifact copy"));
             }
@@ -3429,6 +3560,7 @@ impl AttemptPublication {
                         source,
                     })?;
             }
+            self.await_qualification_release(artifact_id, AttemptTestStage::FileSynchronization)?;
             if self.fault == Some(AttemptFault::DestinationFileSync) {
                 return Err(AttemptError::Injected(
                     "destination quarantine artifact sync",
@@ -3531,10 +3663,54 @@ impl AttemptPublication {
         let mut publishing = self.manifest.clone();
         publishing.state = AttemptState::Publishing;
         self.persist_replacement(publishing, false)?;
+        let mode = self.publication_mode();
+        let execution_id = self.execution_id.clone();
+        let artifact_ids = self
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_id.clone())
+            .collect::<Vec<_>>();
         let outcome_result = match self.fault {
-            Some(AttemptFault::BeforeRename) => registry.commit_all_inner(Some(0), None, None),
-            Some(AttemptFault::DirectorySync) => registry.commit_all_inner(None, Some(0), None),
-            _ => registry.commit_all(),
+            Some(AttemptFault::BeforeRename) => {
+                registry.commit_all_inner(Some(0), None, None, None)
+            }
+            Some(AttemptFault::DirectorySync) => {
+                registry.commit_all_inner(None, Some(0), None, None)
+            }
+            _ => {
+                #[cfg(target_os = "linux")]
+                if self.qualification_stage_control.is_some() {
+                    let control = &mut self.qualification_stage_control;
+                    let mut barrier = |index: usize, stage: AttemptCommitStage| {
+                        let artifact_id = artifact_ids.get(index).ok_or_else(|| {
+                            std::io::Error::other(
+                                "qualification stage referenced an unknown artifact",
+                            )
+                        })?;
+                        let stage = match stage {
+                            AttemptCommitStage::Rename => AttemptTestStage::Rename,
+                            AttemptCommitStage::ParentDirectorySynchronization => {
+                                AttemptTestStage::ParentDirectorySynchronization
+                            }
+                        };
+                        control
+                            .as_mut()
+                            .expect("control presence was checked")
+                            .await_release(AttemptTestEvent {
+                                execution_id: execution_id.clone(),
+                                artifact_id: artifact_id.clone(),
+                                publication_mode: mode,
+                                stage,
+                            })
+                            .map_err(|error| std::io::Error::other(error.to_string()))
+                    };
+                    registry.commit_all_with_stage_control(&mut barrier)
+                } else {
+                    registry.commit_all()
+                }
+                #[cfg(not(target_os = "linux"))]
+                registry.commit_all()
+            }
         };
         let outcome = match outcome_result {
             Ok(outcome) => outcome,
@@ -3578,9 +3754,20 @@ impl AttemptPublication {
         self.persist_replacement(finished, false)?;
         self.terminal = true;
         if outcome.is_complete() {
+            for artifact_id in artifact_ids {
+                self.await_qualification_release(
+                    &artifact_id,
+                    AttemptTestStage::CompleteBeforeCleanup,
+                )?;
+            }
             if let Some(hook) = self.test_hook.take() {
                 hook(AttemptTestEvent {
                     execution_id: self.execution_id.clone(),
+                    artifact_id: self
+                        .artifacts
+                        .first()
+                        .map_or_else(String::new, |artifact| artifact.artifact_id.clone()),
+                    publication_mode: mode,
                     stage: AttemptTestStage::CompleteBeforeCleanup,
                 });
             }
@@ -3762,6 +3949,54 @@ impl AttemptPublication {
         self.test_hook = Some(Box::new(hook));
     }
 
+    /// Install the Linux-local qualification endpoint used by the mounted
+    /// filesystem harness. Ordinary CLI and pipeline configuration have no
+    /// route to this explicit test-support API.
+    #[cfg(target_os = "linux")]
+    #[doc(hidden)]
+    pub fn install_qualification_stage_control(
+        &mut self,
+        stream: UnixStream,
+        timeout: Duration,
+    ) -> Result<(), AttemptError> {
+        if self.qualification_stage_control.is_some() {
+            return Err(AttemptError::QualificationControl(
+                "qualification control is already installed",
+            ));
+        }
+        self.qualification_stage_control = Some(QualificationStageControl::new(stream, timeout)?);
+        Ok(())
+    }
+
+    fn publication_mode(&self) -> PublicationMode {
+        self.policy
+            .as_ref()
+            .map_or(PublicationMode::Direct, ResolvedPublicationPolicy::mode)
+    }
+
+    fn await_qualification_release(
+        &mut self,
+        artifact_id: &str,
+        stage: AttemptTestStage,
+    ) -> Result<(), AttemptError> {
+        #[cfg(target_os = "linux")]
+        if self.qualification_stage_control.is_some() {
+            let publication_mode = self.publication_mode();
+            let control = self
+                .qualification_stage_control
+                .as_mut()
+                .expect("control presence was checked");
+            return control.await_release(AttemptTestEvent {
+                execution_id: self.execution_id.clone(),
+                artifact_id: artifact_id.to_owned(),
+                publication_mode,
+                stage,
+            });
+        }
+        let _ = (artifact_id, stage);
+        Ok(())
+    }
+
     fn persist_replacement(
         &mut self,
         manifest: AttemptManifest,
@@ -3837,6 +4072,8 @@ pub enum AttemptError {
     InvalidContinuation(&'static str),
     #[error("injected attempt publication failure at {0}")]
     Injected(&'static str),
+    #[error("qualification publication control failed: {0}")]
+    QualificationControl(&'static str),
     #[error("artifact destination collision between producers {first:?} and {second:?}")]
     RegistrationCollision { first: String, second: String },
     #[error(

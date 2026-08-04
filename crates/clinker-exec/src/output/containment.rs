@@ -579,6 +579,16 @@ impl OutputContainment {
         disposition: PromotionDisposition,
         fail_after_rename: bool,
     ) -> Result<(), ContainmentError> {
+        self.promote_from_with_sync_barrier(source, disposition, fail_after_rename, None)
+    }
+
+    pub(crate) fn promote_from_with_sync_barrier(
+        &self,
+        source: ValidatedPath,
+        disposition: PromotionDisposition,
+        fail_after_rename: bool,
+        before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
+    ) -> Result<(), ContainmentError> {
         let source_path = absolute_path(source.as_path())?;
         let source_leaf = normal_leaf(&source_path)?;
         let source_parent_path = source_path.parent().ok_or_else(|| {
@@ -597,6 +607,7 @@ impl OutputContainment {
             &source_path,
             self.destination.as_path(),
             fail_after_rename,
+            before_parent_directory_sync,
         )
     }
 }
@@ -640,6 +651,14 @@ impl StagedOutput {
     }
 
     pub(crate) fn publish(&mut self, fail_after_rename: bool) -> Result<(), ContainmentError> {
+        self.publish_with_sync_barrier(fail_after_rename, None)
+    }
+
+    pub(crate) fn publish_with_sync_barrier(
+        &mut self,
+        fail_after_rename: bool,
+        before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
+    ) -> Result<(), ContainmentError> {
         let result = self.destination.parent.promote(
             &self.destination.parent,
             &self.quarantine_leaf,
@@ -648,6 +667,7 @@ impl StagedOutput {
             &self.quarantine_path,
             self.destination.destination.as_path(),
             fail_after_rename,
+            before_parent_directory_sync,
         );
         match result {
             Ok(()) => self.state = PublicationState::Published,
@@ -759,13 +779,18 @@ impl AttemptDestinationReservation {
         Ok(())
     }
 
-    pub(crate) fn publish_from(
+    pub(crate) fn publish_from_with_sync_barrier(
         &self,
         source: ValidatedPath,
         fail_after_rename: bool,
+        before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
     ) -> Result<(), ContainmentError> {
-        self.destination
-            .promote_from_with_sync_fault(source, self.disposition, fail_after_rename)
+        self.destination.promote_from_with_sync_barrier(
+            source,
+            self.disposition,
+            fail_after_rename,
+            before_parent_directory_sync,
+        )
     }
 
     pub(crate) fn finalize_with_cleanup_fault(
@@ -1303,6 +1328,7 @@ mod platform {
             source_path: &Path,
             destination_path: &Path,
             fail_after_rename: bool,
+            before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
         ) -> Result<(), ContainmentError> {
             let source_fd: OwnedFd = openat(
                 &source_parent.file,
@@ -1341,6 +1367,14 @@ mod platform {
             }
             .map_err(|error| nix_io("atomic-promotion", destination_path, error))?;
 
+            if let Some(before_parent_directory_sync) = before_parent_directory_sync {
+                before_parent_directory_sync().map_err(|source| {
+                    ContainmentError::VisibleButUnsynced {
+                        path: destination_path.to_path_buf(),
+                        source,
+                    }
+                })?;
+            }
             if fail_after_rename {
                 return Err(ContainmentError::VisibleButUnsynced {
                     path: destination_path.to_path_buf(),
@@ -1848,6 +1882,7 @@ mod platform {
             source_path: &Path,
             destination_path: &Path,
             fail_after_rename: bool,
+            before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
         ) -> Result<(), ContainmentError> {
             let source_leaf = c_string(source_leaf, source_path)?;
             let destination_leaf = c_string(destination_leaf, destination_path)?;
@@ -1901,6 +1936,14 @@ mod platform {
                     destination_path,
                     std::io::Error::last_os_error(),
                 ));
+            }
+            if let Some(before_parent_directory_sync) = before_parent_directory_sync {
+                before_parent_directory_sync().map_err(|source| {
+                    ContainmentError::VisibleButUnsynced {
+                        path: destination_path.to_path_buf(),
+                        source,
+                    }
+                })?;
             }
             if fail_after_rename {
                 return Err(ContainmentError::VisibleButUnsynced {
@@ -2386,6 +2429,7 @@ mod platform {
             source_path: &Path,
             destination_path: &Path,
             fail_after_rename: bool,
+            before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
         ) -> Result<(), ContainmentError> {
             let source_handle = open_file_at(
                 &source_parent.handle,
@@ -2455,6 +2499,14 @@ mod platform {
                         RtlNtStatusToDosError(status) as i32
                     }),
                 ));
+            }
+            if let Some(before_parent_directory_sync) = before_parent_directory_sync {
+                before_parent_directory_sync().map_err(|source| {
+                    ContainmentError::VisibleButUnsynced {
+                        path: destination_path.to_path_buf(),
+                        source,
+                    }
+                })?;
             }
             if fail_after_rename {
                 return Err(ContainmentError::VisibleButUnsynced {
@@ -2880,6 +2932,7 @@ mod platform {
             _source_path: &Path,
             _destination_path: &Path,
             _fail_after_rename: bool,
+            _before_parent_directory_sync: Option<&mut dyn FnMut() -> std::io::Result<()>>,
         ) -> Result<(), ContainmentError> {
             Err(ContainmentError::PolicyRequired {
                 profile: "local-filesystem".to_owned(),
