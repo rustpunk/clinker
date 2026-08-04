@@ -812,6 +812,29 @@ mod tests {
     }
 
     #[test]
+    fn local_publication_profile_rejects_detected_share_before_attempt_creation() {
+        let destination = tempfile::tempdir().unwrap();
+        let attempt_root = destination.path().join(".clinker-attempts");
+        let policy = PublicationPolicy::default();
+
+        let error = policy
+            .resolve_for_fs_kind(destination.path(), FsKind::Network, 1, u64::MAX)
+            .expect_err("local profile must reject a detected share");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("destination_profile"), "{rendered}");
+        assert!(
+            rendered.contains("destination_profile = \"nfs_v4_1\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("destination_profile = \"smb_3_1_1\""),
+            "{rendered}"
+        );
+        assert!(!attempt_root.exists());
+    }
+
+    #[test]
     fn missing_clinker_toml_yields_defaults() {
         let empty = tempfile::tempdir().unwrap();
         let doc = ClinkerToml::load_from_workspace(empty.path()).unwrap();
