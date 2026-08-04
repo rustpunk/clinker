@@ -1,6 +1,9 @@
-# Validation & Dry Run
+# Validation and Admission
 
-Clinker provides two levels of pre-flight validation so you can catch problems before committing to a full run.
+`clinker-plan` is the authority that admits a pipeline to execution. A pipeline
+is executable only after the planner has parsed canonical YAML, bound schemas
+and compositions, type-checked Clinker Expression Language (CXL), and produced
+a `CompiledPlan`.
 
 ## Compile validation
 
@@ -8,74 +11,62 @@ Clinker provides two levels of pre-flight validation so you can catch problems b
 clinker run pipeline.yaml --dry-run
 ```
 
-This validates everything that can be checked without reading data:
+This validates everything that can be checked without processing records:
 
 - YAML structure and required fields
 - CXL syntax and compile-time type checking
 - Schema compatibility between connected nodes
-- DAG wiring (no cycles, no dangling inputs, no missing nodes)
+- DAG wiring (no cycles, dangling inputs, or missing nodes)
 - Plan-time source and output configuration gates
 
-No records are read and no output files are created. Bare `--dry-run` does not
-perform runtime source discovery or require an input file to be readable.
-Planning may still inspect available file metadata or evaluate matchers for
-cost estimates. The command exits with code 0 on success or code 1 with a
-diagnostic message on failure.
+No runtime readers are opened and no output files are created. Planning may
+inspect available file metadata or evaluate matchers for cost estimates. The
+command exits with code 0 when the planner admits the pipeline and code 1 for a
+configuration, schema, or plan diagnostic. Admission does not prove that later
+input decoding or I/O will succeed.
 
-**Use this after every YAML edit.** It runs in milliseconds and catches the majority of configuration mistakes.
-
-## Record preview
-
-```bash
-clinker run pipeline.yaml --dry-run -n 10
-```
-
-This reads the first 10 records from each source and processes them through the full pipeline -- transforms, aggregations, routing, and output formatting. Results are printed to stdout.
-
-The record preview exercises the runtime evaluation path, catching issues that compile validation cannot:
-
-- CXL expressions that are syntactically valid but fail at runtime (e.g., calling a string method on an integer)
-- Data format mismatches between the declared schema and actual file contents
-- Unexpected null values in required fields
-
-### Save preview to file
-
-```bash
-clinker run pipeline.yaml --dry-run -n 100 --dry-run-output preview.csv
-```
-
-The output format matches what the pipeline's output node would produce, so `preview.csv` shows you exactly what the full run will write.
-
-## Recommended workflow
-
-Use both validation levels in sequence before every production run:
-
-1. **`--dry-run`** -- catch configuration and type errors instantly.
-2. **`--dry-run -n 10`** -- verify output shape and values against real data.
-3. **Full run** -- execute with confidence.
-
-This three-step pattern is especially valuable when:
-
-- Editing CXL expressions in transform or aggregate nodes
-- Changing source schemas or swapping input files
-- Adding or removing nodes from the pipeline DAG
-- Modifying route conditions
-
-## Combining with explain
-
-You can also inspect the execution plan before running:
+Use `--explain` for the same compile-time checks plus a rendered plan:
 
 ```bash
 clinker run pipeline.yaml --explain
 ```
 
-This shows the DAG structure, parallelism strategy, and node ordering without reading any data. See [Explain Plans](explain.md) for details.
+See [Explain Plans](explain.md) for text, JSON, and DOT plan output.
 
-The typical full pre-flight sequence is:
+## Preview options are not yet a bounded preview
 
-```bash
-clinker run pipeline.yaml --explain          # inspect the DAG
-clinker run pipeline.yaml --dry-run          # validate the compiled plan
-clinker run pipeline.yaml --dry-run -n 10    # preview with data
-clinker run pipeline.yaml --force            # run for real
-```
+The CLI accepts `--dry-run -n N` and `--dry-run-output PATH`, but those options
+are not currently wired to a bounded preview. Supplying `-n` proceeds through
+the ordinary execution path instead of enforcing a record limit, and
+`--dry-run-output` is parsed without redirecting preview output.
+
+Do not use either option to protect a production destination. Until bounded
+preview is implemented and tested, run representative data with an explicitly
+isolated destination you can inspect.
+
+## Advisory workspace schema analysis
+
+`clinker-schema` is a separate advisory authoring library. It is not called by
+`clinker run`, and its warnings cannot admit or reject execution. Its coverage
+is narrower than the planner's:
+
+- It discovers external `.schema.yaml` files and scans pipeline text for simple
+  `schema:` references instead of parsing pipelines through the canonical YAML
+  boundary.
+- It checks linked source formats and uses a conservative text heuristic for
+  field references in Transform CXL. It does not reproduce planner name
+  resolution, schema flow, composition binding, or type checking.
+- Inline, generated, multi-record, or otherwise unlinked schemas are skipped.
+- Discovery reports schema parse/read failures separately, while unsupported
+  pipeline analysis can yield no advisory findings.
+
+A tool presenting these results must distinguish **analyzed**, **partial**,
+**skipped**, and **failed** coverage rather than treating silence as success.
+
+## Recommended workflow
+
+1. Run `clinker run pipeline.yaml --dry-run` for planner admission.
+2. Use `--explain` when you also want to inspect the compiled DAG.
+3. Run representative data against an isolated destination and inspect it.
+4. Run the full job only after checking the representative result and
+   destination policy.

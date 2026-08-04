@@ -11,11 +11,12 @@
 //! - Non-null sentinel: 0x01
 //! - Integer: sign-flipped big-endian i64 (8 bytes)
 //! - Float: IEEE-to-signed reinterpretation, big-endian (8 bytes)
-//! - String: UTF-8 bytes + 0x00 terminator
+//! - String: UTF-8 bytes with escaped NULs + a two-byte terminator
 //! - Bool: 0x00 (false) or 0x01 (true)
 //! - Date: sign-flipped big-endian i32 days since Unix epoch (4 bytes)
 //! - DateTime: sign-flipped big-endian i128 nanoseconds since Unix epoch (16 bytes)
-//! - Descending: XOR all segment bytes with 0xFF
+//! - Descending: XOR encoded value bytes with 0xFF; null placement remains
+//!   exactly as authored
 
 use std::cmp::Ordering;
 
@@ -24,11 +25,124 @@ use clinker_record::{Record, Value};
 
 use clinker_plan::config::{NullOrder, SortField, SortOrder};
 
+/// Compare two records using only the fields, directions, and null placement
+/// the author declared.
+///
+/// Returning [`Ordering::Equal`] is intentional when every authored key is
+/// equal. Callers use stable sorting/merge metadata to preserve arrival order;
+/// source identity, filenames, hashes, and other undeclared values never enter
+/// this comparison.
+pub fn compare_authored_keys(a: &Record, b: &Record, sort_by: &[SortField]) -> Ordering {
+    for field in sort_by {
+        let ordering = compare_authored_values_with_nulls(
+            a.get(&field.field),
+            b.get(&field.field),
+            field.order,
+            field.null_order.unwrap_or(NullOrder::Last),
+        );
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Build the memcomparable form of exactly the authored key.
+///
+/// The returned bytes contain no identity tie-breaker. For values admitted by
+/// one resolved sort field, lexicographic byte comparison matches
+/// [`compare_authored_keys`].
+pub fn stable_sort_key_for_record(record: &Record, sort_by: &[SortField]) -> Vec<u8> {
+    encode_sort_key(record, sort_by)
+}
+
+/// Compare optional record values under one authored direction/null rule.
+pub fn compare_authored_values_with_nulls(
+    a: Option<&Value>,
+    b: Option<&Value>,
+    order: SortOrder,
+    null_order: NullOrder,
+) -> Ordering {
+    let a_null = a.is_none() || a.is_some_and(Value::is_null);
+    let b_null = b.is_none() || b.is_some_and(Value::is_null);
+
+    match (a_null, b_null) {
+        (true, true) => Ordering::Equal,
+        (true, false) => match null_order {
+            NullOrder::First => Ordering::Less,
+            NullOrder::Last | NullOrder::Drop => Ordering::Greater,
+        },
+        (false, true) => match null_order {
+            NullOrder::First => Ordering::Greater,
+            NullOrder::Last | NullOrder::Drop => Ordering::Less,
+        },
+        (false, false) => {
+            let (Some(a), Some(b)) = (a, b) else {
+                return Ordering::Equal;
+            };
+            let base = compare_authored_values(a, b);
+            match order {
+                SortOrder::Asc => base,
+                SortOrder::Desc => base.reverse(),
+            }
+        }
+    }
+}
+
+/// Compare two non-null values with the executor's authored-sort semantics.
+pub fn compare_authored_values(a: &Value, b: &Value) -> Ordering {
+    match (a, b) {
+        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Value::Integer(x), Value::Float(y)) => compare_i64_to_f64(*x, *y),
+        (Value::Float(x), Value::Integer(y)) => compare_i64_to_f64(*y, *x).reverse(),
+        (Value::Decimal(x), Value::Decimal(y)) => x.cmp(y),
+        (Value::Decimal(x), Value::Integer(y)) => x.cmp(&rust_decimal::Decimal::from(*y)),
+        (Value::Integer(x), Value::Decimal(y)) => rust_decimal::Decimal::from(*x).cmp(y),
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
+        (Value::DateTime(x), Value::DateTime(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        // Planning resolves one type per authored field. A mismatched runtime
+        // pair is handled by the existing schema/type boundary; keep ordering
+        // stable here rather than inventing a cross-type hierarchy.
+        _ => Ordering::Equal,
+    }
+}
+
+fn compare_i64_to_f64(integer: i64, float: f64) -> Ordering {
+    if float.is_nan() {
+        return Ordering::Equal;
+    }
+    if float >= 9_223_372_036_854_775_808.0 {
+        return Ordering::Less;
+    }
+    if float < i64::MIN as f64 {
+        return Ordering::Greater;
+    }
+
+    let truncated = float.trunc() as i64;
+    match integer.cmp(&truncated) {
+        Ordering::Equal if float.fract().is_sign_positive() && float.fract() != 0.0 => {
+            Ordering::Less
+        }
+        Ordering::Equal if float.fract().is_sign_negative() && float.fract() != 0.0 => {
+            Ordering::Greater
+        }
+        ordering => ordering,
+    }
+}
+
 /// Encode a record's sort fields as a memcomparable byte sequence.
 pub fn encode_sort_key(record: &Record, sort_by: &[SortField]) -> Vec<u8> {
     let mut key = Vec::with_capacity(sort_by.len() * 10);
+    encode_sort_key_into(record, sort_by, &mut key);
+    key
+}
+
+fn encode_sort_key_into(record: &Record, sort_by: &[SortField], key: &mut Vec<u8>) {
+    key.clear();
     for sf in sort_by {
-        let start = key.len();
         let null_order = sf.null_order.unwrap_or(NullOrder::Last);
         match record.get(&sf.field) {
             None | Some(Value::Null) => {
@@ -39,16 +153,16 @@ pub fn encode_sort_key(record: &Record, sort_by: &[SortField]) -> Vec<u8> {
             }
             Some(value) => {
                 key.push(0x01); // non-null sentinel
-                encode_value(value, &mut key);
-            }
-        }
-        if sf.order == SortOrder::Desc {
-            for byte in &mut key[start..] {
-                *byte ^= 0xFF;
+                let value_start = key.len();
+                encode_value(value, key);
+                if sf.order == SortOrder::Desc {
+                    for byte in &mut key[value_start..] {
+                        *byte ^= 0xFF;
+                    }
+                }
             }
         }
     }
-    key
 }
 
 fn encode_value(value: &Value, buf: &mut Vec<u8>) {
@@ -68,8 +182,16 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
         }
         Value::Decimal(d) => encode_decimal_order(*d, buf),
         Value::String(s) => {
-            buf.extend_from_slice(s.as_bytes());
-            buf.push(0x00); // null terminator
+            // Zero-escape plus a two-byte terminator makes compound keys
+            // prefix-free even when a user string contains an embedded NUL.
+            for byte in s.bytes() {
+                if byte == 0 {
+                    buf.extend_from_slice(&[0x00, 0xFF]);
+                } else {
+                    buf.push(byte);
+                }
+            }
+            buf.extend_from_slice(&[0x00, 0x00]);
         }
         Value::Date(d) => {
             let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
@@ -384,28 +506,7 @@ impl SortKeyEncoder {
     /// the `Vec`. This is the streaming-aggregator hot path's
     /// contract with the sort-key layer.
     pub fn encode_into(&self, record: &Record, out: &mut Vec<u8>) {
-        out.clear();
-        for sf in &self.sort_by {
-            let start = out.len();
-            let null_order = sf.null_order.unwrap_or(NullOrder::Last);
-            match record.get(&sf.field) {
-                None | Some(Value::Null) => {
-                    out.push(match null_order {
-                        NullOrder::First => 0x00,
-                        NullOrder::Last | NullOrder::Drop => 0x02,
-                    });
-                }
-                Some(value) => {
-                    out.push(0x01);
-                    encode_value(value, out);
-                }
-            }
-            if sf.order == SortOrder::Desc {
-                for byte in &mut out[start..] {
-                    *byte ^= 0xFF;
-                }
-            }
-        }
+        encode_sort_key_into(record, &self.sort_by, out);
     }
 
     /// Compare two pre-encoded sort keys.

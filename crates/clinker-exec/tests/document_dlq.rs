@@ -201,7 +201,7 @@ fn multiple_failing_records_all_accounted_for() {
     }
     // Every source row 1..=5 appears exactly once across all entries: no row
     // is dropped and none is double-counted.
-    let mut rows: Vec<u64> = dlq_entries.iter().map(|e| e.source_row).collect();
+    let mut rows: Vec<u64> = dlq_entries.iter().map(|e| e.source_row.ordinal()).collect();
     rows.sort_unstable();
     assert_eq!(
         rows,
@@ -241,6 +241,91 @@ fn clean_documents_stream_through() {
         "no record of the rejected document A reaches the sink"
     );
     assert_eq!(dlq_entries.len(), 3);
+}
+
+#[test]
+fn declared_source_type_failure_rejects_whole_document() {
+    let yaml = r#"
+pipeline:
+  name: declared_type_document_dlq
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      glob: ./*.csv
+      dlq_granularity: document
+      files:
+        on_no_match: skip
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: int }
+  - type: output
+    name: out
+    input: events
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+    let config = parse_config(yaml).expect("parse declared-type document-DLQ pipeline");
+    let plan = config
+        .compile(&CompileContext::default())
+        .expect("compile declared-type document-DLQ pipeline");
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+        "events".to_string(),
+        clinker_exec::executor::SourceInput::Files(vec![FileSlot::new(
+            PathBuf::from("typed.csv"),
+            Box::new(Cursor::new(
+                b"id,value\na1,100\na2,not-an-int\na3,300\n".to_vec(),
+            )),
+        )]),
+    )]);
+    let output = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(output.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let report = PipelineExecutor::run_plan_with_readers_writers(
+        &plan,
+        readers,
+        writers,
+        &PipelineRunParams {
+            execution_id: "declared-type-doc".to_string(),
+            batch_id: "batch".to_string(),
+            ..Default::default()
+        },
+    )
+    .expect("run declared-type document-DLQ pipeline");
+
+    assert_eq!(report.counters.ok_count, 0);
+    assert_eq!(report.counters.records_written, 0);
+    assert_eq!(report.counters.dlq_count, 3);
+    assert!(output.as_string().lines().skip(1).all(str::is_empty));
+    assert_eq!(report.dlq_entries.len(), 3);
+    let trigger = report
+        .dlq_entries
+        .iter()
+        .find(|entry| entry.trigger)
+        .expect("declared type failure is the document trigger");
+    assert_eq!(
+        trigger.category,
+        clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure
+    );
+    assert_eq!(trigger.source_row.ordinal(), 2);
+    assert_eq!(
+        report
+            .dlq_entries
+            .iter()
+            .filter(|entry| !entry.trigger)
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -1041,12 +1126,18 @@ fn run_structural(
     file_name: &str,
     fixture: &str,
 ) -> Result<clinker_exec::executor::ExecutionReport, clinker_plan::error::PipelineError> {
+    let reference_field = match format {
+        "edifact" => "msg_ref",
+        _ => "set_ref",
+    };
     let yaml = format!(
         r#"
 pipeline:
   name: structural
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
   - type: source
     name: msgs
@@ -1057,7 +1148,7 @@ nodes:
       dlq_granularity: {dlq_granularity}
       schema:
         - {{ name: seg_id, type: string }}
-        - {{ name: set_ref, type: string }}
+        - {{ name: {reference_field}, type: string }}
   - type: output
     name: out
     input: msgs
@@ -1283,6 +1374,47 @@ nodes:
     assert!(
         msg.contains("E344"),
         "expected the E344 document-DLQ + fail_fast rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn document_dlq_with_correlation_key_is_rejected_at_compile_time() {
+    let yaml = r#"
+pipeline:
+  name: doc_dlq_correlation
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      path: events.csv
+      correlation_key: account_id
+      dlq_granularity: document
+      schema:
+        - { name: account_id, type: string }
+        - { name: amount, type: int }
+  - type: output
+    name: out
+    input: events
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+    let error = parse_config(yaml)
+        .expect_err("document-DLQ and correlation rejection must not reach writer planning");
+    let message = format!("{error:?}");
+    assert!(
+        message.contains("E370")
+            && message.contains("dlq_granularity: document")
+            && message.contains("correlation_key"),
+        "expected a corrective E370 diagnostic, got: {message}"
     );
 }
 

@@ -727,42 +727,77 @@ fn test_all_14_fixtures_have_baseline() {
 /// ChannelPerTarget provenance layer and stamps a channel identity.
 #[test]
 fn test_channel_overlay_provenance_chain_recorded_in_baseline() {
-    use clinker_plan::config::composition::LayerKind;
-    use clinker_plan::config::{ChannelLayout, GroupLayout, ShardScheme};
+    use std::collections::BTreeMap;
 
-    let root = composition_fixture_root();
+    use clinker_plan::config::GroupLayout;
+    use clinker_plan::config::composition::LayerKind;
+    use clinker_plan::resources::{CatalogConfig, WorkspaceCatalog};
+
+    let fixture_root = composition_fixture_root();
+    let ws = tempfile::tempdir().expect("tempdir");
+    for relative_path in [
+        "pipelines/nested_composition_pipeline.yaml",
+        "compositions/nested_caller.comp.yaml",
+        "compositions/address_normalize.comp.yaml",
+    ] {
+        let destination = ws.path().join(relative_path);
+        std::fs::create_dir_all(destination.parent().expect("fixture parent"))
+            .expect("create fixture directory");
+        std::fs::copy(fixture_root.join(relative_path), destination).expect("copy fixture");
+    }
+
+    let root = ws.path();
     let yaml_path = root.join("pipelines/nested_composition_pipeline.yaml");
     let yaml = std::fs::read_to_string(&yaml_path).expect("read fixture");
     let config = parse_config(&yaml).expect("parse_config");
     let ctx = clinker_plan::config::CompileContext::with_pipeline_dir(
-        &root,
+        root,
         std::path::PathBuf::from("pipelines"),
     );
     let mut plan = clinker_plan::config::PipelineConfig::compile(&config, &ctx).expect("compile");
 
     // A tenant folder whose per-target overlay clobbers the pipeline's tracked
-    // `nested_process.strict_mode` parameter. The overlay is resolved by
-    // computed path and applied over the compiled plan's provenance.
-    let ws = tempfile::tempdir().expect("tempdir");
+    // `nested_process.strict_mode` parameter. The overlay is resolved by its
+    // logical catalog target and applied over the compiled plan's provenance.
     let overlay_dir = ws.path().join("channel").join("acme");
     std::fs::create_dir_all(&overlay_dir).expect("create channel dir");
     std::fs::write(
+        overlay_dir.join("channel.cfg.yaml"),
+        "channel:\n  name: acme\n  targets: [nested_composition_pipeline]\n",
+    )
+    .expect("write channel manifest");
+    std::fs::write(
         overlay_dir.join("nested_composition_pipeline.channel.yaml"),
-        "channel:\n  target: ../../pipelines/nested_composition_pipeline.yaml\n\
-         config:\n  nested_process.strict_mode: true\n",
+        "channel:\n  target: nested_composition_pipeline\n\
+         config:\n  nested_process.strict_mode: { value: true }\n",
     )
     .expect("write overlay");
 
-    let channel_layout = ChannelLayout {
-        root: std::path::PathBuf::from("channel"),
-        shard: ShardScheme::None,
+    let catalog_config = CatalogConfig {
+        pipelines: BTreeMap::from([(
+            "nested_composition_pipeline".to_string(),
+            std::path::PathBuf::from("pipelines/nested_composition_pipeline.yaml"),
+        )]),
+        compositions: BTreeMap::from([
+            (
+                "nested_caller".to_string(),
+                std::path::PathBuf::from("compositions/nested_caller.comp.yaml"),
+            ),
+            (
+                "address_normalize".to_string(),
+                std::path::PathBuf::from("compositions/address_normalize.comp.yaml"),
+            ),
+        ]),
+        channels: BTreeMap::from([("acme".to_string(), std::path::PathBuf::from("channel/acme"))]),
+        ..CatalogConfig::default()
     };
+    let catalog = WorkspaceCatalog::load(ws.path(), &catalog_config).expect("load catalog");
     let group_layout = GroupLayout {
         root: std::path::PathBuf::from("group"),
     };
-    let resolution = clinker_channel::resolve(
+    let resolution = clinker_channel::resolve_target_channel(
         ws.path(),
-        &channel_layout,
+        &catalog,
         &group_layout,
         "nested_composition_pipeline",
         Some("acme"),

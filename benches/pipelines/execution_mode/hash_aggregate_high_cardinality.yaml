@@ -13,7 +13,7 @@ nodes:
       schema:
         - { name: f0, type: string }
         - { name: f1, type: string }
-        - { name: f2, type: string }
+        - { name: f2, type: int }
 
   - type: aggregate
     name: agg
@@ -22,7 +22,7 @@ nodes:
       group_by: [f1]
       strategy: hash
       cxl: |
-        emit total = sum(f2.to_int())
+        emit total = sum(f2)
         emit n = count(*)
 
   - type: output

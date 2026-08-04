@@ -13,14 +13,21 @@ mod multi_output_fixtures;
 use std::collections::HashMap;
 
 use clinker_bench_support::io::SharedBuffer;
-use clinker_exec::executor::{DlqEntry, PipelineRunParams};
+use clinker_exec::executor::{DlqEntry, ExecutionReport, PipelineRunParams, SourceRowId};
+use clinker_exec::pipeline::shutdown::ShutdownToken;
 use clinker_plan::error::PipelineError;
+use clinker_plan::plan::{EntityRef, PlanNodeId};
 use clinker_record::{PipelineCounters, Value};
 
 /// Counters, DLQ entries, and per-output CSV bodies keyed by output name —
 /// the result of driving a multi-output pipeline to completion.
 type MultiOutputResult =
     Result<(PipelineCounters, Vec<DlqEntry>, HashMap<String, String>), PipelineError>;
+type MixedFanoutReportResult = Result<(ExecutionReport, HashMap<String, String>), PipelineError>;
+
+fn source_row(ordinal: u64) -> SourceRowId {
+    SourceRowId::new(PlanNodeId::new(0), ordinal)
+}
 
 /// Build a multi-output test fixture with the given YAML config.
 ///
@@ -84,6 +91,720 @@ fn run_multi_output(yaml: &str, csv_input: &str) -> MultiOutputResult {
         .collect();
 
     Ok((report.counters, report.dlq_entries, outputs))
+}
+
+/// Run a multi-source, multi-output fixture through the public executor path.
+fn run_mixed_fanout(yaml: &str, sources: &[(&str, &str)]) -> MultiOutputResult {
+    let (report, outputs) = run_mixed_fanout_report(yaml, sources, test_params())?;
+    Ok((report.counters, report.dlq_entries, outputs))
+}
+
+fn run_mixed_fanout_report(
+    yaml: &str,
+    sources: &[(&str, &str)],
+    params: PipelineRunParams,
+) -> MixedFanoutReportResult {
+    let (config, buffers) = multi_output_fixture(yaml);
+    let readers: clinker_exec::executor::SourceReaders = sources
+        .iter()
+        .map(|(name, csv)| {
+            (
+                (*name).to_string(),
+                clinker_exec::executor::single_file_reader(
+                    format!("{name}.csv"),
+                    Box::new(std::io::Cursor::new(csv.as_bytes().to_vec())),
+                ),
+            )
+        })
+        .collect();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = buffers
+        .iter()
+        .map(|(name, buffer)| {
+            (
+                name.clone(),
+                Box::new(buffer.clone()) as Box<dyn std::io::Write + Send>,
+            )
+        })
+        .collect();
+
+    let report = common::run_config(&config, readers, writers, &params)?;
+    let outputs = buffers
+        .iter()
+        .map(|(name, buffer)| (name.clone(), buffer.as_string()))
+        .collect();
+    Ok((report, outputs))
+}
+
+fn csv_data_rows(rendered: &str) -> Vec<String> {
+    rendered
+        .lines()
+        .skip(1)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn mixed_output_merge_consumer_registry_exact_once() {
+    let yaml = r#"
+pipeline:
+  name: mixed_output_merge_registry
+nodes:
+  - type: source
+    name: shared
+    config:
+      name: shared
+      type: csv
+      path: shared.csv
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: int }
+  - type: source
+    name: sibling
+    config:
+      name: sibling
+      type: csv
+      path: sibling.csv
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: int }
+  - type: output
+    name: direct
+    input: shared
+    config:
+      name: direct
+      type: csv
+      path: direct.csv
+  - type: merge
+    name: joined
+    inputs: [shared, sibling]
+  - type: output
+    name: merged
+    input: joined
+    config:
+      name: merged
+      type: csv
+      path: merged.csv
+"#;
+
+    let (counters, dlq, outputs) = run_mixed_fanout(
+        yaml,
+        &[
+            ("shared", "id,value\ns1,10\ns2,20\n"),
+            ("sibling", "id,value\nx1,30\n"),
+        ],
+    )
+    .expect("mixed Output plus Merge executes");
+
+    assert!(dlq.is_empty());
+    assert_eq!(csv_data_rows(&outputs["direct"]), ["s1,10", "s2,20"]);
+    assert_eq!(
+        csv_data_rows(&outputs["merged"]),
+        ["s1,10", "s2,20", "x1,30"]
+    );
+    assert_eq!(counters.ok_count, 3);
+    assert_eq!(counters.records_written, 5);
+}
+
+#[test]
+fn mixed_output_combine_consumer_registry_exact_once() {
+    let yaml = r#"
+pipeline:
+  name: mixed_output_combine_registry
+nodes:
+  - type: source
+    name: shared
+    config:
+      name: shared
+      type: csv
+      path: shared.csv
+      schema:
+        - { name: id, type: string }
+        - { name: value, type: int }
+  - type: source
+    name: lookup
+    config:
+      name: lookup
+      type: csv
+      path: lookup.csv
+      schema:
+        - { name: id, type: string }
+        - { name: label, type: string }
+  - type: output
+    name: direct
+    input: shared
+    config:
+      name: direct
+      type: csv
+      path: direct.csv
+  - type: combine
+    name: joined
+    input:
+      left: shared
+      right: lookup
+    config:
+      where: "left.id == right.id"
+      match: first
+      on_miss: skip
+      drive: left
+      strategy: grace_hash
+      cxl: |
+        emit id = left.id
+        emit value = left.value
+        emit label = right.label
+      propagate_ck: driver
+  - type: output
+    name: combined
+    input: joined
+    config:
+      name: combined
+      type: csv
+      path: combined.csv
+"#;
+
+    let (counters, dlq, outputs) = run_mixed_fanout(
+        yaml,
+        &[
+            ("shared", "id,value\ns1,10\ns2,20\n"),
+            ("lookup", "id,label\ns1,alpha\ns2,beta\n"),
+        ],
+    )
+    .expect("mixed Output plus Combine executes");
+
+    assert!(dlq.is_empty());
+    assert_eq!(csv_data_rows(&outputs["direct"]), ["s1,10", "s2,20"]);
+    assert_eq!(
+        csv_data_rows(&outputs["combined"]),
+        ["s1,10,alpha", "s2,20,beta"]
+    );
+    assert_eq!(counters.ok_count, 2);
+    assert_eq!(counters.records_written, 4);
+}
+
+fn shared_port_csv(prefix: &str) -> String {
+    let payload = "x".repeat(4 * 1024);
+    let mut csv = String::from("id,payload\n");
+    for ordinal in 1..=24 {
+        csv.push_str(&format!("{prefix}{ordinal},{payload}\n"));
+    }
+    csv
+}
+
+fn shared_port_merge_yaml(memory_limit: &str, computational_first: bool) -> String {
+    let consumers = if computational_first {
+        r#"
+  - type: merge
+    name: joined
+    inputs: [shared, sibling]
+  - type: output
+    name: direct
+    input: shared
+    config: { name: direct, type: csv, path: direct.csv }
+"#
+    } else {
+        r#"
+  - type: output
+    name: direct
+    input: shared
+    config: { name: direct, type: csv, path: direct.csv }
+  - type: merge
+    name: joined
+    inputs: [shared, sibling]
+"#
+    };
+    format!(
+        r#"
+pipeline:
+  name: shared_port_merge_parity
+  memory: {{ limit: "{memory_limit}", backpressure: spill }}
+nodes:
+  - type: source
+    name: shared
+    config:
+      name: shared
+      type: csv
+      path: shared.csv
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: payload, type: string }}
+  - type: source
+    name: sibling
+    config:
+      name: sibling
+      type: csv
+      path: sibling.csv
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: payload, type: string }}
+{consumers}
+  - type: output
+    name: merged
+    input: joined
+    config: {{ name: merged, type: csv, path: merged.csv }}
+"#,
+    )
+}
+
+fn shared_port_combine_yaml(memory_limit: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: shared_port_combine_parity
+  memory: {{ limit: "{memory_limit}", backpressure: spill }}
+nodes:
+  - type: source
+    name: shared
+    config:
+      name: shared
+      type: csv
+      path: shared.csv
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: payload, type: string }}
+  - type: source
+    name: lookup
+    config:
+      name: lookup
+      type: csv
+      path: lookup.csv
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: label, type: string }}
+  - type: output
+    name: direct
+    input: shared
+    config: {{ name: direct, type: csv, path: direct.csv }}
+  - type: combine
+    name: joined
+    input:
+      left: shared
+      right: lookup
+    config:
+      where: "left.id == right.id"
+      match: first
+      on_miss: skip
+      drive: left
+      cxl: |
+        emit id = left.id
+        emit payload = left.payload
+        emit label = right.label
+      propagate_ck: driver
+  - type: output
+    name: combined
+    input: joined
+    config: {{ name: combined, type: csv, path: combined.csv }}
+"#,
+    )
+}
+
+fn shared_port_transform_yaml(memory_limit: &str, computational_first: bool) -> String {
+    let consumers = if computational_first {
+        r#"
+  - type: transform
+    name: copied
+    input: shared
+    config:
+      cxl: |
+        emit copied_id = id
+  - type: output
+    name: direct
+    input: shared
+    config: { name: direct, type: csv, path: direct.csv }
+"#
+    } else {
+        r#"
+  - type: output
+    name: direct
+    input: shared
+    config: { name: direct, type: csv, path: direct.csv }
+  - type: transform
+    name: copied
+    input: shared
+    config:
+      cxl: |
+        emit copied_id = id
+"#
+    };
+    format!(
+        r#"
+pipeline:
+  name: shared_port_transform_parity
+  memory: {{ limit: "{memory_limit}", backpressure: spill }}
+nodes:
+  - type: source
+    name: shared
+    config:
+      name: shared
+      type: csv
+      path: shared.csv
+      schema:
+        - {{ name: id, type: string }}
+        - {{ name: payload, type: string }}
+{consumers}
+  - type: output
+    name: transformed
+    input: copied
+    config: {{ name: transformed, type: csv, path: transformed.csv }}
+"#,
+    )
+}
+
+fn assert_shared_port_run(
+    label: &str,
+    report: &ExecutionReport,
+    outputs: &HashMap<String, String>,
+    continuation: &str,
+    continuation_rows: usize,
+) {
+    assert_eq!(report.counters.ok_count, 48, "{label}");
+    assert_eq!(report.counters.records_written, 72, "{label}");
+    assert_eq!(report.counters.dlq_count, 0, "{label}");
+    assert_eq!(csv_data_rows(&outputs["direct"]).len(), 24, "{label}");
+    assert_eq!(
+        csv_data_rows(&outputs[continuation]).len(),
+        continuation_rows,
+        "{label}"
+    );
+}
+
+#[test]
+fn shared_port_resident_spill_parity() {
+    let shared = shared_port_csv("s");
+    let sibling = shared_port_csv("x");
+    let mut resident_rows = None;
+
+    for computational_first in [false, true] {
+        let resident = run_mixed_fanout_report(
+            &shared_port_merge_yaml("1G", computational_first),
+            &[("shared", &shared), ("sibling", &sibling)],
+            test_params(),
+        )
+        .expect("resident shared Output plus Merge executes");
+        let spilled = run_mixed_fanout_report(
+            &shared_port_merge_yaml("64K", computational_first),
+            &[("shared", &shared), ("sibling", &sibling)],
+            test_params(),
+        )
+        .expect("spilled shared Output plus Merge executes");
+
+        assert_shared_port_run("resident merge", &resident.0, &resident.1, "merged", 48);
+        assert_shared_port_run("spilled merge", &spilled.0, &spilled.1, "merged", 48);
+        assert!(
+            spilled.0.cumulative_spill_bytes > 0,
+            "the 64K run must exercise spill-backed shared-port replay"
+        );
+        assert_eq!(
+            csv_data_rows(&resident.1["direct"]),
+            csv_data_rows(&spilled.1["direct"]),
+            "direct consumer population must be storage-independent"
+        );
+        let mut resident_merged = csv_data_rows(&resident.1["merged"]);
+        let mut spilled_merged = csv_data_rows(&spilled.1["merged"]);
+        resident_merged.sort();
+        spilled_merged.sort();
+        assert_eq!(resident_merged, spilled_merged);
+
+        let current_rows = (
+            csv_data_rows(&spilled.1["direct"]),
+            spilled_merged,
+            spilled.0.counters.records_written,
+        );
+        if let Some(first_rows) = &resident_rows {
+            assert_eq!(
+                first_rows, &current_rows,
+                "reversing sibling dispatch order must preserve exact delivery"
+            );
+        } else {
+            resident_rows = Some(current_rows);
+        }
+    }
+}
+
+const SHARED_PORT_SPILL_ISOLATED_ENV: &str = "CLINKER_TEST_SHARED_PORT_SPILL_ISOLATED";
+const SHARED_PORT_SPILL_SENTINEL: &str = "__clinker_shared_port_spill_ran__";
+
+/// Run the RSS-sensitive spill probe without sibling test threads changing
+/// process-global memory readings between its baseline and execution.
+fn run_isolated_shared_port_spill(probe: impl FnOnce()) {
+    if std::env::var_os(SHARED_PORT_SPILL_ISOLATED_ENV).is_some() {
+        probe();
+        println!("{SHARED_PORT_SPILL_SENTINEL}");
+        return;
+    }
+
+    let output = std::process::Command::new(
+        std::env::current_exe().expect("test binary path must be readable"),
+    )
+    .args([
+        "--exact",
+        "shared_port_output_combine_resident_spill_parity",
+        "--test-threads=1",
+        "--nocapture",
+    ])
+    .env(SHARED_PORT_SPILL_ISOLATED_ENV, "1")
+    .output()
+    .expect("isolated shared-port spill probe must spawn");
+
+    assert!(
+        output.status.success(),
+        "isolated shared-port spill probe failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(SHARED_PORT_SPILL_SENTINEL),
+        "isolated shared-port spill probe exited without running"
+    );
+}
+
+#[test]
+fn shared_port_output_combine_resident_spill_parity() {
+    run_isolated_shared_port_spill(|| {
+        let shared = shared_port_csv("s");
+        let mut lookup = String::from("id,label\n");
+        for ordinal in 1..=24 {
+            lookup.push_str(&format!("s{ordinal},label-{ordinal}\n"));
+        }
+        let resident = run_mixed_fanout_report(
+            &shared_port_combine_yaml("1G"),
+            &[("shared", &shared), ("lookup", &lookup)],
+            test_params(),
+        )
+        .expect("resident shared Output plus Combine executes");
+        // Keep a small, committed pressure pad live while deriving and using
+        // the budget. Windows test binaries can have a very low PrivateUsage
+        // baseline, making ordinary per-run allocator growth larger than the
+        // 20% hard-limit headroom even after test-thread isolation. Touching
+        // each page makes the baseline representative and keeps that fixed
+        // growth well inside the headroom on every first-class platform.
+        let mut pressure_pad = vec![0_u8; 16 * 1024 * 1024];
+        for page in pressure_pad.chunks_mut(4096) {
+            page[0] = 1;
+        }
+        // Keep the hard limit above this test process while placing the 80% soft
+        // threshold below its current RSS. The 20% headroom absorbs allocator and
+        // platform-accounting growth during setup without losing forced spill.
+        // A fixed sub-baseline budget would exercise the hard-abort path on larger
+        // CI workers instead of spill.
+        let forced_spill_limit = clinker_exec::pipeline::memory::rss_bytes()
+            .unwrap_or(64 * 1024 * 1024)
+            .saturating_mul(120)
+            / 100;
+        let spilled = run_mixed_fanout_report(
+            &shared_port_combine_yaml(&forced_spill_limit.to_string()),
+            &[("shared", &shared), ("lookup", &lookup)],
+            test_params(),
+        )
+        .expect("spilled shared Output plus Combine executes");
+
+        assert_eq!(resident.0.counters.ok_count, 24);
+        assert_eq!(spilled.0.counters.ok_count, 24);
+        assert_eq!(resident.0.counters.records_written, 48);
+        assert_eq!(spilled.0.counters.records_written, 48);
+        assert!(spilled.0.cumulative_spill_bytes > 0);
+        assert_eq!(resident.1["direct"], spilled.1["direct"]);
+        assert_eq!(resident.1["combined"], spilled.1["combined"]);
+        std::hint::black_box(&pressure_pad);
+    });
+}
+
+#[test]
+fn shared_port_output_transform_is_order_and_storage_independent() {
+    let shared = shared_port_csv("s");
+    let mut first = None;
+
+    for computational_first in [false, true] {
+        let resident = run_mixed_fanout_report(
+            &shared_port_transform_yaml("1G", computational_first),
+            &[("shared", &shared)],
+            test_params(),
+        )
+        .expect("resident shared Output plus Transform executes");
+        let spilled = run_mixed_fanout_report(
+            &shared_port_transform_yaml("64K", computational_first),
+            &[("shared", &shared)],
+            test_params(),
+        )
+        .expect("spilled shared Output plus Transform executes");
+
+        assert_eq!(resident.0.counters.records_written, 48);
+        assert_eq!(spilled.0.counters.records_written, 48);
+        assert_eq!(resident.0.counters.dlq_count, 0);
+        assert_eq!(spilled.0.counters.dlq_count, 0);
+        assert!(spilled.0.cumulative_spill_bytes > 0);
+        let current = (
+            csv_data_rows(&spilled.1["direct"]),
+            csv_data_rows(&spilled.1["transformed"]),
+        );
+        assert_eq!(csv_data_rows(&resident.1["direct"]), current.0);
+        assert_eq!(csv_data_rows(&resident.1["transformed"]), current.1);
+        if let Some(expected) = &first {
+            assert_eq!(expected, &current);
+        } else {
+            first = Some(current);
+        }
+    }
+}
+
+#[test]
+fn shared_port_interrupt_releases_all_registrations() {
+    struct InterruptingWriter {
+        token: ShutdownToken,
+    }
+
+    impl std::io::Write for InterruptingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.token.request();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let shared = shared_port_csv("s");
+    let yaml = r#"
+pipeline:
+  name: shared_port_interrupt_cleanup
+  memory: { limit: "64K", backpressure: spill }
+nodes:
+  - type: source
+    name: shared
+    config:
+      name: shared
+      type: csv
+      path: shared.csv
+      schema:
+        - { name: id, type: string }
+        - { name: payload, type: string }
+  - type: output
+    name: interrupting
+    input: shared
+    config: { name: interrupting, type: csv, path: interrupting.csv }
+  - type: output
+    name: pending
+    input: shared
+    config: { name: pending, type: csv, path: pending.csv }
+"#;
+    let config = clinker_plan::config::parse_config(yaml).expect("interrupt fixture parses");
+    let token = ShutdownToken::detached();
+    let spill_root = tempfile::tempdir().expect("spill root");
+    let params = PipelineRunParams {
+        shutdown_token: Some(token.clone()),
+        spill_root_dir: Some(spill_root.path().to_path_buf()),
+        ..test_params()
+    };
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+        "shared".to_string(),
+        clinker_exec::executor::single_file_reader(
+            "shared.csv",
+            Box::new(std::io::Cursor::new(shared.as_bytes().to_vec())),
+        ),
+    )]);
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
+        (
+            "interrupting".to_string(),
+            Box::new(InterruptingWriter {
+                token: token.clone(),
+            }) as Box<dyn std::io::Write + Send>,
+        ),
+        (
+            "pending".to_string(),
+            Box::new(InterruptingWriter {
+                token: token.clone(),
+            }) as Box<dyn std::io::Write + Send>,
+        ),
+    ]);
+
+    let report = common::run_config(&config, readers, writers, &params)
+        .expect("interruption after the first shared consumer is graceful");
+    assert!(report.interrupted);
+    assert!(token.is_requested());
+    assert_eq!(
+        std::fs::read_dir(spill_root.path())
+            .expect("spill root remains readable")
+            .count(),
+        0,
+        "interruption must drop the shared backing and its run directory"
+    );
+}
+
+#[test]
+fn shared_port_writer_error_releases_backing() {
+    struct FailingWriter;
+
+    impl std::io::Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("shared writer failure"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let shared = shared_port_csv("s");
+    let yaml = r#"
+pipeline:
+  name: shared_port_writer_error_cleanup
+  memory: { limit: "64K", backpressure: spill }
+nodes:
+  - type: source
+    name: shared
+    config:
+      name: shared
+      type: csv
+      path: shared.csv
+      schema:
+        - { name: id, type: string }
+        - { name: payload, type: string }
+  - type: output
+    name: failing
+    input: shared
+    config: { name: failing, type: csv, path: failing.csv }
+  - type: output
+    name: pending
+    input: shared
+    config: { name: pending, type: csv, path: pending.csv }
+"#;
+    let config = clinker_plan::config::parse_config(yaml).expect("writer fixture parses");
+    let spill_root = tempfile::tempdir().expect("spill root");
+    let params = PipelineRunParams {
+        spill_root_dir: Some(spill_root.path().to_path_buf()),
+        ..test_params()
+    };
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+        "shared".to_string(),
+        clinker_exec::executor::single_file_reader(
+            "shared.csv",
+            Box::new(std::io::Cursor::new(shared.as_bytes().to_vec())),
+        ),
+    )]);
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([
+        (
+            "failing".to_string(),
+            Box::new(FailingWriter) as Box<dyn std::io::Write + Send>,
+        ),
+        (
+            "pending".to_string(),
+            Box::new(SharedBuffer::new()) as Box<dyn std::io::Write + Send>,
+        ),
+    ]);
+
+    let err = common::run_config(&config, readers, writers, &params)
+        .expect_err("writer failure must propagate");
+    assert!(
+        err.to_string().contains("shared writer failure"),
+        "shared consumer must preserve the underlying writer error: {err:?}"
+    );
+    assert_eq!(
+        std::fs::read_dir(spill_root.path())
+            .expect("spill root remains readable")
+            .count(),
+        0,
+        "writer error must drop the shared backing and its run directory"
+    );
 }
 
 #[test]
@@ -852,7 +1573,7 @@ fn test_dlq_stage_source() {
     let schema = std::sync::Arc::new(clinker_record::Schema::new(vec!["id".into()]));
     let record = clinker_record::Record::new(schema, vec![Value::String("1".into())]);
     let entry = DlqEntry {
-        source_row: 1,
+        source_row: source_row(1),
         category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
         error_message: "source read error".to_string(),
         original_record: record,
@@ -1013,7 +1734,7 @@ fn test_dlq_stage_output() {
     let schema = std::sync::Arc::new(clinker_record::Schema::new(vec!["id".into()]));
     let record = clinker_record::Record::new(schema, vec![Value::String("1".into())]);
     let entry = DlqEntry {
-        source_row: 1,
+        source_row: source_row(1),
         category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
         error_message: "write error".to_string(),
         original_record: record,
@@ -1101,7 +1822,7 @@ fn test_dlq_columns_in_csv() {
     let schema = std::sync::Arc::new(clinker_record::Schema::new(vec!["name".into()]));
     let record = clinker_record::Record::new(schema.clone(), vec![Value::String("Alice".into())]);
     let entries = vec![DlqEntry {
-        source_row: 1,
+        source_row: source_row(1),
         category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
         error_message: "eval error".to_string(),
         original_record: record,

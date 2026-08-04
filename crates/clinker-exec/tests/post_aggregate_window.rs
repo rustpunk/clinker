@@ -634,15 +634,13 @@ nodes:
         .indices_to_build
         .get(window_idx_num)
         .expect("indices_to_build must hold the spec");
-    match &spec.root {
-        PlanIndexRoot::Node { upstream, .. } => assert_eq!(
-            *upstream, agg_idx,
-            "node-rooted spec must point at the Aggregate even when a Sort \
-             enforcer was synthesized in between (Sort/Route are pass-through \
-             at lowering time)"
-        ),
-        other => panic!("expected PlanIndexRoot::Node rooted at the Aggregate, got: {other:?}"),
-    }
+    let PlanIndexRoot::Node { upstream, .. } = &spec.root;
+    assert_eq!(
+        *upstream, agg_idx,
+        "node-rooted spec must point at the Aggregate even when a Sort \
+         enforcer was synthesized in between (Sort/Route are pass-through \
+         at lowering time)"
+    );
 }
 
 // ── #12: Merge upstream raises E150d ───────────────────────────────

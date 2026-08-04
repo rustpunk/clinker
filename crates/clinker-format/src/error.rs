@@ -1,5 +1,23 @@
 use std::fmt;
 
+use clinker_record::{Record, Value};
+
+/// Complete evidence for one decoded source value that could not satisfy its
+/// declared type. The executor owns disposition; the format layer only carries
+/// the already-decoded record across the `FormatReader` boundary without
+/// flattening it into a string or losing the offending value.
+#[derive(Debug)]
+pub struct DeclaredTypeFailure {
+    pub source: String,
+    /// One-based declared-column position.
+    pub column: usize,
+    pub field: String,
+    pub declared_type: String,
+    pub original_value: Value,
+    pub original_record: Record,
+    pub message: String,
+}
+
 /// Errors produced by format readers and writers.
 ///
 /// Streaming: errors are returned per-record, not buffered. The executor
@@ -76,6 +94,12 @@ pub enum FormatError {
         message: String,
     },
     SchemaInference(String),
+    /// A decoded value failed the authored source-schema type contract.
+    ///
+    /// Unlike ordinary format corruption, this is a per-record error: the
+    /// executor may fail fast or route the complete original record to the
+    /// configured DLQ. Boxed to keep the common error enum compact.
+    DeclaredType(Box<DeclaredTypeFailure>),
     /// A source with `on_unmapped: reject` encountered an input record
     /// carrying a key the user did not declare in the source's
     /// `schema:` block.
@@ -253,6 +277,15 @@ impl fmt::Display for FormatError {
                 write!(f, "invalid record at row {row}: {message}")
             }
             Self::SchemaInference(msg) => write!(f, "schema inference failed: {msg}"),
+            Self::DeclaredType(failure) => write!(
+                f,
+                "source {:?} column {} ({:?}) could not satisfy declared type {}: {}",
+                failure.source,
+                failure.column,
+                failure.field,
+                failure.declared_type,
+                failure.message
+            ),
             Self::UndeclaredField { source, field } => write!(
                 f,
                 "source {source:?}: input record carries undeclared field {field:?} \

@@ -1,11 +1,11 @@
 //! Producer-side spill helper for `ctx.node_buffers`.
 //!
 //! When `MemoryArbitrator::should_spill()` trips at admission time, the
-//! producer flushes the in-memory `Vec<(Record, u64)>` to disk through
-//! `SpillWriter<u64>` and stores the resulting `(SpillFile<u64>, u64)`
+//! producer flushes the in-memory `Vec<(Record, SourceRowId)>` to disk through
+//! `SpillWriter<SourceRowId>` and stores the resulting `(SpillFile<SourceRowId>, u64)`
 //! pair inside `NodeBuffer::Spilled`. Consumer-side streaming is
 //! already covered by [`NodeBuffer::drain`] (memory rows first, then
-//! per-spill rows via `SpillReader<u64>`), so this module exposes only
+//! per-spill rows via `SpillReader<SourceRowId>`), so this module exposes only
 //! the producer-side packaging.
 //!
 //! Goes through the same generic `pipeline/spill.rs` envelope (format
@@ -15,9 +15,9 @@
 //! distinct, partition-aware format reserved for grace-hash combine
 //! and is intentionally not used here.
 //!
-//! Payload type `u64` carries the source row number alongside each
+//! Payload type `SourceRowId` carries the source-scoped row identity alongside each
 //! record so the original lineage survives the round-trip — the
-//! consumer's drain re-emits the same `(Record, u64)` pairs the
+//! consumer's drain re-emits the same `(Record, SourceRowId)` pairs the
 //! producer wrote.
 
 use std::path::Path;
@@ -25,11 +25,12 @@ use std::sync::Arc;
 
 use clinker_record::Record;
 
+use crate::executor::stream_event::SourceRowId;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_plan::error::PipelineError;
 
-/// Spill a `Vec<(Record, u64)>` to disk and return the resulting
-/// `(SpillFile<u64>, row_count)` pair. Schema is read from the first
+/// Spill a `Vec<(Record, SourceRowId)>` to disk and return the resulting
+/// `(SpillFile<SourceRowId>, row_count)` pair. Schema is read from the first
 /// record; an empty input is a no-op (`Ok(None)`).
 ///
 /// `compress` selects LZ4 framing for the spill file. The caller resolves it
@@ -41,19 +42,22 @@ use clinker_plan::error::PipelineError;
 /// (postcard encode + write), and `finish` (frame finalize) all
 /// surface as `PipelineError::Spill` via the existing
 /// `From<SpillError>` conversion.
-pub(crate) fn spill_node_buffer(
-    rows: Vec<(Record, u64)>,
+pub(crate) fn spill_node_buffer<R>(
+    rows: Vec<(Record, R)>,
     spill_dir: Option<&Path>,
     compress: bool,
-) -> Result<Option<(SpillFile<u64>, u64)>, PipelineError> {
+) -> Result<Option<(SpillFile<SourceRowId>, u64)>, PipelineError>
+where
+    R: Copy + Into<SourceRowId>,
+{
     let Some((first, _)) = rows.first() else {
         return Ok(None);
     };
     let schema = Arc::clone(first.schema());
-    let mut writer: SpillWriter<u64> = SpillWriter::new(schema, spill_dir, compress)?;
+    let mut writer: SpillWriter<SourceRowId> = SpillWriter::new(schema, spill_dir, compress)?;
     let count = rows.len() as u64;
     for (record, rn) in &rows {
-        writer.write_pair(record, rn)?;
+        writer.write_pair(record, &(*rn).into())?;
     }
     let file = writer.finish()?;
     Ok(Some((file, count)))
@@ -98,7 +102,7 @@ mod tests {
         let (drained, _puncts) = nb.drain_split().expect("drain ok");
         assert_eq!(drained.len(), 3);
         for (i, (orig, d)) in rows.iter().zip(drained.iter()).enumerate() {
-            assert_eq!(orig.1, d.1, "row_number mismatch at {i}");
+            assert_eq!(orig.1, d.1.ordinal(), "row_number mismatch at {i}");
             assert_eq!(
                 orig.0.values(),
                 d.0.values(),
@@ -109,7 +113,7 @@ mod tests {
 
     #[test]
     fn spill_node_buffer_empty_input_is_none() {
-        let result = spill_node_buffer(Vec::new(), None, true).expect("spill ok");
+        let result = spill_node_buffer(Vec::<(Record, u64)>::new(), None, true).expect("spill ok");
         assert!(result.is_none(), "empty input must not create a spill file");
     }
 
@@ -141,7 +145,7 @@ mod tests {
         let (drained, _puncts) = nb.drain_split().expect("drain ok");
 
         assert_eq!(drained.len(), 5);
-        let row_numbers: Vec<u64> = drained.iter().map(|(_, rn)| *rn).collect();
+        let row_numbers: Vec<u64> = drained.iter().map(|(_, rn)| rn.ordinal()).collect();
         assert_eq!(row_numbers, vec![10, 11, 12, 13, 14]);
     }
 

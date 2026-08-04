@@ -174,12 +174,13 @@ pub fn analyze_extraction_boundary(
 
     // Config candidates: scan provenance DB for entries matching selected nodes.
     let mut config_candidates = Vec::new();
-    for (key, resolved) in provenance.iter() {
-        let (node_name, param_name) = key;
+    for (_key, address, resolved) in provenance.iter() {
+        let node_name = address.node_name();
+        let param_name = address.field().name();
         if selected_names.contains(node_name) {
             config_candidates.push(ConfigCandidate {
-                node_name: node_name.clone(),
-                param_name: param_name.clone(),
+                node_name: node_name.to_owned(),
+                param_name: param_name.to_owned(),
                 value: resolved.value.clone(),
             });
         }
@@ -474,6 +475,8 @@ mod tests {
             .map(|&idx| graph[idx].name().to_owned())
             .collect();
         let mut dag = ExecutionPlanDag {
+            consumer_registry: Default::default(),
+            order_contract: Default::default(),
             graph,
             topo_order: topo,
             source_dag: vec![SourceTier { sources }],
@@ -574,7 +577,8 @@ mod tests {
 
         // Simulate a provenance entry for a composition config param on t1.
         use crate::config::composition::{LayerKind, ResolvedValue};
-        prov.insert(
+        prov.insert_unscoped(
+            crate::plan::PlanNodeId::new(0),
             "t1".to_owned(),
             "fuzzy_threshold".to_owned(),
             ResolvedValue::new(

@@ -185,7 +185,7 @@ pub(crate) fn dispatch_cull(
     let (input_buffer, _input_reservation) =
         input_buffer.into_materialized_parts(&ctx.memory_budget, name)?;
     let (input, input_puncts): (
-        Vec<(Record, u64)>,
+        Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::stream_event::Punctuation>,
     ) = input_buffer.drain_split()?;
 
@@ -254,7 +254,7 @@ fn run_cull_grouped(
     output_schema: &Arc<Schema>,
     compiled: &Arc<cxl::plan::CompiledAggregate>,
     typed: &Arc<cxl::typecheck::TypedProgram>,
-    input: Vec<(Record, u64)>,
+    input: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     input_puncts: Vec<crate::executor::stream_event::Punctuation>,
     handle: &Arc<ConsumerHandle>,
 ) -> Result<(), PipelineError> {
@@ -304,8 +304,8 @@ fn run_cull_grouped(
     // removed bucket per the precomputed decision. The hard limit gates a
     // single correlation group too large to observe whole.
     let hard_limit = budget.hard_limit();
-    let mut kept: Vec<(Record, u64)> = Vec::new();
-    let mut removed: Vec<(Record, u64)> = Vec::new();
+    let mut kept: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
+    let mut removed: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     let group_order = buffer.take_group_order();
     for key in group_order {
         let mut group = buffer.take_group(name, &config.partition_by, &key, hard_limit)?;
@@ -374,7 +374,7 @@ fn compute_drop_decisions(
     config: &CullBody,
     compiled: &Arc<cxl::plan::CompiledAggregate>,
     typed: &Arc<cxl::typecheck::TypedProgram>,
-    input: &[(Record, u64)],
+    input: &[(Record, crate::executor::stream_event::SourceRowId)],
 ) -> Result<HashMap<Vec<GroupByKey>, bool>, PipelineError> {
     use crate::aggregation::{AggregatorConfig, HashAggregator, SortRow};
 
@@ -508,8 +508,8 @@ fn emit_ports(
     node_idx: NodeIndex,
     name: &str,
     config: &CullBody,
-    kept: Vec<(Record, u64)>,
-    removed: Vec<(Record, u64)>,
+    kept: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
+    removed: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     input_puncts: Vec<crate::executor::stream_event::Punctuation>,
 ) -> Result<(), PipelineError> {
     // The edge's `producer_port` tag selects the record set: `Some(removed_to)`
@@ -541,11 +541,12 @@ fn emit_ports(
         .collect();
 
     for (succ, port, edge_id) in outgoing {
-        let records: &Vec<(Record, u64)> = if is_removed_port(port.as_deref()) {
-            &removed
-        } else {
-            &kept
-        };
+        let records: &Vec<(Record, crate::executor::stream_event::SourceRowId)> =
+            if is_removed_port(port.as_deref()) {
+                &removed
+            } else {
+                &kept
+            };
         // Cross-region tee: a successor inside a deferred region this Cull is
         // not in needs this port's records parked on the matching outgoing edge
         // so the commit-time deferred dispatcher receives exactly them.
@@ -556,7 +557,8 @@ fn emit_ports(
                 .first()
                 .map(|(rec, _)| {
                     (std::mem::size_of::<Value>() * rec.schema().column_count()
-                        + std::mem::size_of::<(Record, u64)>()) as u64
+                        + std::mem::size_of::<(Record, crate::executor::stream_event::SourceRowId)>(
+                        )) as u64
                 })
                 .unwrap_or(0);
             for (record, rn) in records {
@@ -641,21 +643,21 @@ pub(crate) fn reads_predecessor_slot(node: &PlanNode) -> bool {
 // and reloading each group in arrival order at finalize.
 // ---------------------------------------------------------------------
 
-/// One buffered input record plus the two `u64`s the spill round-trip must
+/// One buffered input record plus the two identities the spill round-trip must
 /// preserve: a Cull-local admission sequence that orders the record within
-/// its group across a multi-source merge, and the upstream source row number
+/// its group across a multi-source merge, and the upstream source-row identity
 /// carried through for output.
 struct BufferedRecord {
     record: Record,
     /// Cull-local monotonic admission sequence; the within-group sort key.
     seq: u64,
-    /// Upstream source row number, carried through to the output ports.
-    row_num: u64,
+    /// Upstream source-row identity, carried through to the output ports.
+    row_num: crate::executor::stream_event::SourceRowId,
 }
 
 /// Spill payload for a buffered Cull input record: the admission sequence and
-/// the source row number, both reconstructed on reload.
-type CullSpillPayload = (u64, u64);
+/// the source-row identity, both reconstructed on reload.
+type CullSpillPayload = (u64, crate::executor::stream_event::SourceRowId);
 
 /// One group's buffered input records: a resident tail plus any slices
 /// already evicted to disk.
@@ -713,7 +715,12 @@ impl CullGroupBuffer {
 
     /// Admit one record into its group, stamping a Cull-local admission
     /// sequence and recording first-seen group order.
-    fn push(&mut self, key: Vec<GroupByKey>, record: Record, row_num: u64) {
+    fn push(
+        &mut self,
+        key: Vec<GroupByKey>,
+        record: Record,
+        row_num: crate::executor::stream_event::SourceRowId,
+    ) {
         let bytes = estimated_input_bytes(&record);
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -889,8 +896,9 @@ impl CullGroupBuffer {
     /// loud rather than OOM on reload. A spilled group's records arrive in
     /// spill-file then bucket order, so the merged group is re-sorted by the
     /// Cull-local admission sequence (globally unique and monotonic in
-    /// arrival order, surviving a multi-source merge where source row numbers
-    /// collide) so it emits identically to a resident group.
+    /// arrival order, surviving a multi-source merge whose source-scoped
+    /// identities do not encode cross-source arrival order) so it emits
+    /// identically to a resident group.
     ///
     /// # Errors
     ///
@@ -905,7 +913,7 @@ impl CullGroupBuffer {
         partition_by: &[String],
         key: &[GroupByKey],
         hard_limit: u64,
-    ) -> Result<Vec<(Record, u64)>, PipelineError> {
+    ) -> Result<Vec<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
         let state = self.groups.remove(key).expect("group key present in order");
         self.resident_bytes -= state.resident_bytes;
 
@@ -1033,7 +1041,10 @@ fn partition_key(
 /// Sort a group in place by `order_by`, stable across equal keys (so arrival
 /// order breaks ties deterministically). Nulls sort last regardless of
 /// direction (SQL convention).
-fn sort_group(group: &mut [(Record, u64)], order_by: &[SortField]) {
+fn sort_group(
+    group: &mut [(Record, crate::executor::stream_event::SourceRowId)],
+    order_by: &[SortField],
+) {
     group.sort_by(|(a, _), (b, _)| {
         for sf in order_by {
             let av = a.get(&sf.field).unwrap_or(&Value::Null);
@@ -1120,6 +1131,7 @@ fn cull_decision_budget_error(node_name: &str, used: u64, hard_limit: u64) -> Pi
 mod tests {
     use super::*;
     use crate::pipeline::memory::NoOpPolicy;
+    use clinker_plan::plan::{EntityRef, PlanNodeId};
     use clinker_record::Schema;
 
     fn record(schema: &Arc<Schema>, account: Value) -> Record {
@@ -1195,7 +1207,7 @@ mod tests {
             buffer.push(
                 key.clone(),
                 record(&schema, Value::String(payload.into())),
-                row_num,
+                crate::executor::stream_event::SourceRowId::new(PlanNodeId::new(0), row_num),
             );
             handle.set_bytes(buffer.resident_bytes() as u64);
             if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
@@ -1303,7 +1315,7 @@ mod tests {
             buffer.push(
                 vec![GroupByKey::Str("g".into())],
                 record(&schema, Value::String(payload.into())),
-                row_num,
+                crate::executor::stream_event::SourceRowId::new(PlanNodeId::new(0), row_num),
             );
         }
         handle.set_bytes(buffer.resident_bytes() as u64);

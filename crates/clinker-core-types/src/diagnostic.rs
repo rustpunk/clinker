@@ -95,10 +95,17 @@ diagnostic_registry! {
     "E116", Error, "A channel var declaration is type-incompatible: an override changes the pipeline's type, or a default does not match the entry's declared type";
     "E117", Error, "A channel var's name shadows a reserved system field";
     "E118", Error, "A channel `vars.source` block is keyed by a source name the pipeline does not declare";
+    "E119", Error, "Pipeline `date_locale` is explicit but has no supported locale-aware behavior";
     "E120", Error, "Channel discovery exceeded the tenant-folder scan budget";
     "E121", Error, "Channel manifest failed to parse";
     "E122", Error, "Channel discovery exceeded the group-file scan budget";
     "E123", Error, "Group file failed to parse";
+    "E124", Error, "Pipeline `log_rules` is explicit but pipeline-authored telemetry routing is unsupported";
+    "E125", Error, "Pipeline `include_provenance` is explicit but does not attach output provenance";
+    "E126", Error, "Decoded source value violates its declared column type";
+    "E127", Error, "Provenance field query is empty";
+    "E128", Error, "Provenance exact address or shorthand matches no field";
+    "E129", Error, "Provenance shorthand matches multiple scoped fields";
     // ── Windows, watermarks, phases, and scoped vars ────────────────────
     "E150", Error, "Analytic window on a transform fed by a `correlation_key:` source (per-group arena construction is unsupported)";
     "E150b", Error, "Node-rooted window references a field its rooted upstream operator does not emit";
@@ -113,7 +120,15 @@ diagnostic_registry! {
     "E157", Error, "Source declares an external schema file that failed to load";
     "E158", Error, "Source column declares the non-concrete type `numeric` (inference-only)";
     "E159", Error, "Source declares a `generated` schema on a format with no engine-generated positional column model";
+    "E160", Error, "Composition-body window has no resolvable owning input root";
+    "E161", Error, "Composition-body window input root is ambiguous";
+    "E162", Error, "Composition-body window or ownership path is cyclic";
+    "E163", Error, "Composition body is missing from or referenced outside its owning scope";
     "E164", Error, "Init-phase node has a runtime-phase descendant consuming its records";
+    "E165", Error, "Composition-body window attempts an unsupported cross-input or cross-source lookup";
+    "E166", Error, "Composition-body window is rooted at a Merge node";
+    "E167", Error, "Composition-body window resolves through an undeclared input port";
+    "E168", Error, "Composition-body window root schema is missing or incompatible";
     "E171", Error, "Scoped-var reader is not a DAG descendant of the Transform that writes it";
     "E172", Error, "`$source` scoped var read downstream of a Merge/Combine node (the per-source value is ambiguous there)";
     "E173", Error, "Composition body reads a parent-scope `$pipeline` / `$source` var its `_compose.scoped_vars` schema does not opt into";
@@ -207,6 +222,9 @@ diagnostic_registry! {
     "E364", Error, "An Output `mapping:` block uses the superseded map form or declares a projection that cannot produce unique, meaningful columns";
     "E365", Error, "An Output `mapping:` item reads a column the pipeline does not carry at that point in the graph";
     "E367", Error, "An Output `split.naming` pattern is malformed or does not contain exactly one valid sequence token";
+    "E366", Error, "A declared-sorted source has nested, repeated, inherited, or otherwise non-sortable per-file framing";
+    "E368", Error, "Declared source-type error fraction exceeded `error_handling.type_error_threshold`";
+    "E370", Error, "A pipeline combines document-level DLQ with correlation-key rejection, whose distinct atomic populations cannot share one physical writer boundary";
     // ── Path security ───────────────────────────────────────────────────
     "E-SEC-001", Error, "Path security violation (escape, symlink, etc.)";
     // ── Warnings ────────────────────────────────────────────────────────
@@ -217,6 +235,7 @@ diagnostic_registry! {
     "W302", Warning, "Pure-equi combine with all small inputs — consider InMemoryHash";
     "W305", Warning, "Combine where-clause has no equality conjuncts";
     "W306", Warning, "Combine planner cannot determine optimal driving input";
+    "W307", Warning, "A physical source file violated its declared record order and was repaired before release";
 }
 
 /// Whether `code` is listed in [`REGISTRY`].

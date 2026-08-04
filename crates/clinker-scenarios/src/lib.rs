@@ -137,6 +137,11 @@ pub const REGISTRY: &[Scenario] = &[
         summary: "Helpdesk export: normalise priorities, route to three sinks, dead-letter unparseable rows",
         generate: scenarios::support_triage,
     },
+    Scenario {
+        id: "04-ordering-contract",
+        summary: "Two-file CSV: verify one sorted file, repair one inversion, write exact business order",
+        generate: scenarios::ordering_contract,
+    },
 ];
 
 /// Look up a scenario by directory id.

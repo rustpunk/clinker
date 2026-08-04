@@ -21,9 +21,9 @@ use crate::executor::dispatch::{
     push_write_error, source_name_arc_of,
 };
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
-use crate::executor::{DlqEntry, build_format_writer, format_group_key};
+use crate::executor::{DlqEntry, OutputDeliveryId, build_format_writer, format_group_key};
 use clinker_plan::error::PipelineError;
-use clinker_plan::plan::execution::ExecutionPlanDag;
+use clinker_plan::plan::execution::{ExecutionPlanDag, WriterBoundaryMode};
 
 /// Execute the `CorrelationCommit` arm: drive the relaxed-CK cascading
 /// retraction orchestrator (which, for strict pipelines, runs a single
@@ -56,6 +56,7 @@ pub(crate) fn dispatch_correlation_commit(
 /// identical; only the path that populates the buffer differs.
 pub(crate) fn commit_correlation_buffers(
     ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
 ) -> Result<(), PipelineError> {
     use std::collections::BTreeMap;
 
@@ -81,7 +82,7 @@ pub(crate) fn commit_correlation_buffers(
     }
 
     // Phase 2: drain the clean per-output queues to writers.
-    flush_clean_records_to_writers(ctx, clean_per_output)?;
+    flush_clean_records_to_writers(ctx, current_dag, clean_per_output)?;
 
     Ok(())
 }
@@ -114,14 +115,13 @@ fn commit_one_group(
             count: total_records,
         }
         .to_string();
-        // Dedup distinct rows by (source, row_num) so Route fan-out
-        // (one row to N outputs) emits one DLQ entry, not N. Pairing on
-        // `source_name` matters under multi-source ingest where row_num
-        // is per-source.
-        let mut seen_rows: HashSet<(Arc<str>, u64)> = HashSet::new();
+        // SourceRowId already carries the compiled Source scope. Dedup it
+        // directly so Route fan-out emits one entry per source row without
+        // reconstructing identity from a diagnostic source name.
+        let mut seen_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
         for slot in &records {
             let source_name = source_name_arc_of(&slot.original_record);
-            if !seen_rows.insert((Arc::clone(&source_name), slot.row_num)) {
+            if !seen_rows.insert(slot.row_num) {
                 continue;
             }
             let (category, trigger, error_message) = if !emitted_trigger {
@@ -168,8 +168,8 @@ fn commit_one_group(
             let sn = source_name_arc_of(&slot.original_record);
             per_source_min
                 .entry(sn)
-                .and_modify(|m| *m = (*m).min(slot.row_num))
-                .or_insert(slot.row_num);
+                .and_modify(|m| *m = (*m).min(slot.row_num.ordinal()))
+                .or_insert(slot.row_num.ordinal());
         }
         for (sn, min_rn) in per_source_min {
             ctx.rollback_cursors
@@ -218,18 +218,16 @@ fn commit_one_group(
         .map(|err| source_name_arc_of(&err.original_record))
         .collect();
 
-    // Dedup distinct rows by (source, row_num) so Route fan-out (one
-    // row to N outputs) emits one DLQ entry, not N. Pairing on
-    // `source_name` matters under multi-source ingest where row_num is
-    // per-source — pre-sprint-7 `HashSet<u64>` collided across sources
-    // and silently dropped co-rowed slots from the collateral walk.
-    let mut seen_rows: HashSet<(Arc<str>, u64)> = HashSet::new();
+    // SourceRowId already carries the compiled Source scope. Dedup it
+    // directly so Route fan-out emits one entry per source row without
+    // reconstructing identity from a diagnostic source name.
+    let mut seen_rows: HashSet<crate::executor::stream_event::SourceRowId> = HashSet::new();
     // Trigger entries: one per distinct erroring row. Multiple errors
     // per row (different branches failing) collapse to a single trigger
     // entry carrying the first error.
     for err in &error_messages {
         let source_name = source_name_arc_of(&err.original_record);
-        if !seen_rows.insert((Arc::clone(&source_name), err.row_num)) {
+        if !seen_rows.insert(err.row_num) {
             continue;
         }
         push_dlq(
@@ -263,7 +261,7 @@ fn commit_one_group(
     // different policy.
     for slot in &records {
         let slot_source = source_name_arc_of(&slot.original_record);
-        if seen_rows.contains(&(Arc::clone(&slot_source), slot.row_num)) {
+        if seen_rows.contains(&slot.row_num) {
             continue;
         }
         // Per-source spare: slot's Source did not contribute a trigger
@@ -304,7 +302,7 @@ fn commit_one_group(
                 .push(slot.clone());
             continue;
         }
-        if !seen_rows.insert((Arc::clone(&slot_source), slot.row_num)) {
+        if !seen_rows.insert(slot.row_num) {
             continue;
         }
         push_dlq(
@@ -329,9 +327,14 @@ fn commit_one_group(
 
 fn flush_clean_records_to_writers(
     ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
     per_output: std::collections::BTreeMap<String, Vec<CorrelationRecordSlot>>,
 ) -> Result<(), PipelineError> {
     'outputs: for (output_name, slots) in per_output {
+        if slots.is_empty() {
+            continue;
+        }
+        let slots = order_clean_slots(ctx, current_dag, &output_name, slots)?;
         if slots.is_empty() {
             continue;
         }
@@ -360,6 +363,7 @@ fn flush_clean_records_to_writers(
         ) {
             Ok(mut writer) => {
                 let mut write_failed = false;
+                let mut written_slots: Vec<&CorrelationRecordSlot> = Vec::new();
                 for slot in &slots {
                     let write_result = {
                         let _guard = ctx.write_timer.guard();
@@ -378,6 +382,7 @@ fn flush_clean_records_to_writers(
                         write_failed = true;
                         break;
                     }
+                    written_slots.push(slot);
                 }
                 if !write_failed {
                     let flush_result = {
@@ -403,23 +408,101 @@ fn flush_clean_records_to_writers(
                         }
                     }
                 }
+                // Counter and delivery accounting is deferred until the writer
+                // accepts each record. A later failure cannot manufacture
+                // success evidence for the failed slot or the untouched tail.
+                let mut newly_ok: u64 = 0;
+                for slot in &written_slots {
+                    ctx.ok_deliveries
+                        .insert(OutputDeliveryId::new(slot.row_num, slot.consumer));
+                    if ctx.ok_source_rows.insert(slot.row_num) {
+                        newly_ok += 1;
+                    }
+                }
+                let written = written_slots.len() as u64;
+                ctx.counters.ok_count += newly_ok;
+                ctx.counters.records_written += written;
+                ctx.records_emitted += written;
             }
             Err(e) => ctx.output_errors.push(e),
         }
-
-        // Counter accounting: per-row newly-ok bookkeeping was
-        // deferred at Output arm time when buffering. Apply it here
-        // so records never count toward `ok_count` if their group
-        // rolled back.
-        let mut newly_ok: u64 = 0;
-        for slot in &slots {
-            if ctx.ok_source_rows.insert(slot.row_num) {
-                newly_ok += 1;
-            }
-        }
-        ctx.counters.ok_count += newly_ok;
-        ctx.counters.records_written += slots.len() as u64;
-        ctx.records_emitted += slots.len() as u64;
     }
     Ok(())
+}
+
+/// Enforce the correlation-deferred physical boundary after group disposition
+/// has produced the complete clean population for one Output. Projected rows
+/// move through the shared sorter with their slot index as inert payload; the
+/// original record, consumer identity, and accounting metadata are reattached
+/// only after the authored-key permutation is complete.
+fn order_clean_slots(
+    ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
+    output_name: &str,
+    slots: Vec<CorrelationRecordSlot>,
+) -> Result<Vec<CorrelationRecordSlot>, PipelineError> {
+    struct SlotMetadata {
+        row_num: crate::executor::stream_event::SourceRowId,
+        consumer: clinker_plan::plan::PlanNodeId,
+        original_record: clinker_record::Record,
+        output_name: String,
+    }
+
+    let output_id = slots[0].consumer;
+    if slots
+        .iter()
+        .any(|slot| slot.consumer != output_id || slot.output_name != output_name)
+    {
+        return Err(PipelineError::Internal {
+            op: "writer_boundary",
+            node: output_name.to_string(),
+            detail: "correlation writer queue contains mixed physical boundaries".to_string(),
+        });
+    }
+    let boundary = crate::executor::output_dispatch::OrderedWriterBoundary::for_output(
+        current_dag,
+        output_id,
+        WriterBoundaryMode::CorrelationDeferred,
+    )?;
+
+    let mut metadata = Vec::with_capacity(slots.len());
+    let mut indexed_records = Vec::with_capacity(slots.len());
+    for (index, slot) in slots.into_iter().enumerate() {
+        let CorrelationRecordSlot {
+            row_num,
+            consumer,
+            original_record,
+            projected,
+            output_name,
+        } = slot;
+        metadata.push(Some(SlotMetadata {
+            row_num,
+            consumer,
+            original_record,
+            output_name,
+        }));
+        indexed_records.push((projected, index));
+    }
+
+    boundary
+        .order_indexed_records(ctx, indexed_records)?
+        .into_iter()
+        .map(|(projected, index)| {
+            let slot = metadata
+                .get_mut(index)
+                .and_then(Option::take)
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "writer_boundary",
+                    node: output_name.to_string(),
+                    detail: format!("sorted correlation slot index {index} is invalid"),
+                })?;
+            Ok(CorrelationRecordSlot {
+                row_num: slot.row_num,
+                consumer: slot.consumer,
+                original_record: slot.original_record,
+                projected,
+                output_name: slot.output_name,
+            })
+        })
+        .collect()
 }

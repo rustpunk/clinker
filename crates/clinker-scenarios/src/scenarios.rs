@@ -271,6 +271,56 @@ pub fn support_triage() -> GeneratedData {
     }])
 }
 
+/// Scenario 04 — per-file source verification and exact terminal ordering.
+///
+/// The first CSV already follows the declared `(account_id, batch_seq)` order.
+/// The second contains one adjacent inversion, so the default warn policy must
+/// repair that physical file without treating the two-file source as one global
+/// sequence. The output then authors a different total business order.
+pub fn ordering_contract() -> GeneratedData {
+    let sorted = concat!(
+        "account_id,batch_seq,region,priority,event_id,amount_cents\n",
+        "ACCT-100,1,north,2,EVT-1001,1250\n",
+        "ACCT-100,2,south,5,EVT-1002,2300\n",
+        "ACCT-200,1,east,3,EVT-2001,4999\n",
+        "ACCT-200,2,north,5,EVT-2002,1750\n",
+        "ACCT-300,1,south,1,EVT-3001,820\n",
+        "ACCT-300,2,east,4,EVT-3002,6400\n",
+        "ACCT-400,1,north,3,EVT-4001,3100\n",
+        "ACCT-400,2,east,5,EVT-4002,2700\n",
+        "ACCT-500,1,south,4,EVT-5001,1500\n",
+        "ACCT-500,2,north,1,EVT-5002,910\n",
+        "ACCT-600,1,east,2,EVT-6001,3600\n",
+        "ACCT-600,2,south,3,EVT-6002,4200\n",
+    );
+    let needs_repair = concat!(
+        "account_id,batch_seq,region,priority,event_id,amount_cents\n",
+        "ACCT-100,3,east,5,EVT-1003,5500\n",
+        "ACCT-100,4,north,4,EVT-1004,1325\n",
+        "ACCT-200,3,south,2,EVT-2003,2875\n",
+        "ACCT-200,4,east,1,EVT-2004,940\n",
+        "ACCT-300,4,north,2,EVT-3004,7600\n",
+        "ACCT-300,3,south,5,EVT-3003,5100\n",
+        "ACCT-400,3,east,4,EVT-4003,2250\n",
+        "ACCT-400,4,south,1,EVT-4004,1180\n",
+        "ACCT-500,3,north,5,EVT-5003,6800\n",
+        "ACCT-500,4,east,3,EVT-5004,3425\n",
+        "ACCT-600,3,south,4,EVT-6003,1995\n",
+        "ACCT-600,4,north,3,EVT-6004,4550\n",
+    );
+
+    GeneratedData::new(vec![
+        GeneratedFile {
+            path: "01-sorted.csv",
+            bytes: sorted.as_bytes().to_vec(),
+        },
+        GeneratedFile {
+            path: "02-needs-repair.csv",
+            bytes: needs_repair.as_bytes().to_vec(),
+        },
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +461,135 @@ mod tests {
         assert!(
             has_upper && has_lower,
             "priority normalisation needs both cases present"
+        );
+    }
+
+    fn ordering_key(row: &str) -> (&str, u64) {
+        let mut columns = row.split(',');
+        let account_id = columns.next().expect("account_id");
+        let batch_seq = columns
+            .next()
+            .expect("batch_seq")
+            .parse()
+            .expect("numeric batch_seq");
+        (account_id, batch_seq)
+    }
+
+    fn is_source_ordered(lines: &[String]) -> bool {
+        lines
+            .windows(2)
+            .all(|pair| ordering_key(&pair[0]) <= ordering_key(&pair[1]))
+    }
+
+    #[test]
+    fn ordering_contract_input_is_deterministic_with_one_repair_case() {
+        let first = ordering_contract();
+        let second = ordering_contract();
+
+        assert_eq!(first, second, "ordering input must be byte-deterministic");
+        assert_eq!(
+            first.digest(),
+            "8b891035785d20d9b97616706273f1ab4ccc1b55abf4c2b03083abd3a2d598a2",
+            "the committed golden is meaningful only for this input digest"
+        );
+        assert_eq!(
+            first
+                .files()
+                .iter()
+                .map(|file| file.path)
+                .collect::<Vec<_>>(),
+            ["01-sorted.csv", "02-needs-repair.csv"]
+        );
+
+        let sorted = csv_lines(&first, "01-sorted.csv");
+        let needs_repair = csv_lines(&first, "02-needs-repair.csv");
+        assert!(is_source_ordered(&sorted[1..]), "first file must be sorted");
+        assert!(
+            !is_source_ordered(&needs_repair[1..]),
+            "second file must contain an inversion"
+        );
+        assert_eq!(
+            needs_repair[1..]
+                .windows(2)
+                .filter(|pair| ordering_key(&pair[0]) > ordering_key(&pair[1]))
+                .count(),
+            1,
+            "the repair case should contain exactly one adjacent inversion"
+        );
+    }
+
+    #[test]
+    fn ordering_contract_pipeline_declares_source_and_terminal_order() {
+        let pipeline =
+            include_str!("../../../examples/scenarios/04-ordering-contract/pipeline.yaml");
+
+        assert!(
+            pipeline.contains(
+                "paths:\n        - ./data/01-sorted.csv\n        - ./data/02-needs-repair.csv"
+            ),
+            "the source must consume the two physical files explicitly"
+        );
+        assert!(
+            pipeline.contains("sort_order:\n        - account_id\n        - batch_seq"),
+            "the source must declare its per-file order"
+        );
+        assert!(
+            !pipeline.contains("on_unsorted:"),
+            "omission must exercise the default warn-and-repair policy"
+        );
+        assert!(
+            pipeline.contains(
+                "sort_order:\n        - { field: region, order: asc }\n        - { field: priority, order: desc }\n        - { field: account_id, order: asc }\n        - { field: batch_seq, order: asc }\n        - { field: event_id, order: asc }"
+            ),
+            "the terminal output must author a total business order"
+        );
+    }
+
+    #[test]
+    fn ordering_contract_golden_is_the_repaired_total_order() {
+        let data = ordering_contract();
+        let mut rows = data
+            .files()
+            .iter()
+            .flat_map(|file| {
+                String::from_utf8(file.bytes.clone())
+                    .expect("ordering input is UTF-8")
+                    .lines()
+                    .skip(1)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        rows.sort_by(|left, right| {
+            let left = left.split(',').collect::<Vec<_>>();
+            let right = right.split(',').collect::<Vec<_>>();
+            left[2]
+                .cmp(right[2])
+                .then_with(|| {
+                    right[3]
+                        .parse::<u64>()
+                        .expect("numeric priority")
+                        .cmp(&left[3].parse::<u64>().expect("numeric priority"))
+                })
+                .then_with(|| left[0].cmp(right[0]))
+                .then_with(|| {
+                    left[1]
+                        .parse::<u64>()
+                        .expect("numeric batch_seq")
+                        .cmp(&right[1].parse::<u64>().expect("numeric batch_seq"))
+                })
+                .then_with(|| left[4].cmp(right[4]))
+        });
+
+        let mut derived =
+            String::from("account_id,batch_seq,region,priority,event_id,amount_cents\n");
+        derived.push_str(&rows.join("\n"));
+        derived.push('\n');
+        assert_eq!(
+            include_str!("../../../examples/scenarios/04-ordering-contract/expected/ordered.csv"),
+            derived,
+            "the golden must be the repaired input under the authored total order"
         );
     }
 }

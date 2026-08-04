@@ -40,7 +40,7 @@ pub use schema::{
     RecordType, SourceSchema, StructureConstraint, multi_record_superset,
 };
 pub use source::ReopenableSource;
-pub use traits::{FormatReader, FormatWriter};
+pub use traits::{FormatReader, FormatWriter, SourceLifecycleEvent};
 
 // Default positional-element/field ceilings each reader enforces on a
 // body segment, re-exported under format-disambiguated names so the

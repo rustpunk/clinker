@@ -60,6 +60,8 @@ pub const MAX_COMPOSITION_DEPTH: u32 = 50;
 /// whose CXL body successfully type-checked, plus per-node row types.
 #[derive(Debug, Default, Clone)]
 pub struct CompileArtifacts {
+    /// Planning-resolved CXL module closure retained by `CompiledPlan`.
+    pub cxl_modules: crate::resources::CompiledModuleRegistry,
     /// Per-node typed CXL program (transform/aggregate/combine-body plus
     /// the synthetic pass-through programs for Source/Merge/Output/etc.),
     /// keyed by the node's [`PlanNodeId`]. The id is the node's stable
@@ -347,6 +349,7 @@ pub fn bind_schema(
     scoped_vars: cxl::resolve::ScopedVarsRegistry,
 ) -> CompileArtifacts {
     let mut artifacts = CompileArtifacts::default();
+    artifacts.cxl_modules = ctx.cxl_modules.clone();
     // Mint one id per top-level node in declaration order BEFORE any body
     // recursion, so top-level ids occupy the low, stable id range and
     // `top_level_node_ids[i]` pairs with `nodes[i]`. Lowering stamps the
@@ -359,6 +362,9 @@ pub fn bind_schema(
     // side-table entry by the node's own id.
     let top_level_ids = top_level_name_ids(nodes, &artifacts);
     let mut schema_by_name: HashMap<String, Row> = HashMap::new();
+    let mut scoped_vars = scoped_vars;
+    scoped_vars.module_exports = ctx.cxl_modules.module_exports();
+    scoped_vars.runtime_modules = ctx.cxl_modules.runtime_modules();
     let mut bind_ctx = BindContext {
         ctx,
         symbol_table,
@@ -842,7 +848,11 @@ fn build_body_scoped_vars(
 ) -> cxl::resolve::ScopedVarsRegistry {
     use cxl::resolve::ScopedVarsRegistry;
 
-    let mut registry = ScopedVarsRegistry::default();
+    let mut registry = ScopedVarsRegistry {
+        module_exports: parent.module_exports.clone(),
+        runtime_modules: Arc::clone(&parent.runtime_modules),
+        ..ScopedVarsRegistry::default()
+    };
 
     let check = |scope_str: &str,
                  schema_map: &indexmap::IndexMap<String, crate::config::ScopedVarType>,
@@ -1584,6 +1594,7 @@ fn synthetic_typed_program(output_row: Row) -> TypedProgram {
             span: cxl::lexer::Span::default(),
         },
         bindings: Vec::new(),
+        runtime_modules: Arc::new(Default::default()),
         types: Vec::new(),
         field_types: IndexMap::new(),
         regexes: Vec::new(),
@@ -2971,6 +2982,7 @@ fn bind_composition(
     populate_config_provenance(
         call_config,
         signature,
+        node_id,
         node_name,
         span,
         &mut artifacts.provenance,
@@ -2991,12 +3003,20 @@ fn bind_composition(
         None => return, // E102 errors already pushed
     };
 
-    // 7. Re-read body from disk.
-    let mut body_file =
-        match read_and_parse_body(&signature.source_path, artifacts, node_name, span, diags) {
-            Some(f) => f,
-            None => return,
-        };
+    // 7. Re-read body from disk and verify it is the same snapshot module
+    // closure discovery admitted earlier in this compile invocation.
+    let mut body_file = match read_and_parse_body(
+        &signature.source_path,
+        &resolved_path,
+        bind_ctx.ctx,
+        artifacts,
+        node_name,
+        span,
+        diags,
+    ) {
+        Some(f) => f,
+        None => return,
+    };
 
     // 7a. Apply any channel `sources:` patch addressed at a source declared
     // inside this composition body (qualified key `<this-node>.<inner-source>`).
@@ -3790,10 +3810,10 @@ fn bind_composition(
     // 15. Build and insert BoundBody. `body_indices_to_build` is
     // empty here — the post-parent-DAG-build pass populates it once
     // the parent's NodeIndex space exists, threading the parent's
-    // `name_to_idx` so body-internal port-input references can resolve
-    // to a parent-DAG `NodeIndex` and emit
-    // `PlanIndexRoot::ParentNode { upstream, .. }`.
+    // body call tree is available and every window can receive a stable,
+    // scope-local runtime key.
     let mut bound_body = BoundBody::empty(resolved_path);
+    bound_body.body_scope = body_id.into();
     bound_body.graph = body_graph;
     bound_body.topo_order = body_topo;
     bound_body.name_to_idx = body_name_to_idx;
@@ -3935,6 +3955,7 @@ fn validate_resources(
 fn populate_config_provenance(
     call_site: &IndexMap<String, serde_json::Value>,
     signature: &CompositionSignature,
+    node_id: PlanNodeId,
     node_name: &str,
     span: Span,
     provenance: &mut ProvenanceDb,
@@ -3959,7 +3980,8 @@ fn populate_config_provenance(
             param_decl.span
         };
 
-        provenance.insert(
+        provenance.insert_unscoped(
+            node_id,
             node_name.to_owned(),
             param_name.clone(),
             ResolvedValue::new(resolved_value, LayerKind::PipelineDefault, value_span),
@@ -4133,18 +4155,47 @@ fn port_columns(decl: &PortDecl) -> IndexMap<QualifiedField, Type> {
 /// Re-read and parse a composition body from disk.
 fn read_and_parse_body(
     source_path: &Path,
+    resolved_path: &Path,
+    ctx: &CompileContext,
     artifacts: &mut CompileArtifacts,
     node_name: &str,
     span: Span,
     diags: &mut Vec<Diagnostic>,
 ) -> Option<CompositionFile> {
-    let yaml = match std::fs::read_to_string(source_path) {
-        Ok(s) => s,
+    let bytes = match std::fs::read(source_path) {
+        Ok(bytes) => bytes,
         Err(e) => {
             diags.push(Diagnostic::error(
                 "E103",
                 format!(
                     "composition node {node_name:?}: failed to read body from {}: {e}",
+                    source_path.display()
+                ),
+                LabeledSpan::primary(span, String::new()),
+            ));
+            return None;
+        }
+    };
+    if let Some(expected) = ctx.composition_body_identities.get(resolved_path)
+        && blake3::hash(&bytes).as_bytes() != expected
+    {
+        diags.push(Diagnostic::error(
+            "E103",
+            format!(
+                "composition node {node_name:?}: body {} changed after module-closure discovery; retry compilation against a stable workspace snapshot",
+                source_path.display()
+            ),
+            LabeledSpan::primary(span, String::new()),
+        ));
+        return None;
+    }
+    let yaml = match String::from_utf8(bytes) {
+        Ok(yaml) => yaml,
+        Err(e) => {
+            diags.push(Diagnostic::error(
+                "E101",
+                format!(
+                    "composition node {node_name:?}: body parse failed for {}: body is not UTF-8: {e}",
                     source_path.display()
                 ),
                 LabeledSpan::primary(span, String::new()),
@@ -4710,7 +4761,7 @@ fn typecheck_parsed_program(
         program,
         &field_refs,
         node_count,
-        &std::collections::HashMap::new(),
+        &scoped_vars.module_exports,
         scoped_vars,
     )
     .map_err(|diags| {

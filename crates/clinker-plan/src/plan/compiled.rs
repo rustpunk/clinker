@@ -18,33 +18,143 @@
 //! ## Deriving a node's scoped lineage (klinx export)
 //!
 //! `PlanNodeId` is the sole internal identity; it carries no scope. A
-//! human-readable scoped path (`Outer/Inner/name`) is *derived*, never
-//! keyed: a top-level node lives in [`Self::dag`]; a composition-body
-//! node lives in the graph of the [`BoundBody`] whose
-//! `CompositionBodyId` indexes [`Self::composition_bodies`]. Walk those
-//! graphs to find the node carrying a given `PlanNodeId`, read its
-//! `name`, and prefix the scope's body name(s). No materialized
-//! `PlanNodeId → (scope, name)` map exists because the only consumer is
-//! the out-of-tree klinx exporter; an in-tree map would be unused.
+//! human-readable scoped path is derived from the top-level DAG and nested
+//! composition bodies. Provenance retains that derived address beside its
+//! typed key so explain and overlay paths can resolve authored shorthand
+//! without using names as identity.
 
 use super::bind_schema::CompileArtifacts;
 use super::composition_body::{BoundBody, CompositionBodies, CompositionBodyId};
-use super::execution::ExecutionPlanDag;
+use super::execution::{ExecutionPlanDag, PlanNode};
 use super::statistics::StatisticsCatalog;
 use crate::config::PipelineConfig;
 use crate::config::composition::{ProvenanceDb, SchemaProvenanceDb};
+use crate::resources::CompiledModuleRegistry;
 use clinker_format::SourceSchema;
 use indexmap::IndexMap;
 
-/// Content-hash identity for a compiled channel overlay.
+/// Semantic kind of one retained channel-resolution layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChannelLayerKind {
+    /// The already-compiled pipeline source hash.
+    PipelineDefault,
+    /// One selected group, in resolved precedence order.
+    Group,
+    /// The channel-wide manifest.
+    ChannelWide,
+    /// The selected target overlay.
+    ChannelPerTarget,
+}
+
+/// Why a group joined the retained layer stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChannelGroupSource {
+    /// The group's selector matched the channel labels.
+    Derived,
+    /// The group was explicitly requested.
+    Explicit,
+}
+
+/// Exact identity of one applied pipeline/channel/group layer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ChannelLayerIdentity {
+    /// Semantic layer kind.
+    pub kind: ChannelLayerKind,
+    /// Logical pipeline, group, or channel name.
+    pub name: String,
+    /// Authored group priority, present only for group layers.
+    pub group_priority: Option<i64>,
+    /// Stable group declaration sequence, present only for group layers.
+    pub group_sequence: Option<u32>,
+    /// Selection source, present only for group layers.
+    pub group_source: Option<ChannelGroupSource>,
+    /// Length of the exact parsed bytes. The existing pipeline hash does not
+    /// retain a source length, so the pipeline-default layer uses zero.
+    pub byte_len: u64,
+    /// BLAKE3 of the exact parsed bytes (or `CompiledPlan::pipeline_hash`).
+    pub content_hash: [u8; 32],
+}
+
+/// Content-hash identity for a compiled channel/group resolution.
 ///
-/// Two plans with identical `ChannelIdentity` are byte-equivalent and
-/// do not need re-materialization (SQLMesh Virtual Environments model).
+/// Two plans with identical `ChannelIdentity` have the same pipeline hash and
+/// exact applied layer bytes in the same precedence order.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ChannelIdentity {
+    /// Compatibility display name: the channel id, or `standalone` for an
+    /// explicit group-only resolution.
     pub name: String,
-    /// BLAKE3 hash of the raw `.channel.yaml` file bytes.
+    /// Selected channel id. `None` for an explicit group-only resolution.
+    pub channel: Option<String>,
+    /// Complete immutable applied stack in precedence order.
+    pub layers: Vec<ChannelLayerIdentity>,
+    /// Domain-separated aggregate hash of `channel` and every ordered layer.
     pub content_hash: [u8; 32],
+}
+
+impl ChannelIdentity {
+    /// Build an aggregate identity from a complete ordered layer stack.
+    pub fn from_layers(channel: Option<String>, layers: Vec<ChannelLayerIdentity>) -> Self {
+        fn hash_bytes(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"clinker.channel.identity.v2\0");
+        match channel.as_deref() {
+            Some(name) => {
+                hasher.update(&[1]);
+                hash_bytes(&mut hasher, name.as_bytes());
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        };
+        hasher.update(&(layers.len() as u64).to_le_bytes());
+        for layer in &layers {
+            let kind = match layer.kind {
+                ChannelLayerKind::PipelineDefault => 0,
+                ChannelLayerKind::Group => 1,
+                ChannelLayerKind::ChannelWide => 2,
+                ChannelLayerKind::ChannelPerTarget => 3,
+            };
+            hasher.update(&[kind]);
+            hash_bytes(&mut hasher, layer.name.as_bytes());
+            match layer.group_priority {
+                Some(priority) => {
+                    hasher.update(&[1]);
+                    hasher.update(&priority.to_le_bytes());
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            };
+            match layer.group_sequence {
+                Some(sequence) => {
+                    hasher.update(&[1]);
+                    hasher.update(&sequence.to_le_bytes());
+                }
+                None => {
+                    hasher.update(&[0]);
+                }
+            };
+            match layer.group_source {
+                Some(ChannelGroupSource::Derived) => hasher.update(&[1]),
+                Some(ChannelGroupSource::Explicit) => hasher.update(&[2]),
+                None => hasher.update(&[0]),
+            };
+            hasher.update(&layer.byte_len.to_le_bytes());
+            hash_bytes(&mut hasher, &layer.content_hash);
+        }
+        let name = channel.clone().unwrap_or_else(|| "standalone".to_string());
+        Self {
+            name,
+            channel,
+            layers,
+            content_hash: *hasher.finalize().as_bytes(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -78,6 +188,8 @@ pub struct CompiledPlan {
     /// <source>.<column>.<attribute>`. Excluded from `pipeline_hash`; rebuilt
     /// each compile.
     schema_provenance: SchemaProvenanceDb,
+    /// Complete immutable CXL module closure captured during planning.
+    cxl_modules: CompiledModuleRegistry,
 }
 
 impl CompiledPlan {
@@ -95,7 +207,8 @@ impl CompiledPlan {
         let CompileArtifacts {
             composition_bodies,
             statistics,
-            provenance,
+            mut provenance,
+            cxl_modules,
             ..
         } = artifacts;
         // Base-seed the schema provenance from the resolved schemas. The overlay
@@ -105,6 +218,7 @@ impl CompiledPlan {
         for (name, schema) in &bound_schemas {
             schema_provenance.seed_base(name, schema);
         }
+        assign_provenance_scopes(&dag, &composition_bodies, &mut provenance);
         Self {
             dag,
             config,
@@ -115,6 +229,7 @@ impl CompiledPlan {
             pipeline_hash,
             bound_schemas,
             schema_provenance,
+            cxl_modules,
         }
     }
 
@@ -138,6 +253,12 @@ impl CompiledPlan {
     /// estimates.
     pub fn statistics(&self) -> &StatisticsCatalog {
         &self.statistics
+    }
+
+    /// Planning-resolved module closure. Execution consumes this registry
+    /// directly and does not reopen module source files.
+    pub fn cxl_modules(&self) -> &CompiledModuleRegistry {
+        &self.cxl_modules
     }
 
     /// Look up a composition body by its ID.
@@ -205,4 +326,31 @@ impl CompiledPlan {
     pub(crate) fn merge_schema_provenance(&mut self, overlay: SchemaProvenanceDb) {
         self.schema_provenance.merge_over(overlay);
     }
+}
+
+fn assign_provenance_scopes(
+    dag: &ExecutionPlanDag,
+    bodies: &CompositionBodies,
+    provenance: &mut ProvenanceDb,
+) {
+    fn visit_graph(
+        graph: &petgraph::graph::DiGraph<PlanNode, super::execution::PlanEdge>,
+        call_path: &[String],
+        bodies: &CompositionBodies,
+        provenance: &mut ProvenanceDb,
+    ) {
+        for node in graph.node_weights() {
+            let PlanNode::Composition { name, id, body, .. } = node else {
+                continue;
+            };
+            provenance.assign_scoped_node(*id, call_path.iter().cloned(), name);
+            if let Some(bound_body) = bodies.get(body) {
+                let mut nested_path = call_path.to_vec();
+                nested_path.push(name.clone());
+                visit_graph(&bound_body.graph, &nested_path, bodies, provenance);
+            }
+        }
+    }
+
+    visit_graph(&dag.graph, &[], bodies, provenance);
 }

@@ -90,6 +90,8 @@ struct TypeField {
     name: String,
     ty: Type,
     format: Option<String>,
+    /// Decimal precision (total digits) enforced by the positional parser.
+    precision: Option<u8>,
     /// Decimal scale (fractional digits) for a `decimal` column; `None`
     /// otherwise. Threaded into `coerce_scalar` so a decimal value is rounded
     /// to the column scale at parse.
@@ -682,6 +684,7 @@ fn resolve_fixed_width(
                 name: f.name.clone(),
                 ty: f.ty.clone(),
                 format: f.format.clone(),
+                precision: f.precision,
                 scale: f.scale,
                 fixed: Some(resolved),
                 csv_column: None,
@@ -750,6 +753,7 @@ fn resolve_csv(
                 name: f.name.clone(),
                 ty: f.ty.clone(),
                 format: f.format.clone(),
+                precision: f.precision,
                 scale: f.scale,
                 fixed: None,
                 csv_column: Some(csv_idx),
@@ -890,13 +894,24 @@ fn require_tag(tag: &str, id: &str) -> Result<String, String> {
 fn extract_field_value(tf: &TypeField, line: &ScannedLine, row: u64) -> Result<Value, FormatError> {
     let raw = field_raw_text(tf, line, row)?;
     if raw.is_empty() {
-        return Ok(Value::Null);
-    }
-    field::coerce_scalar(&tf.ty, tf.format.as_deref(), tf.scale, &raw).map_err(|m| {
-        FormatError::InvalidRecord {
-            row,
-            message: format!("field '{}': {m}", tf.name),
+        if tf.ty.is_nullable() || matches!(tf.ty.unwrap_nullable(), Type::Null) {
+            return Ok(Value::Null);
         }
+        return Err(FormatError::InvalidRecord {
+            row,
+            message: format!("field '{}': null is not a valid {}", tf.name, tf.ty),
+        });
+    }
+    field::coerce_scalar_with_constraints(
+        &tf.ty,
+        tf.format.as_deref(),
+        tf.precision,
+        tf.scale,
+        &raw,
+    )
+    .map_err(|m| FormatError::InvalidRecord {
+        row,
+        message: format!("field '{}': {m}", tf.name),
     })
 }
 
@@ -1090,6 +1105,28 @@ mod tests {
             recs[3].get(RECORD_TYPE_COLUMN),
             Some(&Value::String("trailer".into()))
         );
+    }
+
+    #[test]
+    fn active_non_nullable_and_decimal_constraints_fail_in_multi_record_reader() {
+        fn decimal_type() -> Vec<RecordType> {
+            let amount = Column {
+                precision: Some(4),
+                scale: Some(2),
+                ..fw_field("amount", 1, 6, Type::Decimal)
+            };
+            vec![rtype("detail", "D", vec![amount])]
+        }
+
+        for (input, expected) in [
+            (&b"D      \n"[..], "null is not a valid Decimal"),
+            (&b"D12.345\n"[..], "requires rounding"),
+            (&b"D123.45\n"[..], "precision 4"),
+        ] {
+            let mut reader = fw_reader(input, decimal_type(), Vec::new(), Vec::new()).unwrap();
+            let error = reader.next_record().unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
     }
 
     #[test]

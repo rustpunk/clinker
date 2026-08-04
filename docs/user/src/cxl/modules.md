@@ -1,152 +1,181 @@
-# Modules & use
+# Modules and `use`
 
-CXL supports a module system for organizing reusable expressions. Modules contain function declarations and constant bindings that can be imported into CXL programs.
+CXL modules organize reusable constants and pure, single-expression functions.
+Module files use the `.cxl` extension and are admitted while Clinker plans the
+pipeline. Execution uses the admitted declarations stored in the compiled plan;
+it does not read module files again.
 
 ## Module files
 
-A module is a `.cxl` file containing `fn` declarations and `let` constants. Module files live in the rules path (default: `./rules/`).
-
-### Function declarations
-
-Functions are pure, single-expression bodies with named parameters:
-
-```
-fn fiscal_year(d) = if d.month() < 4 then d.year() - 1 else d.year()
-
-fn full_name(first, last) = first.trim() + " " + last.trim()
-
-fn clamp_pct(value) = value.clamp(0, 100).round_to(1)
-```
-
-Functions are pure -- they have no side effects and always return a value.
-
-### Module constants
-
-Constants are `let` bindings at the module level:
-
-```
+```cxl
+# rules/shared/finance.cxl
 let tax_rate = 0.21
-let max_retries = 3
 let default_currency = "USD"
+
+fn tax(amount) = amount * tax_rate
+fn normalize_currency(value) = value.trim().upper()
 ```
 
-### Example module file
+A module may contain:
 
-File: `rules/shared/dates.cxl`
+- `let` constants whose expressions depend only on other constants and pure
+  CXL operations;
+- `fn` declarations with named parameters and one expression body; and
+- `use` declarations for other modules.
 
-```
-fn fiscal_year(d) = if d.month() < 4 then d.year() - 1 else d.year()
+Functions cannot contain statements such as `emit`, `filter`, or `distinct`.
+Recursive function calls and cyclic module imports are rejected during
+planning.
 
-fn quarter(d) = match {
-  d.month() <= 3  => 1,
-  d.month() <= 6  => 2,
-  d.month() <= 9  => 3,
-  _               => 4
-}
+## Where `use` is recognized
 
-fn fiscal_quarter(d) = quarter(d.add_months(-3))
+Planning resolves module imports from every field that carries executable CXL,
+including:
 
-let fiscal_start_month = 4
-```
+- a Transform's primary expression, validation checks, and per-record log
+  conditions;
+- an Aggregate's expression;
+- every Route condition;
+- a Combine predicate and body;
+- Envelope header and footer expressions;
+- Reshape rule conditions, mutations, and synthesized overrides;
+- Cull group-drop conditions; and
+- the same fields inside reachable composition bodies.
 
-## Importing modules
+Ordinary strings do not participate in module resolution. Node names,
+validation and log messages, output paths, and other descriptive text cannot
+introduce an import merely by containing text that resembles `use`.
 
-Use the `use` statement to import a module. Module paths use **dot notation** (not `::`):
+## Importing and using a module
 
-```
-use shared.dates as d
-```
+Module identities and member access both use dot notation:
 
-This imports the module at `rules/shared/dates.cxl` and binds it to the alias `d`.
+```cxl
+use shared.finance as finance
 
-### Import syntax
-
-```
-use module.path
-use module.path as alias
-```
-
-The `as alias` clause is optional. When omitted, the last segment of the path becomes the default name.
-
-```
-use shared.dates          # access as dates::fiscal_year(...)
-use shared.dates as d     # access as d::fiscal_year(...)
+emit tax = finance.tax(amount)
+emit currency = finance.default_currency
 ```
 
-### Path resolution
+The alias is optional. Without `as`, the last identity segment is the alias:
 
-Module paths are resolved relative to the rules path:
-
-| Import | File path |
-|--------|-----------|
-| `use shared.dates` | `rules/shared/dates.cxl` |
-| `use transforms.normalize` | `rules/transforms/normalize.cxl` |
-| `use utils` | `rules/utils.cxl` |
-
-The rules path defaults to `./rules/` and can be overridden with `--rules-path`.
-
-## Using imported functions and constants
-
-After importing, reference module members with `::` (double colon) syntax:
-
-```
-use shared.dates as d
-use shared.finance as f
-
-emit fiscal_year = d::fiscal_year(invoice_date)
-emit quarter = d::quarter(invoice_date)
-emit tax = amount * f::tax_rate
-emit net = amount - tax
+```cxl
+use shared.finance
+emit tax = finance.tax(amount)
 ```
 
-### Functions
+There is no `::` member syntax and no wildcard import. A missing member, calling
+a constant, or reading a function without parentheses is a planning error with
+the offending module and member named in the diagnostic.
 
-Call functions with `alias::function_name(args)`:
+## Direct imports and private dependencies
 
+Pipeline CXL can access only modules it imports directly. A module may import
+another module by its absolute logical identity:
+
+```cxl
+# rules/app/invoice.cxl
+use shared.finance as finance
+
+let standard_rate = finance.tax_rate
+fn invoice_tax(amount) = finance.tax(amount)
 ```
-use shared.dates as d
-emit fy = d::fiscal_year(order_date)
+
+```cxl
+# pipeline transform
+use app.invoice as invoice
+emit tax = invoice.invoice_tax(amount)
 ```
 
-### Constants
+`shared.finance` is included in the admitted transitive closure, but it is
+private to `app.invoice`. The pipeline must add its own `use shared.finance` if
+it needs to address that module directly. Dependencies are never re-exported.
 
-Access constants with `alias::constant_name`:
+## Rules-root selection
 
+Clinker selects exactly one rules root for non-catalog module identities. The
+precedence is:
+
+1. explicit `clinker run --rules-path <DIR>`;
+2. `pipeline.rules_path` in the pipeline YAML;
+3. `[catalog].rules_root` in `clinker.toml`; then
+4. the workspace-relative `rules/` default.
+
+There is no search path and no first-match shadowing. Every relative candidate
+is anchored to the selected workspace, not the process working directory or
+the pipeline file's directory. See the [CLI reference](../ops/cli-reference.md#clinker-run)
+and [typed workspace catalog](../pipelines/channels.md#typed-workspace-catalog).
+
+An explicit `[catalog.rules]` entry maps a logical rule identity to a particular
+workspace-contained file and takes priority over the derived
+`<rules-root>/<identity segments>.cxl` path for that identity.
+
+## Planning bounds and diagnostics
+
+Planning loads only the direct imports and their transitive dependencies. Each
+canonical module is parsed once. The default closure limits are:
+
+| Limit | Default |
+| --- | ---: |
+| One module file | 1 MiB |
+| Unique modules | 64 |
+| Import depth | 32 |
+| Total closure source | 16 MiB |
+
+Planning fails before execution for a missing or unreadable module, invalid
+UTF-8 or CXL, duplicate declarations or aliases, an import/function cycle, or a
+closure that exceeds a bound. Cycle diagnostics show the complete discovered
+chain so the import edge to remove is visible.
+
+After loading the complete reachable closure, planning validates both
+declaration graphs:
+
+- constant dependencies must be acyclic; and
+- function calls must be acyclic, including direct, mutual, and cross-module
+  recursion.
+
+Cycle diagnostics report the complete chain with the relevant call or
+declaration locations. Imported calls are also checked at the authored call
+site. The diagnostic names the logical module and member when the member is not
+a function, the argument count is wrong, or the expanded function body is
+ill-typed. For example, if `shared.numbers.add` takes two arguments, the
+corrected call is:
+
+```cxl
+use shared.numbers as numbers
+emit total = numbers.add(left, right)
 ```
-use shared.finance as f
-emit tax = amount * f::tax_rate
-```
 
-## Restrictions
+## Source-file lifetime
 
-- **No wildcard imports.** `use shared.*` is not supported. Import modules explicitly.
-- **Dot separator only.** Module paths use `.`, not `::`. The `::` syntax is reserved for member access after import.
-- **Single expression bodies.** Functions must be a single expression -- no multi-statement bodies.
-- **Pure functions.** Functions cannot use `emit`, `filter`, `distinct`, or other statement forms. They are pure computations.
-- **No recursion.** Functions cannot call themselves (directly or indirectly).
+Module files are an input to planning, not a runtime dependency. Once planning
+succeeds, the compiled plan owns the immutable parsed declarations for every
+admitted direct and transitive module. The same plan can execute repeatedly if
+those source files are renamed, changed, or removed after planning. Changes take
+effect only after compiling a new plan.
+
+Removing or changing a required file before planning still fails admission.
+This boundary prevents a checked plan from silently executing different module
+code and keeps execution independent of filesystem path authority.
 
 ## Complete example
 
-File: `rules/etl/clean.cxl`
+```cxl
+# rules/etl/clean.cxl
+let max_amount = 999999.99
 
-```
 fn normalize_name(name) = name.trim().upper()
-
 fn safe_amount(raw) = raw.try_float() ?? 0.0
-
 fn flag_suspicious(amount, threshold) =
   if amount > threshold then "review" else "ok"
-
-let max_amount = 999999.99
 ```
 
-Pipeline CXL block:
+```cxl
+# pipeline CXL
+use etl.clean as clean
 
-```
-use etl.clean as c
-
-emit customer = c::normalize_name(raw_customer)
-emit amount = c::safe_amount(raw_amount)
-filter amount <= c::max_amount
-emit review_flag = c::flag_suspicious(amount, 10000)
+emit customer = clean.normalize_name(raw_customer)
+emit amount = clean.safe_amount(raw_amount)
+filter amount <= clean.max_amount
+emit review_flag = clean.flag_suspicious(amount, 10000)
 ```

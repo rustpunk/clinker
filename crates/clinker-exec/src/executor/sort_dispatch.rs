@@ -2,8 +2,9 @@
 //!
 //! Holds the planner-synthesized enforcer-sort body lifted out of
 //! [`crate::executor::dispatch::dispatch_plan_node`]: it materializes the
-//! predecessor's records, sorts them by the enforced key carrying `row_num`
-//! through the permutation, and emits the ordered run. The dispatcher's
+//! predecessor's records, sorts them by the enforced key while carrying each
+//! record's [`SourceRowId`](crate::executor::stream_event::SourceRowId) through
+//! the permutation, and emits the ordered run. The dispatcher's
 //! `Sort` arm is a single delegating call into [`dispatch_sort`].
 
 use clinker_record::Record;
@@ -17,10 +18,43 @@ use crate::executor::{parse_memory_limit, stage_metrics};
 use crate::pipeline::spill_merge::merge_sorted_runs;
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, single_predecessor};
+/// Lazily drained result of a stable authored-key sort. Resident populations
+/// iterate their already-sorted vector; spilled populations retain the shared
+/// bounded-fan-in merger so records reach a terminal writer without
+/// rematerializing the merged run.
+pub(super) enum AuthoredSortStream {
+    InMemory(std::vec::IntoIter<(Record, crate::executor::stream_event::SourceRowId)>),
+    Spilled {
+        merger: crate::pipeline::spill_merge::SortedRunMerger<
+            crate::executor::stream_event::SourceRowId,
+        >,
+        _charge: crate::pipeline::spill_merge::SpillChargeGuard,
+    },
+}
+
+impl Iterator for AuthoredSortStream {
+    type Item = Result<(Record, crate::executor::stream_event::SourceRowId), PipelineError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let result = match self {
+            Self::InMemory(records) => records.next().map(Ok),
+            Self::Spilled { merger, .. } => merger.next(),
+        };
+        if matches!(result, None | Some(Err(_))) && matches!(self, Self::Spilled { .. }) {
+            // Dropping both the merger and its charge guard at exhaustion (or
+            // decode failure) unlinks the final files and releases their exact
+            // live-byte charge at the same boundary. An early caller drop gets
+            // the same behavior from the enum fields' Drop implementations.
+            *self = Self::InMemory(Vec::new().into_iter());
+        }
+        result
+    }
+}
 
 /// Execute the `Sort` arm for `node_idx`: buffer the predecessor's records,
-/// sort by the enforced `sort_fields` key (carrying each record's `row_num`
-/// through the permutation), and emit the ordered run. Blocking: the full
+/// sort by the enforced `sort_fields` key (carrying each record's
+/// [`SourceRowId`](crate::executor::stream_event::SourceRowId) through the
+/// permutation), and emit the ordered run. Blocking: the full
 /// input run materializes before the first sorted record leaves.
 pub(crate) fn dispatch_sort(
     ctx: &mut ExecutorContext<'_>,
@@ -37,12 +71,10 @@ pub(crate) fn dispatch_sort(
         unreachable!("dispatch_sort called with non-Sort node");
     };
     // Enforcer-sort dispatch. Carries `row_num` through
-    // the sort permutation as the `SortBuffer<u64>`
+    // the sort permutation as the `SortBuffer<SourceRowId>`
     // payload — the Record itself carries every field
     // value, emitted content, and metadata, so no
     // parallel bookkeeping map rides alongside.
-    use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
-
     let pred = single_predecessor(current_dag, node_idx, "sort", name)?;
     let producer_port = current_dag
         .graph
@@ -60,7 +92,7 @@ pub(crate) fn dispatch_sort(
     let (input_buffer, _input_reservation) =
         input_buffer.into_materialized_parts(&ctx.memory_budget, name)?;
     let (input_records, input_puncts): (
-        Vec<(Record, u64)>,
+        Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::stream_event::Punctuation>,
     ) = input_buffer.drain_split()?;
 
@@ -82,58 +114,7 @@ pub(crate) fn dispatch_sort(
         return Ok(());
     }
 
-    let schema = input_records[0].0.schema().clone();
-    let mem_limit = parse_memory_limit(ctx.config);
-    // Resolve the spill compression mode against this sort's schema width and
-    // the run's batch size, so spilled runs match what `--explain` projects.
-    let spill_compress = ctx
-        .spill_compress
-        .resolve_for_schema(schema.column_count(), ctx.batch_size as u64);
-    let buf: SortBuffer<u64> = SortBuffer::new(
-        sort_fields.clone(),
-        mem_limit,
-        Some(ctx.spill_root_path.to_path_buf()),
-        spill_compress,
-        schema,
-    );
-
-    let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
-    let sort_count = input_records.len() as u64;
-    // Cloned out of `ctx` so the kernel closure owns it: every spilled run
-    // (including the residue `finish` flushes) is charged against the disk
-    // quota, aborting with E320 the moment the cumulative total crosses
-    // `storage.spill.disk_cap_bytes`.
-    let budget = std::sync::Arc::clone(&ctx.memory_budget);
-    // CPU-bound: sort buffer push + per-batch comparison + spill I/O. The
-    // kernel owns its input (`input_records`, `buf`, `budget`) and borrows
-    // nothing from `ctx`, so it runs on the shared Rayon pool; output order is
-    // fully determined by the sort itself, so pool scheduling cannot perturb it.
-    let sorted = ctx
-        .kernel_pool
-        .install(move || drain_into_sort_buffer(buf, input_records, name, &budget))?;
-
-    // Individually-sorted runs from `SortBuffer` are folded into one globally
-    // ordered run through the same LoserTree k-way merge that aggregation spill
-    // uses; a single in-memory run is already globally ordered and needs no
-    // merge.
-    let out: Vec<(Record, u64)> = match sorted {
-        SortedOutput::InMemory(pairs) => pairs,
-        // A high-fragmentation spill folds down through a bounded-fan-in cascade
-        // before the final merge; intermediate runs charge this node's disk
-        // quota exactly like the runs above.
-        SortedOutput::Spilled(files) => merge_sorted_runs(
-            files,
-            sort_fields,
-            "sort enforcer",
-            crate::pipeline::spill_merge::MergeBudget {
-                budget: &ctx.memory_budget,
-                node: name,
-                compress: spill_compress,
-            },
-        )?,
-    };
-    ctx.collector
-        .record(sort_timer.finish(sort_count, sort_count));
+    let out = sort_records_by_authored_fields(ctx, name, sort_fields, input_records)?;
     tee_emit_to_region_input_buffers(ctx, current_dag, node_idx, &out)?;
     admit_node_buffer(
         ctx,
@@ -148,6 +129,167 @@ pub(crate) fn dispatch_sort(
     Ok(())
 }
 
+/// Apply the shared stable authored-key sort to a materialized record stream.
+///
+/// `SourceRowId` remains payload throughout resident sorting and spill merge;
+/// it is never appended to the comparison key. This is shared by synthesized
+/// Sort nodes and terminal Output declarations so both paths have identical
+/// null, direction, stable-tie, memory, and spill behavior.
+pub(super) fn sort_records_by_authored_fields(
+    ctx: &mut ExecutorContext<'_>,
+    node_name: &str,
+    sort_fields: &[clinker_plan::config::SortField],
+    mut input_records: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
+) -> Result<Vec<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
+    use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
+
+    input_records.retain(|(record, _)| {
+        !sort_fields.iter().any(|field| {
+            field.null_order == Some(clinker_plan::config::NullOrder::Drop)
+                && record
+                    .get(&field.field)
+                    .is_none_or(clinker_record::Value::is_null)
+        })
+    });
+    if input_records.is_empty() {
+        return Ok(input_records);
+    }
+    let schema = input_records[0].0.schema().clone();
+    let mem_limit = parse_memory_limit(ctx.config);
+    let spill_compress = ctx
+        .spill_compress
+        .resolve_for_schema(schema.column_count(), ctx.batch_size as u64);
+    let buf: SortBuffer<crate::executor::stream_event::SourceRowId> = SortBuffer::new(
+        sort_fields.to_vec(),
+        mem_limit,
+        Some(ctx.spill_root_path.to_path_buf()),
+        spill_compress,
+        schema,
+    );
+
+    let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
+    let sort_count = input_records.len() as u64;
+    let charge = crate::pipeline::spill_merge::SpillChargeGuard::new(
+        std::sync::Arc::clone(&ctx.memory_budget),
+        node_name,
+    );
+    let sorted = ctx
+        .kernel_pool
+        .install(|| drain_into_sort_buffer(buf, input_records, node_name, &charge))?;
+    let out = match sorted {
+        SortedOutput::InMemory(pairs) => pairs,
+        SortedOutput::Spilled(files) => merge_sorted_runs(
+            files,
+            sort_fields,
+            "authored sort",
+            crate::pipeline::spill_merge::MergeBudget {
+                budget: &ctx.memory_budget,
+                node: node_name,
+                compress: spill_compress,
+                charge_owner: Some(&charge),
+            },
+        )?,
+    };
+    ctx.collector
+        .record(sort_timer.finish(sort_count, sort_count));
+    Ok(out)
+}
+
+/// Apply the shared stable authored-key sorter to a record iterator and leave
+/// a spilled result lazy. This is the terminal-writer variant of
+/// [`sort_records_by_authored_fields`]: it performs the same null-drop filter,
+/// stable run formation, spill charging, and bounded fan-in merge, while
+/// allowing document/envelope commit paths to write one merged record at a
+/// time instead of collecting the complete result in a second `Vec`.
+pub(super) fn sort_record_stream_by_authored_fields<I>(
+    ctx: &mut ExecutorContext<'_>,
+    node_name: &str,
+    sort_fields: &[clinker_plan::config::SortField],
+    input: I,
+) -> Result<AuthoredSortStream, PipelineError>
+where
+    I: IntoIterator<
+        Item = Result<(Record, crate::executor::stream_event::SourceRowId), PipelineError>,
+    >,
+{
+    use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
+    use crate::pipeline::spill_merge::{MergeBudget, SortedRunMerger, SpillChargeGuard};
+
+    let mem_limit = parse_memory_limit(ctx.config);
+    let mut buffer: Option<SortBuffer<crate::executor::stream_event::SourceRowId>> = None;
+    let mut spill_compress = false;
+    let mut sort_count = 0u64;
+    let sort_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::Sort);
+    let charge = SpillChargeGuard::new(std::sync::Arc::clone(&ctx.memory_budget), node_name);
+
+    for item in input {
+        let (record, source_row) = item?;
+        if sort_fields.iter().any(|field| {
+            field.null_order == Some(clinker_plan::config::NullOrder::Drop)
+                && record
+                    .get(&field.field)
+                    .is_none_or(clinker_record::Value::is_null)
+        }) {
+            continue;
+        }
+        let buf = buffer.get_or_insert_with(|| {
+            spill_compress = ctx
+                .spill_compress
+                .resolve_for_schema(record.schema().column_count(), ctx.batch_size as u64);
+            SortBuffer::new(
+                sort_fields.to_vec(),
+                mem_limit,
+                Some(ctx.spill_root_path.to_path_buf()),
+                spill_compress,
+                record.schema().clone(),
+            )
+        });
+        buf.push(record, source_row);
+        sort_count = sort_count.saturating_add(1);
+        if buf.should_spill() {
+            let written = buf.sort_and_spill().map_err(|error| {
+                PipelineError::Io(std::io::Error::other(format!(
+                    "sort enforcer '{node_name}' spill failed: {error}"
+                )))
+            })?;
+            charge_enforcer_spill(&charge, node_name, written)?;
+        }
+    }
+
+    let Some(buf) = buffer else {
+        return Ok(AuthoredSortStream::InMemory(Vec::new().into_iter()));
+    };
+    let (sorted, residue) = buf.finish().map_err(|error| {
+        PipelineError::Io(std::io::Error::other(format!(
+            "sort enforcer '{node_name}' finish failed: {error}"
+        )))
+    })?;
+    charge_enforcer_spill(&charge, node_name, residue)?;
+    ctx.collector
+        .record(sort_timer.finish(sort_count, sort_count));
+
+    match sorted {
+        SortedOutput::InMemory(records) => Ok(AuthoredSortStream::InMemory(records.into_iter())),
+        SortedOutput::Spilled(files) => {
+            let merger = SortedRunMerger::new(
+                files,
+                sort_fields,
+                "authored sort",
+                MergeBudget {
+                    budget: &ctx.memory_budget,
+                    node: node_name,
+                    compress: spill_compress,
+                    charge_owner: Some(&charge),
+                },
+            )?;
+            Ok(AuthoredSortStream::Spilled {
+                merger,
+                _charge: charge,
+            })
+        }
+    }
+}
+
 /// Drain `input` into `buf`, spilling sorted runs when the buffer exceeds its
 /// budget and charging every spilled run — including the residue flushed by
 /// `finish` — against the arbitrator's disk quota. Returns the buffer's sorted
@@ -156,20 +298,23 @@ pub(crate) fn dispatch_sort(
 ///
 /// CPU-bound: the per-run sort runs on the caller's Rayon pool.
 fn drain_into_sort_buffer(
-    mut buf: crate::pipeline::sort_buffer::SortBuffer<u64>,
-    input: Vec<(Record, u64)>,
+    mut buf: crate::pipeline::sort_buffer::SortBuffer<crate::executor::stream_event::SourceRowId>,
+    input: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     node_name: &str,
-    budget: &crate::pipeline::memory::MemoryArbitrator,
-) -> Result<crate::pipeline::sort_buffer::SortedOutput<u64>, PipelineError> {
-    for (record, row_num) in input {
-        buf.push(record, row_num);
+    charge: &crate::pipeline::spill_merge::SpillChargeGuard,
+) -> Result<
+    crate::pipeline::sort_buffer::SortedOutput<crate::executor::stream_event::SourceRowId>,
+    PipelineError,
+> {
+    for (record, source_row) in input {
+        buf.push(record, source_row);
         if buf.should_spill() {
             let written = buf.sort_and_spill().map_err(|e| {
                 PipelineError::Io(std::io::Error::other(format!(
                     "sort enforcer '{node_name}' spill failed: {e}"
                 )))
             })?;
-            charge_enforcer_spill(budget, node_name, written)?;
+            charge_enforcer_spill(charge, node_name, written)?;
         }
     }
     let (sorted, residue) = buf.finish().map_err(|e| {
@@ -177,7 +322,7 @@ fn drain_into_sort_buffer(
             "sort enforcer '{node_name}' finish failed: {e}"
         )))
     })?;
-    charge_enforcer_spill(budget, node_name, residue)?;
+    charge_enforcer_spill(charge, node_name, residue)?;
     Ok(sorted)
 }
 
@@ -186,16 +331,16 @@ fn drain_into_sort_buffer(
 /// cumulative total crosses `storage.spill.disk_cap_bytes`. A zero-byte write
 /// (nothing flushed) charges nothing.
 fn charge_enforcer_spill(
-    budget: &crate::pipeline::memory::MemoryArbitrator,
+    charge: &crate::pipeline::spill_merge::SpillChargeGuard,
     node_name: &str,
     written: u64,
 ) -> Result<(), PipelineError> {
-    if written > 0 && budget.record_spill_bytes(node_name, written) {
+    if written > 0 && charge.record(written) {
         return Err(PipelineError::spill_cap_exceeded(
             node_name.to_string(),
-            budget.max_spill_bytes(),
+            charge.max_spill_bytes(),
             written,
-            budget.cumulative_spill_bytes(),
+            charge.current_spill_bytes(),
         ));
     }
     Ok(())
@@ -209,8 +354,9 @@ mod tests {
 
     use crate::executor::dispatch::{NodeBufferKey, single_input_node_buffer_key};
     use crate::executor::node_buffer::NodeBuffer;
-    use crate::pipeline::sort_buffer::SortBuffer;
+    use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
     use clinker_plan::config::{SortField, SortOrder};
+    use clinker_plan::plan::{EntityRef, PlanNodeId};
     use clinker_record::{Schema, Value};
     use rust_decimal::Decimal;
 
@@ -239,7 +385,7 @@ mod tests {
     }
 
     /// A record whose sort key `k` is a `Decimal` (mantissa/10) and whose
-    /// `id` mirrors the carried `row_num` for readback.
+    /// `id` mirrors the carried source ordinal for readback.
     fn rec(schema: &Arc<Schema>, k_mantissa: i64, id: i64) -> Record {
         Record::new(
             schema.clone(),
@@ -268,24 +414,36 @@ mod tests {
         use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
 
         let schema = schema();
-        let budget = MemoryArbitrator::with_policy(64 * 1024, 0.80, 0.70, Box::new(NoOpPolicy));
+        let budget = Arc::new(MemoryArbitrator::with_policy(
+            64 * 1024,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        ));
         budget.set_max_spill_bytes(1);
+        let charge =
+            crate::pipeline::spill_merge::SpillChargeGuard::new(Arc::clone(&budget), "enforce");
         let spill_root = tempfile::tempdir().unwrap();
         // threshold=1 → every push spills, so the first run already crosses the
         // one-byte disk cap.
-        let buf: SortBuffer<u64> = SortBuffer::new(
+        let buf: SortBuffer<crate::executor::stream_event::SourceRowId> = SortBuffer::new(
             sort_by_k_asc(),
             1,
             Some(spill_root.path().to_path_buf()),
             true,
             schema.clone(),
         );
-        let input: Vec<(Record, u64)> = (0..6)
-            .map(|i| (rec(&schema, (i as i64 + 1) * 10, i as i64), i))
+        let input: Vec<(Record, crate::executor::stream_event::SourceRowId)> = (0..6)
+            .map(|i| {
+                (
+                    rec(&schema, (i as i64 + 1) * 10, i as i64),
+                    crate::executor::stream_event::SourceRowId::new(PlanNodeId::new(0), i as u64),
+                )
+            })
             .collect();
 
         // `SortedOutput` is not `Debug`, so match rather than `expect_err`.
-        let err = match drain_into_sort_buffer(buf, input, "enforce", &budget) {
+        let err = match drain_into_sort_buffer(buf, input, "enforce", &charge) {
             Ok(_) => panic!("a one-byte disk cap must abort the enforcer sort spill"),
             Err(e) => e,
         };
@@ -306,9 +464,187 @@ mod tests {
             }
             other => panic!("disk-cap overflow must surface SpillCapExceeded; got {other:?}"),
         }
-        assert!(
-            budget.cumulative_spill_bytes() > 1,
-            "cumulative_spill_bytes must reflect the overflowing write"
+        drop(charge);
+        assert_eq!(
+            budget.cumulative_spill_bytes(),
+            0,
+            "the failed sort drops its files and must release their charges"
         );
+    }
+
+    #[test]
+    fn sequential_spilled_sorts_release_live_bytes_between_drains() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        use crate::pipeline::spill_merge::{MergeBudget, SpillChargeGuard, merge_sorted_runs};
+
+        fn run_sort(
+            budget: &Arc<MemoryArbitrator>,
+            schema: &Arc<Schema>,
+        ) -> Result<u64, PipelineError> {
+            let spill_root = tempfile::tempdir().unwrap();
+            let buf = SortBuffer::new(
+                sort_by_k_asc(),
+                1,
+                Some(spill_root.path().to_path_buf()),
+                true,
+                Arc::clone(schema),
+            );
+            let input = (0..6)
+                .map(|i| {
+                    (
+                        rec(schema, (6 - i) * 10, i),
+                        crate::executor::stream_event::SourceRowId::new(
+                            PlanNodeId::new(0),
+                            i as u64,
+                        ),
+                    )
+                })
+                .collect();
+            let charge = SpillChargeGuard::new(Arc::clone(budget), "sequential-sort");
+            let sorted = drain_into_sort_buffer(buf, input, "sequential-sort", &charge)?;
+            let charged = charge.bytes();
+            let SortedOutput::Spilled(files) = sorted else {
+                panic!("one-byte threshold must spill")
+            };
+            let rows = merge_sorted_runs(
+                files,
+                &sort_by_k_asc(),
+                "authored sort",
+                MergeBudget {
+                    budget,
+                    node: "sequential-sort",
+                    compress: true,
+                    charge_owner: Some(&charge),
+                },
+            )?;
+            assert_eq!(rows.len(), 6);
+            drop(charge);
+            Ok(charged)
+        }
+
+        let schema = schema();
+        let budget = Arc::new(MemoryArbitrator::with_policy(
+            64 * 1024,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        ));
+        let first_bytes = run_sort(&budget, &schema).unwrap();
+        assert!(first_bytes > 0);
+        assert_eq!(budget.cumulative_spill_bytes(), 0);
+
+        // Exactly one sort population fits. A stale first charge would make
+        // the second spill exceed this cap.
+        budget.set_max_spill_bytes(first_bytes);
+        run_sort(&budget, &schema).expect("the second sort must not see stale first-sort bytes");
+        assert_eq!(budget.cumulative_spill_bytes(), 0);
+        assert_eq!(
+            budget
+                .per_stage_spill_bytes()
+                .get("sequential-sort")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+    }
+
+    #[test]
+    fn lazy_sort_releases_on_completion_drop_and_constructor_error() {
+        use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
+        use crate::pipeline::spill::SpillFile;
+        use crate::pipeline::spill_merge::{MergeBudget, SortedRunMerger, SpillChargeGuard};
+
+        fn runs(
+            schema: &Arc<Schema>,
+            dir: &std::path::Path,
+        ) -> Vec<SpillFile<crate::executor::stream_event::SourceRowId>> {
+            let mut buffer = SortBuffer::new(
+                sort_by_k_asc(),
+                1,
+                Some(dir.to_path_buf()),
+                true,
+                Arc::clone(schema),
+            );
+            for i in 0..3 {
+                buffer.push(
+                    rec(schema, (3 - i) * 10, i),
+                    crate::executor::stream_event::SourceRowId::new(PlanNodeId::new(0), i as u64),
+                );
+                buffer.sort_and_spill().unwrap();
+            }
+            match buffer.finish().unwrap().0 {
+                SortedOutput::Spilled(files) => files,
+                SortedOutput::InMemory(_) => panic!("expected spilled runs"),
+            }
+        }
+
+        fn charged_stream(
+            budget: &Arc<MemoryArbitrator>,
+            files: Vec<SpillFile<crate::executor::stream_event::SourceRowId>>,
+        ) -> AuthoredSortStream {
+            let charge = SpillChargeGuard::new(Arc::clone(budget), "lazy-sort");
+            let bytes: u64 = files.iter().map(SpillFile::bytes).sum();
+            assert!(!charge.record(bytes));
+            let merger = SortedRunMerger::new(
+                files,
+                &sort_by_k_asc(),
+                "authored sort",
+                MergeBudget {
+                    budget,
+                    node: "lazy-sort",
+                    compress: true,
+                    charge_owner: Some(&charge),
+                },
+            )
+            .unwrap();
+            AuthoredSortStream::Spilled {
+                merger,
+                _charge: charge,
+            }
+        }
+
+        let budget = Arc::new(MemoryArbitrator::with_policy(
+            64 * 1024,
+            0.80,
+            0.70,
+            Box::new(NoOpPolicy),
+        ));
+        let schema = schema();
+
+        let dir = tempfile::tempdir().unwrap();
+        let stream = charged_stream(&budget, runs(&schema, dir.path()));
+        assert!(budget.cumulative_spill_bytes() > 0);
+        assert_eq!(stream.collect::<Result<Vec<_>, _>>().unwrap().len(), 3);
+        assert_eq!(budget.cumulative_spill_bytes(), 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let stream = charged_stream(&budget, runs(&schema, dir.path()));
+        assert!(budget.cumulative_spill_bytes() > 0);
+        drop(stream);
+        assert_eq!(budget.cumulative_spill_bytes(), 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        let files = runs(&schema, dir.path());
+        let bytes: u64 = files.iter().map(SpillFile::bytes).sum();
+        std::fs::write(files[0].path(), b"invalid spill header").unwrap();
+        let charge = SpillChargeGuard::new(Arc::clone(&budget), "lazy-sort");
+        assert!(!charge.record(bytes));
+        let result = SortedRunMerger::new(
+            files,
+            &sort_by_k_asc(),
+            "authored sort",
+            MergeBudget {
+                budget: &budget,
+                node: "lazy-sort",
+                compress: true,
+                charge_owner: Some(&charge),
+            },
+        );
+        assert!(
+            result.is_err(),
+            "corrupt spill must fail during construction"
+        );
+        drop(charge);
+        assert_eq!(budget.cumulative_spill_bytes(), 0);
     }
 }

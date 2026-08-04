@@ -45,7 +45,7 @@ pub(crate) fn recompute_aggregates(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     scope: &RetractScope,
-    new_retract_rows: &[(u64, std::sync::Arc<str>)],
+    new_retract_rows: &[super::detect::RetractRow],
 ) -> Result<(), PipelineError> {
     if scope.aggregates.is_empty() || new_retract_rows.is_empty() {
         return Ok(());
@@ -116,18 +116,13 @@ fn drop_retained_aggregator(ctx: &mut ExecutorContext<'_>, agg_idx: petgraph::gr
 /// in place. Returns `Ok(())` on success, including the wide-net
 /// "row not in this aggregator's lineage" case (treated as no-op).
 ///
-/// Each retract id is paired with its originating source so the
-/// retract match scopes by `(row_num, source)` rather than `row_num`
-/// alone. Cross-source `row_num` namespaces would otherwise collide
-/// under multi-source ingest where each Source has its own monotonic
-/// counter, and a retract intended for `src_a.row_5` would silently
-/// retract `src_b.row_5` from the same group.
+/// Each retract carries its complete source-scoped `SourceRowId` directly.
 fn retract_and_refinalize(
     retained: &mut crate::executor::dispatch::RetainedAggregatorState,
-    retract_ids: &[(u64, std::sync::Arc<str>)],
+    retract_ids: &[super::detect::RetractRow],
 ) -> Result<(), HashAggError> {
-    for (row_id, source) in retract_ids {
-        if let Err(e) = retained.aggregator.retract_row(*row_id, source) {
+    for &source_row in retract_ids {
+        if let Err(e) = retained.aggregator.retract_row(source_row) {
             // Wide-net no-op: the orchestrator hands every relaxed-CK
             // aggregate every newly-failed source row, so an aggregate
             // that didn't ingest this row reports `not found` — that's
@@ -177,7 +172,7 @@ pub(crate) fn emit_post_recompute(
     let finalize_ctx = EvalContext {
         stable: ctx.stable,
         source_file: &crate::executor::dispatch::MERGED_SOURCE_FILE,
-        source_row: 0,
+        source_row: crate::executor::stream_event::SourceRowId::synthetic().ordinal(),
         source_path: &crate::executor::dispatch::MERGED_SOURCE_FILE,
         source_count: merged_source_count,
         source_batch: ctx.source_batch_arc,
@@ -201,7 +196,10 @@ pub(crate) fn emit_post_recompute(
     let buffer_schema = current_dag
         .deferred_region_at_producer(agg_idx)
         .map(|r| r.buffer_schema.clone());
-    let projected: Vec<(clinker_record::Record, u64)> = match buffer_schema {
+    let projected: Vec<(
+        clinker_record::Record,
+        crate::executor::stream_event::SourceRowId,
+    )> = match buffer_schema {
         Some(schema_cols) => project_rows_to_buffer_schema(new_rows, &schema_cols),
         // Missing region at a relaxed-CK aggregate is a planner
         // contract violation; surface it as the wide-row identity

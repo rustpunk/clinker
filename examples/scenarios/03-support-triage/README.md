@@ -41,6 +41,13 @@ TK-200007,2026-01-15T18:16:00Z,nadia.ilves@example.net,Normal,other,...,pending,
 `Low`. And `first_response_mins` is supposed to be a number, but agents type
 free text into it — `pending`, `n/a`, `--`, or nothing at all.
 
+The source declares `opened_at` as `date_time`, so each RFC 3339 `Z` value is
+validated and parsed before any transform runs. The internal value is
+timezone-free; `canonicalize_opened_at` explicitly renders that typed value
+back to the export's `%Y-%m-%dT%H:%M:%SZ` text contract. This keeps the normal
+outputs and any later rejected-row evidence in the same canonical UTC spelling
+without passing the raw source string through as a `date_time`.
+
 ## What to look at
 
 **Normalise before routing.** Folding the priority vocabulary happens first:
@@ -70,9 +77,11 @@ you want is a modelling decision: use `try_int` when a missing value is normal
 and null is a fine answer; use `to_int` when an unreadable value means the record
 cannot be processed and someone needs to see it.
 
-Declaring the column `int` in the schema and letting the reader coerce is *not*
-currently a working alternative — see
-[#975](https://github.com/rustpunk/clinker/issues/975).
+Declaring the column `int` in the schema is also strict: malformed values are
+then rejected at source ingestion. This scenario keeps the source column
+`string` and converts it in `normalize` deliberately, so it demonstrates an
+explicit transform conversion and records `transform:normalize` as the DLQ
+stage.
 
 **`strategy: continue` keeps the run going.** Under the default `fail_fast`, the
 first bad row would end the run. Here the other 54 tickets are still worth

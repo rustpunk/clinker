@@ -35,10 +35,19 @@
 //!   names a pipeline, or a filename stem that does not match the target file
 //!   stem — [`ChannelError::OverlayTargetMismatch`].
 
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{File, Metadata};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use clinker_core_types::{Diagnostic, LabeledSpan, Span};
-use clinker_plan::config::{ChannelLayout, GroupLayout, ShardScheme};
+use clinker_core_types::{Diagnostic, FileId, LabeledSpan, Span};
+use clinker_plan::config::composition::CompositionFile;
+use clinker_plan::config::composition::WORKSPACE_COMPOSITION_BUDGET;
+use clinker_plan::config::{ChannelLayout, GroupLayout, PipelineConfig, PipelineNode, ShardScheme};
+use clinker_plan::overlay_ops::OverlayOp;
+use clinker_plan::plan::bind_schema::MAX_COMPOSITION_DEPTH;
+use clinker_plan::resources::{CatalogResourceKind, LogicalResourceId, WorkspaceCatalog};
 
 use crate::error::ChannelError;
 use crate::group::Group;
@@ -65,6 +74,258 @@ const GROUP_SCAN_BUDGET: usize = 10_000;
 /// under the group root, but a bounded recursive walk tolerates light
 /// sub-foldering without following symlink loops or depth bombs.
 const GROUP_WALK_MAX_DEPTH: usize = 16;
+
+/// Identity of the exact bytes retained by a contained, single-open load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LayerSourceIdentity {
+    pub(crate) path: PathBuf,
+    pub(crate) byte_len: u64,
+    pub(crate) content_hash: [u8; 32],
+}
+
+/// A parsed layer paired with the identity of the exact bytes that produced it.
+#[derive(Debug)]
+pub(crate) struct LoadedLayer<T> {
+    pub(crate) value: T,
+    pub(crate) identity: LayerSourceIdentity,
+}
+
+fn layer_error(context: &str, path: &Path, reason: impl std::fmt::Display) -> ChannelError {
+    ChannelError::InvalidChannelResource {
+        channel: context.to_string(),
+        reason: format!("layer `{}`: {reason}", path.display()),
+    }
+}
+
+fn path_has_parent(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+}
+
+fn same_open_file(
+    opened_file: &File,
+    opened: &Metadata,
+    current_path: &Path,
+    current: &Metadata,
+) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = (opened_file, current_path);
+        use std::os::unix::fs::MetadataExt;
+        opened.dev() == current.dev() && opened.ino() == current.ino()
+    }
+    #[cfg(windows)]
+    {
+        let _ = (opened, current);
+        let Ok(current_file) = File::open(current_path) else {
+            return false;
+        };
+        match (
+            win_file_identity::query(opened_file),
+            win_file_identity::query(&current_file),
+        ) {
+            (Ok(opened), Ok(current)) => opened == current,
+            _ => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (opened_file, current_path);
+        opened.len() == current.len() && opened.modified().ok() == current.modified().ok()
+    }
+}
+
+#[cfg(windows)]
+mod win_file_identity {
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::io;
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    pub(super) fn query(file: &File) -> io::Result<(u32, u64)> {
+        let mut information = MaybeUninit::<ByHandleFileInformation>::uninit();
+        // SAFETY: `file` owns a valid Windows handle for the duration of this
+        // call, and `information` points to writable storage for the exact
+        // structure the API initializes on success.
+        let ok = unsafe {
+            GetFileInformationByHandle(
+                file.as_raw_handle().cast::<c_void>(),
+                information.as_mut_ptr(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a successful call initializes the complete structure.
+        let information = unsafe { information.assume_init() };
+        let file_index =
+            (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
+        Ok((information.volume_serial, file_index))
+    }
+}
+
+fn reject_symlink_components(root: &Path, path: &Path, context: &str) -> Result<(), ChannelError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| layer_error(context, path, "resolves outside its owned root"))?;
+    if path_has_parent(relative) {
+        return Err(layer_error(
+            context,
+            path,
+            "contains parent traversal outside the admitted layer path",
+        ));
+    }
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current)
+            .map_err(|error| layer_error(context, &current, format!("metadata failed: {error}")))?;
+        if metadata.file_type().is_symlink() {
+            return Err(layer_error(
+                context,
+                &current,
+                "symlink entries are not admitted",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Canonicalize, contain, open, bound, read, parse, and hash one layer.
+///
+/// Parsing and identity always consume the same buffer from one open handle.
+pub(crate) fn read_contained_layer<T>(
+    owned_root: &Path,
+    path: &Path,
+    context: &str,
+    parse: impl FnOnce(&[u8], PathBuf) -> Result<T, ChannelError>,
+) -> Result<LoadedLayer<T>, ChannelError> {
+    let root = owned_root.canonicalize().map_err(|error| {
+        layer_error(
+            context,
+            owned_root,
+            format!("root cannot be opened: {error}"),
+        )
+    })?;
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    reject_symlink_components(&root, &candidate, context)?;
+    let canonical = candidate.canonicalize().map_err(|error| {
+        layer_error(
+            context,
+            &candidate,
+            format!("canonicalization failed: {error}"),
+        )
+    })?;
+    if !canonical.starts_with(&root) {
+        return Err(layer_error(
+            context,
+            &candidate,
+            "resolves outside its canonical owned root",
+        ));
+    }
+
+    let file = File::open(&canonical)
+        .map_err(|error| layer_error(context, &canonical, format!("open failed: {error}")))?;
+    let opened_metadata = file
+        .metadata()
+        .map_err(|error| layer_error(context, &canonical, format!("metadata failed: {error}")))?;
+    if !opened_metadata.is_file() {
+        return Err(layer_error(context, &canonical, "is not a regular file"));
+    }
+    reject_symlink_components(&root, &candidate, context)?;
+    let current_canonical = candidate.canonicalize().map_err(|error| {
+        layer_error(
+            context,
+            &candidate,
+            format!("post-open canonicalization failed: {error}"),
+        )
+    })?;
+    if current_canonical != canonical || !current_canonical.starts_with(&root) {
+        return Err(layer_error(
+            context,
+            &candidate,
+            "changed canonical identity while loading",
+        ));
+    }
+    let current_metadata = std::fs::symlink_metadata(&candidate)
+        .map_err(|error| layer_error(context, &candidate, format!("metadata failed: {error}")))?;
+    if current_metadata.file_type().is_symlink() {
+        return Err(layer_error(
+            context,
+            &candidate,
+            "became a symlink while loading",
+        ));
+    }
+    if !same_open_file(&file, &opened_metadata, &candidate, &current_metadata) {
+        return Err(layer_error(
+            context,
+            &candidate,
+            "changed between containment validation and open",
+        ));
+    }
+
+    let max = clinker_plan::yaml::MAX_INPUT_BYTES;
+    let mut bytes = Vec::with_capacity(
+        usize::try_from(opened_metadata.len())
+            .unwrap_or(max)
+            .min(max),
+    );
+    file.take((max as u64) + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| layer_error(context, &canonical, format!("read failed: {error}")))?;
+    if bytes.len() > max {
+        return Err(layer_error(
+            context,
+            &canonical,
+            format!("exceeds the {max}-byte layer limit"),
+        ));
+    }
+    let content_hash = *blake3::hash(&bytes).as_bytes();
+    let byte_len = bytes.len() as u64;
+    let value = parse(&bytes, canonical.clone())
+        .map_err(|error| layer_error(context, &canonical, format!("parse failed: {error}")))?;
+    Ok(LoadedLayer {
+        value,
+        identity: LayerSourceIdentity {
+            path: canonical,
+            byte_len,
+            content_hash,
+        },
+    })
+}
 
 // ── Overlay kind ────────────────────────────────────────────────────────
 
@@ -107,6 +368,534 @@ pub struct ResolvedOverlay {
     pub kind: OverlayKind,
     /// The parsed overlay body.
     pub overlay: OverlayFile,
+    pub(crate) source_identity: LayerSourceIdentity,
+}
+
+/// A catalog pipeline plus the catalog compositions admitted by its closure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChannelTarget {
+    /// Catalog identity of the selected pipeline.
+    pub pipeline: LogicalResourceId,
+    /// Catalog composition identities admitted by the selected closure when
+    /// those identities are available from the catalog.
+    pub compositions: BTreeSet<LogicalResourceId>,
+    pub(crate) composition_paths: BTreeSet<PathBuf>,
+}
+
+impl ChannelTarget {
+    /// Construct a pipeline-only target. Discovery fills its composition
+    /// closure when validating structural target operations.
+    pub fn pipeline(value: &str) -> Result<Self, clinker_plan::resources::ResourceError> {
+        Ok(Self {
+            pipeline: LogicalResourceId::parse(value)?,
+            compositions: BTreeSet::new(),
+            composition_paths: BTreeSet::new(),
+        })
+    }
+}
+
+/// Immutable, per-target view of one catalog channel resource.
+#[derive(Debug, Clone)]
+pub struct ChannelResource {
+    /// Catalog identity of the selected channel.
+    pub channel_id: LogicalResourceId,
+    /// Selected pipeline and its admitted composition closure.
+    pub target: ChannelTarget,
+    /// Parsed channel-wide manifest.
+    pub manifest: Arc<ChannelManifest>,
+    pub(crate) manifest_identity: LayerSourceIdentity,
+    /// Parsed pipeline-specific channel file.
+    pub overlay: Arc<OverlayFile>,
+    /// Resolved path of the pipeline-specific channel file.
+    pub overlay_path: PathBuf,
+    pub(crate) overlay_identity: LayerSourceIdentity,
+}
+
+struct DiscoveredTargetLayer {
+    overlay: Arc<OverlayFile>,
+    path: PathBuf,
+    identity: LayerSourceIdentity,
+}
+
+/// Load a catalog channel folder, validate every declared target/file, and
+/// return the overlay for `selected_pipeline` by logical identity.
+pub fn discover_channel_resource(
+    catalog: &WorkspaceCatalog,
+    channel_id: &str,
+    selected_pipeline: &str,
+) -> Result<ChannelResource, ChannelError> {
+    let channel_id = LogicalResourceId::parse(channel_id).map_err(|error| {
+        ChannelError::InvalidChannelResource {
+            channel: channel_id.to_string(),
+            reason: error.to_string(),
+        }
+    })?;
+    let selected_pipeline = LogicalResourceId::parse(selected_pipeline).map_err(|error| {
+        ChannelError::InvalidChannelResource {
+            channel: channel_id.to_string(),
+            reason: error.to_string(),
+        }
+    })?;
+    let directory = catalog
+        .resolve(CatalogResourceKind::Channel, &channel_id)
+        .map_err(|error| ChannelError::InvalidChannelResource {
+            channel: channel_id.to_string(),
+            reason: error.to_string(),
+        })?;
+    if !directory.is_dir() {
+        return Err(ChannelError::InvalidChannelResource {
+            channel: channel_id.to_string(),
+            reason: "the catalog entry must name a folder containing `channel.cfg.yaml`"
+                .to_string(),
+        });
+    }
+
+    let manifest_path = directory.join(CHANNEL_MANIFEST_FILE);
+    let manifest = read_contained_layer(
+        directory,
+        &manifest_path,
+        &format!("channel `{channel_id}` manifest"),
+        ChannelManifest::from_yaml_bytes,
+    )?;
+    if manifest.value.channel.name != channel_id.as_str() {
+        return Err(ChannelError::InvalidChannelResource {
+            channel: channel_id.to_string(),
+            reason: format!(
+                "manifest declares `{}`; change `channel.name` to `{channel_id}`",
+                manifest.value.channel.name
+            ),
+        });
+    }
+
+    let mut declared = BTreeSet::new();
+    for target in &manifest.value.channel.targets {
+        let id = LogicalResourceId::parse(&target.value).map_err(|error| {
+            ChannelError::InvalidChannelResource {
+                channel: channel_id.to_string(),
+                reason: format!(
+                    "invalid target at line {}: {error}",
+                    target.referenced.line()
+                ),
+            }
+        })?;
+        catalog
+            .resolve(CatalogResourceKind::Pipeline, &id)
+            .map_err(|error| ChannelError::InvalidChannelResource {
+                channel: channel_id.to_string(),
+                reason: format!("target at line {}: {error}", target.referenced.line()),
+            })?;
+        if !declared.insert(id.clone()) {
+            return Err(ChannelError::InvalidChannelResource {
+                channel: channel_id.to_string(),
+                reason: format!(
+                    "duplicate target `{id}` at line {}; remove the repeated identity",
+                    target.referenced.line()
+                ),
+            });
+        }
+    }
+    if !declared.contains(&selected_pipeline) {
+        return Err(ChannelError::InvalidChannelResource {
+            channel: channel_id.to_string(),
+            reason: format!(
+                "selected pipeline `{selected_pipeline}` is not listed in `channel.targets`"
+            ),
+        });
+    }
+
+    let mut entries = std::fs::read_dir(directory)
+        .map_err(|error| ChannelError::InvalidChannelResource {
+            channel: channel_id.to_string(),
+            reason: format!("cannot enumerate channel folder: {error}"),
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ChannelError::InvalidChannelResource {
+            channel: channel_id.to_string(),
+            reason: format!("cannot enumerate channel folder: {error}"),
+        })?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+
+    let mut overlays: BTreeMap<LogicalResourceId, DiscoveredTargetLayer> = BTreeMap::new();
+    for entry in entries {
+        let path = entry.path();
+        let file_type =
+            entry
+                .file_type()
+                .map_err(|error| ChannelError::InvalidChannelResource {
+                    channel: channel_id.to_string(),
+                    reason: format!(
+                        "cannot inspect channel folder entry `{}`: {error}",
+                        path.display()
+                    ),
+                })?;
+        if file_type.is_symlink() {
+            return Err(ChannelError::InvalidChannelResource {
+                channel: channel_id.to_string(),
+                reason: format!(
+                    "target layer `{}` is a symlink; use a contained regular file",
+                    path.display()
+                ),
+            });
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        let display_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| ChannelError::InvalidChannelResource {
+                channel: channel_id.to_string(),
+                reason: format!(
+                    "channel folder contains a non-UTF-8 file name at `{}`",
+                    path.display()
+                ),
+            })?
+            .to_string();
+        if display_name == CHANNEL_MANIFEST_FILE
+            || path.extension().and_then(|extension| extension.to_str()) != Some("yaml")
+        {
+            continue;
+        }
+        let overlay = read_contained_layer(
+            directory,
+            &path,
+            &format!("channel `{channel_id}` target candidate `{display_name}`"),
+            OverlayFile::from_yaml_bytes,
+        )?;
+        let target = LogicalResourceId::parse(&overlay.value.channel.target).map_err(|error| {
+            ChannelError::InvalidChannelResource {
+                channel: channel_id.to_string(),
+                reason: format!("target file `{display_name}`: {error}"),
+            }
+        })?;
+        if !declared.contains(&target) {
+            return Err(ChannelError::InvalidChannelResource {
+                channel: channel_id.to_string(),
+                reason: format!(
+                    "target file declares `{target}`, which is not listed in `channel.targets`"
+                ),
+            });
+        }
+        catalog
+            .resolve(CatalogResourceKind::Pipeline, &target)
+            .map_err(|error| ChannelError::InvalidChannelResource {
+                channel: channel_id.to_string(),
+                reason: format!("target file `{display_name}`: {error}"),
+            })?;
+        if overlays
+            .insert(
+                target.clone(),
+                DiscoveredTargetLayer {
+                    overlay: Arc::new(overlay.value),
+                    path: path.clone(),
+                    identity: overlay.identity,
+                },
+            )
+            .is_some()
+        {
+            return Err(ChannelError::InvalidChannelResource {
+                channel: channel_id.to_string(),
+                reason: format!(
+                    "duplicate target files declare `{target}`; keep exactly one file per logical pipeline"
+                ),
+            });
+        }
+    }
+
+    let mut selected_target = None;
+    for target_id in &declared {
+        let target_layer = overlays.get(target_id).ok_or_else(|| {
+            ChannelError::InvalidChannelResource {
+                channel: channel_id.to_string(),
+                reason: format!(
+                    "`channel.targets` declares `{target_id}` but no target file names that identity"
+                ),
+            }
+        })?;
+        let pipeline_path = catalog
+            .resolve(CatalogResourceKind::Pipeline, target_id)
+            .map_err(|error| ChannelError::InvalidChannelResource {
+                channel: channel_id.to_string(),
+                reason: format!("target `{target_id}`: {error}"),
+            })?;
+        let closure = load_target_closure(catalog, pipeline_path, &channel_id, target_id)?;
+        validate_target_file_scope(
+            &target_layer.overlay,
+            pipeline_path,
+            &closure,
+            &channel_id,
+            target_layer
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("target.yaml"),
+        )?;
+        if target_id == &selected_pipeline {
+            selected_target = Some(channel_target_from_closure(
+                catalog,
+                selected_pipeline.clone(),
+                &closure,
+            ));
+        }
+    }
+    let selected_layer = overlays.remove(&selected_pipeline).ok_or_else(|| {
+        ChannelError::InvalidChannelResource {
+            channel: channel_id.to_string(),
+            reason: format!("selected target `{selected_pipeline}` disappeared after validation"),
+        }
+    })?;
+    let target = selected_target.ok_or_else(|| ChannelError::InvalidChannelResource {
+        channel: channel_id.to_string(),
+        reason: format!("selected target `{selected_pipeline}` was not validated"),
+    })?;
+    Ok(ChannelResource {
+        channel_id,
+        target,
+        manifest: Arc::new(manifest.value),
+        manifest_identity: manifest.identity,
+        overlay: selected_layer.overlay,
+        overlay_path: selected_layer.path,
+        overlay_identity: selected_layer.identity,
+    })
+}
+
+#[derive(Default)]
+struct TargetClosure {
+    compositions: BTreeSet<PathBuf>,
+    nodes: BTreeSet<String>,
+    sources: BTreeSet<String>,
+}
+
+pub(crate) fn discover_channel_target(
+    catalog: &WorkspaceCatalog,
+    pipeline: LogicalResourceId,
+) -> Result<ChannelTarget, ChannelError> {
+    let pipeline_path = catalog
+        .resolve(CatalogResourceKind::Pipeline, &pipeline)
+        .map_err(|error| ChannelError::InvalidChannelResource {
+            channel: "standalone".to_string(),
+            reason: error.to_string(),
+        })?;
+    let closure = load_target_closure(catalog, pipeline_path, &pipeline, &pipeline)?;
+    Ok(channel_target_from_closure(catalog, pipeline, &closure))
+}
+
+fn channel_target_from_closure(
+    catalog: &WorkspaceCatalog,
+    pipeline: LogicalResourceId,
+    closure: &TargetClosure,
+) -> ChannelTarget {
+    let compositions = closure
+        .compositions
+        .iter()
+        .filter_map(|path| {
+            catalog
+                .identify(CatalogResourceKind::Composition, path)
+                .cloned()
+        })
+        .collect();
+    ChannelTarget {
+        pipeline,
+        compositions,
+        composition_paths: closure.compositions.clone(),
+    }
+}
+
+fn load_target_closure(
+    catalog: &WorkspaceCatalog,
+    pipeline_path: &Path,
+    channel_id: &LogicalResourceId,
+    target_id: &LogicalResourceId,
+) -> Result<TargetClosure, ChannelError> {
+    let root = pipeline_path
+        .parent()
+        .ok_or_else(|| ChannelError::InvalidChannelResource {
+            channel: channel_id.to_string(),
+            reason: format!("target `{target_id}` pipeline has no owned parent directory"),
+        })?;
+    let pipeline = read_contained_layer(
+        root,
+        pipeline_path,
+        &format!("channel `{channel_id}` target `{target_id}` pipeline"),
+        |bytes, path| {
+            let yaml = std::str::from_utf8(bytes).map_err(|source| ChannelError::Utf8 {
+                path: path.clone(),
+                source,
+            })?;
+            clinker_plan::yaml::from_str::<PipelineConfig>(yaml).map_err(|source| {
+                ChannelError::Yaml {
+                    path,
+                    source: Box::new(source.0),
+                }
+            })
+        },
+    )?;
+    let mut closure = TargetClosure::default();
+    collect_nodes(
+        catalog,
+        pipeline_path.parent().unwrap_or_else(|| Path::new(".")),
+        &pipeline.value.nodes,
+        &mut closure,
+        channel_id,
+        target_id,
+        0,
+    )?;
+    Ok(closure)
+}
+
+fn collect_nodes(
+    catalog: &WorkspaceCatalog,
+    base_dir: &Path,
+    nodes: &[clinker_plan::yaml::Spanned<PipelineNode>],
+    closure: &mut TargetClosure,
+    channel_id: &LogicalResourceId,
+    target_id: &LogicalResourceId,
+    depth: usize,
+) -> Result<(), ChannelError> {
+    if depth > MAX_COMPOSITION_DEPTH as usize {
+        return Err(ChannelError::InvalidChannelResource {
+            channel: channel_id.to_string(),
+            reason: format!(
+                "composition closure exceeds the maximum depth of {MAX_COMPOSITION_DEPTH}"
+            ),
+        });
+    }
+    for node in nodes {
+        closure.nodes.insert(node.value.name().to_string());
+        if matches!(node.value, PipelineNode::Source { .. }) {
+            closure.sources.insert(node.value.name().to_string());
+        }
+        if let PipelineNode::Composition { r#use, .. } = &node.value {
+            let requested = base_dir.join(r#use);
+            let path = requested.canonicalize().map_err(|error| {
+                ChannelError::InvalidChannelResource {
+                    channel: channel_id.to_string(),
+                    reason: format!(
+                        "target `{target_id}` composition `{}` cannot be canonicalized: {error}",
+                        requested.display()
+                    ),
+                }
+            })?;
+            let composition_id = catalog
+                .identify(CatalogResourceKind::Composition, &path)
+                .ok_or_else(|| ChannelError::InvalidChannelResource {
+                    channel: channel_id.to_string(),
+                    reason: format!(
+                        "target `{target_id}` composition `{}` is outside the admitted catalog composition boundary",
+                        requested.display()
+                    ),
+                })?;
+            if !closure.compositions.insert(path.clone()) {
+                continue;
+            }
+            if closure.compositions.len() > WORKSPACE_COMPOSITION_BUDGET {
+                return Err(ChannelError::InvalidChannelResource {
+                    channel: channel_id.to_string(),
+                    reason: format!(
+                        "target `{target_id}` composition closure exceeds the workspace budget of {WORKSPACE_COMPOSITION_BUDGET}"
+                    ),
+                });
+            }
+            let root = path
+                .parent()
+                .ok_or_else(|| ChannelError::InvalidChannelResource {
+                    channel: channel_id.to_string(),
+                    reason: format!("catalog composition `{composition_id}` has no owned parent"),
+                })?;
+            let composition = read_contained_layer(
+                root,
+                &path,
+                &format!(
+                    "channel `{channel_id}` target `{target_id}` composition `{composition_id}`"
+                ),
+                |bytes, source_path| {
+                    let yaml = std::str::from_utf8(bytes).map_err(|source| ChannelError::Utf8 {
+                        path: source_path.clone(),
+                        source,
+                    })?;
+                    CompositionFile::parse(
+                        yaml,
+                        FileId::new(std::num::NonZeroU32::MIN),
+                        source_path,
+                    )
+                    .map_err(|error| ChannelError::InvalidChannelResource {
+                        channel: channel_id.to_string(),
+                        reason: format!("composition `{composition_id}` is invalid: {error}"),
+                    })
+                },
+            )?;
+            collect_nodes(
+                catalog,
+                path.parent().unwrap_or_else(|| Path::new(".")),
+                &composition.value.nodes,
+                closure,
+                channel_id,
+                target_id,
+                depth + 1,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_target_file_scope(
+    overlay: &OverlayFile,
+    pipeline_path: &Path,
+    closure: &TargetClosure,
+    channel_id: &LogicalResourceId,
+    file_name: &str,
+) -> Result<(), ChannelError> {
+    for operation in &overlay.overrides {
+        let target = match &operation.value {
+            OverlayOp::Remove(value) => Some(value.target.as_str()),
+            OverlayOp::Replace(value) => Some(value.target.as_str()),
+            OverlayOp::Set(value) => Some(value.target.as_str()),
+            OverlayOp::Bypass(value) => Some(value.target.as_str()),
+            OverlayOp::PatchSchema(value) => Some(value.target.as_str()),
+            OverlayOp::Add(value) => {
+                if let Some(composition) = &value.composition {
+                    let path = pipeline_path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(composition)
+                        .canonicalize()
+                        .map_err(|error| ChannelError::InvalidChannelResource {
+                            channel: channel_id.to_string(),
+                            reason: format!(
+                                "target file `{file_name}` composition at line {} cannot be opened: {error}",
+                                operation.referenced.line()
+                            ),
+                        })?;
+                    if !closure.compositions.contains(&path) {
+                        return Err(ChannelError::InvalidChannelResource {
+                            channel: channel_id.to_string(),
+                            reason: format!(
+                                "target file `{file_name}` composition at line {} is outside the selected pipeline closure; move the operation to the pipeline that owns it",
+                                operation.referenced.line()
+                            ),
+                        });
+                    }
+                }
+                value
+                    .after
+                    .as_deref()
+                    .or(value.before.as_deref())
+                    .or_else(|| value.input.as_ref().map(|input| input.name()))
+            }
+        };
+        if let Some(target) = target
+            && !closure.nodes.contains(target)
+        {
+            return Err(ChannelError::InvalidChannelResource {
+                channel: channel_id.to_string(),
+                reason: format!(
+                    "target file `{file_name}` operation at line {} names `{target}` outside the selected pipeline and composition closure",
+                    operation.referenced.line()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 // ── Root / folder path computation ──────────────────────────────────────
@@ -119,6 +908,68 @@ fn resolve_root(root: &Path, workspace_root: &Path) -> PathBuf {
     } else {
         workspace_root.join(root)
     }
+}
+
+pub(crate) fn contained_layout_root(
+    configured_root: &Path,
+    workspace_root: &Path,
+    context: &str,
+) -> Result<Option<PathBuf>, ChannelError> {
+    if path_has_parent(configured_root) {
+        return Err(layer_error(
+            context,
+            configured_root,
+            "contains parent traversal",
+        ));
+    }
+    // An explicit absolute root is itself the admitted boundary. This is a
+    // supported catalog layout (for example, a separately mounted catalog),
+    // so it is not required to sit below the workspace. Relative roots remain
+    // workspace-owned and retain the stricter workspace containment check.
+    let workspace = if configured_root.is_absolute() {
+        None
+    } else {
+        Some(workspace_root.canonicalize().map_err(|error| {
+            layer_error(
+                context,
+                workspace_root,
+                format!("workspace root cannot be opened: {error}"),
+            )
+        })?)
+    };
+    let candidate = match &workspace {
+        Some(workspace) => resolve_root(configured_root, workspace),
+        None => configured_root.to_path_buf(),
+    };
+    if !candidate.try_exists().map_err(|error| {
+        layer_error(
+            context,
+            &candidate,
+            format!("existence check failed: {error}"),
+        )
+    })? {
+        return Ok(None);
+    }
+    if let Some(workspace) = &workspace {
+        reject_symlink_components(workspace, &candidate, context)?;
+    }
+    let canonical = candidate.canonicalize().map_err(|error| {
+        layer_error(
+            context,
+            &candidate,
+            format!("canonicalization failed: {error}"),
+        )
+    })?;
+    if let Some(workspace) = &workspace
+        && !canonical.starts_with(workspace)
+    {
+        return Err(layer_error(
+            context,
+            &candidate,
+            "resolves outside its admitted root",
+        ));
+    }
+    Ok(Some(canonical))
 }
 
 /// Compute the on-disk folder for a channel id under a shard scheme.
@@ -230,7 +1081,9 @@ pub fn resolve_channel_overlay(
     channel_id: &str,
     target_name: &str,
 ) -> Result<Option<ResolvedOverlay>, ChannelError> {
-    let root = resolve_root(&layout.root, workspace_root);
+    let Some(root) = contained_layout_root(&layout.root, workspace_root, "channel root")? else {
+        return Ok(None);
+    };
     let dir = channel_folder_path(&root, layout.shard, channel_id);
 
     // Ordered by suffix specificity; ordering only affects which candidate a
@@ -242,18 +1095,45 @@ pub fn resolve_channel_overlay(
         dir.join(format!("{target_name}.yaml")),
     ];
 
-    let mut present: Vec<PathBuf> = candidates.into_iter().filter(|p| p.is_file()).collect();
+    let mut present = Vec::new();
+    for candidate in candidates {
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(layer_error(
+                    &format!("channel `{channel_id}` target `{target_name}`"),
+                    &candidate,
+                    "symlink entries are not admitted",
+                ));
+            }
+            Ok(metadata) if metadata.is_file() => present.push(candidate),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(layer_error(
+                    &format!("channel `{channel_id}` target `{target_name}`"),
+                    &candidate,
+                    format!("metadata failed: {error}"),
+                ));
+            }
+        }
+    }
 
     match present.len() {
         0 => Ok(None),
         1 => {
             let path = present.remove(0);
-            let overlay = OverlayFile::load(&path)?;
-            let kind = verify_overlay_agreement(&path, &overlay, target_name)?;
+            let loaded = read_contained_layer(
+                &root,
+                &path,
+                &format!("channel `{channel_id}` target `{target_name}`"),
+                OverlayFile::from_yaml_bytes,
+            )?;
+            let kind = verify_overlay_agreement(&path, &loaded.value, target_name)?;
             Ok(Some(ResolvedOverlay {
                 path,
                 kind,
-                overlay,
+                overlay: loaded.value,
+                source_identity: loaded.identity,
             }))
         }
         _ => Err(ChannelError::AmbiguousOverlay {
@@ -335,10 +1215,18 @@ pub fn scan_channels(
 ) -> Result<Vec<DiscoveredChannel>, Vec<Diagnostic>> {
     use walkdir::WalkDir;
 
-    let root = resolve_root(&layout.root, workspace_root);
-    if !root.exists() {
+    let root = contained_layout_root(&layout.root, workspace_root, "channel scan root").map_err(
+        |error| {
+            vec![Diagnostic::error(
+                "E121",
+                error.to_string(),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            )]
+        },
+    )?;
+    let Some(root) = root else {
         return Ok(Vec::new());
-    }
+    };
 
     let depth = channel_folder_depth(layout.shard);
     let mut channels = Vec::new();
@@ -352,14 +1240,30 @@ pub fn scan_channels(
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
-            // Broken symlink / permission denied on a candidate: skip it, the
-            // scan itself is not fatal on per-entry IO errors.
-            Err(_) => continue,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                    "E121",
+                    format!("channel scan failed under {}: {error}", root.display()),
+                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                ));
+                return Err(diagnostics);
+            }
         };
 
         // Only leaf tenant folders at the shard depth are channels; reject
         // symlinks explicitly (belt-and-suspenders with follow_links(false)).
-        if entry.depth() != depth || entry.file_type().is_symlink() || !entry.file_type().is_dir() {
+        if entry.file_type().is_symlink() {
+            diagnostics.push(Diagnostic::error(
+                "E121",
+                format!(
+                    "channel scan rejected symlink entry `{}`",
+                    entry.path().display()
+                ),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diagnostics);
+        }
+        if entry.depth() != depth || !entry.file_type().is_dir() {
             continue;
         }
 
@@ -382,20 +1286,34 @@ pub fn scan_channels(
         }
 
         let manifest_path = dir.join(CHANNEL_MANIFEST_FILE);
-        let manifest = if manifest_path.is_file() {
-            match ChannelManifest::load(&manifest_path) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    diagnostics.push(Diagnostic::error(
-                        "E121",
-                        format!("failed to parse {}: {e}", manifest_path.display()),
-                        LabeledSpan::primary(Span::SYNTHETIC, String::new()),
-                    ));
-                    return Err(diagnostics);
+        let manifest = match std::fs::symlink_metadata(&manifest_path) {
+            Ok(_) => {
+                match read_contained_layer(
+                    dir,
+                    &manifest_path,
+                    &format!("channel `{id}` manifest"),
+                    ChannelManifest::from_yaml_bytes,
+                ) {
+                    Ok(loaded) => Some(loaded.value),
+                    Err(e) => {
+                        diagnostics.push(Diagnostic::error(
+                            "E121",
+                            format!("failed to parse {}: {e}", manifest_path.display()),
+                            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                        ));
+                        return Err(diagnostics);
+                    }
                 }
             }
-        } else {
-            None
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                    "E121",
+                    format!("cannot inspect {}: {error}", manifest_path.display()),
+                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                ));
+                return Err(diagnostics);
+            }
         };
 
         channels.push(DiscoveredChannel {
@@ -417,12 +1335,28 @@ pub fn scan_groups(
     layout: &GroupLayout,
     workspace_root: &Path,
 ) -> Result<Vec<Group>, Vec<Diagnostic>> {
+    scan_groups_with_identity(layout, workspace_root)
+        .map(|groups| groups.into_iter().map(|loaded| loaded.value).collect())
+}
+
+pub(crate) fn scan_groups_with_identity(
+    layout: &GroupLayout,
+    workspace_root: &Path,
+) -> Result<Vec<LoadedLayer<Group>>, Vec<Diagnostic>> {
     use walkdir::WalkDir;
 
-    let root = resolve_root(&layout.root, workspace_root);
-    if !root.exists() {
+    let root = contained_layout_root(&layout.root, workspace_root, "group scan root").map_err(
+        |error| {
+            vec![Diagnostic::error(
+                "E123",
+                error.to_string(),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            )]
+        },
+    )?;
+    let Some(root) = root else {
         return Ok(Vec::new());
-    }
+    };
 
     let mut groups = Vec::new();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
@@ -435,21 +1369,44 @@ pub fn scan_groups(
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(error) => {
+                diagnostics.push(Diagnostic::error(
+                    "E123",
+                    format!("group scan failed under {}: {error}", root.display()),
+                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                ));
+                return Err(diagnostics);
+            }
         };
 
         let file_type = entry.file_type();
-        if file_type.is_symlink() || !file_type.is_file() {
+        if file_type.is_symlink() {
+            diagnostics.push(Diagnostic::error(
+                "E123",
+                format!(
+                    "group scan rejected symlink entry `{}`",
+                    entry.path().display()
+                ),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
+            return Err(diagnostics);
+        }
+        if !file_type.is_file() {
             continue;
         }
 
         let path = entry.path();
-        let is_group = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.ends_with(GROUP_FILE_SUFFIX))
-            .unwrap_or(false);
-        if !is_group {
+        let file_name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            vec![Diagnostic::error(
+                "E123",
+                format!(
+                    "group scan found a non-UTF-8 file name at `{}`",
+                    path.display()
+                ),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            )]
+        })?;
+        if !file_name.ends_with(GROUP_FILE_SUFFIX) {
             continue;
         }
 
@@ -466,7 +1423,12 @@ pub fn scan_groups(
             return Err(diagnostics);
         }
 
-        match Group::load(path) {
+        match read_contained_layer(
+            &root,
+            path,
+            &format!("group candidate `{file_name}`"),
+            Group::from_yaml_bytes,
+        ) {
             Ok(group) => groups.push(group),
             Err(e) => {
                 diagnostics.push(Diagnostic::error(

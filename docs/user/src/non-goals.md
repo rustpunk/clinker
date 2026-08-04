@@ -147,7 +147,7 @@ or vendor-native CDC like Snowflake Streams.
 
 ## What Clinker **is**
 
-For the positive framing, see the [Introduction](README.md) and
+For the positive framing, see the [Introduction](index.html) and
 [Key Concepts](getting-started/concepts.md). The short version:
 
 - A pure-Rust, single-binary, **bounded-memory batch DAG executor** for

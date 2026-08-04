@@ -31,7 +31,7 @@ use crate::plan::row_type::{QualifiedField, Row};
 use crate::plan::types::JoinSide;
 use clinker_core_types::span::Span;
 use clinker_core_types::{Diagnostic, LabeledSpan};
-use cxl::ast::{BinOp, Expr, NodeId, Program, Statement};
+use cxl::ast::{BinOp, Expr, LiteralValue, NodeId, Program, Statement};
 use cxl::typecheck::Type;
 use cxl::typecheck::TypeDiagnostic;
 use cxl::typecheck::pass::TypedProgram;
@@ -410,6 +410,27 @@ pub(crate) fn split_conjunction(expr: &Expr) -> Vec<&Expr> {
     out
 }
 
+/// Return the predicate protected by an explicit `?? false`.
+///
+/// Nullable join keys make range comparisons nullable. Authors must make the
+/// `where:` result concrete with `?? false`, while strategy selection still
+/// needs to see the enclosed cross-input comparisons. The complete coalesced
+/// predicate remains the residual, so this optimization never changes its
+/// three-valued evaluation semantics.
+fn false_coalesced_predicate(expr: &Expr) -> Option<&Expr> {
+    let Expr::Coalesce { lhs, rhs, .. } = expr else {
+        return None;
+    };
+    matches!(
+        rhs.as_ref(),
+        Expr::Literal {
+            value: LiteralValue::Bool(false),
+            ..
+        }
+    )
+    .then_some(lhs.as_ref())
+}
+
 /// Collect all input qualifiers referenced by an expression subtree.
 ///
 /// Walks the AST and returns the set of `Arc<str>` qualifiers gathered
@@ -777,7 +798,8 @@ pub(crate) fn decompose_predicate(
         }
     };
 
-    let conjuncts = split_conjunction(predicate);
+    let coalesced_predicate = false_coalesced_predicate(predicate);
+    let conjuncts = split_conjunction(coalesced_predicate.unwrap_or(predicate));
     let mut equalities = Vec::new();
     let mut ranges = Vec::new();
     let mut residual_exprs = Vec::new();
@@ -798,6 +820,14 @@ pub(crate) fn decompose_predicate(
             }
             ConjunctClass::Residual => residual_exprs.push(c.clone()),
         }
+    }
+
+    if coalesced_predicate.is_some() {
+        // The extracted equality/range axes are optimization metadata. Retain
+        // the original `?? false` expression as the executable residual so a
+        // null operand remains a non-match rather than changing semantics.
+        residual_exprs.clear();
+        residual_exprs.push(predicate.clone());
     }
 
     let residual = if residual_exprs.is_empty() {
@@ -2581,6 +2611,7 @@ mod tests {
                 },
                 types: self.types.clone(),
                 bindings: Vec::new(),
+                runtime_modules: Arc::new(Default::default()),
                 field_types: IndexMap::new(),
                 regexes: Vec::new(),
                 node_count: self.types.len() as u32,
@@ -2947,6 +2978,7 @@ mod tests {
             },
             types: Vec::new(),
             bindings: Vec::new(),
+            runtime_modules: Arc::new(Default::default()),
             field_types: IndexMap::new(),
             regexes: Vec::new(),
             node_count: 0,
@@ -3006,6 +3038,8 @@ mod tests {
             combine_driving: artifacts.combine_driving.get(&combine_id).cloned(),
         });
         let mut plan = ExecutionPlanDag {
+            consumer_registry: Default::default(),
+            order_contract: Default::default(),
             graph,
             topo_order: Vec::new(),
             source_dag: Vec::new(),
@@ -3285,6 +3319,7 @@ mod tests {
             },
             types: Vec::new(),
             bindings: Vec::new(),
+            runtime_modules: Arc::new(Default::default()),
             field_types: IndexMap::new(),
             regexes: Vec::new(),
             node_count: 0,
@@ -3353,6 +3388,8 @@ mod tests {
         }
 
         let mut plan = ExecutionPlanDag {
+            consumer_registry: Default::default(),
+            order_contract: Default::default(),
             graph,
             topo_order: Vec::new(),
             source_dag: Vec::new(),
@@ -3486,6 +3523,7 @@ mod tests {
             },
             types: Vec::new(),
             bindings: Vec::new(),
+            runtime_modules: Arc::new(Default::default()),
             field_types: IndexMap::new(),
             regexes: Vec::new(),
             node_count: 0,
@@ -3718,6 +3756,7 @@ mod tests {
             },
             types: Vec::new(),
             bindings: Vec::new(),
+            runtime_modules: Arc::new(Default::default()),
             field_types: IndexMap::new(),
             regexes: Vec::new(),
             node_count: 0,
@@ -3818,6 +3857,7 @@ mod tests {
             },
             types: Vec::new(),
             bindings: Vec::new(),
+            runtime_modules: Arc::new(Default::default()),
             field_types: IndexMap::new(),
             regexes: Vec::new(),
             node_count: 0,

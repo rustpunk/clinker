@@ -37,11 +37,15 @@
 //! before anything is written.
 
 use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use clinker_plan::config::ClinkerToml;
+use clinker_core_types::FileId;
+use clinker_plan::config::{ClinkerToml, CompositionFile, PipelineConfig, PipelineNode};
+use clinker_plan::plan::bind_schema::MAX_COMPOSITION_DEPTH;
+use clinker_plan::resources::{CatalogResourceKind, LogicalResourceId, WorkspaceCatalog};
 
 use crate::{LintArgs, RenameNodeArgs, run_channels_lint};
 
@@ -64,6 +68,9 @@ pub fn run_rename_node(args: &RenameNodeArgs) -> CmdResult {
         .map_err(|e| format!("workspace root {}: {e}", args.base_dir.display()))?;
     let clinker_toml = ClinkerToml::load_from_workspace(&workspace_root)
         .map_err(|e| format!("clinker.toml: {e}"))?;
+    let catalog = WorkspaceCatalog::load(&workspace_root, &clinker_toml.catalog)
+        .map_err(|e| format!("clinker.toml catalog: {e}"))?;
+    let target_scope = refactor_target_scope(&args.target, &clinker_toml, &catalog)?;
 
     // ---- Base target file: parse, guard, rewrite. ----
     let base_text = std::fs::read_to_string(&args.target)
@@ -105,13 +112,9 @@ pub fn run_rename_node(args: &RenameNodeArgs) -> CmdResult {
     }
 
     // ---- Overlay/group/manifest files: propagate references. ----
-    // A per-target overlay names its target, so it is only rewritten when it
-    // overlays *this* pipeline — otherwise a different pipeline that happens to
-    // share the node name `old` would be corrupted. Channel-wide manifest
-    // overrides and group files are target-agnostic (they apply to whatever
-    // pipeline a channel runs), so their references to `old` are rewritten
-    // wherever they appear, with `channels lint` as the backstop.
-    let target_stem = file_stem_of(&args.target);
+    // Every overlay layer declares logical catalog targets. Rewrite only files
+    // whose declared pipeline/composition set admits this target; filenames and
+    // basenames never establish identity.
     let overlay_files = collect_overlay_files(&workspace_root, &clinker_toml)?;
     for candidate in overlay_files {
         // The base target is never also an overlay file, but dedupe defensively.
@@ -132,10 +135,7 @@ pub fn run_rename_node(args: &RenameNodeArgs) -> CmdResult {
                 continue;
             }
         };
-        if candidate.kind == OverlayFileKind::PerTarget
-            && overlay_target_stem(&dom).as_deref() != Some(target_stem.as_str())
-        {
-            // This overlay targets a different pipeline; leave it untouched.
+        if !overlay_applies_to(&dom, candidate.kind, &target_scope) {
             continue;
         }
         if rename_overlay_surfaces(&mut dom, old, new)? {
@@ -793,9 +793,9 @@ enum OverlayFileKind {
     /// A per-target overlay (`<target>.channel.yaml` / `.comp.yaml` / bare
     /// `<target>.yaml`) — names its target, so rewriting is scoped to it.
     PerTarget,
-    /// A channel manifest (`channel.cfg.yaml`) — channel-wide, target-agnostic.
+    /// A channel manifest (`channel.cfg.yaml`) — admitted by `channel.targets`.
     Manifest,
-    /// A group definition (`*.group.yaml`) — target-agnostic.
+    /// A group definition (`*.group.yaml`) — admitted by `group.targets`.
     Group,
 }
 
@@ -860,28 +860,173 @@ fn collect_overlay_files(
     Ok(files)
 }
 
-/// The bare target stem of an overlay's authoritative `channel.target:`, if
-/// present — used to scope per-target overlay rewriting to the renamed pipeline.
-fn overlay_target_stem(dom: &Value) -> Option<String> {
-    dom.get("channel")
-        .and_then(|c| c.get("target"))
-        .and_then(|t| t.as_str())
-        .map(|t| file_stem_of(Path::new(t)))
+#[derive(Debug, Default)]
+struct RefactorTargetScope {
+    pipelines: BTreeSet<String>,
+    compositions: BTreeSet<String>,
 }
 
-/// The bare file stem of a path: its file name with a `.comp.yaml` or `.yaml`
-/// suffix stripped (so `order.channel.yaml` → `order.channel`, and
-/// `order.yaml`/`order.comp.yaml` → `order`). A per-target overlay's target
-/// path and the base pipeline path reduce to the same stem this way.
-fn file_stem_of(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    name.strip_suffix(".comp.yaml")
-        .or_else(|| name.strip_suffix(".yaml"))
-        .unwrap_or(name)
-        .to_string()
+/// Resolve the selected file through the workspace catalog and determine every
+/// pipeline/composition identity whose overlay may reference it. For a
+/// composition target this includes catalog pipelines whose composition
+/// closure contains the selected file.
+fn refactor_target_scope(
+    selected_path: &Path,
+    clinker_toml: &ClinkerToml,
+    catalog: &WorkspaceCatalog,
+) -> Result<RefactorTargetScope, String> {
+    let selected = selected_path
+        .canonicalize()
+        .map_err(|error| format!("cannot open selected refactor target: {error}"))?;
+    let mut pipeline_paths = Vec::new();
+    let mut composition_paths = Vec::new();
+
+    for id in clinker_toml.catalog.pipelines.keys() {
+        let logical = LogicalResourceId::parse(id).map_err(|error| error.to_string())?;
+        let path = catalog
+            .resolve(CatalogResourceKind::Pipeline, &logical)
+            .map_err(|error| error.to_string())?;
+        pipeline_paths.push((id.clone(), path.to_path_buf()));
+    }
+    for id in clinker_toml.catalog.compositions.keys() {
+        let logical = LogicalResourceId::parse(id).map_err(|error| error.to_string())?;
+        let path = catalog
+            .resolve(CatalogResourceKind::Composition, &logical)
+            .map_err(|error| error.to_string())?;
+        composition_paths.push((id.clone(), path.to_path_buf()));
+    }
+
+    let selected_pipeline = pipeline_paths
+        .iter()
+        .find_map(|(id, path)| (path == &selected).then_some(id.clone()));
+    let selected_composition = composition_paths
+        .iter()
+        .find_map(|(id, path)| (path == &selected).then_some(id.clone()));
+    if selected_pipeline.is_none() && selected_composition.is_none() {
+        return Err(
+            "selected refactor target is not cataloged; add it to `[catalog.pipelines]` or `[catalog.compositions]`"
+                .to_string(),
+        );
+    }
+
+    let mut scope = RefactorTargetScope::default();
+    if let Some(id) = selected_composition {
+        scope.compositions.insert(id);
+    }
+
+    for (pipeline_id, pipeline_path) in pipeline_paths {
+        if let Some(selected_pipeline) = selected_pipeline.as_deref()
+            && selected_pipeline != pipeline_id
+        {
+            continue;
+        }
+        let closure = pipeline_composition_closure(&pipeline_path)?;
+        let admits_selected = selected_pipeline.as_deref() == Some(pipeline_id.as_str())
+            || closure.contains(&selected);
+        if !admits_selected {
+            continue;
+        }
+        scope.pipelines.insert(pipeline_id);
+        for (composition_id, composition_path) in &composition_paths {
+            if closure.contains(composition_path) {
+                scope.compositions.insert(composition_id.clone());
+            }
+        }
+    }
+    Ok(scope)
+}
+
+fn pipeline_composition_closure(path: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    let yaml = std::fs::read_to_string(path)
+        .map_err(|error| format!("reading catalog pipeline: {error}"))?;
+    let pipeline: PipelineConfig = clinker_plan::yaml::from_str(&yaml)
+        .map_err(|error| format!("parsing catalog pipeline: {error}"))?;
+    let mut closure = BTreeSet::new();
+    collect_composition_paths(
+        path.parent().unwrap_or_else(|| Path::new(".")),
+        &pipeline.nodes,
+        &mut closure,
+        0,
+    )?;
+    Ok(closure)
+}
+
+fn collect_composition_paths(
+    base_dir: &Path,
+    nodes: &[clinker_plan::yaml::Spanned<PipelineNode>],
+    closure: &mut BTreeSet<PathBuf>,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > MAX_COMPOSITION_DEPTH as usize {
+        return Err(format!(
+            "composition closure exceeds the maximum depth of {MAX_COMPOSITION_DEPTH}"
+        ));
+    }
+    for node in nodes {
+        let PipelineNode::Composition { r#use, .. } = &node.value else {
+            continue;
+        };
+        let path = base_dir
+            .join(r#use)
+            .canonicalize()
+            .map_err(|error| format!("opening composition closure member: {error}"))?;
+        if !closure.insert(path.clone()) {
+            continue;
+        }
+        let yaml = std::fs::read_to_string(&path)
+            .map_err(|error| format!("reading composition closure member: {error}"))?;
+        let composition =
+            CompositionFile::parse(&yaml, FileId::new(NonZeroU32::MIN), PathBuf::new())
+                .map_err(|error| format!("parsing composition closure member: {error}"))?;
+        collect_composition_paths(
+            path.parent().unwrap_or_else(|| Path::new(".")),
+            &composition.nodes,
+            closure,
+            depth + 1,
+        )?;
+    }
+    Ok(())
+}
+
+fn overlay_applies_to(dom: &Value, kind: OverlayFileKind, scope: &RefactorTargetScope) -> bool {
+    match kind {
+        OverlayFileKind::PerTarget => dom
+            .get("channel")
+            .and_then(|channel| channel.get("target"))
+            .and_then(Value::as_str)
+            .is_some_and(|target| scope.pipelines.contains(target)),
+        OverlayFileKind::Manifest => dom
+            .get("channel")
+            .and_then(|channel| channel.get("targets"))
+            .and_then(Value::as_array)
+            .is_some_and(|targets| {
+                targets
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .any(|target| scope.pipelines.contains(target))
+            }),
+        OverlayFileKind::Group => {
+            let targets = dom.get("group").and_then(|group| group.get("targets"));
+            targets
+                .and_then(|targets| targets.get("pipelines"))
+                .and_then(Value::as_array)
+                .is_some_and(|targets| {
+                    targets
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .any(|target| scope.pipelines.contains(target))
+                })
+                || targets
+                    .and_then(|targets| targets.get("compositions"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|targets| {
+                        targets
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .any(|target| scope.compositions.contains(target))
+                    })
+        }
+    }
 }
 
 /// Non-recursive `*.yaml` listing of a directory (symlinks skipped).

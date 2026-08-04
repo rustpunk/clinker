@@ -333,7 +333,12 @@ fn lazy_probe_spill_routes_to_partition_file() {
     // partition's probe-side file.
     let probe = record_for(&schema, vec![Value::Integer(999)]);
     let outcome = exec
-        .probe_record(&probe, &[Value::Integer(999)], probe_partition_hash)
+        .probe_record(
+            &probe,
+            0.into(),
+            &[Value::Integer(999)],
+            probe_partition_hash,
+        )
         .unwrap();
     assert!(matches!(outcome, ProbeOutcome::Spilled));
 
@@ -346,7 +351,7 @@ fn lazy_probe_spill_routes_to_partition_file() {
         } => {
             assert_eq!(probe_files.len(), 1);
             assert_eq!(*probe_count, 1);
-            assert!(probe_files[0].exists());
+            assert!(probe_files[0].path().exists());
         }
         _ => panic!("partition 0 must remain OnDisk after probe spill"),
     }
@@ -358,10 +363,11 @@ fn lazy_probe_spill_routes_to_partition_file() {
 /// match the cross-product filtered by the predicate, regardless
 /// of which partitions get spilled.
 #[test]
-fn execute_grace_hash_partition_pair_correct() {
+fn combine_driver_identity_survives_grace_hash_partition_pair() {
     use crate::executor::combine::CombineResolverMapping;
     use clinker_plan::plan::combine::{DecomposedPredicate, EqualityConjunct};
     use clinker_plan::plan::types::JoinSide;
+    use clinker_plan::plan::{EntityRef, PlanNodeId};
     use cxl::eval::{EvalContext, StableEvalContext};
 
     // Driver and build schemas use distinct bare names for the
@@ -377,7 +383,7 @@ fn execute_grace_hash_partition_pair_correct() {
                     Arc::clone(&driver_schema),
                     vec![Value::Integer(i), Value::String(format!("d-{i}").into())],
                 ),
-                i as u64,
+                RecordOrder::new(PlanNodeId::new(21 + i as usize), 7),
             )
         })
         .collect();
@@ -563,6 +569,23 @@ fn execute_grace_hash_partition_pair_correct() {
         .collect();
     assert_eq!(seen, expected);
 
+    for (record, identity) in &result {
+        let driver_value = match &record.values()[1] {
+            Value::String(value) => value.as_ref(),
+            other => panic!("driver value not string: {other:?}"),
+        };
+        let driver_index: usize = driver_value
+            .strip_prefix("d-")
+            .expect("driver value prefix")
+            .parse()
+            .expect("driver value index");
+        assert_eq!(
+            *identity,
+            RecordOrder::new(PlanNodeId::new(21 + driver_index), 7),
+            "grace-hash output must retain the exact typed driver identity"
+        );
+    }
+
     // Plane B lifecycle: the join routed all three build-side sketches
     // into the catalog under (products, products).
     let catalog = stats_catalog.lock().unwrap();
@@ -641,7 +664,7 @@ fn execute_grace_hash_spill_then_reload_correct() {
                     Arc::clone(&driver_schema),
                     vec![Value::Integer(i), Value::String(format!("d-{i}").into())],
                 ),
-                i as u64,
+                (i as u64).into(),
             )
         })
         .collect();
@@ -831,7 +854,7 @@ fn execute_grace_hash_aborts_on_disk_quota_overflow() {
                     Arc::clone(&driver_schema),
                     vec![Value::Integer(i), Value::String(format!("d-{i}").into())],
                 ),
-                i as u64,
+                (i as u64).into(),
             )
         })
         .collect();
@@ -1279,6 +1302,7 @@ fn probe_finalize_spill_commit_trips_disk_cap_per_partition() {
     assert!(matches!(
         exec.probe_record(
             &record_for(&schema, vec![Value::Integer(10)]),
+            0.into(),
             &[Value::Integer(10)],
             hash_p0
         )
@@ -1288,6 +1312,7 @@ fn probe_finalize_spill_commit_trips_disk_cap_per_partition() {
     assert!(matches!(
         exec.probe_record(
             &record_for(&schema, vec![Value::Integer(20)]),
+            1.into(),
             &[Value::Integer(20)],
             hash_p1
         )
@@ -1626,7 +1651,6 @@ fn with_reload_context<R>(h: &BnlHarness, f: impl FnOnce(&ReloadContext<'_>) -> 
         emit: &emit,
         ctx: &eval_ctx,
         build_schema: Arc::clone(&h.build_schema),
-        driver_schema: Arc::clone(&h.driver_schema),
         spill_dir: h.spill_dir.path(),
         spill_compress: true,
         hash_state: &h.hash_state,
@@ -1656,16 +1680,20 @@ fn spill_for_bnl(
         sketch.add(hash_composite_key(&keys, &h.hash_state));
     }
     let (bpath, _b_written) = bw.finish().unwrap();
-    let mut probe_files: Vec<SpillFilePath> = Vec::new();
+    let mut probe_files = Vec::new();
     if !probe_records.is_empty() {
-        let mut pw =
-            GraceSpillWriter::new(h.spill_dir.path(), hash_bits, partition_id | 0x8000, true)
+        let mut pw: crate::pipeline::spill::SpillWriter<RecordOrder> =
+            crate::pipeline::spill::SpillWriter::new(
+                Arc::clone(&h.driver_schema),
+                Some(h.spill_dir.path()),
+                true,
+            )
+            .unwrap();
+        for (ordinal, r) in probe_records.iter().enumerate() {
+            pw.write_pair(r, &RecordOrder::from(ordinal as u64))
                 .unwrap();
-        for r in probe_records {
-            pw.write_record(r).unwrap();
         }
-        let (p_path, _p_written) = pw.finish().unwrap();
-        probe_files.push(p_path);
+        probe_files.push(pw.finish().unwrap());
     }
     SpilledPartition {
         partition_id,

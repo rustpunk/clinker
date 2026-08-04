@@ -20,11 +20,12 @@
 ///   equals `ok_count`. For inclusive Route fan-out / multi-Output
 ///   sinks it exceeds `ok_count`.
 ///
-/// Source-row identity for `ok_count` deduplication uses each
-/// record's source row number (`row_num`) as it flows through the
-/// DAG. For multi-source pipelines, row-num collisions across
-/// sources may undercount distinct inputs — a known limitation
-/// pending a globally-unique source-row stamp.
+/// The executor owns `ok_count` membership as attempt-local
+/// `SourceRowId` values: compiled Source-node scope plus the exact
+/// ordinal minted for that source attempt. Equal ordinals from different
+/// Sources are therefore distinct, while fan-out deliveries of one source
+/// row share one membership key. Sequential executions start with fresh
+/// membership and ordinal state; no success identity is process-global.
 #[derive(Debug, Clone, Default)]
 pub struct PipelineCounters {
     pub total_count: u64,

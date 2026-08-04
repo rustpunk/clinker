@@ -1603,18 +1603,14 @@ impl ExecutionPlanDag {
     }
 }
 
-/// Render a [`PlanIndexRoot`] for `--explain` output. Source-rooted
-/// Node-rooted indices show as `node(<idx>)`, parent-node-rooted as
-/// `parent_node(<idx>)`. Windows whose upstream is a Source render
+/// Render a [`PlanIndexRoot`] for `--explain` output. Node-rooted
+/// indices show as `node(<idx>)`. Windows whose upstream is a Source render
 /// as `node(<source_node_idx>)` — there is no separate
 /// source-rooted category at runtime.
 fn format_index_root(root: &crate::plan::index::PlanIndexRoot) -> String {
     match root {
         crate::plan::index::PlanIndexRoot::Node { upstream, .. } => {
             format!("node({})", upstream.index())
-        }
-        crate::plan::index::PlanIndexRoot::ParentNode { upstream, .. } => {
-            format!("parent_node({})", upstream.index())
         }
     }
 }

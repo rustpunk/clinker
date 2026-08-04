@@ -27,7 +27,6 @@ fn write(root: &Path, rel: &str, content: &str) {
     std::fs::write(path, content).unwrap();
 }
 
-const CLINKER_TOML: &str = "[channel]\nroot = \"channel\"\n\n[group]\nroot = \"group\"\n";
 const ORDERS_CSV: &str = "order_id,amount\na1,150.0\na2,20.0\n";
 
 const COMPOSITION: &str = r#"_compose:
@@ -114,10 +113,11 @@ nodes:
 
 const GROUP: &str = r#"group:
   name: enterprise
+  targets: { pipelines: [daily.orders] }
   match: 'tier == "enterprise"'
   priority: 20
 config:
-  scorer.threshold: 0.8
+  scorer.threshold: { value: 0.8 }
 overrides:
   - op: add
     composition: ../composition/screen.comp.yaml
@@ -127,15 +127,16 @@ overrides:
 
 const GLOBEX_MANIFEST: &str = r#"channel:
   name: globex
+  targets: [daily.orders]
 labels: { tier: enterprise, region: west }
 config:
-  scorer.threshold: 0.9
+  scorer.threshold: { value: 0.9 }
 "#;
 
 const GLOBEX_OVERLAY: &str = r#"channel:
-  target: ../../pipeline/order_fulfillment.yaml
+  target: daily.orders
 config:
-  scorer.threshold: 0.95
+  scorer.threshold: { value: 0.95 }
 "#;
 
 /// A manifest declaring a non-enterprise `tier` label. A channel's manifest is
@@ -143,13 +144,15 @@ config:
 /// would error on the unresolved identifier rather than cleanly not match, so
 /// even the "broken" channels carry a manifest.
 fn basic_manifest(name: &str) -> String {
-    format!("channel:\n  name: {name}\nlabels: {{ tier: basic, region: west }}\n")
+    format!(
+        "channel:\n  name: {name}\n  targets: [daily.orders]\nlabels: {{ tier: basic, region: west }}\n"
+    )
 }
 
 /// A per-target overlay whose `add` op splices after a node that does not
 /// exist — the dangling splice anchor lint must surface (E114).
 const DANGLING_OVERLAY: &str = r#"channel:
-  target: ../../pipeline/order_fulfillment.yaml
+  target: daily.orders
 overrides:
   - op: add
     node:
@@ -164,15 +167,26 @@ overrides:
 /// A per-target overlay with a config key matching no composition parameter —
 /// the broken-overlay lint must surface (E113).
 const BADKEY_OVERLAY: &str = r#"channel:
-  target: ../../pipeline/order_fulfillment.yaml
+  target: daily.orders
 config:
-  scorer.bogus_param: 0.1
+  scorer.bogus_param: { value: 0.1 }
 "#;
 
 /// Build the valid workspace (globex only). With `broken`, add two channels
 /// carrying intentionally invalid overlays for the lint failure test.
 fn build_workspace(root: &Path, broken: bool) {
-    write(root, "clinker.toml", CLINKER_TOML);
+    let channel_catalog = if broken {
+        "globex = \"channel/globex\"\ndangling = \"channel/dangling\"\nbadkey = \"channel/badkey\"\n"
+    } else {
+        "globex = \"channel/globex\"\n"
+    };
+    write(
+        root,
+        "clinker.toml",
+        &format!(
+            "[catalog.pipelines]\n\"daily.orders\" = \"pipeline/order_fulfillment.yaml\"\n\n[catalog.compositions]\n\"etl.score\" = \"composition/score.comp.yaml\"\n\"etl.screen\" = \"composition/screen.comp.yaml\"\n\n[catalog.channels]\n{channel_catalog}\n[channel]\nroot = \"channel\"\n\n[group]\nroot = \"group\"\n"
+        ),
+    );
     write(root, "pipeline/orders.csv", ORDERS_CSV);
     write(root, "pipeline/order_fulfillment.yaml", PIPELINE);
     write(root, "composition/score.comp.yaml", COMPOSITION);
@@ -343,20 +357,11 @@ fn run_with_channel_derives_group_and_applies_to_output() {
 }
 
 #[test]
-fn run_channel_composition_target_resolves_by_bare_stem() {
-    // A composition target `score.comp.yaml` must resolve its per-target overlay
-    // by the bare stem `score`, not `score.comp`. If the run path keyed the
-    // lookup by the last extension it would disagree with the overlay's declared
-    // target stem and hard-fail overlay resolution; the run must instead get past
-    // resolution (and fail later, on its own terms, because a composition file is
-    // not a runnable pipeline).
+fn run_channel_rejects_a_composition_as_the_pipeline_target() {
+    // Channel target files name exactly one catalog pipeline. A cataloged
+    // composition is not silently reinterpreted as a runnable pipeline.
     let tmp = tempfile::tempdir().unwrap();
     build_workspace(tmp.path(), false);
-    write(
-        tmp.path(),
-        "channel/globex/score.comp.yaml",
-        "channel:\n  target: ../../composition/score.comp.yaml\n",
-    );
 
     let out = Command::new(clinker_bin())
         .current_dir(tmp.path())
@@ -369,9 +374,10 @@ fn run_channel_composition_target_resolves_by_bare_stem() {
 
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !stderr.contains("overlay resolution failed") && !stderr.contains("target stem"),
-        "the composition overlay must resolve by its bare stem, not fail on a \
-         stem mismatch.\nstderr: {stderr}"
+        !out.status.success()
+            && stderr.contains("selected pipeline")
+            && stderr.contains("not cataloged"),
+        "a composition must not be admitted as a channel pipeline target.\nstderr: {stderr}"
     );
 }
 
@@ -431,12 +437,12 @@ fn channels_resolve_reflects_fixed_lock() {
     write(
         tmp.path(),
         "channel/globex/channel.cfg.yaml",
-        "channel:\n  name: globex\nlabels: { tier: enterprise, region: west }\nfixed:\n  scorer.threshold: 0.9\n",
+        "channel:\n  name: globex\n  targets: [daily.orders]\nlabels: { tier: enterprise, region: west }\nconfig:\n  scorer.threshold: { value: 0.9, fixed: true }\n",
     );
     write(
         tmp.path(),
         "channel/globex/order_fulfillment.channel.yaml",
-        "channel:\n  target: ../../pipeline/order_fulfillment.yaml\nconfig:\n  scorer.threshold: 0.95\n",
+        "channel:\n  target: daily.orders\nconfig:\n  scorer.threshold: { value: 0.95 }\n",
     );
 
     let out = Command::new(clinker_bin())
@@ -450,18 +456,8 @@ fn channels_resolve_reflects_fixed_lock() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        out.status.success(),
-        "channels resolve must succeed.\nstdout: {stdout}\nstderr: {stderr}"
-    );
-
-    let report = overlay_report(&stdout);
-    // The fixed channel-wide value holds against the higher per-target layer,
-    // and the report marks it as locked.
-    assert!(
-        report.contains("scorer.threshold = 0.9")
-            && report.contains("ChannelWide")
-            && report.contains("(fixed)"),
-        "{report}"
+        !out.status.success() && stderr.contains("E103") && stderr.contains("fixed"),
+        "a target candidate cannot override a fixed channel-wide value.\nstdout: {stdout}\nstderr: {stderr}"
     );
 }
 
@@ -540,9 +536,9 @@ fn channels_lint_surfaces_broken_overlays() {
         stderr.contains("E113") && stderr.contains("scorer.bogus_param"),
         "lint must surface the bad config key.\nstderr: {stderr}"
     );
-    // A splice anchor naming a node that does not exist (E114).
+    // A splice anchor naming a node outside the admitted target closure.
     assert!(
-        stderr.contains("E114") && stderr.contains("ghost_node"),
-        "lint must surface the dangling splice anchor.\nstderr: {stderr}"
+        stderr.contains("ghost_node") && stderr.contains("outside the selected pipeline"),
+        "lint must surface the out-of-closure splice anchor.\nstderr: {stderr}"
     );
 }

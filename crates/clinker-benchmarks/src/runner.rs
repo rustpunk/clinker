@@ -175,10 +175,9 @@ fn rewrite_split_output_paths(
 
 /// Derive per-field type layout from a source node's schema declaration.
 ///
-/// CSV delivers all values as strings, so the default int/string alternation
-/// (even=int, odd=string) produces universally parseable data. Only override
-/// for types that need a specific string format (Date, DateTime) — a random
-/// string like "misljiqatu" can't be parsed as a date.
+/// Structured formats preserve native scalar kinds, so generated values must
+/// agree with the declared schema. Text formats still serialize these values
+/// as text before the format reader applies the declaration.
 fn field_types_for_source(body: &SourceBody) -> Vec<FieldKind> {
     use cxl::typecheck::Type;
 
@@ -186,15 +185,16 @@ fn field_types_for_source(body: &SourceBody) -> Vec<FieldKind> {
         .bound_columns()
         .unwrap_or_default()
         .iter()
-        .enumerate()
-        .map(|(i, col)| match &col.ty {
+        .map(|col| match col.ty.unwrap_nullable() {
+            Type::Bool => FieldKind::Bool,
+            Type::Int | Type::Numeric => FieldKind::Int,
+            Type::Float | Type::Decimal => FieldKind::Float,
+            Type::String => FieldKind::String,
             Type::Date | Type::DateTime => FieldKind::Date,
-            _ => {
-                if i % 2 == 0 {
-                    FieldKind::Int
-                } else {
-                    FieldKind::String
-                }
+            // Benchmark schemas use scalar declarations. Generate text for
+            // any future type-agnostic or structured declaration.
+            Type::Null | Type::Array | Type::Map | Type::Any | Type::Nullable(_) => {
+                FieldKind::String
             }
         })
         .collect()

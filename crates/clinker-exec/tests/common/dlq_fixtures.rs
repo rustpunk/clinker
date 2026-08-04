@@ -23,7 +23,7 @@
 /// before the `validate` transform.
 pub fn dlq_validate_pipeline(name: &str, correlation_key: &str, schema: &str) -> String {
     format!(
-        "\npipeline:\n  name: {name}\nerror_handling:\n  strategy: continue\nnodes:\n\
+        "\npipeline:\n  name: {name}\nerror_handling:\n  strategy: continue\n  dlq:\n    path: rejected.csv\nnodes:\n\
 - type: source\n  name: src\n  config:\n    name: src\n    path: input.csv\n    correlation_key: {correlation_key}\n    type: csv\n    schema:\n\
 {schema}\
 - type: transform\n  name: validate\n  input: src\n  config:\n    cxl: 'emit emp_id = employee_id\n\n      emit val = value.to_int()\n\n      '\n\

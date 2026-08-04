@@ -7,8 +7,11 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 use clinker_channel::{OverlayResolution, resolve};
 use clinker_core_types::Span;
-use clinker_plan::config::composition::{LayerKind, ResolvedValue};
+use clinker_plan::config::composition::{
+    LayerKind, ProvenanceField, ProvenanceKey, ResolvedValue, ScopedNodeAddress,
+};
 use clinker_plan::config::{ChannelLayout, GroupLayout, ShardScheme};
+use clinker_plan::plan::{EntityRef, PlanNodeId};
 
 /// Build a tempdir workspace with a `bench` channel whose per-target overlay
 /// carries `n` `config:` clobber entries, and resolve it once. The resolution
@@ -68,9 +71,13 @@ fn bench_channel_merge(c: &mut Criterion) {
 
                 let prov = plan.provenance_mut();
                 for i in 0..100 {
+                    let field = ProvenanceField::ConfigParam(format!("param{i}"));
                     prov.insert(
-                        format!("node{i}"),
-                        format!("param{i}"),
+                        ProvenanceKey {
+                            node: PlanNodeId::new(i),
+                            field: field.clone(),
+                        },
+                        ScopedNodeAddress::top_level(format!("node{i}"), field),
                         ResolvedValue::new(
                             serde_json::json!(0),
                             LayerKind::PipelineDefault,

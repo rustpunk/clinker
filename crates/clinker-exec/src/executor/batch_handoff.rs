@@ -35,7 +35,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::executor::stream_event::{Punctuation, StreamEvent};
+use crate::executor::stream_event::{Punctuation, SourceRowId, StreamEvent};
 use crate::pipeline::memory::{ConsumerHandle, MemoryArbitrator};
 use clinker_plan::error::PipelineError;
 
@@ -108,8 +108,11 @@ impl EventBatch {
     }
 
     /// Append a record event, preserving arrival order.
-    pub(crate) fn push_record(&mut self, record: clinker_record::Record, row_num: u64) {
-        self.events.push(StreamEvent::record(record, row_num));
+    pub(crate) fn push_record<R>(&mut self, record: clinker_record::Record, row_id: R)
+    where
+        R: Into<SourceRowId>,
+    {
+        self.events.push(StreamEvent::record(record, row_id.into()));
     }
 
     /// Append a punctuation event, preserving arrival order.
@@ -166,13 +169,16 @@ where
     }
 
     /// Push a record, flushing the current batch first if it is full.
-    pub(crate) fn push_record(
+    pub(crate) fn push_record<R>(
         &mut self,
         record: clinker_record::Record,
-        row_num: u64,
-    ) -> Result<(), E> {
+        row_id: R,
+    ) -> Result<(), E>
+    where
+        R: Into<SourceRowId>,
+    {
         self.flush_if_full()?;
-        self.current.push_record(record, row_num);
+        self.current.push_record(record, row_id);
         Ok(())
     }
 
@@ -236,7 +242,7 @@ where
 /// which observes RSS without driving the pausing arbitration round) —
 /// and when `spill_allowed` matches the compiled buffer classification — the
 /// flushed batch's records round-trip through a
-/// `SpillFile<u64>` on disk instead of being held in the producer's
+/// `SpillFile<SourceRowId>` on disk instead of being held in the producer's
 /// working set: each maximal run of consecutive records is written out,
 /// re-read, and forwarded to the writer one at a time, relieving the
 /// in-memory peak for that batch. Punctuations are forwarded in place
@@ -299,7 +305,7 @@ impl StreamingChargeHandle {
     /// Adds the batch's estimated bytes to the slot's handle and samples
     /// the arbitrator's peak charged usage. When `spill_allowed` and the
     /// soft RSS threshold has tripped, each maximal run of consecutive
-    /// records is spilled to a `SpillFile<u64>` and streamed back out from
+    /// records is spilled to a `SpillFile<SourceRowId>` and streamed back out from
     /// disk one at a time (relieving the producer's in-memory peak for the
     /// batch) with its spill bytes recorded against the disk quota; an
     /// over-quota total surfaces the structured `MemoryBudgetExceeded`
@@ -328,7 +334,7 @@ impl StreamingChargeHandle {
             // forwarded at its own offset, so a `[DocumentOpen, r0, r1,
             // DocumentClose]` batch re-emits in that exact order instead of
             // moving the open after the records it frames.
-            let mut run: Vec<(clinker_record::Record, u64)> = Vec::new();
+            let mut run: Vec<(clinker_record::Record, SourceRowId)> = Vec::new();
             for event in batch.into_events() {
                 match event {
                     StreamEvent::Record(record, rn) => run.push((record, rn)),
@@ -359,7 +365,7 @@ impl StreamingChargeHandle {
     /// `SpillCapExceeded` (E320) when the cumulative total exceeds the cap.
     fn spill_and_forward_run(
         &self,
-        run: Vec<(clinker_record::Record, u64)>,
+        run: Vec<(clinker_record::Record, SourceRowId)>,
         send: &mut impl FnMut(StreamEvent) -> Result<(), PipelineError>,
     ) -> Result<(), PipelineError> {
         // Resolve the compression mode against this run's schema width and the
@@ -472,7 +478,7 @@ mod tests {
         assert_eq!(flat.len(), 5);
         for (i, ev) in flat.iter().enumerate() {
             match ev {
-                StreamEvent::Record(_, rn) => assert_eq!(*rn, i as u64),
+                StreamEvent::Record(_, rn) => assert_eq!(rn.ordinal(), i as u64),
                 StreamEvent::Punctuation(_) => panic!("expected only records"),
             }
         }
@@ -657,7 +663,7 @@ mod tests {
         let record_rns: Vec<u64> = out
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::Record(_, rn) => Some(*rn),
+                StreamEvent::Record(_, rn) => Some(rn.ordinal()),
                 StreamEvent::Punctuation(_) => None,
             })
             .collect();
@@ -765,7 +771,7 @@ mod tests {
         let shapes: Vec<Shape> = out
             .iter()
             .map(|e| match e {
-                StreamEvent::Record(_, rn) => Shape::Rec(*rn),
+                StreamEvent::Record(_, rn) => Shape::Rec(rn.ordinal()),
                 StreamEvent::Punctuation(p) => match p.kind() {
                     PunctuationKind::DocumentOpen => Shape::Open(p.doc_id()),
                     PunctuationKind::DocumentClose => Shape::Close(p.doc_id()),

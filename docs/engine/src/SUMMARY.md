@@ -5,6 +5,7 @@
 # Architecture
 
 - [Overview & Pillars](architecture.md)
+- [Extension Seams](extension-seams.md)
 
 # Execution Model
 

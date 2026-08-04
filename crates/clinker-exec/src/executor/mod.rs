@@ -9,6 +9,7 @@ pub(crate) mod composition_dispatch;
 mod context;
 pub(crate) mod correlation_dispatch;
 pub(crate) mod cull_dispatch;
+pub(crate) mod diagnostic_preview;
 pub(crate) mod dispatch;
 mod dlq;
 pub(crate) mod document_dlq;
@@ -43,6 +44,7 @@ pub(crate) mod window_runtime;
 pub use batch_handoff::DEFAULT_BATCH_SIZE;
 use context::build_stable_eval_context;
 pub use dlq::DlqEntry;
+pub(crate) use dlq::TypeErrorEvent;
 use ingest::{IngestTaskOutcome, ingest_source};
 use params::sum_cpu_io_totals;
 pub use params::{ExecutionReport, PipelineRunParams};
@@ -53,6 +55,7 @@ pub use storage_validate::{
     CapHeadroomWarning, FreeSpaceWarning, ResolvedStorage, StorageValidationError,
     validate_storage_config,
 };
+pub use stream_event::{OutputDeliveryId, SourceRowId};
 pub(crate) use streaming::StreamingOutputTaskOutput;
 use streaming::{compute_streaming_output_specs, streaming_output};
 pub(crate) use transform::{
@@ -194,8 +197,10 @@ struct DagExecInputs<'a> {
 struct DagExecResources {
     /// One live crossbeam `Receiver` per declared Source, drained by
     /// the Source dispatch arm.
-    source_records:
-        HashMap<String, crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>>,
+    source_records: HashMap<
+        String,
+        crossbeam_channel::Receiver<crate::executor::source_stream::SourceStreamEvent>,
+    >,
     /// Arbitrator registration for each declared Source's ingest-channel
     /// consumer, keyed by Source node name in lockstep with
     /// `source_records`. The dispatch arm that takes a source's receiver
@@ -301,7 +306,20 @@ impl PipelineExecutor {
         writers: W,
         params: &PipelineRunParams,
     ) -> Result<ExecutionReport, PipelineError> {
-        Self::run_with_readers_writers(plan.config(), readers, writers.into(), params)
+        if plan.cxl_modules().is_empty() {
+            return Self::run_with_readers_writers(plan.config(), readers, writers.into(), params);
+        }
+        let compile_ctx = clinker_plan::config::CompileContext {
+            cxl_modules: plan.cxl_modules().clone(),
+            ..clinker_plan::config::CompileContext::default()
+        };
+        Self::run_with_readers_writers_in_context(
+            plan.config(),
+            readers,
+            writers.into(),
+            params,
+            compile_ctx,
+        )
     }
 
     /// Run a compiled plan resolving source paths against an explicit
@@ -328,8 +346,9 @@ impl PipelineExecutor {
         readers: SourceReaders,
         writers: W,
         params: &PipelineRunParams,
-        compile_ctx: clinker_plan::config::CompileContext,
+        mut compile_ctx: clinker_plan::config::CompileContext,
     ) -> Result<ExecutionReport, PipelineError> {
+        compile_ctx.cxl_modules = plan.cxl_modules().clone();
         Self::run_with_readers_writers_in_context(
             plan.config(),
             readers,
@@ -620,7 +639,7 @@ impl PipelineExecutor {
         let counters = PipelineCounters::default();
         let mut source_records: HashMap<
             String,
-            crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>,
+            crossbeam_channel::Receiver<crate::executor::source_stream::SourceStreamEvent>,
         > = HashMap::new();
         let mut watermarks = crate::executor::watermark::PerSourceWatermarks::new();
         let mut ingest_handles: Vec<
@@ -634,6 +653,24 @@ impl PipelineExecutor {
             ),
         > = HashMap::with_capacity(source_configs.len());
         for src_cfg in &source_configs {
+            let source_id = plan
+                .graph
+                .node_weights()
+                .find_map(|node| match node {
+                    clinker_plan::plan::execution::PlanNode::Source { name, id, .. }
+                        if name == &src_cfg.name =>
+                    {
+                        Some(*id)
+                    }
+                    _ => None,
+                })
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "source-ingest-identity",
+                    node: src_cfg.name.clone(),
+                    detail: String::from(
+                        "compiled source has no stable PlanNodeId in the execution DAG",
+                    ),
+                })?;
             // Pre-declare so the report's `iter_declared_sources` view
             // emits a per-source rollup entry even when ingest produces
             // zero observable records (e.g. empty input file).
@@ -657,10 +694,62 @@ impl PipelineExecutor {
             // `sum_consumer_usage` — downstream spill / abort decisions
             // would otherwise keep seeing bytes that already moved on.
             let source_consumer_handle = crate::pipeline::memory::ConsumerHandle::new();
-            let (stream, rx) = crate::executor::source_stream::SourceIngestChannel::new(
-                crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
-                source_consumer_handle.clone(),
-            );
+            let source_body = validated_plan
+                .config()
+                .source_bodies()
+                .find(|body| body.source.name == src_cfg.name)
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "source-order-contract",
+                    node: src_cfg.name.clone(),
+                    detail: "compiled Source has no matching bound source body".to_string(),
+                })?;
+            let compiled_order = plan.order_contract().source_order_by_id(source_id);
+            let order_config = match compiled_order {
+                Some(order) => Some(
+                    crate::source::order_barrier::SourceOrderConfig::from_compiled(
+                        order,
+                        source_id,
+                        &src_cfg.name,
+                        &source_body.schema,
+                    )?,
+                ),
+                None if src_cfg.sort_order.is_some() => {
+                    return Err(PipelineError::Internal {
+                        op: "source-order-contract",
+                        node: src_cfg.name.clone(),
+                        detail: "source declares `sort_order`, but the finalized DAG retained no compiled source-order proof".to_string(),
+                    });
+                }
+                None => None,
+            };
+            let source_column_count = source_body
+                .schema
+                .bound_columns()
+                .map_or(1, |columns| columns.len());
+            let source_batch_size = config
+                .pipeline
+                .batch_size
+                .unwrap_or(crate::executor::batch_handoff::DEFAULT_BATCH_SIZE);
+            let (stream, rx) = match order_config {
+                Some(order_config) => {
+                    crate::executor::source_stream::SourceIngestChannel::new_ordered(
+                        crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
+                        source_consumer_handle.clone(),
+                        source_id,
+                        order_config,
+                        Arc::clone(&memory_budget),
+                        spill_root.path().to_path_buf(),
+                        params
+                            .spill_compress
+                            .resolve_for_schema(source_column_count, source_batch_size as u64),
+                    )
+                }
+                None => crate::executor::source_stream::SourceIngestChannel::new(
+                    crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
+                    source_consumer_handle.clone(),
+                    source_id,
+                ),
+            };
             let source_consumer_id = memory_budget.register_consumer(Arc::new(
                 crate::executor::source_stream::SourceConsumer::new(Arc::clone(
                     &source_consumer_handle,
@@ -1271,11 +1360,14 @@ impl PipelineExecutor {
             dlq_entries: std::mem::take(dlq_entries),
             dlq_per_source: HashMap::new(),
             total_per_source,
+            type_error_population: dispatch::TypeErrorPopulation::default(),
+            applied_attempt_populations: HashSet::new(),
             rollback_cursors: HashMap::new(),
             combine_input_snapshots: HashMap::new(),
             output_errors: Vec::new(),
             mapping_probes: BTreeMap::new(),
             ok_source_rows: HashSet::new(),
+            ok_deliveries: HashSet::new(),
             records_emitted: 0,
             transform_timer: stage_metrics::CumulativeTimer::new(),
             route_timer: stage_metrics::CumulativeTimer::new(),

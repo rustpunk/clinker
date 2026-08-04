@@ -1,5 +1,5 @@
 # Every row on both sides has null in both range columns. Under CXL
-# ternary, every range comparison resolves to false, so the join
+# ternary, every range comparison resolves to null and `?? false` makes the join
 # emits zero matched pairs. The Polars-style NULL pre-pass partitions
 # every record into the null-range bucket; only on_miss: null_fields
 # drives any output. This fixture pins the empty-output case under
@@ -16,8 +16,8 @@ nodes:
       schema:
         - { name: entity_id, type: string }
         - { name: driver_id, type: string }
-        - { name: lo, type: int }
-        - { name: hi, type: int }
+        - { name: lo, type: { nullable: int } }
+        - { name: hi, type: { nullable: int } }
   - type: source
     name: builds
     config:
@@ -27,15 +27,15 @@ nodes:
       schema:
         - { name: entity_id, type: string }
         - { name: build_id, type: string }
-        - { name: lo, type: int }
-        - { name: hi, type: int }
+        - { name: lo, type: { nullable: int } }
+        - { name: hi, type: { nullable: int } }
   - type: combine
     name: never_matches
     input:
       drivers: drivers
       builds: builds
     config:
-      where: "drivers.entity_id == builds.entity_id and drivers.lo >= builds.lo and drivers.hi <= builds.hi"
+      where: "(drivers.entity_id == builds.entity_id and drivers.lo >= builds.lo and drivers.hi <= builds.hi) ?? false"
       match: first
       on_miss: skip
       cxl: |

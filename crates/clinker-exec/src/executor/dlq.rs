@@ -4,10 +4,88 @@ use std::sync::Arc;
 
 use clinker_record::Record;
 
+use crate::executor::diagnostic_preview::{DiagnosticPreview, build_diagnostic_preview};
+
+/// One decoded source row rejected by its authored type declaration.
+#[derive(Debug, Clone)]
+pub(crate) struct TypeErrorEvent {
+    pub(crate) source_row: crate::executor::stream_event::SourceRowId,
+    pub(crate) source_name: Arc<str>,
+    pub(crate) source_file: Arc<str>,
+    pub(crate) row: u64,
+    pub(crate) column: usize,
+    pub(crate) field: Box<str>,
+    pub(crate) declared_type: Box<str>,
+    pub(crate) original_byte_length: usize,
+    pub(crate) preview: DiagnosticPreview,
+    pub(crate) diagnostic_code: &'static str,
+    pub(crate) message: String,
+    pub(crate) original_record: Record,
+    pub(crate) original_value: clinker_record::Value,
+}
+
+impl TypeErrorEvent {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        source_row: crate::executor::stream_event::SourceRowId,
+        source_name: Arc<str>,
+        source_file: Arc<str>,
+        column: usize,
+        field: String,
+        declared_type: String,
+        original_record: Record,
+        original_value: clinker_record::Value,
+        message: String,
+    ) -> Self {
+        let raw = match &original_value {
+            clinker_record::Value::String(value) => value.as_str().as_bytes().to_vec(),
+            value => value.to_string().into_bytes(),
+        };
+        let preview = build_diagnostic_preview(&raw, false);
+        // Keep the engine-authored reason on the same single-line token path
+        // as the value preview. Current coercion reasons exclude input data;
+        // this is defense-in-depth against a future error source echoing it.
+        let message = build_diagnostic_preview(message.as_bytes(), false).rendered;
+        Self {
+            source_row,
+            source_name,
+            source_file,
+            row: source_row.ordinal(),
+            column,
+            field: field.into_boxed_str(),
+            declared_type: declared_type.into_boxed_str(),
+            original_byte_length: preview.original_byte_length,
+            preview,
+            diagnostic_code: "E126",
+            message,
+            original_record,
+            original_value,
+        }
+    }
+
+    /// Single-line bounded diagnostic suitable for stderr and DLQ reason text.
+    pub(crate) fn diagnostic_message(&self) -> String {
+        format!(
+            "[{}] source={:?} file={:?} row={} column={} field={:?} declared_type={} \
+             preview=\"{}\" original_bytes={}: {}",
+            self.diagnostic_code,
+            self.source_name,
+            self.source_file,
+            self.row,
+            self.column,
+            self.field,
+            self.declared_type,
+            self.preview.rendered,
+            self.original_byte_length,
+            self.message,
+        )
+    }
+}
+
 /// Record that failed evaluation, queued for DLQ output.
 #[derive(Debug, Clone)]
 pub struct DlqEntry {
-    pub source_row: u64,
+    pub source_row: crate::executor::stream_event::SourceRowId,
     pub category: clinker_core_types::dlq::DlqErrorCategory,
     pub error_message: String,
     pub original_record: Record,

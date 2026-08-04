@@ -59,6 +59,7 @@ use rust_decimal::Decimal;
 
 use crate::ast::{BinOp, EmitTarget, Expr, LiteralValue, Statement, TraceLevel, UnaryOp};
 use crate::lexer::Span;
+use crate::resolve::ResolvedBinding;
 use crate::resolve::traits::{FieldResolver, WindowContext};
 use crate::typecheck::pass::TypedProgram;
 
@@ -879,7 +880,31 @@ fn compile_expr<S: RecordStorage + 'static>(typed: &TypedProgram, expr: &Expr) -
                     .unwrap_or(Value::Null))
             })
         }
-        Expr::QualifiedFieldRef { parts, .. } => {
+        Expr::QualifiedFieldRef {
+            node_id,
+            parts,
+            span,
+        } => {
+            if let Some(Some(ResolvedBinding::ModuleConstant(module, name))) =
+                typed.bindings.get(node_id.0 as usize)
+            {
+                let call_span = *span;
+                return match typed
+                    .runtime_modules
+                    .expand_constant(module, name, call_span)
+                {
+                    Ok(expanded) => compile_expr::<S>(typed, &expanded),
+                    Err(_) => Box::new(move |_frame| {
+                        Err(EvalError::new(
+                            EvalErrorKind::TypeMismatch {
+                                expected: "retained compiled module constant",
+                                got: "unavailable compiled module declaration",
+                            },
+                            call_span,
+                        ))
+                    }),
+                };
+            }
             let parts: Vec<String> = parts.iter().map(|p| p.to_string()).collect();
             Box::new(move |frame| match parts.len() {
                 2 => Ok(frame
@@ -1112,6 +1137,85 @@ fn compile_method_call<S: RecordStorage + 'static>(
     args: &[Expr],
     span: Span,
 ) -> CompiledExpr<S> {
+    if let Some(Some(ResolvedBinding::ModuleFunction(module, name))) =
+        typed.bindings.get(node_id.0 as usize)
+    {
+        let signature = match typed.runtime_modules.function_signature(module, name) {
+            Ok(signature) => signature,
+            Err(error) => {
+                let declaration = format!("{module}.{name}");
+                return Box::new(move |_frame| {
+                    Err(EvalError::new(
+                        EvalErrorKind::InvariantViolation {
+                            message: format!(
+                                "typed module call `{declaration}` has no retained declaration: {error}"
+                            ),
+                        },
+                        span,
+                    ))
+                });
+            }
+        };
+        let declaration = signature.declaration.label();
+        let parameters = signature.parameters;
+        if parameters.len() != args.len() {
+            let expected = parameters.len();
+            let got = args.len();
+            return Box::new(move |_frame| {
+                Err(EvalError::new(
+                    EvalErrorKind::InvariantViolation {
+                        message: format!(
+                            "typed module call `{declaration}` retained an arity proof of {expected}, but lowering received {got} arguments"
+                        ),
+                    },
+                    span,
+                ))
+            });
+        }
+        let body = match typed.runtime_modules.expand_function(module, name, span) {
+            Ok((_, body)) => body,
+            Err(error) => {
+                return Box::new(move |_frame| {
+                    Err(EvalError::new(
+                        EvalErrorKind::InvariantViolation {
+                            message: format!(
+                                "typed module call `{declaration}` could not expand its retained declaration: {error}"
+                            ),
+                        },
+                        span,
+                    ))
+                });
+            }
+        };
+        let arguments: Vec<CompiledExpr<S>> = args
+            .iter()
+            .map(|argument| compile_expr::<S>(typed, argument))
+            .collect();
+        let body = compile_expr::<S>(typed, &body);
+        return Box::new(move |frame| {
+            let values = arguments
+                .iter()
+                .map(|argument| argument(frame))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut previous = Vec::with_capacity(parameters.len());
+            for (parameter, value) in parameters.iter().zip(values) {
+                previous.push((
+                    parameter.clone(),
+                    frame.env.insert(parameter.to_string(), value),
+                ));
+            }
+            let result = body(frame);
+            for (parameter, value) in previous.into_iter().rev() {
+                if let Some(value) = value {
+                    frame.env.insert(parameter.to_string(), value);
+                } else {
+                    frame.env.remove(parameter.as_ref());
+                }
+            }
+            result
+        });
+    }
+
     // `$window.<fn>(..).<field>` chains resolve a field off a positional
     // window row without a `Value` round-trip. Detect this exact shape and
     // lower it to a single window-leaf node.
@@ -1142,10 +1246,34 @@ fn compile_method_call<S: RecordStorage + 'static>(
     // Capture the node's pre-compiled regex by value once, at lowering, so
     // the `typed.regexes[node_id]` side-table read is a one-time cost
     // rather than a per-record re-index.
-    let regex: Option<Regex> = typed
+    let mut regex: Option<Regex> = typed
         .regexes
         .get(node_id.0 as usize)
         .and_then(|r| r.clone());
+    if regex.is_none()
+        && matches!(method.as_ref(), "matches" | "find" | "capture")
+        && let Some(Expr::Literal {
+            value: LiteralValue::String(pattern),
+            ..
+        }) = args.first()
+    {
+        match Regex::new(pattern) {
+            Ok(compiled) => regex = Some(compiled),
+            Err(error) => {
+                let pattern = pattern.to_string();
+                let error = error.to_string();
+                return Box::new(move |_frame| {
+                    Err(EvalError::new(
+                        EvalErrorKind::RegexCompile {
+                            pattern: pattern.clone(),
+                            error: error.clone(),
+                        },
+                        span,
+                    ))
+                });
+            }
+        }
+    }
 
     Box::new(move |frame| {
         let recv_val = receiver(frame)?;

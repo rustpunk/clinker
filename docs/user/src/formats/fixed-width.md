@@ -106,7 +106,7 @@ Because the fixed-width reader is the sole coercion pass, each element is typed
 here — a `multiple: true` `int` field over `1;2;3` reads as `[1, 2, 3]`. A blank
 field is an empty array; a field with no delimiter is a one-element array. A
 `multiple: true` column with no covering `split_values` entry is rejected at
-compile ([E361](../../explain/E361.md)). The entry is read only on a
+compile ([E361](https://github.com/rustpunk/clinker/blob/main/docs/explain/E361.md)). The entry is read only on a
 single-schema source, not the multi-record reader below.
 
 ## Schema drift
@@ -173,6 +173,6 @@ file is never buffered.
   identically on both paths.
 - An **unknown discriminator value** (a tag no `records:` entry declares)
   is a structural-integrity failure, classified separately from a trailer
-  count mismatch: it [aborts the run](../../explain/E345.md) by default,
+  count mismatch: it [aborts the run](https://github.com/rustpunk/clinker/blob/main/docs/explain/E345.md) by default,
   or under `dlq_granularity: document` condemns the whole file to the
   dead-letter sink and the run continues.

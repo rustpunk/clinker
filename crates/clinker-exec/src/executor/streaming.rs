@@ -22,7 +22,8 @@ use clinker_plan::config::{ErrorStrategy, OutputConfig, PipelineConfig};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::execution::certify_streaming_edge;
 
-use super::stream_event::{Punctuation, StreamEvent};
+use super::output_dispatch::OrderedWriterBoundary;
+use super::stream_event::{OutputDeliveryId, Punctuation, StreamEvent};
 use super::structured_output_guard::StructuredOutputDocumentGuard;
 use super::{DlqEntry, WriterRegistry, build_format_writer, dispatch, stage_metrics};
 
@@ -123,16 +124,28 @@ pub(super) fn compute_streaming_output_specs(
             .expected_input_schema_in(plan)
             .cloned();
         let cxl_emit_names: Vec<String> = plan.graph[output_idx].cxl_emit_names_in(plan);
+        let Ok(writer_boundary) = OrderedWriterBoundary::for_output(
+            plan,
+            plan.graph[output_idx].id(),
+            clinker_plan::plan::execution::WriterBoundaryMode::Streaming,
+        ) else {
+            // A malformed compiled streaming contract must not take the fused
+            // byte-emission path. Leaving it buffered makes the Output arm's
+            // mode assertion surface the mismatch instead of weakening it.
+            continue;
+        };
 
         specs.push(StreamingOutputSpec {
             producer_idx,
             output_idx,
+            consumer: plan.graph[output_idx].id(),
             output_name: output_name.clone(),
             producer_name: plan.graph[producer_idx].name().to_string(),
             out_cfg: out_cfg.clone(),
             expected_input_schema,
             cxl_emit_names,
             strategy: config.error_handling.strategy,
+            writer_boundary,
         });
     }
     specs
@@ -153,6 +166,8 @@ pub(crate) struct StreamingOutputSpec {
     /// short-circuits when its index appears in
     /// [`dispatch::ExecutorContext::streaming_output_nodes`].
     pub(crate) output_idx: petgraph::graph::NodeIndex,
+    /// Stable compiled identity of the terminal Output consumer.
+    pub(crate) consumer: clinker_plan::plan::PlanNodeId,
     pub(crate) output_name: String,
     /// Name of the upstream producer (`Merge` or fused `Transform`), used
     /// as the upstream-node label in the streaming task's E314
@@ -173,6 +188,11 @@ pub(crate) struct StreamingOutputSpec {
     /// collision to the DLQ under `Continue` (and abort under `FailFast`)
     /// with no borrow back into the config.
     pub(crate) strategy: ErrorStrategy,
+    /// Exact compiled physical-writer contract consumed before this Output's
+    /// raw writer is moved onto the fused streaming thread. Construction has
+    /// already asserted `Streaming` mode and an incremental FIFO/unordered
+    /// disposition; sorted streaming is rejected by planning.
+    writer_boundary: OrderedWriterBoundary,
 }
 
 /// Per-thread return shape merged into the dispatcher's
@@ -185,7 +205,8 @@ pub(crate) struct StreamingOutputSpec {
 pub(crate) struct StreamingOutputTaskOutput {
     pub(crate) records_written: u64,
     pub(crate) records_emitted: u64,
-    pub(crate) seen_row_nums: HashSet<u64>,
+    pub(crate) seen_row_nums: HashSet<crate::executor::stream_event::SourceRowId>,
+    pub(crate) seen_deliveries: HashSet<OutputDeliveryId>,
     pub(crate) write_timer: stage_metrics::CumulativeTimer,
     pub(crate) projection_timer: stage_metrics::CumulativeTimer,
     pub(crate) errors: Vec<PipelineError>,
@@ -224,6 +245,7 @@ impl StreamingOutputTaskOutput {
                 newly_ok += 1;
             }
         }
+        ctx.ok_deliveries.extend(self.seen_deliveries);
         ctx.counters.ok_count += newly_ok;
         ctx.counters.records_written += self.records_written;
         ctx.records_emitted += self.records_emitted;
@@ -266,7 +288,11 @@ pub(super) trait StreamingConsumer {
     /// `Break` the skeleton drains the rest of the channel (so the bounded
     /// producer `send` never deadlocks), zeroes the charge, and returns
     /// without calling [`StreamingConsumer::on_close`].
-    fn on_record(&mut self, record: Record, row_num: u64) -> ControlFlow<()>;
+    fn on_record(
+        &mut self,
+        record: Record,
+        row_num: crate::executor::stream_event::SourceRowId,
+    ) -> ControlFlow<()>;
 
     /// Handle one document-boundary punctuation. Carries no memory
     /// discharge — punctuations contribute zero to
@@ -369,6 +395,7 @@ struct OutputStreamConsumer {
 
 impl OutputStreamConsumer {
     fn new(raw_writer: Box<dyn Write + Send>, spec: StreamingOutputSpec) -> Self {
+        debug_assert!(spec.writer_boundary.is_incremental_streaming());
         let structured_guard = StructuredOutputDocumentGuard::new(&spec.out_cfg.format);
         let mapping_probe = crate::projection::MappingProbe::for_config(&spec.out_cfg);
         let output_name = spec.output_name.clone();
@@ -379,6 +406,7 @@ impl OutputStreamConsumer {
                 records_written: 0,
                 records_emitted: 0,
                 seen_row_nums: HashSet::new(),
+                seen_deliveries: HashSet::new(),
                 write_timer: stage_metrics::CumulativeTimer::new(),
                 projection_timer: stage_metrics::CumulativeTimer::new(),
                 errors: Vec::new(),
@@ -399,7 +427,11 @@ impl OutputStreamConsumer {
 }
 
 impl StreamingConsumer for OutputStreamConsumer {
-    fn on_record(&mut self, record: Record, row_num: u64) -> ControlFlow<()> {
+    fn on_record(
+        &mut self,
+        record: Record,
+        row_num: crate::executor::stream_event::SourceRowId,
+    ) -> ControlFlow<()> {
         let cxl_emit_names_opt: Option<&[String]> = if self.spec.cxl_emit_names.is_empty() {
             None
         } else {
@@ -496,6 +528,9 @@ impl StreamingConsumer for OutputStreamConsumer {
                 self.out.records_written += 1;
                 self.out.records_emitted += 1;
                 self.out.seen_row_nums.insert(row_num);
+                self.out
+                    .seen_deliveries
+                    .insert(OutputDeliveryId::new(row_num, self.spec.consumer));
                 ControlFlow::Continue(())
             }
             Err(e) => {
@@ -635,9 +670,13 @@ mod tests {
     }
 
     impl StreamingConsumer for Recorder {
-        fn on_record(&mut self, _record: Record, row_num: u64) -> ControlFlow<()> {
-            self.records.push(row_num);
-            if self.break_at_row == Some(row_num) {
+        fn on_record(
+            &mut self,
+            _record: Record,
+            row_num: crate::executor::stream_event::SourceRowId,
+        ) -> ControlFlow<()> {
+            self.records.push(row_num.ordinal());
+            if self.break_at_row == Some(row_num.ordinal()) {
                 ControlFlow::Break(())
             } else {
                 ControlFlow::Continue(())

@@ -324,6 +324,14 @@ pub enum PipelineError {
         observed_count: u64,
         total_count: u64,
     },
+    /// E368 — the cumulative declared source-type error population is
+    /// strictly above `error_handling.type_error_threshold`.
+    TypeErrorThresholdExceeded {
+        observed_rate: f64,
+        max_rate: f64,
+        observed_count: u64,
+        total_count: u64,
+    },
     /// A chunk-boundary shutdown poll tripped (SIGINT/SIGTERM or a
     /// programmatic shutdown request from the execution layer).
     /// The dispatch unwinds so the executor can drop senders, join worker
@@ -635,6 +643,17 @@ impl fmt::Display for PipelineError {
                      max_rate {max_rate:.4} ({observed_count}/{total_count} records)"
                 ),
             },
+            Self::TypeErrorThresholdExceeded {
+                observed_rate,
+                max_rate,
+                observed_count,
+                total_count,
+            } => write!(
+                f,
+                "E368 type error threshold exceeded: observed rate {observed_rate:.4} is above \
+                 configured type_error_threshold {max_rate:.4} \
+                 ({observed_count}/{total_count} source records)"
+            ),
             Self::Interrupted => write!(f, "pipeline interrupted by shutdown signal"),
         }
     }

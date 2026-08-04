@@ -196,9 +196,9 @@ nodes:
       schema:
         - { name: seg_id, type: string }
         - { name: msg_ref, type: string }
-        - { name: msg_type, type: string }
-        - { name: e01, type: string }
-        - { name: e02, type: string }
+        - { name: msg_type, type: { nullable: string } }
+        - { name: e01, type: { nullable: string } }
+        - { name: e02, type: { nullable: string } }
   - type: output
     name: out
     input: interchange
@@ -297,9 +297,9 @@ nodes:
       schema:
         - { name: seg_id, type: string }
         - { name: msg_ref, type: string }
-        - { name: msg_type, type: string }
-        - { name: e01, type: string }
-        - { name: e02, type: string }
+        - { name: msg_type, type: { nullable: string } }
+        - { name: e01, type: { nullable: string } }
+        - { name: e02, type: { nullable: string } }
   - type: output
     name: out
     input: interchange
@@ -353,10 +353,10 @@ nodes:
       schema:
         - { name: seg_id, type: string }
         - { name: msg_ref, type: string }
-        - { name: msg_type, type: string }
-        - { name: e01, type: string }
-        - { name: e02, type: string }
-        - { name: e03, type: string }
+        - { name: msg_type, type: { nullable: string } }
+        - { name: e01, type: { nullable: string } }
+        - { name: e02, type: { nullable: string } }
+        - { name: e03, type: { nullable: string } }
   - type: output
     name: out
     input: interchange
@@ -593,10 +593,10 @@ nodes:
       schema:
         - { name: seg_id, type: string }
         - { name: msg_ref, type: string }
-        - { name: msg_type, type: string }
-        - { name: e01, type: string }
-        - { name: e02, type: string }
-        - { name: e03, type: string }
+        - { name: msg_type, type: { nullable: string } }
+        - { name: e01, type: { nullable: string } }
+        - { name: e02, type: { nullable: string } }
+        - { name: e03, type: { nullable: string } }
   - type: output
     name: out
     input: interchange

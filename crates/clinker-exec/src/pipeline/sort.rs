@@ -9,6 +9,10 @@ use clinker_record::{Record, RecordStorage, Value};
 
 use clinker_plan::config::{NullOrder, SortField, SortOrder};
 
+use crate::pipeline::sort_key::{
+    compare_authored_keys, compare_authored_values, compare_authored_values_with_nulls,
+};
+
 /// Sort a partition's position vector in-place by sort_by fields.
 ///
 /// Stable sort preserves insertion order for equal keys.
@@ -66,17 +70,7 @@ fn compare_records<S: RecordStorage>(
 /// Unlike `compare_records` which uses RecordStorage + position indices,
 /// this operates on Record references — used by SortBuffer for in-memory sorting.
 pub fn compare_records_by_fields(a: &Record, b: &Record, sort_by: &[SortField]) -> Ordering {
-    for sf in sort_by {
-        let va = a.get(&sf.field);
-        let vb = b.get(&sf.field);
-        let null_order = sf.null_order.unwrap_or(NullOrder::Last);
-
-        let ord = compare_values_with_nulls(va, vb, sf.order, null_order);
-        if ord != Ordering::Equal {
-            return ord;
-        }
-    }
-    Ordering::Equal
+    compare_authored_keys(a, b, sort_by)
 }
 
 /// Compare two optional values with null handling and sort direction.
@@ -86,50 +80,12 @@ pub fn compare_values_with_nulls(
     order: SortOrder,
     null_order: NullOrder,
 ) -> Ordering {
-    let a_null = a.is_none() || a.is_some_and(|v| v.is_null());
-    let b_null = b.is_none() || b.is_some_and(|v| v.is_null());
-
-    match (a_null, b_null) {
-        (true, true) => Ordering::Equal,
-        (true, false) => match null_order {
-            NullOrder::First => Ordering::Less,
-            NullOrder::Last | NullOrder::Drop => Ordering::Greater,
-        },
-        (false, true) => match null_order {
-            NullOrder::First => Ordering::Greater,
-            NullOrder::Last | NullOrder::Drop => Ordering::Less,
-        },
-        (false, false) => {
-            let base = compare_values(a.unwrap(), b.unwrap());
-            match order {
-                SortOrder::Asc => base,
-                SortOrder::Desc => base.reverse(),
-            }
-        }
-    }
+    compare_authored_values_with_nulls(a, b, order, null_order)
 }
 
 /// Compare two non-null values using the same ordering as the evaluator.
 pub fn compare_values(a: &Value, b: &Value) -> Ordering {
-    match (a, b) {
-        (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
-        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-        (Value::Integer(x), Value::Float(y)) => {
-            (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
-        }
-        (Value::Float(x), Value::Integer(y)) => {
-            x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
-        }
-        // Exact decimal ordering, incl. widening int into decimal context.
-        (Value::Decimal(x), Value::Decimal(y)) => x.cmp(y),
-        (Value::Decimal(x), Value::Integer(y)) => x.cmp(&rust_decimal::Decimal::from(*y)),
-        (Value::Integer(x), Value::Decimal(y)) => rust_decimal::Decimal::from(*x).cmp(y),
-        (Value::String(x), Value::String(y)) => x.cmp(y),
-        (Value::Date(x), Value::Date(y)) => x.cmp(y),
-        (Value::DateTime(x), Value::DateTime(y)) => x.cmp(y),
-        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        _ => Ordering::Equal, // incomparable types treated as equal
-    }
+    compare_authored_values(a, b)
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 # AI Onboarding: Performance Notes
 
-Verified against origin/main cf6609b9 (2026-07-24).
+Verified against the working tree on 2026-07-29.
 
 Purpose: Preserve verified performance assumptions, benchmark entry points, and memory-model notes for future AI agents.
 
@@ -9,6 +9,54 @@ Use the labels below carefully:
 - **Verified hot path** means code comments, benchmark targets, or executor structure explicitly identify the path as per-record/per-stage/hot.
 - **Likely hot path** means the path is on core ETL execution, IO, memory, or serialization surfaces, but this session did not find a direct "hot path" claim or run profiling.
 - **Resource-sensitive** means correctness and throughput depend on memory, disk, cache, or synchronization behavior, but the path may not be CPU-hot.
+
+## Evidence Boundaries
+
+### Allocation instrumentation is untrusted
+
+The optional `clinker-exec -> clinker-bench-support` edge and the
+`stage_metrics` heap fields exist behind `bench-alloc`, but their presence and
+successful compilation do not validate the measurements. Under D-21, all
+current allocation measurements are **untrusted** until the complete contract
+is repaired and verified:
+
+- the feature is forwarded through the benchmark entry point that owns the
+  executable;
+- the process-global allocator used for the measurement is proven to be the
+  accounting allocator;
+- end-to-end allocation counts and byte deltas are nonzero and plausible for a
+  known allocating workload; and
+- the timing and concurrency distortion introduced by allocator atomics is
+  documented with the result.
+
+Default and release dependency graphs must continue to exclude benchmark
+support. `cargo check --features bench-alloc -p clinker-benchmarks` is useful
+compile coverage, but it does not satisfy the identity, plausibility, or
+distortion checks above. Phase 5 / PERF-07 owns the repair and evidence. See
+[D-21 in the production-contract register](15_PRODUCTION_CONTRACTS.md).
+
+### Compiled-plan reuse is a locked target, not a current optimization
+
+`CompiledPlan` currently retains an `ExecutionPlanDag`, bound composition
+bodies, statistics, provenance, hashes, and resolved schemas, and public
+executor methods accept `&CompiledPlan`. The main run entry point nevertheless
+passes `plan.config()` into the shared execution path and recompiles before
+dispatch. A borrowed plan survives the call, but that is not sequential
+no-recompile reuse.
+
+D-01 through D-11 lock the supplied compiled artifacts as the future
+authoritative runtime input, permit only an enumerated runtime envelope to
+refresh, and assign direct execution plus sequential in-process reuse to
+Phase 5 / PERF-01. No versioned persistent compiled-plan cache, semantic input
+fingerprint, pre-effect lookup, integrity envelope, or source-map refresh path
+exists today. Persistent caching remains deferred until direct stored-plan
+execution is correct; missing, stale, incompatible, or corrupt entries must
+eventually safe-miss rather than execute.
+
+The in-memory CXL, benchmark-data, staging, and window caches described below
+are current local caches. None is evidence that the D-01 through D-11
+persistent semantic-plan cache or reuse contract has landed. See
+[stored-plan execution and cache identity](15_PRODUCTION_CONTRACTS.md#stored-plan-execution-and-cache-identity).
 
 ## Source Evidence
 
@@ -117,10 +165,10 @@ Primary source evidence used:
 
 ### Caches
 
-1. **Area/module:** CXL compiled-program/regex caches, benchmark data cache, channel staging cache, schema/window runtime caches.
+1. **Area/module:** CXL compiled-program/regex caches, benchmark data cache, channel staging cache, schema/window runtime caches. These are local current caches, not a persistent `CompiledPlan` cache.
 2. **Why performance-sensitive:** These caches prevent repeated compile, generation, copy, or rebuild work on loops and repeated runs.
 3. **Existing optimization choices:** `ProgramEvaluator` caches compiled programs by storage `TypeId`; compiled CXL captures regexes once at lowering; benchmark data cache uses BLAKE3 hash sidecars and atomic temp-file rename; channel staging uses stable content-addressed `.staged`/manifest pairs and per-source OS locks; window runtime shares `Arc` arena/index handles.
-4. **Avoid:** Do not compile regexes per record, regenerate benchmark data unconditionally, copy staged sources when reuse-if-fresh is valid, or remove manifest/lock semantics around staged files.
+4. **Avoid:** Do not compile regexes per record, regenerate benchmark data unconditionally, copy staged sources when reuse-if-fresh is valid, remove manifest/lock semantics around staged files, or describe these caches as D-01 through D-11 plan reuse.
 5. **Benchmarks/tests available:** CXL eval/parse benches; `crates/clinker-bench-support/src/cache.rs` tests; `crates/clinker-channel/tests/staging_reuse_concurrent.rs`; `cargo bench -p clinker-channel --bench channel_merge`.
 6. **Confidence:** High for cache existence and purpose; medium for runtime impact except where comments identify hot use.
 7. **Evidence:** `crates/cxl/src/eval/mod.rs:115`, `:184`; `crates/cxl/src/eval/compiled.rs:33`, `:1129`; `crates/clinker-bench-support/src/cache.rs:1`, `:84`, `:197`; `crates/clinker-channel/src/staging_copy.rs:28`, `:55`, `:101`; `crates/clinker-exec/src/executor/window_runtime.rs:4`.
@@ -139,10 +187,10 @@ Primary source evidence used:
 
 1. **Area/module:** `clinker-exec::executor::stage_metrics`, `clinker-bench-support::alloc`, benchmark harnesses.
 2. **Why performance-sensitive:** These are the supported observability hooks for timing, RSS, CPU, IO, heap deltas, and spill bytes.
-3. **Existing optimization choices:** Stage timers collect elapsed time, RSS, CPU, IO, optional heap deltas, and per-stage spill bytes. RSS capture is documented as low overhead at stage granularity. `bench-alloc` wraps the global allocator with relaxed atomic counters and is explicitly feature-gated because it distorts parallel timings.
-4. **Avoid:** Do not treat `bench-alloc` timing as production throughput, increase stage metrics to per-row sampling without overhead measurements, or remove per-stage spill attribution.
-5. **Benchmarks/tests available:** `cargo check --features bench-alloc -p clinker-benchmarks`; `crates/clinker-bench-support/tests/bench_alloc.rs`; all Criterion targets.
-6. **Confidence:** High.
+3. **Existing optimization choices:** Stage timers collect elapsed time, RSS, CPU, IO, optional heap deltas, and per-stage spill bytes. RSS capture is documented as low overhead at stage granularity. `bench-alloc` wraps a global allocator with relaxed atomic counters and is explicitly feature-gated because it distorts parallel timings.
+4. **Avoid:** Do not treat current `bench-alloc` counts, bytes, or timings as trusted evidence; increase stage metrics to per-row sampling without overhead measurements; or remove per-stage spill attribution.
+5. **Benchmarks/tests available:** `cargo check --features bench-alloc -p clinker-benchmarks`; `crates/clinker-bench-support/tests/bench_alloc.rs`; all Criterion targets. These are inputs to the D-21 repair, not proof that its end-to-end contract passes.
+6. **Confidence:** High for the feature edge and instrumentation code being present; untrusted for allocation measurement validity.
 7. **Evidence:** `crates/clinker-exec/src/executor/stage_metrics.rs:1`, `:13`, `:39`, `:147`, `:199`; `crates/clinker-bench-support/src/alloc.rs:1`, `:16`, `:27`, `:77`.
 
 ## Benchmark Suites
@@ -188,5 +236,7 @@ Do not edit unsafe performance code without reading the local safety comments, s
 ## Review Notes
 
 - This page did not run Criterion measurements; it documents available benchmark entry points and source-level performance assumptions.
+- Existing allocation measurements remain untrusted under D-21, and direct or
+  persistent compiled-plan reuse remains Phase 5 work under D-01 through D-11.
 - Existing docs under `docs/user` and `docs/engine` contain useful context, but source comments, manifests, benches, and tests were treated as primary evidence.
 - Future agents should profile before changing algorithms or memory models, especially in transform/CXL eval, record/value storage, combine joins, memory arbitration, spill, and format IO.

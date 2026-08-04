@@ -159,7 +159,7 @@ pub struct HashAggregator {
     /// call: post-spill the per-group `AggregatorGroupState.input_rows`
     /// holds the canonical lineage shape, and the flat vec is rebuilt
     /// from there during finalize when callers need the dense form.
-    lineage: Option<Vec<(u64, u32)>>,
+    lineage: Option<Vec<(crate::executor::stream_event::SourceRowId, u32)>>,
     /// Buffer-mode per-group state, populated only when
     /// `compiled.requires_buffer_mode` is true. Mutually exclusive with
     /// `groups` at the dispatch level — `add_record` consults
@@ -377,7 +377,10 @@ impl HashAggregator {
     /// is an obvious future optimization but not warranted at current
     /// call frequencies (one walk per detect-phase synthetic-CK
     /// trigger column).
-    pub(crate) fn input_rows_by_group_index(&self, group_index: u32) -> Option<&[(u64, Arc<str>)]> {
+    pub(crate) fn input_rows_by_group_index(
+        &self,
+        group_index: u32,
+    ) -> Option<&[(crate::executor::stream_event::SourceRowId, Arc<str>)]> {
         if self.buffer_mode {
             self.buffered_groups
                 .values()
@@ -465,12 +468,16 @@ impl HashAggregator {
     /// 4. Look up / insert per-group state via the prototype factory.
     /// 5. Dispatch each `BindingArg` to its accumulator slot.
     /// 6. Resize-aware spill trigger.
-    pub fn add_record(
+    pub fn add_record<R>(
         &mut self,
         record: &Record,
-        row_num: u64,
+        row_num: R,
         ctx: &EvalContext,
-    ) -> Result<(), HashAggError> {
+    ) -> Result<(), HashAggError>
+    where
+        R: Into<crate::executor::stream_event::SourceRowId>,
+    {
+        let row_num = row_num.into();
         if self.buffer_mode {
             return self.add_record_buffered(record, row_num, ctx);
         }
@@ -523,12 +530,13 @@ impl HashAggregator {
             state
         });
 
-        // Track the minimum row_num across every input record folded
-        // into this group — emitted as the finalized SortRow's row
-        // number so downstream sort-stable operators preserve the
-        // earliest input row's position.
-        if row_num < group_state.min_row_num {
-            group_state.min_row_num = row_num;
+        // Track the minimum typed identity across every input record folded
+        // into this group. `None` is the only empty-state representation.
+        if group_state
+            .representative_row
+            .is_none_or(|representative| row_num < representative)
+        {
+            group_state.representative_row = Some(row_num);
         }
 
         // Lineage recording. Cost: one branch + two appends per record.
@@ -538,22 +546,14 @@ impl HashAggregator {
         // separate budget knob.
         let lineage_active = self.lineage.is_some();
         if let Some(lin) = self.lineage.as_mut() {
-            // `row_num` is u64 in the API; lineage stores u32 because
-            // every existing aggregation pipeline is bounded by the
-            // 4 GiB hash-aggregation budget. A row number exceeding
-            // u32::MAX requires no special handling here — the truncated
-            // lineage entry will sit alongside the full-precision
-            // `min_row_num`, which is what downstream sort-stable
-            // ordering uses.
-            let row_u64 = row_num;
+            let source_row = row_num;
             let group_idx = group_state.group_index;
-            lin.push((row_u64, group_idx));
-            // Source identity is extracted from the record's
-            // engine-stamped `$source.name` column so retract scopes can
-            // narrow rewinds to the failing source's contributions only.
+            lin.push((source_row, group_idx));
+            // The source label is retained alongside the authoritative typed
+            // identity for cursor-rewind attribution.
             let source_name = crate::executor::dispatch::source_name_arc_of(record);
-            group_state.input_rows.push((row_u64, source_name));
-            // Lineage memory: flat `(row_u64, group_idx)` plus the
+            group_state.input_rows.push((source_row, source_name));
+            // Lineage memory: flat `(source_row, group_idx)` plus the
             // per-group `(u64, Arc<str>)` entry. The Arc fat pointer is
             // 16 bytes and shares the underlying source-name allocation
             // across every row's entry, so per-row charge is dominated
@@ -566,7 +566,8 @@ impl HashAggregator {
             // `&self`-method `consumer_handle.set_bytes` are non-
             // overlapping borrows the borrow checker can split.
             self.value_heap_bytes = self.value_heap_bytes.saturating_add(
-                std::mem::size_of::<(u64, u32)>() + std::mem::size_of::<(u64, Arc<str>)>(),
+                std::mem::size_of::<(u64, u32)>()
+                    + std::mem::size_of::<(crate::executor::stream_event::SourceRowId, Arc<str>)>(),
             );
             self.consumer_handle.set_bytes(self.value_heap_bytes as u64);
         }
@@ -709,7 +710,7 @@ impl HashAggregator {
     fn add_record_buffered(
         &mut self,
         record: &Record,
-        row_num: u64,
+        row_num: crate::executor::stream_event::SourceRowId,
         ctx: &EvalContext,
     ) -> Result<(), HashAggError> {
         // 1. Pre-aggregation filter (same as fold-mode).
@@ -759,8 +760,11 @@ impl HashAggregator {
             state
         });
 
-        if row_num < group_state.min_row_num {
-            group_state.min_row_num = row_num;
+        if group_state
+            .representative_row
+            .is_none_or(|representative| row_num < representative)
+        {
+            group_state.representative_row = Some(row_num);
         }
 
         // 5. Evaluate each binding's argument and push the row's
@@ -768,7 +772,7 @@ impl HashAggregator {
         //    bindings (`weighted_avg(value, weight)`) collapse into a
         //    two-Value inner vec so the rollback step can replay the
         //    exact same `(value, weight)` pair through `add_weighted`.
-        let row_u64 = row_num;
+        let source_row = row_num;
         let mut row_values: Vec<Value> = Vec::with_capacity(self.compiled_bindings.len());
         let mut row_heap_bytes: usize = 0;
         for arg in self.compiled_bindings.iter() {
@@ -799,7 +803,7 @@ impl HashAggregator {
         let row_charge = std::mem::size_of::<Value>().saturating_mul(row_value_count)
             + row_heap_bytes
             + std::mem::size_of::<Vec<Value>>()
-            + std::mem::size_of::<(u64, Arc<str>)>();
+            + std::mem::size_of::<(crate::executor::stream_event::SourceRowId, Arc<str>)>();
         // Hard-limit guard. A single record whose contributions alone
         // exceed the entire memory budget cannot be held in memory and
         // cannot be salvaged by spilling — the very next add of the same
@@ -818,7 +822,7 @@ impl HashAggregator {
         // lineage path's per-source narrowing semantics.
         let source_name = crate::executor::dispatch::source_name_arc_of(record);
         group_state.contributions.push(row_values);
-        group_state.input_rows.push((row_u64, source_name));
+        group_state.input_rows.push((source_row, source_name));
         self.add_value_heap_bytes(row_charge);
 
         // 7. Spill trigger — same dual-threshold check as fold-mode.
@@ -878,11 +882,11 @@ impl HashAggregator {
     /// state. The orchestrator's degrade-fallback surface catches that
     /// case and routes the affected groups through strict-collateral DLQ
     /// per the relaxed-CK fallback contract.
-    pub(crate) fn retract_row(
-        &mut self,
-        input_row_id: u64,
-        source: &Arc<str>,
-    ) -> Result<(), HashAggError> {
+    pub(crate) fn retract_row<R>(&mut self, input_row_id: R) -> Result<(), HashAggError>
+    where
+        R: Into<crate::executor::stream_event::SourceRowId>,
+    {
+        let input_row_id = input_row_id.into();
         if !self.spill_files.is_empty() {
             return Err(HashAggError::Spill(format!(
                 "retract_row {input_row_id} called on aggregator with spilled groups; \
@@ -895,14 +899,17 @@ impl HashAggregator {
                 if let Some(idx) = state
                     .input_rows
                     .iter()
-                    .position(|(r, sn)| *r == input_row_id && sn.as_ref() == source.as_ref())
+                    .position(|(row_id, _)| *row_id == input_row_id)
                 {
                     let removed = state.contributions.remove(idx);
                     state.input_rows.remove(idx);
+                    state.representative_row =
+                        state.input_rows.iter().map(|(row_id, _)| *row_id).min();
                     let row_charge = std::mem::size_of::<Value>().saturating_mul(removed.len())
                         + removed.iter().map(Value::heap_size).sum::<usize>()
                         + std::mem::size_of::<Vec<Value>>()
-                        + std::mem::size_of::<(u64, Arc<str>)>();
+                        + std::mem::size_of::<(crate::executor::stream_event::SourceRowId, Arc<str>)>(
+                        );
                     self.sub_value_heap_bytes(row_charge);
                     return Ok(());
                 }
@@ -919,12 +926,13 @@ impl HashAggregator {
             let Some(idx) = state
                 .input_rows
                 .iter()
-                .position(|(r, sn)| *r == input_row_id && sn.as_ref() == source.as_ref())
+                .position(|(row_id, _)| *row_id == input_row_id)
             else {
                 continue;
             };
             let values = state.retract_values.remove(idx);
             state.input_rows.remove(idx);
+            state.representative_row = state.input_rows.iter().map(|(row_id, _)| *row_id).min();
             let mut value_cursor = 0usize;
             let mut total_delta: isize = 0;
             for (binding, acc) in bindings.iter().zip(state.row.iter_mut()) {
@@ -950,7 +958,7 @@ impl HashAggregator {
             let removed_row_charge = std::mem::size_of::<Value>().saturating_mul(values.len())
                 + values.iter().map(Value::heap_size).sum::<usize>()
                 + std::mem::size_of::<Vec<Value>>()
-                + std::mem::size_of::<(u64, Arc<str>)>();
+                + std::mem::size_of::<(crate::executor::stream_event::SourceRowId, Arc<str>)>();
             self.sub_value_heap_bytes(removed_row_charge);
             // Negative `total_delta` is a shrink; saturating-sub clamps
             // at zero against the running total.
@@ -1003,11 +1011,9 @@ impl HashAggregator {
                     key,
                     &folded,
                 )?;
-                let row_num = if folded.min_row_num == u64::MAX {
-                    0
-                } else {
-                    folded.min_row_num
-                };
+                let row_num = folded
+                    .representative_row
+                    .unwrap_or_else(crate::executor::stream_event::SourceRowId::synthetic);
                 out.push((record, row_num));
             }
         } else {
@@ -1024,11 +1030,9 @@ impl HashAggregator {
                     continue;
                 }
                 let record = self.finalize_group(key, state, ctx)?;
-                let row_num = if state.min_row_num == u64::MAX {
-                    0
-                } else {
-                    state.min_row_num
-                };
+                let row_num = state
+                    .representative_row
+                    .unwrap_or_else(crate::executor::stream_event::SourceRowId::synthetic);
                 out.push((record, row_num));
             }
         }
@@ -1170,7 +1174,10 @@ impl HashAggregator {
         if self.rows_seen == 0 && self.group_by_indices.is_empty() && self.spill_files.is_empty() {
             let record =
                 empty_global_fold_row(&self.factory, &self.output_schema, &self.transform_name)?;
-            out.push((record, 0));
+            out.push((
+                record,
+                crate::executor::stream_event::SourceRowId::synthetic(),
+            ));
             return Ok(());
         }
 
@@ -1187,11 +1194,9 @@ impl HashAggregator {
                 for (key, buffered) in entries {
                     let state = fold_buffered_state(&self.factory, buffered)?;
                     let record = self.finalize_group(&key, &state, ctx)?;
-                    let row_num = if state.min_row_num == u64::MAX {
-                        0
-                    } else {
-                        state.min_row_num
-                    };
+                    let row_num = state
+                        .representative_row
+                        .unwrap_or_else(crate::executor::stream_event::SourceRowId::synthetic);
                     out.push((record, row_num));
                 }
             } else {
@@ -1200,11 +1205,9 @@ impl HashAggregator {
                 out.reserve(entries.len());
                 for (key, state) in entries {
                     let record = self.finalize_group(&key, &state, ctx)?;
-                    let row_num = if state.min_row_num == u64::MAX {
-                        0
-                    } else {
-                        state.min_row_num
-                    };
+                    let row_num = state
+                        .representative_row
+                        .unwrap_or_else(crate::executor::stream_event::SourceRowId::synthetic);
                     out.push((record, row_num));
                 }
             }
@@ -1321,11 +1324,9 @@ impl HashAggregator {
                     };
                     let record =
                         finalize_group_inner(factory, output_schema, transform_name, &gk, &folded)?;
-                    let row_num = if folded.min_row_num == u64::MAX {
-                        0
-                    } else {
-                        folded.min_row_num
-                    };
+                    let row_num = folded
+                        .representative_row
+                        .unwrap_or_else(crate::executor::stream_event::SourceRowId::synthetic);
                     out.push((record, row_num));
                 }
                 // Start new group from the winner.
@@ -1347,11 +1348,9 @@ impl HashAggregator {
             };
             let record =
                 finalize_group_inner(factory, output_schema, transform_name, &gk, &folded)?;
-            let row_num = if folded.min_row_num == u64::MAX {
-                0
-            } else {
-                folded.min_row_num
-            };
+            let row_num = folded
+                .representative_row
+                .unwrap_or_else(crate::executor::stream_event::SourceRowId::synthetic);
             out.push((record, row_num));
         }
 
@@ -1994,7 +1993,7 @@ mod spill_trigger_tests {
         let lineage = agg.lineage.as_ref().expect("lineage allocated");
         assert_eq!(lineage.len(), 5, "every record must produce one entry");
         // Row numbers must be the input order 0..5.
-        let rows: Vec<u64> = lineage.iter().map(|(r, _)| *r).collect();
+        let rows: Vec<u64> = lineage.iter().map(|(r, _)| r.ordinal()).collect();
         assert_eq!(rows, vec![0, 1, 2, 3, 4]);
         // Two distinct group indices, alternating with the input keys.
         let g0 = lineage[0].1;
@@ -2012,7 +2011,7 @@ mod spill_trigger_tests {
         assert_eq!(groups.len(), 2);
         let mut input_row_lists: Vec<Vec<u64>> = groups
             .values()
-            .map(|s| s.input_rows.iter().map(|(r, _)| *r).collect())
+            .map(|s| s.input_rows.iter().map(|(r, _)| r.ordinal()).collect())
             .collect();
         input_row_lists.sort();
         assert_eq!(input_row_lists, vec![vec![0, 2, 4], vec![1, 3]]);
@@ -2069,7 +2068,7 @@ mod spill_trigger_tests {
                 by_key
                     .entry(key_str)
                     .or_default()
-                    .extend(folded.input_rows.iter().map(|(r, _)| *r));
+                    .extend(folded.input_rows.iter().map(|(r, _)| r.ordinal()));
             }
         }
         // Drain in-memory groups too — anything spill missed.
@@ -2081,7 +2080,7 @@ mod spill_trigger_tests {
             by_key
                 .entry(key_str)
                 .or_default()
-                .extend(state.input_rows.iter().map(|(r, _)| *r));
+                .extend(state.input_rows.iter().map(|(r, _)| r.ordinal()));
         }
 
         for (k, mut rows) in by_key.into_iter() {
@@ -2258,7 +2257,7 @@ mod spill_trigger_tests {
             .buffered_groups
             .iter()
             .find(|(k, _)| matches!(&k[0], GroupByKey::Str(s) if s.as_ref() == "a"))
-            .map(|(_, s)| s.input_rows.iter().map(|(r, _)| *r).collect())
+            .map(|(_, s)| s.input_rows.iter().map(|(r, _)| r.ordinal()).collect())
             .unwrap();
         a_rows.sort();
         assert_eq!(a_rows, vec![0, 2, 4]);
@@ -2361,7 +2360,7 @@ mod spill_trigger_tests {
                         Value::Integer(n) => *n,
                         other => panic!("expected Integer, got {other:?}"),
                     };
-                    bucket.push((*row, v));
+                    bucket.push((row.ordinal(), v));
                 }
             }
         }
@@ -2376,7 +2375,7 @@ mod spill_trigger_tests {
                     Value::Integer(n) => *n,
                     other => panic!("expected Integer, got {other:?}"),
                 };
-                bucket.push((*row, v));
+                bucket.push((row.ordinal(), v));
             }
         }
 
@@ -2602,17 +2601,8 @@ mod spill_trigger_tests {
                 )
                 .expect("add_record");
         }
-        // Test records carry no `$source.name` stamp, so every ingest
-        // landed under `MERGED_SOURCE_NAME` — pass the same Arc here so
-        // the source-equality match resolves.
-        let merged_name = crate::executor::dispatch::source_name_arc_of(&make_record(
-            &input,
-            rows.first().expect("at least one input row").0.clone(),
-        ));
         for &row_id in retract {
-            full_agg
-                .retract_row(row_id, &merged_name)
-                .expect("retract_row");
+            full_agg.retract_row(row_id).expect("retract_row");
         }
         let mut out_after_retract = Vec::new();
         full_agg
@@ -2793,7 +2783,7 @@ mod spill_trigger_tests {
     // Per-source lineage narrowing — `retract_row` matches both row
     // and source. Two sources independently number rows starting at 0,
     // so the same `(row_id, group)` can land twice in one group from
-    // different upstreams; the `Vec<(u64, Arc<str>)>` lineage tuple
+    // different upstreams; the `Vec<(crate::executor::stream_event::SourceRowId, Arc<str>)>` lineage tuple
     // must scope each retract to a single source's contribution.
     // ----------------------------------------------------------------
 
@@ -2820,13 +2810,11 @@ mod spill_trigger_tests {
     }
 
     #[test]
-    fn test_retract_row_narrows_by_source_when_two_sources_share_a_row_id() {
+    fn test_retract_row_matches_exact_typed_identity_in_lineage_mode() {
         // Lineage path: SUM is Reversible-only, so a relaxed aggregator
         // builds in-memory groups under the lineage strategy and stores
-        // each contribution under a `(row_id, source_name)` tuple. Per-
-        // source rewinds rely on that tuple matching on both fields —
-        // a regression to bare `u64` would silently retract whichever
-        // source happened to hit the row id first.
+        // each contribution under its exact `SourceRowId`. The adjacent
+        // source label is attribution data, not a second identity key.
         let stable = StableEvalContext::test_default();
         let file: Arc<str> = Arc::from("t.csv");
         let mut agg = build_test_aggregator_relaxed(
@@ -2838,9 +2826,17 @@ mod spill_trigger_tests {
             true,
         );
 
-        // Two sources independently emit row_num=5 into the same group
+        // Two sources independently emit ordinal 5 into the same group
         // "g". Without per-source narrowing the second add would
         // collide with the first in the lineage vec.
+        let row_a = crate::executor::stream_event::SourceRowId::new(
+            <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(11),
+            5,
+        );
+        let row_b = crate::executor::stream_event::SourceRowId::new(
+            <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(12),
+            5,
+        );
         let r_a = make_record_with_source(
             &["k", "v"],
             vec![Value::String("g".into()), Value::Integer(10)],
@@ -2851,9 +2847,9 @@ mod spill_trigger_tests {
             vec![Value::String("g".into()), Value::Integer(100)],
             "src_b",
         );
-        agg.add_record(&r_a, 5, &ctx_for(&stable, &file, 5))
+        agg.add_record(&r_a, row_a, &ctx_for(&stable, &file, 5))
             .expect("add src_a");
-        agg.add_record(&r_b, 5, &ctx_for(&stable, &file, 5))
+        agg.add_record(&r_b, row_b, &ctx_for(&stable, &file, 5))
             .expect("add src_b");
 
         // Sanity: both contributions present in the same group.
@@ -2873,12 +2869,15 @@ mod spill_trigger_tests {
 
         // Retract row 5 scoped to src_a: src_b's contribution at the
         // identical row id must survive.
-        let src_a: Arc<str> = Arc::from("src_a");
-        agg.retract_row(5, &src_a).expect("retract src_a");
+        agg.retract_row(row_a).expect("retract src_a");
         let mut out = Vec::new();
         agg.finalize_in_place(&ctx_for(&stable, &file, 0), &mut out)
             .expect("finalize_in_place after src_a retract");
         assert_eq!(out.len(), 1, "group still present");
+        assert_eq!(
+            out[0].1, row_b,
+            "removing the prior minimum must select the surviving typed representative"
+        );
         match out[0].0.values().get(total_idx).expect("total slot") {
             Value::Integer(n) => assert_eq!(
                 *n, 100,
@@ -2894,13 +2893,12 @@ mod spill_trigger_tests {
         // lineage would have removed src_b's entry on the first
         // retract above and this call would fail with `not found in
         // any lineage group`.
-        let src_b: Arc<str> = Arc::from("src_b");
-        agg.retract_row(5, &src_b)
+        agg.retract_row(row_b)
             .expect("retract src_b at the same row id must succeed");
     }
 
     #[test]
-    fn test_retract_row_narrows_by_source_in_buffer_mode() {
+    fn test_retract_row_matches_exact_typed_identity_in_buffer_mode() {
         // Buffer-mode path: MIN is BufferRequired, so the aggregator
         // routes through `add_record_buffered` / `buffered_groups` and
         // stores `(row_id, source_name)` tuples on `input_rows`. The
@@ -2934,17 +2932,28 @@ mod spill_trigger_tests {
             vec![Value::String("g".into()), Value::Integer(100)],
             "src_b",
         );
-        agg.add_record(&r_a, 5, &ctx_for(&stable, &file, 5))
+        let row_a = crate::executor::stream_event::SourceRowId::new(
+            <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(11),
+            5,
+        );
+        let row_b = crate::executor::stream_event::SourceRowId::new(
+            <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(12),
+            5,
+        );
+        agg.add_record(&r_a, row_a, &ctx_for(&stable, &file, 5))
             .expect("add src_a");
-        agg.add_record(&r_b, 5, &ctx_for(&stable, &file, 5))
+        agg.add_record(&r_b, row_b, &ctx_for(&stable, &file, 5))
             .expect("add src_b");
 
-        let src_a: Arc<str> = Arc::from("src_a");
-        agg.retract_row(5, &src_a).expect("retract src_a");
+        agg.retract_row(row_a).expect("retract src_a");
         let mut out = Vec::new();
         agg.finalize_in_place(&ctx_for(&stable, &file, 0), &mut out)
             .expect("finalize_in_place");
         assert_eq!(out.len(), 1, "single group expected");
+        assert_eq!(
+            out[0].1, row_b,
+            "buffer-mode retraction must refresh the typed representative"
+        );
         let lo_idx = out[0].0.schema().index("lo").expect("lo column on output");
         match out[0].0.values().get(lo_idx).expect("lo slot") {
             Value::Integer(n) => assert_eq!(

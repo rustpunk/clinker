@@ -9,6 +9,16 @@
 
 use clinker_record::{DocumentGrain, EnvelopeRecord, Record};
 
+use crate::executor::stream_event::SourceRowId;
+
+/// First body record and its exact source identity under the envelope node's
+/// first-document representative policy.
+pub(crate) fn first_body_representative(
+    records: &[(Record, SourceRowId)],
+) -> Option<(&Record, SourceRowId)> {
+    records.first().map(|(record, row_id)| (record, *row_id))
+}
+
 /// The distinct non-empty headers a materialized body carries, in body order.
 ///
 /// One [`DocumentGrain`] is one output document, and the *first record of a
@@ -50,7 +60,7 @@ use clinker_record::{DocumentGrain, EnvelopeRecord, Record};
 /// plus an `O(grains²)` `same_header` dedup — both bounded by the document
 /// count, not the record count, because the work per record after the first of
 /// its grain is a single hashset hit.
-pub(crate) fn distinct_body_headers(records: &[(Record, u64)]) -> Vec<EnvelopeRecord> {
+pub(crate) fn distinct_body_headers(records: &[(Record, SourceRowId)]) -> Vec<EnvelopeRecord> {
     let mut seen_grains: std::collections::HashSet<DocumentGrain> =
         std::collections::HashSet::new();
     let mut headers: Vec<EnvelopeRecord> = Vec::new();

@@ -3,16 +3,11 @@
 //! These model the on-the-wire YAML of the channel-centric overlay layout:
 //!
 //! - [`ChannelManifest`] models `channel.cfg.yaml` — a per-channel manifest
-//!   carrying identity `labels`, plus optional channel-wide `config`, `vars`,
-//!   and `overrides` that apply to every pipeline this channel runs. The
-//!   manifest is optional per channel: the containing folder name *is* the
-//!   channel id, so a manifest is only needed when a channel has labels or
-//!   channel-wide overlays.
-//! - [`OverlayFile`] models a per-target overlay file — `<target>.channel.yaml`
-//!   (pipeline overlay), `<target>.comp.yaml` (composition overlay), or a bare
-//!   `<target>.yaml`. The `channel.target:` field is authoritative; the
-//!   filename suffix is optional and secondary (it only aids reading a file
-//!   out of context, e.g. in a diff).
+//!   carrying the catalog channel identity, explicit pipeline targets,
+//!   identity `labels`, and optional channel-wide `config` and `vars`.
+//! - [`OverlayFile`] models one pipeline-specific file. Its authoritative
+//!   `channel.target:` is a logical catalog pipeline identity; filenames and
+//!   basenames do not establish target identity.
 //!
 //! Both parse through `clinker_plan::yaml::from_str` (serde-saphyr, budgeted).
 //! This module is parse-only: it defines the wire shapes and nothing else.
@@ -22,12 +17,12 @@
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use clinker_plan::config::ScopedVarDecl;
+use clinker_plan::config::ScopedVarType;
 use clinker_plan::config::SourceConfigPatch;
 use clinker_plan::overlay_ops::OverlayOp;
-use clinker_plan::yaml::Spanned;
+use clinker_plan::yaml::{Location, Spanned};
 
 use crate::error::ChannelError;
 
@@ -36,9 +31,11 @@ use crate::error::ChannelError;
 /// ```yaml
 /// channel:
 ///   name: globex
+///   targets: [sales.orders]
 /// labels: { region: west, tier: enterprise }
-/// config: { fraud_check.threshold: 0.9 }
-/// fixed:  { fraud_check.mode: strict }   # locked against the per-target layer
+/// config:
+///   fraud_check.threshold: { value: 0.9 }
+///   fraud_check.mode: { value: strict, fixed: true }
 /// vars:
 ///   static: { currency: { type: string, default: "USD" } }
 /// ```
@@ -52,29 +49,13 @@ pub struct ChannelManifest {
     /// kept opaque here — scalar-ness is enforced by a later stage.
     #[serde(default)]
     pub labels: IndexMap<String, serde_json::Value>,
-    /// Channel-wide config clobber values, keyed by `alias.param` dotted
-    /// path. Keys stay raw strings here; dotted-path validation is a later
-    /// stage's concern. Applied non-fixed, so a higher-precedence layer may
-    /// still override them.
+    /// Channel-wide config candidates, each written as `{ value, fixed }`.
     #[serde(default)]
-    pub config: IndexMap<String, serde_json::Value>,
-    /// Channel-wide **fixed** (locked) config values, same `alias.param`
-    /// dotted-path grammar as [`Self::config`]. Applied with the layer `fixed`
-    /// lock set: a fixed value at this `ChannelWide` layer cannot be overridden
-    /// by any higher-precedence layer (the per-target overlay). For a key
-    /// present in both maps, the `fixed` entry wins within the layer.
-    #[serde(default)]
-    pub fixed: IndexMap<String, serde_json::Value>,
+    pub config: IndexMap<String, ChannelConfigValue>,
     /// Channel-wide var overlays, using the same four scopes a pipeline's
     /// `vars:` block uses.
     #[serde(default)]
     pub vars: ChannelVars,
-    /// Channel-wide ordered override op list, applied at the `ChannelWide`
-    /// layer. Each op keeps its source [`Spanned`] location so a later
-    /// ill-typed-op diagnostic anchors to the offending op rather than the
-    /// base pipeline.
-    #[serde(default)]
-    pub overrides: Vec<Spanned<OverlayOp>>,
 }
 
 /// The `channel:` header of a manifest.
@@ -83,6 +64,51 @@ pub struct ChannelManifest {
 pub struct ManifestHeader {
     /// Human-readable channel identifier.
     pub name: String,
+    /// Catalog pipeline identities this channel is allowed to run.
+    #[serde(default)]
+    pub targets: Vec<Spanned<String>>,
+}
+
+/// One authored overlay leaf with its value, fixed bit, and exact YAML spans.
+#[derive(Debug, Clone)]
+pub struct OverlayCandidate<T> {
+    /// Authored candidate value.
+    pub value: T,
+    /// Whether this candidate locks the key against higher-precedence layers.
+    pub fixed: bool,
+    /// Exact YAML location of `value`.
+    pub value_span: Location,
+    /// Exact YAML location of `fixed`, when authored.
+    pub fixed_span: Option<Location>,
+}
+
+/// One channel config candidate with its value, lock, and authored spans.
+pub type ChannelConfigValue = OverlayCandidate<serde_json::Value>;
+
+impl<'de, T> Deserialize<'de> for OverlayCandidate<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawCandidate<T> {
+            value: Spanned<T>,
+            #[serde(default)]
+            fixed: Option<Spanned<bool>>,
+        }
+
+        let raw = RawCandidate::<T>::deserialize(deserializer)?;
+        Ok(Self {
+            value: raw.value.value,
+            fixed: raw.fixed.as_ref().is_some_and(|fixed| fixed.value),
+            value_span: raw.value.referenced,
+            fixed_span: raw.fixed.map(|fixed| fixed.referenced),
+        })
+    }
 }
 
 /// A parsed per-target overlay file (`<target>.channel.yaml` /
@@ -90,8 +116,8 @@ pub struct ManifestHeader {
 ///
 /// ```yaml
 /// channel:
-///   target: ../../pipeline/order_fulfillment.yaml
-/// config: { fraud_check.threshold: 0.95 }
+///   target: sales.orders
+/// config: { fraud_check.threshold: { value: 0.95 } }
 /// vars:   { static: { currency: { type: string, default: "USD" } } }
 /// overrides: [ ... ]
 /// sources:
@@ -103,15 +129,9 @@ pub struct OverlayFile {
     /// The overlay header — carries the authoritative `target`.
     pub channel: OverlayHeader,
     /// Per-target config clobber values, keyed by `alias.param` dotted path.
-    /// Applied non-fixed at the highest `ChannelPerTarget` layer.
+    /// Each leaf independently carries its `fixed` lock at the highest layer.
     #[serde(default)]
-    pub config: IndexMap<String, serde_json::Value>,
-    /// Per-target **fixed** (locked) config values, same `alias.param`
-    /// dotted-path grammar as [`Self::config`]. Applied with the layer `fixed`
-    /// lock set at the `ChannelPerTarget` layer. For a key present in both
-    /// maps, the `fixed` entry wins within the layer.
-    #[serde(default)]
-    pub fixed: IndexMap<String, serde_json::Value>,
+    pub config: IndexMap<String, ChannelConfigValue>,
     /// Per-target var overlays, using the same four scopes a pipeline's
     /// `vars:` block uses.
     #[serde(default)]
@@ -136,6 +156,9 @@ pub struct OverlayFile {
     pub sources: IndexMap<String, SourceConfigPatch>,
 }
 
+/// Target-specific channel document selected by logical pipeline identity.
+pub type PipelineChannelFile = OverlayFile;
+
 /// The `channel:` header of an overlay file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -149,36 +172,124 @@ pub struct OverlayHeader {
 
 /// Var overlays, mirroring the four scopes a pipeline's `vars:` block uses
 /// (`$vars.*` / `$pipeline.*` / `$source.*` / `$record.*`). Each leaf is a
-/// [`ScopedVarDecl`] (`{ type, default }`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// [`ChannelVarValue`] (`{ type, default, fixed }`).
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelVars {
     /// `$vars.*` static-config overlays, keyed by var name.
     #[serde(default, rename = "static")]
-    pub static_scope: IndexMap<String, ScopedVarDecl>,
+    pub static_scope: IndexMap<String, ChannelVarValue>,
     /// `$pipeline.*` overlays, keyed by var name.
     #[serde(default)]
-    pub pipeline: IndexMap<String, ScopedVarDecl>,
+    pub pipeline: IndexMap<String, ChannelVarValue>,
     /// `$source.<src>.*` overlays: outer key is the source-node name, inner
     /// key is the var name.
     #[serde(default)]
-    pub source: IndexMap<String, IndexMap<String, ScopedVarDecl>>,
+    pub source: IndexMap<String, IndexMap<String, ChannelVarValue>>,
     /// `$record.*` overlays, keyed by var name.
     #[serde(default)]
-    pub record: IndexMap<String, ScopedVarDecl>,
+    pub record: IndexMap<String, ChannelVarValue>,
+}
+
+/// A channel variable declaration with the public leaf-level fixed bit.
+#[derive(Debug, Clone)]
+pub struct ChannelVarValue {
+    /// Declared type of the variable candidate.
+    pub var_type: ScopedVarType,
+    /// Authored default/override value, when present.
+    pub default: Option<serde_json::Value>,
+    /// Whether this candidate locks the variable against higher layers.
+    pub fixed: bool,
+    /// Exact YAML location of `type`.
+    pub type_span: Location,
+    /// Exact YAML location of `default`, when authored.
+    pub default_span: Option<Location>,
+    /// Exact YAML location of `fixed`, when authored.
+    pub fixed_span: Option<Location>,
+}
+
+impl<'de> Deserialize<'de> for ChannelVarValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawVar {
+            #[serde(rename = "type")]
+            var_type: Spanned<ScopedVarType>,
+            #[serde(default)]
+            default: Option<Spanned<serde_json::Value>>,
+            #[serde(default)]
+            fixed: Option<Spanned<bool>>,
+        }
+
+        let raw = RawVar::deserialize(deserializer)?;
+        Ok(Self {
+            var_type: raw.var_type.value,
+            default: raw.default.as_ref().map(|value| value.value.clone()),
+            fixed: raw.fixed.as_ref().is_some_and(|fixed| fixed.value),
+            type_span: raw.var_type.referenced,
+            default_span: raw.default.map(|value| value.referenced),
+            fixed_span: raw.fixed.map(|fixed| fixed.referenced),
+        })
+    }
 }
 
 impl ChannelManifest {
     /// Parse a `channel.cfg.yaml` manifest from raw bytes. `source_path` is
     /// used only for diagnostic context.
     pub fn from_yaml_bytes(bytes: &[u8], source_path: PathBuf) -> Result<Self, ChannelError> {
-        parse_yaml(bytes, source_path)
+        let manifest: Self = parse_yaml(bytes, source_path).map_err(rewrite_manifest_error)?;
+        if manifest.channel.targets.is_empty() {
+            return Err(ChannelError::InvalidManifest {
+                line: 1,
+                reason: "`channel.targets` must contain at least one catalog pipeline identity"
+                    .to_string(),
+                correction: "use `channel: { name: tenant.acme, targets: [sales.orders] }`"
+                    .to_string(),
+            });
+        }
+        Ok(manifest)
     }
 
     /// Load and parse a `channel.cfg.yaml` manifest from disk.
     pub fn load(path: &Path) -> Result<Self, ChannelError> {
         let bytes = std::fs::read(path)?;
         Self::from_yaml_bytes(&bytes, path.to_path_buf())
+    }
+}
+
+fn rewrite_manifest_error(error: ChannelError) -> ChannelError {
+    let message = error.to_string();
+    if message.contains("unknown field `fixed`") || message.contains("expected mapping start") {
+        ChannelError::InvalidManifest {
+            line: 1,
+            reason:
+                "channel-wide config entries must use the leaf form; `fixed` is not a sibling block"
+                    .to_string(),
+            correction: "write each entry as `config: { key: { value: VALUE, fixed: true } }`"
+                .to_string(),
+        }
+    } else if message.contains("unknown field `overrides`")
+        || message.contains("unknown field `sources`")
+    {
+        let field = if message.contains("unknown field `overrides`") {
+            "overrides"
+        } else {
+            "sources"
+        };
+        ChannelError::InvalidManifest {
+            line: 1,
+            reason: format!(
+                "channel-wide field `{field}` is forbidden; manifests may declare only labels, config, and vars"
+            ),
+            correction:
+                "move structural, source, and schema operations into a declared target file"
+                    .to_string(),
+        }
+    } else {
+        error
     }
 }
 

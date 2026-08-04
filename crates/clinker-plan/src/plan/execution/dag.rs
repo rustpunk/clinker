@@ -52,6 +52,8 @@ impl ExecutionPlanDag {
         parallelism: ParallelismProfile,
     ) -> Self {
         let mut dag = Self {
+            consumer_registry: CompiledConsumerRegistry::compile(&graph),
+            order_contract: ExecutionOrderContract::default(),
             graph,
             topo_order,
             source_dag,
@@ -82,6 +84,8 @@ impl ExecutionPlanDag {
     /// relative to the record stream.
     pub fn from_body(body: &crate::plan::composition_body::BoundBody) -> Self {
         Self {
+            consumer_registry: CompiledConsumerRegistry::compile(&body.graph),
+            order_contract: ExecutionOrderContract::default(),
             graph: body.graph.clone(),
             topo_order: body.topo_order.clone(),
             source_dag: Vec::new(),
@@ -119,6 +123,7 @@ impl ExecutionPlanDag {
     /// longer resolves. See [`build_id_index`] for the coverage invariant.
     pub fn rebuild_id_index(&mut self) {
         self.id_to_index = build_id_index(&self.graph);
+        self.consumer_registry = CompiledConsumerRegistry::compile(&self.graph);
     }
 
     /// Current storage position of the node with stable identity `id`, or
@@ -731,6 +736,8 @@ mod port_tag_guard_tests {
 
     fn empty_dag() -> ExecutionPlanDag {
         ExecutionPlanDag {
+            consumer_registry: CompiledConsumerRegistry::default(),
+            order_contract: ExecutionOrderContract::default(),
             graph: DiGraph::new(),
             topo_order: Vec::new(),
             source_dag: Vec::new(),
@@ -843,6 +850,7 @@ mod port_tag_guard_tests {
             },
         );
         let body = crate::plan::composition_body::BoundBody {
+            body_scope: body_id.into(),
             signature_path: std::path::PathBuf::from("compositions/test.comp.yaml"),
             graph: body_graph,
             topo_order: Vec::new(),
@@ -855,6 +863,7 @@ mod port_tag_guard_tests {
             input_port_rows: indexmap::IndexMap::new(),
             nested_body_ids: Vec::new(),
             body_indices_to_build: Vec::new(),
+            window_bindings: HashMap::new(),
             body_window_configs: HashMap::new(),
             deferred_regions: HashMap::new(),
             parent_continuations: HashMap::new(),

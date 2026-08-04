@@ -194,13 +194,16 @@ impl Parser {
             emit_each_depth: 0,
         };
         let start_span = parser.current_span();
+        let mut imports = Vec::new();
         let mut functions = Vec::new();
         let mut constants = Vec::new();
+        let mut seen_declaration = false;
 
         parser.skip_newlines();
         while !parser.at_eof() {
             match parser.peek() {
                 Token::Fn => {
+                    seen_declaration = true;
                     match parser.parse_fn_decl() {
                         Ok(decl) => {
                             // Validate: no emit or trace in fn body
@@ -223,6 +226,7 @@ impl Parser {
                         expr,
                         span,
                     }) => {
+                        seen_declaration = true;
                         constants.push(ModuleConst {
                             node_id,
                             name,
@@ -253,12 +257,25 @@ impl Parser {
                     parser.recover_to_newline();
                 }
                 Token::Use => {
-                    parser.errors.push(parser.error(
-                        "modules cannot import other modules",
-                        "Cross-module imports are not supported in v1",
-                        "Move shared logic to a separate module and import it from the transform",
-                    ));
-                    parser.recover_to_newline();
+                    if seen_declaration {
+                        parser.errors.push(parser.error(
+                            "use must appear before module declarations",
+                            "Module imports form the dependency header",
+                            "Move this use statement before every fn and let declaration",
+                        ));
+                        parser.recover_to_newline();
+                    } else {
+                        match parser.parse_use() {
+                            Ok(Statement::UseStmt {
+                                path, alias, span, ..
+                            }) => imports.push(crate::ast::ModuleImport { path, alias, span }),
+                            Ok(_) => unreachable!(),
+                            Err(error) => {
+                                parser.errors.push(error);
+                                parser.recover_to_newline();
+                            }
+                        }
+                    }
                 }
                 Token::Filter => {
                     parser.errors.push(parser.error(
@@ -292,6 +309,7 @@ impl Parser {
         let node_count = parser.next_id;
         ModuleParseResult {
             module: Module {
+                imports,
                 functions,
                 constants,
                 span: Span::new(start_span.start as usize, end_span.end as usize),
@@ -2383,14 +2401,11 @@ mod tests {
     }
 
     #[test]
-    fn test_module_reject_cross_import() {
+    fn test_module_accepts_private_import() {
         let result = Parser::parse_module("use other");
-        assert!(!result.errors.is_empty());
-        assert!(
-            result.errors[0]
-                .message
-                .contains("modules cannot import other modules")
-        );
+        assert!(result.errors.is_empty());
+        assert_eq!(result.module.imports.len(), 1);
+        assert_eq!(&*result.module.imports[0].path[0], "other");
     }
 
     #[test]

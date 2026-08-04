@@ -29,7 +29,9 @@ use crate::pipeline::iejoin::RecordOrder;
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
-use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, matches_upstream_name};
+use clinker_plan::plan::execution::{
+    ExecutionPlanDag, OutputOrderPromise, PlanNode, assert_order_contract, matches_upstream_name,
+};
 
 /// Cap on matches collected per driver row under `match: collect` before
 /// truncation. 10K mirrors the module constants in `pipeline/combine.rs`
@@ -76,6 +78,11 @@ pub(crate) fn dispatch_combine(
     else {
         unreachable!("dispatch_combine called with non-Combine node");
     };
+    assert_order_contract(
+        current_dag.order_contract(),
+        node,
+        OutputOrderPromise::Unordered,
+    )?;
     use crate::executor::combine::CombineResolverMapping;
     use crate::pipeline::combine::{CombineHashTable, KeyExtractor};
     use crate::pipeline::grace_hash::{GraceHashExec, execute_combine_grace_hash};
@@ -303,7 +310,7 @@ pub(crate) fn dispatch_combine(
     // punctuations) arrive on the channel instead, to be reconciled with the
     // retained `build_puncts` after the probe joins.
     let (driver_buf, driver_puncts, _driver_clone_reservation): (
-        Vec<(Record, u64)>,
+        Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::stream_event::Punctuation>,
         Option<crate::executor::node_buffer::TransientNodeBufferReservation>,
     ) = if streaming_probe_driver.is_some() {
@@ -330,7 +337,7 @@ pub(crate) fn dispatch_combine(
     let (build_input, _build_clone_reservation) =
         build_input.into_materialized_parts(&ctx.memory_budget, name)?;
     let (build_buf, build_puncts): (
-        Vec<(Record, u64)>,
+        Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::stream_event::Punctuation>,
     ) = build_input.drain_split()?;
     // The empty-punctuation common case folds to an empty vector,
@@ -725,7 +732,7 @@ pub(crate) fn dispatch_combine(
                         node_idx,
                         &f.probe_record,
                         f.row,
-                        f.matched_build.as_ref(),
+                        f.matched_build.as_ref().map(|record| (record, f.row)),
                         name,
                         f.error,
                     )?;
@@ -938,7 +945,14 @@ pub(crate) fn dispatch_combine(
         for (rec, rn) in &build_buf {
             advance_cursor(ctx, &source_name_arc_of(rec), *rn);
         }
-        let build_records: Vec<Record> = build_buf.into_iter().map(|(r, _)| r).collect();
+        // Keep the authoritative build-side identity aligned with the hash
+        // table's stable insertion indices. The table owns only records, but
+        // output-row failures must attribute both contributors by their exact
+        // SourceRowId rather than borrowing the driver's identity.
+        let (build_records, build_row_ids): (
+            Vec<Record>,
+            Vec<crate::executor::stream_event::SourceRowId>,
+        ) = build_buf.into_iter().unzip();
         let build_records_in = build_records.len() as u64;
         let estimated_rows = Some(build_records.len());
         let hash_table_ctx = ctx.merged_eval_ctx();
@@ -959,6 +973,21 @@ pub(crate) fn dispatch_combine(
             source: BudgetCategory::Arena,
             detail: Some(format!("combine build: {e}")),
         })?;
+        let build_identity_bytes = build_row_ids.capacity().saturating_mul(std::mem::size_of::<
+            crate::executor::stream_event::SourceRowId,
+        >());
+        let inline_bytes = hash_table
+            .memory_bytes()
+            .saturating_add(build_identity_bytes);
+        if budget.should_abort_local(inline_bytes as u64) {
+            return Err(PipelineError::MemoryBudgetExceeded {
+                node: name.clone(),
+                used: inline_bytes as u64,
+                limit: budget.limit(),
+                source: BudgetCategory::Arena,
+                detail: Some("combine build identities exceed memory budget".to_string()),
+            });
+        }
         let build_records_out = hash_table.len() as u64;
         // Mirror the freshly-built table's footprint into the
         // consumer handle so the arbitrator's pull-mode
@@ -966,7 +995,7 @@ pub(crate) fn dispatch_combine(
         // bytes for the duration of the probe loop. The probe
         // loop is read-only on the table so no further updates
         // are needed; arm exit below unregisters the consumer.
-        inline_consumer_handle.set_bytes(hash_table.memory_bytes() as u64);
+        inline_consumer_handle.set_bytes(inline_bytes as u64);
         ctx.collector
             .record(build_timer.finish(build_records_in, build_records_out));
 
@@ -984,6 +1013,7 @@ pub(crate) fn dispatch_combine(
         let kernel = CombineProbeKernel {
             name,
             hash_table: &hash_table,
+            build_row_ids: &build_row_ids,
             resolver_mapping: &resolver_mapping,
             probe_extractor: &probe_extractor,
             decomposed,
@@ -1004,7 +1034,7 @@ pub(crate) fn dispatch_combine(
         let probe_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::CombineProbe {
             name: name.clone(),
         });
-        let output_records: Vec<(Record, u64)> =
+        let output_records: Vec<(Record, crate::executor::stream_event::SourceRowId)> =
             if let Some(driver_producer) = streaming_probe_driver {
                 // Streaming-probe path: the build side is materialized into the
                 // hash table above; now spawn the probe consumer on its own thread,
@@ -1071,7 +1101,9 @@ pub(crate) fn dispatch_combine(
                             node_idx,
                             &f.probe_record,
                             f.rn,
-                            f.matched_build.as_ref(),
+                            f.matched_build
+                                .as_ref()
+                                .map(|matched| (&matched.record, matched.row)),
                             name,
                             f.error,
                         )?;
@@ -1184,7 +1216,7 @@ pub(crate) fn dispatch_combine(
 /// punctuations collected off the channel for post-join reconciliation
 /// with the build side.
 struct StreamingProbeOutput {
-    output_records: Vec<(Record, u64)>,
+    output_records: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     input_count: u64,
     driver_puncts: Vec<crate::executor::stream_event::Punctuation>,
 }
@@ -1198,7 +1230,7 @@ struct StreamingProbeEffects {
     /// `(source_name, row_num)` for each driver record the probe consumed —
     /// replayed via [`advance_cursor`], the streaming analogue of the
     /// materialized arm's operator-entry driver cursor advance.
-    cursor_advances: Vec<(Arc<str>, u64)>,
+    cursor_advances: Vec<(Arc<str>, crate::executor::stream_event::SourceRowId)>,
     /// Distinct driver source names the probe consumed, in first-seen
     /// order. After the join — once the producer has fully advanced its
     /// sources but before the deferred combine advances replay — the
@@ -1269,7 +1301,7 @@ fn run_streaming_combine_probe(
         driver_sources: Vec::new(),
         failures: Vec::new(),
     };
-    let mut output_records: Vec<(Record, u64)> = Vec::new();
+    let mut output_records: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     let mut driver_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
     let mut counters = ProbeCounters::default();
     let mut input_count: u64 = 0;
@@ -1345,7 +1377,7 @@ fn run_streaming_combine_probe(
                 let eval_ctx = EvalContext {
                     stable,
                     source_file: &source_file_arc,
-                    source_row: rn,
+                    source_row: rn.ordinal(),
                     source_path: &source_file_arc,
                     source_count: None,
                     source_batch: source_batch_arc,
@@ -1472,7 +1504,9 @@ fn run_streaming_combine_probe(
             node_idx,
             &f.probe_record,
             f.rn,
-            f.matched_build.as_ref(),
+            f.matched_build
+                .as_ref()
+                .map(|matched| (&matched.record, matched.row)),
             name,
             f.error,
         )?;
@@ -1511,9 +1545,18 @@ enum ProbeRowStep {
 /// the inline path's per-row routing in channel-arrival order.
 struct ProbeFailure {
     probe_record: Record,
-    rn: u64,
-    matched_build: Option<Record>,
+    rn: crate::executor::stream_event::SourceRowId,
+    matched_build: Option<MatchedBuildFailure>,
     error: cxl::eval::EvalError,
+}
+
+/// Exact build-side contribution attached to an inline combine output-row
+/// failure. `record` supplies diagnostics and correlation lineage; `row`
+/// remains the authoritative attempt-local identity used for deduplication.
+#[derive(Clone)]
+struct MatchedBuildFailure {
+    record: Record,
+    row: crate::executor::stream_event::SourceRowId,
 }
 
 /// `distinct` / `filtered` skip counts the probe kernel accumulates so the
@@ -1539,6 +1582,8 @@ struct ProbeCounters {
 struct CombineProbeKernel<'k> {
     name: &'k str,
     hash_table: &'k crate::pipeline::combine::CombineHashTable,
+    /// Build-side identities in the hash table's stable insertion order.
+    build_row_ids: &'k [crate::executor::stream_event::SourceRowId],
     resolver_mapping: &'k crate::executor::combine::CombineResolverMapping,
     probe_extractor: &'k crate::pipeline::combine::KeyExtractor,
     decomposed: &'k clinker_plan::plan::combine::DecomposedPredicate,
@@ -1562,6 +1607,20 @@ struct CombineProbeKernel<'k> {
 }
 
 impl CombineProbeKernel<'_> {
+    fn build_row_id(
+        &self,
+        index: usize,
+    ) -> Result<crate::executor::stream_event::SourceRowId, PipelineError> {
+        self.build_row_ids
+            .get(index)
+            .copied()
+            .ok_or_else(|| PipelineError::Internal {
+                op: "combine",
+                node: self.name.to_string(),
+                detail: format!("matched build index {index} has no aligned source-row identity"),
+            })
+    }
+
     /// Fail loud with E325 if the combine's cumulative output has already reached
     /// the opt-in `max_output_rows` cap. Called before each output push, so the
     /// cap is enforced per-row (exactly `cap` rows land, the first over-cap row
@@ -1591,10 +1650,10 @@ impl CombineProbeKernel<'_> {
         &self,
         eval_ctx: &cxl::eval::EvalContext<'_>,
         probe_record: &Record,
-        rn: u64,
+        rn: crate::executor::stream_event::SourceRowId,
         probe_keys_buf: &mut Vec<Value>,
         counters: &mut ProbeCounters,
-        out: &mut Vec<(Record, u64)>,
+        out: &mut Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     ) -> Result<ProbeRowStep, PipelineError> {
         use crate::executor::combine::CombineResolver;
         use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
@@ -1657,7 +1716,10 @@ impl CombineProbeKernel<'_> {
                                 return Ok(ProbeRowStep::Deferred(Box::new(ProbeFailure {
                                     probe_record: probe_record.clone(),
                                     rn,
-                                    matched_build: Some(candidate.record.clone()),
+                                    matched_build: Some(MatchedBuildFailure {
+                                        record: candidate.record.clone(),
+                                        row: self.build_row_id(candidate.index)?,
+                                    }),
                                     error: e,
                                 })));
                             }
@@ -1709,9 +1771,9 @@ impl CombineProbeKernel<'_> {
                 // Residual-filter + emit pass. Clone each surviving build
                 // record before dropping the iterator so the evaluator
                 // borrow doesn't alias the hash-table borrow.
-                let matched_records: Vec<Record> = {
+                let matched_records: Vec<MatchedBuildFailure> = {
                     let probe_iter = self.hash_table.probe(probe_keys_buf);
-                    let mut matched: Vec<Record> = Vec::new();
+                    let mut matched: Vec<MatchedBuildFailure> = Vec::new();
                     for candidate in probe_iter {
                         if let Some(residual) = self.decomposed.residual.as_ref() {
                             let resolver = CombineResolver::new(
@@ -1742,13 +1804,19 @@ impl CombineProbeKernel<'_> {
                                     return Ok(ProbeRowStep::Deferred(Box::new(ProbeFailure {
                                         probe_record: probe_record.clone(),
                                         rn,
-                                        matched_build: Some(candidate.record.clone()),
+                                        matched_build: Some(MatchedBuildFailure {
+                                            record: candidate.record.clone(),
+                                            row: self.build_row_id(candidate.index)?,
+                                        }),
                                         error: e,
                                     })));
                                 }
                             }
                         }
-                        matched.push(candidate.record.clone());
+                        matched.push(MatchedBuildFailure {
+                            record: candidate.record.clone(),
+                            row: self.build_row_id(candidate.index)?,
+                        });
                         if matches!(self.match_mode, MatchMode::First) {
                             break;
                         }
@@ -1761,7 +1829,7 @@ impl CombineProbeKernel<'_> {
                         OnMiss::Skip => Ok(ProbeRowStep::Continue),
                         OnMiss::Error => Err(PipelineError::CombineMissingMatch {
                             combine: name.to_string(),
-                            driver_row: rn,
+                            driver_row: rn.ordinal(),
                         }),
                         OnMiss::NullFields => {
                             let resolver =
@@ -1831,7 +1899,7 @@ impl CombineProbeKernel<'_> {
                         let resolver = CombineResolver::new(
                             self.resolver_mapping,
                             probe_record,
-                            Some(matched),
+                            Some(&matched.record),
                         );
                         match evaluator.eval_record::<NullStorage>(eval_ctx, &resolver, None) {
                             Ok(EvalResult::Emit {
@@ -1851,7 +1919,7 @@ impl CombineProbeKernel<'_> {
                                 }
                                 crate::executor::copy_build_ck_columns(
                                     &mut rec,
-                                    matched,
+                                    &matched.record,
                                     self.propagate_ck,
                                 );
                                 self.check_output_cap(out.len())?;
@@ -1902,7 +1970,7 @@ impl CombineProbeKernel<'_> {
                         let mut values: Vec<Value> =
                             Vec::with_capacity(target_schema.column_count());
                         values.extend(probe_record.values().iter().cloned());
-                        values.extend(matched.values().iter().cloned());
+                        values.extend(matched.record.values().iter().cloned());
                         if values.len() != target_schema.column_count() {
                             return Err(PipelineError::Internal {
                                 op: "combine",
@@ -1943,7 +2011,7 @@ fn dispatch_combine_output_errors(
             node_idx,
             &f.probe_record,
             f.row,
-            f.matched_build.as_ref(),
+            f.matched_build.as_ref().map(|record| (record, f.row)),
             combine_name,
             f.error,
         )?;
@@ -2061,6 +2129,7 @@ fn drain_block_band_output(
                         budget: &ctx.memory_budget,
                         node: combine_name,
                         compress: merge_compress,
+                        charge_owner: None,
                     },
                 )?;
                 stream_block_band_rows(
@@ -2082,7 +2151,7 @@ fn drain_block_band_output(
             // bounded. Strip the sort payload back to `(record, order)` and admit
             // as the equi+range path does, running the window-root and
             // cross-region tee side effects (no-ops when neither applies).
-            let rows: Vec<(Record, u64)> = pairs
+            let rows: Vec<(Record, crate::executor::stream_event::SourceRowId)> = pairs
                 .into_iter()
                 .map(|(record, (order, _, _))| (record, order))
                 .collect();
@@ -2126,9 +2195,11 @@ fn drain_block_band_output(
                         budget: &ctx.memory_budget,
                         node: combine_name,
                         compress: merge_compress,
+                        charge_owner: None,
                     },
                 )?;
-                let mut rows: Vec<(Record, u64)> = Vec::new();
+                let mut rows: Vec<(Record, crate::executor::stream_event::SourceRowId)> =
+                    Vec::new();
                 for item in merger {
                     let (record, (order, _, _)) = item?;
                     rows.push((record, order));
@@ -2167,7 +2238,9 @@ fn stream_block_band_rows(
     sender: &crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
     batch_size: usize,
     node_name: &str,
-    rows: impl Iterator<Item = Result<(Record, u64), PipelineError>>,
+    rows: impl Iterator<
+        Item = Result<(Record, crate::executor::stream_event::SourceRowId), PipelineError>,
+    >,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
     charge: &crate::executor::batch_handoff::StreamingChargeHandle,
 ) -> Result<u64, PipelineError> {
@@ -2322,8 +2395,8 @@ fn dispatch_combine_output_error(
     ctx: &mut ExecutorContext<'_>,
     node_idx: NodeIndex,
     probe_record: &Record,
-    row_num: u64,
-    matched_build_record: Option<&Record>,
+    row_num: crate::executor::stream_event::SourceRowId,
+    matched_build: Option<(&Record, crate::executor::stream_event::SourceRowId)>,
     combine_name: &str,
     eval_err: cxl::eval::EvalError,
 ) -> Result<(), PipelineError> {
@@ -2332,7 +2405,9 @@ fn dispatch_combine_output_error(
     let message = eval_err.to_string();
 
     let probe_source = source_name_arc_of(probe_record);
-    let build_source = matched_build_record.map(source_name_arc_of);
+    let build_source = matched_build
+        .as_ref()
+        .map(|(record, _)| source_name_arc_of(record));
 
     // Rewind every contributing source to its captured pre-fold floor
     // before admitting any DLQ entry. The snapshot was taken at fold
@@ -2394,19 +2469,14 @@ fn dispatch_combine_output_error(
     }
 
     // When a build row contributed, attribute a build-side entry too so
-    // the contributing build lineage reaches the DLQ. It carries the
-    // same category but is not the trigger. The build row's own source
-    // row number is not threaded to the output stage (build-side row
-    // numbers are consumed at the operator-entry cursor advance), so the
-    // entry borrows the driver row number; the build record's
-    // `original_record` still carries the build's real `$source.name`
-    // stamp and `$ck.*` lineage, which is what attribution and
-    // group-atomicity key off.
-    if let Some(build_record) = matched_build_record {
+    // the contributing build lineage reaches the DLQ. The matched record and
+    // its identity travel as one pair so attribution cannot silently mix a
+    // build record with an unrelated row id.
+    if let Some((build_record, build_row_num)) = matched_build {
         let build_routed = record_error_to_buffer_if_grouped(
             ctx,
             build_record,
-            row_num,
+            build_row_num,
             category,
             message.clone(),
             stage.clone(),
@@ -2419,7 +2489,7 @@ fn dispatch_combine_output_error(
             push_dlq(
                 ctx,
                 DlqEntry {
-                    source_row: row_num,
+                    source_row: build_row_num,
                     category,
                     error_message: message,
                     original_record: build_record.clone(),

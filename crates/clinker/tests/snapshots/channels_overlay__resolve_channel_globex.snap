@@ -2,7 +2,7 @@
 source: crates/clinker/tests/channels_overlay.rs
 expression: report
 ---
-Effective plan for `order_fulfillment`
+Effective plan for `daily.orders`
   channel: globex
   groups:
     - enterprise (priority 20, derived)

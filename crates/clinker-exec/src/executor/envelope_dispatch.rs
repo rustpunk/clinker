@@ -62,7 +62,7 @@ use crate::executor::dispatch::{
     ExecutorContext, NodeBufferKey, admit_node_buffer, node_buffer_spill_allowed,
     require_node_buffer_input, single_input_node_buffer_key,
 };
-use crate::executor::envelope::distinct_body_headers;
+use crate::executor::envelope::{distinct_body_headers, first_body_representative};
 use crate::executor::node_buffer::DrainedEvents;
 use crate::executor::stream_event::{Punctuation, PunctuationKind};
 use clinker_plan::config::pipeline_node::EnvelopeStrategy;
@@ -309,8 +309,8 @@ fn body_predecessor_excluding(
 /// document grain is required, so a second is silent data loss, not a fold.
 fn replace_headers_by_grain(
     name: &str,
-    body: &mut [(Record, u64)],
-    header_records: &[(Record, u64)],
+    body: &mut [(Record, crate::executor::stream_event::SourceRowId)],
+    header_records: &[(Record, crate::executor::stream_event::SourceRowId)],
 ) -> Result<(), PipelineError> {
     if header_records.is_empty() {
         return Ok(());
@@ -393,7 +393,7 @@ fn replace_headers_by_grain(
 /// more distinct non-empty headers would land under the one document.
 fn consolidate(
     name: &str,
-    mut records: Vec<(Record, u64)>,
+    mut records: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     puncts: Vec<Punctuation>,
 ) -> Result<DrainedEvents, PipelineError> {
     // An empty body frames nothing — no document to open or close.
@@ -423,19 +423,31 @@ fn consolidate(
         .next()
         .unwrap_or_else(EnvelopeRecord::empty);
 
-    // The consolidated document inherits the first incoming document's source
-    // file as its representative identity, preferring the first `DocumentOpen`.
-    // That path only seeds the document-DLQ representative and is otherwise
-    // informational here; per-record `$source.file` is a tail column stamped at
-    // ingest and is unaffected by the re-stamp.
-    let source_file = puncts
+    // Select one structural representative before replacing the incoming
+    // boundaries. Its record and typed SourceRowId remain paired through the
+    // reframe; multiple condemned input grains collapse to the first
+    // representative under concat's ordinary first-document policy.
+    let structural_reject = puncts
         .iter()
-        .find(|p| p.kind() == PunctuationKind::DocumentOpen)
-        .map(|p| Arc::clone(p.source_file()))
+        .find_map(Punctuation::structural_reject)
+        .cloned();
+
+    // The consolidated document inherits its source file from the same first
+    // body representative whose identity survives the collapse. A recordless
+    // structural reject supplies its synthetic representative; only an
+    // entirely empty framed document falls back to its first open boundary.
+    let source_file = first_body_representative(&records)
+        .map(|(record, _)| Arc::clone(record.doc_ctx().source_file()))
         .or_else(|| {
-            records
-                .first()
-                .map(|(r, _)| Arc::clone(r.doc_ctx().source_file()))
+            structural_reject
+                .as_ref()
+                .map(|reject| Arc::clone(reject.record.doc_ctx().source_file()))
+        })
+        .or_else(|| {
+            puncts
+                .iter()
+                .find(|punct| punct.kind() == PunctuationKind::DocumentOpen)
+                .map(|punct| Arc::clone(punct.source_file()))
         })
         .unwrap_or_else(|| Arc::from(""));
 
@@ -452,12 +464,18 @@ fn consolidate(
         record.set_doc_ctx(Arc::clone(&ctx));
     }
 
-    // Re-frame: discard the incoming per-document boundaries and emit exactly
-    // one open and one close on the consolidated context.
-    let framing = vec![
-        Punctuation::document_open(Arc::clone(&ctx)),
-        Punctuation::document_close(ctx),
-    ];
+    // Re-frame: replace the incoming per-document boundaries with exactly one
+    // open and one close on the consolidated context. When an input close
+    // carries structural evidence, re-stamp its representative record onto
+    // that same context and retain its exact typed identity on the new close.
+    let close = match structural_reject {
+        Some(mut reject) => {
+            reject.record.set_doc_ctx(Arc::clone(&ctx));
+            Punctuation::structural_reject_close(Arc::clone(&ctx), reject)
+        }
+        None => Punctuation::document_close(Arc::clone(&ctx)),
+    };
+    let framing = vec![Punctuation::document_open(ctx), close];
 
     Ok((records, framing))
 }
@@ -495,7 +513,7 @@ fn synthesize_sections(
     ctx: &ExecutorContext<'_>,
     name: &str,
     synthesis: &EnvelopeSynthesis,
-    records: &mut [(Record, u64)],
+    records: &mut [(Record, crate::executor::stream_event::SourceRowId)],
     puncts: &mut [Punctuation],
 ) -> Result<(), PipelineError> {
     // Group record indices by grain, preserving first-seen order so the rebuilt
@@ -578,7 +596,7 @@ fn synthesize_sections(
 fn fold_footer_section(
     name: &str,
     section: &clinker_plan::plan::envelope_synthesis::SynthesizedFooterSection,
-    records: &[(Record, u64)],
+    records: &[(Record, crate::executor::stream_event::SourceRowId)],
     indices: &[usize],
 ) -> Result<Value, PipelineError> {
     let compiled = &section.compiled;
@@ -666,7 +684,7 @@ fn eval_header_section(
     name: &str,
     section: &clinker_plan::plan::envelope_synthesis::SynthesizedHeaderSection,
     record: &Record,
-    row_num: u64,
+    row_num: crate::executor::stream_event::SourceRowId,
 ) -> Result<Value, PipelineError> {
     let source_file = crate::executor::dispatch::source_file_arc_of(record);
     let source_name = crate::executor::dispatch::source_name_arc_of(record);
@@ -712,6 +730,8 @@ fn merge_envelope_sections(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::stream_event::{SourceRowId, StructuralReject};
+    use clinker_plan::plan::{EntityRef, PlanNodeId};
     use clinker_record::{Schema, SchemaBuilder, Value};
     use indexmap::IndexMap;
 
@@ -744,6 +764,10 @@ mod tests {
         r
     }
 
+    fn row_id(source: usize, ordinal: u64) -> SourceRowId {
+        SourceRowId::new(PlanNodeId::new(source), ordinal)
+    }
+
     /// A header record carrying `ctx`'s grain but a REPLACEMENT envelope
     /// (`with_replaced_envelope` preserves the grain, swaps the header). This is
     /// the shape a grain-preserving header rewrite produces: same body grain,
@@ -761,6 +785,43 @@ mod tests {
     }
 
     #[test]
+    fn concat_reframes_structural_close_without_splitting_representative_identity() {
+        let input_ctx = doc_ctx("a.x12", "BATCH-A");
+        let representative = body_record(&input_ctx, 41);
+        let identity = row_id(7, 19);
+        let reject = StructuralReject {
+            record: representative.clone(),
+            row_num: identity,
+            message: "bad trailer count".to_string(),
+        };
+        let records = vec![(representative, identity)];
+        let puncts = vec![
+            Punctuation::document_open(Arc::clone(&input_ctx)),
+            Punctuation::structural_reject_close(input_ctx, reject),
+        ];
+
+        let (records, puncts) =
+            consolidate("one_document", records, puncts).expect("concat succeeds");
+        let close = puncts
+            .iter()
+            .find(|punct| punct.kind() == PunctuationKind::DocumentClose)
+            .expect("concat emits one close");
+        let reject = close
+            .structural_reject()
+            .expect("concat retains structural evidence");
+
+        assert_eq!(records[0].1, identity);
+        assert_eq!(reject.row_num, identity);
+        assert_eq!(reject.record.get("id"), Some(&Value::Integer(41)));
+        assert_eq!(
+            reject.record.doc_ctx().grain(),
+            records[0].0.doc_ctx().grain(),
+            "the representative record and reframed body share the consolidated context"
+        );
+        assert_eq!(close.source_file().as_ref(), "a.x12");
+    }
+
+    #[test]
     fn replace_attaches_rewritten_header_to_the_matching_grain() {
         // Two body documents (grain A carries two records, grain B one). The
         // wired header stream carries one rewritten header per grain, on the
@@ -770,13 +831,19 @@ mod tests {
         let ctx_a = doc_ctx("a.x12", "ORIG-A");
         let ctx_b = doc_ctx("b.x12", "ORIG-B");
         let mut body = vec![
-            (body_record(&ctx_a, 1), 0),
-            (body_record(&ctx_a, 2), 1),
-            (body_record(&ctx_b, 3), 2),
+            (body_record(&ctx_a, 1), row_id(0, 0)),
+            (body_record(&ctx_a, 2), row_id(0, 1)),
+            (body_record(&ctx_b, 3), row_id(0, 2)),
         ];
         let headers = vec![
-            (header_record(&ctx_a, header_envelope("REWRITTEN-A")), 0),
-            (header_record(&ctx_b, header_envelope("REWRITTEN-B")), 1),
+            (
+                header_record(&ctx_a, header_envelope("REWRITTEN-A")),
+                row_id(0, 0),
+            ),
+            (
+                header_record(&ctx_b, header_envelope("REWRITTEN-B")),
+                row_id(0, 1),
+            ),
         ];
 
         replace_headers_by_grain("framed", &mut body, &headers)
@@ -828,8 +895,14 @@ mod tests {
         // not all-or-nothing.
         let ctx_a = doc_ctx("a.x12", "ORIG-A");
         let ctx_b = doc_ctx("b.x12", "ORIG-B");
-        let mut body = vec![(body_record(&ctx_a, 1), 0), (body_record(&ctx_b, 2), 1)];
-        let headers = vec![(header_record(&ctx_a, header_envelope("REWRITTEN-A")), 0)];
+        let mut body = vec![
+            (body_record(&ctx_a, 1), row_id(0, 0)),
+            (body_record(&ctx_b, 2), row_id(0, 1)),
+        ];
+        let headers = vec![(
+            header_record(&ctx_a, header_envelope("REWRITTEN-A")),
+            row_id(0, 0),
+        )];
 
         replace_headers_by_grain("framed", &mut body, &headers)
             .expect("a partial header stream is valid");
@@ -857,10 +930,10 @@ mod tests {
         // document, so it aborts with E351 — pin the code AND the variant.
         let ctx_a = doc_ctx("a.x12", "ORIG-A");
         let ctx_orphan = doc_ctx("c.x12", "ORPHAN");
-        let mut body = vec![(body_record(&ctx_a, 1), 0)];
+        let mut body = vec![(body_record(&ctx_a, 1), row_id(0, 0))];
         let headers = vec![(
             header_record(&ctx_orphan, header_envelope("REWRITTEN-C")),
-            0,
+            row_id(0, 0),
         )];
 
         let err = replace_headers_by_grain("framed", &mut body, &headers)
@@ -896,7 +969,7 @@ mod tests {
         // a Transform stamps onto an in-pipeline-synthesized record — grounds to
         // no body document and is rejected, even though the body is non-empty.
         let ctx_a = doc_ctx("a.x12", "ORIG-A");
-        let mut body = vec![(body_record(&ctx_a, 1), 0)];
+        let mut body = vec![(body_record(&ctx_a, 1), row_id(0, 0))];
         // A record left on the synthetic context (Record::new default).
         let synthetic_header = Record::new(body_schema(), vec![Value::Integer(0)]);
         assert_eq!(
@@ -904,7 +977,7 @@ mod tests {
             DocumentGrain::SYNTHETIC,
             "the default-constructed record carries the synthetic grain"
         );
-        let headers = vec![(synthetic_header, 0)];
+        let headers = vec![(synthetic_header, row_id(0, 0))];
 
         let err = replace_headers_by_grain("framed", &mut body, &headers)
             .expect_err("a synthetic-grain header must abort");
@@ -922,10 +995,16 @@ mod tests {
         // than silently last-write-wins (which would drop the first header). Pin
         // the code AND the variant payload.
         let ctx_a = doc_ctx("a.x12", "ORIG-A");
-        let mut body = vec![(body_record(&ctx_a, 1), 0)];
+        let mut body = vec![(body_record(&ctx_a, 1), row_id(0, 0))];
         let headers = vec![
-            (header_record(&ctx_a, header_envelope("REWRITE-1")), 0),
-            (header_record(&ctx_a, header_envelope("REWRITE-2")), 1),
+            (
+                header_record(&ctx_a, header_envelope("REWRITE-1")),
+                row_id(0, 0),
+            ),
+            (
+                header_record(&ctx_a, header_envelope("REWRITE-2")),
+                row_id(0, 1),
+            ),
         ];
 
         let err = replace_headers_by_grain("framed", &mut body, &headers)
@@ -957,7 +1036,7 @@ mod tests {
         // No wired header records → the body passes through unchanged (the
         // strategy then frames with each grain's ambient header).
         let ctx_a = doc_ctx("a.x12", "ORIG-A");
-        let mut body = vec![(body_record(&ctx_a, 1), 0)];
+        let mut body = vec![(body_record(&ctx_a, 1), row_id(0, 0))];
         replace_headers_by_grain("framed", &mut body, &[]).expect("empty header stream is valid");
         assert_eq!(
             batch_id_of(&body[0].0),

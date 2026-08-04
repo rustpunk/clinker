@@ -15,6 +15,7 @@
 //!   with the op's source location;
 //! - a plain pipeline with no overlay ops is unaffected (the pass is a no-op).
 
+use crate::config::composition::{ProvenanceDb, ProvenanceQuery};
 use crate::config::pipeline_node::PipelineNode;
 use crate::config::{CompileContext, parse_config};
 use crate::overlay_ops::{LayeredOp, OverlayLayer, OverlayOp};
@@ -472,4 +473,47 @@ nodes:
         diags.iter().any(|d| d.code == "E158"),
         "expected E158 for non-concrete numeric, got: {diags:?}",
     );
+}
+
+#[test]
+fn compiled_plan_round_trip_and_reuse_preserve_scoped_provenance() {
+    let workspace =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../clinker-exec/tests/fixtures");
+    let yaml =
+        std::fs::read_to_string(workspace.join("pipelines/nested_composition_pipeline.yaml"))
+            .expect("read nested composition fixture");
+    let config = parse_config(&yaml).expect("parse nested composition fixture");
+    let ctx = CompileContext::with_pipeline_dir(&workspace, std::path::PathBuf::from("pipelines"));
+    let plan = config
+        .compile(&ctx)
+        .expect("compile nested composition fixture");
+
+    let expected = "/v1/config/calls/nested_process/nodes/inner_normalize/fields/strict_mode";
+    assert!(
+        plan.provenance()
+            .canonical_listing()
+            .iter()
+            .any(|address| address.render() == expected),
+        "nested provenance must retain its structured call path",
+    );
+
+    let bytes = serde_json::to_vec(plan.provenance()).expect("serialize provenance");
+    let restored: ProvenanceDb = serde_json::from_slice(&bytes).expect("deserialize provenance");
+    assert_eq!(restored, *plan.provenance());
+
+    for _ in 0..2 {
+        let query = ProvenanceQuery::parse(expected).expect("parse exact address");
+        let found = restored
+            .resolve_query(&query)
+            .expect("reuse restored provenance");
+        assert_eq!(found.address.render(), expected);
+        assert_eq!(
+            found.resolved.winning_layer(),
+            plan.provenance()
+                .resolve_query(&query)
+                .expect("resolve original provenance")
+                .resolved
+                .winning_layer(),
+        );
+    }
 }

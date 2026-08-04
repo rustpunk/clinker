@@ -2,6 +2,18 @@
 
 Output nodes write processed records to files. They are the terminal nodes of a pipeline -- every pipeline path must end at an output (or records are silently dropped).
 
+> **Terminal-node migration (not available yet):** The current binary accepts
+> only `type: output`, and every runnable example on this page uses that
+> spelling. Decision D-56 assigns a one-way, project-wide rename of the
+> terminal destination concept to Sink and `type: sink` to Phase 4 / AUTH-09.
+> That atomic migration must finish before Phase 4.1 adds REST and SQL
+> endpoints; do not write `type: sink` in current pipelines. The rename is
+> deliberately narrow: composition and node output ports, produced artifacts,
+> files and paths, serialization formats, stdout, command or machine output,
+> writer results, and OpenLineage output datasets keep the word “output.” See
+> [Production Contracts](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#terminal-destination-vocabulary) for
+> the compatibility boundary.
+
 ## Basic structure
 
 ```yaml
@@ -501,6 +513,42 @@ Shorthand: a bare string defaults to ascending with nulls last:
       - { field: "amount", order: desc }
 ```
 
+An Output `sort_order` materializes all records that reach that terminal and
+re-establishes one order across them, including records from several physical
+files or Merge inputs. The guarantee is exactly the authored field sequence,
+direction, and null placement. `drop` is also part of the authored contract:
+records with a null in a sort key do not reach the writer.
+
+The sort is stable. Equal authored keys retain their upstream arrival order
+within a given execution path, and the same path produces the same bytes in
+resident and forced-spill operation. Clinker does not add a source-row,
+filename, or canonical-record tie-breaker. If upstream strategies can produce
+different arrival orders, equal-key rows have no cross-strategy relative-order
+promise. Author enough fields for a total business order before using an exact
+byte comparison; otherwise validate the decoded record multiset and aggregate
+values instead.
+
+### Physical writer boundaries
+
+Planning derives the writer boundary from the finalized graph, not from how
+many Output nodes appear in the YAML. The same ordering promise is therefore
+enforced at every physical byte-emission path:
+
+- ordinary single-file and split-file record output;
+- one output per physical source file;
+- reconstructed envelope output per document;
+- document DLQ output after the whole document is known to be clean;
+- deferred output per correlation group; and
+- incremental streaming output.
+
+Complete-population modes apply the exact authored key at their population
+boundary using the same bounded-memory spill path. Incremental streaming
+cannot truthfully promise a terminal whole-population sort. If a finalized
+output mode is incompatible with an authored `sort_order`, planning rejects
+the pipeline instead of weakening the promise. The diagnostic names the
+Output, mode, authored keys, and last reordering stage, and includes a corrected
+`sort_order` form that can be pasted into the source or upstream node.
+
 ## File splitting
 
 Split output into multiple files based on record count, byte size, or group boundaries:
@@ -576,7 +624,12 @@ When a single Output sits directly after a `Merge` with `mode: interleave` whose
     path: out.csv
 ```
 
-This is automatic — there is no setting to enable it. It applies only to this exact shape: one interleave Merge of Sources feeding one non-splitting Output, in a pipeline without correlation keys. Any other topology buffers as usual, with identical output either way.
+This is automatic — there is no setting to enable it. It applies only to this
+exact shape: one interleave Merge of Sources feeding one non-splitting Output,
+in a pipeline without correlation keys. Any other topology buffers as usual.
+Both paths preserve the same record multiset and writer semantics, but an
+unseeded interleave does not promise one exact cross-input row sequence. Add an
+Output `sort_order` with a total business key when exact bytes are required.
 
 ## Complete example
 

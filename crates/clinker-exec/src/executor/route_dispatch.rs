@@ -100,7 +100,7 @@ pub(crate) fn dispatch_route(
     let (input_buffer, _input_reservation) =
         input_buffer.into_materialized_parts(&ctx.memory_budget, name)?;
     let (input_records, input_puncts): (
-        Vec<(Record, u64)>,
+        Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::stream_event::Punctuation>,
     ) = input_buffer.drain_split()?;
 
@@ -141,7 +141,10 @@ pub(crate) fn dispatch_route(
     // keyed by branch name. Keeping records per port — rather than unioned per
     // successor — lets a predecessor-slot reader (Merge / Combine) that draws
     // several branches of this Route drain each port's slot separately.
-    let mut branch_records: HashMap<String, Vec<(Record, u64)>> = HashMap::new();
+    let mut branch_records: HashMap<
+        String,
+        Vec<(Record, crate::executor::stream_event::SourceRowId)>,
+    > = HashMap::new();
     for branch in branch_to_succ.keys() {
         branch_records.insert((*branch).to_string(), Vec::new());
     }
@@ -257,7 +260,8 @@ pub(crate) fn dispatch_route(
         let charge = ctx
             .streaming_charge_handle(node_idx, name, spill_allowed)
             .expect("streaming sender implies a registered charge consumer");
-        let merged: Vec<(Record, u64)> = branch_records.into_values().flatten().collect();
+        let merged: Vec<(Record, crate::executor::stream_event::SourceRowId)> =
+            branch_records.into_values().flatten().collect();
         stream_linear_producer_emit(&sender, batch_size, name, merged, input_puncts, &charge)?;
         return Ok(());
     }
@@ -298,13 +302,15 @@ pub(crate) fn dispatch_route(
         // Borrow the branch's record set; it is cloned only at the own-slot
         // admit below (a predecessor-slot reader re-reads it in the second loop
         // instead), so a non-crossing Merge/Combine branch costs no clone here.
-        let records: &[(Record, u64)] = branch_records.get(&branch).map_or(&[], |v| v.as_slice());
+        let records: &[(Record, crate::executor::stream_event::SourceRowId)] =
+            branch_records.get(&branch).map_or(&[], |v| v.as_slice());
         if crosses_into_deferred_consumer(current_dag, node_idx, succ_idx) {
             let row_bytes_each: u64 = records
                 .first()
                 .map(|(rec, _)| {
                     (std::mem::size_of::<Value>() * rec.schema().column_count()
-                        + std::mem::size_of::<(Record, u64)>()) as u64
+                        + std::mem::size_of::<(Record, crate::executor::stream_event::SourceRowId)>(
+                        )) as u64
                 })
                 .unwrap_or(0);
             for (record, rn) in records {

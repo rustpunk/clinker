@@ -118,13 +118,11 @@ nodes:
 
     // Spec is rooted at the Aggregate.
     let spec = &dag.indices_to_build[total_window];
-    match &spec.root {
-        PlanIndexRoot::Node { upstream, .. } => assert_eq!(
-            *upstream, agg_idx,
-            "shared IndexSpec must root at the upstream Aggregate"
-        ),
-        other => panic!("expected PlanIndexRoot::Node, got {other:?}"),
-    }
+    let PlanIndexRoot::Node { upstream, .. } = &spec.root;
+    assert_eq!(
+        *upstream, agg_idx,
+        "shared IndexSpec must root at the upstream Aggregate"
+    );
     assert_eq!(
         spec.group_by,
         vec!["department".to_string()],

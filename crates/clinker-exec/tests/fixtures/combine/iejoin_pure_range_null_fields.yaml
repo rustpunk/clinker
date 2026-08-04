@@ -19,7 +19,7 @@ nodes:
       path: tests/fixtures/combine/data/iejoin_prnf_drivers.csv
       schema:
         - { name: did, type: int }
-        - { name: amount, type: int }
+        - { name: amount, type: { nullable: int } }
   - type: source
     name: bands
     config:
@@ -36,7 +36,7 @@ nodes:
       readings: readings
       bands: bands
     config:
-      where: "readings.amount >= bands.lo and readings.amount < bands.hi"
+      where: "(readings.amount >= bands.lo and readings.amount < bands.hi) ?? false"
       match: first
       on_miss: null_fields
       cxl: |

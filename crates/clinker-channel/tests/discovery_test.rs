@@ -43,7 +43,7 @@ fn tenant_dir(ws: &Path, shard: ShardScheme, id: &str) -> PathBuf {
 }
 
 fn overlay_yaml(target: &str) -> String {
-    format!("channel:\n  target: {target}\nconfig: {{ fraud_check.threshold: 0.9 }}\n")
+    format!("channel:\n  target: {target}\nconfig: {{ fraud_check.threshold: {{ value: 0.9 }} }}\n")
 }
 
 // ── Computed-path resolution ────────────────────────────────────────────
@@ -67,7 +67,10 @@ fn resolves_channel_suffixed_overlay_by_tenant_id() {
     .expect("overlay should be found");
 
     assert_eq!(resolved.kind, OverlayKind::Pipeline);
-    assert_eq!(resolved.path, dir.join("orders.channel.yaml"));
+    assert_eq!(
+        resolved.path,
+        fs::canonicalize(dir.join("orders.channel.yaml")).expect("canonical overlay path")
+    );
     assert_eq!(
         resolved.overlay.channel.target,
         "../../pipeline/orders.yaml"
@@ -278,7 +281,7 @@ fn scan_channels_enumerates_tenant_folders_and_loads_manifests() {
     let globex = tenant_dir(ws.path(), ShardScheme::None, "globex");
     write(
         &globex.join("channel.cfg.yaml"),
-        "channel:\n  name: globex\nlabels: { region: west }\n",
+        "channel:\n  name: globex\n  targets: [test.pipeline]\nlabels: { region: west }\n",
     );
     // acme has no manifest — still a discovered channel.
     tenant_dir(ws.path(), ShardScheme::None, "acme");
@@ -335,15 +338,34 @@ fn scan_channels_absent_root_is_empty() {
 }
 
 #[test]
+fn absolute_channel_root_outside_workspace_is_admitted() {
+    let ws = workspace();
+    let catalog = workspace();
+    let root = catalog.path().join("tenant-catalog");
+    let dir = channel_folder_path(&root, ShardScheme::None, "globex");
+    write(
+        &dir.join("channel.cfg.yaml"),
+        "channel:\n  name: globex\n  targets: [test.pipeline]\n",
+    );
+    let layout = ChannelLayout {
+        root,
+        shard: ShardScheme::None,
+    };
+
+    let channels = scan_channels(&layout, ws.path()).expect("external root should be admitted");
+    assert_eq!(ids(&channels), vec!["globex".to_string()]);
+}
+
+#[test]
 fn scan_groups_enumerates_group_files() {
     let ws = workspace();
     write(
         &ws.path().join("group").join("enterprise.group.yaml"),
-        "group:\n  name: enterprise\n  match: 'tier == \"enterprise\"'\n  priority: 20\n",
+        "group:\n  name: enterprise\n  targets: { pipelines: [test.pipeline] }\n  match: 'tier == \"enterprise\"'\n  priority: 20\n",
     );
     write(
         &ws.path().join("group").join("baseline.group.yaml"),
-        "group:\n  name: baseline\n",
+        "group:\n  name: baseline\n  targets: { pipelines: [test.pipeline] }\n",
     );
     // A non-group file is ignored.
     write(&ws.path().join("group").join("README.md"), "not a group\n");
@@ -383,4 +405,20 @@ fn scan_groups_absent_root_is_empty() {
     let ws = workspace();
     let groups = scan_groups(&group_layout(), ws.path()).expect("scan should succeed");
     assert!(groups.is_empty());
+}
+
+#[test]
+fn absolute_group_root_outside_workspace_is_admitted() {
+    let ws = workspace();
+    let catalog = workspace();
+    let root = catalog.path().join("group-catalog");
+    write(
+        &root.join("enterprise.group.yaml"),
+        "group:\n  name: enterprise\n  targets: { pipelines: [test.pipeline] }\n",
+    );
+    let layout = GroupLayout { root };
+
+    let groups = scan_groups(&layout, ws.path()).expect("external root should be admitted");
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].name, "enterprise");
 }

@@ -251,13 +251,24 @@ fn wrap_with_schema_coercion(
                      Set `on_unmapped: drop` or `reject` to make the policy explicit."
                 );
             }
-            let coercing = crate::pipeline::schema_coerce::CoercingReader::new(
-                reader,
-                &columns,
-                policy,
-                source_name,
-                pretyped,
-            )
+            let coercing = match schema {
+                SourceSchema::MultiRecord { record_types, .. } => {
+                    crate::pipeline::schema_coerce::CoercingReader::new_with_record_types(
+                        reader,
+                        &columns,
+                        record_types,
+                        policy,
+                        source_name,
+                    )
+                }
+                _ => crate::pipeline::schema_coerce::CoercingReader::new(
+                    reader,
+                    &columns,
+                    policy,
+                    source_name,
+                    pretyped,
+                ),
+            }
             .map_err(|e| PipelineError::Compilation {
                 transform_name: source_name.to_string(),
                 messages: vec![format!("schema coercion init error: {e}")],
@@ -420,6 +431,7 @@ fn drive_record_source(
 ) -> Result<IngestTaskOutcome, PipelineError> {
     {
         let mut src_reader = src_reader;
+        let shutdown_for_poll = shutdown_token.clone();
         // Hand the reader its cancellation handle before any read so a
         // network reader can poll `is_requested()` at page/batch
         // boundaries and stop within the shutdown bound. The file arm's
@@ -503,10 +515,19 @@ fn drive_record_source(
             }
         };
 
+        let preserve_empty_physical_files = stream.has_order_barrier();
         let mut stream = stream;
-        let mut rn: u64 = 0;
         let mut total_count: u64 = 0;
         let mut watermark_observations: Vec<(Arc<str>, i64)> = Vec::new();
+        // First successfully decoded body record for the current physical
+        // file, kept together with the exact identity minted for it. A
+        // trailer-level structural failure selects this pair as its DLQ
+        // representative instead of fabricating a later ordinal.
+        let mut file_representative: Option<(
+            Arc<str>,
+            clinker_record::Record,
+            crate::executor::stream_event::SourceRowId,
+        )> = None;
         // Per-file envelope-level stack, outermost (file-level) first.
         //
         // A single-level source (XML, JSON, EDIFACT, plain CSV) holds at
@@ -526,11 +547,31 @@ fn drive_record_source(
         // single source of truth for both the live nesting and the open
         // file's identity.
         let mut doc_stack: Vec<Arc<clinker_record::DocumentContext>> = Vec::new();
+        let mut interrupted = false;
         loop {
+            // Ordered sources do not publish body attempts until the complete
+            // physical file closes. Poll at the ingest boundary as well as in
+            // the dispatcher so cancellation can discard an in-progress
+            // barrier instead of waiting for its whole reader to finish.
+            if shutdown_for_poll
+                .as_ref()
+                .is_some_and(crate::pipeline::shutdown::ShutdownToken::is_requested)
+            {
+                interrupted = true;
+                break;
+            }
             match src_reader.next_record() {
                 Ok(Some(record)) => {
-                    rn += 1;
-                    total_count += 1;
+                    total_count =
+                        total_count
+                            .checked_add(1)
+                            .ok_or_else(|| PipelineError::Internal {
+                                op: "source-ingest-count",
+                                node: src_cfg.name.clone(),
+                                detail: String::from(
+                                    "source record count cannot advance beyond u64::MAX",
+                                ),
+                            })?;
                     let file_arc = src_reader
                         .current_source_file()
                         .cloned()
@@ -557,12 +598,13 @@ fn drive_record_source(
                     // here puts every level opened ahead of this record on
                     // the stack first, and pops every level that closed
                     // before it.
-                    apply_envelope_events(
+                    apply_source_lifecycle_events(
                         &src_cfg,
                         &mut stream,
                         &mut doc_stack,
                         &mut src_reader,
                         &file_arc,
+                        preserve_empty_physical_files,
                     )?;
                     let mut values: Vec<clinker_record::Value> = record.values().to_vec();
                     let event_time_value: clinker_record::Value = if let Some(idx) =
@@ -586,14 +628,42 @@ fn drive_record_source(
                     if let Some(ctx) = doc_stack.last() {
                         widened_record.set_doc_ctx(Arc::clone(ctx));
                     }
+                    let representative_record = file_representative
+                        .as_ref()
+                        .filter(|(representative_file, _, _)| {
+                            Arc::ptr_eq(representative_file, &file_arc)
+                        })
+                        .is_none()
+                        .then(|| widened_record.clone());
                     // A closed channel means the consumer stopped pulling —
                     // a shutdown-token unwind dropped the receiver, or the
                     // downstream finished early. That is a graceful stop, not
                     // a failure: stop producing and return the records pushed
                     // so far. The dispatch side surfaces the interruption (if
                     // any) through `report.interrupted`.
-                    if stream.push(widened_record, rn).is_err() {
-                        break;
+                    match stream.push(widened_record) {
+                        Ok(row_id) => {
+                            if let Some(record) = representative_record {
+                                file_representative = Some((Arc::clone(&file_arc), record, row_id));
+                            }
+                        }
+                        Err(crate::executor::source_stream::SourceStreamError::Closed) => break,
+                        Err(
+                            crate::executor::source_stream::SourceStreamError::OrdinalExhausted {
+                                source,
+                            },
+                        ) => {
+                            return Err(PipelineError::Internal {
+                                op: "source-ingest-identity",
+                                node: src_cfg.name.clone(),
+                                detail: format!(
+                                    "source row identity exhausted for {source}: ordinal cannot advance beyond u64::MAX"
+                                ),
+                            });
+                        }
+                        Err(crate::executor::source_stream::SourceStreamError::OrderViolation(
+                            error,
+                        )) => return Err(*error),
                     }
                 }
                 Ok(None) => {
@@ -613,7 +683,7 @@ fn drive_record_source(
                     // file these trailing events belong to: a header-only
                     // interchange for a NEW file (one whose body produced no
                     // record) points here at that new file, and
-                    // `apply_envelope_events` then transitions to it,
+                    // `apply_source_lifecycle_events` then transitions to it,
                     // closing the prior file's stack first. The static
                     // fallback covers a single-file reader with no
                     // per-record file identity.
@@ -621,14 +691,98 @@ fn drive_record_source(
                         .current_source_file()
                         .cloned()
                         .unwrap_or_else(|| Arc::clone(&static_source_file));
-                    apply_envelope_events(
+                    apply_source_lifecycle_events(
                         &src_cfg,
                         &mut stream,
                         &mut doc_stack,
                         &mut src_reader,
                         &file_arc,
+                        preserve_empty_physical_files,
                     )?;
                     break;
+                }
+                Err(clinker_format::FormatError::DeclaredType(failure)) => {
+                    let clinker_format::error::DeclaredTypeFailure {
+                        source: _,
+                        field,
+                        column,
+                        declared_type,
+                        original_value,
+                        mut original_record,
+                        message,
+                    } = *failure;
+                    total_count =
+                        total_count
+                            .checked_add(1)
+                            .ok_or_else(|| PipelineError::Internal {
+                                op: "source-ingest-count",
+                                node: src_cfg.name.clone(),
+                                detail: String::from(
+                                    "source record count cannot advance beyond u64::MAX",
+                                ),
+                            })?;
+                    let file_arc = src_reader
+                        .current_source_file()
+                        .cloned()
+                        .unwrap_or_else(|| Arc::clone(&static_source_file));
+                    if stack_belongs_to_other_file(&doc_stack, &file_arc) {
+                        open_file_level_doc(
+                            &src_cfg,
+                            &mut stream,
+                            &mut doc_stack,
+                            &mut src_reader,
+                            &file_arc,
+                        )?;
+                    }
+                    apply_source_lifecycle_events(
+                        &src_cfg,
+                        &mut stream,
+                        &mut doc_stack,
+                        &mut src_reader,
+                        &file_arc,
+                        preserve_empty_physical_files,
+                    )?;
+                    if let Some(ctx) = doc_stack.last() {
+                        original_record.set_doc_ctx(Arc::clone(ctx));
+                    }
+                    let row_id = stream.reserve_rejected_row_id().map_err(|err| {
+                        PipelineError::Internal {
+                            op: "source-ingest-identity",
+                            node: src_cfg.name.clone(),
+                            detail: err.to_string(),
+                        }
+                    })?;
+                    let event = crate::executor::dlq::TypeErrorEvent::new(
+                        row_id,
+                        Arc::clone(&source_name_arc),
+                        file_arc,
+                        column,
+                        field,
+                        declared_type,
+                        original_record,
+                        original_value,
+                        message,
+                    );
+                    match stream.push_type_error(event) {
+                        Ok(()) => {}
+                        Err(crate::executor::source_stream::SourceStreamError::Closed) => break,
+                        Err(
+                            crate::executor::source_stream::SourceStreamError::OrdinalExhausted {
+                                source,
+                            },
+                        ) => {
+                            return Err(PipelineError::Internal {
+                                op: "source-ingest-identity",
+                                node: src_cfg.name.clone(),
+                                detail: format!(
+                                    "source row identity exhausted for {source}: ordinal cannot advance beyond u64::MAX"
+                                ),
+                            });
+                        }
+                        Err(crate::executor::source_stream::SourceStreamError::OrderViolation(
+                            error,
+                        )) => return Err(*error),
+                    }
                 }
                 Err(other) => {
                     // Two error classes condemn the WHOLE source file rather
@@ -689,10 +843,7 @@ fn drive_record_source(
                         // with no `MSH`), and a first-record failure whose
                         // prior-file stack was just closed above, leave the
                         // stack empty, so synthesize a file-level context from
-                        // the file grain instead. Either way the representative
-                        // record carries a real (non-synthetic) document id and
-                        // the file's `$source.file` stamp, so the document-DLQ
-                        // reject keys at the file grain.
+                        // the file grain instead.
                         let doc_ctx = doc_stack.last().cloned().unwrap_or_else(|| {
                             Arc::new(clinker_record::DocumentContext::new(
                                 clinker_record::DocumentId::next(),
@@ -700,15 +851,36 @@ fn drive_record_source(
                                 clinker_record::EnvelopeRecord::empty(),
                             ))
                         });
-                        let rep_record = build_representative_record(
-                            &widened_schema,
-                            &doc_ctx,
-                            &file_arc,
-                            &source_name_arc,
-                        );
+                        let (rep_record, rejected_row_id) = match file_representative
+                            .as_ref()
+                            .filter(|(representative_file, _, _)| {
+                                Arc::ptr_eq(representative_file, &file_arc)
+                            }) {
+                            Some((_, record, row_id)) => (record.clone(), *row_id),
+                            None => {
+                                // A zero-body or first-record structural
+                                // failure has no decoded row to select. Only
+                                // that case mints a rejected-attempt identity
+                                // for the synthetic representative.
+                                let record = build_representative_record(
+                                    &widened_schema,
+                                    &doc_ctx,
+                                    &file_arc,
+                                    &source_name_arc,
+                                );
+                                let row_id = stream.reserve_rejected_row_id().map_err(|err| {
+                                    PipelineError::Internal {
+                                        op: "source-ingest-identity",
+                                        node: src_cfg.name.clone(),
+                                        detail: err.to_string(),
+                                    }
+                                })?;
+                                (record, row_id)
+                            }
+                        };
                         let reject = crate::executor::stream_event::StructuralReject {
                             record: rep_record,
-                            row_num: rn.saturating_add(1),
+                            row_num: rejected_row_id,
                             message: other.to_string(),
                         };
                         emit_structural_reject_close(
@@ -739,11 +911,16 @@ fn drive_record_source(
                 }
             }
         }
-        // Close every level still open at end-of-input, innermost first.
-        // This balances both the file-level document and any nested level
-        // a reader left open (a truncated `--dry-run -n` read, or a reader
-        // that opens a level it never explicitly closes).
-        close_open_levels(&mut stream, &mut doc_stack)?;
+        if !interrupted {
+            // Close every level still open at end-of-input, innermost first.
+            // This balances both the file-level document and any nested level
+            // a reader left open (a truncated `--dry-run -n` read, or a reader
+            // that opens a level it never explicitly closes).
+            close_open_levels(&mut stream, &mut doc_stack)?;
+        }
+        // On interruption the still-open ordered barrier is deliberately not
+        // closed: dropping `stream` aborts it, removes partial spill files,
+        // and balances its arbitrator charges without releasing partial data.
         // Drop the sender so the dispatch-side `recv` returns `Err`
         // (channel disconnected) once the channel drains.
         drop(stream);
@@ -788,6 +965,18 @@ fn push_doc_punctuation(
 ) -> Result<(), PipelineError> {
     match stream.push_punctuation(punct) {
         Ok(()) | Err(crate::executor::source_stream::SourceStreamError::Closed) => Ok(()),
+        Err(crate::executor::source_stream::SourceStreamError::OrdinalExhausted { source }) => {
+            Err(PipelineError::Internal {
+                op: "source-ingest-identity",
+                node: String::new(),
+                detail: format!(
+                    "source row identity exhausted for {source}: ordinal cannot advance beyond u64::MAX"
+                ),
+            })
+        }
+        Err(crate::executor::source_stream::SourceStreamError::OrderViolation(error)) => {
+            Err(*error)
+        }
     }
 }
 
@@ -939,14 +1128,15 @@ fn open_file_level_doc(
     Ok(())
 }
 
-/// Apply the reader's pending nested-envelope events to the level stack.
+/// Apply the reader's pending physical-file and nested-envelope events.
 ///
-/// `OpenLevel` mints a child of the current innermost level (flattening
-/// the enclosing sections in) and emits its `DocumentOpen`; `CloseLevel`
-/// pops the innermost nested level and emits its `DocumentClose`. A file
-/// that has not yet opened its file-level document opens it here before
-/// applying any nested event, so an envelope boundary with no preceding
-/// body record still frames the document (issue #395).
+/// Physical-file events bracket every file, including a zero-record file.
+/// `OpenLevel` mints a child of the current innermost level (flattening the
+/// enclosing sections in) and emits its `DocumentOpen`; `CloseLevel` pops the
+/// innermost nested level and emits its `DocumentClose`. A file that has not
+/// yet opened its file-level document opens it here before applying any nested
+/// event, so an envelope boundary with no preceding body record still frames
+/// the document (issue #395).
 ///
 /// A stray `CloseLevel` that would pop the file-level document or
 /// underflow an empty stack is ignored: the file-transition / end-of-input
@@ -957,25 +1147,31 @@ fn open_file_level_doc(
 /// Returns [`PipelineError::Internal`] if opening the file-level document
 /// (when a nested event arrives before any record) triggers an envelope
 /// pre-scan failure.
-fn apply_envelope_events(
+fn apply_source_lifecycle_events(
     src_cfg: &clinker_plan::config::SourceConfig,
     stream: &mut crate::executor::source_stream::SourceIngestChannel,
     doc_stack: &mut Vec<Arc<clinker_record::DocumentContext>>,
     src_reader: &mut Box<dyn crate::source::RecordSource>,
     file_arc: &Arc<str>,
+    preserve_empty_physical_files: bool,
 ) -> Result<(), PipelineError> {
-    for event in src_reader.take_envelope_events() {
+    for event in src_reader.take_source_lifecycle_events() {
         match event {
-            clinker_format::EnvelopeEvent::OpenLevel { sections, frame } => {
-                // Open a fresh file-level document when none is open yet,
-                // or when the open stack belongs to a different file than
-                // this event — a trailing header-only interchange for a new
-                // file (one whose body produced no record) reaches the
-                // driver only through this path, so the file transition
-                // (closing the prior file's stack) must happen here too,
-                // not just on a record boundary. `open_file_level_doc`
-                // closes the stale stack before opening the new one.
-                if stack_belongs_to_other_file(doc_stack, file_arc) {
+            clinker_format::SourceLifecycleEvent::PhysicalFileOpen(event_file) => {
+                if preserve_empty_physical_files
+                    && stack_belongs_to_other_file(doc_stack, &event_file)
+                {
+                    open_file_level_doc(src_cfg, stream, doc_stack, src_reader, &event_file)?;
+                }
+            }
+            clinker_format::SourceLifecycleEvent::Envelope(
+                clinker_format::EnvelopeEvent::OpenLevel { sections, frame },
+            ) => {
+                // A multi-file reader has already supplied its physical open;
+                // direct readers without physical lifecycle events still open
+                // their stable file-level document here before the first
+                // nested boundary.
+                if doc_stack.is_empty() {
                     open_file_level_doc(src_cfg, stream, doc_stack, src_reader, file_arc)?;
                 }
                 let parent = doc_stack.last().expect("file-level document opened above");
@@ -995,7 +1191,9 @@ fn apply_envelope_events(
                 )?;
                 doc_stack.push(child);
             }
-            clinker_format::EnvelopeEvent::CloseLevel => {
+            clinker_format::SourceLifecycleEvent::Envelope(
+                clinker_format::EnvelopeEvent::CloseLevel,
+            ) => {
                 // Keep the file-level document (index 0) — its close is the
                 // file-transition / EOF sweep's job — so only pop a
                 // genuinely nested level.
@@ -1006,6 +1204,15 @@ fn apply_envelope_events(
                         stream,
                         crate::executor::stream_event::Punctuation::document_close(level),
                     )?;
+                }
+            }
+            clinker_format::SourceLifecycleEvent::PhysicalFileClose(event_file) => {
+                if preserve_empty_physical_files
+                    && doc_stack
+                        .first()
+                        .is_some_and(|context| Arc::ptr_eq(context.source_file(), &event_file))
+                {
+                    close_open_levels(stream, doc_stack)?;
                 }
             }
         }
@@ -1524,9 +1731,28 @@ nodes:
         let (stream, rx) = crate::executor::source_stream::SourceIngestChannel::new(
             crate::executor::source_stream::SourceIngestChannel::DEFAULT_CAPACITY,
             handle,
+            <clinker_plan::plan::PlanNodeId as clinker_plan::plan::EntityRef>::new(0),
         );
         drive_record_source(src_cfg, reader, stream, None).expect("drive");
-        rx.iter().collect()
+        rx.iter()
+            .map(|event| match event {
+                crate::executor::source_stream::SourceStreamEvent::Attempt {
+                    event:
+                        crate::executor::source_stream::SourceAttemptEvent::Record(record, row_id),
+                    ..
+                } => StreamEvent::record(record, row_id),
+                crate::executor::source_stream::SourceStreamEvent::Attempt {
+                    event: crate::executor::source_stream::SourceAttemptEvent::TypeError(event),
+                    ..
+                } => panic!("unexpected declared-type failure in envelope fixture: {event:?}"),
+                crate::executor::source_stream::SourceStreamEvent::Punctuation(punctuation) => {
+                    StreamEvent::punctuation(punctuation)
+                }
+                crate::executor::source_stream::SourceStreamEvent::Population(population) => {
+                    panic!("unexpected ordered population in envelope fixture: {population:?}")
+                }
+            })
+            .collect()
     }
 
     /// Drive the script and return the ordered stream of records and document

@@ -447,9 +447,9 @@ nodes:
           - { field: f03, components: 5 }
       schema:
         - { name: seg_id, type: string }
-        - { name: f08_c1, type: string }
-        - { name: f08_c2, type: string }
-        - { name: f03_c1, type: string }
+        - { name: f08_c1, type: { nullable: string } }
+        - { name: f08_c2, type: { nullable: string } }
+        - { name: f03_c1, type: { nullable: string } }
   - type: transform
     name: tag
     input: messages
@@ -549,7 +549,7 @@ nodes:
       glob: ./*.hl7
       schema:
         - { name: seg_id, type: string }
-        - { name: f03, type: string }
+        - { name: f03, type: { nullable: string } }
   - type: transform
     name: tag
     input: messages

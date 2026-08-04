@@ -296,7 +296,6 @@ fn harvest_dlq_events(
     for entry in &ctx.dlq_entries[dlq_len_before..] {
         events.push(DlqEvent {
             source_row: entry.source_row,
-            source_name: std::sync::Arc::clone(&entry.source_name),
         });
     }
 }
@@ -445,15 +444,10 @@ fn recurse_into_body(
         .current_body_node_input_refs
         .replace(bound_body.node_input_refs.clone());
 
-    // Push body context onto the window-runtime stack so any window
-    // dispatched inside the body resolves through the body's overlay
-    // and `region_input_buffers` keys land under
+    // Push body context onto the window-runtime stack so
+    // `region_input_buffers` keys land under
     // `(Some(body_id), edge_id)` — the same key the forward-pass
     // body walker used when it tee'd cross-region inputs.
-    let body_index_count = bound_body.body_indices_to_build.len();
-    let body_window_vec: Vec<Option<crate::executor::window_runtime::WindowRuntime>> =
-        (0..body_index_count).map(|_| None).collect();
-    ctx.window_runtime.bodies.insert(body_id, body_window_vec);
     ctx.window_runtime.active_stack.push(body_id);
 
     // Body-scoped detect + recompute: detect against the body's
@@ -478,16 +472,13 @@ fn recurse_into_body(
     // borrow through the recursive dispatch calls, which the borrow
     // checker rejects.
     type CommitHarvest = (
-        Vec<(Record, u64)>,
+        Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::node_buffer::TransientNodeBufferReservation>,
     );
     let walk_and_harvest: Result<CommitHarvest, PipelineError> = (|| {
         let body_scope = super::detect::detect_retract_scope(ctx, &body_dag);
-        let body_initial_rows: Vec<(u64, std::sync::Arc<str>)> = body_scope
-            .seen_source_rows
-            .iter()
-            .map(|(r, sn)| (*r, std::sync::Arc::clone(sn)))
-            .collect();
+        let body_initial_rows: Vec<super::detect::RetractRow> =
+            body_scope.seen_source_rows.iter().copied().collect();
         super::recompute_agg::recompute_aggregates(
             ctx,
             &body_dag,
@@ -532,7 +523,7 @@ fn recurse_into_body(
         // order-stable (IndexMap); today's bodies declare exactly one
         // port, but draining the full set keeps a future multi-port
         // body covered without an extra code path.
-        let mut harvested: Vec<(Record, u64)> = Vec::new();
+        let mut harvested: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
         let mut harvest_reservations = Vec::new();
         for body_out_idx in bound_body.output_port_to_node_idx.values() {
             let input = require_node_buffer_input(
@@ -583,7 +574,7 @@ fn recurse_into_body(
     // through `top` again, mirroring the forward-pass body executor's
     // exit ordering.
     ctx.window_runtime.active_stack.pop();
-    ctx.window_runtime.bodies.remove(&body_id);
+    ctx.window_runtime.remove_body_scope(bound_body.body_scope);
     ctx.current_body_node_input_refs = saved_body_refs;
     ctx.source_records = saved_combine;
     ctx.node_buffers = saved_buffers;

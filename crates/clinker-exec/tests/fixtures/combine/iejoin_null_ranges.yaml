@@ -1,5 +1,5 @@
-# NULL handling: some employees have null income. CXL ternary logic
-# yields false for null comparisons, so those employees never match
+# NULL handling: some employees have null income. The explicit `?? false`
+# turns a nullable range predicate into false, so those employees never match
 # any bracket. With on_miss: null_fields, unmatched driving rows
 # emit with null bracket fields; the IEJoin pre-pass partitions
 # null-range driving records out before sorting (Polars approach).
@@ -15,7 +15,7 @@ nodes:
       schema:
         - { name: entity_id, type: string }
         - { name: employee_id, type: string }
-        - { name: income, type: int }
+        - { name: income, type: { nullable: int } }
   - type: source
     name: brackets
     config:
@@ -34,7 +34,7 @@ nodes:
       employees: employees
       brackets: brackets
     config:
-      where: "employees.entity_id == brackets.entity_id and employees.income >= brackets.bracket_lo and employees.income < brackets.bracket_hi"
+      where: "(employees.entity_id == brackets.entity_id and employees.income >= brackets.bracket_lo and employees.income < brackets.bracket_hi) ?? false"
       match: first
       on_miss: null_fields
       cxl: |

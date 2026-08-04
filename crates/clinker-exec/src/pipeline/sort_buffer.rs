@@ -8,7 +8,7 @@
 //!
 //! Two ordering modes, chosen at construction:
 //!   - Field-ordered ([`SortBuffer::new`]): the sort key is read from the
-//!     record via [`compare_records_by_fields`] and the payload rides along
+//!     record via [`compare_authored_keys`] and the payload rides along
 //!     inert. Every source/output/DAG/join sort uses this.
 //!   - Payload-ordered ([`SortBuffer::new_payload_ordered`]): pairs order by the
 //!     payload `P: Ord` directly, with no record field consulted. This serves a
@@ -17,9 +17,10 @@
 //!     so the key need not be stamped onto the record as a synthetic field.
 //!
 //! Generic over per-record payload `P`. Source/output sort uses `SortBuffer<()>`;
-//! the DAG enforcer-sort and the sort-merge join carry a `u64` row-order tag as
-//! the payload. Payload travels inside the spill envelope (bundled-tuple sort),
-//! not on a parallel array, to avoid permutation-reindex bugs.
+//! the DAG enforcer-sort carries a `SourceRowId`, while the sort-merge join uses
+//! its own typed ordering payload. Payload travels inside the spill envelope
+//! (bundled-tuple sort), not on a parallel array, to avoid permutation-reindex
+//! bugs.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,7 +30,7 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use clinker_record::{Record, Schema};
 
-use crate::pipeline::sort::compare_records_by_fields;
+use crate::pipeline::sort_key::compare_authored_keys;
 use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_plan::SpillError;
 use clinker_plan::config::SortField;
@@ -50,8 +51,12 @@ pub trait HeapBytes {
 
 impl HeapBytes for () {}
 impl HeapBytes for u64 {}
+impl HeapBytes for crate::executor::stream_event::SourceRowId {}
 impl HeapBytes for (u64, u64) {}
+impl HeapBytes for (u64, crate::executor::stream_event::SourceRowId) {}
+impl HeapBytes for (crate::executor::stream_event::SourceRowId, u64) {}
 impl HeapBytes for (u64, u64, u64) {}
+impl HeapBytes for (crate::executor::stream_event::SourceRowId, u64, u64) {}
 impl HeapBytes for (i64, i64, u64) {}
 
 /// Result of finishing a sort buffer: either all (record, payload) pairs
@@ -65,7 +70,7 @@ pub enum SortedOutput<P> {
 
 /// How a [`SortBuffer`] orders its accumulated pairs.
 enum SortOrdering {
-    /// Order by [`compare_records_by_fields`] over these fields; the record
+    /// Order by [`compare_authored_keys`] over these fields; the record
     /// carries the sort key and the payload rides along inert.
     Fields(Vec<SortField>),
     /// Order by the carried payload `P: Ord` directly, with no record field
@@ -181,7 +186,7 @@ impl<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes> SortBuffer<P> {
         } = self;
         match ordering {
             SortOrdering::Fields(sort_by) => {
-                pairs.par_sort_by(|(a, _), (b, _)| compare_records_by_fields(a, b, sort_by));
+                pairs.par_sort_by(|(a, _), (b, _)| compare_authored_keys(a, b, sort_by));
             }
             SortOrdering::Payload => {
                 pairs.par_sort_by(|(_, a), (_, b)| a.cmp(b));

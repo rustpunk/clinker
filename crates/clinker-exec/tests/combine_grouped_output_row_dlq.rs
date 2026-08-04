@@ -122,7 +122,7 @@ nodes:
             "src_bld".to_string(),
             clinker_exec::executor::SourceInput::Files(vec![slot(
                 "bld",
-                "id,factor\n1,2\n2,0\n3,5\n",
+                "id,factor\n3,5\n1,2\n2,0\n",
             )]),
         ),
     ]);
@@ -170,7 +170,8 @@ nodes:
          the generic correlation-commit stage"
     );
     assert_eq!(
-        driver_entry.source_row, 2,
+        driver_entry.source_row.ordinal(),
+        2,
         "the failing driver source row is id=2's 1-based source row"
     );
 
@@ -178,6 +179,16 @@ nodes:
         .iter()
         .find(|e| e.source_name.as_ref() == "src_bld")
         .expect("matched build row is attributed to src_bld, not the merged source");
+    assert_eq!(
+        build_entry.source_row.ordinal(),
+        3,
+        "the matched build source row keeps id=2's independently ordered source ordinal"
+    );
+    assert_ne!(
+        build_entry.source_row.source(),
+        driver_entry.source_row.source(),
+        "driver and matched build entries retain distinct compiled Source scopes"
+    );
     assert_eq!(
         build_entry.stage.as_deref(),
         Some("combine:enriched"),

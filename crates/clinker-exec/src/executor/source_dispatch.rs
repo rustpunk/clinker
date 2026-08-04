@@ -84,7 +84,7 @@ pub(crate) fn dispatch_source(
     };
 
     let (records, source_puncts, transferred_reservation): (
-        Vec<(Record, u64)>,
+        Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::stream_event::Punctuation>,
         Option<TransientNodeBufferReservation>,
     ) = if has_seeded_own_slot {
@@ -129,7 +129,8 @@ pub(crate) fn dispatch_source(
             .map(|schema| seeded.estimated_materialized_bytes_for_columns(schema.column_count()))
             .unwrap_or_else(|| seeded.estimated_materialized_bytes());
         reservation.reserve_additional(prospective_bytes, name)?;
-        let mut out_records: Vec<(Record, u64)> = Vec::with_capacity(seeded.len_hint());
+        let mut out_records: Vec<(Record, crate::executor::stream_event::SourceRowId)> =
+            Vec::with_capacity(seeded.len_hint());
         let mut out_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
         let has_record_seed = !ctx.record_var_seed.is_empty();
         for event in seeded.drain() {
@@ -159,7 +160,7 @@ pub(crate) fn dispatch_source(
         let timeout = ctx.idle_timeouts.get(name.as_str()).copied();
         let has_record_seed = !ctx.record_var_seed.is_empty();
         let source_name_arc: Arc<str> = Arc::from(name.as_str());
-        let mut drained: Vec<(Record, u64)> = Vec::new();
+        let mut drained: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
         let mut drained_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
         // Tracked so an idle-timeout flips THAT file's
         // partition to `Idle`. Before any record arrives the
@@ -175,7 +176,7 @@ pub(crate) fn dispatch_source(
         // `release_source_consumer` at drain end clears the flag and resumes.
         ctx.activate_source_for_drain(name.as_str());
         loop {
-            let item: Option<crate::executor::stream_event::StreamEvent> = match timeout {
+            let item: Option<crate::executor::source_stream::SourceStreamEvent> = match timeout {
                 Some(t) => match rx.recv_timeout(t) {
                     Ok(item) => Some(item),
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -192,17 +193,19 @@ pub(crate) fn dispatch_source(
                 },
                 None => rx.recv().ok(),
             };
-            match item {
-                Some(crate::executor::stream_event::StreamEvent::Record(record, rn)) => {
+            let consumed = item
+                .map(|event| {
+                    crate::executor::dispatch::consume_source_event(ctx, &source_name_arc, event)
+                })
+                .transpose()?;
+            match consumed {
+                Some(crate::executor::dispatch::ConsumedSourceEvent::Record(record, rn)) => {
                     last_file = source_file_arc_of(&record);
                     let mut rec = canonicalize(&record);
                     if has_record_seed {
                         rec.seed_record_vars(ctx.record_var_seed);
                     }
                     seed_source_vars_for_record(ctx, name.as_str(), &rec)?;
-                    if let Some(slot) = ctx.total_per_source.get_mut(&source_name_arc) {
-                        *slot += 1;
-                    }
                     count += 1;
                     records_since_check += 1;
                     if records_since_check >= 1024 {
@@ -211,13 +214,22 @@ pub(crate) fn dispatch_source(
                     }
                     drained.push((rec, rn));
                 }
-                Some(crate::executor::stream_event::StreamEvent::Punctuation(p)) => {
+                Some(crate::executor::dispatch::ConsumedSourceEvent::Rejected) => {
+                    count += 1;
+                    records_since_check += 1;
+                    if records_since_check >= 1024 {
+                        records_since_check = 0;
+                        ctx.check_shutdown()?;
+                    }
+                }
+                Some(crate::executor::dispatch::ConsumedSourceEvent::Punctuation(p)) => {
                     // Mark a structural-count close failed BEFORE forwarding it,
                     // so the Output arm's per-file buffer rejects the file at
                     // this close rather than flushing it.
                     crate::executor::document_dlq::mark_structural_reject_if_present(ctx, &p);
                     drained_puncts.push(p);
                 }
+                Some(crate::executor::dispatch::ConsumedSourceEvent::Population) => {}
                 None => break,
             }
         }

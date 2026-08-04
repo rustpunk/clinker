@@ -8,6 +8,7 @@
 // surface so `crate::plan::execution::*` paths resolve unchanged.
 
 mod composition;
+mod consumer_registry;
 mod dag;
 mod enforcer;
 mod explain;
@@ -16,6 +17,7 @@ mod scheduling;
 mod streaming_class;
 
 pub use composition::*;
+pub use consumer_registry::*;
 pub use dag::*;
 pub use enforcer::*;
 pub use explain::*;
@@ -23,6 +25,7 @@ pub(crate) use graph_util::{build_id_index, resolve_envelope_header_upstreams_in
 pub use graph_util::{
     compute_init_phase_node_set, resolve_envelope_header_upstreams, single_predecessor,
 };
+pub use scheduling::*;
 pub use streaming_class::{
     StreamClass, certify_streaming_edge, classify_stream_nodes,
     compute_merge_interleave_fused_sources, compute_streaming_aggregate_ingest_edges,
@@ -1338,6 +1341,14 @@ pub(super) fn spill_volume_multiplier(node: &PlanNode) -> u64 {
 pub struct ExecutionPlanDag {
     /// petgraph DAG of PlanNode/PlanEdge.
     pub graph: DiGraph<PlanNode, PlanEdge>,
+    /// Stable, complete consumer enumeration compiled from the finalized
+    /// producer-port graph. Runtime shared-port delivery uses this registry
+    /// instead of recomputing consumer counts by node kind.
+    pub consumer_registry: CompiledConsumerRegistry,
+    /// Immutable ordering evidence compiled after every structural rewrite.
+    /// Runtime source verification and downstream strategy checks borrow this
+    /// value rather than reconstructing typed proof from raw configuration.
+    pub(crate) order_contract: ExecutionOrderContract,
     /// Topologically sorted node indices.
     pub topo_order: Vec<NodeIndex>,
     /// Topologically sorted source tiers for Phase 1 ordering.

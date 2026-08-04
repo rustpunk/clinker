@@ -297,13 +297,14 @@ fn per_source_path_partitions_dlq_entries() {
 
     use clinker_core_types::dlq::DlqErrorCategory;
     use clinker_exec::dlq::partition_dlq_entries;
-    use clinker_exec::executor::DlqEntry;
+    use clinker_exec::executor::{DlqEntry, SourceRowId};
     use clinker_plan::config::{DlqConfig, DlqPerSourceConfig};
+    use clinker_plan::plan::{EntityRef, PlanNodeId};
     use clinker_record::{Record, Schema, Value};
 
     let schema = Arc::new(Schema::new(vec!["id".into()]));
     let mk = |src: &str| DlqEntry {
-        source_row: 0,
+        source_row: SourceRowId::new(PlanNodeId::new(0), 0),
         category: DlqErrorCategory::TypeCoercionFailure,
         error_message: String::new(),
         original_record: Record::new(Arc::clone(&schema), vec![Value::Integer(0)]),

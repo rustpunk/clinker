@@ -52,7 +52,7 @@ fn base_yaml(correlation_key: &str) -> String {
     dlq_fixtures::dlq_validate_pipeline(
         "correlated_test",
         correlation_key,
-        "      - { name: employee_id, type: string }\n      - { name: value, type: string }\n      - { name: dept, type: string }\n\n",
+        "      - { name: employee_id, type: string }\n      - { name: value, type: string }\n      - { name: dept, type: { nullable: string } }\n\n",
     )
 }
 

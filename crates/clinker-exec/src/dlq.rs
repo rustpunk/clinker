@@ -276,7 +276,7 @@ mod tests {
             vec![Value::String(name.into()), Value::String(value.into())],
         );
         DlqEntry {
-            source_row: row,
+            source_row: row.into(),
             category,
             error_message: error.to_string(),
             original_record: record,
@@ -519,7 +519,7 @@ mod tests {
             ],
         );
         let entries = vec![DlqEntry {
-            source_row: 1,
+            source_row: 1.into(),
             category: DlqErrorCategory::TypeCoercionFailure,
             error_message: "err".to_string(),
             original_record: record,
@@ -559,7 +559,7 @@ mod tests {
             .with_field_meta("$source.file", FieldMetadata::SourceFile)
             .build();
         let entry = |record, source_name: &'static str| DlqEntry {
-            source_row: 1,
+            source_row: 1.into(),
             category: DlqErrorCategory::TypeCoercionFailure,
             error_message: "bad value".to_owned(),
             original_record: record,
@@ -670,7 +670,7 @@ mod tests {
             ],
         );
         let entry = DlqEntry {
-            source_row: 1,
+            source_row: 1.into(),
             category: DlqErrorCategory::TypeCoercionFailure,
             error_message: "test".to_string(),
             original_record: record,
@@ -726,7 +726,7 @@ mod tests {
             vec![Value::String("Alice".into()), Value::String("oops".into())],
         );
         let entry = DlqEntry {
-            source_row: 7,
+            source_row: 7.into(),
             category: DlqErrorCategory::TypeCoercionFailure,
             error_message: "cannot convert".to_string(),
             original_record: record,
@@ -755,7 +755,7 @@ mod tests {
                 vec![Value::String("n".into()), Value::String("v".into())],
             );
             DlqEntry {
-                source_row: 0,
+                source_row: 0.into(),
                 category: DlqErrorCategory::TypeCoercionFailure,
                 error_message: String::new(),
                 original_record: rec,
@@ -816,7 +816,7 @@ mod tests {
                 vec![Value::String("n".into()), Value::String("v".into())],
             );
             DlqEntry {
-                source_row: 0,
+                source_row: 0.into(),
                 category: DlqErrorCategory::TypeCoercionFailure,
                 error_message: String::new(),
                 original_record: rec,

@@ -323,12 +323,11 @@ fn eval_unary(op: UnaryOp, v: Value) -> Result<Value, AggregateEvalError> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AggregatorGroupState {
     pub row: AccumulatorRow,
-    /// Minimum `row_num` across every input record folded into this
-    /// group. Initialized to `u64::MAX`; finalize emits this as the
-    /// `SortRow` row-number so downstream sort-stable operators preserve
-    /// the earliest input row's position. The global-fold empty-input
-    /// case emits `0` because no record ever updates this field.
-    pub min_row_num: u64,
+    /// Minimum typed source-row identity across every input record folded
+    /// into this group. `None` is the explicit empty-group state; every
+    /// representable [`SourceRowId`](crate::executor::stream_event::SourceRowId),
+    /// including its maximum value, remains a valid contributor identity.
+    pub representative_row: Option<crate::executor::stream_event::SourceRowId>,
     /// Stable in-memory index of this group within the owning
     /// `HashAggregator.groups` map at insertion time. Populated only on
     /// the lineage path (when `compiled.requires_lineage` is true) so a
@@ -336,17 +335,17 @@ pub struct AggregatorGroupState {
     /// a parallel HashMap. Meaningless after spill+merge — index space
     /// is reassigned by the recovery loop.
     pub group_index: u32,
-    /// Per-group `(input_row_number, source_name)` list. Populated only
+    /// Per-group `(source_row_id, source_name)` list. Populated only
     /// on the lineage path; empty otherwise (an empty `Vec` does not
-    /// allocate). The source name pairs each entry with its originating
-    /// Source so a relaxed-CK retract can scope rewinds per source
-    /// without colliding across the per-source `row_num` namespaces.
+    /// allocate). The typed id is authoritative membership identity; the
+    /// adjacent source name preserves the runtime attribution used for cursor
+    /// rewinds.
     /// Spilled alongside accumulator state so the post-merge
     /// `AggregatorGroupState` preserves which input rows folded into
     /// each group across the round trip; serialization uses serde's
     /// `rc` feature to deserialize `Arc<str>` from owned strings on
     /// recovery.
-    pub input_rows: Vec<(u64, Arc<str>)>,
+    pub input_rows: Vec<(crate::executor::stream_event::SourceRowId, Arc<str>)>,
     /// Per-row evaluated binding values, parallel to `input_rows`.
     /// `retract_values[i]` is the per-binding `Vec<Value>` produced by
     /// the i-th ingested row (in `CompiledAggregate.bindings[]` order),
@@ -366,7 +365,7 @@ impl AggregatorGroupState {
     pub(crate) fn new(row: AccumulatorRow) -> Self {
         Self {
             row,
-            min_row_num: u64::MAX,
+            representative_row: None,
             group_index: 0,
             input_rows: Vec::new(),
             retract_values: Vec::new(),
@@ -395,21 +394,20 @@ impl AggregatorGroupState {
 /// `Vec` either way.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BufferedGroupState {
-    /// Minimum `row_num` across every input record folded into this
-    /// group. Same semantics as `AggregatorGroupState.min_row_num`:
-    /// downstream sort-stable operators key off the earliest input
-    /// row's position.
-    pub min_row_num: u64,
+    /// Minimum typed identity across every input record folded into this
+    /// group. Same explicit-empty semantics as
+    /// [`AggregatorGroupState::representative_row`].
+    pub representative_row: Option<crate::executor::stream_event::SourceRowId>,
     /// Stable in-memory index of this group within
     /// `HashAggregator.buffered_groups` at insertion time, mirroring
     /// the lineage path's group index. Meaningless after spill+merge.
     pub group_index: u32,
-    /// Per-group `(input_row_number, source_name)` list. Mirrors
+    /// Per-group `(source_row_id, source_name)` list. Mirrors
     /// `AggregatorGroupState.input_rows` so the spill-merge concat
     /// round-trips through the same shape on both retraction strategies.
     /// `Arc<str>` deserialization uses serde's `rc` feature (owned
     /// copy on recovery).
-    pub input_rows: Vec<(u64, Arc<str>)>,
+    pub input_rows: Vec<(crate::executor::stream_event::SourceRowId, Arc<str>)>,
     /// Per-row evaluated binding values. `contributions[i][slot]`
     /// holds the value the binding at slot `slot` produced for the
     /// i-th ingested row, in `CompiledAggregate.bindings[]` order.
@@ -419,7 +417,7 @@ pub struct BufferedGroupState {
 impl BufferedGroupState {
     pub(crate) fn new() -> Self {
         Self {
-            min_row_num: u64::MAX,
+            representative_row: None,
             group_index: 0,
             input_rows: Vec::new(),
             contributions: Vec::new(),
@@ -432,7 +430,7 @@ impl BufferedGroupState {
 /// been applied via `Record::set` onto the widened schema. Downstream
 /// nodes resolve field references against the Record directly (no
 /// parallel bookkeeping threading).
-pub type SortRow = (Record, u64);
+pub type SortRow = (Record, crate::executor::stream_event::SourceRowId);
 
 // ---------------------------------------------------------------------------
 // AggregateStream wrapper enum
@@ -490,13 +488,17 @@ impl AggregateStream {
     /// `out` (it defers all emission to `finalize`). The Streaming arm
     /// pushes one finalized `SortRow` into `out` for every key boundary
     /// crossed by this record.
-    pub fn add_record(
+    pub fn add_record<R>(
         &mut self,
         record: &Record,
-        row_num: u64,
+        row_num: R,
         ctx: &EvalContext,
         out: &mut Vec<SortRow>,
-    ) -> Result<(), HashAggError> {
+    ) -> Result<(), HashAggError>
+    where
+        R: Into<crate::executor::stream_event::SourceRowId>,
+    {
+        let row_num = row_num.into();
         match self {
             Self::Hash(h) => {
                 let _ = &out; // Hash defers emission to finalize.
@@ -669,12 +671,12 @@ pub(super) fn eval_binding_arg_value(
 /// * [`MergeState`] — `Input = (Vec<u8>, AggregatorGroupState)`. Each
 ///   call carries an encoded sort key (read by the LoserTree
 ///   comparator) plus the full per-group state: the `AccumulatorRow`
-///   and `min_row_num`. `apply_row` folds the incoming state into the
+///   and `representative_row`. `apply_row` folds the incoming state into the
 ///   currently-open per-group `row` via `AccumulatorEnum::merge`. The
-///   `min_row_num` merge lives on `GroupBoundary::push` because it
+///   `representative_row` merge lives on `GroupBoundary::push` because it
 ///   operates on the open group's full `AggregatorGroupState`, not on
 ///   the `row` alone. The full-state shape (rather than just
-///   `AccumulatorRow`) is required because dropping `min_row_num` on
+///   `AccumulatorRow`) is required because dropping `representative_row` on
 ///   the spill-recovery path would yield a different value than the
 ///   in-memory path, breaking byte-identical finalization.
 pub trait AccumulatorOp: Default + 'static {
@@ -754,7 +756,7 @@ impl AccumulatorOp for MergeState {
     fn apply_row(row: &mut AccumulatorRow, _bindings: &[AggregateBinding], input: &Self::Input) {
         // Merge the incoming `AccumulatorRow` into the currently-open
         // group's row slot-by-slot via `AccumulatorEnum::merge`. The
-        // `min_row_num` lives on `AggregatorGroupState` and is merged
+        // `representative_row` lives on `AggregatorGroupState` and is merged
         // by [`crate::pipeline::streaming_merge::GroupBoundary::push`]
         // when it installs / folds the open group — `apply_row` stays
         // focused on accumulator-row reduction so the two merge
@@ -766,7 +768,7 @@ impl AccumulatorOp for MergeState {
     }
 }
 
-/// Associative merge of per-group `min_row_num` and per-row sidecars.
+/// Associative merge of the per-group representative and per-row sidecars.
 /// Operates on a currently-open group's `AggregatorGroupState` and
 /// folds another state's state in.
 ///
@@ -774,9 +776,13 @@ impl AccumulatorOp for MergeState {
 /// raw-streaming path) and the spill-recovery path can call the
 /// identical reduction logic. Exposed at crate scope for tests.
 pub(crate) fn merge_group_sidecars(dst: &mut AggregatorGroupState, src: AggregatorGroupState) {
-    // `min_row_num`: monotonic min. `u64::MAX` is the identity.
-    if src.min_row_num < dst.min_row_num {
-        dst.min_row_num = src.min_row_num;
+    // `representative_row`: monotonic typed minimum with `None` as identity.
+    if let Some(candidate) = src.representative_row
+        && dst
+            .representative_row
+            .is_none_or(|representative| candidate < representative)
+    {
+        dst.representative_row = Some(candidate);
     }
     // `input_rows`: concatenate. The lineage path is the only producer
     // of non-empty `input_rows`; the strict path leaves both sides
@@ -791,8 +797,12 @@ pub(crate) fn merge_group_sidecars(dst: &mut AggregatorGroupState, src: Aggregat
 /// spill files for the same group key. Mirrors `merge_group_sidecars`
 /// for the buffer-mode path.
 pub(crate) fn merge_buffered_sidecars(dst: &mut BufferedGroupState, src: BufferedGroupState) {
-    if src.min_row_num < dst.min_row_num {
-        dst.min_row_num = src.min_row_num;
+    if let Some(candidate) = src.representative_row
+        && dst
+            .representative_row
+            .is_none_or(|representative| candidate < representative)
+    {
+        dst.representative_row = Some(candidate);
     }
     dst.input_rows.extend(src.input_rows);
     dst.contributions.extend(src.contributions);
@@ -830,7 +840,7 @@ pub(super) fn fold_buffered_state(
     }
     Ok(AggregatorGroupState {
         row,
-        min_row_num: buffered.min_row_num,
+        representative_row: buffered.representative_row,
         group_index: buffered.group_index,
         input_rows: buffered.input_rows,
         // `fold_buffered_state` is the buffer→folded conversion driver
@@ -937,13 +947,17 @@ impl StreamingAggregator<AddRaw> {
     ///    boundary the previous group's finalized `SortRow` lands in
     ///    `self.pending`. A strictly lesser key is routed through
     ///    `HashAggError::SortOrderViolation` → hard abort.
-    pub fn add_record(
+    pub fn add_record<R>(
         &mut self,
         record: &Record,
-        row_num: u64,
+        row_num: R,
         ctx: &EvalContext,
         out: &mut Vec<SortRow>,
-    ) -> Result<(), HashAggError> {
+    ) -> Result<(), HashAggError>
+    where
+        R: Into<crate::executor::stream_event::SourceRowId>,
+    {
+        let row_num = row_num.into();
         if let Some(filter) = &self.pre_agg_filter
             && filter.eval(ctx, record)? != Value::Bool(true)
         {
@@ -985,10 +999,10 @@ impl StreamingAggregator<AddRaw> {
             dispatch_binding(arg, acc, record, ctx)?;
         }
 
-        // Seed `min_row_num` on the fresh per-group state; the boundary
+        // Seed the representative on the fresh per-group state; the boundary
         // detector's merge-peer path keeps the minimum across input
         // records folded into the same open group.
-        state.min_row_num = row_num;
+        state.representative_row = Some(row_num);
 
         // Encode the group-by columns into boundary.current via the
         // owned encoder. We feed it the input record directly.
@@ -1052,7 +1066,10 @@ impl StreamingAggregator<AddRaw> {
         if self.rows_seen == 0 && self.group_by_indices.is_empty() {
             let record =
                 empty_global_fold_row(&self.factory, &self.output_schema, &self.transform_name)?;
-            out.push((record, 0));
+            out.push((
+                record,
+                crate::executor::stream_event::SourceRowId::synthetic(),
+            ));
             return Ok(());
         }
         if !self.pending.is_empty() {
@@ -1161,22 +1178,22 @@ mod accumulator_op_tests {
     // ----- merge_group_sidecars -----
 
     #[test]
-    fn test_merge_sidecars_min_row_num_is_min() {
+    fn test_merge_sidecars_representative_is_typed_minimum() {
         let mut dst = state_with_row(Vec::new());
-        dst.min_row_num = 10;
+        dst.representative_row = Some(10.into());
         let mut src = state_with_row(Vec::new());
-        src.min_row_num = 3;
+        src.representative_row = Some(3.into());
         merge_group_sidecars(&mut dst, src);
-        assert_eq!(dst.min_row_num, 3);
+        assert_eq!(dst.representative_row, Some(3.into()));
     }
 
     #[test]
-    fn test_merge_sidecars_min_row_num_identity_is_u64_max() {
+    fn test_merge_sidecars_none_is_empty_identity() {
         let mut dst = state_with_row(Vec::new());
-        dst.min_row_num = 7;
-        let src = state_with_row(Vec::new()); // min_row_num = u64::MAX
+        dst.representative_row = Some(7.into());
+        let src = state_with_row(Vec::new());
         merge_group_sidecars(&mut dst, src);
-        assert_eq!(dst.min_row_num, 7, "u64::MAX must act as identity");
+        assert_eq!(dst.representative_row, Some(7.into()));
     }
 
     // ----- AccumulatorOp::apply_row: AddRaw -----
@@ -1237,8 +1254,8 @@ mod accumulator_op_tests {
         let st = state_with_row(Vec::new());
         let input: (Vec<u8>, AggregatorGroupState) = (Vec::new(), st);
         assert_input_is_full_state(&input);
-        // Confirm `min_row_num` is addressable on the `Input` type —
+        // Confirm `representative_row` is addressable on the `Input` type —
         // if it is missing this line fails to compile.
-        let _ = input.1.min_row_num;
+        let _ = input.1.representative_row;
     }
 }

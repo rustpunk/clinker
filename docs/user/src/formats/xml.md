@@ -62,7 +62,7 @@ The rules, in full:
   called "" and is rejected.
 
 A value breaking any of these fails at compile time with
-[E363](../../explain/E363.md), before any input is opened. The diagnostic names
+[E363](https://github.com/rustpunk/clinker/blob/main/docs/explain/E363.md), before any input is opened. The diagnostic names
 the corrected path where one can be derived.
 
 ### `record_path` and `xml_path` root differently
@@ -175,7 +175,7 @@ when one is configured); an empty-string value emits a self-closing item element
 
 A `multiple:` column that maps to an **attribute** field (a column whose name
 maps to an XML attribute, e.g. `@tags`, declared `multiple: true`) is rejected at
-compile with [E359](../../explain/E359.md) — an XML attribute holds a single
+compile with [E359](https://github.com/rustpunk/clinker/blob/main/docs/explain/E359.md) — an XML attribute holds a single
 value and cannot repeat, and the writer emits repetition only as child elements.
 A runtime array reaching an attribute field is likewise rejected by the writer.
 
@@ -221,7 +221,7 @@ The two combine into the four arrangements, with no other key:
 `repeat_as` and `wrap_in` must each be a well-formed XML name, validated the same
 way as the `root_element` / `record_element` names. Declaring `join_values` on an
 output format that is neither `csv` nor `xml` is rejected at compile
-([E362](../../explain/E362.md)).
+([E362](https://github.com/rustpunk/clinker/blob/main/docs/explain/E362.md)).
 
 **Round trip.** A document read into a `multiple: true` column with the default
 naming writes back to the identical repeated elements — reading

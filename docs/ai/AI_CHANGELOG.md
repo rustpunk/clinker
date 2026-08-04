@@ -1,6 +1,6 @@
 # AI Changelog
 
-Verified against origin/main cf6609b9 (2026-07-24).
+Verified against working tree 56649661 (2026-07-29).
 
 Purpose: Track architectural decisions, history, and evidence that future AI
 agents should know before changing Clinker.

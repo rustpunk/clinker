@@ -9,8 +9,7 @@
 //!
 //! - `channel/<id>/channel.cfg.yaml` — the per-channel [`manifest`]: identity
 //!   `labels` (which drive group selectors), plus optional channel-wide
-//!   `config`, `vars`, and `overrides` that apply to every pipeline the channel
-//!   runs.
+//!   `config` and `vars` that apply to every pipeline the channel runs.
 //! - `channel/<id>/<target>.channel.yaml` — a per-target [`OverlayFile`]:
 //!   `config` / `vars` clobber, an `overrides:` op stream, and `sources:`
 //!   per-source config patches, all scoped to one pipeline or composition.
@@ -27,7 +26,7 @@
 //! PipelineDefault  <  Group(s) by priority  <  ChannelWide  <  ChannelPerTarget
 //! ```
 //!
-//! `fixed:` locks a value within its layer against every higher-precedence
+//! A leaf whose `fixed: true` locks its value against every higher-precedence
 //! layer.
 //!
 //! ## Two application surfaces
@@ -35,8 +34,9 @@
 //! - **Structural** — the `overrides:` op stream ([`OverlayOp`](clinker_plan::overlay_ops::OverlayOp))
 //!   splices into the base AST *pre-compile* (via `CompileContext::overlay_ops`),
 //!   so the effective DAG is what binds and lowers.
-//! - **Value** — `config:` / `vars:` clobber onto the compiled plan's
-//!   `ProvenanceDb` *post-compile*, with `vars` resolving to runtime values.
+//! - **Value** — every `config:` candidate validates against a typed target
+//!   plan before its winning value folds into executable compilation; the full
+//!   provenance chain and validated runtime `vars` are applied post-compile.
 //!
 //! [`resolve`] ties discovery, group derivation, and both surfaces into one
 //! [`OverlayResolution`] for a `(target, channel?, groups)` invocation; the CLI
@@ -72,16 +72,21 @@ pub use derivation::{
     group_layer,
 };
 pub use discovery::{
-    CHANNEL_MANIFEST_FILE, DiscoveredChannel, OverlayKind, ResolvedOverlay, channel_dir,
-    channel_folder_path, resolve_channel_overlay, scan_channels, scan_groups,
+    CHANNEL_MANIFEST_FILE, ChannelResource, ChannelTarget, DiscoveredChannel, OverlayKind,
+    ResolvedOverlay, channel_dir, channel_folder_path, discover_channel_resource,
+    resolve_channel_overlay, scan_channels, scan_groups,
 };
 pub use dotted::DottedPath;
 pub use error::ChannelError;
-pub use group::Group;
-pub use manifest::{ChannelManifest, ChannelVars, ManifestHeader, OverlayFile, OverlayHeader};
-pub use overlay::ChannelOverlayResult;
+pub use group::{Group, GroupTargetSet, ValidatedGroupTargets, validate_group_targets};
+pub use manifest::{
+    ChannelConfigValue, ChannelManifest, ChannelVarValue, ChannelVars, ManifestHeader,
+    OverlayCandidate, OverlayFile, OverlayHeader, PipelineChannelFile,
+};
+pub use overlay::{ChannelOverlayResult, ResolvedChannelConfig};
 pub use resolve::{
     AppliedGroup, GroupSource, InjectedNode, OverlayResolution, ResolveError, resolve,
+    resolve_target_channel,
 };
 pub use selector::{LabelSelector, SelectorError};
 pub use staging_copy::{

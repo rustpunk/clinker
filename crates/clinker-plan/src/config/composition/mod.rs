@@ -81,7 +81,11 @@ mod raw;
 mod resource;
 mod schema_provenance;
 
-pub use provenance::{LayerKind, ProvenanceDb, ProvenanceLayer, ResolvedValue};
+pub use provenance::{
+    LayerKind, ProvenanceDb, ProvenanceField, ProvenanceKey, ProvenanceLayer,
+    ProvenanceLookupError, ProvenanceMatch, ProvenanceQuery, ProvenanceQueryParseError,
+    ResolvedValue, ScopedNodeAddress, ScopedNodeAddressParseError, ScopedSchemaAddress,
+};
 pub use resource::Resource;
 pub use schema_provenance::{
     PRESENCE_ATTR, SchemaAttr, SchemaLayer, SchemaProvRecorder, SchemaProvenanceDb,

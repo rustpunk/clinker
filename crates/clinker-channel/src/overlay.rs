@@ -22,33 +22,34 @@
 //!   `ProvenanceDb` by composition compile.
 //! - **Group** (selector-derived), **ChannelWide** (`channel.cfg.yaml`
 //!   manifest), and **ChannelPerTarget** (per-target overlay) layers all plug
-//!   into the same [`apply_config_clobber`] engine — it resolves at any
-//!   `LayerKind`, so no layer needs bespoke resolution logic. A `fixed:` value
-//!   locks within its layer against every higher-precedence layer.
+//!   into the same [`apply_config_candidates`] engine — it resolves at any
+//!   `LayerKind`, so no layer needs bespoke resolution logic. A leaf whose
+//!   `fixed: true` locks its value against every higher-precedence layer.
 //!
 //! Also resolves channel-supplied var overrides/adds for the four scoped
 //! registries (`$vars.*`, `$pipeline.*`, `$source.*`, `$record.*`) against the
 //! pipeline's declarations (these flow to the executor as runtime values via
 //! `PipelineRunParams`, not into the AST).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use indexmap::IndexMap;
 
 use clinker_core_types::Span;
 use clinker_core_types::{Diagnostic, LabeledSpan};
 use clinker_plan::config::ConfigOverrides;
-use clinker_plan::config::composition::{LayerKind, ProvenanceDb, ResolvedValue};
+use clinker_plan::config::composition::{
+    LayerKind, ProvenanceDb, ProvenanceLookupError, ProvenanceQuery, ResolvedValue,
+};
 use clinker_plan::config::pipeline_node::{PipelineNode, VarScope};
 use clinker_plan::config::{
-    PipelineConfig, ScopedVarDecl, ScopedVarType, check_scoped_var_default,
-    coerce_scoped_var_default, reserved_names_for,
+    PipelineConfig, ScopedVarType, check_scoped_var_default, coerce_scoped_var_default,
+    reserved_names_for,
 };
 use clinker_record::Value;
 
 use crate::dotted::DottedPath;
-use crate::error::ChannelError;
-use crate::manifest::ChannelVars;
+use crate::manifest::{ChannelVarValue, ChannelVars, OverlayCandidate};
 
 /// Resolved channel overlay output: typed var maps and any diagnostics
 /// raised during validation.
@@ -65,57 +66,147 @@ pub struct ChannelOverlayResult {
     /// applied to every record at materialization.
     pub record_vars: IndexMap<String, Value>,
     pub diagnostics: Vec<Diagnostic>,
+    fixed_vars: HashSet<String>,
 }
 
-/// Clobber a config map onto a plan's provenance as one layer.
+/// Fully folded per-node config produced only after every candidate has been
+/// admitted and validated for the selected target.
 ///
-/// Each `alias.param` key selects a single `(node, param)` provenance entry and
-/// *replaces* its value at `kind` (clobber, never deep-merge). When `fixed` is
-/// set the layer locks its value against every higher-precedence layer.
-///
-/// A key that matches no entry in the compiled plan is a hard error (E113, the
-/// promotion of the former W103 warning): at multi-tenant scale a misspelled
-/// key must fail loudly rather than silently no-op.
-///
-/// Shared by every clobber layer: the channel-wide / channel-per-target layers
-/// applied here, and the group layers applied by the group-derivation path
-/// (see [`crate::derivation`]) — each supplies its own [`LayerKind`], so no
-/// layer needs bespoke resolution logic.
-pub(crate) fn apply_config_clobber(
+/// The inner compiler map stays private so callers cannot accidentally pass
+/// raw channel values across the validated-plan boundary.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedChannelConfig(ConfigOverrides);
+
+impl ResolvedChannelConfig {
+    /// Borrow the validated compiler overrides for inspection.
+    pub fn compile_overrides(&self) -> &ConfigOverrides {
+        &self.0
+    }
+
+    /// Consume this validated artifact into the compiler's input map.
+    pub fn into_compile_overrides(self) -> ConfigOverrides {
+        self.0
+    }
+}
+
+/// Validate every authored candidate before adding it to provenance. Invalid
+/// candidates never disappear merely because a later layer would win.
+pub(crate) fn apply_config_candidates(
     provenance: &mut ProvenanceDb,
-    config: &IndexMap<DottedPath, serde_json::Value>,
+    config: &IndexMap<String, OverlayCandidate<serde_json::Value>>,
     kind: LayerKind,
-    fixed: bool,
-    channel_name: &str,
+    source_name: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    for (dotted_path, value) in config {
-        let (node_name, param_name) = match dotted_path.segments() {
-            (Some(alias), param) => (alias, param),
-            (None, param) => ("", param),
+    for (name, candidate) in config {
+        let span = Span::line_only(candidate.value_span.line() as u32);
+        let Ok(dotted) = DottedPath::try_from(name.as_str()) else {
+            diagnostics.push(Diagnostic::error(
+                "E113",
+                format!(
+                    "overlay {source_name:?}: config key {name:?} is not a valid composition parameter address"
+                ),
+                LabeledSpan::primary(span, "invalid config key"),
+            ));
+            continue;
         };
-
-        match provenance.get_mut(node_name, param_name) {
-            Some(resolved) => {
-                if fixed {
-                    resolved.apply_layer_fixed(value.clone(), kind, Span::SYNTHETIC);
-                } else {
-                    resolved.apply_layer(value.clone(), kind, Span::SYNTHETIC);
-                }
-            }
-            None => {
+        let Ok(query) = ProvenanceQuery::parse(dotted.as_str()) else {
+            diagnostics.push(Diagnostic::error(
+                "E113",
+                format!("overlay {source_name:?}: config key {name:?} must use `alias.parameter`"),
+                LabeledSpan::primary(span, "invalid config key"),
+            ));
+            continue;
+        };
+        let key = match provenance.resolve_query_key(&query).cloned() {
+            Ok(key) => key,
+            Err(ProvenanceLookupError::Unknown { .. }) => {
                 diagnostics.push(Diagnostic::error(
                     "E113",
                     format!(
-                        "channel {:?}: config key {:?} does not match any \
-                         composition parameter in the compiled plan",
-                        channel_name,
-                        dotted_path.as_str(),
+                        "overlay {source_name:?}: config key {name:?} does not match any composition parameter in the selected pipeline"
                     ),
-                    LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                    LabeledSpan::primary(span, "unknown config candidate"),
                 ));
+                continue;
             }
+            Err(ProvenanceLookupError::Ambiguous { candidates }) => {
+                let candidates = candidates
+                    .into_iter()
+                    .map(|candidate| candidate.render())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                diagnostics.push(Diagnostic::error(
+                    "E118",
+                    format!(
+                        "overlay {source_name:?}: config key {name:?} is ambiguous; use one of: {candidates}"
+                    ),
+                    LabeledSpan::primary(span, "ambiguous config candidate"),
+                ));
+                continue;
+            }
+        };
+        let Some(resolved) = provenance.get_by_key_mut(&key) else {
+            continue;
+        };
+        let expected = resolved
+            .layer_value(LayerKind::PipelineDefault)
+            .unwrap_or(&resolved.value);
+        if !same_json_type(expected, &candidate.value) {
+            diagnostics.push(Diagnostic::error(
+                "E103",
+                format!(
+                    "overlay {source_name:?}: config candidate {name:?} has type {}, but the declared parameter has type {}",
+                    json_type(&candidate.value),
+                    json_type(expected),
+                ),
+                LabeledSpan::primary(span, "type-mismatched config candidate"),
+            ));
+            continue;
         }
+        if resolved
+            .provenance
+            .iter()
+            .any(|layer| layer.fixed && layer.kind < kind)
+        {
+            diagnostics.push(Diagnostic::error(
+                "E103",
+                format!(
+                    "overlay {source_name:?}: config candidate {name:?} cannot override a fixed lower-precedence value"
+                ),
+                LabeledSpan::primary(span, "override forbidden by fixed value"),
+            ));
+            continue;
+        }
+        if candidate.fixed {
+            resolved.apply_layer_fixed(candidate.value.clone(), kind, span);
+        } else {
+            resolved.apply_layer(candidate.value.clone(), kind, span);
+        }
+    }
+}
+
+fn same_json_type(expected: &serde_json::Value, candidate: &serde_json::Value) -> bool {
+    expected.is_null()
+        || candidate.is_null()
+        || matches!(
+            (expected, candidate),
+            (serde_json::Value::Bool(_), serde_json::Value::Bool(_))
+                | (serde_json::Value::Number(_), serde_json::Value::Number(_))
+                | (serde_json::Value::String(_), serde_json::Value::String(_))
+                | (serde_json::Value::Array(_), serde_json::Value::Array(_))
+                | (serde_json::Value::Object(_), serde_json::Value::Object(_))
+        )
+}
+
+fn json_type(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -126,10 +217,9 @@ pub(crate) fn apply_config_clobber(
 /// Reuses the same [`ResolvedValue`] winner logic the post-compile
 /// [`ProvenanceDb`] path uses, applied in the identical ascending-precedence
 /// order (`apply_config_and_vars`: groups → channel-wide → per-target; the
-/// legacy binding: `config.default` → `config.fixed`). Resolving the fold value
-/// and the rendered provenance from the same layer machinery keeps the executed
-/// value and the `channels resolve` / `explain --field` `[WON]` layer in
-/// agreement.
+/// leaf binding. Resolving the fold value and rendered provenance from the same
+/// layer machinery keeps the executed value and the `channels resolve` /
+/// `explain --field` `[WON]` layer in agreement.
 #[derive(Default)]
 pub(crate) struct EffectiveConfig {
     winners: HashMap<(String, String), ResolvedValue<serde_json::Value>>,
@@ -141,16 +231,15 @@ impl EffectiveConfig {
     /// single-segment key targets no composition node and never folds.
     pub(crate) fn apply(
         &mut self,
-        config: &IndexMap<String, serde_json::Value>,
+        config: &IndexMap<String, OverlayCandidate<serde_json::Value>>,
         kind: LayerKind,
-        fixed: bool,
     ) {
-        for (key, value) in config {
+        for (key, candidate) in config {
             let Ok(dotted) = DottedPath::try_from(key.as_str()) else {
                 continue;
             };
             if let (Some(node), param) = dotted.segments() {
-                self.insert(node, param, value, kind, fixed);
+                self.insert(node, param, &candidate.value, kind, candidate.fixed);
             }
         }
     }
@@ -187,29 +276,13 @@ impl EffectiveConfig {
 
     /// Collapse to the per-node winning values for
     /// [`CompileContext::config_overrides`](clinker_plan::config::CompileContext).
-    pub(crate) fn into_overrides(self) -> ConfigOverrides {
+    pub(crate) fn into_resolved(self) -> ResolvedChannelConfig {
         let mut out = ConfigOverrides::new();
         for ((node, param), rv) in self.winners {
             out.entry(node).or_default().insert(param, rv.value);
         }
-        out
+        ResolvedChannelConfig(out)
     }
-}
-
-/// Validate a raw `alias.param` config map into [`DottedPath`] keys, cloning
-/// the values. The first malformed key fails the whole map.
-///
-/// Shared by the channel-folder resolution ([`crate::resolve`]) so the
-/// channel-wide (`channel.cfg.yaml`) and per-target (`<target>.channel.yaml`)
-/// `config:` maps — which keep raw string keys at parse time — validate through
-/// the same [`DottedPath`] grammar the group and per-target layers already use.
-pub(crate) fn validate_config_keys(
-    config: &IndexMap<String, serde_json::Value>,
-) -> Result<IndexMap<DottedPath, serde_json::Value>, ChannelError> {
-    config
-        .iter()
-        .map(|(key, value)| Ok((DottedPath::try_from(key.as_str())?, value.clone())))
-        .collect()
 }
 
 /// Resolve one overlay layer's [`ChannelVars`] against the pipeline's declared
@@ -227,30 +300,99 @@ pub(crate) fn resolve_vars_layer(
     config: &PipelineConfig,
     out: &mut ChannelOverlayResult,
 ) {
-    out.static_vars.extend(resolve_static_overrides(
+    let static_values = resolve_static_overrides(
         source_label,
         &vars.static_scope,
         config,
         &mut out.diagnostics,
-    ));
-    out.pipeline_vars.extend(resolve_scoped_overrides(
+    );
+    merge_var_layer(
+        source_label,
+        "static",
+        &vars.static_scope,
+        static_values,
+        &mut out.static_vars,
+        &mut out.fixed_vars,
+        &mut out.diagnostics,
+    );
+    let pipeline_values = resolve_scoped_overrides(
         source_label,
         &vars.pipeline,
         config,
         VarScope::Pipeline,
         &mut out.diagnostics,
-    ));
-    out.record_vars.extend(resolve_scoped_overrides(
+    );
+    merge_var_layer(
+        source_label,
+        "pipeline",
+        &vars.pipeline,
+        pipeline_values,
+        &mut out.pipeline_vars,
+        &mut out.fixed_vars,
+        &mut out.diagnostics,
+    );
+    let record_values = resolve_scoped_overrides(
         source_label,
         &vars.record,
         config,
         VarScope::Record,
         &mut out.diagnostics,
-    ));
-    for (src, inner) in
+    );
+    merge_var_layer(
+        source_label,
+        "record",
+        &vars.record,
+        record_values,
+        &mut out.record_vars,
+        &mut out.fixed_vars,
+        &mut out.diagnostics,
+    );
+    for (source, values) in
         resolve_source_overrides(source_label, &vars.source, config, &mut out.diagnostics)
     {
-        out.source_vars.entry(src).or_default().extend(inner);
+        let Some(candidates) = vars.source.get(&source) else {
+            continue;
+        };
+        let destination = out.source_vars.entry(source.clone()).or_default();
+        merge_var_layer(
+            source_label,
+            &format!("source.{source}"),
+            candidates,
+            values,
+            destination,
+            &mut out.fixed_vars,
+            &mut out.diagnostics,
+        );
+    }
+}
+
+fn merge_var_layer(
+    source_label: &str,
+    scope: &str,
+    candidates: &IndexMap<String, ChannelVarValue>,
+    values: IndexMap<String, Value>,
+    destination: &mut IndexMap<String, Value>,
+    fixed_vars: &mut HashSet<String>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (name, value) in values {
+        let key = format!("{scope}.{name}");
+        let candidate = &candidates[&name];
+        let span = candidate_value_span(candidate);
+        if fixed_vars.contains(&key) {
+            diagnostics.push(Diagnostic::error(
+                "E103",
+                format!(
+                    "overlay {source_label:?}: variable candidate `{key}` cannot override a fixed lower-precedence value"
+                ),
+                LabeledSpan::primary(span, "override forbidden by fixed value"),
+            ));
+            continue;
+        }
+        destination.insert(name, value);
+        if candidate.fixed {
+            fixed_vars.insert(key);
+        }
     }
 }
 
@@ -301,7 +443,7 @@ fn declared_source_node_names(config: &PipelineConfig) -> Vec<String> {
 /// [`resolve_scoped_overrides`].
 fn resolve_static_overrides(
     channel_name: &str,
-    overrides: &IndexMap<String, ScopedVarDecl>,
+    overrides: &IndexMap<String, ChannelVarValue>,
     config: &PipelineConfig,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> IndexMap<String, Value> {
@@ -327,7 +469,7 @@ fn resolve_static_overrides(
 /// shared namespaces with reserved-name guards.
 fn resolve_scoped_overrides(
     channel_name: &str,
-    overrides: &IndexMap<String, ScopedVarDecl>,
+    overrides: &IndexMap<String, ChannelVarValue>,
     config: &PipelineConfig,
     scope: VarScope,
     diagnostics: &mut Vec<Diagnostic>,
@@ -361,7 +503,7 @@ fn resolve_scoped_overrides(
 /// [`resolve_scoped_overrides`] for `Source` scope.
 fn resolve_source_overrides(
     channel_name: &str,
-    overrides: &IndexMap<String, IndexMap<String, ScopedVarDecl>>,
+    overrides: &IndexMap<String, IndexMap<String, ChannelVarValue>>,
     config: &PipelineConfig,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> IndexMap<String, IndexMap<String, Value>> {
@@ -370,6 +512,11 @@ fn resolve_source_overrides(
     let mut out: IndexMap<String, IndexMap<String, Value>> = IndexMap::new();
     for (src_name, inner) in overrides {
         if !declared_sources.iter().any(|n| n == src_name) {
+            let span = inner
+                .values()
+                .next()
+                .map(candidate_type_span)
+                .unwrap_or(Span::SYNTHETIC);
             diagnostics.push(Diagnostic::error(
                 "E118",
                 format!(
@@ -378,7 +525,7 @@ fn resolve_source_overrides(
                     src_name,
                     declared_sources.join(", "),
                 ),
-                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+                LabeledSpan::primary(span, "source override declared here"),
             ));
             continue;
         }
@@ -411,7 +558,7 @@ fn validate_and_coerce(
     channel_name: &str,
     scope_label: &str,
     var_name: &str,
-    decl: &ScopedVarDecl,
+    decl: &ChannelVarValue,
     declared_type: Option<ScopedVarType>,
     reserved_scope: Option<VarScope>,
     diagnostics: &mut Vec<Diagnostic>,
@@ -425,7 +572,7 @@ fn validate_and_coerce(
                 "channel {:?}: var ${}.{} shadows reserved system field",
                 channel_name, scope_label, var_name,
             ),
-            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            LabeledSpan::primary(candidate_type_span(decl), "reserved variable name"),
         ));
         return None;
     }
@@ -439,7 +586,7 @@ fn validate_and_coerce(
                 "channel {:?}: var ${}.{} override type mismatch — declared {:?}, override declared {:?}",
                 channel_name, scope_label, var_name, declared, decl.var_type,
             ),
-            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            LabeledSpan::primary(candidate_type_span(decl), "type declared here"),
         ));
         return None;
     }
@@ -454,10 +601,24 @@ fn validate_and_coerce(
                 "channel {:?}: var ${}.{} default does not match type {:?}: {e}",
                 channel_name, scope_label, var_name, decl.var_type,
             ),
-            LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            LabeledSpan::primary(candidate_value_span(decl), "default declared here"),
         ));
         return None;
     }
 
     Some(coerce_scoped_var_default(decl.var_type, default))
+}
+
+fn candidate_type_span(candidate: &ChannelVarValue) -> Span {
+    Span::line_only(candidate.type_span.line() as u32)
+}
+
+fn candidate_value_span(candidate: &ChannelVarValue) -> Span {
+    Span::line_only(
+        candidate
+            .default_span
+            .or(candidate.fixed_span)
+            .unwrap_or(candidate.type_span)
+            .line() as u32,
+    )
 }

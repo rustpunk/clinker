@@ -263,6 +263,33 @@ mod tests {
     }
 
     #[test]
+    fn decimal_constraints_fail_in_the_fixed_width_reader() {
+        fn decimal_field() -> Column {
+            Column {
+                start: Some(0),
+                width: Some(6),
+                precision: Some(4),
+                scale: Some(2),
+                ..Column::bare("amount", Type::Decimal)
+            }
+        }
+
+        for (input, expected) in [
+            (&b"12.345\n"[..], "requires rounding"),
+            (&b"123.45\n"[..], "precision 4"),
+        ] {
+            let mut reader = FixedWidthReader::new(
+                input,
+                vec![decimal_field()],
+                FixedWidthReaderConfig::default(),
+            )
+            .unwrap();
+            let error = reader.next_record().unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
     fn test_fixedwidth_read_basic() {
         // "00042Alice               20240115"
         //  ^^^^^ id (0..5, int)

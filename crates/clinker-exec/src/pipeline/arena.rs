@@ -153,8 +153,8 @@ impl Arena {
     /// `ArenaError::MemoryBudgetExceeded` with the totals at the
     /// moment of failure. The shared budget is what makes the source
     /// arena + N node-rooted arenas fit under one declared limit.
-    pub fn from_records(
-        rows: &[(clinker_record::Record, u64)],
+    pub fn from_records<R>(
+        rows: &[(clinker_record::Record, R)],
         fields: &[String],
         anchor_schema: &Arc<Schema>,
         budget: &MemoryArbitrator,

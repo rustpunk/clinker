@@ -31,8 +31,10 @@ pub struct ResolvedField {
     pub width: usize,
     pub ty: Type,
     pub format: Option<String>,
-    /// Decimal scale (fractional digits) a `decimal` column is rounded to at
-    /// parse; `None` for non-decimal columns and unscaled decimals.
+    /// Decimal precision (total digits) enforced at parse.
+    pub precision: Option<u8>,
+    /// Decimal scale (fractional digits) enforced exactly at parse; values
+    /// requiring rounding are rejected.
     pub scale: Option<u8>,
     pub justify: Option<Justify>,
     pub pad: String,
@@ -72,6 +74,7 @@ impl ResolvedField {
             width,
             ty: f.ty.clone(),
             format: f.format.clone(),
+            precision: f.precision,
             scale: f.scale,
             justify: f.justify.clone(),
             pad: f.pad.clone().unwrap_or_else(|| " ".into()),
@@ -291,12 +294,17 @@ pub fn extract_split_value(
     let parts = raw
         .split(delimiter)
         .map(|part| {
-            coerce_scalar(&field.ty, field.format.as_deref(), field.scale, part).map_err(
-                |message| FormatError::InvalidRecord {
-                    row,
-                    message: with_field(&field.name, &message),
-                },
+            coerce_scalar_with_constraints(
+                &field.ty,
+                field.format.as_deref(),
+                field.precision,
+                field.scale,
+                part,
             )
+            .map_err(|message| FormatError::InvalidRecord {
+                row,
+                message: with_field(&field.name, &message),
+            })
         })
         .collect::<Result<Vec<Value>, _>>()?;
     Ok(Value::Array(parts))
@@ -402,11 +410,16 @@ pub fn parse_field_value(field: &ResolvedField, raw: &str, row: u64) -> Result<V
     if raw.is_empty() {
         return Ok(Value::Null);
     }
-    coerce_scalar(&field.ty, field.format.as_deref(), field.scale, raw).map_err(|message| {
-        FormatError::InvalidRecord {
-            row,
-            message: with_field(&field.name, &message),
-        }
+    coerce_scalar_with_constraints(
+        &field.ty,
+        field.format.as_deref(),
+        field.precision,
+        field.scale,
+        raw,
+    )
+    .map_err(|message| FormatError::InvalidRecord {
+        row,
+        message: with_field(&field.name, &message),
     })
 }
 
@@ -439,26 +452,57 @@ pub fn coerce_scalar(
     scale: Option<u8>,
     raw: &str,
 ) -> Result<Value, String> {
+    coerce_scalar_with_constraints(ty, format, None, scale, raw)
+}
+
+/// Coerce a positional scalar while enforcing authored decimal constraints.
+pub fn coerce_scalar_with_constraints(
+    ty: &Type,
+    format: Option<&str>,
+    precision: Option<u8>,
+    scale: Option<u8>,
+    raw: &str,
+) -> Result<Value, String> {
     match ty.unwrap_nullable() {
         Type::Int => raw
             .parse::<i64>()
             .map(Value::Integer)
             .map_err(|e| format!("cannot parse '{raw}' as int: {e}")),
-        Type::Float => raw
-            .parse::<f64>()
-            .map(Value::Float)
-            .map_err(|e| format!("cannot parse '{raw}' as float: {e}")),
-        // Exact base-10 parse into `Value::Decimal`, rounded to the column
-        // `scale` (banker's rounding). Never routed through a binary float.
+        Type::Float => parse_finite_float(raw).map(Value::Float),
+        // Exact base-10 parse into `Value::Decimal`. Never route through a
+        // binary float and never round to satisfy the authored scale.
         Type::Decimal => {
-            clinker_record::coercion::coerce_to_decimal(&Value::String(raw.into()), scale)
-                .map_err(|e| e.to_string())
+            let parsed =
+                clinker_record::coercion::coerce_to_decimal(&Value::String(raw.into()), None)
+                    .map_err(|e| e.to_string())?;
+            let Value::Decimal(decimal) = parsed else {
+                return Err("decimal coercion returned a non-decimal value".into());
+            };
+            let mut exact = decimal;
+            if let Some(scale) = scale {
+                let rounded =
+                    clinker_record::coercion::round_decimal_to_scale(decimal, Some(scale));
+                if rounded != decimal {
+                    return Err(format!(
+                        "decimal requires rounding to declared scale {scale}"
+                    ));
+                }
+                exact.rescale(u32::from(scale));
+            }
+            if let Some(max_digits) = precision {
+                let digits = exact.mantissa().unsigned_abs().to_string().len();
+                if digits > usize::from(max_digits) {
+                    return Err(format!(
+                        "decimal uses {digits} digits, exceeding declared precision {max_digits}"
+                    ));
+                }
+            }
+            Ok(Value::Decimal(exact))
         }
         Type::Numeric => raw
             .parse::<i64>()
             .map(Value::Integer)
-            .or_else(|_| raw.parse::<f64>().map(Value::Float))
-            .map_err(|e| format!("cannot parse '{raw}' as number: {e}")),
+            .or_else(|_| parse_finite_float(raw).map(Value::Float)),
         Type::Bool => match raw.to_ascii_lowercase().as_str() {
             "true" | "1" | "yes" | "y" => Ok(Value::Bool(true)),
             "false" | "0" | "no" | "n" => Ok(Value::Bool(false)),
@@ -492,6 +536,18 @@ pub fn coerce_scalar(
         ),
         _ => Ok(Value::String(raw.into())),
     }
+}
+
+fn parse_finite_float(raw: &str) -> Result<f64, String> {
+    let number = raw
+        .parse::<f64>()
+        .map_err(|e| format!("cannot parse '{raw}' as float: {e}"))?;
+    if !number.is_finite() {
+        return Err(format!(
+            "non-finite number '{raw}' is outside the declared type"
+        ));
+    }
+    Ok(number)
 }
 
 /// Prefix a coercion message with the offending field name.
@@ -650,17 +706,28 @@ mod tests {
     }
 
     #[test]
-    fn coerce_scalar_decimal_parses_exactly_and_rounds_to_scale() {
+    fn coerce_scalar_decimal_requires_exact_scale_and_precision() {
         // Exact base-10 parse (never via f64): "12.50" is exactly 12.50, and
         // Display preserves the column scale.
         let v = coerce_scalar(&Type::Decimal, None, Some(2), "12.50").unwrap();
         assert!(matches!(v, Value::Decimal(_)));
         assert_eq!(v.to_string(), "12.50");
-        // Rounds to the column scale (banker's): "2.125" at scale 2 -> 2.12.
-        let r = coerce_scalar(&Type::Decimal, None, Some(2), "2.125").unwrap();
-        assert_eq!(r.to_string(), "2.12");
+        // The reader is the proof-producing boundary: values that would need
+        // rounding are rejected rather than silently substituted.
+        let rounding = coerce_scalar(&Type::Decimal, None, Some(2), "2.125").unwrap_err();
+        assert!(rounding.contains("requires rounding"), "{rounding}");
+        let overflow =
+            coerce_scalar_with_constraints(&Type::Decimal, None, Some(4), Some(2), "123.45")
+                .unwrap_err();
+        assert!(overflow.contains("precision 4"), "{overflow}");
         // A non-numeric decimal field is a loud parse error.
         assert!(coerce_scalar(&Type::Decimal, None, Some(2), "abc").is_err());
+    }
+
+    #[test]
+    fn coerce_scalar_rejects_non_finite_numbers() {
+        assert!(coerce_scalar(&Type::Float, None, None, "NaN").is_err());
+        assert!(coerce_scalar(&Type::Numeric, None, None, "inf").is_err());
     }
 
     #[test]

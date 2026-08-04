@@ -127,7 +127,7 @@ pub(crate) struct WindowedEvalCtx<'a> {
 /// `window_index` indexes `plan.indices_to_build`.
 ///
 /// The caller resolves `runtime` via
-/// `ctx.window_runtime.resolve(&spec.root, window_index)` and is
+/// the exact body runtime key (or top-level slot) and is
 /// responsible for surfacing `PipelineError::Internal` if `resolve`
 /// returns `None` — at this point in the dispatch arm the upstream
 /// operator has already finalized its emit, so a missing runtime is
@@ -136,7 +136,7 @@ pub(crate) struct WindowedEvalCtx<'a> {
 /// `record_pos` is the record's position in the arena, derived by the
 /// caller from the spec's root: `(rn - 1)` for `Source(_)` roots
 /// (Phase-0 materializes source records in row-number order), or the
-/// per-record enumerate index for `Node{..}` and `ParentNode{..}` roots
+/// per-record enumerate index for node-rooted windows
 /// (the upstream operator's emit order is the arena's order).
 ///
 /// If the record's group-by values do not resolve to a partition (null
