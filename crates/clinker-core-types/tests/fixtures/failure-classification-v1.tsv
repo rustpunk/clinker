@@ -21,6 +21,12 @@ attempt.publication.registration_failed	publication	policy_required
 attempt.publication.finalization_failed	publication	retry_with_backoff
 attempt.publication.manifest_failed	publication	retry_with_backoff
 attempt.publication.promotion_failed	publication	policy_required
+attempt.retention.ownership_refused	security_policy	policy_required
+attempt.retention.manifest_invalid	security_policy	policy_required
+attempt.retention.live	publication	policy_required
+attempt.retention.clock_ambiguous	publication	policy_required
+attempt.retention.budget_exhausted	publication	retry_with_backoff
+attempt.retention.cleanup_failed	infrastructure	retry_with_backoff
 observability.configuration.invalid	observability	do_not_retry
 observability.configuration.policy_required	observability	policy_required
 observability.delivery.failed	observability	retry_with_backoff

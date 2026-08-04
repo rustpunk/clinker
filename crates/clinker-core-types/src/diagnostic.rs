@@ -20,6 +20,9 @@
 //!   that a source scan cannot see, as well as an error code emitted as a
 //!   warning or vice versa.
 
+use std::path::{Component, Path};
+
+use crate::failure::{FailureCategory, FailureClassification, RetryAdvice};
 use crate::span::{FileId, Span};
 
 /// One row of the diagnostic-code registry.
@@ -225,6 +228,8 @@ diagnostic_registry! {
     "E366", Error, "A declared-sorted source has nested, repeated, inherited, or otherwise non-sortable per-file framing";
     "E368", Error, "Declared source-type error fraction exceeded `error_handling.type_error_threshold`";
     "E370", Error, "A pipeline combines document-level DLQ with correlation-key rejection, whose distinct atomic populations cannot share one physical writer boundary";
+    "E371", Error, "Unsafe or invalid retained attempt refused";
+    "E372", Error, "Attempt cleanup incomplete or budget exhausted";
     // ── Path security ───────────────────────────────────────────────────
     "E-SEC-001", Error, "Path security violation (escape, symlink, etc.)";
     // ── Warnings ────────────────────────────────────────────────────────
@@ -260,6 +265,235 @@ pub enum Severity {
     Error,
     Warning,
     Note,
+}
+
+/// Operator action that produced an attempt-publication diagnostic.
+///
+/// The variants and [`AttemptOperation::as_str`] spellings are stable so the
+/// CLI can render the same logical operation in human and machine output.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum AttemptOperation {
+    /// Finalize or publish one execution attempt.
+    Publication,
+    /// Enumerate retained attempts.
+    List,
+    /// Inspect one retained attempt.
+    Inspect,
+    /// Preview or execute retained-attempt cleanup.
+    Purge,
+}
+
+impl AttemptOperation {
+    /// Return the stable machine spelling for this operation.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Publication => "publication",
+            Self::List => "list",
+            Self::Inspect => "inspect",
+            Self::Purge => "purge",
+        }
+    }
+}
+
+/// Whether a failed attempt operation made any final artifact visible.
+///
+/// This reports exact per-attempt truth without implying that a set of
+/// artifacts is atomically published.
+#[derive(Copy, Clone, Debug, Eq, Hash, PartialEq)]
+pub enum FinalVisibility {
+    /// No final artifact became visible.
+    None,
+    /// At least one final artifact became visible.
+    Some,
+    /// The operation could not determine final visibility safely.
+    Unknown,
+}
+
+impl FinalVisibility {
+    /// Return the stable machine spelling for this visibility result.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Some => "some",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Stable, redacted rendering data for E371 and E372.
+///
+/// Construction accepts only the six registered `attempt.retention` failures,
+/// a canonical execution ID, an optional canonical artifact ID, and a
+/// workspace-relative pipeline path. This keeps machine-local paths,
+/// credentials, record values, and arbitrary debug text out of the payload.
+/// The later CLI renderer can therefore consume fields directly instead of
+/// reverse-mapping message strings into retry or recovery semantics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptDiagnosticData {
+    diagnostic_code: &'static str,
+    failure: FailureClassification,
+    operation: AttemptOperation,
+    execution_id: String,
+    artifact_id: Option<String>,
+    final_visibility: FinalVisibility,
+    durability_uncertain: bool,
+    recovery_command: String,
+}
+
+impl AttemptDiagnosticData {
+    /// Build typed E371/E372 data for a registered attempt-retention failure.
+    ///
+    /// Returns `None` when the failure is outside the E371/E372 families or
+    /// identifying data is not a canonical logical ID and workspace-relative
+    /// pipeline path. No raw failure detail or physical staging path is
+    /// accepted by this boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_failure(
+        failure_code: &str,
+        operation: AttemptOperation,
+        execution_id: &str,
+        artifact_id: Option<&str>,
+        final_visibility: FinalVisibility,
+        durability_uncertain: bool,
+        workspace_pipeline: &str,
+    ) -> Option<Self> {
+        let diagnostic_code = match failure_code {
+            "attempt.retention.ownership_refused"
+            | "attempt.retention.manifest_invalid"
+            | "attempt.retention.live"
+            | "attempt.retention.clock_ambiguous" => "E371",
+            "attempt.retention.budget_exhausted" | "attempt.retention.cleanup_failed" => "E372",
+            _ => return None,
+        };
+        if !is_canonical_execution_id(execution_id)
+            || artifact_id.is_some_and(|id| !is_canonical_artifact_id(id))
+            || !is_workspace_pipeline(workspace_pipeline)
+        {
+            return None;
+        }
+
+        let failure = FailureClassification::for_code(failure_code)?;
+        let recovery_command = format!(
+            "clinker attempts inspect {} --execution-id {}",
+            quote_command_argument(workspace_pipeline),
+            execution_id
+        );
+
+        Some(Self {
+            diagnostic_code,
+            failure,
+            operation,
+            execution_id: execution_id.to_owned(),
+            artifact_id: artifact_id.map(str::to_owned),
+            final_visibility,
+            durability_uncertain,
+            recovery_command,
+        })
+    }
+
+    /// Return the stable diagnostic code selected by the failure family.
+    pub const fn diagnostic_code(&self) -> &'static str {
+        self.diagnostic_code
+    }
+
+    /// Return the stable logical failure code.
+    pub const fn failure_code(&self) -> &'static str {
+        self.failure.code()
+    }
+
+    /// Return the registered broad failure category.
+    pub const fn failure_category(&self) -> FailureCategory {
+        self.failure.category()
+    }
+
+    /// Return the operation that produced the diagnostic.
+    pub const fn operation(&self) -> AttemptOperation {
+        self.operation
+    }
+
+    /// Return the canonical logical execution ID.
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
+    }
+
+    /// Return the canonical logical artifact ID when one failure is artifact-specific.
+    pub fn artifact_id(&self) -> Option<&str> {
+        self.artifact_id.as_deref()
+    }
+
+    /// Return exact final-visibility truth for the failed operation.
+    pub const fn final_visibility(&self) -> FinalVisibility {
+        self.final_visibility
+    }
+
+    /// Return whether successful durability could not be established.
+    pub const fn durability_uncertain(&self) -> bool {
+        self.durability_uncertain
+    }
+
+    /// Return retry policy from the registered logical failure row.
+    pub const fn retry_advice(&self) -> RetryAdvice {
+        self.failure.retry_advice()
+    }
+
+    /// Return the pasteable workspace-relative inspection command.
+    pub fn recovery_command(&self) -> &str {
+        &self.recovery_command
+    }
+}
+
+fn is_canonical_execution_id(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase(),
+        })
+}
+
+fn is_canonical_artifact_id(value: &str) -> bool {
+    value.len() == 17
+        && value.starts_with("artifact-")
+        && value[9..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn is_workspace_pipeline(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 512
+        || value.contains(['\0', '\n', '\r'])
+        || value.contains('\\')
+        || value.starts_with('/')
+        || value.as_bytes().get(1) == Some(&b':')
+        || !(value.ends_with(".yaml") || value.ends_with(".yml"))
+    {
+        return false;
+    }
+
+    Path::new(value)
+        .components()
+        .all(|component| matches!(component, Component::CurDir | Component::Normal(_)))
+}
+
+fn quote_command_argument(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        return value.to_owned();
+    }
+
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for character in value.chars() {
+        if character == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(character);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 /// A span plus an optional human-readable label. Analogous to

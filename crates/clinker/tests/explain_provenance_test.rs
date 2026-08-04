@@ -389,3 +389,120 @@ fn test_explain_help_lists_staging_codes() {
         "help output must advertise the staging-copy code range.\nstdout: {stdout}"
     );
 }
+
+#[test]
+fn attempt_retention_codes_have_one_complete_registered_page() {
+    for (code, failure_codes, retry) in [
+        (
+            "E371",
+            &[
+                "attempt.retention.ownership_refused",
+                "attempt.retention.manifest_invalid",
+                "attempt.retention.live",
+                "attempt.retention.clock_ambiguous",
+            ][..],
+            "policy_required",
+        ),
+        (
+            "E372",
+            &[
+                "attempt.retention.budget_exhausted",
+                "attempt.retention.cleanup_failed",
+            ][..],
+            "retry_with_backoff",
+        ),
+    ] {
+        let registry_rows: Vec<_> = clinker_core_types::diagnostic::REGISTRY
+            .iter()
+            .filter(|entry| entry.code == code)
+            .collect();
+        assert_eq!(registry_rows.len(), 1, "{code} must be registered once");
+
+        let page_rows: Vec<_> = clinker_plan::plan::explain_provenance::EXPLAIN_PAGES
+            .iter()
+            .filter(|(page_code, _)| *page_code == code)
+            .collect();
+        assert_eq!(page_rows.len(), 1, "{code} must compile exactly one page");
+
+        let output = Command::new(clinker_bin())
+            .arg("explain")
+            .arg("--code")
+            .arg(code)
+            .output()
+            .expect("spawn clinker");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "clinker explain --code {code} must succeed.\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains(code), "stdout: {stdout}");
+        for section in REQUIRED_SECTIONS {
+            assert!(stdout.contains(section), "{code} missing {section}");
+        }
+        for failure_code in failure_codes {
+            assert!(
+                stdout.contains(failure_code),
+                "{code} must name its registered failure family row {failure_code}"
+            );
+        }
+        assert!(stdout.contains(retry), "{code} must pin retry advice");
+        assert!(
+            stdout.contains(
+                "clinker attempts inspect pipelines/orders.yaml --execution-id \
+                 018f47a2-9a41-7a27-b4d6-4f7137e3c159"
+            ),
+            "{code} must provide workspace-relative recovery guidance"
+        );
+
+        for sensitive in [
+            "/home/",
+            "/tmp/",
+            r"C:\\Users\\",
+            r"\\server\\share",
+            "password=",
+            "token=",
+            "record={",
+            ".clinker-attempts",
+        ] {
+            assert!(
+                !stdout.contains(sensitive),
+                "{code} explain output disclosed forbidden detail {sensitive:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn attempt_explain_pages_match_typed_diagnostic_identity() {
+    use clinker_core_types::diagnostic::{
+        AttemptDiagnosticData, AttemptOperation, FinalVisibility,
+    };
+
+    for (failure_code, expected_code) in [
+        ("attempt.retention.ownership_refused", "E371"),
+        ("attempt.retention.manifest_invalid", "E371"),
+        ("attempt.retention.live", "E371"),
+        ("attempt.retention.clock_ambiguous", "E371"),
+        ("attempt.retention.budget_exhausted", "E372"),
+        ("attempt.retention.cleanup_failed", "E372"),
+    ] {
+        let data = AttemptDiagnosticData::for_failure(
+            failure_code,
+            AttemptOperation::Inspect,
+            "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+            None,
+            FinalVisibility::Unknown,
+            true,
+            "pipelines/orders.yaml",
+        )
+        .expect("registered retained-attempt diagnostic");
+        assert_eq!(data.diagnostic_code(), expected_code);
+
+        let page = clinker_plan::plan::explain_provenance::explain_code(expected_code)
+            .expect("typed diagnostic code has a compiled page");
+        assert!(page.contains(data.failure_code()));
+        assert!(page.contains(data.retry_advice().as_str()));
+        assert!(page.contains(data.recovery_command()));
+    }
+}

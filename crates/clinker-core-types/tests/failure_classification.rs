@@ -2,6 +2,9 @@
 
 use std::collections::BTreeSet;
 
+use clinker_core_types::diagnostic::{
+    AttemptDiagnosticData, AttemptOperation, FinalVisibility, REGISTRY as DIAGNOSTIC_REGISTRY,
+};
 use clinker_core_types::{FailureCategory, FailureClassification, RetryAdvice};
 
 mod taxonomy {
@@ -53,12 +56,188 @@ mod taxonomy {
             "admission.configuration.",
             "infrastructure.runtime.",
             "attempt.publication.",
+            "attempt.retention.",
             "observability.configuration.",
             "observability.delivery.",
         ] {
             assert!(
                 codes.iter().any(|code| code.starts_with(prefix)),
                 "registry has no code in required family {prefix}"
+            );
+        }
+    }
+
+    #[test]
+    fn attempt_retention_rows_are_appended_in_exact_contract_order() {
+        let codes: Vec<_> = FailureClassification::registered_codes().collect();
+        let publication_end = codes
+            .iter()
+            .position(|code| *code == "attempt.publication.promotion_failed")
+            .expect("publication family remains registered");
+
+        assert_eq!(
+            &codes[publication_end + 1..publication_end + 7],
+            [
+                "attempt.retention.ownership_refused",
+                "attempt.retention.manifest_invalid",
+                "attempt.retention.live",
+                "attempt.retention.clock_ambiguous",
+                "attempt.retention.budget_exhausted",
+                "attempt.retention.cleanup_failed",
+            ]
+        );
+
+        let cases = [
+            (
+                "attempt.retention.ownership_refused",
+                FailureCategory::SecurityPolicy,
+                RetryAdvice::PolicyRequired,
+            ),
+            (
+                "attempt.retention.manifest_invalid",
+                FailureCategory::SecurityPolicy,
+                RetryAdvice::PolicyRequired,
+            ),
+            (
+                "attempt.retention.live",
+                FailureCategory::Publication,
+                RetryAdvice::PolicyRequired,
+            ),
+            (
+                "attempt.retention.clock_ambiguous",
+                FailureCategory::Publication,
+                RetryAdvice::PolicyRequired,
+            ),
+            (
+                "attempt.retention.budget_exhausted",
+                FailureCategory::Publication,
+                RetryAdvice::RetryWithBackoff,
+            ),
+            (
+                "attempt.retention.cleanup_failed",
+                FailureCategory::Infrastructure,
+                RetryAdvice::RetryWithBackoff,
+            ),
+        ];
+
+        for (code, category, retry) in cases {
+            let failure = FailureClassification::for_code(code).expect("registered retention row");
+            assert_eq!(failure.category(), category, "category for {code}");
+            assert_eq!(failure.retry_advice(), retry, "retry advice for {code}");
+        }
+    }
+
+    #[test]
+    fn attempt_diagnostics_bind_codes_to_failure_families_and_redacted_data() {
+        let refusal = AttemptDiagnosticData::for_failure(
+            "attempt.retention.ownership_refused",
+            AttemptOperation::Purge,
+            "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+            Some("artifact-00000001"),
+            FinalVisibility::None,
+            false,
+            "pipelines/orders.yaml",
+        )
+        .expect("safe refusal data");
+        assert_eq!(refusal.diagnostic_code(), "E371");
+        assert_eq!(
+            refusal.failure_code(),
+            "attempt.retention.ownership_refused"
+        );
+        assert_eq!(refusal.operation(), AttemptOperation::Purge);
+        assert_eq!(refusal.operation().as_str(), "purge");
+        assert_eq!(
+            refusal.execution_id(),
+            "018f47a2-9a41-7a27-b4d6-4f7137e3c159"
+        );
+        assert_eq!(refusal.artifact_id(), Some("artifact-00000001"));
+        assert_eq!(refusal.final_visibility(), FinalVisibility::None);
+        assert_eq!(refusal.final_visibility().as_str(), "none");
+        assert!(!refusal.durability_uncertain());
+        assert_eq!(refusal.retry_advice(), RetryAdvice::PolicyRequired);
+        assert_eq!(
+            refusal.recovery_command(),
+            "clinker attempts inspect pipelines/orders.yaml --execution-id 018f47a2-9a41-7a27-b4d6-4f7137e3c159"
+        );
+
+        let cleanup = AttemptDiagnosticData::for_failure(
+            "attempt.retention.budget_exhausted",
+            AttemptOperation::Purge,
+            "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+            None,
+            FinalVisibility::Some,
+            true,
+            "pipelines/orders.yaml",
+        )
+        .expect("safe cleanup data");
+        assert_eq!(cleanup.diagnostic_code(), "E372");
+        assert_eq!(cleanup.retry_advice(), RetryAdvice::RetryWithBackoff);
+        assert!(cleanup.durability_uncertain());
+
+        let diagnostic_codes: Vec<_> = DIAGNOSTIC_REGISTRY
+            .iter()
+            .filter(|entry| matches!(entry.code, "E371" | "E372"))
+            .map(|entry| entry.code)
+            .collect();
+        assert_eq!(diagnostic_codes, ["E371", "E372"]);
+    }
+
+    #[test]
+    fn attempt_diagnostics_reject_unregistered_mismatched_or_sensitive_data() {
+        let args = || {
+            (
+                AttemptOperation::Inspect,
+                "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+                None,
+                FinalVisibility::Unknown,
+                true,
+            )
+        };
+
+        let (operation, execution_id, artifact_id, visibility, uncertain) = args();
+        assert!(
+            AttemptDiagnosticData::for_failure(
+                "attempt.publication.promotion_failed",
+                operation,
+                execution_id,
+                artifact_id,
+                visibility,
+                uncertain,
+                "pipelines/orders.yaml",
+            )
+            .is_none()
+        );
+
+        for (execution_id, artifact_id, pipeline) in [
+            ("token=secret", None, "pipelines/orders.yaml"),
+            (
+                "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+                Some("record={customer-secret}"),
+                "pipelines/orders.yaml",
+            ),
+            (
+                "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+                None,
+                "/private/orders.yaml",
+            ),
+            (
+                "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+                None,
+                "../private/orders.yaml",
+            ),
+        ] {
+            let (operation, _, _, visibility, uncertain) = args();
+            assert!(
+                AttemptDiagnosticData::for_failure(
+                    "attempt.retention.manifest_invalid",
+                    operation,
+                    execution_id,
+                    artifact_id,
+                    visibility,
+                    uncertain,
+                    pipeline,
+                )
+                .is_none()
             );
         }
     }
@@ -223,6 +402,7 @@ mod conformance_fixture {
             "admission.configuration.",
             "infrastructure.runtime.",
             "attempt.publication.",
+            "attempt.retention.",
             "observability.configuration.",
             "observability.delivery.",
         ] {
