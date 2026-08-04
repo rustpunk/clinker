@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 
 use clinker_exec::output::attempt::{
     ARTIFACT_MAX_ENCODED_BYTES, ArtifactManifest, ArtifactState, AttemptFault, AttemptManifest,
@@ -56,12 +56,12 @@ fn direct_artifact_persists_complete_before_immediate_owned_cleanup() {
 
     let (ready_tx, ready_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
-    attempt.install_test_hook(Arc::new(move |stage| {
+    attempt.install_test_hook(move |stage| {
         assert_eq!(stage.execution_id, EXECUTION_ID);
         assert_eq!(stage.stage, AttemptTestStage::CompleteBeforeCleanup);
         ready_tx.send(()).expect("signal durable complete");
         release_rx.recv().expect("release cleanup");
-    }));
+    });
 
     let handle = std::thread::spawn(move || attempt.publish(&registry, &ShutdownToken::detached()));
     ready_rx.recv().expect("complete barrier should be reached");
@@ -300,8 +300,8 @@ fn manifest_rejects_noncanonical_order_overflow_and_ambiguous_clocks() {
 
 #[test]
 fn maximum_manifest_cardinality_stays_below_the_read_limit() {
-    let producer = "\\".repeat(95);
-    let logical_leaf = "\\".repeat(255);
+    let producer = "\"".repeat(95);
+    let logical_leaf = "\"".repeat(255);
     let artifacts = (0..MANIFEST_MAX_ARTIFACTS)
         .map(|index| {
             artifact(

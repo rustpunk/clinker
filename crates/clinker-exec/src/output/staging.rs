@@ -7,15 +7,80 @@ use std::sync::{Arc, Mutex};
 
 use clinker_plan::config::{ConfigError, IfExistsPolicy};
 use clinker_plan::error::PipelineError;
+use clinker_plan::security::ValidatedPath;
 
-use super::containment::{ContainmentError, StagedOutput};
+use super::containment::{ContainmentError, OutputContainment, PromotionDisposition, StagedOutput};
 use super::open::{containment_error, open_output};
 
 #[derive(Debug)]
 struct PendingOutput {
     name: String,
     final_path: PathBuf,
-    staged: StagedOutput,
+    staged: PendingStage,
+}
+
+#[derive(Debug)]
+enum PendingStage {
+    DestinationLocal(StagedOutput),
+    AttemptOwned {
+        destination: OutputContainment,
+        source: ValidatedPath,
+        source_path: PathBuf,
+        disposition: PromotionDisposition,
+    },
+}
+
+impl PendingStage {
+    fn partial_path(&self) -> &std::path::Path {
+        match self {
+            Self::DestinationLocal(staged) => staged.partial_path(),
+            Self::AttemptOwned { source_path, .. } => source_path,
+        }
+    }
+
+    fn preflight(&self) -> Result<(), ContainmentError> {
+        match self {
+            Self::DestinationLocal(staged) => staged.preflight(),
+            Self::AttemptOwned { source_path, .. } => std::fs::File::open(source_path)
+                .and_then(|file| file.sync_all())
+                .map_err(|source| ContainmentError::Io {
+                    operation: "sync-attempt-artifact",
+                    path: source_path.clone(),
+                    source,
+                }),
+        }
+    }
+
+    fn publish(&mut self, fail_after_rename: bool) -> Result<(), ContainmentError> {
+        match self {
+            Self::DestinationLocal(staged) => staged.publish(fail_after_rename),
+            Self::AttemptOwned {
+                destination,
+                source,
+                disposition,
+                ..
+            } => destination.promote_from_with_sync_fault(
+                source.clone(),
+                *disposition,
+                fail_after_rename,
+            ),
+        }
+    }
+
+    fn finalize_with_cleanup_fault(&mut self, fail_cleanup: bool) -> Result<(), ContainmentError> {
+        match self {
+            Self::DestinationLocal(staged) => staged.finalize_with_cleanup_fault(fail_cleanup),
+            Self::AttemptOwned { source_path, .. } if fail_cleanup => Err(ContainmentError::Io {
+                operation: "finalize-attempt-artifact",
+                path: source_path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected attempt cleanup failure",
+                ),
+            }),
+            Self::AttemptOwned { .. } => Ok(()),
+        }
+    }
 }
 
 /// An operator-visible partial retained after an unsuccessful run.
@@ -142,9 +207,41 @@ impl OutputStagingRegistry {
         state.pending.push(PendingOutput {
             name,
             final_path: final_path.clone(),
-            staged,
+            staged: PendingStage::DestinationLocal(staged),
         });
         Ok((final_path, file))
+    }
+
+    /// Register an attempt-owned artifact for the ordinary publication gate.
+    pub(crate) fn register_attempt_output(
+        &self,
+        name: String,
+        final_path: PathBuf,
+        destination: OutputContainment,
+        source: ValidatedPath,
+        disposition: PromotionDisposition,
+    ) -> Result<(), PipelineError> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = destination_key(&final_path)?;
+        if let Some((first_name, first_path)) = state.claims.get(&key) {
+            return Err(collision_error(&name, &final_path, first_name, first_path));
+        }
+        state.claims.insert(key, (name.clone(), final_path.clone()));
+        let source_path = source.as_path().to_path_buf();
+        state.pending.push(PendingOutput {
+            name,
+            final_path,
+            staged: PendingStage::AttemptOwned {
+                destination,
+                source,
+                source_path,
+                disposition,
+            },
+        });
+        Ok(())
     }
 
     /// Snapshot all hidden files that remain pending. This is used to report
@@ -200,7 +297,7 @@ impl OutputStagingRegistry {
         self.commit_all_inner(None, None, None)
     }
 
-    fn commit_all_inner(
+    pub(crate) fn commit_all_inner(
         &self,
         fail_before_rename_at: Option<usize>,
         fail_after_rename_at: Option<usize>,
