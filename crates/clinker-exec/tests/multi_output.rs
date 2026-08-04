@@ -520,40 +520,81 @@ fn shared_port_resident_spill_parity() {
     }
 }
 
+const SHARED_PORT_SPILL_ISOLATED_ENV: &str = "CLINKER_TEST_SHARED_PORT_SPILL_ISOLATED";
+const SHARED_PORT_SPILL_SENTINEL: &str = "__clinker_shared_port_spill_ran__";
+
+/// Run the RSS-sensitive spill probe without sibling test threads changing
+/// process-global memory readings between its baseline and execution.
+fn run_isolated_shared_port_spill(probe: impl FnOnce()) {
+    if std::env::var_os(SHARED_PORT_SPILL_ISOLATED_ENV).is_some() {
+        probe();
+        println!("{SHARED_PORT_SPILL_SENTINEL}");
+        return;
+    }
+
+    let output = std::process::Command::new(
+        std::env::current_exe().expect("test binary path must be readable"),
+    )
+    .args([
+        "--exact",
+        "shared_port_output_combine_resident_spill_parity",
+        "--test-threads=1",
+        "--nocapture",
+    ])
+    .env(SHARED_PORT_SPILL_ISOLATED_ENV, "1")
+    .output()
+    .expect("isolated shared-port spill probe must spawn");
+
+    assert!(
+        output.status.success(),
+        "isolated shared-port spill probe failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(SHARED_PORT_SPILL_SENTINEL),
+        "isolated shared-port spill probe exited without running"
+    );
+}
+
 #[test]
 fn shared_port_output_combine_resident_spill_parity() {
-    let shared = shared_port_csv("s");
-    let mut lookup = String::from("id,label\n");
-    for ordinal in 1..=24 {
-        lookup.push_str(&format!("s{ordinal},label-{ordinal}\n"));
-    }
-    let resident = run_mixed_fanout_report(
-        &shared_port_combine_yaml("1G"),
-        &[("shared", &shared), ("lookup", &lookup)],
-        test_params(),
-    )
-    .expect("resident shared Output plus Combine executes");
-    // Keep the hard limit just above this test process while placing the 80%
-    // soft threshold decisively below it. A fixed sub-baseline budget would
-    // exercise the hard-abort path on larger CI workers instead of spill.
-    let forced_spill_limit = clinker_exec::pipeline::memory::rss_bytes()
-        .unwrap_or(64 * 1024 * 1024)
-        .saturating_mul(105)
-        / 100;
-    let spilled = run_mixed_fanout_report(
-        &shared_port_combine_yaml(&forced_spill_limit.to_string()),
-        &[("shared", &shared), ("lookup", &lookup)],
-        test_params(),
-    )
-    .expect("spilled shared Output plus Combine executes");
+    run_isolated_shared_port_spill(|| {
+        let shared = shared_port_csv("s");
+        let mut lookup = String::from("id,label\n");
+        for ordinal in 1..=24 {
+            lookup.push_str(&format!("s{ordinal},label-{ordinal}\n"));
+        }
+        let resident = run_mixed_fanout_report(
+            &shared_port_combine_yaml("1G"),
+            &[("shared", &shared), ("lookup", &lookup)],
+            test_params(),
+        )
+        .expect("resident shared Output plus Combine executes");
+        // Keep the hard limit above this test process while placing the 80% soft
+        // threshold below its current RSS. The 20% headroom absorbs allocator and
+        // platform-accounting growth during setup without losing forced spill.
+        // A fixed sub-baseline budget would exercise the hard-abort path on larger
+        // CI workers instead of spill.
+        let forced_spill_limit = clinker_exec::pipeline::memory::rss_bytes()
+            .unwrap_or(64 * 1024 * 1024)
+            .saturating_mul(120)
+            / 100;
+        let spilled = run_mixed_fanout_report(
+            &shared_port_combine_yaml(&forced_spill_limit.to_string()),
+            &[("shared", &shared), ("lookup", &lookup)],
+            test_params(),
+        )
+        .expect("spilled shared Output plus Combine executes");
 
-    assert_eq!(resident.0.counters.ok_count, 24);
-    assert_eq!(spilled.0.counters.ok_count, 24);
-    assert_eq!(resident.0.counters.records_written, 48);
-    assert_eq!(spilled.0.counters.records_written, 48);
-    assert!(spilled.0.cumulative_spill_bytes > 0);
-    assert_eq!(resident.1["direct"], spilled.1["direct"]);
-    assert_eq!(resident.1["combined"], spilled.1["combined"]);
+        assert_eq!(resident.0.counters.ok_count, 24);
+        assert_eq!(spilled.0.counters.ok_count, 24);
+        assert_eq!(resident.0.counters.records_written, 48);
+        assert_eq!(spilled.0.counters.records_written, 48);
+        assert!(spilled.0.cumulative_spill_bytes > 0);
+        assert_eq!(resident.1["direct"], spilled.1["direct"]);
+        assert_eq!(resident.1["combined"], spilled.1["combined"]);
+    });
 }
 
 #[test]
