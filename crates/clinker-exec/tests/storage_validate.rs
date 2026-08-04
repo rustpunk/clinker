@@ -15,7 +15,11 @@ use clinker_plan::config::{SpillConfig, StagingPolicy, StorageConfig};
 use std::path::PathBuf;
 
 fn storage(spill: SpillConfig, staging: StagingPolicy) -> StorageConfig {
-    StorageConfig { spill, staging }
+    StorageConfig {
+        spill,
+        staging,
+        publication: Default::default(),
+    }
 }
 
 /// E330 — a spill dir on tmpfs is rejected. Linux-only: `/dev/shm` is the

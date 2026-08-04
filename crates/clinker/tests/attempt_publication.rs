@@ -6,7 +6,7 @@ use clinker_exec::output::attempt::{
     ARTIFACT_MAX_ENCODED_BYTES, ArtifactKind, ArtifactManifest, ArtifactRegistration,
     ArtifactState, AttemptFault, AttemptManifest, AttemptPublication, AttemptState,
     AttemptTestStage, CleanupDisposition, MANIFEST_MAX_ARTIFACTS, MANIFEST_MAX_BYTES,
-    PUBLICATION_COPY_BUFFER_BYTES,
+    PUBLICATION_COPY_BUFFER_BYTES, SanitizedPathOptIn,
 };
 use clinker_exec::output::containment::PromotionDisposition;
 use clinker_exec::output::staging::{OutputStagingRegistry, PublicationOutcome};
@@ -130,10 +130,26 @@ fn run_attempt_owns_every_artifact_kind_across_bounded_destination_roots() {
     drop(writers);
 
     let outcome = attempt
-        .publish(&registry, &ShutdownToken::detached())
+        .publish_run(&registry, &ShutdownToken::detached())
         .expect("publish run attempt")
         .expect("publication gate won");
     assert!(outcome.is_complete());
+    assert_eq!(outcome.artifacts().len(), 5);
+    assert!(
+        outcome
+            .artifacts()
+            .iter()
+            .all(|artifact| artifact.state() == ArtifactState::Published)
+    );
+    let rendered = format!("{outcome:?}");
+    assert!(!rendered.contains(&first.path().display().to_string()));
+    assert!(!rendered.contains(&second.path().display().to_string()));
+    assert_eq!(
+        attempt
+            .physical_paths_for_sanitized_output(SanitizedPathOptIn)
+            .len(),
+        5
+    );
     for (root, leaf) in [
         (first.path(), "primary.bin"),
         (first.path(), "fan.bin"),
@@ -224,7 +240,7 @@ fn local_then_publish_copies_in_bounded_chunks_and_verifies_destination() {
     assert_eq!(std::fs::read(&destination_artifact).unwrap(), body);
 
     let outcome = attempt
-        .publish(&registry, &ShutdownToken::detached())
+        .publish_run(&registry, &ShutdownToken::detached())
         .expect("publish")
         .expect("publication gate won");
     assert!(outcome.is_complete());
@@ -236,7 +252,11 @@ fn local_then_publish_copies_in_bounded_chunks_and_verifies_destination() {
 
 #[test]
 fn local_then_publish_copy_and_digest_failures_never_fallback_to_direct() {
-    for fault in [AttemptFault::Copy, AttemptFault::Digest] {
+    for fault in [
+        AttemptFault::Copy,
+        AttemptFault::DestinationFileSync,
+        AttemptFault::Digest,
+    ] {
         let destination = tempfile::tempdir().expect("destination");
         let spool = tempfile::tempdir().expect("local spool");
         let registry = OutputStagingRegistry::default();

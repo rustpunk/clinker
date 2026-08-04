@@ -69,6 +69,50 @@ liveness is established by the lock plus grace rule rather than by silently
 deleting a file that might belong to a live run. Output publication does not use
 `.backup` entries.
 
+### Attempt-owned publication modes
+
+Output publication is resolved from the strict `[storage.publication]` block
+before an attempt directory or output leaf is created. The run-owned attempt
+uses the invocation's existing execution ID and registers primary, per-source
+fan-out, split, dead-letter, and metadata-sidecar artifacts in one bounded
+ledger. A bounded map of compiled destination parents lets one run target more
+than one directory without inventing a common filesystem root. Duplicate
+destinations are rejected before attempt creation.
+
+`mode = "direct"` is the default. Each writer receives an owner-only file in
+the attempt directory on its destination filesystem. Publication synchronizes
+that file and promotes it by same-filesystem rename; it never copies and never
+falls back to another mode.
+
+`mode = "local_then_publish"` requires `local_spool_dir` on a local filesystem.
+The writer first produces and synchronizes an owner-only local file. The
+publisher then copies it in bounded 1 MiB chunks into the destination attempt
+directory, synchronizes the destination file, and verifies both the checked
+byte count and BLAKE3 digest before marking the artifact ready. The local copy
+is unlinked only after the destination-owned manifest state is durable. The final leaf
+is still reached solely by destination-local promotion; no copy writes directly
+to a visible final. A copy, synchronization, digest, manifest, rename, or
+directory-sync failure retains truthful incomplete state and never changes the
+selected mode.
+
+`destination_profile` is explicit: `local` (the default), `nfs_v4_1`, or
+`smb_3_1_1`. A detected share under `local`, or a detected protocol that does
+not match the qualified share profile, fails before publication effects. The
+remaining strict keys are `failed_retention_seconds`,
+`creation_grace_seconds`, `max_attempt_bytes`, `retained_byte_limit`,
+`retained_attempt_limit`, `min_free_bytes`, `sweep_entry_limit`,
+`sweep_byte_limit`, and `sweep_time_limit_ms`. Their fixed defaults and hard
+ceilings are enforced during policy resolution; only failed-attempt retention
+permits zero.
+
+Free space is observed once at admission and compared with the checked attempt
+estimate plus `min_free_bytes`. That observation is advisory. It reserves no
+blocks or quota, proves no completion guarantee, and does not suppress a later
+`ENOSPC` or `EDQUOT` from a write or synchronization call. Default attempt
+results carry logical execution/artifact IDs, logical leaves, and exact
+published, visible-unsynchronized, or unpublished states. Physical paths are
+available only through an explicit opt-in intended for sanitized diagnostics.
+
 ### Remote filesystem qualification
 
 Normal CLI output is admitted from the filesystem type observed through the

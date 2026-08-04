@@ -2,9 +2,10 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
+use clinker_plan::config::{DestinationProfile, PublicationMode, ResolvedPublicationPolicy};
 use clinker_plan::error::PipelineError;
 use clinker_plan::security::{ValidatedPath, validate_path};
 use fs4::FileExt;
@@ -26,6 +27,192 @@ const LOGICAL_MAX_ENCODED_BYTES: usize = 512;
 pub const ARTIFACT_MAX_ENCODED_BYTES: usize = 992;
 pub const MANIFEST_MAX_ARTIFACTS: usize = 4096;
 pub const MANIFEST_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const PUBLICATION_COPY_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Managed artifact role within one run-owned publication attempt.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ArtifactKind {
+    /// Ordinary output file.
+    Primary,
+    /// Per-source fan-out output.
+    FanOut,
+    /// Split output segment.
+    Split,
+    /// Dead-letter output.
+    Dlq,
+    /// Metadata sidecar associated with a data output.
+    Sidecar,
+}
+
+/// One artifact registered before a run-owned attempt creates any files.
+#[derive(Clone, Debug)]
+pub struct ArtifactRegistration {
+    kind: ArtifactKind,
+    producer_label: String,
+    logical_leaf: String,
+    destination: ValidatedPath,
+    disposition: PromotionDisposition,
+}
+
+impl ArtifactRegistration {
+    /// Build and validate a bounded logical artifact registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] when the producer label or logical leaf is
+    /// oversized, empty, or not a single relative path component.
+    pub fn new(
+        kind: ArtifactKind,
+        producer_label: impl Into<String>,
+        logical_leaf: impl Into<String>,
+        destination: ValidatedPath,
+        disposition: PromotionDisposition,
+    ) -> Result<Self, AttemptError> {
+        let producer_label = producer_label.into();
+        let logical_leaf = logical_leaf.into();
+        validate_text(
+            "producer_label",
+            &producer_label,
+            PRODUCER_MAX_CHARS,
+            PRODUCER_MAX_ENCODED_BYTES,
+        )?;
+        validate_text(
+            "logical_leaf",
+            &logical_leaf,
+            LOGICAL_MAX_CHARS,
+            LOGICAL_MAX_ENCODED_BYTES,
+        )?;
+        if Path::new(&logical_leaf).is_absolute()
+            || Path::new(&logical_leaf).components().count() != 1
+        {
+            return Err(AttemptError::InvalidManifest(
+                "logical_leaf must be one relative path component",
+            ));
+        }
+        Ok(Self {
+            kind,
+            producer_label,
+            logical_leaf,
+            destination,
+            disposition,
+        })
+    }
+}
+
+/// Writable artifact returned by [`AttemptPublication::create_run`].
+#[derive(Debug)]
+pub struct AttemptArtifactWriter {
+    execution_id: String,
+    artifact_id: String,
+    kind: ArtifactKind,
+    file: File,
+}
+
+/// Logical per-artifact result returned by run-owned publication.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactPublicationResult {
+    artifact_id: String,
+    kind: ArtifactKind,
+    logical_leaf: String,
+    state: ArtifactState,
+}
+
+impl ArtifactPublicationResult {
+    /// Stable artifact identity within the execution.
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+
+    /// Managed artifact role.
+    pub fn kind(&self) -> ArtifactKind {
+        self.kind
+    }
+
+    /// Logical leaf without a physical directory prefix.
+    pub fn logical_leaf(&self) -> &str {
+        &self.logical_leaf
+    }
+
+    /// Exact terminal artifact state.
+    pub fn state(&self) -> ArtifactState {
+        self.state
+    }
+}
+
+/// Path-free publication result for a run-owned artifact set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AttemptPublicationOutcome {
+    /// Every artifact is visible and synchronized.
+    Complete {
+        /// Existing execution identity.
+        execution_id: String,
+        /// Exact logical result for every registered artifact.
+        artifacts: Vec<ArtifactPublicationResult>,
+        /// Number of post-publication cleanup-debt entries.
+        cleanup_debt_count: usize,
+    },
+    /// At least one artifact is unpublished or durability is uncertain.
+    Incomplete {
+        /// Existing execution identity.
+        execution_id: String,
+        /// Exact logical result for every registered artifact.
+        artifacts: Vec<ArtifactPublicationResult>,
+        /// Number of post-publication cleanup-debt entries.
+        cleanup_debt_count: usize,
+    },
+}
+
+impl AttemptPublicationOutcome {
+    /// Whether every artifact reached synchronized-visible state.
+    pub fn is_complete(&self) -> bool {
+        matches!(self, Self::Complete { .. })
+    }
+
+    /// Exact logical artifact results without physical paths.
+    pub fn artifacts(&self) -> &[ArtifactPublicationResult] {
+        match self {
+            Self::Complete { artifacts, .. } | Self::Incomplete { artifacts, .. } => artifacts,
+        }
+    }
+}
+
+/// Explicit capability token for callers that sanitize physical paths before
+/// rendering them outside trusted diagnostics.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SanitizedPathOptIn;
+
+/// Physical path view available only through explicit sanitized-output opt-in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactPhysicalPaths {
+    /// Stable artifact identity.
+    pub artifact_id: String,
+    /// Physical final path.
+    pub final_path: PathBuf,
+    /// Physical destination quarantine path.
+    pub quarantine_path: PathBuf,
+}
+
+impl AttemptArtifactWriter {
+    /// Existing execution identity shared by every writer in this run.
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
+    }
+
+    /// Stable bounded artifact identity.
+    pub fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+
+    /// Managed role of this artifact.
+    pub fn kind(&self) -> ArtifactKind {
+        self.kind
+    }
+
+    /// Borrow the restrictive file handle used by the format writer.
+    pub fn file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -299,7 +486,10 @@ impl AttemptManifest {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttemptFault {
     Write,
+    Copy,
     FileSync,
+    DestinationFileSync,
+    Digest,
     ManifestReplace,
     BeforeRename,
     DirectorySync,
@@ -412,18 +602,35 @@ impl AttemptRoot {
 
 #[derive(Debug)]
 struct ArtifactRuntime {
+    kind: ArtifactKind,
     artifact_id: String,
-    source: ValidatedPath,
+    logical_leaf: String,
+    final_path: PathBuf,
+    local_source: ValidatedPath,
+    publication_source: ValidatedPath,
+    publication_root_key: String,
+    copied_from_local: bool,
+}
+
+#[derive(Debug)]
+struct AdditionalAttemptRoot {
+    root: AttemptRoot,
+    lock_file: Option<File>,
 }
 
 /// One destination-owned execution attempt.
 pub struct AttemptPublication {
     execution_id: String,
     attempt_root: Option<AttemptRoot>,
+    owner_root_key: String,
+    owner_profile: DestinationProfile,
+    additional_roots: BTreeMap<String, AdditionalAttemptRoot>,
+    destination_root_keys: Vec<String>,
     manifest_path: PathBuf,
     lock_file: Option<File>,
     manifest: AttemptManifest,
     artifacts: Vec<ArtifactRuntime>,
+    policy: Option<ResolvedPublicationPolicy>,
     terminal: bool,
     fault: Option<AttemptFault>,
     test_hook: Option<Box<dyn FnOnce(AttemptTestEvent) + Send>>,
@@ -439,6 +646,7 @@ impl std::fmt::Debug for AttemptPublication {
                 &self.attempt_root.as_ref().map(|root| root.path.as_path()),
             )
             .field("manifest", &self.manifest)
+            .field("destination_root_count", &self.destination_root_keys.len())
             .field("terminal", &self.terminal)
             .finish_non_exhaustive()
     }
@@ -451,7 +659,24 @@ impl AttemptPublication {
         created_unix_ms: u64,
         eligible_after_unix_ms: u64,
     ) -> Result<Self, AttemptError> {
+        Self::create_with_owner_profile(
+            destination_root,
+            DestinationProfile::Local,
+            execution_id,
+            created_unix_ms,
+            eligible_after_unix_ms,
+        )
+    }
+
+    fn create_with_owner_profile(
+        destination_root: ValidatedPath,
+        owner_profile: DestinationProfile,
+        execution_id: &str,
+        created_unix_ms: u64,
+        eligible_after_unix_ms: u64,
+    ) -> Result<Self, AttemptError> {
         validate_execution_id(execution_id)?;
+        let owner_root_key = destination_root_key(destination_root.as_path());
         let attempt_root = AttemptRoot::create(&destination_root, execution_id)?;
         let lock_path = attempt_root.path.join("live.lock");
         let lock_file = attempt_root.directory.create_file("live.lock")?;
@@ -472,14 +697,318 @@ impl AttemptPublication {
             manifest_path: attempt_root.path.join("manifest.json"),
             lock_file: Some(lock_file),
             attempt_root: Some(attempt_root),
+            owner_root_key: owner_root_key.clone(),
+            owner_profile,
+            additional_roots: BTreeMap::new(),
+            destination_root_keys: vec![owner_root_key],
             manifest,
             artifacts: Vec::new(),
+            policy: None,
             terminal: false,
             fault: None,
             test_hook: None,
         };
         publication.persist_manifest(false)?;
         Ok(publication)
+    }
+
+    /// Create one run-owned attempt for a complete, pre-registered artifact
+    /// set.
+    ///
+    /// Duplicate destinations and over-limit registrations are rejected before
+    /// `.clinker-attempts` is created. Direct mode owns quarantine in each
+    /// destination parent. Local-then-publish owns its writer files in the
+    /// configured local spool and compiles a bounded destination-root map for
+    /// the verified copy step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] for invalid registration cardinality,
+    /// collisions, path validation, contained root creation, manifest writes,
+    /// or artifact admission failures.
+    pub fn create_run(
+        policy: ResolvedPublicationPolicy,
+        registry: &OutputStagingRegistry,
+        execution_id: &str,
+        created_unix_ms: u64,
+        eligible_after_unix_ms: u64,
+        registrations: Vec<ArtifactRegistration>,
+    ) -> Result<(Self, Vec<AttemptArtifactWriter>), AttemptError> {
+        validate_execution_id(execution_id)?;
+        if registrations.is_empty() || registrations.len() > MANIFEST_MAX_ARTIFACTS {
+            return Err(AttemptError::InvalidManifest(
+                "run registration count is outside the bounded artifact range",
+            ));
+        }
+
+        let mut claims = BTreeMap::new();
+        let mut destination_roots = BTreeMap::new();
+        for registration in &registrations {
+            let destination_key = clinker_plan::config::collision_key(
+                &registration.destination.as_path().to_string_lossy(),
+            );
+            if let Some(first) =
+                claims.insert(destination_key, registration.producer_label.as_str())
+            {
+                return Err(AttemptError::RegistrationCollision {
+                    first: first.to_owned(),
+                    second: registration.producer_label.clone(),
+                });
+            }
+            let parent = destination_parent(&registration.destination)?;
+            destination_roots
+                .entry(destination_root_key(parent.as_path()))
+                .or_insert(parent);
+        }
+
+        let owner_root = match policy.mode() {
+            PublicationMode::Direct => destination_roots
+                .first_key_value()
+                .map(|(_, root)| root.clone())
+                .ok_or(AttemptError::InvalidManifest(
+                    "run registration has no destination root",
+                ))?,
+            PublicationMode::LocalThenPublish => {
+                let spool = policy
+                    .local_spool_dir()
+                    .ok_or(AttemptError::InvalidTransition(
+                        "resolved policy is missing local spool",
+                    ))?;
+                validate_path(Path::new("."), spool, false).map_err(|_| {
+                    AttemptError::InvalidManifest("local spool path failed validation")
+                })?
+            }
+        };
+
+        // Exact remote-profile verification happens through the retained
+        // destination-parent containment boundary before any attempt directory
+        // is created. The policy layer has already rejected an unqualified
+        // network destination; this probe distinguishes NFS from SMB.
+        for registration in &registrations {
+            OutputContainment::for_profile(
+                registration.destination.clone(),
+                containment_profile(policy.destination_profile()),
+            )?;
+        }
+
+        let owner_profile = match policy.mode() {
+            PublicationMode::Direct => policy.destination_profile(),
+            PublicationMode::LocalThenPublish => DestinationProfile::Local,
+        };
+        let mut attempt = Self::create_with_owner_profile(
+            owner_root,
+            owner_profile,
+            execution_id,
+            created_unix_ms,
+            eligible_after_unix_ms,
+        )?;
+        attempt.policy = Some(policy);
+        attempt.destination_root_keys.clear();
+        for (key, root) in destination_roots {
+            attempt.ensure_destination_root(key.clone(), root)?;
+            attempt.destination_root_keys.push(key);
+        }
+        attempt.destination_root_keys.sort();
+
+        let mut writers = Vec::with_capacity(registrations.len());
+        for registration in registrations {
+            writers.push(attempt.stage_registered(registry, registration)?);
+        }
+        Ok((attempt, writers))
+    }
+
+    /// Existing execution identity shared by every managed artifact.
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
+    }
+
+    /// Number of distinct compiled destination-parent roots in this run.
+    pub fn destination_root_count(&self) -> usize {
+        self.destination_root_keys.len()
+    }
+
+    /// Artifact roles in deterministic registration order.
+    pub fn registered_kinds(&self) -> Vec<ArtifactKind> {
+        self.artifacts
+            .iter()
+            .map(|artifact| artifact.kind)
+            .collect()
+    }
+
+    /// Return physical paths only for a caller that explicitly opts into a
+    /// sanitized rendering path. Default run outcomes never contain them.
+    pub fn physical_paths_for_sanitized_output(
+        &self,
+        _opt_in: SanitizedPathOptIn,
+    ) -> Vec<ArtifactPhysicalPaths> {
+        self.artifacts
+            .iter()
+            .map(|artifact| ArtifactPhysicalPaths {
+                artifact_id: artifact.artifact_id.clone(),
+                final_path: artifact.final_path.clone(),
+                quarantine_path: artifact.publication_source.as_path().to_path_buf(),
+            })
+            .collect()
+    }
+
+    fn ensure_destination_root(
+        &mut self,
+        key: String,
+        destination_root: ValidatedPath,
+    ) -> Result<(), AttemptError> {
+        if key == self.owner_root_key || self.additional_roots.contains_key(&key) {
+            return Ok(());
+        }
+        if self.additional_roots.len() >= MANIFEST_MAX_ARTIFACTS {
+            return Err(AttemptError::InvalidManifest(
+                "destination root map exceeds its bound",
+            ));
+        }
+        let root = AttemptRoot::create(&destination_root, &self.execution_id)?;
+        let lock_path = root.path.join("live.lock");
+        let lock_file = root.directory.create_file("live.lock")?;
+        FileExt::try_lock(&lock_file).map_err(|source| AttemptError::Io {
+            operation: "lock destination attempt root",
+            path: lock_path,
+            source: source.into(),
+        })?;
+        self.additional_roots.insert(
+            key,
+            AdditionalAttemptRoot {
+                root,
+                lock_file: Some(lock_file),
+            },
+        );
+        Ok(())
+    }
+
+    fn stage_registered(
+        &mut self,
+        registry: &OutputStagingRegistry,
+        registration: ArtifactRegistration,
+    ) -> Result<AttemptArtifactWriter, AttemptError> {
+        if self.terminal || self.manifest.state != AttemptState::Staging {
+            return Err(AttemptError::InvalidTransition(
+                "attempt no longer accepts artifacts",
+            ));
+        }
+        let policy = self.policy.as_ref().ok_or(AttemptError::InvalidTransition(
+            "run attempt has no resolved publication policy",
+        ))?;
+        let mode = policy.mode();
+        let profile = policy.destination_profile();
+        let artifact_id = format!("artifact-{:08x}", self.artifacts.len() + 1);
+        let destination_root = destination_parent(&registration.destination)?;
+        let publication_root_key = destination_root_key(destination_root.as_path());
+        self.ensure_destination_root(publication_root_key.clone(), destination_root)?;
+
+        let publication_leaf = if mode == PublicationMode::LocalThenPublish
+            && publication_root_key == self.owner_root_key
+        {
+            format!("{artifact_id}.destination")
+        } else {
+            artifact_id.clone()
+        };
+        let publication_source =
+            self.validated_artifact_in_root(&publication_root_key, &publication_leaf)?;
+        let (local_source, file, copied_from_local) = match mode {
+            PublicationMode::Direct => {
+                let file =
+                    self.create_artifact_in_root(&publication_root_key, &publication_leaf)?;
+                (publication_source.clone(), file, false)
+            }
+            PublicationMode::LocalThenPublish => {
+                let source = self.validated_artifact_in_root(&self.owner_root_key, &artifact_id)?;
+                let file = self.create_artifact_in_root(&self.owner_root_key, &artifact_id)?;
+                (source, file, true)
+            }
+        };
+
+        let destination_boundary = OutputContainment::for_profile(
+            registration.destination.clone(),
+            containment_profile(profile),
+        )?;
+        registry.register_attempt_output(
+            registration.producer_label.clone(),
+            registration.destination.as_path().to_path_buf(),
+            destination_boundary,
+            publication_source.clone(),
+            registration.disposition,
+        )?;
+        let entry = ArtifactManifest::new(
+            &artifact_id,
+            &registration.producer_label,
+            &registration.logical_leaf,
+            0,
+            &"0".repeat(64),
+            ArtifactState::Staging,
+        )?;
+        let mut next = self.manifest.clone();
+        next.artifacts.push(entry);
+        next.artifact_count = next.artifacts.len();
+        self.persist_replacement(next, false)?;
+        self.artifacts.push(ArtifactRuntime {
+            kind: registration.kind,
+            artifact_id: artifact_id.clone(),
+            logical_leaf: registration.logical_leaf,
+            final_path: registration.destination.as_path().to_path_buf(),
+            local_source,
+            publication_source,
+            publication_root_key,
+            copied_from_local,
+        });
+        Ok(AttemptArtifactWriter {
+            execution_id: self.execution_id.clone(),
+            artifact_id,
+            kind: registration.kind,
+            file,
+        })
+    }
+
+    fn create_artifact_in_root(&self, root_key: &str, leaf: &str) -> Result<File, AttemptError> {
+        if root_key == self.owner_root_key {
+            return self
+                .attempt_root
+                .as_ref()
+                .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?
+                .directory
+                .create_file(leaf)
+                .map_err(AttemptError::from);
+        }
+        self.additional_roots
+            .get(root_key)
+            .ok_or(AttemptError::InvalidTransition(
+                "destination attempt root is missing",
+            ))?
+            .root
+            .directory
+            .create_file(leaf)
+            .map_err(AttemptError::from)
+    }
+
+    fn validated_artifact_in_root(
+        &self,
+        root_key: &str,
+        leaf: &str,
+    ) -> Result<ValidatedPath, AttemptError> {
+        let root_path = if root_key == self.owner_root_key {
+            &self
+                .attempt_root
+                .as_ref()
+                .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?
+                .path
+        } else {
+            &self
+                .additional_roots
+                .get(root_key)
+                .ok_or(AttemptError::InvalidTransition(
+                    "destination attempt root is missing",
+                ))?
+                .root
+                .path
+        };
+        validate_path(Path::new(leaf), root_path, false)
+            .map_err(|_| AttemptError::InvalidManifest("artifact path failed validation"))
     }
 
     pub fn manifest_path(&self) -> &Path {
@@ -537,8 +1066,14 @@ impl AttemptPublication {
         next.artifact_count = next.artifacts.len();
         self.persist_replacement(next, false)?;
         self.artifacts.push(ArtifactRuntime {
+            kind: ArtifactKind::Primary,
             artifact_id: artifact_id.clone(),
-            source,
+            logical_leaf: logical_leaf.to_owned(),
+            final_path: destination.as_path().to_path_buf(),
+            local_source: source.clone(),
+            publication_source: source,
+            publication_root_key: self.owner_root_key.clone(),
+            copied_from_local: false,
         });
         Ok((artifact_id, file))
     }
@@ -554,41 +1089,113 @@ impl AttemptPublication {
             .ok_or(AttemptError::InvalidTransition(
                 "artifact is not registered",
             ))?;
-        let path = runtime.source.as_path();
-        let mut file = File::open(path).map_err(|source| AttemptError::Io {
+        let local_source = runtime.local_source.clone();
+        let publication_source = runtime.publication_source.clone();
+        let publication_root_key = runtime.publication_root_key.clone();
+        let copied_from_local = runtime.copied_from_local;
+
+        let local_path = local_source.as_path();
+        let mut local_file = File::open(local_path).map_err(|source| AttemptError::Io {
             operation: "open staged artifact",
-            path: path.to_path_buf(),
+            path: local_path.to_path_buf(),
             source,
         })?;
         if self.fault == Some(AttemptFault::FileSync) {
             return Err(AttemptError::Injected("artifact file sync"));
         }
-        file.sync_all().map_err(|source| AttemptError::Io {
+        local_file.sync_all().map_err(|source| AttemptError::Io {
             operation: "sync staged artifact",
-            path: path.to_path_buf(),
+            path: local_path.to_path_buf(),
             source,
         })?;
-        let size_bytes = file
+        let local_size = local_file
             .metadata()
             .map_err(|source| AttemptError::Io {
                 operation: "inspect staged artifact",
-                path: path.to_path_buf(),
+                path: local_path.to_path_buf(),
                 source,
             })?
             .len();
-        let mut hasher = blake3::Hasher::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer).map_err(|source| AttemptError::Io {
-                operation: "digest staged artifact",
-                path: path.to_path_buf(),
+        let (size_bytes, digest) = if copied_from_local {
+            if self.fault == Some(AttemptFault::Copy) {
+                return Err(AttemptError::Injected("artifact copy"));
+            }
+            local_file.rewind().map_err(|source| AttemptError::Io {
+                operation: "rewind local artifact",
+                path: local_path.to_path_buf(),
                 source,
             })?;
-            if read == 0 {
-                break;
+            let publication_leaf = publication_source
+                .as_path()
+                .file_name()
+                .and_then(|leaf| leaf.to_str())
+                .ok_or(AttemptError::InvalidManifest(
+                    "publication artifact leaf is not UTF-8",
+                ))?;
+            let mut destination_file =
+                self.create_artifact_in_root(&publication_root_key, publication_leaf)?;
+            let mut source_hasher = blake3::Hasher::new();
+            let mut copied = 0_u64;
+            let mut buffer = vec![0_u8; PUBLICATION_COPY_BUFFER_BYTES];
+            loop {
+                let read = local_file
+                    .read(&mut buffer)
+                    .map_err(|source| AttemptError::Io {
+                        operation: "read local publication artifact",
+                        path: local_path.to_path_buf(),
+                        source,
+                    })?;
+                if read == 0 {
+                    break;
+                }
+                copied = copied
+                    .checked_add(read as u64)
+                    .ok_or(AttemptError::InvalidManifest(
+                        "copied artifact byte count overflows u64",
+                    ))?;
+                source_hasher.update(&buffer[..read]);
+                destination_file
+                    .write_all(&buffer[..read])
+                    .map_err(|source| AttemptError::Io {
+                        operation: "copy artifact into destination quarantine",
+                        path: publication_source.as_path().to_path_buf(),
+                        source,
+                    })?;
             }
-            hasher.update(&buffer[..read]);
-        }
+            if self.fault == Some(AttemptFault::DestinationFileSync) {
+                return Err(AttemptError::Injected(
+                    "destination quarantine artifact sync",
+                ));
+            }
+            destination_file
+                .sync_all()
+                .map_err(|source| AttemptError::Io {
+                    operation: "sync destination quarantine artifact",
+                    path: publication_source.as_path().to_path_buf(),
+                    source,
+                })?;
+            drop(destination_file);
+            if self.fault == Some(AttemptFault::Digest) {
+                return Err(AttemptError::Injected("destination artifact digest"));
+            }
+            let (destination_size, destination_digest) = digest_file(publication_source.as_path())?;
+            let source_digest = source_hasher.finalize().to_hex().to_string();
+            if copied != local_size
+                || destination_size != local_size
+                || destination_digest != source_digest
+            {
+                return Err(AttemptError::IntegrityMismatch {
+                    expected_bytes: local_size,
+                    observed_bytes: destination_size,
+                });
+            }
+            (destination_size, destination_digest)
+        } else {
+            if self.fault == Some(AttemptFault::Digest) {
+                return Err(AttemptError::Injected("artifact digest"));
+            }
+            digest_file(local_path)?
+        };
         let mut next = self.manifest.clone();
         let entry = next
             .artifacts
@@ -598,13 +1205,25 @@ impl AttemptPublication {
                 "artifact receipt is missing",
             ))?;
         entry.size_bytes = size_bytes;
-        entry.blake3_hex = hasher.finalize().to_hex().to_string();
+        entry.blake3_hex = digest;
         entry.state = ArtifactState::Ready;
-        next.total_bytes = next
-            .artifacts
-            .iter()
-            .map(|artifact| artifact.size_bytes)
-            .sum();
+        next.total_bytes = next.artifacts.iter().try_fold(0_u64, |total, artifact| {
+            total
+                .checked_add(artifact.size_bytes)
+                .ok_or(AttemptError::InvalidManifest(
+                    "artifact byte total overflows u64",
+                ))
+        })?;
+        if let Some(policy) = &self.policy {
+            let admitted_estimate = policy.explain().estimated_attempt_bytes;
+            if next.total_bytes > policy.max_attempt_bytes() || next.total_bytes > admitted_estimate
+            {
+                return Err(AttemptError::AttemptByteLimitExceeded {
+                    actual_bytes: next.total_bytes,
+                    admitted_bytes: admitted_estimate.min(policy.max_attempt_bytes()),
+                });
+            }
+        }
         if next
             .artifacts
             .iter()
@@ -612,7 +1231,17 @@ impl AttemptPublication {
         {
             next.state = AttemptState::Ready;
         }
-        self.persist_replacement(next, self.fault == Some(AttemptFault::ManifestReplace))
+        self.persist_replacement(next, self.fault == Some(AttemptFault::ManifestReplace))?;
+
+        if copied_from_local {
+            let owner = self
+                .attempt_root
+                .as_ref()
+                .ok_or(AttemptError::InvalidTransition("attempt root was removed"))?;
+            owner.directory.remove_file(artifact_id)?;
+            owner.directory.sync()?;
+        }
+        Ok(())
     }
 
     pub fn publish(
@@ -678,6 +1307,59 @@ impl AttemptPublication {
             self.remove_completed_attempt()?;
         }
         Ok(Some(outcome))
+    }
+
+    /// Publish a pre-registered run and return path-free logical truth.
+    ///
+    /// Cancellation before the publication gate returns `None` after the
+    /// durable abandoned transition. Physical path disclosure remains outside
+    /// this default result type.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] for invalid transitions, manifest persistence,
+    /// containment, or publication failures.
+    pub fn publish_run(
+        &mut self,
+        registry: &OutputStagingRegistry,
+        shutdown: &ShutdownToken,
+    ) -> Result<Option<AttemptPublicationOutcome>, AttemptError> {
+        let Some(outcome) = self.publish(registry, shutdown)? else {
+            return Ok(None);
+        };
+        let cleanup_debt_count = outcome.cleanup_debt().len();
+        let artifacts = self
+            .artifacts
+            .iter()
+            .map(|runtime| {
+                let state = self
+                    .manifest
+                    .artifacts
+                    .iter()
+                    .find(|entry| entry.artifact_id == runtime.artifact_id)
+                    .map_or(ArtifactState::Unpublished, |entry| entry.state);
+                ArtifactPublicationResult {
+                    artifact_id: runtime.artifact_id.clone(),
+                    kind: runtime.kind,
+                    logical_leaf: runtime.logical_leaf.clone(),
+                    state,
+                }
+            })
+            .collect();
+        let logical = if outcome.is_complete() {
+            AttemptPublicationOutcome::Complete {
+                execution_id: self.execution_id.clone(),
+                artifacts,
+                cleanup_debt_count,
+            }
+        } else {
+            AttemptPublicationOutcome::Incomplete {
+                execution_id: self.execution_id.clone(),
+                artifacts,
+                cleanup_debt_count,
+            }
+        };
+        Ok(Some(logical))
     }
 
     /// Inspect and, only with exact ownership proof, remove one orphaned attempt.
@@ -833,12 +1515,21 @@ impl AttemptPublication {
             .map_err(|_| AttemptError::InvalidManifest("manifest source failed validation"))?;
         let destination = validate_path(Path::new("manifest.json"), &attempt_root.path, false)
             .map_err(|_| AttemptError::InvalidManifest("manifest destination failed validation"))?;
-        OutputContainment::for_profile(destination, "local-filesystem")?
+        OutputContainment::for_profile(destination, containment_profile(self.owner_profile))?
             .promote_from(source, PromotionDisposition::Replace)?;
         Ok(())
     }
 
     fn remove_completed_attempt(&mut self) -> Result<(), AttemptError> {
+        let additional_roots = std::mem::take(&mut self.additional_roots);
+        for (_, mut additional) in additional_roots {
+            if let Some(lock) = additional.lock_file.take() {
+                let _ = FileExt::unlock(&lock);
+                drop(lock);
+            }
+            additional.root.directory.remove_file("live.lock")?;
+            additional.root.remove_empty()?;
+        }
         let attempt_root = self
             .attempt_root
             .as_ref()
@@ -866,6 +1557,22 @@ pub enum AttemptError {
     InvalidTransition(&'static str),
     #[error("injected attempt publication failure at {0}")]
     Injected(&'static str),
+    #[error("artifact destination collision between producers {first:?} and {second:?}")]
+    RegistrationCollision { first: String, second: String },
+    #[error(
+        "destination artifact integrity mismatch: expected {expected_bytes} bytes, observed {observed_bytes} bytes"
+    )]
+    IntegrityMismatch {
+        expected_bytes: u64,
+        observed_bytes: u64,
+    },
+    #[error(
+        "attempt artifacts total {actual_bytes} bytes exceeds the admitted bound {admitted_bytes} bytes"
+    )]
+    AttemptByteLimitExceeded {
+        actual_bytes: u64,
+        admitted_bytes: u64,
+    },
     #[error("attempt manifest serialization failed: {0}")]
     Serialize(serde_json::Error),
     #[error("attempt manifest parsing failed: {0}")]
@@ -881,6 +1588,57 @@ pub enum AttemptError {
     Containment(#[from] ContainmentError),
     #[error(transparent)]
     Pipeline(#[from] PipelineError),
+}
+
+fn destination_parent(destination: &ValidatedPath) -> Result<ValidatedPath, AttemptError> {
+    let parent = destination
+        .as_path()
+        .parent()
+        .ok_or(AttemptError::InvalidManifest(
+            "artifact destination has no parent",
+        ))?;
+    validate_path(Path::new("."), parent, false)
+        .map_err(|_| AttemptError::InvalidManifest("destination parent failed validation"))
+}
+
+fn destination_root_key(path: &Path) -> String {
+    clinker_plan::config::collision_key(&path.to_string_lossy())
+}
+
+fn containment_profile(profile: DestinationProfile) -> &'static str {
+    match profile {
+        DestinationProfile::Local => "local-filesystem",
+        DestinationProfile::NfsV4_1 => "linux-nfsv4.1-loopback-ci",
+        DestinationProfile::Smb3_1_1 => "linux-smb3.1.1-loopback-ci",
+    }
+}
+
+fn digest_file(path: &Path) -> Result<(u64, String), AttemptError> {
+    let mut file = File::open(path).map_err(|source| AttemptError::Io {
+        operation: "open artifact for digest",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut size = 0_u64;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; PUBLICATION_COPY_BUFFER_BYTES];
+    loop {
+        let read = file.read(&mut buffer).map_err(|source| AttemptError::Io {
+            operation: "digest staged artifact",
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(read as u64)
+            .ok_or(AttemptError::InvalidManifest(
+                "artifact digest byte count overflows u64",
+            ))?;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((size, hasher.finalize().to_hex().to_string()))
 }
 
 fn validate_execution_id(execution_id: &str) -> Result<(), AttemptError> {

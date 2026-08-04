@@ -5,12 +5,12 @@ use std::fs::File;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use clinker_plan::config::{ConfigError, IfExistsPolicy};
+use clinker_plan::config::{ConfigError, IfExistsPolicy, ResolvedPublicationPolicy};
 use clinker_plan::error::PipelineError;
 use clinker_plan::security::ValidatedPath;
 
 use super::containment::{ContainmentError, OutputContainment, PromotionDisposition, StagedOutput};
-use super::open::{containment_error, open_output};
+use super::open::{containment_error, open_output, open_output_with_policy};
 
 #[derive(Debug)]
 struct PendingOutput {
@@ -164,12 +164,50 @@ impl OutputStagingRegistry {
         name: impl Into<String>,
         policy: IfExistsPolicy,
         cli_force: bool,
+        path_for_n: F,
+    ) -> Result<(PathBuf, File), PipelineError>
+    where
+        F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
+    {
+        self.stage_output_inner(None, name.into(), policy, cli_force, path_for_n)
+    }
+
+    /// Stage one resolved output through an already validated publication
+    /// policy.
+    ///
+    /// This typed entry point replaces detected-filesystem routing for the
+    /// run-owned attempt path while preserving the shared collision ledger.
+    pub fn stage_output_with_policy<F>(
+        &self,
+        publication: &ResolvedPublicationPolicy,
+        name: impl Into<String>,
+        policy: IfExistsPolicy,
+        cli_force: bool,
+        path_for_n: F,
+    ) -> Result<(PathBuf, File), PipelineError>
+    where
+        F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
+    {
+        self.stage_output_inner(
+            Some(publication),
+            name.into(),
+            policy,
+            cli_force,
+            path_for_n,
+        )
+    }
+
+    fn stage_output_inner<F>(
+        &self,
+        publication: Option<&ResolvedPublicationPolicy>,
+        name: String,
+        policy: IfExistsPolicy,
+        cli_force: bool,
         mut path_for_n: F,
     ) -> Result<(PathBuf, File), PipelineError>
     where
         F: FnMut(Option<u64>) -> Result<PathBuf, ConfigError>,
     {
-        let name = name.into();
         let mut state = self
             .state
             .lock()
@@ -190,10 +228,19 @@ impl OutputStagingRegistry {
             Some(bare)
         };
         let (final_path, file, staged) = if let Some(bare) = bare {
-            open_output(policy, cli_force, |n| match n {
-                None => Ok(bare.clone()),
-                Some(n) => path_for_n(Some(n)),
-            })?
+            if let Some(publication) = publication {
+                open_output_with_policy(publication, policy, cli_force, |n| match n {
+                    None => Ok(bare.clone()),
+                    Some(n) => path_for_n(Some(n)),
+                })?
+            } else {
+                open_output(policy, cli_force, |n| match n {
+                    None => Ok(bare.clone()),
+                    Some(n) => path_for_n(Some(n)),
+                })?
+            }
+        } else if let Some(publication) = publication {
+            open_output_with_policy(publication, policy, cli_force, path_for_n)?
         } else {
             open_output(policy, cli_force, path_for_n)?
         };
