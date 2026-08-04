@@ -102,21 +102,94 @@ fn path_has_parent(path: &Path) -> bool {
         .any(|component| matches!(component, std::path::Component::ParentDir))
 }
 
-fn same_open_file(opened: &Metadata, current: &Metadata) -> bool {
+fn same_open_file(
+    opened_file: &File,
+    opened: &Metadata,
+    current_path: &Path,
+    current: &Metadata,
+) -> bool {
     #[cfg(unix)]
     {
+        let _ = (opened_file, current_path);
         use std::os::unix::fs::MetadataExt;
         opened.dev() == current.dev() && opened.ino() == current.ino()
     }
     #[cfg(windows)]
     {
-        use std::os::windows::fs::MetadataExt;
-        opened.volume_serial_number() == current.volume_serial_number()
-            && opened.file_index() == current.file_index()
+        let _ = (opened, current);
+        let Ok(current_file) = File::open(current_path) else {
+            return false;
+        };
+        match (
+            win_file_identity::query(opened_file),
+            win_file_identity::query(&current_file),
+        ) {
+            (Ok(opened), Ok(current)) => opened == current,
+            _ => false,
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
+        let _ = (opened_file, current_path);
         opened.len() == current.len() && opened.modified().ok() == current.modified().ok()
+    }
+}
+
+#[cfg(windows)]
+mod win_file_identity {
+    use std::ffi::c_void;
+    use std::fs::File;
+    use std::io;
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct FileTime {
+        low: u32,
+        high: u32,
+    }
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        creation_time: FileTime,
+        last_access_time: FileTime,
+        last_write_time: FileTime,
+        volume_serial: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            file: *mut c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    pub(super) fn query(file: &File) -> io::Result<(u32, u64)> {
+        let mut information = MaybeUninit::<ByHandleFileInformation>::uninit();
+        // SAFETY: `file` owns a valid Windows handle for the duration of this
+        // call, and `information` points to writable storage for the exact
+        // structure the API initializes on success.
+        let ok = unsafe {
+            GetFileInformationByHandle(
+                file.as_raw_handle().cast::<c_void>(),
+                information.as_mut_ptr(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a successful call initializes the complete structure.
+        let information = unsafe { information.assume_init() };
+        let file_index =
+            (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
+        Ok((information.volume_serial, file_index))
     }
 }
 
@@ -216,7 +289,7 @@ pub(crate) fn read_contained_layer<T>(
             "became a symlink while loading",
         ));
     }
-    if !same_open_file(&opened_metadata, &current_metadata) {
+    if !same_open_file(&file, &opened_metadata, &candidate, &current_metadata) {
         return Err(layer_error(
             context,
             &candidate,
