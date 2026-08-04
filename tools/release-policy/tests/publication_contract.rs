@@ -880,9 +880,7 @@ impl StateFixture {
         for record in [&mut decision, &mut approval] {
             record["checksum_sha256"] = json!(checksum_sha256);
         }
-        let identity = decision
-            .as_object()
-            .expect("candidate identity");
+        let identity = decision.as_object().expect("candidate identity");
         let archives = archive_bytes
             .iter()
             .map(|(target, _)| {
