@@ -1,6 +1,6 @@
 # AI Onboarding: Architecture
 
-Verified against origin/main cf6609b9 (2026-07-24).
+Verified against the current working tree (2026-07-30).
 
 Purpose: Give a senior Rust engineer or AI coding agent a practical, source-backed architecture overview before changing Clinker.
 
@@ -9,17 +9,23 @@ Purpose: Give a senior Rust engineer or AI coding agent a practical, source-back
 Primary evidence used for this pass:
 
 - Workspace and crate boundaries: `Cargo.toml`, `crates/*/Cargo.toml`, `docs/ai/20_CRATE_MAP.md`.
-- Planning and config: `crates/clinker-plan/src/lib.rs`, `crates/clinker-plan/src/config/pipeline.rs`, `crates/clinker-plan/src/config/pipeline_node.rs`, `crates/clinker-plan/src/yaml.rs`, `crates/clinker-plan/src/plan/compiled.rs`, `crates/clinker-plan/src/plan/execution/mod.rs`.
-- Runtime and IO: `crates/clinker-exec/src/executor/mod.rs`, `crates/clinker-exec/src/executor/params.rs`, `crates/clinker-exec/src/source/mod.rs`, `crates/clinker-exec/src/pipeline/memory.rs`, `crates/clinker-exec/src/pipeline/shutdown.rs`, `crates/clinker-format/src/traits.rs`, `crates/clinker-net/src/lib.rs`.
+- Planning and config: `crates/clinker-plan/src/lib.rs`, `crates/clinker-plan/src/config/pipeline.rs`, `crates/clinker-plan/src/config/pipeline_node.rs`, `crates/clinker-plan/src/resources/mod.rs`, `crates/clinker-plan/src/yaml.rs`, `crates/clinker-plan/src/plan/compiled.rs`, `crates/clinker-plan/src/plan/execution/consumer_registry.rs`, `crates/clinker-plan/src/plan/execution/scheduling.rs`.
+- Runtime and IO: `crates/clinker-exec/src/executor/mod.rs`, `crates/clinker-exec/src/executor/params.rs`, `crates/clinker-exec/src/executor/source_stream.rs`, `crates/clinker-exec/src/executor/output_dispatch.rs`, `crates/clinker-exec/src/executor/stream_event.rs`, `crates/clinker-exec/src/source/mod.rs`, `crates/clinker-exec/src/source/order_barrier.rs`, `crates/clinker-exec/src/pipeline/memory.rs`, `crates/clinker-exec/src/pipeline/shutdown.rs`, `crates/clinker-format/src/traits.rs`, `crates/clinker-net/src/lib.rs`.
 - Data model and language: `crates/clinker-record/src/lib.rs`, `crates/clinker-record/src/record/mod.rs`, `crates/clinker-record/src/storage.rs`, `crates/clinker-record/src/value.rs`, `crates/cxl/src/lib.rs`.
-- Edge surfaces: `crates/clinker/src/main.rs`, `crates/clinker-channel/src/lib.rs`, `crates/clinker-schema/src/lib.rs`, `examples/pipelines/customer_etl.yaml`.
+- Edge surfaces: `crates/clinker/src/main.rs`, `crates/clinker-channel/src/lib.rs`, `crates/clinker-channel/src/discovery.rs`, `crates/clinker-channel/src/group.rs`, `crates/clinker-channel/src/resolve.rs`, `crates/clinker-schema/src/lib.rs`, `examples/pipelines/customer_etl.yaml`.
 - Tests and CI: `crates/clinker-exec/tests/*`, `crates/clinker-plan/src/plan/tests/*`, `crates/clinker-format/tests/*`, `crates/clinker-net/tests/*`, `crates/clinker-channel/tests/*`, `.github/workflows/ci.yml`.
+
+Locked production targets, their current implementation status, compatibility
+posture, and downstream owners are indexed in the
+[production-contract register](15_PRODUCTION_CONTRACTS.md). This architecture
+page remains implementation-first: a locked target is not evidence that the
+current binary implements it.
 
 ## What Clinker Is
 
 Verified facts:
 
-- Clinker is a Rust workspace with 14 active members. The main executable is `crates/clinker`; the standalone CXL tool is `crates/cxl-cli`; lower layers are split into records, CXL, format, planning, execution, channel, network, schema, lineage, and benchmark support crates.
+- Clinker is a Rust workspace with 15 active members. The main executable is `crates/clinker`; the standalone CXL tool is `crates/cxl-cli`; lower layers are split into records, CXL, format, planning, execution, channel, network, schema, lineage, scenario, and benchmark support crates.
 - Pipelines are YAML documents using a unified top-level `nodes:` list. `PipelineConfig` has `nodes: Vec<Spanned<PipelineNode>>`, and comments say legacy top-level `inputs:` / `outputs:` / `transformations:` are rejected by serde.
 - The executable workload is finite batch-style pipeline execution. `RecordSource::next_record` is explicitly finite by contract, `clinker-net` describes REST as a finite-pull source with `max_pages` / `max_records`, and `PipelineExecutor` says no async runtime is required.
 - CXL is the per-record expression language layer. The `cxl` crate exposes parser, resolver, typechecker, analyzer, aggregate extraction, and evaluator modules; plan and exec compile and evaluate CXL-bearing nodes.
@@ -27,7 +33,7 @@ Verified facts:
 
 Current description:
 
-- Clinker is a bounded-memory, single-process DAG executor for finite ETL jobs, with YAML configuration, CXL expression programs, streaming readers/writers, and an explicit plan/runtime boundary. Preferred public wording is tracked in `docs/ai/80_OPEN_QUESTIONS.md`.
+- Clinker is a bounded-memory, single-process DAG executor for finite ETL jobs, with YAML configuration, CXL expression programs, streaming readers/writers, and an explicit plan/runtime boundary. Locked production wording and target deltas are tracked in the [production-contract register](15_PRODUCTION_CONTRACTS.md).
 
 ## Major Subsystems
 
@@ -36,10 +42,10 @@ Verified facts:
 - **Record model:** `clinker-record` owns `Value`, `Record`, `Schema`, `RecordStorage`, `RecordView`, provenance, document context, grouping keys, counters, and accumulator state. `Record` stores positional `Vec<Value>` data behind an `Arc<Schema>`.
 - **Expression engine:** `cxl` owns AST, lexing/parsing, module evaluation, resolution, typechecking, static analysis, aggregate planning, and runtime evaluation. Public symbols used downstream include `Parser`, `resolve_program`, `type_check`, `ProgramEvaluator`, and aggregate extraction/planning APIs.
 - **Format layer:** `clinker-format` owns streaming `FormatReader` / `FormatWriter` traits plus CSV, JSON/NDJSON, XML, fixed-width, HL7, X12, EDIFACT, SWIFT, multi-record, envelope, document index, source reopening, writer counting, and splitting modules.
-- **Planning layer:** `clinker-plan` parses YAML, validates topology and paths, resolves schemas, scans composition signatures, typechecks CXL, lowers unified nodes into `ExecutionPlanDag`, and returns `CompiledPlan`.
-- **Runtime layer:** `clinker-exec` owns `PipelineExecutor`, executor dispatch arms, source ingestion, node buffers, streaming handoff, DLQ, metrics, memory arbitration, spill handling, joins/combines, aggregation, merge, reshape, cull, envelope, output, and shutdown.
+- **Planning layer:** `clinker-plan` parses YAML, validates topology and paths, resolves schemas and the workspace catalog, enumerates every CXL-bearing field through `PipelineNode::visit_cxl_fields`, admits and typechecks the bounded transitive module/declaration closure, lowers unified nodes into `ExecutionPlanDag`, and returns `CompiledPlan`. After all structural rewrites, the finalized DAG retains a `CompiledConsumerRegistry` keyed by `ProducerPortKey` and an immutable `ExecutionOrderContract` containing typed source orders, edge/consumer requirements, terminal promises, and physical-writer boundaries. `CompiledPlan::cxl_modules()` retains the parsed registry needed by execution.
+- **Runtime layer:** `clinker-exec` owns `PipelineExecutor`, executor dispatch arms, the unified `SourceAttemptEvent` stream and `AttemptPopulationDelta` accounting, `SourceRowId`, per-physical-file source-order verification/repair, shared-port replay, node buffers, streaming handoff, DLQ, metrics, memory arbitration, spill handling, joins/combines, aggregation, merge, reshape, cull, envelope, ordered physical-writer boundaries, output, and shutdown.
 - **Network source layer:** `clinker-net` currently exposes `build_rest_source`, adapting REST pages into `Box<dyn clinker_exec::source::RecordSource>`.
-- **Channel/deployment layer:** `clinker-channel` owns channel binding, overlays, dotted paths, and source staging copies. Channels override declared config/resources only.
+- **Channel/deployment layer:** `clinker-channel` owns catalog-backed channel target discovery, explicit group target sets, selector/forced-group admission, typed overlay resolution, dotted paths, and source staging copies. Every applied layer is canonicalized and contained beneath its admitted root; parsing and identity hashing consume one bounded buffer from the same open file. `CompiledPlan::channel_identity()` records the complete ordered pipeline/group/channel/per-target layer stack, not merely a channel name or one overlay hash.
 - **Schema workspace layer:** `clinker-schema` parses `.schema.yaml`, discovers schema files, builds `SchemaIndex`, and validates pipeline schema references.
 - **Lineage layer:** `clinker-lineage` walks a `CompiledPlan` to compute OpenLineage column-level lineage (DIRECT value derivation plus dataset-level INDIRECT influence, traced through composition bodies) and emits run events as NDJSON. Wired to the CLI as `run --lineage` (plan-derived, no data processing) and `run --lineage-events` (live run lifecycle).
 - **CLI layer:** `crates/clinker/src/main.rs` exposes `run`, `metrics`, `explain`, `channels`, `refactor`, and `config` commands through Clap and calls into plan/exec/channel/net/format/lineage code.
@@ -53,17 +59,72 @@ Verified end-to-end shape:
 2. Config loading goes through `clinker-plan`. `load_config` / `load_config_with_vars` parse YAML into `PipelineConfig`, and `clinker_plan::yaml::from_str` is the parser chokepoint over `serde-saphyr` with a 32 MiB input cap and depth/node/alias budgets.
 3. `PipelineNode` deserialization is hand-written around the `type:` discriminator. It intentionally preserves per-node spans and per-variant `deny_unknown_fields` behavior.
 4. `PipelineConfig::compile_topology_only` checks duplicate names, self-loops, general cycles, undeclared input references, path validation, dotted-name restrictions, and log directive sanity.
-5. `PipelineConfig::compile` / `compile_with_diagnostics` scan composition signatures when needed, bind schemas, typecheck CXL, lower nodes to `PlanNode`, build an `ExecutionPlanDag`, and wrap it in `CompiledPlan`.
+5. `PipelineConfig::compile` / `compile_with_diagnostics` use the variant-exhaustive `PipelineNode::visit_cxl_fields` traversal to find direct CXL roots, load only their admitted bounded module/declaration closure, bind schemas, typecheck CXL, lower nodes to `PlanNode`, and apply all structural rewrites. The finalized `ExecutionPlanDag` freezes its complete producer-port consumer registry and ordering/writer contract before `CompiledPlan` is returned.
 6. Source inputs enter runtime as `SourceInput::Files(Vec<FileSlot>)` or `SourceInput::Records(Box<dyn RecordSource>)`. File transports reach `RecordSource` through a blanket impl for `Box<dyn FormatReader>`; REST uses `build_rest_source`.
-7. Source ingest runs per declared source, resolves schemas with `schema(&mut self)`, calls finite `next_record`, attaches document/provenance context, and pushes events to bounded crossbeam channels.
-8. Runtime dispatch walks the plan DAG, executing `PlanNode` variants through focused dispatch modules such as `transform_dispatch`, `aggregate_dispatch`, `combine_dispatch`, `route_dispatch`, `merge_dispatch`, `reshape_dispatch`, `cull_dispatch`, `envelope_dispatch`, and `output_dispatch`.
+7. Source ingest runs per declared source, resolves schemas with `schema(&mut self)`, calls finite `next_record`, assigns an attempt-local monotonic `SourceRowId`, attaches document/provenance context, and emits both successful records and recoverable type failures through one bounded `SourceAttemptEvent` stream. `AttemptPopulationDelta` carries the same attempt population into success, DLQ, and accounting paths. A retained `CompiledSourceOrder` supplies stable source identity, typed key positions/types, event shape, and unsorted policy to the memory-arbitrated barrier; the barrier verifies or stably repairs each physical file before release and never asserts global order across files.
+8. Runtime dispatch walks the plan DAG, executing `PlanNode` variants through focused dispatch modules such as `transform_dispatch`, `aggregate_dispatch`, `combine_dispatch`, `route_dispatch`, `merge_dispatch`, `reshape_dispatch`, `cull_dispatch`, `envelope_dispatch`, and `output_dispatch`. Fan-out consults the planning-owned `CompiledConsumerRegistry`; a shared producer port is materialized once and replayed independently to every compiled consumer, including spill-backed replay when memory pressure requires it.
 9. Records are schema-indexed. Transform and aggregate CXL programs use typechecked artifacts from planning; runtime writes only fields already present in the widened output schema.
-10. Outputs consume `FormatWriter` implementations, optionally with envelope begin/end document hooks, byte counting, splitting, and metrics.
+10. Outputs consume `FormatWriter` implementations through the planning-owned `PhysicalWriterBoundary`. `OrderedWriterBoundary` performs terminal sorting with the shared `MemoryArbitrator`, `SortBuffer`, and `SortedRunMerger`, preserves the authored keys as the whole ordering guarantee, and owns finish/error/temporary-spill cleanup. Writers may also provide envelope begin/end document hooks, byte counting, splitting, and metrics.
 11. `ExecutionReport` returns counters, DLQ entries, execution summary, peak RSS, CPU/IO totals, stage metrics, watermarks, rollback cursors, per-source counts, spill totals, streaming charge peaks, and interrupted status.
 
 Important nuance:
 
-- Public executor APIs take `&CompiledPlan`, but `PipelineExecutor::run_plan_with_readers_writers` currently delegates through `plan.config()` into the shared run path, where the runtime performs the canonical compile path again in context before dispatch. Treat `CompiledPlan` as the public proof boundary, but inspect the current executor body before assuming the stored DAG is always consumed directly.
+- Public executor APIs take `&CompiledPlan`, but `PipelineExecutor::run_plan_with_readers_writers` currently delegates through `plan.config()` into the shared run path, where the runtime performs the canonical compile path again in context before dispatch. When the supplied plan has CXL modules, the executor seeds that compile context from `plan.cxl_modules()`; admitted module source files are not reopened. Treat `CompiledPlan` as the public proof boundary, but inspect the current executor body before assuming the stored DAG is always consumed directly.
+
+### Execution correctness authority map
+
+The compile/runtime division is deliberate: planning proves and freezes
+author-authored meaning; execution consumes those proofs while enforcing finite,
+bounded operation.
+
+| Surface | Planning authority retained by `CompiledPlan` | Runtime enforcement | Invariant |
+|---|---|---|---|
+| CXL in any node variant | `PipelineNode::visit_cxl_fields`, typed direct roots, bounded module/declaration closure, parsed `CompiledModuleRegistry` | Evaluator registry built from retained modules; admitted files are not reopened | No hidden CXL-bearing field or runtime filesystem admission |
+| Channel/group overlays | Catalog target admission plus complete ordered `ChannelIdentity::layers` with exact-byte hashes | The resolved config enters the ordinary compile/run boundary | Every layer is contained, parsed, and identified from the same single-open buffer |
+| DAG fan-out | `CompiledConsumerRegistry` keyed by `(PlanNodeId, producer port)` after structural rewrites | One shared resident or spill-backed replay source supplies independent consumers | No node-kind heuristic may omit a consumer or make one consumer drain another |
+| Source typing and ordering | `CompiledSourceOrder`, typed key positions/types, per-file scope, unsorted policy | Unified attempt stream, population accounting, and `SourceFileOrderBarrier` | Records and recoverable type failures share one attempt order; separate files never imply a global sort |
+| Downstream and terminal order | Edge requirements, output promises, and `PhysicalWriterBoundary` in `ExecutionOrderContract` | Strategy assertions and `OrderedWriterBoundary` using shared sort/spill machinery | Authored fields are the entire order key; no hidden source-identity tie-breaker |
+
+These enforcement paths remain under the one run-scoped `MemoryArbitrator`.
+Source repair, shared-port replay, and writer sorting can spill and merge, but do
+not create private memory budgets, native helpers, async runtimes, or a second
+ordering implementation.
+
+### Current execution path and locked target
+
+The current call path is explicit and non-conforming with the locked target:
+
+```text
+PipelineConfig::compile -> CompiledPlan
+                             |
+PipelineExecutor::run_plan_with_readers_writers(&CompiledPlan)
+                             |
+                        plan.config()
+                             |
+       CompileContext + PipelineConfig::compile
+                             |
+                 newly validated plan.dag()
+                             |
+                         dispatch
+```
+
+The supplied `CompiledPlan` is the locked execution boundary, but direct
+execution of its stored DAG, composition bodies, schemas, compiled artifacts,
+and statistics has **not** landed. D-01 through D-11 assign that correction and
+sequential in-process reuse to Phase 5 / PERF-01; only an enumerated runtime
+envelope may refresh. See
+[stored-plan execution and cache identity](15_PRODUCTION_CONTRACTS.md#stored-plan-execution-and-cache-identity).
+
+### Current terminal node and locked target
+
+Current parser, planner, runtime, examples, and docs use `Output` and public
+YAML `type: output` for the terminal writer node. D-56 assigns one atomic,
+one-way migration of that **terminal destination concept** to Sink and
+`type: sink` to Phase 4 / AUTH-09, before Phase 4.1 endpoint work. It is not
+available today. Output-port maps, produced artifacts and paths, serialization
+formats, stdout, command and machine output, writer results, and OpenLineage
+output datasets remain valid output vocabulary. See
+[terminal destination vocabulary](15_PRODUCTION_CONTRACTS.md#terminal-destination-vocabulary).
 
 ## Architectural Boundaries
 
@@ -71,9 +132,9 @@ Verified boundaries:
 
 - `clinker-record` and `clinker-core-types` are lower-level vocabulary crates. They should not depend on planning or execution.
 - `cxl` depends on records but does not depend on plan or exec.
-- `clinker-plan` sits below execution. Its crate docs say it turns YAML and CXL into a typed, validated `ExecutionPlanDag` "without depending on any runtime operator."
+- `clinker-plan` sits below execution. Its crate docs say it turns YAML and CXL into a typed, validated `ExecutionPlanDag` "without depending on any runtime operator." Its public `resources` module owns workspace catalog identity, rules-root selection, bounded module loading, and `CompiledModuleRegistry`.
 - `clinker-exec` consumes plan/config artifacts and owns runtime operator behavior. Executor public docs include a `compile_fail` doctest showing `&PipelineConfig` is not accepted by `run_plan_with_readers_writers`.
-- `clinker-format` is the streaming IO layer. It depends on `cxl` today, which `20_CRATE_MAP.md` flags as a current but potentially worth-reviewing layering edge.
+- `clinker-format` is the streaming IO layer. Its current dependency on `cxl` is the reviewed D-20 exception for logical types and document path/index behavior, not general permission to move expression evaluation into formats.
 - `clinker-net` is not a low-level HTTP-only crate; it depends on `clinker-exec` because REST readers implement executor `RecordSource`.
 - `clinker-channel`, `clinker-net`, `clinker-schema`, `clinker`, and `cxl-cli` are edge/integration crates.
 - Benchmark helpers must remain outside default runtime paths. The `clinker-exec -> clinker-bench-support` edge is optional and feature-gated for `bench-alloc`.
@@ -88,17 +149,21 @@ Practical guidance:
 
 ## Public API Surfaces
 
-Verified API surfaces future agents should recognize:
+The following are reachable surfaces future agents should recognize. Rust
+visibility does not by itself make each one a supported integration API. Apply
+the D-18/D-19 classification in
+[the crate map](20_CRATE_MAP.md#rust-reachability-and-compatibility) before
+making a compatibility claim or changing a re-export:
 
 - `clinker_plan::config::PipelineConfig::{compile, compile_with_diagnostics, compile_topology_only, source_configs, output_configs}`.
 - `clinker_plan::config::{load_config, load_config_with_vars}` and `clinker_plan::yaml::{from_str, to_string, Spanned, CxlSource}`.
-- `clinker_plan::plan::CompiledPlan::{dag, config, composition_bodies, statistics, body_of, provenance, provenance_mut, channel_identity, pipeline_hash, bound_schemas, schema_provenance}`.
+- `clinker_plan::plan::CompiledPlan::{dag, config, composition_bodies, statistics, body_of, provenance, provenance_mut, channel_identity, pipeline_hash, bound_schemas, schema_provenance, cxl_modules}` and planning-owned module resources under `clinker_plan::resources`.
 - `clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, PlanEdge, NodeExecutionReqs}`.
 - `clinker_exec::executor::{PipelineExecutor, PipelineRunParams, ExecutionReport, WriterRegistry, SourceReaders, SourceInput, RecordSource, single_file_reader}`.
 - `clinker_exec::source::{RecordSource, SourceInput}` for non-file source integration.
 - `clinker_format::{FormatReader, FormatWriter, FormatError, EnvelopeConfig, EnvelopeEvent, EnvelopeFramer, ReopenableSource}`.
 - `clinker_record::{Record, RecordPayload, Value, Schema, SchemaBuilder, RecordStorage, RecordView, DocumentContext, PipelineCounters}`.
-- `clinker_channel::{resolve, OverlayResolution, resolve_channel_overlay, scan_channels, scan_groups, DottedPath, ChannelManifest, OverlayFile, Group, ChannelOverlayResult, SourceStager}`.
+- `clinker_channel::{resolve, OverlayResolution, resolve_channel_overlay, scan_channels, scan_groups, DottedPath, ChannelManifest, OverlayFile, Group, GroupTargetSet, ValidatedGroupTargets, ChannelOverlayResult, ResolvedChannelConfig, SourceStager}`.
 - `clinker_net::build_rest_source`.
 - `clinker_schema::{parse_schema, parse_schema_file, build_workspace_schema_index, validate_pipeline}`.
 - `clinker_lineage::{column_lineage, dataset_identity, run_events, LiveRunEmitter, write_ndjson}`.
@@ -109,6 +174,7 @@ Verified API surfaces future agents should recognize:
 Verified patterns:
 
 - Records own their values but share schema and document context: `Record { schema: Arc<Schema>, values: Vec<Value>, doc_ctx: Arc<DocumentContext> }`.
+- `SourceRowId` lives in executor stream vocabulary because it combines a planning-owned `PlanNodeId` with an attempt-local source ordinal. It is minted once at ingest and preserved through resident/spilled handoffs, fan-out, structural carriers, DLQ/commit state, and terminal accounting; `clinker-record` does not acquire a planner dependency.
 - `RecordStorage` returns borrowed `&Value` and requires `Send + Sync`, allowing zero-copy field resolution in window/evaluator paths.
 - `Value::String(FieldStr)` optimizes short strings inline and longer strings through shared or unique storage hints; serialization intentionally loses the storage hint and preserves content.
 - `RecordPayload` is the spill wire form. It omits schema and full document context; spill files write schema/context side tables and records carry positional values plus a document id.
@@ -144,7 +210,9 @@ Verified facts:
 - `Value` implements custom serde for postcard-compatible spill encoding and textual tagged output; production JSON output uses format/executor conversion helpers rather than relying on the raw enum shape.
 - File readers and writers stream through `FormatReader` / `FormatWriter`. Envelope-aware readers and writers add document hooks without buffering whole documents.
 - Workspace storage configuration uses TOML (`clinker.toml` / storage config in `clinker-plan`), not the YAML parser chokepoint.
-- Channels load `.channel.yaml`, content-hash the raw file with BLAKE3, and apply bounded provenance layers.
+- Channels load `channel.cfg.yaml` plus one catalog-selected per-target `.channel.yaml`, content-hash their raw files with BLAKE3, and apply bounded provenance layers.
+- Planning owns CXL module filesystem admission. It resolves the bounded transitive import closure into a `CompiledModuleRegistry`, records direct program roots and exports, and stores that immutable registry on `CompiledPlan`; runtime evaluation consumes the compiled registry rather than reopening admitted module files. The `cxl_module_resolution` integration gate removes those files after planning and verifies that the run still succeeds.
+- Groups declare explicit pipeline/composition targets. Catalog validation produces `ValidatedGroupTargets`; selector-derived groups are restricted to the already admitted target-intersected subset, and forcing a group bypasses label selection but not target admission. Channel overlay resolution then runs per target and its resolved composition closure.
 - Source staging uses `clinker-channel::SourceStager` and path matching/resource reuse logic; filesystem path validation lives in `clinker-plan::security`.
 
 ## Extension, Plugin, And Scripting Boundaries
@@ -156,7 +224,7 @@ Verified facts:
 - Format extension is by implementing `FormatReader` and/or `FormatWriter` and wiring it through format config and executor reader/writer construction.
 - Transport extension is by implementing `RecordSource` and registering `SourceInput::Records`; REST is the current concrete non-file example.
 - Composition extension is declarative through `.comp.yaml`, signatures, ports, params, resources, and bound bodies. Composition internals are sealed from channel overlays except through declared surfaces.
-- Channel extension is declarative through `.channel.yaml`, `DottedPath`, config/resource overrides, and source staging.
+- Channel extension is declarative through `.channel.yaml`, explicit group target sets, `DottedPath`, config/resource overrides, and source staging. New channel behavior must preserve catalog-backed target admission and per-target composition-closure confinement.
 
 No verified general-purpose plugin system was found in this repository. Treat "plugin" as unsupported unless maintainers identify a specific extension mechanism.
 
@@ -214,4 +282,10 @@ These are supported by current code structure or source comments:
 
 ## Open Question Routing
 
-Current unresolved architecture questions are tracked in `docs/ai/80_OPEN_QUESTIONS.md`. In particular, check that registry before changing layering around `clinker-format`, `clinker-net`, plan reuse in `PipelineExecutor`, or async/Tokio usage.
+Unresolved or explicitly deferred architecture questions are tracked in
+`docs/ai/80_OPEN_QUESTIONS.md`. Locked decisions about the `clinker-format ->
+cxl` edge, plan reuse, public API compatibility, unused Tokio declaration, and
+terminal Sink migration are in the
+[production-contract register](15_PRODUCTION_CONTRACTS.md); do not reopen them
+as implementation-local choices. `clinker-net` layering and any genuinely new
+async-runtime proposal still require source review and architecture approval.

@@ -99,7 +99,7 @@ the cell into an array:
 no delimiter is a one-element array; each element is coerced to the column's
 declared `type:`. A quoted cell is unquoted first, so a delimiter inside the
 quotes is not a boundary. A `multiple: true` column with no covering
-`split_values` entry is rejected at compile ([E361](../../explain/E361.md)). The
+`split_values` entry is rejected at compile ([E361](https://github.com/rustpunk/clinker/blob/main/docs/explain/E361.md)). The
 entry is read only on a single-schema source, not the multi-record reader below.
 See [`split_values`](../nodes/source.md#several-values-in-one-cell-split_values)
 in the Source reference for the full grammar.
@@ -165,7 +165,7 @@ one empty value. Use `encode_json` when that distinction matters. A single
 non-empty value emits that value with no delimiter. The joined cell is quoted by
 the normal CSV rules when it contains the field delimiter, a quote, or a newline.
 Declaring `join_values` on a non-CSV output is rejected at compile
-([E362](../../explain/E362.md)).
+([E362](https://github.com/rustpunk/clinker/blob/main/docs/explain/E362.md)).
 
 **Round trip.** `on_conflict: escape` and `encode_json` are recovered exactly by
 a matching source `split_values` entry:
@@ -262,6 +262,6 @@ own `type` / `trim` / `pad`, the same as a single-record CSV field.
   are skipped rather than parsed.
 - An **unknown discriminator value** (a tag no `records:` entry declares)
   is a structural-integrity failure, classified separately from a trailer
-  count mismatch: it [aborts the run](../../explain/E345.md) by default,
+  count mismatch: it [aborts the run](https://github.com/rustpunk/clinker/blob/main/docs/explain/E345.md) by default,
   or under `dlq_granularity: document` condemns the whole file to the
   dead-letter sink and the run continues.

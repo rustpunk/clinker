@@ -1221,11 +1221,22 @@ nodes:
     )
     .expect("write pipeline");
 
+    std::fs::write(
+        tmp.join("clinker.toml"),
+        "[catalog.pipelines]\npipe = \"pipe.yaml\"\n\n[catalog.channels]\nacme = \"channel/acme\"\n",
+    )
+    .expect("write catalog");
+
     let tenant = tmp.join("channel").join("acme");
     std::fs::create_dir_all(&tenant).expect("create tenant dir");
     std::fs::write(
+        tenant.join("channel.cfg.yaml"),
+        "channel:\n  name: acme\n  targets: [pipe]\n",
+    )
+    .expect("write channel manifest");
+    std::fs::write(
         tenant.join("pipe.channel.yaml"),
-        "channel:\n  target: ../../pipe.yaml\nconfig:\n  nosuchnode.nosuchparam: 1\n",
+        "channel:\n  target: pipe\nconfig:\n  nosuchnode.nosuchparam: { value: 1 }\n",
     )
     .expect("write overlay");
 
@@ -1267,11 +1278,21 @@ fn write_channel_workspace(overlay_body: &str) -> std::path::PathBuf {
     let tmp = tempdir_path();
     std::fs::write(tmp.join("in.json"), "{\"rows\":[]}\n").expect("write input");
     std::fs::write(tmp.join("pipe.yaml"), jsonpath_record_path_yaml()).expect("write pipeline");
+    std::fs::write(
+        tmp.join("clinker.toml"),
+        "[catalog.pipelines]\npipe = \"pipe.yaml\"\n\n[catalog.channels]\nacme = \"channel/acme\"\n",
+    )
+    .expect("write catalog");
     let tenant = tmp.join("channel").join("acme");
     std::fs::create_dir_all(&tenant).expect("create tenant dir");
     std::fs::write(
+        tenant.join("channel.cfg.yaml"),
+        "channel:\n  name: acme\n  targets: [pipe]\n",
+    )
+    .expect("write channel manifest");
+    std::fs::write(
         tenant.join("pipe.channel.yaml"),
-        format!("channel:\n  target: ../../pipe.yaml\n{overlay_body}"),
+        format!("channel:\n  target: pipe\n{overlay_body}"),
     )
     .expect("write overlay");
     tmp

@@ -8,6 +8,8 @@
 //!   paired with its recorded row count. Punctuations never spill —
 //!   they live in the `pending_puncts` sidecar.
 //! - `Mixed`: a mem tail accumulated after a partial spill.
+//! - `ReReadable`: immutable resident or spilled backing shared by sequential
+//!   fan-out consumers, each with an independent cursor.
 //!
 //! Every consumer drains a slot through [`NodeBuffer::drain`], which
 //! returns an iterator that streams memory events first, then per-spill
@@ -24,7 +26,7 @@ use std::vec::IntoIter as VecIntoIter;
 
 use clinker_record::{Record, Value};
 
-use crate::executor::stream_event::{Punctuation, StreamEvent};
+use crate::executor::stream_event::{Punctuation, SourceRowId, StreamEvent};
 use crate::pipeline::spill::{SpillFile, SpillReader};
 use crate::pipeline::spill_merge::{OwnedMergeBudget, SortedRunMerger};
 use clinker_plan::error::PipelineError;
@@ -33,7 +35,7 @@ use clinker_plan::error::PipelineError;
 /// drain. Returned by [`NodeBuffer::drain_split`] and threaded through
 /// the per-operator dispatch sites that reshape records while forwarding
 /// document boundaries unchanged.
-pub(crate) type DrainedEvents = (Vec<(Record, u64)>, Vec<Punctuation>);
+pub(crate) type DrainedEvents = (Vec<(Record, SourceRowId)>, Vec<Punctuation>);
 
 /// Per-record heuristic byte cost for a record of `column_count` columns.
 ///
@@ -45,12 +47,13 @@ pub(crate) type DrainedEvents = (Vec<(Record, u64)>, Vec<Punctuation>);
 /// reports to the arbitrator consistent whether its output is admitted as
 /// one full slot or streamed batch-by-batch.
 ///
-/// Counts the `Value` slots plus the `(Record, u64)` pair overhead; it is
+/// Counts the `Value` slots plus the `(Record, SourceRowId)` pair overhead; it is
 /// a fixed-width heuristic that ignores per-`Value` heap (string / list
 /// payload), matching the existing admission model the soft-spill
 /// threshold is tuned against.
 pub(crate) fn record_byte_cost(column_count: usize) -> u64 {
-    (std::mem::size_of::<Value>() * column_count + std::mem::size_of::<(Record, u64)>()) as u64
+    (std::mem::size_of::<Value>() * column_count + std::mem::size_of::<(Record, SourceRowId)>())
+        as u64
 }
 
 /// One slot inside `ExecutorContext::node_buffers`.
@@ -65,7 +68,7 @@ pub(crate) enum NodeBuffer {
     /// punctuations that arrived before / during the spill — they
     /// drain after the spill chunks at the tail of the document.
     Spilled {
-        chunks: Vec<(SpillFile<u64>, u64)>,
+        chunks: Vec<(SpillFile<SourceRowId>, u64)>,
         pending_puncts: Vec<Punctuation>,
     },
     /// A spill followed by a resident mem tail. The sole producer of this
@@ -86,7 +89,7 @@ pub(crate) enum NodeBuffer {
     /// `Mixed` and their `drain` order is unambiguous.
     Mixed {
         mem: Vec<StreamEvent>,
-        spills: Vec<(SpillFile<u64>, u64)>,
+        spills: Vec<(SpillFile<SourceRowId>, u64)>,
         pending_puncts: Vec<Punctuation>,
     },
     /// Emit-phase payload-ordered output-sort runs adopted whole — never
@@ -96,7 +99,7 @@ pub(crate) enum NodeBuffer {
     /// `len_hint`); `pending_puncts` drain after the merged records. The block-
     /// band IEJoin buffered-spilled path is the sole producer.
     MergeSpilled {
-        runs: Vec<SpillFile<(u64, u64, u64)>>,
+        runs: Vec<SpillFile<(SourceRowId, u64, u64)>>,
         row_count: u64,
         pending_puncts: Vec<Punctuation>,
         /// Charging context for the lazy fold-down: if the adopted runs are too
@@ -115,12 +118,12 @@ pub(crate) enum NodeBuffer {
 pub(crate) enum ReReadableNodeBuffer {
     Memory(Vec<StreamEvent>),
     Spilled {
-        chunks: Vec<(SpillFile<u64>, u64)>,
+        chunks: Vec<(SpillFile<SourceRowId>, u64)>,
         pending_puncts: Vec<Punctuation>,
     },
     Mixed {
         mem: Vec<StreamEvent>,
-        spills: Vec<(SpillFile<u64>, u64)>,
+        spills: Vec<(SpillFile<SourceRowId>, u64)>,
         pending_puncts: Vec<Punctuation>,
     },
 }
@@ -148,7 +151,7 @@ impl ReReadableNodeBuffer {
         }
     }
 
-    fn spill_chunks(&self) -> &[(SpillFile<u64>, u64)] {
+    fn spill_chunks(&self) -> &[(SpillFile<SourceRowId>, u64)] {
         match self {
             Self::Memory(_) => &[],
             Self::Spilled { chunks, .. } => chunks,
@@ -167,15 +170,18 @@ impl ReReadableNodeBuffer {
 }
 
 impl NodeBuffer {
-    /// Promote a `Vec<(Record, u64)>` into a `Memory` variant, wrapping
+    /// Promote a `Vec<(Record, SourceRowId)>` into a `Memory` variant, wrapping
     /// each pair as a [`StreamEvent::Record`]. The dominant existing
     /// pattern at admission sites: producer accumulates records in a
     /// local `Vec`, then publishes the slot via this helper.
-    pub(crate) fn memory_from_records(records: Vec<(Record, u64)>) -> Self {
+    pub(crate) fn memory_from_records<R>(records: Vec<(Record, R)>) -> Self
+    where
+        R: Into<SourceRowId>,
+    {
         Self::Memory(
             records
                 .into_iter()
-                .map(|(r, rn)| StreamEvent::record(r, rn))
+                .map(|(r, rn)| StreamEvent::record(r, rn.into()))
                 .collect(),
         )
     }
@@ -187,7 +193,7 @@ impl NodeBuffer {
     /// merged records. An empty run set or a zero count carries only the
     /// punctuations, so the drain never opens a merge over nothing.
     pub(crate) fn merge_spilled(
-        runs: Vec<SpillFile<(u64, u64, u64)>>,
+        runs: Vec<SpillFile<(SourceRowId, u64, u64)>>,
         row_count: u64,
         pending_puncts: Vec<Punctuation>,
         merge_budget: OwnedMergeBudget,
@@ -318,8 +324,11 @@ impl NodeBuffer {
     /// then insert via `NodeBuffer::memory_from_records(vec)` remain
     /// the dominant pattern; `push` exists so spill-trigger logic can
     /// resume in-memory accumulation after a partial spill.
-    pub(crate) fn push(&mut self, record: Record, rn: u64) {
-        self.push_event(StreamEvent::record(record, rn));
+    pub(crate) fn push<R>(&mut self, record: Record, row_id: R)
+    where
+        R: Into<SourceRowId>,
+    {
+        self.push_event(StreamEvent::record(record, row_id.into()));
     }
 
     /// Append a stream event (record OR punctuation) to the in-memory
@@ -347,7 +356,7 @@ impl NodeBuffer {
             Self::MergeSpilled { .. } => panic!(
                 "push_event on a MergeSpilled node buffer: block-band output slots \
                  are never push_event-ed, and the (u64, u64, u64) runs are format-\
-                 incompatible with Mixed's SpillFile<u64>, so promotion is impossible"
+                 incompatible with Mixed's SpillFile<SourceRowId>, so promotion is impossible"
             ),
             Self::ReReadable(_) => panic!(
                 "push_event on a re-readable node buffer: published fan-out slots are immutable"
@@ -365,7 +374,7 @@ impl NodeBuffer {
     /// call-site this is wired into today operates only on memory-
     /// resident rows; spill-aware pre-flight validation is part of
     /// the spill-wiring sub-issue.
-    pub(crate) fn peek_mem_records(&self) -> Vec<(&Record, u64)> {
+    pub(crate) fn peek_mem_records(&self) -> Vec<(&Record, SourceRowId)> {
         let mem_slice = match self {
             Self::Memory(v) => v.as_slice(),
             Self::Mixed { mem, .. } => mem.as_slice(),
@@ -527,7 +536,7 @@ impl NodeBuffer {
     /// and pattern-match `StreamEvent` to inject per-document logic
     /// at the boundary.
     pub(crate) fn drain_split(self) -> Result<DrainedEvents, PipelineError> {
-        let mut records: Vec<(Record, u64)> = Vec::with_capacity(self.len_hint());
+        let mut records: Vec<(Record, SourceRowId)> = Vec::with_capacity(self.len_hint());
         let mut puncts: Vec<Punctuation> = Vec::new();
         for event in self.drain() {
             match event? {
@@ -545,7 +554,7 @@ impl NodeBuffer {
     /// streaming-contract invariant that drives Aggregate
     /// flush-on-close and Merge dedup.
     pub(crate) fn memory_from_records_and_puncts(
-        records: Vec<(Record, u64)>,
+        records: Vec<(Record, SourceRowId)>,
         puncts: Vec<Punctuation>,
     ) -> Self {
         let mut events: Vec<StreamEvent> = Vec::with_capacity(records.len() + puncts.len());
@@ -596,7 +605,7 @@ impl NodeBuffer {
             },
             other => return Ok((other, 0)),
         };
-        let mut records: Vec<(Record, u64)> = Vec::with_capacity(events.len());
+        let mut records: Vec<(Record, SourceRowId)> = Vec::with_capacity(events.len());
         let mut puncts: Vec<Punctuation> = Vec::new();
         for event in events {
             match event {
@@ -635,7 +644,7 @@ impl NodeBuffer {
     /// `document_dlq::drain_records_in_arrival_order`. Inter-stage slots are
     /// never `Mixed`, so this order is unambiguous for them.
     ///
-    /// Spill rows stream from disk via `SpillReader<u64>` without
+    /// Spill rows stream from disk via `SpillReader<SourceRowId>` without
     /// materializing the spill. Spill-open and per-row decode failures
     /// surface as `PipelineError::Spill` items so the executor's
     /// existing `?`-bubble path applies unchanged.
@@ -896,21 +905,23 @@ impl crate::pipeline::memory::MemoryConsumer for TransientNodeBufferConsumer {
 /// family; both dispatch statically and are infallible to construct.
 ///
 /// - `Chunked` streams a `Memory` / `Spilled` / `Mixed` slot: its in-memory
-///   events first, then each spill chunk's records via `SpillReader<u64>`,
+///   events first, then each spill chunk's records via
+///   `SpillReader<SourceRowId>`,
 ///   finally the trailing punctuations. It owns the spill chunks so each
 ///   chunk's `TempPath` stays alive until the iterator advances past it, even
 ///   if the producer dropped its handle. Fields drop in declaration order: the
 ///   active reader closes its file handle before the chunk it was opened from
 ///   is unlinked.
 /// - `Merged` streams a `MergeSpilled` slot by lazily k-way-merging the adopted
-///   `(u64, u64, u64)` runs and projecting each row to `(record, order)`, then
+///   `(SourceRowId, u64, u64)` runs and projecting each row to
+///   `(record, order)`, then
 ///   the trailing punctuations. The merge opens on the first record poll, so a
 ///   run-open failure surfaces as an `Err` item rather than at construction —
 ///   mirroring the chunked arm's lazy `file.reader()` open.
 pub(crate) enum NodeBufferDrain {
     Chunked {
         mem: VecIntoIter<StreamEvent>,
-        remaining_spills: VecIntoIter<(SpillFile<u64>, u64)>,
+        remaining_spills: VecIntoIter<(SpillFile<SourceRowId>, u64)>,
         // Boxed so the `Chunked` variant's size does not dwarf `Merged`'s: the
         // active `SpillReader` is bulky and only one is live at a time, and the
         // chunked path already does per-chunk file I/O, so the heap indirection
@@ -920,8 +931,8 @@ pub(crate) enum NodeBufferDrain {
     },
     Merged {
         /// Taken on the first record poll to open the merge; `None` afterward.
-        runs: Option<Vec<SpillFile<(u64, u64, u64)>>>,
-        merger: Option<SortedRunMerger<(u64, u64, u64)>>,
+        runs: Option<Vec<SpillFile<(SourceRowId, u64, u64)>>>,
+        merger: Option<SortedRunMerger<(SourceRowId, u64, u64)>>,
         pending_puncts: VecIntoIter<Punctuation>,
         /// Latches once a run-open or decode error has surfaced, so the drain
         /// stops rather than falling through to the trailing punctuations over a
@@ -932,9 +943,9 @@ pub(crate) enum NodeBufferDrain {
         merge_budget: OwnedMergeBudget,
     },
     ReReadable {
+        current: Option<Box<SpillReader<SourceRowId>>>,
         // Drops before `backing`, closing the active handle before the final
         // Arc can unlink its TempPaths on Windows.
-        current: Option<Box<SpillReader<u64>>>,
         backing: Arc<ReReadableNodeBuffer>,
         memory_index: usize,
         spill_index: usize,
@@ -943,9 +954,9 @@ pub(crate) enum NodeBufferDrain {
 }
 
 pub(crate) struct ActiveSpill {
-    reader: SpillReader<u64>,
+    reader: SpillReader<SourceRowId>,
     // Holds the file alive while `reader` streams it.
-    _file: SpillFile<u64>,
+    _file: SpillFile<SourceRowId>,
 }
 
 impl Iterator for NodeBufferDrain {
@@ -1048,8 +1059,8 @@ impl Iterator for NodeBufferDrain {
                 loop {
                     if let Some(reader) = current.as_mut() {
                         match reader.next() {
-                            Some(Ok((record, row_number))) => {
-                                return Some(Ok(StreamEvent::record(record, row_number)));
+                            Some(Ok((record, row_id))) => {
+                                return Some(Ok(StreamEvent::record(record, row_id)));
                             }
                             Some(Err(error)) => return Some(Err(PipelineError::from(error))),
                             None => *current = None,
@@ -1083,11 +1094,11 @@ impl Iterator for NodeBufferDrain {
 /// the flag via `take_spill_request` at the next `dispatch_plan_node`
 /// turn and, for any resident `Memory` slot, spills it through
 /// `NodeBuffer::spill_resident_memory` (postcard, optionally LZ4-framed, via
-/// `SpillWriter<u64>`). Shared and producer-port slots remain readable because
+/// `SpillWriter<SourceRowId>`). Shared and producer-port slots remain readable because
 /// each consumer opens its own sequential cursor over immutable backing.
 ///
 /// `spill_priority = 0`: cheapest victim. Inter-stage buffers are
-/// already row-oriented and write straight through `SpillWriter<u64>`;
+/// already row-oriented and write straight through `SpillWriter<SourceRowId>`;
 /// no per-group or per-run reconstruction needed on the consumer
 /// side. Preferred first victim under `Priority` and
 /// `BackPressurePreferred::wrapping(Priority)`.
@@ -1143,6 +1154,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use clinker_plan::plan::EntityRef;
     use clinker_record::{Schema, Value, synthetic_document_context};
 
     use crate::executor::stream_event::{Punctuation, StreamEvent};
@@ -1163,23 +1175,26 @@ mod tests {
         StreamEvent::record(rec(s, id, v), rn)
     }
 
-    fn spill_chunk(rows: Vec<(Record, u64)>) -> (SpillFile<u64>, u64) {
+    fn spill_chunk<R>(rows: Vec<(Record, R)>) -> (SpillFile<SourceRowId>, u64)
+    where
+        R: Copy + Into<SourceRowId>,
+    {
         let s = if let Some(first) = rows.first() {
             Arc::clone(first.0.schema())
         } else {
             schema()
         };
-        let mut w: SpillWriter<u64> = SpillWriter::new(s, None, true).unwrap();
+        let mut w: SpillWriter<SourceRowId> = SpillWriter::new(s, None, true).unwrap();
         let count = rows.len() as u64;
         for (r, rn) in &rows {
-            w.write_pair(r, rn).unwrap();
+            w.write_pair(r, &(*rn).into()).unwrap();
         }
         (w.finish().unwrap(), count)
     }
 
     fn rec_row_num(e: &StreamEvent) -> u64 {
         match e {
-            StreamEvent::Record(_, rn) => *rn,
+            StreamEvent::Record(_, rn) => rn.ordinal(),
             StreamEvent::Punctuation(_) => panic!("expected Record event"),
         }
     }
@@ -1312,7 +1327,7 @@ mod tests {
         let mem_rns: Vec<u64> = mem
             .iter()
             .filter_map(|e| match e {
-                StreamEvent::Record(_, rn) => Some(*rn),
+                StreamEvent::Record(_, rn) => Some(rn.ordinal()),
                 StreamEvent::Punctuation(_) => None,
             })
             .collect();
@@ -1334,7 +1349,7 @@ mod tests {
         buffer
             .drain()
             .map(|event| match event.expect("re-readable scan event") {
-                StreamEvent::Record(_, row_number) => Some(row_number),
+                StreamEvent::Record(_, row_number) => Some(row_number.ordinal()),
                 StreamEvent::Punctuation(_) => None,
             })
             .collect()
@@ -1484,8 +1499,8 @@ mod tests {
     fn estimated_memory_bytes_scales_with_record_count_only() {
         let s = schema();
         let ctx = synthetic_document_context();
-        let row_bytes_each =
-            std::mem::size_of::<Value>() * s.column_count() + std::mem::size_of::<(Record, u64)>();
+        let row_bytes_each = std::mem::size_of::<Value>() * s.column_count()
+            + std::mem::size_of::<(Record, SourceRowId)>();
 
         // Memory: record count × per-row formula; puncts don't count.
         let mem = NodeBuffer::Memory(vec![
@@ -1802,6 +1817,83 @@ mod tests {
     }
 
     #[test]
+    fn spill_backed_reread_opens_independent_sequential_cursors() {
+        let s = schema();
+        let expected = vec![
+            SourceRowId::new(clinker_plan::plan::PlanNodeId::new(7), 1),
+            SourceRowId::new(clinker_plan::plan::PlanNodeId::new(7), 2),
+        ];
+        let (file, count) = spill_chunk(vec![
+            (rec(&s, 1, "a"), expected[0]),
+            (rec(&s, 2, "b"), expected[1]),
+        ]);
+        let path = file.path().to_path_buf();
+        let mut slot = NodeBuffer::Spilled {
+            chunks: vec![(file, count)],
+            pending_puncts: Vec::new(),
+        };
+
+        let first = slot.reread().expect("first shared cursor");
+        let second = slot.reread().expect("second shared cursor");
+        let collect_ids = |buffer: NodeBuffer| {
+            buffer
+                .drain()
+                .map(|event| match event.expect("shared spill row decodes") {
+                    StreamEvent::Record(_, row_id) => row_id,
+                    StreamEvent::Punctuation(_) => panic!("fixture contains only records"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(collect_ids(first), expected);
+        assert_eq!(collect_ids(second), expected);
+        assert!(path.exists(), "authoritative backing keeps the spill alive");
+
+        drop(slot);
+        assert!(!path.exists(), "last backing drop unlinks the spill");
+    }
+
+    #[test]
+    fn spill_backed_reread_preserves_decode_error_and_cleans_up() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let s = schema();
+        let (file, count) = spill_chunk(vec![(rec(&s, 1, "a"), 1)]);
+        let path = file.path().to_path_buf();
+        let mut slot = NodeBuffer::Spilled {
+            chunks: vec![(file, count)],
+            pending_puncts: Vec::new(),
+        };
+        let cursor = slot.reread().expect("shared cursor");
+
+        let mut raw = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open spill for corruption fixture");
+        raw.seek(SeekFrom::Start(0)).expect("seek to format tag");
+        raw.write_all(&[0xff]).expect("corrupt format tag");
+        raw.flush().expect("flush corrupt tag");
+        drop(raw);
+
+        let err = cursor
+            .drain()
+            .next()
+            .expect("corrupt spill yields one error")
+            .expect_err("corrupt spill must not be swallowed");
+        assert!(
+            matches!(err, PipelineError::Spill(_)),
+            "shared cursor must preserve the underlying spill error: {err:?}"
+        );
+        assert!(
+            path.exists(),
+            "authoritative backing remains live after error"
+        );
+
+        drop(slot);
+        assert!(!path.exists(), "error cleanup unlinks the shared spill");
+    }
+
+    #[test]
     fn spill_resident_memory_converts_records_to_spilled_preserving_puncts() {
         let s = schema();
         let ctx = synthetic_document_context();
@@ -1950,24 +2042,25 @@ mod tests {
         // (order, driver_idx, build_idx) key is a total order with an unambiguous
         // oracle. The record's `id` column mirrors `driver_idx`, making the
         // drained sequence observable.
-        let payloads: Vec<(u64, u64, u64)> = vec![
-            (5, 0, 0),
-            (2, 1, 0),
-            (5, 2, 0),
-            (2, 3, 0),
-            (9, 4, 0),
-            (0, 5, 0),
-            (2, 6, 0),
-            (5, 7, 0),
+        let payloads: Vec<(SourceRowId, u64, u64)> = vec![
+            (5.into(), 0, 0),
+            (2.into(), 1, 0),
+            (5.into(), 2, 0),
+            (2.into(), 3, 0),
+            (9.into(), 4, 0),
+            (0.into(), 5, 0),
+            (2.into(), 6, 0),
+            (5.into(), 7, 0),
         ];
         let row_count = payloads.len() as u64;
 
         // budget=1 is the spill-everything threshold; explicit flushes between
         // chunks force several individually-sorted runs. Each returned byte count
         // is charged exactly once, as the emit phase charges its runs.
-        let mut buf: SortBuffer<(u64, u64, u64)> =
+        let mut buf: SortBuffer<(SourceRowId, u64, u64)> =
             SortBuffer::new_payload_ordered(1, None, true, s.clone());
-        let push_chunk = |buf: &mut SortBuffer<(u64, u64, u64)>, chunk: &[(u64, u64, u64)]| {
+        let push_chunk = |buf: &mut SortBuffer<(SourceRowId, u64, u64)>,
+                          chunk: &[(SourceRowId, u64, u64)]| {
             for &(order, driver_idx, build_idx) in chunk {
                 buf.push(
                     rec(&s, driver_idx as i64, "x"),
@@ -2024,7 +2117,8 @@ mod tests {
             .iter()
             .map(|(_, driver_idx, _)| *driver_idx as i64)
             .collect();
-        let expected_orders: Vec<u64> = oracle.iter().map(|(order, _, _)| *order).collect();
+        let expected_orders: Vec<u64> =
+            oracle.iter().map(|(order, _, _)| order.ordinal()).collect();
         let drained_ids: Vec<i64> = drained
             .iter()
             .map(|(r, _)| match r.get("id") {
@@ -2032,7 +2126,7 @@ mod tests {
                 other => panic!("expected Integer id, got {other:?}"),
             })
             .collect();
-        let drained_orders: Vec<u64> = drained.iter().map(|(_, order)| *order).collect();
+        let drained_orders: Vec<u64> = drained.iter().map(|(_, order)| order.ordinal()).collect();
         assert_eq!(
             drained_ids, expected_ids,
             "drained records order by (order, driver_idx, build_idx)"
@@ -2052,14 +2146,14 @@ mod tests {
         use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
 
         let s = schema();
-        let mut buffer: SortBuffer<(u64, u64, u64)> =
+        let mut buffer: SortBuffer<(SourceRowId, u64, u64)> =
             SortBuffer::new_payload_ordered(1, None, true, Arc::clone(&s));
-        for (record_id, payload) in [(1, (3, 1, 0)), (2, (1, 2, 0))] {
+        for (record_id, payload) in [(1, (3.into(), 1, 0)), (2, (1.into(), 2, 0))] {
             buffer.push(rec(&s, record_id, "x"), payload);
         }
         let first_bytes = buffer.sort_and_spill().expect("first merge run");
         arb.record_spill_bytes("banded", first_bytes);
-        for (record_id, payload) in [(3, (2, 3, 0)), (4, (4, 4, 0))] {
+        for (record_id, payload) in [(3, (2.into(), 3, 0)), (4, (4.into(), 4, 0))] {
             buffer.push(rec(&s, record_id, "x"), payload);
         }
         let second_bytes = buffer.sort_and_spill().expect("second merge run");

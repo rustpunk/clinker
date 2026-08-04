@@ -53,6 +53,10 @@ impl<R: FormatReader> FormatReader for TakeReader<R> {
         // downstream document stack.
         self.inner.take_envelope_events()
     }
+
+    fn take_source_lifecycle_events(&mut self) -> Vec<clinker_format::SourceLifecycleEvent> {
+        self.inner.take_source_lifecycle_events()
+    }
 }
 
 #[cfg(test)]

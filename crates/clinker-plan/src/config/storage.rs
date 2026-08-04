@@ -29,6 +29,10 @@ use std::path::{Path, PathBuf};
 /// top-level tables (future workspace-discovery keys) pass through untouched.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClinkerToml {
+    /// Typed workspace resource catalog. Logical names are scoped by kind,
+    /// while every physical target remains anchored to this workspace.
+    #[serde(default)]
+    pub catalog: crate::resources::CatalogConfig,
     /// The `[storage]` table. Absent → every field defaults (spill to the
     /// OS temp dir, staging off), matching pre-config behavior exactly.
     #[serde(default)]

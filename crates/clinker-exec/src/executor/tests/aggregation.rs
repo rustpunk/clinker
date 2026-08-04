@@ -232,10 +232,10 @@ nodes:
         }
     }
 
-    // ----- Test 3: D57 row_num = min over the group -----
+    // ----- Test 3: D57 representative = typed min over the group -----
 
     #[test]
-    fn test_aggregation_dispatch_synthesized_row_num_is_min_of_group() {
+    fn test_aggregation_dispatch_representative_is_min_of_group() {
         let input = make_schema(&["k"]);
         let mut agg = count_aggregator();
         let stable = StableEvalContext::test_default();
@@ -251,7 +251,7 @@ nodes:
         agg.add_record(&r3, 5, &ctx_for(&stable, &file, 5)).unwrap();
 
         let state = group_state_for_key(&agg, "a").expect("group exists");
-        assert_eq!(state.min_row_num, 3);
+        assert_eq!(state.representative_row, Some(3.into()));
     }
 
     // ----- Test 7: finalize overflow → DLQ under Continue -----

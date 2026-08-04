@@ -21,7 +21,10 @@ use crate::executor::dispatch::{
 };
 use crate::executor::schema_check::check_input_schema;
 use clinker_plan::error::PipelineError;
-use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode, matches_upstream_name};
+use clinker_plan::plan::execution::{
+    ExecutionPlanDag, OrderGuarantee, OutputOrderPromise, PlanNode, assert_order_contract,
+    matches_upstream_name,
+};
 
 /// Execute the `Merge` arm for `node_idx`: concatenate predecessor buffers
 /// in declaration order (Concat), round-robin across them (Interleave), or —
@@ -45,6 +48,14 @@ pub(crate) fn dispatch_merge(
     else {
         unreachable!("dispatch_merge called with non-Merge node");
     };
+    let advertised_promise = match (mode, interleave_seed) {
+        (clinker_plan::config::MergeMode::Concat, _)
+        | (clinker_plan::config::MergeMode::Interleave, Some(_)) => {
+            OutputOrderPromise::Exact(OrderGuarantee::StableArrival)
+        }
+        (clinker_plan::config::MergeMode::Interleave, None) => OutputOrderPromise::Unordered,
+    };
+    assert_order_contract(current_dag.order_contract(), node, advertised_promise)?;
     // Two architectural modes for a Merge arm:
     //
     // 1. **Fused** — every direct predecessor is a Source owned only by
@@ -203,10 +214,10 @@ pub(crate) fn dispatch_merge(
             })
             .sum();
         let mut merged = Vec::with_capacity(total);
-        let emit = |merged: &mut Vec<(Record, u64)>,
+        let emit = |merged: &mut Vec<(Record, crate::executor::stream_event::SourceRowId)>,
                     upstream_name: &str,
                     mut record: Record,
-                    rn: u64|
+                    rn: crate::executor::stream_event::SourceRowId|
          -> Result<(), PipelineError> {
             if let Some(canonical) = merge_output_schema.as_ref() {
                 check_input_schema(canonical, record.schema(), name, "merge", upstream_name)?;
@@ -269,10 +280,15 @@ pub(crate) fn dispatch_merge(
                     .iter()
                     .map(|(src, _)| current_dag.graph[*src].name().to_string())
                     .collect();
-                let mut deques: Vec<VecDeque<(Record, u64)>> = ordered_inputs
+                let mut deques: Vec<
+                    VecDeque<(Record, crate::executor::stream_event::SourceRowId)>,
+                > = ordered_inputs
                     .iter()
                     .map(
-                        |(src, port)| -> Result<VecDeque<(Record, u64)>, PipelineError> {
+                        |(src, port)| -> Result<
+                            VecDeque<(Record, crate::executor::stream_event::SourceRowId)>,
+                            PipelineError,
+                        > {
                             let upstream_name = current_dag.graph[*src].name();
                             let nb = require_node_buffer_input(
                                 ctx,

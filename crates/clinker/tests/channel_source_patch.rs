@@ -22,14 +22,34 @@ fn write(dir: &Path, name: &str, contents: &str) {
     std::fs::write(dir.join(name), contents).expect("write fixture file");
 }
 
-/// Write a per-target overlay for tenant `id` overlaying `pipe.yaml`, at the
-/// computed path `channel/<id>/pipe.channel.yaml`. `body` is the overlay YAML
-/// below the authoritative `channel.target` header (e.g. a `sources:` block).
+/// Write a cataloged channel resource for `id` targeting logical pipeline
+/// `pipe`. `body` is the overlay YAML below the authoritative
+/// `channel.target` header (e.g. a `sources:` block).
 fn write_channel(dir: &Path, id: &str, body: &str) {
     let tenant = dir.join("channel").join(id);
     std::fs::create_dir_all(&tenant).expect("create tenant dir");
-    let yaml = format!("channel:\n  target: ../../pipe.yaml\n{body}");
+    let manifest = format!("channel:\n  name: {id}\n  targets: [pipe]\n");
+    std::fs::write(tenant.join("channel.cfg.yaml"), manifest).expect("write manifest");
+    let yaml = format!("channel:\n  target: pipe\n{body}");
     std::fs::write(tenant.join("pipe.channel.yaml"), yaml).expect("write overlay");
+
+    let mut channel_ids = std::fs::read_dir(dir.join("channel"))
+        .expect("read channel root")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    channel_ids.sort();
+    let mut catalog =
+        "[catalog.pipelines]\npipe = \"pipe.yaml\"\n\n[catalog.channels]\n".to_string();
+    for channel_id in channel_ids {
+        catalog.push_str(&format!("{channel_id} = \"channel/{channel_id}\"\n"));
+    }
+    if dir.join("compositions/with_ref.comp.yaml").is_file() {
+        catalog
+            .push_str("\n[catalog.compositions]\nwith_ref = \"compositions/with_ref.comp.yaml\"\n");
+    }
+    std::fs::write(dir.join("clinker.toml"), catalog).expect("write catalog");
 }
 
 /// Run `clinker run pipe.yaml` (plus any extra args) inside `dir`. With
@@ -252,7 +272,7 @@ nodes:
       schema:
         - { name: id, type: string }
         - { name: tags, type: string }
-        - { name: tag_no, type: int }
+        - { name: tag_no, type: { nullable: int } }
   - type: output
     name: out
     input: src

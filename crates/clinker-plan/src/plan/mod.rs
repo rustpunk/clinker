@@ -18,7 +18,9 @@ pub mod streaming_eligibility;
 pub mod types;
 
 pub use compiled::{ChannelIdentity, CompiledPlan};
-pub use composition_body::{BoundBody, CompositionBodyId};
+pub use composition_body::{
+    BodyScopeId, BodyWindowBinding, BoundBody, CompositionBodyId, WindowRuntimeKey,
+};
 pub use entity::{EntityRef, PlanNodeId, SecondaryMap};
 pub use predicate_support::{PredicateSupport, predicate_support};
 pub use row_type::{ColumnLookup, QualifiedField, Row, RowTail, TailVarId};

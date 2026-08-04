@@ -34,6 +34,50 @@ Lower priority is spilled first, so `node_buffers` slots (priority 0) are the ch
 
 A **Source** and a **streaming Aggregate** show `spill_priority=N/A` because neither *operator* holds spillable accumulated state. A Source's `try_spill` always frees zero bytes — its only real lever is the pause its `can_back_pressure=true` advertises. A streaming Aggregate emits each group as it completes and never accumulates a spillable group table. The `N/A` here is about the operator's own state, not its downstream handoff: when a streaming stage's output rides a per-batch streaming handoff to a single consumer, that handoff registers a priority-0 consumer just like a `node_buffers` slot does, and its in-flight batches are spilled to disk one batch at a time if RSS crosses the soft threshold while they are in flight. So a streaming Aggregate's *group table* is never a spill victim, but the batches it hands downstream can be.
 
+#### Source-order barrier accounting
+
+A Source that declares record-level `sort_order` is the exception to the usual
+pause-only Source shape: it inserts a verification barrier around each physical
+file before the ingest channel releases that file downstream. The barrier reuses
+the Source consumer's live-byte counter. While a file is staged, that counter is
+the shared `SortBuffer`'s resident bytes plus one adjacent record retained for
+inversion detection, plus any verified records from the preceding file still
+queued downstream. During resident release, ownership moves from the sorter to
+an explicitly charged release total and then to the bounded-channel estimate;
+the transition subtracts a record only after the send succeeds, so the same row
+is neither omitted nor charged twice. Document punctuation does not grow with
+row count: admission allows only a flat file or one matching inner frame, so the
+barrier holds a statically bounded set of open/close events. Different physical
+files and different Sources never share a barrier or an authored-key comparison.
+
+The barrier does not expose a second arbitrator victim. At the Source's next
+record boundary it honors the shared consumer's spill request, the sort buffer's
+resident threshold, or the run-wide soft-pressure signal and calls the existing
+`SortBuffer` spill path. `SortedRunMerger` performs any bounded-fan-in cascade;
+each intermediate run is charged before its consumed inputs are unlinked and
+their exact charges are released. For final release, the barrier writes one
+merged spool, charges its exact completed size while the input-run charge is
+still live, then releases the input charge. It reads that final spool once to
+validate every row before emitting the file, and releases the final charge only
+after the second read has drained. Thus a decode or merge failure cannot leak a
+prefix of an unverified file, and disk accounting covers the input/output overlap
+at every completed-run transition.
+
+The same Source counter remains live during release. A resident result moves
+from the remaining sorted-spool estimate to the bounded-channel estimate only
+after each record send transfers ownership, so the handoff never reports a
+zero-byte gap. A spilled result charges each merge reader's 8 KiB I/O buffer plus
+one decoded-record estimate, along with the final writer or validation reader
+that overlaps it. Cleanup clears these transient charges and every outstanding
+stage disk charge on cancellation or read/write/merge failure.
+
+Records spilled through this path keep their typed `SourceRowId` as the stable
+tie-break payload. Spill serialization reconstructs record-owned context, so the
+barrier carries the physical file's original document-context `Arc` once outside
+the row spool and reattaches that exact allocation to every repaired record on
+release. This preserves pointer identity without retaining one extra context per
+row and without replaying the source.
+
 When memory pressure crosses the soft threshold (80 % of `limit`), the arbitrator runs the active policy to pick a victim and invokes the corresponding action: `pause()` on a back-pressureable consumer (its producer's hot loop parks on a `Condvar` until `resume`), or `try_spill(target_bytes)` on a spillable consumer (the consumer's wrapper flips a spill-requested flag the operator reads at its next batch boundary). When RSS crosses the hard limit, the engine fails fast with `E310 MemoryBudgetExceeded`.
 
 This means:

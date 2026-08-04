@@ -176,7 +176,7 @@ pub(crate) fn dispatch_aggregation(
     // The caller-explicit materialization reservation above covers the full
     // collected vector, including spill-backed reloads.
     let (input, input_puncts): (
-        Vec<(Record, u64)>,
+        Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::stream_event::Punctuation>,
     ) = input_buffer.drain_split()?;
 
@@ -846,7 +846,7 @@ fn run_strict_aggregate_per_document(
     factory: DocAggregatorFactory,
     name: &str,
     output_schema: &Arc<Schema>,
-    input: &[(Record, u64)],
+    input: &[(Record, crate::executor::stream_event::SourceRowId)],
     input_puncts: &[crate::executor::stream_event::Punctuation],
 ) -> Result<Vec<crate::aggregation::SortRow>, PipelineError> {
     use crate::executor::stream_event::PunctuationKind;
@@ -965,7 +965,10 @@ fn run_strict_aggregate_per_document(
 /// (an empty closing document), returns the whole slice so
 /// [`emit_aggregate_finalize_dlq`] keeps its existing first-record / node-
 /// name fallback.
-fn document_attribution_record(input: &[(Record, u64)], doc_id: DocumentId) -> &[(Record, u64)] {
+fn document_attribution_record(
+    input: &[(Record, crate::executor::stream_event::SourceRowId)],
+    doc_id: DocumentId,
+) -> &[(Record, crate::executor::stream_event::SourceRowId)] {
     match input.iter().position(|(r, _)| r.doc_ctx().id() == doc_id) {
         Some(pos) => &input[pos..=pos],
         None => input,
@@ -1017,7 +1020,7 @@ fn finalize_bucket(
 fn route_document_flush_result(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
-    attribution: &[(Record, u64)],
+    attribution: &[(Record, crate::executor::stream_event::SourceRowId)],
     output_schema: &Arc<Schema>,
     result: Result<(), crate::aggregation::HashAggError>,
 ) -> Result<(), PipelineError> {
@@ -1057,11 +1060,11 @@ struct StreamingIngestEffects {
     /// `(source_name, row_num)` for each successfully ingested record —
     /// replayed via [`advance_cursor`] so rollback cursors and watermark
     /// liveness match the drain-to-`Vec` path.
-    cursor_advances: Vec<(Arc<str>, u64)>,
+    cursor_advances: Vec<(Arc<str>, crate::executor::stream_event::SourceRowId)>,
     /// `(record, row_num, error_message)` for each `add_record` failure
     /// under `Continue`, replayed via the dispatcher's DLQ routing after
     /// join. `FailFast` surfaces the error eagerly instead.
-    add_errors: Vec<(Record, u64, String)>,
+    add_errors: Vec<(Record, crate::executor::stream_event::SourceRowId, String)>,
 }
 
 /// Finalized aggregate output handed to [`finalize_aggregate_emit`]: the
@@ -1256,7 +1259,7 @@ fn run_streaming_aggregate_ingest(
                     let eval_ctx = EvalContext {
                         stable,
                         source_file: &source_file_arc,
-                        source_row: rn,
+                        source_row: rn.ordinal(),
                         source_path: &source_file_arc,
                         source_count: None,
                         source_batch: source_batch_arc,
@@ -1510,7 +1513,7 @@ fn run_time_windowed_aggregate(
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     win_ctx: &WindowedAggContext<'_>,
-    input: &[(Record, u64)],
+    input: &[(Record, crate::executor::stream_event::SourceRowId)],
     spec: &clinker_plan::config::pipeline_node::TimeWindowSpec,
     allowed_lateness: Option<std::time::Duration>,
 ) -> Result<Vec<crate::aggregation::SortRow>, PipelineError> {
@@ -1557,7 +1560,7 @@ fn run_time_windowed_aggregate(
     // here groups records identically to how the underlying aggregator
     // would have grouped them post-walk.
     let compute_group_key = |record: &Record,
-                             row_num: u64|
+                             row_num: crate::executor::stream_event::SourceRowId|
      -> Result<Vec<GroupByKey>, PipelineError> {
         let mut key: Vec<GroupByKey> = Vec::with_capacity(compiled.group_by_indices.len());
         for (i, idx) in compiled.group_by_indices.iter().enumerate() {
@@ -1571,7 +1574,7 @@ fn run_time_windowed_aggregate(
                 .get(*idx as usize)
                 .cloned()
                 .unwrap_or(Value::Null);
-            match value_to_group_key(&val, field_name, row_num) {
+            match value_to_group_key(&val, field_name, row_num.ordinal()) {
                 Ok(Some(gk)) => key.push(gk),
                 Ok(None) => key.push(GroupByKey::Null),
                 Err(e) => {
@@ -1899,7 +1902,7 @@ fn add_to_window(
     ctx: &mut ExecutorContext<'_>,
     win_ctx: &WindowedAggContext<'_>,
     record: &Record,
-    row_num: u64,
+    row_num: crate::executor::stream_event::SourceRowId,
     window_start: i64,
     per_window: &mut std::collections::HashMap<
         i64,
@@ -1962,7 +1965,7 @@ fn handle_aggregate_add_error(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
     record: &Record,
-    row_num: u64,
+    row_num: crate::executor::stream_event::SourceRowId,
     e: crate::aggregation::HashAggError,
 ) -> Result<(), PipelineError> {
     // A spill-cap breach is resource exhaustion, not a per-record data fault:
@@ -2026,7 +2029,7 @@ fn finalize_windows(
     >,
     out_rows: &mut Vec<crate::aggregation::SortRow>,
     output_schema: &Arc<Schema>,
-    input: &[(Record, u64)],
+    input: &[(Record, crate::executor::stream_event::SourceRowId)],
 ) -> Result<(), PipelineError> {
     use crate::aggregation::HashAggError;
     let mut entries: Vec<(
@@ -2085,7 +2088,7 @@ fn push_late_record(
     ctx: &mut ExecutorContext<'_>,
     transform: &str,
     record: &Record,
-    row_num: u64,
+    row_num: crate::executor::stream_event::SourceRowId,
     bounds: crate::executor::time_window::WindowBounds,
 ) -> Result<(), PipelineError> {
     let source_name = source_name_arc_of(record);
@@ -2125,7 +2128,7 @@ fn push_late_record(
 fn emit_aggregate_finalize_dlq(
     ctx: &mut ExecutorContext<'_>,
     name: &str,
-    records: &[(Record, u64)],
+    records: &[(Record, crate::executor::stream_event::SourceRowId)],
     output_schema: &Arc<Schema>,
     transform: &str,
     binding: &str,
@@ -2143,7 +2146,7 @@ fn emit_aggregate_finalize_dlq(
     push_dlq(
         ctx,
         DlqEntry {
-            source_row: 0,
+            source_row: crate::executor::stream_event::SourceRowId::synthetic(),
             category: clinker_core_types::dlq::DlqErrorCategory::AggregateFinalize,
             error_message: format!("aggregate {transform}.{binding}: {source:?}"),
             original_record: synthetic,
@@ -2263,10 +2266,10 @@ mod tests {
         let doc_a = DocumentId::next();
         let doc_b = DocumentId::next();
         let input = vec![
-            (record_in_document(doc_a, "a0"), 0),
-            (record_in_document(doc_a, "a1"), 1),
-            (record_in_document(doc_b, "b0"), 2),
-            (record_in_document(doc_b, "b1"), 3),
+            (record_in_document(doc_a, "a0"), 0.into()),
+            (record_in_document(doc_a, "a1"), 1.into()),
+            (record_in_document(doc_b, "b0"), 2.into()),
+            (record_in_document(doc_b, "b1"), 3.into()),
         ];
 
         // Document B narrows to B's first record, never A's.
@@ -2299,8 +2302,8 @@ mod tests {
         let doc_a = DocumentId::next();
         let absent = DocumentId::next();
         let input = vec![
-            (record_in_document(doc_a, "a0"), 0),
-            (record_in_document(doc_a, "a1"), 1),
+            (record_in_document(doc_a, "a0"), 0.into()),
+            (record_in_document(doc_a, "a1"), 1.into()),
         ];
 
         let attr = document_attribution_record(&input, absent);
@@ -2311,7 +2314,7 @@ mod tests {
         );
 
         // The empty-input case yields an empty slice (no record to attribute).
-        let empty: Vec<(Record, u64)> = Vec::new();
+        let empty: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
         assert!(document_attribution_record(&empty, absent).is_empty());
     }
 

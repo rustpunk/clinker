@@ -95,7 +95,7 @@ fn spill_threshold_bytes(budget: &MemoryArbitrator) -> usize {
 /// executor's `node_buffers`. Same alias the IEJoin and grace-hash
 /// kernels expose; spelled out here so the public exec entry point's
 /// signature stays self-documenting.
-pub(crate) type RecordOrder = u64;
+pub(crate) type RecordOrder = crate::executor::stream_event::SourceRowId;
 
 // ──────────────────────────────────────────────────────────────────────
 // Match window
@@ -1122,7 +1122,7 @@ fn execute_combine_sort_merge_with_stats(
     {
         return Err(PipelineError::CombineMissingMatch {
             combine: name.to_string(),
-            driver_row: row,
+            driver_row: row.ordinal(),
         });
     }
 
@@ -1419,6 +1419,7 @@ where
                     budget,
                     node: name,
                     compress: spill_compress,
+                    charge_owner: None,
                 },
             )?;
             Ok((
@@ -2097,6 +2098,7 @@ mod tests {
     use crate::executor::combine::CombineResolverMapping;
     use clinker_plan::plan::combine::{CombineInput, RangeConjunct, RangeKeyType};
     use clinker_plan::plan::types::JoinSide;
+    use clinker_plan::plan::{EntityRef, PlanNodeId};
     use clinker_record::SchemaBuilder;
     use cxl::ast::Statement;
     use cxl::lexer::Span as CxlSpan;
@@ -2269,8 +2271,8 @@ mod tests {
     /// Bundle of run_kernel inputs. Bundled so the test driver function
     /// stays under clippy's `too_many_arguments` cap and call sites
     /// update one field without rewriting the whole call.
-    struct RunKernel<'a> {
-        driver_records: Vec<(Record, RecordOrder)>,
+    struct RunKernel<'a, R> {
+        driver_records: Vec<(Record, R)>,
         build_records: Vec<Record>,
         decomposed: DecomposedPredicate,
         driver_qual: &'a str,
@@ -2310,6 +2312,7 @@ mod tests {
                         budget: &arbitrator,
                         node: "sort-merge test drain",
                         compress: true,
+                        charge_owner: None,
                     },
                 )?;
                 let mut v = Vec::new();
@@ -2325,16 +2328,22 @@ mod tests {
     /// Drive the SortMerge kernel on hand-built inputs and return the emitted
     /// (record, order) pairs alongside the stats. Panics if the kernel returns
     /// an error; over-budget-abort tests use [`run_kernel_result`] instead.
-    fn run_kernel(rk: RunKernel<'_>) -> (Vec<(Record, RecordOrder)>, SortMergeStats) {
+    fn run_kernel<R>(rk: RunKernel<'_, R>) -> (Vec<(Record, RecordOrder)>, SortMergeStats)
+    where
+        R: Into<RecordOrder>,
+    {
         run_kernel_result(rk).expect("sort-merge kernel execution failed")
     }
 
     /// Drive the SortMerge kernel, drain its bounded output handle into the
     /// emitted pairs, and return the raw `Result` so tests can assert a clean
     /// over-budget abort rather than unwrapping.
-    fn run_kernel_result(
-        rk: RunKernel<'_>,
-    ) -> Result<(Vec<(Record, RecordOrder)>, SortMergeStats), PipelineError> {
+    fn run_kernel_result<R>(
+        rk: RunKernel<'_, R>,
+    ) -> Result<(Vec<(Record, RecordOrder)>, SortMergeStats), PipelineError>
+    where
+        R: Into<RecordOrder>,
+    {
         run_kernel_result_pinned(rk, None, None)
     }
 
@@ -2345,11 +2354,14 @@ mod tests {
     /// byte count and registered with the arbitrator, so the global memory
     /// backstop can be driven through the host-independent byte-counted arm of
     /// `should_abort` rather than the test process's real RSS.
-    fn run_kernel_result_pinned(
-        rk: RunKernel<'_>,
+    fn run_kernel_result_pinned<R>(
+        rk: RunKernel<'_, R>,
         output_schema: Option<&Arc<Schema>>,
         pinned_consumer_bytes: Option<u64>,
-    ) -> Result<(Vec<(Record, RecordOrder)>, SortMergeStats), PipelineError> {
+    ) -> Result<(Vec<(Record, RecordOrder)>, SortMergeStats), PipelineError>
+    where
+        R: Into<RecordOrder>,
+    {
         let resolver_mapping = make_test_resolver_mapping(
             rk.driver_qual,
             rk.driver_schema,
@@ -2381,10 +2393,15 @@ mod tests {
             .prefix("sm-test-")
             .tempdir()
             .expect("sort-merge test temp dir");
+        let driver_records = rk
+            .driver_records
+            .into_iter()
+            .map(|(record, order)| (record, order.into()))
+            .collect();
         let args = SortMergeExec {
             name: "sm_test",
             build_qualifier: rk.build_qual,
-            driver_records: rk.driver_records,
+            driver_records,
             build_records: rk.build_records,
             decomposed: &rk.decomposed,
             body_program: rk.body_program,
@@ -2493,6 +2510,71 @@ mod tests {
             6,
             "expected 6 cross-product matches; got: {records:?}"
         );
+    }
+
+    #[test]
+    fn combine_driver_identity_survives_sort_merge_fanout_and_collect() {
+        let products = schema_with(&["sku", "price", "bracket"]);
+        let brackets = schema_with(&["bracket_id", "max"]);
+        let driver_identity = RecordOrder::new(PlanNodeId::new(31), 7);
+        let driver = vec![(
+            rec(
+                &products,
+                vec![Value::String("p1".into()), Value::Integer(10), Value::Null],
+            ),
+            driver_identity,
+        )];
+        let build = vec![
+            rec(
+                &brackets,
+                vec![Value::String("b15".into()), Value::Integer(15)],
+            ),
+            rec(
+                &brackets,
+                vec![Value::String("b25".into()), Value::Integer(25)],
+            ),
+        ];
+        let typed = compile_pure_range(
+            "filter product.price < bracket.max",
+            &[
+                ("product", "price", cxl::typecheck::Type::Int),
+                ("bracket", "max", cxl::typecheck::Type::Int),
+            ],
+        );
+        let predicate = decomposed_pure_range(
+            extract_range_conjunct(&typed, "product", "bracket"),
+            Arc::clone(&typed),
+        );
+
+        let run = |match_mode| {
+            run_kernel(RunKernel {
+                driver_records: driver.clone(),
+                build_records: build.clone(),
+                decomposed: predicate.clone(),
+                driver_qual: "product",
+                build_qual: "bracket",
+                driver_schema: &products,
+                build_schema: &brackets,
+                match_mode,
+                on_miss: OnMiss::Skip,
+                presorted: true,
+                body_program: None,
+                budget_bytes: None,
+            })
+            .0
+        };
+
+        let fanout = run(MatchMode::All);
+        assert_eq!(fanout.len(), 2);
+        assert!(
+            fanout
+                .iter()
+                .all(|(_, identity)| *identity == driver_identity)
+        );
+
+        let collected = run(MatchMode::Collect);
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].1, driver_identity);
     }
 
     /// Large matching run forces the inner buffer past `soft_limit / 4`
@@ -2646,7 +2728,7 @@ mod tests {
                             &drivers_schema,
                             vec![Value::Integer(k), Value::String(pad.clone().into())],
                         ),
-                        i as RecordOrder,
+                        RecordOrder::from(i as u64),
                     )
                 })
                 .collect();
@@ -2667,7 +2749,7 @@ mod tests {
         let mut oracle_orders: Vec<RecordOrder> = Vec::new();
         for (i, &dk) in driver_keys.iter().enumerate() {
             let matches = build_keys.iter().filter(|&&bk| dk < bk).count();
-            oracle_orders.extend(std::iter::repeat_n(i as RecordOrder, matches));
+            oracle_orders.extend(std::iter::repeat_n(RecordOrder::from(i as u64), matches));
         }
         oracle_orders.sort_unstable();
         assert_eq!(
@@ -2902,7 +2984,7 @@ mod tests {
                                 Value::Integer(i as i64),
                             ],
                         ),
-                        i as RecordOrder,
+                        RecordOrder::from(i as u64),
                     )
                 })
                 .collect();
@@ -2922,7 +3004,7 @@ mod tests {
         let mut oracle_orders: Vec<RecordOrder> = Vec::new();
         for (i, &dk) in driver_keys.iter().enumerate() {
             let m = build_keys.iter().filter(|&&bk| dk < bk).count();
-            oracle_orders.extend(std::iter::repeat_n(i as RecordOrder, m));
+            oracle_orders.extend(std::iter::repeat_n(RecordOrder::from(i as u64), m));
         }
         oracle_orders.sort_unstable();
         assert_eq!(oracle_orders.len(), (matching * matching) as usize);
@@ -3037,7 +3119,7 @@ mod tests {
                                 Value::Integer(i as i64),
                             ],
                         ),
-                        i as RecordOrder,
+                        RecordOrder::from(i as u64),
                     )
                 })
                 .collect();
@@ -3142,7 +3224,7 @@ mod tests {
                                 Value::Null,
                             ],
                         ),
-                        i as RecordOrder,
+                        RecordOrder::from(i as u64),
                     )
                 })
                 .collect();
@@ -3225,7 +3307,12 @@ mod tests {
         // The single build has key 20, so only the key-10 driver matches
         // (10 < 20). The three misses carry orders 7, 3, 2 — lowest is 2, the
         // key-30 driver, which the range-sorted walk visits last.
-        let driver_spec: [(i64, RecordOrder); 4] = [(100, 7), (50, 3), (10, 9), (30, 2)];
+        let driver_spec: [(i64, RecordOrder); 4] = [
+            (100, 7.into()),
+            (50, 3.into()),
+            (10, 9.into()),
+            (30, 2.into()),
+        ];
         let make_driver = || {
             driver_spec
                 .iter()
@@ -3304,7 +3391,7 @@ mod tests {
             .map(|i| {
                 (
                     rec(&drivers_schema, vec![Value::Integer(i)]),
-                    i as RecordOrder,
+                    RecordOrder::from(i as u64),
                 )
             })
             .collect();
@@ -3321,7 +3408,7 @@ mod tests {
         for i in 0..n_driver {
             for j in 0..n_build {
                 if i < j {
-                    oracle.push(i as RecordOrder);
+                    oracle.push(RecordOrder::from(i as u64));
                 }
             }
         }
@@ -3454,7 +3541,7 @@ mod tests {
             .map(|i| {
                 (
                     rec(&drivers_schema, vec![Value::Integer(0), Value::Null]),
-                    i as RecordOrder,
+                    RecordOrder::from(i as u64),
                 )
             })
             .collect();
@@ -3540,7 +3627,7 @@ mod tests {
                 .map(|i| {
                     (
                         rec(&drivers_schema, vec![Value::Integer(i as i64)]),
-                        i as RecordOrder,
+                        RecordOrder::from(i as u64),
                     )
                 })
                 .collect::<Vec<_>>()
@@ -3625,7 +3712,11 @@ mod tests {
                     &schema,
                     vec![Value::Integer(i as i64), Value::String(pad.as_str().into())],
                 );
-                (r, Value::Integer(i as i64), (i as RecordOrder, i as u64))
+                (
+                    r,
+                    Value::Integer(i as i64),
+                    (RecordOrder::from(i as u64), i as u64),
+                )
             })
             .collect()
     }
@@ -3792,9 +3883,9 @@ mod tests {
         // `RecordOrder` is exercised.
         let driver_order = |i: usize| -> RecordOrder {
             if i == 7 {
-                ((19 * 5) % n_driver) as RecordOrder
+                RecordOrder::from(((19 * 5) % n_driver) as u64)
             } else {
-                ((i * 5) % n_driver) as RecordOrder
+                RecordOrder::from(((i * 5) % n_driver) as u64)
             }
         };
 

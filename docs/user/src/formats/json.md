@@ -59,7 +59,7 @@ The rules, in full:
   called "" and is rejected.
 
 A value breaking any of these fails at compile time with
-[E363](../../explain/E363.md), before any input is opened. The diagnostic names
+[E363](https://github.com/rustpunk/clinker/blob/main/docs/explain/E363.md), before any input is opened. The diagnostic names
 the corrected path where one can be derived.
 
 **`record_path` takes precedence over `format:`.** When both are declared the

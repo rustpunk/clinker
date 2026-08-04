@@ -58,6 +58,14 @@ pub enum ScopedVarType {
 /// non-composition contexts.
 #[derive(Debug, Clone, Default)]
 pub struct ScopedVarsRegistry {
+    /// CXL modules resolved for this compile invocation. Kept beside the
+    /// other resolver inputs so every planner typecheck path sees the same
+    /// immutable module surface.
+    pub module_exports: std::collections::HashMap<String, super::pass::ModuleExports>,
+    /// Planner-admitted module declarations retained for compiled evaluation.
+    /// The registry owns parsed ASTs only; runtime evaluation never reopens
+    /// module source files.
+    pub runtime_modules: std::sync::Arc<crate::module_eval::RuntimeModuleRegistry>,
     pub pipeline: IndexMap<String, ScopedVarType>,
     pub source: IndexMap<String, ScopedVarType>,
     pub record: IndexMap<String, ScopedVarType>,

@@ -8,28 +8,86 @@
 //! supplying back-pressure end-to-end without an intermediate spill
 //! tier.
 //!
-//! Payload is [`StreamEvent`]: either a `(Record, u64)` body event or
+//! Payload is [`StreamEvent`]: either a typed source-record event or
 //! a [`Punctuation`] marking a document boundary. Source ingest emits
 //! one `DocumentOpen` before the first body record of each source
 //! file and one `DocumentClose` after the last.
 
 use std::sync::Arc;
 
-use clinker_record::Record;
+use clinker_plan::plan::PlanNodeId;
+use clinker_record::{DocumentId, Record};
 
-use crate::executor::stream_event::{Punctuation, StreamEvent};
+use crate::executor::stream_event::{Punctuation, SourceRowId};
+
+/// One decoded source attempt. Successful and rejected attempts share this
+/// carrier so an ordered physical file can stage one complete population.
+#[derive(Debug, Clone)]
+pub(crate) enum SourceAttemptEvent {
+    Record(Record, SourceRowId),
+    TypeError(Box<crate::executor::TypeErrorEvent>),
+}
+
+impl SourceAttemptEvent {
+    pub(crate) fn source_row(&self) -> SourceRowId {
+        match self {
+            Self::Record(_, source_row) => *source_row,
+            Self::TypeError(event) => event.source_row,
+        }
+    }
+}
+
+/// Stable identity of one physical-file population decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct AttemptPopulationId {
+    pub(crate) source: PlanNodeId,
+    pub(crate) document: DocumentId,
+}
+
+/// Exact decoded/rejected population applied before an ordered file releases
+/// any attempt or punctuation effect.
+#[derive(Debug, Clone)]
+pub(crate) struct AttemptPopulationDelta {
+    pub(crate) id: AttemptPopulationId,
+    pub(crate) source_name: Arc<str>,
+    pub(crate) attempted: u64,
+    pub(crate) rejected: u64,
+}
+
+/// Source-channel payload. Attempts are either direct (accounted when
+/// consumed) or name the already-applied ordered-file population that covers
+/// them. Type failures are consumed before downstream [`StreamEvent`] buffers
+/// are built.
+#[derive(Debug, Clone)]
+pub(crate) enum SourceStreamEvent {
+    Population(AttemptPopulationDelta),
+    Attempt {
+        event: SourceAttemptEvent,
+        population: Option<AttemptPopulationId>,
+    },
+    Punctuation(Punctuation),
+}
 
 /// Error surface for [`SourceIngestChannel`] sends.
 #[derive(Debug)]
 pub(crate) enum SourceStreamError {
     /// Consumer dropped the receiver before this push completed.
     Closed,
+    /// This attempt already emitted the Source's `u64::MAX` ordinal.
+    OrdinalExhausted { source: PlanNodeId },
+    /// The per-file ordering barrier rejected or failed the staged file.
+    OrderViolation(Box<clinker_plan::error::PipelineError>),
 }
 
 impl std::fmt::Display for SourceStreamError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Closed => write!(f, "source stream closed: consumer dropped receiver"),
+            Self::OrdinalExhausted { source } => write!(
+                f,
+                "source row identity exhausted for {source}: ordinal cannot advance beyond u64::MAX"
+            ),
+            Self::OrderViolation(error) => error.fmt(f),
         }
     }
 }
@@ -44,7 +102,7 @@ impl std::error::Error for SourceStreamError {}
 /// returned by [`Self::new`] and consumed via `recv` by the dispatch
 /// loop's Source arm.
 pub(crate) struct SourceIngestChannel {
-    tx: crossbeam_channel::Sender<StreamEvent>,
+    tx: crossbeam_channel::Sender<SourceStreamEvent>,
     /// Shared with the registered `SourceConsumer` wrapper. Each
     /// `push` updates `handle.bytes` from the current channel queue
     /// depth times a smoothed per-record byte estimate (see
@@ -65,6 +123,13 @@ pub(crate) struct SourceIngestChannel {
     /// "unseeded": the first push adopts its own sample as the baseline
     /// rather than climbing from zero over several records.
     record_bytes_ewma: u64,
+    /// Source-scoped identity to mint for the next successfully sent record.
+    /// `None` means the preceding send used `u64::MAX`; another body record
+    /// must fail the attempt instead of wrapping to zero.
+    next_row_id: Option<SourceRowId>,
+    source: PlanNodeId,
+    /// Present only for a source declaring record-level `sort_order`.
+    order_barrier: Option<crate::source::order_barrier::SourceFileOrderBarrier>,
 }
 
 /// Folds one per-record byte `sample` into an exponentially weighted
@@ -95,6 +160,13 @@ impl SourceIngestChannel {
     /// paces back-pressure.
     pub(crate) const DEFAULT_CAPACITY: usize = 1024;
 
+    /// Whether this source needs explicit physical-file lifecycle events.
+    /// Ordinary sources retain the historical record-driven boundary path;
+    /// an order barrier also needs zero-record files to reach verification.
+    pub(crate) fn has_order_barrier(&self) -> bool {
+        self.order_barrier.is_some()
+    }
+
     /// Create a new channel + paired receiver. The receiver is what the
     /// dispatch loop's Source arm consumes via `recv`. The
     /// `consumer_handle` is shared with the pipeline-scoped
@@ -102,13 +174,50 @@ impl SourceIngestChannel {
     pub(crate) fn new(
         capacity: usize,
         consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
-    ) -> (Self, crossbeam_channel::Receiver<StreamEvent>) {
+        source: PlanNodeId,
+    ) -> (Self, crossbeam_channel::Receiver<SourceStreamEvent>) {
         let (tx, rx) = crossbeam_channel::bounded(capacity);
         (
             Self {
                 tx,
                 consumer_handle,
                 record_bytes_ewma: 0,
+                next_row_id: Some(SourceRowId::first(source)),
+                source,
+                order_barrier: None,
+            },
+            rx,
+        )
+    }
+
+    /// Create the same bounded channel with a per-physical-file order barrier
+    /// inserted before its sender.
+    pub(crate) fn new_ordered(
+        capacity: usize,
+        consumer_handle: Arc<crate::pipeline::memory::ConsumerHandle>,
+        source: PlanNodeId,
+        config: crate::source::order_barrier::SourceOrderConfig,
+        memory: Arc<crate::pipeline::memory::MemoryArbitrator>,
+        spill_dir: std::path::PathBuf,
+        spill_compress: bool,
+    ) -> (Self, crossbeam_channel::Receiver<SourceStreamEvent>) {
+        let (tx, rx) = crossbeam_channel::bounded(capacity);
+        let order_barrier = crate::source::order_barrier::SourceFileOrderBarrier::new(
+            config,
+            tx.clone(),
+            Arc::clone(&consumer_handle),
+            memory,
+            spill_dir,
+            spill_compress,
+        );
+        (
+            Self {
+                tx,
+                consumer_handle,
+                record_bytes_ewma: 0,
+                next_row_id: Some(SourceRowId::first(source)),
+                source,
+                order_barrier: Some(order_barrier),
             },
             rx,
         )
@@ -117,8 +226,10 @@ impl SourceIngestChannel {
     /// Push a body record from the Source ingest thread driving a sync
     /// format reader. Blocks the calling thread when the channel is at
     /// capacity, preserving the bounded-channel back-pressure
-    /// semantics.
-    pub(crate) fn push(&mut self, record: Record, row_num: u64) -> Result<(), SourceStreamError> {
+    /// semantics. Returns the exact typed identity placed on the channel so
+    /// document-level structural carriers can retain the selected record and
+    /// its identity as one pair.
+    pub(crate) fn push(&mut self, record: Record) -> Result<SourceRowId, SourceStreamError> {
         // Block here if the arbitrator has paused this consumer (e.g.
         // `BackPressurePreferred` policy elected this Source as the
         // pause victim). The fast path is lock-free; the slow path
@@ -138,17 +249,70 @@ impl SourceIngestChannel {
         // the abort gate trips on real OS RSS, never on this estimate.
         let sample = (std::mem::size_of::<Record>() + record.estimated_heap_size()) as u64;
         self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, sample);
-        let record_bytes = self.record_bytes_ewma;
-        self.tx
-            .send(StreamEvent::record(record, row_num))
-            .map_err(|_| SourceStreamError::Closed)?;
+        let row_id = self
+            .next_row_id
+            .ok_or(SourceStreamError::OrdinalExhausted {
+                source: self.source,
+            })?;
+        if let Some(barrier) = self.order_barrier.as_mut() {
+            barrier.observe_attempt(SourceAttemptEvent::Record(record, row_id))?;
+        } else {
+            self.tx
+                .send(SourceStreamEvent::Attempt {
+                    event: SourceAttemptEvent::Record(record, row_id),
+                    population: None,
+                })
+                .map_err(|_| SourceStreamError::Closed)?;
+        }
+        self.next_row_id = row_id.checked_next();
         // `Sender::len()` is the number of events sitting in the channel
         // buffer waiting for the consumer — the in-flight queue depth. The
         // product approximates the channel's in-flight memory footprint
         // and is what the arbitrator's `current_usage` reports.
-        let queued = self.tx.len() as u64;
-        self.consumer_handle
-            .set_bytes(queued.saturating_mul(record_bytes));
+        self.update_usage(0);
+        Ok(row_id)
+    }
+
+    /// Reserve the next source-scoped identity for a rejected input attempt.
+    ///
+    /// Structural reader failures do not yield a body [`Record`] to send, but
+    /// their representative DLQ record still needs a unique identity in the
+    /// same attempt sequence as successfully decoded rows. Reserving here keeps
+    /// the counter source-scoped and prevents the next successful record from
+    /// reusing the rejected attempt's identity.
+    pub(crate) fn reserve_rejected_row_id(&mut self) -> Result<SourceRowId, SourceStreamError> {
+        let row_id = self
+            .next_row_id
+            .ok_or(SourceStreamError::OrdinalExhausted {
+                source: self.source,
+            })?;
+        self.next_row_id = row_id.checked_next();
+        Ok(row_id)
+    }
+
+    /// Push a declared-type rejection at its exact source-stream position.
+    /// The full original record is bounded by the same channel capacity and
+    /// accounted with the same per-record queue estimate as successful rows.
+    pub(crate) fn push_type_error(
+        &mut self,
+        event: crate::executor::dlq::TypeErrorEvent,
+    ) -> Result<(), SourceStreamError> {
+        self.consumer_handle.wait_while_paused();
+        let sample = (std::mem::size_of::<crate::executor::dlq::TypeErrorEvent>()
+            + event.original_record.estimated_heap_size()) as u64;
+        self.record_bytes_ewma = ewma_step(self.record_bytes_ewma, sample);
+        let event = SourceAttemptEvent::TypeError(Box::new(event));
+        if let Some(barrier) = self.order_barrier.as_mut() {
+            barrier.observe_attempt(event)?;
+        } else {
+            self.tx
+                .send(SourceStreamEvent::Attempt {
+                    event,
+                    population: None,
+                })
+                .map_err(|_| SourceStreamError::Closed)?;
+        }
+        self.update_usage(0);
         Ok(())
     }
 
@@ -159,9 +323,25 @@ impl SourceIngestChannel {
     /// Route pass through). Punctuations carry no record bytes, so the
     /// `ConsumerHandle` byte estimate is left untouched.
     pub(crate) fn push_punctuation(&mut self, punct: Punctuation) -> Result<(), SourceStreamError> {
-        self.tx
-            .send(StreamEvent::punctuation(punct))
-            .map_err(|_| SourceStreamError::Closed)
+        if let Some(barrier) = self.order_barrier.as_mut() {
+            barrier.observe_punctuation(punct).map(|_| ())
+        } else {
+            self.tx
+                .send(SourceStreamEvent::Punctuation(punct))
+                .map_err(|_| SourceStreamError::Closed)
+        }
+    }
+
+    fn update_usage(&self, releasing_spool_bytes: u64) {
+        let staged = self
+            .order_barrier
+            .as_ref()
+            .map(|barrier| barrier.staged_bytes())
+            .unwrap_or(0)
+            .saturating_add(releasing_spool_bytes);
+        let queued = (self.tx.len() as u64).saturating_mul(self.record_bytes_ewma);
+        self.consumer_handle
+            .set_bytes(staged.saturating_add(queued));
     }
 }
 

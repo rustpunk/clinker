@@ -27,6 +27,7 @@ fn no_selector_group_defaults_priority_and_has_no_match() {
         br#"
 group:
   name: nightly
+  targets: { pipelines: [test.pipeline] }
 "#,
     );
 
@@ -49,6 +50,7 @@ fn multi_key_match_selector_is_preserved_verbatim() {
         br#"
 group:
   name: enterprise_west
+  targets: { pipelines: [test.pipeline] }
   match: 'tier == "enterprise" && region == "west"'
   priority: 30
 "#,
@@ -64,6 +66,7 @@ fn explicit_priority_overrides_default() {
         br#"
 group:
   name: high
+  targets: { pipelines: [test.pipeline] }
   priority: 100
 "#,
     );
@@ -79,6 +82,7 @@ fn negative_priority_is_accepted() {
         br#"
 group:
   name: fallback
+  targets: { pipelines: [test.pipeline] }
   priority: -5
 "#,
     );
@@ -91,11 +95,12 @@ fn full_group_parses_all_surfaces() {
         br#"
 group:
   name: enterprise
+  targets: { pipelines: [test.pipeline] }
   match: 'tier == "enterprise"'
   priority: 20
 config:
-  fraud_check.threshold: 0.9
-  region: west
+  fraud_check.threshold: { value: 0.9 }
+  region: { value: west }
 vars:
   static:
     currency: { type: string, default: "USD" }
@@ -127,11 +132,11 @@ overrides:
     assert_eq!(
         g.config
             .get("fraud_check.threshold")
-            .and_then(|v| v.as_f64()),
+            .and_then(|v| v.value.as_f64()),
         Some(0.9)
     );
     assert_eq!(
-        g.config.get("region").and_then(|v| v.as_str()),
+        g.config.get("region").and_then(|v| v.value.as_str()),
         Some("west")
     );
 
@@ -172,6 +177,7 @@ fn unknown_top_level_key_is_a_parse_error() {
         br#"
 group:
   name: typo
+  targets: { pipelines: [test.pipeline] }
 overides: []
 "#,
         PathBuf::from("bad.group.yaml"),
@@ -186,6 +192,7 @@ fn unknown_group_header_key_is_a_parse_error() {
         br#"
 group:
   name: bad
+  targets: { pipelines: [test.pipeline] }
   weight: 5
 "#,
         PathBuf::from("bad.group.yaml"),
@@ -200,6 +207,7 @@ fn missing_name_is_a_parse_error() {
         br#"
 group:
   priority: 10
+  targets: { pipelines: [test.pipeline] }
 "#,
         PathBuf::from("bad.group.yaml"),
     )

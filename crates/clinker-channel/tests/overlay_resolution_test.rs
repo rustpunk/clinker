@@ -195,7 +195,7 @@ fn per_target_config_clobbers_base() {
     let ws = workspace();
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
-        &per_target_overlay("config: { risk.threshold: 0.95 }\n"),
+        &per_target_overlay("config: { risk.threshold: { value: 0.95 } }\n"),
     );
 
     let (_res, plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
@@ -219,15 +219,15 @@ fn layer_precedence_group_below_channel_wide_below_per_target() {
     let ws = workspace();
     write(
         &ws.path().join("group/enterprise.group.yaml"),
-        "group:\n  name: enterprise\n  match: 'tier == \"enterprise\"'\n  priority: 20\nconfig: { risk.threshold: 0.8 }\n",
+        "group:\n  name: enterprise\n  targets: { pipelines: [base] }\n  match: 'tier == \"enterprise\"'\n  priority: 20\nconfig: { risk.threshold: { value: 0.8 } }\n",
     );
     write(
         &ws.path().join("channel/globex/channel.cfg.yaml"),
-        "channel:\n  name: globex\nlabels: { tier: enterprise }\nconfig: { risk.threshold: 0.9 }\n",
+        "channel:\n  name: globex\n  targets: [base]\nlabels: { tier: enterprise }\nconfig: { risk.threshold: { value: 0.9 } }\n",
     );
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
-        &per_target_overlay("config: { risk.threshold: 0.95 }\n"),
+        &per_target_overlay("config: { risk.threshold: { value: 0.95 } }\n"),
     );
 
     let (res, plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
@@ -271,7 +271,7 @@ fn unmatched_config_key_is_e113() {
     let ws = workspace();
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
-        &per_target_overlay("config: { nonexistent.param: 1 }\n"),
+        &per_target_overlay("config: { nonexistent.param: { value: 1 } }\n"),
     );
 
     let (_res, plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
@@ -293,7 +293,7 @@ fn channel_identity_none_before_overlay_then_stamped() {
     let ws = workspace();
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
-        &per_target_overlay("config: { risk.threshold: 0.95 }\n"),
+        &per_target_overlay("config: { risk.threshold: { value: 0.95 } }\n"),
     );
 
     // A bare compiled plan carries no channel identity.
@@ -323,7 +323,7 @@ fn channel_identity_stable_across_reruns() {
     let ws = workspace();
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
-        &per_target_overlay("config: { risk.threshold: 0.95 }\n"),
+        &per_target_overlay("config: { risk.threshold: { value: 0.95 } }\n"),
     );
 
     let (_r1, plan1, _v1) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
@@ -341,7 +341,7 @@ fn channel_identity_stable_across_reruns() {
 /// A channel manifest body (`channel.cfg.yaml`) for channel `id`, with an
 /// arbitrary trailing block (`config:` / `fixed:` / `labels:`).
 fn manifest(id: &str, body: &str) -> String {
-    format!("channel:\n  name: {id}\n{body}")
+    format!("channel:\n  name: {id}\n  targets: [base]\n{body}")
 }
 
 #[test]
@@ -351,17 +351,21 @@ fn channel_wide_fixed_locks_out_per_target() {
     // overlay (the highest layer) tries to override it non-fixed.
     write(
         &ws.path().join("channel/globex/channel.cfg.yaml"),
-        &manifest("globex", "fixed: { risk.threshold: 0.6 }\n"),
+        &manifest(
+            "globex",
+            "config: { risk.threshold: { value: 0.6, fixed: true } }\n",
+        ),
     );
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
-        &per_target_overlay("config: { risk.threshold: 0.95 }\n"),
+        &per_target_overlay("config: { risk.threshold: { value: 0.95 } }\n"),
     );
 
     let (_res, plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
-    assert!(
-        has_no_errors(&result.diagnostics),
-        "{:?}",
+    assert_eq!(
+        errors_with_code(&result.diagnostics, "E103").len(),
+        1,
+        "fixed-forbidden candidate must fail: {:?}",
         result.diagnostics
     );
 
@@ -383,11 +387,11 @@ fn non_fixed_channel_wide_is_overridden_by_per_target() {
     let ws = workspace();
     write(
         &ws.path().join("channel/globex/channel.cfg.yaml"),
-        &manifest("globex", "config: { risk.threshold: 0.6 }\n"),
+        &manifest("globex", "config: { risk.threshold: { value: 0.6 } }\n"),
     );
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
-        &per_target_overlay("config: { risk.threshold: 0.95 }\n"),
+        &per_target_overlay("config: { risk.threshold: { value: 0.95 } }\n"),
     );
 
     let (_res, plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
@@ -411,24 +415,25 @@ fn group_fixed_locks_out_channel_layers() {
     // layers above try to override it non-fixed.
     write(
         &ws.path().join("group/enterprise.group.yaml"),
-        "group:\n  name: enterprise\n  match: 'tier == \"enterprise\"'\n  priority: 20\nfixed: { risk.threshold: 0.7 }\n",
+        "group:\n  name: enterprise\n  targets: { pipelines: [base] }\n  match: 'tier == \"enterprise\"'\n  priority: 20\nconfig: { risk.threshold: { value: 0.7, fixed: true } }\n",
     );
     write(
         &ws.path().join("channel/globex/channel.cfg.yaml"),
         &manifest(
             "globex",
-            "labels: { tier: enterprise }\nconfig: { risk.threshold: 0.9 }\n",
+            "labels: { tier: enterprise }\nconfig: { risk.threshold: { value: 0.9 } }\n",
         ),
     );
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
-        &per_target_overlay("config: { risk.threshold: 0.95 }\n"),
+        &per_target_overlay("config: { risk.threshold: { value: 0.95 } }\n"),
     );
 
     let (res, plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
-    assert!(
-        has_no_errors(&result.diagnostics),
-        "{:?}",
+    assert_eq!(
+        errors_with_code(&result.diagnostics, "E103").len(),
+        2,
+        "both higher-layer candidates are forbidden: {:?}",
         result.diagnostics
     );
     assert!(
@@ -451,13 +456,12 @@ fn group_fixed_locks_out_channel_layers() {
 }
 
 #[test]
-fn fixed_and_config_same_key_in_layer_fixed_wins() {
-    // A key present in both `config:` and `fixed:` of one file resolves to the
-    // fixed value (fixed is clobbered last within the layer).
+fn fixed_leaf_marks_the_same_config_candidate() {
+    // Fixed is metadata on the candidate, not a second sibling map.
     let ws = workspace();
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
-        &per_target_overlay("config: { risk.threshold: 0.5 }\nfixed: { risk.threshold: 0.9 }\n"),
+        &per_target_overlay("config: { risk.threshold: { value: 0.9, fixed: true } }\n"),
     );
 
     let (_res, plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
@@ -480,7 +484,7 @@ fn per_target_fixed_marks_provenance() {
     let ws = workspace();
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
-        &per_target_overlay("fixed: { risk.threshold: 0.42 }\n"),
+        &per_target_overlay("config: { risk.threshold: { value: 0.42, fixed: true } }\n"),
     );
 
     let (_res, plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
@@ -504,7 +508,7 @@ fn unmatched_fixed_key_is_e113() {
     let ws = workspace();
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
-        &per_target_overlay("fixed: { nonexistent.param: 1 }\n"),
+        &per_target_overlay("config: { nonexistent.param: { value: 1, fixed: true } }\n"),
     );
 
     let (_res, _plan, result) = resolve_apply(ws.path(), "base", Some("globex"), &[], true);
@@ -517,18 +521,21 @@ fn unmatched_fixed_key_is_e113() {
 }
 
 #[test]
-fn effective_config_overrides_fold_honors_fixed() {
+fn validated_config_fold_honors_fixed() {
     // The `$config.<param>` pre-compile fold agrees with the provenance winner:
     // a fixed lower layer wins the folded value too, so the executed body and
     // the rendered `[WON]` layer never disagree.
     let ws = workspace();
     write(
         &ws.path().join("channel/globex/channel.cfg.yaml"),
-        &manifest("globex", "fixed: { risk.threshold: 0.6 }\n"),
+        &manifest(
+            "globex",
+            "config: { risk.threshold: { value: 0.6, fixed: true } }\n",
+        ),
     );
     write(
         &ws.path().join("channel/globex/base.channel.yaml"),
-        &per_target_overlay("config: { risk.threshold: 0.95 }\n"),
+        &per_target_overlay("config: { risk.threshold: { value: 0.95 } }\n"),
     );
 
     let res = resolve(
@@ -541,11 +548,15 @@ fn effective_config_overrides_fold_honors_fixed() {
         true,
     )
     .expect("resolve");
-    let overrides = res.effective_config_overrides();
+    let config = parse_base(ws.path());
+    let validation_plan = compile_base(ws.path(), &config);
+    let resolved = res
+        .resolve_config(&validation_plan)
+        .expect_err("fixed target override is invalid even though the wide value wins");
     assert_eq!(
-        overrides.get("risk").and_then(|m| m.get("threshold")),
-        Some(&json!(0.6)),
-        "fold honors the fixed lower layer: {overrides:?}"
+        errors_with_code(&resolved, "E103").len(),
+        1,
+        "fixed override must fail before executable folding: {resolved:?}"
     );
 }
 
@@ -854,7 +865,7 @@ fn per_target_source_schema_patch_applies() {
     // A channel overlay carrying no `sources:` block at all.
     write(
         &ws.path().join("channel/plain/base.channel.yaml"),
-        &per_target_overlay("config: { risk.threshold: 0.9 }\n"),
+        &per_target_overlay("config: { risk.threshold: { value: 0.9 } }\n"),
     );
 
     let res = resolve(

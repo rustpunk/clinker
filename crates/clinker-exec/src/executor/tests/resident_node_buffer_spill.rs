@@ -144,7 +144,7 @@ fn flagged_resident_memory_slot_spills_and_discharges_via_sweep() {
     // A's records round-trip from disk in arrival order with values intact.
     let a = node_buffers.remove(&idx_a.into()).expect("slot A present");
     let (records, _puncts) = a.drain_split().expect("drain spilled slot");
-    let rns: Vec<u64> = records.iter().map(|(_, rn)| *rn).collect();
+    let rns: Vec<u64> = records.iter().map(|(_, rn)| rn.ordinal()).collect();
     assert_eq!(
         rns,
         vec![10, 11, 12],

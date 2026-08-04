@@ -103,7 +103,8 @@ mod tests {
                 PipelineError::Eval(_)
                 | PipelineError::Accumulator { .. }
                 | PipelineError::CombineRangeKeyOutOfRange { .. }
-                | PipelineError::DlqRateExceeded { .. },
+                | PipelineError::DlqRateExceeded { .. }
+                | PipelineError::TypeErrorThresholdExceeded { .. },
             ) => 3,
             Err(
                 PipelineError::Io(_)
@@ -132,8 +133,11 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    # Keep the success fixture aligned with the physical CSV. Missing
+    # non-nullable declarations are source-type failures by contract.
     schema:
-      - { name: id, type: string }
+      - { name: name, type: string }
+      - { name: age, type: int }
 
 - type: output
   name: dest
@@ -1398,6 +1402,9 @@ pipeline:
   name: filter_err
 error_handling:
   strategy: continue
+  # Continue may retain a rejected row only through an explicit DLQ.
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -1405,8 +1412,9 @@ nodes:
     name: src
     type: csv
     path: input.csv
+    # Declare only physical fields so this fixture reaches the predicate
+    # failure it is intended to exercise.
     schema:
-      - { name: id, type: string }
       - { name: name, type: string }
       - { name: amount, type: string }
 

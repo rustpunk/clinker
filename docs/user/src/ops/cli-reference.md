@@ -21,25 +21,31 @@ clinker run [OPTIONS] <CONFIG>
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--memory-limit <SIZE>` | YAML `memory.limit`, else `512M` | Memory budget for the execution. Uses the same grammar as the YAML `memory.limit`: a byte count with an optional binary (1024-based) `K`/`M`/`G` suffix (`K` = 1024 bytes, `M` = 1024², `G` = 1024³), where a bare integer is bytes. Other forms — a decimal `GB`, an explicit `GiB`, or a fractional value such as `1.5G` — are rejected. When the limit is approached, aggregation operators spill to disk rather than crashing. When passed, this value overrides any `memory.limit` set in the pipeline YAML; when omitted, the YAML value applies (or the `512M` default when the YAML is also silent). An empty or whitespace-only value — as an ops wrapper produces when it forwards an unset variable, e.g. `--memory-limit "$CLINKER_MEM"` with `CLINKER_MEM` unset — is treated the same as omitting the flag. A non-empty malformed value (for example the decimal `4GB` rather than the binary `4G`) is rejected at the CLI boundary with an error naming `--memory-limit` and echoing the value, so a typo fails loudly instead of silently falling back to the default and shrinking a larger YAML budget. Because the flag simply populates `pipeline.memory.limit`, a startup budget error (`E312`) for a value you passed via `--memory-limit` refers to that same limit. |
-| `--threads <N>` | number of CPUs | Size of the thread pool used for parallel node execution. |
-| `--error-threshold <N>` | `0` (unlimited) | Maximum number of records routed to the dead-letter queue before the pipeline aborts. `0` means no limit -- the pipeline will run to completion regardless of DLQ volume. |
-| `--batch-id <ID>` | UUID v7 | Custom execution identifier. Appears in metrics output and log lines. Use a meaningful value (e.g. `daily-2026-04-11`) for correlation across retries. |
+| `--threads <N>` | number of CPUs | Size of the executor thread pool. The selected value is also recorded in execution metrics. |
+| `--error-threshold <N>` | `0` | **Accepted but not enforced in the current binary.** Parsing this flag does not stop a run after that many DLQ records. Phase 4 / AUTH-05 owns the D-45 CLI audit that must wire it or replace it with a nonzero tombstone. |
+| `--batch-id <ID>` | UUID v7 | Correlation ID available as `pipeline.batch_id`, in `{batch_id}` output-path templates, and in opt-in output provenance sidecars. It is distinct from the generated execution ID and is not currently a field in the metrics-spool payload. |
 | `--explain [FORMAT]` | `text` | Print the execution plan and exit without processing data. Accepted formats: `text`, `json`, `dot`. See [Explain Plans](explain.md). |
 | `--lineage <PATH>` | -- | Build column lineage and write it as OpenLineage NDJSON, then exit without processing data. Give a file path, or `-` for stdout. See [Column Lineage](lineage.md). |
-| `--lineage-events <PATH>` | -- | Run the pipeline and emit live OpenLineage run events (a `START` at run begin, then a terminal `COMPLETE` / `FAIL` / `ABORT` with real timing and row counts) as NDJSON to a file path, or `-` for stdout. Cannot be combined with `--lineage`, `--explain`, `--dry-run`, or `-n`. See [Live run events](lineage.md#live-run-events). |
-| `--dry-run` | -- | Validate the configuration (YAML structure, CXL syntax, type checking, DAG wiring) without reading any data. |
-| `-n, --dry-run-n <N>` | -- | Process only the first `N` records through the full pipeline. Implies `--dry-run`. |
-| `--dry-run-output <FILE>` | stdout | Redirect dry-run output to a file instead of stdout. Only meaningful with `-n`. |
-| `--rules-path <DIR>` | `./rules/` | Search path for CXL module files referenced by `use` statements. |
+| `--lineage-events <PATH>` | -- | Run the pipeline and emit live OpenLineage run events (a `START` at run begin, then a terminal `COMPLETE` / `FAIL` / `ABORT` with real timing and row counts) as NDJSON to a file path, or `-` for stdout. Cannot be combined with `--lineage`, `--explain`, `--dry-run`, or `-n`. With `-`, normal run output can interleave with the event stream; use a file for clean NDJSON. See [Live run events](lineage.md#live-run-events). |
+| `--dry-run` | -- | With no `-n`, loads and validates the pipeline configuration, prints resolved outputs, and exits before full plan compilation or data access. It does **not** currently type-check CXL or validate DAG wiring; use `--explain` for the current no-data compile check. |
+| `-n, --dry-run-n <N>` | -- | **Current limitation:** requires an explicit `--dry-run`, but the current binary does not apply the `N` limit and instead continues into a normal full run. Do not use this as a bounded preview. Phase 4 / AUTH-05 owns the D-45 fix. |
+| `--dry-run-output <FILE>` | -- | **Accepted but unused in the current binary.** It does not redirect output. Phase 4 / AUTH-05 must wire it or replace it with a nonzero tombstone. |
+| `--rules-path <DIR>` | selected workspace's `rules/` | Select the CXL module rules root for this run. Precedence is explicit CLI value, then `pipeline.rules_path`, then `[catalog].rules_root`, then the workspace-relative `rules/` default. A relative value is anchored to the workspace selected by `--base-dir` or workspace discovery, not the process working directory. One root is selected; Clinker does not search multiple roots. See [Modules and `use`](../cxl/modules.md#rules-root-selection) and the [typed workspace catalog](../pipelines/channels.md#typed-workspace-catalog). |
 | `--base-dir <DIR>` | -- | Base directory for resolving relative paths in the YAML config. Defaults to the directory containing the config file. |
 | `--allow-absolute-paths` | -- | Permit absolute file paths in the pipeline YAML. By default, absolute paths are rejected to encourage portable configs. |
-| `--env <NAME>` | -- | Set the active environment. Equivalent to setting `CLINKER_ENV`. Used by `when:` conditions in channel overrides. |
-| `--quiet` | -- | Suppress progress output. Errors are still printed to stderr. |
-| `--force` | -- | Allow output files to be overwritten if they already exist. Without this flag, the pipeline aborts rather than clobbering existing output. |
-| `--log-level <LEVEL>` | `info` | Logging verbosity. One of: `error`, `warn`, `info`, `debug`, `trace`. |
+| `--env <NAME>` | -- | Sets `CLINKER_ENV` in the current process before the pipeline loads. The current run path does not otherwise consume that value for channel selection; select a channel explicitly with `--channel`. |
+| `--quiet` | -- | Suppresses the “applied overlay” summary. Other stdout, tracing, warnings, and errors are not uniformly silenced. |
+| `--force` | -- | Overrides an output's `if_exists: error` policy and permits overwrite. Outputs using the default `if_exists: overwrite` already overwrite without this flag; `unique_suffix` keeps its own collision behavior. |
+| `--log-level <LEVEL>` | `info` | Logging verbosity: `error`, `warn`, `info`, `debug`, or `trace`. **Current limitation:** an unrecognized value is silently treated as `info` instead of being rejected; Phase 4 / AUTH-05 owns strict CLI typing. |
 | `--metrics-spool-dir <DIR>` | -- | Directory for per-execution metrics files. See [Metrics & Monitoring](metrics.md). |
-| `--group <NAME>` | -- | Force-include a group overlay by name (repeatable). Applies the group's `overrides` op stream and `config`/`vars` clobber before the pipeline compiles, regardless of the group's selector. Use `clinker channels resolve` to preview the effective plan. |
+| `--channel <ID>` | -- | Apply a logical id from `[catalog.channels]`. The selected file must also have a `[catalog.pipelines]` id listed in the channel manifest. Matching groups are target-bounded before labels narrow them. |
+| `--group <NAME>` | -- | Force-include a group overlay by name (repeatable). The selected pipeline or one of its admitted compositions must appear in the group's explicit `targets:` set. Use `clinker channels resolve` to preview the effective plan. |
 | `--no-auto-groups` | -- | Suppress selector-derived group membership; only groups named with `--group` apply. |
+
+The limitations called out above are the current parser/runtime behavior, not
+recommended contracts. Decision D-45 requires every visible option to be
+wired and behavior-tested, or replaced by a nonzero tombstone with a
+paste-ready alternative. That audit is assigned to Phase 4 / AUTH-05.
 
 ### Examples
 
@@ -53,14 +59,14 @@ clinker run pipeline.yaml --memory-limit 512M --force --log-level warn
 # Validate without processing
 clinker run pipeline.yaml --dry-run
 
-# Preview first 10 records
-clinker run pipeline.yaml --dry-run -n 10
+# Compile and explain without reading data
+clinker run pipeline.yaml --explain text
 
 # Show execution plan as Graphviz
 clinker run pipeline.yaml --explain dot | dot -Tpng -o plan.png
 
-# Run with a custom batch ID for tracing
-clinker run pipeline.yaml --batch-id "daily-2026-04-11" --metrics-spool-dir ./metrics/
+# Run with a batch ID available to templates and provenance sidecars
+clinker run pipeline.yaml --batch-id "daily-2026-04-11"
 ```
 
 ---
@@ -120,8 +126,8 @@ node). This answers "what does tenant X actually run?".
 | Flag | Default | Description |
 |------|---------|-------------|
 | `<TARGET>` | -- | Path to the base pipeline (or composition) YAML to resolve (required). |
-| `--channel <ID>` | -- | Channel id to resolve for (a folder under the channel root). Matching groups are derived from the channel's labels. |
-| `--group <NAME>` | -- | Force-include a group overlay by name (repeatable), with or without a channel. |
+| `--channel <ID>` | -- | Logical channel id from `[catalog.channels]`. Matching groups are derived only after explicit target admission. |
+| `--group <NAME>` | -- | Force-include a group overlay by name (repeatable), subject to the same target set as automatic selection. |
 | `--no-auto-groups` | -- | Suppress selector-derived group membership. |
 | `--base-dir <DIR>` | `.` | Workspace root holding `clinker.toml` and the channel/group roots. |
 
@@ -130,9 +136,10 @@ parameter), so `resolve` doubles as a targeted check for one tenant.
 
 ### clinker channels lint
 
-Compiles every (target × overlay) combination across the workspace and reports
-failures — the CI safety net for base-change blast radius. This is where the
-full-tree scan lives; the run path resolves a single channel by computed lookup.
+Compiles every target declared by every `[catalog.channels]` entry and reports
+failures — the CI safety net for base-change blast radius. It uses the same
+logical identity and target-scope checks as `run` and `explain`; a basename or
+current working directory never supplies target identity.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -164,8 +171,9 @@ the command exits non-zero when any such error occurs.
 Stamps (or overwrites) one label across the named channels by editing each
 channel's `channel.cfg.yaml` manifest in place. Idempotent: re-running with the
 same value writes nothing. Only the manifest's `labels:` block is rewritten;
-other keys and comments are preserved. A channel with no manifest yet gets one
-created (with its folder name as the channel name).
+other keys and comments are preserved. The channel manifest must already exist
+with a non-empty `channel.targets` list; `label set` will not create a
+targetless manifest.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -221,7 +229,8 @@ operation:
   `where:` / `cxl:` bodies, rewritten via the CXL parser so only true source
   qualifiers are touched (a method receiver like `region.contains(...)` is left
   alone);
-- across every group / channel-manifest / per-target overlay file: op `target`,
+- across every target-admitted group / channel-manifest / per-target overlay
+  file: op `target`,
   `after`, `before`, injected `alias`, explicit `input`, `rewire` keys and
   values, an inline `node`, a `set config.cxl` value's CXL, and top-level
   `config` dotted-path prefixes (`old.param` → `new.param`).
@@ -240,13 +249,12 @@ body that must be rewritten but does not parse aborts the whole operation before
 anything is written. After a real (non-dry-run) run the command re-runs
 `channels lint` so an incomplete rename fails loudly.
 
-Scope: a *per-target* overlay (`<target>.channel.yaml` / `.comp.yaml`) is
-rewritten only when it overlays the renamed pipeline, so a different pipeline
-that happens to share the node name is left alone. *Target-agnostic* layers —
-channel-wide manifest overrides and group files — are rewritten wherever they
-reference the old name; if two pipelines share a node name and the same group or
-channel-wide override targets it, review the `--dry-run` diff and rely on
-`channels lint` to catch any pipeline the rename should not have touched.
+Scope is catalog- and target-bounded. Per-target files are matched by their
+logical `channel.target`; channel manifests are admitted only when
+`channel.targets` contains the selected pipeline; and groups are admitted only
+when `group.targets` names that pipeline or a composition in its resolved
+closure. Filenames and basenames never establish identity, and a selector match
+cannot widen the refactor beyond the group's declared target set.
 
 Files are rewritten by re-serializing their YAML: key order is preserved, but
 comments and incidental scalar styling are normalized. Use `--dry-run` to review

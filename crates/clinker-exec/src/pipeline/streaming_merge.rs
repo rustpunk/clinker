@@ -107,21 +107,27 @@ impl GroupBoundary {
     /// is one `Vec<u8>::cmp` per group boundary (memcmp on the encoded
     /// key bytes) — O(group_count), not O(record_count) — so the
     /// always-on contract is free in steady state.
-    pub(crate) fn push<F>(
+    pub(crate) fn push<F, R>(
         &mut self,
         mut state: AggregatorGroupState,
         record: Record,
-        row_num: u64,
+        row_num: R,
         finalize: &F,
         out: &mut Vec<SortRow>,
     ) -> Result<(), HashAggError>
     where
         F: Fn(&Record, &AggregatorGroupState) -> Result<Record, HashAggError>,
+        R: Into<crate::executor::stream_event::SourceRowId>,
     {
         use std::cmp::Ordering;
 
-        if row_num < state.min_row_num {
-            state.min_row_num = row_num;
+        let row_num = row_num.into();
+
+        if state
+            .representative_row
+            .is_none_or(|representative| row_num < representative)
+        {
+            state.representative_row = Some(row_num);
         }
 
         if self.open_state.is_none() {
@@ -155,11 +161,9 @@ impl GroupBoundary {
                     .take()
                     .expect("open_record must be Some whenever open_state is Some");
                 let out_record = finalize(&prev_record, &prev_state)?;
-                let prev_row_num = if prev_state.min_row_num == u64::MAX {
-                    0
-                } else {
-                    prev_state.min_row_num
-                };
+                let prev_row_num = prev_state
+                    .representative_row
+                    .unwrap_or_else(crate::executor::stream_event::SourceRowId::synthetic);
                 out.push((out_record, prev_row_num));
 
                 // Install the new open group.
@@ -202,11 +206,9 @@ impl GroupBoundary {
                 .take()
                 .expect("open_record must be Some whenever open_state is Some");
             let out_record = finalize(&prev_record, &state)?;
-            let row_num = if state.min_row_num == u64::MAX {
-                0
-            } else {
-                state.min_row_num
-            };
+            let row_num = state
+                .representative_row
+                .unwrap_or_else(crate::executor::stream_event::SourceRowId::synthetic);
             out.push((out_record, row_num));
         }
         Ok(())

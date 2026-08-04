@@ -851,7 +851,7 @@ nodes:
       schema:
         - { name: team, type: string }
         - { name: name, type: string }
-        - { name: hired, type: date }
+        - { name: hired, type: { nullable: date } }
   - type: cull
     name: drop_recent_or_late
     input: people
@@ -953,7 +953,7 @@ nodes:
       type: json
       path: test.json
       schema:
-        - { name: account, type: string }
+        - { name: account, type: { nullable: string } }
         - { name: status, type: string }
   - type: cull
     name: drop_errors

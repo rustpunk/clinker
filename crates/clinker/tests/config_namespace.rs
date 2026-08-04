@@ -22,7 +22,7 @@ fn write(root: &Path, rel: &str, content: &str) {
     std::fs::write(path, content).unwrap();
 }
 
-const CLINKER_TOML: &str = "[channel]\nroot = \"channel\"\n\n[group]\nroot = \"group\"\n";
+const CLINKER_TOML: &str = "[catalog.pipelines]\norders = \"pipeline/order_fulfillment.yaml\"\n\n[catalog.compositions]\ngate = \"composition/gate.comp.yaml\"\n\n[channel]\nroot = \"channel\"\n\n[group]\nroot = \"group\"\n";
 const ORDERS_CSV: &str = "order_id,amount\na1,150.0\na2,20.0\na3,200.0\n";
 
 /// The `gate` composition: its body reads `$config.min_amount` in a `filter`,
@@ -92,9 +92,10 @@ nodes:
 /// clobbers the `gate.min_amount` config param up to `100`.
 const GROUP: &str = r#"group:
   name: big_orders
+  targets: { pipelines: [orders] }
   priority: 20
 config:
-  gate.min_amount: 100.0
+  gate.min_amount: { value: 100.0 }
 "#;
 
 fn build_workspace(root: &Path) {

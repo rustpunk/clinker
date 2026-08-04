@@ -224,18 +224,16 @@ fn streaming_writes_correct_output_under_slow_source() {
     );
 
     // Counters match the buffered Output arm's semantics. `ok_count`
-    // counts DISTINCT `row_num` values across sources, and src_a /
-    // src_b both produce row_nums 1..=10, so the cross-source
-    // duplicates collide in the executor's `ok_source_rows` HashSet
-    // and `ok_count` lands at 10 (one count per distinct row_num).
+    // counts distinct source-scoped row identities, so src_a and src_b
+    // each contribute all ten rows even though both use ordinals 1..=10.
     assert_eq!(counters.dlq_count, 0, "no DLQ entries expected");
     assert_eq!(
         counters.records_written, 20,
         "expected 20 writes (10 per source); counters={counters:?}",
     );
     assert_eq!(
-        counters.ok_count, 10,
-        "expected 10 distinct row_nums across sources; counters={counters:?}",
+        counters.ok_count, 20,
+        "expected 20 distinct source-scoped rows; counters={counters:?}",
     );
     assert_eq!(
         counters.total_count, 20,

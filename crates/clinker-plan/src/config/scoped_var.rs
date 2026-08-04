@@ -62,6 +62,8 @@ pub fn build_scoped_vars_registry(
 ) -> cxl::resolve::ScopedVarsRegistry {
     use crate::config::pipeline_node::{PipelineNode, VarScope};
     let mut reg = cxl::resolve::ScopedVarsRegistry {
+        module_exports: std::collections::HashMap::new(),
+        runtime_modules: std::sync::Arc::new(Default::default()),
         pipeline: indexmap::IndexMap::new(),
         source: indexmap::IndexMap::new(),
         record: indexmap::IndexMap::new(),

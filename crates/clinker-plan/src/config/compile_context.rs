@@ -10,7 +10,7 @@
 //! which reads CWD at call time — a convenience that is explicitly not
 //! sanctioned for production callers.
 //!
-//! Field cap: 6. If growth pressure exceeds that, split the context
+//! Field cap: 8. If growth pressure exceeds that, split the context
 //! into purpose-specific bags rather than letting it sprawl.
 
 use std::collections::HashMap;
@@ -72,6 +72,15 @@ pub struct CompileContext {
     /// freshly re-read body before it binds. Empty (the default) means "no
     /// deferred body-source patches": the compile path is unchanged.
     pub body_source_patches: crate::config::patch::BodySourcePatchMap,
+    /// Immutable CXL module closure already resolved for this invocation.
+    /// The planner retains it on the resulting `CompiledPlan` so execution
+    /// never needs the source files again.
+    pub cxl_modules: crate::resources::CompiledModuleRegistry,
+    /// Content identities captured while discovering the reachable
+    /// composition closure for module admission. Schema binding verifies the
+    /// bytes it reopens against this map, failing closed if a body changed
+    /// between the two planning phases.
+    pub composition_body_identities: HashMap<PathBuf, [u8; 32]>,
 }
 
 impl CompileContext {
@@ -86,6 +95,8 @@ impl CompileContext {
             overlay_ops: Vec::new(),
             config_overrides: ConfigOverrides::new(),
             body_source_patches: crate::config::patch::BodySourcePatchMap::new(),
+            cxl_modules: crate::resources::CompiledModuleRegistry::default(),
+            composition_body_identities: HashMap::new(),
         }
     }
 
@@ -101,6 +112,8 @@ impl CompileContext {
             overlay_ops: Vec::new(),
             config_overrides: ConfigOverrides::new(),
             body_source_patches: crate::config::patch::BodySourcePatchMap::new(),
+            cxl_modules: crate::resources::CompiledModuleRegistry::default(),
+            composition_body_identities: HashMap::new(),
         }
     }
 
@@ -129,6 +142,8 @@ impl CompileContext {
             overlay_ops: Vec::new(),
             config_overrides: self.config_overrides.clone(),
             body_source_patches: self.body_source_patches.clone(),
+            cxl_modules: self.cxl_modules.clone(),
+            composition_body_identities: self.composition_body_identities.clone(),
         }
     }
 }
@@ -144,6 +159,8 @@ impl Default for CompileContext {
             overlay_ops: Vec::new(),
             config_overrides: ConfigOverrides::new(),
             body_source_patches: crate::config::patch::BodySourcePatchMap::new(),
+            cxl_modules: crate::resources::CompiledModuleRegistry::default(),
+            composition_body_identities: HashMap::new(),
         }
     }
 }

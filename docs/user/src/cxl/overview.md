@@ -1,19 +1,21 @@
-# CXL Overview
+# Clinker Expression Language Overview
 
-CXL (Clinker Expression Language) is a per-record expression language designed for ETL transformations. Every CXL program operates on one record at a time, producing output fields, filtering records, or computing derived values.
+Clinker Expression Language (CXL) is a per-record ETL expression language.
+Every program operates on one record at a time, producing output fields,
+filtering records, or computing derived values.
 
-**CXL is not SQL.** There are no `SELECT`, `FROM`, or `WHERE` keywords. CXL programs are sequences of statements -- `emit`, `let`, `filter`, `distinct` -- that execute top to bottom against the current record.
+Programs are sequences of `emit`, `let`, `filter`, and `distinct` statements
+that execute from top to bottom against the current record.
 
-## Key differences from SQL
+## Core expression forms
 
-| SQL | CXL |
-|-----|-----|
-| `SELECT col AS alias` | `emit alias = col` |
-| `WHERE condition` | `filter condition` |
-| `AND` / `OR` / `NOT` | `and` / `or` / `not` (keywords) |
-| `&&` / `\|\|` / `!` | Not supported -- use keywords |
-| `COALESCE(a, b)` | `a ?? b` |
-| `CASE WHEN ... THEN ... END` | `if ... then ... else ...` or `match { }` |
+| Intent | CXL form |
+|--------|----------|
+| Produce or rename a field | `emit alias = col` |
+| Keep only matching records | `filter condition` |
+| Combine conditions | `and` / `or` / `not` (keywords) |
+| Choose the first non-null value | `a ?? b` |
+| Choose between values | `if ... then ... else ...` or `match { }` |
 
 ## Boolean operators are keywords
 

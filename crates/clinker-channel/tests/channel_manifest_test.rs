@@ -1,312 +1,151 @@
-//! Parse coverage for the channel-centric overlay serde types (issue #517).
-//!
-//! Pins the on-the-wire YAML surface for `channel.cfg.yaml` manifests
-//! ([`ChannelManifest`]) and per-target overlay files ([`OverlayFile`]).
-//! These types are parse-only; layer resolution and override application
-//! live in later stages, so the assertions here stay at the deserialized
-//! shape: header fields, label order/values, the four var scopes, and the
-//! opaque `overrides` list.
+//! Wire-format contract for catalog-scoped channel resources.
 
 use std::path::PathBuf;
 
 use clinker_channel::{ChannelManifest, OverlayFile};
 use clinker_plan::config::ScopedVarType;
-use clinker_plan::overlay_ops::OverlayOp;
 
-fn manifest(yaml: &[u8]) -> ChannelManifest {
+fn parse_manifest(yaml: &[u8]) -> ChannelManifest {
     ChannelManifest::from_yaml_bytes(yaml, PathBuf::from("channel.cfg.yaml"))
-        .expect("manifest YAML parses")
-}
-
-fn overlay(yaml: &[u8], name: &str) -> OverlayFile {
-    OverlayFile::from_yaml_bytes(yaml, PathBuf::from(name)).expect("overlay YAML parses")
+        .expect("manifest parses")
 }
 
 #[test]
-fn parses_full_manifest() {
-    let m = manifest(
+fn fixed_leaf_values_parse_with_authored_spans_and_default_false() {
+    let manifest = parse_manifest(
         br#"
 channel:
-  name: globex
-labels: { region: west, tier: enterprise }
+  name: tenant.acme
+  targets: [sales.orders]
 config:
-  fraud_check.threshold: 0.9
+  fraud.threshold: { value: 0.9, fixed: true }
+  fraud.mode: { value: strict }
 vars:
   static:
-    currency: { type: string, default: "USD" }
+    currency: { type: string, default: USD, fixed: true }
   pipeline:
-    retries: { type: int }
-  source:
-    orders:
-      cutoff: { type: int, default: 100 }
-  record:
-    tag: { type: string, default: "batch" }
-overrides:
-  - { op: add, composition: ./composition/fraud.comp.yaml, alias: fraud }
+    retries: { type: int, default: 3 }
 "#,
     );
 
-    assert_eq!(m.channel.name, "globex");
+    assert_eq!(manifest.channel.name, "tenant.acme");
+    assert_eq!(manifest.channel.targets[0].value, "sales.orders");
 
-    // Labels preserve declared order and scalar values.
-    let labels: Vec<(&str, &serde_json::Value)> =
-        m.labels.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    assert_eq!(labels[0].0, "region");
-    assert_eq!(labels[0].1, &serde_json::json!("west"));
-    assert_eq!(labels[1].0, "tier");
-    assert_eq!(labels[1].1, &serde_json::json!("enterprise"));
+    let threshold = &manifest.config["fraud.threshold"];
+    assert_eq!(threshold.value, serde_json::json!(0.9));
+    assert!(threshold.fixed);
+    assert_eq!(threshold.value_span.line(), 6);
+    assert_eq!(threshold.fixed_span.expect("fixed span").line(), 6);
 
-    // Channel-wide config keeps raw dotted-path keys.
-    assert_eq!(
-        m.config.get("fraud_check.threshold"),
-        Some(&serde_json::json!(0.9))
-    );
+    let mode = &manifest.config["fraud.mode"];
+    assert_eq!(mode.value, serde_json::json!("strict"));
+    assert!(!mode.fixed, "fixed defaults to false at every leaf");
 
-    // All four var scopes populate.
-    assert_eq!(
-        m.vars.static_scope["currency"].var_type,
-        ScopedVarType::String
-    );
-    assert_eq!(
-        m.vars.static_scope["currency"].default,
-        Some(serde_json::json!("USD"))
-    );
-    assert_eq!(m.vars.pipeline["retries"].var_type, ScopedVarType::Int);
-    assert!(m.vars.pipeline["retries"].default.is_none());
-    assert_eq!(
-        m.vars.source["orders"]["cutoff"].var_type,
-        ScopedVarType::Int
-    );
-    assert_eq!(m.vars.record["tag"].var_type, ScopedVarType::String);
+    let currency = &manifest.vars.static_scope["currency"];
+    assert_eq!(currency.var_type, ScopedVarType::String);
+    assert_eq!(currency.default, Some(serde_json::json!("USD")));
+    assert!(currency.fixed);
+    assert_eq!(currency.fixed_span.expect("fixed span").line(), 10);
 
-    // `overrides` parses into the typed op vocabulary, keeping each op's span.
-    assert_eq!(m.overrides.len(), 1);
-    match &m.overrides[0].value {
-        OverlayOp::Add(add) => {
-            assert_eq!(add.alias.as_deref(), Some("fraud"));
-            assert_eq!(
-                add.composition.as_deref(),
-                Some(std::path::Path::new("./composition/fraud.comp.yaml"))
-            );
-        }
-        other => panic!("expected add op, got {other:?}"),
-    }
+    assert!(!manifest.vars.pipeline["retries"].fixed);
 }
 
 #[test]
-fn parses_fixed_lock_block() {
-    // The `fixed:` block is a sibling of `config:` on both the manifest and the
-    // per-target overlay, carrying the same raw `alias.param` dotted keys.
-    let m = manifest(
+fn fixed_unknown_or_misplaced_keys_fail_at_the_authored_input() {
+    let unknown = ChannelManifest::from_yaml_bytes(
         br#"
 channel:
-  name: globex
-config: { fraud_check.threshold: 0.9 }
-fixed:  { fraud_check.mode: 1 }
-"#,
-    );
-    assert_eq!(
-        m.config.get("fraud_check.threshold"),
-        Some(&serde_json::json!(0.9))
-    );
-    assert_eq!(m.fixed.get("fraud_check.mode"), Some(&serde_json::json!(1)));
-
-    let o = overlay(
-        br#"
-channel:
-  target: ../../pipeline/base.yaml
-config: { scorer.threshold: 0.5 }
-fixed:  { scorer.threshold: 0.9 }
-"#,
-        "base.channel.yaml",
-    );
-    assert_eq!(
-        o.config.get("scorer.threshold"),
-        Some(&serde_json::json!(0.5))
-    );
-    assert_eq!(
-        o.fixed.get("scorer.threshold"),
-        Some(&serde_json::json!(0.9))
-    );
-}
-
-#[test]
-fn parses_minimal_manifest() {
-    // Only the header is required; every other block defaults to empty.
-    let m = manifest(
-        br#"
-channel:
-  name: acme
-"#,
-    );
-    assert_eq!(m.channel.name, "acme");
-    assert!(m.labels.is_empty());
-    assert!(m.config.is_empty());
-    assert!(m.vars.static_scope.is_empty());
-    assert!(m.vars.pipeline.is_empty());
-    assert!(m.vars.source.is_empty());
-    assert!(m.vars.record.is_empty());
-    assert!(m.overrides.is_empty());
-}
-
-#[test]
-fn manifest_rejects_unknown_top_level_field() {
-    let err = ChannelManifest::from_yaml_bytes(
-        br#"
-channel:
-  name: acme
-lables: { region: west }
+  name: tenant.acme
+  targets: [sales.orders]
+config:
+  fraud.threshold: { value: 0.9, fiexed: true }
 "#,
         PathBuf::from("channel.cfg.yaml"),
+    )
+    .expect_err("unknown leaf keys must fail closed");
+    let unknown = unknown.to_string();
+    assert!(unknown.contains("fiexed"), "{unknown}");
+    assert!(
+        unknown.contains("fixed"),
+        "diagnostic should name the corrected key: {unknown}"
     );
-    assert!(err.is_err(), "typo'd top-level key must be rejected");
-}
 
-#[test]
-fn manifest_labels_round_trip() {
-    let m = manifest(
+    let misplaced = ChannelManifest::from_yaml_bytes(
         br#"
 channel:
-  name: globex
-labels: { region: west, tier: enterprise, shard: "07" }
-"#,
-    );
-
-    // Labels are an order-preserving scalar map: round-tripping them through
-    // JSON keeps declared order and values (the manifest itself is parse-only
-    // now that `overrides` carries span-bearing typed ops).
-    let json = serde_json::to_string(&m.labels).expect("labels serialize");
-    let round: indexmap::IndexMap<String, serde_json::Value> =
-        serde_json::from_str(&json).expect("labels re-parse");
-
-    let before: Vec<(&String, &serde_json::Value)> = m.labels.iter().collect();
-    let after: Vec<(&String, &serde_json::Value)> = round.iter().collect();
-    assert_eq!(before, after);
-    assert_eq!(
-        after[2],
-        (&"shard".to_string(), &serde_json::json!("07")),
-        "quoted scalar label round-trips as a string, order preserved"
-    );
-}
-
-#[test]
-fn parses_full_overlay() {
-    let o = overlay(
-        br#"
-channel:
-  target: ../../pipeline/order_fulfillment.yaml
+  name: tenant.acme
+  targets: [sales.orders]
 config:
-  fraud_check.threshold: 0.95
-vars:
-  static:
-    currency: { type: string, default: "EUR" }
-overrides:
-  - { op: set, target: route_priority, field: config.cxl, value: "emit _route = a" }
+  fraud.threshold: 0.9
+fixed:
+  fraud.threshold: true
 "#,
-        "order_fulfillment.channel.yaml",
+        PathBuf::from("channel.cfg.yaml"),
+    )
+    .expect_err("a sibling fixed block is not a second public syntax");
+    let misplaced = misplaced.to_string();
+    assert!(misplaced.contains("fixed"), "{misplaced}");
+    assert!(
+        misplaced.contains("value"),
+        "diagnostic should show the leaf form: {misplaced}"
     );
+}
 
-    assert_eq!(o.channel.target, "../../pipeline/order_fulfillment.yaml");
-    assert_eq!(
-        o.config.get("fraud_check.threshold"),
-        Some(&serde_json::json!(0.95))
-    );
-    assert_eq!(
-        o.vars.static_scope["currency"].var_type,
-        ScopedVarType::String
-    );
-    assert_eq!(o.overrides.len(), 1);
-    match &o.overrides[0].value {
-        OverlayOp::Set(set) => {
-            assert_eq!(set.target, "route_priority");
-            assert_eq!(set.field, "config.cxl");
-        }
-        other => panic!("expected set op, got {other:?}"),
+#[test]
+fn channel_manifest_rejects_empty_or_omitted_targets() {
+    for yaml in [
+        br#"channel: { name: tenant.acme, targets: [] }"#.as_slice(),
+        br#"channel: { name: tenant.acme }"#.as_slice(),
+    ] {
+        let error = ChannelManifest::from_yaml_bytes(yaml, PathBuf::from("channel.cfg.yaml"))
+            .expect_err("target scope is mandatory and non-empty")
+            .to_string();
+        assert!(error.contains("targets"), "{error}");
+        assert!(error.contains("pipeline"), "{error}");
     }
 }
 
 #[test]
-fn overlay_target_is_authoritative_over_filename() {
-    // Identical body under each of the three filename forms; the parsed
-    // target comes from the YAML, so it is identical across all of them.
-    let body = br#"
-channel:
-  target: ../../pipeline/order_fulfillment.yaml
-config: {}
-"#;
-
-    let as_channel = overlay(body, "anything.channel.yaml");
-    let as_comp = overlay(body, "anything.comp.yaml");
-    let as_bare = overlay(body, "anything.yaml");
-
-    assert_eq!(
-        as_channel.channel.target,
-        "../../pipeline/order_fulfillment.yaml"
-    );
-    assert_eq!(as_comp.channel.target, as_channel.channel.target);
-    assert_eq!(as_bare.channel.target, as_channel.channel.target);
-
-    // Even when the filename stem disagrees with the target stem, the YAML
-    // wins: parsing does not derive the target from the filename.
-    let mismatched = overlay(
-        br#"
-channel:
-  target: ../../composition/tax_calc.comp.yaml
-"#,
-        "order_fulfillment.channel.yaml",
-    );
-    assert_eq!(
-        mismatched.channel.target,
-        "../../composition/tax_calc.comp.yaml"
-    );
+fn channel_wide_manifest_rejects_graph_and_source_operations() {
+    for (field, body) in [
+        ("overrides", "overrides: [{ op: bypass, target: audit }]"),
+        (
+            "sources",
+            "sources: { orders: { options: { delimiter: '|' } } }",
+        ),
+    ] {
+        let yaml = format!("channel:\n  name: tenant.acme\n  targets: [sales.orders]\n{body}\n");
+        let error =
+            ChannelManifest::from_yaml_bytes(yaml.as_bytes(), PathBuf::from("channel.cfg.yaml"))
+                .expect_err("channel-wide graph/source operations are forbidden")
+                .to_string();
+        assert!(error.contains(field), "{error}");
+        assert!(
+            error.contains("target"),
+            "diagnostic should direct the author to a target file: {error}"
+        );
+    }
 }
 
 #[test]
-fn overlay_rejects_unknown_top_level_field() {
-    let err = OverlayFile::from_yaml_bytes(
+fn target_file_uses_a_logical_pipeline_identity_not_a_path() {
+    let overlay = OverlayFile::from_yaml_bytes(
         br#"
 channel:
-  target: ./pipeline.yaml
-labels: { region: west }
-"#,
-        PathBuf::from("pipeline.channel.yaml"),
-    );
-    assert!(
-        err.is_err(),
-        "overlay files carry no `labels:` block — labels live on the manifest"
-    );
-}
-
-#[test]
-fn overlay_overrides_parse_typed() {
-    // A structurally rich op list parses into the typed op vocabulary, each op
-    // keeping its source span. The keyed `schema:` grammar (not a list) is the
-    // canonical `patch_schema` shape.
-    let o = overlay(
-        br#"
-channel:
-  target: ./pipeline.yaml
+  target: sales.orders
+config:
+  fraud.threshold: { value: 0.95 }
 overrides:
-  - { op: add, node: { type: transform, name: stamp, input: src, config: { cxl: "emit a = b" } }, after: src }
-  - { op: patch_schema, target: orders, schema: { tax_exempt: { add: { type: bool } } } }
   - { op: bypass, target: legacy_audit }
 "#,
-        "pipeline.channel.yaml",
-    );
+        PathBuf::from("orders.yaml"),
+    )
+    .expect("target overlay parses");
 
-    assert_eq!(o.overrides.len(), 3);
-    assert!(matches!(o.overrides[0].value, OverlayOp::Add(_)));
-    match &o.overrides[1].value {
-        OverlayOp::PatchSchema(patch) => {
-            assert_eq!(patch.target, "orders");
-            assert!(patch.schema.contains_key("tax_exempt"));
-        }
-        other => panic!("expected patch_schema op, got {other:?}"),
-    }
-    match &o.overrides[2].value {
-        OverlayOp::Bypass(bypass) => assert_eq!(bypass.target, "legacy_audit"),
-        other => panic!("expected bypass op, got {other:?}"),
-    }
-    // Ops carry a non-zero source line (span anchoring for op diagnostics).
-    assert!(o.overrides[0].referenced.line() > 0);
+    assert_eq!(overlay.channel.target, "sales.orders");
+    assert_eq!(
+        overlay.config["fraud.threshold"].value,
+        serde_json::json!(0.95)
+    );
+    assert_eq!(overlay.overrides.len(), 1);
 }

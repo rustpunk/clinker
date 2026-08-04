@@ -23,6 +23,10 @@ Use these evidence labels consistently:
 - **Open question:** Unresolved uncertainty that should be tracked in
   [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md), not guessed around.
 
+Locked or resolved production decisions belong in the canonical
+[production-contract register](15_PRODUCTION_CONTRACTS.md). The open-question
+ledger is reserved for unresolved or explicitly deferred questions.
+
 ## How to use these docs
 
 Recommended reading order by task:
@@ -34,13 +38,14 @@ Recommended reading order by task:
    [docs/ai/50_TESTING_AND_COMMANDS.md](50_TESTING_AND_COMMANDS.md).
 2. **Feature implementation:** add
    [docs/ai/10_ARCHITECTURE.md](10_ARCHITECTURE.md),
+   [docs/ai/35_EXTENSION_SEAMS.md](35_EXTENSION_SEAMS.md),
    [docs/ai/40_COMMON_PATTERNS.md](40_COMMON_PATTERNS.md), the relevant
    crate-level `AGENTS.md`, and user/engine docs for the touched behavior.
 3. **Bug fixing:** read the crate map, design rules, testing commands, the
    nearest crate-level `AGENTS.md`, and tests or fixtures near the bug. Use
    [docs/ai/70_GLOSSARY.md](70_GLOSSARY.md) when terminology affects behavior.
 4. **Cross-crate refactor:** read architecture, crate map, design rules,
-   common patterns, open questions, and
+   extension seams, common patterns, open questions, and
    [docs/ai/AI_CHANGELOG.md](AI_CHANGELOG.md) before editing.
 5. **Performance work:** read
    [docs/ai/60_PERFORMANCE_NOTES.md](60_PERFORMANCE_NOTES.md), testing
@@ -108,23 +113,34 @@ Before claiming success, an agent should:
 6. Report verification commands run.
 7. Report remaining uncertainty or skipped checks.
 
-For docs-only AI onboarding edits, the smallest relevant gate is usually:
+For docs-only AI onboarding edits, the mandatory smallest relevant gate is:
 
 ```bash
-git diff --check
+bash scripts/check-ai-docs.sh
+git diff --check -- docs/ai/<owned-file>.md docs/ai/<other-owned-file>.md
 ```
+
+Use [docs/ai/50_TESTING_AND_COMMANDS.md](50_TESTING_AND_COMMANDS.md) for the
+additional mdBook, rendered-link, rustdoc, or executable-documentation gate
+required by the audience and files changed.
 
 ## Documentation map
 
 - [docs/ai/10_ARCHITECTURE.md](10_ARCHITECTURE.md): source-backed overview of
   Clinker's runtime model, planning/execution boundary, subsystem roles, and
   architectural invariants.
+- [docs/ai/15_PRODUCTION_CONTRACTS.md](15_PRODUCTION_CONTRACTS.md): canonical
+  status-aware index of observed behavior, locked production targets,
+  compatibility posture, evidence, and downstream ownership.
 - [docs/ai/20_CRATE_MAP.md](20_CRATE_MAP.md): workspace crate list, dependency
   direction, crate responsibilities, known coupling, tests, benches, examples,
   and stale references.
 - [docs/ai/30_DESIGN_RULES.md](30_DESIGN_RULES.md): design constraints for
   finite batch execution, crate layering, YAML parsing, dependency policy,
   bounded memory, config strictness, and review gates.
+- [docs/ai/35_EXTENSION_SEAMS.md](35_EXTENSION_SEAMS.md): change-oriented map
+  of format, transport, node, CXL, diagnostic, runtime-resource, composition,
+  and edge-consumer seams.
 - [docs/ai/40_COMMON_PATTERNS.md](40_COMMON_PATTERNS.md): repeated local
   implementation patterns such as streaming traits, proof tokens, registries,
   span-aware YAML, error enums, and test organization.
@@ -138,8 +154,8 @@ git diff --check
   performance boundaries.
 - [docs/ai/70_GLOSSARY.md](70_GLOSSARY.md): repository-specific terms for
   product, crates, pipeline nodes, CXL, execution, formats, and storage.
-- [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md): unresolved
-  architecture, documentation, API, and testing questions.
+- [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md): unresolved or
+  explicitly deferred architecture, documentation, API, and testing questions.
 - [docs/ai/90_CRATE_AGENT_PLAN.md](90_CRATE_AGENT_PLAN.md): planning notes for
   existing crate-level `AGENTS.md` coverage, remaining gaps, and guidance
   ownership.
@@ -163,6 +179,7 @@ docs, or intended behavior need clarification.
 | New crate | [docs/ai/20_CRATE_MAP.md](20_CRATE_MAP.md), root [AGENTS.md](../../AGENTS.md) if repo-wide guidance changes |
 | Architecture change | [docs/ai/10_ARCHITECTURE.md](10_ARCHITECTURE.md), [docs/ai/AI_CHANGELOG.md](AI_CHANGELOG.md), [docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md) if uncertainty remains |
 | New design rule | [docs/ai/30_DESIGN_RULES.md](30_DESIGN_RULES.md) |
+| Extension or cross-layer change | [docs/ai/35_EXTENSION_SEAMS.md](35_EXTENSION_SEAMS.md), plus the owning subsystem docs |
 | New repeated pattern | [docs/ai/40_COMMON_PATTERNS.md](40_COMMON_PATTERNS.md) |
 | New command/test workflow | [docs/ai/50_TESTING_AND_COMMANDS.md](50_TESTING_AND_COMMANDS.md) |
 | Performance-sensitive change | [docs/ai/60_PERFORMANCE_NOTES.md](60_PERFORMANCE_NOTES.md), benchmark docs or tests when relevant |
@@ -172,25 +189,23 @@ docs, or intended behavior need clarification.
 | Public behavior, config, or diagnostic change | User docs, examples or explain-code docs, plus the relevant `docs/ai/` file |
 | Test fixture, snapshot, or benchmark policy change | [docs/ai/50_TESTING_AND_COMMANDS.md](50_TESTING_AND_COMMANDS.md), [docs/ai/40_COMMON_PATTERNS.md](40_COMMON_PATTERNS.md), or [docs/ai/60_PERFORMANCE_NOTES.md](60_PERFORMANCE_NOTES.md) as applicable |
 
-## Current known limitations
+## Current contract and question status
 
-The full list is in
-[docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md). The most important
-uncertainties as of the verification date above are:
+Every numbered item currently captured in
+[docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md) has a terminal
+`Status: Resolved`; the ledger currently contains no deferred numbered
+questions. Do not reopen those decisions because their implementation has not
+landed yet.
 
-- `PipelineExecutor::run_plan_with_readers_writers` accepts `CompiledPlan`, but
-  the intended relationship between the stored DAG and runtime recompilation
-  needs confirmation.
-- Channel resource overlays and pipeline-target channel config validation need
-  clearer intended behavior.
-- The long-term boundary and validation depth of `clinker-schema` versus
-  `clinker-plan` remain unresolved.
-- Some user-facing docs may still describe retired config shapes, an outdated
-  node count, or unclear envelope/document-context examples.
-- The `clinker-format -> cxl` dependency edge is current, but whether it is a
-  permanent layering rule remains open.
-- Some public planner/CXL symbols may be exposed without a clear stability
-  policy.
+Use [docs/ai/15_PRODUCTION_CONTRACTS.md](15_PRODUCTION_CONTRACTS.md) for each
+resolved topic's stable D identifier, observed behavior, locked target, status,
+compatibility posture, evidence, and downstream owner. In particular,
+`locked-not-implemented`, `partially-implemented`, and `deferred` contract rows
+describe owned implementation state, not unresolved design questions.
+
+Reserve the open-question ledger for genuinely new uncertainty or an explicit
+deferral. A deferred entry must name its governing D identifier, evidence-backed
+reason, implementation owner, and verification date.
 
 ## First prompt for a new Codex session
 

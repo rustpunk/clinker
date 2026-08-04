@@ -12,6 +12,7 @@ use ahash::RandomState;
 use clinker_record::{Record, Schema, Value};
 use cxl::eval::{EvalContext, ProgramEvaluator};
 
+use super::RecordOrder;
 use super::build::{BuildChunkIter, GraceHll, PartitionAssigner};
 use super::probe::{EmitArgs, GraceEmitSink, emit_for_probe};
 use crate::executor::combine::CombineResolver;
@@ -20,6 +21,7 @@ use crate::pipeline::grace_spill::{
     GraceSpillReader, GraceSpillWriter, SpillFilePath, grace_spill_error,
 };
 use crate::pipeline::memory::MemoryArbitrator;
+use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_plan::BudgetCategory;
 use clinker_plan::error::PipelineError;
 
@@ -54,7 +56,7 @@ pub(crate) const SKEW_REDUCTION_THRESHOLD: f64 = 0.20;
 pub(crate) struct SpilledPartition {
     pub partition_id: u16,
     pub build_files: Vec<SpillFilePath>,
-    pub probe_files: Vec<SpillFilePath>,
+    pub probe_files: Vec<SpillFile<RecordOrder>>,
     pub build_count: u64,
     pub hash_bits: u8,
     pub distinct_sketch: GraceHll,
@@ -71,7 +73,6 @@ pub(super) struct ReloadContext<'a> {
     pub(super) emit: &'a EmitArgs<'a>,
     pub(super) ctx: &'a EvalContext<'a>,
     pub(super) build_schema: Arc<Schema>,
-    pub(super) driver_schema: Arc<Schema>,
     pub(super) spill_dir: &'a Path,
     /// Whether repartition spill files written during reload are
     /// LZ4-compressed. Carried from the dispatcher's resolved
@@ -97,7 +98,6 @@ pub(super) fn process_spilled_partition(
     let driver_extractor = rc.driver_extractor;
     let ctx = rc.ctx;
     let build_schema = Arc::clone(&rc.build_schema);
-    let driver_schema = Arc::clone(&rc.driver_schema);
     let spill_dir = rc.spill_dir;
     let spill_compress = rc.spill_compress;
     let hash_state = rc.hash_state;
@@ -230,36 +230,24 @@ pub(super) fn process_spilled_partition(
         }
 
         // Repartition probe records similarly.
-        let mut child_a_probe: Vec<Record> = Vec::new();
-        let mut child_b_probe: Vec<Record> = Vec::new();
+        let mut child_a_probe: Vec<(Record, RecordOrder)> = Vec::new();
+        let mut child_b_probe: Vec<(Record, RecordOrder)> = Vec::new();
         for path in &sp.probe_files {
-            let preader =
-                GraceSpillReader::open(path, Arc::clone(&driver_schema)).map_err(|e| {
-                    PipelineError::Internal {
-                        op: "combine",
-                        node: name.to_string(),
-                        detail: format!("grace hash reload open probe failed: {e}"),
+            let preader = path.reader()?;
+            for r in preader {
+                let (record, row_id) = r?;
+                let keys = driver_extractor.extract(ctx, &record).map_err(|e| {
+                    PipelineError::Compilation {
+                        transform_name: name.to_string(),
+                        messages: vec![format!("grace hash repartition probe key eval: {e}")],
                     }
                 })?;
-            for r in preader {
-                let r = r.map_err(|e| PipelineError::Internal {
-                    op: "combine",
-                    node: name.to_string(),
-                    detail: format!("grace hash reload probe read failed: {e}"),
-                })?;
-                let keys =
-                    driver_extractor
-                        .extract(ctx, &r)
-                        .map_err(|e| PipelineError::Compilation {
-                            transform_name: name.to_string(),
-                            messages: vec![format!("grace hash repartition probe key eval: {e}")],
-                        })?;
                 let h = hash_composite_key(&keys, hash_state);
                 let cp = child_assigner.partition_for(h) as u64;
                 if cp == parent_id * 2 {
-                    child_a_probe.push(r);
+                    child_a_probe.push((record, row_id));
                 } else {
-                    child_b_probe.push(r);
+                    child_b_probe.push((record, row_id));
                 }
             }
         }
@@ -291,22 +279,17 @@ pub(super) fn process_spilled_partition(
                     budget.cumulative_spill_bytes(),
                 ));
             }
-            let mut probe_files: Vec<SpillFilePath> = Vec::new();
+            let mut probe_files: Vec<SpillFile<RecordOrder>> = Vec::new();
             if !child_probe.is_empty() {
-                let mut pw = GraceSpillWriter::new(
-                    spill_dir,
-                    child_assigner.hash_bits(),
-                    (child_id as u16) | 0x8000,
+                let mut pw = SpillWriter::new(
+                    Arc::clone(child_probe[0].0.schema()),
+                    Some(spill_dir),
                     spill_compress,
-                )
-                .map_err(|e| grace_spill_error(e, name, "repartition probe writer"))?;
-                for r in &child_probe {
-                    pw.write_record(r)
-                        .map_err(|e| grace_spill_error(e, name, "repartition probe write"))?;
+                )?;
+                for (record, row_id) in &child_probe {
+                    pw.write_pair(record, row_id)?;
                 }
-                let (p, p_written) = pw
-                    .finish()
-                    .map_err(|e| grace_spill_error(e, name, "repartition probe finalize"))?;
+                let (p, p_written) = pw.finish_with_bytes()?;
                 if budget.record_spill_bytes(name, p_written) {
                     return Err(PipelineError::spill_cap_exceeded(
                         name,
@@ -364,22 +347,11 @@ pub(super) fn process_spilled_partition(
 
     // Walk every probe-side spill file and emit matches.
     let mut probe_keys_buf: Vec<Value> = Vec::with_capacity(driver_extractor.len());
-    let mut row_seq: u64 = 0;
     for path in &sp.probe_files {
-        let reader = GraceSpillReader::open(path, Arc::clone(&driver_schema)).map_err(|e| {
-            PipelineError::Internal {
-                op: "combine",
-                node: name.to_string(),
-                detail: format!("grace hash reload open probe failed: {e}"),
-            }
-        })?;
+        let reader = path.reader()?;
         for r in reader {
-            let probe_record = r.map_err(|e| PipelineError::Internal {
-                op: "combine",
-                node: name.to_string(),
-                detail: format!("grace hash reload probe read failed: {e}"),
-            })?;
-            let row_ctx = ctx.with_row(row_seq);
+            let (probe_record, row_id) = r?;
+            let row_ctx = ctx.with_row(row_id.ordinal());
             let resolver = CombineResolver::new(rc.emit.resolver_mapping, &probe_record, None);
             probe_keys_buf.clear();
             driver_extractor
@@ -392,13 +364,12 @@ pub(super) fn process_spilled_partition(
             emit_for_probe(
                 rc.emit,
                 &probe_record,
-                row_seq,
+                row_id,
                 probe_iter,
                 body_evaluator.as_mut(),
                 &row_ctx,
                 sink,
             )?;
-            row_seq += 1;
         }
     }
     Ok(())
@@ -463,7 +434,6 @@ pub(super) fn bnl_fallback(
     stats: &mut BnlStats,
 ) -> Result<(), PipelineError> {
     let name = rc.name;
-    let driver_schema = Arc::clone(&rc.driver_schema);
     let approx_distinct = sp.distinct_sketch.estimate();
 
     // Per-chunk byte budget. Soft-limit minus probe reservation, then
@@ -514,26 +484,11 @@ pub(super) fn bnl_fallback(
         // probe records → M outputs per probe) gets caught.
         let mut emitted_in_batch = 0usize;
 
-        // Per-chunk row-sequence baseline so each probe stream sees a
-        // contiguous numbering. The probe-side spill files were
-        // written with the original probe order discarded; we reissue
-        // monotonic row numbers for downstream sort stability.
-        let mut row_seq: u64 = 0;
         for path in &sp.probe_files {
-            let reader = GraceSpillReader::open(path, Arc::clone(&driver_schema)).map_err(|e| {
-                PipelineError::Internal {
-                    op: "combine",
-                    node: name.to_string(),
-                    detail: format!("grace hash bnl probe open failed: {e}"),
-                }
-            })?;
+            let reader = path.reader()?;
             for r in reader {
-                let probe_record = r.map_err(|e| PipelineError::Internal {
-                    op: "combine",
-                    node: name.to_string(),
-                    detail: format!("grace hash bnl probe read failed: {e}"),
-                })?;
-                let row_ctx = rc.ctx.with_row(row_seq);
+                let (probe_record, row_id) = r?;
+                let row_ctx = rc.ctx.with_row(row_id.ordinal());
                 let resolver = CombineResolver::new(rc.emit.resolver_mapping, &probe_record, None);
                 probe_keys_buf.clear();
                 rc.driver_extractor
@@ -547,7 +502,7 @@ pub(super) fn bnl_fallback(
                 emit_for_probe(
                     rc.emit,
                     &probe_record,
-                    row_seq,
+                    row_id,
                     probe_iter,
                     body_evaluator.as_mut(),
                     &row_ctx,
@@ -555,7 +510,6 @@ pub(super) fn bnl_fallback(
                 )?;
                 let added = sink.records.len() - pre;
                 emitted_in_batch += added;
-                row_seq += 1;
 
                 while emitted_in_batch >= RESULT_BATCH_SIZE {
                     stats.batches_emitted += 1;

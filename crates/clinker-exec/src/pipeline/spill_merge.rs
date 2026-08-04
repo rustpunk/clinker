@@ -11,7 +11,7 @@
 //! Ordering mirrors the [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer)
 //! mode the runs were spilled under, so the merged order is byte-identical to
 //! the single in-memory sort the buffer would have produced without spilling:
-//!   - Field-ordered ([`SortedRunMerger::new`]): by [`compare_records_by_fields`]
+//!   - Field-ordered ([`SortedRunMerger::new`]): by [`compare_authored_keys`]
 //!     — the exact field comparator each run was formed with.
 //!   - Payload-ordered ([`SortedRunMerger::new_payload_ordered`]): by the
 //!     carried payload `P: Ord` directly, matching a payload-ordered buffer.
@@ -44,6 +44,7 @@
 use std::cmp::Ordering;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -51,7 +52,7 @@ use clinker_record::Record;
 
 use crate::pipeline::loser_tree::LoserTree;
 use crate::pipeline::memory::MemoryArbitrator;
-use crate::pipeline::sort::compare_records_by_fields;
+use crate::pipeline::sort_key::compare_authored_keys;
 use crate::pipeline::spill::{SpillFile, SpillReader, SpillWriter};
 use clinker_plan::config::SortField;
 use clinker_plan::error::PipelineError;
@@ -97,6 +98,94 @@ pub(crate) struct MergeBudget<'a> {
     /// LZ4 vs. raw for intermediate runs, matching the caller's own spill
     /// compression so a cascade reuses the operator's chosen on-disk format.
     pub(crate) compress: bool,
+    /// Optional owned charge ledger for an authored sort. When present,
+    /// cascade rewrites update the same balance the caller's original runs
+    /// charged, allowing one guard to release exactly the surviving live files
+    /// on normal completion, decode/open failure, or early stream drop.
+    pub(crate) charge_owner: Option<&'a SpillChargeGuard>,
+}
+
+impl MergeBudget<'_> {
+    fn record_spill_bytes(&self, n: u64) -> bool {
+        self.charge_owner.map_or_else(
+            || self.budget.record_spill_bytes(self.node, n),
+            |owner| owner.record(n),
+        )
+    }
+
+    fn release_spill_bytes(&self, n: u64) {
+        if let Some(owner) = self.charge_owner {
+            owner.release(n);
+        } else {
+            self.budget.release_spill_bytes(self.node, n);
+        }
+    }
+}
+
+/// Owns one authored sort's live spill charge. Every original and cascade run
+/// updates this ledger; dropping it releases the exact remaining balance once.
+pub(crate) struct SpillChargeGuard {
+    budget: Arc<MemoryArbitrator>,
+    node: Arc<str>,
+    bytes: AtomicU64,
+}
+
+impl SpillChargeGuard {
+    pub(crate) fn new(budget: Arc<MemoryArbitrator>, node: impl Into<Arc<str>>) -> Self {
+        Self {
+            budget,
+            node: node.into(),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn record(&self, n: u64) -> bool {
+        if n == 0 {
+            return false;
+        }
+        let _ = self.bytes.fetch_update(
+            AtomicOrdering::Relaxed,
+            AtomicOrdering::Relaxed,
+            |current| Some(current.saturating_add(n)),
+        );
+        self.budget.record_spill_bytes(&self.node, n)
+    }
+
+    pub(crate) fn max_spill_bytes(&self) -> u64 {
+        self.budget.max_spill_bytes()
+    }
+
+    pub(crate) fn current_spill_bytes(&self) -> u64 {
+        self.budget.cumulative_spill_bytes()
+    }
+
+    fn release(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        let released = self
+            .bytes
+            .fetch_update(
+                AtomicOrdering::Relaxed,
+                AtomicOrdering::Relaxed,
+                |current| Some(current.saturating_sub(n)),
+            )
+            .unwrap_or(0)
+            .min(n);
+        self.budget.release_spill_bytes(&self.node, released);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes.load(AtomicOrdering::Relaxed)
+    }
+}
+
+impl Drop for SpillChargeGuard {
+    fn drop(&mut self) {
+        let remaining = self.bytes.swap(0, AtomicOrdering::Relaxed);
+        self.budget.release_spill_bytes(&self.node, remaining);
+    }
 }
 
 /// Owned form of [`MergeBudget`] for a caller that opens the merge lazily — the
@@ -126,6 +215,7 @@ impl OwnedMergeBudget {
             budget: &self.budget,
             node: &self.node,
             compress: self.compress,
+            charge_owner: None,
         }
     }
 
@@ -135,10 +225,10 @@ impl OwnedMergeBudget {
     /// files unlinked by the failed fold are released before returning.
     pub(crate) fn fold_payload_ordered_runs(
         &self,
-        runs: Vec<SpillFile<(u64, u64, u64)>>,
+        runs: Vec<SpillFile<(crate::executor::SourceRowId, u64, u64)>>,
         expected_rows: u64,
         context: &'static str,
-    ) -> Result<(SpillFile<u64>, u64), PipelineError> {
+    ) -> Result<(SpillFile<crate::executor::SourceRowId>, u64), PipelineError> {
         let Some(first) = runs.first() else {
             return Err(PipelineError::Internal {
                 op: "spill merge",
@@ -152,8 +242,12 @@ impl OwnedMergeBudget {
         let input_bytes = merger.spill_bytes();
 
         let folded = (|| {
-            let mut writer = SpillWriter::<u64>::new(schema, spill_dir.as_deref(), self.compress)
-                .map_err(PipelineError::from)?;
+            let mut writer = SpillWriter::<crate::executor::SourceRowId>::new(
+                schema,
+                spill_dir.as_deref(),
+                self.compress,
+            )
+            .map_err(PipelineError::from)?;
             let mut row_count = 0u64;
             for item in &mut merger {
                 let (record, (order, _, _)) = item?;
@@ -206,7 +300,7 @@ impl OwnedMergeBudget {
 /// spilled under. Cheap to clone: the field variant shares one `Arc`.
 #[derive(Clone)]
 enum RunOrdering {
-    /// Order by [`compare_records_by_fields`] over the shared fields — the
+    /// Order by [`compare_authored_keys`] over the shared fields — the
     /// record carries the sort key.
     Fields(Arc<[SortField]>),
     /// Order by the carried payload `P: Ord` directly — no record field.
@@ -240,7 +334,7 @@ impl<P: Ord> Ord for Run<P> {
     fn cmp(&self, other: &Self) -> Ordering {
         match &self.ordering {
             RunOrdering::Fields(sort_by) => {
-                compare_records_by_fields(&self.record, &other.record, sort_by)
+                compare_authored_keys(&self.record, &other.record, sort_by)
             }
             RunOrdering::Payload => self.payload.cmp(&other.payload),
         }
@@ -322,7 +416,7 @@ impl<P: Ord> SortedRunMerger<P> {
 }
 
 impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
-    /// Field-ordered merge: runs are ordered by [`compare_records_by_fields`]
+    /// Field-ordered merge: runs are ordered by [`compare_authored_keys`]
     /// over `sort_by`, matching a field-ordered
     /// [`SortBuffer`](crate::pipeline::sort_buffer::SortBuffer). `context` names
     /// the calling operator/phase so a spill open or decode failure localizes
@@ -341,6 +435,13 @@ impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
             budget,
             MERGE_FAN_IN,
         )
+    }
+
+    /// Number of spill readers held concurrently by the final merge pass.
+    /// Callers use this to account the bounded reader buffers and one decoded
+    /// cursor per run while the merger is live.
+    pub(crate) fn reader_count(&self) -> usize {
+        self.readers.len()
     }
 
     /// Payload-ordered merge: runs are ordered by the carried payload `P: Ord`
@@ -525,7 +626,7 @@ fn merge_group<P: Serialize + DeserializeOwned + Ord>(
     let mut writer = match SpillWriter::<P>::new(schema, spill_dir.as_deref(), budget.compress) {
         Ok(writer) => writer,
         Err(error) => {
-            budget.budget.release_spill_bytes(budget.node, input_bytes);
+            budget.release_spill_bytes(input_bytes);
             return Err(PipelineError::from(error));
         }
     };
@@ -536,19 +637,19 @@ fn merge_group<P: Serialize + DeserializeOwned + Ord>(
         let (record, payload) = match item {
             Ok(item) => item,
             Err(error) => {
-                budget.budget.release_spill_bytes(budget.node, input_bytes);
+                budget.release_spill_bytes(input_bytes);
                 return Err(error);
             }
         };
         if let Err(error) = writer.write_pair(&record, &payload) {
-            budget.budget.release_spill_bytes(budget.node, input_bytes);
+            budget.release_spill_bytes(input_bytes);
             return Err(PipelineError::from(error));
         }
     }
     let (file, written) = match writer.finish_with_bytes() {
         Ok(finished) => finished,
         Err(error) => {
-            budget.budget.release_spill_bytes(budget.node, input_bytes);
+            budget.release_spill_bytes(input_bytes);
             return Err(PipelineError::from(error));
         }
     };
@@ -556,10 +657,10 @@ fn merge_group<P: Serialize + DeserializeOwned + Ord>(
     // the end of the drain loop, but nothing has released their bytes yet), so
     // the cap check sees inputs + this output — the cascade's true concurrent
     // peak. On overflow the inputs stay counted in the E320 figure.
-    if written > 0 && budget.budget.record_spill_bytes(budget.node, written) {
+    if written > 0 && budget.record_spill_bytes(written) {
         let total = budget.budget.cumulative_spill_bytes();
-        budget.budget.release_spill_bytes(budget.node, written);
-        budget.budget.release_spill_bytes(budget.node, input_bytes);
+        budget.release_spill_bytes(written);
+        budget.release_spill_bytes(input_bytes);
         return Err(PipelineError::spill_cap_exceeded(
             budget.node,
             budget.budget.max_spill_bytes(),
@@ -567,7 +668,7 @@ fn merge_group<P: Serialize + DeserializeOwned + Ord>(
             total,
         ));
     }
-    budget.budget.release_spill_bytes(budget.node, input_bytes);
+    budget.release_spill_bytes(input_bytes);
     Ok(file)
 }
 
@@ -651,9 +752,12 @@ impl<P: Serialize + DeserializeOwned + Ord> SortedRunMerger<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::SourceRowId;
     use crate::pipeline::memory::{MemoryArbitrator, NoOpPolicy};
     use crate::pipeline::sort_buffer::{SortBuffer, SortedOutput};
-    use clinker_plan::config::SortOrder;
+    use crate::pipeline::sort_key::compare_authored_keys;
+    use clinker_plan::config::{NullOrder, SortOrder};
+    use clinker_plan::plan::{EntityRef, PlanNodeId};
     use clinker_record::{Schema, Value};
     use rust_decimal::Decimal;
 
@@ -672,6 +776,7 @@ mod tests {
             budget: arb,
             node: "test",
             compress: true,
+            charge_owner: None,
         }
     }
 
@@ -693,6 +798,97 @@ mod tests {
             order: SortOrder::Asc,
             null_order: None,
         }]
+    }
+
+    #[test]
+    fn authored_comparator_matches_resident_sort_for_every_tested_spill_fan_in() {
+        let schema = Arc::new(Schema::new(vec![
+            "primary".into(),
+            "secondary".into(),
+            "identity".into(),
+        ]));
+        let sort_by = vec![
+            SortField {
+                field: "primary".into(),
+                order: SortOrder::Asc,
+                null_order: Some(NullOrder::Last),
+            },
+            SortField {
+                field: "secondary".into(),
+                order: SortOrder::Desc,
+                null_order: Some(NullOrder::First),
+            },
+        ];
+        let values = [
+            (Value::Integer(0), Value::String("a\0".into()), 90, 2),
+            (
+                Value::Integer(i64::MAX),
+                Value::String("éclair".into()),
+                1,
+                9,
+            ),
+            (Value::Null, Value::String("漢字".into()), 7, 3),
+            (Value::Integer(i64::MIN), Value::String("z".into()), 2, 8),
+            (Value::Integer(0), Value::String("漢字".into()), 50, 1),
+            (Value::Integer(0), Value::String("漢字".into()), -50, 7),
+            (Value::Null, Value::String("".into()), 8, 4),
+        ];
+        let input = values
+            .into_iter()
+            .map(|(primary, secondary, identity, source)| {
+                (
+                    Record::new(
+                        schema.clone(),
+                        vec![primary, secondary, Value::Integer(identity)],
+                    ),
+                    SourceRowId::new(PlanNodeId::new(source), identity.unsigned_abs()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let mut resident_buffer: SortBuffer<SourceRowId> =
+            SortBuffer::new(sort_by.clone(), usize::MAX, None, true, schema.clone());
+        for (record, source_row) in input.iter().cloned() {
+            resident_buffer.push(record, source_row);
+        }
+        let resident = match resident_buffer.finish().unwrap().0 {
+            SortedOutput::InMemory(rows) => rows,
+            SortedOutput::Spilled(_) => panic!("resident oracle unexpectedly spilled"),
+        };
+        assert!(resident.windows(2).all(|pair| {
+            compare_authored_keys(&pair[0].0, &pair[1].0, &sort_by) != Ordering::Greater
+        }));
+        let resident_identities = resident.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+
+        for fan_in in [2, 3, MERGE_FAN_IN] {
+            let mut spill_buffer: SortBuffer<SourceRowId> =
+                SortBuffer::new(sort_by.clone(), 1, None, true, schema.clone());
+            for (record, source_row) in input.iter().cloned() {
+                spill_buffer.push(record, source_row);
+                spill_buffer.sort_and_spill().unwrap();
+            }
+            let files = match spill_buffer.finish().unwrap().0 {
+                SortedOutput::Spilled(files) => files,
+                SortedOutput::InMemory(_) => panic!("forced-spill run stayed resident"),
+            };
+            let arb = unlimited_arbitrator();
+            let spilled = SortedRunMerger::new_with_fan_in(
+                files,
+                &sort_by,
+                "authored comparator differential",
+                test_budget(&arb),
+                fan_in,
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+            let spilled_identities = spilled.iter().map(|(_, id)| *id).collect::<Vec<_>>();
+
+            assert_eq!(
+                spilled_identities, resident_identities,
+                "fan-in {fan_in} changed authored-key order or stable equal-key arrival"
+            );
+        }
     }
 
     /// Multiple individually-sorted spill runs — with a `Decimal` sort key,
@@ -1209,6 +1405,7 @@ mod tests {
             budget: &arb,
             node: "quota-node",
             compress: true,
+            charge_owner: None,
         };
         let (files, sort_by, _) = build_dup_key_runs(8, 4);
         // `SortedRunMerger` is not `Debug`, so unwrap the error by hand.
@@ -1253,6 +1450,7 @@ mod tests {
             budget: &arb,
             node: "sort",
             compress: true,
+            charge_owner: None,
         };
         let merged: Vec<(Decimal, u64)> =
             SortedRunMerger::new_with_fan_in(files, &sort_by, "sort", budget, 2)
@@ -1318,6 +1516,7 @@ mod tests {
             budget: &arb,
             node: "test",
             compress: true,
+            charge_owner: None,
         };
         let merged: Vec<u64> = SortedRunMerger::new_with_fan_in(files, &sort_by, "test", budget, 2)
             .unwrap()

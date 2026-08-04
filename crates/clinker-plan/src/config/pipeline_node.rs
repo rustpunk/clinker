@@ -196,6 +196,49 @@ pub enum PipelineNode {
     },
 }
 
+/// Authored scope containing an executable CXL field.
+///
+/// The scope is retained with every field so module-admission diagnostics can
+/// distinguish a top-level node from a node loaded through a composition body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CxlFieldScope {
+    /// Field authored directly in the pipeline's `nodes:` list.
+    TopLevel,
+    /// Field authored in one reachable `.comp.yaml` body.
+    CompositionBody { composition: PathBuf },
+}
+
+impl CxlFieldScope {
+    /// A stable, user-facing label for diagnostics.
+    pub fn label(&self) -> String {
+        match self {
+            Self::TopLevel => "top-level pipeline".to_string(),
+            Self::CompositionBody { composition } => {
+                format!("composition body `{}`", composition.display())
+            }
+        }
+    }
+}
+
+/// One structurally admitted executable CXL source.
+///
+/// Instances can only be produced by [`PipelineNode::visit_cxl_fields`], so
+/// ordinary descriptions, paths, messages, notes, templates, options, and
+/// composition resource strings cannot cross the YAML-to-CXL trust boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CxlBearingField {
+    /// Exact authored CXL source text.
+    pub source: String,
+    /// Node that owns the field.
+    pub node_name: String,
+    /// Stable config path within the owning node.
+    pub surface: String,
+    /// YAML span of the field, or the owning node for legacy string fields.
+    pub authored_span: crate::yaml::Span,
+    /// Top-level or composition-body origin.
+    pub scope: CxlFieldScope,
+}
+
 // ---------------------------------------------------------------------
 // Custom Deserialize impl for PipelineNode (pre-C.1)
 //
@@ -777,6 +820,150 @@ impl CompositionPayload {
 }
 
 impl PipelineNode {
+    /// Visit every authored field that the compiler or runtime interprets as
+    /// CXL, in stable configuration order.
+    ///
+    /// This exhaustive match is the sole structural admission boundary for
+    /// module-root discovery. `fallback_span` is used for the two legacy CXL
+    /// surfaces that are still represented as plain strings (validation
+    /// checks and log conditions); all [`CxlSource`] fields retain their own
+    /// authored span.
+    pub fn visit_cxl_fields(
+        &self,
+        scope: CxlFieldScope,
+        fallback_span: crate::yaml::Span,
+        visitor: &mut impl FnMut(CxlBearingField),
+    ) {
+        let node_name = self.name().to_string();
+        let mut emit = |source: &str, surface: String, span: crate::yaml::Span| {
+            visitor(CxlBearingField {
+                source: source.to_string(),
+                node_name: node_name.clone(),
+                surface,
+                authored_span: span,
+                scope: scope.clone(),
+            });
+        };
+
+        match self {
+            PipelineNode::Transform { config, .. } => {
+                emit(
+                    &config.cxl.source,
+                    "config.cxl".to_string(),
+                    config.cxl.span,
+                );
+                if let Some(validations) = &config.validations {
+                    for (index, validation) in validations.iter().enumerate() {
+                        emit(
+                            &validation.check,
+                            format!("config.validations[{index}].check"),
+                            fallback_span,
+                        );
+                    }
+                }
+                if let Some(directives) = &config.log {
+                    for (index, directive) in directives.iter().enumerate() {
+                        if let Some(condition) = &directive.condition {
+                            emit(
+                                condition,
+                                format!("config.log[{index}].condition"),
+                                fallback_span,
+                            );
+                        }
+                    }
+                }
+            }
+            PipelineNode::Aggregate { config, .. } => {
+                emit(
+                    &config.cxl.source,
+                    "config.cxl".to_string(),
+                    config.cxl.span,
+                );
+            }
+            PipelineNode::Route { config, .. } => {
+                for (branch, condition) in &config.conditions {
+                    emit(
+                        &condition.source,
+                        format!("config.conditions.{branch}"),
+                        condition.span,
+                    );
+                }
+            }
+            PipelineNode::Combine { config, .. } => {
+                emit(
+                    &config.where_expr.source,
+                    "config.where".to_string(),
+                    config.where_expr.span,
+                );
+                emit(
+                    &config.cxl.source,
+                    "config.cxl".to_string(),
+                    config.cxl.span,
+                );
+            }
+            PipelineNode::Envelope { config, .. } => {
+                for (section, fields) in &config.header {
+                    for (field, source) in fields {
+                        emit(
+                            &source.source,
+                            format!("config.header.{section}.{field}"),
+                            source.span,
+                        );
+                    }
+                }
+                for (section, fields) in &config.footer {
+                    for (field, source) in fields {
+                        emit(
+                            &source.source,
+                            format!("config.footer.{section}.{field}"),
+                            source.span,
+                        );
+                    }
+                }
+            }
+            PipelineNode::Reshape { config, .. } => {
+                for (rule_index, rule) in config.rules.iter().enumerate() {
+                    emit(
+                        &rule.when.source,
+                        format!("config.rules[{rule_index}].when"),
+                        rule.when.span,
+                    );
+                    if let Some(mutate) = &rule.mutate {
+                        for (field, source) in &mutate.set {
+                            emit(
+                                &source.source,
+                                format!("config.rules[{rule_index}].mutate.set.{field}"),
+                                source.span,
+                            );
+                        }
+                    }
+                    if let Some(synthesize) = &rule.synthesize {
+                        for (field, source) in &synthesize.overrides {
+                            emit(
+                                &source.source,
+                                format!("config.rules[{rule_index}].synthesize.overrides.{field}"),
+                                source.span,
+                            );
+                        }
+                    }
+                }
+            }
+            PipelineNode::Cull { config, .. } => {
+                for (rule_index, rule) in config.rules.iter().enumerate() {
+                    emit(
+                        &rule.drop_group_when.source,
+                        format!("config.rules[{rule_index}].drop_group_when"),
+                        rule.drop_group_when.span,
+                    );
+                }
+            }
+            PipelineNode::Source { .. }
+            | PipelineNode::Merge { .. }
+            | PipelineNode::Output { .. }
+            | PipelineNode::Composition { .. } => {}
+        }
+    }
+
     /// The author-given node name (from the variant's header).
     pub fn name(&self) -> &str {
         match self {

@@ -4,7 +4,7 @@ A Clinker pipeline is a single flat `nodes:` list. Every entry carries a
 `type:` discriminator that selects a node kind — the **unified node
 taxonomy**. There is no separate "join section" or "filter section":
 records flow through one homogeneous graph of typed nodes, wired together
-by [`input:` / `inputs:`](../pipelines/structure.md#wiring-input-and-inputs).
+by [`input:` / `inputs:`](../pipelines/structure.md#wiring-by-node-kind).
 This part documents the nine record-processing node kinds; a tenth,
 [Composition](../pipelines/compositions.md), is a call-site that inlines a
 reusable sub-pipeline and is covered under Pipelines.

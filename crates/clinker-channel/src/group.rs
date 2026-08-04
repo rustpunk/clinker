@@ -33,10 +33,11 @@ use indexmap::IndexMap;
 use serde::Deserialize;
 
 use clinker_plan::overlay_ops::OverlayOp;
+use clinker_plan::resources::{CatalogResourceKind, LogicalResourceId, WorkspaceCatalog};
 use clinker_plan::yaml::Spanned;
 
 use crate::error::ChannelError;
-use crate::manifest::ChannelVars;
+use crate::manifest::{ChannelConfigValue, ChannelVars};
 
 /// Priority applied to a group that omits `priority:`.
 ///
@@ -65,16 +66,12 @@ pub struct Group {
     /// Selection priority (`group.priority`); higher wins among multiple
     /// matching groups. Defaults to [`DEFAULT_GROUP_PRIORITY`] when absent.
     pub priority: i64,
+    /// Catalog pipeline/composition identities this group is allowed to affect.
+    pub targets: GroupTargetSet,
     /// Value-clobber config surface. Keys are `alias.param` dotted paths (kept
     /// as raw strings here; dotted-path validation happens at apply time).
-    /// Applied non-fixed, so a higher-precedence layer may override them.
-    pub config: IndexMap<String, serde_json::Value>,
-    /// **Fixed** (locked) config surface, same `alias.param` dotted-path
-    /// grammar as [`Self::config`]. Applied with the layer `fixed` lock set at
-    /// this group's `Group` layer: a fixed value locks against every
-    /// higher-precedence layer (other groups, channel-wide, and per-target).
-    /// For a key present in both maps, the `fixed` entry wins within the layer.
-    pub fixed: IndexMap<String, serde_json::Value>,
+    /// Each leaf independently carries its `fixed` lock.
+    pub config: IndexMap<String, ChannelConfigValue>,
     /// Value-clobber vars surface, in the same four scopes a pipeline's `vars:`
     /// block uses (`static` / `pipeline` / `source` / `record`). Reuses the
     /// channel overlay's [`ChannelVars`](crate::manifest::ChannelVars) type.
@@ -102,12 +99,22 @@ impl Group {
                 source: Box::new(e.0),
             })?;
 
+        if raw.group.targets.pipelines.is_empty() && raw.group.targets.compositions.is_empty() {
+            return Err(ChannelError::InvalidGroup {
+                group: raw.group.name,
+                line: 1,
+                reason: "`group.targets` must not be empty".to_string(),
+                correction: "use `targets: { pipelines: [sales.orders] }` or list compositions"
+                    .to_string(),
+            });
+        }
+
         Ok(Group {
             name: raw.group.name,
             selector: raw.group.selector,
             priority: raw.group.priority,
+            targets: raw.group.targets,
             config: raw.config,
-            fixed: raw.fixed,
             vars: raw.vars,
             overrides: raw.overrides,
         })
@@ -127,9 +134,7 @@ impl Group {
 struct RawGroupFile {
     group: RawGroupMeta,
     #[serde(default)]
-    config: IndexMap<String, serde_json::Value>,
-    #[serde(default)]
-    fixed: IndexMap<String, serde_json::Value>,
+    config: IndexMap<String, ChannelConfigValue>,
     #[serde(default)]
     vars: ChannelVars,
     #[serde(default)]
@@ -144,4 +149,84 @@ struct RawGroupMeta {
     selector: Option<String>,
     #[serde(default = "default_priority")]
     priority: i64,
+    #[serde(default)]
+    targets: GroupTargetSet,
+}
+
+/// Explicit target scope for a group. Selectors may only narrow this set.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupTargetSet {
+    /// Catalog pipeline identities this group may affect.
+    #[serde(default)]
+    pub pipelines: Vec<Spanned<String>>,
+    /// Catalog composition identities whose owning closures this group may affect.
+    #[serde(default)]
+    pub compositions: Vec<Spanned<String>>,
+}
+
+/// Catalog-validated group target identities.
+#[derive(Debug, Clone, Default)]
+pub struct ValidatedGroupTargets {
+    pipelines: std::collections::BTreeSet<LogicalResourceId>,
+    compositions: std::collections::BTreeMap<LogicalResourceId, PathBuf>,
+}
+
+impl ValidatedGroupTargets {
+    /// Whether this target's pipeline or composition closure intersects the
+    /// group's catalog-validated target set.
+    pub fn admits(&self, target: &crate::discovery::ChannelTarget) -> bool {
+        self.pipelines.contains(&target.pipeline)
+            || target.composition_paths.iter().any(|path| {
+                self.compositions
+                    .values()
+                    .any(|candidate| candidate == path)
+            })
+    }
+}
+
+/// Resolve every group target through the workspace catalog before selection.
+pub fn validate_group_targets(
+    catalog: &WorkspaceCatalog,
+    group: &Group,
+) -> Result<ValidatedGroupTargets, ChannelError> {
+    if group.targets.pipelines.is_empty() && group.targets.compositions.is_empty() {
+        return Err(ChannelError::InvalidGroupTargets {
+            group: group.name.clone(),
+            reason: "`group.targets` must list at least one pipeline or composition; for example `targets: { pipelines: [sales.orders] }`".to_string(),
+        });
+    }
+
+    let mut validated = ValidatedGroupTargets::default();
+    for target in &group.targets.pipelines {
+        let id = LogicalResourceId::parse(&target.value).map_err(|error| {
+            ChannelError::InvalidGroupTargets {
+                group: group.name.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        catalog
+            .resolve(CatalogResourceKind::Pipeline, &id)
+            .map_err(|error| ChannelError::InvalidGroupTargets {
+                group: group.name.clone(),
+                reason: error.to_string(),
+            })?;
+        validated.pipelines.insert(id);
+    }
+    for target in &group.targets.compositions {
+        let id = LogicalResourceId::parse(&target.value).map_err(|error| {
+            ChannelError::InvalidGroupTargets {
+                group: group.name.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        let path = catalog
+            .resolve(CatalogResourceKind::Composition, &id)
+            .map_err(|error| ChannelError::InvalidGroupTargets {
+                group: group.name.clone(),
+                reason: error.to_string(),
+            })?;
+        validated.compositions.insert(id, path.to_path_buf());
+    }
+    Ok(validated)
 }

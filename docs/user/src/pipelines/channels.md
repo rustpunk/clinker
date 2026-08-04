@@ -8,9 +8,9 @@ against one pipeline, with strict validation and per-value provenance.
 
 A channel is a tenant. A **group** is a reusable overlay shared by many
 channels — selected automatically from a channel's labels, or invoked by name.
-Everything a channel or group contributes is expressed through two surfaces:
-**value clobber** (`config:` / `vars:`) and an ordered **op list**
-(`overrides:`).
+Groups and target files can contribute **value clobber** (`config:` / `vars:`)
+and an ordered **op list** (`overrides:`). A channel-wide manifest is narrower:
+it may contain only labels plus declared config and variables.
 
 ## Workspace layout
 
@@ -24,16 +24,15 @@ workspace/
   composition/    *.comp.yaml        # reusable sub-pipelines
   schema/         *.schema.yaml      # shared schemas
   group/          *.group.yaml       # group overlays: selector, priority, overrides
-  channel/<tenant>/                  # one folder per channel; the folder name is the channel id
-    channel.cfg.yaml                 # channel manifest: labels + channel-wide overlays (optional)
-    <target>.channel.yaml            # per-target overlay of a pipeline
-    <target>.comp.yaml               # per-target overlay of a composition
+  channel/<tenant>/                  # one cataloged channel resource folder
+    channel.cfg.yaml                 # required manifest: identity, targets, labels, wide values
+    orders.yaml                      # filename is descriptive; channel.target is authoritative
 ```
 
-The channel **folder name is the channel id** — `channel/globex/` is the
-`globex` channel. A `--channel globex` invocation resolves by a computed path
-(`channel/globex/…`), never an O(N) scan of the workspace; the full scan is
-reserved for `channels lint`.
+The channel id is the stable logical key in `[catalog.channels]`. A
+`--channel tenant.globex` invocation resolves that catalog entry directly and
+then selects the target file by its declared logical pipeline id. Neither a
+folder name, a file basename, nor the current working directory is an identity.
 
 ### `clinker.toml` roots
 
@@ -51,6 +50,53 @@ Both tables are optional; omitting them defaults `[channel].root` to `channel`,
 enumeration-ergonomics choice for very large channel trees (it splits the folder
 fan-out); a channel is always looked up by computed path regardless of shard
 scheme, so `shard` never changes resolution semantics.
+
+### Typed workspace catalog
+
+The same `clinker.toml` may declare stable logical identities for five resource
+kinds: `rules`, `schemas`, `compositions`, `pipelines`, and `channels`.
+
+```toml
+[catalog]
+rules_root = "rules"
+
+[catalog.rules]
+"shared.dates" = "rules/shared/dates.cxl"
+
+[catalog.schemas]
+"shared.dates" = "schema/shared/dates.schema.yaml"
+
+[catalog.compositions]
+"etl.normalize" = "composition/normalize.comp.yaml"
+
+[catalog.pipelines]
+"daily.orders" = "pipeline/orders.yaml"
+
+[catalog.channels]
+"tenant.globex" = "channel/globex"
+```
+
+Logical identities are kind-scoped. The rule and schema named `shared.dates`
+above are distinct typed resources; asking for one kind never substitutes an
+entry from another kind. A missing identity or a reference through the wrong
+kind fails planning and names the catalog table that must contain it.
+
+Every catalog path and rules root is anchored to the selected workspace (from
+`--base-dir` or workspace discovery). Parent traversal, an absolute path outside
+the workspace, and a symlink whose canonical target escapes the workspace are
+rejected. Duplicate identities within one kind are rejected, as are two catalog
+identities—even across kinds—that alias the same canonical file. These checks
+happen before compilation, so neither lexical aliases nor symlink aliases can
+create a hidden second authority for one file.
+
+For CXL modules, an explicit rule entry is used when present; otherwise the
+logical identity maps beneath one selected rules root. Root precedence is
+explicit CLI `--rules-path`, then `pipeline.rules_path`, then
+`[catalog].rules_root`, then the workspace-relative `rules/` default. Selection
+chooses one root rather than searching several. Planning admits the bounded
+direct/transitive module closure into the compiled plan, after which execution
+does not reopen module source files. See [Modules and `use`](../cxl/modules.md)
+and the [`--rules-path` reference](../ops/cli-reference.md#clinker-run).
 
 ## The layer model
 
@@ -83,10 +129,13 @@ then declaration order within a layer. Collisions are **errors, never silent
 no-ops**: adding a node whose name already exists, or targeting a missing or
 already-removed node, fails with a diagnostic anchored to the offending op.
 
-Overlays are applied **pre-compile**: layers are resolved, `config`/`vars` values
-are clobbered, the `overrides:` op streams are concatenated in total order and
-folded over the base pipeline's node list, and only then does schema binding and
-compilation run. One invocation produces one effective plan.
+Overlays are resolved **before executable compilation**. Structural op streams
+are concatenated in total order and folded over the base node list. Clinker then
+compiles that target once for typed candidate validation; only when every
+`config:` candidate passes name, type, ambiguity, and fixed-lock checks does the
+winning config map enter executable compilation. Scoped `vars:` are likewise
+validated before executor initialization. One invocation produces one validated
+effective plan.
 
 ## Value clobber: `config` and `vars`
 
@@ -98,7 +147,7 @@ paths (the composition node's alias, then the parameter name):
 
 ```yaml
 config:
-  scorer.threshold: 0.95     # override the `threshold` knob of the `scorer` composition node
+  scorer.threshold: { value: 0.95 } # override the `threshold` knob of `scorer`
 ```
 
 The override changes executed behavior, not just the rendered provenance: the
@@ -114,34 +163,32 @@ silently doing nothing.
 
 ### Locking a value: `fixed`
 
-Every layer file (a group, the channel manifest, and a per-target overlay) may
-carry a `fixed:` block beside its `config:` block. Both use the same
-`alias.param` dotted-path grammar and the same unknown-key hard error
-([E113](#diagnostics)); the difference is precedence. A key under `config:` is a
-plain clobber — a higher layer may still override it. A key under `fixed:` is
-**locked**: it holds against every *higher*-precedence layer, so a lower layer
-can pin a value the layers above it cannot change.
+`fixed` is metadata on the value it locks, never a sibling map. A config leaf
+uses `{ value, fixed }`; a variable leaf uses `{ type, default, fixed }`.
+`fixed` defaults to `false`. Unknown spellings and a misplaced top-level
+`fixed:` block fail at the authored line with the corrected leaf form.
 
 ```yaml
 # channel.cfg.yaml — the channel-wide manifest
-channel: { name: globex }
-fixed:
-  scorer.threshold: 0.9      # locked channel-wide
+channel:
+  name: tenant.globex
+  targets: [daily.orders]
+config:
+  scorer.threshold: { value: 0.9, fixed: true }
 ```
 
 ```yaml
 # order_fulfillment.channel.yaml — the per-target overlay (a higher layer)
-channel: { target: ../../pipeline/order_fulfillment.yaml }
+channel: { target: daily.orders }
 config:
-  scorer.threshold: 0.95     # ignored: the channel-wide layer locked this key
+  scorer.threshold: { value: 0.95 } # rejected: channel-wide locked this key
 ```
 
-Here the resolved `scorer.threshold` is `0.9`, not `0.95`: the fixed channel-wide
-value wins even though the per-target layer is higher. When several layers lock
-the same key, the **lowest**-precedence lock wins (it pinned the value first). A
-key present in both `config:` and `fixed:` of the *same* file resolves to the
-`fixed:` value. `channels resolve` marks a locked value with `(fixed)` next to
-its winning layer, and `explain --field` reports the same.
+The per-target candidate is invalid because the channel-wide value is fixed;
+the diagnostic points to the per-target leaf and the run does not start. The
+resolved provenance remains `0.9`, and `channels resolve` marks that winning
+layer `(fixed)`. Invalid candidates are validated even when another layer would
+win, so a typo or type mismatch cannot hide behind precedence.
 
 `vars:` overrides or adds scoped-variable defaults, using the same four scopes a
 pipeline's own `vars:` block uses (`$vars.*` / `$pipeline.*` / `$source.*` /
@@ -151,7 +198,7 @@ declaration uses:
 ```yaml
 vars:
   static:                    # $vars.*
-    currency: { type: string, default: "USD" }
+    currency: { type: string, default: "USD", fixed: true }
   pipeline:                  # $pipeline.*
     cutoff_date: { type: date, default: "2026-01-01" }
   source:                    # $source.<src>.*  — outer key is the source-node name
@@ -326,10 +373,13 @@ surfaces every layer carries — `config:` / `vars:` value clobber and an
 ```yaml
 group:
   name: enterprise
+  targets:
+    pipelines: [daily.orders]
+    compositions: [etl.normalize]
   match: 'tier == "enterprise"'   # optional selector; higher priority wins
   priority: 20
 config:
-  scorer.threshold: 0.8
+  scorer.threshold: { value: 0.8 }
 overrides:
   - op: add
     node:
@@ -352,6 +402,10 @@ A group plays two roles under one concept:
   channel-agnostic — their overrides never read channel labels — so any group can
   run standalone against the base pipeline, with or without a channel.
 
+Every group owns a non-empty explicit `targets:` set of catalog pipeline and/or
+composition ids. A selector only narrows that set: a matching label can never
+make the group global. Forced `--group` use is target-bounded by the same set.
+
 ### Selectors are label-only CXL
 
 `match:` is a bare [CXL](../cxl/overview.md) boolean expression evaluated in a
@@ -372,38 +426,37 @@ quietly excluding the channel.
 
 ### The channel manifest
 
-`channel.cfg.yaml` declares a channel's identity labels and optional
-channel-wide overlays (applied to every pipeline this channel runs):
+`channel.cfg.yaml` declares the channel identity, its non-empty pipeline target
+set, identity labels, and optional channel-wide values:
 
 ```yaml
 channel:
-  name: globex
+  name: tenant.globex
+  targets: [daily.orders]
 labels: { region: west, tier: enterprise }   # identity — drives group selectors
 config:
-  scorer.threshold: 0.9                        # channel-wide value clobber (optional)
+  scorer.threshold: { value: 0.9, fixed: true }
 vars:
   static:
-    currency: { type: string, default: "USD" }
-overrides: []                                  # channel-wide op list (optional)
+    currency: { type: string, default: "USD", fixed: false }
 ```
 
-Labels are **identity, never a pipeline override**. The manifest is optional: a
-channel with no labels and no channel-wide overlays needs no `channel.cfg.yaml`
-at all — its folder name is still its id. But a channel that groups select on
-must declare the labels those selectors read, otherwise the selector errors on
-the unresolved label rather than cleanly not matching.
+Labels are **identity, never a pipeline override**. The manifest and its target
+set are required. Channel-wide `overrides:` and `sources:` are forbidden because
+they would apply graph/source/schema changes without a single admitted target;
+move those operations into the corresponding target file.
 
 ### The per-target overlay
 
-`<target>.channel.yaml` overlays a single pipeline (or `<target>.comp.yaml` a
-composition). The `channel.target:` field is authoritative — the filename suffix
-is optional and, when present, must agree:
+A target file overlays exactly one manifest-declared catalog pipeline and its
+admitted composition closure. The `channel.target:` logical id is authoritative;
+the filename has no identity semantics:
 
 ```yaml
 channel:
-  target: ../../pipeline/order_fulfillment.yaml
+  target: daily.orders
 config:
-  scorer.threshold: 0.95
+  scorer.threshold: { value: 0.95 }
 overrides:
   - op: patch_schema
     target: orders
@@ -411,13 +464,38 @@ overrides:
       tax_exempt: { add: { type: bool } }
 ```
 
+### Complete admission and execution identity
+
+Channel loading is fail closed. Clinker canonicalizes the workspace root and
+candidate path, rejects traversal and symlink escapes, opens each admitted file
+once, verifies its post-open identity, and reads it into one bounded byte
+buffer. UTF-8 validation, parsing, and content identity all use that exact
+buffer; the bytes cannot be swapped between validation and hashing.
+
+Planning validates the whole admitted catalog before selecting a requested
+pipeline or target:
+
+- every manifest target must have exactly one target overlay;
+- every declared target is parsed and validated, including targets not
+  selected for this run;
+- the complete reachable pipeline and composition closure is validated for
+  every target; and
+- group discovery, channel discovery, or file I/O errors abort admission rather
+  than silently skipping an entry.
+
+The planned execution identity includes the selected pipeline bytes and every
+applied layer in precedence order: defaults, ordered groups, the channel-wide
+overlay, and the selected target overlay. Group priority, declaration sequence,
+and whether membership was derived or explicit are part of that identity.
+Changing applied bytes or their order changes the identity; changing an
+unapplied overlay does not.
+
 ## CLI surface
 
 ### Running with overlays
 
 ```
-# Run as a tenant: resolves the channel folder and derives matching groups
-# from its labels.
+# Run as a tenant: resolves catalog identities and derives target-bounded groups.
 clinker run pipeline/order_fulfillment.yaml --channel globex --base-dir .
 
 # Force-include a group by name, with or without a channel.
@@ -430,9 +508,9 @@ before execution. Overlay flags shared across `run` and `explain`:
 
 | Flag | Meaning |
 |------|---------|
-| `--group <NAME>` | Force-include a group overlay by name (repeatable), with or without a channel. |
+| `--group <NAME>` | Force-include a group overlay by name (repeatable), provided its explicit target set admits the selected pipeline or composition closure. |
 | `--no-auto-groups` | Suppress selector-derived group membership; only explicit `--group` overlays apply. |
-| `--channel <ID>` | Apply a tenant channel by id (its folder under the channel root), resolved by computed path. Derives matching groups from the channel's labels and applies the layered `config`/`vars` clobber, the `overrides:` op stream, and `sources:` per-source patches. |
+| `--channel <ID>` | Apply a logical id from `[catalog.channels]`; the selected `[catalog.pipelines]` id must appear in its manifest targets. Derives only target-admitted matching groups. |
 
 `explain --field <alias.param> --group <NAME>` reports the same overlay stack for
 provenance lookups, mirroring `run`.
@@ -451,12 +529,13 @@ clinker channels resolve pipeline/order_fulfillment.yaml --channel globex --base
 clinker channels resolve pipeline/order_fulfillment.yaml --group enterprise --base-dir .
 ```
 
-Here `--channel` is a **channel id** (the folder name under the channel root),
-resolved by computed path; `resolve` derives that channel's matching groups from
-its labels unless `--no-auto-groups` is passed.
+Here `--channel` is a logical id from `[catalog.channels]`. The selected pipeline
+must likewise appear in `[catalog.pipelines]`; `resolve` never guesses identity
+from the filename. Matching groups are considered only after their explicit
+target sets admit that pipeline or one of its composition dependencies.
 
-`channels lint` compiles every channel/group overlay in the workspace and reports
-every failure — the one full-tree scan in the system:
+`channels lint` compiles every cataloged channel target and reports every
+failure through the same resolver used by `run` and `explain`:
 
 ```
 clinker channels lint --base-dir .
@@ -474,7 +553,9 @@ clinker channels label set tier=enterprise globex initech --base-dir .
 
 `channels label set` takes a `key=value` assignment; the value is typed by YAML
 scalar inference (`true`/`false` → bool, integers → int, decimals → float, else
-string) so numeric and boolean labels compare correctly against selectors.
+string) so numeric and boolean labels compare correctly against selectors. The
+channel manifest must already exist with its explicit `channel.targets` list;
+the command never creates a targetless manifest.
 
 ### Renaming a base node
 
@@ -646,8 +727,13 @@ lineage do not collide.
 
 | Code | Meaning |
 |------|---------|
+| **E103** | A `config:` candidate has the wrong value type or attempts to override a lower fixed value. Every candidate is checked at its own leaf, including one a later layer would shadow. |
+| **E107** | A channel/group variable candidate disagrees with the pipeline declaration or its default does not match the declared type. |
+| **E110** | A variable candidate shadows a reserved scoped-variable name. |
+| **E111** | A `vars.source` candidate names no source in the selected pipeline. |
 | **E113** | A `config:` / override key matches no composition parameter in the compiled plan. A misspelled or stale key aborts the run instead of silently doing nothing. |
 | **E114** | An overlay op failed to apply (missing splice anchor, duplicate node name, missing/removed `target`, invalid `set` field, invalid `bypass` node). The diagnostic is anchored to the offending op's source span, not the base pipeline. |
+| **E118** | A shorthand `alias.param` candidate is ambiguous in the selected composition closure; use the exact target-specific alias. |
 | **E230** | A source patch (`sources.<src>` or `patch_schema`) targets a source that does not exist: an unknown top-level source, an unknown composition for a qualified `<composition>.<source>` key, a `<composition>.<source>` naming no source in that composition's body, or a nested (`a.b.c`) key. |
 | **E231** | A schema `rename` / `modify` / `remove` of a column that does not exist. |
 | **E232** | A schema `add` of a column name that already exists. |

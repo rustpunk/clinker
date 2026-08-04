@@ -35,14 +35,19 @@ Validate this page against:
 
 - `00_READ_THIS_FIRST.md`: entry point, reading order, evidence labels, and documentation update map.
 - `10_ARCHITECTURE.md`: architecture overview and subsystem boundaries.
+- `15_PRODUCTION_CONTRACTS.md`: canonical status-aware authority for observed
+  behavior, locked production contracts, evidence, compatibility, and owners.
 - `20_CRATE_MAP.md`: current workspace crate roles and dependency direction.
 - `30_DESIGN_RULES.md`: architecture, dependency, config, and review rules.
+- `35_EXTENSION_SEAMS.md`: extension contracts and coordinated cross-layer
+  change paths.
 - `40_COMMON_PATTERNS.md`: repeated implementation patterns and local conventions.
 - `45_COMMON_AGENT_MISTAKES.md`: recurring agent mistakes and the drift traps behind them; companion to `40_COMMON_PATTERNS.md`.
 - `50_TESTING_AND_COMMANDS.md`: canonical command guide.
 - `60_PERFORMANCE_NOTES.md`: hot paths, memory-sensitive code, and benchmark entry points.
 - `70_GLOSSARY.md`: project-specific terms.
-- `80_OPEN_QUESTIONS.md`: unresolved uncertainty.
+- `80_OPEN_QUESTIONS.md`: unresolved or explicitly deferred uncertainty;
+  locked and resolved production decisions route to `15_PRODUCTION_CONTRACTS.md`.
 - `90_CRATE_AGENT_PLAN.md`: crate-level `AGENTS.md` inventory and ownership map.
 - `GITHUB_ISSUE_AGENT_WORKFLOW.md`: issue-driven agent workflow entry point.
 - `github-workflow/`: focused workflow slices for planning, grounding,

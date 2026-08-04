@@ -103,6 +103,9 @@ pub struct MultiFileFormatReader {
     schema: Option<Arc<Schema>>,
     /// Per-file factory.
     factory: Box<FactoryFn>,
+    /// Ordered structural events accumulated while the wrapper advances.
+    /// Physical open/close entries make zero-record files visible.
+    lifecycle_events: Vec<clinker_format::SourceLifecycleEvent>,
 }
 
 impl MultiFileFormatReader {
@@ -128,6 +131,7 @@ impl MultiFileFormatReader {
             current_file: initial_file,
             schema: None,
             factory,
+            lifecycle_events: Vec::new(),
         }
     }
 
@@ -154,9 +158,13 @@ impl MultiFileFormatReader {
                 source: ReopenableSource::one_shot(Box::new(std::io::empty())),
             },
         );
+        let reader = (self.factory)(slot.source)?;
         self.current_file = Arc::from(slot.path.to_string_lossy().into_owned());
         self.cursor += 1;
-        let reader = (self.factory)(slot.source)?;
+        self.lifecycle_events
+            .push(clinker_format::SourceLifecycleEvent::PhysicalFileOpen(
+                Arc::clone(&self.current_file),
+            ));
         self.active = Some(reader);
         Ok(true)
     }
@@ -233,6 +241,10 @@ impl FormatReader for MultiFileFormatReader {
         }
     }
 
+    fn take_source_lifecycle_events(&mut self) -> Vec<clinker_format::SourceLifecycleEvent> {
+        std::mem::take(&mut self.lifecycle_events)
+    }
+
     fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
         // Materialize file 0 if we haven't yet.
         if self.active.is_none() {
@@ -251,8 +263,19 @@ impl FormatReader for MultiFileFormatReader {
                 .as_mut()
                 .expect("active reader present after advance");
             match active.next_record()? {
-                Some(record) => return Ok(Some(record)),
+                Some(record) => {
+                    self.lifecycle_events
+                        .extend(active.take_source_lifecycle_events());
+                    return Ok(Some(record));
+                }
                 None => {
+                    self.lifecycle_events
+                        .extend(active.take_source_lifecycle_events());
+                    self.lifecycle_events.push(
+                        clinker_format::SourceLifecycleEvent::PhysicalFileClose(Arc::clone(
+                            &self.current_file,
+                        )),
+                    );
                     // Inner reader EOF'd; advance to next file.
                     if !self.advance()? {
                         return Ok(None);
@@ -274,6 +297,14 @@ impl FormatReader for MultiFileFormatReader {
         // whole file is condemned either way, so nothing that should stream
         // is lost. Verify the new file's schema before its records flow,
         // exactly as the EOF-driven advance in `next_record` does.
+        if let Some(active) = self.active.as_mut() {
+            self.lifecycle_events
+                .extend(active.take_source_lifecycle_events());
+            self.lifecycle_events
+                .push(clinker_format::SourceLifecycleEvent::PhysicalFileClose(
+                    Arc::clone(&self.current_file),
+                ));
+        }
         self.active = None;
         if !self.advance()? {
             return Ok(false);
@@ -288,6 +319,7 @@ impl FormatReader for MultiFileFormatReader {
 mod tests {
     use super::*;
     use clinker_format::csv::reader::{CsvReader, CsvReaderConfig};
+    use clinker_format::swift::reader::{SwiftReader, SwiftReaderConfig};
 
     fn slot(path: &str, s: &str) -> FileSlot {
         FileSlot::new(
@@ -305,6 +337,51 @@ mod tests {
                 )))
             },
         )
+    }
+
+    fn swift_factory() -> Box<FactoryFn> {
+        Box::new(
+            |source: ReopenableSource| -> Result<Box<dyn FormatReader>, FormatError> {
+                Ok(Box::new(SwiftReader::new(
+                    source.open()?,
+                    SwiftReaderConfig::default(),
+                )))
+            },
+        )
+    }
+
+    #[test]
+    fn empty_single_frame_keeps_ordered_physical_and_nested_boundaries() {
+        let header_only = "{1:F01BANKBEBBAXXX0000000000}{2:I103BANKDEFFXXXXN}{5:{CHK:ABC}}";
+        let mut reader =
+            MultiFileFormatReader::new(vec![slot("empty.swift", header_only)], swift_factory());
+        reader.schema().expect("schema");
+        assert!(reader.next_record().expect("read").is_none());
+
+        let events = reader.take_source_lifecycle_events();
+        assert_eq!(events.len(), 4, "events: {events:?}");
+        assert!(matches!(
+            &events[0],
+            clinker_format::SourceLifecycleEvent::PhysicalFileOpen(file)
+                if file.ends_with("empty.swift")
+        ));
+        assert!(matches!(
+            &events[1],
+            clinker_format::SourceLifecycleEvent::Envelope(
+                clinker_format::EnvelopeEvent::OpenLevel { .. }
+            )
+        ));
+        assert!(matches!(
+            &events[2],
+            clinker_format::SourceLifecycleEvent::Envelope(
+                clinker_format::EnvelopeEvent::CloseLevel
+            )
+        ));
+        assert!(matches!(
+            &events[3],
+            clinker_format::SourceLifecycleEvent::PhysicalFileClose(file)
+                if file.ends_with("empty.swift")
+        ));
     }
 
     #[test]

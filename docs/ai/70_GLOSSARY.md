@@ -1,8 +1,13 @@
 # AI Onboarding: Glossary
 
-Verified against origin/main cf6609b9 (2026-07-24).
+Verified against the working tree on 2026-07-29.
 
 Purpose: Define repository-specific terms that AI agents should validate before using them in explanations or code review.
+
+Clinker Expression Language (CXL) is Clinker's per-record ETL expression
+language. It is not SQL. This page expands the canonical name on first use and
+uses CXL thereafter, as required by D-50 in the
+[production-contract register](15_PRODUCTION_CONTRACTS.md).
 
 ## Source Evidence
 
@@ -75,6 +80,20 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
 
 ## Pipeline Terms
 
+### Terminal vocabulary boundary
+
+`Output` and authored `type: output` are the current terminal-node names in
+`PipelineNode`, `OutputConfig`, runtime dispatch, examples, and user docs.
+`Sink` and `type: sink` are the locked Phase 4 / AUTH-09 target and are **not
+implemented**. Phase 4 performs that one-way atomic migration before Phase 4.1
+adds endpoint implementations; this glossary does not rename code or runnable
+YAML. See [D-56 in the production-contract register](15_PRODUCTION_CONTRACTS.md).
+
+The migration is semantic, not a global word replacement. It leaves these
+distinct meanings unchanged: node and composition output ports, output paths
+and produced artifacts, serialization output and formats, stdout, command and
+machine output, writer output/results, and OpenLineage output datasets.
+
 | Term | Meaning | Where it appears | Related terms | Confidence |
 |---|---|---|---|---|
 | Source node | Entry-point node that reads finite records from a file or other finite transport. It has no upstream input. | `docs/user/src/nodes/source.md`; `crates/clinker-plan/src/config/source.rs`; `PipelineNode::Source` | SourceConfig, RecordSource, InputFormat | High |
@@ -83,11 +102,12 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
 | Route node | Per-record fan-out node that evaluates ordered CXL conditions and emits records to named output ports. | `docs/user/src/nodes/route.md`; `crates/clinker-plan/src/config/pipeline_node.rs`; `crates/clinker-exec/src/executor/route.rs` | RouteBody, RouteMode, ports | High |
 | Merge node | Fan-in node that concatenates or interleaves upstream streams sharing a compatible schema. | `docs/user/src/nodes/merge.md`; `crates/clinker-plan/src/config/format.rs`; `crates/clinker-exec/src/executor/merge_dispatch.rs` | MergeMode, inputs, streaming interleave | High |
 | Combine node | N-ary record-combining/join node using qualified inputs, a CXL `where:` predicate, match/on-miss policy, and output CXL. | `docs/user/src/nodes/combine.md`; `crates/clinker-plan/src/plan/combine.rs`; `crates/clinker-exec/src/pipeline/combine.rs` | driver, build side, IEJoin, grace hash | High |
-| Output node | Sink node that writes records to a configured path and format, with projection, splitting, correlation-key visibility, and envelope reconstruction options. | `docs/user/src/nodes/output.md`; `crates/clinker-plan/src/config/output.rs`; `crates/clinker-exec/src/executor/output_dispatch.rs` | OutputConfig, FormatWriter, split | High |
+| Output node | Current terminal-destination node, authored as `type: output`, that writes records to a configured path and format with projection, splitting, correlation-key visibility, and envelope reconstruction options. | `docs/user/src/nodes/output.md`; `crates/clinker-plan/src/config/output.rs`; `crates/clinker-exec/src/executor/output_dispatch.rs` | OutputConfig, FormatWriter, split | High |
+| Sink | Locked Phase 4 target name for the terminal-destination node, authored as `type: sink` only after AUTH-09 lands. It is not current syntax or a current Rust variant. | `docs/ai/15_PRODUCTION_CONTRACTS.md` (D-56); `.planning/REQUIREMENTS.md` (AUTH-09) | Output node, Phase 4, Phase 4.1 | High for target; not implemented |
 | Reshape node | Blocking group operator that mutates trigger rows and/or synthesizes new rows within each `partition_by` group. | `docs/user/src/nodes/reshape.md`; `crates/clinker-plan/src/config/pipeline_node.rs`; `crates/clinker-exec/src/executor/reshape_dispatch.rs` | partition_by, `$meta.*`, synthesize | High |
 | Cull node | Blocking group operator that routes whole groups matching a group-level predicate to a side-output port instead of the main output. | `docs/user/src/nodes/cull.md`; `crates/clinker-plan/src/config/pipeline_node.rs`; `crates/clinker-exec/src/executor/cull_dispatch.rs` | removed_to, partition_by, route ports | High |
 | Envelope node | Node that frames a body stream into per-document documents with `preserve` or `concat` strategy and optional header/footer synthesis. | `docs/user/src/nodes/envelope.md`; `crates/clinker-plan/src/config/pipeline_node.rs`; `crates/clinker-exec/src/executor/envelope_dispatch.rs` | DocumentContext, document grain, `$doc.*` | High |
-| Composition node | Call-site node for a `.comp.yaml` reusable body. It supports `use`, optional alias, input/output port bindings, config, and resources. | `docs/user/src/pipelines/compositions.md`; `crates/clinker-plan/src/config/pipeline_node.rs`; `crates/clinker-plan/src/config/composition/` | BoundBody, CompositionBodyId, resources | High |
+| Composition node | Call-site node for a sealed `.comp.yaml` body. Declared ports are bound through `inputs:`, config parameters through `config:`, and output ports come from `_compose.outputs`; parsed call-site alias/output/resource fields are reserved rather than working remapping or runtime-resource facilities. | `docs/user/src/pipelines/compositions.md`; `crates/clinker-plan/src/config/pipeline_node.rs`; `crates/clinker-plan/src/config/composition/` | BoundBody, CompositionBodyId, resources | High |
 | `input:` | Node wiring field for a single upstream reference; combine overloads it as a qualifier-to-upstream map. | `docs/user/src/pipelines/structure.md`; `docs/user/src/nodes/combine.md`; `crates/clinker-plan/src/config/node_header.rs` | inputs, qualifier, port syntax | High |
 | `inputs:` | Node wiring field for multiple upstreams on merge and composition port binding contexts. | `docs/user/src/pipelines/structure.md`; `docs/user/src/pipelines/compositions.md`; `crates/clinker-plan/src/config/node_header.rs` | input, merge, composition | High |
 | `body:` | Envelope node's required body input port. | `docs/user/src/nodes/envelope.md`; `crates/clinker-plan/src/config/node_header.rs`; `crates/clinker-plan/src/config/pipeline_node.rs` | envelope, header, trailer | High |
@@ -121,7 +141,7 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
 
 | Term | Meaning | Where it appears | Related terms | Confidence |
 |---|---|---|---|---|
-| CXL | Clinker's per-record ETL expression language. It is parsed, resolved, typechecked, and evaluated by the `cxl` crate; it is not SQL. The repo does not clearly define the acronym expansion. | `crates/cxl/src/lib.rs`; `docs/user/src/getting-started/concepts.md`; `docs/engine/src/cxl-internals.md` | AST, TypedProgram, ProgramEvaluator | High for behavior, Low for acronym expansion |
+| CXL | Canonical abbreviation for Clinker Expression Language, Clinker's per-record ETL expression language. It is parsed, resolved, typechecked, and evaluated by the `cxl` crate; it is not SQL. | `crates/cxl/src/lib.rs`; `docs/ai/15_PRODUCTION_CONTRACTS.md` (D-50); `docs/engine/src/cxl-internals.md` | AST, TypedProgram, ProgramEvaluator | High |
 | CXL program | A sequence of CXL statements such as `emit`, `let`, `filter`, `distinct`, and `emit each`. | `crates/cxl/src/ast.rs`; `docs/user/src/cxl/overview.md`; `docs/user/src/nodes/transform.md` | Program, Statement, Parser | High |
 | `emit` | CXL statement that writes a field to the output record. Only emitted fields appear downstream unless pass-through/unmapped rules apply. | `docs/user/src/getting-started/concepts.md`; `crates/cxl/src/ast.rs`; `crates/clinker-exec/src/executor/transform_dispatch.rs` | Transform, CompiledEmit, projection | High |
 | `let` | CXL statement that binds a local variable for later expressions but does not emit a field. | `docs/user/src/getting-started/concepts.md`; `crates/cxl/src/ast.rs` | emit, filter, scope | High |
@@ -129,7 +149,7 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
 | `distinct` | CXL deduplication statement, either across all output fields or by a named field. | `docs/user/src/getting-started/concepts.md`; `crates/cxl/src/ast.rs`; `crates/clinker-plan/src/plan/execution/composition.rs` | Transform, dedupe | High |
 | `emit each` | CXL fan-out construct that can produce multiple output records from one input record, bounded by `max_expansion`. | `docs/user/src/cxl/emit-each.md`; `docs/user/src/nodes/transform.md`; `crates/cxl/src/ast.rs` | max_expansion, DLQ | High |
 | `max_expansion` | Transform safety cap on output rows produced by `emit each` for one input record. | `docs/user/src/nodes/transform.md`; `crates/clinker-plan/src/config/pipeline_node.rs`; `crates/clinker-exec/src/executor/transform_dispatch.rs` | emit each, expansion_limit_exceeded | High |
-| CXL module | CXL source unit imported/resolved through module support and `rules_path`. | `docs/user/src/cxl/modules.md`; `crates/cxl/src/module_eval.rs`; `crates/clinker-exec/src/modules.rs` | rules_path, ModuleConst, ModuleRegistry | High |
+| CXL module | CXL source unit admitted into a compiled plan through the typed workspace catalog and selected `rules_path`. | `docs/user/src/cxl/modules.md`; `crates/cxl/src/module_eval.rs`; `crates/clinker-plan/src/resources/mod.rs` | rules_path, ModuleConst, CompiledModuleRegistry | High |
 | `TypedProgram` | Typechecked CXL program returned by the typecheck pass and stored in compile artifacts. | `crates/cxl/src/typecheck/pass.rs`; `crates/clinker-plan/src/plan/bind_schema.rs`; `docs/engine/src/cxl-internals.md` | type_check, CompileArtifacts, ProgramEvaluator | High |
 | `ProgramEvaluator` | Runtime evaluator that compiles and caches typed CXL programs for per-record execution. | `crates/cxl/src/eval/mod.rs`; `docs/ai/60_PERFORMANCE_NOTES.md`; `crates/clinker-exec/src/executor/transform.rs` | TypedProgram, EvalContext, compiled path | High |
 | `CompiledScalar` | Compiled scalar expression used by hot paths such as aggregate filters and operator predicates. | `crates/cxl/src/eval/compiled.rs`; `crates/cxl/src/eval/mod.rs`; `docs/ai/60_PERFORMANCE_NOTES.md` | compile_scalar, EvalContext | High |
@@ -244,5 +264,8 @@ Existing files under `docs/*` may be stale. Treat them as secondary context only
 ## Review Notes
 
 - The glossary intentionally avoids generic Rust terms unless Clinker gives them a project-specific role.
-- `docs/user/src/getting-started/concepts.md` still says "eight node types"; current `PipelineNode` code has eleven variants. See `docs/ai/80_OPEN_QUESTIONS.md`.
-- CXL is defined by behavior and crate boundaries here; the acronym expansion itself remains unclear and is tracked in `docs/ai/80_OPEN_QUESTIONS.md`.
+- Current user and engine node catalogs describe all eleven `PipelineNode`
+  variants. Retired composition examples outside the books remain tracked in
+  `docs/ai/80_OPEN_QUESTIONS.md`.
+- Clinker Expression Language and the current Output versus Phase 4 Sink
+  boundary are locked by D-50 and D-56; they are not open terminology choices.

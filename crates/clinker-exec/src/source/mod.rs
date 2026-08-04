@@ -9,11 +9,12 @@
 //! per-file `RecordProvenance` Arc swaps).
 
 pub mod multi_file;
+pub(crate) mod order_barrier;
 
 use std::sync::Arc;
 
 use clinker_format::traits::FormatReader;
-use clinker_format::{EnvelopeConfig, EnvelopeEvent, FormatError};
+use clinker_format::{EnvelopeConfig, EnvelopeEvent, FormatError, SourceLifecycleEvent};
 use clinker_record::{Record, Schema, Value};
 use indexmap::IndexMap;
 
@@ -76,6 +77,16 @@ pub trait RecordSource: Send {
         Vec::new()
     }
 
+    /// Drain ordered physical-file and nested-envelope lifecycle events.
+    /// The default preserves direct transport behavior by lifting its
+    /// envelope events into the unified carrier.
+    fn take_source_lifecycle_events(&mut self) -> Vec<SourceLifecycleEvent> {
+        self.take_envelope_events()
+            .into_iter()
+            .map(SourceLifecycleEvent::Envelope)
+            .collect()
+    }
+
     /// Hand the source its run shutdown handle so it can poll for
     /// cancellation at page/row-batch boundaries and stop cleanly
     /// (returning `Ok(None)` like a normal EOF). The ingest driver
@@ -129,6 +140,10 @@ impl RecordSource for Box<dyn FormatReader> {
 
     fn take_envelope_events(&mut self) -> Vec<EnvelopeEvent> {
         (**self).take_envelope_events()
+    }
+
+    fn take_source_lifecycle_events(&mut self) -> Vec<SourceLifecycleEvent> {
+        (**self).take_source_lifecycle_events()
     }
 
     fn advance_to_next_file(&mut self) -> Result<bool, FormatError> {

@@ -196,7 +196,7 @@ storage surface, and it helps to know which is which before comparing figures:
 
 - **Config values you write** (`disk_cap_bytes = "10GB"`) use **decimal** units
   — `1GB` = 1,000,000,000 bytes — matching `du`, `df`, and the AWS CLI (see
-  [the disk-cap grammar](#storagespilldisk_cap_bytes--cap-cumulative-spill)).
+  [the disk-cap grammar](#storagespilldisk_cap_bytes--cap-concurrent-spill)).
 - **The `=== Estimated Spill Volume ===` section** humanizes with **binary**
   suffixes — `K`/`M`/`G` = KiB/MiB/GiB — so it lines up with the
   `predicted_peak` figure on each stage's Physical Properties line, which uses

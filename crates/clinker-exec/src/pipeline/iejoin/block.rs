@@ -1700,6 +1700,7 @@ fn finish_and_slice<P: Serialize + DeserializeOwned + Send + Ord + HeapBytes>(
             budget: ctx.budget,
             node: ctx.name,
             compress: ctx.spill_compress,
+            charge_owner: None,
         },
     )?;
     let blocks = slice_side(stream, schema, ctx, resident, key_of)?;
@@ -1957,6 +1958,7 @@ fn finish_unmatched_stream(
             budget: ctx.budget,
             node: ctx.name,
             compress: ctx.spill_compress,
+            charge_owner: None,
         },
     )
 }
@@ -2103,6 +2105,7 @@ mod tests {
     use clinker_plan::config::pipeline_node::PropagateCkSpec;
     use clinker_plan::plan::combine::CombineInput;
     use clinker_plan::plan::execution::ResolvedColumnMap;
+    use clinker_plan::plan::{EntityRef, PlanNodeId};
     use clinker_record::{Schema, Value};
     use cxl::eval::StableEvalContext;
     use indexmap::IndexMap;
@@ -2169,7 +2172,7 @@ mod tests {
             k1: 0,
             k2: 0,
             driver_idx: 0,
-            order: 0,
+            order: 0.into(),
             eq: Vec::new(),
         }
     }
@@ -2259,6 +2262,7 @@ mod tests {
                 budget: &arb,
                 node: "block-band test drain",
                 compress: true,
+                charge_owner: None,
             },
         )? {
             let (record, (order, _, _)) = item?;
@@ -2306,6 +2310,24 @@ mod tests {
         cfg: &RunCfg,
         budget: &MemoryArbitrator,
     ) -> Result<Vec<Record>, PipelineError> {
+        let orders = (0..driver.len())
+            .map(|i| RecordOrder::from(i as u64))
+            .collect::<Vec<_>>();
+        Ok(
+            run_block_on_with_orders(driver, build, cfg, budget, &orders)?
+                .into_iter()
+                .map(|(record, _)| record)
+                .collect(),
+        )
+    }
+
+    fn run_block_on_with_orders(
+        driver: &Side,
+        build: &Side,
+        cfg: &RunCfg,
+        budget: &MemoryArbitrator,
+        orders: &[RecordOrder],
+    ) -> Result<Vec<(Record, RecordOrder)>, PipelineError> {
         let d_schema = driver_schema();
         let b_schema = build_schema();
         let out_schema = match cfg.match_mode {
@@ -2326,10 +2348,10 @@ mod tests {
         };
 
         let (driver_records_bare, driver_scans) = to_records_scans(driver, &d_schema);
+        assert_eq!(driver_records_bare.len(), orders.len());
         let driver_records: Vec<(Record, RecordOrder)> = driver_records_bare
             .into_iter()
-            .enumerate()
-            .map(|(i, r)| (r, i as RecordOrder))
+            .zip(orders.iter().copied())
             .collect();
         let (build_records, build_scans) = to_records_scans(build, &b_schema);
 
@@ -2376,10 +2398,50 @@ mod tests {
             out.output_eval_failures.is_empty(),
             "the synthetic emit path never defers an eval failure"
         );
-        Ok(drain_sorted(out.sorted)?
-            .into_iter()
-            .map(|(r, _)| r)
-            .collect())
+        drain_sorted(out.sorted)
+    }
+
+    #[test]
+    fn combine_driver_identity_survives_iejoin_fanout_and_collect() {
+        let driver = vec![(Some((1, 1)), 10), (Some((1, 1)), 11)];
+        let build = vec![(Some((2, 2)), 20), (Some((3, 3)), 21)];
+        let first = RecordOrder::new(PlanNodeId::new(41), 7);
+        let second = RecordOrder::new(PlanNodeId::new(42), 7);
+        let orders = [first, second];
+        let budget = arbitrator(u64::MAX);
+        let cfg = |match_mode| RunCfg {
+            op1: RangeOp::Lt,
+            op2: None,
+            match_mode,
+            on_miss: OnMiss::Skip,
+            block_target: 2,
+            hard_limit: u64::MAX,
+            max_spill_bytes: None,
+            sort_spill: None,
+            resident_budget: None,
+        };
+
+        let fanout =
+            run_block_on_with_orders(&driver, &build, &cfg(MatchMode::All), &budget, &orders)
+                .expect("IEJoin fanout");
+        assert_eq!(
+            fanout
+                .iter()
+                .map(|(_, identity)| *identity)
+                .collect::<Vec<_>>(),
+            vec![first, first, second, second]
+        );
+
+        let collected =
+            run_block_on_with_orders(&driver, &build, &cfg(MatchMode::Collect), &budget, &orders)
+                .expect("IEJoin collect");
+        assert_eq!(
+            collected
+                .iter()
+                .map(|(_, identity)| *identity)
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
     }
 
     fn int(v: Option<&Value>) -> i64 {
@@ -3515,7 +3577,7 @@ mod tests {
         let driver_records: Vec<(Record, RecordOrder)> = driver_records_bare
             .into_iter()
             .enumerate()
-            .map(|(i, r)| (r, i as RecordOrder))
+            .map(|(i, r)| (r, RecordOrder::from(i as u64)))
             .collect();
         let (build_records, build_scans) = to_records_scans(build, &b_schema);
         let budget = arbitrator(cfg.hard_limit);
@@ -3814,10 +3876,10 @@ mod tests {
         // (k1, k2, id, order). The two matches (key 5,5) keep the miss set from
         // being the whole input; the two misses use an unreachable key.
         let driver_keyed: [(i64, i64, i64, RecordOrder); 4] = [
-            (5, 5, 0, 50),
-            (100_000, 100_000, 1, 30),
-            (100_000, 100_000, 2, 10),
-            (5, 5, 3, 40),
+            (5, 5, 0, 50.into()),
+            (100_000, 100_000, 1, 30.into()),
+            (100_000, 100_000, 2, 10.into()),
+            (5, 5, 3, 40.into()),
         ];
         let build: Side = (0..3).map(|i| (Some((5, 5)), 100 + i)).collect();
 
@@ -3911,8 +3973,12 @@ mod tests {
             "b_id".into(),
         ]));
         // Four drivers, all key (5, 5); ids 1 and 2 share the duplicate order 7.
-        let driver_keyed: [(i64, i64, i64, RecordOrder); 4] =
-            [(5, 5, 0, 0), (5, 5, 1, 7), (5, 5, 2, 7), (5, 5, 3, 9)];
+        let driver_keyed: [(i64, i64, i64, RecordOrder); 4] = [
+            (5, 5, 0, 0.into()),
+            (5, 5, 1, 7.into()),
+            (5, 5, 2, 7.into()),
+            (5, 5, 3, 9.into()),
+        ];
         let build: Side = (0..4).map(|i| (Some((5, 5)), 100 + i)).collect();
 
         let run = |block_target: usize, resident: Option<u64>| -> Vec<(i64, i64)> {
@@ -4021,7 +4087,7 @@ mod tests {
         // `Le AND Ge` driver i matches only build i, so match:first holds build
         // i's wide record — one held candidate per driver across the block.
         let driver_records: Vec<(Record, RecordOrder)> = (0..n)
-            .map(|i| (make_rec(&d_schema, i, i, i), i as RecordOrder))
+            .map(|i| (make_rec(&d_schema, i, i, i), RecordOrder::from(i as u64)))
             .collect();
         let driver_scans: Vec<RecordScan> = (0..n)
             .map(|i| RecordScan::Matched {
@@ -4300,7 +4366,7 @@ mod tests {
         let driver_records: Vec<(Record, RecordOrder)> = driver_bare
             .into_iter()
             .enumerate()
-            .map(|(i, r)| (r, i as RecordOrder))
+            .map(|(i, r)| (r, RecordOrder::from(i as u64)))
             .collect();
         let (build_records, build_scans) = to_records_scans(&build, &b_schema);
 
@@ -4538,7 +4604,7 @@ mod tests {
         let driver_records: Vec<(Record, RecordOrder)> = driver_bare
             .into_iter()
             .enumerate()
-            .map(|(i, r)| (r, i as RecordOrder))
+            .map(|(i, r)| (r, RecordOrder::from(i as u64)))
             .collect();
         let (build_records, build_scans) = to_records_scans(build, &b_schema);
 
@@ -5000,7 +5066,7 @@ mod tests {
         let driver_records: Vec<(Record, RecordOrder)> = driver_records_bare
             .into_iter()
             .enumerate()
-            .map(|(i, r)| (r, i as RecordOrder))
+            .map(|(i, r)| (r, RecordOrder::from(i as u64)))
             .collect();
         let (build_records, build_scans) = to_records_scans_equi(build, &b_schema, hash_of, eq_of);
 

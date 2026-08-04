@@ -2,8 +2,8 @@
 
 This page covers the mental model behind Clinker pipelines. If you have
 experience with other ETL tools, most of this will feel familiar -- but pay
-attention to where Clinker diverges, especially around CXL, per-record
-evaluation, and the memory budget.
+attention to where Clinker diverges, especially around Clinker Expression Language (CXL),
+per-record evaluation, and the memory budget.
 
 ## Batch jobs, not unbounded streams
 
@@ -50,14 +50,33 @@ A pipeline is a directed acyclic graph of nodes. Data flows from sources,
 through processing nodes, to outputs. There are no cycles -- a node cannot
 consume its own output, directly or indirectly.
 
-You define the graph by setting `input:` on each consumer node, naming the
-upstream node it reads from. Clinker resolves these references, validates that
-the graph is acyclic, and determines execution order automatically.
+You define the graph with each node kind's input fields. Most consumers use a
+single `input:`, Merge uses an `inputs:` list, Combine uses a named `input:`
+map, and Envelope names its `body` plus optional `header` and `trailer`
+streams. Clinker resolves these references, validates that the graph is
+acyclic, and determines execution order automatically.
+
+### From YAML to a run
+
+Clinker first parses and validates the pipeline, binds schemas, compiles CXL,
+and produces a typed `CompiledPlan`. Execution entry points require that plan,
+so invalid pipelines are rejected before records are read. The current runtime
+then recompiles the configuration embedded in the supplied plan and executes
+the newly validated artifacts. It does not yet execute the stored DAG and
+other stored artifacts directly.
+
+The locked D-01 through D-11 contract changes that lifecycle: the supplied
+`CompiledPlan` becomes authoritative, survives execution, and may be reused
+sequentially in one process while only a defined runtime envelope may refresh.
+Phase 5 owns that correction and any versioned persistent plan cache. Direct
+stored-plan execution and persistent caching are not current capabilities. See
+[Stored-plan execution and cache identity](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#stored-plan-execution-and-cache-identity)
+for the current status and owner of each contract.
 
 ## The `nodes:` list
 
 Every pipeline has a single flat list of nodes. Each node has a `type:`
-discriminator that determines its behavior. The eight node types are:
+discriminator that determines its behavior. The eleven node types are:
 
 | Type          | Purpose                                                     |
 |---------------|-------------------------------------------------------------|
@@ -67,17 +86,20 @@ discriminator that determines its behavior. The eight node types are:
 | `route`       | Split a stream into named ports based on conditions          |
 | `merge`       | Concatenate multiple streams that share a schema             |
 | `combine`     | Join records across N inputs with cross-input predicates     |
+| `reshape`     | Mutate or synthesize records within correlation groups       |
+| `cull`        | Remove whole correlation groups to a side-output port        |
+| `envelope`    | Frame body records with document headers and trailers        |
 | `output`      | Write data to a file                                         |
 | `composition` | Embed a reusable sub-pipeline                                |
 
 You can have as many nodes of each type as your pipeline requires. The only
 constraint is that the resulting graph must be a valid DAG.
 
-## CXL is not SQL
+## CXL is per-record ETL
 
-CXL is a per-record expression language. Each record flows through a CXL block
-independently -- there is no table-level context, no `SELECT`, no `FROM`, no
-`JOIN`. Think of it as a programmable row mapper.
+CXL is Clinker's per-record ETL expression language. Each record flows through
+a CXL block independently. A program maps, filters, or enriches the current
+record in statement order; it is not a table query or join planner.
 
 The core statements:
 
@@ -206,6 +228,10 @@ Merge nodes accept multiple inputs using `inputs:` (plural):
     - us_transform
     - eu_transform
 ```
+
+Combine, Envelope, and Composition have their own multi-input shapes. See
+[Pipeline YAML Structure](../pipelines/structure.md#wiring-by-node-kind) for
+the complete wiring table.
 
 ## Schema declaration
 

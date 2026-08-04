@@ -81,6 +81,7 @@ use crate::pipeline::grace_spill::{
 use crate::pipeline::memory::MemoryArbitrator;
 #[cfg(test)]
 use crate::pipeline::memory::NoOpPolicy;
+use crate::pipeline::spill::{SpillFile, SpillWriter};
 use clinker_plan::BudgetCategory;
 use clinker_plan::config::pipeline_node::{MatchMode, OnMiss};
 use clinker_plan::error::PipelineError;
@@ -116,7 +117,7 @@ fn representative_key_value(keys: &[Value]) -> Value {
 /// Order-tracking sidecar carried alongside every record in the
 /// executor's `node_buffers`. Mirrors the alias in `iejoin`; the grace
 /// path emits matches in driver-order-then-build-walk-order.
-pub(crate) type RecordOrder = u64;
+pub(crate) type RecordOrder = crate::executor::stream_event::SourceRowId;
 
 // ──────────────────────────────────────────────────────────────────────────
 // Partition state
@@ -152,8 +153,8 @@ enum PartitionState {
     /// partition slot).
     OnDisk {
         build_files: Vec<SpillFilePath>,
-        probe_writer: Option<Box<GraceSpillWriter>>,
-        probe_files: Vec<SpillFilePath>,
+        probe_writer: Option<Box<SpillWriter<RecordOrder>>>,
+        probe_files: Vec<SpillFile<RecordOrder>>,
         build_count: u64,
         probe_count: u64,
         hash_bits: u8,
@@ -574,6 +575,7 @@ impl GraceHashExecutor {
     pub(crate) fn probe_record<'a>(
         &'a mut self,
         record: &Record,
+        row_id: RecordOrder,
         probe_keys: &'a [Value],
         hash: u64,
     ) -> Result<ProbeOutcome<'a>, GraceSpillError> {
@@ -586,24 +588,17 @@ impl GraceHashExecutor {
                 probe_writer,
                 probe_files,
                 probe_count,
-                hash_bits,
                 ..
             } => {
                 if probe_writer.is_none() {
-                    *probe_writer = Some(Box::new(GraceSpillWriter::new(
-                        &self.spill_dir,
-                        *hash_bits,
-                        // Probe-side files share the partition_id but
-                        // are distinguishable by adding 0x8000 — the
-                        // top bit is unused by partition assignment so
-                        // it serves as a probe-vs-build tag at the
-                        // file-name level for diagnostic clarity.
-                        (p as u16) | 0x8000,
+                    *probe_writer = Some(Box::new(SpillWriter::new(
+                        Arc::clone(record.schema()),
+                        Some(&self.spill_dir),
                         self.spill_compress,
                     )?));
                 }
                 let w = probe_writer.as_mut().unwrap();
-                w.write_record(record)?;
+                w.write_pair(record, &row_id)?;
                 *probe_count += 1;
                 let _ = probe_files; // bookkeeping in the reload path
                 Ok(ProbeOutcome::Spilled)
@@ -637,7 +632,7 @@ impl GraceHashExecutor {
             } = state
                 && let Some(w) = probe_writer.take()
             {
-                let (path, written) = (*w).finish()?;
+                let (path, written) = (*w).finish_with_bytes()?;
                 probe_files.push(path);
                 charge_grace_spill(budget, &self.name, written)?;
             }
@@ -763,21 +758,13 @@ pub(crate) fn execute_combine_grace_hash(
     let driver_extractor = KeyExtractor::new(driver_progs);
     let build_extractor = KeyExtractor::new(build_progs);
 
-    // Determine the build-side and driver-side schemas. Each is
-    // recovered from the first record on its side, falling back to
-    // the output schema so the spill reader has something to attach
-    // even on empty inputs.
+    // Determine the build-side schema, falling back to the output schema
+    // so the spill reader has something to attach even on empty input.
     let build_schema: Arc<Schema> = build_records
         .first()
         .map(|r| Arc::clone(r.schema()))
         .or_else(|| output_schema.cloned())
         .unwrap_or_else(|| Arc::new(Schema::new(Vec::new())));
-    let driver_schema: Arc<Schema> = driver_records
-        .first()
-        .map(|(r, _)| Arc::clone(r.schema()))
-        .or_else(|| output_schema.cloned())
-        .unwrap_or_else(|| Arc::new(Schema::new(Vec::new())));
-
     let mut executor = GraceHashExecutor::new(
         partition_bits,
         spill_dir,
@@ -909,7 +896,7 @@ pub(crate) fn execute_combine_grace_hash(
     };
 
     for (probe_record, rn) in driver_records {
-        let row_ctx = ctx.with_row(rn);
+        let row_ctx = ctx.with_row(rn.ordinal());
         let probe_resolver = CombineResolver::new(resolver_mapping, &probe_record, None);
         probe_keys_buf.clear();
         driver_extractor
@@ -921,7 +908,7 @@ pub(crate) fn execute_combine_grace_hash(
         let hash = hash_composite_key(&probe_keys_buf, executor.hash_state());
 
         let outcome = executor
-            .probe_record(&probe_record, &probe_keys_buf, hash)
+            .probe_record(&probe_record, rn, &probe_keys_buf, hash)
             .map_err(|e| grace_spill_error(e, name, "probe failed"))?;
 
         match outcome {
@@ -982,7 +969,6 @@ pub(crate) fn execute_combine_grace_hash(
         emit: &emit_args,
         ctx,
         build_schema: Arc::clone(&build_schema),
-        driver_schema: Arc::clone(&driver_schema),
         spill_dir: &spill_dir_path,
         spill_compress,
         hash_state: &hash_state,

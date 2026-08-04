@@ -262,10 +262,10 @@ nodes:
         - { name: seg_id, type: string }
         - { name: set_ref, type: string }
         - { name: set_type, type: string }
-        - { name: e01, type: string }
-        - { name: e02, type: string }
-        - { name: e03, type: string }
-        - { name: e04, type: string }
+        - { name: e01, type: { nullable: string } }
+        - { name: e02, type: { nullable: string } }
+        - { name: e03, type: { nullable: string } }
+        - { name: e04, type: { nullable: string } }
   - type: output
     name: out
     input: interchange
@@ -376,11 +376,11 @@ nodes:
         - { name: seg_id, type: string }
         - { name: set_ref, type: string }
         - { name: set_type, type: string }
-        - { name: e01, type: string }
-        - { name: e02, type: string }
-        - { name: e03, type: string }
-        - { name: e04, type: string }
-        - { name: e05, type: string }
+        - { name: e01, type: { nullable: string } }
+        - { name: e02, type: { nullable: string } }
+        - { name: e03, type: { nullable: string } }
+        - { name: e04, type: { nullable: string } }
+        - { name: e05, type: { nullable: string } }
   - type: output
     name: out
     input: interchange
@@ -493,10 +493,10 @@ nodes:
         - { name: seg_id, type: string }
         - { name: set_ref, type: string }
         - { name: set_type, type: string }
-        - { name: e01, type: string }
-        - { name: e02, type: string }
-        - { name: e03, type: string }
-        - { name: e04, type: string }
+        - { name: e01, type: { nullable: string } }
+        - { name: e02, type: { nullable: string } }
+        - { name: e03, type: { nullable: string } }
+        - { name: e04, type: { nullable: string } }
   - type: transform
     name: regroup
     input: interchange

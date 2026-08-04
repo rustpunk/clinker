@@ -6,6 +6,18 @@ use indexmap::IndexMap;
 use crate::envelope::{EnvelopeConfig, EnvelopeEvent};
 use crate::error::FormatError;
 
+/// Ordered structural events surfaced alongside a reader's record stream.
+///
+/// Most readers emit only nested [`EnvelopeEvent`] values. A multi-file
+/// wrapper also emits the physical-file open/close transitions so an empty
+/// file remains observable to execution barriers and document consumers.
+#[derive(Debug, Clone)]
+pub enum SourceLifecycleEvent {
+    PhysicalFileOpen(Arc<str>),
+    Envelope(EnvelopeEvent),
+    PhysicalFileClose(Arc<str>),
+}
+
 /// Streaming record reader. Yields records one at a time.
 ///
 /// `&mut self` on `schema()` because some formats (e.g. CSV) must read
@@ -69,6 +81,19 @@ pub trait FormatReader: Send {
     /// through them keeps emitting boundaries.
     fn take_envelope_events(&mut self) -> Vec<EnvelopeEvent> {
         Vec::new()
+    }
+
+    /// Drain structural events queued while serving the most recent read.
+    ///
+    /// The default lifts the established nested-envelope stream into the
+    /// unified lifecycle carrier. Wrappers must delegate this method; the
+    /// multi-file wrapper additionally brackets every physical file, even
+    /// when it contains no body records.
+    fn take_source_lifecycle_events(&mut self) -> Vec<SourceLifecycleEvent> {
+        self.take_envelope_events()
+            .into_iter()
+            .map(SourceLifecycleEvent::Envelope)
+            .collect()
     }
 
     /// Abandon the file currently being read and advance to the next one,

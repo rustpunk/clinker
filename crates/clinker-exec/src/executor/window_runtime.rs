@@ -1,5 +1,5 @@
 //! Per-window arena+index runtime, scoped over the top-level DAG and
-//! every active composition body.
+//! exact composition-body execution scope.
 //!
 //! A `WindowRuntime` is the bare minimum the windowed Transform arm
 //! needs to look up: an `Arc<Arena>` carrying the projected source-side
@@ -9,19 +9,16 @@
 //! without forcing the dispatcher to rebuild either at retract time.
 //!
 //! `WindowRuntimeRegistry` is the executor-context handle. Slot `i` in
-//! `top` corresponds to `plan.indices_to_build[i]`; body executors
-//! push a fresh per-body vec onto `bodies` at recursion entry and pop
-//! it at exit. `active_stack` records the currently-executing body
-//! chain so `resolve` walks the body's overlay first and falls back to
-//! `top` for `ParentNode` roots that escape the body's mini-DAG.
+//! `top` corresponds to `plan.indices_to_build[i]`; body runtimes are
+//! keyed by the full `(body_scope, window, input_root)` identity. No
+//! numeric slot fallback crosses a composition boundary.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::pipeline::arena::Arena;
 use crate::pipeline::index::SecondaryIndex;
-use clinker_plan::plan::composition_body::CompositionBodyId;
-use clinker_plan::plan::index::PlanIndexRoot;
+use clinker_plan::plan::composition_body::{BodyScopeId, CompositionBodyId, WindowRuntimeKey};
 
 /// Resolved arena + secondary index for one windowed Transform.
 ///
@@ -44,13 +41,7 @@ impl Clone for WindowRuntime {
     }
 }
 
-/// Body-scoped registry of `WindowRuntime`s indexed by
-/// `IndexSpec` slot.
-///
-/// The registry resolves a window's runtime from a `(PlanIndexRoot,
-/// idx)` pair — one structure handles top-level DAG windows
-/// (`Source` / `Node`) and composition-body windows
-/// (`ParentNode` overlays + body-internal `Node`/`Source` slots).
+/// Registry of top-level slot runtimes and exactly keyed body runtimes.
 pub(crate) struct WindowRuntimeRegistry {
     /// Top-level DAG window runtimes; sized to
     /// `plan.indices_to_build.len()` at executor start. Slot `i`
@@ -58,17 +49,10 @@ pub(crate) struct WindowRuntimeRegistry {
     /// until their owner operator (Source materialization, or an
     /// upstream operator's dispatch-arm finalize) populates them.
     pub(crate) top: Vec<Option<WindowRuntime>>,
-    /// One body-scoped vector per active composition body, keyed by
-    /// `CompositionBodyId`. Body executors insert a fresh vec on
-    /// recursion entry, populate it as body operators finalize, and
-    /// remove it on exit. Slot `i` corresponds to
-    /// `bound_body.indices_to_build[i]` — body NodeIndex space, not
-    /// parent-DAG space.
-    pub(crate) bodies: HashMap<CompositionBodyId, Vec<Option<WindowRuntime>>>,
-    /// Stack of currently-active body IDs, top-of-stack last. The
-    /// active body's vec receives node-rooted writes; resolution
-    /// walks this stack from top to bottom for `ParentNode` lookups
-    /// before falling back to `top`.
+    /// Body runtimes keyed by stable scope and node identities.
+    pub(crate) bodies: HashMap<WindowRuntimeKey, WindowRuntime>,
+    /// Stack of currently-active body IDs, top-of-stack last. Other
+    /// executor subsystems use this for body-local buffer namespaces.
     pub(crate) active_stack: Vec<CompositionBodyId>,
 }
 
@@ -85,73 +69,95 @@ impl WindowRuntimeRegistry {
         }
     }
 
-    /// Resolve a runtime by `(root, idx)`. `idx` is the spec's
-    /// position in `plan.indices_to_build` for top-level lookups, or
-    /// the body's spec position for body-internal lookups.
-    ///
-    /// Resolution rules:
-    /// - `Node { .. }`: prefer the active body's vec[idx] if
-    ///   present and populated; otherwise `top[idx]`.
-    /// - `ParentNode { .. }`: walk `active_stack` for any body
-    ///   whose vec[idx] is populated; ultimately fall back to
-    ///   `top[idx]` (the parent-DAG runtime that the
-    ///   ParentNode rooting points at).
-    pub(crate) fn resolve(&self, root: &PlanIndexRoot, idx: usize) -> Option<&WindowRuntime> {
-        match root {
-            PlanIndexRoot::Node { .. } => {
-                if let Some(&body_id) = self.active_stack.last()
-                    && let Some(body_vec) = self.bodies.get(&body_id)
-                    && let Some(slot) = body_vec.get(idx).and_then(|o| o.as_ref())
-                {
-                    return Some(slot);
-                }
-                self.top.get(idx).and_then(|o| o.as_ref())
-            }
-            PlanIndexRoot::ParentNode { .. } => {
-                // Body's overlay first — body-executor entry is what
-                // installed the runtime via `Arc::clone` from the
-                // parent's `top` slot, so a populated body vec[idx]
-                // is the correct hit.
-                for &body_id in self.active_stack.iter().rev() {
-                    if let Some(body_vec) = self.bodies.get(&body_id)
-                        && let Some(slot) = body_vec.get(idx).and_then(|o| o.as_ref())
-                    {
-                        return Some(slot);
-                    }
-                }
-                // Fallback: the parent's runtime list. Reached when a
-                // body is freshly entered and its overlay has not yet
-                // been populated — `idx` is then a body-spec index,
-                // not a top-level index, so this fallback is only
-                // correct when the body's spec table mirrors the
-                // parent's at this slot.
-                self.top.get(idx).and_then(|o| o.as_ref())
-            }
-        }
+    pub(crate) fn resolve_top(&self, idx: usize) -> Option<&WindowRuntime> {
+        self.top.get(idx).and_then(|slot| slot.as_ref())
     }
 
-    /// Write a runtime to `slot_idx` of the active scope. The active
-    /// body's vec wins when `active_stack` is non-empty; otherwise
-    /// the top-level vec is the target.
-    ///
-    /// Returns `true` if the write landed; `false` if the slot was
-    /// out of bounds (a planner-pass invariant violation — the spec
-    /// list size and the registry's vec sizing are kept in lockstep
-    /// at construction time).
-    pub(crate) fn install(&mut self, slot_idx: usize, runtime: WindowRuntime) -> bool {
-        if let Some(&body_id) = self.active_stack.last()
-            && let Some(body_vec) = self.bodies.get_mut(&body_id)
-        {
-            if let Some(slot) = body_vec.get_mut(slot_idx) {
-                *slot = Some(runtime);
-                return true;
-            }
-            return false;
-        }
+    pub(crate) fn resolve_body(&self, key: &WindowRuntimeKey) -> Option<&WindowRuntime> {
+        self.bodies.get(key)
+    }
+
+    pub(crate) fn install_top(&mut self, slot_idx: usize, runtime: WindowRuntime) -> bool {
         if let Some(slot) = self.top.get_mut(slot_idx) {
             *slot = Some(runtime);
             return true;
         }
         false
+    }
+
+    pub(crate) fn install_body(&mut self, key: WindowRuntimeKey, runtime: WindowRuntime) {
+        self.bodies.insert(key, runtime);
+    }
+
+    pub(crate) fn remove_body_scope(&mut self, scope: BodyScopeId) {
+        self.bodies.retain(|key, _| key.body_scope != scope);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clinker_plan::plan::index::{IndexSpec, PlanIndexRoot};
+    use clinker_plan::plan::{BodyScopeId, EntityRef, PlanNodeId, WindowRuntimeKey};
+    use clinker_record::Schema;
+    use petgraph::graph::NodeIndex;
+
+    fn empty_runtime() -> WindowRuntime {
+        let arena = Arc::new(Arena::empty(Arc::new(Schema::new(Vec::new()))));
+        let index = Arc::new(SecondaryIndex {
+            groups: HashMap::new(),
+        });
+        WindowRuntime { arena, index }
+    }
+
+    #[test]
+    fn body_lookup_does_not_fall_back_to_same_numbered_top_slot() {
+        let schema = Arc::new(Schema::new(Vec::new()));
+        let spec = IndexSpec {
+            root: PlanIndexRoot::Node {
+                upstream: NodeIndex::new(0),
+                anchor_schema: schema,
+            },
+            group_by: Vec::new(),
+            sort_by: Vec::new(),
+            arena_fields: Vec::new(),
+            already_sorted: false,
+            requires_buffer_recompute: false,
+        };
+        let mut registry = WindowRuntimeRegistry::new(&[spec]);
+        registry.top[0] = Some(empty_runtime());
+        registry.active_stack.push(CompositionBodyId(7));
+        let key = WindowRuntimeKey {
+            body_scope: BodyScopeId(7),
+            window: PlanNodeId::new(12),
+            input_root: PlanNodeId::new(4),
+        };
+
+        assert!(
+            registry.resolve_body(&key).is_none(),
+            "a missing body runtime must not alias a populated top-level slot"
+        );
+        assert!(registry.resolve_top(0).is_some());
+    }
+
+    #[test]
+    fn removing_one_body_scope_preserves_sibling_runtime() {
+        let mut registry = WindowRuntimeRegistry::new(&[]);
+        let left = WindowRuntimeKey {
+            body_scope: BodyScopeId(7),
+            window: PlanNodeId::new(12),
+            input_root: PlanNodeId::new(4),
+        };
+        let right = WindowRuntimeKey {
+            body_scope: BodyScopeId(8),
+            ..left
+        };
+        registry.install_body(left, empty_runtime());
+        registry.install_body(right, empty_runtime());
+
+        registry.remove_body_scope(left.body_scope);
+
+        assert!(registry.resolve_body(&left).is_none());
+        assert!(registry.resolve_body(&right).is_some());
     }
 }

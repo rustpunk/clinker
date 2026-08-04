@@ -1,5 +1,5 @@
 use crate::value::Value;
-use chrono::{NaiveDate, NaiveDateTime};
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 use rust_decimal::{Decimal, RoundingStrategy};
 use std::fmt;
 use std::str::FromStr;
@@ -246,6 +246,11 @@ pub fn coerce_to_date_lenient(value: &Value, formats: &[&str]) -> Option<Value> 
 }
 
 /// Strict datetime coercion with configurable format chain.
+///
+/// With the default chain, RFC 3339 timestamps are accepted and normalized to
+/// UTC before entering Clinker's timezone-free [`Value::DateTime`]
+/// representation. An explicit format chain remains exclusive and does not
+/// fall back to RFC 3339 parsing.
 /// Date values promoted to DateTime at midnight.
 pub fn coerce_to_datetime(value: &Value, formats: &[&str]) -> Result<Value, CoercionError> {
     match value {
@@ -260,6 +265,20 @@ pub fn coerce_to_datetime(value: &Value, formats: &[&str]) -> Result<Value, Coer
                 })
         }
         Value::String(s) => {
+            if formats.is_empty()
+                && (s.chars().next().is_some_and(char::is_whitespace)
+                    || s.chars().next_back().is_some_and(char::is_whitespace))
+            {
+                return Err(CoercionError::ParseFailure {
+                    input: s.to_string(),
+                    target: "DateTime",
+                });
+            }
+            if formats.is_empty()
+                && let Ok(dt) = DateTime::parse_from_rfc3339(s)
+            {
+                return Ok(Value::DateTime(dt.naive_utc()));
+            }
             let chain = if formats.is_empty() {
                 DEFAULT_DATETIME_FORMATS
             } else {
@@ -355,6 +374,50 @@ mod tests {
         // US datetime format
         let v = Value::String("01/15/2024 10:30:00".into());
         assert_eq!(coerce_to_datetime(&v, &[]).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_coerce_rfc3339_datetime_is_exact_and_strict() {
+        let d = NaiveDate::from_ymd_opt(2026, 1, 31).unwrap();
+        let expected = Value::DateTime(d.and_hms_nano_opt(8, 27, 0, 123_456_789).unwrap());
+
+        assert_eq!(
+            coerce_to_datetime(&Value::String("2026-01-31T08:27:00.123456789Z".into()), &[],)
+                .unwrap(),
+            expected,
+        );
+
+        assert_eq!(
+            coerce_to_datetime(
+                &Value::String("2026-01-31T10:57:00.123456789+02:30".into()),
+                &[],
+            )
+            .unwrap(),
+            expected,
+        );
+
+        for malformed in [
+            " 2026-01-31T08:27:00Z",
+            "2026-01-31T08:27:00Z ",
+            "2026-02-30T08:27:00Z",
+            "2026-01-31T08:27:00junkZ",
+            "10000-01-01T00:00:00Z",
+            "2026-01-31T08:27:00+24:00",
+        ] {
+            assert!(
+                coerce_to_datetime(&Value::String(malformed.into()), &[]).is_err(),
+                "default datetime coercion admitted {malformed:?}",
+            );
+        }
+
+        assert!(
+            coerce_to_datetime(
+                &Value::String("2026-01-31T08:27:00Z".into()),
+                &["%Y-%m-%dT%H:%M:%S"],
+            )
+            .is_err(),
+            "an explicit format must not fall back to RFC 3339",
+        );
     }
 
     #[test]

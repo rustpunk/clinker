@@ -979,7 +979,7 @@ nodes:
       path: drivers.csv
       schema:
         - { name: did, type: int }
-        - { name: k1, type: int }
+        - { name: k1, type: { nullable: int } }
   - type: source
     name: builds
     config:
@@ -996,7 +996,7 @@ nodes:
       drivers: drivers
       builds: builds
     config:
-      where: "drivers.k1 >= builds.lo and drivers.k1 < builds.hi"
+      where: "(drivers.k1 >= builds.lo and drivers.k1 < builds.hi) ?? false"
       match: all
       on_miss: null_fields
       cxl: |

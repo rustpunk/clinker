@@ -14,6 +14,7 @@
 use super::detect::RetractScope;
 use crate::executor::dispatch::{ExecutorContext, commit_correlation_buffers};
 use clinker_plan::error::PipelineError;
+use clinker_plan::plan::execution::ExecutionPlanDag;
 
 /// Drain the converged correlation buffer to writers and DLQ.
 ///
@@ -25,7 +26,8 @@ use clinker_plan::error::PipelineError;
 /// runs, every deferred-Output queue holds only the converged set.
 pub(crate) fn flush_buffered(
     ctx: &mut ExecutorContext<'_>,
+    current_dag: &ExecutionPlanDag,
     _scope: &RetractScope,
 ) -> Result<(), PipelineError> {
-    commit_correlation_buffers(ctx)
+    commit_correlation_buffers(ctx, current_dag)
 }

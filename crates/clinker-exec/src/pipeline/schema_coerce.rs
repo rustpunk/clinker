@@ -26,30 +26,139 @@
 //! declared with a concrete type (`Type::Int`, `Type::Float`, `Type::Bool`,
 //! `Type::Date`, `Type::DateTime`, `Type::Numeric`) are coerced here,
 //! honoring each column's `format:` strftime string for `date` / `date_time`;
-//! `Type::String` / `Type::Any` skip coercion, and a native `Map` passes
-//! through untouched. A `multiple:` column arrives array-valued and its
-//! declared type describes each element, so coercion recurses into the array
-//! one element at a time. The `to_*` / `try_*` CXL builtins remain available
-//! for derived fields computed during the pipeline.
+//! Every declared type has an explicit admission policy: coercible scalar
+//! types use the canonical coercion helpers, `String` / `Null` / `Array` /
+//! `Map` validate their exact native variants, and `Any` explicitly accepts
+//! every [`Value`] variant. A `multiple:` column arrives array-valued and its
+//! declared type describes each element, so the same scalar admission function
+//! is applied one element at a time. The `to_*` / `try_*` CXL builtins remain
+//! available for derived fields computed during the pipeline.
 //!
 //! Positional formats (fixed-width / multi-record) parse their bytes into
 //! final typed values in the reader itself (`fixed_width::field::coerce_scalar`,
-//! also format-aware), so those readers are wrapped with coercion disabled
+//! also format-aware), so those readers are wrapped with parsing disabled
 //! (`pretyped`) — the value is already typed, and a second parse here would be
-//! redundant. Those readers keep every other reprojection service (the
+//! redundant. The wrapper still verifies the reader's typed proof, including
+//! native variants, nullability, decimal constraints, and finite numerics.
+//! Those readers keep every other reprojection service (the
 //! `OnUnmapped` policy, the `$widened` sidecar, the `long_unique` storage hint).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use clinker_format::error::FormatError;
+use clinker_format::error::{DeclaredTypeFailure, FormatError};
 use clinker_format::traits::FormatReader;
 use clinker_record::{FieldMetadata, Record, Schema, SchemaBuilder, Value, coercion};
 use cxl::typecheck::Type;
 use indexmap::IndexMap;
 
-use clinker_format::Column;
+use clinker_format::{Column, RECORD_TYPE_COLUMN, RecordType};
 use clinker_plan::config::pipeline_node::{OnUnmapped, WIDENED_SIDECAR_COLUMN};
+
+/// Exhaustive admission policy for one output-schema slot.
+///
+/// This replaces the former `Option<Type>` encoding, where `None` meant both
+/// intentionally unconstrained (`Any`) and accidentally unchecked (`String`,
+/// `Null`, pretyped readers, and the engine-owned widened sidecar).
+#[derive(Debug, Clone)]
+enum DeclaredTypeTarget {
+    /// Parse or convert a decoded scalar through the canonical coercion path.
+    Coerce(Type),
+    /// Admit only the matching already-typed [`Value`] variant.
+    ValidateExact(Type),
+    /// Authored `Any`: intentionally admit every supported [`Value`] variant.
+    AcceptAny,
+    /// A positional reader already parsed the authored type from bytes. Keep
+    /// the type at the trust boundary so the emitted native value is still
+    /// verified rather than accepted on the strength of an untyped marker.
+    ReaderProven { declared: Type },
+    /// Engine-owned sidecar populated by reprojection rather than source data.
+    EngineManaged,
+}
+
+/// One active multi-record column's reader proof. The output row still uses
+/// the planner's widened superset schema, but admission must use the local
+/// declaration that parsed this record type's physical bytes.
+#[derive(Debug, Clone)]
+struct ReaderColumnProof {
+    target: DeclaredTypeTarget,
+    declared_type: Type,
+    nullable: bool,
+    precision: Option<u8>,
+    scale: Option<u8>,
+}
+
+/// Record-type id to its authored local column proofs. The multi-record reader
+/// stamps that id into the reserved `record_type` slot on every emitted row;
+/// retaining this map keeps the identity and typed declaration together until
+/// the coercion wrapper verifies the reader's output.
+#[derive(Debug, Clone)]
+struct MultiRecordProofs {
+    by_record_type: HashMap<Box<str>, HashMap<Box<str>, ReaderColumnProof>>,
+}
+
+impl MultiRecordProofs {
+    fn new(record_types: &[RecordType]) -> Result<Self, FormatError> {
+        let mut by_record_type = HashMap::with_capacity(record_types.len());
+        for record_type in record_types {
+            let mut columns = HashMap::with_capacity(record_type.columns.len());
+            for column in &record_type.columns {
+                let proof = ReaderColumnProof {
+                    target: DeclaredTypeTarget::ReaderProven {
+                        declared: column.ty.clone(),
+                    },
+                    declared_type: column.ty.clone(),
+                    nullable: column.ty.is_nullable(),
+                    precision: column.precision,
+                    scale: column.scale,
+                };
+                if columns.insert(column.name.clone().into(), proof).is_some() {
+                    return Err(FormatError::SchemaInference(format!(
+                        "multi-record type '{}' declares column '{}' more than once",
+                        record_type.id, column.name
+                    )));
+                }
+            }
+            if by_record_type
+                .insert(record_type.id.clone().into(), columns)
+                .is_some()
+            {
+                return Err(FormatError::SchemaInference(format!(
+                    "multi-record type id '{}' is declared more than once",
+                    record_type.id
+                )));
+            }
+        }
+        Ok(Self { by_record_type })
+    }
+
+    fn active_columns<'a>(
+        &'a self,
+        record: &Record,
+    ) -> Result<&'a HashMap<Box<str>, ReaderColumnProof>, FormatError> {
+        let record_type = match record.get(RECORD_TYPE_COLUMN) {
+            Some(Value::String(record_type)) => record_type.as_str(),
+            Some(value) => {
+                return Err(FormatError::SchemaInference(format!(
+                    "multi-record reader emitted native {} in reserved '{}' column",
+                    native_value_name(value),
+                    RECORD_TYPE_COLUMN
+                )));
+            }
+            None => {
+                return Err(FormatError::SchemaInference(format!(
+                    "multi-record reader omitted reserved '{}' column",
+                    RECORD_TYPE_COLUMN
+                )));
+            }
+        };
+        self.by_record_type.get(record_type).ok_or_else(|| {
+            FormatError::SchemaInference(format!(
+                "multi-record reader emitted unknown record type id '{record_type}'"
+            ))
+        })
+    }
+}
 
 /// Wraps a `FormatReader` and reprojects every record onto the
 /// user-declared `Arc<Schema>` (plus the `$widened` engine-stamped
@@ -76,20 +185,34 @@ pub struct CoercingReader {
     /// Output schema — declared columns (keyed by exposed name) followed
     /// (under `AutoWiden`) by the `$widened` engine-stamped sidecar column.
     output_schema: Arc<Schema>,
-    /// Per-output-column coercion target (`None` for pass-through).
-    /// Indexed by position in `output_schema`. The `$widened` sidecar
-    /// slot, when present, gets `None` (no coercion — payload is a
-    /// `Value::Map`). Every slot is `None` when the inner reader is
-    /// `pretyped` (positional formats parse their own final typed values).
-    targets: Vec<Option<Type>>,
+    /// Per-output-column admission target, indexed by position in
+    /// `output_schema`. Every slot has one explicit disposition, including
+    /// authored `Any`, reader-proven positional values, and the engine-owned
+    /// `$widened` sidecar.
+    targets: Vec<DeclaredTypeTarget>,
+    /// Active-record proof table for a discriminator-driven source. `None` for
+    /// every single-schema reader. The row's stamped `record_type` selects one
+    /// local table before any value is admitted against the widened superset.
+    multi_record_proofs: Option<MultiRecordProofs>,
+    /// Full authored type retained for a structured failure diagnostic.
+    declared_types: Vec<Type>,
+    /// Whether native null is admitted by the authored declaration.
+    nullable: Vec<bool>,
+    /// Whether authored empty text maps to null. This is narrower than
+    /// `nullable`: `nullable(string)`, `nullable(any)`, and `null` keep empty
+    /// text distinct from native null.
+    empty_is_null: Vec<bool>,
     /// Per-output-column `format:` strftime string for `date` / `date_time`
     /// coercion, indexed alongside `targets`. `None` uses the default format
     /// chain. The `$widened` sidecar slot is always `None`.
     formats: Vec<Option<String>>,
     /// Per-output-column decimal `scale`, indexed alongside `targets`. Used
-    /// only by the `Type::Decimal` coercion arm (rounds to this scale); `None`
-    /// for non-decimal columns and the `$widened` sidecar slot.
+    /// only by the `Type::Decimal` coercion arm; values that would need
+    /// rounding to reach the scale are rejected. `None` for non-decimal
+    /// columns and the `$widened` sidecar slot.
     scales: Vec<Option<u8>>,
+    /// Per-output-column decimal precision, indexed alongside `scales`.
+    precisions: Vec<Option<u8>>,
     /// Per-output-column `long_unique` storage hint, indexed alongside
     /// `targets`. When set for a column, its string values are stored in
     /// the header-free `Box`-backed [`FieldStr`](clinker_record::FieldStr)
@@ -116,33 +239,79 @@ impl CoercingReader {
     ///
     /// `pretyped` is set for positional readers (fixed-width / multi-record)
     /// whose bytes are already parsed into final typed values by the reader
-    /// itself; coercion is then disabled (every target `None`) so no value is
-    /// parsed twice. It is clear for untyped/native readers (CSV / JSON / XML /
+    /// itself; parsing is then disabled while each emitted value is validated
+    /// against the retained proof, so no value is parsed twice. It is clear
+    /// for untyped/native readers (CSV / JSON / XML /
     /// REST), where this is the sole coercion pass and each column's `format:`
     /// is honored for `date` / `date_time`.
     pub fn new(
-        mut inner: Box<dyn FormatReader>,
+        inner: Box<dyn FormatReader>,
         schema_decl: &[Column],
         policy: OnUnmapped,
         source_name: &str,
         pretyped: bool,
     ) -> Result<Self, FormatError> {
+        Self::new_inner(inner, schema_decl, policy, source_name, pretyped, None)
+    }
+
+    /// Build a coercing reader for a discriminator-driven positional source.
+    /// `schema_decl` remains the widened output shape, while `record_types`
+    /// retains the local declaration that proves each active row.
+    pub(crate) fn new_with_record_types(
+        inner: Box<dyn FormatReader>,
+        schema_decl: &[Column],
+        record_types: &[RecordType],
+        policy: OnUnmapped,
+        source_name: &str,
+    ) -> Result<Self, FormatError> {
+        Self::new_inner(
+            inner,
+            schema_decl,
+            policy,
+            source_name,
+            true,
+            Some(MultiRecordProofs::new(record_types)?),
+        )
+    }
+
+    fn new_inner(
+        mut inner: Box<dyn FormatReader>,
+        schema_decl: &[Column],
+        policy: OnUnmapped,
+        source_name: &str,
+        pretyped: bool,
+        multi_record_proofs: Option<MultiRecordProofs>,
+    ) -> Result<Self, FormatError> {
         // Trigger schema discovery on the inner reader so the first
         // record isn't gated behind an on-demand schema call.
         inner.schema()?;
 
+        // Positional readers construct their output schema from the effective
+        // declaration and therefore emit the exposed logical names. Decoded
+        // map-like readers emit physical source keys and need reprojection.
+        let reader_emits_logical_names = pretyped;
+
         // A column "aliases" only when its `source_name` names a DIFFERENT
         // physical field; `source_name == name` is a no-op treated as no alias.
-        let has_alias = schema_decl
-            .iter()
-            .any(|c| c.source_name.as_deref().is_some_and(|s| s != c.name));
+        // Positional readers already applied that alias while constructing
+        // their schema, so only decoded map-like readers need physical lookup.
+        let has_alias = !reader_emits_logical_names
+            && schema_decl
+                .iter()
+                .any(|c| c.source_name.as_deref().is_some_and(|s| s != c.name));
 
-        // The declared-key set uses each column's PHYSICAL name (the alias when
-        // set, else the exposed name) so an aliased source field counts as
-        // declared rather than widened.
+        // Match the names the reader actually emits. A positional reader has
+        // already relabeled each field to its logical declaration; every other
+        // reader still exposes the physical source key at this boundary.
         let declared_names: HashSet<Box<str>> = schema_decl
             .iter()
-            .map(|c| c.physical_name().into())
+            .map(|c| {
+                if reader_emits_logical_names {
+                    c.name.as_str().into()
+                } else {
+                    c.physical_name().into()
+                }
+            })
             .collect();
 
         // Per-column physical name is only materialized when some column
@@ -155,32 +324,38 @@ impl CoercingReader {
         });
 
         // Exposed-name → physical-name for real aliases, to detect an input
-        // field colliding with an alias's exposed name. Empty when no aliases.
+        // field colliding with an alias's exposed name. Positional readers emit
+        // only the post-alias logical schema, so their logical field is the
+        // declaration itself rather than evidence of a collision.
         let aliased_exposed: HashMap<Box<str>, Box<str>> = schema_decl
             .iter()
             .filter_map(|c| {
+                if reader_emits_logical_names {
+                    return None;
+                }
                 let physical = c.source_name.as_deref()?;
                 (physical != c.name).then(|| (c.name.as_str().into(), physical.into()))
             })
             .collect();
-        let mut targets: Vec<Option<Type>> = schema_decl
+        let mut targets: Vec<DeclaredTypeTarget> = schema_decl
             .iter()
-            .map(|c| {
-                // A pretyped (positional) reader already produced the final
-                // typed value; a second coercion here would be a redundant
-                // re-parse, so leave every target as pass-through.
-                if pretyped {
-                    return None;
-                }
-                match unwrap_nullable(&c.ty) {
-                    Type::String | Type::Any | Type::Null => None,
-                    other => Some(other.clone()),
-                }
-            })
+            .map(|column| declared_type_target(&column.ty, pretyped))
             .collect();
         let mut formats: Vec<Option<String>> =
             schema_decl.iter().map(|c| c.format.clone()).collect();
         let mut scales: Vec<Option<u8>> = schema_decl.iter().map(|c| c.scale).collect();
+        let mut precisions: Vec<Option<u8>> = schema_decl.iter().map(|c| c.precision).collect();
+        let mut declared_types: Vec<Type> = schema_decl.iter().map(|c| c.ty.clone()).collect();
+        let mut nullable: Vec<bool> = schema_decl.iter().map(|c| c.ty.is_nullable()).collect();
+        let mut empty_is_null: Vec<bool> = schema_decl
+            .iter()
+            .map(|column| match &column.ty {
+                Type::Nullable(inner) => {
+                    !matches!(unwrap_nullable(inner), Type::String | Type::Any)
+                }
+                _ => false,
+            })
+            .collect();
         let mut long_unique: Vec<bool> = schema_decl.iter().map(|c| c.is_long_unique()).collect();
         let mut multiple: Vec<bool> = schema_decl.iter().map(|c| c.is_multiple()).collect();
 
@@ -196,9 +371,13 @@ impl CoercingReader {
             let idx = schema_decl.len();
             builder =
                 builder.with_field_meta(WIDENED_SIDECAR_COLUMN, FieldMetadata::widened_sidecar());
-            targets.push(None);
+            targets.push(DeclaredTypeTarget::EngineManaged);
             formats.push(None);
             scales.push(None);
+            precisions.push(None);
+            declared_types.push(Type::Any);
+            nullable.push(true);
+            empty_is_null.push(false);
             long_unique.push(false);
             multiple.push(false);
             Some(idx)
@@ -214,8 +393,13 @@ impl CoercingReader {
             aliased_exposed,
             output_schema,
             targets,
+            multi_record_proofs,
+            declared_types,
+            nullable,
+            empty_is_null,
             formats,
             scales,
+            precisions,
             long_unique,
             multiple,
             widened_idx,
@@ -262,6 +446,10 @@ impl CoercingReader {
         let cols = self.output_schema.columns();
         let col_count = cols.len();
         let mut values: Vec<Value> = Vec::with_capacity(col_count);
+        let active_reader_proofs = match &self.multi_record_proofs {
+            Some(proofs) => Some(proofs.active_columns(record)?),
+            None => None,
+        };
         for i in 0..col_count {
             // The widened slot is filled from the sidecar map (if any
             // non-declared keys were observed); otherwise Null.
@@ -281,28 +469,77 @@ impl CoercingReader {
                 None => cols[i].as_ref(),
             };
             let raw = record.get(physical).cloned().unwrap_or(Value::Null);
-            let coerced = match &self.targets[i] {
-                // A `multiple:` column's declared type describes each ELEMENT,
-                // so coercion applies element-wise; the array itself has no
-                // scalar type to coerce to and would otherwise pass through as
-                // a vector of raw strings. A one-off scalar under the same
-                // declaration still coerces, so a reader that produced a bare
-                // value is not left uncoerced.
-                Some(target) if self.multiple[i] => match raw {
-                    Value::Array(items) => Value::Array(
-                        items
-                            .into_iter()
-                            .map(|item| {
-                                coerce_value(
-                                    &item,
-                                    target,
-                                    self.formats[i].as_deref(),
-                                    self.scales[i],
-                                )
-                                .unwrap_or(item)
-                            })
-                            .collect(),
+            let local_proof = active_reader_proofs.and_then(|proofs| proofs.get(cols[i].as_ref()));
+            if active_reader_proofs.is_some()
+                && cols[i].as_ref() != RECORD_TYPE_COLUMN
+                && local_proof.is_none()
+            {
+                if matches!(raw, Value::Null) {
+                    // This column belongs to a different record type. Sparse
+                    // Null is admitted only for that inactive state; an active
+                    // column selects a local proof below and must satisfy its
+                    // own nullability.
+                    values.push(Value::Null);
+                    continue;
+                }
+                let native_type = native_value_name(&raw);
+                return Err(FormatError::DeclaredType(Box::new(DeclaredTypeFailure {
+                    source: self.source_name.to_string(),
+                    field: cols[i].to_string(),
+                    column: i + 1,
+                    declared_type: "inactive multi-record column".to_string(),
+                    original_value: raw,
+                    original_record: record.clone(),
+                    message: format!(
+                        "reader emitted a non-null {} for a column inactive on this record type",
+                        native_type
                     ),
+                })));
+            }
+            let (target, format, precision, scale, nullable, empty_is_null, declared_type) =
+                match local_proof {
+                    Some(proof) => (
+                        &proof.target,
+                        None,
+                        proof.precision,
+                        proof.scale,
+                        proof.nullable,
+                        false,
+                        &proof.declared_type,
+                    ),
+                    None => (
+                        &self.targets[i],
+                        self.formats[i].as_deref(),
+                        self.precisions[i],
+                        self.scales[i],
+                        self.nullable[i],
+                        self.empty_is_null[i],
+                        &self.declared_types[i],
+                    ),
+                };
+            let conversion = if self.multiple[i] {
+                // A `multiple:` column's declared type describes each ELEMENT,
+                // so the same scalar admission rule applies element-wise. A
+                // one-off scalar under the same declaration still follows that
+                // rule and is normalized to a one-element array.
+                match &raw {
+                    Value::Array(items) => items
+                        .iter()
+                        .enumerate()
+                        .map(|(index, item)| {
+                            validate_declared_value(
+                                item,
+                                target,
+                                format,
+                                precision,
+                                scale,
+                                nullable,
+                                empty_is_null,
+                            )
+                            .map_err(|message| format!("element {}: {message}", index + 1))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(Value::Array),
                     // Defensive. E361 owns the invariant that a declared-
                     // multiple column comes from a format whose reader
                     // produces an array, so this arm is unreachable for a
@@ -314,23 +551,55 @@ impl CoercingReader {
                     // cannot put a scalar in a slot the planner typed as an
                     // array and have every downstream array expression read it
                     // as the wrong shape.
-                    Value::Null => Value::Null,
-                    scalar => Value::Array(vec![
-                        coerce_value(&scalar, target, self.formats[i].as_deref(), self.scales[i])
-                            .unwrap_or(scalar),
-                    ]),
-                },
-                Some(target) => {
-                    coerce_value(&raw, target, self.formats[i].as_deref(), self.scales[i])
-                        .unwrap_or(raw)
+                    Value::Null => validate_declared_value(
+                        &raw,
+                        target,
+                        format,
+                        precision,
+                        scale,
+                        nullable,
+                        empty_is_null,
+                    ),
+                    scalar => validate_declared_value(
+                        scalar,
+                        target,
+                        format,
+                        precision,
+                        scale,
+                        nullable,
+                        empty_is_null,
+                    )
+                    .map(|value| Value::Array(vec![value])),
                 }
-                None => raw,
+            } else {
+                validate_declared_value(
+                    &raw,
+                    target,
+                    format,
+                    precision,
+                    scale,
+                    nullable,
+                    empty_is_null,
+                )
+            };
+            let coerced = match conversion {
+                Ok(value) => value,
+                Err(message) => {
+                    return Err(FormatError::DeclaredType(Box::new(DeclaredTypeFailure {
+                        source: self.source_name.to_string(),
+                        field: cols[i].to_string(),
+                        column: i + 1,
+                        declared_type: declared_type.to_string(),
+                        original_value: raw,
+                        original_record: record.clone(),
+                        message,
+                    })));
+                }
             };
             // Honor the column's `long_unique` storage hint: rebuild a string
             // value in the header-free `Box`-backed arm. Coercion runs first, so
-            // a column declared `string` (coercion target `None`) is the usual
-            // case; a value that failed numeric coercion and fell back to its
-            // string form is also re-homed. Non-string values are untouched.
+            // a column declared `string` (exact native validation) is the usual
+            // case. Non-string values are untouched.
             let stored = if self.long_unique[i] {
                 match coerced {
                     Value::String(s) => Value::string_unique(s.as_str()),
@@ -380,6 +649,10 @@ impl FormatReader for CoercingReader {
         self.inner.take_envelope_events()
     }
 
+    fn take_source_lifecycle_events(&mut self) -> Vec<clinker_format::SourceLifecycleEvent> {
+        self.inner.take_source_lifecycle_events()
+    }
+
     fn advance_to_next_file(&mut self) -> Result<bool, FormatError> {
         // File advancement is the inner multi-file reader's concern; coercion
         // is per-record and stateless across files, so forward verbatim.
@@ -395,38 +668,261 @@ fn unwrap_nullable(ty: &Type) -> &Type {
     }
 }
 
-/// Coerce a value to the target type. Returns None if coercion fails
-/// (value passes through unchanged — lenient behavior at read time).
+/// Classify one authored column into an explicit admission target.
+fn declared_type_target(ty: &Type, pretyped: bool) -> DeclaredTypeTarget {
+    if pretyped {
+        return DeclaredTypeTarget::ReaderProven {
+            declared: ty.clone(),
+        };
+    }
+    match ty {
+        Type::Nullable(inner) => declared_type_target(inner, false),
+        Type::String | Type::Null | Type::Array | Type::Map => {
+            DeclaredTypeTarget::ValidateExact(ty.clone())
+        }
+        Type::Any => DeclaredTypeTarget::AcceptAny,
+        Type::Bool
+        | Type::Int
+        | Type::Float
+        | Type::Decimal
+        | Type::Date
+        | Type::DateTime
+        | Type::Numeric => DeclaredTypeTarget::Coerce(ty.clone()),
+    }
+}
+
+/// Admit a decoded scalar according to its explicit declared-type target.
+///
+/// This function is shared by ordinary scalar columns and every element of a
+/// `multiple:` column. It never mutates the original [`Value`], so the caller
+/// can retain the complete source value and record when admission fails.
+fn validate_declared_value(
+    value: &Value,
+    target: &DeclaredTypeTarget,
+    format: Option<&str>,
+    precision: Option<u8>,
+    scale: Option<u8>,
+    nullable: bool,
+    empty_is_null: bool,
+) -> Result<Value, String> {
+    if empty_is_null && matches!(value, Value::String(text) if text.is_empty()) {
+        return Ok(Value::Null);
+    }
+
+    if matches!(value, Value::Null) {
+        return match target {
+            DeclaredTypeTarget::ValidateExact(Type::Null)
+            | DeclaredTypeTarget::ReaderProven {
+                declared: Type::Null | Type::Any,
+            }
+            | DeclaredTypeTarget::AcceptAny
+            | DeclaredTypeTarget::EngineManaged => Ok(Value::Null),
+            _ if nullable => Ok(Value::Null),
+            DeclaredTypeTarget::Coerce(declared)
+            | DeclaredTypeTarget::ValidateExact(declared)
+            | DeclaredTypeTarget::ReaderProven { declared, .. } => {
+                Err(format!("null is not a valid {declared}"))
+            }
+        };
+    }
+
+    match target {
+        DeclaredTypeTarget::Coerce(declared) => {
+            coerce_value(value, declared, format, precision, scale)
+        }
+        DeclaredTypeTarget::ValidateExact(declared) => {
+            if native_value_matches(value, declared) {
+                Ok(value.clone())
+            } else {
+                Err(format!(
+                    "native {} does not match declared {declared}",
+                    native_value_name(value)
+                ))
+            }
+        }
+        DeclaredTypeTarget::ReaderProven { declared, .. } => {
+            validate_reader_proof(value, declared, precision, scale)
+        }
+        DeclaredTypeTarget::AcceptAny | DeclaredTypeTarget::EngineManaged => Ok(value.clone()),
+    }
+}
+
+/// Validate the value emitted by a positional reader against the facts that
+/// reader claims to have established. This is deliberately validation-only:
+/// a reader bug cannot be hidden by coercing its output a second time.
+fn validate_reader_proof(
+    value: &Value,
+    declared: &Type,
+    precision: Option<u8>,
+    scale: Option<u8>,
+) -> Result<Value, String> {
+    let declared = unwrap_nullable(declared);
+    if !native_value_matches(value, declared) {
+        return Err(format!(
+            "reader emitted native {} for declared {declared}",
+            native_value_name(value)
+        ));
+    }
+    match value {
+        Value::Float(number) if !number.is_finite() => {
+            Err("non-finite float is outside the declared type".into())
+        }
+        Value::Decimal(decimal) => validate_decimal_constraints(*decimal, precision, scale),
+        _ => Ok(value.clone()),
+    }
+}
+
+fn validate_decimal_constraints(
+    decimal: rust_decimal::Decimal,
+    precision: Option<u8>,
+    scale: Option<u8>,
+) -> Result<Value, String> {
+    let mut exact = decimal;
+    if let Some(scale) = scale {
+        let rounded = coercion::round_decimal_to_scale(decimal, Some(scale));
+        if rounded != decimal {
+            return Err(format!(
+                "decimal requires rounding to declared scale {scale}"
+            ));
+        }
+        exact.rescale(u32::from(scale));
+    }
+    if let Some(max_digits) = precision {
+        let digits = exact.mantissa().unsigned_abs().to_string().len();
+        if digits > usize::from(max_digits) {
+            return Err(format!(
+                "decimal uses {digits} digits, exceeding declared precision {max_digits}"
+            ));
+        }
+    }
+    Ok(Value::Decimal(exact))
+}
+
+fn native_value_matches(value: &Value, declared: &Type) -> bool {
+    match declared {
+        Type::Null => matches!(value, Value::Null),
+        Type::Bool => matches!(value, Value::Bool(_)),
+        Type::Int => matches!(value, Value::Integer(_)),
+        Type::Float => matches!(value, Value::Float(_)),
+        Type::Decimal => matches!(value, Value::Decimal(_)),
+        Type::String => matches!(value, Value::String(_)),
+        Type::Date => matches!(value, Value::Date(_)),
+        Type::DateTime => matches!(value, Value::DateTime(_)),
+        Type::Array => matches!(value, Value::Array(_)),
+        Type::Map => matches!(value, Value::Map(_)),
+        Type::Numeric => matches!(value, Value::Integer(_) | Value::Float(_)),
+        Type::Any => true,
+        Type::Nullable(inner) => matches!(value, Value::Null) || native_value_matches(value, inner),
+    }
+}
+
+fn native_value_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Integer(_) => "int",
+        Value::Float(_) => "float",
+        Value::Decimal(_) => "decimal",
+        Value::String(_) => "string",
+        Value::Date(_) => "date",
+        Value::DateTime(_) => "date_time",
+        Value::Array(_) => "array",
+        Value::Map(_) => "map",
+    }
+}
+
+/// Coerce a value transactionally to its declared type.
 ///
 /// `format` is the column's `format:` strftime string, honored for `date` /
 /// `date_time`; `None` falls back to the coercion module's default format
-/// chain. Native `Map` / `Array` (and any other type) return `None`, so a
-/// JSON/XML composite passes through untouched.
+/// chain. Failure is returned to the caller with no partially converted row.
 fn coerce_value(
     value: &Value,
     target: &Type,
     format: Option<&str>,
+    precision: Option<u8>,
     scale: Option<u8>,
-) -> Option<Value> {
+) -> Result<Value, String> {
+    if matches!(value, Value::String(s) if s.is_empty()) {
+        return Err(format!("empty string is not a valid {target}"));
+    }
     // `Option<&str>::into_iter` yields the one format when present, else
     // nothing — an empty chain selects the default formats.
     let chain: Vec<&str> = format.into_iter().collect();
-    match target {
-        Type::Int => coercion::coerce_to_int_lenient(value),
-        Type::Float => coercion::coerce_to_float_lenient(value),
-        // Exact base-10 parse into `Value::Decimal`, rounded to the column
-        // scale. A native JSON number already parsed to `f64` is the one lossy
-        // input; a CSV string parses exactly.
-        Type::Decimal => coercion::coerce_to_decimal_lenient(value, scale),
-        Type::Bool => coercion::coerce_to_bool_lenient(value),
-        Type::Date => coercion::coerce_to_date_lenient(value, &chain),
-        Type::DateTime => coercion::coerce_to_datetime_lenient(value, &chain),
-        Type::Numeric => {
-            // Try int first, then float
-            coercion::coerce_to_int_lenient(value)
-                .or_else(|| coercion::coerce_to_float_lenient(value))
+    let converted = match target {
+        Type::Int => {
+            if let Value::Float(number) = value
+                && (!number.is_finite()
+                    || number.fract() != 0.0
+                    || *number < i64::MIN as f64
+                    || *number >= -(i64::MIN as f64))
+            {
+                return Err("conversion to int would overflow or discard a fraction".into());
+            }
+            coercion::coerce_to_int(value)
         }
-        _ => None,
+        Type::Float => {
+            let converted = coercion::coerce_to_float(value).map_err(coercion_failure_reason)?;
+            let Value::Float(number) = converted else {
+                return Ok(converted);
+            };
+            if !number.is_finite() {
+                return Err("non-finite float is outside the declared type".into());
+            }
+            if let Value::Integer(integer) = value
+                && number as i128 != i128::from(*integer)
+            {
+                return Err("conversion to float would lose integer precision".into());
+            }
+            return Ok(Value::Float(number));
+        }
+        Type::Decimal => {
+            let unscaled =
+                coercion::coerce_to_decimal(value, None).map_err(coercion_failure_reason)?;
+            let Value::Decimal(decimal) = unscaled else {
+                return Ok(unscaled);
+            };
+            return validate_decimal_constraints(decimal, precision, scale);
+        }
+        Type::Bool => coercion::coerce_to_bool(value),
+        Type::Date => coercion::coerce_to_date(value, &chain),
+        Type::DateTime => coercion::coerce_to_datetime(value, &chain),
+        Type::Numeric => {
+            let converted = match value {
+                Value::Integer(_) => return Ok(value.clone()),
+                Value::Float(number) if number.is_finite() => return Ok(value.clone()),
+                Value::Float(_) => {
+                    return Err("non-finite float is outside the declared type".into());
+                }
+                // Textual numeric input prefers an exact integer parse, then a
+                // finite float. Native floats never take the integer branch
+                // above, so a fractional value cannot be truncated merely
+                // because the union also admits integers.
+                _ => coercion::coerce_to_int(value)
+                    .or_else(|_| coercion::coerce_to_float(value))
+                    .map_err(coercion_failure_reason)?,
+            };
+            if matches!(converted, Value::Float(number) if !number.is_finite()) {
+                return Err("non-finite float is outside the declared type".into());
+            }
+            return Ok(converted);
+        }
+        _ => return Err(format!("unsupported declared coercion target {target}")),
+    };
+    converted.map_err(coercion_failure_reason)
+}
+
+/// Render the coercion class without echoing the untrusted value embedded in
+/// `CoercionError`. The value itself is represented only by the bounded,
+/// sanitized diagnostic preview and by the complete DLQ evidence.
+fn coercion_failure_reason(error: coercion::CoercionError) -> String {
+    match error {
+        coercion::CoercionError::TypeMismatch { from, to, .. } => {
+            format!("cannot coerce {from} to {to}")
+        }
+        coercion::CoercionError::ParseFailure { target, .. } => {
+            format!("value cannot be parsed as {target}")
+        }
     }
 }
 
@@ -514,7 +1010,13 @@ mod tests {
         };
         // `absent` is declared but not carried by the input, which is the one
         // route to a null here.
-        let schema = vec![multi("codes"), multi("absent")];
+        let schema = vec![
+            multi("codes"),
+            Column {
+                multiple: Some(true),
+                ..col("absent", Type::nullable(Type::Int))
+            },
+        ];
         let reader = csv_reader("codes\n7\n");
         let mut coercing =
             CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
@@ -553,15 +1055,18 @@ mod tests {
     }
 
     #[test]
-    fn test_coerce_failure_passes_through() {
+    fn test_coerce_failure_is_declared_type_error() {
         let schema = vec![col("num", Type::Int)];
         let reader = csv_reader("num\nnot_a_number\n");
         let mut coercing =
             CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
 
-        let rec = coercing.next_record().unwrap().unwrap();
-        // Coercion fails → value passes through as original string
-        assert_eq!(rec.get("num"), Some(&Value::String("not_a_number".into())));
+        let error = coercing.next_record().unwrap_err();
+        let FormatError::DeclaredType(failure) = error else {
+            panic!("expected declared type failure, got {error:?}");
+        };
+        assert_eq!(failure.field, "num");
+        assert_eq!(failure.original_value, Value::String("not_a_number".into()));
     }
 
     /// A CSV `date` column honors the column's `format:` strftime string — the
@@ -586,24 +1091,45 @@ mod tests {
     }
 
     /// Without the column `format:`, `15/01/2024` matches no default date
-    /// format (`%m/%d/%Y` rejects month 15), so lenient coercion leaves it a
-    /// String — proving the custom format above is what parsed it.
+    /// format (`%m/%d/%Y` rejects month 15), so strict coercion rejects the
+    /// row — proving the custom format above is what admitted it.
     #[test]
-    fn test_coerce_date_without_format_falls_through() {
+    fn test_coerce_date_without_format_is_declared_type_error() {
         let schema = vec![Column::bare("d", Type::Date)];
         let reader = csv_reader("d\n15/01/2024\n");
         let mut coercing =
             CoercingReader::new(reader, &schema, drop_policy(), "src", false).unwrap();
-        let rec = coercing.next_record().unwrap().unwrap();
-        assert_eq!(rec.get("d"), Some(&Value::String("15/01/2024".into())));
+        let error = coercing.next_record().unwrap_err();
+        assert!(matches!(error, FormatError::DeclaredType(_)));
     }
 
-    /// With `pretyped` set, the second coercion is disabled: a value the reader
-    /// emitted passes through untouched even when it would otherwise coerce.
-    /// The positional readers rely on this — they already produced final typed
-    /// values, so a redundant re-parse is skipped.
+    /// A format-free declared `date_time` accepts the canonical RFC 3339 UTC
+    /// spelling used by scenario and operational exports. The source value is
+    /// parsed into the declared temporal type rather than retained as raw text.
     #[test]
-    fn test_pretyped_passes_values_through_uncoerced() {
+    fn test_coerce_datetime_accepts_rfc3339_utc_as_typed_value() {
+        let schema = vec![Column::bare("opened_at", Type::DateTime)];
+        let reader = csv_reader("opened_at\n2026-01-31T08:27:00Z\n");
+        let mut coercing =
+            CoercingReader::new(reader, &schema, drop_policy(), "tickets", false).unwrap();
+
+        let record = coercing.next_record().unwrap().unwrap();
+        assert_eq!(
+            record.get("opened_at"),
+            Some(&Value::DateTime(
+                chrono::NaiveDate::from_ymd_opt(2026, 1, 31)
+                    .unwrap()
+                    .and_hms_opt(8, 27, 0)
+                    .unwrap(),
+            )),
+        );
+    }
+
+    /// A positional reader's proof retains the declared type. Wrong native
+    /// variants and nulls in non-nullable columns fail instead of being hidden
+    /// behind a marker that merely skipped the second coercion pass.
+    #[test]
+    fn test_pretyped_proof_rejects_wrong_variant_and_non_nullable_null() {
         use clinker_format::traits::FormatReader as FRTrait;
         use clinker_record::Schema as RecordSchema;
         use std::sync::Arc as StdArc;
@@ -625,16 +1151,76 @@ mod tests {
         }
 
         let schema_arc = StdArc::new(RecordSchema::new(vec!["n".into()]));
-        let reader = Box::new(StubReader {
-            schema: StdArc::clone(&schema_arc),
-            rows: vec![vec![Value::String("42".into())]].into_iter(),
-        });
         let decl = vec![col("n", Type::Int)];
-        let mut coercing = CoercingReader::new(reader, &decl, drop_policy(), "p", true).unwrap();
-        let rec = coercing.next_record().unwrap().unwrap();
-        // pretyped=true disables coercion: the Int column keeps the reader's
-        // String value rather than coercing to Integer(42).
-        assert_eq!(rec.get("n"), Some(&Value::String("42".into())));
+        for value in [Value::String("42".into()), Value::Null] {
+            let reader = Box::new(StubReader {
+                schema: StdArc::clone(&schema_arc),
+                rows: vec![vec![value]].into_iter(),
+            });
+            let mut coercing =
+                CoercingReader::new(reader, &decl, drop_policy(), "p", true).unwrap();
+            assert!(matches!(
+                coercing.next_record(),
+                Err(FormatError::DeclaredType(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn test_pretyped_proof_enforces_decimal_constraints_and_finite_float() {
+        use clinker_format::traits::FormatReader as FRTrait;
+        use clinker_record::Schema as RecordSchema;
+        use rust_decimal::Decimal;
+        use std::sync::Arc as StdArc;
+
+        struct StubReader {
+            schema: StdArc<RecordSchema>,
+            value: Option<Value>,
+        }
+        impl FRTrait for StubReader {
+            fn schema(&mut self) -> Result<StdArc<RecordSchema>, FormatError> {
+                Ok(StdArc::clone(&self.schema))
+            }
+            fn next_record(&mut self) -> Result<Option<Record>, FormatError> {
+                Ok(self
+                    .value
+                    .take()
+                    .map(|value| Record::new(StdArc::clone(&self.schema), vec![value])))
+            }
+        }
+
+        let schema = StdArc::new(RecordSchema::new(vec!["v".into()]));
+        let cases = [
+            (
+                Value::Decimal(Decimal::new(12_345, 3)),
+                Column {
+                    precision: Some(8),
+                    scale: Some(2),
+                    ..col("v", Type::Decimal)
+                },
+            ),
+            (
+                Value::Decimal(Decimal::new(12_345, 2)),
+                Column {
+                    precision: Some(4),
+                    scale: Some(2),
+                    ..col("v", Type::Decimal)
+                },
+            ),
+            (Value::Float(f64::INFINITY), col("v", Type::Float)),
+        ];
+        for (value, declaration) in cases {
+            let reader = Box::new(StubReader {
+                schema: StdArc::clone(&schema),
+                value: Some(value),
+            });
+            let mut coercing =
+                CoercingReader::new(reader, &[declaration], drop_policy(), "p", true).unwrap();
+            assert!(matches!(
+                coercing.next_record(),
+                Err(FormatError::DeclaredType(_))
+            ));
+        }
     }
 
     #[test]

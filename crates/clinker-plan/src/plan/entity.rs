@@ -41,6 +41,7 @@ macro_rules! entity_id {
         $(#[$meta])*
         #[derive(
             Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize,
+            serde::Deserialize,
         )]
         $vis struct $name(u32);
 

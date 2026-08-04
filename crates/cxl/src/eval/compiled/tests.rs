@@ -106,6 +106,79 @@ fn type_program(src: &str, fields: &[&str]) -> TypedProgram {
         .with_source(Arc::from(src))
 }
 
+fn type_module_program(src: &str, module_source: &str) -> TypedProgram {
+    let parsed_module = Parser::parse_module(module_source);
+    assert!(parsed_module.errors.is_empty());
+    let exports = crate::resolve::ModuleExports {
+        functions: parsed_module
+            .module
+            .functions
+            .iter()
+            .map(|function| function.name.to_string())
+            .collect(),
+        constants: parsed_module
+            .module
+            .constants
+            .iter()
+            .map(|constant| constant.name.to_string())
+            .collect(),
+    };
+    let mut runtime_modules = crate::module_eval::RuntimeModuleRegistry::default();
+    runtime_modules.insert("app.main", parsed_module.module, HashMap::new());
+    let scoped_vars = crate::resolve::ScopedVarsRegistry {
+        module_exports: HashMap::from([("app.main".to_owned(), exports)]),
+        runtime_modules: Arc::new(runtime_modules),
+        ..Default::default()
+    };
+    let parsed = Parser::parse(src);
+    assert!(parsed.errors.is_empty());
+    let resolved = crate::resolve::resolve_program_with_modules_and_vars(
+        parsed.ast,
+        &[],
+        parsed.node_count,
+        &scoped_vars.module_exports,
+        &scoped_vars,
+    )
+    .unwrap();
+    crate::typecheck::pass::type_check_with_mode_and_vars(
+        resolved,
+        &empty_row(),
+        crate::typecheck::AggregateMode::Row,
+        &scoped_vars,
+    )
+    .unwrap()
+    .with_source(Arc::from(src))
+}
+
+#[test]
+fn module_function_typed_proof_corruption_is_internal_invariant() {
+    let mut typed = type_module_program(
+        "use app.main as app\nemit value = app.combine(1, 2)",
+        "fn combine(left, right) = left + right\n",
+    );
+    let Some(crate::ast::Statement::Emit {
+        expr: crate::ast::Expr::MethodCall { args, .. },
+        ..
+    }) = typed.program.statements.get_mut(1)
+    else {
+        panic!("fixture must contain one module call emit");
+    };
+    args.pop();
+
+    let stable = StableEvalContext::test_default();
+    let ctx = EvalContext::test_default_borrowed(&stable);
+    let resolver = HashMapResolver::new(HashMap::new());
+    let mut evaluator = ProgramEvaluator::new(Arc::new(typed), false);
+    let error = evaluator
+        .eval_record::<NullStorage>(&ctx, &resolver, None)
+        .expect_err("mutated typed proof must fail as an internal invariant");
+    let kind = format!("{:?}", error.kind);
+
+    assert!(kind.contains("InvariantViolation"), "got {kind}");
+    assert!(kind.contains("app.main.combine"), "got {kind}");
+    assert!(!kind.contains("ArityMismatch"), "got {kind}");
+}
+
 /// Ordered `(key, value)` pairs from an emit channel, captured for
 /// equality comparison.
 type Pairs = Vec<(String, Value)>;

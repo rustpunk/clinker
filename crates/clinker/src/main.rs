@@ -95,7 +95,9 @@ NDJSON archives.")]
         long_about = "\
 Inspect field-level provenance chains or look up error/warning code documentation.\n\n\
 Use --field to trace where a resolved value comes from across all configuration \
-layers. A two-part `node.param` path traces a composition config value \
+layers. An exact `/v1/config/...` or `/v1/schema/...` address is unambiguous. \
+A two-part `node.param` shorthand traces a composition config value when the \
+authored name is unique \
 (composition defaults, channel defaults, channel fixed); a three-part \
 `source.column.attribute` path traces a source-schema attribute across the \
 Base < Pipeline < Group < Channel schema layers. \
@@ -412,8 +414,8 @@ pub struct RunArgs {
     pub dry_run_output: Option<PathBuf>,
 
     /// CXL module search path
-    #[arg(long, default_value = "./rules/", help_heading = "Paths")]
-    pub rules_path: PathBuf,
+    #[arg(long, help_heading = "Paths")]
+    pub rules_path: Option<PathBuf>,
 
     /// Base directory for relative path resolution
     #[arg(long, help_heading = "Paths")]
@@ -554,7 +556,7 @@ pub struct ExplainArgs {
     /// Not required when using --code alone.
     pub config: Option<PathBuf>,
 
-    /// Dotted field path to explain provenance for (e.g. "enrich1.fuzzy_threshold")
+    /// Exact versioned address or unique dotted shorthand to explain.
     #[arg(long)]
     pub field: Option<String>,
 
@@ -582,6 +584,55 @@ pub struct ExplainArgs {
     pub base_dir: PathBuf,
 }
 
+fn pipeline_error_exit_code(error: &PipelineError) -> u8 {
+    match error {
+        PipelineError::Config(_)
+        | PipelineError::Schema(_)
+        | PipelineError::PlanDiagnostics { .. }
+        | PipelineError::OverlayDiagnostics(_)
+        | PipelineError::Compilation { .. }
+        | PipelineError::Internal { .. }
+        | PipelineError::SortOrderViolation { .. }
+        | PipelineError::MergeSortOrderViolation { .. }
+        | PipelineError::SchemaMismatch { .. }
+        | PipelineError::CompositionDepthExceeded { .. }
+        | PipelineError::CompositionBodyMissing { .. }
+        | PipelineError::CompositionUnknownPort { .. }
+        | PipelineError::CompositionBodyError { .. }
+        | PipelineError::MemoryBudgetExceeded { .. }
+        | PipelineError::UnsatisfiableMemoryBudget { .. }
+        | PipelineError::CombineMissingMatch { .. }
+        | PipelineError::CombineOutputCapExceeded { .. }
+        | PipelineError::EnvelopeMultiHeaderConflict { .. }
+        | PipelineError::EnvelopeHeaderGrainUnmatched { .. }
+        | PipelineError::EnvelopeHeaderMultipleForGrain { .. } => 1,
+        // Disk-cap exceedance (E320) is a resource-exhaustion halt — the run
+        // filled its configured spill budget. Group it with the other
+        // infrastructure failures (I/O, spill, full-volume) at exit 4 rather
+        // than the config exit 1: the pipeline is valid, the host ran out of
+        // the disk headroom the cap allotted.
+        PipelineError::Io(_) | PipelineError::Spill(_) | PipelineError::SpillCapExceeded { .. } => {
+            4
+        }
+        // Runtime data-quality halts sit between config (1) and infrastructure
+        // (4). This includes values outside an exact range axis and configured
+        // DLQ or declared-type error ceilings.
+        PipelineError::Eval(_)
+        | PipelineError::Accumulator { .. }
+        | PipelineError::CombineRangeKeyOutOfRange { .. }
+        | PipelineError::DlqRateExceeded { .. }
+        | PipelineError::TypeErrorThresholdExceeded { .. } => 3,
+        PipelineError::Format(_) | PipelineError::ThreadPool(_) | PipelineError::Multiple(_) => 4,
+        // Diagnostic-carrier — never propagated as a top-level error; folded
+        // into DLQ at the emission site. Treat as exit 4 defensively in case a
+        // future caller surfaces it.
+        PipelineError::CorrelationGroupOverflow { .. } => 4,
+        // A shutdown signal unwound the run before it finished draining. 130
+        // is the conventional "terminated by SIGINT" status.
+        PipelineError::Interrupted => 130,
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -605,59 +656,7 @@ fn main() -> ExitCode {
                 Ok(code) => ExitCode::from(code),
                 Err(e) => {
                     render_pipeline_error(&e, &args.config);
-                    match &e {
-                        PipelineError::Config(_)
-                        | PipelineError::Schema(_)
-                        | PipelineError::PlanDiagnostics { .. }
-                        | PipelineError::OverlayDiagnostics(_)
-                        | PipelineError::Compilation { .. }
-                        | PipelineError::Internal { .. }
-                        | PipelineError::SortOrderViolation { .. }
-                        | PipelineError::MergeSortOrderViolation { .. }
-                        | PipelineError::SchemaMismatch { .. }
-                        | PipelineError::CompositionDepthExceeded { .. }
-                        | PipelineError::CompositionBodyMissing { .. }
-                        | PipelineError::CompositionUnknownPort { .. }
-                        | PipelineError::CompositionBodyError { .. }
-                        | PipelineError::MemoryBudgetExceeded { .. }
-                        | PipelineError::UnsatisfiableMemoryBudget { .. }
-                        | PipelineError::CombineMissingMatch { .. }
-                        | PipelineError::CombineOutputCapExceeded { .. }
-                        | PipelineError::EnvelopeMultiHeaderConflict { .. }
-                        | PipelineError::EnvelopeHeaderGrainUnmatched { .. }
-                        | PipelineError::EnvelopeHeaderMultipleForGrain { .. } => ExitCode::from(1),
-                        // Disk-cap exceedance (E320) is a resource-exhaustion
-                        // halt — the run filled its configured spill budget.
-                        // Group it with the other infrastructure failures
-                        // (I/O, spill, full-volume) at exit 4 rather than the
-                        // config exit 1: the pipeline is valid, the host ran
-                        // out of the disk headroom the cap allotted.
-                        PipelineError::Io(_)
-                        | PipelineError::Spill(_)
-                        | PipelineError::SpillCapExceeded { .. } => ExitCode::from(4),
-                        // A range key whose value is beyond the exact
-                        // fixed-point axis (E326) is a bad-data-value halt, the
-                        // same data-quality class as an eval failure — exit 3.
-                        PipelineError::Eval(_)
-                        | PipelineError::Accumulator { .. }
-                        | PipelineError::CombineRangeKeyOutOfRange { .. } => ExitCode::from(3),
-                        PipelineError::Format(_)
-                        | PipelineError::ThreadPool(_)
-                        | PipelineError::Multiple(_) => ExitCode::from(4),
-                        // Diagnostic-carrier — never propagated as a
-                        // top-level error; folded into DLQ at the
-                        // emission site. Treat as exit 4 defensively
-                        // in case a future caller surfaces it.
-                        PipelineError::CorrelationGroupOverflow { .. } => ExitCode::from(4),
-                        // Configured DLQ rate ceiling tripped (E315 /
-                        // E316). Treat as a data-quality halt — exit 3
-                        // sits between config (1) and infrastructure (4).
-                        PipelineError::DlqRateExceeded { .. } => ExitCode::from(3),
-                        // A shutdown signal unwound the run before it
-                        // finished draining. 130 is the conventional
-                        // "terminated by SIGINT" status.
-                        PipelineError::Interrupted => ExitCode::from(130),
-                    }
+                    ExitCode::from(pipeline_error_exit_code(&e))
                 }
             }
         }
@@ -1235,6 +1234,29 @@ fn abort_on_overlay_errors(
     Ok(())
 }
 
+/// Compile the target once without config clobbers, validate every authored
+/// channel/group config candidate against that typed provenance, and install
+/// only the resulting validated fold into the executable compile context.
+fn resolve_overlay_config_before_compile(
+    config: &clinker_plan::config::PipelineConfig,
+    compile_ctx: &mut clinker_plan::config::CompileContext,
+    resolution: &clinker_channel::OverlayResolution,
+) -> Result<(), PipelineError> {
+    let mut validation_ctx = compile_ctx.clone();
+    validation_ctx.config_overrides.clear();
+    let validation_plan = config.compile(&validation_ctx).map_err(|diagnostics| {
+        plan_diagnostics(
+            diagnostics,
+            plan_line_anchors_trusted(config, overlay_contributed(Some(resolution))),
+        )
+    })?;
+    let resolved = resolution
+        .resolve_config(&validation_plan)
+        .map_err(PipelineError::overlay_diagnostics)?;
+    compile_ctx.config_overrides = resolved.into_compile_overrides();
+    Ok(())
+}
+
 /// Resolve the `(workspace_root, pipeline_dir)` pair for a `run` /
 /// `run --explain` compile context from the pipeline file `config` and an
 /// optional `--base-dir`.
@@ -1345,8 +1367,8 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // same resolved root the validator re-derives.
     let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
         .map_err(storage_config_error)?;
-    let channel_layout = clinker_toml.channel.clone();
     let group_layout = clinker_toml.group.clone();
+    let catalog_config = clinker_toml.catalog.clone();
     let storage_config = clinker_toml.storage;
     let spill_root_dir = storage_config
         .spill
@@ -1388,16 +1410,26 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // Strip the full `.comp.yaml` / `.yaml` suffix (not just the last extension)
     // so a composition target `score.comp.yaml` resolves to the bare stem the
     // discovery layer expects — matching `channels resolve` / `channels lint`.
-    let target_name = target_stem_of(&args.config.to_string_lossy());
     let overlay_resolution = if args.channel.is_none() && args.groups.is_empty() {
         None
     } else {
+        let catalog =
+            clinker_plan::resources::WorkspaceCatalog::load(&workspace_root, &catalog_config)
+                .map_err(|error| {
+                    PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                        error.to_string(),
+                    ))
+                })?;
+        let pipeline_id = catalog_pipeline_id(&workspace_root, &catalog_config, &args.config)
+            .map_err(|error| {
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(error))
+            })?;
         Some(
-            clinker_channel::resolve(
+            clinker_channel::resolve_target_channel(
                 &workspace_root,
-                &channel_layout,
+                &catalog,
                 &group_layout,
-                &target_name,
+                &pipeline_id,
                 args.channel.as_deref(),
                 &args.groups,
                 !args.no_auto_groups,
@@ -1465,13 +1497,64 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     let mut compile_ctx =
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
     compile_ctx.allow_absolute_paths = args.allow_absolute_paths;
+    let clinker_plan::resources::CompositionDiscovery {
+        fields: cxl_fields,
+        identities: composition_body_identities,
+    } = clinker_plan::resources::collect_cxl_fields_with_composition_identities(
+        &pipeline_config.nodes,
+        compile_ctx.workspace_root(),
+        &compile_ctx.pipeline_dir,
+    )
+    .map_err(|error| {
+        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+            error.to_string(),
+        ))
+    })?;
+    compile_ctx.composition_body_identities = composition_body_identities;
+    let direct_imports =
+        clinker_plan::resources::collect_direct_imports(&cxl_fields).map_err(|error| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                error.to_string(),
+            ))
+        })?;
+    if !direct_imports.is_empty() {
+        let catalog = clinker_plan::resources::WorkspaceCatalog::load(
+            compile_ctx.workspace_root(),
+            &catalog_config,
+        )
+        .map_err(|error| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                error.to_string(),
+            ))
+        })?;
+        let rules_root = catalog
+            .select_rules_root(
+                args.rules_path.as_deref(),
+                pipeline_config
+                    .pipeline
+                    .rules_path
+                    .as_deref()
+                    .map(std::path::Path::new),
+            )
+            .map_err(|error| {
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                    error.to_string(),
+                ))
+            })?;
+        compile_ctx.cxl_modules = clinker_plan::resources::compile_module_closure(
+            &catalog,
+            &rules_root,
+            &direct_imports,
+            clinker_plan::resources::ModuleLimits::default(),
+        )
+        .map_err(|error| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                error.to_string(),
+            ))
+        })?;
+    }
     if let Some(res) = &overlay_resolution {
         compile_ctx.overlay_ops = res.op_stream().to_vec();
-        // Resolve the winning `config:` value per composition node so the
-        // compile-time fold substitutes it into `$config.<param>` reads. The
-        // ProvenanceDb still records the full layer chain (post-compile
-        // overlay), so this drives execution without double-applying to it.
-        compile_ctx.config_overrides = res.effective_config_overrides();
     }
 
     // Run identity values flow through Output path templates and the
@@ -1547,13 +1630,25 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     }
 
     if let Some(format) = args.explain {
-        let anchors_trusted = plan_line_anchors_trusted(
-            &pipeline_config,
-            overlay_contributed(overlay_resolution.as_ref()),
-        );
+        let mut effective_compile_ctx = compile_ctx.clone();
+        if let Some(res) = &overlay_resolution {
+            resolve_overlay_config_before_compile(
+                &pipeline_config,
+                &mut effective_compile_ctx,
+                res,
+            )?;
+        }
         let mut compiled_plan = pipeline_config
-            .compile(&compile_ctx)
-            .map_err(|d| plan_diagnostics(d, anchors_trusted))?;
+            .compile(&effective_compile_ctx)
+            .map_err(|d| {
+                plan_diagnostics(
+                    d,
+                    plan_line_anchors_trusted(
+                        &pipeline_config,
+                        overlay_contributed(overlay_resolution.as_ref()),
+                    ),
+                )
+            })?;
         if let Some(res) = &overlay_resolution {
             let overlay = res.apply_config_and_vars(&mut compiled_plan, &pipeline_config);
             abort_on_overlay_errors(&overlay)?;
@@ -1669,11 +1764,16 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         let cfg = lineage_config
             .as_ref()
             .expect("lineage_config is captured whenever --lineage is set");
-        let anchors_trusted =
-            plan_line_anchors_trusted(cfg, overlay_contributed(overlay_resolution.as_ref()));
-        let mut compiled_plan = cfg
-            .compile(&compile_ctx)
-            .map_err(|d| plan_diagnostics(d, anchors_trusted))?;
+        let mut effective_compile_ctx = compile_ctx.clone();
+        if let Some(res) = &overlay_resolution {
+            resolve_overlay_config_before_compile(cfg, &mut effective_compile_ctx, res)?;
+        }
+        let mut compiled_plan = cfg.compile(&effective_compile_ctx).map_err(|d| {
+            plan_diagnostics(
+                d,
+                plan_line_anchors_trusted(cfg, overlay_contributed(overlay_resolution.as_ref())),
+            )
+        })?;
         if let Some(res) = &overlay_resolution {
             let overlay = res.apply_config_and_vars(&mut compiled_plan, cfg);
             abort_on_overlay_errors(&overlay)?;
@@ -1756,13 +1856,18 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
     // The structural overlay op stream (if any) is applied inside `compile`
     // via `compile_ctx.overlay_ops`, so a bad splice anchor or ill-typed op is
     // a compile diagnostic, not a panic — propagate it rather than unwrapping.
-    let anchors_trusted = plan_line_anchors_trusted(
-        &pipeline_config,
-        overlay_contributed(overlay_resolution.as_ref()),
-    );
-    let mut compiled_plan = pipeline_config
-        .compile(&compile_ctx)
-        .map_err(|d| plan_diagnostics(d, anchors_trusted))?;
+    if let Some(res) = &overlay_resolution {
+        resolve_overlay_config_before_compile(&pipeline_config, &mut compile_ctx, res)?;
+    }
+    let mut compiled_plan = pipeline_config.compile(&compile_ctx).map_err(|d| {
+        plan_diagnostics(
+            d,
+            plan_line_anchors_trusted(
+                &pipeline_config,
+                overlay_contributed(overlay_resolution.as_ref()),
+            ),
+        )
+    })?;
     // Channel/group overlay: config/vars clobber over the compiled plan's
     // provenance, resolving the four scoped var registries into the runtime
     // values the executor layers atop Transform-declared defaults at init.
@@ -3115,18 +3220,20 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
     // clobber apply before provenance is computed, mirroring `run`.
     let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
         .map_err(|e| format!("clinker.toml: {e}"))?;
-    // Strip the full `.comp.yaml` / `.yaml` suffix so a composition target
-    // resolves to the bare stem the discovery layer expects, mirroring `run`.
-    let target_name = target_stem_of(&config_path.to_string_lossy());
     let overlay_resolution = if args.channel.is_none() && args.groups.is_empty() {
         None
     } else {
+        let catalog = clinker_plan::resources::WorkspaceCatalog::load(
+            &workspace_root,
+            &clinker_toml.catalog,
+        )?;
+        let pipeline_id = catalog_pipeline_id(&workspace_root, &clinker_toml.catalog, config_path)?;
         Some(
-            clinker_channel::resolve(
+            clinker_channel::resolve_target_channel(
                 &workspace_root,
-                &clinker_toml.channel,
+                &catalog,
                 &clinker_toml.group,
-                &target_name,
+                &pipeline_id,
                 args.channel.as_deref(),
                 &args.groups,
                 !args.no_auto_groups,
@@ -3147,6 +3254,8 @@ fn run_explain(args: &ExplainArgs) -> Result<(), Box<dyn std::error::Error>> {
         clinker_plan::config::CompileContext::with_pipeline_dir(&workspace_root, pipeline_dir);
     if let Some(res) = &overlay_resolution {
         compile_ctx.overlay_ops = res.op_stream().to_vec();
+        resolve_overlay_config_before_compile(&pipeline_config, &mut compile_ctx, res)
+            .map_err(|error| format!("overlay validation failed: {error}"))?;
     }
 
     // Compile failures render through the same path `clinker run` uses, so a
@@ -3294,6 +3403,12 @@ fn compile_effective_plan(
         clinker_plan::config::CompileContext::with_pipeline_dir(workspace_root, pipeline_dir);
     ctx.overlay_ops = res.op_stream().to_vec();
 
+    let validation_plan = config.compile(&ctx).map_err(E::Diagnostics)?;
+    let resolved_config = res
+        .resolve_config(&validation_plan)
+        .map_err(E::Diagnostics)?;
+    ctx.config_overrides = resolved_config.into_compile_overrides();
+
     let mut plan = config.compile(&ctx).map_err(E::Diagnostics)?;
     let overlay = res.apply_config_and_vars(&mut plan, &config);
     Ok((config, plan, overlay))
@@ -3349,7 +3464,7 @@ fn render_resolved(
 
     out.push_str("Config provenance (overlay-affected):\n");
     let mut rows: Vec<String> = Vec::new();
-    for ((node, param), resolved) in plan.provenance().iter() {
+    for (_key, address, resolved) in plan.provenance().iter() {
         let Some(win) = resolved.winning_layer() else {
             continue;
         };
@@ -3364,8 +3479,14 @@ fn render_resolved(
         // every higher-precedence layer, so the winning layer here may be a
         // lower one than plain precedence would pick.
         let lock = if win.fixed { " (fixed)" } else { "" };
+        let display_field = if address.call_path().is_empty() {
+            format!("{}.{}", address.node_name(), address.field().name())
+        } else {
+            address.render()
+        };
         rows.push(format!(
-            "  {node}.{param} = {}  [{}]{lock}  (base: {})",
+            "  {} = {}  [{}]{lock}  (base: {})",
+            display_field,
             format_overlay_value(&resolved.value),
             win.kind,
             base
@@ -3408,21 +3529,15 @@ fn run_channels_resolve(args: &ResolveArgs) -> Result<u8, Box<dyn std::error::Er
     let workspace_root = args.base_dir.canonicalize()?;
     let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
         .map_err(|e| format!("clinker.toml: {e}"))?;
-    // Strip the full `.comp.yaml` / `.yaml` suffix (not just the last
-    // extension) so a composition target `score.comp.yaml` resolves to the bare
-    // stem `score` the discovery layer expects — matching `channels lint`.
-    let file_name = args
-        .target
-        .file_name()
-        .and_then(|s| s.to_str())
-        .ok_or("target path has no file name")?;
-    let target_name = target_stem_of(file_name);
+    let catalog =
+        clinker_plan::resources::WorkspaceCatalog::load(&workspace_root, &clinker_toml.catalog)?;
+    let pipeline_id = catalog_pipeline_id(&workspace_root, &clinker_toml.catalog, &args.target)?;
 
-    let res = clinker_channel::resolve(
+    let res = clinker_channel::resolve_target_channel(
         &workspace_root,
-        &clinker_toml.channel,
+        &catalog,
         &clinker_toml.group,
-        &target_name,
+        &pipeline_id,
         args.channel.as_deref(),
         &args.groups,
         !args.no_auto_groups,
@@ -3448,7 +3563,7 @@ fn run_channels_resolve(args: &ResolveArgs) -> Result<u8, Box<dyn std::error::Er
     };
 
     // Overlay report (deterministic) followed by the effective DAG for context.
-    print!("{}", render_resolved(&plan, &overlay, &res, &target_name));
+    print!("{}", render_resolved(&plan, &overlay, &res, &pipeline_id));
     println!("\nEffective DAG:");
     print!("{}", plan.dag().explain_text(&config));
 
@@ -3470,51 +3585,66 @@ fn run_channels_lint(args: &LintArgs) -> Result<u8, Box<dyn std::error::Error>> 
     let clinker_toml = clinker_plan::config::ClinkerToml::load_from_workspace(&workspace_root)
         .map_err(|e| format!("clinker.toml: {e}"))?;
 
-    let channels = clinker_channel::scan_channels(&clinker_toml.channel, &workspace_root).map_err(
-        |diags| {
-            let msgs: Vec<String> = diags
-                .iter()
-                .map(|d| format!("[{}] {}", d.code, d.message))
-                .collect();
-            format!("channel scan failed:\n{}", msgs.join("\n"))
-        },
-    )?;
+    let catalog =
+        clinker_plan::resources::WorkspaceCatalog::load(&workspace_root, &clinker_toml.catalog)?;
 
     let mut checked = 0usize;
     let mut failures: Vec<(String, String, Vec<String>)> = Vec::new();
 
-    for channel in &channels {
-        // Every overlay file in the tenant folder is a (channel × target) combo.
-        for overlay_path in overlay_files_in(&channel.dir) {
-            let overlay_file = match clinker_channel::OverlayFile::load(&overlay_path) {
-                Ok(o) => o,
-                Err(e) => {
-                    failures.push((
-                        channel.id.clone(),
-                        overlay_path.display().to_string(),
-                        vec![format!("overlay parse error: {e}")],
-                    ));
+    for channel_id in clinker_toml.catalog.channels.keys() {
+        let logical_channel = clinker_plan::resources::LogicalResourceId::parse(channel_id)?;
+        let channel_dir = catalog.resolve(
+            clinker_plan::resources::CatalogResourceKind::Channel,
+            &logical_channel,
+        )?;
+        let manifest = match clinker_channel::ChannelManifest::load(
+            &channel_dir.join(clinker_channel::CHANNEL_MANIFEST_FILE),
+        ) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                failures.push((
+                    channel_id.clone(),
+                    "channel.cfg.yaml".to_string(),
+                    vec![format!("manifest error: {error}")],
+                ));
+                continue;
+            }
+        };
+        for target in &manifest.channel.targets {
+            let pipeline_id = target.value.clone();
+            let logical_pipeline =
+                match clinker_plan::resources::LogicalResourceId::parse(&pipeline_id) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        failures.push((channel_id.clone(), pipeline_id, vec![error.to_string()]));
+                        continue;
+                    }
+                };
+            let base_path = match catalog.resolve(
+                clinker_plan::resources::CatalogResourceKind::Pipeline,
+                &logical_pipeline,
+            ) {
+                Ok(path) => path.to_path_buf(),
+                Err(error) => {
+                    failures.push((channel_id.clone(), pipeline_id, vec![error.to_string()]));
                     continue;
                 }
             };
-            let target_name = target_stem_of(&overlay_file.channel.target);
-            let base_path = channel.dir.join(&overlay_file.channel.target);
-
             checked += 1;
-            let res = match clinker_channel::resolve(
+            let res = match clinker_channel::resolve_target_channel(
                 &workspace_root,
-                &clinker_toml.channel,
+                &catalog,
                 &clinker_toml.group,
-                &target_name,
-                Some(&channel.id),
+                &pipeline_id,
+                Some(channel_id),
                 &[],
                 true,
             ) {
                 Ok(r) => r,
                 Err(e) => {
                     failures.push((
-                        channel.id.clone(),
-                        target_name.clone(),
+                        channel_id.clone(),
+                        pipeline_id.clone(),
                         vec![format!("resolution failed: {e}")],
                     ));
                     continue;
@@ -3531,11 +3661,11 @@ fn run_channels_lint(args: &LintArgs) -> Result<u8, Box<dyn std::error::Error>> 
                         .map(|d| format!("[{}] {}", d.code, d.message))
                         .collect();
                     if !errs.is_empty() {
-                        failures.push((channel.id.clone(), target_name.clone(), errs));
+                        failures.push((channel_id.clone(), pipeline_id.clone(), errs));
                     }
                 }
                 Err(e) => {
-                    failures.push((channel.id.clone(), target_name.clone(), e.lines()));
+                    failures.push((channel_id.clone(), pipeline_id.clone(), e.lines()));
                 }
             }
         }
@@ -3544,7 +3674,7 @@ fn run_channels_lint(args: &LintArgs) -> Result<u8, Box<dyn std::error::Error>> 
     if failures.is_empty() {
         println!(
             "channels lint: OK — {checked} (target × overlay) combination(s) across {} channel(s) compiled clean",
-            channels.len()
+            clinker_toml.catalog.channels.len()
         );
         Ok(0)
     } else {
@@ -3562,43 +3692,30 @@ fn run_channels_lint(args: &LintArgs) -> Result<u8, Box<dyn std::error::Error>> 
     }
 }
 
-/// The candidate overlay files in a tenant folder: every `*.yaml` except the
-/// `channel.cfg.yaml` manifest. Non-recursive, symlinks skipped.
-fn overlay_files_in(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut files = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return files;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
+/// Find the logical pipeline identity for a CLI path. Runtime overlay
+/// selection never derives identity from a filename or current directory.
+fn catalog_pipeline_id(
+    workspace_root: &std::path::Path,
+    catalog: &clinker_plan::resources::CatalogConfig,
+    pipeline_path: &std::path::Path,
+) -> Result<String, String> {
+    let selected = pipeline_path
+        .canonicalize()
+        .map_err(|error| format!("cannot open selected pipeline: {error}"))?;
+    for (id, configured) in &catalog.pipelines {
+        let candidate = if configured.is_absolute() {
+            configured.clone()
+        } else {
+            workspace_root.join(configured)
         };
-        if name == clinker_channel::CHANNEL_MANIFEST_FILE {
-            continue;
-        }
-        if name.ends_with(".yaml") {
-            files.push(path);
+        if candidate.canonicalize().ok().as_deref() == Some(selected.as_path()) {
+            return Ok(id.clone());
         }
     }
-    files.sort();
-    files
-}
-
-/// The bare target stem of a `channel.target:` path (strip `.comp.yaml` /
-/// `.yaml` and the directory).
-fn target_stem_of(target: &str) -> String {
-    let file = std::path::Path::new(target)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(target);
-    file.strip_suffix(".comp.yaml")
-        .or_else(|| file.strip_suffix(".yaml"))
-        .unwrap_or(file)
-        .to_string()
+    Err(
+        "selected pipeline is not cataloged; add it to `[catalog.pipelines]` in clinker.toml before using channels or groups"
+            .to_string(),
+    )
 }
 
 /// `clinker channels group members <group>` — list the channels whose labels
@@ -3721,7 +3838,6 @@ fn run_channels_label_set(args: &LabelSetArgs) -> Result<u8, Box<dyn std::error:
             Ok(outcome) => {
                 changed += 1;
                 let verb = match outcome {
-                    LabelOutcome::Created => "created manifest",
                     LabelOutcome::Updated => "set",
                     LabelOutcome::Unchanged => unreachable!(),
                 };
@@ -3745,9 +3861,8 @@ fn run_channels_label_set(args: &LabelSetArgs) -> Result<u8, Box<dyn std::error:
 }
 
 /// The effect of a `label set` on one manifest.
+#[derive(Debug)]
 enum LabelOutcome {
-    /// The manifest did not exist and was created with the label.
-    Created,
     /// The label was added or its value changed.
     Updated,
     /// The label already had this exact value; nothing was written.
@@ -3882,11 +3997,10 @@ fn set_manifest_label(
     value: &serde_json::Value,
 ) -> Result<LabelOutcome, String> {
     if !manifest_path.exists() {
-        let block = render_labels_block(&[(key.to_string(), value.clone())]);
-        let text = format!("channel:\n  name: {channel_id}\n{}\n", block.join("\n"));
-        std::fs::write(manifest_path, text)
-            .map_err(|e| format!("writing {}: {e}", manifest_path.display()))?;
-        return Ok(LabelOutcome::Created);
+        return Err(format!(
+            "channel `{channel_id}` has no {}; create it with `channel.targets` before setting labels",
+            clinker_channel::CHANNEL_MANIFEST_FILE
+        ));
     }
 
     let original = std::fs::read_to_string(manifest_path)
@@ -4022,6 +4136,29 @@ mod tests {
     }
     use clap::Parser;
 
+    #[test]
+    fn declared_type_threshold_uses_the_data_quality_exit_code() {
+        let declared_type_threshold = PipelineError::TypeErrorThresholdExceeded {
+            observed_rate: 0.25,
+            max_rate: 0.20,
+            observed_count: 1,
+            total_count: 4,
+        };
+        let dlq_rate_threshold = PipelineError::DlqRateExceeded {
+            source: Some(std::sync::Arc::from("input")),
+            observed_rate: 0.25,
+            max_rate: 0.20,
+            observed_count: 1,
+            total_count: 4,
+        };
+
+        assert_eq!(pipeline_error_exit_code(&declared_type_threshold), 3);
+        assert_eq!(
+            pipeline_error_exit_code(&declared_type_threshold),
+            pipeline_error_exit_code(&dlq_rate_threshold),
+        );
+    }
+
     // ── Plan-diagnostic rendering ───────────────────────────────────────
 
     #[test]
@@ -4152,7 +4289,7 @@ mod tests {
         let path = write_channel_manifest(
             root,
             "acme",
-            "channel:\n  name: acme\n# keep me\nlabels:\n  region: west\nconfig:\n  fraud.threshold: 0.9\n",
+            "channel:\n  name: acme\n  targets: [sales.orders]\n# keep me\nlabels:\n  region: west\nconfig:\n  fraud.threshold: { value: 0.9 }\n",
         );
 
         // Insert a new label.
@@ -4167,7 +4304,7 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# keep me"), "comment preserved:\n{text}");
         assert!(
-            text.contains("fraud.threshold: 0.9"),
+            text.contains("fraud.threshold: { value: 0.9 }"),
             "config preserved:\n{text}"
         );
         assert!(
@@ -4211,7 +4348,7 @@ mod tests {
         let path = write_channel_manifest(
             root,
             "acme",
-            "channel:\n  name: acme\nlabels:\n  region: west\n# note\n  region2: east\nconfig:\n  k.v: 1\n",
+            "channel:\n  name: acme\n  targets: [sales.orders]\nlabels:\n  region: west\n# note\n  region2: east\nconfig:\n  k.v: { value: 1 }\n",
         );
         set_manifest_label(
             &path,
@@ -4237,27 +4374,22 @@ mod tests {
     }
 
     #[test]
-    fn label_set_creates_absent_manifest() {
+    fn label_set_rejects_absent_manifest_without_writing() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let dir = root.join("channel").join("globex");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(clinker_channel::CHANNEL_MANIFEST_FILE);
 
-        let out = set_manifest_label(
+        let error = set_manifest_label(
             &path,
             "globex",
             "tier",
             &serde_json::Value::from("enterprise"),
         )
-        .unwrap();
-        assert!(matches!(out, LabelOutcome::Created));
-        let m = clinker_channel::ChannelManifest::load(&path).unwrap();
-        assert_eq!(m.channel.name, "globex");
-        assert_eq!(
-            m.labels.get("tier"),
-            Some(&serde_json::Value::from("enterprise"))
-        );
+        .expect_err("targetless manifests must not be created");
+        assert!(error.contains("channel.targets"), "{error}");
+        assert!(!path.exists(), "an invalid manifest must not be written");
     }
 
     // ── CH-15: group members via the full command ───────────────────────
@@ -4274,18 +4406,18 @@ mod tests {
         std::fs::create_dir_all(root.join("group")).unwrap();
         std::fs::write(
             root.join("group/enterprise.group.yaml"),
-            "group:\n  name: enterprise\n  match: 'tier == \"enterprise\"'\n",
+            "group:\n  name: enterprise\n  targets: { pipelines: [sales.orders] }\n  match: 'tier == \"enterprise\"'\n",
         )
         .unwrap();
         write_channel_manifest(
             root,
             "acme",
-            "channel:\n  name: acme\nlabels:\n  tier: enterprise\n",
+            "channel:\n  name: acme\n  targets: [sales.orders]\nlabels:\n  tier: enterprise\n",
         );
         write_channel_manifest(
             root,
             "beta",
-            "channel:\n  name: beta\nlabels:\n  tier: basic\n",
+            "channel:\n  name: beta\n  targets: [sales.orders]\nlabels:\n  tier: basic\n",
         );
 
         let code = run_channels_group_members(&GroupMembersArgs {

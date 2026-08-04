@@ -148,7 +148,7 @@ nodes:
       record_path: records/record
     schema:
       - { name: name, type: string }
-      - { name: age, type: string }
+      - { name: age, type: int }
 
 - type: output
   name: dest
@@ -196,7 +196,7 @@ nodes:
       record_path: records/record
     schema:
       - { name: name, type: string }
-      - { name: age, type: string }
+      - { name: age, type: int }
 - type: output
   name: dest
   input: src
@@ -235,6 +235,8 @@ pipeline:
   name: xml-undeclared-repeat-dlq
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -247,7 +249,7 @@ nodes:
       record_path: records/record
     schema:
       - { name: name, type: string }
-      - { name: age, type: string }
+      - { name: age, type: int }
 - type: output
   name: dest
   input: src
@@ -296,6 +298,8 @@ pipeline:
   name: xml-first-record-repeat
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -308,7 +312,7 @@ nodes:
       record_path: records/record
     schema:
       - { name: name, type: string }
-      - { name: age, type: string }
+      - { name: age, type: int }
 - type: output
   name: dest
   input: src
@@ -353,6 +357,8 @@ pipeline:
   name: xml-multi-file-repeat
 error_handling:
   strategy: continue
+  dlq:
+    path: rejected.csv
 nodes:
 - type: source
   name: src
@@ -367,7 +373,7 @@ nodes:
       record_path: records/record
     schema:
       - { name: name, type: string }
-      - { name: age, type: string }
+      - { name: age, type: int }
 - type: output
   name: dest
   input: src

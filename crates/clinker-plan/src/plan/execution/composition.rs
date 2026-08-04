@@ -2,7 +2,7 @@
 
 use super::*;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use petgraph::graph::{DiGraph, NodeIndex};
 
@@ -11,25 +11,11 @@ use crate::config::{SortField, SourceConfig};
 use cxl::ast::Statement;
 use cxl::typecheck::pass::TypedProgram;
 
-/// Resolve composition-body analytic-window IndexSpecs against the
-/// fully-built parent DAG.
+/// Bind every reachable composition-body window to a scope-local runtime key.
 ///
-/// Body lowering (`bind_composition`) runs before the parent DAG's
-/// NodeIndex space is allocated, so it cannot stamp `window_index`
-/// onto body Transform nodes whose first non-pass-through ancestor
-/// reaches the body's `input:` port — that port resolves to a
-/// parent-DAG operator only after Stage 5 has built the parent's
-/// `name_to_idx`. This pass closes that gap: per body, per Transform
-/// carrying a captured `body_window_configs` entry, walk
-/// `first_non_passthrough_ancestor` through the body graph, classify
-/// the rooting (`Source` / `Node` / `ParentNode`), construct the
-/// `RawIndexRequest` set, deduplicate it, and backfill `window_index`
-/// onto the body Transform.
-///
-/// Cross-body recursion (composition-of-composition) is handled by
-/// running the pass per-body; nested bodies' parent context is the
-/// enclosing body's mini-DAG plus any ancestor port resolutions
-/// already baked into the encoding scope's index list.
+/// The walk follows actual Composition call edges from the top-level DAG into
+/// nested bodies. Each window roots in its own mini-DAG, including windows fed
+/// by a synthetic input-port Source. No parent-DAG slot is encoded or inferred.
 pub(crate) fn resolve_composition_body_windows(
     parent_dag: &ExecutionPlanDag,
     artifacts: &mut crate::plan::bind_schema::CompileArtifacts,
@@ -38,58 +24,13 @@ pub(crate) fn resolve_composition_body_windows(
     use crate::plan::index::{
         IndexSpec, PlanIndexRoot, RawIndexRequest, deduplicate_indices, find_index_for,
     };
-    use clinker_core_types::span::Span as PlanSpan;
-    use clinker_core_types::{Diagnostic, LabeledSpan};
+    use crate::plan::{BodyWindowBinding, WindowRuntimeKey};
 
-    // Two-step ownership shuffle: (1) compute every body's
-    // (idx_specs, window_index_assignments) without holding a mutable
-    // borrow on `artifacts`, then (2) write the results back.
-    // `artifacts.composition_bodies` holds `BoundBody` values keyed
-    // by `CompositionBodyId`; the immutable borrow during compute
-    // also covers parent_dag access.
-    let body_ids: Vec<crate::plan::composition_body::CompositionBodyId> =
-        artifacts.composition_bodies.keys().copied().collect();
-
+    let body_ids = reachable_body_order(parent_dag, artifacts, diags);
     for body_id in body_ids {
         let Some(body) = artifacts.composition_bodies.get(&body_id) else {
             continue;
         };
-
-        // Find this body's call-site composition node in the parent
-        // DAG. Multi-call-site signatures (the same .comp.yaml
-        // referenced by N composition nodes) bind to N distinct
-        // `CompositionBodyId`s — `composition_body_assignments` keys
-        // by composition node id, not body file path, so each body has
-        // exactly one composition node. The call-site id resolves to its
-        // current `NodeIndex` through the parent DAG's `id_to_index`
-        // bridge.
-        let mut composition_idx: Option<NodeIndex> = None;
-        for (&comp_id, &assigned_id) in &artifacts.composition_body_assignments {
-            if assigned_id == body_id
-                && let Some(idx) = *parent_dag.id_to_index.get(comp_id)
-            {
-                composition_idx = Some(idx);
-                break;
-            }
-        }
-        let Some(composition_idx) = composition_idx else {
-            // No call site — body is dead code. Skip.
-            continue;
-        };
-
-        // Per-port → parent-DAG NodeIndex via the composition's
-        // incoming port-tagged edges.
-        let mut port_to_parent_idx: std::collections::HashMap<&str, NodeIndex> =
-            std::collections::HashMap::new();
-        use petgraph::visit::EdgeRef;
-        for edge in parent_dag
-            .graph
-            .edges_directed(composition_idx, petgraph::Direction::Incoming)
-        {
-            if let Some(port_name) = edge.weight().port.as_deref() {
-                port_to_parent_idx.insert(port_name, edge.source());
-            }
-        }
 
         // Per-Transform spec construction. Walk in declaration order
         // (HashMap iteration order is undefined but stable per
@@ -138,102 +79,115 @@ pub(crate) fn resolve_composition_body_windows(
             arena_fields_vec.sort();
 
             // Body-internal first non-pass-through ancestor.
-            let pred_idx = match body
+            let predecessors: Vec<NodeIndex> = body
                 .graph
                 .neighbors_directed(transform_idx, petgraph::Direction::Incoming)
-                .next()
-            {
-                Some(p) => p,
-                None => continue,
+                .collect();
+            let pred_idx = match predecessors.as_slice() {
+                [only] => *only,
+                [] => {
+                    diags.push(body_window_diag(
+                        "E160",
+                        &body.graph[transform_idx],
+                        format!(
+                            "composition body windowed transform {transform_name:?} has no input root"
+                        ),
+                    ));
+                    continue;
+                }
+                _ => {
+                    diags.push(body_window_diag(
+                        "E161",
+                        &body.graph[transform_idx],
+                        format!(
+                            "composition body windowed transform {transform_name:?} has ambiguous input roots"
+                        ),
+                    ));
+                    continue;
+                }
             };
-            let rooted_idx = first_non_passthrough_ancestor(&body.graph, pred_idx);
+            let rooted_idx = match body_window_root(&body.graph, pred_idx) {
+                Ok(idx) => idx,
+                Err((code, detail)) => {
+                    diags.push(body_window_diag(code, &body.graph[transform_idx], detail));
+                    continue;
+                }
+            };
             let rooted_node = &body.graph[rooted_idx];
 
-            // Classify the rooting:
-            // - Body Source whose name matches a port → ParentNode.
-            // - Body Source not a port (declared inside body) →
-            //   Node{ body_source_idx, .. } anchored at the body's
-            //   own Source NodeIndex (the body's Source dispatch arm
-            //   populates the slot at its emit, the same way every
-            //   top-level Source-anchored window now does).
-            // - Other body operator → Node{ body_upstream, .. }.
+            if wc.on.is_some()
+                || wc
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source != rooted_node.name())
+            {
+                diags.push(body_window_diag(
+                    "E165",
+                    &body.graph[transform_idx],
+                    format!(
+                        "composition body windowed transform {transform_name:?} uses a cross-input/source lookup; body windows must read their owning input root"
+                    ),
+                ));
+                continue;
+            }
+
             let root: PlanIndexRoot = match rooted_node {
-                PlanNode::Source { name, .. } => {
-                    if let Some(&parent_upstream) = port_to_parent_idx.get(name.as_str()) {
-                        let anchor_schema = match parent_dag.graph[parent_upstream]
-                            .stored_output_schema()
-                            .cloned()
-                        {
-                            Some(s) => s,
-                            None => {
-                                diags.push(Diagnostic::error(
-                                    "E003",
-                                    format!(
-                                        "composition body windowed transform {transform_name:?} \
-                                         resolves through input port {name:?} to parent operator {:?} \
-                                         which has no output schema",
-                                        parent_dag.graph[parent_upstream].name()
-                                    ),
-                                    LabeledSpan::primary(PlanSpan::SYNTHETIC, String::new()),
-                                ));
-                                continue;
-                            }
-                        };
-                        PlanIndexRoot::ParentNode {
-                            upstream: parent_upstream,
-                            anchor_schema,
-                        }
-                    } else {
-                        // Body-declared Source — rare but legal. Anchor
-                        // at the body Source's NodeIndex; its dispatch
-                        // arm finalizes the arena at emit.
-                        let Some(anchor_schema) = rooted_node.stored_output_schema().cloned()
-                        else {
-                            diags.push(Diagnostic::error(
-                                "E003",
-                                format!(
-                                    "composition body windowed transform {transform_name:?} \
-                                     rooted at body Source {name:?} which has no output schema"
-                                ),
-                                LabeledSpan::primary(PlanSpan::SYNTHETIC, String::new()),
-                            ));
-                            continue;
-                        };
-                        PlanIndexRoot::Node {
-                            upstream: rooted_idx,
-                            anchor_schema,
-                        }
+                PlanNode::Source { name, resolved, .. } => {
+                    if resolved.is_none() && !body.input_port_rows.contains_key(name) {
+                        diags.push(body_window_diag(
+                            "E167",
+                            &body.graph[transform_idx],
+                            format!(
+                                "composition body windowed transform {transform_name:?} resolves to undeclared input port {name:?}"
+                            ),
+                        ));
+                        continue;
+                    }
+                    let Some(anchor_schema) = rooted_node.stored_output_schema().cloned() else {
+                        diags.push(body_window_diag(
+                            "E168",
+                            &body.graph[transform_idx],
+                            format!(
+                                "composition body windowed transform {transform_name:?} has an input root with no output schema"
+                            ),
+                        ));
+                        continue;
+                    };
+                    PlanIndexRoot::Node {
+                        upstream: rooted_idx,
+                        anchor_schema,
                     }
                 }
                 PlanNode::Merge { .. } => {
-                    diags.push(Diagnostic::error(
-                        "E150d",
+                    diags.push(body_window_diag(
+                        "E166",
+                        &body.graph[transform_idx],
                         format!(
                             "composition body windowed transform {transform_name:?} \
                              is rooted at a Merge node; Merge concatenates streams \
                              without a single producer identity, so a window cannot \
                              anchor to it"
                         ),
-                        LabeledSpan::primary(PlanSpan::SYNTHETIC, String::new()),
                     ));
                     continue;
                 }
                 other => {
                     let Some(anchor_schema) = other.stored_output_schema().cloned() else {
+                        diags.push(body_window_diag(
+                            "E168",
+                            &body.graph[transform_idx],
+                            format!(
+                                "composition body windowed transform {transform_name:?} has an input root with no output schema"
+                            ),
+                        ));
                         continue;
                     };
-                    // E150b — every arena field must be present in the
-                    // upstream operator's output schema. The top-level
-                    // lowering enforces this at `config/mod.rs`; body
-                    // windows enforce it here so body-internal
-                    // post-aggregate windows that reference a column
-                    // the aggregate did not emit fail at compile rather
-                    // than silently reading Null at runtime.
-                    let mut e150b_fired = false;
+                    let mut schema_error = false;
                     for f in &arena_fields_vec {
                         if !anchor_schema.contains(f.as_str()) {
-                            diags.push(Diagnostic::error(
-                                "E150b",
+                            diags.push(body_window_diag(
+                                "E168",
+                                &body.graph[transform_idx],
                                 format!(
                                     "composition body windowed transform {transform_name:?} \
                                      references field {f:?} that the upstream operator {:?} \
@@ -241,12 +195,11 @@ pub(crate) fn resolve_composition_body_windows(
                                      columns produced by its rooted operator",
                                     other.name()
                                 ),
-                                LabeledSpan::primary(PlanSpan::SYNTHETIC, String::new()),
                             ));
-                            e150b_fired = true;
+                            schema_error = true;
                         }
                     }
-                    if e150b_fired {
+                    if schema_error {
                         continue;
                     }
                     PlanIndexRoot::Node {
@@ -283,34 +236,218 @@ pub(crate) fn resolve_composition_body_windows(
             raw_requests.iter().map(|(r, _)| r.clone()).collect();
         let body_indices: Vec<IndexSpec> = deduplicate_indices(request_only);
 
-        // Backfill `window_index` onto each body Transform node. Re-
-        // borrow `body` mutably now that we've finished consulting it
-        // immutably. Only mutate `body.graph`, `body.body_indices_to_build`.
+        let body_scope = body.body_scope;
+        let binding_data: Vec<_> = raw_requests
+            .iter()
+            .filter_map(|(req, transform_idx)| {
+                find_index_for(&body_indices, &req.root, &req.group_by, &req.sort_by).map(|index| {
+                    let window = body.graph[*transform_idx].id();
+                    let input_root = match req.root {
+                        PlanIndexRoot::Node { upstream, .. } => body.graph[upstream].id(),
+                    };
+                    (
+                        window,
+                        BodyWindowBinding {
+                            key: WindowRuntimeKey {
+                                body_scope,
+                                window,
+                                input_root,
+                            },
+                            index,
+                        },
+                        *transform_idx,
+                    )
+                })
+            })
+            .collect();
+
         let Some(body_mut) = artifacts.composition_bodies.get_mut(&body_id) else {
             continue;
         };
-        for (req, transform_idx) in &raw_requests {
-            let new_window_index =
-                find_index_for(&body_indices, &req.root, &req.group_by, &req.sort_by);
+        body_mut.window_bindings.clear();
+        for (window, binding, transform_idx) in binding_data {
             if let PlanNode::Transform {
                 window_index,
                 partition_lookup,
                 ..
-            } = &mut body_mut.graph[*transform_idx]
+            } = &mut body_mut.graph[transform_idx]
             {
-                *window_index = new_window_index;
-                // Body-internal partition lookup: cross-source
-                // (`wc.source: <other>`) is not a body-level surface
-                // today, so every body window resolves through the
-                // same-source path. Stamping `SameSource` keeps
-                // downstream consumers that branch on
-                // `partition_lookup` uniform with the top-level
-                // lowering arm in `lower_node_to_plan_node`.
+                *window_index = Some(binding.index);
                 *partition_lookup = Some(PartitionLookupKind::SameSource);
             }
+            body_mut.window_bindings.insert(window, binding);
         }
         body_mut.body_indices_to_build = body_indices;
     }
+}
+
+fn body_window_diag(
+    code: &'static str,
+    node: &PlanNode,
+    message: String,
+) -> clinker_core_types::Diagnostic {
+    clinker_core_types::Diagnostic::error(
+        code,
+        message,
+        clinker_core_types::LabeledSpan::primary(node.span(), "window declared here"),
+    )
+}
+
+fn body_window_root(
+    graph: &DiGraph<PlanNode, PlanEdge>,
+    start: NodeIndex,
+) -> Result<NodeIndex, (&'static str, String)> {
+    let mut current = start;
+    let mut visited = HashSet::new();
+    loop {
+        if !visited.insert(current) {
+            return Err((
+                "E162",
+                format!(
+                    "composition body window input path cycles at {:?}",
+                    graph[current].name()
+                ),
+            ));
+        }
+        if !matches!(
+            graph[current],
+            PlanNode::Sort { .. } | PlanNode::Route { .. }
+        ) {
+            return Ok(current);
+        }
+        let incoming: Vec<_> = graph
+            .neighbors_directed(current, petgraph::Direction::Incoming)
+            .collect();
+        match incoming.as_slice() {
+            [only] => current = *only,
+            [] => {
+                return Err((
+                    "E160",
+                    format!(
+                        "composition body window input path stops at {:?} without a producer",
+                        graph[current].name()
+                    ),
+                ));
+            }
+            _ => {
+                return Err((
+                    "E161",
+                    format!(
+                        "composition body window input path reaches ambiguous producer {:?}",
+                        graph[current].name()
+                    ),
+                ));
+            }
+        }
+    }
+}
+
+fn reachable_body_order(
+    parent_dag: &ExecutionPlanDag,
+    artifacts: &crate::plan::bind_schema::CompileArtifacts,
+    diags: &mut Vec<clinker_core_types::Diagnostic>,
+) -> Vec<crate::plan::CompositionBodyId> {
+    struct Traversal<'a> {
+        owner_by_body:
+            &'a mut HashMap<crate::plan::CompositionBodyId, Option<crate::plan::BodyScopeId>>,
+        visiting: &'a mut HashSet<crate::plan::CompositionBodyId>,
+        visited: &'a mut HashSet<crate::plan::CompositionBodyId>,
+        order: &'a mut Vec<crate::plan::CompositionBodyId>,
+        diags: &'a mut Vec<clinker_core_types::Diagnostic>,
+    }
+
+    fn visit(
+        body_id: crate::plan::CompositionBodyId,
+        owner: Option<crate::plan::BodyScopeId>,
+        artifacts: &crate::plan::bind_schema::CompileArtifacts,
+        traversal: &mut Traversal<'_>,
+    ) {
+        if let Some(previous_owner) = traversal.owner_by_body.insert(body_id, owner)
+            && previous_owner != owner
+        {
+            traversal.diags.push(clinker_core_types::Diagnostic::error(
+                "E163",
+                format!(
+                    "composition body {:?} is referenced outside its owning call scope",
+                    body_id
+                ),
+                clinker_core_types::LabeledSpan::primary(
+                    clinker_core_types::span::Span::SYNTHETIC,
+                    "body ownership is not unique",
+                ),
+            ));
+            return;
+        }
+        if traversal.visited.contains(&body_id) {
+            return;
+        }
+        if !traversal.visiting.insert(body_id) {
+            traversal.diags.push(clinker_core_types::Diagnostic::error(
+                "E162",
+                format!("composition body call graph cycles through {:?}", body_id),
+                clinker_core_types::LabeledSpan::primary(
+                    clinker_core_types::span::Span::SYNTHETIC,
+                    "cyclic body ownership",
+                ),
+            ));
+            return;
+        }
+        let Some(body) = artifacts.composition_bodies.get(&body_id) else {
+            traversal.diags.push(clinker_core_types::Diagnostic::error(
+                "E163",
+                format!("composition call references missing body {:?}", body_id),
+                clinker_core_types::LabeledSpan::primary(
+                    clinker_core_types::span::Span::SYNTHETIC,
+                    "missing owned body",
+                ),
+            ));
+            traversal.visiting.remove(&body_id);
+            return;
+        };
+        traversal.order.push(body_id);
+        for idx in &body.topo_order {
+            if let PlanNode::Composition { body: child, .. } = body.graph[*idx] {
+                visit(child, Some(body.body_scope), artifacts, traversal);
+            }
+        }
+        traversal.visiting.remove(&body_id);
+        traversal.visited.insert(body_id);
+    }
+
+    let mut owner_by_body = HashMap::new();
+    let mut visiting = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut order = Vec::new();
+    {
+        let mut traversal = Traversal {
+            owner_by_body: &mut owner_by_body,
+            visiting: &mut visiting,
+            visited: &mut visited,
+            order: &mut order,
+            diags,
+        };
+        for idx in &parent_dag.topo_order {
+            if let PlanNode::Composition { body, .. } = parent_dag.graph[*idx] {
+                visit(body, None, artifacts, &mut traversal);
+            }
+        }
+    }
+    for body_id in artifacts.composition_bodies.keys() {
+        if !visited.contains(body_id) {
+            diags.push(clinker_core_types::Diagnostic::error(
+                "E163",
+                format!(
+                    "composition body {:?} is outside the reachable owner tree",
+                    body_id
+                ),
+                clinker_core_types::LabeledSpan::primary(
+                    clinker_core_types::span::Span::SYNTHETIC,
+                    "unowned composition body",
+                ),
+            ));
+        }
+    }
+    order
 }
 
 /// On-disk byte seed for a file-backed Source's `predicted_peak_bytes`.

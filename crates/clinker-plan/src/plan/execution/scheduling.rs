@@ -3,19 +3,302 @@
 
 use super::*;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use petgraph::graph::NodeIndex;
-use petgraph::visit::Topo;
+use petgraph::visit::{EdgeRef, Topo};
 
-use crate::config::SortField;
+use crate::config::{
+    NullOrder, OnUnsorted, SortField, SortOrder, SortableEventShape, sortable_event_shape,
+    validate_source_sort_policy,
+};
 use crate::error::PipelineError;
 use crate::plan::properties::{
     NodeProperties, Ordering, OrderingProvenance, Partitioning, PartitioningKind,
     PartitioningProvenance,
 };
 
+/// Scope at which an ordering fact or requirement holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrderScope {
+    /// Records are ordered independently inside each physical source file.
+    PerPhysicalFile,
+    /// Records form one ordered sequence across the complete edge.
+    Global,
+}
+
+/// One source sort field after schema binding.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResolvedSortField {
+    pub field: String,
+    pub field_index: usize,
+    pub value_type: cxl::typecheck::Type,
+    pub order: SortOrder,
+    pub null_order: NullOrder,
+}
+
+/// Source-level sort declaration compiled for the physical-file verifier.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CompiledSourceOrder {
+    pub source_id: PlanNodeId,
+    pub source_name: String,
+    pub fields: Vec<ResolvedSortField>,
+    pub on_unsorted: OnUnsorted,
+    pub scope: OrderScope,
+    pub shape: SortableEventShape,
+}
+
+/// Ordering fact exposed by one compiled edge.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum OrderGuarantee {
+    /// No sequence is part of the operator contract.
+    Unordered,
+    /// Input arrival order is retained, without asserting a business-key sort.
+    StableArrival,
+    /// Exact authored-key ordering across the complete edge.
+    Sorted(Vec<ResolvedSortField>),
+}
+
+/// Exact ordering a consumer needs, including the Sources whose physical files
+/// must be verified before that consumer may rely on the requirement.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct OrderRequirement {
+    pub consumer_id: PlanNodeId,
+    pub consumer_name: String,
+    pub fields: Vec<ResolvedSortField>,
+    pub scope: OrderScope,
+    pub verified_sources: Vec<PlanNodeId>,
+}
+
+/// One producer-to-consumer edge and the ordering it promises.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CompiledEdgeOrder {
+    pub producer_id: PlanNodeId,
+    pub producer_name: String,
+    pub consumer_id: PlanNodeId,
+    pub consumer_name: String,
+    pub guarantee: OrderGuarantee,
+}
+
+/// Terminal ordering promised by an authored Output declaration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CompiledTerminalOrder {
+    pub node_id: PlanNodeId,
+    pub node_name: String,
+    pub guarantee: OrderGuarantee,
+}
+
+/// Runtime path that owns one physical writer boundary.
+///
+/// The variants mirror the mutually-exclusive Output dispatch paths. Keeping
+/// this explicit prevents a new writer path from silently inheriting a sort
+/// disposition that was compiled for a different population boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriterBoundaryMode {
+    /// Materialized records are written through one ordinary Output arm.
+    RecordsOnly,
+    /// Records are routed to one writer per concrete source file.
+    PerSourceFile,
+    /// Records retain document framing through begin/end-document hooks.
+    Envelope,
+    /// Clean document populations are committed atomically after DLQ review.
+    DocumentDlq,
+    /// Clean correlation populations are committed after group disposition.
+    CorrelationDeferred,
+    /// A certified producer writes through the bounded streaming sink task.
+    Streaming,
+}
+
+impl WriterBoundaryMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::RecordsOnly => "records_only",
+            Self::PerSourceFile => "per_source_file",
+            Self::Envelope => "envelope",
+            Self::DocumentDlq => "document_dlq",
+            Self::CorrelationDeferred => "correlation_deferred",
+            Self::Streaming => "streaming",
+        }
+    }
+}
+
+/// Logical key that selects one physical writer instance from an Output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WriterPartitionKey {
+    Single,
+    SourceFile,
+    SplitSequence,
+    Document,
+    CorrelationGroup,
+}
+
+/// Stable writer identity retained by the compiled boundary.
+///
+/// `path_template` is the authored Output path, not a resolved runtime path;
+/// per-file and split writers resolve one concrete path from it at execution.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WriterPartitionIdentity {
+    pub key: WriterPartitionKey,
+    pub path_template: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub split_naming: Option<String>,
+}
+
+/// Stable identity of a graph stage retained by terminal writer-order proof.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WriterOrderStage {
+    pub node_id: PlanNodeId,
+    pub node_name: String,
+}
+
+/// How one physical writer satisfies its compiled sequence guarantee.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum WriterOrderDisposition {
+    /// D-19: no sequence is promised for this boundary.
+    Unordered,
+    /// The boundary preserves the exact upstream arrival or sorted sequence.
+    Preserve,
+    /// A planner-compiled Sort is the final producer before the Output and
+    /// applies exactly the authored comparator.
+    ProvenTerminalSort {
+        sort: WriterOrderStage,
+        fields: Vec<ResolvedSortField>,
+    },
+    /// The complete physical-boundary population must be stably sorted at
+    /// commit by exactly these authored fields.
+    DeferredSort { fields: Vec<ResolvedSortField> },
+}
+
+/// One topology-derived physical writer contract.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PhysicalWriterBoundary {
+    pub producer: WriterProducerPort,
+    pub output_id: PlanNodeId,
+    pub output_name: String,
+    pub mode: WriterBoundaryMode,
+    pub partition: WriterPartitionIdentity,
+    pub guarantee: OrderGuarantee,
+    pub disposition: WriterOrderDisposition,
+    /// Last upstream stage that can destroy or redefine record sequence,
+    /// located after every structural graph rewrite.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_reorder_capable: Option<WriterOrderStage>,
+    /// Authored `null_order: drop` fields applied to the complete boundary
+    /// population before any key comparison.
+    pub pre_sort_drop_fields: Vec<ResolvedSortField>,
+}
+
+/// Serializable copy of the promoted registry's producer-port identity.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WriterProducerPort {
+    pub producer: PlanNodeId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub producer_port: Option<String>,
+}
+
+/// Complete explicit ordering contract derived from a compiled DAG.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExecutionOrderContract {
+    pub source_orders: Vec<CompiledSourceOrder>,
+    pub edges: Vec<CompiledEdgeOrder>,
+    pub requirements: Vec<OrderRequirement>,
+    pub terminals: Vec<CompiledTerminalOrder>,
+    pub writer_boundaries: Vec<PhysicalWriterBoundary>,
+}
+
+impl ExecutionOrderContract {
+    /// Return the compiled per-file order proof for stable source identity
+    /// `source_id`.
+    pub fn source_order_by_id(&self, source_id: PlanNodeId) -> Option<&CompiledSourceOrder> {
+        self.source_orders
+            .iter()
+            .find(|order| order.source_id == source_id)
+    }
+}
+
+/// Observable sequence promise attached to an operator strategy.
+///
+/// Exact promises may be compared as sequences. Unordered promises expose
+/// membership or aggregate results only; execution traversal is incidental.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum OutputOrderPromise {
+    Exact(OrderGuarantee),
+    Unordered,
+}
+
+/// Select the explicit promise compiled for `node_id`, defaulting to
+/// unordered when the node has no outgoing or terminal order evidence.
+pub fn select_order_compatible_strategy(
+    contract: &ExecutionOrderContract,
+    node_id: PlanNodeId,
+) -> OutputOrderPromise {
+    if let Some(edge) = contract
+        .edges
+        .iter()
+        .find(|edge| edge.producer_id == node_id)
+    {
+        return match &edge.guarantee {
+            OrderGuarantee::Unordered => OutputOrderPromise::Unordered,
+            guarantee => OutputOrderPromise::Exact(guarantee.clone()),
+        };
+    }
+    contract
+        .terminals
+        .iter()
+        .find(|terminal| terminal.node_id == node_id)
+        .map_or(OutputOrderPromise::Unordered, |terminal| {
+            OutputOrderPromise::Exact(terminal.guarantee.clone())
+        })
+}
+
+/// Fail closed when runtime strategy selection is weaker than the compiled
+/// output promise.
+///
+/// An unordered compiled promise deliberately makes no sequence claim, so a
+/// strategy that happens to preserve a stronger exact order is compatible.
+/// Exact compiled promises still require the strategy to advertise the same
+/// guarantee.
+pub fn assert_order_contract(
+    contract: &ExecutionOrderContract,
+    node: &PlanNode,
+    advertised: OutputOrderPromise,
+) -> Result<(), PipelineError> {
+    let promised = select_order_compatible_strategy(contract, node.id());
+    if promised == OutputOrderPromise::Unordered || promised == advertised {
+        Ok(())
+    } else {
+        Err(PipelineError::Internal {
+            op: "order_contract",
+            node: node.name().to_string(),
+            detail: format!(
+                "compiled order promise {promised:?} is incompatible with selected strategy promise {advertised:?}"
+            ),
+        })
+    }
+}
+
 impl ExecutionPlanDag {
+    /// Frozen source, edge, requirement, and terminal ordering evidence for
+    /// this finalized DAG.
+    pub fn order_contract(&self) -> &ExecutionOrderContract {
+        &self.order_contract
+    }
+
+    /// Derive and retain the ordering contract after the final structural
+    /// rewrite. No later planner pass may mutate graph topology.
+    pub(crate) fn freeze_order_contract(
+        &mut self,
+        inputs: &HashMap<String, &crate::config::pipeline_node::SourceBody>,
+    ) -> Result<(), PipelineError> {
+        let mut contract = self.derive_order_contracts(inputs)?;
+        self.enforce_terminal_writer_order(&mut contract)?;
+        self.order_contract = contract;
+        Ok(())
+    }
+
     /// Populate `node_properties` via topological walk.
     ///
     /// Computes [`NodeProperties`] for every node in the DAG, derived from
@@ -36,6 +319,9 @@ impl ExecutionPlanDag {
         &mut self,
         inputs: &HashMap<String, &crate::config::pipeline_node::SourceBody>,
     ) -> Result<(), PipelineError> {
+        for body in inputs.values() {
+            validate_source_sort_policy(&body.source, &body.schema)?;
+        }
         assert!(
             self.node_properties.is_empty(),
             "compute_node_properties called twice on the same ExecutionPlanDag"
@@ -56,6 +342,335 @@ impl ExecutionPlanDag {
 
         self.populate_fan_out_flags();
         Ok(())
+    }
+
+    /// Derive the exact source, edge, and consumer ordering contract from the
+    /// frozen plan. Source declarations are always compiled at
+    /// [`OrderScope::PerPhysicalFile`]; a multi-file Source therefore exposes
+    /// only [`OrderGuarantee::StableArrival`] on its aggregate edge sequence.
+    pub fn derive_order_contracts(
+        &self,
+        inputs: &HashMap<String, &crate::config::pipeline_node::SourceBody>,
+    ) -> Result<ExecutionOrderContract, PipelineError> {
+        let mut source_orders = Vec::new();
+        let mut source_by_id = HashMap::new();
+
+        for idx in self.graph.node_indices() {
+            let PlanNode::Source {
+                id, name, resolved, ..
+            } = &self.graph[idx]
+            else {
+                continue;
+            };
+            let config_name = resolved
+                .as_deref()
+                .map(|payload| payload.source.name.as_str())
+                .unwrap_or(name);
+            let Some(body) = inputs.get(config_name).copied() else {
+                // Composition input ports are synthetic Source nodes backed
+                // by the parent row, not top-level source declarations. They
+                // retain stable arrival but have no physical-file contract to
+                // compile here.
+                if resolved.is_none() {
+                    continue;
+                }
+                return Err(PipelineError::Internal {
+                    op: "order_contract",
+                    node: name.clone(),
+                    detail: "compiled Source has no matching source body".to_string(),
+                });
+            };
+            let Some(order) = compile_source_order(*id, name, body)? else {
+                continue;
+            };
+            source_by_id.insert(*id, order.clone());
+            source_orders.push(order);
+        }
+
+        let mut edges = Vec::with_capacity(self.graph.edge_count());
+        for edge in self.graph.edge_references() {
+            let producer_idx = edge.source();
+            let consumer_idx = edge.target();
+            let producer = &self.graph[producer_idx];
+            let consumer = &self.graph[consumer_idx];
+            let guarantee =
+                edge_order_guarantee(self, producer_idx, producer, inputs, &source_by_id)?;
+            edges.push(CompiledEdgeOrder {
+                producer_id: producer.id(),
+                producer_name: producer.name().to_string(),
+                consumer_id: consumer.id(),
+                consumer_name: consumer.name().to_string(),
+                guarantee,
+            });
+        }
+
+        let mut requirements = Vec::new();
+        for idx in self.graph.node_indices() {
+            let node = &self.graph[idx];
+            let required = match node {
+                PlanNode::Transform {
+                    execution_reqs: NodeExecutionReqs::RequiresSortedInput { sort_fields },
+                    ..
+                } => Some(sort_fields.as_slice()),
+                PlanNode::Aggregation {
+                    strategy: crate::plan::types::AggregateStrategy::Streaming,
+                    qualified_sort_order: Some(sort_fields),
+                    ..
+                } if !sort_fields.is_empty() => Some(sort_fields.as_slice()),
+                _ => None,
+            };
+            let Some(required) = required else {
+                continue;
+            };
+
+            let parent_indices: Vec<NodeIndex> = self
+                .graph
+                .neighbors_directed(idx, petgraph::Direction::Incoming)
+                .collect();
+            let Some(&primary_parent) = parent_indices.first() else {
+                return Err(PipelineError::Internal {
+                    op: "order_contract",
+                    node: node.name().to_string(),
+                    detail: "order-dependent consumer has no upstream edge".to_string(),
+                });
+            };
+            let fields =
+                resolve_fields_for_node(self, primary_parent, required, inputs, &source_by_id)?;
+            let parent_guarantee = edge_order_guarantee(
+                self,
+                primary_parent,
+                &self.graph[primary_parent],
+                inputs,
+                &source_by_id,
+            )?;
+            let mut verified_sources = Vec::new();
+            let scope = if matches!(parent_guarantee, OrderGuarantee::Sorted(_)) {
+                OrderScope::Global
+            } else {
+                verified_sources = upstream_source_ids(self, idx)
+                    .into_iter()
+                    .filter(|source_id| source_by_id.contains_key(source_id))
+                    .collect();
+                if verified_sources.is_empty() {
+                    OrderScope::Global
+                } else {
+                    OrderScope::PerPhysicalFile
+                }
+            };
+            requirements.push(OrderRequirement {
+                consumer_id: node.id(),
+                consumer_name: node.name().to_string(),
+                fields,
+                scope,
+                verified_sources,
+            });
+        }
+
+        let mut terminals = Vec::new();
+        for idx in self.graph.node_indices() {
+            let PlanNode::Output {
+                id,
+                name,
+                resolved: Some(payload),
+                ..
+            } = &self.graph[idx]
+            else {
+                continue;
+            };
+            let Some(specs) = payload.output.sort_order.as_ref() else {
+                continue;
+            };
+            let authored: Vec<SortField> = specs
+                .iter()
+                .cloned()
+                .map(|spec| spec.into_sort_field())
+                .collect();
+            let fields = resolve_fields_for_node(self, idx, &authored, inputs, &source_by_id)?;
+            terminals.push(CompiledTerminalOrder {
+                node_id: *id,
+                node_name: name.clone(),
+                guarantee: OrderGuarantee::Sorted(fields),
+            });
+        }
+
+        let writer_boundaries = self.derive_writer_boundaries(inputs, &edges, &terminals)?;
+
+        Ok(ExecutionOrderContract {
+            source_orders,
+            edges,
+            requirements,
+            terminals,
+            writer_boundaries,
+        })
+    }
+
+    fn derive_writer_boundaries(
+        &self,
+        inputs: &HashMap<String, &crate::config::pipeline_node::SourceBody>,
+        edges: &[CompiledEdgeOrder],
+        terminals: &[CompiledTerminalOrder],
+    ) -> Result<Vec<PhysicalWriterBoundary>, PipelineError> {
+        let correlation_active = inputs.values().any(|body| body.correlation_key.is_some());
+        let document_dlq_active = inputs
+            .values()
+            .any(|body| body.source.dlq_granularity == crate::config::DlqGranularity::Document);
+        let envelope_active = self.graph.node_weights().any(|node| {
+            matches!(
+                node,
+                PlanNode::Output {
+                    resolved: Some(payload),
+                    ..
+                } if payload.output.reconstruct_envelope
+            )
+        });
+
+        // Reproduce the plan-derived producer sets used by the runtime's
+        // streaming classifier without consulting raw Output side counts.
+        let init_phase = compute_init_phase_node_set(self);
+        let mut merge_fused_sources = HashSet::new();
+        for merge_idx in self.graph.node_indices() {
+            let PlanNode::Merge {
+                mode: crate::config::MergeMode::Interleave,
+                interleave_seed: None,
+                ..
+            } = &self.graph[merge_idx]
+            else {
+                continue;
+            };
+            let predecessors: Vec<_> = self
+                .graph
+                .neighbors_directed(merge_idx, petgraph::Direction::Incoming)
+                .collect();
+            if predecessors.is_empty()
+                || !predecessors
+                    .iter()
+                    .all(|idx| matches!(self.graph[*idx], PlanNode::Source { .. }))
+            {
+                continue;
+            }
+            for predecessor in predecessors {
+                if let PlanNode::Source { name, .. } = &self.graph[predecessor] {
+                    merge_fused_sources.insert(name.clone());
+                }
+            }
+        }
+        let (_, fused_transforms) =
+            compute_transform_fused_sources(self, &merge_fused_sources, &init_phase);
+
+        let mut boundaries = Vec::new();
+        for (producer, consumers) in self.consumer_registry.iter() {
+            for consumer in consumers {
+                if consumer.kind != CompiledConsumerKind::PhysicalWriterBoundary {
+                    continue;
+                }
+                let output_idx = self.index_of_or_scan(consumer.node).ok_or_else(|| {
+                    PipelineError::Internal {
+                        op: "writer_boundary",
+                        node: format!("{:?}", consumer.node),
+                        detail: "compiled writer consumer has no live DAG node".to_string(),
+                    }
+                })?;
+                let PlanNode::Output {
+                    id,
+                    name,
+                    resolved: Some(payload),
+                    ..
+                } = &self.graph[output_idx]
+                else {
+                    return Err(PipelineError::Internal {
+                        op: "writer_boundary",
+                        node: self.graph[output_idx].name().to_string(),
+                        detail: "consumer registry classified a non-Output node as a physical writer boundary"
+                            .to_string(),
+                    });
+                };
+
+                let guarantee = terminals
+                    .iter()
+                    .find(|terminal| terminal.node_id == *id)
+                    .map(|terminal| terminal.guarantee.clone())
+                    .or_else(|| {
+                        edges
+                            .iter()
+                            .find(|edge| {
+                                edge.producer_id == producer.producer && edge.consumer_id == *id
+                            })
+                            .map(|edge| edge.guarantee.clone())
+                    })
+                    .unwrap_or(OrderGuarantee::Unordered);
+
+                let mode = if correlation_active {
+                    WriterBoundaryMode::CorrelationDeferred
+                } else if document_dlq_active {
+                    WriterBoundaryMode::DocumentDlq
+                } else if payload.output.reconstruct_envelope {
+                    WriterBoundaryMode::Envelope
+                } else if payload.fan_out_per_source_file {
+                    WriterBoundaryMode::PerSourceFile
+                } else if !envelope_active
+                    && certify_streaming_edge(self, output_idx, &fused_transforms, &init_phase)
+                        .is_some()
+                {
+                    WriterBoundaryMode::Streaming
+                } else {
+                    WriterBoundaryMode::RecordsOnly
+                };
+
+                let partition_key = match mode {
+                    WriterBoundaryMode::PerSourceFile => WriterPartitionKey::SourceFile,
+                    WriterBoundaryMode::Envelope | WriterBoundaryMode::DocumentDlq => {
+                        WriterPartitionKey::Document
+                    }
+                    WriterBoundaryMode::CorrelationDeferred => WriterPartitionKey::CorrelationGroup,
+                    WriterBoundaryMode::RecordsOnly | WriterBoundaryMode::Streaming => {
+                        if payload.output.split.is_some() {
+                            WriterPartitionKey::SplitSequence
+                        } else {
+                            WriterPartitionKey::Single
+                        }
+                    }
+                };
+                let pre_sort_drop_fields = match &guarantee {
+                    OrderGuarantee::Sorted(fields) => fields
+                        .iter()
+                        .filter(|field| field.null_order == NullOrder::Drop)
+                        .cloned()
+                        .collect(),
+                    OrderGuarantee::Unordered | OrderGuarantee::StableArrival => Vec::new(),
+                };
+                let disposition = match &guarantee {
+                    OrderGuarantee::Unordered => WriterOrderDisposition::Unordered,
+                    OrderGuarantee::StableArrival => WriterOrderDisposition::Preserve,
+                    OrderGuarantee::Sorted(fields) => WriterOrderDisposition::DeferredSort {
+                        fields: fields.clone(),
+                    },
+                };
+
+                boundaries.push(PhysicalWriterBoundary {
+                    producer: WriterProducerPort {
+                        producer: producer.producer,
+                        producer_port: producer.producer_port.clone(),
+                    },
+                    output_id: *id,
+                    output_name: name.clone(),
+                    mode,
+                    partition: WriterPartitionIdentity {
+                        key: partition_key,
+                        path_template: payload.output.path.clone(),
+                        split_naming: payload
+                            .output
+                            .split
+                            .as_ref()
+                            .map(|split| split.naming.clone()),
+                    },
+                    guarantee,
+                    disposition,
+                    last_reorder_capable: None,
+                    pre_sort_drop_fields,
+                });
+            }
+        }
+        Ok(boundaries)
     }
 
     /// Seed the statistics catalog's Plane A row counts from source file
@@ -576,6 +1191,254 @@ impl crate::plan::scheduling_hint::SchedulingHint for ExecutionPlanDag {
     }
 }
 
+fn compile_source_order(
+    source_id: PlanNodeId,
+    source_name: &str,
+    body: &crate::config::pipeline_node::SourceBody,
+) -> Result<Option<CompiledSourceOrder>, PipelineError> {
+    validate_source_sort_policy(&body.source, &body.schema)?;
+    let Some(specs) = body.source.sort_order.as_ref() else {
+        return Ok(None);
+    };
+    let columns = body
+        .schema
+        .bound_columns()
+        .ok_or_else(|| PipelineError::Compilation {
+            transform_name: source_name.to_string(),
+            messages: vec![format!(
+                "source '{source_name}' declares `sort_order`, but its schema has not resolved to \
+             concrete columns; resolve the schema before compiling source ordering"
+            )],
+        })?;
+    let mut fields = Vec::with_capacity(specs.len());
+    for spec in specs.iter().cloned() {
+        let field = spec.into_sort_field();
+        let (field_index, column) = columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.name == field.field)
+            .ok_or_else(|| PipelineError::Internal {
+                op: "order_contract",
+                node: source_name.to_string(),
+                detail: format!(
+                    "validated source sort field '{}' disappeared before contract derivation",
+                    field.field
+                ),
+            })?;
+        fields.push(ResolvedSortField {
+            field: field.field,
+            field_index,
+            value_type: column.bound_type(),
+            order: field.order,
+            null_order: field.null_order.unwrap_or(NullOrder::Last),
+        });
+    }
+    Ok(Some(CompiledSourceOrder {
+        source_id,
+        source_name: source_name.to_string(),
+        fields,
+        on_unsorted: body.source.on_unsorted.unwrap_or_default(),
+        scope: OrderScope::PerPhysicalFile,
+        shape: sortable_event_shape(&body.source)?,
+    }))
+}
+
+fn edge_order_guarantee(
+    dag: &ExecutionPlanDag,
+    producer_idx: NodeIndex,
+    producer: &PlanNode,
+    inputs: &HashMap<String, &crate::config::pipeline_node::SourceBody>,
+    source_by_id: &HashMap<PlanNodeId, CompiledSourceOrder>,
+) -> Result<OrderGuarantee, PipelineError> {
+    match producer {
+        PlanNode::Source { .. } => {
+            // A source declaration is scoped to each physical file. Even a
+            // literal `path:` remains a per-file promise rather than becoming
+            // an implicit global edge sort.
+            return Ok(OrderGuarantee::StableArrival);
+        }
+        PlanNode::Sort { sort_fields, .. } => {
+            return resolve_fields_for_node(dag, producer_idx, sort_fields, inputs, source_by_id)
+                .map(OrderGuarantee::Sorted);
+        }
+        PlanNode::Merge {
+            mode: crate::config::MergeMode::Interleave,
+            interleave_seed: None,
+            ..
+        }
+        | PlanNode::Combine { .. }
+        | PlanNode::Reshape { .. }
+        | PlanNode::Cull { .. }
+        | PlanNode::Aggregation {
+            strategy: crate::plan::types::AggregateStrategy::Hash,
+            ..
+        } => return Ok(OrderGuarantee::Unordered),
+        PlanNode::Merge {
+            mode: crate::config::MergeMode::Concat,
+            ..
+        }
+        | PlanNode::Merge {
+            mode: crate::config::MergeMode::Interleave,
+            interleave_seed: Some(_),
+            ..
+        } => return Ok(OrderGuarantee::StableArrival),
+        PlanNode::Aggregation {
+            strategy: crate::plan::types::AggregateStrategy::Streaming,
+            qualified_sort_order,
+            ..
+        } => {
+            let parent = first_parent_order_guarantee(dag, producer_idx, inputs, source_by_id)?;
+            if matches!(parent, OrderGuarantee::Sorted(_))
+                && let Some(sort_fields) = qualified_sort_order.as_deref()
+            {
+                return resolve_fields_for_node(
+                    dag,
+                    producer_idx,
+                    sort_fields,
+                    inputs,
+                    source_by_id,
+                )
+                .map(OrderGuarantee::Sorted);
+            }
+            return Ok(parent);
+        }
+        _ => {}
+    }
+
+    if preserves_stable_arrival(producer) {
+        first_parent_order_guarantee(dag, producer_idx, inputs, source_by_id)
+    } else {
+        Ok(OrderGuarantee::Unordered)
+    }
+}
+
+fn first_parent_order_guarantee(
+    dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+    inputs: &HashMap<String, &crate::config::pipeline_node::SourceBody>,
+    source_by_id: &HashMap<PlanNodeId, CompiledSourceOrder>,
+) -> Result<OrderGuarantee, PipelineError> {
+    let Some(parent_idx) = dag
+        .graph
+        .neighbors_directed(node_idx, petgraph::Direction::Incoming)
+        .next()
+    else {
+        return Ok(OrderGuarantee::Unordered);
+    };
+    edge_order_guarantee(
+        dag,
+        parent_idx,
+        &dag.graph[parent_idx],
+        inputs,
+        source_by_id,
+    )
+}
+
+fn resolve_fields_for_node(
+    dag: &ExecutionPlanDag,
+    node_idx: NodeIndex,
+    sort_fields: &[SortField],
+    _inputs: &HashMap<String, &crate::config::pipeline_node::SourceBody>,
+    source_by_id: &HashMap<PlanNodeId, CompiledSourceOrder>,
+) -> Result<Vec<ResolvedSortField>, PipelineError> {
+    let node = &dag.graph[node_idx];
+    if let Some(source) = source_by_id.get(&node.id()) {
+        let mut resolved = Vec::with_capacity(sort_fields.len());
+        for requested in sort_fields {
+            let Some(field) = source
+                .fields
+                .iter()
+                .find(|field| field.field == requested.field)
+            else {
+                return Err(PipelineError::Internal {
+                    op: "order_contract",
+                    node: node.name().to_string(),
+                    detail: format!(
+                        "required sort field '{}' is absent from the compiled source order",
+                        requested.field
+                    ),
+                });
+            };
+            resolved.push(ResolvedSortField {
+                field: field.field.clone(),
+                field_index: field.field_index,
+                value_type: field.value_type.clone(),
+                order: requested.order,
+                null_order: requested.null_order.unwrap_or(NullOrder::Last),
+            });
+        }
+        return Ok(resolved);
+    }
+
+    let schema = node.output_schema_in(dag);
+    let mut resolved = Vec::with_capacity(sort_fields.len());
+    for field in sort_fields {
+        let field_index = schema
+            .index(&field.field)
+            .ok_or_else(|| PipelineError::Internal {
+                op: "order_contract",
+                node: node.name().to_string(),
+                detail: format!(
+                    "sort field '{}' is absent from the producer's compiled schema",
+                    field.field
+                ),
+            })?;
+        resolved.push(ResolvedSortField {
+            field: field.field.clone(),
+            field_index,
+            // Record schemas intentionally carry column identity only. Source
+            // fields retain their exact admitted CXL type above; derived node
+            // fields use `Any` until the typed artifact is projected onto the
+            // execution edge in the later strategy-contract plan.
+            value_type: cxl::typecheck::Type::Any,
+            order: field.order,
+            null_order: field.null_order.unwrap_or(NullOrder::Last),
+        });
+    }
+    Ok(resolved)
+}
+
+fn preserves_stable_arrival(node: &PlanNode) -> bool {
+    matches!(
+        node,
+        PlanNode::Source { .. }
+            | PlanNode::Route { .. }
+            | PlanNode::Output { .. }
+            | PlanNode::Composition { .. }
+            | PlanNode::Envelope { .. }
+            | PlanNode::CorrelationCommit { .. }
+    ) || matches!(
+        node,
+        PlanNode::Transform {
+            has_distinct: false,
+            ..
+        }
+    )
+}
+
+fn upstream_source_ids(dag: &ExecutionPlanDag, start: NodeIndex) -> Vec<PlanNodeId> {
+    let mut pending = vec![start];
+    let mut visited = std::collections::BTreeSet::new();
+    let mut sources = std::collections::BTreeSet::new();
+    while let Some(idx) = pending.pop() {
+        if !visited.insert(idx.index()) {
+            continue;
+        }
+        for parent in dag
+            .graph
+            .neighbors_directed(idx, petgraph::Direction::Incoming)
+        {
+            match &dag.graph[parent] {
+                PlanNode::Source { id, .. } => {
+                    sources.insert(*id);
+                }
+                _ => pending.push(parent),
+            }
+        }
+    }
+    sources.into_iter().collect()
+}
+
 /// Internal carrier for `select_aggregation_strategies` resolution result.
 struct ResolvedStrategy {
     strategy: crate::plan::types::AggregateStrategy,
@@ -804,10 +1667,6 @@ fn compute_one(
             if parents.is_empty() {
                 return NodeProperties::unordered_single();
             }
-            let first_so = parents[0].ordering.sort_order.clone();
-            let all_match = parents
-                .iter()
-                .all(|p| sort_orders_equal(&p.ordering.sort_order, &first_so));
             // Merge is the explicit opt-out from per-file partitioning:
             // when any parent carries `FilePartitioned`, the merged
             // stream is unpartitioned (the user asked to cross file
@@ -849,40 +1708,25 @@ fn compute_one(
                     None => BTreeSet::new(),
                 }
             };
-            if all_match {
-                let provenance = if first_so.is_some() {
-                    OrderingProvenance::Preserved {
-                        from_node: name.clone(),
-                    }
-                } else {
-                    OrderingProvenance::NoOrdering
-                };
-                NodeProperties {
-                    ordering: Ordering {
-                        sort_order: first_so,
-                        provenance,
+            // Independently sorted inputs do not form one globally sorted
+            // sequence after either concat or interleave. Preserve stable
+            // arrival as an explicit edge promise for concat, but never expose
+            // authored-key ordering to strategy selection without a real Sort.
+            NodeProperties {
+                ordering: Ordering {
+                    sort_order: None,
+                    provenance: OrderingProvenance::DestroyedByMergeMismatch {
+                        at_node: name.clone(),
+                        parent_orderings: parents
+                            .iter()
+                            .map(|p| p.ordering.sort_order.clone())
+                            .collect(),
+                        confidence: crate::plan::properties::Confidence::Proven,
                     },
-                    partitioning,
-                    ck_set,
-                    ..NodeProperties::unordered_single()
-                }
-            } else {
-                NodeProperties {
-                    ordering: Ordering {
-                        sort_order: None,
-                        provenance: OrderingProvenance::DestroyedByMergeMismatch {
-                            at_node: name.clone(),
-                            parent_orderings: parents
-                                .iter()
-                                .map(|p| p.ordering.sort_order.clone())
-                                .collect(),
-                            confidence: crate::plan::properties::Confidence::Proven,
-                        },
-                    },
-                    partitioning,
-                    ck_set,
-                    ..NodeProperties::unordered_single()
-                }
+                },
+                partitioning,
+                ck_set,
+                ..NodeProperties::unordered_single()
             }
         }
 
@@ -1193,22 +2037,5 @@ fn compute_one(
                 ..NodeProperties::unordered_single()
             }
         }
-    }
-}
-
-/// Field-wise equality for `Option<Vec<SortField>>` — `SortField` itself does
-/// not derive `PartialEq` and we deliberately avoid adding the derive in this
-/// task. Used by the `Merge` arm of `compute_one` for parent-ordering
-/// reconciliation.
-fn sort_orders_equal(a: &Option<Vec<SortField>>, b: &Option<Vec<SortField>>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(x), Some(y)) => {
-            x.len() == y.len()
-                && x.iter().zip(y.iter()).all(|(p, q)| {
-                    p.field == q.field && p.order == q.order && p.null_order == q.null_order
-                })
-        }
-        _ => false,
     }
 }

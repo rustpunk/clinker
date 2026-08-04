@@ -16,41 +16,74 @@ Every design decision cascades from three commitments. They are permanent — an
 
 These pillars are why the memory arbitrator is a single in-process component rather than a distributed scheduler, why there is no network shuffle in Combine, and why spill-to-local-disk is the universal pressure-relief valve.
 
-## Crate dependency layers (bottom → top)
+## Crate dependency layers (top → bottom)
 
 ```
-Applications:   clinker (CLI)  |  cxl-cli (CXL tool)
-                     ↓                ↓
-Orchestration:  clinker-core (DAG planner + executor)
-                clinker-channel (workspace/channel mgmt)
-                clinker-schema (source .schema.yaml validation)
-                     ↓
-Language/IO:    cxl (lexer → parser → typecheck → eval)
-                clinker-format (CSV/JSON/XML/fixed-width readers/writers)
-                     ↓
-Foundation:     clinker-record (Value, Record, Schema, coercion)
+Applications:    clinker (CLI) | cxl-cli (CXL tool)
+                      |
+Edge services:   clinker-channel | clinker-net | clinker-schema | clinker-lineage
+                      |
+Execution:       clinker-exec (runtime operators, memory, spill, metrics)
+                      |
+Planning:        clinker-plan (YAML, validation, CXL binding, compiled DAG)
+                      |
+Language / IO:   cxl | clinker-format
+                      |
+Foundation:      clinker-record | clinker-core-types
 
-Bench plumbing: clinker-bench-support (deterministic RecordFactory + payload generators)
-                clinker-benchmarks (cross-crate benchmark harness)
+Support:         clinker-scenarios | clinker-bench-support | clinker-benchmarks
 ```
 
-The bench crates are siblings, not part of the runtime layer.
+The support crates are siblings, not part of the default runtime path. Some
+edge crates depend on more than one lower layer; the repository's AI crate map
+records the detailed dependency edges and their evidence.
 
 ## The node taxonomy
 
 Pipelines use a single flat `nodes:` list; each entry's `type:` discriminator selects a variant of one homogeneous DAG:
 
-- **Source** — input reader bound to a `.schema.yaml`.
+- **Source** — finite input endpoint with an inline, generated, or external schema.
 - **Transform** — record-level CXL projection / filter / lookup (1×1).
 - **Aggregate** — grouped or windowed reduction.
 - **Route** — predicate-based fan-out.
 - **Merge** — streamwise concatenation of inputs.
 - **Combine** — N-ary record combining with mixed predicates (equi + range + arbitrary CXL); distinct from Merge and Transform+lookup.
 - **Reshape** — per-group mutate-and-synthesize.
+- **Cull** — per-group rule evaluation with retained and removed output ports.
+- **Envelope** — document-level consolidation or expansion at explicit DAG boundaries.
 - **Output** — sink writer.
 - **Composition** — call-site node referencing a `.comp.yaml` reusable sub-pipeline, lowered at compile time.
 
 The plan itself is a petgraph DAG (`ExecutionPlanDag`) of topologically-sorted nodes, each carrying a parallelism strategy and `NodeProperties` (ordering / partitioning provenance). CXL is typechecked at compile time into a `TypedProgram`, and schema is propagated across the DAG at plan time.
+
+## Planner/runtime handoff
+
+`clinker-plan` is the execution-admission layer: canonical YAML parsing,
+topology and path validation, schema binding, CXL typechecking, composition
+binding, and lowering produce a `CompiledPlan`. Public executor entry points
+accept `&CompiledPlan`, but the current implementation then calls
+`plan.config()` and recompiles before dispatch. The stored plan is therefore a
+typed public boundary today, but its stored DAG and other compiled artifacts
+are not yet the artifacts the runtime dispatches directly.
+
+The locked D-01 through D-11 contract corrects that mismatch in Phase 5 /
+PERF-01: the supplied plan must remain authoritative and reusable for
+sequential in-process runs, while only an enumerated run envelope may refresh.
+Persistent cache identity, semantic comparison, integrity checks, and
+source-map refresh are part of the same downstream contract; none of that work
+is implemented by this chapter. See
+[Stored-plan execution and cache identity](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#stored-plan-execution-and-cache-identity)
+and [Streaming vs. Blocking Stages](execution-model.md#plan-admission-and-runtime-entry).
+
+## Terminal destination vocabulary
+
+`PipelineNode::Output` and YAML `type: output` are the current terminal-writer
+surface. D-56 assigns an atomic migration of that terminal destination concept
+to `Sink` / `type: sink` to Phase 4 / AUTH-09, before Phase 4.1 endpoint
+expansion. The migration has not landed. Output ports, produced artifacts and
+paths, serialization formats, stdout and machine output, writer results, and
+OpenLineage output datasets remain distinct and valid output vocabulary. See
+[Terminal destination vocabulary](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#terminal-destination-vocabulary).
 
 ## Key engine decisions
 
@@ -58,3 +91,6 @@ The plan itself is a petgraph DAG (`ExecutionPlanDag`) of topologically-sorted n
 - **Compile-time CXL typechecking.** Type inference produces a `TypedProgram`; see [Compiler Phases & Type Unification](cxl-internals.md).
 - **Diagnostics.** All user-facing errors use `miette` for span-annotated reports. `Spanned<PipelineNode>` covers the YAML side, `cxl::Span` covers the expression side, and they compose into one report.
 - **Pure Rust policy.** `deny.toml` bans cmake; no C build dependencies in clinker crates.
+
+The boundaries available to engine extensions are described in
+[Extension Seams](extension-seams.md).

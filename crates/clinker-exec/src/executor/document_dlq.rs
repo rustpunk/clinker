@@ -65,7 +65,8 @@ use crate::executor::dispatch::{
     source_name_arc_of,
 };
 use crate::executor::node_buffer::NodeBuffer;
-use crate::executor::stream_event::StreamEvent;
+use crate::executor::output_dispatch::OrderedWriterBoundary;
+use crate::executor::stream_event::{SourceRowId, StreamEvent};
 use crate::executor::structured_output_guard::StructuredOutputDocumentGuard;
 use crate::executor::{DlqEntry, build_format_writer};
 use clinker_plan::config::OutputConfig;
@@ -80,7 +81,7 @@ type DocKey = Arc<str>;
 /// records (or an out-of-band validation) fails. Replayed as the single
 /// `trigger: true` DLQ entry when the document is rejected.
 struct DocTrigger {
-    source_row: u64,
+    source_row: SourceRowId,
     category: clinker_core_types::dlq::DlqErrorCategory,
     error_message: String,
     original_record: Record,
@@ -121,7 +122,7 @@ pub(crate) struct DocumentDlqState {
     /// captured here and emitted as a `DocumentRejected` collateral at the
     /// document's reject — preserving the invariant that every record of a
     /// rejected N-record document contributes exactly one DLQ entry.
-    extra_collaterals: HashMap<DocKey, Vec<(Record, u64)>>,
+    extra_collaterals: HashMap<DocKey, Vec<(Record, SourceRowId)>>,
     /// Documents whose reject DLQ entries have already been emitted. A
     /// duplicate close (fan-in dedup escapee, malformed input) finds the key
     /// here and emits nothing more.
@@ -192,7 +193,7 @@ pub(crate) fn is_concrete_file(file: &Arc<str>) -> bool {
 pub(crate) fn record_error_to_document_buffer_if_doc_dlq(
     ctx: &mut ExecutorContext<'_>,
     record: &Record,
-    row_num: u64,
+    source_row: SourceRowId,
     category: clinker_core_types::dlq::DlqErrorCategory,
     error_message: String,
     stage: Option<String>,
@@ -211,7 +212,7 @@ pub(crate) fn record_error_to_document_buffer_if_doc_dlq(
         ctx,
         key,
         DocTrigger {
-            source_row: row_num,
+            source_row,
             category,
             error_message,
             original_record: record.clone(),
@@ -220,6 +221,42 @@ pub(crate) fn record_error_to_document_buffer_if_doc_dlq(
             source_name,
             triggering_field,
             triggering_value,
+        },
+    );
+    true
+}
+
+/// Mark the document containing a source declared-type failure. The rejected
+/// row has its document context, but it has not passed the ordinary source
+/// stamping path, so source and file identity must come from the
+/// [`crate::executor::dlq::TypeErrorEvent`] itself.
+pub(crate) fn record_type_error_to_document_buffer_if_doc_dlq(
+    ctx: &mut ExecutorContext<'_>,
+    event: &crate::executor::dlq::TypeErrorEvent,
+    diagnostic: String,
+) -> bool {
+    let Some(state) = ctx.document_dlq.as_ref() else {
+        return false;
+    };
+    if event.original_record.doc_ctx().id() == DocumentId::SYNTHETIC
+        || !state.doc_sources.contains(&event.source_name)
+        || !is_concrete_file(&event.source_file)
+    {
+        return false;
+    }
+    mark_document_failed(
+        ctx,
+        Arc::clone(&event.source_file),
+        DocTrigger {
+            source_row: event.source_row,
+            category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
+            error_message: diagnostic,
+            original_record: event.original_record.clone(),
+            stage: Some(DlqEntry::stage_source()),
+            route: None,
+            source_name: Arc::clone(&event.source_name),
+            triggering_field: Some(Arc::from(event.field.as_ref())),
+            triggering_value: Some(event.original_value.clone()),
         },
     );
     true
@@ -329,6 +366,7 @@ pub(crate) struct DocumentDlqDriver<'cfg> {
     ok_count: u64,
     records_written: u64,
     structured_guard: StructuredOutputDocumentGuard,
+    writer_boundary: OrderedWriterBoundary,
 }
 
 impl<'cfg> DocumentDlqDriver<'cfg> {
@@ -340,6 +378,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         output_name: &str,
         out_cfg: &'cfg OutputConfig,
         cxl_emit_names: Vec<String>,
+        writer_boundary: OrderedWriterBoundary,
     ) -> Self {
         let cxl_emit_names = if cxl_emit_names.is_empty() {
             None
@@ -360,6 +399,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
             ok_count: 0,
             records_written: 0,
             structured_guard: StructuredOutputDocumentGuard::new(&out_cfg.format),
+            writer_boundary,
         }
     }
 
@@ -396,11 +436,11 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         &mut self,
         key: &DocKey,
         record: Record,
-        row_num: u64,
+        source_row: SourceRowId,
     ) -> Result<(), PipelineError> {
         let column_count = record.schema().column_count();
         let bucket = Self::bucket_for(&mut self.buckets, &self.arbitrator, key);
-        bucket.buffer.push(record, row_num);
+        bucket.buffer.push(record, source_row);
         bucket
             .handle
             .set_bytes(bucket.buffer.estimated_memory_bytes());
@@ -465,54 +505,55 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
             ..
         } = bucket;
         handle.set_bytes(0);
-        let cxl_emit_names_opt: Option<&[String]> = self.cxl_emit_names.as_deref();
-
-        let mut projected: Vec<Record> = Vec::with_capacity(buffer.len_hint());
-        // Drain in ARRIVAL order. The success sink is order-sensitive, and a
-        // bucket that spilled and then kept a resident mem tail
-        // (`NodeBuffer::Mixed`) has its NEWEST records in the mem tail —
-        // `NodeBuffer::drain` yields mem-first, which would write the
-        // post-spill tail ahead of the pre-spill body. Emitting the spill
-        // chunks (older) before the resident tail (newer) restores arrival
-        // order. (The reject path's DLQ order is not contractual, so it
-        // drains directly.)
-        for item in drain_records_in_arrival_order(buffer) {
-            let (record, row_num) = item?;
-            if let Err(err) = self
-                .structured_guard
-                .observe(&self.output_name, record.doc_ctx())
-            {
-                ctx.output_errors.push(err);
-                self.arbitrator.unregister_consumer(consumer_id);
-                return Ok(());
-            }
-            let record = match self.out_cfg.mapping.as_ref() {
-                Some(_) => {
-                    let probe =
-                        mapping_probe(&mut ctx.mapping_probes, &self.output_name, self.out_cfg);
-                    crate::projection::project_output_probed(
+        let result = (|| {
+            // Drain in ARRIVAL order. The success sink is order-sensitive, and
+            // a bucket that spilled and then kept a resident mem tail has its
+            // newest records in the mem tail. Feed the restored arrival stream
+            // into the compiled boundary; a deferred boundary drains its
+            // bounded spill merge lazily into the writer.
+            let ordered = self
+                .writer_boundary
+                .order_record_stream(ctx, drain_records_in_arrival_order(buffer))?;
+            for item in ordered {
+                let (record, source_row) = item?;
+                if let Err(err) = self
+                    .structured_guard
+                    .observe(&self.output_name, record.doc_ctx())
+                {
+                    ctx.output_errors.push(err);
+                    return Ok(());
+                }
+                let projected = match self.out_cfg.mapping.as_ref() {
+                    Some(_) => {
+                        let probe =
+                            mapping_probe(&mut ctx.mapping_probes, &self.output_name, self.out_cfg);
+                        crate::projection::project_output_probed(
+                            &record,
+                            self.out_cfg,
+                            self.cxl_emit_names.as_deref(),
+                            Some(probe),
+                        )
+                    }
+                    None => crate::projection::project_output_from_record(
                         &record,
                         self.out_cfg,
-                        cxl_emit_names_opt,
-                        Some(probe),
-                    )
+                        self.cxl_emit_names.as_deref(),
+                    ),
+                };
+                let prior_errors = ctx.output_errors.len();
+                self.write_projected(ctx, std::slice::from_ref(&projected));
+                if ctx.output_errors.len() != prior_errors {
+                    break;
                 }
-                None => crate::projection::project_output_from_record(
-                    &record,
-                    self.out_cfg,
-                    cxl_emit_names_opt,
-                ),
-            };
-            projected.push(record);
-            if ctx.ok_source_rows.insert(row_num) {
-                self.ok_count += 1;
+                if ctx.ok_source_rows.insert(source_row) {
+                    self.ok_count += 1;
+                }
+                self.records_written += 1;
             }
-            self.records_written += 1;
-        }
+            Ok(())
+        })();
         self.arbitrator.unregister_consumer(consumer_id);
-
-        self.write_projected(ctx, &projected);
-        Ok(())
+        result
     }
 
     /// Write a non-governed record straight through to this Output's writer,
@@ -520,38 +561,48 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
     /// per-record Output path does. Used for records a `record`-policy
     /// source (or in-pipeline synthesis) routes to a document-DLQ Output,
     /// and for a late record arriving after its file already flushed clean.
-    fn write_through(&mut self, ctx: &mut ExecutorContext<'_>, record: Record, row_num: u64) {
+    fn write_through(
+        &mut self,
+        ctx: &mut ExecutorContext<'_>,
+        record: Record,
+        source_row: SourceRowId,
+    ) -> Result<(), PipelineError> {
+        let mut ordered = self
+            .writer_boundary
+            .order_record_stream(ctx, std::iter::once(Ok((record, source_row))))?;
+        let Some(item) = ordered.next() else {
+            return Ok(());
+        };
+        let (record, source_row) = item?;
         if let Err(err) = self
             .structured_guard
             .observe(&self.output_name, record.doc_ctx())
         {
             ctx.output_errors.push(err);
-            return;
+            return Ok(());
         }
-        let projected = {
-            match self.out_cfg.mapping.as_ref() {
-                Some(_) => {
-                    let probe =
-                        mapping_probe(&mut ctx.mapping_probes, &self.output_name, self.out_cfg);
-                    crate::projection::project_output_probed(
-                        &record,
-                        self.out_cfg,
-                        self.cxl_emit_names.as_deref(),
-                        Some(probe),
-                    )
-                }
-                None => crate::projection::project_output_from_record(
+        let projected = match self.out_cfg.mapping.as_ref() {
+            Some(_) => {
+                let probe = mapping_probe(&mut ctx.mapping_probes, &self.output_name, self.out_cfg);
+                crate::projection::project_output_probed(
                     &record,
                     self.out_cfg,
                     self.cxl_emit_names.as_deref(),
-                ),
+                    Some(probe),
+                )
             }
+            None => crate::projection::project_output_from_record(
+                &record,
+                self.out_cfg,
+                self.cxl_emit_names.as_deref(),
+            ),
         };
-        if ctx.ok_source_rows.insert(row_num) {
+        if ctx.ok_source_rows.insert(source_row) {
             self.ok_count += 1;
         }
         self.records_written += 1;
         self.write_projected(ctx, std::slice::from_ref(&projected));
+        Ok(())
     }
 
     /// Write a batch of already-projected records through this Output's
@@ -617,7 +668,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         ctx: &mut ExecutorContext<'_>,
         key: DocKey,
         record: Record,
-        row_num: u64,
+        source_row: SourceRowId,
     ) -> Result<(), PipelineError> {
         if self.decided.contains(&key) {
             let is_failed = ctx
@@ -625,13 +676,13 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                 .as_ref()
                 .is_some_and(|s| s.failed.contains_key(&key));
             if is_failed {
-                push_document_collateral(ctx, &key, record, row_num)?;
+                push_document_collateral(ctx, &key, record, source_row)?;
             } else {
-                self.write_through(ctx, record, row_num);
+                self.write_through(ctx, record, source_row)?;
             }
             return Ok(());
         }
-        self.buffer_record(&key, record, row_num)
+        self.buffer_record(&key, record, source_row)
     }
 
     /// Drive the Output arm's full drained event stream: buffer each record
@@ -652,7 +703,7 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
         use crate::executor::stream_event::PunctuationKind;
         for event in events {
             match event {
-                StreamEvent::Record(record, row_num) => {
+                StreamEvent::Record(record, source_row) => {
                     // A governed record buffers under its file's policy; a
                     // non-governed one (synthetic id, file-less, or a
                     // `record`-policy source feeding the same Output) writes
@@ -662,8 +713,8 @@ impl<'cfg> DocumentDlqDriver<'cfg> {
                         .as_ref()
                         .and_then(|s| s.governing_key(&record));
                     match key {
-                        Some(key) => self.admit_governed(ctx, key, record, row_num)?,
-                        None => self.write_through(ctx, record, row_num),
+                        Some(key) => self.admit_governed(ctx, key, record, source_row)?,
+                        None => self.write_through(ctx, record, source_row)?,
                     }
                 }
                 StreamEvent::Punctuation(p) => {
@@ -783,7 +834,7 @@ pub(crate) fn reject_unclosed_failed_documents(
 /// `PipelineError` item.
 fn drain_records_in_arrival_order(
     buffer: NodeBuffer,
-) -> impl Iterator<Item = Result<(Record, u64), PipelineError>> {
+) -> impl Iterator<Item = Result<(Record, SourceRowId), PipelineError>> {
     let SpilledRemainder {
         mem_records,
         chunks,
@@ -809,8 +860,8 @@ fn drain_records_in_arrival_order(
 /// [`spill_bucket_in_place`] needs to append a new chunk without reading any
 /// existing chunk back from disk.
 struct SpilledRemainder {
-    mem_records: Vec<(Record, u64)>,
-    chunks: Vec<(crate::pipeline::spill::SpillFile<u64>, u64)>,
+    mem_records: Vec<(Record, SourceRowId)>,
+    chunks: Vec<(crate::pipeline::spill::SpillFile<SourceRowId>, u64)>,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
 }
 
@@ -833,7 +884,7 @@ fn peel_mem_tail(buffer: NodeBuffer) -> SpilledRemainder {
             unreachable!("document DLQ buckets are only ever mutable Memory/Spilled/Mixed buffers")
         }
     };
-    let mut mem_records: Vec<(Record, u64)> = Vec::with_capacity(mem_events.len());
+    let mut mem_records: Vec<(Record, SourceRowId)> = Vec::with_capacity(mem_events.len());
     for event in mem_events {
         match event {
             StreamEvent::Record(r, rn) => mem_records.push((r, rn)),
@@ -919,13 +970,13 @@ fn push_document_collateral(
     ctx: &mut ExecutorContext<'_>,
     key: &DocKey,
     record: Record,
-    row_num: u64,
+    source_row: SourceRowId,
 ) -> Result<(), PipelineError> {
     let source_name = source_name_arc_of(&record);
     push_dlq(
         ctx,
         DlqEntry {
-            source_row: row_num,
+            source_row,
             category: clinker_core_types::dlq::DlqErrorCategory::DocumentRejected,
             error_message: format!("document {key:?} rejected: a sibling record failed"),
             original_record: record,
@@ -978,24 +1029,24 @@ fn reject_document_now(
     };
 
     // Collect this document's collateral rows out of the bucket before any
-    // `push_dlq` borrows `ctx` mutably. Dedup collateral by `(source_name,
-    // row_num)` so a fan-out that routed one source row to several Outputs
-    // emits one collateral, not N — the same identity the correlation
-    // collateral walk dedups on. The trigger's own row is seeded into the
-    // seen set so the root-cause record is never also a collateral.
-    let mut seen: HashSet<(Arc<str>, u64)> = HashSet::new();
+    // `push_dlq` borrows `ctx` mutably. SourceRowId already contains the
+    // compiled Source scope, so it is the complete dedup key: a fan-out that
+    // routed one source row to several Outputs emits one collateral, while
+    // same-ordinal rows from different Sources remain distinct. The trigger's
+    // own row is seeded so the root-cause record is never also a collateral.
+    let mut seen: HashSet<SourceRowId> = HashSet::new();
     if let Some(t) = trigger.as_ref() {
-        seen.insert((Arc::clone(&t.source_name), t.source_row));
+        seen.insert(t.source_row);
     }
-    let mut collaterals: Vec<(Record, u64, Arc<str>)> = Vec::new();
+    let mut collaterals: Vec<(Record, SourceRowId, Arc<str>)> = Vec::new();
     // A non-first failing record of this document was suppressed at its
     // failure site (it never reached an Output bucket), so emit it as a
     // collateral here. Added before the bucket walk so a record that
     // somehow appears in both is deduped to one entry.
-    for (record, row_num) in extra_collaterals {
+    for (record, source_row) in extra_collaterals {
         let source_name = source_name_arc_of(&record);
-        if seen.insert((Arc::clone(&source_name), row_num)) {
-            collaterals.push((record, row_num, source_name));
+        if seen.insert(source_row) {
+            collaterals.push((record, source_row, source_name));
         }
     }
     if let Some(bucket) = bucket {
@@ -1007,10 +1058,10 @@ fn reject_document_now(
         } = bucket;
         handle.set_bytes(0);
         for event in buffer.drain() {
-            if let StreamEvent::Record(record, row_num) = event? {
+            if let StreamEvent::Record(record, source_row) = event? {
                 let source_name = source_name_arc_of(&record);
-                if seen.insert((Arc::clone(&source_name), row_num)) {
-                    collaterals.push((record, row_num, source_name));
+                if seen.insert(source_row) {
+                    collaterals.push((record, source_row, source_name));
                 }
             }
         }
@@ -1034,11 +1085,11 @@ fn reject_document_now(
             },
         )?;
     }
-    for (record, row_num, source_name) in collaterals {
+    for (record, source_row, source_name) in collaterals {
         push_dlq(
             ctx,
             DlqEntry {
-                source_row: row_num,
+                source_row,
                 category: clinker_core_types::dlq::DlqErrorCategory::DocumentRejected,
                 error_message: format!("document {key:?} rejected: a sibling record failed"),
                 original_record: record,
@@ -1138,7 +1189,7 @@ mod tests {
                     Value::Integer(v) => *v,
                     other => panic!("unexpected value: {other:?}"),
                 };
-                drained.push((id, value, row_num));
+                drained.push((id, value, row_num.ordinal()));
             }
         }
         arbitrator.unregister_consumer(consumer_id);
@@ -1270,7 +1321,7 @@ mod tests {
             ..
         } = bucket;
         let rows: Vec<u64> = drain_records_in_arrival_order(buffer)
-            .map(|item| item.expect("drains cleanly").1)
+            .map(|item| item.expect("drains cleanly").1.ordinal())
             .collect();
         arbitrator.unregister_consumer(consumer_id);
 

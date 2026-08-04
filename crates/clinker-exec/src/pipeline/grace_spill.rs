@@ -184,6 +184,17 @@ impl From<std::io::Error> for GraceSpillError {
     }
 }
 
+impl From<SpillError> for GraceSpillError {
+    fn from(error: SpillError) -> Self {
+        match error {
+            dir_err @ SpillError::DirUnavailable { .. } => Self::DirUnavailable(dir_err),
+            disk_err @ SpillError::DiskFull { .. } => Self::DiskFull(disk_err),
+            SpillError::Io(io) => Self::Io(io),
+            other => Self::Io(std::io::Error::other(other.to_string())),
+        }
+    }
+}
+
 impl GraceSpillWriter {
     /// Classify a write/finalize `io::Error` against the partition file's
     /// parent directory: an `ENOSPC` becomes [`GraceSpillError::DiskFull`]

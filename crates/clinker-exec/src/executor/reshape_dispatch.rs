@@ -164,7 +164,7 @@ struct MutationConflict {
     rule_b: String,
     field: String,
     record: Record,
-    row_num: u64,
+    row_num: crate::executor::stream_event::SourceRowId,
 }
 
 /// Execute the `Reshape` arm for `node_idx`. Drains the predecessor,
@@ -207,7 +207,7 @@ pub(crate) fn dispatch_reshape(
     let (input_buffer, _input_reservation) =
         input_buffer.into_materialized_parts(&ctx.memory_budget, name)?;
     let (input, input_puncts): (
-        Vec<(Record, u64)>,
+        Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::stream_event::Punctuation>,
     ) = input_buffer.drain_split()?;
 
@@ -273,7 +273,7 @@ fn run_reshape_grouped(
     config: &ReshapeBody,
     output_schema: &Arc<Schema>,
     compiled_rules: &[CompiledReshapeRule],
-    input: Vec<(Record, u64)>,
+    input: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     input_puncts: Vec<crate::executor::stream_event::Punctuation>,
     handle: &Arc<ConsumerHandle>,
 ) -> Result<(), PipelineError> {
@@ -333,7 +333,7 @@ fn run_reshape_grouped(
     // the buffer footprint shrinking through the drain. The hard limit gates
     // a single correlation group that is too large to observe whole.
     let hard_limit = budget.hard_limit();
-    let mut out: Vec<(Record, u64)> = Vec::new();
+    let mut out: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     let group_order = buffer.take_group_order();
     for key in group_order {
         let mut group = buffer.take_group(name, &config.partition_by, &key, hard_limit)?;
@@ -357,32 +357,29 @@ fn run_reshape_grouped(
     Ok(())
 }
 
-/// One buffered input record plus the two `u64`s the spill round-trip must
+/// One buffered input record plus the two identities the spill round-trip must
 /// preserve: a Reshape-local admission sequence that orders the record within
-/// its group, and the upstream source row number the rule kernel needs for
+/// its group, and the upstream source-row identity the rule kernel needs for
 /// source attribution and DLQ row identity.
 ///
-/// `seq` — not the source row number — is the ordering key. The source row
-/// number is unique only per source: a `Merge` of two sources forwards each
-/// source's row number without renumbering, so two records from different
-/// sources can share a row number and land in the same group. Sorting a
-/// reloaded group by the source row number would then reorder those records
-/// relative to a resident group. The Reshape-local sequence is assigned once
-/// per admitted record from a single monotonic counter, so it is globally
-/// unique across all sources and captures the true merged arrival order.
+/// `seq` — not the source-row identity — is the ordering key. The typed
+/// identity distinguishes sources but does not encode their interleaved arrival
+/// order after a `Merge`. The Reshape-local sequence is assigned once per
+/// admitted record from a single monotonic counter, so it is globally unique
+/// across all sources and captures the true merged arrival order.
 struct BufferedRecord {
     record: Record,
     /// Reshape-local monotonic admission sequence; the within-group sort key.
     seq: u64,
-    /// Upstream source row number, carried through for the rule kernel.
-    row_num: u64,
+    /// Upstream source-row identity, carried through for the rule kernel.
+    row_num: crate::executor::stream_event::SourceRowId,
 }
 
 /// Spill payload for a buffered Reshape input record: the admission sequence
-/// and the source row number, both reconstructed on reload. `SpillWriter` is
+/// and the source-row identity, both reconstructed on reload. `SpillWriter` is
 /// generic over the payload type, so this changes only what Reshape stores
 /// per record — not the shared spill envelope or `RecordPayload`.
-type ReshapeSpillPayload = (u64, u64);
+type ReshapeSpillPayload = (u64, crate::executor::stream_event::SourceRowId);
 
 /// One group's buffered input records: a resident tail plus any slices
 /// already evicted to disk.
@@ -469,7 +466,12 @@ impl ReshapeGroupBuffer {
 
     /// Admit one record into its group, stamping a Reshape-local admission
     /// sequence and recording first-seen group order.
-    fn push(&mut self, key: Vec<GroupByKey>, record: Record, row_num: u64) {
+    fn push(
+        &mut self,
+        key: Vec<GroupByKey>,
+        record: Record,
+        row_num: crate::executor::stream_event::SourceRowId,
+    ) {
         let bytes = estimated_input_bytes(&record);
         let seq = self.next_seq;
         self.next_seq += 1;
@@ -688,11 +690,12 @@ impl ReshapeGroupBuffer {
     /// A spilled group's records arrive in spill-file then bucket order, not
     /// arrival order, so the merged group is re-sorted by the Reshape-local
     /// admission sequence — a globally-unique, monotonic-in-arrival-order key
-    /// that survives a multi-source `Merge` where source row numbers collide.
+    /// that survives a multi-source `Merge` whose identities do not encode
+    /// cross-source arrival order.
     /// A spilled group then emits identically to a resident one, which is
     /// essential because output must not depend on the memory budget. The
     /// never-spilled fast path keeps its already-ordered resident Vec
-    /// untouched. The returned tuples carry the source row number the rule
+    /// untouched. The returned tuples carry the source-row identity the rule
     /// kernel needs; the admission sequence has done its job by reload.
     ///
     /// # Errors
@@ -708,7 +711,7 @@ impl ReshapeGroupBuffer {
         partition_by: &[String],
         key: &[GroupByKey],
         hard_limit: u64,
-    ) -> Result<Vec<(Record, u64)>, PipelineError> {
+    ) -> Result<Vec<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
         let state = self.groups.remove(key).expect("group key present in order");
         self.resident_bytes -= state.resident_bytes;
 
@@ -764,7 +767,7 @@ impl ReshapeGroupBuffer {
 /// totals so `--explain` calibration and the disk-spill cap both see it.
 ///
 /// Each record's payload carries its admission sequence (the reload sort key)
-/// and its source row number (for the rule kernel) so both survive the
+/// and its source-row identity (for the rule kernel) so both survive the
 /// round-trip.
 fn write_spill_slice<'a>(
     node_name: &str,
@@ -835,8 +838,8 @@ fn process_group(
     node_name: &str,
     rules: &mut [CompiledRule],
     output_schema: &Arc<clinker_record::Schema>,
-    group: Vec<(Record, u64)>,
-    out: &mut Vec<(Record, u64)>,
+    group: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
+    out: &mut Vec<(Record, crate::executor::stream_event::SourceRowId)>,
 ) -> Result<(), PipelineError> {
     // Per original row: accumulated field writes (field → (value, rule
     // name)). A second write to an already-written field by a different
@@ -847,7 +850,7 @@ fn process_group(
     // `$meta.mutated_by` audit stamp.
     let mut mutated_by: Vec<Vec<String>> = (0..group.len()).map(|_| Vec::new()).collect();
     // Synthesized rows accumulated across rules: `(record, source_row_num)`.
-    let mut synthesized: Vec<(Record, u64)> = Vec::new();
+    let mut synthesized: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     // First detected cross-rule mutation conflict, captured as owned data
     // so the whole group can roll back to the DLQ once the immutable
     // `ctx` borrow held by the eval context is released.
@@ -1057,7 +1060,10 @@ fn partition_key(record: &Record, partition_by: &[String]) -> Vec<GroupByKey> {
 
 /// Sort a group in place by `order_by`, stable across equal keys (so
 /// arrival order breaks ties deterministically).
-fn sort_group(group: &mut [(Record, u64)], order_by: &[SortField]) {
+fn sort_group(
+    group: &mut [(Record, crate::executor::stream_event::SourceRowId)],
+    order_by: &[SortField],
+) {
     group.sort_by(|(a, _), (b, _)| {
         for sf in order_by {
             let av = a.get(&sf.field).unwrap_or(&Value::Null);
@@ -1130,6 +1136,7 @@ mod tests {
     use super::*;
     use crate::pipeline::memory::NoOpPolicy;
     use clinker_plan::BudgetCategory;
+    use clinker_plan::plan::{EntityRef, PlanNodeId};
 
     fn schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec!["gid".into(), "payload".into()]))
@@ -1142,6 +1149,10 @@ mod tests {
             Arc::clone(schema),
             vec![Value::String(gid.into()), Value::String(payload.into())],
         )
+    }
+
+    fn source_row(ordinal: u64) -> crate::executor::stream_event::SourceRowId {
+        crate::executor::stream_event::SourceRowId::new(PlanNodeId::new(23), ordinal)
     }
 
     /// An arbitrator whose soft limit is `soft_bytes` and whose seeded peak
@@ -1181,7 +1192,11 @@ mod tests {
         let mut buffer = ReshapeGroupBuffer::new(Arc::clone(schema), true);
         for row_num in 0..n {
             let payload = format!("{row_num:063}");
-            buffer.push(single_group_key(), rec(schema, "g", &payload), row_num);
+            buffer.push(
+                single_group_key(),
+                rec(schema, "g", &payload),
+                source_row(row_num),
+            );
             handle.set_bytes(buffer.resident_bytes() as u64);
             if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
                 buffer
@@ -1211,7 +1226,7 @@ mod tests {
             "the single oversized group must have partition-spilled"
         );
         let group = buffer.take_group("rs", &partition_by(), &key, 0).unwrap();
-        let row_nums: Vec<u64> = group.iter().map(|(_, rn)| *rn).collect();
+        let row_nums: Vec<u64> = group.iter().map(|(_, rn)| rn.ordinal()).collect();
         let expected: Vec<u64> = (0..64).collect();
         assert_eq!(
             row_nums, expected,
@@ -1235,7 +1250,7 @@ mod tests {
             buffer.push(
                 vec![GroupByKey::Int(g as i64)],
                 rec(&schema, &g.to_string(), &payload),
-                g,
+                source_row(g),
             );
         }
         let total = buffer.resident_bytes();
@@ -1375,7 +1390,11 @@ mod tests {
         // Every record keys to the empty tuple, so all 8 land in one group.
         for row_num in 0..8u64 {
             let payload = format!("{row_num:063}");
-            buffer.push(Vec::new(), rec(&schema, "any", &payload), row_num);
+            buffer.push(
+                Vec::new(),
+                rec(&schema, "any", &payload),
+                source_row(row_num),
+            );
         }
         assert_eq!(
             buffer.groups.len(),
@@ -1440,7 +1459,7 @@ mod tests {
         let mut buffer = ReshapeGroupBuffer::new(Arc::clone(&schema), true);
         for row_num in 0..64u64 {
             let payload = format!("{row_num:063}");
-            buffer.push(key.clone(), rec(&schema, "", &payload), row_num);
+            buffer.push(key.clone(), rec(&schema, "", &payload), source_row(row_num));
             handle.set_bytes(buffer.resident_bytes() as u64);
             if arb.spill_threshold_bytes() < buffer.resident_bytes() as u64 {
                 buffer
@@ -1494,7 +1513,11 @@ mod tests {
         // one-byte disk cap.
         for row_num in 0..64u64 {
             let payload = format!("{row_num:063}");
-            buffer.push(single_group_key(), rec(&schema, "g", &payload), row_num);
+            buffer.push(
+                single_group_key(),
+                rec(&schema, "g", &payload),
+                source_row(row_num),
+            );
         }
         handle.set_bytes(buffer.resident_bytes() as u64);
         let err = buffer

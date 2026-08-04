@@ -474,9 +474,8 @@ pub(crate) struct CombineOutputEvalFailure {
     /// real `$source.name` / `$ck.*` lineage the dispatcher attributes the
     /// dead-letter entry to.
     pub probe_record: Record,
-    /// The driver record's source row number, used as the dead-letter
-    /// entry's source row.
-    pub row: u64,
+    /// The driver record's source-row identity, used by the dead-letter entry.
+    pub row: crate::executor::stream_event::SourceRowId,
     /// The matched build record when the failure occurred on a matched pair
     /// (residual or matched body); `None` for an `on_miss: null_fields`
     /// failure where no build row contributed.
@@ -490,7 +489,8 @@ pub(crate) struct CombineOutputEvalFailure {
 /// failures it deferred to the dispatcher.
 ///
 /// Returned by the IEJoin, grace-hash, and sort-merge kernels in place of a
-/// bare `Vec<(Record, u64)>`. Under `FailFast` the failures vector is always
+/// bare `Vec<(Record, crate::executor::stream_event::SourceRowId)>`. Under
+/// `FailFast` the failures vector is always
 /// empty because those errors propagate immediately; under `Continue` each
 /// deferred failure is drained by the dispatcher into the
 /// `combine_output_row` dead-letter path.
@@ -498,7 +498,7 @@ pub(crate) struct CombineOutputEvalFailure {
 pub(crate) struct CombineKernelOutput {
     /// Emitted `(record, source-row-order)` pairs, identical in shape to the
     /// pre-change kernel return.
-    pub records: Vec<(Record, u64)>,
+    pub records: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     /// Recoverable output-stage eval failures the dispatcher must route.
     /// Empty under `FailFast`.
     pub output_eval_failures: Vec<CombineOutputEvalFailure>,

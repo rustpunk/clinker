@@ -82,6 +82,129 @@ consumer charge for the same bytes.
 
 This distinction is what makes Clinker a bounded-memory executor: a pipeline's peak memory is set by its largest live blocking-or-non-fused-streaming stage plus one batch per fused streaming stage, not by the cumulative size of every stage at once. A streaming stage's output is never separately buffered between dispatch arms, so it is never charged twice: the arbitrator counts each in-flight batch once when the producer flushes it and discharges that charge as the consumer drains it. If RSS still crosses the soft threshold while a single-consumer streaming stage holds batches in flight, the engine spills those batches' records to disk one batch at a time — the streaming handoff is the per-batch counterpart of a blocking stage's full-stage spill, not an exemption from spilling.
 
+## Plan admission and runtime entry
+
+The current public entry is typed as a compiled-plan boundary, but its complete
+call path re-enters planning:
+
+```text
+PipelineConfig::compile -> CompiledPlan
+                             |
+PipelineExecutor::run_plan_with_readers_writers(&CompiledPlan)
+                             |
+                        plan.config()
+                             |
+          run_with_readers_writers[_in_context]
+                             |
+                    PipelineConfig::compile
+                             |
+        newly validated plan.dag() -> runtime dispatch
+```
+
+The `_in_context` entry supplies a `CompileContext` so file-size estimates are
+resolved against the intended workspace instead of the process working
+directory. The run body also derives memory admission from the embedded config
+before compiling again. `PipelineRunParams` carries the current run-scoped
+envelope: execution and batch IDs, pipeline/static/source/record variable
+overlays, a shutdown token, and spill root, quota, and compression policy.
+These parameters affect a run without serving as a second authoring topology.
+
+This is the observed implementation, not the locked destination. D-01 through
+D-11 require Phase 5 / PERF-01 to execute the supplied plan's stored DAG,
+composition bodies, bound schemas, compiled expression artifacts, statistics,
+and semantic identity directly. Only an explicitly enumerated runtime envelope
+may refresh; semantic planning changes require replanning. A `CompiledPlan` is
+borrowed and survives a call today, but the current recompilation means
+sequential reuse still repeats immutable planning work. Persistent cache
+identity, safe misses, atomic replacement, and fresh source-map/provenance
+handling are also Phase 5 work. See the canonical
+[stored-plan execution and cache identity contract](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#stored-plan-execution-and-cache-identity).
+
+## Frozen execution wiring
+
+The canonical compile completes every structural graph rewrite before it
+freezes the two artifacts that runtime dispatch consumes:
+
+- `CompiledConsumerRegistry` is keyed by stable producer identity and optional
+  producer port. Each deterministic consumer entry records the consumer's
+  stable identity and input port, whether it reads the shared producer slot or
+  a pre-forked slot, and whether it crosses a physical writer boundary.
+- `ExecutionOrderContract` retains source orders, edge guarantees, consumer
+  requirements, terminal guarantees, and topology-derived physical writer
+  boundaries. No later planner pass may change topology after this contract is
+  frozen.
+
+The registry is the single delivery authority for fan-out. A consumer of a
+shared producer port obtains one complete sequential scan: all but the final
+observed consumer receive an independent re-readable cursor, and the final
+consumer removes the authoritative slot and its one `MemoryArbitrator`
+registration. Completion is tracked by compiled identities, not graph indexes
+or dispatch order. A missing entry, duplicate read, missing shared slot, or
+incomplete final scan is an internal invariant failure instead of a silent
+short delivery.
+
+For a Source with `sort_order`, its `CompiledSourceOrder` binds stable source
+identity, field indexes and types, direction and null policy, `on_unsorted`,
+the sortable event shape, and `PerPhysicalFile` scope. Runtime constructs the
+physical-file barrier from that compiled value. Successful rows and declared
+type failures share one attempt stream; document punctuation is staged with
+them. The barrier emits the complete attempted/rejected population before the
+covered attempts. The executor applies that population exactly once and checks
+its threshold before routing any covered attempt into the DLQ, downstream
+state or counters, or writer effects.
+
+Each `PhysicalWriterBoundary` binds one Output to the producer port, writer
+mode, partition identity, ordering guarantee, and runtime disposition selected
+from the finalized topology. The modes are `RecordsOnly`, `PerSourceFile`,
+`Envelope`, `DocumentDlq`, `CorrelationDeferred`, and `Streaming`; partition
+identity distinguishes a single writer, split sequence, source file, document,
+or correlation group. `OrderedWriterBoundary` verifies that the active dispatch
+arm matches the compiled mode and that its disposition satisfies the compiled
+guarantee. Deferred boundaries use the shared stable authored-key sorter and
+bounded-fan-in spill merge; source-row identities and population indexes remain
+payload and never become comparison keys. A streaming arm rejects a
+complete-population disposition rather than pretending to implement it.
+
+All of this remains synchronous, single-process, finite-batch execution.
+Bounded channels provide back-pressure, `MemoryArbitrator` remains the one
+run-scoped memory authority, and source repair, terminal ordering, and shared
+fan-out reuse the existing spill and merge machinery. Runtime never recounts
+Outputs or invents a weaker order when a frozen contract and the selected path
+disagree; it returns `PipelineError::Internal`.
+
+## Ordering evidence and test oracles
+
+Ordering is an explicit plan/runtime contract, not a side effect of scheduling.
+The frozen `ExecutionOrderContract` records where stable arrival is preserved,
+where order is destroyed, and which physical-file sources require
+verification. Runtime strategies must satisfy that contract; an unordered
+compiled promise is a conservative lower bound and may be served by a stronger
+exact runtime path.
+
+| Boundary or strategy | Runtime behavior | Scope and supported oracle |
+|---|---|---|
+| Source without `sort_order` | Preserves the reader's arrival sequence but claims no sorted keys. | No authored sortedness promise; use multiset and aggregate assertions unless a later operator establishes order. |
+| Source with `sort_order` | Strict declared-type coercion precedes adjacent-key verification. A memory-arbitrated barrier releases each physical file only after it is verified; default `on_unsorted: warn` stably repairs and emits one `W307`, while `error` releases no prefix. | `PerPhysicalFile`, never global across files. For one fixed path, resident and spill repair must be byte-identical and stable for equal authored keys. |
+| Order-preserving unary paths and `Merge` `concat` | Retain predecessor arrival; concat drains inputs in declaration order. | Exact sequence is valid for the same upstream paths. Matching per-input sorts are not promoted to global order. |
+| Seeded `Merge` interleave | Establishes a reproducible stable-arrival schedule for the seed. | Exact sequence is valid for the same seed and paths. |
+| Unseeded interleave and every current `Combine` strategy | Cross-input or matched-row arrival is incidental and the plan marks it unordered. | Compare decoded multisets, aggregate values, counters, and identities; never exact incidental row order. |
+| Terminal Output `sort_order` | Uses the shared stable resident/spill kernel and orders all records reaching that terminal by exactly the authored fields. | Exact authored-key order. Equal-key order is stable within a path, but cross-strategy exact bytes require a total authored business key. |
+
+Neither source repair nor terminal sorting adds `SourceRowId`, physical-file,
+or canonical-row tie fields. Equal authored keys compare equal. Stability is
+maintained by arrival/run position within the selected path, so tests must not
+turn an unpromised upstream tie order into a hidden compatibility contract.
+
+The source barrier stages the whole sortable event shape, including successful
+and rejected attempts plus file and single-frame punctuation, and charges
+resident rows, release state, spill I/O buffers, merge cursors, and queued
+verified rows to the run-scoped memory authority. It first releases one
+complete population delta, then the attempts covered by that identity. It
+preserves the exact `SourceRowId`, source/file provenance, and original
+document-context `Arc` while repairing. This is a safe pre-effect barrier; it
+does not replay a source after downstream writers, DLQ, counters, metrics,
+lineage, or document state have mutated.
+
 ## Which stages stream
 
 A stage streams when its output is handed straight to a single downstream consumer instead of crossing a charged inter-stage buffer. The downstream consumer is a sink `Output` writer, an `Aggregate`'s ingest, or a hash build-probe `Combine`'s probe (driver) side — see [Streaming into an Aggregate](#streaming-into-an-aggregate) and [Streaming into a Combine probe](#streaming-into-a-combine-probe) below.

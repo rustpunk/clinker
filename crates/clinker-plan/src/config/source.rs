@@ -122,6 +122,11 @@ pub struct SourceConfig {
     /// `files.sort_order` which orders the file set itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sort_order: Option<Vec<SortFieldSpec>>,
+    /// Policy applied when records inside one physical file violate
+    /// `sort_order`. Omission compiles to [`OnUnsorted::Warn`]. This field is
+    /// meaningful only when `sort_order` is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_unsorted: Option<OnUnsorted>,
     /// Transport selecting WHERE the records come from, sitting above the
     /// on-disk FORMAT (`format` / `type:` below). A plain optional
     /// snake_case enum field — deliberately NOT a second
@@ -137,6 +142,148 @@ pub struct SourceConfig {
     /// External tooling metadata: stage notes + field annotations. Ignored by the engine.
     #[serde(default, rename = "_notes", skip_serializing_if = "Option::is_none")]
     pub notes: Option<serde_json::Value>,
+}
+
+/// Response to a per-physical-file source ordering violation.
+///
+/// `Warn` permits the executor to repair the affected file with the shared
+/// stable sort kernel and emit one warning for that file. `Error` rejects the
+/// input rather than repairing it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnUnsorted {
+    #[default]
+    Warn,
+    Error,
+}
+
+/// Event shape a physical-file order barrier can preserve losslessly.
+///
+/// The executor may reorder records only when punctuation has one of these
+/// statically-known shapes. Formats that can open inherited nesting or emit
+/// several document frames per physical file are rejected before execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SortableEventShape {
+    /// The file contributes only its outer file-level open/close pair.
+    Flat,
+    /// The file contributes one nested, non-repeating frame inside the outer
+    /// file boundary; records are reordered only inside that frame.
+    SingleFramePerPhysicalFile,
+}
+
+/// Derive the punctuation contract used by source-order verification.
+///
+/// This is deliberately format-owned rather than inferred from observed
+/// runtime events: an unsupported reader must fail before any source bytes are
+/// consumed or downstream state is touched.
+pub fn sortable_event_shape(
+    source: &SourceConfig,
+) -> Result<SortableEventShape, crate::error::PipelineError> {
+    match source.format {
+        InputFormat::Csv(_)
+        | InputFormat::Json(_)
+        | InputFormat::Xml(_)
+        | InputFormat::FixedWidth(_)
+        | InputFormat::Edifact(_) => Ok(SortableEventShape::Flat),
+        InputFormat::Swift(_) => Ok(SortableEventShape::SingleFramePerPhysicalFile),
+        InputFormat::X12(_) | InputFormat::Hl7(_) => Err(source_order_error(
+            source,
+            format!(
+                "[E366] source '{}' declares `sort_order`, but {} can emit nested, repeated, or inherited document frames inside one physical file; remove `sort_order` or normalize each logical frame into a separate flat or single-frame physical file before this source",
+                source.name,
+                source.format.format_name(),
+            ),
+        )),
+    }
+}
+
+/// Validate the author-facing source ordering policy before it becomes an
+/// execution assumption.
+///
+/// Source ordering is a promise about records *inside each physical file*.
+/// Verification may repair that file, but it may never discard records, so
+/// `null_order: drop` is deliberately not admitted here.
+pub fn validate_source_sort_policy(
+    source: &SourceConfig,
+    schema: &SourceSchema,
+) -> Result<(), crate::error::PipelineError> {
+    let sort_order = source.sort_order.as_deref().unwrap_or_default();
+    if source.on_unsorted.is_some() && sort_order.is_empty() {
+        let example_field = schema
+            .bound_columns()
+            .and_then(|columns| columns.into_iter().next())
+            .map(|column| column.name)
+            .unwrap_or_else(|| "key".to_string());
+        return Err(source_order_error(
+            source,
+            format!(
+                "source '{}' sets `on_unsorted` without a record-level `sort_order`; add `sort_order: [{example_field}]` or remove `on_unsorted`",
+                source.name
+            ),
+        ));
+    }
+    if source.sort_order.is_some() && sort_order.is_empty() {
+        return Err(source_order_error(
+            source,
+            format!(
+                "source '{}' declares an empty `sort_order`; add at least one field or remove `sort_order`",
+                source.name
+            ),
+        ));
+    }
+
+    if !sort_order.is_empty() {
+        sortable_event_shape(source)?;
+    }
+    let declared_columns = schema.bound_columns();
+    let mut seen = std::collections::BTreeSet::new();
+    for spec in sort_order {
+        let field = spec.clone().into_sort_field();
+        if !seen.insert(field.field.clone()) {
+            return Err(source_order_error(
+                source,
+                format!(
+                    "source '{}' repeats field '{}' in `sort_order`; keep each authored key once",
+                    source.name, field.field
+                ),
+            ));
+        }
+        if matches!(field.null_order, Some(NullOrder::Drop)) {
+            return Err(source_order_error(
+                source,
+                format!(
+                    "source '{}' uses `null_order: drop` for sort field '{}'; source verification cannot discard records, so use `null_order: first` or `null_order: last`",
+                    source.name, field.field
+                ),
+            ));
+        }
+        if let Some(columns) = &declared_columns
+            && !columns.iter().any(|column| column.name == field.field)
+        {
+            let available = columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(source_order_error(
+                source,
+                format!(
+                    "source '{}' sort field '{}' is not declared by its schema; choose one of: [{available}]",
+                    source.name, field.field
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn source_order_error(source: &SourceConfig, message: String) -> crate::error::PipelineError {
+    crate::error::PipelineError::Compilation {
+        transform_name: source.name.clone(),
+        messages: vec![message],
+    }
 }
 
 /// Per-source dead-letter granularity under `continue`.

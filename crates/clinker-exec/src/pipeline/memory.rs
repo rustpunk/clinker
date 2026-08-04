@@ -1167,10 +1167,9 @@ impl MemoryArbitrator {
     /// The disk cap bounds *concurrent* on-disk spill (how much a run holds at
     /// once), so a caller that later unlinks a run it charged here releases the
     /// bytes with [`Self::release_spill_bytes`]; the counter then tracks current
-    /// on-disk usage. A spill site that never deletes a run before the run ends
-    /// (every existing spill path except the cascaded k-way merge) never
-    /// releases, so for it current stays equal to the monotonic total — the
-    /// historical behavior, unchanged.
+    /// on-disk usage. Cascaded merges release consumed inputs, and authored
+    /// sorts release their surviving runs when the eager merger or lazy stream
+    /// drops.
     pub fn record_spill_bytes(&self, node: &str, n: u64) -> bool {
         let _ =
             self.cumulative_spill_bytes
@@ -1195,11 +1194,10 @@ impl MemoryArbitrator {
     /// the disk-cap counter reflects the bytes still on disk rather than every
     /// byte ever written.
     ///
-    /// Only the cascaded k-way spill merge calls this: when it folds a group of
-    /// runs into one intermediate run it unlinks the consumed runs, and their
-    /// bytes were charged (by this same merge for a prior-pass intermediate, or
-    /// by the operator that spilled the originals) against `node`. No cap check
-    /// here — releasing bytes can only move the total further under the cap.
+    /// Cascaded k-way spill merges call this when they unlink consumed inputs;
+    /// authored-sort charge guards call it when the final eager merger or lazy
+    /// stream drops. No cap check here — releasing bytes can only move the total
+    /// further under the cap.
     /// Saturating-sub floors at zero, so an over-release (a run whose bytes were
     /// never charged to this node) cannot wrap the counter below other stages'
     /// live charges.

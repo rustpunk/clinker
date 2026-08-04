@@ -1,5 +1,7 @@
 use clinker_core_types::span::Span;
+use clinker_plan::config::composition::{ProvenanceField, ProvenanceKey, ScopedNodeAddress};
 use clinker_plan::config::{LayerKind, ProvenanceDb, ResolvedValue};
+use clinker_plan::plan::{EntityRef, PlanNodeId};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 fn test_span() -> Span {
@@ -40,9 +42,13 @@ fn bench_provenance_db_insert_50(c: &mut Criterion) {
         b.iter(|| {
             let mut db = ProvenanceDb::default();
             for i in 0..50 {
+                let field = ProvenanceField::ConfigParam(format!("param_{i}"));
                 db.insert(
-                    format!("node_{i}"),
-                    format!("param_{i}"),
+                    ProvenanceKey {
+                        node: PlanNodeId::new(i),
+                        field: field.clone(),
+                    },
+                    ScopedNodeAddress::top_level(format!("node_{i}"), field),
                     ResolvedValue::new(
                         serde_json::json!(i),
                         LayerKind::PipelineDefault,

@@ -419,9 +419,10 @@ pub fn compute_streaming_combine_probe_edges(
 ///
 /// Consumer-specific eligibility, and how each resolves its producer:
 ///
-/// - `Output`: not a per-source-file fan-out writer and no `split:` block
-///   (both own their own writer lifecycle, incompatible with the single
-///   streaming writer task). Producer = its sole incoming edge.
+/// - `Output`: no authored `sort_order:`, not a per-source-file fan-out
+///   writer, and no `split:` block. All three require terminal-owned
+///   materialization and are incompatible with the single streaming writer
+///   task. Producer = its sole incoming edge.
 /// - `Aggregation`: strict only — not relaxed-CK (`requires_lineage` /
 ///   `requires_buffer_mode`, which retains state for the correlation
 ///   commit) and not time-windowed (multi-pass over the whole batch).
@@ -498,12 +499,14 @@ pub fn certify_streaming_edge(
     let producer_idx: petgraph::graph::NodeIndex = match &plan.graph[consumer_idx] {
         PlanNode::Output { resolved, .. } => {
             let payload = resolved.as_deref()?;
-            // Per-source-file fan-out and split writers own their own file
-            // rotation lifecycle and cannot share the single streaming
-            // writer task. Both are plan-derived so the explain and
-            // runtime surfaces agree without consulting the runtime writer
-            // registry.
-            if payload.fan_out_per_source_file || payload.output.split.is_some() {
+            // Authored output sorting materializes through the bounded shared
+            // SortBuffer before writing. Per-source-file fan-out and split
+            // writers likewise own terminal lifecycle. None can bypass the
+            // Output arm through the single streaming writer task.
+            if payload.output.sort_order.is_some()
+                || payload.fan_out_per_source_file
+                || payload.output.split.is_some()
+            {
                 return None;
             }
             single_incoming_producer(plan, consumer_idx)?
@@ -1142,6 +1145,33 @@ nodes:
                 &parse_config(PURE_RANGE_TO_OUTPUT).expect("re-parse for config"),
             );
             assert_eq!(classes[&combine], StreamClass::Streaming);
+        });
+    }
+
+    #[test]
+    fn authored_output_sort_is_not_certified_for_streaming() {
+        let yaml = PURE_RANGE_TO_OUTPUT.replacen(
+            "    path: out.csv\n",
+            "    path: out.csv\n    sort_order: [order_id]\n",
+            1,
+        );
+        with_certification_inputs(&yaml, |dag, fused, init| {
+            let combine = find_node(dag, "combine", |node| {
+                matches!(node, PlanNode::Combine { .. })
+            });
+            let output = find_node(dag, "output", |node| {
+                matches!(node, PlanNode::Output { .. })
+            });
+            assert_eq!(
+                certify_streaming_edge(dag, output, fused, init),
+                None,
+                "authored output sorting must run before the writer receives records"
+            );
+            let config = parse_config(&yaml).expect("re-parse sorted output fixture");
+            assert_eq!(
+                classify_stream_nodes(dag, &config)[&combine],
+                StreamClass::Materialized
+            );
         });
     }
 

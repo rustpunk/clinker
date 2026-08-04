@@ -6,6 +6,14 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+const REQUIRED_SECTIONS: [&str; 5] = [
+    "## What it means",
+    "## Example",
+    "## How to fix",
+    "## Technical context",
+    "## See also",
+];
+
 /// Path to the `clinker` binary built by Cargo for this test run.
 fn clinker_bin() -> &'static str {
     env!("CARGO_BIN_EXE_clinker")
@@ -17,6 +25,58 @@ fn fixture_root() -> PathBuf {
         .join("../clinker-exec/tests/fixtures")
         .canonicalize()
         .expect("fixture root must exist")
+}
+
+fn sibling_scope_workspace() -> tempfile::TempDir {
+    let workspace = tempfile::tempdir().expect("create fixture workspace");
+    let compositions = workspace.path().join("compositions");
+    std::fs::create_dir(&compositions).expect("create compositions directory");
+    let source = fixture_root().join("compositions");
+    for file in ["nested_caller.comp.yaml", "address_normalize.comp.yaml"] {
+        std::fs::copy(source.join(file), compositions.join(file)).expect("copy composition");
+    }
+    std::fs::write(
+        workspace.path().join("pipeline.yaml"),
+        r#"
+pipeline:
+  name: sibling_provenance
+nodes:
+  - type: source
+    name: raw
+    config:
+      name: raw
+      type: csv
+      path: raw.csv
+      schema:
+        - { name: customer_id, type: string }
+        - { name: name, type: string }
+        - { name: street, type: string }
+        - { name: city, type: string }
+        - { name: zip, type: string }
+  - type: composition
+    name: left
+    input: raw
+    use: ./compositions/nested_caller.comp.yaml
+    inputs: { raw: raw }
+    config: { strict_mode: false }
+  - type: composition
+    name: right
+    input: raw
+    use: ./compositions/nested_caller.comp.yaml
+    inputs: { raw: raw }
+    config: { strict_mode: true }
+  - type: output
+    name: left_out
+    input: left
+    config: { name: left_out, type: csv, path: left.csv }
+  - type: output
+    name: right_out
+    input: right
+    config: { name: right_out, type: csv, path: right.csv }
+"#,
+    )
+    .expect("write pipeline");
+    workspace
 }
 
 #[test]
@@ -90,17 +150,104 @@ fn test_explain_field_unknown_path_returns_helpful_error() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Must mention the unknown param
+    // Must carry the stable no-match code and mention the unknown param.
+    assert!(stderr.contains("[E128]"), "stderr: {stderr}");
     assert!(
         stderr.contains("nonexistent_param"),
         "error must mention the unknown param.\nstderr: {stderr}"
     );
-
-    // Must suggest valid params
+    // Candidate disclosure is same-field only. A different parameter on the
+    // same node must not be suggested.
     assert!(
-        stderr.contains("strict_mode"),
-        "error must suggest valid params like strict_mode.\nstderr: {stderr}"
+        !stderr.contains("strict_mode"),
+        "error must not leak a different field.\nstderr: {stderr}"
     );
+}
+
+#[test]
+fn empty_query_reports_e116_with_paste_ready_help() {
+    let fixture_dir = fixture_root();
+    let pipeline_path = fixture_dir.join("pipelines/nested_composition_pipeline.yaml");
+    let output = Command::new(clinker_bin())
+        .arg("explain")
+        .arg(&pipeline_path)
+        .arg("--field")
+        .arg("")
+        .arg("--base-dir")
+        .arg(&fixture_dir)
+        .output()
+        .expect("spawn clinker");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success());
+    assert!(stderr.contains("[E127]"), "stderr: {stderr}");
+    assert!(stderr.contains("--field 'node.param'"), "stderr: {stderr}");
+}
+
+#[test]
+fn ambiguous_shorthand_reports_e118_and_only_exact_same_field_candidates() {
+    let workspace = sibling_scope_workspace();
+    let pipeline = workspace.path().join("pipeline.yaml");
+    let output = Command::new(clinker_bin())
+        .arg("explain")
+        .arg(&pipeline)
+        .arg("--field")
+        .arg("inner_normalize.strict_mode")
+        .arg("--base-dir")
+        .arg(workspace.path())
+        .output()
+        .expect("spawn clinker");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("[E129]"), "stderr: {stderr}");
+    let left = "/v1/config/calls/left/nodes/inner_normalize/fields/strict_mode";
+    let right = "/v1/config/calls/right/nodes/inner_normalize/fields/strict_mode";
+    assert!(stderr.contains(left), "stderr: {stderr}");
+    assert!(stderr.contains(right), "stderr: {stderr}");
+    assert!(stderr.find(left) < stderr.find(right), "stderr: {stderr}");
+    assert!(!stderr.contains("customer_id"), "stderr: {stderr}");
+
+    let exact = Command::new(clinker_bin())
+        .arg("explain")
+        .arg(&pipeline)
+        .arg("--field")
+        .arg(left)
+        .arg("--base-dir")
+        .arg(workspace.path())
+        .output()
+        .expect("spawn clinker");
+    assert!(
+        exact.status.success(),
+        "exact address must resolve.\nstderr: {}",
+        String::from_utf8_lossy(&exact.stderr)
+    );
+}
+
+#[test]
+fn provenance_query_codes_are_registered_and_have_complete_pages() {
+    for code in ["E127", "E128", "E129"] {
+        let entries: Vec<_> = clinker_core_types::diagnostic::REGISTRY
+            .iter()
+            .filter(|entry| entry.code == code)
+            .collect();
+        assert_eq!(entries.len(), 1, "{code} must be registered exactly once");
+
+        let output = Command::new(clinker_bin())
+            .arg("explain")
+            .arg("--code")
+            .arg(code)
+            .output()
+            .expect("spawn clinker");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{code}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout.contains(code), "stdout: {stdout}");
+        for section in REQUIRED_SECTIONS {
+            assert!(stdout.contains(section), "{code} missing {section}");
+        }
+    }
 }
 
 #[test]

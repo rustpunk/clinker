@@ -9,6 +9,7 @@ pub mod config;
 pub mod error;
 pub mod overlay_ops;
 pub mod plan;
+pub mod resources;
 pub mod runtime_error;
 pub mod schema;
 pub mod security;

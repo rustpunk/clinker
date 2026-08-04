@@ -6,13 +6,28 @@
 
 use std::fmt;
 
-use crate::config::composition::SchemaResolvedValue;
+use crate::config::composition::{
+    ProvenanceLookupError, ProvenanceQuery, ProvenanceQueryParseError, SchemaResolvedValue,
+    ScopedSchemaAddress,
+};
 use crate::plan::CompiledPlan;
 use clinker_core_types::span::Span;
 
 /// Error returned when field provenance cannot be resolved.
 #[derive(Debug)]
 pub enum ProvenanceExplainError {
+    /// The author passed an empty `--field` value.
+    EmptyQuery,
+    /// No config provenance entry matched the exact address or shorthand.
+    UnknownQuery {
+        query: String,
+        candidates: Vec<String>,
+    },
+    /// A shorthand matched multiple scoped config entries.
+    AmbiguousQuery {
+        query: String,
+        candidates: Vec<String>,
+    },
     /// Dotted path is neither `node.param` (config) nor `source.column.attr`
     /// (schema).
     InvalidPath(String),
@@ -50,6 +65,35 @@ pub enum ProvenanceExplainError {
 impl fmt::Display for ProvenanceExplainError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            ProvenanceExplainError::EmptyQuery => write!(
+                f,
+                "[E127] provenance query is empty\n  help: pass a field, for example --field 'node.param'"
+            ),
+            ProvenanceExplainError::UnknownQuery { query, candidates } => {
+                write!(f, "[E128] no provenance entry matches {query:?}")?;
+                if candidates.is_empty() {
+                    write!(
+                        f,
+                        "\n  help: remove --field {query:?} or use a known exact /v1/config or /v1/schema address"
+                    )
+                } else {
+                    write!(f, "\n  help: use one exact same-field address:")?;
+                    for candidate in candidates {
+                        write!(f, "\n    --field '{candidate}'")?;
+                    }
+                    Ok(())
+                }
+            }
+            ProvenanceExplainError::AmbiguousQuery { query, candidates } => {
+                write!(
+                    f,
+                    "[E129] provenance shorthand {query:?} matches multiple scoped nodes\n  help: replace it with one exact address:"
+                )?;
+                for candidate in candidates {
+                    write!(f, "\n    --field '{candidate}'")?;
+                }
+                Ok(())
+            }
             ProvenanceExplainError::InvalidPath(path) => {
                 write!(
                     f,
@@ -136,6 +180,18 @@ impl fmt::Display for ProvenanceExplainError {
 
 impl std::error::Error for ProvenanceExplainError {}
 
+impl ProvenanceExplainError {
+    /// Stable diagnostic code for query-class errors.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::EmptyQuery => Some("E116"),
+            Self::UnknownQuery { .. } => Some("E117"),
+            Self::AmbiguousQuery { .. } => Some("E118"),
+            _ => None,
+        }
+    }
+}
+
 /// Format a span for human-readable output.
 ///
 /// Since the compile path uses `Span::line_only` (synthetic spans without
@@ -168,44 +224,54 @@ fn format_span(span: Span) -> String {
 /// ```
 pub fn explain_field_provenance(
     plan: &CompiledPlan,
-    dotted_path: &str,
+    query_text: &str,
 ) -> Result<String, ProvenanceExplainError> {
-    // Dispatch by path arity: a three-part `source.column.attribute` path is a
-    // source-schema attribute; a two-part `node.param` is a composition config
-    // param. Both are honest, documented forms.
-    let segments: Vec<&str> = dotted_path.split('.').collect();
-    if segments.len() == 3 && segments.iter().all(|s| !s.is_empty()) {
-        return explain_schema_field(plan, segments[0], segments[1], segments[2]);
-    }
-
-    let (node_name, param_name) = parse_dotted_path(dotted_path)?;
-
-    let provenance_db = plan.provenance();
-
-    // Check if the node exists in the provenance DB at all.
-    let node_params = provenance_db.params_for_node(node_name);
-    if node_params.is_empty() {
-        return Err(ProvenanceExplainError::NodeNotFound {
-            node_name: node_name.to_owned(),
-            valid_nodes: provenance_db
-                .node_names()
-                .into_iter()
-                .map(String::from)
-                .collect(),
-        });
-    }
-
-    // Look up the specific (node, param) entry.
-    let resolved = provenance_db.get(node_name, param_name).ok_or_else(|| {
-        ProvenanceExplainError::ParamNotFound {
-            node_name: node_name.to_owned(),
-            param_name: param_name.to_owned(),
-            valid_params: node_params.into_iter().map(String::from).collect(),
-        }
+    let query = ProvenanceQuery::parse(query_text).map_err(|error| match error {
+        ProvenanceQueryParseError::Empty => ProvenanceExplainError::EmptyQuery,
+        ProvenanceQueryParseError::Malformed(_) => ProvenanceExplainError::UnknownQuery {
+            query: query_text.to_owned(),
+            candidates: Vec::new(),
+        },
     })?;
 
+    if let ProvenanceQuery::SchemaExact(address) | ProvenanceQuery::SchemaShorthand(address) =
+        &query
+    {
+        return explain_schema_field(
+            plan,
+            address.source(),
+            address.column(),
+            address.attribute(),
+            query_text,
+        );
+    }
+
+    let found = plan.provenance().resolve_query(&query).map_err(|error| {
+        let (candidates, ambiguous) = match error {
+            ProvenanceLookupError::Unknown { candidates } => (candidates, false),
+            ProvenanceLookupError::Ambiguous { candidates } => (candidates, true),
+        };
+        let candidates = candidates
+            .into_iter()
+            .map(|candidate| candidate.render())
+            .collect();
+        if ambiguous {
+            ProvenanceExplainError::AmbiguousQuery {
+                query: query_text.to_owned(),
+                candidates,
+            }
+        } else {
+            ProvenanceExplainError::UnknownQuery {
+                query: query_text.to_owned(),
+                candidates,
+            }
+        }
+    })?;
+    let resolved = found.resolved;
+
     let mut output = String::new();
-    output.push_str(&format!("Field: {dotted_path}\n\n"));
+    output.push_str(&format!("Field: {query_text}\n"));
+    output.push_str(&format!("Exact address: {}\n\n", found.address.render()));
     output.push_str(&format!(
         "  Resolved value: {}\n\n",
         format_json_value(&resolved.value)
@@ -249,6 +315,7 @@ fn explain_schema_field(
     source: &str,
     column: &str,
     attribute: &str,
+    query_text: &str,
 ) -> Result<String, ProvenanceExplainError> {
     let db = plan.schema_provenance();
     let resolved = db.get(source, column, attribute).ok_or_else(|| {
@@ -280,16 +347,23 @@ fn explain_schema_field(
         }
     })?;
 
+    let address = ScopedSchemaAddress::new(source, column, attribute);
     Ok(render_schema_resolved(
-        &format!("{source}.{column}.{attribute}"),
+        query_text,
+        &address.render(),
         resolved,
     ))
 }
 
 /// Render a resolved schema-attribute leaf as the `[WON]` / `(shadowed)` chain.
-fn render_schema_resolved(field: &str, resolved: &SchemaResolvedValue) -> String {
+fn render_schema_resolved(
+    field: &str,
+    exact_address: &str,
+    resolved: &SchemaResolvedValue,
+) -> String {
     let mut output = String::new();
-    output.push_str(&format!("Field: {field}\n\n"));
+    output.push_str(&format!("Field: {field}\n"));
+    output.push_str(&format!("Exact address: {exact_address}\n\n"));
     output.push_str(&format!("  Resolved value: {}\n\n", resolved.value));
     output.push_str("  Provenance chain (outermost to innermost):\n");
 
@@ -327,6 +401,7 @@ fn format_json_value(v: &serde_json::Value) -> String {
 }
 
 /// Split a dotted path into `(node_name, param_name)`.
+#[cfg(test)]
 fn parse_dotted_path(path: &str) -> Result<(&str, &str), ProvenanceExplainError> {
     let dot_idx = path
         .find('.')
@@ -362,6 +437,9 @@ pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
     ("E116", include_str!("../../../../docs/explain/E116.md")),
     ("E117", include_str!("../../../../docs/explain/E117.md")),
     ("E118", include_str!("../../../../docs/explain/E118.md")),
+    ("E127", include_str!("../../../../docs/explain/E127.md")),
+    ("E128", include_str!("../../../../docs/explain/E128.md")),
+    ("E129", include_str!("../../../../docs/explain/E129.md")),
     ("E300", include_str!("../../../../docs/explain/E300.md")),
     ("E301", include_str!("../../../../docs/explain/E301.md")),
     ("E303", include_str!("../../../../docs/explain/E303.md")),
@@ -418,6 +496,9 @@ pub const EXPLAIN_PAGES: &[(&str, &str)] = &[
     ("E363", include_str!("../../../../docs/explain/E363.md")),
     ("E364", include_str!("../../../../docs/explain/E364.md")),
     ("E365", include_str!("../../../../docs/explain/E365.md")),
+    ("E367", include_str!("../../../../docs/explain/E367.md")),
+    ("E368", include_str!("../../../../docs/explain/E368.md")),
+    ("E370", include_str!("../../../../docs/explain/E370.md")),
     ("E323", include_str!("../../../../docs/explain/E323.md")),
     ("E150b", include_str!("../../../../docs/explain/E150b.md")),
     ("E150c", include_str!("../../../../docs/explain/E150c.md")),

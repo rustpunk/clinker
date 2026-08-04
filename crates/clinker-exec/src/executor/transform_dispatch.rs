@@ -113,7 +113,7 @@ pub(crate) fn dispatch_transform(
     // The caller-explicit materialization reservation above covers the full
     // collected vector, including spill-backed reloads.
     let (input_records, input_puncts): (
-        Vec<(Record, u64)>,
+        Vec<(Record, crate::executor::stream_event::SourceRowId)>,
         Vec<crate::executor::stream_event::Punctuation>,
     ) = input_buffer.drain_split()?;
 
@@ -162,37 +162,77 @@ pub(crate) fn dispatch_transform(
         .unwrap_or_default();
 
     // Plan invariant: any Transform with `window_index: Some`
-    // requires its WindowRuntime slot populated by either the
-    // source-rooted Phase-0 build (Source root) or the upstream
-    // operator's `finalize_node_rooted_windows` call (Node /
-    // ParentNode roots). Fail loudly if the slot is missing —
+    // requires its WindowRuntime populated by the upstream operator's
+    // `finalize_node_rooted_windows` call. Body transforms resolve only
+    // through their compiled exact key; top-level transforms use their
+    // top-level slot. Fail loudly if the runtime is missing —
     // the alternative (silently fall back to no-window eval)
     // corrupts `$window.*` results.
-    if let Some(idx_num) = window_index {
-        let spec =
-            current_dag
-                .indices_to_build
-                .get(idx_num)
-                .ok_or_else(|| PipelineError::Internal {
+    let body_window_key = if let Some(idx_num) = window_index {
+        current_dag
+            .indices_to_build
+            .get(idx_num)
+            .ok_or_else(|| PipelineError::Internal {
+                op: "executor",
+                node: name.clone(),
+                detail: format!(
+                    "transform {name:?} declares window_index {idx_num} \
+                     but plan.indices_to_build is too short"
+                ),
+            })?;
+        let binding = if let Some(body_id) = ctx.window_runtime.active_stack.last().copied() {
+            let body =
+                ctx.composition_bodies
+                    .get(&body_id)
+                    .ok_or_else(|| PipelineError::Internal {
+                        op: "executor",
+                        node: name.clone(),
+                        detail: format!(
+                            "transform {name:?} executes in missing composition body {body_id:?}"
+                        ),
+                    })?;
+            let binding = body.window_bindings.get(&node.id()).copied().ok_or_else(|| {
+                PipelineError::Internal {
                     op: "executor",
                     node: name.clone(),
                     detail: format!(
-                        "transform {name:?} declares window_index {idx_num} \
-                             but plan.indices_to_build is too short"
+                        "body transform {name:?} has window_index {idx_num} but no exact runtime binding"
                     ),
-                })?;
-        if ctx.window_runtime.resolve(&spec.root, idx_num).is_none() {
+                }
+            })?;
+            if binding.index != idx_num {
+                return Err(PipelineError::Internal {
+                    op: "executor",
+                    node: name.clone(),
+                    detail: format!(
+                        "body transform {name:?} binding points to slot {} but node declares {idx_num}",
+                        binding.index
+                    ),
+                });
+            }
+            Some(binding.key)
+        } else {
+            None
+        };
+        let present = match binding {
+            Some(key) => ctx.window_runtime.resolve_body(&key).is_some(),
+            None => ctx.window_runtime.resolve_top(idx_num).is_some(),
+        };
+        if !present {
             return Err(PipelineError::Internal {
                 op: "executor",
                 node: name.clone(),
                 detail: format!(
                     "transform {name:?} declares window_index {idx_num} \
-                             but the runtime registry has no populated slot for that root; \
-                             upstream operator did not finalize its node-rooted windows"
+                     but the runtime registry has no exact populated entry; \
+                     upstream operator did not finalize its owning window root"
                 ),
             });
         }
-    }
+        binding
+    } else {
+        None
+    };
 
     let mut output_records = Vec::with_capacity(input_records.len());
 
@@ -226,19 +266,19 @@ pub(crate) fn dispatch_transform(
                 // returns `Some`; reaching `None` here is an
                 // upstream-arm bug (e.g. forgetting to call
                 // `finalize_node_rooted_windows` after emit).
-                let spec = &current_dag.indices_to_build[idx_num];
-                let runtime = ctx
-                    .window_runtime
-                    .resolve(&spec.root, idx_num)
-                    .ok_or_else(|| PipelineError::Internal {
-                        op: "executor",
-                        node: name.clone(),
-                        detail: format!(
-                            "transform {name:?} window_index {idx_num} \
-                                         resolves to no runtime at per-record dispatch; \
-                                         upstream finalize was skipped"
-                        ),
-                    })?;
+                let runtime = match body_window_key {
+                    Some(key) => ctx.window_runtime.resolve_body(&key),
+                    None => ctx.window_runtime.resolve_top(idx_num),
+                }
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "executor",
+                    node: name.clone(),
+                    detail: format!(
+                        "transform {name:?} window_index {idx_num} \
+                                 resolves to no exact runtime at per-record dispatch; \
+                                 upstream finalize was skipped"
+                    ),
+                })?;
                 // record_pos: enumerate index `i`. Every arena
                 // is node-rooted; it was built from the
                 // upstream's emit buffer in iteration order,

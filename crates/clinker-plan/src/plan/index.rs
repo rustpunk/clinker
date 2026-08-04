@@ -22,7 +22,7 @@ use crate::config::SortField;
 /// `NodeIndex`; the arena builds at the upstream operator's
 /// dispatch-arm exit through `finalize_node_rooted_windows`.
 ///
-/// The `Arc<Schema>` carried by both variants is the upstream
+/// The `Arc<Schema>` carried by the root is the upstream
 /// operator's `output_schema` at lowering time. It is **not** part of
 /// equality / hashing — only `upstream: NodeIndex` is. Two
 /// `IndexSpec`s with the same `upstream` always carry the same
@@ -32,14 +32,6 @@ pub enum PlanIndexRoot {
     /// Node-rooted in the current DAG: arena built at the upstream
     /// operator's dispatch-arm exit from `node_buffers[upstream]`.
     Node {
-        upstream: NodeIndex,
-        anchor_schema: Arc<Schema>,
-    },
-    /// Body-rooted at a parent-DAG node: a composition body's window
-    /// references rows produced by the body's `input:` port, which in
-    /// turn resolves to a parent-DAG operator. Lookup walks the body's
-    /// runtime overlay first, then falls back to the parent's runtime.
-    ParentNode {
         upstream: NodeIndex,
         anchor_schema: Arc<Schema>,
     },
@@ -55,13 +47,6 @@ impl Clone for PlanIndexRoot {
                 upstream: *upstream,
                 anchor_schema: Arc::clone(anchor_schema),
             },
-            Self::ParentNode {
-                upstream,
-                anchor_schema,
-            } => Self::ParentNode {
-                upstream: *upstream,
-                anchor_schema: Arc::clone(anchor_schema),
-            },
         }
     }
 }
@@ -73,21 +58,14 @@ impl std::fmt::Debug for PlanIndexRoot {
                 .debug_struct("Node")
                 .field("upstream", upstream)
                 .finish_non_exhaustive(),
-            Self::ParentNode { upstream, .. } => f
-                .debug_struct("ParentNode")
-                .field("upstream", upstream)
-                .finish_non_exhaustive(),
         }
     }
 }
 
 impl PartialEq for PlanIndexRoot {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Node { upstream: a, .. }, Self::Node { upstream: b, .. }) => a == b,
-            (Self::ParentNode { upstream: a, .. }, Self::ParentNode { upstream: b, .. }) => a == b,
-            _ => false,
-        }
+        let (Self::Node { upstream: a, .. }, Self::Node { upstream: b, .. }) = (self, other);
+        a == b
     }
 }
 
@@ -95,15 +73,14 @@ impl Eq for PlanIndexRoot {}
 
 impl Hash for PlanIndexRoot {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Discriminant + payload: Node / ParentNode by upstream
-        // NodeIndex. The Arc<Schema> is a side-channel — every
+        // Discriminant + payload: Node by upstream NodeIndex. The
+        // Arc<Schema> is a side-channel — every
         // IndexSpec sharing an `upstream` carries the same Arc
         // instance (it's the upstream operator's output_schema), so
         // excluding it from the hash key keeps dedup correct.
         std::mem::discriminant(self).hash(state);
-        match self {
-            Self::Node { upstream, .. } | Self::ParentNode { upstream, .. } => upstream.hash(state),
-        }
+        let Self::Node { upstream, .. } = self;
+        upstream.hash(state);
     }
 }
 
@@ -228,10 +205,8 @@ pub struct RawIndexRequest {
 pub fn collect_arena_fields_for_node(indices: &[IndexSpec], upstream: NodeIndex) -> Vec<String> {
     let mut fields = HashSet::new();
     for spec in indices {
-        let matches = match &spec.root {
-            PlanIndexRoot::Node { upstream: u, .. } => *u == upstream,
-            PlanIndexRoot::ParentNode { upstream: u, .. } => *u == upstream,
-        };
+        let matches =
+            matches!(&spec.root, PlanIndexRoot::Node { upstream: u, .. } if *u == upstream);
         if matches {
             for f in &spec.arena_fields {
                 fields.insert(f.clone());

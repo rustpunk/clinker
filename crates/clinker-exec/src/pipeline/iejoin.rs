@@ -108,7 +108,7 @@ const MEMORY_CHECK_INTERVAL: usize = 10_000;
 /// Order-tracking sidecar carried alongside every record in the
 /// executor's `node_buffers`. Spelled out here so the IEJoin entry
 /// point's signature stays self-documenting.
-pub(crate) type RecordOrder = u64;
+pub(crate) type RecordOrder = crate::executor::stream_event::SourceRowId;
 
 /// The block-band combine's bounded output: a payload-ordered sorted handle over
 /// the emitted rows — resident when the whole result fit the output sort
@@ -1516,7 +1516,7 @@ fn dispatch_on_miss(
         OnMiss::Skip => Ok(()),
         OnMiss::Error => Err(PipelineError::CombineMissingMatch {
             combine: cfg.name.to_string(),
-            driver_row: driver_order,
+            driver_row: driver_order.ordinal(),
         }),
         OnMiss::NullFields => {
             let resolver = CombineResolver::new(cfg.resolver_mapping, driver_record, None);

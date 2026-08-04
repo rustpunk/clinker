@@ -100,7 +100,8 @@ pub struct Column {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub precision: Option<u8>,
     /// Decimal scale (fractional digits). For a `type: decimal` column, the
-    /// coercion path rounds parsed values to this scale (banker's rounding).
+    /// source coercion path admits exact values at this scale and rejects a
+    /// value that would require rounding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scale: Option<u8>,
     /// Whether the column must be present/non-null.

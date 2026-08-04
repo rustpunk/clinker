@@ -171,7 +171,8 @@ pub(crate) fn dispatch_composition(
 ///
 /// Resolves ports via the live edge graph: walks `parent_dag`'s incoming
 /// edges into `composition_node_idx`, reads each edge's `port` tag, and
-/// clones records from the producer's `node_buffers` slot. The frozen
+/// acquires that exact compiled consumer's sequential scan of the producer
+/// port. The frozen
 /// port-name snapshot kept by an earlier design drifted whenever a
 /// planner pass spliced a node between the producer and the composition
 /// (the synthetic `inject_correlation_sort` Sort being the canonical
@@ -184,7 +185,7 @@ pub(crate) fn dispatch_composition(
 /// intact for any sibling consumer the parent walk has not yet reached;
 /// fan-out from a single producer to multiple ports is a normal case.
 struct ReservedPortRecords {
-    records: Vec<(Record, u64)>,
+    records: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     reservation: Option<TransientNodeBufferReservation>,
 }
 
@@ -211,7 +212,6 @@ fn discard_deferred_body_residue(ctx: &mut ExecutorContext<'_>, body_dag: &Execu
         drain_node_buffer_slot(ctx, key);
     }
 }
-
 fn collect_port_records(
     ctx: &mut ExecutorContext<'_>,
     parent_dag: &ExecutionPlanDag,
@@ -298,8 +298,6 @@ fn execute_composition_body(
     port_records: IndexMap<String, ReservedPortRecords>,
     composition_name: &str,
 ) -> Result<ReservedPortRecords, PipelineError> {
-    use clinker_plan::plan::index::PlanIndexRoot;
-
     // Resolve body and pre-compute everything that needs the
     // bound_body borrow before the swap so the body_dag clone is
     // independent of the composition_bodies borrow.
@@ -309,28 +307,6 @@ fn execute_composition_body(
         .ok_or_else(|| PipelineError::compose_body_missing(composition_name.to_string()))?;
 
     let body_dag = clinker_plan::plan::execution::ExecutionPlanDag::from_body(bound_body);
-
-    // Window runtime entry: install a fresh per-body vec sized to
-    // `body_indices_to_build.len()`. ParentNode-rooted slots inherit
-    // the parent's runtime via `Arc::clone` from `top` so the body's
-    // windowed Transform arm can resolve through to it without re-
-    // materializing the parent's arena. Node-rooted body slots stay
-    // `None` here — they populate when the body's upstream operator
-    // arm calls `finalize_node_rooted_windows` during the body walk.
-    let body_index_count = bound_body.body_indices_to_build.len();
-    let mut body_window_vec: Vec<Option<crate::executor::window_runtime::WindowRuntime>> =
-        (0..body_index_count).map(|_| None).collect();
-    for (idx, spec) in bound_body.body_indices_to_build.iter().enumerate() {
-        if matches!(spec.root, PlanIndexRoot::ParentNode { .. })
-            && let Some(parent_runtime) = ctx.window_runtime.resolve(&spec.root, idx)
-        {
-            // `resolve` for ParentNode in this position falls through
-            // to top[idx] (no body is on the active_stack yet), which
-            // is correct: the body inherits the parent operator's
-            // runtime by cloning its `Arc<Arena>` and `Arc<SecondaryIndex>`.
-            body_window_vec[idx] = Some(parent_runtime.clone());
-        }
-    }
 
     // Resolve every body-local slot before transferring any reservation out of
     // its RAII guard. If port resolution fails, all still-owned guards drop and
@@ -428,14 +404,6 @@ fn execute_composition_body(
         .current_body_node_input_refs
         .replace(bound_body.node_input_refs.clone());
 
-    // Push the body's window-runtime overlay onto the registry. The
-    // ParentNode-rooted slots were populated above via `Arc::clone`
-    // from the parent's `top` runtime; Node-rooted body slots stay
-    // `None` and populate when the body's upstream operator arm
-    // calls `finalize_node_rooted_windows` during the body walk.
-    // `active_stack.push` makes `resolve` route through this overlay
-    // for any window dispatched inside the body.
-    ctx.window_runtime.bodies.insert(body_id, body_window_vec);
     ctx.window_runtime.active_stack.push(body_id);
 
     // Increment depth before recursing. The walk and output harvest execute
@@ -535,12 +503,8 @@ fn execute_composition_body(
         ctx.memory_budget.unregister_consumer(id);
     }
     ctx.window_arena_consumer_ids = saved_arena_ids;
-    // Pop the window-runtime overlay so subsequent windows in the
-    // parent scope route through `top` again. Removing the body's
-    // entry releases the `Arc` clones (parent runtimes stay alive in
-    // `top`; body-local node-rooted runtimes drop here).
     ctx.window_runtime.active_stack.pop();
-    ctx.window_runtime.bodies.remove(&body_id);
+    ctx.window_runtime.remove_body_scope(bound_body.body_scope);
 
     walk_and_harvest
 }

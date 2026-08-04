@@ -27,6 +27,7 @@ use petgraph::graph::NodeIndex;
 
 use clinker_plan::config::{ErrorStrategy, OutputConfig, PipelineConfig};
 use clinker_plan::error::PipelineError;
+use clinker_plan::plan::EntityRef;
 
 /// Re-export of the correlation-buffer commit entry point, relocated to
 /// [`crate::executor::correlation_dispatch`]. The commit subtree reaches it
@@ -134,6 +135,242 @@ pub(crate) fn push_dlq(
     check_dlq_rate(ctx, &source_name)
 }
 
+/// One population shared by source-type strategy routing and its circuit
+/// breaker. `attempted` counts decoded source rows observed so far;
+/// `rejected` is the subset represented by [`TypeErrorEvent`]s.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TypeErrorPopulation {
+    pub(crate) attempted: u64,
+    pub(crate) rejected: u64,
+}
+
+/// Result of consuming one source-channel event through the shared population
+/// accounting and type-error strategy boundary.
+pub(crate) enum ConsumedSourceEvent {
+    Record(Record, crate::executor::stream_event::SourceRowId),
+    Punctuation(crate::executor::stream_event::Punctuation),
+    Rejected,
+    Population,
+}
+
+/// Record one successfully admitted source row in the threshold denominator.
+pub(crate) fn record_source_success(ctx: &mut ExecutorContext<'_>, source: &Arc<str>) {
+    ctx.type_error_population.attempted = ctx.type_error_population.attempted.saturating_add(1);
+    if let Some(slot) = ctx.total_per_source.get_mut(source) {
+        *slot = slot.saturating_add(1);
+    }
+}
+
+/// Add exactly one rejected row to the shared type-error population.
+pub(crate) fn record_type_error(
+    ctx: &mut ExecutorContext<'_>,
+    event: &crate::executor::dlq::TypeErrorEvent,
+) {
+    ctx.type_error_population.attempted = ctx.type_error_population.attempted.saturating_add(1);
+    ctx.type_error_population.rejected = ctx.type_error_population.rejected.saturating_add(1);
+    if let Some(slot) = ctx.total_per_source.get_mut(&event.source_name) {
+        *slot = slot.saturating_add(1);
+    }
+}
+
+/// Apply one complete ordered-file population exactly once, then decide its
+/// threshold before any covered attempt or punctuation can be consumed.
+pub(crate) fn apply_source_attempt_population(
+    ctx: &mut ExecutorContext<'_>,
+    expected_source: &Arc<str>,
+    delta: crate::executor::source_stream::AttemptPopulationDelta,
+) -> Result<(), PipelineError> {
+    if delta.source_name.as_ref() != expected_source.as_ref() {
+        return Err(PipelineError::Internal {
+            op: "source-attempt-population",
+            node: expected_source.to_string(),
+            detail: format!(
+                "population for source '{}' reached consumer '{}'",
+                delta.source_name, expected_source
+            ),
+        });
+    }
+    if delta.rejected > delta.attempted {
+        return Err(PipelineError::Internal {
+            op: "source-attempt-population",
+            node: expected_source.to_string(),
+            detail: format!(
+                "population reports {} rejected attempts out of {} total",
+                delta.rejected, delta.attempted
+            ),
+        });
+    }
+    if !ctx.applied_attempt_populations.insert(delta.id) {
+        return Err(PipelineError::Internal {
+            op: "source-attempt-population",
+            node: expected_source.to_string(),
+            detail: format!("duplicate population application for {:?}", delta.id),
+        });
+    }
+    ctx.type_error_population.attempted = ctx
+        .type_error_population
+        .attempted
+        .saturating_add(delta.attempted);
+    ctx.type_error_population.rejected = ctx
+        .type_error_population
+        .rejected
+        .saturating_add(delta.rejected);
+    if let Some(slot) = ctx.total_per_source.get_mut(expected_source) {
+        *slot = slot.saturating_add(delta.attempted);
+    }
+    if matches!(ctx.strategy, ErrorStrategy::Continue) {
+        evaluate_type_error_threshold(ctx)?;
+    }
+    Ok(())
+}
+
+/// Consume all source-channel shapes through one accounting seam. Ordered
+/// payloads prove their population was applied; direct unordered attempts are
+/// counted one at a time through the same counters.
+pub(crate) fn consume_source_event(
+    ctx: &mut ExecutorContext<'_>,
+    expected_source: &Arc<str>,
+    event: crate::executor::source_stream::SourceStreamEvent,
+) -> Result<ConsumedSourceEvent, PipelineError> {
+    match event {
+        crate::executor::source_stream::SourceStreamEvent::Population(delta) => {
+            apply_source_attempt_population(ctx, expected_source, delta)?;
+            Ok(ConsumedSourceEvent::Population)
+        }
+        crate::executor::source_stream::SourceStreamEvent::Punctuation(punctuation) => {
+            Ok(ConsumedSourceEvent::Punctuation(punctuation))
+        }
+        crate::executor::source_stream::SourceStreamEvent::Attempt { event, population } => {
+            let source_row = event.source_row();
+            if let Some(population) = population {
+                if source_row.source() != population.source {
+                    return Err(PipelineError::Internal {
+                        op: "source-attempt-population",
+                        node: expected_source.to_string(),
+                        detail: format!(
+                            "attempt identity {:?} does not belong to population source {:?}",
+                            source_row.source(),
+                            population.source
+                        ),
+                    });
+                }
+                if !ctx.applied_attempt_populations.contains(&population) {
+                    return Err(PipelineError::Internal {
+                        op: "source-attempt-population",
+                        node: expected_source.to_string(),
+                        detail: format!(
+                            "attempt {:?} arrived before population {:?}",
+                            source_row, population
+                        ),
+                    });
+                }
+            }
+            match event {
+                crate::executor::source_stream::SourceAttemptEvent::Record(record, row_id) => {
+                    if population.is_none() {
+                        record_source_success(ctx, expected_source);
+                    }
+                    Ok(ConsumedSourceEvent::Record(record, row_id))
+                }
+                crate::executor::source_stream::SourceAttemptEvent::TypeError(event) => {
+                    let event = *event;
+                    if event.source_name.as_ref() != expected_source.as_ref() {
+                        return Err(PipelineError::Internal {
+                            op: "source-attempt-population",
+                            node: expected_source.to_string(),
+                            detail: format!(
+                                "rejected attempt for source '{}' reached consumer '{}'",
+                                event.source_name, expected_source
+                            ),
+                        });
+                    }
+                    if population.is_none() {
+                        record_type_error(ctx, &event);
+                    }
+                    route_type_error(ctx, event)?;
+                    Ok(ConsumedSourceEvent::Rejected)
+                }
+            }
+        }
+    }
+}
+
+/// Evaluate `rejected / attempted` after the event has entered the population.
+/// Equality is admitted: the circuit breaker trips only when the observed
+/// fraction is strictly greater than the authored threshold.
+pub(crate) fn evaluate_type_error_threshold(
+    ctx: &ExecutorContext<'_>,
+) -> Result<(), PipelineError> {
+    let Some(limit) = ctx.config.error_handling.type_error_threshold else {
+        return Ok(());
+    };
+    let population = ctx.type_error_population;
+    if population.attempted == 0 {
+        return Ok(());
+    }
+    let observed = population.rejected as f64 / population.attempted as f64;
+    if observed > limit {
+        return Err(PipelineError::TypeErrorThresholdExceeded {
+            observed_rate: observed,
+            max_rate: limit,
+            observed_count: population.rejected,
+            total_count: population.attempted,
+        });
+    }
+    Ok(())
+}
+
+/// Exhaustive source-type disposition. The failing row never leaves this
+/// function as a downstream record: fail-fast returns immediately; continuing
+/// strategies require an explicit DLQ and preserve the complete original row.
+fn route_type_error(
+    ctx: &mut ExecutorContext<'_>,
+    event: crate::executor::dlq::TypeErrorEvent,
+) -> Result<(), PipelineError> {
+    let diagnostic = event.diagnostic_message();
+    tracing::error!(target: "clinker::source_type", "{diagnostic}");
+    match ctx.strategy {
+        ErrorStrategy::FailFast => Err(PipelineError::Format(
+            clinker_format::FormatError::InvalidRecord {
+                row: event.row,
+                message: diagnostic,
+            },
+        )),
+        ErrorStrategy::Continue => {
+            if ctx.config.error_handling.dlq.is_none() {
+                return Err(PipelineError::Config(
+                    clinker_plan::config::ConfigError::Validation(format!(
+                        "[E126] source type error requires `error_handling.dlq` under strategy {:?}",
+                        ctx.strategy
+                    )),
+                ));
+            }
+            let document_marked =
+                crate::executor::document_dlq::record_type_error_to_document_buffer_if_doc_dlq(
+                    ctx,
+                    &event,
+                    diagnostic.clone(),
+                );
+            if !document_marked {
+                let entry = DlqEntry {
+                    source_row: event.source_row,
+                    category: clinker_core_types::dlq::DlqErrorCategory::TypeCoercionFailure,
+                    error_message: diagnostic,
+                    original_record: event.original_record,
+                    stage: Some(DlqEntry::stage_source()),
+                    route: None,
+                    trigger: true,
+                    source_name: event.source_name,
+                    triggering_field: Some(Arc::from(event.field)),
+                    triggering_value: Some(event.original_value),
+                };
+                push_dlq(ctx, entry)?;
+            }
+            evaluate_type_error_threshold(ctx)
+        }
+    }
+}
+
 /// Advance `rollback_cursors[source_name]` to `row_num` when the
 /// argument exceeds the stored value. Called at every clean exit from
 /// a forward operator: Transform / Route success branches, and the
@@ -149,7 +386,7 @@ pub(crate) fn push_dlq(
 /// `PipelineError::Internal { op: "combine" }` invariant violations,
 /// which still fail-fast.
 ///
-/// `row_num` is the engine-stamped source row number stamped on each
+/// `row_num` is the engine-stamped source-row identity attached to each
 /// record as it leaves the Source ingest thread's `SourceIngestChannel`
 /// and threaded through every `(record, row_num)` tuple in the
 /// dispatch path. It is the same value the relaxed-CK retract
@@ -157,13 +394,17 @@ pub(crate) fn push_dlq(
 /// [`crate::aggregation::HashAggregator::retract_row`], so a cursor
 /// stored here is directly comparable against `retract_row`
 /// arguments at rewind time.
-pub(crate) fn advance_cursor(ctx: &mut ExecutorContext<'_>, source_name: &Arc<str>, row_num: u64) {
+pub(crate) fn advance_cursor(
+    ctx: &mut ExecutorContext<'_>,
+    source_name: &Arc<str>,
+    row_num: crate::executor::stream_event::SourceRowId,
+) {
     let slot = ctx
         .rollback_cursors
         .entry(Arc::clone(source_name))
         .or_insert(0);
-    if row_num > *slot {
-        *slot = row_num;
+    if row_num.ordinal() > *slot {
+        *slot = row_num.ordinal();
     }
 }
 
@@ -266,11 +507,14 @@ fn key_is_null(key: &[GroupByKey]) -> bool {
 /// record carries no correlation-lattice columns (e.g. an Aggregate
 /// output that did not propagate `$ck.*` because the user did not
 /// list it in `group_by`) or because every snapshot value is itself
-/// Null — a row-number disambiguator lands the record in its own
+/// Null — a source-scoped row disambiguator lands the record in its own
 /// buffer cell, preserving per-record null-rejection semantics
 /// without forcing the Output arm onto a separate non-buffered writer
 /// path.
-pub(crate) fn buffer_key_for_record(record: &Record, row_num: u64) -> Vec<GroupByKey> {
+pub(crate) fn buffer_key_for_record(
+    record: &Record,
+    row_num: crate::executor::stream_event::SourceRowId,
+) -> Vec<GroupByKey> {
     use clinker_record::FieldMetadata;
     let schema = record.schema();
     let mut key: Vec<GroupByKey> = Vec::new();
@@ -290,7 +534,8 @@ pub(crate) fn buffer_key_for_record(record: &Record, row_num: u64) -> Vec<GroupB
         }
     }
     if key.is_empty() || key_is_null(&key) {
-        key.push(GroupByKey::Int(row_num as i64));
+        key.push(GroupByKey::Int(row_num.source().index() as i64));
+        key.push(GroupByKey::Int(row_num.ordinal() as i64));
     }
     key
 }
@@ -309,7 +554,7 @@ pub(crate) fn buffer_key_for_record(record: &Record, row_num: u64) -> Vec<GroupB
 pub(crate) fn record_error_to_buffer_if_grouped(
     ctx: &mut ExecutorContext<'_>,
     record: &Record,
-    row_num: u64,
+    row_num: crate::executor::stream_event::SourceRowId,
     category: clinker_core_types::dlq::DlqErrorCategory,
     error_message: String,
     stage: Option<String>,
@@ -356,7 +601,7 @@ pub(crate) fn record_error_to_buffer_if_grouped(
 pub(crate) fn dispatch_transform_eval_error(
     ctx: &mut ExecutorContext<'_>,
     record: Record,
-    row_num: u64,
+    row_num: crate::executor::stream_event::SourceRowId,
     transform_name: String,
     eval_err: cxl::eval::EvalError,
 ) -> Result<(), PipelineError> {
@@ -451,7 +696,7 @@ pub(crate) fn push_write_error(
 /// (E315/E316) is still enforced.
 pub(crate) fn sink_collision_dlq_entry(
     record: &Record,
-    row_num: u64,
+    row_num: crate::executor::stream_event::SourceRowId,
     output_name: &str,
     err: &clinker_format::error::FormatError,
 ) -> Option<DlqEntry> {
@@ -766,12 +1011,14 @@ pub(crate) struct ExecutorContext<'a> {
     /// declared Source has one `std::thread` pushing records through a
     /// `SourceIngestChannel`; this map holds the paired `Receiver` the
     /// dispatch loop's Source arm drains via `recv`. Replaces the
-    /// pre-drained `Vec<(Record, u64)>` carrier: producers run
+    /// pre-drained `Vec<(Record, crate::executor::stream_event::SourceRowId)>` carrier: producers run
     /// concurrently with consumption, bounded by channel capacity so
     /// back-pressure flows end-to-end. A missing entry at the Source arm
     /// surfaces as a defense-in-depth Internal error.
-    pub(crate) source_records:
-        HashMap<String, crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>>,
+    pub(crate) source_records: HashMap<
+        String,
+        crossbeam_channel::Receiver<crate::executor::source_stream::SourceStreamEvent>,
+    >,
     /// Arbitrator registration for each declared Source's ingest-channel
     /// consumer, keyed by Source node name in lockstep with
     /// [`Self::source_records`]. Ownership follows the receiver: the arm
@@ -879,6 +1126,13 @@ pub(crate) struct ExecutorContext<'a> {
     /// [`ExecutorContext::source_records`] so the rate-check
     /// denominator is the per-source ingest count, not a moving target.
     pub(crate) total_per_source: HashMap<Arc<str>, u64>,
+    /// Decoded source attempts and their declared-type-error subset.
+    pub(crate) type_error_population: TypeErrorPopulation,
+    /// Ordered physical-file populations already applied. A covered attempt
+    /// must name an entry in this set; reinserting a population is an invariant
+    /// failure rather than double-counting its numerator and denominator.
+    pub(crate) applied_attempt_populations:
+        HashSet<crate::executor::source_stream::AttemptPopulationId>,
     /// Per-source forward-progress rollback cursor keyed by Source-node
     /// name. Advances at each clean exit from a forward operator via
     /// [`advance_cursor`]; consulted at every collateral-DLQ and
@@ -909,7 +1163,11 @@ pub(crate) struct ExecutorContext<'a> {
     /// the whole stream can distinguish a column no record carried (a typo) from
     /// one that some record carried (a sparse column in a heterogeneous stream).
     pub(crate) mapping_probes: BTreeMap<String, crate::projection::MappingProbe>,
-    pub(crate) ok_source_rows: HashSet<u64>,
+    pub(crate) ok_source_rows: HashSet<crate::executor::stream_event::SourceRowId>,
+    /// Successful writes keyed by both the source row and the stable terminal
+    /// Output node. This preserves fan-out evidence without changing
+    /// `ok_count`, which remains deduplicated by `ok_source_rows`.
+    pub(crate) ok_deliveries: HashSet<crate::executor::stream_event::OutputDeliveryId>,
     pub(crate) records_emitted: u64,
     pub(crate) transform_timer: stage_metrics::CumulativeTimer,
     pub(crate) route_timer: stage_metrics::CumulativeTimer,
@@ -966,8 +1224,7 @@ pub(crate) struct ExecutorContext<'a> {
     /// operator's dispatch-arm exit through
     /// `finalize_node_rooted_windows`. Body executors push a fresh
     /// per-body vec onto `bodies` at recursion entry and pop it at
-    /// exit; `ParentNode`-rooted slots in a body are inherited via
-    /// `Arc::clone` from the parent's `top` vec at body entry.
+    /// exit; body runtimes are addressed by exact scope/window/root keys.
     /// Replaces the singleton `(arena, indices)` pair the
     /// source-only geometry shipped: the singleton silently broke
     /// when a window sat downstream of an aggregate because the
@@ -1215,7 +1472,7 @@ type RegionInputBuffers = HashMap<
         Option<clinker_plan::plan::CompositionBodyId>,
         petgraph::graph::EdgeIndex,
     ),
-    Vec<(Record, u64)>,
+    Vec<(Record, crate::executor::stream_event::SourceRowId)>,
 >;
 
 /// Which commit-step body the orchestrator selected for the current
@@ -1542,7 +1799,7 @@ impl<'a> ExecutorContext<'a> {
         &self,
         source_file: &'r Arc<str>,
         source_name: &'r Arc<str>,
-        row_num: u64,
+        row_num: crate::executor::stream_event::SourceRowId,
         doc_ctx: &'r Arc<clinker_record::DocumentContext>,
     ) -> EvalContext<'r>
     where
@@ -1551,7 +1808,7 @@ impl<'a> ExecutorContext<'a> {
         EvalContext {
             stable: self.stable,
             source_file,
-            source_row: row_num,
+            source_row: row_num.ordinal(),
             source_path: source_file,
             source_count: self.source_count_by_name(source_name),
             source_batch: self.source_batch_arc,
@@ -1592,9 +1849,9 @@ impl<'a> ExecutorContext<'a> {
 /// schema before re-seeding the producer's `node_buffers` slot for
 /// the deferred dispatcher to consume.
 pub(crate) fn project_rows_to_buffer_schema(
-    rows: Vec<(Record, u64)>,
+    rows: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     buffer_schema: &[String],
-) -> Vec<(Record, u64)> {
+) -> Vec<(Record, crate::executor::stream_event::SourceRowId)> {
     // Reuse the wide schema's field metadata for every narrow column;
     // dropping it would silently strip `FieldMetadata::SourceCorrelation`
     // / `AggregateGroupIndex` markers the downstream Output's
@@ -1654,7 +1911,7 @@ pub(crate) fn tee_emit_to_region_input_buffers(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     producer_idx: NodeIndex,
-    emit_rows: &[(Record, u64)],
+    emit_rows: &[(Record, crate::executor::stream_event::SourceRowId)],
 ) -> Result<(), PipelineError> {
     use petgraph::visit::EdgeRef;
     let active_body = ctx.window_runtime.active_stack.last().copied();
@@ -1709,7 +1966,9 @@ pub(crate) fn crosses_into_deferred_consumer(
 /// Per-row heuristic byte cost. Returns `0` for an empty slice. The
 /// formula matches `NodeBuffer::estimated_memory_bytes` so the
 /// admission surfaces agree on the same per-row size.
-pub(crate) fn estimate_node_buffer_bytes(rows: &[(Record, u64)]) -> u64 {
+pub(crate) fn estimate_node_buffer_bytes(
+    rows: &[(Record, crate::executor::stream_event::SourceRowId)],
+) -> u64 {
     let Some((first, _)) = rows.first() else {
         return 0;
     };
@@ -1741,7 +2000,7 @@ pub(crate) fn node_buffer_spill_allowed(
 ///    `should_abort` poll guards the pipeline-wide hard limit.
 /// 3. When `spill_allowed` is `true` and `MemoryArbitrator::should_spill()`
 ///    reports the RSS soft threshold tripped, the rows flush to a
-///    `SpillFile<u64>` via [`node_buffer_spill::spill_node_buffer`].
+///    `SpillFile<crate::executor::stream_event::SourceRowId>` via [`node_buffer_spill::spill_node_buffer`].
 ///    The in-memory charge is discharged immediately and the file size
 ///    is added to `cumulative_spill_bytes`; an over-quota disk total
 ///    surfaces `PipelineError::SpillCapExceeded` (E320) — a disk-cap
@@ -2163,7 +2422,7 @@ pub(crate) fn admit_node_buffer(
     current_dag: &ExecutionPlanDag,
     node_name: &str,
     key: impl Into<NodeBufferKey>,
-    rows: Vec<(Record, u64)>,
+    rows: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
     spill_allowed: bool,
 ) -> Result<(), PipelineError> {
@@ -2206,7 +2465,7 @@ pub(crate) fn admit_node_buffer_with_readers(
     ctx: &mut ExecutorContext<'_>,
     node_name: &str,
     key: impl Into<NodeBufferKey>,
-    rows: Vec<(Record, u64)>,
+    rows: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
     spill_allowed: bool,
     readers: usize,
@@ -2273,7 +2532,7 @@ pub(crate) fn admit_node_buffer_transferred(
     current_dag: &ExecutionPlanDag,
     node_name: &str,
     key: impl Into<NodeBufferKey>,
-    rows: Vec<(Record, u64)>,
+    rows: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
     reservation: TransientNodeBufferReservation,
 ) -> Result<(), PipelineError> {
@@ -2395,7 +2654,7 @@ fn admit_node_buffer_inner(
     ctx: &mut ExecutorContext<'_>,
     node_name: &str,
     slot_key: NodeBufferKey,
-    rows: Vec<(Record, u64)>,
+    rows: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
     spill_allowed: bool,
     transferred_reservation: Option<TransientNodeBufferReservation>,
@@ -2557,7 +2816,7 @@ pub(crate) fn stream_linear_producer_emit(
     sender: &crossbeam_channel::Sender<crate::executor::stream_event::StreamEvent>,
     batch_size: usize,
     node_name: &str,
-    rows: Vec<(Record, u64)>,
+    rows: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     puncts: Vec<crate::executor::stream_event::Punctuation>,
     charge: &crate::executor::batch_handoff::StreamingChargeHandle,
 ) -> Result<(), PipelineError> {
@@ -2743,14 +3002,13 @@ pub(crate) fn seed_source_vars_for_record(
 /// projects each row onto the spec's `arena_fields` against the spec's
 /// `anchor_schema` (which equals the upstream operator's
 /// `output_schema` at lowering time). The arena and SecondaryIndex are
-/// inserted into `ctx.window_runtime` at the spec's slot — into the
-/// active body's vec when `active_stack` is non-empty, otherwise into
-/// `top`.
+/// inserted into `ctx.window_runtime` at the exact compiled body key when a
+/// body is active, otherwise into the top-level slot.
 pub(crate) fn finalize_node_rooted_windows(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     upstream_idx: NodeIndex,
-    rows: &[(Record, u64)],
+    rows: &[(Record, crate::executor::stream_event::SourceRowId)],
 ) -> Result<(), PipelineError> {
     use crate::executor::window_runtime::WindowRuntime;
     use crate::pipeline::arena::Arena;
@@ -2764,9 +3022,6 @@ pub(crate) fn finalize_node_rooted_windows(
                 upstream,
                 anchor_schema,
             } if *upstream == upstream_idx => anchor_schema,
-            // ParentNode never matches a current-DAG upstream — body
-            // recursion installs ParentNode slots from the parent's
-            // runtime at body entry, not here.
             _ => continue,
         };
         // The plan-time `anchor_schema` is the upstream operator's
@@ -2861,7 +3116,35 @@ pub(crate) fn finalize_node_rooted_windows(
             arena: Arc::new(arena),
             index: Arc::new(secondary_index),
         };
-        if !ctx.window_runtime.install(idx, runtime) {
+        if let Some(body_id) = ctx.window_runtime.active_stack.last().copied() {
+            let body =
+                ctx.composition_bodies
+                    .get(&body_id)
+                    .ok_or_else(|| PipelineError::Internal {
+                        op: "executor",
+                        node: current_dag.graph[upstream_idx].name().to_string(),
+                        detail: format!("active composition body {body_id:?} is missing"),
+                    })?;
+            let input_root = current_dag.graph[upstream_idx].id();
+            let keys: Vec<_> = body
+                .window_bindings
+                .values()
+                .filter(|binding| binding.index == idx && binding.key.input_root == input_root)
+                .map(|binding| binding.key)
+                .collect();
+            if keys.is_empty() {
+                return Err(PipelineError::Internal {
+                    op: "executor",
+                    node: current_dag.graph[upstream_idx].name().to_string(),
+                    detail: format!(
+                        "body window slot {idx} has no exact binding for input root {input_root}"
+                    ),
+                });
+            }
+            for key in keys {
+                ctx.window_runtime.install_body(key, runtime.clone());
+            }
+        } else if !ctx.window_runtime.install_top(idx, runtime) {
             return Err(PipelineError::Internal {
                 op: "executor",
                 node: current_dag.graph[upstream_idx].name().to_string(),
@@ -2895,7 +3178,7 @@ pub(crate) struct MergeStreamHandoff<'a> {
 /// on the materialized path the caller admits both into the node buffer,
 /// boundaries trailing the records.
 pub(crate) struct FusedMergeOutput {
-    pub(crate) records: Vec<(Record, u64)>,
+    pub(crate) records: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
     pub(crate) puncts: Vec<crate::executor::stream_event::Punctuation>,
 }
 
@@ -2973,7 +3256,7 @@ pub(crate) fn merge_fused_interleave(
 
     let mut states: Vec<PredState> = Vec::with_capacity(sorted_preds.len());
     let mut receivers: Vec<
-        Option<crossbeam_channel::Receiver<crate::executor::stream_event::StreamEvent>>,
+        Option<crossbeam_channel::Receiver<crate::executor::source_stream::SourceStreamEvent>>,
     > = Vec::with_capacity(sorted_preds.len());
     for pred in sorted_preds {
         let PlanNode::Source { name, .. } = &current_dag.graph[*pred] else {
@@ -3013,7 +3296,7 @@ pub(crate) fn merge_fused_interleave(
 
     let merge_schema_arc = merge_output_schema.cloned();
     let has_record_seed = !ctx.record_var_seed.is_empty();
-    let mut merged: Vec<(Record, u64)> = Vec::new();
+    let mut merged: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     // Document-boundary punctuations arriving on the Source channels collect
     // here and reconcile once at close, mirroring the non-fused Merge arm's
     // collect-then-dedup pass. Punctuations are O(1) per document, so this
@@ -3118,7 +3401,7 @@ pub(crate) fn merge_fused_interleave(
         // record/punctuation; `Err(RecvError)` means that source's
         // channel disconnected (all senders dropped) — `ok()` maps it to
         // the `None` close arm below.
-        let item: Option<crate::executor::stream_event::StreamEvent> = oper
+        let item: Option<crate::executor::source_stream::SourceStreamEvent> = oper
             .recv(
                 receivers[i]
                     .as_ref()
@@ -3128,9 +3411,16 @@ pub(crate) fn merge_fused_interleave(
         // A document-boundary punctuation off a Source channel is collected
         // for the close-time reconcile rather than forwarded inline; only
         // records flow into the per-record pipeline below.
-        let item: Option<(Record, u64)> = match item {
-            Some(crate::executor::stream_event::StreamEvent::Record(r, rn)) => Some((r, rn)),
-            Some(crate::executor::stream_event::StreamEvent::Punctuation(p)) => {
+        let consumed = item
+            .map(|event| consume_source_event(ctx, &states[i].source_name_arc, event))
+            .transpose()?;
+        let item: Option<(Record, crate::executor::stream_event::SourceRowId)> = match consumed {
+            Some(ConsumedSourceEvent::Record(record, row_id)) => Some((record, row_id)),
+            Some(ConsumedSourceEvent::Rejected) => {
+                per_source_counts[i] += 1;
+                continue;
+            }
+            Some(ConsumedSourceEvent::Punctuation(p)) => {
                 // A structural-count close condemns its whole file; mark it
                 // failed before the reconcile so the Output arm's per-file
                 // buffer rejects every already-streamed record of the file.
@@ -3138,6 +3428,7 @@ pub(crate) fn merge_fused_interleave(
                 collected_puncts.push(p);
                 continue;
             }
+            Some(ConsumedSourceEvent::Population) => continue,
             None => None,
         };
         match item {
@@ -3153,9 +3444,6 @@ pub(crate) fn merge_fused_interleave(
                     rec.seed_record_vars(ctx.record_var_seed);
                 }
                 seed_source_vars_for_record(ctx, &state.source_name_string, &rec)?;
-                if let Some(slot) = ctx.total_per_source.get_mut(&state.source_name_arc) {
-                    *slot += 1;
-                }
                 per_source_counts[i] += 1;
                 // Re-canonicalize onto the Merge's output schema so
                 // downstream operators hit `Arc::ptr_eq` regardless of which
@@ -3418,7 +3706,7 @@ pub(crate) fn transform_fused_consume(
     // operator observe the same boundaries the non-fused Transform arm
     // preserves; punctuations are O(1) per document, so they stay tiny
     // next to the record stream — no per-record clone.
-    let mut output_records: Vec<(Record, u64)> = Vec::new();
+    let mut output_records: Vec<(Record, crate::executor::stream_event::SourceRowId)> = Vec::new();
     let mut forwarded_puncts: Vec<crate::executor::stream_event::Punctuation> = Vec::new();
     let mut last_file: Arc<str> = Arc::clone(&MERGED_SOURCE_FILE);
     let mut count: u64 = 0;
@@ -3477,7 +3765,7 @@ pub(crate) fn transform_fused_consume(
     );
     let loop_result: Result<(), PipelineError> = (|| {
         loop {
-            let item: Option<crate::executor::stream_event::StreamEvent> = match timeout {
+            let item: Option<crate::executor::source_stream::SourceStreamEvent> = match timeout {
                 Some(t) => match rx.recv_timeout(t) {
                     Ok(item) => Some(item),
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
@@ -3498,9 +3786,21 @@ pub(crate) fn transform_fused_consume(
             // appended in arrival order, a `DocumentClose` stays after the
             // last record of its own document even when a multi-file Source
             // interleaves several documents through this one fused Transform.
-            let (record, rn) = match item {
-                Some(crate::executor::stream_event::StreamEvent::Record(r, rn)) => (r, rn),
-                Some(crate::executor::stream_event::StreamEvent::Punctuation(p)) => {
+            let consumed = item
+                .map(|event| consume_source_event(ctx, &source_name_arc, event))
+                .transpose()?;
+            let (record, rn) = match consumed {
+                Some(ConsumedSourceEvent::Record(record, row_id)) => (record, row_id),
+                Some(ConsumedSourceEvent::Rejected) => {
+                    count += 1;
+                    records_since_check += 1;
+                    if records_since_check >= 1024 {
+                        records_since_check = 0;
+                        ctx.check_shutdown()?;
+                    }
+                    continue;
+                }
+                Some(ConsumedSourceEvent::Punctuation(p)) => {
                     // A structural-count close condemns its whole file; mark
                     // it failed before forwarding so the Output arm's
                     // per-file buffer rejects every already-streamed record
@@ -3509,6 +3809,7 @@ pub(crate) fn transform_fused_consume(
                     event_batcher.push_punctuation(p)?;
                     continue;
                 }
+                Some(ConsumedSourceEvent::Population) => continue,
                 None => break,
             };
             last_file = source_file_arc_of(&record);
@@ -3517,9 +3818,6 @@ pub(crate) fn transform_fused_consume(
                 rec.seed_record_vars(ctx.record_var_seed);
             }
             seed_source_vars_for_record(ctx, source_name_owned.as_str(), &rec)?;
-            if let Some(slot) = ctx.total_per_source.get_mut(&source_name_arc) {
-                *slot += 1;
-            }
             count += 1;
             records_since_check += 1;
             if records_since_check >= 1024 {
@@ -3537,7 +3835,7 @@ pub(crate) fn transform_fused_consume(
                 let eval_ctx = EvalContext {
                     stable: ctx.stable,
                     source_file: &source_file_arc,
-                    source_row: rn,
+                    source_row: rn.ordinal(),
                     source_path: &source_file_arc,
                     source_count: ctx.source_count_by_name(&rec_source_name_arc),
                     source_batch: ctx.source_batch_arc,
@@ -3925,7 +4223,7 @@ pub(crate) fn dispatch_plan_node(
 #[derive(Debug, Default, Clone)]
 pub(crate) struct CorrelationGroupBuffer {
     pub(crate) records: Vec<CorrelationRecordSlot>,
-    pub(crate) error_rows: HashSet<u64>,
+    pub(crate) error_rows: HashSet<crate::executor::stream_event::SourceRowId>,
     pub(crate) error_messages: Vec<CorrelationErrorRecord>,
     pub(crate) total_records: u64,
     pub(crate) overflowed: bool,
@@ -3940,7 +4238,8 @@ pub(crate) struct CorrelationGroupBuffer {
 /// to preserve source-side context.
 #[derive(Debug, Clone)]
 pub(crate) struct CorrelationRecordSlot {
-    pub(crate) row_num: u64,
+    pub(crate) row_num: crate::executor::stream_event::SourceRowId,
+    pub(crate) consumer: clinker_plan::plan::PlanNodeId,
     pub(crate) original_record: Record,
     pub(crate) projected: Record,
     pub(crate) output_name: String,
@@ -3956,7 +4255,7 @@ pub(crate) struct CorrelationRecordSlot {
 /// arm dedupes by `row_num` for trigger emission.
 #[derive(Debug, Clone)]
 pub(crate) struct CorrelationErrorRecord {
-    pub(crate) row_num: u64,
+    pub(crate) row_num: crate::executor::stream_event::SourceRowId,
     pub(crate) original_record: Record,
     pub(crate) category: clinker_core_types::dlq::DlqErrorCategory,
     pub(crate) error_message: String,

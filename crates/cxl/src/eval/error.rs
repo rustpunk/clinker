@@ -57,6 +57,12 @@ pub enum EvalErrorKind {
         expected: usize,
         got: usize,
     },
+    /// An admitted compiler proof and its retained runtime declaration
+    /// disagree. Ordinary authored programs are rejected before evaluation;
+    /// this variant reports corruption or an internal compiler defect.
+    InvariantViolation {
+        message: String,
+    },
     IntegerOverflow {
         op: &'static str,
     },
@@ -100,6 +106,9 @@ impl std::fmt::Display for EvalErrorKind {
                 "argument count mismatch for '{}': expected {}, got {}",
                 name, expected, got
             ),
+            Self::InvariantViolation { message } => {
+                write!(f, "internal invariant violation: {message}")
+            }
             Self::IntegerOverflow { op } => write!(f, "integer overflow in {} operation", op),
             Self::StringTooLarge { size, limit } => write!(
                 f,
@@ -210,6 +219,7 @@ pub fn extract_triggering_value(kind: &EvalErrorKind) -> Option<Value> {
         EvalErrorKind::TypeMismatch { .. }
         | EvalErrorKind::DivisionByZero
         | EvalErrorKind::RegexCompile { .. }
+        | EvalErrorKind::InvariantViolation { .. }
         | EvalErrorKind::IntegerOverflow { .. }
         | EvalErrorKind::StringTooLarge { .. }
         | EvalErrorKind::ExpansionLimitExceeded { .. } => None,
@@ -225,6 +235,7 @@ impl miette::Diagnostic for EvalError {
             EvalErrorKind::RegexCompile { .. } => "cxl::eval::regex_compile",
             EvalErrorKind::IndexOutOfBounds { .. } => "cxl::eval::index_out_of_bounds",
             EvalErrorKind::ArityMismatch { .. } => "cxl::eval::arity_mismatch",
+            EvalErrorKind::InvariantViolation { .. } => "cxl::eval::internal_invariant",
             EvalErrorKind::IntegerOverflow { .. } => "cxl::eval::integer_overflow",
             EvalErrorKind::StringTooLarge { .. } => "cxl::eval::string_too_large",
             EvalErrorKind::ExpansionLimitExceeded { .. } => "cxl::eval::expansion_limit_exceeded",

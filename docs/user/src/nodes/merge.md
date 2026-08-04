@@ -53,7 +53,7 @@ Merge's cross-input ordering discipline is selected by `config.mode`. Two modes 
 
 ### `concat` (default)
 
-Predecessor records drain in **declaration order**: `inputs[0]` flows to output first, then `inputs[1]`, then `inputs[2]`, and so on. Within a single predecessor, per-source FIFO order is preserved. Output is reproducible run-to-run.
+Predecessor records drain in **declaration order**: `inputs[0]` flows to output first, then `inputs[1]`, then `inputs[2]`, and so on. Within a single predecessor, its arrival order is preserved. Output is reproducible run-to-run for the same predecessor paths.
 
 ```yaml
 - type: merge
@@ -65,7 +65,9 @@ Predecessor records drain in **declaration order**: `inputs[0]` flows to output 
 
 ### `interleave`
 
-Records flow to output **as they become available** from any predecessor. Per-source FIFO is preserved within each input; cross-input order follows wall-clock arrival and is non-deterministic.
+Records flow to output **as they become available** from any predecessor. Each
+input's arrival order is preserved; cross-input order follows wall-clock
+arrival and is not promised.
 
 ```yaml
 - type: merge
@@ -102,7 +104,19 @@ For high-volume merges, prefer `concat` or unseeded `interleave` — both stream
 
 ## Record ordering
 
-Records arrive in the order described by the mode in use — see [Modes](#modes) and [Choosing a mode](#choosing-a-mode) above. If you need sorted output regardless of merge mode, apply a `sort_order` on the downstream output node.
+Records arrive in the order described by the mode in use — see [Modes](#modes)
+and [Choosing a mode](#choosing-a-mode) above. Merge does not promote matching
+per-input `sort_order` declarations into one global sort: concatenating two
+independently sorted files can still put a high key before a lower key at the
+input boundary.
+
+For `concat` and seeded `interleave`, exact sequence is a supported oracle for
+the same input paths and configuration. For unseeded `interleave`, compare the
+decoded record multiset and aggregate values; snapshotting incidental
+cross-input arrival order would assert behavior Clinker does not promise. If
+you need one sorted sequence regardless of Merge mode, declare `sort_order` on
+the downstream [Output](output.md#sort-order). That terminal sort uses only the
+authored keys and does not invent a hidden identity tie-breaker.
 
 ## Use cases
 

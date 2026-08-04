@@ -3990,13 +3990,9 @@ nodes:
     /// Verify an order with NULL product_id produces no join match.
     #[test]
     fn test_combine_exec_null_key_no_match() {
-        // Empty product_id field on ORD-2 triggers Null after schema
-        // coercion (string type preserves it as empty string, not
-        // Null). To generate a true Null probe key, use a compare-to-
-        // nonexistent column or rely on runtime Null propagation via
-        // a residual equality that always resolves to Null. The
-        // simplest way: orders schema carries product_id as int with a
-        // blank field which coerces to Null.
+        // The explicitly nullable integer declaration maps ORD-2's empty
+        // product_id to Null; the equality then follows CXL three-valued
+        // semantics and cannot match the product row.
         let orders = "order_id,product_id,amount\nORD-1,1,10\nORD-2,,20\n";
         let products = "product_id,name,category\n1,Widget,cat-1\n";
         let yaml = r#"
@@ -4011,7 +4007,7 @@ nodes:
       path: orders.csv
       schema:
         - { name: order_id, type: string }
-        - { name: product_id, type: int }
+        - { name: product_id, type: { nullable: int } }
         - { name: amount, type: int }
   - type: source
     name: products
@@ -5430,6 +5426,7 @@ nodes:
             },
             types: Vec::new(),
             bindings: Vec::new(),
+            runtime_modules: Arc::new(Default::default()),
             field_types: IndexMap::new(),
             regexes: Vec::new(),
             node_count: 0,

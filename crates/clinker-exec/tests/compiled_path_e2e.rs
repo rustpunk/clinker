@@ -104,7 +104,7 @@ nodes:
       schema:
         - { name: name, type: string }
         - { name: amount, type: int }
-        - { name: note, type: string }
+        - { name: note, type: { nullable: string } }
         - { name: prices, type: any }
   - type: transform
     name: derive

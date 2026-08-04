@@ -34,4 +34,21 @@ pub enum ChannelError {
         declared: String,
         reason: String,
     },
+    #[error("invalid channel manifest at line {line}: {reason}. {correction}")]
+    InvalidManifest {
+        line: u64,
+        reason: String,
+        correction: String,
+    },
+    #[error("invalid group `{group}` at line {line}: {reason}. {correction}")]
+    InvalidGroup {
+        group: String,
+        line: u64,
+        reason: String,
+        correction: String,
+    },
+    #[error("channel resource `{channel}` is invalid: {reason}")]
+    InvalidChannelResource { channel: String, reason: String },
+    #[error("group `{group}` has an invalid target set: {reason}")]
+    InvalidGroupTargets { group: String, reason: String },
 }

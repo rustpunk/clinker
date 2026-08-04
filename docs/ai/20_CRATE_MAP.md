@@ -1,6 +1,6 @@
 # AI Onboarding: Crate Map
 
-Verified against origin/main cf6609b9 (2026-07-24).
+Verified against the current working tree (2026-07-30).
 
 Purpose: Give future AI agents a factual map of the current Cargo workspace, with dependency direction, crate roles, and evidence anchors for safe code changes.
 
@@ -54,8 +54,8 @@ wire-format serialization policy.
 - `clinker-record` is the shared data model leaf for row values, schemas, storage traits, grouping keys, document context, and accumulators (`crates/clinker-record/src/lib.rs`).
 - `cxl` sits above records but below planning/execution: it parses, resolves, type-checks, plans aggregates, and evaluates expressions against `clinker-record` values (`crates/cxl/src/lib.rs`).
 - `clinker-format` owns streaming readers/writers and document/envelope framing. It depends on `cxl`, so it is not a pure serialization leaf (`crates/clinker-format/Cargo.toml`; `crates/clinker-format/src/lib.rs`).
-- `clinker-plan` is compile-time orchestration and DAG construction below the runtime executor; its crate docs explicitly say execution consumes its plan (`crates/clinker-plan/src/lib.rs`).
-- `clinker-exec` is runtime orchestration and operators; binaries and network transports depend on it rather than the reverse (`crates/clinker-exec/src/lib.rs`; `crates/clinker-exec/src/executor/mod.rs`).
+- `clinker-plan` is the sole execution-admission authority below the runtime executor. It discovers every typed CXL root, freezes the complete producer-port consumer registry and execution-order/writer contract after structural rewrites, and returns those proofs on `CompiledPlan` (`crates/clinker-plan/src/lib.rs`; `crates/clinker-plan/src/plan/execution/consumer_registry.rs`; `crates/clinker-plan/src/plan/execution/scheduling.rs`).
+- `clinker-exec` is runtime orchestration and operators. It consumes planning-owned proofs, owns the unified source-attempt and population-accounting stream, and enforces shared-port replay plus source/writer ordering under one run-scoped memory arbitrator. Binaries and network transports depend on it rather than the reverse (`crates/clinker-exec/src/lib.rs`; `crates/clinker-exec/src/executor/mod.rs`).
 - `clinker-channel`, `clinker-net`, `clinker-schema`, `clinker`, and `cxl-cli` appear to be edge/application or integration crates around the plan/exec/language core.
 - `clinker-lineage` is a plan-time, read-only consumer of `clinker-plan`: it maps Source/Output nodes to OpenLineage dataset identities and walks the compiled DAG to emit DIRECT (per-column) and INDIRECT (whole-dataset influence) column-level lineage facets (OpenLineage `2-0-2` / `ColumnLineageDatasetFacet` `1-2-0`). It reads typed/compiled programs off plan nodes via `cxl`; it does not run pipelines or hold any clock — the CLI supplies every timestamp (`crates/clinker-lineage/src/lib.rs`). The `clinker` CLI consumes it two ways: `run --lineage <path>` compiles the plan and writes a static START/COMPLETE OpenLineage NDJSON pair without reading data (mirroring `--explain`); `run --lineage-events <path>` runs the pipeline and, via `emit::LiveRunEmitter`, emits live run-lifecycle events tied to the execution — a START at run begin and a terminal COMPLETE / FAIL / ABORT at run end, carrying real timing, row counts (the clinker-defined `clinker_runStats` run facet), and, on FAIL, the standard `ErrorMessageRunFacet`. The engine core (`clinker-exec`) has no lineage dependency; the run lifecycle is orchestrated at the CLI edge. Live emission over an HTTP/network transport is a separate, deferred layer.
 - Benchmark crates appear intended to stay outside the runtime layer. `clinker-benchmarks/src/lib.rs` says it houses a runner needing both `clinker-exec` and `clinker-bench-support` to avoid a circular dependency.
@@ -65,6 +65,47 @@ wire-format serialization policy.
 - No normal workspace dependency cycle was found in `cargo metadata --no-deps` or `cargo tree --workspace --depth 1`.
 - `clinker-exec` has an optional normal dependency on `clinker-bench-support` for `bench-alloc` (`crates/clinker-exec/Cargo.toml`). That may be intentional for allocation measurement, but future agents should avoid letting benchmark helpers leak into default runtime code.
 - `clinker-net` depends on `clinker-exec` to implement `RecordSource` (`crates/clinker-net/src/lib.rs`; `clinker_exec::source::RecordSource`). This couples network source readers to executor source traits; it appears deliberate but means network transport is not a low-level IO crate.
+
+## Rust Reachability And Compatibility
+
+Rust `pub` controls whether a path is reachable. It does not establish that
+Clinker supports the path as an integration API. D-18 locks four compatibility
+classes: supported integration API, workspace-internal exposed API, test
+support, and deprecated cleanup debt; D-19 also distinguishes a deprecated
+route whose supported replacement already exists. Structural facade work is
+owned by Phase 4. See
+[validation authority and Rust API compatibility](15_PRODUCTION_CONTRACTS.md#validation-authority-and-rust-api-compatibility).
+
+Every D-19 seed has exactly one class:
+
+| Reachable symbol | D-19 class | Compatibility posture | Evidence and route |
+|---|---|---|---|
+| `clinker_record::FieldResolver` | Supported integration API | Changes require an explicit compatibility decision and migration note. | Root re-export in `crates/clinker-record/src/lib.rs` |
+| `clinker_record::HashMapResolver` | Supported integration API | Changes require an explicit compatibility decision and migration note. | Root re-export in `crates/clinker-record/src/lib.rs` |
+| `clinker_record::WindowContext` | Supported integration API | Changes require an explicit compatibility decision and migration note. | Root re-export in `crates/clinker-record/src/lib.rs` |
+| `cxl::resolve::HashMapResolver` | Deprecated route | Migrate consumers to `clinker_record::HashMapResolver`; removal follows a bounded migration. | Re-export from `cxl::resolve::test_double` in `crates/cxl/src/resolve/mod.rs` |
+| `cxl::resolve::test_double` | Deprecated cleanup debt | Public module reachability is accidental debt, not test-support compatibility. | Public module declaration in `crates/cxl/src/resolve/mod.rs` |
+| `cxl::typecheck::Row` | Workspace-internal exposed API | Compiler representation; workspace use does not create downstream support. | Re-export in `crates/cxl/src/typecheck/mod.rs` |
+| `cxl::typecheck::RowTail` | Workspace-internal exposed API | Compiler representation; workspace use does not create downstream support. | Re-export in `crates/cxl/src/typecheck/mod.rs` |
+| `cxl::typecheck::TailVarId` | Workspace-internal exposed API | Compiler representation; workspace use does not create downstream support. | Re-export in `crates/cxl/src/typecheck/mod.rs` |
+| `cxl::typecheck::ColumnLookup` | Workspace-internal exposed API | Compiler representation; workspace use does not create downstream support. | Re-export in `crates/cxl/src/typecheck/mod.rs` |
+| `cxl::typecheck::QualifiedField` | Workspace-internal exposed API | Compiler representation; workspace use does not create downstream support. | Re-export in `crates/cxl/src/typecheck/mod.rs` |
+| `clinker_plan::config::RouteConfig` | Deprecated cleanup debt | Legacy config reachability may be removed through bounded cleanup; it is not a supported facade. | `route::*` re-export in `crates/clinker-plan/src/config/mod.rs` |
+| `clinker_plan::config::RouteBranch` | Deprecated cleanup debt | Legacy config reachability may be removed through bounded cleanup; it is not a supported facade. | `route::*` re-export in `crates/clinker-plan/src/config/mod.rs` |
+
+**Test support** remains a valid D-18 class for deliberately gated helpers, but
+none of the D-19 seed symbols is assigned to it. In particular,
+`cxl::resolve::test_double` is cleanup debt, not a supported test facade.
+
+## Terminal Node Vocabulary
+
+The current planner and runtime use `PipelineNode::Output`, `OutputConfig`,
+Output-oriented dispatch, and public YAML `type: output`. D-56 assigns the
+terminal-node-only migration to Sink to Phase 4 / AUTH-09, wholly before Phase
+4.1 endpoint work. Phase 1 does not change Rust, YAML, examples, fixtures, or
+tests. Output ports, artifacts, paths, formats, stdout, machine output, writer
+results, and OpenLineage output datasets keep their existing vocabulary. See
+[terminal destination vocabulary](15_PRODUCTION_CONTRACTS.md#terminal-destination-vocabulary).
 
 ## Crates
 
@@ -138,24 +179,24 @@ wire-format serialization policy.
 - Crate name: `clinker-plan`
 - Path: `crates/clinker-plan`
 - Role: Library crate with in-crate plan/config tests.
-- Purpose: Parses YAML pipeline/composition configuration, resolve schemas and source discovery, validate configs, compile CXL against row types, and produce typed execution DAGs consumed by `clinker-exec`.
-- Important public modules: `config`, `error`, `overlay_ops`, `plan`, `runtime_error`, `schema`, `security`, `span`, `validation`, `yaml`. `config` exposes source/output/format/route/aggregate/storage/composition modules; `plan` exposes `compiled`, `execution`, `properties`, `statistics`, `streaming_eligibility`, `deferred_region`, and `envelope_synthesis`.
+- Purpose: Parses YAML pipeline/composition configuration, resolves schemas, discovers sources and workspace resources, validates configs, and produces typed execution DAGs consumed by `clinker-exec`. Planning uses the variant-exhaustive `PipelineNode::visit_cxl_fields` traversal to own direct CXL roots and the bounded transitive module/declaration closure; the parsed `CompiledModuleRegistry` remains on `CompiledPlan`. After every structural rewrite it also freezes `CompiledConsumerRegistry` and `ExecutionOrderContract`, including source-order proofs and physical-writer boundaries.
+- Important public modules: `config`, `error`, `overlay_ops`, `plan`, `resources`, `runtime_error`, `schema`, `security`, `span`, `validation`, `yaml`. `config` exposes aggregate/canonical/compile-context/composition/discovery/format/output/patch/pipeline/route/sort/source/storage/transform surfaces; `plan` exposes binding, combine, compiled plans, composition bodies, deferred regions, entities, envelope synthesis, execution, provenance, extraction/index, properties, row types, scheduling, statistics, streaming eligibility, and plan types. `plan::execution` owns `ProducerPortKey`, `CompiledConsumerRegistry`, `CompiledSourceOrder`, `PhysicalWriterBoundary`, and `ExecutionOrderContract`; `resources` owns `CompiledModuleRegistry`, parsed module entries, export metadata, and evaluator-registry construction.
 - Internal dependencies: `clinker-core-types`, `clinker-format`, `clinker-record`, `cxl`.
 - Architecturally important external dependencies: `serde`, `serde_json`, `serde-saphyr`, `toml`, `indexmap`, `miette`, `petgraph`, `regex`, `tracing`, `walkdir`, `glob`, `blake3`, `postcard`, `lz4_flex`, `tempfile`, platform `nix`/`windows-sys`.
-- Known tests/examples/benches: in-crate rename gates in `src/lib.rs`; plan tests under `crates/clinker-plan/src/plan/tests/` for DAGs, CK lattice/aligned partitions, cull validation, deferred regions, route ports, watermark validation, doc paths, envelope synthesis, and explain output; config composition tests in `crates/clinker-plan/src/config/composition/tests.rs`.
+- Known tests/examples/benches: in-crate rename gates in `src/lib.rs`; plan tests under `crates/clinker-plan/src/plan/tests/` for DAGs, consumer registries, frozen ordering contracts, CK lattice/aligned partitions, cull validation, deferred regions, route ports, watermark validation, source type diagnostics, doc paths, envelope synthesis, and explain output; config composition tests in `crates/clinker-plan/src/config/composition/tests.rs`.
 - Confidence: High.
-- Evidence: `crates/clinker-plan/src/lib.rs` states it sits below execution and produces `plan::execution::ExecutionPlanDag`; `crates/clinker-plan/src/config/mod.rs`; `crates/clinker-plan/src/plan/mod.rs`; `crates/clinker-plan/src/plan/execution/mod.rs` symbols `PlanNode`, `PlanEdge`, `ExecutionPlanDag`, and `PlanError`.
+- Evidence: `crates/clinker-plan/src/lib.rs` states it sits below execution and produces `plan::execution::ExecutionPlanDag`; `crates/clinker-plan/src/config/mod.rs`; `crates/clinker-plan/src/plan/mod.rs`; `crates/clinker-plan/src/plan/compiled.rs`; `crates/clinker-plan/src/resources/mod.rs`; `crates/clinker-plan/src/plan/execution/mod.rs` symbols `PlanNode`, `PlanEdge`, `ExecutionPlanDag`, and `PlanError`.
 
 ### clinker-exec
 
 - Crate name: `clinker-exec`
 - Path: `crates/clinker-exec`
 - Role: Library crate with the largest integration-test and benchmark surface.
-- Purpose: Executes compiled pipeline DAGs: source ingestion, dispatch for node kinds, transforms, aggregations, combines/joins, route/merge/reshape/cull/output dispatch, DLQ, metrics, memory arbitration, spill handling, record sources, progress, and runtime modules.
-- Important public modules: `aggregation`, `dlq`, `executor`, `exit_codes`, `log_dispatch`, `log_rules`, `log_template`, `metrics`, `modules`, `output`, `partial`, `pipeline`, `progress`, `projection`, `sketch`, `source`. The `executor` module exposes `PipelineExecutor`, `PipelineRunParams`, `ExecutionReport`, `WriterRegistry`, `RecordSource`, `SourceInput`, and validation types. The `pipeline` module exposes sort, combine, grace hash, IEJoin, memory, spill, streaming merge, and window context helpers.
+- Purpose: Executes compiled pipeline DAGs: unified successful/type-error source attempts and population accounting, attempt-local row identity, per-physical-file source-order verification/repair, compiled shared-port replay, dispatch for node kinds, transforms, aggregations, combines/joins, route/merge/reshape/cull/output dispatch, physical-writer ordering and cleanup, DLQ, metrics, memory arbitration, spill handling, record sources, and progress. CXL and channel filesystem admission, the consumer graph, and ordering/writer proofs are planning-owned; execution consumes the retained artifacts.
+- Important public modules: `aggregation`, `dlq`, `executor`, `exit_codes`, `log_dispatch`, `log_rules`, `log_template`, `metrics`, `output`, `partial`, `pipeline`, `progress`, `projection`, `sketch`, `source`. The `executor` module exposes `PipelineExecutor`, `PipelineRunParams`, `ExecutionReport`, `WriterRegistry`, `RecordSource`, `SourceInput`, and validation types; internal `source_stream` owns `SourceAttemptEvent` and `AttemptPopulationDelta`, `stream_event` owns `SourceRowId`, and `output_dispatch` owns `OrderedWriterBoundary`. The `pipeline` module exposes sort, combine, grace hash, IEJoin, memory, spill, streaming merge, and window context helpers. Source repair and writer ordering both reuse `MemoryArbitrator`, `SortBuffer`, and `SortedRunMerger` rather than defining private budgets or another ordering engine.
 - Internal dependencies: `clinker-core-types`, `clinker-format`, `clinker-plan`, `clinker-record`, `cxl`; optional normal dependency on `clinker-bench-support`; dev-depends on `clinker-bench-support` and `clinker-channel`.
 - Architecturally important external dependencies: `crossbeam-channel`, `rayon`, `arc-swap`, `hashbrown`, `lz4_flex`, `postcard`, `fs4`, `petgraph`, `miette`, `tracing`, `serde-saphyr`, `serde_json`, `csv`, `glob`, `uuid`, `ctrlc` on native targets, `windows-sys` on Windows, `criterion`, `insta`, `proptest`, `serial_test`.
-- Known tests/examples/benches: many integration tests in `crates/clinker-exec/tests/`, covering aggregates, combine, composition, correlation/retraction, output, formats, storage, memory, streaming, docs, and fixtures under `crates/clinker-exec/tests/fixtures/`; white-box tests under `crates/clinker-exec/src/executor/tests/`; benches under `crates/clinker-exec/benches/` including `sort`, `arena`, `window`, `pipeline`, `parallel`, `provenance`, `composition`, `combine`, `combine_iejoin`, `combine_nary_3input`, `combine_grace_hash`, `deferred_buffer_pruning`, `arbitration_poll`, and `spill_compression`.
+- Known tests/examples/benches: many integration tests in `crates/clinker-exec/tests/`, including `multi_output`, `source_order_verification`, `source_type_errors`, `ordering_contract`, `output_envelope_seam`, `streaming_output`, and `document_dlq`, plus aggregate, combine, composition, correlation/retraction, format, storage, memory, streaming, docs, and fixture coverage; white-box tests under `crates/clinker-exec/src/executor/tests/`; benches under `crates/clinker-exec/benches/` including `sort`, `arena`, `window`, `pipeline`, `parallel`, `provenance`, `composition`, `combine`, `combine_iejoin`, `combine_nary_3input`, `combine_grace_hash`, `deferred_buffer_pruning`, `arbitration_poll`, and `spill_compression`.
 - Confidence: High.
 - Evidence: `crates/clinker-exec/Cargo.toml`; `crates/clinker-exec/src/lib.rs`; `crates/clinker-exec/src/executor/mod.rs` symbols `PipelineExecutor`, `SourceReaders`, `single_file_reader`, `PipelineRunParams`; `crates/clinker-exec/src/source/mod.rs` symbols `RecordSource` and `SourceInput`.
 
@@ -164,13 +205,13 @@ wire-format serialization policy.
 - Crate name: `clinker-channel`
 - Path: `crates/clinker-channel`
 - Role: Library crate plus integration tests and `channel_merge` bench.
-- Purpose: Manages channel files for multi-tenant pipeline/composition launches: binding channel targets, validating config override paths, applying overlays, and staging source copies with reuse/crash-safety logic.
+- Purpose: Manages channel files for multi-tenant pipeline/composition launches: discovering catalog targets, validating explicit pipeline/composition group target sets, deriving selector or forced groups within the admitted target subset, resolving one target's channel overlay and composition closure, validating config override paths, applying overlays, and staging source copies with reuse/crash-safety logic. Each applied layer is canonicalized and contained beneath its admitted root, then read, parsed, and hashed from one bounded buffer on the same open handle. Resolution stamps the complete ordered pipeline/group/channel/per-target layer identity on `CompiledPlan`.
 - Important public modules: `derivation`, `discovery`, `dotted`, `error`, `group`, `manifest`, `overlay`, `resolve`, `selector`, `staging_copy`.
 - Internal dependencies: `clinker-core-types`, `clinker-plan`, `clinker-record`.
 - Architecturally important external dependencies: `serde-saphyr`, `serde`, `serde_json`, `blake3`, `indexmap`, `tracing`, `thiserror`, `walkdir`, `uuid`, `tempfile`, `fs4`, Unix `nix`.
-- Known tests/examples/benches: `crates/clinker-channel/tests/overlay_resolution_test.rs`, `discovery_test.rs`, `channel_manifest_test.rs`, `group_parse_test.rs`, `source_patch_parse_test.rs`, `staging_reuse_concurrent.rs`; `crates/clinker-channel/benches/channel_merge.rs`; the multitenant overlay workspace under `examples/multitenant/`.
+- Known tests/examples/benches: `crates/clinker-channel/tests/overlay_resolution_test.rs`, `discovery_test.rs`, `channel_manifest_test.rs`, `group_parse_test.rs`, `source_patch_parse_test.rs`, `scoped_overlay_validation.rs`, `staging_reuse_concurrent.rs`; `scoped_overlay_validation` includes containment, single-open, target-admission, and complete-identity gates; `crates/clinker-channel/benches/channel_merge.rs`; the multitenant overlay workspace under `examples/multitenant/`.
 - Confidence: High.
-- Evidence: `crates/clinker-channel/src/lib.rs` channel/group overlay guide; re-exports `resolve`, `OverlayResolution`, `resolve_channel_overlay`, `scan_channels`, `scan_groups`, `DottedPath`, `ChannelManifest`, `OverlayFile`, `Group`, and `SourceStager`.
+- Evidence: `crates/clinker-channel/src/lib.rs` channel/group overlay guide; re-exports `resolve`, `OverlayResolution`, `resolve_target_channel`, `resolve_channel_overlay`, `scan_channels`, `scan_groups`, `DottedPath`, `ChannelManifest`, `OverlayFile`, `Group`, `GroupTargetSet`, `ValidatedGroupTargets`, and `SourceStager`.
 
 ### clinker-net
 
@@ -208,7 +249,7 @@ wire-format serialization policy.
 - Internal dependencies: `clinker-plan`.
 - Architecturally important external dependencies: `serde`, `serde_json`, `serde-saphyr`, `ahash`; `tempfile` for dev tests.
 - Known tests/examples/benches: unit tests in `parse.rs`, `discovery.rs`, and `validate.rs`; schema examples/fixtures under `examples/pipelines/retract-demo/*.schema.yaml`.
-- Confidence: Medium. The crate is an edge/authoring support crate, and its long-term boundary with `clinker-plan` is tracked as an open question.
+- Confidence: High. The crate is an advisory edge/authoring support crate; D-17 keeps `clinker-plan` as the sole execution-admission authority, so schema-index validation cannot substitute for compilation.
 - Evidence: `crates/clinker-schema/src/lib.rs`; public symbols `build_workspace_schema_index`, `parse_schema`, `parse_schema_file`, `validate_pipeline`, `SourceSchema`, and `SchemaIndex`.
 
 ### clinker-lineage
@@ -266,11 +307,14 @@ wire-format serialization policy.
 - CI runs `cargo fmt --all --check`, two Clippy passes (`cargo clippy --workspace -- -D warnings` and `cargo clippy --workspace --all-targets -- -D warnings`), `cargo test --workspace`, bench compile/smoke checks, native Windows/macOS tests, selected cross-target checks, and `cargo deny` (`.github/workflows/ci.yml`).
 - Release workflow builds CLI tools `clinker` and `cxl-cli` (`.github/workflows/release.yml`).
 
-## Unresolved Items
+## Contract Routing
 
-Open questions are centralized in
-[docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md). Crate-map-specific
-items currently tracked there include `clinker-schema` versus `clinker-plan`
-ownership, the `clinker-format -> cxl` edge, the optional
-`clinker-exec -> clinker-bench-support` `bench-alloc` edge, and stale
-`clinker-core` references in older docs.
+Locked crate-map decisions are centralized in
+[the production-contract register](15_PRODUCTION_CONTRACTS.md), not the
+open-question ledger. In particular, D-17 makes `clinker-plan` the sole
+execution-admission authority and `clinker-schema` advisory; D-20 bounds the
+`clinker-format -> cxl` exception; D-21 permits only repaired feature-gated
+`clinker-exec -> clinker-bench-support` instrumentation; D-22 forbids parser
+bypasses; and D-23 routes unused dependency cleanup. Use
+[docs/ai/80_OPEN_QUESTIONS.md](80_OPEN_QUESTIONS.md) only for uncertainty that
+remains unresolved or explicitly deferred.

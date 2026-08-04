@@ -38,21 +38,43 @@ schema:
 
 | Type | Description |
 |------|-------------|
+| `null` | The null value only |
 | `string` | UTF-8 text |
 | `int` | 64-bit signed integer |
 | `float` | 64-bit IEEE 754 floating point |
+| `decimal` | Exact fixed-point number, subject to the declared precision and scale |
 | `bool` | Boolean (`true` / `false`) |
 | `date` | Calendar date |
 | `date_time` | Date with time component |
 | `array` | Ordered sequence of values |
+| `map` | String-keyed object |
 | `any` | Unknown type -- field used in type-agnostic contexts |
 | `nullable(T)` | Nullable wrapper around any inner type (e.g. `nullable(int)`) |
+
+Without a column `format:`, `date_time` accepts the default offset-free forms
+and RFC 3339 timestamps with `Z` or an explicit numeric offset, such as
+`2026-01-31T08:27:00Z` and `2026-01-31T10:57:00+02:30`. Zoned timestamps are
+normalized to UTC before entering Clinker's timezone-free `date_time`
+representation. Parsing is exact: surrounding whitespace, malformed calendar
+values, and out-of-range timestamps are rejected rather than trimmed, guessed,
+overflowed, or rounded. A column-level strftime `format:` is exclusive: only
+that authored format is tried.
 
 A source column's declared type must be **concrete**: `numeric` — the
 inference-only `int | float` union CXL resolves during type unification — is
 **not** a valid source column type. Declaring one is rejected at compile with
 [**E158**](../ops/exit-codes.md#plan-time-diagnostic-codes); declare `int` or
 `float` explicitly.
+
+There is no `clinker guess` command in the current CLI. Decision D-55 locks an
+authoring-only inference workflow for Phase 4 / AUTH-03: a deterministic,
+bounded multi-file preview by default, plus an exhaustive bounded-memory mode
+for conclusive evidence. That future command will inspect only columns marked
+`numeric`; it will not run transformations or outputs, and it will not weaken
+runtime validation. Until AUTH-03 ships, inspect the source data yourself and
+commit a concrete `int` or `float` declaration before compiling the pipeline.
+See [Production Contracts](https://github.com/rustpunk/clinker/blob/main/docs/ai/15_PRODUCTION_CONTRACTS.md#scoped-provenance-nested-windows-and-numeric-authoring)
+for the locked safety and write-back rules.
 
 ### `long_unique` — storage hint for high-cardinality text
 
@@ -135,6 +157,66 @@ decoded record onto the declared schema, and undeclared input fields fall
 under the [`on_unmapped`](#on_unmapped--undeclared-input-fields) policy
 below.
 
+## Declared-type failures
+
+Source types are enforced before a record reaches buffering, sorting, or any
+downstream node. A value that cannot satisfy its authored type rejects the
+whole row exactly once; Clinker never substitutes the raw string, a sentinel,
+or an error-derived null.
+
+Empty input has three distinct outcomes:
+
+- an empty value declared as `string` remains the empty string;
+- an empty non-string value declared `nullable(T)` becomes null;
+- an empty non-string value declared as non-nullable is a type error.
+
+Parsing does not trim whitespace, guess locale conventions, or recognize
+case-insensitive null sentinels. Integer overflow, invalid/out-of-range dates,
+decimal precision overflow, and decimal values that would need rounding to
+the declared `scale` are type errors. Accepted decimal and date values retain
+their declared precision.
+
+The **E126** diagnostic identifies source, file, one-based row and column,
+field, and declared type. Its value preview is sanitized to one line and
+limited to 256 rendered UTF-8 bytes; controls, bidi characters, diagnostic
+delimiters, backslashes, and invalid UTF-8 are explicit indivisible escape
+tokens. When truncated, the preview ends in one `…` without splitting a token
+or Unicode scalar and reports the original byte length. The complete original
+record/value is retained only in the configured DLQ. See [Error Handling &
+DLQ](../pipelines/error-handling.md#strategies) for strategy and threshold
+behavior.
+
+Already-decoded values obey the same declarations without hidden coercions:
+`string` admits only a string, `null` admits only null, and `any` admits every
+supported native value while preserving its represented value. Numeric
+conversions must be exact; non-finite floating-point values and decimal values
+that would require rounding are rejected. With `multiple: true`, the scalar
+declaration is applied to every array element. If any element fails, the whole
+source record is rejected and the complete original array remains available
+through the DLQ.
+
+### Error strategies and complete populations
+
+`fail_fast` aborts on the first declared source failure. `continue` and
+`best_effort` require a DLQ and use the configured threshold over the complete
+population:
+
+```text
+rejected records / attempted records
+```
+
+The run aborts only when that ratio is strictly greater than the threshold.
+Equality is accepted, so a threshold of `0.1` admits exactly one rejected
+record in a population of ten but not two. A zero threshold aborts on the first
+rejection; a threshold of `1.0` admits an all-rejected population for the
+continuing strategies.
+
+For ordered file sources, Clinker establishes the complete attempted and
+rejected population before any accepted record, punctuation, downstream side
+effect, or output byte is released. That population is applied exactly once
+whether execution remains resident, spills, or fuses a downstream node. A
+threshold violation therefore cannot leave a committed prefix of output.
+
 ## `on_unmapped` — undeclared input fields
 
 The per-source `on_unmapped` policy decides what to do with input fields the source's `schema:` block does not name. Three modes — `auto_widen` (default), `drop`, `reject`:
@@ -160,7 +242,8 @@ mismatch, and fixed-width behavior.
 
 ## Sort order
 
-If your source data is pre-sorted, declare the sort order so the optimizer can use streaming aggregation instead of hash aggregation:
+If each physical input file is pre-sorted, declare the record order so the
+planner can admit order-dependent strategies such as streaming aggregation:
 
 ```yaml
 - type: source
@@ -178,7 +261,42 @@ If your source data is pre-sorted, declare the sort order so the optimizer can u
       - { field: "txn_date", order: asc }
 ```
 
-Sort order declarations are trusted -- Clinker does not verify that the data is actually sorted. If the data violates the declared order, downstream streaming aggregation may produce incorrect results.
+Clinker binds these fields to the declared source schema, compares the typed
+values, and verifies each physical file independently before any record from
+that file reaches an order-dependent consumer. The declaration never means
+that a multi-file source is globally sorted: the last key in one file is not
+compared with the first key in the next file.
+
+`on_unsorted` controls the result of the first adjacent inversion:
+
+| Value | Behavior |
+|-------|----------|
+| `warn` (default) | Stably repair the complete physical file with the shared bounded-memory sort, emit one `W307` warning for that file, then release it. A file already in order emits no warning. |
+| `error` | Reject the physical file without releasing an unverified prefix. The diagnostic identifies the source, file, adjacent rows, and keys. |
+
+```yaml
+    sort_order:
+      - { field: "account_id", order: asc, null_order: last }
+      - { field: "txn_date", order: desc, null_order: first }
+    on_unsorted: warn
+```
+
+Source ordering accepts `null_order: first` or `last`; `drop` is rejected
+because verifying order must not discard source records. Equal authored keys
+retain arrival order within the selected execution path. Clinker does not add
+a source identity, physical filename, or canonical-row tie-breaker.
+
+Verification stages the complete sortable file event sequence behind the
+run's memory arbitrator. It uses the existing stable resident/spill sort and
+bounded-fan-in merge machinery when repair spills, while preserving row
+identity, source/file provenance, and document context. Only flat sources and
+sources with one sortable frame per physical file are admitted; a format whose
+nested or repeated framing cannot be reordered losslessly fails during
+planning with a correction to remove `sort_order` or normalize the input.
+
+If a downstream consumer needs one global order across all files, declare
+`sort_order` on the terminal [Output](output.md#sort-order). Use enough output
+fields to define a total business order when byte-identical output matters.
 
 The shorthand form is also accepted -- a bare string defaults to ascending:
 

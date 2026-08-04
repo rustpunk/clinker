@@ -14,7 +14,7 @@
 //! `PipelineDefault < Group(s) by priority < ChannelWide < ChannelPerTarget`.
 //! Each selected group becomes a distinct [`LayerKind::Group { priority, seq }`]
 //! layer; [`apply_group_config`] clobbers its `config:` onto the plan's
-//! provenance through the *same* [`apply_config_clobber`](crate::overlay) engine
+//! provenance through the *same* candidate-validation engine
 //! the channel layers use — no bespoke resolution logic per layer.
 //!
 //! # Channel-agnostic: standalone application
@@ -39,7 +39,6 @@ use serde_json::Value as JsonValue;
 use clinker_core_types::Diagnostic;
 use clinker_plan::config::composition::{LayerKind, ProvenanceDb};
 
-use crate::dotted::DottedPath;
 use crate::error::ChannelError;
 use crate::group::Group;
 use crate::selector::{LabelSelector, SelectorError};
@@ -246,50 +245,24 @@ fn evaluate_group(
 
 /// Clobber a group's `config:` onto a plan's provenance at its group `layer`.
 ///
-/// Reuses the shared [`apply_config_clobber`](crate::overlay) engine — the same
+/// Reuses the shared candidate-validation engine — the same
 /// clobber the channel layers use — so a group layer resolves with no bespoke
-/// logic. Group config keys are raw `alias.param` strings; they are validated
-/// into [`DottedPath`] here (apply-time validation), and a malformed key is a
-/// hard [`ChannelError::InvalidDottedPath`]. A well-formed key that matches no
-/// plan parameter is reported as an `E113` diagnostic by the clobber, exactly as
-/// for a channel layer.
-///
-/// A group carries both a non-fixed `config:` map and a `fixed:` map: the
-/// former applies non-fixed (a higher layer may override it), the latter with
-/// the layer `fixed` lock set so it holds against every higher-precedence layer
-/// (other groups, channel-wide, per-target). Both share the `alias.param`
-/// grammar; a key present in both applies `fixed` (it is clobbered last within
-/// the layer). This is the single apply used by both the derived path and the
-/// standalone `--group` path.
+/// logic. Each candidate validates before folding, including candidates that a
+/// later group or channel layer will shadow.
 pub fn apply_group_config(
     provenance: &mut ProvenanceDb,
     group: &Group,
     layer: LayerKind,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<(), ChannelError> {
-    let config = validate_group_config_keys(&group.config)?;
-    crate::overlay::apply_config_clobber(
+    crate::overlay::apply_config_candidates(
         provenance,
-        &config,
+        &group.config,
         layer,
-        false,
         &group.name,
         diagnostics,
     );
-    let fixed = validate_group_config_keys(&group.fixed)?;
-    crate::overlay::apply_config_clobber(provenance, &fixed, layer, true, &group.name, diagnostics);
     Ok(())
-}
-
-/// Validate a group's raw `config:` keys into [`DottedPath`]s, cloning the
-/// values. The first malformed key fails the whole apply.
-fn validate_group_config_keys(
-    config: &IndexMap<String, JsonValue>,
-) -> Result<IndexMap<DottedPath, JsonValue>, ChannelError> {
-    config
-        .iter()
-        .map(|(key, value)| Ok((DottedPath::try_from(key.as_str())?, value.clone())))
-        .collect()
 }
 
 #[cfg(test)]
@@ -298,6 +271,8 @@ mod tests {
 
     use clinker_core_types::Span;
     use clinker_plan::config::composition::ResolvedValue;
+    use clinker_plan::plan::{EntityRef, PlanNodeId};
+    use clinker_plan::yaml::Location;
 
     /// Build a label set from `(name, json)` pairs.
     fn labels(pairs: &[(&str, JsonValue)]) -> IndexMap<String, JsonValue> {
@@ -318,11 +293,21 @@ mod tests {
             name: name.to_string(),
             selector: selector.map(|s| s.to_string()),
             priority,
+            targets: Default::default(),
             config: config
                 .iter()
-                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .map(|(k, v)| {
+                    (
+                        (*k).to_string(),
+                        crate::manifest::OverlayCandidate {
+                            value: v.clone(),
+                            fixed: false,
+                            value_span: Location::UNKNOWN,
+                            fixed_span: None,
+                        },
+                    )
+                })
                 .collect(),
-            fixed: IndexMap::new(),
             vars: Default::default(),
             overrides: Vec::new(),
         }
@@ -487,7 +472,8 @@ mod tests {
             &[("fraud_check.threshold", JsonValue::from(0.8))],
         );
         let mut prov = ProvenanceDb::default();
-        prov.insert(
+        prov.insert_unscoped(
+            PlanNodeId::new(0),
             "fraud_check".to_string(),
             "threshold".to_string(),
             ResolvedValue::new(
@@ -528,7 +514,8 @@ mod tests {
         let groups = vec![base, strong];
 
         let mut prov = ProvenanceDb::default();
-        prov.insert(
+        prov.insert_unscoped(
+            PlanNodeId::new(0),
             "fraud_check".to_string(),
             "threshold".to_string(),
             ResolvedValue::new(
@@ -585,15 +572,13 @@ mod tests {
     }
 
     #[test]
-    fn malformed_group_config_key_is_hard_error() {
-        // A syntactically invalid dotted path fails the apply outright.
+    fn malformed_group_config_key_is_e113_at_candidate() {
+        // Every malformed candidate is collected as an E113 diagnostic.
         let group = group_with("g", Some("true"), 10, &[("a.b.c", JsonValue::from(1))]);
         let mut prov = ProvenanceDb::default();
         let mut diags = Vec::new();
-        let result = apply_group_config(&mut prov, &group, group_layer(&group, 0), &mut diags);
-        assert!(matches!(
-            result,
-            Err(ChannelError::InvalidDottedPath { .. })
-        ));
+        apply_group_config(&mut prov, &group, group_layer(&group, 0), &mut diags).unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "E113");
     }
 }

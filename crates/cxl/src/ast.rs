@@ -956,11 +956,21 @@ pub struct FnDecl {
     pub span: Span,
 }
 
-/// A parsed CXL module file (only fn declarations and let constants).
+/// A parsed CXL module file.
 #[derive(Debug, Clone)]
 pub struct Module {
+    /// Private module dependencies. These are available only while compiling
+    /// this module and are not re-exported to its callers.
+    pub imports: Vec<ModuleImport>,
     pub functions: Vec<FnDecl>,
     pub constants: Vec<ModuleConst>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModuleImport {
+    pub path: Vec<Box<str>>,
+    pub alias: Option<Box<str>>,
     pub span: Span,
 }
 

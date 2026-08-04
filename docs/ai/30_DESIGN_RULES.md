@@ -1,161 +1,121 @@
 # AI Onboarding: Design Rules
 
-Verified against origin/main cf6609b9 (2026-07-24).
+Verified against the working tree on 2026-07-29.
 
-Purpose: Collect design constraints and review rules that AI agents must validate before changing behavior.
+Purpose: Record the reviewed invariants that constrain Clinker changes. This
+page is intentionally narrower than [common patterns](40_COMMON_PATTERNS.md):
+repetition is not a rule. Approved exceptions belong in the
+[extension-seam map](35_EXTENSION_SEAMS.md), and full current-versus-target
+status belongs in the
+[production-contract register](15_PRODUCTION_CONTRACTS.md).
 
-## Source Evidence
+The rule schema is fixed: every rule names its scope, rationale, evidence,
+exceptions, and verification method. If one of those fields cannot be filled
+from current source, manifests, tests, or an accepted contract, route the claim
+to [open questions](80_OPEN_QUESTIONS.md) rather than promoting it here.
 
-Validate this page against:
+## Execution Model
 
-- `CLAUDE.md`
-- `deny.toml`
-- `.github/workflows/ci.yml`
-- `rg "Legacy|Internal|Block|serde\\(default\\)|ignore" crates docs`
-- `rg "serde-saphyr|serde_yaml|serde_yml|cmake|native-tls|openssl" Cargo.toml Cargo.lock crates deny.toml`
-- `cargo metadata --no-deps`
+### Finite synchronous jobs
 
-Existing files under `docs/*` may be stale. Treat them as secondary context only; any design-rule claim found in `docs/*` must be validated against code, manifests, tests, examples, or safe local commands before being copied here.
+- **Scope:** Core execution, sources, transports, scheduling, and embedding
+  APIs.
+- **Invariant:** Clinker executes finite jobs synchronously in one process.
+  Sources have a provable finite bound; core execution uses OS threads,
+  bounded channels, and a run-scoped Rayon pool. An unbounded stream, daemon,
+  distributed worker model, or async runtime is an architecture change.
+- **Rationale:** Termination, bounded-resource reasoning, cancellation, and
+  operator scheduling all rely on finite input and synchronous ownership.
+- **Evidence:** `RecordSource`'s finite contract in
+  `crates/clinker-exec/src/source/mod.rs`, executor construction under
+  `crates/clinker-exec/src/executor/`, bounded REST options in
+  `crates/clinker-net/src/rest.rs`, and the workspace dependency graph.
+- **Exceptions:** None in the core runtime. External orchestrators may launch
+  and supervise the synchronous CLI; see D-25 through D-33 in the
+  [contract register](15_PRODUCTION_CONTRACTS.md).
+- **Verification:** Inspect source construction and run the relevant executor
+  or transport tests from [the command guide](50_TESTING_AND_COMMANDS.md).
 
-## Architectural Rules
+### Compiled topology is authoritative
 
-- Clinker is a finite-job, single-process pipeline engine. The user-facing
-  non-goals explicitly rule out unbounded stream processing, worker-process
-  pools, distributed execution, daemon/service mode, SQL query-engine behavior,
-  connector marketplaces, and CDC. Code evidence matches this: `RecordSource`
-  says `next_record` is finite by contract, REST sources require page/record
-  caps, and `PipelineExecutor` runs synchronously over OS threads, bounded
-  channels, and Rayon rather than an async service loop.
-- Preserve the current crate layering. `clinker-plan` parses config, resolves
-  schemas, compiles CXL, validates, and produces a typed
-  `ExecutionPlanDag`; it does not depend on runtime operators. `clinker-exec`
-  consumes compiled plans and owns runtime dispatch. `clinker-record` and
-  `clinker-core-types` are lower-level vocabulary crates. Edge crates
-  (`clinker`, `cxl-cli`, `clinker-channel`, `clinker-net`, `clinker-schema`,
-  `clinker-lineage`)
-  should not become back-edges into lower layers without a deliberate design
-  review.
-- The executor public entry point is compiled-plan based. The
-  `PipelineExecutor::run_plan_with_readers_writers` method accepts
-  `&clinker_plan::plan::CompiledPlan` and includes a `compile_fail` doctest
-  rejecting `&PipelineConfig`. New executor APIs should keep
-  planning/validation ahead of execution rather than accepting raw config
-  casually.
-- The runtime path is synchronous. `PipelineExecutor` docs state no async
-  runtime is required; source ingest uses one `std::thread` per declared source,
-  live handoff uses bounded `crossbeam_channel`s, and CPU-bound kernels use one
-  run-scoped Rayon pool sized by `pipeline.concurrency.threads`. `tokio` exists
-  in workspace dependencies, but current core execution is not async.
-- Bounded-memory behavior is load-bearing. `PipelineMeta.memory` defaults to a
-  512 MiB limit at arbitrator construction, and `BackpressureKnob` selects
-  `spill`, `pause`, or `both`. Runtime code creates one run-scoped spill
-  directory, one run-scoped `MemoryArbitrator`, registers source/node-buffer
-  consumers, and uses spill cleanup/locking. Changes to blocking operators,
-  streaming eligibility, or buffer admission need memory tests or explain-output
-  coverage.
-- The unified `nodes:` topology is the only parsed pipeline shape. `PipelineConfig`
-  uses `nodes: Vec<Spanned<PipelineNode>>`; comments say legacy top-level
-  `inputs`/`outputs`/`transformations` are rejected by serde. Current
-  `PipelineNode` variants include `Source`, `Transform`, `Aggregate`, `Route`,
-  `Merge`, `Combine`, `Output`, `Reshape`, `Cull`, `Envelope`, and
-  `Composition`.
-- Channels and compositions are sealed at declared boundaries. `clinker-channel`
-  documents that channels can override declared config parameters only, cannot
-  patch mid-graph internals, and cannot reach sealed composition internals.
-  Keep extension points explicit through schemas, declared params, ports, and
-  resources.
-- Path security uses proof tokens. `clinker-plan::security::ValidatedPath` has a
-  private inner path and can only be obtained through `validate_path`, which
-  rejects null bytes, traversal, encoded traversal, unauthorized absolute paths,
-  and symlink escapes where filesystem state permits. APIs that need trusted
-  paths should accept `ValidatedPath`, not raw `PathBuf`.
+- **Scope:** Planning, executor entry points, topology, plan consumers, and
+  runtime dispatch.
+- **Invariant:** `clinker-plan` owns author-input admission and produces a
+  compiled `ExecutionPlanDag`. That DAG is the authoritative topology and
+  runtime-dispatch surface; `clinker-exec` consumes compiled planning artifacts
+  rather than accepting raw YAML or `PipelineConfig` as an execution input.
+- **Rationale:** One typed topology keeps validation, enrichment, scheduling,
+  explain output, and exhaustive dispatch aligned and prevents runtime code
+  from inventing a second graph interpretation.
+- **Evidence:** `PipelineConfig::compile` and `ExecutionPlanDag` in
+  `crates/clinker-plan/src/config/pipeline.rs` and
+  `crates/clinker-plan/src/plan/execution/`, plus the compiled-plan executor
+  entry point and compile-fail boundary in
+  `crates/clinker-exec/src/executor/mod.rs`.
+- **Exceptions:** A runtime envelope may refresh only the fields enumerated by
+  D-01 through D-11. Persistent reuse and cache behavior remain owned by
+  Phase 5 / PERF-01; this rule does not claim that work has landed.
+- **Verification:** Run the compiled-plan boundary doctest and the smallest
+  planner/executor tests named in the command guide; inspect explain output
+  when topology or properties change.
 
-## Primary Code Evidence
+## Layering And Typed Boundaries
 
-- Workspace and layering: root `Cargo.toml`; `docs/ai/20_CRATE_MAP.md`;
-  `crates/*/Cargo.toml`.
-- Planning boundary: `crates/clinker-plan/src/lib.rs`;
-  `crates/clinker-plan/src/config/pipeline.rs`;
-  `crates/clinker-plan/src/config/pipeline_node.rs`.
-- Runtime boundary: `crates/clinker-exec/src/executor/mod.rs`;
-  `crates/clinker-exec/src/source/mod.rs`;
-  `crates/clinker-exec/src/executor/source_stream.rs`;
-  `crates/clinker-exec/src/executor/dispatch.rs`;
-  `crates/clinker-exec/src/pipeline/memory.rs`.
-- Finite network transport: `crates/clinker-net/src/lib.rs`;
-  `crates/clinker-net/src/rest.rs`.
-- Records and format APIs: `crates/clinker-record/src/lib.rs`;
-  `crates/clinker-format/src/lib.rs`;
-  `crates/clinker-format/src/error.rs`.
-- Channel boundary: `crates/clinker-channel/src/lib.rs`;
-  `crates/clinker-channel/src/resolve.rs`;
-  `crates/clinker-channel/src/overlay.rs`.
-- Security: `crates/clinker-plan/src/security.rs`.
-- CI/dependency gates: `.github/workflows/ci.yml`; `deny.toml`; root
-  `Cargo.toml`.
+### Preserve dependency direction
 
-## Refactoring Rules
+- **Scope:** Workspace manifests, crate APIs, and cross-crate imports.
+- **Invariant:** Record and core vocabulary remain below Clinker Expression
+  Language (CXL), format, and planning; `clinker-exec` consumes compiled plans;
+  CLI and integration crates remain at the edge. New back-edges require a
+  reviewed contract rather than local convenience.
+- **Rationale:** Lower layers must not acquire planner or runtime policy, and
+  edge integrations must not become alternate admission authorities.
+- **Evidence:** Root and crate `Cargo.toml` files, crate responsibilities in
+  [the crate map](20_CRATE_MAP.md), and current imports.
+- **Exceptions:** Only the bounded D-20 and D-21 edges recorded in the
+  [extension-seam map](35_EXTENSION_SEAMS.md) are approved; their presence does
+  not authorize adjacent imports.
+- **Verification:** Review `cargo metadata --no-deps`, relevant `cargo tree`
+  output, and source imports before and after a dependency change.
 
-- Do not add compatibility shims around retired config shapes or old module
-  names. Current code contains explicit retire-gate tests in
-  `clinker-plan/src/lib.rs` for the old `cxl_compile` module name and retired
-  `E100` diagnostic code.
-- Keep dead-code pressure intact. CI intentionally runs
-  `cargo clippy --workspace -- -D warnings` without `--all-targets` before the
-  all-targets pass so test-only `pub(crate)` items still fail as dead code.
-  New public or crate-public items should have real non-test callers or a clear
-  public API reason.
-- Prefer typed state and proof types at subsystem boundaries. Existing examples:
-  `ValidatedPath` for path security, `CompiledPlan` for executor entry,
-  `RecordSource: Send` for source transport, `CxlSource` for source-spanned CXL,
-  and `Spanned<PipelineNode>` for YAML-origin diagnostics.
-- Preserve span-aware parsing paths. `PipelineNode` uses a custom serde visitor
-  to dispatch on `type:` while retaining serde-saphyr spans; avoid replacing
-  that with a `serde_json::Value` intermediate unless you can prove diagnostic
-  spans and `deny_unknown_fields` behavior survive.
-- Use `PipelineError::Internal` for plan-time invariant violations discovered
-  at runtime, not `panic!`, `todo!`, or silent fallback. Several executor and
-  plan graph utilities document this convention.
-- Add focused tests where the boundary is architectural, not just functional.
-  Existing tests pin node taxonomy, streaming/fusion behavior, memory
-  backpressure, scheduling, spill handling, document DLQ, channel overlays, REST
-  pagination, provenance, and snapshot explain output.
+### Use typed handoffs and proof tokens
 
-## Configuration And Format Rules
+- **Scope:** Planner/runtime, record/format, author-source, path-security, and
+  transport boundaries.
+- **Invariant:** Preserve established typed boundaries such as `CompiledPlan`,
+  `ExecutionPlanDag`, `Spanned<T>`, `CxlSource`, `RecordSource`,
+  `FormatReader`, `FormatWriter`, and `ValidatedPath`; do not replace them with
+  raw YAML, unspanned strings, unchecked paths, or untyped maps.
+- **Rationale:** These types carry validation, source locations, finiteness,
+  ownership, or trust proofs that raw substitutes would erase.
+- **Evidence:** `crates/clinker-plan/src/security.rs`,
+  `crates/clinker-plan/src/yaml.rs`, `crates/clinker-plan/src/plan/`,
+  `crates/clinker-format/src/traits.rs`, and
+  `crates/clinker-exec/src/source/mod.rs`.
+- **Exceptions:** TOML workspace/storage configuration and JSON data parsing
+  have separate typed paths; they are not pipeline-YAML bypasses.
+- **Verification:** Run boundary-specific parse, security, format, source, or
+  executor tests and confirm public signatures retain the proof-bearing type.
 
-These rules govern how config is parsed and modeled. What a surface should
-*look like* to the author who types it is a separate question, answered by the
-User-Facing Surface contract in [AGENTS.md](../../AGENTS.md); consult it before
-adding, renaming, or narrowing anything a pipeline author writes by hand.
+### Keep declared extension boundaries sealed
 
-- YAML parsing must go through `clinker_plan::yaml`. The module states it is
-  the single YAML parser chokepoint and the only place that should call
-  `serde_saphyr::from_str*` or construct a serde-saphyr budget. It enforces a
-  32 MiB pre-parse input limit, max depth 256, include depth 0, max nodes
-  100,000, and alias/anchor ratio checks.
-- Use `serde-saphyr`, not `serde_yaml` or `serde_yml`, for YAML. The workspace
-  pins `serde-saphyr = "=0.0.23"` with `miette` support. Current source shows
-  normal YAML config paths using `clinker_plan::yaml::from_str`; the direct
-  `serde_saphyr::from_str` found in tests should be treated as test-local
-  spike/validation code, not a new production pattern.
-- Keep `#[serde(deny_unknown_fields)]` on user-facing config structs where it
-  already exists. This is part of the config contract for top-level pipeline
-  metadata, memory/concurrency/metrics blocks, and node variant payloads.
-- Be conservative with `#[serde(default)]`. It is valid for optional or
-  backward-compatible config surfaces already modeled that way, but do not use
-  it to hide newly mandatory fields or preserve a retired shape. If adding a
-  default, document the user-facing omitted-value behavior and add parse tests.
-- Source and format behavior should stay transport-agnostic where possible.
-  File readers implement `FormatReader`; executor ingest works through
-  `RecordSource`; REST adapts into `RecordSource` and then flows through the
-  same ingest channel as files. Avoid special-case runtime dispatch for a
-  transport unless the shared contract is insufficient.
-- TOML is used for storage/workspace configuration (`ClinkerToml`,
-  `StorageConfig`) through the `toml` crate; do not route TOML through YAML
-  helpers.
-- JSON parsing with `serde_json` is normal for data-format readers, metrics,
-  output sidecars, tests, and CXL CLI input. The YAML chokepoint rule does not
-  apply to JSON payload parsing.
+- **Scope:** Channels, compositions, overlays, ports, parameters, and resource
+  bindings.
+- **Invariant:** Extensions may affect only declared schemas, ports,
+  parameters, variables, and typed resource slots. They may not patch sealed
+  composition internals or introduce an alternate plan-admission path.
+- **Rationale:** Explicit boundaries preserve validation, provenance,
+  reproducibility, and bounded reasoning across reusable graphs.
+- **Evidence:** `crates/clinker-channel/src/resolve.rs`,
+  `crates/clinker-channel/src/overlay.rs`, and composition binding under
+  `crates/clinker-plan/src/config/composition/`.
+- **Exceptions:** D-12 through D-16 define the locked typed resource-catalog
+  target and reject ordinary call-site `outputs:` and `alias:`; current and
+  target status is in the contract register.
+- **Verification:** Run focused channel/composition parse, provenance, binding,
+  and execution tests for every changed declared surface.
+
+## Correctness And Fail-Closed Admission
 
 ## Dependency Rules
 
@@ -192,48 +152,158 @@ adding, renaming, or narrowing anything a pipeline author writes by hand.
   dependency decision was wrong, not a reason to keep patching. Reopen the
   approval question instead of growing the substitute.
 
-## Documentation Rules
+### Canonical span-aware YAML parsing
 
-- Validate AI onboarding claims against code, manifests, tests, examples, and
-  safe local commands.
-- Prefer evidence anchors over intent claims. Name files, modules, traits,
-  functions, variants, tests, and commands that support a rule.
-- Separate verified facts from hypotheses and stale references. Current example:
-  older docs mention `clinker-core` and "11 workspace crates", while the current
-  root workspace has 14 members and separate `clinker-plan` / `clinker-exec` /
-  `clinker-core-types` crates.
-- Do not write marketing copy in AI-facing docs. Keep rules actionable for a
-  future engineer or coding agent deciding whether a change crosses an
-  architectural boundary.
-- When adding public Rust APIs, follow the repo's source-doc convention:
-  public items generally have `///` summaries and `# Errors` / `# Panics` /
-  `# Safety` sections where applicable. For documentation-only changes, do not
-  edit Rust source to "fix" docs unless the task explicitly allows source edits.
+- **Scope:** Production and test parsing of pipeline, composition, channel, and
+  related YAML outside parser-specific tests.
+- **Invariant:** YAML enters through `clinker_plan::yaml`; span-aware
+  `serde-saphyr` parsing, strict budgets, custom node dispatch, and
+  `Spanned<T>` diagnostics are load-bearing.
+- **Rationale:** A direct parser call can bypass input budgets, source spans,
+  or the single admission behavior used by production.
+- **Evidence:** `crates/clinker-plan/src/yaml.rs`, the custom visitor in
+  `crates/clinker-plan/src/config/pipeline_node.rs`, and strict config tests.
+- **Exceptions:** The parser module's own parser-specific tests may call the
+  underlying parser. D-22 records the current executor-test violation and its
+  downstream repair owner; tests receive no general bypass.
+- **Verification:** Search Rust sources for `serde_saphyr::from_str` outside
+  `clinker-plan::yaml`, then run the affected parse and diagnostic tests.
 
-## Testing And Review Rules
+### Strict user-facing configuration
 
-- The CI gate in `.github/workflows/ci.yml` currently runs:
-  `cargo fmt --all --check`, two clippy passes, `cargo test --workspace`,
-  `cargo check --benches --workspace`, `cargo check --features bench-alloc -p
-  clinker-benchmarks`, `cargo test --benches -p clinker-benchmarks`, native
-  Windows/macOS workspace tests, selected cross-target checks, and `cargo deny`.
-- For docs-only edits, cargo tests are often unnecessary, but run targeted
-  commands if the documentation generated from source or examples might be
-  broken. At minimum inspect the rendered Markdown for broken headings and
-  stale file names.
-- For behavior changes, match tests to the boundary touched:
-  config parsing/validation in `clinker-plan`, runtime execution in
-  `clinker-exec/tests` or `src/executor/tests`, channel behavior in
-  `clinker-channel/tests`, format reader/writer behavior in `clinker-format`
-  tests, language changes in `cxl` tests and benches, and CLI behavior in
-  `crates/clinker/tests`.
-- Snapshot tests using `insta` and fixture YAML under `crates/clinker-exec/tests`
-  are part of the design contract for explain output, node taxonomy, combine
-  behavior, and user-visible diagnostics.
+- **Scope:** YAML fields, node bodies, defaults, retired shapes, CLI/config
+  diagnostics, and typed overlays.
+- **Invariant:** Preserve `deny_unknown_fields` where established, reject
+  retired or unsupported surfaces, and require a source-located diagnostic
+  that names the bad input, violated rule, and a paste-ready correction.
+- **Rationale:** Silent fallback and successful no-ops turn author mistakes
+  into incorrect ETL results.
+- **Evidence:** Strict config structs and retire-gate tests in
+  `crates/clinker-plan`, plus diagnostic types in
+  `crates/clinker-core-types/src/diagnostic.rs`.
+- **Exceptions:** Existing documented optional fields may use deliberate
+  defaults. A new default must define omission behavior and add parse tests; it
+  may not preserve a retired shape or hide a mandatory value.
+- **Verification:** Add positive and negative boundary tests covering unknown,
+  omitted, wrong-type, retired, and corrected inputs with expected spans.
 
-## Review Notes
+### Structured invariant failures
 
-- Confirm whether the direct `serde_saphyr::from_str` call in
-  `crates/clinker-exec/tests/composition_binding_test.rs` is intentionally
-  test-local, or whether a future cleanup should route even that through
-  `clinker_plan::yaml::from_str`.
+- **Scope:** Runtime discovery of states that planning should have made
+  unreachable.
+- **Invariant:** Return the owning subsystem error, normally
+  `PipelineError::Internal`, rather than panicking, silently falling back, or
+  reporting success.
+- **Rationale:** A malformed or mismatched compiled artifact must fail closed
+  without aborting the host process or corrupting downstream output.
+- **Evidence:** `crates/clinker-plan/src/error.rs` and executor dispatch and
+  error-strategy handling under `crates/clinker-exec/src/executor/`.
+- **Exceptions:** Process aborts caused by unrecoverable platform behavior are
+  not converted by documentation; ordinary reachable invariant mismatches have
+  no exception.
+- **Verification:** Add a focused regression that reaches the mismatch through
+  a public boundary and asserts the structured error/result.
+
+### Trusted paths use validated capabilities
+
+- **Scope:** Input, output, include, spill, workspace, and staging paths that
+  cross a trust boundary.
+- **Invariant:** Code requiring a trusted path accepts `ValidatedPath` or an
+  equivalent proven capability produced by canonical validation, not an
+  unchecked `PathBuf` or string.
+- **Rationale:** Lexical validation alone does not prevent traversal, encoded
+  traversal, absolute-path policy violations, or symlink/junction escape.
+- **Evidence:** `ValidatedPath` and `validate_path` in
+  `crates/clinker-plan/src/security.rs` and their platform-specific tests.
+- **Exceptions:** Internal paths derived entirely beneath an already validated
+  root still require explicit containment reasoning; no public author input
+  bypass exists.
+- **Verification:** Run security tests for present and missing leaves on each
+  supported native platform affected by the change.
+
+## Bounded Resources
+
+### Share one run-scoped memory authority
+
+- **Scope:** Ingest, node buffers, blocking/stateful operators, fan-out,
+  telemetry arenas, spill, pause/resume, and cleanup.
+- **Invariant:** Retained runtime state participates in the run-scoped
+  `MemoryArbitrator`; spill-capable or pausable consumers account for all
+  retained structures, poll at bounded intervals, and clean up on success,
+  error, and interruption.
+- **Rationale:** Independent budgets and invisible buffers defeat the process's
+  cooperative bounded-memory guarantee and can deadlock backpressure.
+- **Evidence:** `crates/clinker-exec/src/pipeline/memory.rs`, runtime consumer
+  registration, node-buffer code, and spill integration tests.
+- **Exceptions:** Small fixed-size state may be accounted as fixed admission
+  overhead when the owning contract says so. The configured limit is a soft
+  cooperative control, not a strict OS RSS reservation.
+- **Verification:** Run focused memory, overshoot, pause/resume, spill, cleanup,
+  and file-descriptor tests for the affected consumer.
+
+### Keep test and benchmark support out of default runtime paths
+
+- **Scope:** Dependency features, allocator instrumentation, benchmark helpers,
+  release graphs, and performance claims.
+- **Invariant:** Test/benchmark support is absent from default and release
+  runtime graphs, and performance evidence is trusted only when its feature,
+  allocator identity, plausibility, and distortion contract is verified.
+- **Rationale:** Instrumentation must not change ordinary production behavior
+  or lend authority to invalid measurements.
+- **Evidence:** `bench-alloc` feature declarations in Cargo manifests,
+  `crates/clinker-exec/src/executor/stage_metrics.rs`, and D-21 in the
+  [extension-seam map](35_EXTENSION_SEAMS.md).
+- **Exceptions:** The conditional D-21 edge is permitted only after its full
+  repair contract passes; current allocation measurements remain untrusted.
+- **Verification:** Compare default/release and feature-enabled `cargo tree`
+  output and run the allocation plausibility/identity checks owned by Phase 5.
+
+## Stable Contracts And Review
+
+### Compatibility is curated, not inferred from visibility
+
+- **Scope:** Public Rust re-exports, features, CLI/YAML surfaces, diagnostics,
+  serialized tooling artifacts, and user-facing behavior.
+- **Invariant:** A symbol or spelling is a compatibility promise only when its
+  curated contract says so. Breaking a supported surface requires an explicit
+  decision, migration note, documentation, and boundary tests.
+- **Rationale:** Rust `pub` reachability, workspace reuse, or repeated prose do
+  not by themselves establish support.
+- **Evidence:** D-18 and D-19 in the contract register, root re-exports, feature
+  gates, user docs, and current compatibility tests.
+- **Exceptions:** Workspace-internal exposed API, test support, deprecated
+  routes, and cleanup debt remain usable only within their named class.
+- **Verification:** Review the compatibility matrix and run the public API,
+  CLI/config, diagnostic, or serialization gates appropriate to the changed
+  surface.
+
+### Behavior and evidence change together
+
+- **Scope:** Public behavior, configuration, diagnostics, commands,
+  architecture, examples, documentation, and performance claims.
+- **Invariant:** Update source-aligned docs and focused tests in the same change
+  as behavior; label measurements by evidence status and never expose record
+  values, credentials, machine-local paths, or local identities in examples.
+- **Rationale:** Stale instructions and unsafe examples are correctness and
+  information-disclosure failures, not editorial polish.
+- **Evidence:** [AGENTS.md](../../AGENTS.md), the repository documentation gate,
+  mdBook configuration, and D-34 through D-42 and D-51 through D-52.
+- **Exceptions:** Pure prose corrections do not require Rust tests unless they
+  touch generated, executable, or code-coupled documentation.
+- **Verification:** Run `bash scripts/check-ai-docs.sh`, scoped
+  `git diff --check`, the affected mdBook build, and focused executable tests
+  when the changed surface is code-coupled.
+
+## Review Checklist
+
+Before changing behavior:
+
+1. Identify the rule, its scope, and any explicitly approved exception.
+2. Recheck the named source/manifests/tests rather than copying older prose.
+3. Confirm the change preserves `ExecutionPlanDag` authority, dependency
+   direction, typed trust boundaries, fail-closed admission, and run-scoped
+   resource accounting where relevant.
+4. Run the smallest verification named by the applicable rule, then broaden
+   only across the dependency or user-facing surface that changed.
+5. Update the contract register or open-question ledger when evidence changes;
+   do not silently invent a new invariant.

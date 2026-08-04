@@ -71,29 +71,22 @@ nodes:
         .find(|i| dag.graph[*i].name() == "src")
         .expect("src present");
     let spec = &dag.indices_to_build[window_idx_num];
-    match &spec.root {
-        PlanIndexRoot::Node {
-            upstream,
-            anchor_schema,
-        } => {
-            assert_eq!(
-                *upstream, src_idx,
-                "Source-anchored window must root at the Source's NodeIndex"
-            );
-            // The anchor schema is the source's plan-time
-            // output_schema; it must contain the user-declared
-            // columns the window reads.
-            assert!(
-                anchor_schema.contains("department"),
-                "anchor schema must carry the source's department column"
-            );
-            assert!(
-                anchor_schema.contains("amount"),
-                "anchor schema must carry the source's amount column"
-            );
-        }
-        other => panic!("expected PlanIndexRoot::Node at the Source, got {other:?}"),
-    }
+    let PlanIndexRoot::Node {
+        upstream,
+        anchor_schema,
+    } = &spec.root;
+    assert_eq!(
+        *upstream, src_idx,
+        "Source-anchored window must root at the Source's NodeIndex"
+    );
+    assert!(
+        anchor_schema.contains("department"),
+        "anchor schema must carry the source's department column"
+    );
+    assert!(
+        anchor_schema.contains("amount"),
+        "anchor schema must carry the source's amount column"
+    );
 }
 
 #[test]
@@ -160,28 +153,21 @@ nodes:
         })
         .expect("running has window_index");
     let spec = &dag.indices_to_build[window_idx_num];
-    match &spec.root {
-        PlanIndexRoot::Node {
-            upstream,
-            anchor_schema,
-        } => {
-            assert_eq!(
-                *upstream, agg_idx,
-                "Aggregate ancestor must be the rooted node, not the upstream Source"
-            );
-            // The anchor schema is the aggregate's emit schema, so it
-            // must contain the aggregate-emitted columns and NOT
-            // contain a column that lives only on the source.
-            assert!(
-                anchor_schema.contains("department"),
-                "anchor schema must carry the aggregate's emitted department column"
-            );
-            assert!(
-                anchor_schema.contains("total"),
-                "anchor schema must carry the aggregate's emitted total column \
-                 (this is the column the previous source-rooted geometry could not see)"
-            );
-        }
-        other => panic!("expected PlanIndexRoot::Node, got {other:?}"),
-    }
+    let PlanIndexRoot::Node {
+        upstream,
+        anchor_schema,
+    } = &spec.root;
+    assert_eq!(
+        *upstream, agg_idx,
+        "Aggregate ancestor must be the rooted node, not the upstream Source"
+    );
+    assert!(
+        anchor_schema.contains("department"),
+        "anchor schema must carry the aggregate's emitted department column"
+    );
+    assert!(
+        anchor_schema.contains("total"),
+        "anchor schema must carry the aggregate's emitted total column \
+         (this is the column the previous source-rooted geometry could not see)"
+    );
 }

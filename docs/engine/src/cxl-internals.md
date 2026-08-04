@@ -2,11 +2,34 @@
 
 *User-facing view: the User Guide's "CXL Overview" and "Types & Literals" pages.*
 
-This page is the engine-internals reference for how a CXL program is compiled before any record flows: the four-phase pipeline that turns source text into a typed, evaluable program, and the formal type-unification algorithm the typechecker runs when two types meet in an expression. CXL is a per-record ETL expression language — not SQL — so every program operates on one record at a time, and every type error is caught at compile time rather than surfacing mid-run. The depth here is the phase boundaries (Parse → Resolve → Typecheck → Eval), what each phase consumes and produces, the `miette` diagnostic surface, and the multi-point unification rules over CXL's 9 value types. The user-facing pages document the surface syntax and the literal grammar; this page documents the compiler that stands behind them.
+This page is the engine-internals reference for how Clinker Expression
+Language (CXL) source becomes typed planner artifacts and, later, evaluated
+records. The shared front end parses, resolves, and typechecks a program.
+Planner consumers may then analyze the typed tree and extract or lower
+aggregate behavior before runtime evaluation. CXL is a per-record ETL
+expression language — not SQL — so type errors are reported before records
+flow. This page covers those boundaries, the `miette` diagnostic surface, and
+unification over CXL's ten runtime value types.
 
-## The four-phase compilation pipeline
+`clinker-plan` is the sole execution-admission authority. It supplies the
+bound row schema, compiles CXL, and decides whether the resulting pipeline may
+run. The CXL crate owns expression semantics but does not parse pipeline YAML
+or schedule operators. `clinker-schema` may report advisory findings from
+bounded discovery and heuristic field extraction; those warnings do not
+replace canonical planner parsing or admit a rejected pipeline (D-17).
 
-CXL catches type errors before data processing begins. The compilation pipeline runs four ordered phases, each consuming the previous phase's output and producing the input to the next. A failure at any phase produces a rich diagnostic with source locations and fix suggestions via `miette`, and short-circuits the remaining phases — a parse error never reaches the typechecker, a type error never reaches eval.
+One lower-layer dependency is intentionally narrow: `clinker-format` may use
+only CXL's logical `Type` and document `DocPath`/`DocIndex` vocabulary. D-20
+does not permit it to depend on the parser, resolver, evaluator, planner, or
+other analyzers. A neutral lower-vocabulary extraction may replace this edge
+later, but no broader dependency is approved now.
+
+## Compilation and evaluation pipeline
+
+CXL catches type errors before data processing begins. Its front-end phases are
+ordered, and a failure short-circuits the remaining work: a parse error never
+reaches the resolver, and a type error never reaches planner analysis or
+runtime evaluation.
 
 1. **Parse** — tokenize and build an AST from CXL source text. The lexer turns raw source into a token stream; the parser assembles those tokens into an abstract syntax tree of statements (`emit`, `let`, `filter`, `distinct`) and the expressions inside them. This is the phase that rejects the symbolic boolean operators: `&&`, `||`, and `!` are syntax errors in CXL — the language uses the `and` / `or` / `not` keywords — and that rejection happens here, at parse time, before any name or type is known.
 
@@ -14,7 +37,15 @@ CXL catches type errors before data processing begins. The compilation pipeline 
 
 3. **Typecheck** — infer types, validate operator compatibility, and check method receiver types. The typechecker walks the resolved tree, infers a type for every expression, and applies the [unification rules](#type-unification-rules) below at each point two types meet (a binary operator, a method receiver, a conditional's branches). It rejects incompatible combinations — applying `+` to a `String` and an `Int`, for instance — and emits a span-annotated diagnostic that names both operand types and suggests a coercion. The output of this phase is a `TypedProgram`: the AST annotated with the inferred type of every node, ready to evaluate without further inference.
 
-4. **Eval** — execute the typed program against each record. With types resolved, evaluation is a straightforward per-record walk of the `TypedProgram`. Statements execute top to bottom against the current record; later statements can reference fields produced by earlier `emit` or `let` statements, and a `filter` whose condition is false short-circuits the remaining statements and excludes the record from output. No type inference happens at this phase — every dispatch decision was settled in Typecheck — so eval is the hot per-record path and carries none of the compile-time machinery.
+4. **Analyze and extract** — planner consumers inspect the `TypedProgram` for
+   execution properties and, where the node kind requires it, extract compiled
+   aggregates or other lowered artifacts. This is not one universal AST rewrite:
+   individual planning paths invoke the analyses they need.
+
+**Runtime evaluation** then executes the typed or extracted artifact against
+records. Statements execute top to bottom; later statements can reference
+fields produced by earlier `emit` or `let` statements, and a false `filter`
+excludes the record. Evaluation performs no type inference.
 
 The phase split is what makes CXL's compile-time guarantee meaningful: a `cxl check transform.cxl` runs Parse → Resolve → Typecheck and reports any error with a span before a single record is read, e.g.
 
@@ -23,7 +54,8 @@ error[typecheck]: cannot apply '+' to String and Int (at transform.cxl:12)
   help: convert one operand — use .to_int() or .to_string()
 ```
 
-Because the typecheck phase produces a fully-typed program, an error here is a guarantee the corresponding runtime failure cannot occur — the class of error is eliminated before Eval, not merely detected earlier.
+Because the typecheck phase produces a fully typed program, that class of type
+mismatch is eliminated before evaluation rather than merely detected earlier.
 
 ## The type lattice
 
@@ -44,7 +76,11 @@ CXL has 10 value types, and unification operates over them plus two compile-time
 
 Two further type-level constructs appear only at compile time, never as a runtime `Value`:
 
-- **`Numeric`** — a union accepting either `Int` or `Float`. It is the declared schema type for a column that may carry either; unification resolves it to a concrete numeric type when it meets one.
+- **`Numeric`** — an inference-only union accepting either `Int` or `Float`.
+  Unification resolves it when enough context supplies a concrete numeric type.
+  It may not survive into a compiled source schema: an unresolved authored
+  `type: numeric` is rejected with `E158`, so source authors must declare
+  `int` or `float`.
 - **`Any`** — an unconstrained type with no type constraints, the declared type for a column whose type is unknown. It unifies away to whatever it meets.
 
 And the `Nullable(T)` wrapper marks a type whose value may be `null`. Nullability is tracked through unification rather than discarded, so a nullable operand propagates its nullability into the result.
@@ -71,4 +107,7 @@ When two types meet in an expression — the two operands of a binary operator, 
 
 The ordering matters: `Any` and `Numeric` are resolved before the promotion and nullability rules, so by the time rules 4–6 run, both sides are concrete (or nullable-wrapped concrete) types. Rule 6's recursion is the only point the algorithm re-enters itself, and it always recurses on strictly-inner types, so unification terminates.
 
-These rules are what let the typechecker hand Eval a fully-resolved `TypedProgram`: every binary operator, method receiver, and conditional has a single inferred result type, computed once at compile time, so the per-record evaluator never re-derives a type or discovers a mismatch mid-run.
+These rules let the typechecker hand later planner phases a resolved
+`TypedProgram`: every binary operator, method receiver, and conditional has a
+single inferred result type, computed once before the per-record evaluator
+runs.

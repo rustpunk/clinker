@@ -2,12 +2,12 @@
 
 use super::*;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 
-use crate::config::{SortField, SourceConfig};
+use crate::config::{NullOrder, SortField, SortOrder, SourceConfig};
 use crate::error::PipelineError;
 use clinker_core_types::span::Span;
 
@@ -45,7 +45,192 @@ pub fn matches_upstream_name(node_name: &str, target: &str) -> bool {
             .is_some_and(|stripped| stripped == target)
 }
 
+fn is_reorder_capable_stage(node: &PlanNode) -> bool {
+    matches!(
+        node,
+        PlanNode::Merge { .. }
+            | PlanNode::Combine { .. }
+            | PlanNode::Aggregation { .. }
+            | PlanNode::Reshape { .. }
+            | PlanNode::Cull { .. }
+            | PlanNode::Envelope { .. }
+            | PlanNode::CorrelationCommit { .. }
+    ) || matches!(
+        node,
+        PlanNode::Transform {
+            has_distinct: true,
+            ..
+        }
+    )
+}
+
+fn writer_sort_fields_match(planned: &[SortField], required: &[ResolvedSortField]) -> bool {
+    planned.len() == required.len()
+        && planned.iter().zip(required).all(|(planned, required)| {
+            planned.field == required.field
+                && planned.order == required.order
+                && planned.null_order.unwrap_or(NullOrder::Last) == required.null_order
+        })
+}
+
+fn render_writer_sort_fields(fields: &[ResolvedSortField]) -> String {
+    fields
+        .iter()
+        .map(|field| {
+            let order = match field.order {
+                SortOrder::Asc => "asc",
+                SortOrder::Desc => "desc",
+            };
+            let null_order = match field.null_order {
+                NullOrder::First => "first",
+                NullOrder::Last => "last",
+                NullOrder::Drop => "drop",
+            };
+            format!("{} {order} nulls {null_order}", field.field)
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_writer_sort_yaml(fields: &[ResolvedSortField]) -> String {
+    fields
+        .iter()
+        .map(|field| {
+            let order = match field.order {
+                SortOrder::Asc => "asc",
+                SortOrder::Desc => "desc",
+            };
+            let null_order = match field.null_order {
+                NullOrder::First => "first",
+                NullOrder::Last => "last",
+                NullOrder::Drop => "drop",
+            };
+            format!(
+                "  - {{ field: {}, order: {order}, null_order: {null_order} }}",
+                field.field
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 impl ExecutionPlanDag {
+    /// Prove or defer every physical writer's terminal ordering contract.
+    ///
+    /// This pass runs only after structural graph rewrites and therefore
+    /// records stable node identities for the actual final producer path.
+    /// Sorted streaming output is rejected because it exposes records before
+    /// the complete boundary population is available for a stable sort.
+    pub fn enforce_terminal_writer_order(
+        &self,
+        contract: &mut ExecutionOrderContract,
+    ) -> Result<(), PipelineError> {
+        for boundary in &mut contract.writer_boundaries {
+            let producer_idx = self
+                .index_of_or_scan(boundary.producer.producer)
+                .ok_or_else(|| PipelineError::Internal {
+                    op: "writer_boundary_order",
+                    node: boundary.output_name.clone(),
+                    detail: "compiled writer producer has no live post-rewrite DAG node"
+                        .to_string(),
+                })?;
+            let last_reorder = self.last_reorder_capable_stage(producer_idx);
+            boundary.last_reorder_capable = last_reorder.clone();
+
+            let OrderGuarantee::Sorted(fields) = &boundary.guarantee else {
+                continue;
+            };
+
+            if boundary.mode == WriterBoundaryMode::Streaming {
+                let authored_keys = render_writer_sort_fields(fields);
+                let authored_yaml = render_writer_sort_yaml(fields);
+                let broken_stage = last_reorder
+                    .as_ref()
+                    .map(|stage| stage.node_name.as_str())
+                    .unwrap_or_else(|| self.graph[producer_idx].name());
+                return Err(PipelineError::Compilation {
+                    transform_name: boundary.output_name.clone(),
+                    messages: vec![format!(
+                        "Output '{}' uses {} writer mode after stage '{}' but authored keys [{}] require a complete-population stable sort; materialize the Output after '{}' with:\nsort_order:\n{}\nor remove the Output `sort_order` to keep streaming",
+                        boundary.output_name,
+                        boundary.mode.as_str(),
+                        broken_stage,
+                        authored_keys,
+                        broken_stage,
+                        authored_yaml,
+                    )],
+                });
+            }
+
+            let preserving_mode = matches!(
+                boundary.mode,
+                WriterBoundaryMode::RecordsOnly | WriterBoundaryMode::PerSourceFile
+            );
+            if preserving_mode
+                && let PlanNode::Sort {
+                    id,
+                    name,
+                    sort_fields,
+                    ..
+                } = &self.graph[producer_idx]
+                && writer_sort_fields_match(sort_fields, fields)
+            {
+                boundary.disposition = WriterOrderDisposition::ProvenTerminalSort {
+                    sort: WriterOrderStage {
+                        node_id: *id,
+                        node_name: name.clone(),
+                    },
+                    fields: fields.clone(),
+                };
+                continue;
+            }
+
+            boundary.disposition = WriterOrderDisposition::DeferredSort {
+                fields: fields.clone(),
+            };
+        }
+
+        Ok(())
+    }
+
+    fn last_reorder_capable_stage(&self, producer_idx: NodeIndex) -> Option<WriterOrderStage> {
+        let rank_by_index: HashMap<_, _> = self
+            .topo_order
+            .iter()
+            .enumerate()
+            .map(|(rank, idx)| (*idx, rank))
+            .collect();
+        let mut pending = vec![producer_idx];
+        let mut visited = HashSet::new();
+        let mut last: Option<(usize, WriterOrderStage)> = None;
+
+        while let Some(idx) = pending.pop() {
+            if !visited.insert(idx) {
+                continue;
+            }
+            let node = &self.graph[idx];
+            if is_reorder_capable_stage(node) {
+                let rank = rank_by_index.get(&idx).copied().unwrap_or(idx.index());
+                let replace = last.as_ref().is_none_or(|(last_rank, _)| rank > *last_rank);
+                if replace {
+                    last = Some((
+                        rank,
+                        WriterOrderStage {
+                            node_id: node.id(),
+                            node_name: node.name().to_string(),
+                        },
+                    ));
+                }
+            }
+            pending.extend(
+                self.graph
+                    .neighbors_directed(idx, petgraph::Direction::Incoming),
+            );
+        }
+
+        last.map(|(_, stage)| stage)
+    }
+
     /// Enforcer-sort insertion.
     ///
     /// Walks every [`PlanNode::Transform`] whose

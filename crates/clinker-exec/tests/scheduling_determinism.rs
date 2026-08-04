@@ -141,8 +141,19 @@ fn readers() -> SourceReaders {
 /// regardless of `anchor`, so the only thing `anchor` controls is whether the
 /// `path:` files exist on disk and therefore whether the scheduler sees
 /// non-zero volume estimates.
-fn run_at(anchor: &Path) -> (String, String, u64) {
-    let config = parse_config(TWO_CHAIN_YAML).expect("parse");
+fn controlled_yaml(memory_limit: &str, worker_threads: usize) -> String {
+    TWO_CHAIN_YAML.replacen(
+        "  name: two_chain\n",
+        &format!(
+            "  name: two_chain\n  memory: {{ limit: \"{memory_limit}\", backpressure: spill }}\n  concurrency: {{ threads: {worker_threads} }}\n"
+        ),
+        1,
+    )
+}
+
+fn run_at(anchor: &Path, memory_limit: &str, worker_threads: usize) -> (String, String, u64) {
+    let yaml = controlled_yaml(memory_limit, worker_threads);
+    let config = parse_config(&yaml).expect("parse");
     let plan = config
         .compile(&CompileContext::with_pipeline_dir(anchor, ""))
         .expect("compile");
@@ -222,8 +233,8 @@ fn scheduling_reorder_does_not_change_output() {
         "empty anchor must seed zero (scheduler falls back to topo order)"
     );
 
-    let (small_a, large_a, total_a) = run_at(sized.path());
-    let (small_b, large_b, total_b) = run_at(empty.path());
+    let (small_a, large_a, total_a) = run_at(sized.path(), "64M", 1);
+    let (small_b, large_b, total_b) = run_at(empty.path(), "64M", 1);
 
     // Sorted multiset of rows: insensitive to the hash Aggregate's
     // per-process group emission order, sensitive to any difference in the
@@ -249,4 +260,24 @@ fn scheduling_reorder_does_not_change_output() {
         "ingested record count must not depend on dispatch order"
     );
     assert_eq!(total_a, 40 + 400, "all rows from both chains ingested");
+
+    for (anchor, memory_limit, worker_threads) in [
+        (sized.path(), "64M", 4),
+        (sized.path(), "128K", 1),
+        (empty.path(), "128K", 4),
+        (empty.path(), "128K", 4),
+    ] {
+        let (small, large, total) = run_at(anchor, memory_limit, worker_threads);
+        assert_eq!(
+            rows(&small),
+            rows(&small_a),
+            "small aggregate multiset changed under memory/worker variation"
+        );
+        assert_eq!(
+            rows(&large),
+            rows(&large_a),
+            "large aggregate multiset changed under memory/worker variation"
+        );
+        assert_eq!(total, total_a, "record count changed across repeated runs");
+    }
 }

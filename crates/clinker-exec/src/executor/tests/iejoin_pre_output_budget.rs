@@ -1147,7 +1147,10 @@ fn block_band_dlq_order_is_identical_across_memory_limits() {
             .iter()
             .filter(|e| e.category == clinker_core_types::dlq::DlqErrorCategory::CombineOutputRow)
             .collect();
-        let full: Vec<(u64, bool)> = rows.iter().map(|e| (e.source_row, e.trigger)).collect();
+        let full: Vec<(u64, bool)> = rows
+            .iter()
+            .map(|e| (e.source_row.ordinal(), e.trigger))
+            .collect();
         let builds: Vec<(u64, u64)> = rows
             .iter()
             .filter(|e| !e.trigger)
@@ -1160,7 +1163,7 @@ fn block_band_dlq_order_is_identical_across_memory_limits() {
                     .strip_prefix('b')
                     .and_then(|d| d.parse::<u64>().ok())
                     .unwrap_or_else(|| panic!("band_id must be b<input-index>; got {band:?}"));
-                (e.source_row, idx)
+                (e.source_row.ordinal(), idx)
             })
             .collect();
         (full, builds)

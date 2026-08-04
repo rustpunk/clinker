@@ -4,7 +4,7 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Sort field specification for output and window partition ordering.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SortField {
     pub field: String,
@@ -30,7 +30,7 @@ pub enum SortOrder {
 ///
 /// Custom Deserialize: visit_str -> Short, visit_map -> Full.
 /// This gives specific error messages instead of serde(untagged)'s generic "no variant matched".
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum SortFieldSpec {
     Short(String),
     Full(SortField),

@@ -230,7 +230,7 @@ pub(super) fn emit_for_probe<'a>(
                     OnMiss::Error => {
                         return Err(PipelineError::CombineMissingMatch {
                             combine: name.to_string(),
-                            driver_row: rn,
+                            driver_row: rn.ordinal(),
                         });
                     }
                     OnMiss::NullFields => {

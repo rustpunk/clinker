@@ -347,7 +347,7 @@ This generated docs successfully but emitted rustdoc warnings for broken/private
 User guide mdBook:
 
 ```bash
-mdbook build docs/user -d /tmp/clinker-mdbook-user
+mdbook build docs/user -d target/mdbook/user
 ```
 
 Status: **Verified.**
@@ -355,10 +355,24 @@ Status: **Verified.**
 Engine internals mdBook:
 
 ```bash
-mdbook build docs/engine -d /tmp/clinker-mdbook-engine
+mdbook build docs/engine -d target/mdbook/engine
 ```
 
 Status: **Verified.**
+
+After building either book, validate every chapter-page local `href` target and
+fragment in the generated HTML:
+
+```bash
+bash scripts/check-ai-docs.sh --check-rendered-links \
+  target/mdbook/user target/mdbook/engine
+```
+
+Status: **Verified.** External URLs remain outside this offline post-build
+check; they follow the scheduled, cached policy described in section 12. The
+derived `print.html` concatenation is excluded because mdBook rewrites all
+chapter links into one document, where duplicate heading IDs do not preserve
+the chapter-local fragment model.
 
 ## 9. Example/Demo Commands
 
@@ -446,27 +460,44 @@ Status: **Inferred.** This session did not run Criterion benchmark measurements.
 
 ## 12. Commands Codex Should Run Before Claiming Success
 
-For AI onboarding docs-only changes under `docs/ai/`:
+For AI onboarding docs-only changes under `docs/ai/`, run the pinned
+repository-owned offline gate and scope the whitespace check to the files the
+change owns:
 
 ```bash
-git diff --check
+bash scripts/check-ai-docs.sh
+git diff --check -- docs/ai/<changed-file>.md docs/ai/<other-changed-file>.md
 ```
 
-Status: **Verified.** AI docs are not currently an mdBook, so this is the
-smallest relevant gate unless the edit changes commands, links into generated
-books, or user/engine docs.
+Status: **Verified.** The same `bash scripts/check-ai-docs.sh` command blocks
+CI. It recursively checks `docs/ai/**/*.md` offline for the selected GitHub
+Flavored Markdown structure, local targets, GitHub heading fragments, and the
+production-contract schema and coverage. It installs no package and makes no
+network request. D-52's authoritative status and ownership are in the
+[production-contract register](15_PRODUCTION_CONTRACTS.md). The scoped
+`git diff --check -- ...` remains required for the exact owned files; avoid an
+unscoped check when unrelated working-tree edits are present.
+
+External URLs are intentionally outside the blocking offline gate. D-52 assigns
+them to a scheduled, cached, non-blocking check so network availability cannot
+become a merge requirement. No external-link package, third-party action, or
+specific implementation is pre-approved by that boundary.
 
 For user or engine mdBook documentation changes, run the relevant book build:
 
 ```bash
-mdbook build docs/user -d /tmp/clinker-mdbook-user
-mdbook build docs/engine -d /tmp/clinker-mdbook-engine
+mdbook build docs/user -d target/mdbook/user
+mdbook build docs/engine -d target/mdbook/engine
+bash scripts/check-ai-docs.sh --check-rendered-links \
+  target/mdbook/user target/mdbook/engine
 ```
 
 Status: **Verified.** Run the mdBook command relevant to the docs changed; run
 both if shared docs/theme or cross-book docs changed. `cargo fmt --all --check`
 is not required for pure Markdown edits unless Rust source or generated Rust
-docs are touched.
+docs are touched. Rust tests are likewise reserved for executable, generated,
+or code-coupled documentation; ordinary prose-only AI or book edits use the
+documentation gates above.
 
 For Rust code changes:
 

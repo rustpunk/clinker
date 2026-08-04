@@ -80,13 +80,15 @@ pub struct PipelineMeta {
     pub rules_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub concurrency: Option<ConcurrencyConfig>,
-    // Spec stubs — processed in later phases
+    // Typed capture for rejected reserved fields. The value wrapper preserves
+    // each authored occurrence's source location until plan validation emits
+    // its field-specific diagnostic; no explicit value reaches execution.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub date_locale: Option<String>,
+    pub date_locale: Option<Spanned<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub log_rules: Option<serde_json::Value>,
+    pub log_rules: Option<Spanned<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub include_provenance: Option<bool>,
+    pub include_provenance: Option<Spanned<bool>>,
     /// Execution metrics spool configuration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metrics: Option<MetricsConfig>,
@@ -434,7 +436,7 @@ impl PipelineConfig {
         use clinker_core_types::{Diagnostic, LabeledSpan};
         use std::collections::BTreeMap;
 
-        let mut diags = Vec::new();
+        let mut diags = validate_inert_metadata(self);
         // span_for(spanned) converts a per-node saphyr
         // `Spanned<PipelineNode>` into a `LabeledSpan` carrying a
         // `Span::line_only` synthetic span with the real source line.
@@ -1988,15 +1990,12 @@ impl PipelineConfig {
         // `window_index` on body Transforms because body lowering
         // runs before the parent DAG's NodeIndex space is allocated.
         // This post-pass walks each body's mini-DAG, classifies each
-        // window's rooting (Source / Node / ParentNode), constructs
-        // the body's IndexSpec list, and backfills `window_index` on
-        // each body Transform. Bodies whose windows resolve through
-        // an `input:` port emit `PlanIndexRoot::ParentNode` pointing
-        // at the parent-DAG operator feeding the port — the body
-        // executor inherits the parent's WindowRuntime via
-        // `Arc::clone` at recursion entry. The pass only short-
-        // circuits on errors it itself emits (E003 / E150d at body
-        // root). Any E102-E108 from bind_composition are already in
+        // body-local root, constructs the body's IndexSpec list and
+        // exact runtime keys, and backfills `window_index` on each body
+        // Transform. Input-port windows root at the body's synthetic
+        // Source and never inherit a parent numeric slot. The pass only
+        // short-circuits on errors it emits. Any E102-E109 from
+        // bind_composition are already in
         // `diags` and are caught by the post-lowering gate below; this
         // pass only needs to surface the window-rooting errors it adds.
         let pre_pass_diag_count = diags.len();
@@ -2283,10 +2282,7 @@ impl PipelineConfig {
                         .get(*idx_num)
                         .map(|s| {
                             let upstream_is_correlated_source = match &s.root {
-                                crate::plan::index::PlanIndexRoot::Node { upstream, .. }
-                                | crate::plan::index::PlanIndexRoot::ParentNode {
-                                    upstream, ..
-                                } => {
+                                crate::plan::index::PlanIndexRoot::Node { upstream, .. } => {
                                     let upstream_node = &dag.graph[*upstream];
                                     if let crate::plan::execution::PlanNode::Source {
                                         name: source_name,
@@ -2386,6 +2382,19 @@ impl PipelineConfig {
             .iter()
             .any(|d| matches!(d.severity, clinker_core_types::Severity::Error));
         if has_fatal_errors {
+            return Err(diags);
+        }
+
+        // Freeze the complete order contract only after every structural
+        // rewrite and property/strategy pass has reached its final shape.
+        // Runtime consumers borrow this retained proof and never rebuild it
+        // from the mutable/raw configuration surface.
+        if let Err(error) = dag.freeze_order_contract(&inputs_map) {
+            diags.push(Diagnostic::error(
+                "E003",
+                format!("order-contract finalization failed: {error}"),
+                LabeledSpan::primary(Span::SYNTHETIC, String::new()),
+            ));
             return Err(diags);
         }
 
@@ -4533,6 +4542,15 @@ pub fn reserved_names_for(scope: pipeline_node::VarScope) -> &'static [&'static 
 
 /// Post-deserialization validation.
 pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError> {
+    if let Some(threshold) = config.error_handling.type_error_threshold
+        && !(threshold.is_finite() && (0.0..=1.0).contains(&threshold))
+    {
+        return Err(ConfigError::Validation(format!(
+            "[E368] error_handling.type_error_threshold = {threshold}: must be a finite \
+             fraction in [0.0, 1.0]"
+        )));
+    }
+
     // Pipeline-level memory knobs. `resume_threshold` is the low watermark
     // of the pause/resume hysteresis band; it must sit strictly inside
     // `(0, spill_threshold)` so the resume point is below the pause point
@@ -4892,6 +4910,33 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
         )));
     }
 
+    // Document-level and correlation-key rejection both defer terminal writes
+    // until a population has a final clean/failed disposition, but they key
+    // and commit different populations (source file versus correlation key).
+    // No combined writer boundary exists, so accepting both would let planner
+    // and runtime precedence select different physical-writer modes. Reject
+    // the ambiguous pairing before an executable plan can be produced.
+    if config.any_source_has_document_dlq() && config.any_source_has_correlation_key() {
+        let document_source = config
+            .source_configs()
+            .find(|source| source.dlq_granularity == DlqGranularity::Document)
+            .map(|source| source.name.as_str())
+            .unwrap_or("");
+        let correlated_source = config
+            .source_bodies()
+            .find(|source| source.correlation_key.is_some())
+            .map(|source| source.source.name.as_str())
+            .unwrap_or("");
+        return Err(ConfigError::Validation(format!(
+            "[E370] source '{document_source}' declares `dlq_granularity: document`, but \
+             source '{correlated_source}' declares `correlation_key` — document and \
+             correlation rejection use different atomic populations and cannot share one \
+             output writer boundary. Keep document rejection by removing every \
+             `correlation_key`, or keep correlation rejection by setting \
+             `dlq_granularity: record`"
+        )));
+    }
+
     // `reconstruct_envelope` drives a single per-document writer through the
     // punctuation-unaware Output arm, which streams each record straight
     // through one writer with per-document header/footer framing. Three
@@ -5094,6 +5139,71 @@ pub(crate) fn validate_config(config: &PipelineConfig) -> Result<(), ConfigError
     }
 
     Ok(())
+}
+
+/// Reject reserved pipeline metadata that has no supported runtime effect.
+///
+/// Fields stay typed and spanned through YAML admission so every explicit
+/// occurrence, including empty strings/maps and `false`, produces its own
+/// diagnostic. Sorting by the authored location keeps output stable even
+/// though `PipelineMeta`'s Rust field order differs from the YAML order.
+pub(crate) fn validate_inert_metadata(
+    config: &PipelineConfig,
+) -> Vec<clinker_core_types::Diagnostic> {
+    use clinker_core_types::span::Span;
+    use clinker_core_types::{Diagnostic, LabeledSpan};
+
+    fn authored_span<T>(value: &Spanned<T>) -> Span {
+        let line = value.referenced.line() as u32;
+        if line > 0 {
+            Span::line_only(line)
+        } else {
+            Span::SYNTHETIC
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    if let Some(value) = &config.pipeline.date_locale {
+        diagnostics.push(
+            Diagnostic::error(
+                "E119",
+                "pipeline.date_locale is unsupported: date parsing has no locale-aware runtime behavior",
+                LabeledSpan::primary(authored_span(value), "unsupported date_locale value"),
+            )
+            .with_help(
+                "remove `date_locale:`; use explicit `date_formats:` entries for supported date parsing",
+            ),
+        );
+    }
+    if let Some(value) = &config.pipeline.log_rules {
+        diagnostics.push(
+            Diagnostic::error(
+                "E124",
+                "pipeline.log_rules is unsupported: pipeline-authored telemetry routing is not consumed",
+                LabeledSpan::primary(authored_span(value), "unsupported log_rules value"),
+            )
+            .with_help(
+                "remove the entire `log_rules:` entry; configure runtime logging outside pipeline YAML",
+            ),
+        );
+    }
+    if let Some(value) = &config.pipeline.include_provenance {
+        diagnostics.push(
+            Diagnostic::error(
+                "E125",
+                "pipeline.include_provenance is unsupported: it does not attach output provenance",
+                LabeledSpan::primary(
+                    authored_span(value),
+                    "unsupported include_provenance value",
+                ),
+            )
+            .with_help(
+                "remove `include_provenance:` and set `write_meta: true` in each intended Output config",
+            ),
+        );
+    }
+    diagnostics.sort_by_key(|diagnostic| diagnostic.primary.span.start);
+    diagnostics
 }
 
 /// A node-scoped config violation found by [`validate_node_configs`]:
@@ -5789,11 +5899,117 @@ nodes:
 }
 
 #[cfg(test)]
+mod inert_metadata_tests {
+    use super::*;
+    use crate::config::parse_config;
+
+    fn pipeline(metadata: &str) -> String {
+        format!(
+            "pipeline:\n  name: inert_metadata\n{metadata}nodes:\n  - type: source\n    name: src\n    config:\n      name: src\n      type: csv\n      path: in.csv\n      schema: [{{ name: id, type: int }}]\n  - type: output\n    name: out\n    input: src\n    config: {{ name: out, type: csv, path: out.csv }}\n"
+        )
+    }
+
+    #[test]
+    fn inert_metadata_omission_is_accepted_and_explicit_values_are_rejected() {
+        let omitted = parse_config(&pipeline("")).expect("omission parses");
+        assert!(validate_inert_metadata(&omitted).is_empty());
+        omitted
+            .compile(&CompileContext::default())
+            .expect("omission produces an accepted plan");
+
+        for (field, value, code) in [
+            ("date_locale", "\"\"", "E119"),
+            ("log_rules", "{}", "E124"),
+            ("include_provenance", "false", "E125"),
+        ] {
+            let config = parse_config(&pipeline(&format!("  {field}: {value}\n")))
+                .expect("typed inert field must survive parsing for validation");
+            let diagnostics = validate_inert_metadata(&config);
+            assert_eq!(diagnostics.len(), 1, "{field}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].code, code);
+            assert!(diagnostics[0].message.contains(field));
+            assert!(
+                diagnostics[0]
+                    .help
+                    .as_deref()
+                    .is_some_and(|help| help.contains(field)),
+                "{field} diagnostic needs a paste-ready correction",
+            );
+            let compile_diagnostics = config
+                .compile(&CompileContext::default())
+                .expect_err("no explicit inert metadata may enter a compiled plan");
+            assert!(
+                compile_diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == code)
+            );
+        }
+    }
+
+    #[test]
+    fn inert_metadata_adjacent_fields_keep_distinct_authored_spans() {
+        let config = parse_config(&pipeline(
+            "  date_locale: en-US\n  log_rules: {}\n  include_provenance: false\n",
+        ))
+        .expect("typed inert fields parse");
+        let diagnostics = validate_inert_metadata(&config);
+        let lines: Vec<_> = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.primary.span.synthetic_line_number())
+            .collect();
+        assert_eq!(lines, vec![Some(3), Some(4), Some(5)]);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["E119", "E124", "E125"],
+        );
+    }
+
+    #[test]
+    fn inert_metadata_diagnostics_follow_source_order_with_field_specific_help() {
+        let config = parse_config(&pipeline(
+            "  include_provenance: false\n  date_locale: \"\"\n  log_rules: {}\n",
+        ))
+        .expect("typed inert fields parse");
+        let diagnostics = validate_inert_metadata(&config);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            vec!["E125", "E119", "E124"],
+        );
+        assert!(
+            diagnostics[0]
+                .help
+                .as_deref()
+                .unwrap()
+                .contains("write_meta")
+        );
+        assert!(
+            diagnostics[1]
+                .help
+                .as_deref()
+                .unwrap()
+                .contains("date_locale")
+        );
+        assert!(
+            diagnostics[2]
+                .help
+                .as_deref()
+                .unwrap()
+                .contains("log_rules")
+        );
+    }
+}
+
+#[cfg(test)]
 mod error_strategy_tests {
     use super::ErrorStrategy;
     use crate::config::parse_config;
 
-    /// Minimal pipeline whose `error_handling.strategy` is caller-supplied.
     fn strategy_pipeline(strategy: &str) -> String {
         format!(
             r#"
@@ -5829,9 +6045,6 @@ nodes:
         assert_eq!(cont.error_handling.strategy, ErrorStrategy::Continue);
     }
 
-    /// The unknown-variant diagnostic lists [`ERROR_STRATEGY_VARIANTS`], so a
-    /// spelling that drifted out of the deserializer's match would advertise a
-    /// value the parser rejects.
     #[test]
     fn every_listed_strategy_parses() {
         for spelling in super::ERROR_STRATEGY_VARIANTS {
@@ -5848,23 +6061,12 @@ nodes:
         assert_eq!(cfg.error_handling.strategy, ErrorStrategy::FailFast);
     }
 
-    /// `best_effort` was runtime-identical to `continue` and is gone. A
-    /// pipeline still carrying it must be told what to write instead — a bare
-    /// unknown-variant list would name `continue` without saying it is the
-    /// replacement.
     #[test]
     fn removed_best_effort_rejected_with_a_migration_diagnostic() {
         let err = parse_config(&strategy_pipeline("best_effort"))
             .expect_err("`best_effort` is no longer a strategy");
         let msg = err.to_string();
-        for expected in [
-            // the offending input
-            "best_effort",
-            // the rule it broke
-            "is not a strategy",
-            // the corrected form the author can paste
-            "strategy: continue",
-        ] {
+        for expected in ["best_effort", "is not a strategy", "strategy: continue"] {
             assert!(
                 msg.contains(expected),
                 "the best_effort rejection must contain {expected:?}: {msg}"

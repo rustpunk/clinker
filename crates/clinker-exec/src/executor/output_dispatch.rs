@@ -26,11 +26,206 @@ use crate::executor::schema_check::check_input_schema;
 use crate::executor::structured_output_guard::{
     StructuredOutputDocumentGuard, structured_output_format,
 };
-use crate::executor::{DlqEntry, build_format_writer, stage_metrics};
+use crate::executor::{DlqEntry, OutputDeliveryId, build_format_writer, stage_metrics};
 use crate::projection::project_output_from_record;
 use clinker_plan::config::ErrorStrategy;
 use clinker_plan::error::PipelineError;
-use clinker_plan::plan::execution::{ExecutionPlanDag, PlanNode};
+use clinker_plan::plan::execution::{
+    ExecutionPlanDag, OrderGuarantee, PhysicalWriterBoundary, PlanNode, WriterBoundaryMode,
+    WriterOrderDisposition,
+};
+
+/// Runtime adapter for one topology-derived physical writer boundary.
+///
+/// The adapter is constructed from the frozen planner contract and validated
+/// against the writer implementation that is about to emit bytes. Deferred
+/// boundaries reuse the executor's shared stable authored-key sorter; preserve
+/// and proven-terminal-sort boundaries retain FIFO without consulting raw
+/// Output configuration or adding a comparison key.
+#[derive(Clone)]
+pub(crate) struct OrderedWriterBoundary {
+    boundary: PhysicalWriterBoundary,
+}
+
+type OrderedRecord = Result<(Record, crate::executor::stream_event::SourceRowId), PipelineError>;
+type OrderedRecordStream<'a> = Box<dyn Iterator<Item = OrderedRecord> + 'a>;
+
+impl OrderedWriterBoundary {
+    /// Resolve the one compiled boundary for `output_id` and assert that the
+    /// runtime path matches its planner-selected mode.
+    pub(crate) fn for_output(
+        current_dag: &ExecutionPlanDag,
+        output_id: clinker_plan::plan::PlanNodeId,
+        expected_mode: WriterBoundaryMode,
+    ) -> Result<Self, PipelineError> {
+        let mut matches = current_dag
+            .order_contract()
+            .writer_boundaries
+            .iter()
+            .filter(|boundary| boundary.output_id == output_id);
+        let boundary = matches.next().ok_or_else(|| PipelineError::Internal {
+            op: "writer_boundary",
+            node: format!("{output_id:?}"),
+            detail: "compiled Output has no physical writer boundary".to_string(),
+        })?;
+        if matches.next().is_some() {
+            return Err(PipelineError::Internal {
+                op: "writer_boundary",
+                node: boundary.output_name.clone(),
+                detail: "compiled Output has more than one physical writer boundary template"
+                    .to_string(),
+            });
+        }
+        if boundary.mode != expected_mode {
+            return Err(PipelineError::Internal {
+                op: "writer_boundary",
+                node: boundary.output_name.clone(),
+                detail: format!(
+                    "compiled writer mode {:?} reached the {:?} byte-emission path",
+                    boundary.mode, expected_mode
+                ),
+            });
+        }
+        validate_writer_disposition(boundary)?;
+        if expected_mode == WriterBoundaryMode::Streaming
+            && !matches!(
+                boundary.disposition,
+                WriterOrderDisposition::Preserve | WriterOrderDisposition::Unordered
+            )
+        {
+            return Err(PipelineError::Internal {
+                op: "writer_boundary",
+                node: boundary.output_name.clone(),
+                detail:
+                    "streaming writer boundary cannot consume a complete-population disposition"
+                        .to_string(),
+            });
+        }
+        Ok(Self {
+            boundary: boundary.clone(),
+        })
+    }
+
+    pub(crate) fn is_incremental_streaming(&self) -> bool {
+        self.boundary.mode == WriterBoundaryMode::Streaming
+            && matches!(
+                self.boundary.disposition,
+                WriterOrderDisposition::Preserve | WriterOrderDisposition::Unordered
+            )
+    }
+
+    /// Apply the compiled complete-population disposition to records carrying
+    /// their real source identity as inert payload. `SourceRowId` never joins
+    /// the comparator, so equal authored keys retain arrival order.
+    pub(crate) fn order_records(
+        &self,
+        ctx: &mut ExecutorContext<'_>,
+        records: Vec<(Record, crate::executor::stream_event::SourceRowId)>,
+    ) -> Result<Vec<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
+        self.order_record_stream(ctx, records.into_iter().map(Ok))?
+            .collect()
+    }
+
+    /// Apply this boundary to a complete population while leaving a spilled
+    /// merge lazy. Preserving and unordered boundaries forward their input
+    /// iterator untouched; deferred boundaries delegate to the shared stable
+    /// sorter and bounded-fan-in merger.
+    pub(crate) fn order_record_stream<'a, I>(
+        &self,
+        ctx: &mut ExecutorContext<'_>,
+        records: I,
+    ) -> Result<OrderedRecordStream<'a>, PipelineError>
+    where
+        I: IntoIterator<
+                Item = Result<(Record, crate::executor::stream_event::SourceRowId), PipelineError>,
+            > + 'a,
+        I::IntoIter: 'a,
+    {
+        let WriterOrderDisposition::DeferredSort { fields } = &self.boundary.disposition else {
+            return Ok(Box::new(records.into_iter()));
+        };
+        let fields: Vec<clinker_plan::config::SortField> = fields
+            .iter()
+            .map(|field| clinker_plan::config::SortField {
+                field: field.field.clone(),
+                order: field.order,
+                null_order: Some(field.null_order),
+            })
+            .collect();
+        Ok(Box::new(
+            crate::executor::sort_dispatch::sort_record_stream_by_authored_fields(
+                ctx,
+                &self.boundary.output_name,
+                &fields,
+                records,
+            )?,
+        ))
+    }
+
+    /// Sort records carrying a stable zero-based slot index. The index is
+    /// payload only and lets deferred correlation/document commits restore
+    /// their record metadata after the shared sorter permutes the population.
+    pub(crate) fn order_indexed_records(
+        &self,
+        ctx: &mut ExecutorContext<'_>,
+        records: Vec<(Record, usize)>,
+    ) -> Result<Vec<(Record, usize)>, PipelineError> {
+        let indexed = records
+            .into_iter()
+            .map(|(record, index)| {
+                let ordinal = u64::try_from(index).map_err(|_| PipelineError::Internal {
+                    op: "writer_boundary",
+                    node: self.boundary.output_name.clone(),
+                    detail: "writer population index exceeds u64".to_string(),
+                })?;
+                Ok((
+                    record,
+                    crate::executor::stream_event::SourceRowId::new(
+                        self.boundary.output_id,
+                        ordinal,
+                    ),
+                ))
+            })
+            .collect::<Result<Vec<_>, PipelineError>>()?;
+        self.order_records(ctx, indexed)?
+            .into_iter()
+            .map(|(record, index)| {
+                usize::try_from(index.ordinal())
+                    .map(|index| (record, index))
+                    .map_err(|_| PipelineError::Internal {
+                        op: "writer_boundary",
+                        node: self.boundary.output_name.clone(),
+                        detail: "writer population index does not fit usize".to_string(),
+                    })
+            })
+            .collect()
+    }
+}
+
+fn validate_writer_disposition(boundary: &PhysicalWriterBoundary) -> Result<(), PipelineError> {
+    let valid = match (&boundary.guarantee, &boundary.disposition) {
+        (OrderGuarantee::Unordered, WriterOrderDisposition::Unordered)
+        | (OrderGuarantee::StableArrival, WriterOrderDisposition::Preserve) => true,
+        (
+            OrderGuarantee::Sorted(expected),
+            WriterOrderDisposition::DeferredSort { fields }
+            | WriterOrderDisposition::ProvenTerminalSort { fields, .. },
+        ) => expected == fields,
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(PipelineError::Internal {
+            op: "writer_boundary",
+            node: boundary.output_name.clone(),
+            detail: format!(
+                "compiled guarantee {:?} is incompatible with writer disposition {:?}",
+                boundary.guarantee, boundary.disposition
+            ),
+        })
+    }
+}
 
 /// Resolve the [`OutputConfig`](clinker_plan::config::OutputConfig) for the
 /// Output named `name`, falling back to the pipeline's primary output when no
@@ -80,16 +275,23 @@ fn resolve_output_inputs(current_dag: &ExecutionPlanDag, node_idx: NodeIndex) ->
 /// configured), and write — taking the per-record fan-out path for
 /// source-file-keyed outputs, the correlation-buffer capture path under a
 /// correlation-key pipeline, and the streaming-fused short-circuit when a
-/// streaming sender was installed. Stateless and streaming per record.
+/// streaming sender was installed. Deferred physical boundaries block only at
+/// their compiled population grain and spill through the shared sorter.
 pub(crate) fn dispatch_output(
     ctx: &mut ExecutorContext<'_>,
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     node: &PlanNode,
 ) -> Result<(), PipelineError> {
-    let PlanNode::Output { ref name, .. } = *node else {
+    let PlanNode::Output {
+        ref name,
+        ref resolved,
+        ..
+    } = *node
+    else {
         unreachable!("dispatch_output called with non-Output node");
     };
+    let output_id = node.id();
     // Streaming-Output short-circuit (issue #72). The executor
     // entry already moved this Output's writer into a
     // `std::thread` that drained records from a bounded crossbeam
@@ -110,19 +312,41 @@ pub(crate) fn dispatch_output(
     // below discards — an additive read of the same buffer, not a change to
     // the records-vs-puncts split contract every other operator relies on.
     if ctx.document_dlq.is_some() {
-        return dispatch_output_document_dlq(ctx, current_dag, node_idx, name);
+        let writer_boundary = OrderedWriterBoundary::for_output(
+            current_dag,
+            output_id,
+            WriterBoundaryMode::DocumentDlq,
+        )?;
+        return dispatch_output_document_dlq(ctx, current_dag, node_idx, name, writer_boundary);
     }
     // Envelope-reconstruction short-circuit. When this Output declares
     // `reconstruct_envelope: true`, its writer's `begin_document` /
     // `end_document` framing must fire around each document's records. This
     // arm detects document boundaries from each record's `doc_ctx`
     // (a change in the per-frame `grain()` between consecutive records) rather
-    // than the records-only path's boundary-blind write loop. It buffers
-    // nothing: each body record streams straight through `write_record`
-    // between the header and footer, so a 1 GiB document flows at O(1-record).
+    // than the records-only path's boundary-blind write loop. Preserving
+    // boundaries stream each body record; deferred boundaries sort one
+    // document through the bounded shared spill path before framing its body.
     if resolve_out_cfg(ctx, name).reconstruct_envelope {
-        return dispatch_output_envelope(ctx, current_dag, node_idx, name);
+        let writer_boundary = OrderedWriterBoundary::for_output(
+            current_dag,
+            output_id,
+            WriterBoundaryMode::Envelope,
+        )?;
+        return dispatch_output_envelope(ctx, current_dag, node_idx, name, writer_boundary);
     }
+    let correlation_deferred = ctx.correlation_buffers.is_some();
+    let expected_mode = if correlation_deferred {
+        WriterBoundaryMode::CorrelationDeferred
+    } else if resolved
+        .as_deref()
+        .is_some_and(|payload| payload.fan_out_per_source_file)
+    {
+        WriterBoundaryMode::PerSourceFile
+    } else {
+        WriterBoundaryMode::RecordsOnly
+    };
+    let writer_boundary = OrderedWriterBoundary::for_output(current_dag, output_id, expected_mode)?;
     // Get input records: check own buffer first (Route
     // nodes store records at the successor's index), then
     // fall back to predecessor buffers.
@@ -153,7 +377,16 @@ pub(crate) fn dispatch_output(
     )?;
     let (input, input_materialization_reservation) =
         input.into_materialized_parts(&ctx.memory_budget, name)?;
-    let (input_records, _input_puncts) = input.drain_split()?;
+    let (mut input_records, _input_puncts) = input.drain_split()?;
+
+    // Correlation queues commit only after every group has reached its final
+    // clean/dirty disposition. Sorting here would be destroyed by the group
+    // walk, so that complete population consumes the same boundary in
+    // `commit_correlation_buffers`. Ordinary and per-file paths are complete
+    // now and can enforce their disposition before projection or writing.
+    if !correlation_deferred {
+        input_records = writer_boundary.order_records(ctx, input_records)?;
+    }
 
     let OutputInputs {
         expected_input_schema,
@@ -173,8 +406,12 @@ pub(crate) fn dispatch_output(
     // records get a row-disambiguated buffer cell each so
     // they retain per-record-rejection semantics without
     // splitting the writer path.
-    let buffered: Vec<(Record, u64, Vec<GroupByKey>)>;
-    let unbuffered: Vec<(Record, u64)>;
+    let buffered: Vec<(
+        Record,
+        crate::executor::stream_event::SourceRowId,
+        Vec<GroupByKey>,
+    )>;
+    let unbuffered: Vec<(Record, crate::executor::stream_event::SourceRowId)>;
     if ctx.correlation_buffers.is_some() {
         buffered = input_records
             .into_iter()
@@ -297,6 +534,7 @@ pub(crate) fn dispatch_output(
             }
             entry.records.push(CorrelationRecordSlot {
                 row_num: *rn,
+                consumer: output_id,
                 original_record: record.clone(),
                 projected,
                 output_name: name.clone(),
@@ -366,7 +604,7 @@ pub(crate) fn dispatch_output(
     // borrows) and applied below once `ctx` is free again: `dlq_pending` drains
     // through `push_dlq`, `written_rows` drives the ok/written/emitted counts.
     let mut dlq_pending: Vec<DlqEntry> = Vec::new();
-    let mut written_rows: Vec<u64> = Vec::new();
+    let mut written_rows: Vec<crate::executor::stream_event::SourceRowId> = Vec::new();
     let output_staging = ctx.output_staging.clone();
     {
         let mut fan_ctx = FanOutContext {
@@ -409,16 +647,21 @@ pub(crate) fn dispatch_output(
     // counts as ok exactly once regardless of Output order. Without a writer, no
     // record was written, so `written_rows` is empty; fall back to the per-record
     // bump over `unbuffered` to preserve the dry-run / flag-parity count.
-    let counted: &[(Record, u64)] = if had_writer { &[] } else { &unbuffered };
+    let counted: &[(Record, crate::executor::stream_event::SourceRowId)] =
+        if had_writer { &[] } else { &unbuffered };
     let mut newly_ok: u64 = 0;
     let mut written_total: u64 = written_rows.len() as u64;
     for row_num in &written_rows {
+        ctx.ok_deliveries
+            .insert(OutputDeliveryId::new(*row_num, output_id));
         if ctx.ok_source_rows.insert(*row_num) {
             newly_ok += 1;
         }
     }
     for (_, row_num) in counted {
         written_total += 1;
+        ctx.ok_deliveries
+            .insert(OutputDeliveryId::new(*row_num, output_id));
         if ctx.ok_source_rows.insert(*row_num) {
             newly_ok += 1;
         }
@@ -464,7 +707,7 @@ fn record_has_widened_extras(record: &Record) -> bool {
 /// materialized at this arm), and a second projection only on the drifting
 /// minority.
 fn build_csv_union_schema(
-    unbuffered: &[(Record, u64)],
+    unbuffered: &[(Record, crate::executor::stream_event::SourceRowId)],
     out_cfg: &clinker_plan::config::OutputConfig,
     cxl_emit_names_opt: Option<&[String]>,
 ) -> Arc<Schema> {
@@ -498,6 +741,7 @@ fn dispatch_output_document_dlq(
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     name: &str,
+    writer_boundary: OrderedWriterBoundary,
 ) -> Result<(), PipelineError> {
     let (events, _input_clone_reservation) =
         drain_output_input_events(ctx, current_dag, node_idx, name)?;
@@ -524,8 +768,13 @@ fn dispatch_output_document_dlq(
         .iter()
         .find(|o| o.name == *name)
         .unwrap_or(ctx.primary_output);
-    let driver =
-        crate::executor::document_dlq::DocumentDlqDriver::new(ctx, name, out_cfg, cxl_emit_names);
+    let driver = crate::executor::document_dlq::DocumentDlqDriver::new(
+        ctx,
+        name,
+        out_cfg,
+        cxl_emit_names,
+        writer_boundary,
+    );
     driver.run(ctx, events)
 }
 
@@ -580,10 +829,10 @@ fn drain_output_input_events(
 /// and `dlq_granularity: document` are mutually exclusive (rejected by E347),
 /// so no record is ever both DLQ-bucketed and envelope-framed.
 ///
-/// Bounded-memory: this path buffers no records. It holds only the current
-/// document's context, so a multi-gigabyte document streams at O(1-record).
-/// The input drain is itself lazy — a spilled predecessor buffer streams from
-/// disk one record at a time rather than materializing.
+/// Bounded-memory: a preserving boundary holds only the current document's
+/// context. A deferred boundary feeds one document into the shared spillable
+/// sorter and drains its bounded-fan-in merge lazily, so it never materializes
+/// the sorted document in a second collection. The input drain is itself lazy.
 ///
 /// Records with a non-concrete source file (the `<merged>` sentinel or an
 /// empty stamp — an in-pipeline synthesis or fan-in row that belongs to no
@@ -602,9 +851,8 @@ fn dispatch_output_envelope(
     current_dag: &ExecutionPlanDag,
     node_idx: NodeIndex,
     name: &str,
+    writer_boundary: OrderedWriterBoundary,
 ) -> Result<(), PipelineError> {
-    use crate::executor::stream_event::StreamEvent;
-
     let OutputInputs {
         expected_input_schema,
         upstream_name,
@@ -625,89 +873,110 @@ fn dispatch_output_envelope(
     let scan_timer = stage_metrics::StageTimer::new(stage_metrics::StageName::SchemaScan);
     let mut any_record = false;
 
-    let events = drain_output_input_event_iter(ctx, current_dag, node_idx, name, false)?;
+    let mut events = drain_output_input_event_iter(ctx, current_dag, node_idx, name, false)?;
     let mut driver = EnvelopeWriterDriver::default();
     let mut structured_guard = StructuredOutputDocumentGuard::new(&out_cfg.format);
-
-    for event in events {
-        // Boundaries come from records, so punctuations are irrelevant here —
-        // drop them exactly as the records-only `drain_split` path does.
-        let StreamEvent::Record(record, row_num) = event? else {
-            continue;
-        };
-        any_record = true;
-        if let Some(expected) = expected_input_schema.as_ref()
-            && let Err(e) =
-                check_input_schema(expected, record.schema(), name, "output", &upstream_name)
-        {
-            // Fail fast like the records-only / DLQ arms, but first close the
-            // open document and surface any framing/write errors accumulated
-            // so far — the in-flight footer and prior errors are not lost.
-            {
-                let _guard = ctx.write_timer.guard();
-                driver.finish();
-            }
-            ctx.output_errors.append(&mut driver.errors);
-            return Err(e);
-        }
-        if let Err(err) = structured_guard.observe(name, record.doc_ctx()) {
-            {
-                let _guard = ctx.write_timer.guard();
-                driver.finish();
-            }
-            ctx.output_errors.append(&mut driver.errors);
-            ctx.output_errors.push(err);
-            return Ok(());
-        }
-        let projected = {
-            let _guard = ctx.projection_timer.guard();
-            match out_cfg.mapping.as_ref() {
-                Some(_) => {
-                    let probe = mapping_probe(&mut ctx.mapping_probes, name, &out_cfg);
-                    crate::projection::project_output_probed(
-                        &record,
-                        &out_cfg,
-                        cxl_emit_names_opt,
-                        Some(probe),
-                    )
+    let mut pending = None;
+    let processing_result = (|| {
+        loop {
+            let first = match pending.take() {
+                Some(record) => record,
+                None => match next_envelope_record(&mut events)? {
+                    Some(record) => record,
+                    None => break,
+                },
+            };
+            any_record = true;
+            let grain =
+                crate::executor::document_dlq::is_concrete_file(first.0.doc_ctx().source_file())
+                    .then(|| first.0.doc_ctx().grain());
+            let mut first = Some(first);
+            let mut population_done = false;
+            let population = std::iter::from_fn(|| {
+                if let Some(record) = first.take() {
+                    return Some(Ok(record));
                 }
-                None => crate::projection::project_output_from_record(
-                    &record,
-                    &out_cfg,
-                    cxl_emit_names_opt,
-                ),
-            }
-        };
-        {
-            let _guard = ctx.write_timer.guard();
-            // The borrowed `ctx.writers` registry is consulted only when the
-            // writer opens (first record); passing the raw-writer source as a
-            // closure keeps the driver free of `ExecutorContext` so its
-            // boundary logic is unit-testable against a probe writer.
-            driver.on_record(record.doc_ctx(), &projected, &mut |schema| {
-                let raw_writer = ctx.writers.remove(name)?;
-                Some(build_format_writer(
-                    &out_cfg,
-                    raw_writer,
-                    schema,
-                    ctx.output_staging.clone(),
-                ))
+                if population_done {
+                    return None;
+                }
+                match next_envelope_record(&mut events) {
+                    Err(error) => {
+                        population_done = true;
+                        Some(Err(error))
+                    }
+                    Ok(None) => {
+                        population_done = true;
+                        None
+                    }
+                    Ok(Some(record)) => {
+                        let same_document = grain.is_some_and(|grain| {
+                            crate::executor::document_dlq::is_concrete_file(
+                                record.0.doc_ctx().source_file(),
+                            ) && record.0.doc_ctx().grain() == grain
+                        });
+                        if same_document {
+                            Some(Ok(record))
+                        } else {
+                            pending = Some(record);
+                            population_done = true;
+                            None
+                        }
+                    }
+                }
             });
+            let checked = population.map(|item| {
+                let (record, row_num) = item?;
+                if let Some(expected) = expected_input_schema.as_ref() {
+                    check_input_schema(expected, record.schema(), name, "output", &upstream_name)?;
+                }
+                Ok((record, row_num))
+            });
+            let ordered = writer_boundary.order_record_stream(ctx, checked)?;
+            for item in ordered {
+                let (record, row_num) = item?;
+                if let Err(err) = structured_guard.observe(name, record.doc_ctx()) {
+                    ctx.output_errors.push(err);
+                    return Ok::<(), PipelineError>(());
+                }
+                let projected = {
+                    let _guard = ctx.projection_timer.guard();
+                    match out_cfg.mapping.as_ref() {
+                        Some(_) => {
+                            let probe = mapping_probe(&mut ctx.mapping_probes, name, &out_cfg);
+                            crate::projection::project_output_probed(
+                                &record,
+                                &out_cfg,
+                                cxl_emit_names_opt,
+                                Some(probe),
+                            )
+                        }
+                        None => project_output_from_record(&record, &out_cfg, cxl_emit_names_opt),
+                    }
+                };
+                {
+                    let _guard = ctx.write_timer.guard();
+                    driver.on_record(record.doc_ctx(), &projected, &mut |schema| {
+                        let raw_writer = ctx.writers.remove(name)?;
+                        Some(build_format_writer(
+                            &out_cfg,
+                            raw_writer,
+                            schema,
+                            ctx.output_staging.clone(),
+                        ))
+                    });
+                }
+                if !driver.errors.is_empty() {
+                    return Ok(());
+                }
+                ctx.counters.records_written += 1;
+                ctx.records_emitted += 1;
+                if ctx.ok_source_rows.insert(row_num) {
+                    ctx.counters.ok_count += 1;
+                }
+            }
         }
-        // Count unconditionally per record, independent of whether a writer is
-        // open or even registered, so flag-on (with no-op hooks) stays invariant
-        // against flag-off on the no-writer / dry-run path where no byte is
-        // emitted — the records-only arm makes the same unconditional bump there.
-        // The two arms diverge only on a `join_values` collision: the records-only
-        // arm dead-letters that record and excludes it from the write count, while
-        // this envelope arm keeps a collision fatal (documented above), so a
-        // successfully-written stream counts identically on both.
-        ctx.counters.records_written += 1;
-        ctx.records_emitted += 1;
-        if ctx.ok_source_rows.insert(row_num) {
-            ctx.counters.ok_count += 1;
-        }
-    }
+        Ok(())
+    })();
     {
         let _guard = ctx.write_timer.guard();
         driver.finish();
@@ -719,7 +988,20 @@ fn dispatch_output_envelope(
         ctx.collector.record(scan_timer.finish(0, 0));
     }
     ctx.output_errors.append(&mut driver.errors);
-    Ok(())
+    processing_result
+}
+
+fn next_envelope_record(
+    events: &mut dyn Iterator<
+        Item = Result<crate::executor::stream_event::StreamEvent, PipelineError>,
+    >,
+) -> Result<Option<(Record, crate::executor::stream_event::SourceRowId)>, PipelineError> {
+    for event in events {
+        if let crate::executor::stream_event::StreamEvent::Record(record, row_num) = event? {
+            return Ok(Some((record, row_num)));
+        }
+    }
+    Ok(None)
 }
 
 /// Lazy writer-open source the [`EnvelopeWriterDriver`] calls on the first
@@ -994,7 +1276,7 @@ struct FanOutContext<'a> {
     /// from its length and inserts each into `ok_source_rows`, matching the
     /// streaming arm; a record a collision dead-letters is simply never pushed
     /// here, so a written sibling sharing its row_num still counts.
-    written_rows: &'a mut Vec<u64>,
+    written_rows: &'a mut Vec<crate::executor::stream_event::SourceRowId>,
     output_staging: &'a crate::output::staging::OutputStagingRegistry,
 }
 
@@ -1005,7 +1287,7 @@ struct FanOutContext<'a> {
 fn emit_single_writer(
     fan_ctx: &mut FanOutContext<'_>,
     raw_writer: Box<dyn Write + Send>,
-    unbuffered: &[(Record, u64)],
+    unbuffered: &[(Record, crate::executor::stream_event::SourceRowId)],
     scan_timer: crate::executor::stage_metrics::StageTimer,
 ) {
     match build_format_writer(
@@ -1087,7 +1369,7 @@ fn emit_single_writer(
 /// their chance to flush or report.
 fn emit_fan_out(
     fan_ctx: &mut FanOutContext<'_>,
-    unbuffered: &[(Record, u64)],
+    unbuffered: &[(Record, crate::executor::stream_event::SourceRowId)],
     per_file: HashMap<Arc<str>, Box<dyn Write + Send>>,
     mut resolved_paths: HashMap<Arc<str>, String>,
     scan_timer: crate::executor::stage_metrics::StageTimer,

@@ -1,0 +1,44 @@
+# Two physical CSV files -> one globally ordered business export.
+#
+# `sort_order` on a Source applies independently inside each physical file.
+# Omitting `on_unsorted` exercises the default `warn` policy: an inverted file
+# is repaired before any of its records are released, with one W307 warning.
+pipeline:
+  name: ordering_contract
+
+nodes:
+  - type: source
+    name: events
+    config:
+      name: events
+      type: csv
+      paths:
+        - ./data/01-sorted.csv
+        - ./data/02-needs-repair.csv
+      options:
+        has_header: true
+      schema:
+        - { name: account_id, type: string }
+        - { name: batch_seq, type: int }
+        - { name: region, type: string }
+        - { name: priority, type: int }
+        - { name: event_id, type: string }
+        - { name: amount_cents, type: int }
+      sort_order:
+        - account_id
+        - batch_seq
+
+  - type: output
+    name: ordered
+    input: events
+    config:
+      name: ordered
+      type: csv
+      path: ./output/ordered.csv
+      include_unmapped: false
+      sort_order:
+        - { field: region, order: asc }
+        - { field: priority, order: desc }
+        - { field: account_id, order: asc }
+        - { field: batch_seq, order: asc }
+        - { field: event_id, order: asc }

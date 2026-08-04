@@ -249,18 +249,22 @@ fn combine_cxl_parse_failure_aborts() {
 }
 
 #[test]
-fn file_stem_reduces_target_paths() {
-    assert_eq!(
-        file_stem_of(std::path::Path::new("pipeline/order.yaml")),
-        "order"
-    );
-    assert_eq!(
-        file_stem_of(std::path::Path::new("../../pipeline/score.comp.yaml")),
-        "score"
-    );
-    // A per-target overlay's `channel.target` and the base path reduce equal.
-    let overlay = dom("channel:\n  target: ../../pipeline/order.yaml\n");
-    assert_eq!(overlay_target_stem(&overlay).as_deref(), Some("order"));
+fn logical_overlay_target_matches_only_the_catalog_scope() {
+    let overlay = dom("channel:\n  target: sales.orders\n");
+    let mut scope = RefactorTargetScope::default();
+    scope.pipelines.insert("sales.orders".to_string());
+    assert!(overlay_applies_to(
+        &overlay,
+        OverlayFileKind::PerTarget,
+        &scope
+    ));
+    scope.pipelines.clear();
+    scope.pipelines.insert("sales.returns".to_string());
+    assert!(!overlay_applies_to(
+        &overlay,
+        OverlayFileKind::PerTarget,
+        &scope
+    ));
 }
 
 // ── Discovery / guards ───────────────────────────────────────────────
@@ -304,7 +308,7 @@ fn write_fixture(root: &std::path::Path) {
 
     w(
         "clinker.toml",
-        "[channel]\nroot = \"channel\"\n[group]\nroot = \"group\"\n",
+        "[catalog.pipelines]\norder = \"pipeline/order.yaml\"\nother = \"pipeline/other.yaml\"\n\n[catalog.channels]\nacme = \"channel/acme\"\nbeta = \"channel/beta\"\n\n[channel]\nroot = \"channel\"\n[group]\nroot = \"group\"\n",
     );
 
     w(
@@ -315,24 +319,24 @@ fn write_fixture(root: &std::path::Path) {
     // Group: a structural op targeting the renamed source.
     w(
         "group/enterprise.group.yaml",
-        "group:\n  name: enterprise\n  match: 'tier == \"enterprise\"'\n  priority: 20\noverrides:\n  - op: patch_schema\n    target: orders\n    schema:\n      region: { add: { type: string } }\n",
+        "group:\n  name: enterprise\n  targets: { pipelines: [order] }\n  match: 'tier == \"enterprise\"'\n  priority: 20\noverrides:\n  - op: patch_schema\n    target: orders\n    schema:\n      region: { add: { type: string } }\n",
     );
 
     // Channel: manifest labels select the group; per-target overlay overrides the
     // combine's CXL, whose value references the renamed source qualifier.
     w(
         "channel/acme/channel.cfg.yaml",
-        "channel:\n  name: acme\nlabels:\n  tier: enterprise\n",
+        "channel:\n  name: acme\n  targets: [order]\nlabels:\n  tier: enterprise\n",
     );
     w(
         "channel/acme/order.channel.yaml",
-        "channel:\n  target: ../../pipeline/order.yaml\noverrides:\n  - op: set\n    target: joined\n    field: config.cxl\n    value: |\n      emit id = orders.id\n      emit amt = orders.amt\n",
+        "channel:\n  target: order\noverrides:\n  - op: set\n    target: joined\n    field: config.cxl\n    value: |\n      emit id = orders.id\n      emit amt = orders.amt\n",
     );
 
     // A DIFFERENT pipeline that also has a node named `orders`, with its own
     // per-target overlay referencing it under a channel that does NOT select the
-    // enterprise group (so the group's target-agnostic op never composes against
-    // it). Renaming `orders` in `order.yaml` must leave this overlay untouched
+    // enterprise group (whose target set excludes this pipeline). Renaming
+    // `orders` in `order.yaml` must leave this overlay untouched
     // (per-target scoping keyed on the overlay's target).
     w(
         "pipeline/other.yaml",
@@ -340,11 +344,11 @@ fn write_fixture(root: &std::path::Path) {
     );
     w(
         "channel/beta/channel.cfg.yaml",
-        "channel:\n  name: beta\nlabels:\n  tier: basic\n",
+        "channel:\n  name: beta\n  targets: [other]\nlabels:\n  tier: basic\n",
     );
     w(
         "channel/beta/other.channel.yaml",
-        "channel:\n  target: ../../pipeline/other.yaml\noverrides:\n  - op: patch_schema\n    target: orders\n    schema:\n      region: { add: { type: string } }\n",
+        "channel:\n  target: other\noverrides:\n  - op: patch_schema\n    target: orders\n    schema:\n      region: { add: { type: string } }\n",
     );
 
     // Source data files are declared with inline schemas, but create them so any
@@ -436,7 +440,7 @@ fn rename_node_real_run_propagates_and_relints_clean() {
     let manifest = std::fs::read_to_string(root.join("channel/acme/channel.cfg.yaml")).unwrap();
     assert_eq!(
         manifest,
-        "channel:\n  name: acme\nlabels:\n  tier: enterprise\n"
+        "channel:\n  name: acme\n  targets: [order]\nlabels:\n  tier: enterprise\n"
     );
 
     // A per-target overlay for a *different* pipeline that also has an `orders`

@@ -103,6 +103,9 @@ struct FieldConstraint {
 pub struct TypedProgram {
     pub program: Program,
     pub bindings: Vec<Option<ResolvedBinding>>,
+    /// Planner-admitted module declarations used to lower resolved module
+    /// constants and functions without filesystem access.
+    pub runtime_modules: Arc<crate::module_eval::RuntimeModuleRegistry>,
     /// Per-node type annotation, indexed by NodeId.
     pub types: Vec<Option<Type>>,
     /// Inferred field types for runtime DLQ validation. Deterministic
@@ -215,6 +218,7 @@ pub fn type_check_with_mode_and_vars(
         regexes: vec![None; node_count as usize],
         field_constraints: HashMap::new(),
         let_binding_nodes,
+        lexical_types: Vec::new(),
         diagnostics: Vec::new(),
         aggregate_mode: aggregate_mode.clone(),
         agg_function_depth: 0,
@@ -247,6 +251,7 @@ pub fn type_check_with_mode_and_vars(
     Ok(TypedProgram {
         program,
         bindings,
+        runtime_modules: Arc::clone(&scoped_vars.runtime_modules),
         types,
         field_types,
         regexes,
@@ -282,6 +287,10 @@ struct TypeChecker<'a> {
     /// `Any`, which is correct: an iterator/closure element type is unknown
     /// here. No index ever aliases an already-annotated unrelated binding.
     let_binding_nodes: Vec<NodeId>,
+    /// Lexical types for admitted module parameters and closure binders while
+    /// a retained declaration body is checked. Later entries shadow earlier
+    /// ones.
+    lexical_types: Vec<HashMap<Box<str>, Type>>,
     diagnostics: Vec<TypeDiagnostic>,
     // Note: in_predicate_expr tracking is done via the resolver's context,
     // but we track it here for the nested-window check
@@ -408,6 +417,13 @@ impl<'a> TypeChecker<'a> {
             });
     }
 
+    fn lexical_type(&self, name: &str) -> Option<Type> {
+        self.lexical_types
+            .iter()
+            .rev()
+            .find_map(|scope| scope.get(name).cloned())
+    }
+
     fn error(&mut self, span: Span, message: String, help: Option<String>) {
         self.diagnostics.push(TypeDiagnostic {
             span,
@@ -529,6 +545,10 @@ impl<'a> TypeChecker<'a> {
                 name,
                 span,
             } => {
+                if let Some(ty) = self.lexical_type(name) {
+                    self.set_type(*node_id, ty.clone());
+                    return ty;
+                }
                 let binding = self
                     .bindings
                     .get(node_id.0 as usize)
@@ -846,6 +866,35 @@ impl<'a> TypeChecker<'a> {
                 args,
                 span,
             } => {
+                let module_binding = self
+                    .bindings
+                    .get(node_id.0 as usize)
+                    .and_then(|binding| binding.as_ref())
+                    .and_then(|binding| match binding {
+                        ResolvedBinding::ModuleFunction(module, name) => {
+                            Some((module.clone(), name.clone()))
+                        }
+                        _ => None,
+                    });
+                if let Some((module, name)) = module_binding {
+                    let arg_types = args
+                        .iter()
+                        .map(|arg| self.check_expr(arg, in_predicate))
+                        .collect::<Vec<_>>();
+                    let ty = self.check_module_function_call(
+                        &module,
+                        &name,
+                        receiver,
+                        method,
+                        args,
+                        &arg_types,
+                        *span,
+                        in_predicate,
+                    );
+                    self.set_type(*node_id, ty.clone());
+                    return ty;
+                }
+
                 // `$window.lag(n).<field>` style postfix-field chain on a
                 // positional window builtin. The result type is the
                 // upstream row's declared type for `field`; an unknown
@@ -1167,16 +1216,133 @@ impl<'a> TypeChecker<'a> {
                 Type::Any
             }
 
-            Expr::Closure { node_id, body, .. } => {
+            Expr::Closure {
+                node_id,
+                param,
+                body,
+                ..
+            } => {
                 // Standalone closure typecheck happens here only for
                 // diagnostics — `MethodCall` callsites typecheck the
                 // body with the closure parameter introduced into
                 // scope. The closure as a value has no runtime type.
+                self.lexical_types
+                    .push(HashMap::from([(param.clone(), Type::Any)]));
                 self.check_expr(body, in_predicate);
+                self.lexical_types.pop();
                 self.set_type(*node_id, Type::Any);
                 Type::Any
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_module_function_call(
+        &mut self,
+        module: &str,
+        name: &str,
+        receiver: &Expr,
+        method: &str,
+        args: &[Expr],
+        arg_types: &[Type],
+        call_span: Span,
+        in_predicate: bool,
+    ) -> Type {
+        let call = match receiver {
+            Expr::FieldRef { name: alias, .. } => format!("{alias}.{method}"),
+            _ => format!("{module}.{name}"),
+        };
+        let signature = match self
+            .scoped_vars
+            .runtime_modules
+            .function_signature(module, name)
+        {
+            Ok(signature) => signature,
+            Err(error) => {
+                self.error(
+                    call_span,
+                    format!(
+                        "module call `{call}` resolved to `{module}.{name}`, but its admitted declaration is unavailable: {error}"
+                    ),
+                    Some(
+                        "recompile the pipeline so resolution and retained declarations agree"
+                            .into(),
+                    ),
+                );
+                return Type::Any;
+            }
+        };
+        if signature.parameters.len() != args.len() {
+            let expected = signature.parameters.len();
+            let actual = args.len();
+            let corrected = signature
+                .parameters
+                .iter()
+                .map(|parameter| format!("<{parameter}>"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.diagnostics.push(TypeDiagnostic {
+                span: call_span,
+                message: format!(
+                    "module call `{call}` resolves to `{module}.{name}`, which expects {expected} arguments, got {actual}; corrected form: `{call}({corrected})`"
+                ),
+                help: Some(format!(
+                    "pass exactly {expected} arguments declared by `{module}.{name}`"
+                )),
+                related_span: Some(signature.declaration_span),
+                is_warning: false,
+            });
+            return Type::Any;
+        }
+
+        let (_, mut body) = match self
+            .scoped_vars
+            .runtime_modules
+            .expand_function(module, name, call_span)
+        {
+            Ok(expanded) => expanded,
+            Err(error) => {
+                self.diagnostics.push(TypeDiagnostic {
+                    span: call_span,
+                    message: format!(
+                        "module call `{call}` could not admit body `{module}.{name}`: {error}"
+                    ),
+                    help: Some("correct the nested imported call to match its declaration".into()),
+                    related_span: Some(signature.declaration_span),
+                    is_warning: false,
+                });
+                return Type::Any;
+            }
+        };
+
+        let transient_start = self.types.len();
+        let mut next_id = u32::try_from(transient_start)
+            .expect("type side-table length is bounded by the parser node limit");
+        reindex_expr(&mut body, &mut next_id);
+        let transient_end = next_id as usize;
+        self.types.resize(transient_end, None);
+        self.regexes.resize(transient_end, None);
+
+        let lexical = signature
+            .parameters
+            .iter()
+            .cloned()
+            .zip(arg_types.iter().cloned())
+            .collect::<HashMap<_, _>>();
+        self.lexical_types.push(lexical);
+        let diagnostic_start = self.diagnostics.len();
+        let body_type = self.check_expr(&body, in_predicate);
+        self.lexical_types.pop();
+        for diagnostic in &mut self.diagnostics[diagnostic_start..] {
+            diagnostic.message = format!(
+                "module function `{module}.{name}` called as `{call}` has an ill-typed body: {}",
+                diagnostic.message
+            );
+            diagnostic.related_span = Some(signature.declaration_span);
+        }
+        self.types.truncate(transient_start);
+        self.regexes.truncate(transient_start);
+        body_type
     }
 
     /// enforce aggregate-context rules. Walks the program after type
@@ -1708,6 +1874,10 @@ impl<'a> TypeChecker<'a> {
         lt: &Type,
         rt: &Type,
     ) {
+        let lexical_lhs =
+            matches!(lhs, Expr::FieldRef { name, .. } if self.lexical_type(name).is_some());
+        let lexical_rhs =
+            matches!(rhs, Expr::FieldRef { name, .. } if self.lexical_type(name).is_some());
         // Only infer from operators that imply types
         let implied_type = match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => Some(Type::Numeric),
@@ -1722,11 +1892,13 @@ impl<'a> TypeChecker<'a> {
             BinOp::Eq | BinOp::Neq | BinOp::Gt | BinOp::Lt | BinOp::Gte | BinOp::Lte
         ) {
             if let Expr::FieldRef { name, span, .. } = lhs
+                && !lexical_lhs
                 && !matches!(rt, Type::Any)
             {
                 self.add_constraint(name, rt.clone(), *span);
             }
             if let Expr::FieldRef { name, span, .. } = rhs
+                && !lexical_rhs
                 && !matches!(lt, Type::Any)
             {
                 self.add_constraint(name, lt.clone(), *span);
@@ -1734,10 +1906,14 @@ impl<'a> TypeChecker<'a> {
         }
 
         if let Some(ref ty) = implied_type {
-            if let Expr::FieldRef { name, span, .. } = lhs {
+            if let Expr::FieldRef { name, span, .. } = lhs
+                && !lexical_lhs
+            {
                 self.add_constraint(name, ty.clone(), *span);
             }
-            if let Expr::FieldRef { name, span, .. } = rhs {
+            if let Expr::FieldRef { name, span, .. } = rhs
+                && !lexical_rhs
+            {
                 self.add_constraint(name, ty.clone(), *span);
             }
         }
@@ -1857,6 +2033,104 @@ impl<'a> TypeChecker<'a> {
     }
 }
 
+fn reindex_expr(expr: &mut Expr, next_id: &mut u32) {
+    let node_id = match expr {
+        Expr::Binary { node_id, .. }
+        | Expr::Unary { node_id, .. }
+        | Expr::Literal { node_id, .. }
+        | Expr::FieldRef { node_id, .. }
+        | Expr::QualifiedFieldRef { node_id, .. }
+        | Expr::MethodCall { node_id, .. }
+        | Expr::Match { node_id, .. }
+        | Expr::IfThenElse { node_id, .. }
+        | Expr::Coalesce { node_id, .. }
+        | Expr::WindowCall { node_id, .. }
+        | Expr::PipelineAccess { node_id, .. }
+        | Expr::VarsAccess { node_id, .. }
+        | Expr::ConfigAccess { node_id, .. }
+        | Expr::SourceAccess { node_id, .. }
+        | Expr::QualifiedSourceAccess { node_id, .. }
+        | Expr::RecordAccess { node_id, .. }
+        | Expr::DocAccess { node_id, .. }
+        | Expr::Now { node_id, .. }
+        | Expr::Wildcard { node_id, .. }
+        | Expr::AggCall { node_id, .. }
+        | Expr::AggSlot { node_id, .. }
+        | Expr::GroupKey { node_id, .. }
+        | Expr::IndexAccess { node_id, .. }
+        | Expr::Closure { node_id, .. } => node_id,
+    };
+    *node_id = NodeId(*next_id);
+    *next_id = next_id
+        .checked_add(1)
+        .expect("module body node count fits in u32");
+
+    match expr {
+        Expr::Binary { lhs, rhs, .. } | Expr::Coalesce { lhs, rhs, .. } => {
+            reindex_expr(lhs, next_id);
+            reindex_expr(rhs, next_id);
+        }
+        Expr::Unary { operand, .. } => reindex_expr(operand, next_id),
+        Expr::MethodCall { receiver, args, .. } => {
+            reindex_expr(receiver, next_id);
+            for arg in args {
+                reindex_expr(arg, next_id);
+            }
+        }
+        Expr::Match { subject, arms, .. } => {
+            if let Some(subject) = subject {
+                reindex_expr(subject, next_id);
+            }
+            for arm in arms {
+                arm.node_id = NodeId(*next_id);
+                *next_id = next_id
+                    .checked_add(1)
+                    .expect("module body node count fits in u32");
+                reindex_expr(&mut arm.pattern, next_id);
+                reindex_expr(&mut arm.body, next_id);
+            }
+        }
+        Expr::IfThenElse {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            reindex_expr(condition, next_id);
+            reindex_expr(then_branch, next_id);
+            if let Some(else_branch) = else_branch {
+                reindex_expr(else_branch, next_id);
+            }
+        }
+        Expr::WindowCall { args, .. } | Expr::AggCall { args, .. } => {
+            for arg in args {
+                reindex_expr(arg, next_id);
+            }
+        }
+        Expr::IndexAccess {
+            receiver, index, ..
+        } => {
+            reindex_expr(receiver, next_id);
+            reindex_expr(index, next_id);
+        }
+        Expr::Closure { body, .. } => reindex_expr(body, next_id),
+        Expr::Literal { .. }
+        | Expr::FieldRef { .. }
+        | Expr::QualifiedFieldRef { .. }
+        | Expr::PipelineAccess { .. }
+        | Expr::VarsAccess { .. }
+        | Expr::ConfigAccess { .. }
+        | Expr::SourceAccess { .. }
+        | Expr::QualifiedSourceAccess { .. }
+        | Expr::RecordAccess { .. }
+        | Expr::DocAccess { .. }
+        | Expr::Now { .. }
+        | Expr::Wildcard { .. }
+        | Expr::AggSlot { .. }
+        | Expr::GroupKey { .. } => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::row::Row;
@@ -1894,6 +2168,95 @@ mod tests {
         assert!(parsed.errors.is_empty());
         let resolved = resolve_program(parsed.ast, fields, parsed.node_count).unwrap();
         type_check(resolved, schema).expect_err("Expected type errors but got Ok")
+    }
+
+    fn typecheck_with_module(
+        source: &str,
+        module_source: &str,
+    ) -> Result<TypedProgram, Vec<TypeDiagnostic>> {
+        let parsed_module = Parser::parse_module(module_source);
+        assert!(parsed_module.errors.is_empty());
+        let exports = crate::resolve::ModuleExports {
+            functions: parsed_module
+                .module
+                .functions
+                .iter()
+                .map(|function| function.name.to_string())
+                .collect(),
+            constants: parsed_module
+                .module
+                .constants
+                .iter()
+                .map(|constant| constant.name.to_string())
+                .collect(),
+        };
+        let mut runtime_modules = crate::module_eval::RuntimeModuleRegistry::default();
+        runtime_modules.insert("app.main", parsed_module.module, HashMap::new());
+        let scoped_vars = crate::resolve::ScopedVarsRegistry {
+            module_exports: HashMap::from([("app.main".to_owned(), exports)]),
+            runtime_modules: Arc::new(runtime_modules),
+            ..Default::default()
+        };
+        let parsed = Parser::parse(source);
+        assert!(parsed.errors.is_empty());
+        let resolved = crate::resolve::resolve_program_with_modules_and_vars(
+            parsed.ast,
+            &["value"],
+            parsed.node_count,
+            &scoped_vars.module_exports,
+            &scoped_vars,
+        )
+        .unwrap();
+        let schema = Row::closed(
+            IndexMap::from([(QualifiedField::bare("value"), Type::Int)]),
+            Span::new(0, 0),
+        );
+        type_check_with_mode_and_vars(resolved, &schema, AggregateMode::Row, &scoped_vars)
+    }
+
+    #[test]
+    fn module_function_arity_diagnostic_has_call_and_declaration_spans() {
+        let diagnostics = typecheck_with_module(
+            "use app.main as app\nemit value = app.combine(value)",
+            "fn combine(left, right) = left + right\n",
+        )
+        .expect_err("wrong arity must fail typecheck");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("expects 2 arguments"))
+            .expect("arity diagnostic");
+
+        assert!(diagnostic.span.end > diagnostic.span.start);
+        assert!(diagnostic.related_span.is_some());
+        assert!(diagnostic.message.contains("app.combine(<left>, <right>)"));
+    }
+
+    #[test]
+    fn module_function_body_uses_callsite_argument_type() {
+        let diagnostics = typecheck_with_module(
+            "use app.main as app\nemit value = app.add_one(\"text\")",
+            "fn add_one(value) = value + 1\n",
+        )
+        .expect_err("String argument makes the numeric body ill-typed");
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("ill-typed body"))
+            .expect("body diagnostic");
+
+        assert!(diagnostic.message.contains("String"));
+        assert!(diagnostic.message.contains("Int"));
+        assert!(diagnostic.related_span.is_some());
+    }
+
+    #[test]
+    fn module_function_binding_precedes_builtin_registry() {
+        let typed = typecheck_with_module(
+            "use app.main as app\nemit value = app.length(value)",
+            "fn length(value) = value + 1\n",
+        )
+        .expect("resolved module declaration shadows the builtin name");
+
+        assert_eq!(first_emit_expr_type(&typed), Type::Int);
     }
 
     // Find the type of the first expression in the first emit statement

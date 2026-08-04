@@ -38,10 +38,30 @@ nodes:
         - { name: first_response_mins, type: string }
         - { name: satisfaction, type: string }
 
+  # The source validates `opened_at` as a real DateTime. Clinker's internal
+  # DateTime is timezone-free, while this export's public text contract uses
+  # RFC 3339 UTC, so render the typed value back to that exact spelling before
+  # the transform that may reject a row. That keeps both successful outputs
+  # and rejected-row evidence byte-stable without retaining the raw source
+  # string as the declared value.
+  - type: transform
+    name: canonicalize_opened_at
+    input: tickets
+    config:
+      cxl: |
+        emit ticket_id = ticket_id
+        emit opened_at = opened_at.format_date("%Y-%m-%dT%H:%M:%SZ")
+        emit customer_email = customer_email
+        emit raw_priority = raw_priority
+        emit category = category
+        emit subject = subject
+        emit first_response_mins = first_response_mins
+        emit satisfaction = satisfaction
+
   - type: transform
     name: normalize
     description: Fold the priority vocabulary and derive an SLA breach flag
-    input: tickets
+    input: canonicalize_opened_at
     config:
       cxl: |
         let p = raw_priority.upper()

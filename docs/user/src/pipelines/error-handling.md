@@ -47,6 +47,13 @@ A pipeline that completes with DLQ entries exits with **code 2** -- this signals
 
 > **Migrating from `best_effort`.** The removed `best_effort` spelling was a third name for the `continue` behavior: it wrote the same DLQ entries and produced the same exit code, because the runtime never distinguished the two. Replace it with `strategy: continue`. A pipeline still carrying `best_effort` is rejected at config-validation time with a message naming the replacement.
 
+Declared source-type failures are deliberately not lossy: under `continue`,
+the complete original record is written to the
+configured DLQ and no null, raw, or partially converted replacement enters the
+pipeline. This strategy therefore requires an `error_handling.dlq` block when
+such a failure occurs. `fail_fast` stops on the first failure without emitting a
+replacement.
+
 ## DLQ configuration
 
 The DLQ is always written as CSV, regardless of the pipeline's input/output formats.
@@ -60,7 +67,7 @@ The DLQ is always written as CSV, regardless of the pipeline's input/output form
 
 | Field | Required | Default | Description |
 |-------|----------|---------|-------------|
-| `path` | No | -- | File path for DLQ output. If omitted, DLQ records are logged but not written to file. |
+| `path` | No | -- | File path for DLQ output. If omitted, DLQ records are logged but not written to file. The `dlq:` block itself is required to continue past a declared source-type failure. |
 | `include_reason` | No | -- | Include `_cxl_dlq_error_category` and `_cxl_dlq_error_detail` columns. |
 | `include_source_row` | No | -- | Include the stable alphabetical union of user source fields across all DLQ records. A field absent from one record is an empty cell. |
 
@@ -116,13 +123,25 @@ The `_cxl_dlq_error_category` column contains one of these values:
 
 ### Type error threshold
 
-Abort the pipeline if the fraction of failing records exceeds a threshold:
+Abort the pipeline if the fraction of declared source-type failures exceeds a threshold:
 
 ```yaml
   type_error_threshold: 0.05    # Abort if >5% of records fail
 ```
 
-This acts as a circuit breaker -- if your input data is unexpectedly corrupt, the pipeline stops early rather than filling the DLQ with millions of entries.
+The cumulative ratio is:
+
+```text
+declared source-type failures / decoded source rows observed
+```
+
+The rejected row appears once in both numerator and denominator. The same
+typed-error event is used for strategy routing, DLQ accounting, and this
+circuit breaker; unrelated validation, structural-document, and collateral
+DLQ entries do not enter the numerator. Equality is allowed: a threshold of
+`0.05` stops only when the ratio is strictly greater than 5%. `0.0` stops on
+the first type failure, while `1.0` never trips. Values must be finite and in
+`[0.0, 1.0]`.
 
 ### Correlation key
 
@@ -181,13 +200,22 @@ This is the document-shaped analogue of [correlation keys](#correlation-key): us
 
 **Document grain.** The document is the **outermost** level — the source file. For a flat format (CSV, JSON, plain XML) each input file is one document. For a nested-envelope format (an X12 `ISA → GS → ST` interchange, an EDIFACT `UNB → UNG → UNH`) the document is the whole **interchange / file**, not an inner functional group or transaction set: a failure anywhere in the interchange rejects the entire interchange, including the transaction sets that validated cleanly. Reject the inner-level grain instead by partitioning the input so each interchange is its own file is not currently offered — the grain is fixed at the file.
 
-**DLQ rate.** Every emitted entry — the trigger and each collateral — counts toward the DLQ-rate denominator the [type error threshold](#type-error-threshold) circuit breaker measures, matching the correlated-collateral precedent. A rejected 1000-record document contributes 1000 entries, so size any `type_error_threshold` with whole-document rejection in mind.
+**DLQ rate.** Every emitted entry — the trigger and each collateral — counts toward the configured DLQ `max_rate`, matching the correlated-collateral precedent. A rejected 1000-record document contributes 1000 DLQ entries. It does **not** affect [`type_error_threshold`](#type-error-threshold), whose numerator contains only declared source-type failures.
 
 **Memory.** The engine buffers each open document's records until its boundary, then flushes the document clean to the sink or rejects it and drops the buffer. Peak memory scales with the **concurrently-open** documents, not the total input; a single very large document spills its buffer to disk under the run's memory budget rather than holding everything in RAM. See [Streaming vs blocking](../ops/streaming-vs-blocking.md) for the spill model.
 
 **Output restriction.** Document-level DLQ flushes each whole document to a single output writer, so it cannot be combined with a [per-source-file output](../nodes/output.md) (a `{source_file}` / `{source_path}` path template over a multi-file source). The two are rejected together at compile time (E343); use a single output path, or set `dlq_granularity: record` if per-file output is the requirement.
 
 **Strategy requirement.** `dlq_granularity: document` requires `error_handling.strategy: continue`. It is incompatible with the default `fail_fast`: document-level dead-lettering keeps the run going past a bad document, which contradicts fail-fast's abort-on-first-error. The combination is rejected at compile time (E344) — set `strategy: continue` to dead-letter bad documents, or keep `fail_fast` with the default `dlq_granularity: record`.
+
+**Correlation restriction.** Document-level and correlation-key rejection are
+alternative atomic-disposition models. A document is keyed by its source file;
+a correlation group can span files and is keyed by authored field values. The
+engine does not define precedence or a combined writer boundary for those two
+populations, so a pipeline containing both `dlq_granularity: document` and any
+`correlation_key` is rejected at compile time (E370). Remove every
+`correlation_key` to keep document rejection, or set `dlq_granularity: record`
+to keep correlation rejection.
 
 **Spilling stages.** Document identity survives memory pressure end to end. The per-document buffer identifies each document before buffering and spills under the memory budget, and a blocking stage (Sort, hash Aggregate, grace-hash Combine) between the source and the output preserves each record's document context — including the source file the grain keys on — across its own spill round-trip. A document whose records pass through a spilling stage is therefore still grouped and rejected as one document under memory pressure, exactly as it would be in memory.
 

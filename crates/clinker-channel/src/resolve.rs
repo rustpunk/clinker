@@ -38,21 +38,27 @@ use clinker_plan::config::composition::LayerKind;
 use clinker_plan::config::pipeline_node::PipelineNode;
 use clinker_plan::config::{ChannelLayout, GroupLayout, PipelineConfig, SourceConfigPatch};
 use clinker_plan::overlay_ops::{LayeredOp, OverlayLayer, OverlayOp};
-use clinker_plan::plan::{ChannelIdentity, CompiledPlan};
+use clinker_plan::plan::CompiledPlan;
+use clinker_plan::plan::compiled::{
+    ChannelGroupSource, ChannelIdentity, ChannelLayerIdentity, ChannelLayerKind,
+};
+use clinker_plan::resources::{CatalogResourceKind, LogicalResourceId, WorkspaceCatalog};
 use clinker_plan::yaml::Spanned;
 
+use crate::apply_group_config;
 use crate::derivation::{derive_groups, group_layer};
 use crate::discovery::{
-    CHANNEL_MANIFEST_FILE, OverlayKind, ResolvedOverlay, channel_dir, resolve_channel_overlay,
+    CHANNEL_MANIFEST_FILE, LayerSourceIdentity, OverlayKind, ResolvedOverlay,
+    contained_layout_root, discover_channel_resource, discover_channel_target,
+    read_contained_layer, resolve_channel_overlay, scan_groups_with_identity,
 };
 use crate::error::ChannelError;
-use crate::group::Group;
+use crate::group::{Group, validate_group_targets};
 use crate::manifest::{ChannelManifest, ChannelVars};
 use crate::overlay::{
-    ChannelOverlayResult, EffectiveConfig, apply_config_clobber, resolve_vars_layer,
-    validate_config_keys,
+    ChannelOverlayResult, EffectiveConfig, ResolvedChannelConfig, apply_config_candidates,
+    resolve_vars_layer,
 };
-use crate::{apply_group_config, scan_groups};
 
 /// Why a group joined the overlay stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +77,13 @@ impl GroupSource {
             GroupSource::Explicit => "explicit",
         }
     }
+
+    fn identity(self) -> ChannelGroupSource {
+        match self {
+            GroupSource::Derived => ChannelGroupSource::Derived,
+            GroupSource::Explicit => ChannelGroupSource::Explicit,
+        }
+    }
 }
 
 /// One group applied to the stack, carrying the layer identities both surfaces
@@ -83,6 +96,9 @@ pub struct AppliedGroup {
     pub priority: i64,
     /// Why this group was applied.
     pub source: GroupSource,
+    /// Stable declaration order after deterministic group discovery sorting.
+    declaration_sequence: u32,
+    source_identity: LayerSourceIdentity,
     /// Config-clobber layer (carries priority + declaration seq).
     layer: LayerKind,
     /// Op-stream precedence layer.
@@ -109,12 +125,8 @@ pub struct InjectedNode {
 struct ChannelContext {
     id: String,
     manifest: Option<ChannelManifest>,
+    manifest_identity: Option<LayerSourceIdentity>,
     per_target: Option<ResolvedOverlay>,
-    /// BLAKE3 over the channel id plus the raw bytes of its manifest and
-    /// per-target overlay files. Content-sensitive so a changed overlay yields
-    /// a distinct [`ChannelIdentity`], rather than a bare id hash that would
-    /// collide across edits.
-    content_hash: [u8; 32],
 }
 
 /// A fully resolved overlay stack for one (target, channel?, groups)
@@ -161,13 +173,15 @@ impl OverlayResolution {
             || self
                 .applied_groups
                 .iter()
-                .any(|applied| !applied.group.config.is_empty() || !applied.group.fixed.is_empty())
+                .any(|applied| !applied.group.config.is_empty())
             || self.channel.as_ref().is_some_and(|ctx| {
-                ctx.manifest.as_ref().is_some_and(|manifest| {
-                    !manifest.config.is_empty() || !manifest.fixed.is_empty()
-                }) || ctx.per_target.as_ref().is_some_and(|overlay| {
-                    !overlay.overlay.config.is_empty() || !overlay.overlay.fixed.is_empty()
-                })
+                ctx.manifest
+                    .as_ref()
+                    .is_some_and(|manifest| !manifest.config.is_empty())
+                    || ctx
+                        .per_target
+                        .as_ref()
+                        .is_some_and(|overlay| !overlay.overlay.config.is_empty())
             })
     }
 
@@ -219,34 +233,72 @@ impl OverlayResolution {
             .map(|o| &o.overlay.sources)
     }
 
-    /// Resolve the winning composition `config:` value per node for the
-    /// pre-compile `$config.<param>` fold, keyed
-    /// `composition-node-name -> param -> value`.
+    /// Validate every composition `config:` candidate against a compiled view
+    /// of the selected target, then resolve the winning value per node for the
+    /// executable `$config.<param>` fold.
     ///
-    /// Applies the same layers in the same ascending-precedence order as
+    /// Validation applies every candidate to a private provenance clone before
+    /// any winning map is exposed. Thus an invalid value cannot disappear just
+    /// because a later layer would shadow it. The fold uses the same order as
     /// [`Self::apply_config_and_vars`] (groups by priority → channel-wide →
-    /// per-target), so the folded value matches the layer the `ProvenanceDb`
-    /// renders as `[WON]`. The map feeds
-    /// [`CompileContext::config_overrides`](clinker_plan::config::CompileContext);
-    /// the provenance chain is still recorded separately by
-    /// `apply_config_and_vars`, so this does not double-apply the override.
-    pub fn effective_config_overrides(&self) -> clinker_plan::config::ConfigOverrides {
-        let mut eff = EffectiveConfig::default();
+    /// per-target), so execution and rendered `[WON]` provenance agree.
+    ///
+    /// # Errors
+    ///
+    /// Returns all candidate diagnostics when any name, type, ambiguity, or
+    /// fixed-lock check fails. Callers must abort before executable compile.
+    pub fn resolve_config(
+        &self,
+        validation_plan: &CompiledPlan,
+    ) -> Result<ResolvedChannelConfig, Vec<Diagnostic>> {
+        let mut provenance = validation_plan.provenance().clone();
+        let mut diagnostics = Vec::new();
         for applied in &self.applied_groups {
-            eff.apply(&applied.group.config, applied.layer, false);
-            eff.apply(&applied.group.fixed, applied.layer, true);
+            apply_config_candidates(
+                &mut provenance,
+                &applied.group.config,
+                applied.layer,
+                &applied.name,
+                &mut diagnostics,
+            );
         }
         if let Some(ctx) = &self.channel {
             if let Some(manifest) = &ctx.manifest {
-                eff.apply(&manifest.config, LayerKind::ChannelWide, false);
-                eff.apply(&manifest.fixed, LayerKind::ChannelWide, true);
+                apply_config_candidates(
+                    &mut provenance,
+                    &manifest.config,
+                    LayerKind::ChannelWide,
+                    &ctx.id,
+                    &mut diagnostics,
+                );
             }
             if let Some(overlay) = &ctx.per_target {
-                eff.apply(&overlay.overlay.config, LayerKind::ChannelPerTarget, false);
-                eff.apply(&overlay.overlay.fixed, LayerKind::ChannelPerTarget, true);
+                apply_config_candidates(
+                    &mut provenance,
+                    &overlay.overlay.config,
+                    LayerKind::ChannelPerTarget,
+                    &ctx.id,
+                    &mut diagnostics,
+                );
             }
         }
-        eff.into_overrides()
+        if !diagnostics.is_empty() {
+            return Err(diagnostics);
+        }
+
+        let mut eff = EffectiveConfig::default();
+        for applied in &self.applied_groups {
+            eff.apply(&applied.group.config, applied.layer);
+        }
+        if let Some(ctx) = &self.channel {
+            if let Some(manifest) = &ctx.manifest {
+                eff.apply(&manifest.config, LayerKind::ChannelWide);
+            }
+            if let Some(overlay) = &ctx.per_target {
+                eff.apply(&overlay.overlay.config, LayerKind::ChannelPerTarget);
+            }
+        }
+        Ok(eff.into_resolved())
     }
 
     /// Apply the value-clobber surface (`config` + `vars`) of every layer over a
@@ -282,77 +334,95 @@ impl OverlayResolution {
             // Channel-wide (manifest): applies to every pipeline this channel
             // runs.
             if let Some(manifest) = &ctx.manifest {
-                clobber_config(
-                    plan,
+                apply_config_candidates(
+                    plan.provenance_mut(),
                     &manifest.config,
-                    &manifest.fixed,
                     LayerKind::ChannelWide,
                     &ctx.id,
-                    &mut result,
+                    &mut result.diagnostics,
                 );
                 resolve_vars_layer(&ctx.id, &manifest.vars, config, &mut result);
             }
             // Per-target overlay: the highest layer.
             if let Some(overlay) = &ctx.per_target {
-                clobber_config(
-                    plan,
+                apply_config_candidates(
+                    plan.provenance_mut(),
                     &overlay.overlay.config,
-                    &overlay.overlay.fixed,
                     LayerKind::ChannelPerTarget,
                     &ctx.id,
-                    &mut result,
+                    &mut result.diagnostics,
                 );
                 apply_overlay_vars(overlay, &ctx.id, config, &mut result);
             }
-            plan.set_channel_identity(ChannelIdentity {
-                name: ctx.id.clone(),
-                content_hash: ctx.content_hash,
+        }
+
+        if self.channel.is_some() || !self.applied_groups.is_empty() {
+            let mut layers = Vec::with_capacity(
+                1 + self.applied_groups.len()
+                    + self.channel.as_ref().map_or(0, |context| {
+                        usize::from(context.manifest.is_some())
+                            + usize::from(context.per_target.is_some())
+                    }),
+            );
+            layers.push(ChannelLayerIdentity {
+                kind: ChannelLayerKind::PipelineDefault,
+                name: config.pipeline.name.clone(),
+                group_priority: None,
+                group_sequence: None,
+                group_source: None,
+                byte_len: 0,
+                content_hash: *plan.pipeline_hash(),
             });
+            for applied in &self.applied_groups {
+                layers.push(ChannelLayerIdentity {
+                    kind: ChannelLayerKind::Group,
+                    name: applied.name.clone(),
+                    group_priority: Some(applied.priority),
+                    group_sequence: Some(applied.declaration_sequence),
+                    group_source: Some(applied.source.identity()),
+                    byte_len: applied.source_identity.byte_len,
+                    content_hash: applied.source_identity.content_hash,
+                });
+            }
+            if let Some(context) = &self.channel {
+                if let Some(identity) = &context.manifest_identity {
+                    layers.push(channel_file_identity(
+                        ChannelLayerKind::ChannelWide,
+                        &context.id,
+                        identity,
+                    ));
+                }
+                if let Some(overlay) = &context.per_target {
+                    layers.push(channel_file_identity(
+                        ChannelLayerKind::ChannelPerTarget,
+                        &overlay.overlay.channel.target,
+                        &overlay.source_identity,
+                    ));
+                }
+            }
+            plan.set_channel_identity(ChannelIdentity::from_layers(
+                self.channel.as_ref().map(|context| context.id.clone()),
+                layers,
+            ));
         }
 
         result
     }
 }
 
-/// Clobber a channel layer's value-clobber surface — the non-fixed `config` map
-/// and the locked `fixed` map — onto a plan's provenance at `layer`. `config`
-/// applies non-fixed (a higher layer may override it); `fixed` applies with the
-/// layer `fixed` lock set so it holds against every higher-precedence layer. A
-/// key present in both is clobbered `fixed`-last and thus wins within the layer.
-fn clobber_config(
-    plan: &mut CompiledPlan,
-    config: &indexmap::IndexMap<String, serde_json::Value>,
-    fixed: &indexmap::IndexMap<String, serde_json::Value>,
-    layer: LayerKind,
-    source_label: &str,
-    result: &mut ChannelOverlayResult,
-) {
-    clobber_config_map(plan, config, layer, false, source_label, result);
-    clobber_config_map(plan, fixed, layer, true, source_label, result);
-}
-
-/// Clobber one raw config map (string keys validated into dotted paths) onto a
-/// plan's provenance at `layer`, with the layer `fixed` lock set per `fixed`. A
-/// malformed key is a hard error surfaced as a diagnostic; an
-/// unknown-but-well-formed key is `E113` from the clobber.
-fn clobber_config_map(
-    plan: &mut CompiledPlan,
-    config: &indexmap::IndexMap<String, serde_json::Value>,
-    layer: LayerKind,
-    fixed: bool,
-    source_label: &str,
-    result: &mut ChannelOverlayResult,
-) {
-    match validate_config_keys(config) {
-        Ok(validated) => apply_config_clobber(
-            plan.provenance_mut(),
-            &validated,
-            layer,
-            fixed,
-            source_label,
-            &mut result.diagnostics,
-        ),
-        Err(e) => push_config_error(&mut result.diagnostics, source_label, &e),
+fn channel_file_identity(
+    kind: ChannelLayerKind,
+    name: &str,
+    source: &LayerSourceIdentity,
+) -> ChannelLayerIdentity {
+    ChannelLayerIdentity {
+        kind,
+        name: name.to_string(),
+        group_priority: None,
+        group_sequence: None,
+        group_source: None,
+        byte_len: source.byte_len,
+        content_hash: source.content_hash,
     }
 }
 
@@ -415,6 +485,8 @@ pub enum ResolveError {
         /// Group names that do exist, for a "did you mean" hint.
         known: Vec<String>,
     },
+    /// A forced group exists but does not admit the selected logical target.
+    GroupOutOfScope { name: String, target: String },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -448,11 +520,204 @@ impl std::fmt::Display for ResolveError {
                 }
                 Ok(())
             }
+            ResolveError::GroupOutOfScope { name, target } => write!(
+                f,
+                "group {name:?} does not declare target `{target}`; add the pipeline or one of its admitted compositions to `group.targets`"
+            ),
         }
     }
 }
 
 impl std::error::Error for ResolveError {}
+
+/// Resolve one logical catalog pipeline through the target-scoped channel and
+/// group contract. This is the authoritative run/explain/lint entry point.
+pub fn resolve_target_channel(
+    workspace_root: &Path,
+    catalog: &WorkspaceCatalog,
+    group_layout: &GroupLayout,
+    pipeline_id: &str,
+    channel_id: Option<&str>,
+    explicit_groups: &[String],
+    auto_groups: bool,
+) -> Result<OverlayResolution, ResolveError> {
+    let pipeline = LogicalResourceId::parse(pipeline_id).map_err(|error| {
+        ResolveError::Channel(ChannelError::InvalidChannelResource {
+            channel: channel_id.unwrap_or("standalone").to_string(),
+            reason: error.to_string(),
+        })
+    })?;
+    catalog
+        .resolve(CatalogResourceKind::Pipeline, &pipeline)
+        .map_err(|error| {
+            ResolveError::Channel(ChannelError::InvalidChannelResource {
+                channel: channel_id.unwrap_or("standalone").to_string(),
+                reason: error.to_string(),
+            })
+        })?;
+
+    let mut loaded_groups =
+        scan_groups_with_identity(group_layout, workspace_root).map_err(ResolveError::Scan)?;
+    loaded_groups.sort_by(|a, b| a.value.name.cmp(&b.value.name));
+    let group_identities = loaded_groups
+        .iter()
+        .map(|loaded| loaded.identity.clone())
+        .collect::<Vec<_>>();
+    let all_groups = loaded_groups
+        .into_iter()
+        .map(|loaded| loaded.value)
+        .collect::<Vec<_>>();
+
+    let (channel, target) = match channel_id {
+        Some(id) => {
+            let resource = discover_channel_resource(catalog, id, pipeline_id)
+                .map_err(ResolveError::Channel)?;
+            let target = resource.target.clone();
+            (
+                Some(ChannelContext {
+                    id: id.to_string(),
+                    manifest: Some((*resource.manifest).clone()),
+                    manifest_identity: Some(resource.manifest_identity),
+                    per_target: Some(ResolvedOverlay {
+                        path: resource.overlay_path,
+                        kind: OverlayKind::Pipeline,
+                        overlay: (*resource.overlay).clone(),
+                        source_identity: resource.overlay_identity,
+                    }),
+                }),
+                target,
+            )
+        }
+        None => (
+            None,
+            discover_channel_target(catalog, pipeline).map_err(ResolveError::Channel)?,
+        ),
+    };
+
+    let mut admitted = Vec::with_capacity(all_groups.len());
+    for group in &all_groups {
+        let targets = validate_group_targets(catalog, group).map_err(ResolveError::Channel)?;
+        admitted.push(targets.admits(&target));
+    }
+
+    let labels = channel
+        .as_ref()
+        .and_then(|context| context.manifest.as_ref())
+        .map(|manifest| manifest.labels.clone())
+        .unwrap_or_default();
+    let mut chosen: Vec<(usize, GroupSource)> = Vec::new();
+    if auto_groups && channel.is_some() {
+        let scoped: Vec<(usize, Group)> = all_groups
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(index, _)| admitted[*index])
+            .collect();
+        let scoped_groups: Vec<Group> = scoped.iter().map(|(_, group)| group.clone()).collect();
+        let derivation = derive_groups(&scoped_groups, &labels);
+        if derivation.has_errors() {
+            return Err(ResolveError::Selector(
+                derivation
+                    .errors()
+                    .map(|(group, error)| (group.name.clone(), error.to_string()))
+                    .collect(),
+            ));
+        }
+        for selection in derivation.selected() {
+            chosen.push((scoped[selection.seq as usize].0, GroupSource::Derived));
+        }
+    }
+    for name in explicit_groups {
+        let index = all_groups
+            .iter()
+            .position(|group| &group.name == name)
+            .ok_or_else(|| ResolveError::UnknownGroup {
+                name: name.clone(),
+                known: all_groups.iter().map(|group| group.name.clone()).collect(),
+            })?;
+        if !admitted[index] {
+            return Err(ResolveError::GroupOutOfScope {
+                name: name.clone(),
+                target: pipeline_id.to_string(),
+            });
+        }
+        if !chosen
+            .iter()
+            .any(|(chosen_index, _)| *chosen_index == index)
+        {
+            chosen.push((index, GroupSource::Explicit));
+        }
+    }
+
+    Ok(build_resolution(
+        all_groups,
+        group_identities,
+        channel,
+        chosen,
+    ))
+}
+
+fn build_resolution(
+    all_groups: Vec<Group>,
+    group_identities: Vec<LayerSourceIdentity>,
+    channel: Option<ChannelContext>,
+    chosen: Vec<(usize, GroupSource)>,
+) -> OverlayResolution {
+    let mut applied_groups: Vec<AppliedGroup> = chosen
+        .into_iter()
+        .map(|(index, source)| {
+            let group = all_groups[index].clone();
+            let seq = u32::try_from(index).unwrap_or(u32::MAX);
+            let layer = group_layer(&group, seq);
+            let op_priority = match layer {
+                LayerKind::Group { priority, .. } => i64::from(priority),
+                _ => group.priority,
+            };
+            AppliedGroup {
+                name: group.name.clone(),
+                priority: group.priority,
+                source,
+                declaration_sequence: seq,
+                source_identity: group_identities[index].clone(),
+                layer,
+                op_layer: OverlayLayer::Group {
+                    priority: op_priority,
+                },
+                group,
+            }
+        })
+        .collect();
+    applied_groups.sort_by_key(|group| group.layer);
+
+    let mut op_stream = Vec::new();
+    let mut injected_nodes = Vec::new();
+    for applied in &applied_groups {
+        push_ops(
+            &mut op_stream,
+            &mut injected_nodes,
+            &applied.group.overrides,
+            applied.op_layer,
+            &applied.name,
+        );
+    }
+    if let Some(context) = &channel
+        && let Some(overlay) = &context.per_target
+    {
+        push_ops(
+            &mut op_stream,
+            &mut injected_nodes,
+            &overlay.overlay.overrides,
+            OverlayLayer::ChannelPerTarget,
+            &context.id,
+        );
+    }
+    OverlayResolution {
+        channel,
+        applied_groups,
+        injected_nodes,
+        op_stream,
+    }
+}
 
 /// Resolve the overlay stack for one target.
 ///
@@ -477,41 +742,66 @@ pub fn resolve(
     // derivation both read this set. Sort by name so the derivation `seq` (which
     // breaks equal-priority ties) is a stable, portable order rather than the
     // filesystem-dependent `scan_groups` walk order.
-    let mut all_groups = scan_groups(group_layout, workspace_root).map_err(ResolveError::Scan)?;
-    all_groups.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut loaded_groups =
+        scan_groups_with_identity(group_layout, workspace_root).map_err(ResolveError::Scan)?;
+    loaded_groups.sort_by(|a, b| a.value.name.cmp(&b.value.name));
+    let group_identities = loaded_groups
+        .iter()
+        .map(|loaded| loaded.identity.clone())
+        .collect::<Vec<_>>();
+    let all_groups = loaded_groups
+        .into_iter()
+        .map(|loaded| loaded.value)
+        .collect::<Vec<_>>();
 
     // Channel context: manifest (labels + channel-wide overlay) + per-target
     // overlay, both by computed path.
     let channel = match channel_id {
         Some(id) => {
-            let dir = channel_dir(channel_layout, workspace_root, id);
-            let manifest_path = dir.join(CHANNEL_MANIFEST_FILE);
-            let manifest = if manifest_path.is_file() {
-                Some(ChannelManifest::load(&manifest_path).map_err(ResolveError::Channel)?)
+            let root = contained_layout_root(
+                &channel_layout.root,
+                workspace_root,
+                &format!("channel `{id}` root"),
+            )
+            .map_err(ResolveError::Channel)?;
+            let (manifest, manifest_identity) = if let Some(root) = root {
+                let dir = crate::discovery::channel_folder_path(&root, channel_layout.shard, id);
+                let manifest_path = dir.join(CHANNEL_MANIFEST_FILE);
+                match std::fs::symlink_metadata(&manifest_path) {
+                    Ok(_) => {
+                        let loaded = read_contained_layer(
+                            &root,
+                            &manifest_path,
+                            &format!("channel `{id}` manifest"),
+                            ChannelManifest::from_yaml_bytes,
+                        )
+                        .map_err(ResolveError::Channel)?;
+                        (Some(loaded.value), Some(loaded.identity))
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+                    Err(error) => {
+                        return Err(ResolveError::Channel(
+                            ChannelError::InvalidChannelResource {
+                                channel: id.to_string(),
+                                reason: format!(
+                                    "cannot inspect manifest `{}`: {error}",
+                                    manifest_path.display()
+                                ),
+                            },
+                        ));
+                    }
+                }
             } else {
-                None
+                (None, None)
             };
             let per_target =
                 resolve_channel_overlay(channel_layout, workspace_root, id, target_name)
                     .map_err(ResolveError::Channel)?;
-            // Content-sensitive identity: id plus the raw bytes of the channel's
-            // own overlay files (manifest + per-target). A changed overlay must
-            // yield a distinct hash so any identity-keyed cache invalidates.
-            let mut hasher = blake3::Hasher::new();
-            hasher.update(id.as_bytes());
-            if let Ok(bytes) = std::fs::read(&manifest_path) {
-                hasher.update(&bytes);
-            }
-            if let Some(overlay) = &per_target
-                && let Ok(bytes) = std::fs::read(&overlay.path)
-            {
-                hasher.update(&bytes);
-            }
             Some(ChannelContext {
                 id: id.to_string(),
                 manifest,
+                manifest_identity,
                 per_target,
-                content_hash: *hasher.finalize().as_bytes(),
             })
         }
         None => None,
@@ -580,6 +870,8 @@ pub fn resolve(
                 name: group.name.clone(),
                 priority: group.priority,
                 source,
+                declaration_sequence: seq,
+                source_identity: group_identities[idx].clone(),
                 layer,
                 op_layer: OverlayLayer::Group {
                     priority: op_priority,
@@ -603,25 +895,16 @@ pub fn resolve(
             &applied.name,
         );
     }
-    if let Some(ctx) = &channel {
-        if let Some(manifest) = &ctx.manifest {
-            push_ops(
-                &mut op_stream,
-                &mut injected_nodes,
-                &manifest.overrides,
-                OverlayLayer::ChannelWide,
-                &ctx.id,
-            );
-        }
-        if let Some(overlay) = &ctx.per_target {
-            push_ops(
-                &mut op_stream,
-                &mut injected_nodes,
-                &overlay.overlay.overrides,
-                OverlayLayer::ChannelPerTarget,
-                &ctx.id,
-            );
-        }
+    if let Some(ctx) = &channel
+        && let Some(overlay) = &ctx.per_target
+    {
+        push_ops(
+            &mut op_stream,
+            &mut injected_nodes,
+            &overlay.overlay.overrides,
+            OverlayLayer::ChannelPerTarget,
+            &ctx.id,
+        );
     }
 
     Ok(OverlayResolution {

@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 use crate::config::{CompileContext, PipelineConfig, parse_config};
+use crate::resources::{CompositionDiscovery, collect_cxl_fields_with_composition_identities};
 
 /// Build a workspace with one composition body and a pipeline whose
 /// single composition node invokes `use_path`. The output reads from the
@@ -110,4 +111,57 @@ fn resolvable_use_path_still_compiles() {
     config
         .compile(&ctx)
         .expect("a composition whose body binds cleanly must compile");
+}
+
+#[test]
+fn body_replacement_between_module_discovery_and_binding_fails_closed() {
+    let (workspace, config) = workspace_with_use("../compositions/passthrough.comp.yaml");
+    let pipeline_dir = PathBuf::from("pipelines");
+    let CompositionDiscovery { identities, .. } = collect_cxl_fields_with_composition_identities(
+        &config.nodes,
+        workspace.path(),
+        &pipeline_dir,
+    )
+    .expect("module-discovery snapshot");
+
+    // Keep the signature identical while changing the executable body. A
+    // second independent parse would otherwise compile this replacement under
+    // the module closure discovered from the earlier bytes.
+    std::fs::write(
+        workspace.path().join("compositions/passthrough.comp.yaml"),
+        r#"_compose:
+  name: passthrough
+  inputs:
+    inp:
+      schema:
+        - { name: id, type: string }
+  outputs:
+    out: shape
+  config_schema: {}
+
+nodes:
+  - type: transform
+    name: shape
+    input: inp
+    config:
+      cxl: |
+        emit id = upper(id)
+"#,
+    )
+    .expect("replace composition body");
+
+    let mut ctx = CompileContext::with_pipeline_dir(workspace.path(), pipeline_dir);
+    ctx.composition_body_identities = identities;
+    let diagnostics = config
+        .compile(&ctx)
+        .expect_err("mixed composition snapshots must not compile");
+    let mismatch = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E103")
+        .expect("snapshot replacement must surface E103");
+    assert!(
+        mismatch
+            .message
+            .contains("changed after module-closure discovery")
+    );
 }

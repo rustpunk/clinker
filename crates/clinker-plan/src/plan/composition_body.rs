@@ -14,7 +14,9 @@ use super::execution::{PlanEdge, PlanNode};
 /// Opaque handle into `CompileArtifacts.composition_bodies`. Each
 /// `PipelineNode::Composition` in `CompiledPlan` carries one of these
 /// pointing at its bound body.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct CompositionBodyId(pub u32);
 
 impl CompositionBodyId {
@@ -29,6 +31,45 @@ impl Default for CompositionBodyId {
     fn default() -> Self {
         Self::SENTINEL
     }
+}
+
+/// Stable execution scope for one bound composition body.
+///
+/// This is deliberately distinct from [`CompositionBodyId`]: the former is
+/// an artifact-registry handle, while this type is part of the runtime window
+/// identity contract. The current binder derives it from the body id because
+/// body ids are allocated deterministically per call site.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct BodyScopeId(pub u32);
+
+impl BodyScopeId {
+    pub const SENTINEL: Self = Self(u32::MAX);
+}
+
+impl From<CompositionBodyId> for BodyScopeId {
+    fn from(value: CompositionBodyId) -> Self {
+        Self(value.0)
+    }
+}
+
+/// Exact identity for a composition-body window runtime.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct WindowRuntimeKey {
+    pub body_scope: BodyScopeId,
+    pub window: crate::plan::PlanNodeId,
+    pub input_root: crate::plan::PlanNodeId,
+}
+
+/// Compile-time handoff from a window Transform to its exact runtime key and
+/// deduplicated IndexSpec slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BodyWindowBinding {
+    pub key: WindowRuntimeKey,
+    pub index: usize,
 }
 
 /// All bound composition bodies, keyed by `CompositionBodyId`. The
@@ -57,6 +98,9 @@ pub type CompositionBodies = IndexMap<CompositionBodyId, BoundBody>;
 /// wrong, so the right fix is keeping the namespaces apart.
 #[derive(Debug, Clone)]
 pub struct BoundBody {
+    /// Stable runtime scope derived from this call site's body identity.
+    pub body_scope: BodyScopeId,
+
     /// The composition signature this body was bound against.
     /// Workspace-relative path used as the `CompositionSymbolTable` key.
     pub signature_path: PathBuf,
@@ -127,16 +171,15 @@ pub struct BoundBody {
     pub nested_body_ids: Vec<CompositionBodyId>,
 
     /// Body-scope analytic-window IndexSpecs. Populated by the post-
-    /// parent-DAG-build pass that runs after `bind_composition` —
-    /// body lowering happens before the parent DAG's NodeIndex space
-    /// is allocated, so a body window whose first non-pass-through
-    /// ancestor is the body's `input:` port (which resolves through to
-    /// a parent-DAG operator) needs the parent's `name_to_idx` map
-    /// to emit the right `PlanIndexRoot::ParentNode { upstream, .. }`.
-    /// The body executor sizes its `window_runtime.bodies[body_id]`
-    /// vec to this list at recursion entry. Empty for bodies whose
+    /// body-call-tree pass that runs after `bind_composition`. Every root
+    /// remains in this body's local NodeIndex space; exact runtime identity
+    /// lives in `window_bindings`. Empty for bodies whose
     /// transforms declare no `analytic_window:` config.
     pub body_indices_to_build: Vec<crate::plan::index::IndexSpec>,
+
+    /// Exact runtime identity for every window-bearing Transform in this
+    /// body, keyed by the Transform's stable node id.
+    pub window_bindings: HashMap<crate::plan::PlanNodeId, BodyWindowBinding>,
 
     /// Per-Transform analytic-window configs captured at
     /// `bind_composition` time. Keyed by the body Transform's name;
@@ -189,6 +232,7 @@ impl BoundBody {
     /// fully-populated body via `bind_composition` and never calls this.
     pub fn empty(signature_path: PathBuf) -> Self {
         Self {
+            body_scope: BodyScopeId::SENTINEL,
             signature_path,
             graph: DiGraph::new(),
             topo_order: Vec::new(),
@@ -201,6 +245,7 @@ impl BoundBody {
             input_port_rows: IndexMap::new(),
             nested_body_ids: Vec::new(),
             body_indices_to_build: Vec::new(),
+            window_bindings: HashMap::new(),
             body_window_configs: HashMap::new(),
             deferred_regions: HashMap::new(),
             parent_continuations: HashMap::new(),

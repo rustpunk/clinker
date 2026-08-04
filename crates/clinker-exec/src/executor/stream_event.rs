@@ -3,8 +3,8 @@
 //! Every channel and buffer between executor stages carries
 //! [`StreamEvent`], a two-variant enum:
 //!
-//! - [`StreamEvent::Record`] — the existing `(Record, u64)` payload
-//!   (record + row number within the source file).
+//! - [`StreamEvent::Record`] — a record paired with its exact
+//!   [`SourceRowId`] for the current execution attempt.
 //! - [`StreamEvent::Punctuation`] — a document-boundary signal carrying
 //!   the `Arc<DocumentContext>` whose boundary is being marked.
 //!
@@ -25,7 +25,129 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use clinker_plan::plan::PlanNodeId;
 use clinker_record::{DocumentContext, DocumentId, Record};
+
+/// Attempt-local identity of one successfully decoded source record.
+///
+/// `source` scopes the exact `ordinal` to the compiled Source node that
+/// minted it. The ordinal is monotonic across every physical file consumed by
+/// that Source during one execution attempt. A later attempt starts a fresh
+/// sequence, so it may mint the same values without sharing success state.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct SourceRowId {
+    source: PlanNodeId,
+    ordinal: u64,
+}
+
+impl SourceRowId {
+    /// First record ordinal minted by a Source in one execution attempt.
+    pub const FIRST_ORDINAL: u64 = 1;
+
+    /// Construct the identity for `ordinal` under one compiled Source node.
+    pub const fn new(source: PlanNodeId, ordinal: u64) -> Self {
+        Self { source, ordinal }
+    }
+
+    /// Construct the first identity minted by a Source in one attempt.
+    pub const fn first(source: PlanNodeId) -> Self {
+        Self::new(source, Self::FIRST_ORDINAL)
+    }
+
+    /// Greatest representable identity.
+    ///
+    /// This remains a valid typed identity. Operator state represents absence
+    /// explicitly rather than borrowing this value as a sentinel.
+    pub fn maximum() -> Self {
+        Self::new(
+            <PlanNodeId as clinker_plan::plan::EntityRef>::new(u32::MAX as usize),
+            u64::MAX,
+        )
+    }
+
+    /// Reserved compatibility identity for a synthetic row with no decoded
+    /// source contributor (for example, a global aggregate over empty input).
+    /// Source ingest starts at ordinal 1, so this value cannot collide with a
+    /// row minted by an execution attempt.
+    pub(crate) fn synthetic() -> Self {
+        Self::new(<PlanNodeId as clinker_plan::plan::EntityRef>::new(0), 0)
+    }
+
+    /// The compiled Source node that minted this identity.
+    pub const fn source(self) -> PlanNodeId {
+        self.source
+    }
+
+    /// The exact attempt-local ordinal assigned by the Source.
+    pub const fn ordinal(self) -> u64 {
+        self.ordinal
+    }
+
+    /// Advance this Source's ordinal without wrapping at [`u64::MAX`].
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.ordinal.checked_add(1) {
+            Some(ordinal) => Some(Self::new(self.source, ordinal)),
+            None => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SourceRowId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.ordinal.fmt(f)
+    }
+}
+
+// Existing unit fixtures historically passed bare row ordinals into transport
+// constructors. Keep that convenience test-only so production code cannot
+// reconstruct an authoritative identity without a compiled Source scope.
+#[cfg(test)]
+impl From<u64> for SourceRowId {
+    fn from(ordinal: u64) -> Self {
+        Self::new(
+            <PlanNodeId as clinker_plan::plan::EntityRef>::new(0),
+            ordinal,
+        )
+    }
+}
+
+#[cfg(test)]
+impl PartialEq<u64> for SourceRowId {
+    fn eq(&self, other: &u64) -> bool {
+        self.ordinal == *other
+    }
+}
+
+/// Evidence that one source row was delivered to one terminal consumer.
+///
+/// Global successful-record accounting keys by [`SourceRowId`]. This type adds
+/// only the consumer dimension needed by per-output and fan-out evidence.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct OutputDeliveryId {
+    row: SourceRowId,
+    consumer: PlanNodeId,
+}
+
+impl OutputDeliveryId {
+    /// Construct delivery evidence for `row` at `consumer`.
+    pub const fn new(row: SourceRowId, consumer: PlanNodeId) -> Self {
+        Self { row, consumer }
+    }
+
+    /// The attempt-local source row that was delivered.
+    pub const fn row(self) -> SourceRowId {
+        self.row
+    }
+
+    /// The compiled terminal consumer that received the row.
+    pub const fn consumer(self) -> PlanNodeId {
+        self.consumer
+    }
+}
 
 /// Discriminator for [`Punctuation`] — what the punctuation is signaling.
 ///
@@ -59,8 +181,8 @@ pub struct StructuralReject {
     /// document-context-stamped row the reject seam captures as the
     /// `trigger: true` root cause for the file's reject.
     pub record: Record,
-    /// Source row number of the representative record, for DLQ attribution.
-    pub row_num: u64,
+    /// Source-scoped identity of the representative record, for DLQ attribution.
+    pub row_num: SourceRowId,
     /// The precise count-mismatch message the reader built at the trailer.
     pub message: String,
 }
@@ -180,14 +302,14 @@ impl Punctuation {
 /// punctuation branch.
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
-    Record(Record, u64),
+    Record(Record, SourceRowId),
     Punctuation(Punctuation),
 }
 
 impl StreamEvent {
     /// Construct a `Record` variant.
-    pub fn record(record: Record, row_num: u64) -> Self {
-        Self::Record(record, row_num)
+    pub fn record(record: Record, row_id: impl Into<SourceRowId>) -> Self {
+        Self::Record(record, row_id.into())
     }
 
     /// Construct a `Punctuation` variant.
@@ -327,7 +449,7 @@ mod tests {
         let ctx = doc_ctx();
         let reject = StructuralReject {
             record: rec(7),
-            row_num: 42,
+            row_num: SourceRowId::from(42),
             message: "SE segment count mismatch".to_string(),
         };
         let close = Punctuation::structural_reject_close(Arc::clone(&ctx), reject);

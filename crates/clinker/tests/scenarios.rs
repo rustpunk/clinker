@@ -68,6 +68,8 @@ struct Gate {
     /// latter. Pinning the correct value here is what lets the stale-marker
     /// check fire on the run that fixes the underlying bug.
     counters: Counters,
+    /// Expected W307 source-order repair warnings by physical filename.
+    warning_counts: &'static [WarningCount],
     /// Set when the scenario does not hold on current `main`, naming precisely
     /// what is wrong so that everything else stays gated.
     known_broken: Option<KnownBroken>,
@@ -109,6 +111,12 @@ struct Counters {
     dlq: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct WarningCount {
+    file: &'static str,
+    count: usize,
+}
+
 /// DLQ columns that legitimately differ between two runs of identical input:
 /// a per-entry UUID and a wall-clock stamp. They are blanked before comparison.
 /// Every other DLQ column — source row, triggering value, error category and
@@ -126,6 +134,7 @@ const GATES: &[Gate] = &[
             written: 38,
             dlq: 0,
         },
+        warning_counts: &[],
         known_broken: None,
     },
     Gate {
@@ -138,6 +147,7 @@ const GATES: &[Gate] = &[
             written: 28,
             dlq: 0,
         },
+        warning_counts: &[],
         known_broken: None,
     },
     Gate {
@@ -155,6 +165,29 @@ const GATES: &[Gate] = &[
             written: 54,
             dlq: 6,
         },
+        warning_counts: &[],
+        known_broken: None,
+    },
+    Gate {
+        id: "04-ordering-contract",
+        input_digest: "8b891035785d",
+        outputs: &["output/ordered.csv"],
+        counters: Counters {
+            total: 24,
+            ok: 24,
+            written: 24,
+            dlq: 0,
+        },
+        warning_counts: &[
+            WarningCount {
+                file: "01-sorted.csv",
+                count: 0,
+            },
+            WarningCount {
+                file: "02-needs-repair.csv",
+                count: 1,
+            },
+        ],
         known_broken: None,
     },
 ];
@@ -430,6 +463,40 @@ fn run_gate(gate: &Gate) -> Vec<Failure> {
         ))),
     }
 
+    let source_order_warnings = stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter(|line| {
+            line.contains("W307")
+                && line
+                    .contains("source file violated declared order and was repaired before release")
+        })
+        .collect::<Vec<_>>();
+    let expected_warning_total = gate
+        .warning_counts
+        .iter()
+        .map(|expected| expected.count)
+        .sum::<usize>();
+    if source_order_warnings.len() != expected_warning_total {
+        failures.push(Failure::fatal(format!(
+            "{}: observed {} W307 source-order warnings, expected {expected_warning_total}.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            gate.id,
+            source_order_warnings.len(),
+        )));
+    }
+    for expected in gate.warning_counts {
+        let actual = source_order_warnings
+            .iter()
+            .filter(|line| line.contains(expected.file))
+            .count();
+        if actual != expected.count {
+            failures.push(Failure::fatal(format!(
+                "{}: file '{}' produced {actual} W307 warnings, expected {}.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                gate.id, expected.file, expected.count,
+            )));
+        }
+    }
+
     for rel in gate.outputs {
         let produced = work.join(rel);
         let golden = scenario_dir
@@ -601,6 +668,29 @@ fn every_registered_scenario_has_a_gate() {
 }
 
 #[test]
+fn every_scenario_directory_is_registered() {
+    // The list-to-list checks above cannot see a corpus directory that neither
+    // list names. Such a directory is never generated or executed, so any
+    // committed golden inside it asserts nothing.
+    let corpus = repo_root().join("examples/scenarios");
+    let mut unregistered: Vec<String> = std::fs::read_dir(&corpus)
+        .unwrap_or_else(|error| panic!("read {}: {error}", corpus.display()))
+        .map(|entry| entry.expect("scenario corpus entry"))
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| !REGISTRY.iter().any(|scenario| scenario.id == *name))
+        .collect();
+    unregistered.sort();
+
+    assert!(
+        unregistered.is_empty(),
+        "examples/scenarios/ holds directories absent from the generator registry: {}. \
+         Add each directory to clinker_scenarios::REGISTRY and GATES, or delete it.",
+        unregistered.join(", "),
+    );
+}
+
+#[test]
 fn blanking_leaves_later_columns_untouched() {
     // The DLQ's trailing columns embed the original record and may contain
     // quoted commas; blanking must not disturb them.
@@ -625,4 +715,37 @@ fn counter_parsing_reads_the_run_summary() {
         })
     );
     assert_eq!(parse_counters("nothing here"), None);
+}
+
+#[test]
+fn ordering_contract_gate_pins_digest_output_counters_and_warning_cardinality() {
+    let gate = GATES
+        .iter()
+        .find(|gate| gate.id == "04-ordering-contract")
+        .expect("ordering contract must have an end-to-end gate");
+
+    assert_eq!(gate.input_digest, "8b891035785d");
+    assert_eq!(gate.outputs, &["output/ordered.csv"]);
+    assert_eq!(
+        gate.counters,
+        Counters {
+            total: 24,
+            ok: 24,
+            written: 24,
+            dlq: 0,
+        }
+    );
+    assert_eq!(
+        gate.warning_counts,
+        &[
+            WarningCount {
+                file: "01-sorted.csv",
+                count: 0,
+            },
+            WarningCount {
+                file: "02-needs-repair.csv",
+                count: 1,
+            },
+        ]
+    );
 }

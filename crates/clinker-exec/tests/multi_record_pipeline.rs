@@ -157,6 +157,395 @@ fn run_files(
     Ok((report, big.as_string(), small.as_string()))
 }
 
+/// Run a discriminator-driven source directly into one CSV sink. The
+/// `continue` strategy in the fixtures makes a misplaced reader-proof failure
+/// observable as a DLQ row instead of aborting before the assertions can
+/// compare successful and rejected population.
+fn run_typed_multi_record(
+    yaml: &str,
+    file_name: &str,
+    fixture: &str,
+) -> Result<(clinker_exec::executor::ExecutionReport, String), String> {
+    let config = parse_config(yaml).map_err(|e| format!("parse: {e:?}"))?;
+    let plan = config
+        .compile(&CompileContext::default())
+        .map_err(|e| format!("compile: {e:?}"))?;
+    let readers: clinker_exec::executor::SourceReaders = HashMap::from([(
+        "src".to_string(),
+        clinker_exec::executor::single_file_reader(
+            file_name,
+            Box::new(Cursor::new(fixture.as_bytes().to_vec())),
+        ),
+    )]);
+    let out = SharedBuffer::new();
+    let writers: HashMap<String, Box<dyn std::io::Write + Send>> = HashMap::from([(
+        "out".to_string(),
+        Box::new(out.clone()) as Box<dyn std::io::Write + Send>,
+    )]);
+    let params = PipelineRunParams {
+        execution_id: "typed-proof".to_string(),
+        batch_id: "batch".to_string(),
+        ..Default::default()
+    };
+    let report = PipelineExecutor::run_plan_with_readers_writers(&plan, readers, writers, &params)
+        .map_err(|e| format!("run: {e:?}"))?;
+    Ok((report, out.as_string()))
+}
+
+fn fixed_width_typed_proof_yaml(first: &str, second: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: fixed_width_typed_proof
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: fixed_width
+      path: input.txt
+      on_unmapped:
+        mode: drop
+      schema:
+        discriminator:
+          start: 0
+          width: 1
+        records:
+{first}
+{second}
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    )
+}
+
+fn csv_typed_proof_yaml(first: &str, second: &str) -> String {
+    format!(
+        r#"
+pipeline:
+  name: csv_typed_proof
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: input.csv
+      on_unmapped:
+        mode: drop
+      options:
+        has_header: false
+      schema:
+        discriminator:
+          field: kind
+        records:
+{first}
+{second}
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#
+    )
+}
+
+fn assert_two_typed_rows_succeed(report: &clinker_exec::executor::ExecutionReport, output: &str) {
+    assert_eq!(report.counters.total_count, 2, "output={output}");
+    assert_eq!(report.counters.ok_count, 2, "output={output}");
+    assert_eq!(report.counters.dlq_count, 0, "output={output}");
+    assert!(report.dlq_entries.is_empty(), "output={output}");
+    assert_eq!(
+        output.lines().count(),
+        3,
+        "CSV header plus both typed rows must reach the sink: {output}"
+    );
+}
+
+fn assert_one_alias_row(
+    report: &clinker_exec::executor::ExecutionReport,
+    output: &str,
+    expected_headers: &[&str],
+    expected_values: &[&str],
+) {
+    assert_eq!(report.counters.total_count, 1, "output={output}");
+    assert_eq!(report.counters.ok_count, 1, "output={output}");
+    assert_eq!(report.counters.dlq_count, 0, "output={output}");
+    assert!(report.dlq_entries.is_empty(), "output={output}");
+
+    let mut csv = csv::Reader::from_reader(output.as_bytes());
+    assert_eq!(
+        csv.headers()
+            .expect("output headers")
+            .iter()
+            .collect::<Vec<_>>(),
+        expected_headers,
+    );
+    let rows = csv
+        .records()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("valid CSV output");
+    assert_eq!(rows.len(), 1, "output={output}");
+    assert_eq!(rows[0].iter().collect::<Vec<_>>(), expected_values);
+}
+
+#[test]
+fn single_fixed_width_aliases_preserve_required_and_nullable_values() {
+    let yaml = r#"
+pipeline:
+  name: fixed_width_aliases
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: fixed_width
+      path: input.txt
+      on_unmapped:
+        mode: drop
+      schema:
+        - { name: required_alias, source_name: required_wire, type: int, start: 0, width: 3 }
+        - { name: nullable_alias, source_name: nullable_wire, type: { nullable: int }, start: 3, width: 3 }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+    let (report, output) = run_typed_multi_record(yaml, "input.txt", "007042\n")
+        .expect("fixed-width aliases must retain reader-emitted logical fields");
+    assert_one_alias_row(
+        &report,
+        &output,
+        &["required_alias", "nullable_alias"],
+        &["7", "42"],
+    );
+}
+
+#[test]
+fn multi_record_fixed_width_aliases_preserve_required_and_nullable_values() {
+    let yaml = r#"
+pipeline:
+  name: multi_record_fixed_width_aliases
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: fixed_width
+      path: input.txt
+      on_unmapped:
+        mode: drop
+      schema:
+        discriminator: { start: 0, width: 1 }
+        records:
+          - id: detail
+            tag: D
+            columns:
+              - { name: required_alias, source_name: required_wire, type: int, start: 1, width: 3 }
+              - { name: nullable_alias, source_name: nullable_wire, type: { nullable: int }, start: 4, width: 3 }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+    let (report, output) = run_typed_multi_record(yaml, "input.txt", "D007042\n")
+        .expect("multi-record fixed-width aliases must retain logical fields");
+    assert_one_alias_row(
+        &report,
+        &output,
+        &["record_type", "required_alias", "nullable_alias"],
+        &["detail", "7", "42"],
+    );
+}
+
+#[test]
+fn multi_record_csv_aliases_preserve_required_and_nullable_values() {
+    let yaml = r#"
+pipeline:
+  name: multi_record_csv_aliases
+error_handling:
+  strategy: continue
+  dlq:
+    path: rejected.csv
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: input.csv
+      on_unmapped:
+        mode: drop
+      options:
+        has_header: false
+      schema:
+        discriminator: { field: kind }
+        records:
+          - id: detail
+            tag: D
+            columns:
+              - { name: kind, type: string }
+              - { name: required_alias, source_name: required_wire, type: int }
+              - { name: nullable_alias, source_name: nullable_wire, type: { nullable: int } }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+    let (report, output) = run_typed_multi_record(yaml, "input.csv", "D,7,42\n")
+        .expect("multi-record CSV aliases must retain logical fields");
+    assert_one_alias_row(
+        &report,
+        &output,
+        &["record_type", "kind", "required_alias", "nullable_alias"],
+        &["detail", "D", "7", "42"],
+    );
+}
+
+#[test]
+fn ordinary_csv_alias_collision_is_rejected_without_dropping_either_value() {
+    let yaml = r#"
+pipeline:
+  name: csv_alias_collision
+nodes:
+  - type: source
+    name: src
+    config:
+      name: src
+      type: csv
+      path: input.csv
+      on_unmapped:
+        mode: drop
+      schema:
+        - { name: logical, source_name: physical, type: string }
+  - type: output
+    name: out
+    input: src
+    config:
+      name: out
+      type: csv
+      path: out.csv
+"#;
+
+    let error = run_typed_multi_record(yaml, "input.csv", "physical,logical\nkept,collision\n")
+        .expect_err("a physical/exposed alias collision must fail closed");
+    assert!(
+        error.contains("AliasNameCollision")
+            && error.contains("logical")
+            && error.contains("physical"),
+        "collision error must name both source fields: {error}"
+    );
+}
+
+#[test]
+fn fixed_width_int_float_widening_succeeds_in_both_declaration_orders() {
+    let integer = r#"          - id: integer
+            tag: I
+            columns:
+              - { name: amount, type: int, start: 1, width: 5 }"#;
+    let floating = r#"          - id: floating
+            tag: F
+            columns:
+              - { name: amount, type: float, start: 1, width: 5 }"#;
+
+    for (first, second) in [(integer, floating), (floating, integer)] {
+        let yaml = fixed_width_typed_proof_yaml(first, second);
+        let (report, output) = run_typed_multi_record(&yaml, "input.txt", "I00007\nF01.50\n")
+            .expect("valid fixed-width widened rows");
+        assert_two_typed_rows_succeed(&report, &output);
+    }
+}
+
+#[test]
+fn csv_int_float_widening_succeeds_in_both_declaration_orders() {
+    let integer = r#"          - id: integer
+            tag: I
+            columns:
+              - { name: kind, type: string }
+              - { name: amount, type: int }"#;
+    let floating = r#"          - id: floating
+            tag: F
+            columns:
+              - { name: kind, type: string }
+              - { name: amount, type: float }"#;
+
+    for (first, second) in [(integer, floating), (floating, integer)] {
+        let yaml = csv_typed_proof_yaml(first, second);
+        let (report, output) = run_typed_multi_record(&yaml, "input.csv", "I,7\nF,1.5\n")
+            .expect("valid multi-record CSV widened rows");
+        assert_two_typed_rows_succeed(&report, &output);
+    }
+}
+
+#[test]
+fn fixed_width_decimal_rows_use_their_local_precision_and_scale() {
+    let narrow = r#"          - id: narrow
+            tag: N
+            columns:
+              - { name: amount, type: decimal, precision: 4, scale: 2, start: 1, width: 8 }"#;
+    let wider = r#"          - id: wider
+            tag: W
+            columns:
+              - { name: amount, type: decimal, precision: 7, scale: 3, start: 1, width: 8 }"#;
+    let yaml = fixed_width_typed_proof_yaml(narrow, wider);
+    let (report, output) = run_typed_multi_record(&yaml, "input.txt", "N00012.34\nW0123.456\n")
+        .expect("valid fixed-width decimals under local declarations");
+    assert_two_typed_rows_succeed(&report, &output);
+}
+
+#[test]
+fn csv_decimal_rows_use_their_local_precision_and_scale() {
+    let narrow = r#"          - id: narrow
+            tag: N
+            columns:
+              - { name: kind, type: string }
+              - { name: amount, type: decimal, precision: 4, scale: 2 }"#;
+    let wider = r#"          - id: wider
+            tag: W
+            columns:
+              - { name: kind, type: string }
+              - { name: amount, type: decimal, precision: 7, scale: 3 }"#;
+    let yaml = csv_typed_proof_yaml(narrow, wider);
+    let (report, output) = run_typed_multi_record(&yaml, "input.csv", "N,12.34\nW,123.456\n")
+        .expect("valid multi-record CSV decimals under local declarations");
+    assert_two_typed_rows_succeed(&report, &output);
+}
+
 #[test]
 fn header_surfaces_as_doc_body_routes_trailer_validates() {
     let (report, big, small) =
@@ -377,10 +766,15 @@ fn unknown_tag_under_document_dlq_condemns_the_file_not_the_run() {
     );
     assert_eq!(
         report.dlq_entries.iter().filter(|e| !e.trigger).count(),
-        1,
-        "the one already-streamed detail row is rejected with the file"
+        0,
+        "the one already-streamed detail row is the selected structural trigger, not a duplicate collateral"
     );
-    // The already-streamed detail row is rejected with the file, so the
+    assert_eq!(
+        report.dlq_entries.len(),
+        1,
+        "the selected representative accounts for the file's one decoded row exactly once"
+    );
+    // The already-streamed detail row is represented by the trigger, so the
     // success sink holds no body rows.
     let body: Vec<&str> = sink.lines().skip(1).collect();
     assert!(
@@ -413,8 +807,13 @@ fn trailer_count_mismatch_under_document_dlq_condemns_the_file_not_the_run() {
     );
     assert_eq!(
         report.dlq_entries.iter().filter(|e| !e.trigger).count(),
+        1,
+        "the selected first detail is the trigger and the second detail is its collateral"
+    );
+    assert_eq!(
+        report.dlq_entries.len(),
         2,
-        "both already-streamed detail rows are rejected with the file"
+        "each decoded row in the condemned file is accounted for exactly once"
     );
     let body: Vec<&str> = sink.lines().skip(1).collect();
     assert!(
