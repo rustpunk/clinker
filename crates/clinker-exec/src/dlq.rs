@@ -105,13 +105,28 @@ pub fn write_dlq<W: Write>(
 }
 
 fn stable_user_columns(entries: &[DlqEntry]) -> Vec<String> {
-    entries
-        .iter()
-        .flat_map(|entry| dlq_user_columns(entry.original_record.schema()).map(|(_, name)| name))
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    let mut shared_layout: Option<Vec<String>> = None;
+    for entry in entries {
+        let layout = dlq_user_columns(entry.original_record.schema())
+            .map(|(_, name)| name.to_owned())
+            .collect::<Vec<_>>();
+        match shared_layout.as_ref() {
+            None => shared_layout = Some(layout),
+            Some(columns) if columns == &layout => {}
+            Some(_) => {
+                return entries
+                    .iter()
+                    .flat_map(|entry| {
+                        dlq_user_columns(entry.original_record.schema()).map(|(_, name)| name)
+                    })
+                    .map(str::to_owned)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+            }
+        }
+    }
+    shared_layout.unwrap_or_default()
 }
 
 fn source_file_of(entry: &DlqEntry) -> &str {
@@ -489,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dlq_source_fields_use_stable_union_order() {
+    fn test_dlq_source_fields_keep_shared_schema_order() {
         let schema = Arc::new(Schema::new(vec![
             "zulu".into(),
             "alpha".into(),
@@ -521,15 +536,14 @@ mod tests {
 
         let header_line = output.lines().next().unwrap();
         let columns: Vec<&str> = header_line.split(',').collect();
-        // Heterogeneous DLQ records do not share one schema order. The emitted
-        // union is therefore alphabetical so it remains stable across record
-        // arrival order and schema variants.
+        // A single shared schema keeps the user-declared order. Only genuinely
+        // heterogeneous layouts need the lexical union fallback.
         // Columns 0-4 are the identity prelude; 5-6 are triggering_field/
         // triggering_value; 7-8 are error category/detail; 9-11 are
         // stage/route/trigger.
-        assert_eq!(columns[12], "alpha");
-        assert_eq!(columns[13], "mike");
-        assert_eq!(columns[14], "zulu");
+        assert_eq!(columns[12], "zulu");
+        assert_eq!(columns[13], "alpha");
+        assert_eq!(columns[14], "mike");
     }
 
     #[test]
@@ -559,16 +573,6 @@ mod tests {
         let entries = vec![
             entry(
                 Record::new(
-                    alpha_schema,
-                    vec![
-                        Value::String("A".into()),
-                        Value::String("inputs/alpha.csv".into()),
-                    ],
-                ),
-                "alpha-source",
-            ),
-            entry(
-                Record::new(
                     beta_schema,
                     vec![
                         Value::String("B".into()),
@@ -576,6 +580,16 @@ mod tests {
                     ],
                 ),
                 "beta-source",
+            ),
+            entry(
+                Record::new(
+                    alpha_schema,
+                    vec![
+                        Value::String("A".into()),
+                        Value::String("inputs/alpha.csv".into()),
+                    ],
+                ),
+                "alpha-source",
             ),
         ];
 
@@ -592,12 +606,12 @@ mod tests {
             .records()
             .collect::<Result<Vec<_>, _>>()
             .expect("DLQ rows");
-        assert_eq!(&rows[0][2], "inputs/alpha.csv");
-        assert_eq!(&rows[0][alpha], "A");
-        assert_eq!(&rows[0][beta], "");
-        assert_eq!(&rows[1][2], "inputs/beta.csv");
-        assert_eq!(&rows[1][alpha], "");
-        assert_eq!(&rows[1][beta], "B");
+        assert_eq!(&rows[0][2], "inputs/beta.csv");
+        assert_eq!(&rows[0][alpha], "");
+        assert_eq!(&rows[0][beta], "B");
+        assert_eq!(&rows[1][2], "inputs/alpha.csv");
+        assert_eq!(&rows[1][alpha], "A");
+        assert_eq!(&rows[1][beta], "");
     }
 
     #[test]

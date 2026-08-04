@@ -592,8 +592,22 @@ nodes:
         .expect("spawn clinker");
     assert!(!output.status.success(), "duplicate fan-out must fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("east/orders.csv"), "stderr: {stderr}");
-    assert!(stderr.contains("west/orders.csv"), "stderr: {stderr}");
+    // Miette may hard-wrap a long temporary path after `/` and prefix the
+    // continuation with its `│` gutter. Compact only presentation characters
+    // so these assertions test the diagnostic content at every terminal width.
+    let compact_stderr = stderr
+        .chars()
+        .filter(|character| !character.is_whitespace() && *character != '│')
+        .collect::<String>()
+        .replace('\\', "/");
+    assert!(
+        compact_stderr.contains("east/orders.csv"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        compact_stderr.contains("west/orders.csv"),
+        "stderr: {stderr}"
+    );
     assert!(!dir.path().join("result_orders.csv").exists());
     assert!(
         std::fs::read_dir(dir.path())
