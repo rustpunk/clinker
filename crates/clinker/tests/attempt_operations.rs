@@ -363,7 +363,14 @@ fn show_paths_is_workspace_relative_and_redacts_sensitive_components() {
     );
     assert!(inspect.status.success(), "{}", stderr(&inspect));
     let text = stdout(&inspect);
-    assert!(text.contains("<redacted>/.clinker-attempts"), "{text}");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("compact JSON");
+    let path = value["roots"][0]["attempts"][0]["path"]
+        .as_str()
+        .expect("sanitized attempt path");
+    assert!(
+        Path::new(path).starts_with(Path::new("<redacted>").join(".clinker-attempts")),
+        "{text}"
+    );
     assert!(!text.contains("secret-token-output"), "{text}");
     assert!(!text.contains(&workspace.path().display().to_string()));
 }
