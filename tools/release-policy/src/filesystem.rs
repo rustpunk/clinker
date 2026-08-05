@@ -2269,16 +2269,17 @@ fn validate_retained_observation(
 
 fn interrupt_profile(state: &EnvironmentState) -> Result<(), GateError> {
     if state.profile == NFS_PROFILE {
+        let server_root = state.scratch.join("server");
         checked(
             "sudo",
             &[
-                OsString::from("systemctl"),
-                OsString::from("stop"),
-                OsString::from("nfs-kernel-server"),
+                OsString::from("exportfs"),
+                OsString::from("-u"),
+                OsString::from(format!("127.0.0.1:{}", server_root.display())),
             ],
             inherited_environment(&[]),
             Duration::from_secs(30),
-            "stop exact NFS publication service",
+            "withdraw exact NFS publication export",
         )?;
     } else {
         let pid_path = state
