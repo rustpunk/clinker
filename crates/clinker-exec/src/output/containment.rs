@@ -780,7 +780,13 @@ impl StagedOutput {
 
 impl Drop for StagedOutput {
     fn drop(&mut self) {
-        if let Some(reservation) = self.reservation.as_ref() {
+        // A finalized value that still owns a reservation represents the
+        // deterministic post-publication cleanup-failure seam. Preserve that
+        // stale leaf as the cleanup debt reports; ordinary error paths remain
+        // eligible for this best-effort retry while their state is nonterminal.
+        if self.state != PublicationState::Finalized
+            && let Some(reservation) = self.reservation.as_ref()
+        {
             let _ = self.destination.parent.remove_leaf(&reservation.leaf);
             let _ = self
                 .destination
