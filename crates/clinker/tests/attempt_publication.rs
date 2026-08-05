@@ -4,6 +4,8 @@ use std::io::{BufRead, BufReader};
 #[cfg(target_os = "linux")]
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+use std::process::{Child, Command};
 use std::sync::mpsc;
 #[cfg(target_os = "linux")]
 use std::time::Duration;
@@ -1693,6 +1695,230 @@ fn matrix_enospc(destination: &Path, index: u64) {
 }
 
 #[cfg(target_os = "linux")]
+fn matrix_admission_policy(
+    destination: &Path,
+    profile: &str,
+    scenario: &str,
+) -> ResolvedPublicationPolicy {
+    let destination_profile = match profile {
+        "linux-nfsv4.1-loopback-ci" => "nfs_v4_1",
+        "linux-smb3.1.1-loopback-ci" => "smb3_1_1",
+        _ => panic!("unsupported qualification profile"),
+    };
+    let (retained_attempt_limit, retained_byte_limit) = match scenario {
+        "admission-count" => (1, 10_000_000),
+        "admission-bytes" => (8, 150),
+        _ => panic!("unsupported admission scenario"),
+    };
+    ClinkerToml::parse(&format!(
+        "[storage.publication]\ndestination_profile = \"{destination_profile}\"\nfailed_retention_seconds = 0\ncreation_grace_seconds = 1\nmax_attempt_bytes = \"100B\"\nretained_byte_limit = \"{retained_byte_limit}B\"\nretained_attempt_limit = {retained_attempt_limit}\nmin_free_bytes = \"1B\"\n"
+    ))
+    .expect("parse mounted admission policy")
+    .storage
+    .publication
+    .resolve(destination, 100, 8_000_000_000)
+    .expect("resolve mounted admission policy")
+}
+
+#[cfg(target_os = "linux")]
+fn wait_for_admission_child(child: &mut Child) -> std::process::ExitStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll admission worker") {
+            return status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("admission worker exceeded its bounded completion deadline");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn remove_matrix_namespace(root: &Path) {
+    let namespace = root.join(".clinker-attempts");
+    if !namespace.exists() {
+        return;
+    }
+    let lock = namespace.join(".admission.lock");
+    if lock.exists() {
+        std::fs::remove_file(lock).expect("remove matrix admission lock");
+    }
+    std::fs::remove_dir(namespace).expect("remove empty matrix attempt namespace");
+}
+
+#[cfg(target_os = "linux")]
+fn matrix_admission_contention(destination: &Path, profile: &str, scenario: &str, index: u64) {
+    let first_root = destination.join(format!("{scenario}-first"));
+    let second_root = destination.join(format!("{scenario}-second"));
+    std::fs::create_dir(&first_root).expect("create first mounted admission root");
+    std::fs::create_dir(&second_root).expect("create second mounted admission root");
+    let start = destination.join(format!("{scenario}.start"));
+    let first_result = destination.join(format!("{scenario}.first.result"));
+    let second_result = destination.join(format!("{scenario}.second.result"));
+    let first_execution = matrix_execution_id(index);
+    let second_execution = matrix_execution_id(index + 1);
+    let executable = std::env::current_exe().expect("current mounted test binary");
+    let spawn = |first: &Path, second: &Path, result: &Path, execution_id: &str| {
+        Command::new(&executable)
+            .args([
+                "--exact",
+                "remote_filesystem_admission_worker",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("CLINKER_ADMISSION_WORKER_SCENARIO", scenario)
+            .env("CLINKER_ADMISSION_WORKER_PROFILE", profile)
+            .env("CLINKER_ADMISSION_WORKER_FIRST_ROOT", first)
+            .env("CLINKER_ADMISSION_WORKER_SECOND_ROOT", second)
+            .env("CLINKER_ADMISSION_WORKER_START", &start)
+            .env("CLINKER_ADMISSION_WORKER_RESULT", result)
+            .env("CLINKER_ADMISSION_WORKER_EXECUTION_ID", execution_id)
+            .spawn()
+            .expect("spawn independent admission worker")
+    };
+    let mut first = spawn(&first_root, &second_root, &first_result, &first_execution);
+    let mut second = spawn(&second_root, &first_root, &second_result, &second_execution);
+    std::fs::write(&start, b"start\n").expect("release admission workers");
+    assert!(wait_for_admission_child(&mut first).success());
+    assert!(wait_for_admission_child(&mut second).success());
+    let first_outcome = std::fs::read_to_string(&first_result).expect("first worker result");
+    let second_outcome = std::fs::read_to_string(&second_result).expect("second worker result");
+    let outcomes = [first_outcome.trim(), second_outcome.trim()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == "admitted")
+            .count(),
+        1,
+        "exactly one independent process must be admitted"
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == "rejected")
+            .count(),
+        1,
+        "exactly one independent process must be rejected"
+    );
+    let admitted_execution = if outcomes[0] == "admitted" {
+        &first_execution
+    } else {
+        &second_execution
+    };
+    for root in [&first_root, &second_root] {
+        let namespace = root.join(".clinker-attempts");
+        let retained = std::fs::read_dir(&namespace)
+            .expect("mounted admission namespace readback")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            retained,
+            vec![std::ffi::OsString::from(admitted_execution)],
+            "each mounted root must retain exactly the same one execution"
+        );
+        let attempt_root = namespace.join(admitted_execution);
+        assert!(
+            attempt_root.is_dir(),
+            "mounted root must retain admitted attempt"
+        );
+        let manifest = AttemptManifest::read(&attempt_root.join("manifest.json"), 100_000_000)
+            .expect("mounted admitted manifest readback");
+        assert_eq!(manifest.execution_id(), admitted_execution);
+        assert_eq!(manifest.admitted_bytes(), 100);
+        let cleanup =
+            AttemptPublication::cleanup(validated(root, "."), admitted_execution, 100_000_000)
+                .expect("cleanup admitted contention fixture");
+        assert_eq!(cleanup.disposition(), CleanupDisposition::Removed);
+    }
+
+    let mut stream = matrix_connection(destination, scenario, PublicationMode::Direct);
+    let mut reader = BufReader::new(stream.try_clone().expect("clone admission endpoint"));
+    matrix_send(
+        &mut stream,
+        &serde_json::json!({
+            "action": "admission_complete",
+            "bounded_completion": true,
+            "estimated_attempt_bytes": 100,
+            "exactly_one_admitted": true,
+            "independent_processes": true,
+            "mounted_root_readback": true,
+            "opposite_root_order": true,
+            "retained_limit": if scenario == "admission-count" { 1 } else { 150 },
+            "scenario": scenario,
+            "schema": "clinker.filesystem-publication-control/1",
+        }),
+    );
+    matrix_wait(&mut reader, "finish", scenario);
+
+    for path in [&start, &first_result, &second_result] {
+        std::fs::remove_file(path).expect("remove admission worker control file");
+    }
+    for root in [&first_root, &second_root] {
+        remove_matrix_namespace(root);
+        std::fs::remove_dir(root).expect("remove mounted admission root");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_filesystem_admission_worker() {
+    let Ok(scenario) = std::env::var("CLINKER_ADMISSION_WORKER_SCENARIO") else {
+        return;
+    };
+    let profile = std::env::var("CLINKER_ADMISSION_WORKER_PROFILE")
+        .expect("mounted admission worker profile");
+    let first_root = PathBuf::from(
+        std::env::var_os("CLINKER_ADMISSION_WORKER_FIRST_ROOT")
+            .expect("first mounted admission root"),
+    );
+    let second_root = PathBuf::from(
+        std::env::var_os("CLINKER_ADMISSION_WORKER_SECOND_ROOT")
+            .expect("second mounted admission root"),
+    );
+    let start = PathBuf::from(
+        std::env::var_os("CLINKER_ADMISSION_WORKER_START").expect("admission start marker"),
+    );
+    let result = PathBuf::from(
+        std::env::var_os("CLINKER_ADMISSION_WORKER_RESULT").expect("admission result path"),
+    );
+    let execution_id =
+        std::env::var("CLINKER_ADMISSION_WORKER_EXECUTION_ID").expect("worker execution identity");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !start.is_file() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "admission worker start marker exceeded its deadline"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let policy = matrix_admission_policy(&first_root, &profile, &scenario);
+    let outcome = RunAttemptPublication::create(
+        policy,
+        &execution_id,
+        1_000,
+        2_000,
+        vec![validated(&first_root, "."), validated(&second_root, ".")],
+    );
+    match outcome {
+        Ok(attempt) => {
+            attempt.abandon().expect("retain admitted worker attempt");
+            std::fs::write(result, b"admitted\n").expect("write admitted worker result");
+        }
+        Err(
+            clinker_exec::output::attempt::AttemptError::RetainedAttemptLimitExceeded { .. }
+            | clinker_exec::output::attempt::AttemptError::RetainedByteLimitExceeded { .. },
+        ) => {
+            std::fs::write(result, b"rejected\n").expect("write rejected worker result");
+        }
+        Err(error) => panic!("unexpected mounted admission failure: {error}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn remote_filesystem_publication_matrix() {
     let (Ok(profile), Ok(mount_root)) = (
@@ -1757,6 +1983,9 @@ fn remote_filesystem_publication_matrix() {
         }
     }
     matrix_enospc(&destination, 30);
+    matrix_admission_contention(&destination, &profile, "admission-count", 40);
+    matrix_admission_contention(&destination, &profile, "admission-bytes", 50);
+    remove_matrix_namespace(&destination);
     std::fs::remove_dir(&destination).expect("remove mounted publication sandbox");
 }
 

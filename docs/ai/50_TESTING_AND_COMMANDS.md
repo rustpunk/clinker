@@ -274,10 +274,11 @@ delegation without carrying policy semantics.
 `filesystem self-test` validates the direct two-profile hosted-runner topology,
 including unconditional teardown followed by unconditional bounded evidence
 upload. Local tests validate the strict
-`clinker.filesystem-matrix-evidence/2` parser and reject legacy, unknown,
+`clinker.filesystem-matrix-evidence/3` parser and reject legacy, unknown,
 missing, or truncated lifecycle, stage, capacity, operator, recovery,
-persistence, and teardown proof. Actual NFSv4.1/SMB3.1.1 interruption and
-mounted `ENOSPC` certification runs only in the privileged `filesystem-matrix`
+persistence, production admission-lock, and teardown proof. Actual
+NFSv4.1/SMB3.1.1 interruption, independent-process count/byte contention, and
+mounted `ENOSPC` certification run only in the privileged `filesystem-matrix`
 job; an ordinary local run cannot create positive support evidence. Injected
 `EDQUOT` remains non-qualifying seam coverage.
 

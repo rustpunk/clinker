@@ -107,7 +107,11 @@ profile mismatch fails closed.
 The supported destination profile is a qualification claim, not a spelling
 that makes an arbitrary mount safe. NFSv4.1 and SMB3.1.1 support requires an
 actual mounted destination qualified with the selected profile, including real
-late-failure behavior. Release evidence for low space must observe a real
+late-failure behavior. Hosted qualification also runs the ordinary publication
+admission API from independent processes against each mounted profile, in
+opposite multi-root order, and requires exactly one process to enter the final
+retained-count and retained-byte slot without deadlock. This production lock
+proof is separate from the filesystem's byte-range/OFD lock probe. Release evidence for low space must observe a real
 `ENOSPC`. Injected `EDQUOT` is useful seam coverage but is non-qualifying unless
 a real quota is provisioned and the filesystem reports `EDQUOT` during the
 mounted test.

@@ -249,7 +249,7 @@ fn exact_teardown_argv_cannot_upgrade_absent_or_incomplete_evidence() {
     fs::write(
         &evidence_path,
         format!(
-            "{{\"schema\":\"clinker.filesystem-matrix-evidence/2\",\"profile\":\"{SMB}\",\"status\":\"incomplete\",\"support_eligible\":false,\"cleanup_success\":false}}\n"
+            "{{\"schema\":\"clinker.filesystem-matrix-evidence/3\",\"profile\":\"{SMB}\",\"status\":\"incomplete\",\"support_eligible\":false,\"cleanup_success\":false}}\n"
         ),
     )
     .unwrap();
@@ -370,6 +370,28 @@ fn mount_contract_requires_exact_loopback_protocol_and_lock_options() {
 
 fn complete_semantic_evidence() -> Value {
     json!({
+        "admission_lock_results": {
+            "api": "RunAttemptPublication::create",
+            "count_limit": {
+                "bounded_completion": "pass",
+                "estimated_attempt_bytes": 100,
+                "exactly_one_admitted": "pass",
+                "independent_processes": "pass",
+                "mounted_root_readback": "pass",
+                "opposite_root_order": "pass",
+                "retained_attempt_limit": 1
+            },
+            "lock": "fs4::FileExt::lock",
+            "retained_byte_limit": {
+                "bounded_completion": "pass",
+                "estimated_attempt_bytes": 100,
+                "exactly_one_admitted": "pass",
+                "independent_processes": "pass",
+                "mounted_root_readback": "pass",
+                "opposite_root_order": "pass",
+                "retained_byte_limit": 150
+            }
+        },
         "ci_identity": {
             "job": "filesystem-matrix",
             "repository": "rustpunk/clinker",
@@ -482,7 +504,7 @@ fn complete_semantic_evidence() -> Value {
             "test_filter": "remote_filesystem_publication_matrix",
             "test_log": "publication-test.txt"
         },
-        "schema": "clinker.filesystem-matrix-evidence/2",
+        "schema": "clinker.filesystem-matrix-evidence/3",
         "status": "semantic_pass",
         "support_eligible": false
     })
@@ -552,6 +574,24 @@ fn positive_transition_requires_complete_semantics_and_successful_teardown() {
     );
     assert_eq!(missing_lock["support_eligible"], false);
 
+    let mut missing_admission = complete_semantic_evidence();
+    missing_admission
+        .as_object_mut()
+        .expect("semantic evidence object")
+        .remove("admission_lock_results");
+    assert!(
+        clinker_release_policy::filesystem::finalize_qualification(&mut missing_admission, true)
+            .is_err()
+    );
+
+    let mut forged_admission = complete_semantic_evidence();
+    forged_admission["admission_lock_results"]["retained_byte_limit"]["exactly_one_admitted"] =
+        json!("forged");
+    assert!(
+        clinker_release_policy::filesystem::finalize_qualification(&mut forged_admission, true)
+            .is_err()
+    );
+
     let mut complete = complete_semantic_evidence();
     clinker_release_policy::filesystem::finalize_qualification(&mut complete, true)
         .expect("complete teardown may finalize evidence");
@@ -574,13 +614,14 @@ fn positive_transition_requires_complete_semantics_and_successful_teardown() {
 }
 
 #[test]
-fn v2_rejects_legacy_unknown_or_truncated_lifecycle_capacity_and_operator_evidence() {
+fn v3_rejects_legacy_unknown_or_truncated_lifecycle_capacity_and_operator_evidence() {
     let mut legacy = complete_semantic_evidence();
     legacy["schema"] = json!("clinker.filesystem-matrix-evidence/v1");
     assert!(clinker_release_policy::filesystem::finalize_qualification(&mut legacy, true).is_err());
 
     for path in [
         "capacity_results",
+        "admission_lock_results",
         "edge_outcomes",
         "prohibitions",
         "publication_results",
@@ -636,7 +677,7 @@ fn redundant_teardown_accepts_durable_failure_cleanup() {
     fs::write(
         &evidence_path,
         format!(
-            "{{\"cleanup_success\":true,\"failed_step\":\"server-and-mount\",\"profile\":\"{SMB}\",\"schema\":\"clinker.filesystem-matrix-evidence/2\",\"status\":\"failed\",\"support_eligible\":false}}"
+            "{{\"cleanup_success\":true,\"failed_step\":\"server-and-mount\",\"profile\":\"{SMB}\",\"schema\":\"clinker.filesystem-matrix-evidence/3\",\"status\":\"failed\",\"support_eligible\":false}}"
         ),
     )
     .expect("failed evidence");

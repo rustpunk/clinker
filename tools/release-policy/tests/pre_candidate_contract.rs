@@ -701,6 +701,28 @@ fn write_filesystem_evidence(root: &Path, profile: &str, relative_path: &str) {
     write_canonical_json(
         &root.join(relative_path),
         &json!({
+            "admission_lock_results": {
+                "api": "RunAttemptPublication::create",
+                "count_limit": {
+                    "bounded_completion": "pass",
+                    "estimated_attempt_bytes": 100,
+                    "exactly_one_admitted": "pass",
+                    "independent_processes": "pass",
+                    "mounted_root_readback": "pass",
+                    "opposite_root_order": "pass",
+                    "retained_attempt_limit": 1
+                },
+                "lock": "fs4::FileExt::lock",
+                "retained_byte_limit": {
+                    "bounded_completion": "pass",
+                    "estimated_attempt_bytes": 100,
+                    "exactly_one_admitted": "pass",
+                    "independent_processes": "pass",
+                    "mounted_root_readback": "pass",
+                    "opposite_root_order": "pass",
+                    "retained_byte_limit": 150
+                }
+            },
             "ci_identity": {
                 "job": "filesystem-matrix",
                 "repository": "rustpunk/clinker",
@@ -797,7 +819,7 @@ fn write_filesystem_evidence(root: &Path, profile: &str, relative_path: &str) {
                 "test_filter": "remote_filesystem_publication_matrix",
                 "test_log": "publication-test.txt"
             },
-            "schema": "clinker.filesystem-matrix-evidence/2",
+            "schema": "clinker.filesystem-matrix-evidence/3",
             "status": "passed",
             "support_eligible": true
         }),

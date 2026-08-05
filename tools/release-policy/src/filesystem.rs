@@ -24,7 +24,7 @@ pub const NFS_PROFILE: &str = "linux-nfsv4.1-loopback-ci";
 /// Exact SMB profile eligible for qualification.
 pub const SMB_PROFILE: &str = "linux-smb3.1.1-loopback-ci";
 
-const EVIDENCE_SCHEMA: &str = "clinker.filesystem-matrix-evidence/2";
+const EVIDENCE_SCHEMA: &str = "clinker.filesystem-matrix-evidence/3";
 const NFS_EXPORT: &str = "/etc/exports.d/clinker-ci.exports";
 const CI_REPOSITORY: &str = "rustpunk/clinker";
 const CI_WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
@@ -302,9 +302,12 @@ fn run_profile_inner(request: &RunProfileRequest) -> Result<Value, GateError> {
         &semantic.publication_observations,
         &semantic.publication,
     )?;
+    let admission_lock_results =
+        admission_lock_results_from_observations(&semantic.publication_observations)?;
     require_cleanup_liveness(&request.mount_root)?;
     let runner = runner_observation()?;
     Ok(json!({
+        "admission_lock_results": admission_lock_results,
         "ci_identity": ci_identity()?,
         "cleanup_success": false,
         "cleanup_observations": [],
@@ -359,6 +362,57 @@ fn run_profile_inner(request: &RunProfileRequest) -> Result<Value, GateError> {
         "schema": EVIDENCE_SCHEMA,
         "status": "semantic_pass",
         "support_eligible": false,
+    }))
+}
+
+fn admission_lock_results_from_observations(observations: &[String]) -> Result<Value, GateError> {
+    for scenario in ["admission-count", "admission-bytes"] {
+        for outcome in [
+            "bounded_completion",
+            "exactly_one_admitted",
+            "independent_processes",
+            "mounted_root_readback",
+            "opposite_root_order",
+        ] {
+            let expected = format!("{scenario}:{outcome}=pass");
+            if !observations.iter().any(|observed| observed == &expected) {
+                return Err(missing(format!(
+                    "validated production admission observation {expected} is absent"
+                )));
+            }
+        }
+    }
+    for expected in [
+        "admission-count:estimated_attempt_bytes=100,retained_limit=1",
+        "admission-bytes:estimated_attempt_bytes=100,retained_limit=150",
+    ] {
+        if !observations.iter().any(|observed| observed == expected) {
+            return Err(missing(format!(
+                "validated production admission bound {expected} is absent"
+            )));
+        }
+    }
+    Ok(json!({
+        "api": "RunAttemptPublication::create",
+        "count_limit": {
+            "bounded_completion": "pass",
+            "estimated_attempt_bytes": 100,
+            "exactly_one_admitted": "pass",
+            "independent_processes": "pass",
+            "mounted_root_readback": "pass",
+            "opposite_root_order": "pass",
+            "retained_attempt_limit": 1,
+        },
+        "lock": "fs4::FileExt::lock",
+        "retained_byte_limit": {
+            "bounded_completion": "pass",
+            "estimated_attempt_bytes": 100,
+            "exactly_one_admitted": "pass",
+            "independent_processes": "pass",
+            "mounted_root_readback": "pass",
+            "opposite_root_order": "pass",
+            "retained_byte_limit": 150,
+        },
     }))
 }
 
@@ -557,6 +611,7 @@ pub fn finalize_qualification(
     exact_fields(
         object,
         &[
+            "admission_lock_results",
             "ci_identity",
             "capacity_results",
             "cleanup_success",
@@ -653,6 +708,68 @@ pub fn finalize_qualification(
             options: string_array(mount.get("options"), "mount options")?,
         },
     )?;
+
+    let admission = object
+        .get("admission_lock_results")
+        .and_then(Value::as_object)
+        .ok_or_else(|| missing("production admission-lock results are absent"))?;
+    exact_fields(
+        admission,
+        &["api", "count_limit", "lock", "retained_byte_limit"],
+        "production admission-lock results",
+    )?;
+    if admission.get("api") != Some(&Value::String("RunAttemptPublication::create".to_owned()))
+        || admission.get("lock") != Some(&Value::String("fs4::FileExt::lock".to_owned()))
+    {
+        return Err(missing(
+            "production admission API and filesystem lock proof are absent",
+        ));
+    }
+    for (field, limit_field, expected_limit) in [
+        ("count_limit", "retained_attempt_limit", 1),
+        ("retained_byte_limit", "retained_byte_limit", 150),
+    ] {
+        let result = admission
+            .get(field)
+            .and_then(Value::as_object)
+            .ok_or_else(|| missing(format!("production admission result {field} is absent")))?;
+        exact_fields(
+            result,
+            &[
+                "bounded_completion",
+                "estimated_attempt_bytes",
+                "exactly_one_admitted",
+                "independent_processes",
+                "mounted_root_readback",
+                "opposite_root_order",
+                limit_field,
+            ],
+            "production admission scenario",
+        )?;
+        for outcome in [
+            "bounded_completion",
+            "exactly_one_admitted",
+            "independent_processes",
+            "mounted_root_readback",
+            "opposite_root_order",
+        ] {
+            if result.get(outcome) != Some(&Value::String("pass".to_owned())) {
+                return Err(missing(format!(
+                    "production admission result {field}.{outcome} did not pass"
+                )));
+            }
+        }
+        if result
+            .get("estimated_attempt_bytes")
+            .and_then(Value::as_u64)
+            != Some(100)
+            || result.get(limit_field).and_then(Value::as_u64) != Some(expected_limit)
+        {
+            return Err(missing(format!(
+                "production admission result {field} has the wrong bound"
+            )));
+        }
+    }
 
     if object.get("lock_observations")
         != Some(&json!([
@@ -1443,7 +1560,80 @@ fn run_publication_controller(
 
     let mut stream = accept_control(listener)?;
     validate_scenario_begin(&mut stream, "capacity-enospc", "direct")?;
-    control_capacity(state, &mut stream, observations)
+    control_capacity(state, &mut stream, observations)?;
+
+    for scenario in ["admission-count", "admission-bytes"] {
+        let mut stream = accept_control(listener)?;
+        validate_scenario_begin(&mut stream, scenario, "direct")?;
+        control_admission(&mut stream, scenario, observations)?;
+    }
+    Ok(())
+}
+
+fn control_admission(
+    stream: &mut UnixStream,
+    scenario: &str,
+    observations: &mut Vec<String>,
+) -> Result<(), GateError> {
+    let result = read_control(stream)?;
+    let object = result
+        .as_object()
+        .ok_or_else(|| policy("admission result must be an object"))?;
+    exact_fields(
+        object,
+        &[
+            "action",
+            "bounded_completion",
+            "estimated_attempt_bytes",
+            "exactly_one_admitted",
+            "independent_processes",
+            "mounted_root_readback",
+            "opposite_root_order",
+            "retained_limit",
+            "scenario",
+            "schema",
+        ],
+        "admission result",
+    )?;
+    let expected_limit = if scenario == "admission-count" {
+        1
+    } else {
+        150
+    };
+    if object.get("schema")
+        != Some(&Value::String(
+            "clinker.filesystem-publication-control/1".to_owned(),
+        ))
+        || object.get("action") != Some(&Value::String("admission_complete".to_owned()))
+        || object.get("scenario") != Some(&Value::String(scenario.to_owned()))
+        || object
+            .get("estimated_attempt_bytes")
+            .and_then(Value::as_u64)
+            != Some(100)
+        || object.get("retained_limit").and_then(Value::as_u64) != Some(expected_limit)
+    {
+        return Err(policy(
+            "admission result does not match the exact scenario contract",
+        ));
+    }
+    for field in [
+        "bounded_completion",
+        "exactly_one_admitted",
+        "independent_processes",
+        "mounted_root_readback",
+        "opposite_root_order",
+    ] {
+        if object.get(field).and_then(Value::as_bool) != Some(true) {
+            return Err(missing(format!(
+                "admission result {field} did not pass for {scenario}"
+            )));
+        }
+        observations.push(format!("{scenario}:{field}=pass"));
+    }
+    observations.push(format!(
+        "{scenario}:estimated_attempt_bytes=100,retained_limit={expected_limit}"
+    ));
+    write_scenario_action(stream, "finish", scenario)
 }
 
 fn accept_control(listener: &UnixListener) -> Result<UnixStream, GateError> {
@@ -1933,10 +2123,8 @@ struct RetainedExpectation {
 
 fn retained_expectation(scenario: &str) -> Result<RetainedExpectation, GateError> {
     const EMPTY: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-    const REPLACEMENT: &str =
-        "865329d9aa64a0a90e28403e1ad5bdfc26b0b5beb5a967537e78818c17e78c67";
-    const INTERRUPTION: &str =
-        "b7a4c2f87d102d06628d1ff7affff81fd46eb89f6dc029a1aae1033276227b30";
+    const REPLACEMENT: &str = "865329d9aa64a0a90e28403e1ad5bdfc26b0b5beb5a967537e78818c17e78c67";
+    const INTERRUPTION: &str = "b7a4c2f87d102d06628d1ff7affff81fd46eb89f6dc029a1aae1033276227b30";
 
     if scenario.starts_with("ordinary-failure-") {
         return Ok(RetainedExpectation {
@@ -1977,7 +2165,9 @@ fn retained_expectation(scenario: &str) -> Result<RetainedExpectation, GateError
             final_bytes: Some(b"mounted interruption"),
         });
     }
-    Err(policy("publication scenario has no retained-state contract"))
+    Err(policy(
+        "publication scenario has no retained-state contract",
+    ))
 }
 
 fn validate_child_manifest_state(
@@ -2045,8 +2235,7 @@ fn validate_retained_observation(
         || artifact.get("artifact_id") != Some(&Value::String(artifact_id.to_owned()))
         || artifact.get("state") != Some(&Value::String(expectation.artifact_state.to_owned()))
         || artifact.get("size_bytes").and_then(Value::as_u64) != Some(expectation.size_bytes)
-        || artifact.get("blake3_hex")
-            != Some(&Value::String(expectation.blake3_hex.to_owned()))
+        || artifact.get("blake3_hex") != Some(&Value::String(expectation.blake3_hex.to_owned()))
         || final_bytes != expectation.final_bytes
     {
         return Err(missing(
@@ -2869,11 +3058,8 @@ fn direct_locked_command(run: &str, command: &str) -> bool {
         "--evidence",
         "${EVIDENCE_PATH}",
     ];
-    shell_free_argv(run).is_some_and(|argv| {
-        argv.iter()
-            .map(String::as_str)
-            .eq(expected.iter().copied())
-    })
+    shell_free_argv(run)
+        .is_some_and(|argv| argv.iter().map(String::as_str).eq(expected.iter().copied()))
 }
 
 fn shell_free_argv(run: &str) -> Option<Vec<String>> {
@@ -3292,10 +3478,9 @@ mod tests {
 
     #[test]
     fn retained_support_evidence_rejects_wrong_state_artifact_and_final_bytes() {
-        let expectation = retained_expectation(
-            "interruption-direct-parent_directory_synchronization",
-        )
-        .expect("known retained scenario");
+        let expectation =
+            retained_expectation("interruption-direct-parent_directory_synchronization")
+                .expect("known retained scenario");
         let manifest = json!({
             "execution_id": "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
             "state": expectation.attempt_state,
@@ -3307,8 +3492,7 @@ mod tests {
                 "blake3_hex": expectation.blake3_hex,
             }],
         });
-        validate_child_manifest_state("publishing", &expectation)
-            .expect("derived child state");
+        validate_child_manifest_state("publishing", &expectation).expect("derived child state");
         validate_retained_observation(
             &manifest,
             "018f47a2-9a41-7a27-b4d6-4f7137e3c159",

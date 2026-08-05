@@ -187,7 +187,7 @@ must remain absent and operator cleanup must remove the staging attempt.
 Deterministic `EDQUOT` coverage is recorded only as `seam_covered` unless a real
 quota is separately provisioned and observed.
 
-Evidence uses `clinker.filesystem-matrix-evidence/2`. It records the runner and
+Evidence uses `clinker.filesystem-matrix-evidence/3`. It records the runner and
 kernel, exact package and protocol observations, mount and lock behavior, the
 six unchanged edge outcomes, six lifecycle classes, ordered success and
 interruption readbacks, real capacity behavior, recovery, persistence,
@@ -195,6 +195,13 @@ operator cleanup, and environment teardown. Teardown and bounded evidence/log
 upload run unconditionally for passing, failing, timed-out, and interrupted
 matrix cells. Legacy schema 1 or any missing, unknown, or truncated proof is
 ineligible.
+
+The byte-range/OFD lock observation remains separate from publication
+admission. A dedicated production admission-lock section records independent
+test-binary processes calling `RunAttemptPublication::create` on the mounted
+profile with opposite multi-root order. Both the retained-count and
+retained-byte scenarios require bounded completion, exactly one admission, one
+rejection, and readback of the same retained execution from every mounted root.
 
 A profile is support-eligible only when that exact cell writes `status: passed`,
 `support_eligible: true`, and successful client-mount, bounded-backing, service,
