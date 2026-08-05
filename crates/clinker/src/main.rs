@@ -1549,13 +1549,13 @@ fn run_unix_ms() -> Result<u64, PipelineError> {
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum PublicationFailureKind {
     Readiness,
     ReadinessAndAbandonment,
     CleanupDebt(usize),
     Incomplete(usize),
-    Publish,
+    Publish(String),
 }
 
 fn publication_failure_diagnostic(execution_id: &str, failure: PublicationFailureKind) -> String {
@@ -1574,11 +1574,75 @@ fn publication_failure_diagnostic(execution_id: &str, failure: PublicationFailur
                 "output publication was incomplete with {count} cleanup debt item(s) for execution {execution_id}; run `clinker attempts inspect <pipeline> --execution-id {execution_id}` with the same identity options"
             );
         }
-        PublicationFailureKind::Publish => "output publication failed",
+        PublicationFailureKind::Publish(category) => {
+            return format!(
+                "output publication failed ({category}) for execution {execution_id}; run `clinker attempts inspect <pipeline> --execution-id {execution_id}` with the same identity options"
+            );
+        }
     };
     format!(
         "{reason} for execution {execution_id}; run `clinker attempts inspect <pipeline> --execution-id {execution_id}` with the same identity options"
     )
+}
+
+fn publication_error_category(error: &clinker_exec::output::attempt::AttemptError) -> String {
+    use clinker_exec::output::attempt::AttemptError;
+
+    match error {
+        AttemptError::Containment(error) => {
+            use clinker_exec::output::containment::ContainmentError;
+            match error {
+                ContainmentError::SecurityPolicy { code, .. } => {
+                    format!("containment security policy {code}")
+                }
+                ContainmentError::PolicyRequired { profile, .. } => {
+                    format!("unqualified destination profile {profile}")
+                }
+                ContainmentError::Io {
+                    operation, source, ..
+                } => format!(
+                    "containment {operation}: kind={:?}, os_code={:?}",
+                    source.kind(),
+                    source.raw_os_error()
+                ),
+                ContainmentError::VisibleButUnsynced { source, .. } => format!(
+                    "destination synchronization: kind={:?}, os_code={:?}",
+                    source.kind(),
+                    source.raw_os_error()
+                ),
+                ContainmentError::PublishedCleanup { .. } => {
+                    "published cleanup operation".to_owned()
+                }
+            }
+        }
+        AttemptError::Pipeline(PipelineError::Io(source)) => format!(
+            "I/O operation: kind={:?}, os_code={:?}",
+            source.kind(),
+            source.raw_os_error()
+        ),
+        AttemptError::Io {
+            operation, source, ..
+        } => format!(
+            "{operation}: kind={:?}, os_code={:?}",
+            source.kind(),
+            source.raw_os_error()
+        ),
+        AttemptError::Pipeline(_) => "pipeline operation".to_owned(),
+        AttemptError::Serialize(_) | AttemptError::Deserialize(_) => "manifest encoding".to_owned(),
+        AttemptError::InvalidManifest(_)
+        | AttemptError::InvalidTransition(_)
+        | AttemptError::InvalidQuery(_)
+        | AttemptError::InvalidContinuation(_) => "invalid durable state".to_owned(),
+        AttemptError::Injected(_) | AttemptError::QualificationControl(_) => {
+            "qualification control".to_owned()
+        }
+        AttemptError::RegistrationCollision { .. } => "destination collision".to_owned(),
+        AttemptError::IntegrityMismatch { .. } => "integrity verification".to_owned(),
+        AttemptError::AttemptByteLimitExceeded { .. }
+        | AttemptError::AggregateAdmissionUnproven(_)
+        | AttemptError::RetainedAttemptLimitExceeded { .. }
+        | AttemptError::RetainedByteLimitExceeded { .. } => "publication admission".to_owned(),
+    }
 }
 
 fn run(args: &RunArgs) -> Result<u8, PipelineError> {
@@ -2872,10 +2936,10 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                         PublicationFailureKind::Incomplete(cleanup_debt_count),
                     ));
                 }
-                Err(_) => {
+                Err(error) => {
                     publication_failure = Some(publication_failure_diagnostic(
                         &execution_id,
-                        PublicationFailureKind::Publish,
+                        PublicationFailureKind::Publish(publication_error_category(&error)),
                     ));
                 }
             },
@@ -6086,7 +6150,7 @@ mod tests {
             PublicationFailureKind::ReadinessAndAbandonment,
             PublicationFailureKind::CleanupDebt(2),
             PublicationFailureKind::Incomplete(1),
-            PublicationFailureKind::Publish,
+            PublicationFailureKind::Publish("I/O operation".to_owned()),
         ] {
             let rendered = publication_failure_diagnostic(execution_id, failure);
             assert!(rendered.contains(execution_id), "{rendered}");

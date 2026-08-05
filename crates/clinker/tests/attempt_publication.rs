@@ -2041,10 +2041,22 @@ fn matrix_admission_contention(destination: &Path, profile: &str, scenario: &str
             .expect("mounted admitted manifest readback");
         assert_eq!(manifest.execution_id(), admitted_execution);
         assert_eq!(manifest.admitted_bytes(), 100);
-        let cleanup =
-            AttemptPublication::cleanup(validated(root, "."), admitted_execution, 100_000_000)
-                .expect("cleanup admitted contention fixture");
-        assert_eq!(cleanup.disposition(), CleanupDisposition::Removed);
+    }
+
+    // The retained root receipt makes cleanup span every owned root. Inspect
+    // both copies before invoking that one logical cleanup operation.
+    let cleanup =
+        AttemptPublication::cleanup(validated(&first_root, "."), admitted_execution, 100_000_000)
+            .expect("cleanup admitted contention fixture");
+    assert_eq!(cleanup.disposition(), CleanupDisposition::Removed);
+    for root in [&first_root, &second_root] {
+        assert!(
+            !root
+                .join(".clinker-attempts")
+                .join(admitted_execution)
+                .exists(),
+            "logical cleanup must remove the admitted attempt from every owned root"
+        );
     }
 
     let mut stream = matrix_connection(scenario, PublicationMode::Direct);
@@ -2424,7 +2436,9 @@ fn fresh_query_reconciles_durable_promotion_intent_from_handles() {
         };
         assert_eq!(
             inspection.artifact_states(),
-            &[(artifact_id.clone(), expected)]
+            &[(artifact_id.clone(), expected)],
+            "reconciliation debt: {:?}",
+            inspection.cleanup_debt()
         );
     }
 }
