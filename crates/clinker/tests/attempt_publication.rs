@@ -1933,6 +1933,51 @@ fn bounded_attempt_listing_stops_at_exact_entry_byte_and_monotonic_time_limits()
 }
 
 #[test]
+fn bounded_attempt_listing_advances_across_more_attempts_than_one_page() {
+    let root = tempfile::tempdir().expect("temporary destination");
+    let execution_ids = [
+        "018f47a2-9a41-7a27-b4d6-4f7137e3c201",
+        "018f47a2-9a41-7a27-b4d6-4f7137e3c202",
+        "018f47a2-9a41-7a27-b4d6-4f7137e3c203",
+        "018f47a2-9a41-7a27-b4d6-4f7137e3c204",
+        "018f47a2-9a41-7a27-b4d6-4f7137e3c205",
+    ];
+    for execution_id in execution_ids {
+        let attempt =
+            AttemptPublication::create(validated(root.path(), "."), execution_id, 1_000, 301_000)
+                .expect("attempt fixture");
+        drop(attempt);
+    }
+    let policy = bounded_policy(root.path(), 86_400, 2, 8_000_000_000, 2_000);
+    let query = query(root.path(), &policy, "multi_page_listing");
+    let root_id = query.owned_root_ids()[0].to_owned();
+    let mut continuation = None;
+    let mut observed = Vec::new();
+    let mut encoded_tokens = std::collections::BTreeSet::new();
+
+    loop {
+        let page = query
+            .list(&root_id, 400_000, continuation.as_ref())
+            .expect("bounded list page");
+        observed.extend(
+            page.entries()
+                .iter()
+                .map(|entry| entry.inspection().execution_id().to_owned()),
+        );
+        continuation = page.continuation().cloned();
+        let Some(token) = continuation.as_ref() else {
+            break;
+        };
+        assert!(
+            encoded_tokens.insert(token.to_bytes().expect("canonical token")),
+            "a continuation token must never repeat the same page"
+        );
+    }
+
+    assert_eq!(observed, execution_ids);
+}
+
+#[test]
 fn continuation_is_versioned_plan_root_selector_bound_and_single_use() {
     let first = tempfile::tempdir().expect("first destination");
     let second = tempfile::tempdir().expect("second destination");

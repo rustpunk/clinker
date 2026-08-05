@@ -1178,18 +1178,28 @@ impl AttemptQuery {
                 return Ok(list);
             }
         };
-        let remaining = budget.remaining_entries_as_usize();
-        let mut namespace_entries = match namespace.bounded_entries(remaining) {
-            Ok(entries) => entries,
-            Err(_) => {
-                list.cleanup_debt.push(CleanupDebt::new(
-                    CleanupDebtKind::Operational,
-                    "attempt namespace enumeration failed",
-                ));
-                list.bounds = budget.bounds();
-                return Ok(list);
-            }
-        };
+        let inventory_limit =
+            usize::try_from(self.policy.retained_attempt_limit()).unwrap_or(usize::MAX);
+        let mut namespace_entries =
+            match namespace.bounded_entries(inventory_limit.saturating_add(1)) {
+                Ok(entries) => entries,
+                Err(_) => {
+                    list.cleanup_debt.push(CleanupDebt::new(
+                        CleanupDebtKind::Operational,
+                        "attempt namespace enumeration failed",
+                    ));
+                    list.bounds = budget.bounds();
+                    return Ok(list);
+                }
+            };
+        if !namespace_entries.complete || namespace_entries.entries.len() > inventory_limit {
+            list.cleanup_debt.push(CleanupDebt::new(
+                CleanupDebtKind::EntryBudget,
+                "attempt namespace exceeds the aggregate retained-attempt inventory bound",
+            ));
+            list.bounds = budget.bounds();
+            return Ok(list);
+        }
         namespace_entries
             .entries
             .sort_by(|left, right| left.name.cmp(&right.name));
@@ -2305,14 +2315,6 @@ impl QueryBudget {
         } else {
             Ok(())
         }
-    }
-
-    fn remaining_entries_as_usize(&self) -> usize {
-        usize::try_from(
-            self.entry_limit
-                .saturating_sub(self.bounds.considered_entries),
-        )
-        .unwrap_or(usize::MAX)
     }
 
     fn bounds(&self) -> AttemptQueryBounds {
