@@ -1973,6 +1973,34 @@ fn remove_matrix_namespace(root: &Path) {
 }
 
 #[cfg(target_os = "linux")]
+fn remove_empty_matrix_directory(path: &Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match std::fs::remove_dir(path) {
+            Ok(()) => return,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                let mut remaining = std::fs::read_dir(path)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Result::ok)
+                    .map(|entry| entry.file_name())
+                    .collect::<Vec<_>>();
+                remaining.sort();
+                panic!(
+                    "remove mounted publication sandbox: {error}; remaining entries: {remaining:?}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn wait_for_retained_manifest(root: &Path, execution_id: &str) -> AttemptManifest {
     let manifest_path = root
         .join(".clinker-attempts")
@@ -2240,7 +2268,7 @@ fn remote_filesystem_publication_matrix() {
     matrix_admission_contention(&destination, &profile, "admission-count", 40);
     matrix_admission_contention(&destination, &profile, "admission-bytes", 50);
     remove_matrix_namespace(&destination);
-    std::fs::remove_dir(&destination).expect("remove mounted publication sandbox");
+    remove_empty_matrix_directory(&destination);
 }
 
 fn stage_ready(
