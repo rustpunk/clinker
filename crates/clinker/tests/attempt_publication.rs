@@ -1651,6 +1651,47 @@ fn fresh_query_reconciles_durable_promotion_intent_from_handles() {
     }
 }
 
+#[test]
+fn fresh_query_prefers_intact_quarantine_over_a_preexisting_replacement_final() {
+    for existing in [b"older final".as_slice(), b"promotion evidence".as_slice()] {
+        let root = tempfile::tempdir().expect("temporary destination");
+        std::fs::write(root.path().join("result.bin"), existing).expect("preexisting final");
+        let registry = OutputStagingRegistry::default();
+        let mut attempt = begin(root.path());
+        let (artifact_id, mut file) = attempt
+            .stage_direct(
+                &registry,
+                validated(root.path(), "result.bin"),
+                "primary-output",
+                "result.bin",
+                PromotionDisposition::Replace,
+            )
+            .expect("stage replacement");
+        file.write_all(b"promotion evidence")
+            .expect("write replacement");
+        drop(file);
+        attempt.mark_ready(&artifact_id).expect("ready replacement");
+        attempt.set_fault_for_testing(AttemptFault::PromotionInterrupted);
+        attempt
+            .publish(&registry, &ShutdownToken::detached())
+            .expect_err("promotion interruption must retain quarantine");
+        drop(attempt);
+        drop(registry);
+
+        let policy = bounded_policy(root.path(), 0, 1_000, 8_000_000_000, 2_000);
+        let query = query(root.path(), &policy, "replacement_reconciliation");
+        let root_id = query.owned_root_ids()[0].to_owned();
+        let inspection = query
+            .inspect(&root_id, EXECUTION_ID, 400_000)
+            .expect("fresh handle-relative inspection");
+        assert_eq!(
+            inspection.artifact_states(),
+            &[(artifact_id, ArtifactState::Unpublished)]
+        );
+        assert_eq!(std::fs::read(root.path().join("result.bin")).unwrap(), existing);
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn quota_fault_is_an_explicit_seam_and_never_a_mounted_observation() {

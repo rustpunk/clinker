@@ -2909,11 +2909,40 @@ fn reconcile_promoting_artifact(
             "promotion destination could not be opened through its retained root",
         )
     })?;
-    match destination.open_file(final_leaf) {
-        Ok(mut file) => {
-            consume_reconciliation_bytes(&file, budget)?;
+    match attempt_root.directory.open_file(quarantine_leaf) {
+        Ok(mut quarantine) => {
+            consume_reconciliation_bytes(&quarantine, budget)?;
             let (size, digest) =
-                digest_file(&mut file, &root.destination.as_path().join(final_leaf)).map_err(
+                digest_file(&mut quarantine, &attempt_root.path.join(quarantine_leaf)).map_err(
+                    |_| {
+                        CleanupDebt::new(
+                            CleanupDebtKind::Operational,
+                            "quarantine promotion evidence could not be digested",
+                        )
+                    },
+                )?;
+            if size == artifact.size_bytes && digest == artifact.blake3_hex {
+                return Ok(ArtifactState::Unpublished);
+            }
+            return Err(CleanupDebt::new(
+                CleanupDebtKind::InvalidOwnership,
+                "quarantine promotion evidence does not match durable intent",
+            ));
+        }
+        Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {}
+        Err(_) => {
+            return Err(CleanupDebt::new(
+                CleanupDebtKind::Operational,
+                "quarantine promotion evidence could not be inspected handle-relatively",
+            ));
+        }
+    }
+
+    match destination.open_file(final_leaf) {
+        Ok(mut final_file) => {
+            consume_reconciliation_bytes(&final_file, budget)?;
+            let (size, digest) =
+                digest_file(&mut final_file, &root.destination.as_path().join(final_leaf)).map_err(
                     |_| {
                         CleanupDebt::new(
                             CleanupDebtKind::Operational,
@@ -2930,33 +2959,12 @@ fn reconcile_promoting_artifact(
                 ))
             }
         }
-        Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
-            let mut file = attempt_root
-                .directory
-                .open_file(quarantine_leaf)
-                .map_err(|_| {
-                    CleanupDebt::new(
-                        CleanupDebtKind::Operational,
-                        "neither final nor quarantine promotion evidence could be reopened",
-                    )
-                })?;
-            consume_reconciliation_bytes(&file, budget)?;
-            let (size, digest) = digest_file(&mut file, &attempt_root.path.join(quarantine_leaf))
-                .map_err(|_| {
-                CleanupDebt::new(
-                    CleanupDebtKind::Operational,
-                    "quarantine promotion evidence could not be digested",
-                )
-            })?;
-            if size == artifact.size_bytes && digest == artifact.blake3_hex {
-                Ok(ArtifactState::Unpublished)
-            } else {
-                Err(CleanupDebt::new(
-                    CleanupDebtKind::InvalidOwnership,
-                    "quarantine promotion evidence does not match durable intent",
-                ))
-            }
-        }
+        Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => Err(
+            CleanupDebt::new(
+                CleanupDebtKind::Operational,
+                "neither final nor quarantine promotion evidence could be reopened",
+            ),
+        ),
         Err(_) => Err(CleanupDebt::new(
             CleanupDebtKind::Operational,
             "promotion destination could not be inspected handle-relatively",
