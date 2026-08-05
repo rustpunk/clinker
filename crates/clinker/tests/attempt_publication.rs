@@ -1744,6 +1744,7 @@ fn matrix_interruption(
         "mounted disruption must retain non-success truth"
     );
     drop(attempt);
+    drop(registry);
     matrix_send(
         &mut stream,
         &serde_json::json!({
