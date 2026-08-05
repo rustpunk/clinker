@@ -146,8 +146,14 @@ clinker attempts purge pipelines/orders.yaml --expired --execute
 Repeat any path or overlay identity used by the run (`--base-dir`, absolute-path
 permission, rules root, channel/groups, `--path-execution-id`, batch identity,
 or timestamp) so the command recompiles the same typed owned roots. File-backed
-fan-out roots are reconstructed by replaying source discovery. Attempt commands
-do not accept a raw cleanup path. Continuation tokens are opaque raw values;
+fan-out roots normally replay source discovery. A retained failure also keeps
+a bounded, plan-bound receipt containing the logical source identities used by
+`{source_file}` and `{source_path}` plus path-free identifiers for every owned
+output or spool root. If a source is later removed or its directory is renamed,
+attempt commands re-render those authored templates and require the resulting
+validated roots to match the receipt exactly before listing, inspection, or
+purge. Successful publication removes the receipt with the rest of the attempt.
+Attempt commands do not accept a raw cleanup path. Continuation tokens are opaque raw values;
 JSON output provides authoritative structured recovery/resume argument arrays
 for shell-independent automation.
 

@@ -59,6 +59,86 @@ fn validated(root: &Path, relative: &str) -> ValidatedPath {
     validate_path(Path::new(relative), root, false).expect("fixture path should validate")
 }
 
+fn retained_execution_id(root: &Path) -> String {
+    std::fs::read_dir(root.join(".clinker-attempts"))
+        .expect("retained attempt namespace")
+        .filter_map(Result::ok)
+        .find(|entry| entry.path().is_dir())
+        .and_then(|entry| entry.file_name().into_string().ok())
+        .expect("retained execution directory")
+}
+
+fn assert_historical_attempt_is_operable(workspace: &Path, old_root: &Path) {
+    let execution_id = retained_execution_id(old_root);
+    let list = clinker_in(
+        workspace,
+        &["attempts", "list", "pipeline.yaml", "--format", "json"],
+    );
+    assert!(list.status.success(), "{}", stderr(&list));
+    let listed: serde_json::Value =
+        serde_json::from_slice(&list.stdout).expect("list JSON response");
+    assert!(
+        listed["roots"].as_array().is_some_and(|roots| {
+            roots.iter().any(|root| {
+                root["attempts"].as_array().is_some_and(|attempts| {
+                    attempts
+                        .iter()
+                        .any(|attempt| attempt["execution_id"] == execution_id)
+                })
+            })
+        }),
+        "historical execution must remain listable: {}",
+        stdout(&list)
+    );
+
+    let inspect = clinker_in(
+        workspace,
+        &[
+            "attempts",
+            "inspect",
+            "pipeline.yaml",
+            "--execution-id",
+            &execution_id,
+            "--format",
+            "json",
+        ],
+    );
+    assert!(inspect.status.success(), "{}", stderr(&inspect));
+    assert!(
+        stdout(&inspect).contains(&execution_id),
+        "historical execution must remain inspectable"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    let purge = clinker_in(
+        workspace,
+        &[
+            "attempts",
+            "purge",
+            "pipeline.yaml",
+            "--execution-id",
+            &execution_id,
+            "--execute",
+            "--format",
+            "json",
+        ],
+    );
+    assert!(purge.status.success(), "{}", stderr(&purge));
+    assert!(
+        !old_root
+            .join(".clinker-attempts")
+            .join(&execution_id)
+            .exists()
+    );
+    assert!(
+        !workspace
+            .join(".clinker-attempts")
+            .join(&execution_id)
+            .exists(),
+        "successful purge must remove the stable receipt copy"
+    );
+}
+
 fn write_workspace(publication: &str) -> (tempfile::TempDir, PathBuf) {
     let workspace = tempfile::tempdir().expect("temporary workspace");
     std::fs::create_dir(workspace.path().join("output")).expect("output directory");
@@ -631,6 +711,117 @@ nodes:
 }
 
 #[test]
+fn retained_source_file_root_survives_source_removal_through_purge() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    std::fs::create_dir_all(workspace.path().join("output/input-a"))
+        .expect("fan-out destination root");
+    std::fs::create_dir_all(workspace.path().join("output/input-b"))
+        .expect("second fan-out destination root");
+    let mut input = String::from("value\n");
+    input.push_str(&"x".repeat(1_100_000));
+    input.push('\n');
+    std::fs::write(workspace.path().join("input-a.csv"), input).expect("large source fixture");
+    std::fs::write(workspace.path().join("input-b.csv"), "value\nsmall\n")
+        .expect("second source fixture");
+    std::fs::write(
+        workspace.path().join("clinker.toml"),
+        "[storage.publication]\nfailed_retention_seconds = 0\ncreation_grace_seconds = 1\nmax_attempt_bytes = \"1MB\"\nretained_byte_limit = \"2MB\"\nmin_free_bytes = \"1B\"\n",
+    )
+    .expect("workspace config");
+    std::fs::write(
+        workspace.path().join("pipeline.yaml"),
+        r#"pipeline:
+  name: retained_source_file_root
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      glob: input-*.csv
+      schema:
+        - { name: value, type: string }
+  - type: output
+    name: result
+    input: source
+    config:
+      name: result
+      type: csv
+      path: output/{source_file}/result.csv
+"#,
+    )
+    .expect("pipeline fixture");
+
+    let run = clinker_in(workspace.path(), &["run", "pipeline.yaml"]);
+    assert_eq!(run.status.code(), Some(4), "{}", stderr(&run));
+    let old_root = workspace.path().join("output/input-a");
+    std::fs::remove_file(workspace.path().join("input-a.csv")).expect("remove source fixture");
+    std::fs::remove_file(workspace.path().join("input-b.csv"))
+        .expect("remove second source fixture");
+
+    assert_historical_attempt_is_operable(workspace.path(), &old_root);
+}
+
+#[test]
+fn retained_source_path_root_survives_source_directory_rename_through_purge() {
+    let workspace = tempfile::tempdir().expect("temporary workspace");
+    std::fs::create_dir_all(workspace.path().join("inputs/original")).expect("source directory");
+    std::fs::create_dir_all(workspace.path().join("output/inputs/original/input.csv"))
+        .expect("directory-changing fan-out destination root");
+    std::fs::create_dir_all(workspace.path().join("output/inputs/original/second.csv"))
+        .expect("second directory-changing fan-out destination root");
+    let mut input = String::from("value\n");
+    input.push_str(&"x".repeat(1_100_000));
+    input.push('\n');
+    std::fs::write(workspace.path().join("inputs/original/input.csv"), input)
+        .expect("large source fixture");
+    std::fs::write(
+        workspace.path().join("inputs/original/second.csv"),
+        "value\nsmall\n",
+    )
+    .expect("second source fixture");
+    std::fs::write(
+        workspace.path().join("clinker.toml"),
+        "[storage.publication]\nfailed_retention_seconds = 0\ncreation_grace_seconds = 1\nmax_attempt_bytes = \"1MB\"\nretained_byte_limit = \"2MB\"\nmin_free_bytes = \"1B\"\n",
+    )
+    .expect("workspace config");
+    std::fs::write(
+        workspace.path().join("pipeline.yaml"),
+        r#"pipeline:
+  name: retained_source_path_root
+nodes:
+  - type: source
+    name: source
+    config:
+      name: source
+      type: csv
+      glob: inputs/original/*.csv
+      schema:
+        - { name: value, type: string }
+  - type: output
+    name: result
+    input: source
+    config:
+      name: result
+      type: csv
+      path: output/{source_path}/result.csv
+"#,
+    )
+    .expect("pipeline fixture");
+
+    let run = clinker_in(workspace.path(), &["run", "pipeline.yaml"]);
+    assert_eq!(run.status.code(), Some(4), "{}", stderr(&run));
+    let old_root = workspace.path().join("output/inputs/original/input.csv");
+    std::fs::rename(
+        workspace.path().join("inputs/original"),
+        workspace.path().join("inputs/renamed"),
+    )
+    .expect("rename source directory");
+
+    assert_historical_attempt_is_operable(workspace.path(), &old_root);
+}
+
+#[test]
 fn attempts_default_anchor_matches_a_nested_pipeline_directory() {
     let workspace = tempfile::tempdir().expect("temporary workspace");
     let nested = workspace.path().join("nested");
@@ -802,6 +993,7 @@ nodes:
     for root in [
         workspace.path().join("output"),
         workspace.path().join("spool"),
+        workspace.path().to_path_buf(),
     ] {
         let namespace = root.join(".clinker-attempts");
         assert!(namespace.join(".admission.lock").is_file());
@@ -839,6 +1031,7 @@ fn ordinary_run_retains_truthful_abandoned_state_when_actual_bytes_exceed_admiss
     let attempts = std::fs::read_dir(&namespace)
         .expect("retained namespace")
         .filter_map(Result::ok)
+        .filter(|entry| entry.path().is_dir())
         .collect::<Vec<_>>();
     assert_eq!(attempts.len(), 1, "one run must own one retained attempt");
     let manifest: serde_json::Value = serde_json::from_slice(

@@ -38,6 +38,10 @@ const PRODUCER_MAX_CHARS: usize = 96;
 const PRODUCER_MAX_ENCODED_BYTES: usize = 192;
 const LOGICAL_MAX_CHARS: usize = 384;
 const LOGICAL_MAX_ENCODED_BYTES: usize = 512;
+const HISTORICAL_SOURCE_NAME_MAX_CHARS: usize = 128;
+const HISTORICAL_SOURCE_NAME_MAX_ENCODED_BYTES: usize = 256;
+const HISTORICAL_SOURCE_PATH_MAX_CHARS: usize = 4096;
+const HISTORICAL_SOURCE_PATH_MAX_ENCODED_BYTES: usize = 8192;
 pub const ARTIFACT_MAX_ENCODED_BYTES: usize = 992;
 pub const MANIFEST_MAX_ARTIFACTS: usize = 4096;
 pub const MANIFEST_MAX_BYTES: usize = PUBLICATION_MANIFEST_MAX_BYTES as usize;
@@ -51,6 +55,92 @@ pub fn observed_available_space(path: &Path) -> Result<u64, AttemptError> {
         path: path.to_path_buf(),
         source,
     })
+}
+
+/// Discover bounded, plan-bound historical root receipts from the stable
+/// pipeline-root control copy. Missing receipt metadata is an empty result;
+/// malformed ownership metadata fails closed.
+///
+/// # Errors
+///
+/// Returns [`AttemptError`] for invalid selectors, unsafe namespace entries,
+/// over-budget enumeration, or malformed retained manifests.
+pub fn discover_retained_root_receipts(
+    plan: &CompiledPlan,
+    receipt_root: &ValidatedPath,
+    execution_id: Option<&str>,
+    observed_unix_ms: u64,
+) -> Result<Vec<RetainedRootReceipt>, AttemptError> {
+    if let Some(execution_id) = execution_id {
+        validate_execution_id(execution_id)?;
+    }
+    let destination = AnchoredDirectory::open(receipt_root)?;
+    let namespace = match destination.open_child(ATTEMPT_NAMESPACE_LEAF) {
+        Ok(namespace) => namespace,
+        Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
+            return Ok(Vec::new());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let execution_ids = if let Some(execution_id) = execution_id {
+        vec![execution_id.to_owned()]
+    } else {
+        let entries = namespace.bounded_entries(
+            usize::try_from(PUBLICATION_MAX_RETAINED_ATTEMPTS)
+                .unwrap_or(usize::MAX)
+                .saturating_add(2),
+        )?;
+        if !entries.complete {
+            return Err(AttemptError::InvalidQuery(
+                "historical receipt namespace exceeds its bounded entry limit",
+            ));
+        }
+        let mut execution_ids = Vec::new();
+        for entry in entries.entries {
+            let name = entry.name.into_string().map_err(|_| {
+                AttemptError::InvalidQuery(
+                    "historical receipt namespace contains a non-UTF-8 entry",
+                )
+            })?;
+            if name == ADMISSION_LOCK_LEAF && entry.kind == ContainedEntryKind::File {
+                continue;
+            }
+            if entry.kind != ContainedEntryKind::Directory {
+                return Err(AttemptError::InvalidQuery(
+                    "historical receipt namespace contains an unsafe entry",
+                ));
+            }
+            validate_execution_id(&name)?;
+            execution_ids.push(name);
+        }
+        execution_ids.sort();
+        execution_ids
+    };
+
+    let mut receipts = Vec::new();
+    for execution_id in execution_ids {
+        let Some(attempt_root) = AttemptRoot::open(receipt_root, &execution_id)? else {
+            continue;
+        };
+        let manifest = read_manifest_from_anchor(&attempt_root.directory, observed_unix_ms)?;
+        if manifest.execution_id != execution_id {
+            return Err(AttemptError::InvalidManifest(
+                "receipt manifest execution identity does not match its directory",
+            ));
+        }
+        let Some(receipt) = manifest.root_receipt else {
+            continue;
+        };
+        if !receipt.matches_plan(plan) {
+            continue;
+        }
+        receipts.push(RetainedRootReceipt {
+            execution_id,
+            historical_sources: receipt.historical_sources,
+            owned_root_ids: receipt.owned_root_ids,
+        });
+    }
+    Ok(receipts)
 }
 
 /// Exact cross-platform outcome vocabulary preserved by publication and cleanup.
@@ -95,6 +185,184 @@ pub struct ArtifactRegistration {
     logical_leaf: String,
     destination: ValidatedPath,
     disposition: PromotionDisposition,
+}
+
+/// Bounded logical source identity retained solely to reconstruct authored
+/// fan-out templates after the source file is no longer discoverable.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HistoricalSourceIdentity {
+    source_name: String,
+    source_path: String,
+}
+
+impl HistoricalSourceIdentity {
+    /// Validate one source name and the exact logical path used by runtime
+    /// template rendering.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] when either value is empty or exceeds its
+    /// bounded character or encoded-byte limit.
+    pub fn new(
+        source_name: impl Into<String>,
+        source_path: impl Into<String>,
+    ) -> Result<Self, AttemptError> {
+        let source_name = source_name.into();
+        let source_path = source_path.into();
+        validate_bounded_text(
+            &source_name,
+            HISTORICAL_SOURCE_NAME_MAX_CHARS,
+            HISTORICAL_SOURCE_NAME_MAX_ENCODED_BYTES,
+            "historical source name exceeds its character or encoded byte limit",
+        )?;
+        validate_bounded_text(
+            &source_path,
+            HISTORICAL_SOURCE_PATH_MAX_CHARS,
+            HISTORICAL_SOURCE_PATH_MAX_ENCODED_BYTES,
+            "historical source path exceeds its character or encoded byte limit",
+        )?;
+        Ok(Self {
+            source_name,
+            source_path,
+        })
+    }
+
+    /// Compiled source node name used to select the authored fan-out edge.
+    pub fn source_name(&self) -> &str {
+        &self.source_name
+    }
+
+    /// Exact logical source path passed to the authored path template.
+    pub fn source_path(&self) -> &str {
+        &self.source_path
+    }
+}
+
+/// Plan-bound, path-free root receipt discovered from retained attempt
+/// metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RetainedRootReceipt {
+    execution_id: String,
+    historical_sources: Vec<HistoricalSourceIdentity>,
+    owned_root_ids: Vec<String>,
+}
+
+impl RetainedRootReceipt {
+    /// Execution whose retained roots this receipt authenticates.
+    pub fn execution_id(&self) -> &str {
+        &self.execution_id
+    }
+
+    /// Historical source identities needed by authored fan-out templates.
+    pub fn historical_sources(&self) -> &[HistoricalSourceIdentity] {
+        &self.historical_sources
+    }
+
+    /// Sorted path-free identifiers for every output or spool root owned by
+    /// the execution.
+    pub fn owned_root_ids(&self) -> &[String] {
+        &self.owned_root_ids
+    }
+
+    /// Verify that freshly rendered, validated roots match the path-free set
+    /// retained by this execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] when the reconstructed root set is empty,
+    /// contains duplicates, or differs from the receipt.
+    pub fn authenticate_roots(&self, roots: &[ValidatedPath]) -> Result<(), AttemptError> {
+        if roots.is_empty() {
+            return Err(AttemptError::InvalidQuery(
+                "historical receipt reconstructed no owned roots",
+            ));
+        }
+        let mut observed = roots
+            .iter()
+            .map(|root| owned_root_identifier(root.as_path()))
+            .collect::<Vec<_>>();
+        observed.sort();
+        observed.dedup();
+        if observed == self.owned_root_ids {
+            Ok(())
+        } else {
+            Err(AttemptError::InvalidQuery(
+                "historical receipt does not match reconstructed owned roots",
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ManifestRootReceipt {
+    pipeline_hash: String,
+    historical_sources: Vec<HistoricalSourceIdentity>,
+    owned_root_ids: Vec<String>,
+}
+
+impl ManifestRootReceipt {
+    fn new_from_hash(
+        pipeline_hash: &[u8; 32],
+        mut historical_sources: Vec<HistoricalSourceIdentity>,
+        mut owned_root_ids: Vec<String>,
+    ) -> Result<Self, AttemptError> {
+        historical_sources.sort();
+        historical_sources.dedup();
+        owned_root_ids.sort();
+        owned_root_ids.dedup();
+        let receipt = Self {
+            pipeline_hash: blake3::Hash::from_bytes(*pipeline_hash)
+                .to_hex()
+                .to_string(),
+            historical_sources,
+            owned_root_ids,
+        };
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    fn validate(&self) -> Result<(), AttemptError> {
+        validate_root_identifier(&self.pipeline_hash)?;
+        if self.historical_sources.len() > MANIFEST_MAX_ARTIFACTS
+            || self.owned_root_ids.is_empty()
+            || self.owned_root_ids.len() > MANIFEST_MAX_ARTIFACTS
+        {
+            return Err(AttemptError::InvalidManifest(
+                "root receipt is outside its bounded cardinality",
+            ));
+        }
+        let mut previous_source = None;
+        for source in &self.historical_sources {
+            HistoricalSourceIdentity::new(source.source_name.clone(), source.source_path.clone())?;
+            if previous_source.is_some_and(|previous: &HistoricalSourceIdentity| previous >= source)
+            {
+                return Err(AttemptError::InvalidManifest(
+                    "historical source identities must be strictly ordered",
+                ));
+            }
+            previous_source = Some(source);
+        }
+        let mut previous_root = None;
+        for root_id in &self.owned_root_ids {
+            validate_root_identifier(root_id)?;
+            if previous_root.is_some_and(|previous: &str| previous >= root_id.as_str()) {
+                return Err(AttemptError::InvalidManifest(
+                    "receipt root identifiers must be strictly ordered",
+                ));
+            }
+            previous_root = Some(root_id);
+        }
+        Ok(())
+    }
+
+    fn matches_plan(&self, plan: &CompiledPlan) -> bool {
+        self.pipeline_hash
+            == blake3::Hash::from_bytes(*plan.pipeline_hash())
+                .to_hex()
+                .as_str()
+    }
 }
 
 impl ArtifactRegistration {
@@ -432,6 +700,8 @@ pub struct AttemptManifest {
     total_bytes: u64,
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     admitted_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    root_receipt: Option<ManifestRootReceipt>,
     artifacts: Vec<ArtifactManifest>,
 }
 
@@ -459,6 +729,7 @@ impl AttemptManifest {
             artifact_count: artifacts.len(),
             total_bytes,
             admitted_bytes: 0,
+            root_receipt: None,
             artifacts,
         };
         manifest.validate(None)?;
@@ -542,6 +813,15 @@ impl AttemptManifest {
         Ok(self)
     }
 
+    fn with_root_receipt(
+        mut self,
+        root_receipt: Option<ManifestRootReceipt>,
+    ) -> Result<Self, AttemptError> {
+        self.root_receipt = root_receipt;
+        self.validate(None)?;
+        Ok(self)
+    }
+
     fn validate(&self, observed_unix_ms: Option<u64>) -> Result<(), AttemptError> {
         if self.schema != MANIFEST_SCHEMA {
             return Err(AttemptError::InvalidManifest(
@@ -582,6 +862,9 @@ impl AttemptManifest {
             return Err(AttemptError::InvalidManifest(
                 "artifact byte total does not match entries",
             ));
+        }
+        if let Some(receipt) = &self.root_receipt {
+            receipt.validate()?;
         }
         if self.state == AttemptState::Complete
             && self
@@ -3442,6 +3725,12 @@ pub struct RunAttemptPublication {
     inner: Arc<Mutex<AttemptPublication>>,
 }
 
+struct RootReceiptInput {
+    receipt_root: ValidatedPath,
+    plan_hash: [u8; 32],
+    historical_sources: Vec<HistoricalSourceIdentity>,
+}
+
 impl RunAttemptPublication {
     /// Create one empty run-owned attempt over a finite set of compiled
     /// destination-parent roots.
@@ -3458,6 +3747,43 @@ impl RunAttemptPublication {
             created_unix_ms,
             eligible_after_unix_ms,
             destination_roots,
+            None,
+        )
+        .map(|attempt| Self {
+            inner: Arc::new(Mutex::new(attempt)),
+        })
+    }
+
+    /// Create one run-owned attempt with a plan-bound historical root receipt
+    /// replicated into a stable pipeline-root control copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AttemptError`] when the receipt or any destination root is
+    /// invalid, admission cannot be proven, or durable metadata creation
+    /// fails.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_root_receipt(
+        policy: ResolvedPublicationPolicy,
+        plan: &CompiledPlan,
+        receipt_root: ValidatedPath,
+        historical_sources: Vec<HistoricalSourceIdentity>,
+        execution_id: &str,
+        created_unix_ms: u64,
+        eligible_after_unix_ms: u64,
+        destination_roots: Vec<ValidatedPath>,
+    ) -> Result<Self, AttemptError> {
+        AttemptPublication::create_dynamic_run(
+            policy,
+            execution_id,
+            created_unix_ms,
+            eligible_after_unix_ms,
+            destination_roots,
+            Some(RootReceiptInput {
+                receipt_root,
+                plan_hash: *plan.pipeline_hash(),
+                historical_sources,
+            }),
         )
         .map(|attempt| Self {
             inner: Arc::new(Mutex::new(attempt)),
@@ -3571,6 +3897,7 @@ impl AttemptPublication {
             created_unix_ms,
             eligible_after_unix_ms,
             0,
+            None,
         )
     }
 
@@ -3581,6 +3908,7 @@ impl AttemptPublication {
         created_unix_ms: u64,
         eligible_after_unix_ms: u64,
         admitted_bytes: u64,
+        root_receipt: Option<ManifestRootReceipt>,
     ) -> Result<Self, AttemptError> {
         validate_execution_id(execution_id)?;
         let owner_root_key = destination_root_key(destination_root.as_path());
@@ -3599,7 +3927,8 @@ impl AttemptPublication {
             AttemptState::Staging,
             Vec::new(),
         )?
-        .with_admitted_bytes(admitted_bytes)?;
+        .with_admitted_bytes(admitted_bytes)?
+        .with_root_receipt(root_receipt)?;
         let mut publication = Self {
             execution_id: execution_id.to_owned(),
             manifest_path: attempt_root.path.join("manifest.json"),
@@ -3677,6 +4006,7 @@ impl AttemptPublication {
             created_unix_ms,
             eligible_after_unix_ms,
             destination_roots.into_values().collect(),
+            None,
         )?;
 
         let mut writers = Vec::with_capacity(registrations.len());
@@ -3692,6 +4022,7 @@ impl AttemptPublication {
         created_unix_ms: u64,
         eligible_after_unix_ms: u64,
         destination_roots: Vec<ValidatedPath>,
+        receipt_input: Option<RootReceiptInput>,
     ) -> Result<Self, AttemptError> {
         validate_execution_id(execution_id)?;
         if destination_roots.is_empty() || destination_roots.len() > MANIFEST_MAX_ARTIFACTS {
@@ -3750,6 +4081,28 @@ impl AttemptPublication {
         }) {
             admission_roots.push(owner_root.clone());
         }
+        let owned_root_ids = admission_roots
+            .iter()
+            .map(|root| owned_root_identifier(root.as_path()))
+            .collect::<Vec<_>>();
+        if let Some(input) = &receipt_input
+            && !admission_roots.iter().any(|root| {
+                destination_root_key(root.as_path())
+                    == destination_root_key(input.receipt_root.as_path())
+            })
+        {
+            admission_roots.push(input.receipt_root.clone());
+        }
+        let root_receipt = receipt_input
+            .as_ref()
+            .map(|input| {
+                ManifestRootReceipt::new_from_hash(
+                    &input.plan_hash,
+                    input.historical_sources.clone(),
+                    owned_root_ids,
+                )
+            })
+            .transpose()?;
         let admission_locks = lock_admission_roots(&admission_roots)?;
         enforce_retained_attempt_admission(&policy, admission_roots.clone(), created_unix_ms)?;
         let owner_profile = match policy.mode() {
@@ -3763,12 +4116,17 @@ impl AttemptPublication {
             created_unix_ms,
             eligible_after_unix_ms,
             policy.explain().estimated_attempt_bytes,
+            root_receipt,
         )?;
         attempt.policy = Some(policy);
         attempt.destination_root_keys.clear();
         for (key, root) in roots {
             attempt.ensure_destination_root(key.clone(), root)?;
             attempt.destination_root_keys.push(key);
+        }
+        if let Some(input) = receipt_input {
+            let key = destination_root_key(input.receipt_root.as_path());
+            attempt.ensure_additional_root(key, input.receipt_root, DestinationProfile::Local)?;
         }
         attempt.destination_root_keys.sort();
         drop(admission_locks);
@@ -3814,6 +4172,22 @@ impl AttemptPublication {
         key: String,
         destination_root: ValidatedPath,
     ) -> Result<(), AttemptError> {
+        let profile = self
+            .policy
+            .as_ref()
+            .ok_or(AttemptError::InvalidTransition(
+                "run attempt has no resolved publication policy",
+            ))?
+            .destination_profile();
+        self.ensure_additional_root(key, destination_root, profile)
+    }
+
+    fn ensure_additional_root(
+        &mut self,
+        key: String,
+        destination_root: ValidatedPath,
+        profile: DestinationProfile,
+    ) -> Result<(), AttemptError> {
         if key == self.owner_root_key || self.additional_roots.contains_key(&key) {
             return Ok(());
         }
@@ -3830,13 +4204,6 @@ impl AttemptPublication {
             path: lock_path,
             source: source.into(),
         })?;
-        let profile = self
-            .policy
-            .as_ref()
-            .ok_or(AttemptError::InvalidTransition(
-                "run attempt has no resolved publication policy",
-            ))?
-            .destination_profile();
         if let Err(error) = persist_manifest_in_root(&root, profile, &self.manifest, false) {
             let _ = FileExt::unlock(&lock_file);
             drop(lock_file);
@@ -4990,6 +5357,25 @@ fn validate_text(
                 "logical_leaf exceeds its character or encoded byte limit",
             ),
         });
+    }
+    Ok(())
+}
+
+fn validate_bounded_text(
+    value: &str,
+    max_chars: usize,
+    max_encoded_bytes: usize,
+    message: &'static str,
+) -> Result<(), AttemptError> {
+    if value.is_empty()
+        || value.chars().count() > max_chars
+        || serde_json::to_string(value)
+            .map_err(AttemptError::Serialize)?
+            .len()
+            .saturating_sub(2)
+            > max_encoded_bytes
+    {
+        return Err(AttemptError::InvalidManifest(message));
     }
     Ok(())
 }

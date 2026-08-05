@@ -139,6 +139,17 @@ which lets expired cleanup reconstruct an execution-scoped root. Continuations
 cross the CLI as their canonical raw bytes; structured argument arrays are the
 authoritative automation surface and text commands apply platform quoting.
 
+Run-owned manifests also replicate a bounded historical-root receipt into the
+stable pipeline root. The receipt is bound to the compiled-plan hash, stores
+only typed logical source name/path pairs needed by `{source_file}` and
+`{source_path}`, and records sorted path-free identifiers for the execution's
+output and spool roots. It contains no direct deletion path. When live source
+discovery no longer finds a retained failure's inputs, operator compilation
+re-renders the authored templates from the receipt, validates the resulting
+paths, and requires their identifiers to match exactly. The stable replica is
+itself ordinary manifest ownership: successful publication removes it, while
+bounded purge removes it only after the same ownership checks as other roots.
+
 ### Remote filesystem qualification
 
 Normal CLI output is admitted from the filesystem type observed through the

@@ -12,8 +12,9 @@ use clinker_exec::output::attempt::{
     ARTIFACT_MAX_ENCODED_BYTES, ATTEMPT_EDGE_OUTCOME_TAXONOMY, ATTEMPT_PUBLICATION_PROHIBITIONS,
     ArtifactKind, ArtifactManifest, ArtifactRegistration, ArtifactState, AttemptContinuation,
     AttemptFault, AttemptManifest, AttemptPublication, AttemptQuery, AttemptState,
-    AttemptTestStage, CleanupDebtKind, CleanupDisposition, MANIFEST_MAX_ARTIFACTS,
-    MANIFEST_MAX_BYTES, PUBLICATION_COPY_BUFFER_BYTES, PurgeDisposition, SanitizedPathOptIn,
+    AttemptTestStage, CleanupDebtKind, CleanupDisposition, HistoricalSourceIdentity,
+    MANIFEST_MAX_ARTIFACTS, MANIFEST_MAX_BYTES, PUBLICATION_COPY_BUFFER_BYTES, PurgeDisposition,
+    RunAttemptPublication, SanitizedPathOptIn, discover_retained_root_receipts,
 };
 use clinker_exec::output::containment::PromotionDisposition;
 use clinker_exec::output::staging::{OutputStagingRegistry, PublicationOutcome};
@@ -236,6 +237,48 @@ fn run_attempt_owns_every_artifact_kind_across_bounded_destination_roots() {
     ] {
         assert!(root.join(leaf).is_file(), "missing {leaf}");
     }
+}
+
+#[test]
+fn retained_root_receipt_is_plan_bound_bounded_and_authenticates_reconstructed_roots() {
+    let receipt_root = tempfile::tempdir().expect("receipt root");
+    let destination = tempfile::tempdir().expect("destination root");
+    let unrelated = tempfile::tempdir().expect("unrelated root");
+    let plan = compiled_plan("retained_root_receipt");
+    let policy = resolved_policy(destination.path(), PublicationMode::Direct, None, 1_024);
+    let attempt = RunAttemptPublication::create_with_root_receipt(
+        policy,
+        &plan,
+        validated(receipt_root.path(), "."),
+        vec![
+            HistoricalSourceIdentity::new("src", "inputs/original.csv")
+                .expect("historical source identity"),
+        ],
+        EXECUTION_ID,
+        1_000,
+        2_000,
+        vec![validated(destination.path(), ".")],
+    )
+    .expect("create receipt-bearing attempt");
+    attempt.abandon().expect("retain attempt");
+    drop(attempt);
+
+    let receipts = discover_retained_root_receipts(
+        &plan,
+        &validated(receipt_root.path(), "."),
+        Some(EXECUTION_ID),
+        3_000,
+    )
+    .expect("discover retained receipt");
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].historical_sources().len(), 1);
+    receipts[0]
+        .authenticate_roots(&[validated(destination.path(), ".")])
+        .expect("exact reconstructed root must authenticate");
+    let error = receipts[0]
+        .authenticate_roots(&[validated(unrelated.path(), ".")])
+        .expect_err("different root must not authenticate");
+    assert!(error.to_string().contains("does not match"), "{error}");
 }
 
 fn assert_root_local_recovery(

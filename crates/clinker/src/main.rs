@@ -2280,6 +2280,7 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
         String,
         Vec<(std::sync::Arc<str>, std::path::PathBuf, std::path::PathBuf)>,
     > = std::collections::HashMap::new();
+    let mut historical_source_identities = std::collections::BTreeSet::new();
     for output in pipeline_config.output_configs() {
         if !output_is_fan_out(compiled_plan.dag(), &output.name) {
             continue;
@@ -2294,6 +2295,19 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
             std::collections::HashMap::new();
         let mut rendered = Vec::with_capacity(files.len());
         for source_path in files {
+            if let Some(source_name) = &upstream_source {
+                historical_source_identities.insert(
+                    clinker_exec::output::attempt::HistoricalSourceIdentity::new(
+                        source_name.clone(),
+                        source_path.to_string_lossy().into_owned(),
+                    )
+                    .map_err(|error| {
+                        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                            error.to_string(),
+                        ))
+                    })?,
+                );
+            }
             let source_key: std::sync::Arc<str> =
                 std::sync::Arc::from(source_path.to_string_lossy().into_owned());
             let source_file = source_path
@@ -2416,18 +2430,29 @@ fn run(args: &RunArgs) -> Result<u8, PipelineError> {
                 "publication attempt eligibility overflows the durable clock".to_owned(),
             ))
         })?;
-    let run_attempt = clinker_exec::output::attempt::RunAttemptPublication::create(
-        publication_policy,
-        &execution_id,
-        created_unix_ms,
-        eligible_after_unix_ms,
-        publication_roots.into_values().collect(),
-    )
-    .map_err(|error| {
-        PipelineError::Config(clinker_plan::config::ConfigError::Validation(
-            error.to_string(),
-        ))
-    })?;
+    let receipt_root =
+        clinker_plan::security::validate_path(std::path::Path::new("."), &workspace_root, false)
+            .map_err(|diagnostic| {
+                PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                    diagnostic.message,
+                ))
+            })?;
+    let run_attempt =
+        clinker_exec::output::attempt::RunAttemptPublication::create_with_root_receipt(
+            publication_policy,
+            &compiled_plan,
+            receipt_root,
+            historical_source_identities.into_iter().collect(),
+            &execution_id,
+            created_unix_ms,
+            eligible_after_unix_ms,
+            publication_roots.into_values().collect(),
+        )
+        .map_err(|error| {
+            PipelineError::Config(clinker_plan::config::ConfigError::Validation(
+                error.to_string(),
+            ))
+        })?;
     let _attempt_guard = RunAttemptAbandonGuard(run_attempt.clone());
     let output_staging =
         clinker_exec::output::staging::OutputStagingRegistry::for_run_attempt(run_attempt.clone());
@@ -4373,6 +4398,16 @@ fn compile_attempt_context(
     }
 
     let pipeline_base = workspace_root.join(&pipeline_dir);
+    let receipt_root =
+        clinker_plan::security::validate_path(std::path::Path::new("."), &pipeline_base, false)
+            .map_err(|diagnostic| AttemptCommandError::new(diagnostic.message))?;
+    let historical_receipts = clinker_exec::output::attempt::discover_retained_root_receipts(
+        &compiled_plan,
+        &receipt_root,
+        execution_id,
+        observed_unix_ms()?,
+    )
+    .map_err(attempt_query_error)?;
     let mut source_files_by_name = std::collections::BTreeMap::new();
     for body in pipeline_config.source_bodies() {
         let source = &body.source;
@@ -4380,17 +4415,33 @@ fn compile_attempt_context(
             source_files_by_name.insert(source.name.clone(), Vec::new());
             continue;
         }
-        let outcome =
-            clinker_plan::config::discovery::discover(source, &pipeline_base).map_err(|error| {
-                AttemptCommandError::new(format!(
+        let outcome = match clinker_plan::config::discovery::discover(source, &pipeline_base) {
+            Ok(outcome) => Some(outcome),
+            Err(clinker_plan::config::discovery::DiscoveryError::NoMatch { .. })
+                if historical_receipts.iter().any(|receipt| {
+                    receipt
+                        .historical_sources()
+                        .iter()
+                        .any(|identity| identity.source_name() == source.name)
+                }) =>
+            {
+                None
+            }
+            Err(error) => {
+                return Err(AttemptCommandError::new(format!(
                     "source '{}' discovery failed while reconstructing attempt roots: {error}",
                     source.name
-                ))
-            })?;
+                )));
+            }
+        };
         source_files_by_name.insert(
             source.name.clone(),
             outcome
-                .files()
+                .as_ref()
+                .map_or(
+                    &[][..],
+                    clinker_plan::config::discovery::DiscoveryOutcome::files,
+                )
                 .iter()
                 .map(|file| file.path.clone())
                 .collect::<Vec<_>>(),
@@ -4412,7 +4463,14 @@ fn compile_attempt_context(
                     output.name
                 ))
             })?;
-            if files.is_empty() {
+            if files.is_empty()
+                && !historical_receipts.iter().any(|receipt| {
+                    receipt
+                        .historical_sources()
+                        .iter()
+                        .any(|identity| identity.source_name() == upstream_source)
+                })
+            {
                 return Err(AttemptCommandError::new(format!(
                     "output {:?} has per-source path tokens but source {upstream_source:?} has no discovered files",
                     output.name
@@ -4462,7 +4520,7 @@ fn compile_attempt_context(
             }
         }
     }
-    if destination_roots.is_empty() {
+    if destination_roots.is_empty() && historical_receipts.is_empty() {
         return Err(AttemptCommandError::new(
             "compiled pipeline has no file destination roots",
         ));
@@ -4492,6 +4550,22 @@ fn compile_attempt_context(
         let root = clinker_plan::security::validate_path(std::path::Path::new("."), spool, false)
             .map_err(|diagnostic| AttemptCommandError::new(diagnostic.message))?;
         destination_roots.insert(root.as_path().to_path_buf(), root);
+    }
+    for receipt in &historical_receipts {
+        for root in reconstruct_historical_receipt_roots(
+            &compiled_plan,
+            receipt,
+            &pipeline_base,
+            identity.allow_absolute_paths,
+            resolved_policy
+                .as_ref()
+                .and_then(clinker_plan::config::ResolvedPublicationPolicy::local_spool_dir),
+        )? {
+            destination_roots.insert(root.as_path().to_path_buf(), root);
+        }
+    }
+    if !historical_receipts.is_empty() {
+        destination_roots.insert(receipt_root.as_path().to_path_buf(), receipt_root);
     }
 
     let existing_roots = destination_roots
@@ -4594,6 +4668,77 @@ fn insert_attempt_root(
     .map_err(|diagnostic| AttemptCommandError::new(diagnostic.message))?;
     roots.insert(validated.as_path().to_path_buf(), validated);
     Ok(())
+}
+
+fn reconstruct_historical_receipt_roots(
+    compiled_plan: &clinker_plan::plan::CompiledPlan,
+    receipt: &clinker_exec::output::attempt::RetainedRootReceipt,
+    pipeline_base: &std::path::Path,
+    allow_absolute_paths: bool,
+    local_spool_dir: Option<&std::path::Path>,
+) -> Result<Vec<clinker_plan::security::ValidatedPath>, AttemptCommandError> {
+    let mut roots = std::collections::BTreeMap::new();
+    for output in compiled_plan.config().output_configs() {
+        if output.has_per_record_path_tokens() {
+            let upstream_source = upstream_source_for_output(compiled_plan.dag(), &output.name)
+                .ok_or_else(|| {
+                    AttemptCommandError::new(format!(
+                        "output {:?} has historical path tokens but no reconstructible file source",
+                        output.name
+                    ))
+                })?;
+            let sources = receipt
+                .historical_sources()
+                .iter()
+                .filter(|identity| identity.source_name() == upstream_source)
+                .collect::<Vec<_>>();
+            if sources.is_empty() {
+                return Err(AttemptCommandError::new(format!(
+                    "retained execution {} has no historical source identity for output {:?}",
+                    receipt.execution_id(),
+                    output.name
+                )));
+            }
+            for identity in sources {
+                let source_path = std::path::Path::new(identity.source_path());
+                let source_file = source_path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("source");
+                let rendered = output
+                    .render_runtime_path(source_file, identity.source_path())
+                    .map_err(|error| AttemptCommandError::new(error.to_string()))?;
+                insert_attempt_root(&mut roots, &rendered, pipeline_base, allow_absolute_paths)?;
+            }
+        } else {
+            insert_attempt_root(
+                &mut roots,
+                &output.path,
+                pipeline_base,
+                allow_absolute_paths,
+            )?;
+        }
+    }
+    if let Some(dlq) = &compiled_plan.config().error_handling.dlq {
+        if let Some(path) = &dlq.path {
+            insert_attempt_root(&mut roots, path, pipeline_base, allow_absolute_paths)?;
+        }
+        for source in dlq.per_source.values() {
+            if let Some(path) = &source.path {
+                insert_attempt_root(&mut roots, path, pipeline_base, allow_absolute_paths)?;
+            }
+        }
+    }
+    if let Some(spool) = local_spool_dir {
+        let root = clinker_plan::security::validate_path(std::path::Path::new("."), spool, false)
+            .map_err(|diagnostic| AttemptCommandError::new(diagnostic.message))?;
+        roots.insert(root.as_path().to_path_buf(), root);
+    }
+    let roots = roots.into_values().collect::<Vec<_>>();
+    receipt
+        .authenticate_roots(&roots)
+        .map_err(attempt_query_error)?;
+    Ok(roots)
 }
 
 fn workspace_pipeline_display(pipeline: &std::path::Path) -> Result<String, AttemptCommandError> {
