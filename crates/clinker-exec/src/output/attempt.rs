@@ -2822,37 +2822,46 @@ fn enforce_retained_attempt_admission(
     observed_unix_ms: u64,
 ) -> Result<(), AttemptError> {
     let query = AttemptQuery::for_admission(policy, roots.clone())?;
-    for entry in collect_retained_inventory(&query, observed_unix_ms)?
-        .into_iter()
-        .filter(|entry| entry.eligible)
-    {
-        let request = query.purge_execution(&entry.root_identifier, &entry.execution_id)?;
-        let mut continuation = None;
-        let mut seen = std::collections::BTreeSet::new();
-        loop {
-            let report = query.execute(
-                &request,
-                observed_unix_ms,
-                continuation.as_ref(),
-                &ShutdownToken::detached(),
-            )?;
-            if matches!(
-                report.disposition(),
-                PurgeDisposition::Removed | PurgeDisposition::AlreadyAbsent
-            ) {
-                break;
+    let mut retained_by_execution = BTreeMap::new();
+    for entry in collect_retained_inventory(&query, observed_unix_ms)? {
+        retained_by_execution
+            .entry(entry.execution_id.clone())
+            .or_insert_with(Vec::new)
+            .push(entry);
+    }
+    for entries in retained_by_execution.values() {
+        if !entries.iter().all(|entry| entry.eligible) {
+            continue;
+        }
+        for entry in entries {
+            let request = query.purge_execution(&entry.root_identifier, &entry.execution_id)?;
+            let mut continuation = None;
+            let mut seen = std::collections::BTreeSet::new();
+            loop {
+                let report = query.execute(
+                    &request,
+                    observed_unix_ms,
+                    continuation.as_ref(),
+                    &ShutdownToken::detached(),
+                )?;
+                if matches!(
+                    report.disposition(),
+                    PurgeDisposition::Removed | PurgeDisposition::AlreadyAbsent
+                ) {
+                    break;
+                }
+                let Some(next) = report.continuation().cloned() else {
+                    return Err(AttemptError::AggregateAdmissionUnproven(
+                        "eligible retained attempt could not be removed",
+                    ));
+                };
+                if !seen.insert(next.to_bytes()?) {
+                    return Err(AttemptError::AggregateAdmissionUnproven(
+                        "retained cleanup continuation did not advance",
+                    ));
+                }
+                continuation = Some(next);
             }
-            let Some(next) = report.continuation().cloned() else {
-                return Err(AttemptError::AggregateAdmissionUnproven(
-                    "eligible retained attempt could not be removed",
-                ));
-            };
-            if !seen.insert(next.to_bytes()?) {
-                return Err(AttemptError::AggregateAdmissionUnproven(
-                    "retained cleanup continuation did not advance",
-                ));
-            }
-            continuation = Some(next);
         }
     }
 

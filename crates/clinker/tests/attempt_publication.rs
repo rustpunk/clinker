@@ -1948,6 +1948,18 @@ fn wait_for_admission_child(child: &mut Child) -> std::process::ExitStatus {
 }
 
 #[cfg(target_os = "linux")]
+fn wait_for_admission_results(paths: &[&Path]) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while !paths.iter().all(|path| path.is_file()) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "admission workers did not report outcomes before the deadline"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn remove_matrix_namespace(root: &Path) {
     let namespace = root.join(".clinker-attempts");
     if !namespace.exists() {
@@ -1987,6 +1999,7 @@ fn matrix_admission_contention(destination: &Path, profile: &str, scenario: &str
     std::fs::create_dir(&first_root).expect("create first mounted admission root");
     std::fs::create_dir(&second_root).expect("create second mounted admission root");
     let start = destination.join(format!("{scenario}.start"));
+    let release = destination.join(format!("{scenario}.release"));
     let first_result = destination.join(format!("{scenario}.first.result"));
     let second_result = destination.join(format!("{scenario}.second.result"));
     let first_execution = matrix_execution_id(index);
@@ -2005,6 +2018,7 @@ fn matrix_admission_contention(destination: &Path, profile: &str, scenario: &str
             .env("CLINKER_ADMISSION_WORKER_FIRST_ROOT", first)
             .env("CLINKER_ADMISSION_WORKER_SECOND_ROOT", second)
             .env("CLINKER_ADMISSION_WORKER_START", &start)
+            .env("CLINKER_ADMISSION_WORKER_RELEASE", &release)
             .env("CLINKER_ADMISSION_WORKER_RESULT", result)
             .env("CLINKER_ADMISSION_WORKER_EXECUTION_ID", execution_id)
             .spawn()
@@ -2013,10 +2027,12 @@ fn matrix_admission_contention(destination: &Path, profile: &str, scenario: &str
     let mut first = spawn(&first_root, &second_root, &first_result, &first_execution);
     let mut second = spawn(&second_root, &first_root, &second_result, &second_execution);
     std::fs::write(&start, b"start\n").expect("release admission workers");
-    assert!(wait_for_admission_child(&mut first).success());
-    assert!(wait_for_admission_child(&mut second).success());
+    wait_for_admission_results(&[&first_result, &second_result]);
     let first_outcome = std::fs::read_to_string(&first_result).expect("first worker result");
     let second_outcome = std::fs::read_to_string(&second_result).expect("second worker result");
+    std::fs::write(&release, b"release\n").expect("release admitted worker");
+    assert!(wait_for_admission_child(&mut first).success());
+    assert!(wait_for_admission_child(&mut second).success());
     let outcomes = [first_outcome.trim(), second_outcome.trim()];
     assert_eq!(
         outcomes
@@ -2081,7 +2097,7 @@ fn matrix_admission_contention(destination: &Path, profile: &str, scenario: &str
     );
     matrix_wait(&mut reader, "finish", scenario);
 
-    for path in [&start, &first_result, &second_result] {
+    for path in [&start, &release, &first_result, &second_result] {
         std::fs::remove_file(path).expect("remove admission worker control file");
     }
     for root in [&first_root, &second_root] {
@@ -2109,6 +2125,9 @@ fn remote_filesystem_admission_worker() {
     let start = PathBuf::from(
         std::env::var_os("CLINKER_ADMISSION_WORKER_START").expect("admission start marker"),
     );
+    let release = PathBuf::from(
+        std::env::var_os("CLINKER_ADMISSION_WORKER_RELEASE").expect("admission release marker"),
+    );
     let result = PathBuf::from(
         std::env::var_os("CLINKER_ADMISSION_WORKER_RESULT").expect("admission result path"),
     );
@@ -2132,8 +2151,16 @@ fn remote_filesystem_admission_worker() {
     );
     match outcome {
         Ok(attempt) => {
-            attempt.abandon().expect("retain admitted worker attempt");
             std::fs::write(result, b"admitted\n").expect("write admitted worker result");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !release.is_file() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "admission worker release marker exceeded its deadline"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            attempt.abandon().expect("retain admitted worker attempt");
         }
         Err(
             clinker_exec::output::attempt::AttemptError::RetainedAttemptLimitExceeded { .. }
