@@ -159,6 +159,17 @@ mod taxonomy {
             refusal.recovery_command(),
             "clinker attempts inspect pipelines/orders.yaml --execution-id 018f47a2-9a41-7a27-b4d6-4f7137e3c159"
         );
+        assert_eq!(
+            refusal.recovery_argv(),
+            [
+                "clinker",
+                "attempts",
+                "inspect",
+                "pipelines/orders.yaml",
+                "--execution-id",
+                "018f47a2-9a41-7a27-b4d6-4f7137e3c159",
+            ]
+        );
 
         let cleanup = AttemptDiagnosticData::for_failure(
             "attempt.retention.budget_exhausted",

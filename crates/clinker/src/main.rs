@@ -3420,6 +3420,8 @@ struct AttemptRootView {
     continuation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     resume_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resume_argv: Option<Vec<String>>,
     cleanup_debt: Vec<AttemptDebtView>,
     diagnostics: Vec<AttemptDiagnosticView>,
     bounds: AttemptBoundsView,
@@ -3463,6 +3465,7 @@ struct AttemptDiagnosticView {
     durability_uncertain: bool,
     retry_advice: &'static str,
     recovery_command: String,
+    recovery_argv: Vec<String>,
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -3589,6 +3592,7 @@ fn run_attempts_inspect(args: &AttemptsInspectArgs) -> Result<u8, AttemptCommand
                 removed_artifact_count: 0,
                 continuation: None,
                 resume_command: None,
+                resume_argv: None,
                 cleanup_debt,
                 diagnostics,
                 bounds,
@@ -3728,6 +3732,9 @@ fn purge_root_view(
         let resume_command = continuation
             .as_deref()
             .map(|continuation| purge_resume_command(args, &context.pipeline, continuation));
+        let resume_argv = continuation
+            .as_deref()
+            .map(|continuation| purge_resume_argv(args, &context.pipeline, continuation));
         Ok(AttemptRootView {
             root_id: root_id.to_owned(),
             disposition: purge_disposition_name(report.disposition()).to_owned(),
@@ -3738,6 +3745,7 @@ fn purge_root_view(
             removed_artifact_count: report.removed_artifact_count(),
             continuation,
             resume_command,
+            resume_argv,
             cleanup_debt: debt_views(report.cleanup_debt()),
             diagnostics,
             bounds: report.bounds().into(),
@@ -3779,6 +3787,9 @@ fn purge_root_view(
         let resume_command = continuation
             .as_deref()
             .map(|continuation| purge_resume_command(args, &context.pipeline, continuation));
+        let resume_argv = continuation
+            .as_deref()
+            .map(|continuation| purge_resume_argv(args, &context.pipeline, continuation));
         Ok(AttemptRootView {
             root_id: root_id.to_owned(),
             disposition: "preview".to_owned(),
@@ -3789,6 +3800,7 @@ fn purge_root_view(
             removed_artifact_count: 0,
             continuation,
             resume_command,
+            resume_argv,
             cleanup_debt: debt_views(preview.cleanup_debt()),
             diagnostics,
             bounds: preview.bounds().into(),
@@ -3827,13 +3839,17 @@ fn list_root_view(
         })
         .collect();
     let continuation = encode_attempt_continuation(list.continuation())?;
-    let resume_command = continuation.as_deref().map(|continuation| {
-        format!(
-            "clinker attempts list {} --continuation {}",
-            quote_attempt_argument(&context.pipeline),
-            quote_attempt_argument(continuation)
-        )
+    let resume_argv = continuation.as_deref().map(|continuation| {
+        vec![
+            "clinker".to_owned(),
+            "attempts".to_owned(),
+            "list".to_owned(),
+            context.pipeline.clone(),
+            "--continuation".to_owned(),
+            continuation.to_owned(),
+        ]
     });
+    let resume_command = resume_argv.as_deref().map(render_attempt_command);
     Ok(AttemptRootView {
         root_id: root_id.to_owned(),
         disposition: "listed".to_owned(),
@@ -3844,6 +3860,7 @@ fn list_root_view(
         removed_artifact_count: 0,
         continuation,
         resume_command,
+        resume_argv,
         cleanup_debt: debt_views(list.cleanup_debt()),
         diagnostics,
         bounds: AttemptBoundsView {
@@ -3917,6 +3934,7 @@ fn diagnostic_views(
             durability_uncertain: diagnostic.durability_uncertain(),
             retry_advice: diagnostic.retry_advice().as_str(),
             recovery_command: diagnostic.recovery_command().to_owned(),
+            recovery_argv: diagnostic.recovery_argv().to_vec(),
         })
         .collect()
 }
@@ -4256,10 +4274,10 @@ fn decode_attempt_continuation(
 ) -> Result<Option<clinker_exec::output::attempt::AttemptContinuation>, AttemptCommandError> {
     continuation
         .map(|value| {
-            clinker_exec::output::attempt::AttemptContinuation::from_bytes(value.as_bytes())
-                .map_err(|error| {
-                    AttemptCommandError::new(format!("invalid --continuation: {error}"))
-                })
+            let bytes = decode_continuation_hex(value)?;
+            clinker_exec::output::attempt::AttemptContinuation::from_bytes(&bytes).map_err(
+                |error| AttemptCommandError::new(format!("invalid --continuation: {error}")),
+            )
         })
         .transpose()
 }
@@ -4270,26 +4288,45 @@ fn encode_attempt_continuation(
     continuation
         .map(|continuation| {
             let bytes = continuation.to_bytes().map_err(attempt_query_error)?;
-            String::from_utf8(bytes).map_err(|_| {
-                AttemptCommandError::new("attempt continuation was not valid UTF-8 JSON")
-            })
+            Ok::<_, AttemptCommandError>(encode_continuation_hex(&bytes))
         })
         .transpose()
 }
 
 fn purge_resume_command(args: &AttemptsPurgeArgs, pipeline: &str, continuation: &str) -> String {
-    let selector = match args.execution_id.as_deref() {
-        Some(execution_id) => format!("--execution-id {execution_id}"),
-        None => "--expired".to_owned(),
-    };
-    let execute = if args.execute { " --execute" } else { "" };
-    format!(
-        "clinker attempts purge {} {selector}{execute} --continuation {}",
-        quote_attempt_argument(pipeline),
-        quote_attempt_argument(continuation)
-    )
+    render_attempt_command(&purge_resume_argv(args, pipeline, continuation))
 }
 
+fn purge_resume_argv(args: &AttemptsPurgeArgs, pipeline: &str, continuation: &str) -> Vec<String> {
+    let mut argv = vec![
+        "clinker".to_owned(),
+        "attempts".to_owned(),
+        "purge".to_owned(),
+        pipeline.to_owned(),
+    ];
+    match args.execution_id.as_deref() {
+        Some(execution_id) => {
+            argv.push("--execution-id".to_owned());
+            argv.push(execution_id.to_owned());
+        }
+        None => argv.push("--expired".to_owned()),
+    }
+    if args.execute {
+        argv.push("--execute".to_owned());
+    }
+    argv.push("--continuation".to_owned());
+    argv.push(continuation.to_owned());
+    argv
+}
+
+fn render_attempt_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| quote_attempt_argument(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(not(windows))]
 fn quote_attempt_argument(value: &str) -> String {
     if value
         .bytes()
@@ -4308,6 +4345,54 @@ fn quote_attempt_argument(value: &str) -> String {
     }
     quoted.push('\'');
     quoted
+}
+
+#[cfg(windows)]
+fn quote_attempt_argument(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        return value.to_owned();
+    }
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn encode_continuation_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn decode_continuation_hex(value: &str) -> Result<Vec<u8>, AttemptCommandError> {
+    if value.is_empty() || value.len() > 4_096 || !value.len().is_multiple_of(2) {
+        return Err(AttemptCommandError::new(
+            "invalid --continuation: token length is invalid",
+        ));
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = decode_hex_nibble(pair[0])?;
+            let low = decode_hex_nibble(pair[1])?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn decode_hex_nibble(byte: u8) -> Result<u8, AttemptCommandError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(AttemptCommandError::new(
+            "invalid --continuation: token is not lowercase hexadecimal",
+        )),
+    }
 }
 
 fn attempt_query_error(error: clinker_exec::output::attempt::AttemptError) -> AttemptCommandError {

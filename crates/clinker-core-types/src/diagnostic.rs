@@ -338,6 +338,7 @@ pub struct AttemptDiagnosticData {
     final_visibility: FinalVisibility,
     durability_uncertain: bool,
     recovery_command: String,
+    recovery_argv: Vec<String>,
 }
 
 impl AttemptDiagnosticData {
@@ -373,11 +374,15 @@ impl AttemptDiagnosticData {
         }
 
         let failure = FailureClassification::for_code(failure_code)?;
-        let recovery_command = format!(
-            "clinker attempts inspect {} --execution-id {}",
-            quote_command_argument(workspace_pipeline),
-            execution_id
-        );
+        let recovery_argv = vec![
+            "clinker".to_owned(),
+            "attempts".to_owned(),
+            "inspect".to_owned(),
+            workspace_pipeline.to_owned(),
+            "--execution-id".to_owned(),
+            execution_id.to_owned(),
+        ];
+        let recovery_command = render_command(&recovery_argv);
 
         Some(Self {
             diagnostic_code,
@@ -388,6 +393,7 @@ impl AttemptDiagnosticData {
             final_visibility,
             durability_uncertain,
             recovery_command,
+            recovery_argv,
         })
     }
 
@@ -440,6 +446,11 @@ impl AttemptDiagnosticData {
     pub fn recovery_command(&self) -> &str {
         &self.recovery_command
     }
+
+    /// Return the shell-independent recovery argument vector.
+    pub fn recovery_argv(&self) -> &[String] {
+        &self.recovery_argv
+    }
 }
 
 fn is_canonical_execution_id(value: &str) -> bool {
@@ -475,6 +486,14 @@ fn is_workspace_pipeline(value: &str) -> bool {
         .all(|component| matches!(component, Component::CurDir | Component::Normal(_)))
 }
 
+fn render_command(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| quote_command_argument(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(not(windows))]
 fn quote_command_argument(value: &str) -> String {
     if value
         .bytes()
@@ -494,6 +513,17 @@ fn quote_command_argument(value: &str) -> String {
     }
     quoted.push('\'');
     quoted
+}
+
+#[cfg(windows)]
+fn quote_command_argument(value: &str) -> String {
+    if value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+    {
+        return value.to_owned();
+    }
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 /// A span plus an optional human-readable label. Analogous to

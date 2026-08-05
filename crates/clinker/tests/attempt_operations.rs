@@ -298,7 +298,7 @@ fn invalid_manifest_refusal_uses_typed_e371_recovery_data() {
 
 #[test]
 fn bounded_inspection_uses_typed_e372_and_exit_four() {
-    let (workspace, output_root) = write_workspace("sweep_entry_limit = 1\n");
+    let (workspace, output_root) = write_workspace("sweep_byte_limit = \"1B\"\n");
     seed_incomplete_attempt(&output_root, EXECUTION_ID);
 
     let inspect = clinker_in(
@@ -349,8 +349,32 @@ fn continuation_output_preserves_the_exact_selector_and_execution_mode() {
     let resume = root["resume_command"]
         .as_str()
         .expect("bounded purge should emit a resume command");
+    let resume_argv = root["resume_argv"]
+        .as_array()
+        .expect("bounded purge should emit structured resume arguments");
+    assert!(
+        continuation
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
+        "continuation must use a lowercase URL-safe alphabet: {continuation}"
+    );
+    assert!(!continuation.starts_with('{'));
     assert!(resume.contains("attempts purge pipeline.yaml --expired --execute"));
-    assert!(resume.ends_with(&format!("--continuation '{continuation}'")));
+    assert!(resume.ends_with(&format!("--continuation {continuation}")));
+    assert_eq!(
+        resume_argv,
+        &[
+            "clinker",
+            "attempts",
+            "purge",
+            "pipeline.yaml",
+            "--expired",
+            "--execute",
+            "--continuation",
+            continuation,
+        ]
+        .map(serde_json::Value::from)
+    );
 }
 
 #[test]
