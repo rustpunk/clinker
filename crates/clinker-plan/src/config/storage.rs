@@ -124,6 +124,9 @@ const DEFAULT_SWEEP_BYTE_LIMIT: u64 = 8 * GIGABYTE;
 const MAX_SWEEP_BYTE_LIMIT: u64 = 64 * GIGABYTE;
 const DEFAULT_SWEEP_TIME_LIMIT_MS: u64 = 2_000;
 const MAX_SWEEP_TIME_LIMIT_MS: u64 = 30_000;
+/// Maximum durable attempt-manifest bytes that one cleanup page must inspect
+/// in addition to the largest admitted artifact set.
+pub const PUBLICATION_MANIFEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 fn default_failed_retention_seconds() -> u64 {
     DEFAULT_FAILED_RETENTION_SECONDS
@@ -467,6 +470,22 @@ impl PublicationPolicy {
             false,
             "sweep_byte_limit = \"64GB\"",
         )?;
+        let minimum_sweep_bytes = self
+            .max_attempt_bytes
+            .0
+            .checked_add(PUBLICATION_MANIFEST_MAX_BYTES)
+            .ok_or(StorageConfigError::PublicationSweepCapacityOverflow {
+                max_attempt_bytes: self.max_attempt_bytes.0,
+                manifest_overhead_bytes: PUBLICATION_MANIFEST_MAX_BYTES,
+            })?;
+        if self.sweep_byte_limit.0 < minimum_sweep_bytes {
+            return Err(StorageConfigError::PublicationSweepCapacityTooSmall {
+                sweep_byte_limit: self.sweep_byte_limit.0,
+                max_attempt_bytes: self.max_attempt_bytes.0,
+                manifest_overhead_bytes: PUBLICATION_MANIFEST_MAX_BYTES,
+                minimum_sweep_bytes,
+            });
+        }
         validate_publication_bound(
             "sweep_time_limit_ms",
             self.sweep_time_limit_ms,
@@ -1309,6 +1328,18 @@ pub enum StorageConfigError {
         estimated_attempt_bytes: u64,
         min_free_bytes: u64,
     },
+    /// The configured maximum plus bounded manifest overhead overflowed `u64`.
+    PublicationSweepCapacityOverflow {
+        max_attempt_bytes: u64,
+        manifest_overhead_bytes: u64,
+    },
+    /// One maximum-sized attempt could not fit in a cleanup page.
+    PublicationSweepCapacityTooSmall {
+        sweep_byte_limit: u64,
+        max_attempt_bytes: u64,
+        manifest_overhead_bytes: u64,
+        minimum_sweep_bytes: u64,
+    },
     /// The attempt estimate exceeds a configured byte limit.
     PublicationEstimateExceedsLimit {
         key: &'static str,
@@ -1415,6 +1446,22 @@ impl std::fmt::Display for StorageConfigError {
             } => write!(
                 f,
                 "publication capacity estimate overflow: estimated_attempt_bytes {estimated_attempt_bytes} + storage.publication.min_free_bytes {min_free_bytes}; reduce the estimate or set `[storage.publication]\nmin_free_bytes = \"2GB\"`"
+            ),
+            Self::PublicationSweepCapacityOverflow {
+                max_attempt_bytes,
+                manifest_overhead_bytes,
+            } => write!(
+                f,
+                "publication cleanup capacity overflow: storage.publication.max_attempt_bytes {max_attempt_bytes} + bounded manifest overhead {manifest_overhead_bytes}; reduce max_attempt_bytes"
+            ),
+            Self::PublicationSweepCapacityTooSmall {
+                sweep_byte_limit,
+                max_attempt_bytes,
+                manifest_overhead_bytes,
+                minimum_sweep_bytes,
+            } => write!(
+                f,
+                "storage.publication.sweep_byte_limit {sweep_byte_limit} cannot inspect one maximum attempt: max_attempt_bytes {max_attempt_bytes} + bounded manifest overhead {manifest_overhead_bytes} = {minimum_sweep_bytes}; use `[storage.publication]\nsweep_byte_limit = \"{minimum_sweep_bytes}B\"`"
             ),
             Self::PublicationEstimateExceedsLimit {
                 key,

@@ -803,6 +803,34 @@ fn publication_rejects_missing_spool_estimate_and_advisory_capacity() {
 }
 
 #[test]
+fn publication_requires_one_maximum_attempt_to_fit_in_a_cleanup_page() {
+    let destination = tempdir_path();
+    let doc = ClinkerToml::parse(
+        "[storage.publication]\nmax_attempt_bytes = \"2MB\"\nsweep_byte_limit = \"6MB\"\n",
+    )
+    .expect("parse sweep relationship");
+
+    let error = doc
+        .storage
+        .publication
+        .resolve(&destination, 1, u64::MAX)
+        .expect_err("manifest overhead must fit beside the maximum attempt");
+    let rendered = error.to_string();
+    assert!(rendered.contains("sweep_byte_limit 6000000"), "{rendered}");
+    assert!(rendered.contains("max_attempt_bytes 2000000"), "{rendered}");
+    assert!(
+        rendered.contains("bounded manifest overhead 4194304"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("sweep_byte_limit = \"6194304B\""),
+        "{rendered}"
+    );
+
+    let _ = std::fs::remove_dir_all(&destination);
+}
+
+#[test]
 fn invalid_publication_key_fails_before_attempt_creation() {
     let tmp = tempdir_path();
     let pipeline = tmp.join("pipeline.yaml");

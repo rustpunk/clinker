@@ -1688,7 +1688,10 @@ fn fresh_query_prefers_intact_quarantine_over_a_preexisting_replacement_final() 
             inspection.artifact_states(),
             &[(artifact_id, ArtifactState::Unpublished)]
         );
-        assert_eq!(std::fs::read(root.path().join("result.bin")).unwrap(), existing);
+        assert_eq!(
+            std::fs::read(root.path().join("result.bin")).unwrap(),
+            existing
+        );
     }
 }
 

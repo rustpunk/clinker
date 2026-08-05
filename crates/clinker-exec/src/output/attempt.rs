@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use clinker_plan::config::{DestinationProfile, PublicationMode, ResolvedPublicationPolicy};
+use clinker_plan::config::{
+    DestinationProfile, PUBLICATION_MANIFEST_MAX_BYTES, PublicationMode, ResolvedPublicationPolicy,
+};
 use clinker_plan::error::PipelineError;
 use clinker_plan::plan::CompiledPlan;
 use clinker_plan::security::{ValidatedPath, validate_path};
@@ -35,7 +37,7 @@ const LOGICAL_MAX_CHARS: usize = 384;
 const LOGICAL_MAX_ENCODED_BYTES: usize = 512;
 pub const ARTIFACT_MAX_ENCODED_BYTES: usize = 992;
 pub const MANIFEST_MAX_ARTIFACTS: usize = 4096;
-pub const MANIFEST_MAX_BYTES: usize = 4 * 1024 * 1024;
+pub const MANIFEST_MAX_BYTES: usize = PUBLICATION_MANIFEST_MAX_BYTES as usize;
 pub const PUBLICATION_COPY_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Observe destination free space at publication admission without reserving
@@ -2941,15 +2943,16 @@ fn reconcile_promoting_artifact(
     match destination.open_file(final_leaf) {
         Ok(mut final_file) => {
             consume_reconciliation_bytes(&final_file, budget)?;
-            let (size, digest) =
-                digest_file(&mut final_file, &root.destination.as_path().join(final_leaf)).map_err(
-                    |_| {
-                        CleanupDebt::new(
-                            CleanupDebtKind::Operational,
-                            "visible promotion evidence could not be digested",
-                        )
-                    },
-                )?;
+            let (size, digest) = digest_file(
+                &mut final_file,
+                &root.destination.as_path().join(final_leaf),
+            )
+            .map_err(|_| {
+                CleanupDebt::new(
+                    CleanupDebtKind::Operational,
+                    "visible promotion evidence could not be digested",
+                )
+            })?;
             if size == artifact.size_bytes && digest == artifact.blake3_hex {
                 Ok(ArtifactState::VisibleUnsynchronized)
             } else {
@@ -2959,12 +2962,12 @@ fn reconcile_promoting_artifact(
                 ))
             }
         }
-        Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => Err(
-            CleanupDebt::new(
+        Err(error) if containment_kind(&error) == Some(std::io::ErrorKind::NotFound) => {
+            Err(CleanupDebt::new(
                 CleanupDebtKind::Operational,
                 "neither final nor quarantine promotion evidence could be reopened",
-            ),
-        ),
+            ))
+        }
         Err(_) => Err(CleanupDebt::new(
             CleanupDebtKind::Operational,
             "promotion destination could not be inspected handle-relatively",

@@ -103,7 +103,9 @@ remaining strict keys are `failed_retention_seconds`,
 `retained_attempt_limit`, `min_free_bytes`, `sweep_entry_limit`,
 `sweep_byte_limit`, and `sweep_time_limit_ms`. Their fixed defaults and hard
 ceilings are enforced during policy resolution; only failed-attempt retention
-permits zero.
+permits zero. Resolution also requires `sweep_byte_limit` to cover
+`max_attempt_bytes` plus the bounded 4 MiB manifest, so a valid maximum-sized
+attempt cannot permanently stall cleanup paging.
 
 Free space is observed once at admission and compared with the checked attempt
 estimate plus `min_free_bytes`. That observation is advisory. It reserves no

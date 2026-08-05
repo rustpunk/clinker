@@ -64,7 +64,7 @@ sweep_time_limit_ms = 2000
 | `retained_attempt_limit` | 8 | 128 | Aggregate retained-attempt count ceiling. |
 | `min_free_bytes` | 2 GB | 64 GB | Additional free-space headroom required by admission. |
 | `sweep_entry_limit` | 1,000 | 10,000 | Maximum directory entries considered by one cleanup page. |
-| `sweep_byte_limit` | 8 GB | 64 GB | Maximum regular-file metadata bytes considered by one cleanup page. |
+| `sweep_byte_limit` | 8 GB | 64 GB | Maximum regular-file bytes considered by one cleanup page. Must be at least `max_attempt_bytes + 4,194,304B` so one maximum attempt and its bounded manifest can always make progress. |
 | `sweep_time_limit_ms` | 2,000 | 30,000 | Maximum monotonic elapsed time for one cleanup page. |
 
 The capacity observation is advisory. It is a one-time comparison of the
@@ -72,6 +72,11 @@ attempt estimate plus `min_free_bytes` against observed free space; it reserves
 no blocks or quota. A later write or synchronization can still fail with
 `ENOSPC` or `EDQUOT`, and Clinker retains exact attempt state rather than
 claiming publication succeeded.
+
+Configuration resolution rejects a sweep budget that cannot inspect one
+maximum-sized attempt plus the bounded 4 MiB manifest. The diagnostic reports
+the exact minimum and a paste-ready `sweep_byte_limit` setting; this prevents a
+valid admitted attempt from becoming permanently too large for cleanup.
 
 ### Publication modes and destination profiles
 
